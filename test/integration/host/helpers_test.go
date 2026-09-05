@@ -46,6 +46,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
@@ -1556,19 +1557,13 @@ func addNodeToCluster(
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}
 
-	// Request membership addition from the leader.
-	leaderIdx := cluster.findLeader(shardID)
-	if leaderIdx < 0 {
+	// Request the membership addition through whichever node leads the shard
+	// at each attempt, and accept only a change a linearizable membership
+	// read confirms. See test/membership for why neither the leader nor
+	// "did it commit" may be sampled once.
+	if err := membership.TryAddNode(cluster.leaderHost, shardID, newReplicaID, addr, membershipTimeout); err != nil {
 		h.Close()
-		t.Fatal("no leader found for membership addition")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := cluster.hosts[leaderIdx].SyncRequestAddNode(ctx, shardID, newReplicaID, addr, 0); err != nil {
-		h.Close()
-		t.Fatalf("SyncRequestAddNode(replica=%d) failed: %v", newReplicaID, err)
+		t.Fatal(err)
 	}
 
 	// Start the shard in join mode on the new host.

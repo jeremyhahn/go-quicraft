@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/test/membership"
 )
 
 // TestHostAPI_MembershipChange_AddAndRemoveNode verifies that a 4th node
@@ -91,16 +92,9 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, allData, membershipTimeout)
 	t.Logf("phase 3 complete: node[%d] received 10 post-add entries, total=%d", result.idx, len(allData))
 
-	// Phase 4: Remove the 4th node from the cluster.
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, newReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", newReplicaID, err)
-	}
+	// Phase 4: Remove the 4th node from the cluster, through whichever node
+	// leads at each attempt (test/membership).
+	membership.DeleteNode(t, cluster.leaderHost, shardID, newReplicaID, membershipTimeout)
 	t.Logf("phase 4: requested removal of replica=%d", newReplicaID)
 
 	// Wait for the leader to reflect 3 voting members.
@@ -254,14 +248,9 @@ func TestHostAPI_MembershipChange_RemoveFollower(t *testing.T) {
 	followerReplicaID := uint64(followerIdx + 1)
 	t.Logf("removing follower node[%d] (replica=%d)", followerIdx, followerReplicaID)
 
-	// Request the removal.
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, followerReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", followerReplicaID, err)
-	}
+	// Request the removal through whichever node leads at each attempt
+	// (test/membership).
+	membership.DeleteNode(t, cluster.leaderHost, shardID, followerReplicaID, membershipTimeout)
 
 	// Wait for membership to reflect 2 nodes.
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
@@ -397,12 +386,7 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, allData, membershipTimeout)
 
 	// Remove the 4th node and verify the 3-node cluster continues.
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	rmCtx, rmCancel := context.WithTimeout(context.Background(), membershipTimeout)
-	defer rmCancel()
-	if err := cluster.hosts[leaderIdx].SyncRequestDeleteNode(rmCtx, shardID, newReplicaID, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode(replica=%d) failed: %v", newReplicaID, err)
-	}
+	membership.DeleteNode(t, cluster.leaderHost, shardID, newReplicaID, membershipTimeout)
 	cluster.stopNode(result.idx)
 
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)

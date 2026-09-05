@@ -39,6 +39,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
@@ -153,6 +154,14 @@ const leaderElectionTimeout = coldStartElectionRounds * electionRound
 // happens over transport that is already established between survivors that
 // already know one another, while a cold start pays for the handshakes first.
 const failoverTimeout = 20 * electionRound
+
+// membershipTimeout is the budget for a membership change to LAND: to be
+// accepted by a leader and confirmed by a linearizable membership read
+// (test/membership). It is the sum of the two waits the old direct call sites
+// made in sequence — a failover that may be in progress when the change is
+// requested, then the change itself — because the retry loop absorbs both
+// inside one budget rather than sampling the leader once and then calling.
+const membershipTimeout = failoverTimeout + defaultTimeout
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
@@ -955,37 +964,17 @@ func (c *testCluster) addNode(shardID uint64) int {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
 	}
 
-	// Wait for a leader rather than sampling once. addNode is called mid-test
-	// under sustained client load, where a transient election leaves findLeader
-	// returning -1 for a few ticks; an instantaneous sample turns that ordinary
-	// window into a test failure. This still fails — loudly — if no leader
-	// appears within leaderElectionTimeout, so the assertion is not weakened,
-	// only made insensitive to when it is sampled.
-	//
-	// h is closed on the failure path via defer rather than inline:
-	// waitForClusterLeader calls t.Fatalf, which runs Goexit and would otherwise
-	// leak the host we just constructed.
-	leaderFound := false
-	defer func() {
-		if !leaderFound {
-			h.Close()
-		}
-	}()
-	leaderIdx := c.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderFound = true
-
-	c.hostsMu.RLock()
-	leaderHost := c.hosts[leaderIdx]
-	c.hostsMu.RUnlock()
-
 	newReplicaID := uint64(len(c.addrs) + 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestAddNode(ctx, shardID, newReplicaID, addr, 0); err != nil {
+	// The change goes through whichever node leads the shard at each attempt,
+	// and is accepted only once a linearizable membership read confirms it.
+	// addNode is called mid-test under sustained client load, where a transient
+	// election leaves leaderHost returning nil for a few ticks; the loop asks
+	// again rather than sampling once, and still fails — loudly — if the
+	// change has not landed within membershipTimeout. See test/membership.
+	if err := membership.TryAddNode(c.leaderHost, shardID, newReplicaID, addr, membershipTimeout); err != nil {
 		h.Close()
-		c.t.Fatalf("addNode: SyncRequestAddNode(replica=%d) failed: %v", newReplicaID, err)
+		c.t.Fatalf("addNode: %v", err)
 	}
 
 	// Start the shard in join mode on the new host.
@@ -1014,25 +1003,25 @@ func (c *testCluster) addNode(shardID uint64) int {
 func (c *testCluster) removeNode(idx int, shardID uint64) {
 	c.t.Helper()
 
-	leaderIdx := c.findLeader(shardID)
-	if leaderIdx < 0 {
-		c.t.Fatal("removeNode: no leader found")
-	}
+	// The precondition is on the TARGET: the caller chose a follower, and this
+	// checks that it still is one. A leader is waited for rather than sampled
+	// once — removeNode runs mid-test under sustained client load, where a
+	// transient election leaves findLeader at -1 for a few ticks, and a single
+	// sample turned that ordinary window into "no leader found". A leader that
+	// has moved ONTO the target is still fatal: the test asked to remove a
+	// follower, and the caller (not this helper) owns choosing one that is
+	// current.
+	leaderIdx := c.waitForClusterLeader(shardID, failoverTimeout)
 	if leaderIdx == idx {
 		c.t.Fatalf("removeNode: cannot remove the leader (node[%d])", idx)
 	}
 
-	c.hostsMu.RLock()
-	leaderHost := c.hosts[leaderIdx]
-	c.hostsMu.RUnlock()
-
 	replicaID := uint64(idx + 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	if err := leaderHost.SyncRequestDeleteNode(ctx, shardID, replicaID, 0); err != nil {
-		c.t.Fatalf("removeNode: SyncRequestDeleteNode(replica=%d) failed: %v", replicaID, err)
+	// The change itself goes through whichever node leads at each attempt
+	// (test/membership), not the leader observed above.
+	if err := membership.TryDeleteNode(c.leaderHost, shardID, replicaID, membershipTimeout); err != nil {
+		c.t.Fatalf("removeNode: %v", err)
 	}
 
 	c.stopNode(idx)
