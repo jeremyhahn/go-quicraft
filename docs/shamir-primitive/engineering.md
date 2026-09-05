@@ -14,7 +14,7 @@ Import paths:
 
 ```go
 const MaxSecretBytes    = 64 << 10   // 65536
-const MaxShareSetBytes  = 1 << 20    // 1 MiB — whole-set footprint budget
+const MaxShareSetBytes  = 2 << 20    // 2 MiB — whole-set footprint budget, in PAGES
 
 // Split / combine — struct form (DEPRECATED: string custody)
 func Split(secret []byte, threshold, total int) ([]*Share, error)
@@ -326,8 +326,8 @@ accept.
 | `threshold <= 255`, `total <= 255` | `Split`, `SplitProtected` | `SplitError` |
 | `len(secret) > 0` | `Split`, `SplitProtected` | `SplitError` |
 | `len(secret) <= MaxSecretBytes` | `Split`, `SplitProtected` | `SplitError` |
-| whole-set footprint `<= MaxShareSetBytes` | `SplitProtected` | `SplitError` |
-| summed element length `<= MaxShareSetBytes` | `UnmarshalShareSet` | `ValidationError` |
+| page-rounded whole-set footprint `<= MaxShareSetBytes` | `SplitProtected` | `SplitError` |
+| page-rounded sum of share-value lengths `<= MaxShareSetBytes` | `UnmarshalShareSet` | `ValidationError` |
 | `len(shares) <= 255` | `UnmarshalShareSet` | `ValidationError` |
 | `len(shares) <= 255` (`maxShares`) | `Combine`, `CombineBytes` | `CombineError` |
 | payload `<= MaxSecretBytes` | `parseRawShare` | `CombineError` |
@@ -382,15 +382,34 @@ Three obligations come with `ProtectedShare`:
 Because of the second one, the two calls that allocate a whole set price it
 first. `SplitProtected` rejects parameters whose footprint — coefficients,
 the reused scratch, the reused ENCODING scratch, and every returned share value —
-exceeds `MaxShareSetBytes` (1 MiB), since individually legal arguments multiply
+exceeds `MaxShareSetBytes` (2 MiB), since individually legal arguments multiply
 into one no host can lock (a 64 KiB secret split 255 ways needs ~16 MiB of
 coefficients alone). The encoding scratch is counted because it is live at the
 peak: go-enclave has no post-fill freeze, so a share's frozen value is built by
 copying out of the scratch and both exist during the copy. Omitting it made the
 cap stop being an upper bound, which is a defect rather than an approximation —
-`secretLen=1757` at 255-of-255 priced under the cap and exceeded it in fact. A full 255-share ceremony over a 32-byte
-root key needs ~24 KiB of that budget; sharing a 4 KiB *payload* 255 ways does
-not fit and should be enveloped under a key that does.
+`secretLen=1757` at 255-of-255 priced under the cap and exceeded it in fact.
+
+**Every term is priced in whole PAGES**, through go-enclave's `LockedSize`.
+That is the unit the kernel charges: each region is its own enclave and a
+32-byte enclave locks a full 4 KiB page, so a figure summed from requested
+sizes cannot be compared to `RLIMIT_MEMLOCK` at all — which is the only
+comparison the budget exists to make. Summing requested bytes, as this did
+before issue #94, under-priced a 255-share split of a one-byte secret at 1,536
+bytes against a measured `VmLck` delta of 1,044,480: 680x, with the per-share
+rounding rather than the secret accounting for all of it.
+
+The constant moved with the arithmetic. A full 255-share ceremony over a
+32-byte root key costs 259 pages (1,060,864 bytes), which does not fit the old
+1 MiB's 256 — a cap that refuses the operation the package exists for is a bug,
+not a policy. 2 MiB sits at the edge of the regime the primitive serves, a
+split whose **encoded share fits one page**: secrets up to 3,070 bytes at the
+full 255 ways, peaking at 1,835,008. One byte past that every share needs a
+second page and the footprint jumps to 2,879,488, which is refused — as is
+sharing a 4 KiB *payload* 255 ways (3,141,632). Envelope large payloads under a
+key that does fit. Against the 8 MiB `RLIMIT_MEMLOCK` a Linux host commonly
+defaults to, one maximal set is a quarter of the ceiling; that bounds ONE call
+and is deliberately not a concurrency budget.
 
 And **shares arriving from outside the process are decoded with
 `UnmarshalShareSet`, not `json.Unmarshal` into a `[]*ProtectedShare`.** Shares
@@ -400,15 +419,28 @@ handed, and the generic decoder allocates one locked buffer per element as it
 visits them: the submission, not the service, would choose how much locked
 memory to take, exhausting a process-wide resource every other caller depends
 on. `UnmarshalShareSet` bounds the element count (255, the scheme's own limit) and
-the **summed length of the raw JSON elements** against `MaxShareSetBytes`
+the **page-rounded sum of the share VALUE lengths** against `MaxShareSetBytes`
 before it allocates any of it, and destroys the accepted prefix if a later
 element is rejected. The sum is taken over the elements rather than from
-`len(data)` deliberately: it is the same bound, but it cannot be evaded by
-whitespace accounting, and each element's length is an upper bound on the
-locked buffer it will produce. For scale, the full 255-share set of a 32-byte
-root key is ~24 KiB against the 1 MiB budget. A ceremony that legitimately
-needs more than the budget does its own accounting and decodes share by share
-with `NewProtectedShare`.
+`len(data)` deliberately: it cannot be evaded by whitespace accounting. Rounding
+each value up to a page is what makes it a bound on the RESOURCE: one element is
+one enclave and costs a whole page however small the share, so the full
+255-share set of a 32-byte root key is ~25 KiB of JSON and 1,044,480 bytes of
+locked memory. Bounding the raw length, as this did before issue #94, priced
+that submission at a fortieth of what it takes — on the path whose entire reason
+for existing is that the submitter cannot be authenticated.
+
+Pricing the **value** rather than the whole element is the second half, and it
+is what keeps this bound and `splitLockedBytes` comparable. An element carries
+~48 bytes of JSON header, and when the encoded value lands on an exact page
+multiple that header pushes every element into a further page — so a 171-share
+set of a 6142-byte secret splits at 1,429,504 and, priced per element, decodes
+at 2,101,248: admitted by one guard and refused by the other, on a set the
+library itself produced. Priced per value the decode sum is exactly
+`splitLockedBytes`' `total*lockedBytes(encoded)` term, to which that function
+adds four more positive terms, so **anything the split admits the ingest path
+admits** by construction. A ceremony that legitimately needs more than the budget
+does its own accounting and decodes share by share with `NewProtectedShare`.
 
 **Constant time**
 

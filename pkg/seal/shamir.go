@@ -187,8 +187,9 @@ func (r *ShamirInitResult) Destroy() {
 // process. The scheme's own count bound in shamir.CombineProtected runs on
 // shares already allocated, far too late to help. So the shares are held first
 // as raw JSON and decoded through
-// shamir.UnmarshalShareSet, which bounds the set (at most maxShares elements and
-// MaxShareSetBytes of JSON) BEFORE it locks anything.
+// shamir.UnmarshalShareSet, which bounds the set (at most maxShares elements,
+// and at most MaxShareSetBytes of locked memory priced in the PAGES the kernel
+// charges — a page per share however small the share) BEFORE it locks anything.
 //
 // Ownership: every step that can fail runs before the receiver is touched, and
 // UnmarshalShareSet destroys every share it built if a later element is rejected

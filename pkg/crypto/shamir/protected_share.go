@@ -82,13 +82,59 @@ func testOnlySizedProtectedMemory(fn func(int) (*enclave.MemoryEnclave, error)) 
 // [version:1][x:1][y:MaxSecretBytes] share. It is the locked-memory analogue
 // of parseRawShare's MaxSecretBytes bound, applied one step earlier because
 // the allocation it guards is a kernel resource rather than heap.
+//
+// It is a bound on the VALUE, not a budget, so it is stated in value bytes and
+// is not page-rounded. NewProtectedShare makes exactly one allocation, whose
+// real cost is lockedBytes of that value — at most one page more than this
+// number, and no share count multiplies it. The under-counting that page
+// rounding fixes (issue #94) is a property of the SET paths, where one page of
+// slack per share is the dominant term; here it cannot compound. The paths that
+// build a set from many NewProtectedShare calls — UnmarshalShareSet, and
+// seal.ShamirInitResult.UnmarshalJSON through it — price the set page-rounded
+// against MaxShareSetBytes before the first of those calls runs.
 var maxProtectedValueBytes = base64.StdEncoding.EncodedLen(rawShareOverhead + MaxSecretBytes)
 
+// lockedBytes reports what ONE allocation of n bytes actually costs against
+// RLIMIT_MEMLOCK, which is n rounded UP to a whole page.
+//
+// It is go-enclave's own [enclave.LockedSize], not a local rounding rule, for
+// the reason go-enclave exports it: the page size is the allocator's property,
+// so a copy here would be a second answer to a question the dependency already
+// answers, and the two would drift the first time either moved.
+//
+// The unit matters more than the arithmetic. A caller's bytes and the kernel's
+// bytes are NOT the same unit — a 32-byte enclave locks a full 4 KiB page — so a
+// budget summed from requested sizes cannot be compared to RLIMIT_MEMLOCK at
+// all, which is the only comparison the budget exists to make. Every locked
+// allocation this package prices goes through here.
+//
+// It returns 0 for n <= 0, matching LockedSize, and every caller below has
+// already bounded n to a positive value.
+//
+// It does NOT pass LockedSize's other zero through. LockedSize also reports 0
+// for a positive n too large to map at all, and a budget is the one place that
+// answer must not be taken literally: pricing an impossible allocation at
+// nothing ADMITS it, and the caller then meets the refusal deep inside a
+// half-built set — which is the outcome pricing up front exists to avoid. So an
+// unmappable size is priced past the budget, which refuses it. Unreachable from
+// SplitProtected, whose factors validateSplitParams has already bounded; the
+// path that can reach it in principle is UnmarshalShareSet, whose element
+// lengths come from a document that arrives from outside the process.
+func lockedBytes(n int) int {
+	locked := enclave.LockedSize(n)
+	if n > 0 && locked <= 0 {
+		return MaxShareSetBytes + 1
+	}
+	return int(locked)
+}
+
 // MaxShareSetBytes is the locked memory this package will spend on ONE share
-// set. Both paths that can allocate a whole set enforce it before they allocate
-// any of it: SplitProtected against the footprint its parameters imply, and
-// UnmarshalShareSet against the size of the undecoded document (every share
-// value is a substring of it, so the document bounds the sum of the buffers).
+// set, counted in the PAGES the kernel charges rather than the bytes a caller
+// asks for. Both paths that can allocate a whole set enforce it before they
+// allocate any of it: SplitProtected against the page-rounded footprint its
+// parameters imply, and UnmarshalShareSet against the page-rounded sum of the
+// undecoded elements (every share value is a substring of its element, so the
+// element bounds the buffer it will produce).
 //
 // It is a POLICY bound, unlike maxProtectedValueBytes and maxShares which are
 // properties of the scheme, and it exists because the per-value bounds are
@@ -107,44 +153,80 @@ var maxProtectedValueBytes = base64.StdEncoding.EncodedLen(rawShareOverhead + Ma
 // that has to be torn down — but it no longer stands between a caller and a
 // dead service.
 //
-// 1 MiB is far above any key-custody ceremony this primitive exists to serve
-// and far below any plausible locked-memory allowance. It admits the full
-// 255-share set of a 32-byte root key (~24 KiB) and a 5-of-5 split of the
-// largest secret the package accepts (~750 KiB); it refuses combinations like
-// 255 shares of a 4 KiB secret, which is sharing a payload rather than a key.
+// # Why 2 MiB, and why it is not 1 MiB any more
+//
+// It was 1 MiB while the accounting summed REQUESTED bytes, and both halves of
+// that were wrong together: the pricing under-counted a 255-share split by
+// ~680x (issue #94), so the cap looked generous while admitting sets that lock
+// far more than it names. Page-rounded, a share set costs at least one page per
+// share, and the arithmetic that fixes the pricing moves the constant with it.
+//
+// The floor is the headline case this primitive exists to serve — the full
+// 255-share split of a 32-byte root key, which is 259 pages (1,060,864 bytes)
+// and no longer fits 1 MiB's 256. A cap that refuses the operation the package
+// is for is not a cap, it is a bug, so the constant had to rise; what follows is
+// where it was put and why.
+//
+// 2 MiB (512 pages on a 4 KiB-page host) is set at the natural edge of the
+// regime the primitive serves: a split whose ENCODED SHARE FITS ONE PAGE. That
+// is every secret up to 3070 bytes at the full 255 ways, whose peak is 448 pages
+// (1,835,008 bytes) — the largest footprint on that side of the line, and the
+// number 2 MiB is chosen to clear. It also admits the 5-of-5 split of the
+// largest secret the package accepts, 192 pages (786,432 bytes). One byte past
+// that edge every share needs a second page and the footprint jumps: 255 shares
+// of a 3071-byte secret price at 2,879,488 and are refused, as are 255 shares of
+// a 4 KiB secret at 3,141,632 — which is sharing a payload rather than a key.
 // Envelope large payloads under a key that IS this size, exactly as
-// MaxSecretBytes says. A caller that genuinely needs more does its own
-// accounting and works share by share with SplitBytes and NewProtectedShare —
-// the policy is then explicitly the caller's, which is where a number that
-// cannot be derived from the scheme belongs.
-const MaxShareSetBytes = 1 << 20
+// MaxSecretBytes says.
+//
+// Against the 8 MiB RLIMIT_MEMLOCK a Linux host commonly defaults to, one
+// maximal share set is a quarter of the ceiling. That is deliberately not a
+// concurrency budget: this bounds ONE call, and a process running several at
+// once — or holding sets after they return — still has to bound itself.
+// go-enclave's Allocator is the mechanism for that, and it belongs to whoever
+// owns the process's locked-memory policy, not to this primitive.
+//
+// A caller that genuinely needs more does its own accounting and works share by
+// share with SplitBytes and NewProtectedShare — the policy is then explicitly
+// the caller's, which is where a number that cannot be derived from the scheme
+// belongs.
+const MaxShareSetBytes = 2 << 20
 
 // splitLockedBytes reports the locked memory SplitProtected holds at its peak
 // for these parameters: the random polynomial coefficients, the per-share
 // coefficient vector and raw payload it reuses, and the encoded value of every
 // share it returns.
 //
+// Every term is priced through lockedBytes, SEPARATELY, because each is its own
+// enclave and the kernel charges each a whole page. Summing the requested sizes
+// first and rounding once at the end is the bug this replaces: it prices 255
+// four-byte share values at 1020 bytes when the kernel charges 255 pages, and
+// measured against VmLck a 255-share split of a one-byte secret came out 680x
+// over its own price — 1,044,480 charged against 1,536 priced (issue #94). The
+// per-share rounding, not the secret size, is what dominates a wide split.
+//
 // THE ENCODING SCRATCH USED TO BE A TERM HERE and no longer is, because the
 // scratch itself is gone. go-enclave had no post-fill freeze, so a share's
 // frozen value had to be built by copying OUT of a reused writable scratch, and
 // for the duration of that copy both regions were live — which made the scratch
 // part of the PEAK rather than an implementation detail. Omitting it was not a
-// rounding error: secretLen=1757 at threshold=total=255 priced at 1,047,032 and
-// was admitted while its true peak was 1,049,380, over the 1,048,576 cap (caught
-// by Codex on PR #69). Each share is now encoded directly into its own sized
-// enclave and frozen in place (go-enclave #6), so nothing is live that this does
-// not count.
+// rounding error; it made MaxShareSetBytes stop being an upper bound (caught by
+// Codex on PR #69). Each share is now encoded directly into its own sized
+// enclave and frozen in place (go-enclave #6, adopted in #83), so nothing is
+// live that this does not count. The figures that used to be quoted here for
+// that defect were summed in requested BYTES and correspond to nothing this
+// function computes any more, so they are gone with the term.
 //
-// The multiplications cannot overflow because validateSplitParams runs first
-// and bounds each factor — the secret to MaxSecretBytes (64 KiB) and both
-// threshold and total to maxShares (255) — so the largest product this can
-// compute is ~39 MB.
+// The multiplication cannot overflow because validateSplitParams runs first and
+// bounds each factor — the secret to MaxSecretBytes (64 KiB) and both threshold
+// and total to maxShares (255) — so the largest product this can compute is 255
+// page-rounded encodings of a 64 KiB secret, ~23 MB.
 func splitLockedBytes(secretLen, threshold, total int) int {
 	encoded := base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen)
-	coefficients := secretLen * (threshold - 1)
-	scratch := threshold + rawShareOverhead + secretLen
-	values := total * encoded
-	return coefficients + scratch + values
+	return lockedBytes(secretLen*(threshold-1)) + // random coefficients
+		lockedBytes(threshold) + // per-share coefficient vector
+		lockedBytes(rawShareOverhead+secretLen) + // reused raw payload
+		total*lockedBytes(encoded) // one frozen value per returned share
 }
 
 // ProtectedShare is a Shamir share whose VALUE lives in memory-protected
@@ -333,8 +415,8 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// terminated the process.
 	if need := splitLockedBytes(len(secret), threshold, total); need > MaxShareSetBytes {
 		return nil, &SplitError{Reason: fmt.Sprintf(
-			"%d shares of a %d-byte secret need %d bytes of locked memory, exceeding the %d-byte budget",
-			total, len(secret), need, MaxShareSetBytes)}
+			"%d-of-%d shares of a %d-byte secret need %d bytes of locked memory, exceeding the %d-byte budget",
+			threshold, total, len(secret), need, MaxShareSetBytes)}
 	}
 
 	// One degree-(threshold-1) polynomial per secret byte, sharing a single
@@ -483,6 +565,15 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 // those fix, once more to accumulate each share's contribution into the
 // result. Decoding base64 twice is cheap; a peak that an untrusted share set
 // gets to choose is not.
+//
+// That shape is also why this path needs no budget arithmetic and so has none
+// to get wrong. It allocates TWO regions whatever the size of the set — the
+// decode buffer and the secret scratch — each bounded by a share value the
+// constructor already bounded, so page rounding costs at most two pages of
+// slack in total and nothing multiplies by the share count. The under-counting
+// fixed in issue #94 was per-share rounding summed 255 times, which cannot
+// arise here. The shares themselves were locked by whoever built them, against
+// MaxShareSetBytes on that path.
 //
 // Only the x-coordinates and the Lagrange basis derived from them live on the
 // ordinary heap: a share's x-coordinate is its published index, not secret (see
@@ -922,6 +1013,68 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// shareSetLockedBytes prices the locked memory UnmarshalShareSet will hold for
+// these raw elements, in the PAGES the kernel charges.
+//
+// It is the SINGLE copy of that arithmetic, called by the guard and asserted
+// against by its tests. A test that recomputed the sum for itself would track
+// whatever the right answer is regardless of what the guard does, which is the
+// same "witness derived from the code under test" failure that let the
+// under-counting of issue #94 stand certified for as long as it did.
+//
+// The sum STOPS at the first element that carries it past the budget. That is
+// what keeps it from overflowing: rounding adds up to a page per element on top
+// of lengths already bounded only by a document that arrives from outside the
+// process. The figure it returns on refusal is therefore a true LOWER bound on
+// what the set would have taken, which is what the error says.
+func shareSetLockedBytes(raw []json.RawMessage) int {
+	size := 0
+	for _, elem := range raw {
+		size += elementLockedBytes(elem)
+		if size > MaxShareSetBytes {
+			return size
+		}
+	}
+	return size
+}
+
+// elementLockedBytes prices the ONE enclave a share element becomes: its value,
+// page-rounded.
+//
+// It prices the VALUE and not the whole element, and that is not a refinement —
+// it is what keeps this bound and SplitProtected's comparable. A share's element
+// carries ~48 bytes of JSON header on top of its value, and when the encoded
+// value is an exact multiple of the page size that header pushes every element
+// into an extra page. Priced per element, a 171-share set of 6142-byte secrets
+// costs 2,101,248 here and 1,429,504 in splitLockedBytes: SplitProtected admits
+// it and this refuses it, so a ceremony cannot read back a set the library
+// itself produced. Priced per value the two agree by construction — this sum is
+// exactly splitLockedBytes' total*lockedBytes(encoded) term, and that function
+// adds four more positive terms on top — so whatever a split admits, this
+// admits. Caught in review of #94.
+//
+// The value is read out as a RAW token, so its length is the length of the
+// literal NewProtectedShare will be handed, escapes and all; the enclave is
+// built over exactly those bytes, which makes this an equality rather than a
+// bound. The copy the decode makes is share material and is wiped here.
+//
+// An element that does not decode as a share object is priced at its whole
+// length, which is an upper bound on any value inside it. Nothing is admitted on
+// the strength of that estimate that would not also be admitted on a correct
+// one, and UnmarshalJSON reports the real error a moment later.
+func elementLockedBytes(elem json.RawMessage) int {
+	var aux struct {
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(elem, &aux); err != nil || len(aux.Value) < 2 {
+		return lockedBytes(len(elem))
+	}
+	defer wipe(aux.Value)
+	// Less the two quotes: UnmarshalJSON passes aux.Value[1:len-1] to
+	// NewProtectedShare, and that slice is what becomes the enclave.
+	return lockedBytes(len(aux.Value) - 2)
+}
+
 // UnmarshalShareSet decodes a JSON array of shares — the shape json.Marshal
 // produces for a []*Share or a []*ProtectedShare — bounding the set BEFORE it
 // allocates any locked memory for it.
@@ -947,8 +1100,14 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 //   - at most maxShares (255) elements — the scheme's own bound, since the
 //     x-coordinate is a non-zero byte and no larger set can hold distinct
 //     shares;
-//   - at most MaxShareSetBytes of JSON, which bounds the sum of the values
-//     because each is a substring of the document.
+//   - at most MaxShareSetBytes of LOCKED MEMORY, priced by shareSetLockedBytes
+//     as the sum over the elements of each element's VALUE rounded up to a whole
+//     page. Each element becomes exactly one enclave over that value, and the
+//     kernel charges it a page whatever it holds. Summing the raw lengths
+//     instead under-counts a wide set of small shares by the page size
+//     (issue #94); pricing the element rather than the value over-counts by a
+//     page and puts this bound out of step with SplitProtected's, so a set the
+//     library produced could not be read back.
 //
 // Neither reads a value, and the second is measured on the raw elements the
 // standard decoder has already copied, so bounding costs no additional copy of
@@ -983,14 +1142,17 @@ func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error) {
 	}
 	// Summed over the elements rather than taken from len(data): the same
 	// bound, but it cannot be evaded by whitespace accounting, and each
-	// element's length is an upper bound on the locked buffer it will produce.
-	size := 0
-	for _, elem := range raw {
-		size += len(elem)
-	}
-	if size > MaxShareSetBytes {
+	// element's length is an upper bound on the length of the value inside it.
+	//
+	// PAGE-ROUNDED per element, because that is what the element will cost. Each
+	// one becomes exactly one enclave, and the kernel charges a whole page for
+	// it however few bytes the value holds — so summing the raw lengths prices
+	// 255 shares of a 32-byte key at ~25 KiB when they lock 255 pages, and the
+	// bound stops bounding the resource it names (issue #94).
+	if size := shareSetLockedBytes(raw); size > MaxShareSetBytes {
 		return nil, &ValidationError{Field: "shares", Reason: fmt.Sprintf(
-			"share set is %d bytes of JSON, exceeding the %d-byte budget", size, MaxShareSetBytes)}
+			"share set needs at least %d bytes of locked memory, exceeding the %d-byte budget",
+			size, MaxShareSetBytes)}
 	}
 
 	shares := make([]*ProtectedShare, 0, len(raw))

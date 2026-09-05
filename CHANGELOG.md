@@ -46,6 +46,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Shamir locked-memory budget is priced in pages, and `MaxShareSetBytes`
+  is 2 MiB (#94).** Consumer-observable: `MaxShareSetBytes` doubles, and a wide
+  split of a multi-kilobyte secret that the old figure admitted is now refused
+  with a `*SplitError`.
+
+  `splitLockedBytes` priced *requested* bytes. go-enclave charges *whole pages* —
+  a 32-byte enclave locks 4 KiB — and a 255-share split takes 255 separate
+  allocations, so the per-share rounding was the entire cost and none of the
+  price. Measured against `VmLck` in `/proc/self/status`:
+  `SplitProtected(secret[1], 255, 255)` priced at 1,536 bytes and locked
+  1,044,480. That is 680x, and it admitted the call with ~683x of headroom to
+  spare.
+
+  The consequence is not local to this package. Locked memory is a fixed
+  PROCESS-WIDE resource, so a recovery ceremony issuing a few 255-share splits
+  drains the 8 MiB `RLIMIT_MEMLOCK` a Linux host commonly defaults to, and the
+  next allocation to be refused is whichever comes next — including the
+  barrier's own root-key enclave, which then fails `Unseal` with
+  `ErrLockedMemoryUnavailable`. The consensus engine could not unseal because an
+  unrelated share split had priced itself wrong.
+
+  Every region is now priced through go-enclave's `LockedSize`, separately,
+  because each is its own enclave and the kernel charges each a page. The same
+  correction applies to `UnmarshalShareSet`, which bounded the raw JSON length:
+  255 small shares are ~25 KiB of document and 1,044,480 bytes of locked memory,
+  so an unauthenticated submission was priced at a fortieth of what it takes. It
+  now sums the share VALUES page-rounded — the value and not the whole element,
+  because an element's ~48-byte JSON header can push every share into a further
+  page and put this bound out of step with the split's, which would refuse a set
+  the library itself produced. Priced per value the decode sum is exactly the
+  split's per-share term, so anything a split admits the ingest path admits.
+
+  Its refusal message changed from `share set is N bytes of JSON, ...` to
+  `share set needs at least N bytes of locked memory, ...`. The
+  `*ValidationError{Field: "shares"}` shape is unchanged, so `errors.Is`/`As`
+  consumers are unaffected; anything matching the old text is not.
+  `SplitProtected`'s refusal now names the threshold as well as the total, since
+  the threshold drives the coefficient term and is often the cheaper knob.
+
+  `MaxShareSetBytes` had to move with the arithmetic rather than merely be
+  re-derived: page-rounded, the 255-share split of a 32-byte root key — the
+  headline case this primitive exists for — is 259 pages, and the old 1 MiB is
+  256. 2 MiB sits at the edge of the regime the primitive serves, a split whose
+  encoded share fits one page (secrets to 3,070 bytes at the full 255 ways,
+  peaking at 1,835,008); one byte past it every share takes a second page and
+  the footprint jumps to 2,879,488, which is refused. Against a common 8 MiB
+  ceiling one maximal set is a quarter of it. That bounds ONE call and is
+  deliberately not a concurrency budget — a process running several at once
+  bounds itself, with go-enclave's `Allocator`.
+
+  The test that certified the property could not have caught it: it counted the
+  regions the seam handed out, never the bytes the kernel locked, so it agreed
+  with the wrong accounting as readily as the right one. The witness is now a
+  measured `VmLck` delta, which is the only one that cannot be fooled by the
+  arithmetic under test.
+
 - **`Stop()` now announces a graceful shutdown to the peers that dialed this
   node (#78).** Consumer-observable: a node shutting down cleanly used to be
   indistinguishable from one that had vanished.

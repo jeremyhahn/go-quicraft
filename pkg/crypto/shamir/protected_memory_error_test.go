@@ -17,7 +17,10 @@ package shamir
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -164,34 +167,57 @@ func TestTestOnlyProtectedMemory_RestoresPrevious(t *testing.T) {
 	e.Destroy()
 }
 
-// TestSplitProtected_BudgetIsATrueUpperBound pins MaxShareSetBytes as a true
-// upper bound on the locked memory SplitProtected holds at its peak, and pins
-// the accounting change that moved that peak.
+// TestSplitProtected_BudgetCountsEveryLiveRegion pins the arithmetic of
+// splitLockedBytes term by term, and pins that every region the seam hands out
+// is still alive when the split returns.
+//
+// It was called TestSplitProtected_BudgetIsATrueUpperBound. The name moved to
+// the measured test in protected_share_lockedmem_linux_test.go, because that is
+// where it is now earned: this test counts REGIONS, and issue #94 is precisely
+// the case of a budget that counted regions correctly and priced them by a
+// factor of 680. A test cannot witness "true upper bound" without measuring what
+// the kernel charged, so the claim and the name went together to the test that
+// reads VmLck. What is left here is still worth having, and is what the name now
+// says.
 //
 // HISTORY, because the numbers below only make sense with it. The go-enclave
 // port could not freeze a sized enclave after filling it, so each share's frozen
 // value was built by copying OUT of a reused writable encoding scratch — both
 // regions live during the copy, so the scratch was part of the PEAK. It was
 // missing from splitLockedBytes, and the gap was real rather than a rounding
-// error: these exact dimensions priced at 1,047,032 were ADMITTED while the true
-// peak was 1,049,380, over the 1,048,576 cap (caught by Codex on PR #69).
+// error (caught by Codex on PR #69).
 //
-// go-enclave v0.5.0-alpha grew MemoryEnclave.Freeze, so a share value is encoded
-// directly into the region it will keep and frozen there. The scratch is gone,
-// the term that counted it is gone with it, and 1,047,032 is now BOTH the price
-// and the true peak — so the same dimensions are admitted, correctly this time.
+// go-enclave v0.5.0-alpha grew MemoryEnclave.Freeze (#83), so a share value is
+// encoded directly into the region it will keep and frozen there. The scratch is
+// gone and the term that counted it is gone with it.
+//
+// THE FIGURES ARE RE-DERIVED, NOT MERGE-RESOLVED. Both sides of that merge were
+// wrong for this tree: #83's 1,047,032 and 1,049,380 were summed in requested
+// bytes, and #94's 2,105,344 was page-rounded but still carried the scratch.
+// Recomputed under page rounding with no scratch, these dimensions cost
+// 774,144 + 4,096 + 65,536 + 13x90,112 = 2,015,232 — and the fixture still
+// straddles the cap in the direction that matters: it is ADMITTED now, and the
+// 90,112 the scratch used to add would have carried it to 2,105,344 and a
+// refusal.
 //
 // The parameters and the expected figures are deliberately hard-coded rather
 // than derived: a test that recomputed the bound from the helper it is checking
 // would agree with any accounting, including a wrong one.
-func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
-	const (
-		secretLen = 1757
-		threshold = 255
-		total     = 255
+func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
+	// The figures below are derived for a 4 KiB page, exactly as in the tests
+	// that follow. Read from the OS, never from lockedBytes: a guard phrased in
+	// the helper under test skips itself under the mutation it exists to catch.
+	if page := os.Getpagesize(); page != 4096 {
+		t.Skipf("hard-coded figures assume a 4 KiB page, host reports %d", page)
+	}
 
-		peakWithoutScratch = 1047032 // today's accounting AND today's true peak
-		peakWithScratch    = 1049380 // what it cost while the scratch existed
+	const (
+		secretLen = 64511
+		threshold = 13
+		total     = 13
+
+		peakWithoutScratch = 2015232 // today's accounting AND today's true peak
+		peakWithScratch    = 2105344 // what it cost while the scratch existed
 	)
 
 	got := splitLockedBytes(secretLen, threshold, total)
@@ -199,12 +225,14 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 		t.Fatalf("splitLockedBytes(%d,%d,%d) = %d, want %d",
 			secretLen, threshold, total, got, peakWithoutScratch)
 	}
-	// One encoded value is the difference, and saying so here means a change that
-	// reintroduces a scratch — or drops a term it should keep — fails with a
-	// readable reason rather than an unexplained number.
-	encoded := base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen)
+	// One PAGE-ROUNDED encoded value is the difference, and saying so here means a
+	// change that reintroduces a scratch — or drops a term it should keep — fails
+	// with a readable reason rather than an unexplained number. Page-rounded
+	// because that is the unit the region is charged in: the scratch was a whole
+	// enclave, so retiring it returned a whole number of pages, not 86,020 bytes.
+	encoded := lockedBytes(base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen))
 	if peakWithScratch-got != encoded {
-		t.Fatalf("the retired scratch term is %d, want one encoded value (%d)",
+		t.Fatalf("the retired scratch term is %d, want one page-rounded encoded value (%d)",
 			peakWithScratch-got, encoded)
 	}
 	if got > MaxShareSetBytes {
@@ -251,13 +279,19 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 // the bound: a request whose priced footprint exceeds MaxShareSetBytes is a
 // rejected REQUEST, refused before a single locked page is taken.
 //
-// secretLen is the first length at these dimensions whose peak crosses the cap
-// (1,048,817 > 1,048,576). It is one step past the fixture above, which is what
-// makes the pair meaningful: the same shape, admitted on one side of the line
-// and refused on the other.
+// secretLen is the first length at these dimensions whose peak crosses the cap,
+// RE-DERIVED for page-rounded accounting: 1,760 was the crossing when the peak
+// was summed in requested bytes against a 1 MiB cap, and neither half of that
+// holds now. At 3,071 bytes the encoded share no longer fits one page, so all
+// 255 values take a second one and the peak jumps to 2,879,488, over the
+// 2,097,152 cap — while 3,070 is admitted at 1,835,008. The pair is meaningful
+// for the same reason it always was: the same shape, admitted on one side of the
+// line and refused on the other. TestSplitProtected_AdmissionBoundaryIsPageRounded
+// pins both sides and the size of the step; this pins that the refusal costs no
+// locked memory.
 func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
 	const (
-		secretLen = 1760
+		secretLen = 3071
 		threshold = 255
 		total     = 255
 	)
@@ -287,4 +321,345 @@ func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
 	if allocated {
 		t.Fatal("locked memory was allocated before the budget refused the request")
 	}
+}
+
+// TestSplitLockedBytes_PricesEveryRegionInPages pins the page-rounded accounting
+// term by term, against figures worked out by hand rather than recomputed from
+// the helper under test.
+//
+// The regions SplitProtected locks are separate enclaves, and the kernel charges
+// each a whole page. Pricing the SUM of the requested sizes and rounding once —
+// or, as the code did before issue #94, not rounding at all — under-counts by
+// nearly a page per share, which for a 255-share set is the entire figure: a
+// one-byte secret split 255 ways was priced at 1,536 bytes and locked 1,044,480.
+//
+// The at-rest column is what a caller holds after the split returns (the four
+// transient regions are destroyed on the way out), so it is exactly one page per
+// share and is what the measured witness in the _linux test compares against.
+func TestSplitLockedBytes_PricesEveryRegionInPages(t *testing.T) {
+	// The skip guard reads the page size from the OS, NOT from lockedBytes:
+	// a guard phrased in terms of the helper under test skips itself the moment
+	// that helper stops rounding, which is exactly the mutation these figures
+	// exist to catch.
+	page := os.Getpagesize()
+	if page != 4096 {
+		t.Skipf("hard-coded figures assume a 4 KiB page, host reports %d", page)
+	}
+	if got := lockedBytes(1); got != page {
+		t.Fatalf("lockedBytes(1) = %d, want one page (%d): allocations are not "+
+			"being priced in the unit the kernel charges", got, page)
+	}
+
+	for _, tc := range []struct {
+		name                        string
+		secretLen, threshold, total int
+		peak                        int
+		atRest                      int
+	}{
+		{
+			// The issue's own measurement. Priced at 1,536 bytes by the old
+			// accounting, which is 680x under what the kernel charged.
+			name:      "255 shares of a one-byte secret",
+			secretLen: 1, threshold: 255, total: 255,
+			peak:   1056768, // 259 pages: 255 values + coefficients + vector + raw + scratch
+			atRest: 1044480, // 255 pages: one per share value
+		},
+		{
+			// The headline case: a full 255-share split of a root key. 259 pages
+			// is over the 256 that the old 1 MiB cap allowed, which is why
+			// MaxShareSetBytes had to move rather than merely be re-derived.
+			name:      "255 shares of a 32-byte root key",
+			secretLen: 32, threshold: 255, total: 255,
+			peak:   1060864,
+			atRest: 1044480,
+		},
+		{
+			name:      "5-of-5 of the largest secret the package accepts",
+			secretLen: MaxSecretBytes, threshold: 5, total: 5,
+			peak:   786432,
+			atRest: 450560,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitLockedBytes(tc.secretLen, tc.threshold, tc.total)
+			if got != tc.peak {
+				t.Fatalf("splitLockedBytes(%d,%d,%d) = %d, want %d",
+					tc.secretLen, tc.threshold, tc.total, got, tc.peak)
+			}
+			if got > MaxShareSetBytes {
+				t.Fatalf("priced at %d, over MaxShareSetBytes (%d): a case the "+
+					"primitive exists to serve must be admitted",
+					got, MaxShareSetBytes)
+			}
+			encoded := base64.StdEncoding.EncodedLen(rawShareOverhead + tc.secretLen)
+			if resident := tc.total * lockedBytes(encoded); resident != tc.atRest {
+				t.Fatalf("at-rest cost = %d, want %d", resident, tc.atRest)
+			}
+			if got < tc.atRest {
+				t.Fatal("the peak is below what the call leaves resident")
+			}
+		})
+	}
+}
+
+// TestSplitProtected_AdmissionBoundaryIsPageRounded pins where the cap now
+// falls, and pins that the step is the PAGE and not the byte.
+//
+// A 3070-byte secret is the largest whose encoded share still fits one page.
+// One byte more and every one of the 255 values needs a second page, so the
+// footprint jumps by 255 pages at a stroke — from 1,835,008 to 2,879,488 — and
+// crosses the cap. Byte-summed accounting sees the same step as 1,279 bytes and
+// admits both, which is the whole defect of issue #94 stated as a boundary.
+//
+// The refusal-allocates-nothing half lives in
+// TestSplitProtected_OverBudgetIsRefusedBeforeAllocating, which shares this
+// fixture; this test owns the arithmetic of both sides and the size of the step.
+func TestSplitProtected_AdmissionBoundaryIsPageRounded(t *testing.T) {
+	// From the OS, not from lockedBytes — see the note in
+	// TestSplitLockedBytes_PricesEveryRegionInPages.
+	if page := os.Getpagesize(); page != 4096 {
+		t.Skipf("hard-coded figures assume a 4 KiB page, host reports %d", page)
+	}
+	if got := lockedBytes(1); got != 4096 {
+		t.Fatalf("lockedBytes(1) = %d, want one page: allocations are not being "+
+			"priced in the unit the kernel charges", got)
+	}
+
+	const (
+		admitted = 3070
+		refused  = 3071
+
+		admittedPrice = 1835008
+		refusedPrice  = 2879488
+	)
+
+	if got := splitLockedBytes(admitted, maxShares, maxShares); got != admittedPrice {
+		t.Fatalf("splitLockedBytes(%d,255,255) = %d, want %d", admitted, got, admittedPrice)
+	} else if got > MaxShareSetBytes {
+		t.Fatalf("the largest one-page-per-share split (%d bytes) is refused at %d", got, MaxShareSetBytes)
+	}
+	if got := splitLockedBytes(refused, maxShares, maxShares); got != refusedPrice {
+		t.Fatalf("splitLockedBytes(%d,255,255) = %d, want %d", refused, got, refusedPrice)
+	} else if got <= MaxShareSetBytes {
+		t.Fatalf("a two-page-per-share split prices at %d and fits %d: the cap no "+
+			"longer sits at the edge its doc comment claims", got, MaxShareSetBytes)
+	}
+
+	// One byte of secret decides it. That the refusal then costs no locked memory
+	// is TestSplitProtected_OverBudgetIsRefusedBeforeAllocating's assertion, on
+	// this same fixture, rather than a second copy here.
+}
+
+// TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue pins the ingestion
+// path's bound to the same unit, and the same object, as SplitProtected's.
+//
+// A share set arriving as JSON is one enclave per element, so 255 small shares
+// lock 255 PAGES — around 1 MiB — while their document is about 25 KiB. Bounding
+// the raw document length, as this did before issue #94, therefore priced an
+// unauthenticated submission at a fortieth of what it takes.
+//
+// The unit is the page; the OBJECT is the share's value, not its element. That
+// second half is what keeps this bound and splitLockedBytes' comparable, and
+// TestShareSet_RoundTripsAtTheAdmissionBoundary is where it is exercised
+// end to end.
+func TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue(t *testing.T) {
+	// From the OS, not from lockedBytes — see the note in
+	// TestSplitLockedBytes_PricesEveryRegionInPages.
+	page := os.Getpagesize()
+	if page != 4096 {
+		t.Skipf("hard-coded figures assume a 4 KiB page, host reports %d", page)
+	}
+	if got := lockedBytes(1); got != page {
+		t.Fatalf("lockedBytes(1) = %d, want one page (%d)", got, page)
+	}
+
+	shares, err := SplitProtected(make([]byte, 32), maxShares, maxShares)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	doc, err := json.Marshal(shares)
+	for _, s := range shares {
+		s.Destroy()
+	}
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	var raw []json.RawMessage
+	if err := json.Unmarshal(doc, &raw); err != nil {
+		t.Fatalf("Unmarshal into elements: %v", err)
+	}
+	plain := 0
+	for _, elem := range raw {
+		plain += len(elem)
+	}
+	// From the guard's own function, not a sum recomputed here.
+	paged := shareSetLockedBytes(raw)
+	if want := maxShares * page; paged != want {
+		t.Fatalf("page-rounded set cost = %d, want %d (one page per share)", paged, want)
+	}
+	if plain*8 > paged {
+		t.Fatalf("the fixture no longer separates the two accountings: raw %d vs "+
+			"page-rounded %d", plain, paged)
+	}
+
+	// The set is legal and must decode: this is the primitive's headline case,
+	// and it is the case the re-derived MaxShareSetBytes exists to admit.
+	decoded, err := UnmarshalShareSet(doc)
+	if err != nil {
+		t.Fatalf("UnmarshalShareSet of a 255-share root-key set: %v", err)
+	}
+	if len(decoded) != maxShares {
+		t.Fatalf("decoded %d shares, want %d", len(decoded), maxShares)
+	}
+	for _, s := range decoded {
+		s.Destroy()
+	}
+
+	// And the mutation the fix has to survive: a set whose page-rounded cost is
+	// over the cap while its RAW length is under it. Each value is sized one
+	// token past two pages, so it costs three, and 171 of them are 2,101,248
+	// locked bytes against 1,409,040 raw — admitted by the accounting this
+	// replaces, refused by this one.
+	//
+	// 171 rather than 255: pricing the VALUE leaves only the rounding slack to
+	// separate the two sums, and at 255 elements a value big enough to need a
+	// third page already carries the raw sum past the cap on its own, which
+	// would prove nothing.
+	const (
+		elems    = 171
+		valueLen = 8196 // 2*4096 + 4, a whole number of base64 quanta
+	)
+	prefix := `{"index":1,"threshold":2,"total":255,"value":"`
+	const suffix = `"}`
+	elem := prefix + strings.Repeat("A", valueLen) + suffix
+	if got := lockedBytes(valueLen); got != 3*page {
+		t.Fatalf("fixture value is %d bytes, which rounds to %d not %d: it no "+
+			"longer separates the two accountings", valueLen, got, 3*page)
+	}
+
+	over := "[" + strings.Repeat(elem+",", elems-1) + elem + "]"
+	rawSum := elems * len(elem)
+	if rawSum > MaxShareSetBytes {
+		t.Fatalf("fixture is %d raw bytes, which the byte-summed bound would also "+
+			"have refused: it proves nothing", rawSum)
+	}
+	if _, err := UnmarshalShareSet([]byte(over)); err == nil {
+		t.Fatalf("a set of %d raw bytes that locks %d was admitted under a "+
+			"%d-byte budget", rawSum, elems*lockedBytes(valueLen), MaxShareSetBytes)
+	}
+}
+
+// TestShareSet_RoundTripsWhateverTheSplitAdmits pins the invariant a ceremony
+// depends on: anything SplitProtected admits, UnmarshalShareSet admits.
+//
+// The two guards price different operations — a split's peak includes the
+// coefficients and the two reused scratches, a decode's is one enclave per share
+// — so nothing about the two arithmetics forces them to agree. A disagreement
+// does not look like a bug from outside; it looks like a legitimate recovery
+// being refused, on a set the library itself produced, at a ceremony.
+//
+// It held only by accident on the first cut of issue #94, which priced a decode
+// by the ELEMENT. A share's element carries ~48 bytes of JSON header, and when
+// the encoded value lands on an exact page multiple that header pushes every
+// element into a further page: 171 shares of a 6142-byte secret split at
+// 1,429,504 and decoded at 2,101,248, so the split was admitted and the decode
+// refused. Pricing the VALUE makes the decode sum exactly splitLockedBytes'
+// per-share term, which that function then adds four positive terms to — so the
+// invariant is now structural rather than lucky, and this walks the space to say
+// so rather than pinning the one point that happened to survive.
+//
+// # Why the sweep is shaped the way it is
+//
+// A split costs secretLen x threshold x total byte operations, and `CI / Test`
+// runs `go test -race -count=1 -timeout=900s -coverprofile=...`. Race and
+// coverage instrumentation together are worth one to two orders of magnitude, so
+// the first cut of this sweep — every secret length against threshold=total as
+// well as threshold=2 — took ~40s bare and blew the 900s package budget in CI,
+// timing out inside a single (3068, 255, 255) split.
+//
+// The trim is chosen so it cannot cost a witness rather than to hit a number.
+// A HIGH threshold makes a split MORE expensive to admit, because
+// splitLockedBytes charges pageRound(secretLen*(threshold-1)) for the
+// coefficients — so the combinations at risk of being admitted here and refused
+// on ingest are the LOW-threshold ones, and those are exactly what the expensive
+// half was not contributing. Checked rather than assumed: sweeping
+// secretLen 1..13000 against eight share counts and four thresholds finds 417
+// combinations an element-priced decode would refuse, 150 of them at
+// threshold=2, and NONE at any secret length at or below 64 bytes. So the sweep
+// runs every secret length at threshold=2, and threshold=total only for the
+// small secrets where the 255-share root-key case lives and where no witness
+// exists to lose. Three witnesses survive the trim — (6140, 2, 171),
+// (6142, 2, 171) and (9214, 2, 129) — the first being the one the regression was
+// found on, and the mutation is verified to still fail there.
+//
+// The share COUNTS are trimmed on the same principle. A combination's cost is
+// dominated by the number of enclaves it maps, not by the GF(256) arithmetic, so
+// dropping two of the seven totals halved the run without touching a witness:
+// measured under the CI invocation, this test went 152s -> 82s and the package
+// 285s -> ~204s against a 900s budget.
+func TestShareSet_RoundTripsWhateverTheSplitAdmits(t *testing.T) {
+	// Sizes that bracket every page boundary an encoded share can land on,
+	// including the exact multiples that produced the regression.
+	secretLens := []int{1, 32, 64, 3068, 3070, 3071, 6140, 6142, 6143, 9214, 12286}
+	totals := []int{2, 5, 129, 171, maxShares}
+
+	// A split of a large secret at a high threshold is the expensive corner and
+	// the one that cannot hold a witness; see the note above.
+	const wideThresholdSecretLimit = 64
+
+	tested, admitted := 0, 0
+	for _, secretLen := range secretLens {
+		for _, total := range totals {
+			thresholds := []int{2}
+			if secretLen <= wideThresholdSecretLimit && total != 2 {
+				thresholds = append(thresholds, total)
+			}
+			for _, threshold := range thresholds {
+				if threshold > total || threshold < 2 {
+					continue
+				}
+				tested++
+				if splitLockedBytes(secretLen, threshold, total) > MaxShareSetBytes {
+					continue // refused up front; nothing to round-trip
+				}
+
+				shares, err := SplitProtected(make([]byte, secretLen), threshold, total)
+				if err != nil {
+					t.Fatalf("SplitProtected(%d,%d,%d) priced under the cap but "+
+						"failed: %v", secretLen, threshold, total, err)
+				}
+				doc, err := json.Marshal(shares)
+				for _, s := range shares {
+					s.Destroy()
+				}
+				if err != nil {
+					t.Fatalf("Marshal(%d,%d,%d): %v", secretLen, threshold, total, err)
+				}
+
+				decoded, err := UnmarshalShareSet(doc)
+				if err != nil {
+					t.Fatalf("SplitProtected(%d,%d,%d) was admitted at %d bytes, "+
+						"but the set it produced cannot be read back: %v\n"+
+						"the split and ingestion bounds disagree, so a ceremony "+
+						"that distributes shares as JSON cannot collect them again",
+						secretLen, threshold, total,
+						splitLockedBytes(secretLen, threshold, total), err)
+				}
+				if len(decoded) != total {
+					t.Fatalf("decoded %d shares, want %d", len(decoded), total)
+				}
+				for _, s := range decoded {
+					s.Destroy()
+				}
+				admitted++
+			}
+		}
+	}
+
+	// A run in which the split refused everything would pass vacuously.
+	if admitted == 0 {
+		t.Fatalf("no combination out of %d was admitted, so nothing round-tripped", tested)
+	}
+	t.Logf("%d of %d combinations admitted and round-tripped", admitted, tested)
 }

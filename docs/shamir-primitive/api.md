@@ -103,7 +103,8 @@ endpoint decodes whatever it is handed; the generic decoder allocates one locked
 buffer per element as it visits them, which lets the submission rather than the
 service choose how much locked memory to take, exhausting a process-wide
 resource every other caller depends on. `UnmarshalShareSet` bounds the element
-count (255) and the document size (`MaxShareSetBytes`) *before* allocating, and
+count (255) and the page-rounded locked cost of the share values
+(`MaxShareSetBytes`) *before* allocating, and
 destroys the accepted prefix if a later element is rejected.
 
 `NewProtectedShare` builds one share at a time, and where it wipes the source
@@ -226,17 +227,24 @@ the allocator's own error, so `errors.Is` reaches go-enclave's sentinels.
 
 ```go
 const MaxSecretBytes   = 64 << 10   // 65536 — one secret
-const MaxShareSetBytes = 1 << 20    // 1 MiB — whole-set locked-memory budget
+const MaxShareSetBytes = 2 << 20    // 2 MiB — whole-set locked-memory budget, in PAGES
 ```
 
 The share-set maximum is 255, from the GF(2^8) x-coordinate space.
 
 `MaxShareSetBytes` exists because individually legal arguments multiply into a
 footprint no host can lock — a 64 KiB secret split 255 ways needs ~16 MiB of
-coefficients alone, and a failed lock is a dead process rather than an error. A
-full 255-share ceremony over a 32-byte root key needs ~24 KiB of the budget;
-sharing a 4 KiB *payload* 255 ways does not fit and should be enveloped under a
-key that does.
+coefficients alone.
+
+It is counted in the PAGES the kernel charges, not the bytes a caller asks for:
+every region is its own enclave and a 32-byte enclave locks a full page, so a
+figure summed from requested sizes cannot be compared to `RLIMIT_MEMLOCK` at
+all. A full 255-share ceremony over a 32-byte root key therefore costs 259 pages
+(1,060,864 bytes) rather than the ~24 KiB the byte-summed accounting claimed —
+which is why the constant is 2 MiB and not 1 MiB (issue #94). 2 MiB admits every
+split whose encoded share fits one page, meaning secrets up to 3,070 bytes at
+the full 255 ways; sharing a 4 KiB *payload* 255 ways does not fit and should be
+enveloped under a key that does.
 
 ## Go API — the custody interfaces
 
