@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -688,13 +687,9 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 		if err := p.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node, save: true}); err != nil {
 			t.Fatalf("save request (shard %d): %v", shardID, err)
 		}
-		select {
-		case res := <-p.CompletedC():
-			if res.err != nil {
-				t.Fatalf("save (shard %d) failed: %v", shardID, res.err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("save (shard %d) timeout", shardID)
+		res := awaitSnapshotResult(t, p, "save (shard %d)", shardID)
+		if res.err != nil {
+			t.Fatalf("save (shard %d) failed: %v", shardID, res.err)
 		}
 	}
 	saveShard(p1, 5, 1, 200)
@@ -725,13 +720,9 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 		if err := p.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node, save: false}); err != nil {
 			t.Fatalf("recover request (shard %d): %v", shardID, err)
 		}
-		select {
-		case res := <-p.CompletedC():
-			if res.err != nil {
-				t.Fatalf("recover (shard %d) failed: %v", shardID, res.err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("recover (shard %d) timeout", shardID)
+		res := awaitSnapshotResult(t, p, "recover (shard %d)", shardID)
+		if res.err != nil {
+			t.Fatalf("recover (shard %d) failed: %v", shardID, res.err)
 		}
 		if got := ss.state.Load(); got != wantState {
 			t.Fatalf("shard %d recovered state = %d, want %d", shardID, got, wantState)

@@ -23,7 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
@@ -106,16 +105,12 @@ func TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected save error: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected save error: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// The LogDB record must carry the term captured under the gate (3), not
@@ -222,13 +217,9 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("requestSnapshot(save) failed: %v", err)
 	}
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil || result.index != 100 {
-			t.Fatalf("save result = (index=%d, err=%v), want (100, nil)", result.index, result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("save did not complete within timeout")
+	result := awaitSnapshotResult(t, p, "save")
+	if result.err != nil || result.index != 100 {
+		t.Fatalf("save result = (index=%d, err=%v), want (100, nil)", result.index, result.err)
 	}
 
 	// Phase 2: a fresh snapshotter (stale counter at 40) recovers the
@@ -243,13 +234,9 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("requestSnapshot(recover) failed: %v", err)
 	}
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("recover failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("recover did not complete within timeout")
+	result = awaitSnapshotResult(t, p, "recover")
+	if result.err != nil {
+		t.Fatalf("recover failed: %v", result.err)
 	}
 
 	if got := recoverer.LastApplied(); got != 100 {
@@ -268,17 +255,13 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("requestSnapshot(post-recovery save) failed: %v", err)
 	}
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("post-recovery save failed: %v", result.err)
-		}
-		if result.index != 0 {
-			t.Fatalf("save at the recovered index = %d, want 0 (no-op): re-saving "+
-				"truncates the artifact the recovery just read", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("post-recovery save did not complete within timeout")
+	result = awaitSnapshotResult(t, p, "post-recovery save")
+	if result.err != nil {
+		t.Fatalf("post-recovery save failed: %v", result.err)
+	}
+	if result.index != 0 {
+		t.Fatalf("save at the recovered index = %d, want 0 (no-op): re-saving "+
+			"truncates the artifact the recovery just read", result.index)
 	}
 
 	// Phase 4: once applies advance past the recovered index, the save records
@@ -291,17 +274,13 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("requestSnapshot(advanced save) failed: %v", err)
 	}
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("advanced save failed: %v", result.err)
-		}
-		if result.index != 150 {
-			t.Fatalf("advanced save index = %d, want 150: snapshot "+
-				"records a stale index against recovered state", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("advanced save did not complete within timeout")
+	result = awaitSnapshotResult(t, p, "advanced save")
+	if result.err != nil {
+		t.Fatalf("advanced save failed: %v", result.err)
+	}
+	if result.index != 150 {
+		t.Fatalf("advanced save index = %d, want 150: snapshot "+
+			"records a stale index against recovered state", result.index)
 	}
 
 	snap, err := ldb.GetSnapshot(33, 1)

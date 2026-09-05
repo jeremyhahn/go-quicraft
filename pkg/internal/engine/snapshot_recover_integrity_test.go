@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
@@ -90,13 +89,11 @@ func saveEncryptedTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLo
 	}); err != nil {
 		t.Fatalf("save request: %v", err)
 	}
-	select {
-	case res := <-p.CompletedC():
-		if res.err != nil {
-			t.Fatalf("save failed: %v", res.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("save timeout")
+	// The pool's snapshotResult is the save's completion mark; nothing about
+	// a save bounds it in wall-clock terms, so the wait is bounded by the test
+	// deadline alone (awaitSnapshotResult).
+	if res := awaitSnapshotResult(t, p, "save (shard %d)", shardID); res.err != nil {
+		t.Fatalf("save failed: %v", res.err)
 	}
 }
 
@@ -125,13 +122,8 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 	}); err != nil {
 		t.Fatalf("recover request: %v", err)
 	}
-	select {
-	case res := <-p.CompletedC():
-		return ss.state.Load(), res.err
-	case <-time.After(2 * time.Second):
-		t.Fatal("recover timeout")
-	}
-	return 0, nil
+	res := awaitSnapshotResult(t, p, "recover (shard %d)", shardID)
+	return ss.state.Load(), res.err
 }
 
 // TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier is the

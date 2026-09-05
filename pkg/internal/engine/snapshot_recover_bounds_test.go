@@ -279,13 +279,9 @@ func TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker(t *testing.
 	node.publishLogMarkers()
 	node.raftMu.Unlock()
 
-	select {
-	case res := <-p.CompletedC():
-		if res.err != nil {
-			t.Fatalf("recovery failed after install: %v", res.err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("recovery never completed after the snapshot was installed")
+	res := awaitSnapshotResult(t, p, "recovery after install")
+	if res.err != nil {
+		t.Fatalf("recovery failed after install: %v", res.err)
 	}
 	if got := ss.state.Load(); got != 100 {
 		t.Errorf("state machine state = %d, want 100", got)

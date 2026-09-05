@@ -156,12 +156,7 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 	// picks up the request (both flags are initially false), and
 	// then the worker sets recovering=true, causing the assertion
 	// at line 151 to fail.
-	select {
-	case <-p.CompletedC():
-		// Recovery completed.
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for recovery to complete")
-	}
+	awaitSnapshotResult(t, p, "recovery")
 
 	// Verify the flag was cleared.
 	if node.IsRecovering() {
@@ -504,12 +499,7 @@ func TestRecovering_WorkSignalNotifiedAfterRecovery(t *testing.T) {
 	// Wait for recovery to complete by reading from completedC.
 	// This is the most reliable synchronization point because
 	// completedC is written AFTER the Notify call in the worker.
-	select {
-	case <-p.CompletedC():
-		// Recovery completed.
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for recovery completion")
-	}
+	awaitSnapshotResult(t, p, "recovery")
 
 	// The work signal should have been notified. Check by seeing
 	// if the signal has work pending for the worker that owns

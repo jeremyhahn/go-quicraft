@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
@@ -79,16 +78,12 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 	}); err != nil {
 		t.Fatalf("save request failed: %v", err)
 	}
-	select {
-	case res := <-p.CompletedC():
-		if res.err != nil {
-			t.Fatalf("save failed: %v", res.err)
-		}
-		if res.index != snapshotIndex {
-			t.Fatalf("saved index = %d, want %d", res.index, snapshotIndex)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the save request never completed")
+	res := awaitSnapshotResult(t, p, "save")
+	if res.err != nil {
+		t.Fatalf("save failed: %v", res.err)
+	}
+	if res.index != snapshotIndex {
+		t.Fatalf("saved index = %d, want %d", res.index, snapshotIndex)
 	}
 
 	// The artifact is genuinely encrypted at rest: the LogDB record carries the
@@ -134,21 +129,17 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 	}); err != nil {
 		t.Fatalf("recovery request failed: %v", err)
 	}
-	select {
-	case res := <-p.CompletedC():
-		var stale *SnapshotRecoveryStaleError
-		if !errors.As(res.err, &stale) {
-			t.Fatalf("barrier recovery error = %T (%v), want *SnapshotRecoveryStaleError.\n"+
-				"If this is a wrapped or differently-typed error, the engine's decline "+
-				"branch is bypassed and every stale InstallSnapshot on the encrypted "+
-				"path kills the shard (#126 candidate B)", res.err, res.err)
-		}
-		if stale.SnapshotIndex != snapshotIndex || stale.LastApplied != appliedAhead {
-			t.Errorf("stale error = %+v, want SnapshotIndex %d / LastApplied %d",
-				stale, snapshotIndex, appliedAhead)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the recovery request never completed")
+	res = awaitSnapshotResult(t, p, "recovery")
+	var stale *SnapshotRecoveryStaleError
+	if !errors.As(res.err, &stale) {
+		t.Fatalf("barrier recovery error = %T (%v), want *SnapshotRecoveryStaleError.\n"+
+			"If this is a wrapped or differently-typed error, the engine's decline "+
+			"branch is bypassed and every stale InstallSnapshot on the encrypted "+
+			"path kills the shard (#126 candidate B)", res.err, res.err)
+	}
+	if stale.SnapshotIndex != snapshotIndex || stale.LastApplied != appliedAhead {
+		t.Errorf("stale error = %+v, want SnapshotIndex %d / LastApplied %d",
+			stale, snapshotIndex, appliedAhead)
 	}
 
 	// The engine declines rather than failing the shard: the refusal was
@@ -196,14 +187,10 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 	}); err != nil {
 		t.Fatalf("control recovery request failed: %v", err)
 	}
-	select {
-	case res := <-p.CompletedC():
-		if res.err != nil {
-			t.Fatalf("control recovery failed: %v -- the encrypted artifact is not "+
-				"recoverable at all, so the refusal above proved nothing", res.err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the control recovery request never completed")
+	res = awaitSnapshotResult(t, p, "control recovery")
+	if res.err != nil {
+		t.Fatalf("control recovery failed: %v -- the encrypted artifact is not "+
+			"recoverable at all, so the refusal above proved nothing", res.err)
 	}
 	if got := behindSM.state.Load(); got != snapshotIndex {
 		t.Errorf("control state machine state = %d, want %d: the barrier artifact "+

@@ -266,19 +266,15 @@ func TestSnapshotPool_SaveSnapshot_Success(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.shardID != 10 {
-			t.Fatalf("result.shardID = %d, want 10", result.shardID)
-		}
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.shardID != 10 {
+		t.Fatalf("result.shardID = %d, want 10", result.shardID)
+	}
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify snapshot data file was created.
@@ -335,20 +331,16 @@ func TestSnapshotPool_SaveSnapshot_NilSnapshotter(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err == nil {
-			t.Fatal("expected error for nil snapshotter")
-		}
-		var snapErr *SnapshotError
-		if !errors.As(result.err, &snapErr) {
-			t.Fatalf("expected SnapshotError, got %T: %v", result.err, result.err)
-		}
-		if !snapErr.Save {
-			t.Fatal("expected Save=true in SnapshotError")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err == nil {
+		t.Fatal("expected error for nil snapshotter")
+	}
+	var snapErr *SnapshotError
+	if !errors.As(result.err, &snapErr) {
+		t.Fatalf("expected SnapshotError, got %T: %v", result.err, result.err)
+	}
+	if !snapErr.Save {
+		t.Fatal("expected Save=true in SnapshotError")
 	}
 }
 
@@ -379,26 +371,22 @@ func TestSnapshotPool_SaveSnapshot_ExceedsMaxSnapshotSize(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err == nil {
-			t.Fatal("expected SnapshotTooLargeError, got nil")
-		}
-		if !errors.Is(result.err, ErrSnapshotTooLarge) {
-			t.Fatalf("expected ErrSnapshotTooLarge, got: %v", result.err)
-		}
-		var tooLarge *SnapshotTooLargeError
-		if !errors.As(result.err, &tooLarge) {
-			t.Fatalf("expected *SnapshotTooLargeError, got %T: %v", result.err, result.err)
-		}
-		if tooLarge.Size != 8 {
-			t.Fatalf("expected Size=8, got %d", tooLarge.Size)
-		}
-		if tooLarge.Limit != 4 {
-			t.Fatalf("expected Limit=4, got %d", tooLarge.Limit)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err == nil {
+		t.Fatal("expected SnapshotTooLargeError, got nil")
+	}
+	if !errors.Is(result.err, ErrSnapshotTooLarge) {
+		t.Fatalf("expected ErrSnapshotTooLarge, got: %v", result.err)
+	}
+	var tooLarge *SnapshotTooLargeError
+	if !errors.As(result.err, &tooLarge) {
+		t.Fatalf("expected *SnapshotTooLargeError, got %T: %v", result.err, result.err)
+	}
+	if tooLarge.Size != 8 {
+		t.Fatalf("expected Size=8, got %d", tooLarge.Size)
+	}
+	if tooLarge.Limit != 4 {
+		t.Fatalf("expected Limit=4, got %d", tooLarge.Limit)
 	}
 
 	// Verify the oversized snapshot directory was cleaned up.
@@ -435,16 +423,12 @@ func TestSnapshotPool_SaveSnapshot_MaxSnapshotSizeZeroDisablesCheck(t *testing.T
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 }
 
@@ -470,16 +454,12 @@ func TestSnapshotPool_SaveSnapshot_ZeroLastApplied(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 0 {
-			t.Fatalf("result.index = %d, want 0", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 0 {
+		t.Fatalf("result.index = %d, want 0", result.index)
 	}
 }
 
@@ -509,13 +489,9 @@ func TestSnapshotPool_RecoverSnapshot_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save request failed: %v", err)
 	}
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("save failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("save timeout")
+	result := awaitSnapshotResult(t, p, "save")
+	if result.err != nil {
+		t.Fatalf("save failed: %v", result.err)
 	}
 
 	// Now recover into a fresh snapshotter.
@@ -529,19 +505,15 @@ func TestSnapshotPool_RecoverSnapshot_Success(t *testing.T) {
 		t.Fatalf("recover request failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("recover failed: %v", result.err)
-		}
-		if result.shardID != 5 {
-			t.Fatalf("result.shardID = %d, want 5", result.shardID)
-		}
-		if result.replicaID != 2 {
-			t.Fatalf("result.replicaID = %d, want 2", result.replicaID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive recover result within timeout")
+	result = awaitSnapshotResult(t, p, "recover")
+	if result.err != nil {
+		t.Fatalf("recover failed: %v", result.err)
+	}
+	if result.shardID != 5 {
+		t.Fatalf("result.shardID = %d, want 5", result.shardID)
+	}
+	if result.replicaID != 2 {
+		t.Fatalf("result.replicaID = %d, want 2", result.replicaID)
 	}
 
 	// Verify the state was recovered.
@@ -577,13 +549,9 @@ func TestSnapshotPool_RecoverSnapshot_NoSnapshot(t *testing.T) {
 		t.Fatalf("recover request failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive recover result within timeout")
+	result := awaitSnapshotResult(t, p, "recover")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
 	}
 }
 
@@ -607,13 +575,9 @@ func TestSnapshotPool_RecoverSnapshot_NilSnapshotter(t *testing.T) {
 		t.Fatalf("recover request failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error for nil snapshotter: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive recover result within timeout")
+	result := awaitSnapshotResult(t, p, "recover")
+	if result.err != nil {
+		t.Fatalf("unexpected error for nil snapshotter: %v", result.err)
 	}
 }
 
@@ -638,13 +602,9 @@ func TestSnapshotPool_RecoverSnapshot_NilLogDB(t *testing.T) {
 		t.Fatalf("recover request failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive recover result within timeout")
+	result := awaitSnapshotResult(t, p, "recover")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
 	}
 }
 
@@ -707,11 +667,7 @@ func TestSnapshotPool_DedupClearedAfterCompletion(t *testing.T) {
 		t.Fatalf("first request failed: %v", err)
 	}
 
-	select {
-	case <-p.CompletedC():
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive first result within timeout")
-	}
+	awaitSnapshotResult(t, p, "first save")
 
 	// Update lastApplied so the second save creates a new snapshot.
 	ss.lastApplied.Store(60)
@@ -725,11 +681,7 @@ func TestSnapshotPool_DedupClearedAfterCompletion(t *testing.T) {
 		t.Fatalf("second request should succeed after first completes: %v", err)
 	}
 
-	select {
-	case <-p.CompletedC():
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive second result within timeout")
-	}
+	awaitSnapshotResult(t, p, "second save")
 }
 
 func TestSnapshotPool_ConcurrentRequests_DifferentShards(t *testing.T) {
@@ -761,15 +713,11 @@ func TestSnapshotPool_ConcurrentRequests_DifferentShards(t *testing.T) {
 
 	results := make(map[uint64]bool)
 	for range numShards {
-		select {
-		case result := <-p.CompletedC():
-			if result.err != nil {
-				t.Fatalf("shard %d failed: %v", result.shardID, result.err)
-			}
-			results[result.shardID] = true
-		case <-time.After(5 * time.Second):
-			t.Fatal("did not receive all results within timeout")
+		result := awaitSnapshotResult(t, p, "save")
+		if result.err != nil {
+			t.Fatalf("shard %d failed: %v", result.shardID, result.err)
 		}
+		results[result.shardID] = true
 	}
 
 	if len(results) != numShards {
@@ -860,11 +808,7 @@ func TestSnapshotPool_CallbackFiredOnSave(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case <-p.CompletedC():
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
-	}
+	awaitSnapshotResult(t, p, "snapshot")
 
 	// The callback is fired BEFORE sending to CompletedC, so by the
 	// time we receive from CompletedC the callback has already run.
@@ -910,13 +854,9 @@ func TestSnapshotPool_GarbageCollection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request %d failed: %v", i, err)
 		}
-		select {
-		case result := <-p.CompletedC():
-			if result.err != nil {
-				t.Fatalf("snapshot %d failed: %v", i, result.err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timeout waiting for snapshot %d", i)
+		result := awaitSnapshotResult(t, p, "snapshot %d", i)
+		if result.err != nil {
+			t.Fatalf("snapshot %d failed: %v", i, result.err)
 		}
 	}
 
@@ -963,13 +903,9 @@ func TestSnapshotPool_MetadataWritten(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
 	}
 
 	// Read and verify metadata.
@@ -1461,16 +1397,12 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("save request failed: %v", err)
 			}
-			select {
-			case result := <-p.CompletedC():
-				if result.err != nil {
-					t.Fatalf("save failed: %v", result.err)
-				}
-				if result.index != 100 {
-					t.Fatalf("result.index = %d, want 100", result.index)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("save timeout")
+			result := awaitSnapshotResult(t, p, "save")
+			if result.err != nil {
+				t.Fatalf("save failed: %v", result.err)
+			}
+			if result.index != 100 {
+				t.Fatalf("result.index = %d, want 100", result.index)
 			}
 
 			// The LogDB record carries the at-rest epoch, and recovery keys off
@@ -1529,13 +1461,9 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("recover request failed: %v", err)
 			}
-			select {
-			case result := <-p.CompletedC():
-				if result.err != nil {
-					t.Fatalf("recover failed: %v", result.err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("recover timeout")
+			result = awaitSnapshotResult(t, p, "recover")
+			if result.err != nil {
+				t.Fatalf("recover failed: %v", result.err)
 			}
 
 			if recoverSS.state.Load() != 100 {
@@ -2040,13 +1968,9 @@ func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 		t.Fatalf("request failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if !errors.Is(result.err, ErrSnapshotBarrierSealed) {
-			t.Fatalf("save error = %v, want ErrSnapshotBarrierSealed", result.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if !errors.Is(result.err, ErrSnapshotBarrierSealed) {
+		t.Fatalf("save error = %v, want ErrSnapshotBarrierSealed", result.err)
 	}
 
 	if snap, _ := ldb.GetSnapshot(1, 1); snap.Index != 0 {
@@ -2300,13 +2224,9 @@ func TestSnapshotPool_PurgeWiredAfterSave(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request %d failed: %v", i, err)
 		}
-		select {
-		case result := <-p.CompletedC():
-			if result.err != nil {
-				t.Fatalf("save %d failed: %v", i, result.err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timeout waiting for snapshot %d", i)
+		result := awaitSnapshotResult(t, p, "snapshot %d", i)
+		if result.err != nil {
+			t.Fatalf("save %d failed: %v", i, result.err)
 		}
 	}
 
@@ -3119,16 +3039,12 @@ func TestSnapshotPool_SaveSnapshot_PersistsMembership(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify LogDB snapshot contains the membership.
@@ -3181,16 +3097,12 @@ func TestSnapshotPool_SaveSnapshot_NilPeer_EmptyMembership(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 50 {
-			t.Fatalf("result.index = %d, want 50", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 50 {
+		t.Fatalf("result.index = %d, want 50", result.index)
 	}
 
 	// Verify LogDB snapshot has zero-value membership (not nil maps, just empty).
@@ -3263,16 +3175,12 @@ func TestSnapshotPool_SaveSnapshot_MembershipMultiNode(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("unexpected error: %v", result.err)
-		}
-		if result.index != 200 {
-			t.Fatalf("result.index = %d, want 200", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("unexpected error: %v", result.err)
+	}
+	if result.index != 200 {
+		t.Fatalf("result.index = %d, want 200", result.index)
 	}
 
 	// Verify LogDB snapshot captured the full 3-node membership.
@@ -3613,16 +3521,12 @@ func TestSnapshotPool_Metrics_IncSnapshot(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-		if result.shardID != 7 {
-			t.Fatalf("result.shardID = %d, want 7", result.shardID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
+	}
+	if result.shardID != 7 {
+		t.Fatalf("result.shardID = %d, want 7", result.shardID)
 	}
 
 	count := metrics.getSnapshotCount(7)
@@ -3655,13 +3559,9 @@ func TestSnapshotPool_Metrics_NilSafe(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
 	}
 	// No panic = success with nil metrics.
 }
@@ -3749,16 +3649,12 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify LogDB snapshot has term=7 (from AppliedToTerm, not 0 from LogReader).
@@ -3800,13 +3696,9 @@ func TestSnapshotPool_SaveSnapshot_NilPeerTermZero(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
 	}
 
 	// Term should be 0 since there's no peer.
@@ -3894,16 +3786,12 @@ func TestSnapshotRequest_AppliedToTermCarriedInRequest(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify the LogDB snapshot has the term from the request.
@@ -3946,13 +3834,9 @@ func TestSnapshotRequest_ZeroTermWhenNoPeer(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
 	}
 
 	snap, snapErr := ldb.GetSnapshot(25, 1)
@@ -4033,13 +3917,9 @@ func TestSnapshotRequest_TermOverridesStaleValue(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
 	}
 
 	snap, snapErr := ldb.GetSnapshot(shardID, replicaID)
@@ -4092,16 +3972,12 @@ func TestSnapshotPool_SaveSnapshot_CreateSnapshotOutOfDate(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify that the snapshot was persisted to LogDB despite the
@@ -4146,16 +4022,12 @@ func TestSnapshotPool_SaveSnapshot_CreateSnapshotSuccess(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-pool.CompletedC():
-		if result.err != nil {
-			t.Fatalf("snapshot save failed: %v", result.err)
-		}
-		if result.index != 100 {
-			t.Fatalf("result.index = %d, want 100", result.index)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, pool, "snapshot")
+	if result.err != nil {
+		t.Fatalf("snapshot save failed: %v", result.err)
+	}
+	if result.index != 100 {
+		t.Fatalf("result.index = %d, want 100", result.index)
 	}
 
 	// Verify the LogReader's snapshot was updated.
@@ -4237,25 +4109,21 @@ func TestSnapshotPool_SaveSnapshot_NoPartialFileOnError(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	select {
-	case result := <-p.CompletedC():
-		if result.err == nil {
-			t.Fatal("expected error from failing snapshotter, got nil")
-		}
-		var snapErr *SnapshotError
-		if !errors.As(result.err, &snapErr) {
-			t.Fatalf("expected *SnapshotError, got %T: %v", result.err, result.err)
-		}
-		if !snapErr.Save {
-			t.Fatal("expected Save=true in SnapshotError")
-		}
-		// Verify the underlying cause is our simulated error.
-		var cause *ErrSnapshotSaveFailed
-		if !errors.As(snapErr.Err, &cause) {
-			t.Fatalf("expected *ErrSnapshotSaveFailed as cause, got %T: %v", snapErr.Err, snapErr.Err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("did not receive snapshot result within timeout")
+	result := awaitSnapshotResult(t, p, "snapshot")
+	if result.err == nil {
+		t.Fatal("expected error from failing snapshotter, got nil")
+	}
+	var snapErr *SnapshotError
+	if !errors.As(result.err, &snapErr) {
+		t.Fatalf("expected *SnapshotError, got %T: %v", result.err, result.err)
+	}
+	if !snapErr.Save {
+		t.Fatal("expected Save=true in SnapshotError")
+	}
+	// Verify the underlying cause is our simulated error.
+	var cause *ErrSnapshotSaveFailed
+	if !errors.As(snapErr.Err, &cause) {
+		t.Fatalf("expected *ErrSnapshotSaveFailed as cause, got %T: %v", snapErr.Err, snapErr.Err)
 	}
 
 	// Verify the snapshot was NOT recorded in LogDB. A partial snapshot

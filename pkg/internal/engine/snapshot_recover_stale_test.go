@@ -20,7 +20,6 @@ import (
 	"io"
 	"sync"
 	"testing"
-	"time"
 )
 
 // failingRecoverSnapshotter refuses RecoverFromSnapshot, so a test can observe
@@ -91,17 +90,13 @@ func TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard(t *testing.T)
 		t.Fatalf("requestSnapshot: %v", err)
 	}
 
-	select {
-	case res := <-p.CompletedC():
-		var stale *SnapshotRecoveryStaleError
-		if !errors.As(res.err, &stale) {
-			t.Fatalf("recovery error = %T (%v), want *SnapshotRecoveryStaleError", res.err, res.err)
-		}
-		if stale.SnapshotIndex != 500 || stale.LastApplied != 900 {
-			t.Errorf("stale error = %+v, want SnapshotIndex 500 / LastApplied 900", stale)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the recovery request never completed")
+	res := awaitSnapshotResult(t, p, "recovery")
+	var stale *SnapshotRecoveryStaleError
+	if !errors.As(res.err, &stale) {
+		t.Fatalf("recovery error = %T (%v), want *SnapshotRecoveryStaleError", res.err, res.err)
+	}
+	if stale.SnapshotIndex != 500 || stale.LastApplied != 900 {
+		t.Errorf("stale error = %+v, want SnapshotIndex 500 / LastApplied 900", stale)
 	}
 
 	// The whole point: a declined recovery is not a dead shard.
@@ -156,13 +151,9 @@ func TestSnapshotPool_FailedRecovery_StillFailsTheShard(t *testing.T) {
 		t.Fatalf("requestSnapshot: %v", err)
 	}
 
-	select {
-	case res := <-p.CompletedC():
-		if res.err == nil {
-			t.Fatal("a failed RecoverFromSnapshot completed without an error")
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the recovery request never completed")
+	res := awaitSnapshotResult(t, p, "recovery")
+	if res.err == nil {
+		t.Fatal("a failed RecoverFromSnapshot completed without an error")
 	}
 
 	if !node.IsFailed() {

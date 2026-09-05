@@ -364,13 +364,9 @@ func TestEngine_SnapshotPoolIntegration(t *testing.T) {
 		t.Fatalf("snapshot request failed: %v", err)
 	}
 
-	select {
-	case result := <-sp.CompletedC():
-		if result.shardID != 1 {
-			t.Fatalf("result.shardID = %d, want 1", result.shardID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot result not received within timeout")
+	result := awaitSnapshotResult(t, sp, "snapshot")
+	if result.shardID != 1 {
+		t.Fatalf("result.shardID = %d, want 1", result.shardID)
 	}
 
 	e.Stop()
@@ -613,12 +609,7 @@ func TestEngine_RequestSnapshot_WithPeer(t *testing.T) {
 
 	// Wait for snapshot pool to process (it will fail because no snapshotter,
 	// but the request should be accepted without error).
-	select {
-	case <-e.SnapshotPool().CompletedC():
-		// Expected: pool processed the request.
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot pool did not produce a result within timeout")
-	}
+	awaitSnapshotResult(t, e.SnapshotPool(), "snapshot")
 }
 
 // heldSnapshotter is a Snapshotter that parks the pool worker inside
@@ -707,12 +698,7 @@ func TestEngine_RequestSnapshot_NilPeer(t *testing.T) {
 		t.Fatalf("RequestSnapshot with nil peer should succeed: %v", err)
 	}
 
-	select {
-	case <-e.SnapshotPool().CompletedC():
-		// Expected.
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot pool did not produce a result within timeout")
-	}
+	awaitSnapshotResult(t, e.SnapshotPool(), "snapshot")
 }
 
 // ---------------------------------------------------------------------------
@@ -736,12 +722,7 @@ func TestEngine_RequestSnapshotRecovery_Success(t *testing.T) {
 		t.Fatalf("RequestSnapshotRecovery should succeed: %v", err)
 	}
 
-	select {
-	case <-e.SnapshotPool().CompletedC():
-		// Expected.
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot pool did not produce a result within timeout")
-	}
+	awaitSnapshotResult(t, e.SnapshotPool(), "snapshot")
 }
 
 // ---------------------------------------------------------------------------
