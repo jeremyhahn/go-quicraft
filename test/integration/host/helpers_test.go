@@ -32,6 +32,7 @@ import (
 	"io/fs"
 	"math/big"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -49,20 +50,125 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Constants
+// Raft timing, and the election budgets derived from it
+//
+// Every election budget below is DERIVED from the shard configuration these
+// tests actually start, and the config builders are written in terms of the
+// same constants: hostConfigAt (behind testHostConfig, newTestClusterWithRestart
+// and restartNode) reads testRTTMillisecond, and testShardConfig /
+// testShardConfigWithSnapshot leave ElectionRTT to config.Config.SetDefaults,
+// which is the value testElectionRTT names rather than restates. Neither side
+// can be changed without the other following, and
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins that they still agree.
+//
+// A budget written as a literal is a value that is not pinned treated as
+// though it were — the class this repository keeps being bitten by (#84, #88,
+// #90, #91, #103, #107, #111, #112, #115, #121). In those the unpinned value
+// was a leader index or a replica ID; here it is the shard configuration the
+// budget is supposed to describe. A literal cannot follow a config change and
+// gives no signal when it stops matching; a derivation cannot drift at all.
+//
+// This suite was the THIRD copy of the 5s literal (#130). The derivation is
+// the one contrib/dragonboat took in PR #124 and test/integration/e2e took in
+// PR #125, mirrored on purpose: the suites keep separate copies because each
+// owns its own helpers and its own config builders; the shape is shared, the
+// constants are not.
 // ---------------------------------------------------------------------------
 
-// defaultTimeout is the standard timeout for host API test operations.
+// defaultTimeout is the standard budget for a single Raft operation that is
+// NOT an election: a proposal round trip, a lookup, a membership query. It is
+// deliberately not expressed in election rounds, because none of its callers
+// is waiting for an election.
 const defaultTimeout = 10 * time.Second
 
-// leaderElectionTimeout is the time to wait for a leader election.
-// With RTT=50ms and ElectionRTT=10, election timeout is ~500ms.
-// We give generous headroom for container/CI environments.
-const leaderElectionTimeout = 5 * time.Second
+// testRTTMillisecond is the Raft tick interval, in milliseconds, that
+// hostConfigAt gives every host in this suite. One tick is one RTTMillisecond,
+// so every timeout the engine expresses in ticks is this many milliseconds per
+// tick.
+const testRTTMillisecond = 50
 
-// failoverTimeout is extended timeout for failover scenarios where
-// the old leader must time out before a new election starts.
-const failoverTimeout = 20 * time.Second
+// testElectionRTT is the number of ticks a follower waits without hearing from
+// a leader before it stands for election.
+//
+// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
+// This reads THAT value rather than restating it, so the budgets below follow
+// the default if it ever moves.
+const testElectionRTT = config.DefaultElectionRTT
+
+// raftTick is one Raft tick in wall-clock time.
+const raftTick = testRTTMillisecond * time.Millisecond
+
+// electionRound is the longest a SINGLE election attempt can run before the
+// next candidate's timer fires and supersedes it.
+//
+// It is TWICE ElectionRTT, not once. Raft randomises each replica's election
+// timer over [electionTimeout, 2*electionTimeout) —
+// randomizedElectionTimeout = electionTimeout + rng.Intn(electionTimeout), see
+// pkg/internal/raft — so the upper bound on one attempt is two election
+// timeouts' worth of ticks. A budget written against the un-randomised value
+// is half the size it appears to be, which is how a "10x headroom" constant
+// turns out to be 5x. Here: 2 * 10 * 50ms = 1s.
+const electionRound = 2 * time.Duration(testElectionRTT) * raftTick
+
+// coldStartElectionRounds is how many worst-case election rounds
+// leaderElectionTimeout allows a shard that was started moments ago to produce
+// its FIRST leader.
+//
+// FOUR of them are the protocol's own worst case for a cold start, each
+// bounded by electionRound:
+//
+//   - the QUIC handshake and mTLS exchange between all the hosts, which must
+//     complete before the first RequestVote can even be answered;
+//   - the PreVote round (SetDefaults turns PreVote on), which precedes the
+//     real one;
+//   - the vote round itself;
+//   - one split-vote retry. On a cold start a split is likely rather than
+//     exceptional: every replica arms its election timer within microseconds
+//     of the others, which is the one situation the randomised timer has least
+//     room to separate.
+//
+// The remaining factor is host saturation, and it is a MULTIPLIER rather than
+// an addend. A Raft tick is a goroutine wakeup; on a box oversubscribed k
+// times a 50ms tick lands roughly k times late, and the whole cold start
+// stretches with it. The distribution measured for the e2e suite under that
+// load — the same root module, the same 50ms tick and ElectionRTT 10, the same
+// CI box — is heavy-tailed and is recorded on #111; the failure this suite
+// produced under it (#130) was a cold start that ran past the 5s literal.
+//
+// Thirty rounds is thirty seconds. It is BOUNDED on purpose, and the bound is
+// the point of the number rather than an afterthought: a shard that CANNOT
+// elect — a lost quorum, a broken transport, a membership that does not agree
+// — is still reported in half a minute, naming the shard, instead of running
+// to the suite timeout. That case is verified directly rather than assumed:
+// a three-member shard with only one replica running fails this wait at the
+// 30s mark (30.57s of test time, the budget plus cluster setup).
+//
+// This budget is LARGER than failoverTimeout even though the names suggest the
+// opposite, and that is the correction. A cold start is the HARDER of the two
+// waits: a failover happens over transport that is already established between
+// survivors that already know one another, while a cold start pays for the
+// handshakes first. The easier case had 20s and the harder one had 5s.
+const coldStartElectionRounds = 30
+
+// leaderElectionTimeout is the budget for a freshly started shard to produce
+// its FIRST leader. See coldStartElectionRounds for the derivation.
+//
+// It is a SETUP budget and nothing else. Every one of its call sites waits on
+// a shard started moments earlier, before the test's subject is reached, so a
+// test that exhausts it has asserted nothing at all. A wait for a SUBSEQUENT
+// leader, after one has been stopped or partitioned away, is a different
+// question and takes failoverTimeout.
+const leaderElectionTimeout = coldStartElectionRounds * electionRound
+
+// failoverTimeout is the budget for a shard that has already been led to elect
+// a REPLACEMENT leader after the incumbent is stopped or partitioned away.
+//
+// Its value is unchanged at 20s; it is re-expressed in election rounds so that
+// it tracks ElectionRTT and RTTMillisecond alongside leaderElectionTimeout
+// instead of drifting away from them. A failover needs one election timeout for
+// the survivors to notice the silence and a round or two to elect, over warm
+// connections.
+const failoverTimeout = 20 * electionRound
 
 // membershipTimeout is the generous timeout for config change operations
 // that may require leader round-trips, log replication, and QUIC setup.
@@ -534,18 +640,18 @@ func testMTLSConfig(t *testing.T) *config.MTLSConfig {
 	}
 }
 
-// testHostConfig creates a valid HostConfig for host API testing. Each call
-// gets unique temp directories via t.TempDir(). The mtls parameter must be
-// shared across all nodes in a cluster for mutual verification.
-func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
-	t.Helper()
-	assertApplyOrder(t)
+// hostConfigAt is the ONE HostConfig this suite starts hosts from, over the
+// given directories and address. testHostConfig, newTestClusterWithRestart and
+// restartNode all build through it, so the Raft tick every budget in this file
+// is derived from is read from testRTTMillisecond in exactly one place; three
+// inline literals were three places for it to drift (#130).
+func hostConfigAt(walDir, nodeHostDir, addr string, mtls *config.MTLSConfig) config.HostConfig {
 	return config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           listenAddr,
-		ListenAddress:         listenAddr,
-		RTTMillisecond:        50,
+		WALDir:                walDir,
+		NodeHostDir:           nodeHostDir,
+		RaftAddress:           addr,
+		ListenAddress:         addr,
+		RTTMillisecond:        testRTTMillisecond,
 		DeploymentID:          1,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
@@ -554,6 +660,15 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 			MTLSConfig: mtls,
 		},
 	}
+}
+
+// testHostConfig creates a valid HostConfig for host API testing. Each call
+// gets unique temp directories via t.TempDir(). The mtls parameter must be
+// shared across all nodes in a cluster for mutual verification.
+func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
+	t.Helper()
+	assertApplyOrder(t)
+	return hostConfigAt(t.TempDir(), t.TempDir(), listenAddr, mtls)
 }
 
 // testShardConfig creates a per-shard config for host API testing.
@@ -1515,13 +1630,72 @@ func waitForNodeData(
 // Snapshot Helpers
 // ---------------------------------------------------------------------------
 
-// snapshotArtifacts returns the path of every snapshot data file under dir.
+// snapshotDataFileName is the on-disk name of a snapshot payload
+// (engine.snapshotDataFile). It is duplicated here rather than exported from
+// the engine because a test that reads the constant from the code under test
+// cannot notice the code writing somewhere else entirely.
+const snapshotDataFileName = "snapshot.dat"
+
+// publishedSnapshotDirPrefix is the name a snapshot directory carries once the
+// artifact in it is FINISHED: snapshot-<020d index> (engine snapshotSaveDir).
+const publishedSnapshotDirPrefix = "snapshot-"
+
+// The two names a snapshot directory can carry BEFORE it is published. Each is
+// a directory a writer creates for itself, fills, and then renames onto the
+// canonical snapshot-<index> name in one step, so the canonical name only ever
+// holds a complete artifact. Both are deliberately unparsable as
+// snapshot-<index> so that the engine's own listSnapshotDirs, snapshot GC and
+// DEK purge-floor scan skip them; this scan must skip them for the same reason.
+//
+// The set is the one Host.StartShard's sweeps recognise, restated from
+// pkg/internal/engine/snapshot_pool.go rather than imported (the package is
+// internal to pkg/, and a scan that borrowed the writer's matcher could not
+// notice the writer staging under a name it does not sweep):
+//
+//   - engine.RecvStageDirPrefix, ".recv-": the InstallSnapshot RECEIVE path
+//     (pkg/messagehandler.go) stages here, encrypting inline from the
+//     in-memory chunks, and publishes by rename. Swept by
+//     engine.SweepStaleRecvStageDirs.
+//   - engine.ImportStageDirPrefix, ".import-": Host.ImportSnapshot stages
+//     here and publishes by rename. Swept by engine.SweepStaleImportStageDirs.
+//
+// engine.SaveEncryptTempPrefix, ".encrypt-", is NOT in this set because it is
+// not a directory: it names the scratch FILE (".encrypt-*.tmp") a local save
+// encrypts into INSIDE an already-published snapshot-<index> directory before
+// renaming it over snapshot.dat. A scratch file never carries the payload name
+// this scan matches on, so the walk never sees one. The local-save window in
+// which snapshot.dat exists in a published directory but is not yet finished
+// is #108's, and it is judged by snapshot.meta (PR #119), not by the name.
+const (
+	recvStageDirPrefix   = ".recv-"
+	importStageDirPrefix = ".import-"
+)
+
+// isSnapshotStagingDir reports whether name is a snapshot directory that has
+// not been published yet. A directory that is not yet published is not an
+// artifact: asserting "every artifact lives in snapshot-<index>/" over one of
+// these reports the receive path's ordinary staging discipline as a malformed
+// artifact (#130), which is the receive-path twin of #108.
+func isSnapshotStagingDir(name string) bool {
+	return strings.HasPrefix(name, recvStageDirPrefix) ||
+		strings.HasPrefix(name, importStageDirPrefix)
+}
+
+// snapshotArtifacts returns the path of every PUBLISHED snapshot data file
+// under dir.
 //
 // A snapshot artifact lives at
 // <snapshotDir>/shard-<N>/replica-<N>/snapshot-<020d index>/snapshot.dat
 // (pkg/internal/engine/snapshot_pool.go, snapshotSaveDir), and snapshotDir is
 // rooted under the host's NodeHostDir. Walking the whole NodeHostDir keeps the
 // check independent of that layout.
+//
+// The walk does not descend into a staging directory (isSnapshotStagingDir):
+// a receive or import in flight is by design not an artifact yet, and every
+// caller of this scan polls, so skipping the directory now and finding the
+// published one on a later poll IS waiting the staging out. Nothing else is
+// skipped. In particular a payload under any OTHER unexpected directory name
+// is still returned, so snapshotArtifactIndexes still rejects it.
 func snapshotArtifacts(t *testing.T, dir string) []string {
 	t.Helper()
 	var found []string
@@ -1534,6 +1708,9 @@ func snapshotArtifacts(t *testing.T, dir string) []string {
 			}
 			return walkErr
 		}
+		if d.IsDir() && isSnapshotStagingDir(d.Name()) {
+			return filepath.SkipDir
+		}
 		if !d.IsDir() && d.Name() == snapshotDataFileName {
 			found = append(found, path)
 		}
@@ -1545,25 +1722,37 @@ func snapshotArtifacts(t *testing.T, dir string) []string {
 	return found
 }
 
-// snapshotDataFileName is the on-disk name of a snapshot payload
-// (engine.snapshotDataFile).
-const snapshotDataFileName = "snapshot.dat"
+// snapshotArtifactIndex returns the raft index a published snapshot artifact
+// at path was recorded under, read from its parent directory's
+// snapshot-<020d index> name. It is the judgement snapshotArtifactIndexes
+// applies to every path the scan returns, kept non-fatal so a test can
+// exercise the rejections directly.
+func snapshotArtifactIndex(path string) (uint64, error) {
+	name := filepath.Base(filepath.Dir(path))
+	digits, ok := strings.CutPrefix(name, publishedSnapshotDirPrefix)
+	if !ok {
+		return 0, fmt.Errorf("snapshot artifact %s is not inside a %s<index> directory",
+			path, publishedSnapshotDirPrefix)
+	}
+	index, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("snapshot artifact %s has an unparsable index %q: %w", path, digits, err)
+	}
+	return index, nil
+}
 
-// snapshotArtifactIndexes returns the raft indexes of the snapshot artifacts
-// under dir, ascending. The index is encoded in the artifact's parent
-// directory name as snapshot-<020d index>.
+// snapshotArtifactIndexes returns the raft indexes of the published snapshot
+// artifacts under dir, ascending. A published artifact whose directory does not
+// parse as snapshot-<index> fails the test: that is a malformed artifact, not
+// one in flight, and the scan is deliberately not narrowed to the newest one
+// so that a stale artifact under a wrong name is still found (#116).
 func snapshotArtifactIndexes(t *testing.T, dir string) []uint64 {
 	t.Helper()
 	var indexes []uint64
 	for _, path := range snapshotArtifacts(t, dir) {
-		name := filepath.Base(filepath.Dir(path))
-		digits, ok := strings.CutPrefix(name, "snapshot-")
-		if !ok {
-			t.Fatalf("snapshot artifact %s is not inside a snapshot-<index> directory", path)
-		}
-		index, err := strconv.ParseUint(digits, 10, 64)
+		index, err := snapshotArtifactIndex(path)
 		if err != nil {
-			t.Fatalf("snapshot artifact %s has an unparsable index %q: %v", path, digits, err)
+			t.Fatal(err)
 		}
 		indexes = append(indexes, index)
 	}
@@ -1763,21 +1952,7 @@ func newTestClusterWithRestart(t *testing.T, numNodes int) (*testCluster, []node
 	for i := range numNodes {
 		walDir := t.TempDir()
 		nodeHostDir := t.TempDir()
-		cfg := config.HostConfig{
-			WALDir:                walDir,
-			NodeHostDir:           nodeHostDir,
-			RaftAddress:           addrs[i],
-			ListenAddress:         addrs[i],
-			RTTMillisecond:        50,
-			DeploymentID:          1,
-			AllowZeroDeploymentID: false,
-			NumWorkers:            1,
-			MaxApplyWorkers:       1,
-			TransportConfig: config.TransportConfig{
-				MTLSConfig: mtls,
-			},
-		}
-		h, err := quicraft.NewHost(cfg)
+		h, err := quicraft.NewHost(hostConfigAt(walDir, nodeHostDir, addrs[i], mtls))
 		if err != nil {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
@@ -1826,21 +2001,7 @@ func restartNode(
 	}
 
 	// Create a new host reusing the same data directories and address.
-	cfg := config.HostConfig{
-		WALDir:                nc.walDir,
-		NodeHostDir:           nc.nodeHostDir,
-		RaftAddress:           nc.addr,
-		ListenAddress:         nc.addr,
-		RTTMillisecond:        50,
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-		NumWorkers:            1,
-		MaxApplyWorkers:       1,
-		TransportConfig: config.TransportConfig{
-			MTLSConfig: cluster.mtls,
-		},
-	}
-	h, err := quicraft.NewHost(cfg)
+	h, err := quicraft.NewHost(hostConfigAt(nc.walDir, nc.nodeHostDir, nc.addr, cluster.mtls))
 	if err != nil {
 		t.Fatalf("restartNode[%d] NewHost failed: %v", idx, err)
 	}
@@ -1867,4 +2028,109 @@ func restartNode(
 		cluster.trackers[idx] = tracker
 	}
 	cluster.hostsMu.Unlock()
+}
+
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation at the top of
+// this file to the configuration the suite actually starts.
+//
+// The constants are only worth having if the config builders keep reading
+// them. If a future change gives testShardConfig an explicit ElectionRTT, or
+// hands hostConfigAt a different RTTMillisecond, electionRound silently starts
+// describing a cluster that no longer exists and every budget built on it is
+// wrong by that factor — which is exactly the drift the derivation replaced a
+// literal to prevent. This is the only place that can notice.
+func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
+	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
+		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+
+			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
+			"thinks it is", got, uint64(testRTTMillisecond), electionRound)
+	}
+	for _, tc := range []struct {
+		name string
+		cfg  config.Config
+	}{
+		{"testShardConfig", testShardConfig(1, 1)},
+		{"testShardConfigWithSnapshot", testShardConfigWithSnapshot(1, 1, 10, 5)},
+	} {
+		if got := tc.cfg.ElectionRTT; got != testElectionRTT {
+			t.Fatalf("%s sets ElectionRTT=%d but the budgets are derived from "+
+				"testElectionRTT=%d; electionRound (%v) and every budget built on it "+
+				"are wrong by a factor of %.2f", tc.name, got, testElectionRTT,
+				electionRound, float64(got)/float64(testElectionRTT))
+		}
+	}
+	if electionRound != 2*time.Duration(testElectionRTT)*raftTick {
+		t.Fatalf("electionRound=%v is not 2*ElectionRTT*tick", electionRound)
+	}
+	t.Logf("tick=%v electionRound=%v leaderElectionTimeout=%v (%d rounds) failoverTimeout=%v",
+		raftTick, electionRound, leaderElectionTimeout, coldStartElectionRounds, failoverTimeout)
+}
+
+// TestSnapshotScanJudgesOnlyPublishedArtifacts pins the two halves of the
+// artifact scan against each other over a tree laid out the way the engine
+// lays one out: a staging directory mid-flight is not an artifact and is not
+// judged, while a PUBLISHED directory under a malformed name still is (#130).
+//
+// The tree is built by hand rather than by driving a cluster into an
+// InstallSnapshot, because the window in which a .recv-<n> directory exists is
+// the length of one receive and cannot be held open from a test; the layout is
+// the engine's documented one (engine.RecvStageDirPattern,
+// engine.ImportStageDirPattern, snapshotSaveDir).
+func TestSnapshotScanJudgesOnlyPublishedArtifacts(t *testing.T) {
+	root := t.TempDir()
+	replica := filepath.Join(root, "snapshots", "shard-1", "shard-1", "replica-2")
+	payload := func(dir string) string {
+		full := filepath.Join(replica, dir)
+		if err := os.MkdirAll(full, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(full, snapshotDataFileName)
+		if err := os.WriteFile(path, []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	published := payload(fmt.Sprintf("%s%020d", publishedSnapshotDirPrefix, 42))
+	staging := []string{
+		payload(recvStageDirPrefix + "2503549359"),
+		payload(importStageDirPrefix + "1180032867"),
+	}
+
+	found := snapshotArtifacts(t, replica)
+	if len(found) != 1 || found[0] != published {
+		t.Fatalf("scan over a published artifact beside %d staging dirs returned %v, want only %s",
+			len(staging), found, published)
+	}
+	if got := snapshotArtifactIndexes(t, replica); len(got) != 1 || got[0] != 42 {
+		t.Fatalf("indexes = %v, want [42]", got)
+	}
+
+	// A malformed PUBLISHED directory is still a finding. It is not a staging
+	// name, so the walk returns it, and the judgement rejects it.
+	for _, dir := range []string{
+		"snapshot-",            // no index at all
+		"snapshot-notanumber",  // unparsable index
+		"snap-000000000000043", // wrong prefix entirely
+		".stale-42",            // dotted, but not a name any writer stages under
+	} {
+		path := payload(dir)
+		if _, err := snapshotArtifactIndex(path); err == nil {
+			t.Fatalf("a published artifact under %q was accepted as well-formed", dir)
+		}
+		if seen := snapshotArtifacts(t, replica); !slices.Contains(seen, path) {
+			t.Fatalf("the walk skipped %q, so its malformed artifact could never be judged: %v", dir, seen)
+		}
+		if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// And a staging directory holds no artifact, however it is judged: it is
+	// never handed to the judgement in the first place.
+	for _, path := range staging {
+		if seen := snapshotArtifacts(t, replica); slices.Contains(seen, path) {
+			t.Fatalf("the walk returned the staging payload %s as an artifact", path)
+		}
+	}
 }

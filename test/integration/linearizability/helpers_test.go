@@ -43,17 +43,116 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Constants
+// Raft timing, and the election budgets derived from it
+//
+// Every election budget below is DERIVED from the shard configuration these
+// tests actually start, and the config builders are written in terms of the
+// same constants: testHostConfig reads testRTTMillisecond, and testShardConfig
+// leaves ElectionRTT to config.Config.SetDefaults, which is the value
+// testElectionRTT names rather than restates. Neither side can be changed
+// without the other following, and TestBudgetsDescribeTheClusterTheyBudgetFor
+// pins that they still agree.
+//
+// A budget written as a literal is a value that is not pinned treated as
+// though it were — the class this repository keeps being bitten by (#84, #88,
+// #90, #91, #103, #107, #111, #112, #115, #121). In those the unpinned value
+// was a leader index or a replica ID; here it is the shard configuration the
+// budget is supposed to describe. A literal cannot follow a config change and
+// gives no signal when it stops matching; a derivation cannot drift at all.
+//
+// This suite was the FIFTH copy of the 5s literal, found while #130 fixed the third. The derivation is the one contrib/dragonboat took in PR #124
+// and test/integration/e2e took in PR #125, mirrored on purpose: the suites
+// keep separate copies because each owns its own helpers and its own config
+// builders; the shape is shared, the constants are not.
 // ---------------------------------------------------------------------------
 
-// defaultTimeout is the standard timeout for linearizability test operations.
+// defaultTimeout is the standard budget for a single Raft operation that is
+// NOT an election: a proposal round trip, a lookup, a membership query. It is
+// deliberately not expressed in election rounds, because none of its callers
+// is waiting for an election.
 const defaultTimeout = 15 * time.Second
 
-// leaderElectionTimeout is the time to wait for a leader election.
-const leaderElectionTimeout = 5 * time.Second
+// testRTTMillisecond is the Raft tick interval, in milliseconds, that
+// testHostConfig gives every host in this suite. One tick is one
+// RTTMillisecond, so every timeout the engine expresses in ticks is this many
+// milliseconds per tick.
+const testRTTMillisecond = 50
 
-// failoverTimeout is extended timeout for failover scenarios.
-const failoverTimeout = 20 * time.Second
+// testElectionRTT is the number of ticks a follower waits without hearing from
+// a leader before it stands for election.
+//
+// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
+// This reads THAT value rather than restating it, so the budgets below follow
+// the default if it ever moves.
+const testElectionRTT = config.DefaultElectionRTT
+
+// raftTick is one Raft tick in wall-clock time.
+const raftTick = testRTTMillisecond * time.Millisecond
+
+// electionRound is the longest a SINGLE election attempt can run before the
+// next candidate's timer fires and supersedes it.
+//
+// It is TWICE ElectionRTT, not once. Raft randomises each replica's election
+// timer over [electionTimeout, 2*electionTimeout) —
+// randomizedElectionTimeout = electionTimeout + rng.Intn(electionTimeout), see
+// pkg/internal/raft — so the upper bound on one attempt is two election
+// timeouts' worth of ticks. A budget written against the un-randomised value
+// is half the size it appears to be, which is how a "10x headroom" constant
+// turns out to be 5x. Here: 2 * 10 * 50ms = 1s.
+const electionRound = 2 * time.Duration(testElectionRTT) * raftTick
+
+// coldStartElectionRounds is how many worst-case election rounds
+// leaderElectionTimeout allows a shard that was started moments ago to produce
+// its FIRST leader.
+//
+// FOUR of them are the protocol's own worst case for a cold start, each
+// bounded by electionRound:
+//
+//   - the QUIC handshake and mTLS exchange between all the hosts, which must
+//     complete before the first RequestVote can even be answered;
+//   - the PreVote round (SetDefaults turns PreVote on), which precedes the
+//     real one;
+//   - the vote round itself;
+//   - one split-vote retry. On a cold start a split is likely rather than
+//     exceptional: every replica arms its election timer within microseconds
+//     of the others, which is the one situation the randomised timer has least
+//     room to separate.
+//
+// The remaining factor is host saturation, and it is a MULTIPLIER rather than
+// an addend. A Raft tick is a goroutine wakeup; on a box oversubscribed k
+// times a 50ms tick lands roughly k times late, and the whole cold start
+// stretches with it. The distribution measured for the e2e suite under that
+// load — the same root module, the same 50ms tick and ElectionRTT 10, the same
+// CI box — is heavy-tailed and is recorded on #111.
+//
+// Thirty rounds is thirty seconds. It is BOUNDED on purpose, and the bound is
+// the point of the number rather than an afterthought: a shard that CANNOT
+// elect — a lost quorum, a broken transport, a membership that does not agree
+// — is still reported in half a minute, naming the shard, instead of running
+// to the suite timeout. That case was verified directly in the host suite
+// (#130): a three-member shard with only one replica running fails this wait
+// at the 30s mark (30.57s of test time, the budget plus cluster setup).
+const coldStartElectionRounds = 30
+
+// leaderElectionTimeout is the budget for a freshly started shard to produce
+// its FIRST leader. See coldStartElectionRounds for the derivation.
+//
+// It is a SETUP budget and nothing else. Every one of its call sites waits on
+// a shard started moments earlier, before the test's subject is reached, so a
+// test that exhausts it has asserted nothing at all.
+const leaderElectionTimeout = coldStartElectionRounds * electionRound
+
+// failoverTimeout is the budget for a shard that has already been led to elect
+// a REPLACEMENT leader after the incumbent is stopped or partitioned away.
+//
+// Its value is unchanged at 20s; it is re-expressed in election rounds so that
+// it tracks ElectionRTT and RTTMillisecond alongside leaderElectionTimeout
+// instead of drifting away from them. A failover needs one election timeout for
+// the survivors to notice the silence and a round or two to elect, over warm
+// connections. It is SMALLER than leaderElectionTimeout on purpose: a failover
+// happens over transport that is already established between survivors that
+// already know one another, while a cold start pays for the handshakes first.
+const failoverTimeout = 20 * electionRound
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
@@ -550,7 +649,7 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		NodeHostDir:           t.TempDir(),
 		RaftAddress:           listenAddr,
 		ListenAddress:         listenAddr,
-		RTTMillisecond:        50,
+		RTTMillisecond:        testRTTMillisecond,
 		DeploymentID:          1,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
@@ -1107,4 +1206,32 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 		case <-ticker.C:
 		}
 	}
+}
+
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation beside the
+// budgets to the configuration the suite actually starts.
+//
+// The constants are only worth having if the config builders keep reading
+// them. If a future change gives testShardConfig an explicit ElectionRTT, or
+// hands testHostConfig a different RTTMillisecond, electionRound silently
+// starts describing a cluster that no longer exists and every budget built on
+// it is wrong by that factor — which is exactly the drift the derivation
+// replaced a literal to prevent. This is the only place that can notice.
+func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
+	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
+		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+
+			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
+			"thinks it is", got, uint64(testRTTMillisecond), electionRound)
+	}
+	if got := testShardConfig(1, 1).ElectionRTT; got != testElectionRTT {
+		t.Fatalf("testShardConfig sets ElectionRTT=%d but the budgets are derived from "+
+			"testElectionRTT=%d; electionRound (%v) and every budget built on it "+
+			"are wrong by a factor of %.2f", got, testElectionRTT,
+			electionRound, float64(got)/float64(testElectionRTT))
+	}
+	if electionRound != 2*time.Duration(testElectionRTT)*raftTick {
+		t.Fatalf("electionRound=%v is not 2*ElectionRTT*tick", electionRound)
+	}
+	t.Logf("tick=%v electionRound=%v leaderElectionTimeout=%v (%d rounds)%s",
+		raftTick, electionRound, leaderElectionTimeout, coldStartElectionRounds, fmt.Sprintf(" failoverTimeout=%v", failoverTimeout))
 }
