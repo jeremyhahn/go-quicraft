@@ -681,12 +681,26 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	item.node = node
 	applyC <- item
 
+	// commitPending is the worker's per-item completion mark: the per-shard
+	// goroutine clears it in a defer that runs AFTER SM.Apply has returned
+	// and lastApplied has been stored, and the unloaded-discard path clears
+	// it too, so the wait ends promptly whichever way the item went and
+	// every read below is pinned. testSM.Update bumps applyCount on ENTRY,
+	// so waiting on that alone observes the batch mid-apply, before the
+	// worker has advanced lastApplied (#139).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"committed batch of the re-loaded shard was never applied",
-		func() bool { return testSm.applyCount.Load() == 1 })
+		"committed batch of the re-loaded shard was never processed",
+		func() bool { return !node.commitPending.Load() })
 
 	if node.IsFailed() {
 		t.Fatal("node must not be failed")
+	}
+	// The ordering guarantee: had the item been dispatched before the reload
+	// was serviced, the dispatcher would have dropped it as "unloaded" and
+	// the state machine would never have seen it.
+	if got := testSm.applyCount.Load(); got != 1 {
+		t.Fatalf("applyCount = %d, want 1: the batch was dropped as unloaded, "+
+			"so the reload was not serviced before it", got)
 	}
 	if got := node.lastApplied.Load(); got != 1 {
 		t.Fatalf("lastApplied = %d, want 1", got)
@@ -786,9 +800,14 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	item.node = node
 	applyC <- item
 
+	// failApply reports the batch through OnProposalFailed BEFORE it marks
+	// the node failed, so waiting on the callback count alone reads
+	// IsFailed before the worker has set it. commitPending is cleared by
+	// the per-shard goroutine's defer after failApply has returned, which
+	// pins every read below (#139).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for the gap to be reported",
-		func() bool { return cb.proposalFailedCount.Load() == 1 })
+		"timed out waiting for the gapped batch to be processed",
+		func() bool { return !node.commitPending.Load() })
 
 	if !node.IsFailed() {
 		t.Fatal("node must be marked failed on a committed-entry gap")
@@ -798,6 +817,9 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	}
 	if got := node.lastApplied.Load(); got != 5 {
 		t.Fatalf("lastApplied must not advance past the gap, got %d", got)
+	}
+	if got := cb.proposalFailedCount.Load(); got != 1 {
+		t.Fatalf("OnProposalFailed calls = %d, want 1", got)
 	}
 	failed := cb.getProposalFailedCalls()
 	if !errors.Is(failed[0].err, ErrApplyGap) {
@@ -851,12 +873,17 @@ func TestApplyWorker_GapDetection_FailsShardWhenNothingApplied(t *testing.T) {
 	item.node = node
 	applyC <- item
 
+	// See TestApplyWorker_GapDetection_FailsShard: the deferred commitPending
+	// clear is the only mark that follows failed.Store (#139).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for the gap to be reported",
-		func() bool { return cb.proposalFailedCount.Load() == 1 })
+		"timed out waiting for the gapped batch to be processed",
+		func() bool { return !node.commitPending.Load() })
 
 	if !node.IsFailed() {
 		t.Fatal("node must be marked failed on a committed-entry gap")
+	}
+	if got := cb.proposalFailedCount.Load(); got != 1 {
+		t.Fatalf("OnProposalFailed calls = %d, want 1", got)
 	}
 	if got := testSm.applyCount.Load(); got != 0 {
 		t.Fatalf("entries after a gap must not be applied, applyCount = %d", got)

@@ -1932,10 +1932,15 @@ func TestApplyWorker_AutoSnapshot_ClearsSnapshottingOnPoolFull(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Poll until the apply completes (lastApplied advances to 5).
+	// Poll until the worker has finished with the item. The auto-snapshot
+	// trigger runs AFTER lastApplied is stored: it sets snapshotting, has
+	// the request rejected, and clears the flag again. Waiting on
+	// lastApplied alone can land between the set and the clear and read
+	// the flag as true. The deferred commitPending clear follows the whole
+	// trigger, so it pins the read below (#139).
 	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for 5 entries to be applied",
-		func() bool { return node.lastApplied.Load() >= 5 })
+		"timed out waiting for the 5-entry batch to be processed",
+		func() bool { return !node.commitPending.Load() })
 
 	// The auto-snapshot request should have been rejected (pool full),
 	// and the snapshotting flag should have been cleared so future
