@@ -1630,76 +1630,11 @@ func addNodeToCluster(
 	}
 }
 
-// syncAddNode adds a voting replica through whichever node is CURRENTLY the
-// leader, retrying transient leadership errors until it succeeds or timeout.
-//
-// The membership calls used to be issued against a leader index sampled once,
-// then treated ErrNotLeader as fatal. A re-election between the sample and the
-// call is ordinary Raft behaviour, so the test failed with "not leader, leader
-// unknown" for a membership change that was never actually refused. The
-// assertion is unchanged in strength: the change must still succeed, and it
-// still fails hard on a non-transient error or on running out of time.
-func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr string, timeout time.Duration) {
-	t.Helper()
-	syncMembershipChange(t, cluster, shardID, timeout,
-		fmt.Sprintf("SyncRequestAddNode(replica=%d)", replicaID),
-		func(ctx context.Context, h *quicraft.Host) error {
-			return h.SyncRequestAddNode(ctx, shardID, replicaID, addr, 0)
-		})
-}
-
-// syncDeleteNode removes a replica through whichever node is CURRENTLY the
-// leader, retrying transient leadership errors. See syncAddNode.
-func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, timeout time.Duration) {
-	t.Helper()
-	syncMembershipChange(t, cluster, shardID, timeout,
-		fmt.Sprintf("SyncRequestDeleteNode(replica=%d)", replicaID),
-		func(ctx context.Context, h *quicraft.Host) error {
-			return h.SyncRequestDeleteNode(ctx, shardID, replicaID, 0)
-		})
-}
-
-// syncMembershipChange runs fn against the current leader until it succeeds,
-// retrying only transient leadership errors.
-func syncMembershipChange(
-	t *testing.T,
-	cluster *testCluster,
-	shardID uint64,
-	timeout time.Duration,
-	desc string,
-	fn func(context.Context, *quicraft.Host) error,
-) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		leaderHost := cluster.leaderHost(shardID)
-		if leaderHost == nil {
-			lastErr = quicraft.ErrNotLeader
-			timer := time.NewTimer(50 * time.Millisecond)
-			<-timer.C
-			timer.Stop()
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), membershipTimeout)
-		err := fn(ctx, leaderHost)
-		cancel()
-		if err == nil {
-			return
-		}
-		if !isTransientLeadershipError(err) {
-			t.Fatalf("%s failed: %v", desc, err)
-			return
-		}
-		lastErr = err
-		timer := time.NewTimer(50 * time.Millisecond)
-		<-timer.C
-		timer.Stop()
-	}
-	t.Fatalf("%s never succeeded within %v: %v", desc, timeout, lastErr)
-}
+// syncAddNode and syncDeleteNode used to live here. They moved to
+// membership_idempotence_test.go when #112 showed that retrying the leadership
+// error was only half of what a membership change needs: the retry also
+// assumed an error meant the config change had NOT happened, which for a
+// change already delivered to raft is false.
 
 // proposeUntilCommitted proposes one key/value through whichever node is
 // CURRENTLY the leader, retrying transient leadership errors until the entry
