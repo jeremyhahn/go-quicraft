@@ -639,7 +639,7 @@ Same package set as unit tests, prefixed with `coverage-` instead of `test-`. Pr
 | Target | Description |
 |--------|-------------|
 | `ci` | `fmt` → `no-mutants` → `vet` → `lint` → `security` → `build` → `test`. Untagged only |
-| `ci-full` | `ci` plus `ci-modules`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`, and the three FIPS targets (`build-fips`, `verify-fips`, `verify-fips-transport`). Matches ci.yml |
+| `ci-full` | `ci` plus `ci-modules`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`, and the three FIPS targets (`build-fips`, `verify-fips`, `verify-fips-exempt`). Matches ci.yml |
 | `ci-modules` | Build and vet every `go.mod` in the tree, with `GOWORK=off` |
 | `remote-<target>` | rsync the working tree to the remote build host and run `<target>` there |
 | `remote-tools` | Provision the remote host's scanners |

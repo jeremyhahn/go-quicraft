@@ -196,10 +196,11 @@ A peer must not be able to make this process allocate by asserting a size.
   its at-rest snapshot to a sibling temp file, streams it, and the receiver
   re-encrypts under its **own** barrier. Nodes cannot decrypt each other's
   at-rest data; confidentiality in transit is TLS's, not the barrier's.
-- **The transport runs in FIPS mode but is not approved-only.** See the
-  exemption record below. `-tags fips` makes go-quicraft FIPS **at rest**, and
-  a process that opens a QUIC connection under `GODEBUG=fips140=only` still
-  panics inside the QUIC library.
+- **One SHA-1 identifier on the OCSP path is outside approved-only.** See the
+  exemption record below. It is the OCSP CertID hash, which RFC 6960 mandates
+  and which protects nothing; a deployment configured `Mode: "crl"` never
+  computes it. Everything else in this tree, packet protection included, runs
+  under `GODEBUG=fips140=only`.
 
 ## Approved key exchange, and how a running cluster gets there
 
@@ -250,50 +251,158 @@ rather than that the harness accepts anything.
 
 ### What this migration does NOT achieve
 
-Approved KEY EXCHANGE, and nothing beyond it. Completing the rollout above does
-not make the transport approved-only: the packet protection and OCSP exemptions
-in the record below are properties of the QUIC and OCSP standards, not of the
-curve list, and no cluster configuration reaches them. A deployment that must be
-approved-only end to end still has to terminate this transport outside the
-boundary.
+Approved KEY EXCHANGE as a property of the BINARY, and nothing beyond it. Under
+`GODEBUG=fips140=on` or `=only` Go already filters X25519 out of the offer, so
+the module is satisfied either way; what the build tag adds is that a
+`-tags fips` binary cannot offer X25519 even with the module inactive. That is
+the same absence-not-refusal shape `pkg/seal` uses, and it is worth having, but
+it is not what makes a deployment approved-only.
+
+Two things this rollout does not supply: a `quic-go` at v0.60.0 or later (for
+approved packet protection) and a revocation `Mode` that does not consult OCSP.
+See [the approved-only recipe](#the-approved-only-recipe) below — completing
+this rollout alone is necessary, not sufficient.
 
 ## FIPS 140-3 exemption record
 
-This is the authoritative record of why `pkg/internal/transport/...` is the one
-package tree `make verify-fips` does not judge, and what covers it instead. It
-is not a waiver for the tree's own cryptography: the key exchange above is
-approved in a `-tags fips` build, and `make verify-fips-transport` runs the
-whole tree under `GODEBUG=fips140=on`, which is a gate that has already caught
-a real defect.
+This is the authoritative record of why `pkg/internal/transport/revocation/...`
+is the one package tree `make verify-fips` does not judge, and what covers it
+instead. It is not a waiver for that tree's cryptography: `make
+verify-fips-exempt` runs it under `GODEBUG=fips140=on`, so everything on the
+revocation path OTHER than the one primitive below is still proven approved.
 
-| | Exemption 1 | Exemption 2 |
+**The QUIC transport itself is inside the approved-only gate.** That changed in
+#85, and the paragraph that used to stand here said the opposite.
+
+### What changed: packet protection stopped being an exemption
+
+Until `quic-go` v0.59.1 this record listed two exemptions, and the first was
+QUIC packet protection. RFC 9001 §5.3 derives each packet's nonce by XOR-ing the
+packet number into a fixed IV — a caller-supplied IV, which
+`cipher.NewGCMWithRandomNonce` cannot express. `quic-go` reached it through the
+general `cipher.NewGCM`, which `fips140=only` declines, so a process panicked
+constructing the initial AEAD before any handshake.
+
+`quic-go` **v0.60.0** fixed this by constructing packet-protection AEADs through
+Go's TLS 1.3 AES-GCM implementation instead of the general API. In v0.62.0 it is
+`internal/handshake/cipher_suite.go`, whose `aeadAESGCMTLS13` dispatches to
+`aeadAESGCMTLS13FIPS140` when `crypto/fips140.Enabled()` — the same approved path
+`crypto/tls` uses for its own records, for the same construction. The old record
+asserted that "no version of any QUIC library can differ." That was true of the
+public API surface available in 2026-08 and it is false now; the fix was to stop
+using the public API, not to change the wire format.
+
+**How it reaches that path, and why that matters to an assessor.** The standard
+library does not yet export a constructor for it, so
+`internal/handshake/cipher_suite_fips140.go` uses `go:linkname` to bind the
+unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences worth stating rather
+than discovering:
+
+- The primitive executing is `crypto/tls`'s own AES-GCM, inside the Go
+  Cryptographic Module. The linkname changes who can call it, not what it is.
+- It therefore depends on a **Go toolchain** that has that symbol, not only on a
+  `quic-go` version. `quic-go` v0.62.0 declares `go 1.26.0`; this repository
+  pins 1.26.7.
+- It is explicitly a stopgap. `quic-go`'s own comment cites
+  [golang/go#79219](https://github.com/golang/go/issues/79219) and the pending
+  `NewGCMForQUIC` constructor; when the standard library exports one, the
+  linkname goes away. A toolchain bump is therefore a thing to re-measure this
+  gate against, not to assume through — which `make verify-fips` does on every
+  nightly run.
+
+go-quicraft moved to v0.62.0 in #85.
+Measured on 2026-09-03 with real QUIC handshakes over loopback:
+
+| | v0.59.1 | v0.62.0 |
 |---|---|---|
-| Primitive | AES-GCM with a caller-supplied IV | SHA-1 |
-| Where | `quic-go` packet protection (`internal/handshake`) | `golang.org/x/crypto/ocsp.CreateRequest` |
-| Reached from | every QUIC connection | `revocation.Checker.queryOCSP` |
-| Mandated by | RFC 9001 §5.3 — each nonce is the packet number XORed into a fixed IV, which `cipher.NewGCMWithRandomNonce` cannot express | RFC 6960 §4.1.1 — `CertID.issuerNameHash` / `issuerKeyHash` |
-| What it protects | nothing regulated; it is the standard's own key-derivation construction | nothing; the hash is an ISSUER IDENTIFIER, matched against a responder's index |
-| Fixable here? | No. In a dependency, and no version of any QUIC library can differ — the wire format requires it | No. In a dependency, and a compliant responder rejects any other hash |
-| Behaviour under `fips140=only` | panics constructing the initial AEAD, before any handshake | panics inside `CreateRequest` |
-| Behaviour under `fips140=on` | permitted | permitted |
+| `pkg/internal/transport` under `fips140=only` | panics on the first dial | **ok, 155.6s** |
 
-Neither is a compliance defect under FedRAMP, PCI DSS or HIPAA: those
-frameworks govern the protection of regulated data, and one of these is the
-protocol's own AEAD construction while the other is an identifier. What they
-do mean is that go-quicraft is **FIPS at rest, not FIPS on the wire** — a
-deployment that must be approved-only end to end has to terminate this
-transport outside the boundary.
+Re-measured 2026-09-04 against live clusters rather than unit suites. Under
+`GOFIPS140=latest GODEBUG=fips140=only go test -tags integration,fips`, three-
+and five-node clusters form, elect a leader, agree on it across every node, and
+replicate — single entry, concurrent proposals, large values, multiple shards,
+and stale reads from a follower. `TestE2E_ThreeNodeCluster_LeaderElection` and
+`TestE2E_FiveNode_Replication_ConcurrentProposals` are the ends of that range.
+This is the demonstration #27
+asked for and, on v0.59.1, could not have had.
 
-### Acceptance — owner ruling, 2026-09-03
+`v0.60.0` is therefore the **minimum** version for an approved-only deployment.
+A downgrade below it silently reintroduces the exemption, which is why the
+version floor is stated here rather than only in `go.mod`.
 
-**The two exemptions above are ACCEPTED for the FedRAMP claim.** Ruled by the
-owner on 2026-09-03, closing #27.
+### The one remaining exemption
 
-The grounds are the ones the table states: neither exemption protects regulated
-data. Exemption 1 is the QUIC standard's own key-derivation construction, and
-exemption 2 is an issuer identifier matched against a responder's index. FedRAMP,
-PCI DSS and HIPAA govern the protection of regulated data; neither construction
-carries any.
+| | Exemption |
+|---|---|
+| Primitive | SHA-1 |
+| Where | `golang.org/x/crypto/ocsp.CreateRequest` |
+| Reached from | `revocation.Checker.queryOCSP`, `pkg/internal/transport/revocation/checker.go:938` |
+| Mandated by | RFC 6960 §4.1.1 — `CertID.issuerNameHash` / `issuerKeyHash` |
+| What it protects | nothing; the hash is an ISSUER IDENTIFIER, matched against a responder's index |
+| Fixable here? | No. In a dependency, and a compliant responder rejects any other hash |
+| **Avoidable here?** | **Yes — by configuration. See below.** |
+| Behaviour under `fips140=only` | panics inside `CreateRequest` |
+| Behaviour under `fips140=on` | permitted |
+
+It is not a compliance defect under FedRAMP, PCI DSS or HIPAA: those frameworks
+govern the protection of regulated data, and this hash carries none — it names
+an issuer.
+
+### The exemption is avoidable by configuration
+
+`queryOCSP` is the only call site, and it is reached only when this checker
+actually queries a responder. `checkOCSPRaw` returns early when
+`OCSPResponderURL` is empty, and `IsRevoked` dispatches on `Mode`:
+
+| `Mode` | reaches SHA-1? |
+|---|---|
+| `crl` | **never**, at any configuration |
+| `ocsp` | yes — `Config.Validate` requires a responder URL for this mode |
+| `both` | yes — same requirement |
+| `any` (the default) | only when `OCSPResponderURL` is set; never when it is empty |
+
+So `Mode: "crl"` is a supported configuration under which go-quicraft runs
+**fully approved-only, with no exemptions at all**. That is a stronger posture
+than this document claimed before #85, and it is a deployment choice rather than
+a limit of the library.
+
+### The approved-only recipe
+
+Four things, all of them checkable:
+
+1. `quic-go` **≥ v0.60.0** — go-quicraft pins v0.62.0.
+2. Build with **`-tags fips`**. Measured caveat, so the reason is not mistaken
+   for the curve list: Go filters X25519 out of the offer under `fips140` mode
+   by itself, and `TestHandshakeCurves` passes untagged under `only`. What the
+   tag buys is the SEAL layer — Argon2id and ChaCha20-Poly1305 are compiled out
+   rather than refused at runtime, which is the absence-not-refusal shape
+   `pkg/seal` uses deliberately. It is also the only combination
+   `make verify-fips` exercises.
+3. Run with **`GOFIPS140=latest GODEBUG=fips140=only`**.
+4. Configure revocation **`Mode: "crl"`** with at least one CRL path, so the
+   OCSP CertID is never computed.
+
+Drop (1), (3) or (4) and the deployment is no longer approved-only; dropping (4)
+alone leaves exactly the residual this record covers. Drop (2) and it still is,
+on the module's own enforcement — what you lose is the guarantee that the
+non-approved primitives are ABSENT rather than merely refused, and the assurance
+that the configuration you shipped is the one CI exercises. Keep it.
+
+### Acceptance — owner ruling, 2026-09-03, re-recorded against the smaller residual
+
+**The exemption above is ACCEPTED for the FedRAMP claim.** Ruled by the owner on
+2026-09-03, closing #27.
+
+The ruling was granted against **two** exemptions. One of them — QUIC packet
+protection — has since been removed outright rather than accepted, so the
+acceptance now applies to a strictly smaller residual than it was asked about.
+It is re-recorded here rather than re-litigated: an acceptance that covered two
+primitives covers one of them a fortiori.
+
+The grounds are the ones the table states: the exemption does not protect
+regulated data. The OCSP CertID is an issuer identifier matched against a
+responder's index. FedRAMP, PCI DSS and HIPAA govern the protection of regulated
+data; this construction carries none.
 
 Recorded here rather than only in the issue tracker because this is the artifact
 an assessor reads. Three things an assessor should be able to check without
@@ -301,33 +410,26 @@ taking anyone's word:
 
 1. **The scope is bounded and enforced.** `make verify-fips` excludes exactly one
    package tree, by a deny-list keyed on a single Makefile variable, and
-   `test/buildgates/fips_gate_test.go` fails if that list grows, if the mode is
-   weakened from `only`, or if the excluded tree stops being run by
-   `make verify-fips-transport`.
+   `test/buildgates/fips_gate_test.go` fails if that list grows, if the tree it
+   names is widened back to the whole transport, if the mode is weakened from
+   `only`, or if the excluded tree stops being run by `make verify-fips-exempt`.
 2. **The excluded tree is still gated**, one notch lower, at
-   `GODEBUG=fips140=on` — which is a real gate rather than a formality: it is
-   what proves the key exchange is approved, and it has already caught a defect
-   (an X25519-only curve list that failed every handshake under FIPS).
-3. **Everything else is approved-only.** The seal layer, the WAL and snapshots
-   run under `GODEBUG=fips140=only` and are proven to.
+   `GODEBUG=fips140=on`. `on` still loads the validated module, so it proves
+   everything on the revocation path apart from the cited hash is approved.
+3. **Everything else is approved-only, the QUIC transport included.** The seal
+   layer, the WAL, snapshots, and packet protection all run under
+   `GODEBUG=fips140=only` and are proven to.
 
-**What this acceptance does NOT say.** It does not claim the transport is
-approved-only, and no configuration makes it so. go-quicraft is FIPS **at rest**,
-not FIPS **on the wire**. A deployment that must be approved-only end to end
-still has to terminate this transport outside the boundary — that sentence is
-unchanged by the ruling and remains the honest description.
+**What this acceptance does NOT say.** It does not claim that an OCSP-configured
+deployment is approved-only — it is not, and that is what the acceptance
+covers. It no longer needs to say anything about the wire: since #85 the
+transport is approved-only, and a deployment that must be approved-only end to
+end **no longer has to terminate this transport outside the boundary**. The
+sentence that said it did was true of v0.59.1 and has been removed.
 
-The alternative was considered and rejected on cost, not on principle:
-terminating the transport outside the boundary buys no cryptographic property
-these two exemptions lack, because neither protects anything an assessor
-regulates.
-
-The scope is exactly one tree and no more. `make verify-fips` filters it out by
-a deny-list keyed on a single Makefile variable, so a package added tomorrow is
-inside the approved-only gate by default, and
-`test/buildgates/fips_gate_test.go` fails if that list ever grows, if the mode
-is weakened from `only`, or if the excluded tree stops being run by
-`make verify-fips-transport`.
+The alternative considered in the original ruling — terminating the transport
+outside the boundary — was rejected on cost. It is now unnecessary on the
+merits as well.
 
 ## Component boundaries
 
@@ -361,7 +463,9 @@ log replication and QUIC transport in `docs/00 §R`.
 - **No authorization beyond membership.** A verified peer that is a committed
   member may send Raft messages. There are no scopes, roles or per-shard
   permissions here.
-- **No approved-only wire.** The transport runs under `GODEBUG=fips140=on` and
-  its own key exchange is approved, but two protocol-mandated primitives in
-  dependencies keep it out of `fips140=only`. Stated as a limit, not a
-  footnote — see [FIPS 140-3 exemption record](#fips-140-3-exemption-record).
+- **No approved-only OCSP.** The transport runs under `GODEBUG=fips140=only`,
+  packet protection and key exchange included, but the OCSP CertID is SHA-1 by
+  protocol definition (RFC 6960 §4.1.1) inside `golang.org/x/crypto/ocsp`.
+  Revocation `Mode: "crl"` avoids it entirely; `ocsp`, `both`, and `any` with a
+  responder URL do not. See
+  [FIPS 140-3 exemption record](#fips-140-3-exemption-record).

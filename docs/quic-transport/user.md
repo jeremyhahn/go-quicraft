@@ -135,7 +135,8 @@ validate.
 ## Task: choose a FIPS mode
 
 If you are deploying into a FIPS-regulated environment, this is the decision to
-make, and it has one sharp edge.
+make. It used to have one sharp edge — a clustered process panicked under
+`fips140=only` — and that edge is gone as of `quic-go` v0.60.0.
 
 ### The three modes
 
@@ -149,48 +150,108 @@ make, and it has one sharp edge.
 
 ### What works, measured
 
+Measured 2026-09-04 with `quic-go` v0.62.0, `-tags fips`, real handshakes and
+live three- and five-node clusters:
+
 | | `fips140=on` | `fips140=only` |
 |---|---|---|
 | seal layer, WAL, snapshots (at rest) | works | works |
 | TLS 1.3 handshake, approved curves | works | works |
-| **QUIC packet protection** | works | **panics** |
+| QUIC packet protection | works | **works** |
+| Raft replication across a live cluster | works | **works** |
+| **OCSP revocation checking** | works | **panics** |
 
-**Run a cluster under `GODEBUG=fips140=only` and the process panics** while
-constructing the initial AEAD — before any handshake, so you get no connection
-at all rather than a degraded one. Use `fips140=on`.
+**Use `GODEBUG=fips140=only`.** With revocation `Mode: "crl"` there is nothing
+in go-quicraft that `only` refuses.
 
-### Why `only` refuses it
+### The approved-only recipe
 
-Not because QUIC uses weak or unapproved cryptography. QUIC protects packets
-with **AES-GCM**, and derives each nonce by XORing the packet number into a
-static IV (RFC 9001 §5.3). That deterministic construction is one NIST
-explicitly permits — SP 800-38D §8.2.1 — and is essentially what TLS 1.3 does
-for its own records.
+go-quicraft is a library, so the tag and the environment belong to **your**
+binary, not to this module:
 
-The refusal is about API surface, not algorithms. Go's module validates
-`cipher.NewGCMWithRandomNonce`; `cipher.NewGCM` with a caller-supplied IV is
-declined under `only`:
-
-```
-crypto/cipher: use of GCM with arbitrary IVs is not allowed in FIPS 140-only
-mode, use NewGCMWithRandomNonce
+```bash
+go build -tags fips -o your-service ./cmd/your-service
+GOFIPS140=latest GODEBUG=fips140=only ./your-service
 ```
 
-`crypto/tls` reaches an approved path internally for the same construction.
-`quic-go` cannot: it is third-party code and only public APIs are available to
-it. No configuration of this library changes that, and no QUIC implementation
-can differ — the wire format requires the construction.
+```go
+cfg.TransportConfig.RevocationConfig = &config.RevocationConfig{
+    CRLPaths:      []string{"<config-dir>/crl/issuing.crl"},
+    Mode:          "crl", // NOT "ocsp", "both", or "any"
+    CheckInterval: 60 * time.Second,
+}
+```
+
+Leaving `RevocationConfig` nil also avoids OCSP, at the cost of no revocation
+checking at all. That is a security tradeoff, not a FIPS one — see
+[Task: turn on revocation](#task-turn-on-revocation).
+
+Four requirements. Three are what make it approved-only; the second is defence
+in depth, and you want it anyway:
+
+1. **`quic-go` ≥ v0.60.0.** go-quicraft pins v0.62.0. Below v0.60.0 the process
+   panics constructing the initial AEAD, before any handshake.
+2. **`-tags fips`.** Not for the curve list — Go filters X25519 out of the
+   offered groups under `fips140` mode on its own, and an untagged build
+   handshakes fine under `only` (measured). The tag is for the **seal layer**:
+   it compiles Argon2id and ChaCha20-Poly1305 out of the binary entirely, so no
+   configuration, environment or stored metadata can reach them. Untagged they
+   are present and merely refused at runtime
+   (`ErrKDFNotFIPSApproved`). Absence beats refusal, and this is the only
+   combination the project's gate actually tests.
+3. **`GODEBUG=fips140=only`** with `GOFIPS140=latest`. `on` loads the module but
+   still permits non-approved algorithms, so it proves less than it looks like.
+4. **Revocation `Mode: "crl"`.** This is the one that is easy to miss, because
+   the default (`any`) reaches OCSP whenever a responder URL is configured.
+
+### Why OCSP still refuses `only`
+
+Not because OCSP is weak. The refused primitive is **SHA-1**, and it is used as
+an IDENTIFIER rather than for any security property: RFC 6960 §4.1.1 defines a
+`CertID` as the hash of the issuer's name and public key, which a responder
+matches against its index. `golang.org/x/crypto/ocsp.CreateRequest` computes it,
+and under `only` that call panics:
+
+```
+crypto/sha1: use of SHA-1 is not allowed in FIPS 140-only mode
+```
+
+A compliant responder rejects any other hash, so this cannot be fixed in the
+library or in the dependency. It can be **avoided**, which is what `Mode: "crl"`
+does:
+
+| `Mode` | reaches SHA-1? |
+|---|---|
+| `"crl"` | **never** |
+| `"ocsp"` | yes |
+| `"both"` | yes |
+| `"any"` (default) | only when `OCSPResponderURL` is set |
+
+If you need OCSP *and* approved-only, those two requirements are in genuine
+conflict and the conflict is the OCSP standard's, not this library's.
+
+### What used to be here, and why it is gone
+
+Earlier versions of this document told you to use `fips140=on` because QUIC
+packet protection could not be approved: RFC 9001 §5.3 derives each nonce by
+XOR-ing the packet number into a fixed IV, `cipher.NewGCMWithRandomNonce` cannot
+express that, and `quic-go` reached the construction through the general
+`cipher.NewGCM`, which `only` declines.
+
+`quic-go` v0.60.0 removed that. It now builds packet-protection AEADs through
+Go's TLS 1.3 AES-GCM implementation — the same approved path `crypto/tls` uses
+for its own records, for the same construction — so the deterministic nonce that
+SP 800-38D §8.2.1 permits is now reached through an approved service rather than
+a declined one. **If you configured `fips140=on` on the old advice, you can move
+to `only`.** Nothing in your configuration needs to change except that variable
+and, if you use OCSP, the revocation mode.
 
 ### Do NOT reach for GOEXPERIMENT=boringcrypto
 
-It looks like a fix and is a trap. BoringCrypto is a different validated module
-and it fails the *other* way round: `cipher.NewGCM` with a caller-supplied IV
-works, so QUIC is happy — but `NewGCMWithRandomNonce` fails with
-`cipher: NewGCMWithRandomNonce requires aes.Block`, which is what the **seal
-layer** uses. You trade a broken wire for broken data-at-rest.
-
-TLS 1.3 over TCP is clean under both modules; QUIC is clean under neither in
-`only`. That is the whole shape of the problem.
+Still true, and still a trap. BoringCrypto is a different validated module:
+`NewGCMWithRandomNonce` fails there with `cipher: NewGCMWithRandomNonce requires
+aes.Block`, which is what the **seal layer** uses. You would trade a working
+deployment for broken data-at-rest, to solve a problem that no longer exists.
 
 ### What we can and cannot tell you about compliance
 
@@ -199,29 +260,26 @@ rather you arrive prepared than surprised.
 
 **What is established:**
 
-- Under `fips140=on` the validated module is active, and AES-GCM executes
-  through it.
-- The IV construction QUIC uses is a permitted one under SP 800-38D §8.2.1.
-- Everything outside `pkg/internal/transport` runs and is tested under
-  `fips140=only` — `make verify-fips` proves it, continuously.
+- Under `fips140=only` the validated module is active and every algorithm
+  go-quicraft executes is one the module vouches for — the seal layer, the WAL,
+  snapshots, the TLS 1.3 handshake, and QUIC packet protection.
+- `make verify-fips` proves it continuously, over every package except
+  `pkg/internal/transport/revocation`.
+- `make verify-fips-exempt` runs that one remaining tree under `fips140=on`, so
+  it is gated rather than merely excluded.
 
 **What is NOT established, and we will not claim:**
 
-- Whether Go's CMVP certificate lists **GCM with an externally-supplied IV** as
-  an approved *service* of the validated module. `only` declining it is evidence
-  that the module does not vouch for it, whatever SP 800-38D permits of the
-  construction in the abstract.
+- That your deployment as a whole is FIPS 140-3 validated. This is a library. Go's
+  module is the validated component; what a certificate covers, and what your
+  assessor accepts, are questions for them.
+- Anything about a deployment that keeps OCSP revocation enabled. That path
+  executes SHA-1 and we say so rather than arguing it away.
 
-That distinction is a question for your assessor and for Go's FIPS 140-3
-security policy, not for this project. **We are telling you exactly where the
-boundary of our knowledge is rather than asserting a compliance posture we are
-not qualified to grant.**
-
-The accurate summary: go-quicraft is **FIPS at rest, not FIPS on the wire.** If
-your assessment requires approved-only cryptography end to end on the wire, you
-must terminate this transport inside an approved tunnel or outside the boundary.
-If your assessment accepts `fips140=on` with the module active, nothing here
-blocks you.
+The accurate summary: with `quic-go` ≥ v0.60.0, `-tags fips`,
+`GODEBUG=fips140=only` and revocation `Mode: "crl"`, go-quicraft is **FIPS at
+rest and on the wire**, with no exemptions. Enable OCSP and you take on one
+documented exemption, for an issuer identifier that protects nothing.
 
 `docs/quic-transport/architecture.md` §FIPS 140-3 exemption record carries the
 full citations, the scope enforcement, and the owner's acceptance decision —
@@ -275,9 +333,16 @@ frame length is reserved against `MaxMessageReceiveMemory` before the body is
 read, so a peer cannot make this process allocate by asserting a size.
 
 **A process panics inside the QUIC library under `GODEBUG=fips140=only`** —
-expected, and not fixable from here. QUIC's packet protection is arbitrary-IV
-AES-GCM by protocol definition. `-tags fips` makes go-quicraft FIPS **at rest,
-not on the wire**.
+your `quic-go` is older than v0.60.0. That version routes packet protection
+through Go's approved TLS 1.3 AES-GCM; before it, constructing the initial AEAD
+panics before any handshake. go-quicraft pins v0.62.0, so this means a
+`replace` directive or a stale `go.sum` in the embedding module.
+
+**A process panics with `crypto/sha1: use of SHA-1 is not allowed` under
+`GODEBUG=fips140=only`** — that is OCSP, and it is the one documented
+exemption. The OCSP CertID is SHA-1 by protocol definition (RFC 6960 §4.1.1).
+Set revocation `Mode: "crl"` and it is never computed. See
+[Choose a FIPS mode](#task-choose-a-fips-mode).
 
 **A frame rejected for a foreign wire version** — two binaries built from
 different commits. Until the first production release, formats are pinned at 1

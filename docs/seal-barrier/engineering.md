@@ -586,20 +586,26 @@ non-FIPS build and re-sealing with `NewSoftwareStrategyFIPS`, which stamps
 `KDFPbkdf2SHA256` and unseals identically in either build.
 
 **The boundary, as a limit rather than a footnote.**
-`pkg/internal/transport` and `pkg/internal/transport/revocation` do **not** pass
-`GODEBUG=fips140=only`, and this tag does not change that. QUIC's packet
-protection is arbitrary-IV AES-GCM by protocol definition (RFC 9001 §5.3) and
-OCSP's `CertID` is SHA-1 by protocol definition (RFC 6960 §4.1.1); both live in
-dependencies and neither can be made approved from here.
+`pkg/internal/transport/revocation` does **not** pass `GODEBUG=fips140=only`,
+and this tag does not change that: OCSP's `CertID` is SHA-1 by protocol
+definition (RFC 6960 §4.1.1), it lives in `golang.org/x/crypto/ocsp`, and it
+cannot be made approved from here. It can be avoided — revocation
+`Mode: "crl"` never reaches it.
 
-So **`-tags fips` makes go-quicraft FIPS at rest, not FIPS on the wire.** Three
-make targets keep those apart and none speaks for the others:
+`pkg/internal/transport` itself DOES pass `fips140=only` as of `quic-go`
+v0.60.0, which builds packet-protection AEADs through Go's TLS 1.3 AES-GCM
+instead of the general `cipher.NewGCM`. That was the second exemption and it is
+gone (go-quicraft#85); this paragraph used to say otherwise.
+
+So **`-tags fips` makes go-quicraft FIPS at rest and on the wire**, with one
+configurable exemption on the OCSP path. Three make targets keep the claims
+apart and none speaks for the others:
 
 | Target | Does | Proves |
 |---|---|---|
 | `make build-fips` | `go build` (± `-tags fips`) under `GOFIPS140` | the tree **compiles**. Nothing more — this module has no `main`, so no artifact is produced, and `GOFIPS140` alone never executes a cryptographic operation. |
-| `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package **except** `pkg/internal/transport/...` | everything inside the boundary **runs** under approved-only enforcement. The exclusion is a deny-list of that one tree, so a package added later is inside the gate by default. |
-| `make verify-fips-transport` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly `pkg/internal/transport/...` | the excluded tree is still **gated**, just at `on` rather than `only` — the exemption buys a weaker mode, not an unmeasured one. |
+| `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package **except** `pkg/internal/transport/revocation/...` | everything inside the boundary — the QUIC transport included — **runs** under approved-only enforcement. The exclusion is a deny-list of that one tree, so a package added later is inside the gate by default. |
+| `make verify-fips-exempt` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly `pkg/internal/transport/revocation/...` | the excluded tree is still **gated**, just at `on` rather than `only` — the exemption buys a weaker mode, not an unmeasured one. |
 
 Do not read `build-fips` as a compliance gate or a shippable FIPS artifact.
 

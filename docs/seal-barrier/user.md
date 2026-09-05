@@ -257,17 +257,17 @@ Set `cfg.RequireFIPS = true` as well. Without it, "FIPS was not requested" and
 the second **fails open** onto Argon2id and possibly ChaCha20-Poly1305.
 `RequireFIPS` turns that silent downgrade into a refusal at `NewBarrier`.
 
-Know the boundary: **`-tags fips` makes go-quicraft FIPS at rest, not FIPS on
-the wire.** The QUIC transport does not pass `GODEBUG=fips140=only` — QUIC's
-packet protection is arbitrary-IV AES-GCM by protocol definition and OCSP's
-`CertID` is SHA-1 by protocol definition, both in dependencies. A process that
-opens a QUIC connection in a `fips140=only` environment still panics inside the
-QUIC library.
+Know the boundary: **`-tags fips` makes go-quicraft FIPS at rest AND on the
+wire**, with one exemption you can configure away. The QUIC transport passes
+`GODEBUG=fips140=only` as of `quic-go` v0.60.0, which routes packet protection
+through Go's approved TLS 1.3 AES-GCM. What still refuses `only` is OCSP: its
+`CertID` is SHA-1 by protocol definition, inside `golang.org/x/crypto/ocsp`.
+Revocation `Mode: "crl"` never computes it.
 
-That exemption is recorded, not assumed: which primitives, under which RFCs,
-and what it means for FedRAMP/PCI/HIPAA are in
+That exemption is recorded, not assumed: which primitive, under which RFC, and
+what it means for FedRAMP/PCI/HIPAA are in
 [`../quic-transport/architecture.md`](../quic-transport/architecture.md#fips-140-3-exemption-record).
-The excluded tree still runs under `make verify-fips-transport` at
+The excluded tree still runs under `make verify-fips-exempt` at
 `GODEBUG=fips140=on`, so it is gated at a weaker mode rather than left
 unmeasured.
 

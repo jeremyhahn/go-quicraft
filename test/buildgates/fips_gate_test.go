@@ -34,6 +34,10 @@ import (
 //     passes on exactly the thing it exists to catch.
 //   * another `grep -v` in verify-fips, moving whichever package went red out
 //     of the gate.
+//   * WIDENING the single exclusion. The deny-list is one Makefile variable
+//     matched as a path PREFIX, so appending `/..`-worth of parent directory to
+//     it removes a whole subtree while the list still holds exactly one entry.
+//     That is how pkg/internal/transport was outside the gate before #85.
 //   * dropping the step that covers the one tree already exempt from
 //     approved-only, which would turn a documented exemption into no coverage
 //     at all.
@@ -138,29 +142,38 @@ func TestVerifyFIPSRunsApprovedOnly(t *testing.T) {
 	}
 }
 
-// TestFIPSExclusionIsOneDocumentedTree pins the SIZE of the approved-only
-// deny-list at one.
-//
-// The exclusion is legitimate and cited: QUIC packet protection (RFC 9001
-// s5.3) and the OCSP CertID (RFC 6960 s4.1.1) are arbitrary-IV AES-GCM and
-// SHA-1 by protocol definition, both inside dependencies. What must not happen
-// is a second entry appearing because some package went red -- that is
-// route-around-the-failure, and it is indistinguishable from the first entry
-// once both are in the file.
-func TestFIPSExclusionIsOneDocumentedTree(t *testing.T) {
-	makefile := readRepoFile(t, makefilePath)
+// fipsExcluded returns the single package tree named by FIPS_EXCLUDED, failing
+// if the variable is gone or names anything other than exactly one tree.
+func fipsExcluded(t *testing.T, makefile string) string {
+	t.Helper()
 
 	assign := regexp.MustCompile(`(?m)^FIPS_EXCLUDED\s*:?=\s*(.*)$`).FindStringSubmatch(makefile)
 	if assign == nil {
 		t.Fatal("Makefile no longer defines FIPS_EXCLUDED; the approved-only gate's " +
 			"scope is no longer stated in one place.")
 	}
-	if got := strings.Fields(assign[1]); len(got) != 1 {
-		t.Errorf("FIPS_EXCLUDED names %d package trees (%v), want exactly 1.\n\n"+
+	got := strings.Fields(assign[1])
+	if len(got) != 1 {
+		t.Fatalf("FIPS_EXCLUDED names %d package trees (%v), want exactly 1.\n\n"+
 			"Every entry is a tree the approved-only gate does not judge. Adding "+
 			"one because a package failed is the forbidden fix; the failure is "+
 			"the finding.", len(got), got)
 	}
+	return got[0]
+}
+
+// TestFIPSExclusionIsOneDocumentedTree pins the SIZE of the approved-only
+// deny-list at one.
+//
+// The exclusion is legitimate and cited: the OCSP CertID (RFC 6960 s4.1.1) is
+// SHA-1 by protocol definition, inside golang.org/x/crypto/ocsp. What must not
+// happen is a second entry appearing because some package went red -- that is
+// route-around-the-failure, and it is indistinguishable from the first entry
+// once both are in the file.
+func TestFIPSExclusionIsOneDocumentedTree(t *testing.T) {
+	makefile := readRepoFile(t, makefilePath)
+
+	fipsExcluded(t, makefile)
 
 	// The deny-list is applied with grep -v. A second filter would shrink the
 	// gate just as effectively as a second FIPS_EXCLUDED entry, and would not
@@ -173,39 +186,91 @@ func TestFIPSExclusionIsOneDocumentedTree(t *testing.T) {
 	}
 }
 
+// TestQUICTransportIsInsideApprovedOnly pins WHICH tree is excluded, not just
+// how many.
+//
+// Counting entries is not enough on its own. The deny-list is applied as a path
+// PREFIX (`grep -v '^$(FIPS_EXCLUDED)'`), so trimming the variable back to a
+// parent directory removes an entire subtree while the list still holds exactly
+// one entry and TestFIPSExclusionIsOneDocumentedTree still passes. That is not
+// hypothetical: until go-quicraft#85 the variable named the whole
+// pkg/internal/transport tree, and shrinking it to the revocation package is
+// what put the QUIC transport inside the approved-only gate.
+//
+// quic-go v0.60.0 made that possible by routing packet-protection AEADs through
+// Go's TLS 1.3 AES-GCM implementation instead of the general cipher.NewGCM, so
+// the arbitrary-IV construction RFC 9001 s5.3 requires no longer trips
+// fips140=only. If the transport goes red under `only`, that failure is the
+// finding -- widening this variable to bury it is the forbidden fix.
+func TestQUICTransportIsInsideApprovedOnly(t *testing.T) {
+	const (
+		transportPkg  = "github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
+		revocationPkg = transportPkg + "/revocation"
+	)
+
+	excluded := fipsExcluded(t, readRepoFile(t, makefilePath))
+
+	if excluded != revocationPkg {
+		t.Errorf("FIPS_EXCLUDED is %q, want %q.\n\n"+
+			"The exemption is the OCSP CertID's SHA-1 (RFC 6960 s4.1.1) in "+
+			"golang.org/x/crypto/ocsp, reached only from revocation.Checker's OCSP "+
+			"path. Nothing else in pkg/internal/transport needs to be outside the "+
+			"approved-only gate, and quic-go >= v0.60.0 is why.", excluded, revocationPkg)
+	}
+
+	// Stated separately from the equality above so a failure says WHICH mistake
+	// was made, and this is the one that matters most.
+	//
+	// verify-fips applies the deny-list as `grep -v '^$(FIPS_EXCLUDED)'`, a path
+	// PREFIX. So the QUIC transport is outside the gate exactly when
+	// FIPS_EXCLUDED is a prefix of the transport's own import path -- which is
+	// true of the transport tree itself and of every parent of it, and false of
+	// the revocation subpackage. Testing the prefix relation rather than
+	// inequality keeps this from firing on an unrelated wrong value (say
+	// pkg/seal), which would report a regression that had not happened.
+	if strings.HasPrefix(transportPkg, excluded) {
+		t.Errorf("FIPS_EXCLUDED (%q) is a path prefix of %q, so the QUIC transport "+
+			"is filtered out of the approved-only gate.\n\n"+
+			"Packet protection stopped being an exemption at quic-go v0.60.0. The "+
+			"transport passes under GODEBUG=fips140=only and must be judged there.",
+			excluded, transportPkg)
+	}
+}
+
 // TestExcludedTreeIsStillGated pins that the one tree outside approved-only is
 // covered by a target of its own, at fips140=on.
 //
 // Without this, "excluded from the approved-only gate" and "not tested under
-// the module at all" are the same file. They are not the same claim: `on` is
-// what proves the transport's own key exchange is approved, and it is what
-// caught the X25519-only curve list that failed every intra-cluster handshake.
+// the module at all" are the same file. They are not the same claim: `on` still
+// loads the validated module, so it proves the exempt tree's cryptography is
+// approved APART from the one cited primitive, and that a `-tags fips` build of
+// it still passes its suite.
 func TestExcludedTreeIsStillGated(t *testing.T) {
 	makefile := readRepoFile(t, makefilePath)
-	recipe := strings.Join(makeRecipe(t, makefile, "verify-fips-transport"), "\n")
+	recipe := strings.Join(makeRecipe(t, makefile, "verify-fips-exempt"), "\n")
 
 	if !strings.Contains(recipe, "$(FIPS_EXCLUDED)") {
-		t.Errorf("verify-fips-transport does not run $(FIPS_EXCLUDED):\n%s\n\n"+
+		t.Errorf("verify-fips-exempt does not run $(FIPS_EXCLUDED):\n%s\n\n"+
 			"It must name the same variable verify-fips excludes, so the two "+
 			"targets are a partition by construction rather than by coincidence.",
 			recipe)
 	}
 	// `on` is what this tree is expected to run at today and `only` is where it
-	// would go if quic-go and x/crypto/ocsp ever stopped needing the exemption,
-	// so both pass. Anything else -- no mode, or fips140=off -- means the
+	// would go if x/crypto/ocsp ever stopped needing the exemption -- or if the
+	// OCSP path were excluded from the run some other way -- so both pass. Anything else -- no mode, or fips140=off -- means the
 	// excluded tree is not gated at all.
 	switch mode := fipsModePattern.FindStringSubmatch(recipe); {
 	case mode == nil:
-		t.Errorf("verify-fips-transport sets no GODEBUG=fips140 mode:\n%s\n\n"+
+		t.Errorf("verify-fips-exempt sets no GODEBUG=fips140 mode:\n%s\n\n"+
 			"Then it is an ordinary `go test` run and the excluded tree is not "+
 			"gated at all.", recipe)
 	case mode[1] != "on" && mode[1] != "only":
-		t.Errorf("verify-fips-transport runs GODEBUG=fips140=%s:\n%s\n\n"+
+		t.Errorf("verify-fips-exempt runs GODEBUG=fips140=%s:\n%s\n\n"+
 			"Only `on` or `only` load the Go Cryptographic Module; anything else "+
 			"leaves this tree ungated.", mode[1], recipe)
 	}
 	if !strings.Contains(recipe, "-tags fips") {
-		t.Errorf("verify-fips-transport does not pass -tags fips:\n%s\n\n"+
+		t.Errorf("verify-fips-exempt does not pass -tags fips:\n%s\n\n"+
 			"The tagged build of the transport would then never run its tests "+
 			"anywhere, and the FIPS curve list could break unnoticed.", recipe)
 	}
@@ -230,7 +295,7 @@ func TestCIRunsTheFIPSGate(t *testing.T) {
 		}
 	}
 
-	for _, target := range []string{"make build-fips", "make verify-fips", "make verify-fips-transport"} {
+	for _, target := range []string{"make build-fips", "make verify-fips", "make verify-fips-exempt"} {
 		var found bool
 		for _, run := range runs {
 			if run == target {

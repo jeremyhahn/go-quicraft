@@ -955,39 +955,45 @@ $(COVER_DIR):
 # Ratified by the owner (conventions/configuration.md section 5); do not weaken
 # it, and do not add exclusions to route around a failure.
 #
-# verify-fips-transport RUNS pkg/internal/transport under GODEBUG=fips140=on,
-# one notch lower, and that gap is a documented exemption rather than an
-# oversight. Two primitives on that path are mandated by protocol and live in
-# dependencies, so neither can be made approved from this repository:
+# verify-fips-exempt RUNS pkg/internal/transport/revocation under
+# GODEBUG=fips140=on, one notch lower, and that gap is a documented exemption
+# rather than an oversight. ONE primitive on that path is mandated by protocol
+# and lives in a dependency, so it cannot be made approved from this repository:
 #
-#   * QUIC packet protection is arbitrary-IV AES-GCM by definition. RFC 9001
-#     section 5.3 derives each nonce by XOR-ing the packet number into a fixed
-#     IV, which cipher.NewGCMWithRandomNonce cannot express. Inside quic-go.
 #   * OCSP CertID is SHA-1 by definition. RFC 6960 section 4.1.1 mandates it for
 #     issuerNameHash/issuerKeyHash, where it is an identifier and protects
 #     nothing. Inside golang.org/x/crypto/ocsp.
 #
-# Both are permitted under `on`, so this target is a real gate and not a
-# formality: it is what proves the transport's own key exchange is approved
-# (fips140=on removes X25519 from the offered groups, and an X25519-only list
-# fails EVERY handshake) and that a `-tags fips` build of the transport still
-# passes its suite.
+# It is permitted under `on`, so this target is a real gate and not a formality:
+# it proves a `-tags fips` build of the revocation checker still passes its
+# suite, and that nothing OTHER than the CertID hash on that path is
+# non-approved.
+#
+# QUIC PACKET PROTECTION USED TO BE THE SECOND EXEMPTION AND IS NOT ANY MORE.
+# quic-go v0.60.0 (go-quicraft#85) routes packet AEADs through Go's TLS 1.3
+# AES-GCM implementation instead of the general cipher.NewGCM -- see
+# internal/handshake/cipher_suite.go, which dispatches to
+# aeadAESGCMTLS13FIPS140 when the module is active. The whole
+# pkg/internal/transport tree therefore passes under fips140=only, and it is
+# INSIDE the approved-only gate. Do not move it back out; if it goes red, the
+# failure is the finding.
 #
 # The split is a partition, not a hole: verify-fips is a deny-list of exactly
-# the one tree verify-fips-transport then runs, so a package added tomorrow is
+# the one tree verify-fips-exempt then runs, so a package added tomorrow is
 # inside the approved-only gate by default rather than silently outside every
 # gate. test/buildgates/fips_gate_test.go fails if that stops being true.
 #
-# So: `-tags fips` makes go-quicraft FIPS at rest — the seal layer, the WAL and
-# snapshots execute only approved primitives and are proven to. Its QUIC
-# transport is FIPS-mode-compatible but not approved-only, and
-# docs/quic-transport/architecture.md carries the citations above as the
-# exemption record.
+# So: `-tags fips` makes go-quicraft FIPS at rest AND on the wire — the seal
+# layer, the WAL, snapshots and the QUIC transport execute only approved
+# primitives and are proven to. The residual is one SHA-1 identifier on the OCSP
+# path, and a deployment that configures revocation Mode: crl never reaches it.
+# docs/quic-transport/architecture.md carries the citation as the exemption
+# record.
 # ============================================================================
 
 # The one package tree outside the approved-only gate, and the exact tree
-# verify-fips-transport covers instead. See above.
-FIPS_EXCLUDED := github.com/jeremyhahn/go-quicraft/pkg/internal/transport
+# verify-fips-exempt covers instead. See above.
+FIPS_EXCLUDED := github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation
 
 .PHONY: build-fips
 build-fips:
@@ -1000,9 +1006,9 @@ verify-fips:
 	GOFIPS140=latest GODEBUG=fips140=only $(GO) test -tags fips -timeout=900s \
 		$$($(GO) list -tags fips ./... | grep -v '^$(FIPS_EXCLUDED)')
 
-.PHONY: verify-fips-transport
-verify-fips-transport:
-	@echo "==> GODEBUG=fips140=on, -tags fips, $(FIPS_EXCLUDED)/... (exempt from only; see above)"
+.PHONY: verify-fips-exempt
+verify-fips-exempt:
+	@echo "==> GODEBUG=fips140=on, -tags fips, $(FIPS_EXCLUDED) (exempt from only; see above)"
 	GOFIPS140=latest GODEBUG=fips140=on $(GO) test -tags fips -timeout=900s \
 		$(FIPS_EXCLUDED)/...
 
@@ -1166,7 +1172,7 @@ check-lint-toolchain:
 
 .PHONY: ci-full
 ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci-netfault \
-        build-fips verify-fips verify-fips-transport
+        build-fips verify-fips verify-fips-exempt
 	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + fuzz mutation + all modules + FIPS)"
 
 # ============================================================================
@@ -1654,9 +1660,10 @@ help:
 	@echo "FIPS:"
 	@echo "  build-fips             Compile check: GOFIPS140=v1.0.0, untagged and -tags fips"
 	@echo "  verify-fips            Compliance check: run -tags fips under GODEBUG=fips140=only"
-	@echo "                         (excludes pkg/internal/transport/... -- see the Makefile)"
-	@echo "  verify-fips-transport  That excluded tree, -tags fips under GODEBUG=fips140=on"
-	@echo "                         (protocol-mandated primitives; the exemption is documented)"
+	@echo "                         (covers the QUIC transport; excludes only"
+	@echo "                         pkg/internal/transport/revocation -- see the Makefile)"
+	@echo "  verify-fips-exempt     That excluded tree, -tags fips under GODEBUG=fips140=on"
+	@echo "                         (OCSP CertID SHA-1; the exemption is documented)"
 	@echo ""
 	@echo "Linting:"
 	@echo "  lint                   Run golangci-lint (the one from install-lint, not PATH)"

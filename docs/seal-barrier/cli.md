@@ -43,8 +43,8 @@ worth stating because one of them is routinely over-read:
 | `make bench-seal` | `go test -bench ./pkg/seal/...` | throughput of the data path |
 | `make fuzz-seal` | the four `FuzzBarrier*` targets | decode robustness, and that `Decrypt` stays non-discriminating |
 | `make build-fips` | `go build` (± `-tags fips`) under `GOFIPS140` | **only that the tree compiles.** This module has no `main`, so no artifact is produced, and `GOFIPS140` alone never executes a cryptographic operation. Not a compliance gate. |
-| `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package except `pkg/internal/transport/...` | that everything inside the FIPS boundary **runs** under approved-only enforcement |
-| `make verify-fips-transport` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly `pkg/internal/transport/...` | that the excluded tree is still gated, at `on` rather than `only` — the exemption buys a weaker mode, not an unmeasured one |
+| `make verify-fips` | `GOFIPS140=latest GODEBUG=fips140=only go test -tags fips` over every package except `pkg/internal/transport/revocation/...` | that everything inside the FIPS boundary — the QUIC transport included — **runs** under approved-only enforcement |
+| `make verify-fips-exempt` | `GOFIPS140=latest GODEBUG=fips140=on go test -tags fips` over exactly `pkg/internal/transport/revocation/...` | that the excluded tree is still gated, at `on` rather than `only` — the exemption buys a weaker mode, not an unmeasured one |
 
 Building a FIPS-at-rest consumer:
 

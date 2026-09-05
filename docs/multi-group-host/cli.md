@@ -56,8 +56,8 @@ The complete list is `make help`. The ones that matter:
 | `make ci-netfault` | partitions, delays, drops |
 | `make fuzz-all` | every fuzz target |
 | `make build-fips` | **a compile check only** — no artifact is produced and no cryptographic operation runs |
-| `make verify-fips` | approved-only enforcement over everything except `pkg/internal/transport/...` |
-| `make verify-fips-transport` | that one excluded tree, at `GODEBUG=fips140=on` — see the quic-transport exemption record |
+| `make verify-fips` | approved-only enforcement over everything except `pkg/internal/transport/revocation/...` — the QUIC transport is inside this gate |
+| `make verify-fips-exempt` | that one excluded tree, at `GODEBUG=fips140=on` — see the quic-transport exemption record |
 | `make bench-compare` | benchmark regression against stored baselines |
 | `make security` | `gosec vuln modverify trivy` |
 

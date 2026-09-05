@@ -1328,7 +1328,7 @@ targets are listed in each feature folder's `cli.md`.
 | linearizability | `make integration-test-linearizability` | that observed histories are actually linearizable |
 | I/O faults | `make ci-errfs` | the `test/errfs` harness |
 | network faults | `make ci-netfault` | partitions, delays, drops |
-| FIPS | `make verify-fips`, `make verify-fips-transport` | approved-only enforcement inside the boundary, and `fips140=on` over the one exempt tree |
+| FIPS | `make verify-fips`, `make verify-fips-exempt` | approved-only enforcement inside the boundary (QUIC transport included), and `fips140=on` over the one exempt tree, `pkg/internal/transport/revocation` |
 | benchmarks | `make bench-compare` | regression against stored baselines |
 
 **The host-level regression suites are the institutional memory of this

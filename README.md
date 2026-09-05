@@ -596,12 +596,15 @@ make ci         # fmt, no-mutants, vet, lint, security scans, build, test
 make ci-full    # ci plus the build-tagged suites: modules, errfs, fuzz, integration, netfault
 make build-fips  # Compile check under GOFIPS140, with and without -tags fips
 make verify-fips # Run the FIPS boundary under GODEBUG=fips140=only
-make verify-fips-transport # Run the one exempt tree under GODEBUG=fips140=on
+make verify-fips-exempt # Run the one exempt tree under GODEBUG=fips140=on
 ```
 
-**Deploying under FIPS?** Use `GODEBUG=fips140=on`, not `only` — a clustered
-process panics inside the QUIC library under `only`, and
-`GOEXPERIMENT=boringcrypto` breaks the seal layer instead. See
+**Deploying under FIPS?** `GODEBUG=fips140=only` works, QUIC transport included
+— that needs quic-go v0.60.0 or later, which routes packet protection through
+Go's approved TLS 1.3 AES-GCM. The one path that still refuses `only` is OCSP,
+whose CertID is SHA-1 by protocol definition; configure revocation
+`Mode: "crl"` and there is nothing left. Do NOT reach for
+`GOEXPERIMENT=boringcrypto` — it breaks the seal layer. See
 [Choose a FIPS mode](docs/quic-transport/user.md#task-choose-a-fips-mode) for
 what is established about compliance and what is not.
 

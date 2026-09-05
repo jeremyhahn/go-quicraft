@@ -315,6 +315,62 @@ toolchain wave land together so the portfolio pays for ONE cascade, not three.
 
 ### Changed
 
+- **The QUIC transport is now inside the approved-only FIPS gate; `quic-go`
+  moves v0.59.1 -> v0.62.0 (#85).** Packet protection was the larger of the two
+  documented FIPS 140-3 exemptions, and it is gone rather than accepted.
+
+  RFC 9001 §5.3 derives each packet's nonce by XOR-ing the packet number into a
+  fixed IV. That is a caller-supplied IV, `cipher.NewGCMWithRandomNonce` cannot
+  express it, and `quic-go` reached the construction through the general
+  `cipher.NewGCM` — which `GODEBUG=fips140=only` declines, so a process panicked
+  building the initial AEAD before any handshake. `quic-go` **v0.60.0** fixed it
+  by constructing packet-protection AEADs through Go's TLS 1.3 AES-GCM
+  implementation instead: the same approved path `crypto/tls` uses for its own
+  records, for the same construction.
+
+  Measured, not inferred. Under `GOFIPS140=latest GODEBUG=fips140=only go test
+  -tags fips`, the whole `pkg/internal/transport` tree passes in 155.6s where
+  v0.59.1 panicked on the first dial.
+
+  Consequences:
+
+  - `FIPS_EXCLUDED` shrinks from `pkg/internal/transport` to
+    `pkg/internal/transport/revocation`, so `make verify-fips` now judges the
+    QUIC transport under approved-only. This is a real strengthening of the
+    gate, not a re-partition.
+  - `make verify-fips-transport` is **renamed `make verify-fips-exempt`**. It no
+    longer runs the transport, and a target named for a tree it does not cover
+    is the same class of false claim this change exists to remove.
+  - `test/buildgates/fips_gate_test.go` gains
+    `TestQUICTransportIsInsideApprovedOnly`, which pins *which* tree is excluded
+    rather than only how many. The deny-list is a path prefix, so trimming it
+    back to a parent directory removes a whole subtree while the count stays at
+    one — that is exactly how the transport sat outside the gate before this
+    change.
+
+  **The remaining exemption is avoidable by configuration.** SHA-1 reaches the
+  module from one call site, `ocsp.CreateRequest` in `Checker.queryOCSP`, where
+  RFC 6960 §4.1.1 mandates it for the `CertID` issuer identifier. Revocation
+  `Mode: "crl"` never reaches it, and `Mode: "any"` (the default) reaches it only
+  when `OCSPResponderURL` is set. So `quic-go` >= v0.60.0 + `-tags fips` +
+  `GODEBUG=fips140=only` + `Mode: "crl"` is an approved-only deployment with **no
+  exemptions at all** — a posture the documentation previously said was
+  impossible.
+
+  The documentation said so in several places and every one of them is corrected:
+  `docs/quic-transport/architecture.md` (the exemption record, rewritten; the
+  owner's 2026-09-03 acceptance re-recorded against the smaller residual),
+  `docs/quic-transport/user.md` (§Task: choose a FIPS mode no longer tells
+  operators to use `on`), `docs/quic-transport/{cli,engineering}.md`,
+  `docs/seal-barrier/{user,engineering,cli}.md`,
+  `docs/multi-group-host/{user,cli,engineering}.md`, `docs/testing/overview.md`,
+  `README.md` and `CONTRIBUTING.md`. The claim that "no version of any QUIC
+  library can differ" was true of the public API surface in 2026-08 and is now
+  false; the fix was to stop using the public API, not to change the wire format.
+
+  Carried along by the bump: `testify` v1.11.1 -> v1.12.1 and `x/sync` v0.20.0 ->
+  v0.22.0. No wire or on-disk format version changes.
+
 - **The barrier holds its root key in locked memory for the whole of
   `Initialize` and `Unseal` (#39, owner-ruled option (b)).** Both functions used
   to carry the root key in an ordinary heap slice — swappable and core-dumpable —

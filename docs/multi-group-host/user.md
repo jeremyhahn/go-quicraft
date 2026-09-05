@@ -1290,16 +1290,17 @@ binary rather than declining them at runtime. See
 for what the tag removes.
 
 **Read the boundary before you claim compliance for a deployment.** `-tags fips`
-covers the data at rest — the seal layer, the WAL, snapshots. It does **not**
-cover `pkg/internal/transport`: QUIC packet protection is arbitrary-IV AES-GCM
-by protocol definition (RFC 9001 §5.3, inside `quic-go`) and OCSP `CertID` is
-SHA-1 by protocol definition (RFC 6960 §4.1.1, inside `x/crypto/ocsp`), so a
-process that opens a QUIC connection under `GODEBUG=fips140=only` still fails
-there. That tree is gated one notch lower instead, by
-`make verify-fips-transport` at `GODEBUG=fips140=on`, and the exemption is
-recorded with its citations in
+covers the data at rest — the seal layer, the WAL, snapshots — and, as of
+`quic-go` v0.60.0, the wire as well: packet protection now runs through Go's
+approved TLS 1.3 AES-GCM, so `pkg/internal/transport` passes
+`GODEBUG=fips140=only`. The one tree that does not is
+`pkg/internal/transport/revocation`, where OCSP's `CertID` is SHA-1 by protocol
+definition (RFC 6960 §4.1.1, inside `x/crypto/ocsp`). It is gated one notch
+lower instead, by `make verify-fips-exempt` at `GODEBUG=fips140=on`, and the
+exemption is recorded with its citation in
 [quic-transport/architecture.md](../quic-transport/architecture.md#fips-140-3-exemption-record).
-So go-quicraft is FIPS at rest, not FIPS on the wire.
+Configure revocation `Mode: "crl"` and that path is never reached, which makes
+an approved-only deployment achievable with no exemptions at all.
 
 ### Building
 
@@ -1324,8 +1325,8 @@ primitive is:
 # Every package inside the FIPS boundary, under approved-only enforcement:
 make verify-fips
 
-# The one exempt tree (pkg/internal/transport/...), with the module loaded:
-make verify-fips-transport
+# The one exempt tree (pkg/internal/transport/revocation/...), module loaded:
+make verify-fips-exempt
 ```
 
 ### KDF Selection

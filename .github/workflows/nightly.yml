@@ -14,13 +14,17 @@
 # verification exactly as it ran in ci.yml before this move — `make
 # build-fips` (compile under the module, tagged and untagged), `make
 # verify-fips` (GODEBUG=fips140=only over every package except
-# pkg/internal/transport), and `make verify-fips-transport`
-# (GODEBUG=fips140=on, pkg/internal/transport only — one notch lower because
-# QUIC packet protection and OCSP CertID are arbitrary-IV AES-GCM and SHA-1 by
-# protocol definition; see Makefile:910-951 and
-# docs/quic-transport/architecture.md for the exemption record). A bare `go
-# test ./...` would drag in build-tag-gated suites the Test job deliberately
-# excludes and fail for reasons that have nothing to do with FIPS.
+# pkg/internal/transport/revocation, so the QUIC transport IS judged under
+# approved-only), and `make verify-fips-exempt` (GODEBUG=fips140=on,
+# pkg/internal/transport/revocation only — one notch lower because the OCSP
+# CertID is SHA-1 by protocol definition; see the FIPS block in the Makefile
+# and docs/quic-transport/architecture.md for the exemption record). A bare
+# `go test ./...` would drag in build-tag-gated suites the Test job
+# deliberately excludes and fail for reasons that have nothing to do with FIPS.
+#
+# The QUIC packet-protection exemption was retired in go-quicraft#85: quic-go
+# v0.60.0 routes packet AEADs through Go's TLS 1.3 AES-GCM implementation, so
+# the transport passes under fips140=only and is inside the approved-only gate.
 #
 # The `trivy` job is copied verbatim from the retired quality.yml, including
 # go-quicraft's skip-dirs (test, examples, contrib — none of which ship in a
@@ -65,22 +69,23 @@ jobs:
       - name: Compile under the module, tagged and untagged
         run: make build-fips
 
-      # GODEBUG=fips140=only over every package except pkg/internal/transport.
+      # GODEBUG=fips140=only over every package except
+      # pkg/internal/transport/revocation. Since go-quicraft#85 this INCLUDES
+      # the QUIC transport, which is the slowest tree in the run and the reason
+      # this job's timeout has headroom. It is also where go-quicraft#24's
+      # flake now lands (10s waitBatch timeout under runner contention, worse
+      # under FIPS mode's non-X25519 key exchange); running here off the push
+      # path is that issue's mitigation and #24 remains open for a real fix.
       - name: Approved-only gate
         run: make verify-fips
 
-      # pkg/internal/transport under GODEBUG=fips140=on. It is one notch lower
-      # because QUIC packet protection (RFC 9001 s5.3) and the OCSP CertID
-      # (RFC 6960 s4.1.1) are arbitrary-IV AES-GCM and SHA-1 by protocol
-      # definition, both inside dependencies. The exemption is recorded with
-      # its citations in docs/quic-transport/architecture.md; this step is
-      # what keeps the exempt tree gated rather than merely excluded. This is
-      # also the step tracked flaky by go-quicraft#24 (10s waitBatch timeout
-      # under runner contention, worse under fips140=on's non-X25519 key
-      # exchange) — moving here off the push path is that issue's mitigation;
-      # #24 remains open for a real fix.
-      - name: Exempt transport tree, FIPS mode
-        run: make verify-fips-transport
+      # pkg/internal/transport/revocation under GODEBUG=fips140=on. It is one
+      # notch lower because the OCSP CertID (RFC 6960 s4.1.1) is SHA-1 by
+      # protocol definition, inside golang.org/x/crypto/ocsp. The exemption is
+      # recorded with its citation in docs/quic-transport/architecture.md; this
+      # step is what keeps the exempt tree gated rather than merely excluded.
+      - name: Exempt revocation tree, FIPS mode
+        run: make verify-fips-exempt
 
   trivy:
     name: Trivy
