@@ -1268,7 +1268,14 @@ func stepCandidate(r *raft, msg proto.Message) error {
 	case proto.InstallSnapshot:
 		r.stepDownToFollower(msg)
 		return r.handleSnapshot(msg)
-	case proto.Propose:
+	case proto.Propose, proto.ReadIndex:
+		// A campaigning replica knows no leader, so it refuses both client
+		// request types the way handleFollowerReadIndex and stepFollower's
+		// Propose case do when r.leaderID == noLeader. ReadIndex must be
+		// listed explicitly: letting it fall to the default drops it, and a
+		// dropped ReadIndex is never answered — nothing is queued, forwarded
+		// or resolved, so the host's pending read waits to the caller's
+		// deadline and reports a timeout for a not-leader condition (#153).
 		return &NotLeaderError{LeaderID: 0}
 	default:
 		return nil
