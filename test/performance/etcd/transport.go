@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // maxMessageSize is the maximum allowed protobuf message size (64 MB).
@@ -62,7 +63,7 @@ type raftTransport struct {
 	conns     map[uint64]net.Conn // nodeID -> cached outbound TLS conn
 	listener  net.Listener
 	clientCfg *tls.Config
-	recvFn    func(raftpb.Message) // callback when a message is received
+	recvFn    func(*raftpb.Message) // callback when a message is received
 	stopCh    chan struct{}
 	done      sync.WaitGroup
 }
@@ -184,7 +185,7 @@ func newRaftTransport(
 	addr string,
 	peers map[uint64]string,
 	tlsCfg *sharedTLSConfig,
-	recvFn func(raftpb.Message),
+	recvFn func(*raftpb.Message),
 ) (*raftTransport, error) {
 
 	listener, err := tls.Listen("tcp", addr, tlsCfg.server)
@@ -265,11 +266,11 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 		}
 
 		var msg raftpb.Message
-		if err := msg.Unmarshal(data); err != nil {
+		if err := proto.Unmarshal(data, &msg); err != nil {
 			return
 		}
 
-		t.recvFn(msg)
+		t.recvFn(&msg)
 	}
 }
 
@@ -278,11 +279,11 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 // goroutine per distinct target. Within each target, messages are
 // sent sequentially over the cached or newly-dialed TLS connection.
 // This prevents a slow peer from blocking sends to all other peers.
-func (t *raftTransport) send(msgs []raftpb.Message) {
+func (t *raftTransport) send(msgs []*raftpb.Message) {
 	// Fast path: single target (common case: 1 heartbeat response).
 	if len(msgs) <= 1 {
 		for i := range msgs {
-			t.sendOne(&msgs[i])
+			t.sendOne(msgs[i])
 		}
 		return
 	}
@@ -290,8 +291,8 @@ func (t *raftTransport) send(msgs []raftpb.Message) {
 	// Group messages by target node.
 	byTarget := make(map[uint64][]*raftpb.Message, len(t.peers))
 	for i := range msgs {
-		to := msgs[i].To
-		byTarget[to] = append(byTarget[to], &msgs[i])
+		to := msgs[i].GetTo()
+		byTarget[to] = append(byTarget[to], msgs[i])
 	}
 
 	// Single target: no parallelism needed.
@@ -324,11 +325,11 @@ func (t *raftTransport) send(msgs []raftpb.Message) {
 // so the next attempt will re-dial.
 func (t *raftTransport) sendOne(msg *raftpb.Message) {
 	t.mu.Lock()
-	conn, ok := t.conns[msg.To]
+	conn, ok := t.conns[msg.GetTo()]
 	t.mu.Unlock()
 
 	if !ok {
-		peerAddr, exists := t.peers[msg.To]
+		peerAddr, exists := t.peers[msg.GetTo()]
 		if !exists {
 			return
 		}
@@ -343,11 +344,11 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 			return
 		}
 		t.mu.Lock()
-		t.conns[msg.To] = conn
+		t.conns[msg.GetTo()] = conn
 		t.mu.Unlock()
 	}
 
-	data, err := msg.Marshal()
+	data, err := proto.Marshal(msg)
 	if err != nil {
 		return
 	}
@@ -357,11 +358,11 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 
 	conn.SetWriteDeadline(time.Now().Add(connWriteDeadline))
 	if _, err := conn.Write(lengthBuf[:]); err != nil {
-		t.removeConn(msg.To)
+		t.removeConn(msg.GetTo())
 		return
 	}
 	if _, err := conn.Write(data); err != nil {
-		t.removeConn(msg.To)
+		t.removeConn(msg.GetTo())
 		return
 	}
 }

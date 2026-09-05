@@ -34,7 +34,7 @@ const concurrentGoroutines = 8
 
 // suite is the global BenchmarkSuite populated by benchmark functions
 // and serialized to stdout in TestMain.
-var suite = perfresult.NewBenchmarkSuite("etcd", "v3.6.0")
+var suite = perfresult.NewBenchmarkSuite("etcd", "v3.7.0")
 
 // ---------------------------------------------------------------------------
 // Throughput Benchmarks (WAL)

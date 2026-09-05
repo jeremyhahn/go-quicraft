@@ -38,6 +38,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // tlsTransportState holds TLS transport resources created for the etcd/raft
@@ -163,11 +164,11 @@ func newWALWriter(dir string) (*walWriter, error) {
 // persistEntries serializes raft entries to disk with a length-prefix
 // framing protocol and calls fsync to ensure durability. This matches
 // the I/O pattern of QuicRaft's WAL: encode entries, write, fsync.
-func (w *walWriter) persistEntries(entries []raftpb.Entry) error {
+func (w *walWriter) persistEntries(entries []*raftpb.Entry) error {
 	for i := range entries {
-		data, err := entries[i].Marshal()
+		data, err := proto.Marshal(entries[i])
 		if err != nil {
-			return fmt.Errorf("walWriter: marshal entry index=%d: %w", entries[i].Index, err)
+			return fmt.Errorf("walWriter: marshal entry index=%d: %w", entries[i].GetIndex(), err)
 		}
 		binary.LittleEndian.PutUint32(w.lengthBuf[:], uint32(len(data)))
 		if _, err := w.f.Write(w.lengthBuf[:]); err != nil {
@@ -184,8 +185,8 @@ func (w *walWriter) persistEntries(entries []raftpb.Entry) error {
 }
 
 // persistHardState serializes the hard state to disk with fsync.
-func (w *walWriter) persistHardState(hs raftpb.HardState) error {
-	data, err := hs.Marshal()
+func (w *walWriter) persistHardState(hs *raftpb.HardState) error {
+	data, err := proto.Marshal(hs)
 	if err != nil {
 		return fmt.Errorf("walWriter: marshal hard state: %w", err)
 	}
@@ -207,12 +208,12 @@ func (w *walWriter) persistHardState(hs raftpb.HardState) error {
 // when persistEntries and persistHardState are called separately within
 // the same Ready cycle. Entries are written first, then the hard state,
 // followed by a single fsync to ensure durability of both.
-func (w *walWriter) persistReady(entries []raftpb.Entry, hs raftpb.HardState) error {
+func (w *walWriter) persistReady(entries []*raftpb.Entry, hs *raftpb.HardState) error {
 	// Write entries without fsyncing.
 	for i := range entries {
-		data, err := entries[i].Marshal()
+		data, err := proto.Marshal(entries[i])
 		if err != nil {
-			return fmt.Errorf("walWriter: marshal entry index=%d: %w", entries[i].Index, err)
+			return fmt.Errorf("walWriter: marshal entry index=%d: %w", entries[i].GetIndex(), err)
 		}
 		binary.LittleEndian.PutUint32(w.lengthBuf[:], uint32(len(data)))
 		if _, err := w.f.Write(w.lengthBuf[:]); err != nil {
@@ -225,7 +226,7 @@ func (w *walWriter) persistReady(entries []raftpb.Entry, hs raftpb.HardState) er
 
 	// Write hard state if non-empty.
 	if !raft.IsEmptyHardState(hs) {
-		data, err := hs.Marshal()
+		data, err := proto.Marshal(hs)
 		if err != nil {
 			return fmt.Errorf("walWriter: marshal hard state: %w", err)
 		}
@@ -273,17 +274,17 @@ func newBenchStateMachineEtcd() *benchStateMachineEtcd {
 // normal entry it parses the KV command, copies the value, and stores it
 // keyed by the command key, matching the work done by the other engines'
 // state machines.
-func (sm *benchStateMachineEtcd) apply(entries []raftpb.Entry) {
+func (sm *benchStateMachineEtcd) apply(entries []*raftpb.Entry) {
 	sm.mu.Lock()
 	for _, entry := range entries {
-		if entry.Type == raftpb.EntryNormal && len(entry.Data) > 0 {
+		if entry.GetType() == raftpb.EntryNormal && len(entry.Data) > 0 {
 			_, key, value := parseKVCmd(entry.Data)
 			if key != nil {
 				owned := make([]byte, len(value))
 				copy(owned, value)
 				sm.data[string(key)] = owned
 			}
-			sm.applied = entry.Index
+			sm.applied = entry.GetIndex()
 		}
 	}
 	sm.mu.Unlock()
@@ -505,11 +506,11 @@ func (tn *etcdRaftTestNode) eventLoop() {
 			if len(rd.CommittedEntries) > 0 {
 				applied := int64(0)
 				for _, entry := range rd.CommittedEntries {
-					switch entry.Type {
+					switch entry.GetType() {
 					case raftpb.EntryConfChange:
 						var cc raftpb.ConfChange
-						if err := cc.Unmarshal(entry.Data); err == nil {
-							tn.node.ApplyConfChange(cc)
+						if err := proto.Unmarshal(entry.Data, &cc); err == nil {
+							tn.node.ApplyConfChange(&cc)
 						}
 						tn.confTracker.signal()
 					case raftpb.EntryNormal:
@@ -760,10 +761,10 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 						storage.Append(rd.Entries)
 					}
 					for _, entry := range rd.CommittedEntries {
-						if entry.Type == raftpb.EntryConfChange {
+						if entry.GetType() == raftpb.EntryConfChange {
 							var cc raftpb.ConfChange
-							if unmarshalErr := cc.Unmarshal(entry.Data); unmarshalErr == nil {
-								node.ApplyConfChange(cc)
+							if unmarshalErr := proto.Unmarshal(entry.Data, &cc); unmarshalErr == nil {
+								node.ApplyConfChange(&cc)
 							}
 						}
 					}
@@ -1271,10 +1272,10 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 						storage.Append(rd.Entries)
 					}
 					for _, entry := range rd.CommittedEntries {
-						if entry.Type == raftpb.EntryConfChange {
+						if entry.GetType() == raftpb.EntryConfChange {
 							var cc raftpb.ConfChange
-							if unmarshalErr := cc.Unmarshal(entry.Data); unmarshalErr == nil {
-								node.ApplyConfChange(cc)
+							if unmarshalErr := proto.Unmarshal(entry.Data, &cc); unmarshalErr == nil {
+								node.ApplyConfChange(&cc)
 							}
 						}
 					}

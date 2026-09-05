@@ -25,6 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // clusterTickInterval is the tick interval for cluster node tickers.
@@ -212,7 +213,7 @@ func SetupEtcdCluster(b *testing.B, numNodes int) *EtcdCluster {
 			addrs[nodeID],
 			peerAddrs,
 			tlsCfg,
-			func(msg raftpb.Message) {
+			func(msg *raftpb.Message) {
 				// Deliver received message into the raft node.
 				// Errors from Step are expected during shutdown.
 				localNode.Step(context.Background(), msg)
@@ -333,11 +334,11 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 			if len(rd.CommittedEntries) > 0 {
 				applied := int64(0)
 				for _, entry := range rd.CommittedEntries {
-					switch entry.Type {
+					switch entry.GetType() {
 					case raftpb.EntryConfChange:
 						var cc raftpb.ConfChange
-						if unmarshalErr := cc.Unmarshal(entry.Data); unmarshalErr == nil {
-							cn.node.ApplyConfChange(cc)
+						if unmarshalErr := proto.Unmarshal(entry.Data, &cc); unmarshalErr == nil {
+							cn.node.ApplyConfChange(&cc)
 						}
 						cn.confDone.signal()
 					case raftpb.EntryNormal:
