@@ -19,11 +19,11 @@ package raft_test
 import (
 	"context"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg"
+	"github.com/jeremyhahn/go-quicraft/test/netport"
 )
 
 // ---------------------------------------------------------------------------
@@ -51,16 +51,12 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 
 	addrs := make([]string, numNodes)
 	for i := range numNodes {
-		// Bind a temporary UDP listener to let the OS assign a free port,
-		// then close it so NewHost can bind to the same address. This
-		// avoids hardcoded ports that cause "address already in use"
-		// errors when tests run sequentially.
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("failed to find free port for node %d: %v", i, err)
-		}
-		addrs[i] = pc.LocalAddr().String()
-		pc.Close()
+		// Reserve from a window outside the kernel's ephemeral range, so the
+		// port cannot be handed to anything else before NewHost binds it. The
+		// loop used to bind 127.0.0.1:0 and close it, which is #131: nothing
+		// held the port between the close and the bind, and two nodes of one
+		// cluster could be given the same one.
+		addrs[i] = netport.MustReserveUDP(t.Fatalf)
 	}
 
 	mtls := testMTLSConfig(t)

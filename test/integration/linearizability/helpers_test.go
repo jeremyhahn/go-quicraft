@@ -40,6 +40,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/test/membership"
+	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
@@ -679,17 +680,13 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// freePort returns a free UDP port by binding and immediately closing a
-// temporary listener.
+// freePort returns a loopback address for a host that does not exist yet,
+// reserved so that nothing else can be handed the same port before the host
+// binds it. It used to bind 127.0.0.1:0 and close the socket, which is #131.
+// test/netport carries the reasoning and the measurements.
 func freePort(t *testing.T) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to find free port: %v", err)
-	}
-	addr := pc.LocalAddr().String()
-	pc.Close()
-	return addr
+	return netport.MustReserveUDP(t.Fatalf)
 }
 
 // ---------------------------------------------------------------------------
