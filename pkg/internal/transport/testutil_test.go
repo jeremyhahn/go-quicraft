@@ -15,9 +15,12 @@
 package transport
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // pollUntil polls condition() every interval until it returns true or timeout
@@ -119,6 +122,85 @@ func waitForChan(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg st
 	case <-timer.C:
 		t.Fatal(msg)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// First contact: what a cold Send is allowed to take
+// ---------------------------------------------------------------------------
+
+// firstContactBound is the longest a single Send to a target with no live
+// connection can legitimately take, and the point past which waiting is
+// pointless.
+//
+// A cold Send passes through three bounds the transport applies to ITSELF:
+// the dial (dialTimeout, covering the QUIC handshake), the stream open
+// (streamOpenTimeout) and the frame write (sendWriteDeadline). The moment any
+// of them expires the batch is DROPPED, by contract — "Raft retransmission
+// will resend it" — so no wait, however long, delivers that particular Send.
+// The bound is their sum, read from the transport's own constants rather than
+// restated, so it follows a change to any of them.
+//
+// #142: the wait at every first-contact site was a 10s literal, BELOW this
+// bound. Under CI saturation (load 150-200 on 24 cores, -race and coverage
+// instrumentation, 24 packages in parallel) a cold handshake was traced at
+// 4.3s against the 5s dial deadline and delivery at 5.35s, with the whole
+// process descheduled for seconds at a time; the batcher itself flushes on
+// dequeue with no timer. A literal below the transport's own ceiling could
+// neither outlast a slow-but-legal handshake nor survive an abandoned one.
+const firstContactBound = dialTimeout + streamOpenTimeout + sendWriteDeadline
+
+// firstContactAttempts is how many cold Sends sendFirstContact makes before
+// failing: one the transport is allowed to abandon at firstContactBound, and
+// one more. Two consecutive abandoned dials is a broken transport, not a busy
+// box.
+const firstContactAttempts = 2
+
+// firstContactError reports a cold Send that no attempt delivered.
+type firstContactError struct {
+	attempts int
+	wait     time.Duration
+}
+
+func (e *firstContactError) Error() string {
+	return fmt.Sprintf("transport test: no batch delivered by %d cold sends of %v each",
+		e.attempts, e.wait)
+}
+
+// sendFirstContact delivers msgs to a target the sender has no connection to
+// yet and returns once h has seen a batch. After each firstContactBound with
+// nothing delivered it sends again, as Raft does on its next tick, so a cold
+// dial the transport abandons under saturation does not strand the test on a
+// message nothing would ever retransmit.
+//
+// h may therefore see MORE than one batch, and a later waitBatch on h may be
+// satisfied by the duplicate. Use it only for the first contact of a test that
+// asserts on batch content rather than batch count.
+func sendFirstContact(t testing.TB, tr *QUICTransport, h *testHandler, msgs []proto.Message) {
+	t.Helper()
+	if err := sendUntilDelivered(tr, h, msgs, firstContactAttempts, firstContactBound); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sendUntilDelivered is sendFirstContact with the attempt count and the
+// per-attempt wait injected, so that its re-send and give-up behaviour can be
+// tested at a scale that does not take firstContactAttempts*firstContactBound
+// to fail.
+func sendUntilDelivered(tr *QUICTransport, h *testHandler, msgs []proto.Message, attempts int, wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			timer.Reset(wait)
+		}
+		tr.Send(msgs)
+		select {
+		case <-h.batchNotify:
+			return nil
+		case <-timer.C:
+		}
+	}
+	return &firstContactError{attempts: attempts, wait: wait}
 }
 
 // dropRecorder implements the transport Metrics interface, recording only the

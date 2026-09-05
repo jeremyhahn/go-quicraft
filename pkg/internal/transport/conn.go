@@ -39,6 +39,11 @@ const (
 	// dialTimeout is the maximum time for a single dial attempt.
 	dialTimeout = 5 * time.Second
 
+	// streamOpenTimeout is the maximum time for a single OpenStreamSync on
+	// an established connection: the heartbeat pre-open, the pooled-stream
+	// slow path, and that path's one retry after a stale-stream eviction.
+	streamOpenTimeout = 5 * time.Second
+
 	// supersededEpochRing is how many retired boot epochs are remembered per
 	// peer. Each slot covers one restart whose late frames may still be in
 	// flight; four spans a crash-loop without letting the record grow.
@@ -254,7 +259,7 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(t.shutdownCtx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.shutdownCtx, streamOpenTimeout)
 	defer cancel()
 
 	s, err := conn.OpenStreamSync(ctx)
@@ -779,7 +784,7 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(t.shutdownCtx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.shutdownCtx, streamOpenTimeout)
 	defer cancel()
 
 	s, err := conn.OpenStreamSync(ctx)
@@ -864,7 +869,7 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		if retryErr != nil {
 			return nil, retryErr
 		}
-		retryCtx, retryCancel := context.WithTimeout(t.shutdownCtx, 5*time.Second)
+		retryCtx, retryCancel := context.WithTimeout(t.shutdownCtx, streamOpenTimeout)
 		defer retryCancel()
 		retryStream, retryErr := retryConn.OpenStreamSync(retryCtx)
 		if retryErr != nil {

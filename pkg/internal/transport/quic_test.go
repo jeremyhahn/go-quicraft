@@ -505,8 +505,7 @@ func TestHeartbeatUsesStreamZero(t *testing.T) {
 	heartbeat := []proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
 	}
-	t1.Send(heartbeat)
-	handler2.waitBatch(t, 10*time.Second)
+	sendFirstContact(t, t1, handler2, heartbeat)
 
 	batches := handler2.getBatches()
 	if len(batches) == 0 {
@@ -4046,11 +4045,11 @@ func TestSendSnapshotStreaming_OpenStreamSyncError(t *testing.T) {
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)
 
-	// Establish connection.
-	t1.Send([]proto.Message{
+	// Establish the connection: a cold Send, bounded by what the transport
+	// allows one and re-sent if it is abandoned (#142).
+	sendFirstContact(t, t1, handler2, []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-	handler2.waitBatch(t, 10*time.Second)
 
 	// Stop t2 and close the connection.
 	t2.Stop()
