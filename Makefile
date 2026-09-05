@@ -49,11 +49,28 @@ GOTEST        := $(GO) test -race -count=1 -v
 GOBENCH       := $(GO) test -run=^$$ -bench=. -benchmem
 GOVET         := $(GO) vet
 GOFMT         := gofmt
+# The analyser's name on PATH. Which BINARY `make lint` actually runs is
+# GOLANGCI_BIN below, which prefers the one `make install-lint` builds.
 GOLINT        := golangci-lint
 # Must match the version quality.yml installs. A different MAJOR version is not
 # a cosmetic difference: v2 moved flags (`--timeout`) and changed which linters
 # are enabled by default, so a developer and CI would gate on different rules.
 GOLANGCI_VERSION := v2.13.2
+# Where `make install-lint` puts the analyser, and the first place `make lint`
+# looks. Repo-local so the binary this repo lints with is built by this repo's
+# Go and cannot be replaced by another project's `go install` into GOPATH/bin.
+TOOLS_BIN     := $(CURDIR)/.tools/bin
+# The analyser `make lint` runs, resolved at use time: the repo-local build
+# first, then PATH (which is where CI's baked runner-image tool lives). Kept
+# recursive (`=`) rather than `:=` so an uninstalled tool is not a parse-time
+# failure for every other target. See the guard at check-lint-toolchain.
+GOLANGCI_BIN   = $(shell if [ -x '$(TOOLS_BIN)/golangci-lint' ]; then \
+			echo '$(TOOLS_BIN)/golangci-lint'; \
+		else command -v $(GOLINT) 2>/dev/null; fi)
+# The module's own language floor. DERIVED from go.mod, hence `override` per
+# the rule above: nothing a caller supplies for it could be meaningful, and it
+# is the value the analyser's build toolchain is checked against.
+override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod)
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 
@@ -1022,9 +1039,14 @@ ci: fmt no-mutants check-tool-versions vet lint security build test
 # Mechanical rather than a matter of remembering, for the same reason
 # no-mutants is. The floor matters: a discovery that finds nothing must fail,
 # or a renamed file silently turns this into a gate over an empty set.
+#
+# The literal pins are only half of it. A version pin says WHICH ANALYSER, not
+# WHICH GO BUILT IT, and the second half is invisible to any amount of grepping
+# — so check-lint-toolchain below inspects the installed binary itself. That
+# gap cost a CI round trip in #118; the two checks together are the gate.
 # ============================================================================
 .PHONY: check-tool-versions
-check-tool-versions:
+check-tool-versions: check-lint-toolchain
 	@pins=$$(git grep -hoE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
 		.github .devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
 	count=$$(printf '%s\n' "$$pins" | grep -c . || true); \
@@ -1044,6 +1066,87 @@ check-tool-versions:
 		exit 1; \
 	fi; \
 	echo "golangci-lint pins agree ($(GOLANGCI_VERSION))"
+
+# ============================================================================
+# Analyser build-toolchain guard
+#
+# A version pin constrains WHICH ANALYSER, not WHICH GO BUILT IT — and an
+# analysis tool built by an older Go cannot analyse a module targeting a newer
+# one. When go.mod moved to `go 1.27.0` (#83), every locally installed
+# golangci-lint refused the module before reading a line of source:
+#
+#   Error: can't load config: the Go language version (go1.26) used to build
+#   golangci-lint is lower than the targeted Go version (1.27.0)
+#
+# and staticcheck failed differently, choking on the 1.27 standard library
+# ("unknown field rfd in struct literal of type splicePipe").
+#
+# CI never saw it. The runner image bakes v2.13.2 built with its own 1.27
+# toolchain and passes; the identically-versioned release binary in ~/go/bin
+# was built with go1.26.2 and refuses. Same version string, opposite outcome —
+# which is exactly why the literal-pin check above could not see it, and why
+# nobody could lint before pushing. Lint findings then surfaced only after a
+# full CI round trip on a contended runner pool (#117 burned a cycle on a
+# one-line ST1023 a five-second local run would have caught).
+#
+# So the guard reads the build toolchain out of the binary's own self-report
+# ("built with go1.26.2") and compares it to the module's `go` directive, and
+# `make lint` runs $(GOLANGCI_BIN) rather than whatever PATH offers first.
+# A mismatch prints what to run; the alternative is a developer meeting the
+# analyser's own version-comparison error with no idea what produced it.
+#
+# staticcheck gets NO guard of its own, deliberately: it runs as a
+# golangci-lint linter (.golangci.yml `linters.enable`), never as a standalone
+# binary — nothing in this Makefile or under .github/ invokes it directly. A
+# second guard would gate a tool this repository does not run. Installing the
+# analyser with a 1.27 toolchain fixes its half of #118 along with the rest.
+# ============================================================================
+.PHONY: check-lint-toolchain
+check-lint-toolchain:
+	@bin='$(GOLANGCI_BIN)'; \
+	want='$(GOLANGCI_VERSION)'; \
+	need='$(GO_DIRECTIVE)'; \
+	if [ -z "$$bin" ]; then \
+		echo "FAIL: no golangci-lint found."; \
+		echo "      Looked in $(TOOLS_BIN), then on PATH."; \
+		echo ""; \
+		echo "      Install the pinned analyser, built with this repo's Go:"; \
+		echo "          make install-lint"; \
+		exit 1; \
+	fi; \
+	report=$$("$$bin" --version 2>/dev/null); \
+	have=$$(printf '%s' "$$report" | sed -n 's/.*has version \([0-9][0-9.]*\).*/v\1/p'); \
+	built=$$(printf '%s' "$$report" | sed -n 's/.*built with go\([0-9][0-9.]*\).*/\1/p'); \
+	if [ -z "$$have" ] || [ -z "$$built" ]; then \
+		echo "FAIL: could not read the version of $$bin."; \
+		echo "      It reported: $$report"; \
+		echo ""; \
+		echo "      Reinstall the pinned analyser:"; \
+		echo "          make install-lint"; \
+		exit 1; \
+	fi; \
+	if [ "$$have" != "$$want" ]; then \
+		echo "FAIL: $$bin is $$have, this repo pins $$want."; \
+		echo "      An analyser of the wrong version gates on a different rule"; \
+		echo "      set from CI while looking like it passed the same gate."; \
+		echo ""; \
+		echo "      Install the pinned analyser:"; \
+		echo "          make install-lint"; \
+		exit 1; \
+	fi; \
+	if [ "$$(printf '%s\n%s\n' "$$need" "$$built" | sort -V | head -1)" != "$$need" ]; then \
+		echo "FAIL: $$bin was built with go$$built, but this module targets $$need."; \
+		echo "      An analyser built by an older Go cannot analyse a newer"; \
+		echo "      module: golangci-lint refuses the config outright, and"; \
+		echo "      staticcheck chokes parsing the go$$need standard library."; \
+		echo "      The version pin ($$want) is satisfied and irrelevant here —"; \
+		echo "      what is wrong is the toolchain that BUILT this binary."; \
+		echo ""; \
+		echo "      Rebuild it with the Go on this PATH ($$($(GO) env GOVERSION)):"; \
+		echo "          make install-lint"; \
+		exit 1; \
+	fi; \
+	echo "golangci-lint $$have built with go$$built (module targets $$need): $$bin"
 
 # ============================================================================
 # Full CI pipeline, including every build-tagged suite.
@@ -1201,9 +1304,12 @@ ci-modules:
 # Linting and static analysis
 # ============================================================================
 
+# Runs the analyser resolved by GOLANGCI_BIN, NOT the first golangci-lint on
+# PATH, and only after check-lint-toolchain has established that the binary can
+# actually analyse this module (#118).
 .PHONY: lint
-lint:
-	$(GOLINT) run --timeout=5m ./...
+lint: check-lint-toolchain
+	$(GOLANGCI_BIN) run --timeout=5m ./...
 
 .PHONY: vet
 vet:
@@ -1403,10 +1509,27 @@ install-nancy:
 # the same gate. That is the exact failure remote-tools was hardened against —
 # see the note above it: an analyser of the wrong version is worse than none.
 # `make check-tool-versions` now enforces this mechanically.
+#
+# It installs golangci-lint by delegating to install-lint rather than fetching
+# a release binary through install.sh. The published binaries are built by the
+# upstream project's own Go, which is how a correctly pinned analyser came to
+# be built with go1.26.2 and refused this 1.27 module (#118). `go install`
+# builds it with the toolchain that is about to lint with it, so the two can
+# never disagree.
 .PHONY: install-tools
-install-tools: install-gosec install-govulncheck install-trivy install-nancy
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $$(go env GOPATH)/bin $(GOLANGCI_VERSION)
+install-tools: install-gosec install-govulncheck install-trivy install-nancy install-lint
 	@echo "All CI tools installed ($(GOLANGCI_VERSION))"
+
+# Builds the pinned analyser WITH THIS REPO'S GO and puts it where `make lint`
+# looks first, which is the whole point: `go install` compiles it against the
+# toolchain running the install, so its language version is by construction at
+# least the module's `go` directive. Installing into $(TOOLS_BIN) rather than
+# GOPATH/bin keeps it out of reach of every other project's `go install`.
+.PHONY: install-lint
+install-lint:
+	@echo "==> golangci-lint $(GOLANGCI_VERSION), built with $$($(GO) env GOVERSION), into $(TOOLS_BIN)"
+	GOBIN=$(TOOLS_BIN) $(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+	@$(TOOLS_BIN)/golangci-lint --version
 
 # ============================================================================
 # Docker
@@ -1536,8 +1659,9 @@ help:
 	@echo "                         (protocol-mandated primitives; the exemption is documented)"
 	@echo ""
 	@echo "Linting:"
-	@echo "  lint                   Run golangci-lint"
+	@echo "  lint                   Run golangci-lint (the one from install-lint, not PATH)"
 	@echo "  check-tool-versions    Assert every golangci-lint pin matches GOLANGCI_VERSION"
+	@echo "  check-lint-toolchain   Assert the installed analyser can analyse this module"
 	@echo "  vet                    Run go vet"
 	@echo "  fmt                    Check gofmt formatting"
 	@echo ""
@@ -1553,6 +1677,7 @@ help:
 	@echo ""
 	@echo "Tool Installation:"
 	@echo "  install-tools          Install all CI tools (golangci-lint, gosec, govulncheck, trivy)"
+	@echo "  install-lint           Build the pinned golangci-lint with this repo's Go"
 	@echo "  install-gosec          Install gosec"
 	@echo "  install-govulncheck    Install govulncheck"
 	@echo "  install-trivy          Install Trivy"

@@ -34,7 +34,8 @@ Useful targets:
 | `make test-<pkg>` | One package (`test-raft`, `test-waldb`, `test-seal`, …) |
 | `make coverage` | Coverage over `./...`, enforced against `COVER_MIN` (91) |
 | `make coverage-<pkg>` | Coverage for one package, same floor |
-| `make lint` | golangci-lint |
+| `make lint` | golangci-lint, from `make install-lint` rather than PATH |
+| `make install-lint` | Builds the pinned golangci-lint with this repo's Go, into `.tools/bin` |
 | `make fmt` | Fails if anything is unformatted |
 | `make vet` | `go vet ./...` |
 | `make no-mutants` | Fails if a mutation marker survived in production code |

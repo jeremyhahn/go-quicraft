@@ -1238,6 +1238,14 @@ make ci-full     # everything, including integration and fuzz
 make install-tools
 ```
 
+`make lint` runs the golangci-lint that `make install-lint` builds into
+`.tools/bin`, not the first one on `PATH`. That is deliberate: a version pin
+constrains which analyser, not which Go compiled it, and an analyser built by
+an older Go refuses this module outright once `go.mod` moves forward. `make
+install-lint` builds the pinned version with the toolchain that is about to
+lint with it, and `make check-lint-toolchain` fails with the command to run if
+the binary it finds cannot analyse the module.
+
 Heavyweight targets under `-race` stand up multi-node QUIC clusters and will
 flake on a workstation that is also running editors and browsers — the 30-second
 catch-up waits in the snapshot tests are the usual casualty, and the failures

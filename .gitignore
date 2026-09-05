@@ -28,3 +28,9 @@ resume.txt
 .serena
 go.work
 go.work.sum
+
+# Analysers built by `make install-lint`. Repo-local so `make lint` runs a
+# binary built with this repo's Go, rather than whatever GOPATH/bin happens to
+# hold -- a correctly pinned golangci-lint built by an older Go cannot analyse
+# this module at all (#118).
+.tools/
