@@ -494,7 +494,38 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// worker re-evaluates this node immediately rather than
 	// waiting for the next tick.
 	if !req.save {
-		if err != nil {
+		var stale *SnapshotRecoveryStaleError
+		if errors.As(err, &stale) {
+			// NOT a shard failure, and nothing to do.
+			//
+			// recoveryBlockedByLog produces this refusal BEFORE the recovering
+			// gate is raised and before RecoverFromSnapshot is called, so the
+			// state machine has not been touched. The reasoning below — a
+			// possibly half-restored state machine — does not apply to it.
+			//
+			// It is also a NORMAL condition rather than a fault. A leader that
+			// has just been elected rebuilds every remote's next index, and a
+			// rejection walk-down can drive one below the compacted floor, so it
+			// ships an InstallSnapshot to a follower that is not actually behind.
+			// raft.handleSnapshot rejects that snapshot itself ("snapshot
+			// rejected, behind committed index") and answers with the follower's
+			// real committed index, which is how the leader learns to stop
+			// sending it. The host queues state-machine recovery on DELIVERY of
+			// the InstallSnapshot, not on raft ACCEPTING it, so the pool still
+			// receives a request for a snapshot raft has already discarded.
+			//
+			// The state machine is at or past the snapshot index, so it already
+			// holds everything that snapshot represents: declining IS the correct
+			// and complete action. Failing the shard here turned a race the
+			// protocol handles by itself into a dead shard (#106).
+			slog.Info("snapshot recovery declined: the state machine is already past "+
+				"this snapshot, and raft rejected it too",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"snapshot_index", stale.SnapshotIndex,
+				"last_applied", stale.LastApplied,
+			)
+		} else if err != nil {
 			// A FAILED restore must fail the shard, not resume applies on it.
 			//
 			// StateMachine.RecoverFromSnapshot now stages the session table so

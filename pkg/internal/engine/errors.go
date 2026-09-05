@@ -271,6 +271,14 @@ func (e *SnapshotRecoveryBehindError) Retryable() bool { return true }
 // follower's real progress (a leader change or rejection walk-down that drives
 // remote.next backwards). Raft itself rejects such a snapshot, so the engine
 // must refuse it too rather than recover behind raft's back.
+//
+// It does NOT fail the shard. The refusal is produced by recoveryBlockedByLog
+// before the recovering gate is raised and before RecoverFromSnapshot runs, so
+// the state machine is untouched and is already at or past the snapshot index —
+// there is nothing to restore and nothing to repair. It reports a race the
+// protocol resolves on its own: raft answers the rejected InstallSnapshot with
+// the follower's real committed index and the leader stops sending it. Treating
+// it as terminal killed shards under load (#106).
 type SnapshotRecoveryStaleError struct {
 	ShardID       uint64
 	ReplicaID     uint64

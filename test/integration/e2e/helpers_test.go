@@ -1047,6 +1047,43 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 	return nil
 }
 
+// awaitLeaderHostInterval is how often awaitLeaderHost re-asks. An election
+// completes in roughly one election timeout, so polling faster only burns CPU
+// that the shard needs to hold the election.
+const awaitLeaderHostInterval = 5 * time.Millisecond
+
+// awaitLeaderHost is leaderHost's blocking form: it returns the Host that leads
+// shardID, waiting up to timeout for one to emerge, and nil if none does.
+//
+// It never touches *testing.T, so it is usable OFF the test goroutine -- which
+// is the point, since waitForClusterLeader's t.Fatalf is illegal there.
+// Returning nil rather than failing leaves the caller to decide what a
+// leaderless shard means to it.
+//
+// It exists so a writer that finds a shard mid-election does not have to spend
+// one of its writes on a proposal it never attempted. Counting those as losses
+// is what made TestE2E_MultiShardFailover_UnderLoad score the runner's clock
+// instead of the cluster's recovery (#107).
+func (c *testCluster) awaitLeaderHost(shardID uint64, timeout time.Duration) *quicraft.Host {
+	ticker := time.NewTicker(awaitLeaderHostInterval)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		if h := c.leaderHost(shardID); h != nil {
+			return h
+		}
+		select {
+		case <-deadline.C:
+			// One last look: the leader may have appeared while this goroutine
+			// was descheduled, and reporting leaderless then would blame the
+			// cluster for the runner.
+			return c.leaderHost(shardID)
+		case <-ticker.C:
+		}
+	}
+}
+
 // liveNodes returns the count of nodes that are not stopped.
 func (c *testCluster) liveNodes() int {
 	count := 0

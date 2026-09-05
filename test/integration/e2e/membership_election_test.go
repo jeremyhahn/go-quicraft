@@ -311,6 +311,29 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 // host. It verifies that all shards elect new leaders, all in-flight
 // proposals either complete or return errors, and after recovery all
 // shards are functional and consistent.
+//
+// # What the write count asserts
+//
+// Each shard has one sequential writer with a budget of writesPerShard. The
+// kill is armed only once EVERY shard has committed a write and is parked, so
+// at the instant the host is stopped all three shards have the same amount of
+// work left and are actively proposing. From there the property is exact: a
+// leader-host kill costs a shard the ONE proposal that was in flight when the
+// host went away, and nothing else -- every later write goes to the shard's
+// new leader and must commit.
+//
+// That is what the per-shard floor of writesPerShard-maxLostPerShard checks. It
+// is a statement about the cluster's recovery, and it holds identically on a
+// fast box and a saturated one.
+//
+// It replaces an aggregate floor of 7-of-30 gated on a 50ms timer, which was a
+// statement about the RUNNER: the writers had whatever fitted into 50ms to
+// commit in, and after the kill every remaining iteration was spent instantly
+// on a nil leader without a proposal being attempted. A slow runner scored
+// 6-of-30 and the gate went red with nothing wrong (#107).
+//
+// A failed proposal is still permanent here. Nothing is re-sent, so the floor
+// cannot be met by retrying past a cluster that has not recovered.
 func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -355,67 +378,164 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 	// Launch concurrent writers on all shards.
 	const writesPerShard = 10
 
+	// maxLostPerShard is the whole cost a leader-host kill is allowed to have.
+	// Each writer is SEQUENTIAL, so at most one proposal per shard can be
+	// outstanding at the instant the host goes away; every write after it is
+	// submitted to the shard's new leader and has to commit. A shard that lost
+	// more than one write did not recover cleanly, and that is a statement
+	// about the cluster rather than about how fast the runner is.
+	const maxLostPerShard = 1
+
 	type shardWriteResult struct {
 		shardIdx int
 		shardID  uint64
 		success  map[string]string
 		errors   int64
+		// firstErr is the first proposal error the shard saw, kept so a
+		// failure names the cause instead of only the count.
+		firstErr error
+		// leaderless is set when the shard never produced a leader within
+		// failoverTimeout, so the writer stopped early.
+		leaderless bool
 	}
 
 	resultCh := make(chan shardWriteResult, numShards)
 	writerStarted := make(chan struct{})
+	// One send per shard, the moment that shard commits its first write. Every
+	// writer then parks on killArmed, so no writer can run its whole budget out
+	// before the others have started.
+	firstCommits := make(chan uint64, numShards)
+	killArmed := make(chan struct{})
+	// One send per shard, the moment that shard has SUBMITTED its next proposal
+	// and is waiting for it to commit. The kill is fired on this signal, so
+	// every shard has a proposal genuinely outstanding when the host goes away
+	// -- which is what "under load" has to mean for the count below to be about
+	// the failover at all.
+	inFlight := make(chan uint64, numShards)
 
 	for i, sid := range shardIDs {
 		go func(shardIdx int, shardID uint64) {
 			<-writerStarted
 			success := make(map[string]string)
 			var errCount int64
+			var firstErr error
+			armed, leaderless, awaitingKill := false, false, false
+			// Announce that this shard's kill-window proposal has been
+			// submitted. Called on the error path too: main must not block
+			// waiting for a proposal that was refused on submission.
+			announceInFlight := func() {
+				if awaitingKill {
+					awaitingKill = false
+					inFlight <- shardID
+				}
+			}
 			for w := range writesPerShard {
 				key := fmt.Sprintf("shard%d-load-%03d", shardID, w)
 				value := fmt.Sprintf("val-shard%d-%03d", shardID, w)
 
-				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-				leaderHost := cluster.leaderHost(shardID)
+				// Resolve the leader at the point of proposal, and WAIT for one
+				// while the shard is mid-election. Waiting is not a retry: it
+				// refuses to score a write that was never attempted. Spending an
+				// iteration on a nil leader is what turned this test's count into
+				// "how many writes fit in the pre-kill window on this machine"
+				// (#107) -- during the election every remaining iteration was
+				// consumed in microseconds without a proposal being made.
+				leaderHost := cluster.awaitLeaderHost(shardID, failoverTimeout)
 				if leaderHost == nil {
-					cancel()
-					errCount++
-					continue
+					// The shard never re-elected. Nothing later in this loop can
+					// succeed either, so stop rather than burn the budget again.
+					leaderless = true
+					break
 				}
 
+				// ONE attempt, and no retry. A proposal that WAS attempted and
+				// then refused is a real loss and stays counted -- that is the
+				// cost of the failover this test measures, and re-sending it
+				// would make the test pass without the cluster recovering.
+				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 				cmd := encodeKVPut(key, value)
 				//quicraft:direct-propose leaderHost is resolved at the top of this same loop iteration
 				rs, propErr := leaderHost.Propose(ctx, shardID, cmd)
 				if propErr != nil {
 					cancel()
 					errCount++
+					if firstErr == nil {
+						firstErr = propErr
+					}
+					announceInFlight()
 					continue
 				}
+				// Submitted. The kill fires from here, while Result is pending.
+				announceInFlight()
 
 				_, resErr := rs.Result()
 				rs.Release()
 				cancel()
-
 				if resErr != nil {
 					errCount++
+					if firstErr == nil {
+						firstErr = resErr
+					}
 					continue
 				}
 				success[key] = value
+
+				if !armed {
+					armed = true
+					firstCommits <- shardID
+					<-killArmed
+					awaitingKill = true
+				}
 			}
+			// The loop can end (or break) with the announcement still owed;
+			// main would otherwise wait out its guard for a signal that is
+			// never coming.
+			announceInFlight()
 			resultCh <- shardWriteResult{
-				shardIdx: shardIdx,
-				shardID:  shardID,
-				success:  success,
-				errors:   errCount,
+				shardIdx:   shardIdx,
+				shardID:    shardID,
+				success:    success,
+				errors:     errCount,
+				firstErr:   firstErr,
+				leaderless: leaderless,
 			}
 		}(i, sid)
 	}
 
-	// Start writers and then kill the leader node while writes are in flight.
+	// Gate the kill on PROGRESS, not on a clock. The 50ms timer this replaces
+	// was the entire pre-kill budget, so the test scored how much work fitted
+	// into a fixed window on the runner rather than what the cluster did with
+	// it (#107).
+	//
+	// Two barriers, because "under load" needs both halves: every shard has
+	// committed a write (so the cluster is warm and the writers are level), and
+	// every shard then has a proposal actually outstanding at the kill instant.
 	close(writerStarted)
-	// Wait for proposals to be in flight before killing the leader.
-	chaosTimer := time.NewTimer(50 * time.Millisecond)
-	<-chaosTimer.C
-	chaosTimer.Stop()
+	armGuard := time.NewTimer(failoverTimeout)
+	defer armGuard.Stop()
+	for range numShards {
+		select {
+		case sid := <-firstCommits:
+			t.Logf("shard %d committed its first write under load", sid)
+		case <-armGuard.C:
+			// Release the parked writers so they finish and exit rather than
+			// leaking on a channel nothing will ever close.
+			close(killArmed)
+			t.Fatalf("timed out after %v waiting for all %d shards to commit a "+
+				"write on a healthy cluster, before the leader kill",
+				failoverTimeout, numShards)
+		}
+	}
+	close(killArmed)
+	for range numShards {
+		select {
+		case sid := <-inFlight:
+			t.Logf("shard %d has a proposal in flight", sid)
+		case <-armGuard.C:
+			t.Fatalf("timed out after %v waiting for all %d shards to put a "+
+				"proposal in flight for the leader kill", failoverTimeout, numShards)
+		}
+	}
 
 	t.Logf("stopping leader host node[%d] while %d shards are under load", leaderNode, numShards)
 	cluster.stopNode(leaderNode)
@@ -429,24 +549,30 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 
 	totalSuccess := 0
 	for _, r := range shardResults {
-		t.Logf("shard %d: %d successful writes, %d errors", r.shardID, len(r.success), r.errors)
-		// Every shard has to have committed SOMETHING. A shard that committed
-		// nothing contributes an empty expected-set to the consistency check
-		// below, which then verifies nothing for that shard.
-		if len(r.success) == 0 {
-			t.Fatalf("shard %d committed none of its %d writes while under load", r.shardID, writesPerShard)
-		}
+		t.Logf("shard %d: %d of %d writes committed, %d errors (first: %v), leaderless=%v",
+			r.shardID, len(r.success), writesPerShard, r.errors, r.firstErr, r.leaderless)
 		totalSuccess += len(r.success)
 	}
-	// Killing the leader host mid-flight legitimately loses the in-flight
-	// window on the shards it led, so the aggregate floor is deliberately
-	// modest; measured at HEAD it is 14-16 of 30. What it rules out is a run
-	// whose writers achieved almost nothing, which every downstream assertion
-	// here would otherwise report as success.
-	const totalWriteFloor = numShards * writesPerShard / 4
-	if totalSuccess < totalWriteFloor {
-		t.Fatalf("only %d of %d writes committed across %d shards under load (floor %d)",
-			totalSuccess, numShards*writesPerShard, numShards, totalWriteFloor)
+	for _, r := range shardResults {
+		if r.leaderless {
+			t.Errorf("shard %d never elected a leader within %v after the kill, so it "+
+				"stopped after %d of %d writes", r.shardID, failoverTimeout,
+				len(r.success), writesPerShard)
+		}
+		// A shard that lost more than the single in-flight proposal did not
+		// survive the kill. This is per-shard on purpose: an aggregate hides a
+		// shard that stalled behind two that did not, and the consistency check
+		// below verifies nothing for the keys a shard never wrote.
+		if len(r.success) < writesPerShard-maxLostPerShard {
+			t.Errorf("shard %d committed only %d of its %d writes across the leader "+
+				"kill; at most %d may be lost in flight (%d errors, first: %v)",
+				r.shardID, len(r.success), writesPerShard, maxLostPerShard,
+				r.errors, r.firstErr)
+		}
+	}
+	if t.Failed() {
+		t.Fatalf("multi-shard failover lost more than the in-flight window: %d of %d "+
+			"writes committed across %d shards", totalSuccess, numShards*writesPerShard, numShards)
 	}
 
 	// Wait for all shards to elect new leaders.
