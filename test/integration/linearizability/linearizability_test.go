@@ -1872,7 +1872,11 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 	defer cluster.close()
 
 	cluster.startShard(shardID)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	// The index is deliberately NOT retained. Leadership is not pinned for the
+	// life of this test — a membership change and roughly eight seconds separate
+	// this call from the removal below — so a leader captured here is stale by
+	// the time it is used. See the removal block for what that cost.
+	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	startLeaderTermGuard(t, cluster, shardID)
 	warmupCluster(t, cluster, shardID)
 
@@ -1900,14 +1904,35 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 	removeNodeTimer := time.NewTimer(5 * time.Second)
 	<-removeNodeTimer.C
 	removeNodeTimer.Stop()
+
+	// Re-read the leader HERE rather than reusing the one from setup.
+	//
+	// The old code picked the first index that was not the leader as observed
+	// at the TOP of the test — more than eight seconds, a node addition and a
+	// catch-up wait earlier. Leadership does not hold still across that window:
+	// under a loaded runner the campaign lands differently and elections recur,
+	// and when leadership had moved to the index this loop chose, removeNode
+	// correctly refused with "cannot remove the leader" and the test failed
+	// having proven nothing — checkLinearizability, the entire point, is the
+	// last line and was never reached. That is how main went red at 0cb4eb8.
+	//
+	// The comment this block always carried said "not the leader, not the newly
+	// added node". It now means it.
+	currentLeader := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	removeIdx := -1
 	for i := range numNodes {
-		if i != leaderIdx {
+		// newIdx is excluded EXPLICITLY. numNodes is 5 and the added node is
+		// index 5, so the loop bound already skips it — by arithmetic accident,
+		// which stops being true the moment numNodes or this bound changes.
+		if i != currentLeader && i != newIdx {
 			removeIdx = i
 			break
 		}
 	}
-	t.Logf("removing follower node[%d]", removeIdx)
+	if removeIdx < 0 {
+		t.Fatalf("no removable follower: leader=%d newIdx=%d numNodes=%d", currentLeader, newIdx, numNodes)
+	}
+	t.Logf("removing follower node[%d] (leader is node[%d])", removeIdx, currentLeader)
 	cluster.removeNode(removeIdx, shardID)
 
 	// Confirm the cluster still has a leader after removal.
