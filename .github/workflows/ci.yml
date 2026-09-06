@@ -3,10 +3,12 @@
 # v1.9 (2026-08-20, owner ruling — FAIL-FAST STAGED PIPELINE, adopted here via
 # go-quicraft#22): a fast tier (lint + build, ~minutes) gates the expensive
 # tier (security, test, integration, netfault, errfs, fuzz-seeds,
-# contrib-dragonboat). Gitea cannot cancel in-flight jobs (no cancel route —
-# company task #90), so fail-fast comes from ORDERING: a broken push reports
-# in minutes and burns nothing downstream; a green push pays one fast-tier of
-# extra latency. `fips` and `trivy` move to nightly.yml (schedule +
+# contrib-dragonboat): a broken push reports in minutes and burns nothing
+# downstream; a green push pays one fast-tier of extra latency. Ordering and
+# the `concurrency:` block below are complementary, not alternatives —
+# ordering stops a BROKEN push from spending the expensive tier, cancellation
+# stops a SUPERSEDED push from spending anything at all. `fips` and `trivy`
+# move to nightly.yml (schedule +
 # workflow_dispatch, gating nothing): both were known-red on every push here
 # (fips: go-quicraft#24's runner-contention flake under GODEBUG=fips140=on;
 # trivy: shared the same class of concern portfolio-wide), and a known-red job
@@ -50,6 +52,35 @@ on:
   workflow_dispatch:                    # re-fire a whole workflow; also the
                                         # only retry when a run was never
                                         # created
+
+# Cancel superseded runs (go-quicraft#166). The runner pool is `capacity: 3`
+# for the WHOLE portfolio, so a run whose head has already moved on is a slot
+# no other repo can use — this one took 29 runs on `ci.yml@refs/heads/main` in
+# a five-hour window. Measured working on Gitea 1.27.1 (older run cancelled,
+# newest completes); piloted in go-truststrap#49.
+#
+# Three things this shape gets right, each of which has been got wrong:
+#
+#   - Keyed on the REF, so a branch supersedes only itself. e61a9d3 ("ci: drop
+#     concurrency from workflows") removed a block keyed on
+#     `${{ github.repository }}` with NO ref component and
+#     `cancel-in-progress: false`, at JOB level, on task-worker.yml: every
+#     worker shared one group, and Gitea cannot QUEUE, so siblings that could
+#     not cancel each other saturated it. That is not evidence about this.
+#   - The literal `true`. `cancel-in-progress` does not evaluate expressions on
+#     1.27.1 — any non-empty value is truthy, so `${{ ... }}` here would mean
+#     `true` whatever it rendered.
+#   - Workflow level, not per-job, so the whole superseded pipeline goes.
+#
+# There is still no `cancel` REST route on this Gitea (checked against
+# swagger.v1.json), which is exactly why `concurrency:` is the only mechanism:
+# nothing can cancel a run after the fact, so the successor does it on arrival.
+# `ci-gate` below correctly treats `cancelled` as not-`success`; that cannot
+# block a merge, because the required context is `CI / CI Gate (pull_request)`
+# and a cancellation only lands on a superseded sha the head has moved past.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
