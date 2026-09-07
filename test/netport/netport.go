@@ -149,7 +149,7 @@ const (
 const inFlightRetain = 512
 
 // probeConfig binds the candidate port. It is deliberately the zero value: see
-// the bind in scanWindow for why the probe must carry no socket options.
+// probe for why it must carry no socket options.
 var probeConfig net.ListenConfig
 
 // state is the process-wide reservation window and the ports already handed
@@ -174,6 +174,36 @@ var state struct {
 // engines these tests drive bind by address and cannot inherit a descriptor.
 // The window makes that safe: see the package comment.
 func ReserveUDP() (string, error) {
+	return reserve("udp")
+}
+
+// ReserveTCP is ReserveUDP for a TCP listener. Everything the package comment
+// says applies unchanged: the class it removes is a port drawn from the
+// kernel's ephemeral range being reassigned between the probe and the bind, and
+// nothing about that is specific to UDP. It is here rather than in a second
+// copy of this package because a copy is how the two drift — the window, the
+// recycle policy and the PID offset all have to agree or the guarantee is only
+// as good as whichever copy a caller reached for (#163).
+//
+// This engine speaks QUIC and reserves UDP; the TCP form exists for the
+// comparison harnesses in test/performance, whose baselines (etcd/raft,
+// Dragonboat) are TCP and which hit the identical EADDRINUSE class.
+func ReserveTCP() (string, error) {
+	return reserve("tcp")
+}
+
+// reserve hands out one port from the window, proven bindable on network.
+//
+// # One window for both networks
+//
+// TCP and UDP port spaces are independent in the kernel, so 40000/tcp and
+// 40000/udp could safely be issued to two callers. They are not: one window,
+// one taken set, one cursor. Sharing is strictly MORE conservative than the
+// kernel requires, costs nothing a test can observe — the window is thousands
+// of ports wide and a process reserves tens — and it is what keeps the recycle
+// policy and the PID start offset single. Two sets would be two policies to
+// keep in step, which is the defect this package was folded together to end.
+func reserve(network string) (string, error) {
 	state.once.Do(initWindow)
 
 	state.mu.Lock()
@@ -185,11 +215,11 @@ func ReserveUDP() (string, error) {
 
 	// Two passes. The first honors every port handed out so far; the second
 	// forgets all but the most recent, so the window can be recycled.
-	if addr, ok := scanWindow(); ok {
+	if addr, ok := scanWindow(network); ok {
 		return addr, nil
 	}
 	recycleWindow()
-	if addr, ok := scanWindow(); ok {
+	if addr, ok := scanWindow(network); ok {
 		return addr, nil
 	}
 
@@ -208,11 +238,22 @@ func MustReserveUDP(fatalf func(format string, args ...any)) string {
 	return addr
 }
 
+// MustReserveTCP is ReserveTCP for callers that cannot proceed without an
+// address, on the same terms as MustReserveUDP. A benchmark passes (*B).Fatalf.
+func MustReserveTCP(fatalf func(format string, args ...any)) string {
+	addr, err := ReserveTCP()
+	if err != nil {
+		fatalf("reserve loopback TCP port: %v", err)
+		return ""
+	}
+	return addr
+}
+
 // scanWindow walks the whole window once, starting where the last reservation
 // left off, and returns the first port that is neither already handed out nor
-// held by a listener in this or any other process. The caller must hold
-// state.mu.
-func scanWindow() (string, bool) {
+// held by a listener in this or any other process on network. The caller must
+// hold state.mu.
+func scanWindow(network string) (string, bool) {
 	span := state.hi - state.lo + 1
 	if span <= 0 {
 		return "", false
@@ -224,18 +265,8 @@ func scanWindow() (string, bool) {
 			continue
 		}
 		addr := "127.0.0.1:" + strconv.Itoa(p)
-		// A ZERO ListenConfig, deliberately: no Control hook, so the probe
-		// carries no SO_REUSEADDR and is refused by a live SO_REUSEADDR holder,
-		// which is how a host another process already started is detected. A
-		// probe that set SO_REUSEADDR itself would bind straight through that
-		// host and report the port free. (net.ListenPacket would be the same
-		// bind, but noctx requires the ListenConfig spelling.)
-		pc, err := probeConfig.ListenPacket(context.Background(), "udp", addr)
-		if err != nil {
+		if !probe(network, addr) {
 			// Held by something outside this process. Skip it.
-			continue
-		}
-		if cerr := pc.Close(); cerr != nil {
 			continue
 		}
 		state.taken[p] = true
@@ -244,6 +275,39 @@ func scanWindow() (string, bool) {
 		return addr, true
 	}
 	return "", false
+}
+
+// probe reports whether addr can be bound on network right now. It opens the
+// socket and closes it again; the caller gets the address, not the descriptor.
+//
+// A ZERO ListenConfig, deliberately: no Control hook, so the probe carries no
+// socket options of its own and is refused by a live holder, which is how a
+// host another process already started is detected. A UDP probe that set
+// SO_REUSEADDR itself would bind straight through such a host and report the
+// port free. TCP needs no such care in the other direction — Go sets
+// SO_REUSEADDR on a TCP listener by default, and SO_REUSEADDR permits binding
+// over a socket in TIME_WAIT, never over a LIVE listener; two live listeners on
+// one address need SO_REUSEPORT, which nothing here sets.
+//
+// A failed Close is treated as "not free" rather than ignored: the port's state
+// is then unknown, and handing out an address whose probe socket may still be
+// open is exactly the race this package exists to remove.
+//
+// (net.ListenPacket and net.Listen would be the same binds, but noctx requires
+// the ListenConfig spelling.)
+func probe(network, addr string) bool {
+	if network == "udp" {
+		pc, err := probeConfig.ListenPacket(context.Background(), network, addr)
+		if err != nil {
+			return false
+		}
+		return pc.Close() == nil
+	}
+	l, err := probeConfig.Listen(context.Background(), network, addr)
+	if err != nil {
+		return false
+	}
+	return l.Close() == nil
 }
 
 // recycleWindow forgets every reservation except the most recent ones, which

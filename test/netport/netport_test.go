@@ -39,6 +39,18 @@ func reuseAddrListen(addr string) (net.PacketConn, error) {
 	return lc.ListenPacket(context.Background(), "udp", addr)
 }
 
+// plainListen binds a TCP listener with no socket options of its own, which is
+// how the harnesses in test/performance bind and the strongest holder TCP has:
+// Go sets SO_REUSEADDR on a listener by default, and SO_REUSEADDR never permits
+// binding over a LIVE listener.
+//
+// It spells the bind through a ListenConfig rather than net.Listen only because
+// noctx requires it; the zero value adds nothing.
+func plainListen(addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	return lc.Listen(context.Background(), "tcp", addr)
+}
+
 // forget drops one port from the in-process reservation record, so a test can
 // exercise the probe bind rather than the taken-set that would shadow it.
 func forget(port int) {
@@ -221,6 +233,154 @@ func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 		// back so every iteration re-probes it rather than marching away.
 		forget(heldPort)
 		rewindTo(heldPort)
+	}
+}
+
+// TestReserveTCPSkipsPortsHeldByALiveListener is
+// TestReserveUDPSkipsPortsHeldByALiveListener for the TCP form, and it is the
+// test that says the TCP probe is a real probe rather than an unconditional
+// yes.
+//
+// It matters because the two networks bind through different calls — Listen
+// against ListenPacket — so a probe that dispatched on network and got the TCP
+// arm wrong would hand out a live port while every UDP test stayed green.
+//
+// The holder is plainListen, the strongest holder TCP has — see its comment —
+// so the probe must be refused by it.
+func TestReserveTCPSkipsPortsHeldByALiveListener(t *testing.T) {
+	held, err := ReserveTCP()
+	if err != nil {
+		t.Fatalf("reserve address to hold: %v", err)
+	}
+	heldPort := portOf(t, held)
+	l, err := plainListen(held)
+	if err != nil {
+		t.Fatalf("bind held address %s: %v", held, err)
+	}
+	defer l.Close()
+
+	forget(heldPort)
+	rewindTo(heldPort)
+
+	const reservations = 128
+	for i := range reservations {
+		addr, err := ReserveTCP()
+		if err != nil {
+			t.Fatalf("reservation %d: %v", i, err)
+		}
+		if addr == held {
+			t.Fatalf("reservation %d returned %s while a live TCP listener "+
+				"holds it; the probe bind failed to detect the holder", i, addr)
+		}
+		forget(heldPort)
+		rewindTo(heldPort)
+	}
+}
+
+// TestReserveTCPAndUDPShareOneWindow pins the choice reserve documents: one
+// window and one taken set across both networks.
+//
+// The kernel would allow 40000/tcp and 40000/udp to be issued to two callers,
+// and this package deliberately does not. The property is worth a test because
+// the alternative — per-network state — is the obvious refactor, and it would
+// silently reintroduce two recycle policies and two cursors to keep in step.
+func TestReserveTCPAndUDPShareOneWindow(t *testing.T) {
+	lo, hi := 61300, 61363
+	withWindow(t, lo, hi)
+
+	seen := make(map[string]string)
+	const reservations = 40
+	for i := range reservations {
+		// Rewind before every reservation. Without this the scan cursor alone
+		// keeps the addresses distinct — it advances past each port it hands
+		// out and never laps a 64-port window in 40 reservations — and the test
+		// would pass against per-network taken sets, asserting nothing. Pinned
+		// to the bottom of the window, the taken set is the ONLY thing that can
+		// stop the next reservation returning the port just issued.
+		rewindTo(lo)
+
+		network, reserve := "udp", ReserveUDP
+		if i%2 == 1 {
+			network, reserve = "tcp", ReserveTCP
+		}
+		addr, err := reserve()
+		if err != nil {
+			t.Fatalf("reservation %d (%s): %v", i, network, err)
+		}
+		if prev, dup := seen[addr]; dup {
+			t.Fatalf("reservation %d handed out %s for %s, already issued for %s; "+
+				"the two networks are not sharing one taken set", i, addr, network, prev)
+		}
+		seen[addr] = network
+	}
+}
+
+// TestReserveTCPAddressesAreBindable asserts a reservation is actually usable:
+// every address handed out for a five-node cluster must still bind after all
+// five have been reserved.
+//
+// It is the sequence that failed in the benchmark smoke run this window was
+// built for — five ports reserved up front, then five servers started, the last
+// binding long after the first was handed out — and it comes over from
+// test/performance/benchutil, whose own copy of this window it replaces (#163).
+// A skip test proves the probe REFUSES a held port; only this proves it does
+// not also refuse, or hand out, a port that cannot be bound.
+func TestReserveTCPAddressesAreBindable(t *testing.T) {
+	const nodes = 5
+
+	addrs := make([]string, nodes)
+	for i := range addrs {
+		addr, err := ReserveTCP()
+		if err != nil {
+			t.Fatalf("ReserveTCP: %v", err)
+		}
+		addrs[i] = addr
+	}
+
+	listeners := make([]net.Listener, 0, nodes)
+	defer func() {
+		for _, l := range listeners {
+			l.Close()
+		}
+	}()
+	for i, addr := range addrs {
+		l, err := plainListen(addr)
+		if err != nil {
+			t.Fatalf("node %d could not bind its reserved address %s: %v", i, addr, err)
+		}
+		listeners = append(listeners, l)
+	}
+}
+
+// TestWindowRecyclesOnceReservationsAreNoLongerInFlight is the positive half of
+// TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort.
+//
+// That test pins the refusal: a window whose ports are all live must fail
+// rather than reissue one. This pins the other half — a run that asks for far
+// more ports than the window holds, with nothing still in flight, must keep
+// being served. The election benchmarks build and tear down a whole cluster per
+// b.N iteration, so an allocator that never reused a port would turn the
+// EADDRINUSE flake it replaced into a guaranteed failure late in a long run.
+//
+// Both halves are needed: retention alone starves, recycling alone reissues a
+// port a caller is still holding.
+func TestWindowRecyclesOnceReservationsAreNoLongerInFlight(t *testing.T) {
+	const lo, hi = 61400, 61403
+	const span = hi - lo + 1
+	withWindow(t, lo, hi)
+
+	seen := make(map[string]int)
+	for i := range span * 8 {
+		addr, err := ReserveUDP()
+		if err != nil {
+			t.Fatalf("reservation %d of %d in a %d-port window: %v",
+				i+1, span*8, span, err)
+		}
+		seen[addr]++
+	}
+	if len(seen) != span {
+		t.Fatalf("reservations covered %d distinct ports; want %d (the whole window)",
+			len(seen), span)
 	}
 }
 
