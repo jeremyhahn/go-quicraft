@@ -416,24 +416,22 @@ func TestIntegration_DB_StartReplicaWaitForReadiness(t *testing.T) {
 	// correctly per the Raft specification.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("readiness-check", "ready")
-	// The read below must go to the replica that accepted the warmup entry, so
-	// take the host back from the proposal rather than from an earlier index.
-	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
+	// The proposal's own host used to be captured here, because the read below
+	// was a direct SyncRead and pinning it to the replica that accepted the
+	// warmup entry was the closest thing to a leader it could get. The read
+	// re-resolves now, and waitForReplication below proves every node holds the
+	// entry, so a linearizable read answers correctly whichever replica leads.
+	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
 
 	// Verify the warmup entry replicated to all nodes, confirming
 	// cluster-wide readiness.
 	waitForReplication(t, cluster, trackers, 1, "readiness-check", "ready", defaultTimeout)
 	t.Logf("all 3 nodes replicated warmup entry")
 
-	// Now perform a SyncRead on the leader to confirm linearizable
-	// reads are operational.
-	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer readCancel()
-
-	readResult, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet("readiness-check"))
-	if readErr != nil {
-		t.Fatalf("SyncRead on leader failed after StartReplica: %v", readErr)
-	}
+	// Now read from the leader to confirm linearizable reads are operational.
+	// The follower walk below is what pins a replica on purpose; this one is
+	// about the shard being readable at all, so it re-resolves.
+	readResult := cluster.readFromLeader(t, 1, encodeKVGet("readiness-check"), defaultTimeout)
 	val, ok := readResult.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", readResult)

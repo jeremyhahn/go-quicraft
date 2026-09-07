@@ -1493,15 +1493,15 @@ type dbAsyncProposal struct {
 	Index int
 }
 
-// proposeRetryInterval is how long a proposal helper waits before re-resolving
-// after a not-leader rejection. An election completes in roughly one election
-// timeout, so polling faster than this only burns CPU.
-const proposeRetryInterval = 20 * time.Millisecond
+// leaderRetryInterval is how long a leader-resolving helper waits before
+// re-resolving after a not-leader rejection. An election completes in roughly
+// one election timeout, so polling faster than this only burns CPU.
+const leaderRetryInterval = 20 * time.Millisecond
 
-// minProposeAttempt is the smallest budget an attempt will be started with.
+// minLeaderAttempt is the smallest budget an attempt will be started with.
 // Below it the attempt would time out on arrival and overwrite the real cause
 // with ErrTimeout, reporting leadership churn as a slow shard.
-const minProposeAttempt = 200 * time.Millisecond
+const minLeaderAttempt = 200 * time.Millisecond
 
 // leaderHost returns the NodeHost that leads shardID at the moment of the call
 // together with its index in the cluster, or (nil, -1) when no live replica
@@ -1561,6 +1561,70 @@ func isNotLeaderRejection(err error) bool {
 		// A raw quicraft error can still reach a test through a path that
 		// does not run translateError.
 		errors.Is(err, quicraft.ErrNotLeader)
+}
+
+// driveToLeader is the ONE retry loop behind every leader-resolving helper in
+// this file -- synchronous propose, asynchronous propose, linearizable read and
+// read index alike -- so the resolve-before-every-attempt rule, the minimum
+// attempt budget and the deadline arithmetic cannot drift between them.
+//
+// It was extracted when the read helpers landed (#161). Until then the loop was
+// written out twice; adding the reads without extracting it would have made
+// four copies, which is how a propose path and a read path start disagreeing
+// about which errors are retried.
+//
+// attempt is handed the NodeHost resolved for THIS attempt, its index in the
+// cluster, and the budget left for it. driveToLeader never calls attempt with a
+// nil NodeHost and never starts an attempt with less than minLeaderAttempt.
+//
+// It is a FUNCTION rather than a method because Go does not allow a method to
+// declare its own type parameter, and the result type differs per caller.
+//
+// The retryable set is deliberately NOT a parameter. isNotLeaderRejection is
+// the only one this module has: the adapter folds every not-leader shape into
+// ErrShardNotReady, so there is nothing else to distinguish. The parent's
+// test/proposer takes a Retryable because it also serves Pinned callers; this
+// module has none, because a site that means one SPECIFIC replica keeps its
+// direct call and says so with a quicraft:direct-propose or
+// quicraft:direct-read marker.
+func driveToLeader[T any](
+	c *dbTestCluster,
+	shardID uint64,
+	timeout time.Duration,
+	attempt func(nh *dragonboat.NodeHost, idx int, budget time.Duration) (T, error),
+) (T, error) {
+	var zero T
+	deadline := time.Now().Add(timeout)
+	retry := time.NewTicker(leaderRetryInterval)
+	defer retry.Stop()
+	expiry := time.NewTimer(timeout)
+	defer expiry.Stop()
+
+	// Reported if the deadline passes without a leader ever being observed,
+	// which is itself a not-leader condition.
+	lastErr := dragonboat.ErrShardNotReady
+
+	for {
+		if nh, idx := c.leaderHost(shardID); nh != nil {
+			remaining := time.Until(deadline)
+			if remaining < minLeaderAttempt {
+				return zero, lastErr
+			}
+			result, err := attempt(nh, idx, remaining)
+			if err == nil {
+				return result, nil
+			}
+			if !isNotLeaderRejection(err) {
+				return zero, err
+			}
+			lastErr = err
+		}
+		select {
+		case <-expiry.C:
+			return zero, lastErr
+		case <-retry.C:
+		}
+	}
 }
 
 // proposeOnce submits cmd to nh and waits for the entry to commit. It does NOT
@@ -1626,38 +1690,14 @@ func (c *dbTestCluster) tryProposeToLeader(
 	cmd []byte,
 	timeout time.Duration,
 ) (dbProposal, error) {
-	shardID := session.ShardID
-	deadline := time.Now().Add(timeout)
-	retry := time.NewTicker(proposeRetryInterval)
-	defer retry.Stop()
-	expiry := time.NewTimer(timeout)
-	defer expiry.Stop()
-
-	// Reported if the deadline passes without a leader ever being observed,
-	// which is itself a not-leader condition.
-	var lastErr error = dragonboat.ErrShardNotReady
-
-	for {
-		if nh, idx := c.leaderHost(shardID); nh != nil {
-			remaining := time.Until(deadline)
-			if remaining < minProposeAttempt {
-				return dbProposal{}, lastErr
-			}
-			result, err := proposeOnce(nh, session, cmd, remaining)
-			if err == nil {
-				return dbProposal{Result: result, Host: nh, Index: idx}, nil
-			}
-			if !isNotLeaderRejection(err) {
+	return driveToLeader(c, session.ShardID, timeout,
+		func(nh *dragonboat.NodeHost, idx int, budget time.Duration) (dbProposal, error) {
+			result, err := proposeOnce(nh, session, cmd, budget)
+			if err != nil {
 				return dbProposal{}, err
 			}
-			lastErr = err
-		}
-		select {
-		case <-expiry.C:
-			return dbProposal{}, lastErr
-		case <-retry.C:
-		}
-	}
+			return dbProposal{Result: result, Host: nh, Index: idx}, nil
+		})
 }
 
 // proposeAsyncToLeader is proposeToLeader for the asynchronous Propose path.
@@ -1689,37 +1729,140 @@ func (c *dbTestCluster) tryProposeAsyncToLeader(
 	cmd []byte,
 	timeout time.Duration,
 ) (dbAsyncProposal, error) {
-	shardID := session.ShardID
-	deadline := time.Now().Add(timeout)
-	retry := time.NewTicker(proposeRetryInterval)
-	defer retry.Stop()
-	expiry := time.NewTimer(timeout)
-	defer expiry.Stop()
-
-	var lastErr error = dragonboat.ErrShardNotReady
-
-	for {
-		if nh, idx := c.leaderHost(shardID); nh != nil {
-			remaining := time.Until(deadline)
-			if remaining < minProposeAttempt {
-				return dbAsyncProposal{}, lastErr
-			}
+	return driveToLeader(c, session.ShardID, timeout,
+		func(nh *dragonboat.NodeHost, idx int, budget time.Duration) (dbAsyncProposal, error) {
 			//quicraft:direct-propose the single attempt this loop is built from
-			rs, err := nh.Propose(session, cmd, remaining)
-			if err == nil {
-				return dbAsyncProposal{RS: rs, Host: nh, Index: idx}, nil
-			}
-			if !isNotLeaderRejection(err) {
+			rs, err := nh.Propose(session, cmd, budget)
+			if err != nil {
 				return dbAsyncProposal{}, err
 			}
-			lastErr = err
-		}
-		select {
-		case <-expiry.C:
-			return dbAsyncProposal{}, lastErr
-		case <-retry.C:
-		}
+			return dbAsyncProposal{RS: rs, Host: nh, Index: idx}, nil
+		})
+}
+
+// ---------------------------------------------------------------------------
+// Leader-resolving linearizable reads
+// ---------------------------------------------------------------------------
+//
+// A linearizable read is leader-bound exactly as a proposal is, and fails on
+// exactly the same election. SyncRead is a ReadIndex followed by a local
+// lookup; a replica that has just lost the shard refuses the ReadIndex
+// CORRECTLY while the test reports a failure the cluster never had. The
+// adapter folds that refusal into ErrShardNotReady like every other, so the
+// read path and the propose path share one retryable and one loop.
+//
+// Re-issuing a refused read is safe unconditionally -- a read that was refused
+// was never answered, so there is no "read twice" to reason about. The retry
+// set stays as narrow as it is for proposals anyway: a timeout, a busy pipeline
+// or a state-machine error comes from the replica that genuinely leads the
+// shard, and re-resolving changes nothing about it, so it must reach the test.
+
+// readOnce issues one linearizable read of query against nh with its own
+// deadline. It does NOT resolve the leader and does NOT retry: it is the single
+// attempt tryReadFromLeader is built from, and the way a test addresses one
+// specific replica on purpose.
+func readOnce(
+	nh *dragonboat.NodeHost,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	//quicraft:direct-read the single attempt tryReadFromLeader is built from
+	return nh.SyncRead(ctx, shardID, query)
+}
+
+// readFromLeader reads query from whichever replica leads shardID at the moment
+// of the call and fails the test on any error.
+//
+// The same rule as proposeToLeader decides who may use it. A caller that means
+// "the current leader" -- almost always, because it is reading back a value to
+// assert on the VALUE -- uses this. A caller that means one SPECIFIC replica --
+// a deposed incumbent whose refusal IS the assertion, a follower whose
+// forwarding is the subject, a node being checked for a local-only API -- keeps
+// its direct call and says so with a quicraft:direct-read marker.
+func (c *dbTestCluster) readFromLeader(
+	t *testing.T,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) interface{} {
+	t.Helper()
+	result, err := c.tryReadFromLeader(shardID, query, timeout)
+	if err != nil {
+		t.Fatalf("linearizable read on shard %d failed within %v: %v",
+			shardID, timeout, err)
 	}
+	return result
+}
+
+// tryReadFromLeader is readFromLeader's error-returning form, for callers that
+// layer their own assertion on the error and for goroutines, which must not
+// touch a *testing.T.
+//
+// ONLY the not-leader rejection is retried, and it is retried by RE-RESOLVING
+// the leader rather than by re-reading from the same replica.
+func (c *dbTestCluster) tryReadFromLeader(
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+) (interface{}, error) {
+	return driveToLeader(c, shardID, timeout,
+		func(nh *dragonboat.NodeHost, _ int, budget time.Duration) (interface{}, error) {
+			return readOnce(nh, shardID, query, budget)
+		})
+}
+
+// dbReadIndex is a ReadIndex request accepted by the replica that led the shard
+// when it was submitted.
+type dbReadIndex struct {
+	// RS is the in-flight request. The caller owns it and must Release it.
+	RS *dragonboat.RequestState
+	// Host is the NodeHost that accepted the request.
+	Host *dragonboat.NodeHost
+	// Index is Host's position in the cluster's hosts slice.
+	Index int
+}
+
+// readIndexFromLeader obtains a ReadIndex request from whichever replica leads
+// shardID at the moment of the call, and fails the test if none accepts one.
+//
+// It returns the live RequestState rather than a resolved index because the
+// only thing in this suite that needs a ReadIndex needs the REQUEST: NALookup
+// and NAReadLocalNode take the *RequestState itself. A helper that resolved and
+// released it would leave that caller with nothing to pass.
+//
+// Only the SUBMISSION is retried, exactly as in proposeAsyncToLeader. Once
+// ReadIndex has accepted the request the outcome belongs to the returned
+// RequestState, and what the caller reads from it is the test's own assertion.
+func (c *dbTestCluster) readIndexFromLeader(
+	t *testing.T,
+	shardID uint64,
+	timeout time.Duration,
+) dbReadIndex {
+	t.Helper()
+	ri, err := c.tryReadIndexFromLeader(shardID, timeout)
+	if err != nil {
+		t.Fatalf("read index on shard %d failed within %v: %v", shardID, timeout, err)
+	}
+	return ri
+}
+
+// tryReadIndexFromLeader is readIndexFromLeader's error-returning form.
+func (c *dbTestCluster) tryReadIndexFromLeader(
+	shardID uint64,
+	timeout time.Duration,
+) (dbReadIndex, error) {
+	return driveToLeader(c, shardID, timeout,
+		func(nh *dragonboat.NodeHost, idx int, budget time.Duration) (dbReadIndex, error) {
+			//quicraft:direct-read the single attempt this loop is built from
+			rs, err := nh.ReadIndex(shardID, budget)
+			if err != nil {
+				return dbReadIndex{}, err
+			}
+			return dbReadIndex{RS: rs, Host: nh, Index: idx}, nil
+		})
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,7 +2115,7 @@ const leaderTransferInProgress = "transfer in progress"
 //   - ErrTimeout. The adapter's Sync* methods refuse a context that has no
 //     deadline or an expired one BEFORE calling quicraft (timeoutFromContext),
 //     and every attempt here is given a fresh context of at least
-//     minProposeAttempt, so an ErrTimeout can only be quicraft's own: the
+//     minLeaderAttempt, so an ErrTimeout can only be quicraft's own: the
 //     select on ctx.Done() after RequestX returned a live RequestState, or the
 //     deadline sweep completing a registered pending proposal. Both are after
 //     delivery.
@@ -2044,7 +2187,7 @@ func driveConfigChange(
 	readMembership func(context.Context) (*dragonboat.Membership, error),
 ) error {
 	deadline := time.Now().Add(budget)
-	retry := time.NewTicker(proposeRetryInterval)
+	retry := time.NewTicker(leaderRetryInterval)
 	defer retry.Stop()
 	expiry := time.NewTimer(budget)
 	defer expiry.Stop()
@@ -2054,7 +2197,7 @@ func driveConfigChange(
 
 	for {
 		remaining := time.Until(deadline)
-		if remaining < minProposeAttempt {
+		if remaining < minLeaderAttempt {
 			return &configChangeExhaustedError{change: cc, budget: budget, last: lastErr}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), min(remaining, defaultTimeout))
@@ -2106,7 +2249,7 @@ func observeConfigChange(
 	deadline time.Time,
 	readMembership func(context.Context) (*dragonboat.Membership, error),
 ) (landed bool, conflict, readErr error) {
-	ctx, cancel := context.WithTimeout(context.Background(), max(min(time.Until(deadline), defaultTimeout), minProposeAttempt))
+	ctx, cancel := context.WithTimeout(context.Background(), max(min(time.Until(deadline), defaultTimeout), minLeaderAttempt))
 	defer cancel()
 
 	m, err := readMembership(ctx)
@@ -2207,7 +2350,7 @@ func (c *dbTestCluster) deleteReplicaToLeader(t *testing.T, shardID, replicaID, 
 func (c *dbTestCluster) membershipFromLeader(t *testing.T, shardID uint64, budget time.Duration) *dragonboat.Membership {
 	t.Helper()
 	deadline := time.Now().Add(budget)
-	retry := time.NewTicker(proposeRetryInterval)
+	retry := time.NewTicker(leaderRetryInterval)
 	defer retry.Stop()
 	expiry := time.NewTimer(budget)
 	defer expiry.Stop()
@@ -2216,7 +2359,7 @@ func (c *dbTestCluster) membershipFromLeader(t *testing.T, shardID uint64, budge
 	lastErr := errNoLeaderObserved
 	for {
 		remaining := time.Until(deadline)
-		if remaining < minProposeAttempt {
+		if remaining < minLeaderAttempt {
 			break
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), min(remaining, defaultTimeout))

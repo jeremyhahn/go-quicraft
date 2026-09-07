@@ -529,45 +529,28 @@ var pendingConfigChangeSites = []pendingSite{
 
 // pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table.
 //
-// Every entry is a CONVERSION that needs a file this change could not edit.
-// The waivers found by the same audit are not here — a waiver is a marker in
-// the file that needs it, and every file needing one was writable, so all 15
-// landed with this change. Deferring a waiver would have recorded "known
-// violation" for a site that is not one.
+// A waiver never belongs here — a waiver is a marker in the file that needs it,
+// and recording one as "deferred" would file a site that is CORRECT as a known
+// violation. What belongs here is a conversion that cannot be made yet, and the
+// entry is the ratchet that fails when it lands.
+//
+// #161 held the adapter suite's 21 rows until #131 released
+// contrib/dragonboat/test/integration/helpers_test.go. They are gone: 20 sites
+// now route through the adapter's own readFromLeader / tryReadFromLeader, and
+// the twenty-first turned out not to be a conversion at all and took a waiver
+// (linearizable_test.go, the failover-without-warmup loop — it retries
+// IsTempError on a fixed slice, which is wider and differently budgeted than
+// any leader-resolving helper).
 var pendingReadSites = []pendingSite{
-	// #161 — the dragonboat adapter's 21 conversions. They cannot be made
-	// here: the contrib module is a separate module that cannot import the
-	// parent's test/proposer across the NodeHost API boundary (see
-	// integrationRoots), so it needs its own readFromLeader /
-	// tryReadFromLeader beside its proposeToLeader — and
-	// contrib/dragonboat/test/integration/helpers_test.go is owned by #131
-	// while that is open. The dispositions are written down on #161; this
-	// table is only the ratchet that makes the gate notice when they land.
-	{file: "contrib/dragonboat/test/integration/election_test.go", fn: "TestIntegration_DB_PreVoteElection", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/lifecycle_test.go", fn: "TestIntegration_DB_StartReplicaWaitForReadiness", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/linearizable_test.go", fn: "TestIntegration_DB_LinearizableRead_AfterLeaderFailover_NoManualWarmup", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/linearizable_test.go", fn: "TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads", call: "SyncRead", count: 3, issue: 161},
-	{file: "contrib/dragonboat/test/integration/multishard_test.go", fn: "TestIntegration_DB_MultiShard", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/naread_test.go", fn: "TestIntegration_DB_NAReadLocalNode", call: "ReadIndex", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/nodehost_advanced_test.go", fn: "TestIntegration_DB_ConcurrentSMLookup", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/nodehost_advanced_test.go", fn: "TestIntegration_DB_SyncIOAPIs", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/nodehost_test.go", fn: "TestIntegration_DB_ProposeAndRead", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/readindex_advanced_test.go", fn: "TestIntegration_DB_SyncRead_AfterLeaderChange", call: "SyncRead", count: 3, issue: 161},
-	{file: "contrib/dragonboat/test/integration/session_dedup_test.go", fn: "TestIntegration_DB_TrackedSession_Deduplication", call: "SyncRead", count: 2, issue: 161},
-	{file: "contrib/dragonboat/test/integration/session_dedup_test.go", fn: "TestIntegration_DB_TrackedSession_DuplicateRejection", call: "SyncRead", count: 2, issue: 161},
-	{file: "contrib/dragonboat/test/integration/session_test.go", fn: "TestIntegration_DB_NoOPSession", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/statemachine_test.go", fn: "TestIntegration_DB_ConcurrentStateMachine", call: "SyncRead", count: 1, issue: 161},
-	{file: "contrib/dragonboat/test/integration/statemachine_test.go", fn: "TestIntegration_DB_OnDiskStateMachine", call: "SyncRead", count: 1, issue: 161},
-
 	// #162 — syncReadExact in the raft suite's helpers. It is the read twin
 	// of proposer.Pinned: a caller hands it ONE replica and the loop retries
 	// quicraft.Temporary against that replica on purpose, because the
 	// assertion is about that replica's own applied state (Leader
 	// Completeness).
 	//
-	// It is deferred for a reason no other row here has: not a file this
-	// change could not edit, but a disposition that is not this change's to
-	// pick. A waiver records the site as deliberate; growing
+	// It is deferred for a reason unlike #161's, which is why it outlived
+	// them: not a file a change could not edit, but a disposition that is not
+	// a gate installation's to pick. A waiver records the site as deliberate; growing
 	// proposer.TryReadWith and routing it there gives the pinned-retry loop
 	// ONE home the way #96 and #133 gave the propose and election budgets one
 	// home each. Both are defensible, they diverge on where the retry lives

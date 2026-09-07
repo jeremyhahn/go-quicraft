@@ -51,14 +51,9 @@ func TestIntegration_DB_NoOPSession(t *testing.T) {
 		t.Fatalf("session.ShardID = %d, want 1", session.ShardID)
 	}
 
-	// Use the session for SyncPropose through the dragonboat adapter. The read
-	// below is on "the leader", so keep the replica the proposal actually used.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	// Use the session for SyncPropose through the dragonboat adapter.
 	cmd := encodeKVPut("session-key", "session-value")
-	proposal := cluster.proposeToLeader(t, session, cmd, defaultTimeout)
-	leaderHost, result := proposal.Host, proposal.Result
+	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 	if result.Value != uint64(len("session-value")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("session-value"))
 	}
@@ -66,11 +61,9 @@ func TestIntegration_DB_NoOPSession(t *testing.T) {
 	// Verify the entry replicated to all nodes.
 	waitForReplication(t, cluster, trackers, 1, "session-key", "session-value", defaultTimeout)
 
-	// Verify via SyncRead on the leader.
-	readResult, err := leaderHost.SyncRead(ctx, 1, encodeKVGet("session-key"))
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
+	// Verify with a linearizable read. The assertion is on the value, so the
+	// read re-resolves rather than pinning the replica that took the proposal.
+	readResult := cluster.readFromLeader(t, 1, encodeKVGet("session-key"), defaultTimeout)
 	val, ok := readResult.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", readResult)

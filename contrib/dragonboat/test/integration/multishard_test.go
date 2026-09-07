@@ -17,7 +17,6 @@
 package integration_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 )
@@ -111,20 +110,13 @@ func TestIntegration_DB_MultiShard(t *testing.T) {
 	}
 	t.Logf("shard independence verified: shard 1 and shard 2 data are completely isolated")
 
-	// Cross-verify via SyncRead that each shard only sees its own data.
+	// Cross-verify with a linearizable read that each shard only sees its own
+	// data. The leader is resolved PER READ and per shard: findLeader once per
+	// shard was a value taken before a loop long enough to outlive it, and the
+	// two shards elect independently.
 	for shardID, expected := range map[uint64]map[string]string{1: shard1Expected, 2: shard2Expected} {
-		leaderIdx := cluster.findLeader(shardID)
-		if leaderIdx < 0 {
-			t.Fatalf("no leader for shard %d during cross-verify", shardID)
-		}
-		leaderHost := cluster.hosts[leaderIdx]
 		for key, wantVal := range expected {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			result, readErr := leaderHost.SyncRead(ctx, shardID, encodeKVGet(key))
-			cancel()
-			if readErr != nil {
-				t.Fatalf("SyncRead shard=%d key=%q failed: %v", shardID, key, readErr)
-			}
+			result := cluster.readFromLeader(t, shardID, encodeKVGet(key), defaultTimeout)
 			gotVal, ok := result.(string)
 			if !ok {
 				t.Fatalf("SyncRead shard=%d key=%q returned type %T, want string", shardID, key, result)

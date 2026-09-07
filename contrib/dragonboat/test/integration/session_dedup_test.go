@@ -80,13 +80,10 @@ func TestIntegration_DB_TrackedSession_Deduplication(t *testing.T) {
 		t.Fatalf("first result.Value = %d, want %d", result1.Value, len("dedup-val1"))
 	}
 
-	// Read back the first entry via SyncRead.
-	read1Ctx, read1Cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer read1Cancel()
-	readResult1, read1Err := leaderHost.SyncRead(read1Ctx, 1, encodeKVGet("dedup-key1"))
-	if read1Err != nil {
-		t.Fatalf("first SyncRead failed: %v", read1Err)
-	}
+	// Read back the first entry. The PROPOSALS in this test stay pinned --
+	// deduplication is what is under test and re-proposing would change the
+	// subject -- but a read asserts only on the value and re-resolves.
+	readResult1 := cluster.readFromLeader(t, 1, encodeKVGet("dedup-key1"), defaultTimeout)
 	val1, ok := readResult1.(string)
 	if !ok {
 		t.Fatalf("first SyncRead returned type %T, want string", readResult1)
@@ -123,12 +120,7 @@ func TestIntegration_DB_TrackedSession_Deduplication(t *testing.T) {
 	}
 
 	// Read back the second entry.
-	read2Ctx, read2Cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer read2Cancel()
-	readResult2, read2Err := leaderHost.SyncRead(read2Ctx, 1, encodeKVGet("dedup-key2"))
-	if read2Err != nil {
-		t.Fatalf("second SyncRead failed: %v", read2Err)
-	}
+	readResult2 := cluster.readFromLeader(t, 1, encodeKVGet("dedup-key2"), defaultTimeout)
 	val2, ok := readResult2.(string)
 	if !ok {
 		t.Fatalf("second SyncRead returned type %T, want string", readResult2)
@@ -248,13 +240,10 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	}
 
 	// Verify the second key was NOT written (the duplicate should not
-	// have applied the different command).
-	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer readCancel()
-	readResult, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet("dup-reject-key2"))
-	if readErr != nil {
-		t.Fatalf("SyncRead for dup key failed: %v", readErr)
-	}
+	// have applied the different command). The proposals above stay pinned
+	// because the SERIES ID is the subject; this read is not, so it resolves
+	// the leader.
+	readResult := cluster.readFromLeader(t, 1, encodeKVGet("dup-reject-key2"), defaultTimeout)
 	val, ok := readResult.(string)
 	if ok && val == "dup-reject-val2" {
 		// If the duplicate wrote a different value, that is a violation
@@ -291,12 +280,7 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	t.Logf("post-advance proposal succeeded with SeriesID=%d", seriesAfter)
 
 	// Verify the post-advance entry was written.
-	read3Ctx, read3Cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer read3Cancel()
-	readResult3, read3Err := leaderHost.SyncRead(read3Ctx, 1, encodeKVGet("dup-post-key"))
-	if read3Err != nil {
-		t.Fatalf("SyncRead for post-advance key failed: %v", read3Err)
-	}
+	readResult3 := cluster.readFromLeader(t, 1, encodeKVGet("dup-post-key"), defaultTimeout)
 	val3, ok3 := readResult3.(string)
 	if !ok3 || val3 != "dup-post-val" {
 		t.Fatalf("post-advance SyncRead = %q, want %q", val3, "dup-post-val")

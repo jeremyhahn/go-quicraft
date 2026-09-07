@@ -17,7 +17,6 @@
 package integration_test
 
 import (
-	"context"
 	"testing"
 
 	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
@@ -103,15 +102,10 @@ func TestIntegration_DB_PreVoteElection(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "prevote-key", "prevote-value")
 	waitForReplication(t, cluster, trackers, 1, "prevote-key", "prevote-value", defaultTimeout)
 
-	// Verify linearizable read round-trip works with PreVote enabled.
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	result, err := leaderHost.SyncRead(ctx, 1, encodeKVGet("prevote-key"))
-	if err != nil {
-		t.Fatalf("SyncRead with PreVote enabled failed: %v", err)
-	}
+	// Verify linearizable read round-trip works with PreVote enabled. The
+	// subject is the round-trip, not a particular replica, so the read
+	// re-resolves rather than pinning the leader observed above.
+	result := cluster.readFromLeader(t, 1, encodeKVGet("prevote-key"), defaultTimeout)
 	val, ok := result.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", result)

@@ -119,7 +119,7 @@ func deleteTwo() configChange {
 	return configChange{kind: deleteReplica, shardID: 1, replicaID: 2, configChangeID: 7}
 }
 
-// helperBudget is generous for a loop that never sleeps past proposeRetryInterval
+// helperBudget is generous for a loop that never sleeps past leaderRetryInterval
 // between attempts and short enough that the exhaustion tests stay quick.
 const helperBudget = 3 * time.Second
 

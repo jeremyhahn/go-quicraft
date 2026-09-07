@@ -47,17 +47,12 @@ func TestIntegration_DB_ProposeAndRead(t *testing.T) {
 	verifyAllData(t, cluster, trackers, 1, expected)
 	t.Logf("all 10 entries replicated to 3 nodes via dragonboat adapter")
 
-	// Perform a linearizable SyncRead from the leader.
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
+	// Perform a linearizable read from whichever replica leads shard 1 NOW.
+	// leaderIdx was true when waitForClusterLeader returned it and is not a
+	// pin: the assertion here is about the VALUE, so the read re-resolves.
 	targetKey := "db-rw-005"
 	expectedValue := expected[targetKey]
-	result, err := leaderHost.SyncRead(ctx, 1, encodeKVGet(targetKey))
-	if err != nil {
-		t.Fatalf("SyncRead(%q) failed: %v", targetKey, err)
-	}
+	result := cluster.readFromLeader(t, 1, encodeKVGet(targetKey), defaultTimeout)
 
 	val, ok := result.(string)
 	if !ok {

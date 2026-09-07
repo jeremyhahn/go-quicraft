@@ -152,15 +152,11 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "post-leader-change", "new-value")
 	t.Logf("post-failover entry proposed")
 
-	// Verify linearizable reads of old entries on the new leader.
-	newLeaderHost := cluster.hosts[newLeaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	oldResult, oldErr := newLeaderHost.SyncRead(ctx, 1, encodeKVGet("pre-leader-change"))
-	if oldErr != nil {
-		t.Fatalf("SyncRead of old entry after leader change failed: %v", oldErr)
-	}
+	// Verify linearizable reads of the pre-failover entries. What is under test
+	// is that the DATA survived the leadership change, not which replica serves
+	// it -- and with one node stopped the surviving two can elect again, so
+	// newLeaderIdx is a snapshot and each read re-resolves.
+	oldResult := cluster.readFromLeader(t, 1, encodeKVGet("pre-leader-change"), defaultTimeout)
 	oldVal, ok := oldResult.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", oldResult)
@@ -171,12 +167,7 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 	t.Logf("old entry readable after leader change: %q = %q", "pre-leader-change", oldVal)
 
 	// Verify linearizable reads of old entry #2.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel2()
-	oldResult2, oldErr2 := newLeaderHost.SyncRead(ctx2, 1, encodeKVGet("pre-leader-change-2"))
-	if oldErr2 != nil {
-		t.Fatalf("SyncRead of old entry 2 after leader change failed: %v", oldErr2)
-	}
+	oldResult2 := cluster.readFromLeader(t, 1, encodeKVGet("pre-leader-change-2"), defaultTimeout)
 	oldVal2, ok2 := oldResult2.(string)
 	if !ok2 {
 		t.Fatalf("SyncRead returned type %T, want string", oldResult2)
@@ -187,12 +178,7 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 	t.Logf("old entry 2 readable after leader change: %q = %q", "pre-leader-change-2", oldVal2)
 
 	// Verify linearizable reads of the new entry.
-	ctx3, cancel3 := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel3()
-	newResult, newErr := newLeaderHost.SyncRead(ctx3, 1, encodeKVGet("post-leader-change"))
-	if newErr != nil {
-		t.Fatalf("SyncRead of new entry after leader change failed: %v", newErr)
-	}
+	newResult := cluster.readFromLeader(t, 1, encodeKVGet("post-leader-change"), defaultTimeout)
 	newVal, ok3 := newResult.(string)
 	if !ok3 {
 		t.Fatalf("SyncRead returned type %T, want string", newResult)

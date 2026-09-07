@@ -17,7 +17,6 @@
 package integration_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -36,11 +35,13 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("concurrent SM cluster leader at node[%d]", leaderIdx)
 
-	// Warmup entry required after election (PhD 6.4). The SyncRead pass at the
-	// end reads back from the replica that accepted it, so keep that host.
+	// Warmup entry required after election (PhD 6.4). The read pass at the end
+	// used to be pinned to the replica that accepted this entry, because a
+	// direct SyncRead had no better target; it re-resolves now, so the host is
+	// no longer kept.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("warmup", "ok")
-	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
+	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
 
 	// Wait for warmup to replicate to all concurrent SMs.
 	for i := range cluster.hosts {
@@ -87,14 +88,11 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 		}
 	}
 
-	// Verify via SyncRead through the adapter.
+	// Verify via a linearizable read through the adapter. Each key is read
+	// from whichever replica leads at that moment: the assertion is on the
+	// VALUE, and this loop is long enough for an election to fall inside it.
 	for key, expectedVal := range expected {
-		readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		result, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet(key))
-		readCancel()
-		if readErr != nil {
-			t.Fatalf("SyncRead(%q) failed: %v", key, readErr)
-		}
+		result := cluster.readFromLeader(t, 1, encodeKVGet(key), defaultTimeout)
 		val, ok := result.(string)
 		if !ok {
 			t.Fatalf("SyncRead(%q) returned type %T, want string", key, result)
@@ -119,11 +117,13 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	t.Logf("on-disk SM cluster leader at node[%d]", leaderIdx)
 
-	// Warmup entry required after election (PhD 6.4). The SyncRead pass at the
-	// end reads back from the replica that accepted it, so keep that host.
+	// Warmup entry required after election (PhD 6.4). The read pass at the end
+	// used to be pinned to the replica that accepted this entry, because a
+	// direct SyncRead had no better target; it re-resolves now, so the host is
+	// no longer kept.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("warmup", "ok")
-	leaderHost := cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout).Host
+	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
 
 	// Wait for warmup to replicate to all on-disk SMs.
 	for i := range cluster.hosts {
@@ -170,14 +170,11 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 		}
 	}
 
-	// Verify via SyncRead through the adapter.
+	// Verify via a linearizable read through the adapter. Each key is read
+	// from whichever replica leads at that moment: the assertion is on the
+	// VALUE, and this loop is long enough for an election to fall inside it.
 	for key, expectedVal := range expected {
-		readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-		result, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet(key))
-		readCancel()
-		if readErr != nil {
-			t.Fatalf("SyncRead(%q) failed: %v", key, readErr)
-		}
+		result := cluster.readFromLeader(t, 1, encodeKVGet(key), defaultTimeout)
 		val, ok := result.(string)
 		if !ok {
 			t.Fatalf("SyncRead(%q) returned type %T, want string", key, result)

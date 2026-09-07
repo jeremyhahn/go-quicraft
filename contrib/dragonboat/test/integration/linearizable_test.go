@@ -260,10 +260,28 @@ func TestIntegration_DB_LinearizableRead_AfterLeaderFailover_NoManualWarmup(t *t
 	// commits — the defect this test exists to catch — every attempt returns
 	// a temporary error until the deadline expires and the test still fails,
 	// it just spends its whole budget first instead of failing instantly.
+	// This loop is the leader-resolving helper's job done differently ON
+	// PURPOSE, and readFromLeader cannot do it.
+	//
+	// Two things here are not what tryReadFromLeader provides. Its retry
+	// predicate is dragonboat.IsTempError, deliberately WIDER than
+	// isNotLeaderRejection, because the condition being waited out is the
+	// no-op's replication round rather than a leadership change. And each
+	// attempt gets a FIXED 2s slice of the failover budget, where driveToLeader
+	// hands an attempt everything left on the deadline -- one read that hangs
+	// would then swallow the whole budget instead of being retried every 2s,
+	// which is the load-sensitivity this loop was rewritten to remove.
+	//
+	// Re-resolving would also be beside the point: the assertion is that a
+	// replica which has JUST become leader serves a read with no manual warmup,
+	// so the newly elected leader is the subject.
 	newLeaderHost := cluster.hosts[newLeaderIdx]
 	deadline := time.Now().Add(failoverTimeout)
 	for {
 		readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		//quicraft:direct-read the newly elected leader IS the subject, and this
+		// loop retries IsTempError on a fixed 2s slice, which driveToLeader does
+		// not do -- see the block above this loop
 		result, err := newLeaderHost.SyncRead(readCtx, shardID, encodeKVGet("failover-key"))
 		readCancel()
 
@@ -313,19 +331,17 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// Warmup entry required after election (PhD 6.4).
 	proposeAndWait(t, cluster, trackers, shardID, "warmup", "ok")
 
-	// Seed the initial value so reads never see an empty string. The reader
-	// below polls the replica that accepted the seed, so take it from the
-	// proposal rather than from leaderIdx.
+	// Seed the initial value so reads never see an empty string.
 	session := dbClient.NewNoOPSession(shardID, nil)
-	leaderHost := cluster.proposeToLeader(t, session, encodeKVPut("counter", "0"), defaultTimeout).Host
+	cluster.proposeToLeader(t, session, encodeKVPut("counter", "0"), defaultTimeout)
 
-	// Wait for the seed to be readable via SyncRead before starting the
-	// concurrent phase. This ensures the test does not fail due to the
-	// initial entry not yet being applied.
-	waitForCondition(t, defaultTimeout, "seed value readable via SyncRead", func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		result, err := leaderHost.SyncRead(ctx, shardID, encodeKVGet("counter"))
+	// Wait for the seed to be readable before starting the concurrent phase, so
+	// the test does not fail on the initial entry not yet being applied.
+	// tryReadFromLeader, not readFromLeader: a t.Fatal inside a
+	// waitForCondition predicate would report the first not-yet-applied poll as
+	// a failure instead of polling again.
+	waitForCondition(t, defaultTimeout, "seed value readable", func() bool {
+		result, err := cluster.tryReadFromLeader(shardID, encodeKVGet("counter"), 2*time.Second)
 		if err != nil {
 			return false
 		}
@@ -479,9 +495,15 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 			default:
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			result, err := leaderHost.SyncRead(ctx, shardID, encodeKVGet("counter"))
-			cancel()
+			// tryReadFromLeader, not a pinned SyncRead: the reader used to
+			// poll the replica that accepted the seed, so every leadership
+			// move turned into a run of counted errors that said nothing
+			// about linearizability. It must be the Try form -- this is a
+			// goroutine and must not touch t. The counters below stay
+			// meaningful: what the helper absorbs is the not-leader refusal,
+			// which was never evidence of a defect, and everything that IS
+			// still reaches them.
+			result, err := cluster.tryReadFromLeader(shardID, encodeKVGet("counter"), 5*time.Second)
 
 			if err != nil {
 				// Transient errors during concurrent writes are expected, but
@@ -643,12 +665,7 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// A final linearizable read after the writer has stopped must return the
 	// settled counter: at least the highest value already observed, and never
 	// a value the writer never proposed.
-	finalCtx, finalCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer finalCancel()
-	finalResult, finalErr := leaderHost.SyncRead(finalCtx, shardID, encodeKVGet("counter"))
-	if finalErr != nil {
-		t.Fatalf("final SyncRead after the concurrent phase failed: %v", finalErr)
-	}
+	finalResult := cluster.readFromLeader(t, shardID, encodeKVGet("counter"), defaultTimeout)
 	finalVal, ok := finalResult.(string)
 	if !ok {
 		t.Fatalf("final SyncRead returned type %T, want string", finalResult)

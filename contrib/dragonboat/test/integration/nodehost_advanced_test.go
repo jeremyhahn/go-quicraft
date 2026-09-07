@@ -42,25 +42,19 @@ func TestIntegration_DB_SyncIOAPIs(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
 	session := dbClient.NewNoOPSession(1, nil)
 
-	// Propose. The read below is the other half of the round trip and must go to
-	// the replica that accepted the entry, so take the host from the proposal.
+	// Propose. The read below is the other half of the round trip; it is
+	// linearizable, so it re-resolves rather than pinning the replica the
+	// proposal happened to use.
 	cmd := encodeKVPut("sync-key", "sync-value")
-	proposal := cluster.proposeToLeader(t, session, cmd, defaultTimeout)
-	leaderHost, result := proposal.Host, proposal.Result
+	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
 	if result.Value != uint64(len("sync-value")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("sync-value"))
 	}
 
 	// Read.
-	readResult, readErr := leaderHost.SyncRead(ctx, 1, encodeKVGet("sync-key"))
-	if readErr != nil {
-		t.Fatalf("SyncRead failed: %v", readErr)
-	}
+	readResult := cluster.readFromLeader(t, 1, encodeKVGet("sync-key"), defaultTimeout)
 	val, ok := readResult.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", readResult)
@@ -84,9 +78,9 @@ func TestIntegration_DB_ConcurrentSMLookup(t *testing.T) {
 
 	session := dbClient.NewNoOPSession(1, nil)
 
-	// Warmup entry. The SyncRead at the end of the test reads back from the
-	// replica that accepted it, so keep the host the proposal actually used.
-	leaderHost := cluster.proposeToLeader(t, session, encodeKVPut("warmup", "ok"), defaultTimeout).Host
+	// Warmup entry. The read at the end re-resolves, so the accepting replica
+	// is not kept.
+	cluster.proposeToLeader(t, session, encodeKVPut("warmup", "ok"), defaultTimeout)
 	for i := range cluster.hosts {
 		if cluster.stopped[i].Load() || concTrackers[i] == nil {
 			continue
@@ -109,13 +103,9 @@ func TestIntegration_DB_ConcurrentSMLookup(t *testing.T) {
 		cluster.proposeToLeader(t, session, cmd, defaultTimeout)
 	}
 
-	// Verify via SyncRead (exercises the Lookup path on concurrent SM).
-	readCtx, readCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer readCancel()
-	result, readErr := leaderHost.SyncRead(readCtx, 1, encodeKVGet("conc-lookup-005"))
-	if readErr != nil {
-		t.Fatalf("SyncRead failed: %v", readErr)
-	}
+	// Verify with a linearizable read (exercises the Lookup path on the
+	// concurrent SM).
+	result := cluster.readFromLeader(t, 1, encodeKVGet("conc-lookup-005"), defaultTimeout)
 	val, ok := result.(string)
 	if !ok {
 		t.Fatalf("SyncRead returned type %T, want string", result)

@@ -46,15 +46,17 @@ func TestIntegration_DB_NAReadLocalNode(t *testing.T) {
 	waitForReplication(t, cluster, trackers, 1, "naread-key", "naread-value", defaultTimeout)
 
 	// First, get a valid ReadIndex RequestState so we have a real rs to pass.
-	leaderHost := cluster.hosts[leaderIdx]
-	rs, err := leaderHost.ReadIndex(1, defaultTimeout)
-	if err != nil {
-		t.Fatalf("ReadIndex failed: %v", err)
-	}
-	defer rs.Release()
+	// The ReadIndex itself is leader-bound and would be refused after an
+	// election, which has nothing to do with what this test asserts, so it
+	// resolves the leader instead of pinning leaderIdx. NAReadLocalNode is
+	// then called on the replica that ACCEPTED the request: it is a local
+	// read against that node's own state machine, so the rs and the host it
+	// is presented to must be the same one.
+	ri := cluster.readIndexFromLeader(t, 1, defaultTimeout)
+	defer ri.RS.Release()
 
 	// Call NAReadLocalNode which should return ErrNotImplemented.
-	_, naErr := leaderHost.NAReadLocalNode(rs, encodeKVGet("naread-key"))
+	_, naErr := ri.Host.NAReadLocalNode(ri.RS, encodeKVGet("naread-key"))
 	if naErr == nil {
 		t.Fatal("NAReadLocalNode should return an error (ErrNotImplemented)")
 	}
