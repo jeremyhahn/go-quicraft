@@ -992,10 +992,41 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// compressed bytes to the state machine.
 	compression := node.cfg.SnapshotCompressionType
 	ctx := context.Background()
+
+	// SEAL AS WE WRITE (#116). The state machine's bytes reach the barrier
+	// before they reach the disk, so no plaintext state machine is ever durable
+	// under the canonical snapshot.dat.
+	//
+	// The previous form wrote the state machine in the clear, fsynced it, and
+	// encrypted in place afterwards. Between that fsync and the rename a
+	// COMPLETE PLAINTEXT STATE MACHINE was on disk under the name every
+	// consumer, backup and operator reads: measured live at 206ms and 461ms
+	// under load, and PERMANENT after a kill in the window, because the
+	// directory is then left with snapshot.dat and no snapshot.meta and the
+	// deferred discard guard never runs. This is the receive path's shape
+	// (messagehandler.go), which never had the window for the same reason.
+	//
+	// The on-disk frame layout is UNCHANGED -- same frames, same AAD, same
+	// per-frame epoch -- so no format version moves and nothing needs
+	// migrating; encryptSnapshotFile, which the recovery, import and
+	// re-encryption paths still use, now drives the same writer.
+	//
+	// A nil barrier is the configured plaintext deployment and writes straight
+	// to the file, exactly as the receive path copies through for a nil
+	// barrier. There is nothing to seal with and nothing to leak.
+	//
+	// ORDER: state machine -> snappy -> frame writer -> file. Compression comes
+	// first because ciphertext does not compress, which is also the order the
+	// two-step form produced.
 	var w io.Writer = f
+	var frameW *snapshotFrameWriter
+	if barrier != nil {
+		frameW = newSnapshotFrameWriter(f, barrier, req.shardID, req.replicaID, snapshotIndex)
+		w = frameW
+	}
 	var snappyW *snappy.Writer
 	if compression == config.Snappy {
-		snappyW = snappy.NewBufferedWriter(f)
+		snappyW = snappy.NewBufferedWriter(w)
 		w = snappyW
 	}
 	// Use the gated save when available (rsm.StateMachine) so the apply gate is
@@ -1025,11 +1056,40 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 	// Flush the Snappy writer to ensure all compressed data reaches
-	// the underlying file before fsync.
+	// the frame writer (and through it the file) before fsync.
 	if snappyW != nil {
 		if err := snappyW.Close(); err != nil {
+			if frameW != nil {
+				frameW.ReleasePins()
+			}
 			if closeErr := f.Close(); closeErr != nil {
 				slog.Debug("snapshot: file close failed after snappy flush error",
+					"shard_id", req.shardID,
+					"replica_id", req.replicaID,
+					"path", dataPath,
+					"error", closeErr,
+				)
+			}
+			return 0, &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      true,
+				Err:       err,
+			}
+		}
+	}
+
+	// Emit the trailing partial frame. Everything the state machine wrote is
+	// sealed by the time this returns, and only then is anything fsynced.
+	//
+	// A barrier SEALED mid-artifact fails here or in an earlier frame, and it
+	// fails with no plaintext artifact in existence -- which is what the old
+	// post-write re-check was reaching for and could not achieve, because by
+	// the time it ran the plaintext was already fsynced.
+	if frameW != nil {
+		if err := frameW.Close(); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				slog.Debug("snapshot: file close failed after frame flush error",
 					"shard_id", req.shardID,
 					"replica_id", req.replicaID,
 					"path", dataPath,
@@ -1121,55 +1181,36 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
-	// Encrypt the snapshot data file in-place when a barrier is configured.
-	// The recorded epoch is the MINIMUM epoch across all encrypted frames
-	// (returned by encryptSnapshotFile), not a post-hoc CurrentEpoch() read.
-	// A key rotation can run concurrently on a separate goroutine, so frames
-	// written before the rotation are sealed at epoch E and frames after at
-	// E+1; recording the min guarantees the global DEK-purge floor never
-	// purges a DEK any retained frame still needs. As defense-in-depth,
-	// RegisterInFlightEpoch pins the epoch live at save start so a concurrent
-	// purge cannot remove it mid-save; the deregister runs after encryption.
+	// The artifact is ALREADY sealed: the frame writer above encrypted every
+	// byte on its way to the file, so there is no separate encrypt step and
+	// never was a plaintext file to replace (#116).
 	//
-	// The data file on disk is PLAINTEXT until encryptSnapshotFile replaces
-	// it, so the deferred discard guard above covers this whole span: leaving
-	// the directory behind would strand exactly the plaintext artifact this
-	// branch exists to prevent.
+	// The recorded epoch is the MINIMUM epoch across all frames, not a post-hoc
+	// CurrentEpoch() read. A key rotation can run concurrently on a separate
+	// goroutine, so frames written before it are sealed at epoch E and frames
+	// after at E+1; recording the min guarantees the global DEK-purge floor
+	// never purges a DEK any retained frame still needs.
+	//
+	// The pins cover EVERY epoch a frame was sealed under, and are held until
+	// saveSnapshot returns — past the metadata-file and LogDB snapshot-record
+	// writes below — so a concurrent rotate+purge cannot remove any frame's DEK
+	// in the window before the recorded epoch becomes durable and visible to
+	// the snapshot-floor scan. Pinning every epoch, not just the minimum,
+	// closes the intermediate-frame-epoch gap a mid-artifact rotation opens.
+	//
+	// There is no seal re-check here any more. The old one ran AFTER the
+	// plaintext was fsynced, so it could not prevent what it was checking for;
+	// a seal landing mid-artifact now fails inside the frame writer, with no
+	// artifact in existence to leak.
 	var epoch uint64
-	if barrier != nil {
-		// Re-check: an operator seal (EmergencySeal) can land between the
-		// entry check and here, after the plaintext data file was written.
-		if barrier.IsSealed() {
-			return 0, &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      true,
-				Err:       ErrSnapshotBarrierSealed,
-			}
-		}
-		// encryptSnapshotFile pins EVERY epoch it seals a frame under (before and
-		// after each seal) and returns the set. Hold those pins until saveSnapshot
-		// returns — past the metadata-file and LogDB snapshot-record writes below —
-		// so a concurrent rotate+purge cannot remove any frame's DEK in the window
-		// before the snapshot's recorded epoch becomes durable and visible to the
-		// snapshot-floor scan. Pinning every epoch (not just the pre-read) closes
-		// the intermediate-frame-epoch gap a mid-loop rotation opens.
-		minEpoch, encPins, encryptErr := p.encryptSnapshotFile(
-			dataPath, req.shardID, req.replicaID, snapshotIndex, barrier)
+	if frameW != nil {
+		framePins := frameW.Epochs()
 		defer func() {
-			for _, e := range encPins {
+			for _, e := range framePins {
 				barrier.DeregisterInFlightEpoch(e)
 			}
 		}()
-		if encryptErr != nil {
-			return 0, &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      true,
-				Err:       encryptErr,
-			}
-		}
-		epoch = minEpoch
+		epoch = frameW.MinEpoch()
 	}
 
 	// Write snapshot metadata file (includes epoch for encrypted snapshots).
@@ -1873,58 +1914,37 @@ func (p *snapshotPool) encryptSnapshotFile(path string, shardID, replicaID, inde
 		}
 	}()
 
-	// Encrypt in chunks to bound memory usage. Track the minimum epoch used
-	// across all frames: a concurrent rotation can advance the barrier epoch
-	// between chunks, so EncryptWithEpoch returns the epoch each frame was
-	// sealed with and minEpoch records the lowest. The caller persists
-	// minEpoch as the snapshot's Epoch so the DEK-purge floor protects every
-	// frame. minEpoch stays 0 for an empty file (no frames), which the caller
-	// treats as a plaintext/unencrypted snapshot.
-	chunkBuf := make([]byte, snapshotEncryptChunkSize)
-	var frameBuf [4]byte
-	var minEpoch uint64
-	// Pin EVERY epoch a frame is sealed under, not just the minimum, so a
-	// concurrent rotation + PurgeEpochsBefore cannot orphan an INTERMEDIATE frame
-	// epoch's DEK (which the min-only record left exposed once two rotations
-	// landed mid-loop), leaving the snapshot undecryptable. The returned set is
-	// released by the caller AFTER the snapshot's epoch is durably recorded.
-	pins := newEpochPinner(barrier)
+	// Sealing and framing are snapshotFrameWriter's, not a second copy of them
+	// here (#116). It bounds memory to one chunk, tracks the minimum epoch
+	// across frames — a concurrent rotation can advance the barrier between
+	// chunks, and the recorded epoch has to be the lowest so the DEK-purge
+	// floor never drops a key a retained frame still needs — and pins EVERY
+	// epoch it seals under, not just that minimum, so a rotation landing
+	// mid-artifact cannot leave an intermediate frame's DEK unprotected. The
+	// pins are released by the CALLER, after the epoch is durably recorded.
+	//
+	// minEpoch stays 0 for an empty source (no frames), which the caller reads
+	// the same way it reads a plaintext artifact.
+	fw := newSnapshotFrameWriter(tmpFile, barrier, shardID, replicaID, index)
 	encErrOf := func(op string, e error) error {
-		pins.releaseAll()
+		fw.ReleasePins()
 		return &SnapshotEncryptError{Op: op, Err: e}
 	}
-	// One builder for the whole artifact; Frame stamps the ordinal into its
-	// reused scratch buffer, so the AAD costs no per-frame allocation.
-	aad := NewSnapshotAAD(shardID, replicaID, index, barrier)
-	var seq uint64
-	for {
-		n, readErr := srcFile.Read(chunkBuf)
-		if n > 0 {
-			encrypted, frameEpoch, encErr := pins.sealFrame(chunkBuf[:n], aad.Frame(seq))
-			if encErr != nil {
-				return 0, nil, encErrOf("encrypt", encErr)
-			}
-			seq++
-			if minEpoch == 0 || frameEpoch < minEpoch {
-				minEpoch = frameEpoch
-			}
-
-			// Write frame: 4-byte little-endian length + encrypted data.
-			binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(encrypted)))
-			if _, err := tmpFile.Write(frameBuf[:]); err != nil {
-				return 0, nil, encErrOf("write_frame", err)
-			}
-			if _, err := tmpFile.Write(encrypted); err != nil {
-				return 0, nil, encErrOf("write_data", err)
-			}
+	if _, copyErr := io.Copy(fw, srcFile); copyErr != nil {
+		// A sealing or destination-write failure has already released the pins
+		// and comes back as a *SnapshotEncryptError naming its own op; only a
+		// source read error still needs the release encErrOf performs.
+		var already *SnapshotEncryptError
+		if errors.As(copyErr, &already) {
+			return 0, nil, copyErr
 		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return 0, nil, encErrOf("read", readErr)
-		}
+		return 0, nil, encErrOf("read", copyErr)
 	}
+	if closeErr := fw.Close(); closeErr != nil {
+		return 0, nil, closeErr
+	}
+	minEpoch := fw.MinEpoch()
+	pins := fw.Epochs()
 
 	// Fsync before rename to guarantee durability.
 	if err := tmpFile.Sync(); err != nil {
@@ -1947,7 +1967,7 @@ func (p *snapshotPool) encryptSnapshotFile(path string, shardID, replicaID, inde
 	if err := SyncDir(dir); err != nil {
 		return 0, nil, encErrOf("sync_dir", err)
 	}
-	return minEpoch, pins.epochs(), nil
+	return minEpoch, pins, nil
 }
 
 // decryptSnapshotToSibling reads the encrypted snapshot data file and writes
