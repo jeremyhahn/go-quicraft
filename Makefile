@@ -1258,7 +1258,7 @@ remote-tools:
 	@# verification failed" until the host key is known -- an error that reads
 	@# like a missing repository rather than a missing known_hosts entry.
 	@$(OMEGA_SSH) 'mkdir -p $$HOME/.ssh && chmod 700 $$HOME/.ssh; \
-		for hk in "-p 2222 198.51.100.91" "github.com"; do \
+		for hk in "-p 2222 198.51.100.50" "github.com"; do \
 			ssh-keyscan $$hk 2>/dev/null >> $$HOME/.ssh/known_hosts; \
 		done; \
 		sort -u $$HOME/.ssh/known_hosts -o $$HOME/.ssh/known_hosts; \

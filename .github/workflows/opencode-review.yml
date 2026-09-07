@@ -80,6 +80,12 @@ jobs:
           GITEA_CODEX_TOKEN: ${{ secrets.OPENCODE_BOT_TOKEN }}
           REVIEW_BOT_USER: opencode
           REVIEW_ENGINE: qwen
+          # 198.51.100.91 is gpu-host, the GPU host, and is DELIBERATELY not the
+          # Gitea address. Gitea moved to 198.51.100.50 on 2026-09-07; Ollama
+          # did not move with it. The two services shared a host until then, so
+          # a sweep that repoints "the old address" will break this job while
+          # every Gitea reference around it looks consistent. GITEA_URL above is
+          # github.server_url and follows the server on its own.
           OLLAMA_URL: http://198.51.100.91:11434
           OLLAMA_MODEL: >-
             ${{ contains(github.event.pull_request.labels.*.name, 'model:qwen-122b') && 'qwen3.5:122b'
