@@ -2099,14 +2099,6 @@ func (e *configChangeExhaustedError) Unwrap() error { return e.last }
 // retried, and it must never arm the submission bit.
 var errNoLeaderObserved = errors.New("integration: no live replica reports leadership")
 
-// leaderTransferInProgress is the text of the engine's raft.ErrTransferInProgress,
-// which handleLeaderPropose returns for EVERY proposal, config changes
-// included, while a leadership transfer is in flight. translateError has no
-// mapping for it, so it reaches a test wrapped in AdapterError and can only be
-// matched by text (#146 asks for the mapping). It is produced before the entry
-// enters the log, so it is retryable and never a submission.
-const leaderTransferInProgress = "transfer in progress"
-
 // configChangeMaybeSubmitted reports whether err could have been produced
 // AFTER the change was delivered to Raft, so the entry may still commit.
 //
@@ -2152,6 +2144,17 @@ var configChangeRetryableSentinels = [...]error{
 	dragonboat.ErrTimeout,
 	dragonboat.ErrRejected,
 	errNoLeaderObserved,
+	// A leadership transfer is in flight; it clears when the transfer
+	// completes or times out, and it is produced before the entry enters the
+	// log, so it is never a submission.
+	//
+	// It is the QUICRAFT sentinel, not a dragonboat one, and that is the whole
+	// point: translateError has no mapping for it, so it arrives wrapped in
+	// *AdapterError -- whose Unwrap returns the quicraft error, which
+	// errors.Is walks. Until #146 re-exported it there was nothing importable
+	// to compare against and this was a strings.Contains on "transfer in
+	// progress".
+	quicraft.ErrTransferInProgress,
 }
 
 // configChangeRetryable reports whether one more attempt at a membership
@@ -2165,7 +2168,7 @@ func configChangeRetryable(err error) bool {
 			return true
 		}
 	}
-	return strings.Contains(err.Error(), leaderTransferInProgress)
+	return false
 }
 
 // driveConfigChange runs attempt until cc is in effect, the budget runs out,
@@ -2418,7 +2421,7 @@ func (c *dbTestCluster) transferLeadershipTo(t *testing.T, shardID, targetReplic
 				if err == nil {
 					t.Logf("transfer request %d to replica %d accepted by node[%d] at %v",
 						requests, targetReplicaID, idx, time.Since(started).Round(time.Millisecond))
-				} else if isNotLeaderRejection(err) || strings.Contains(err.Error(), leaderTransferInProgress) {
+				} else if isNotLeaderRejection(err) || errors.Is(err, quicraft.ErrTransferInProgress) {
 					lastRefusal = err
 				} else {
 					t.Fatalf("RequestLeaderTransfer(shard=%d, target=%d) on node[%d] failed: %v",

@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -851,8 +850,10 @@ func isTransientLeadershipError(err error) bool {
 		return true
 	}
 	// Leadership transfer in progress is transient — it clears after
-	// the transfer completes or the election timeout expires.
-	if strings.Contains(err.Error(), "transfer in progress") {
+	// the transfer completes or the election timeout expires. Matched by
+	// sentinel since #146 re-exported it; it was a substring match on the
+	// error text while the engine's error was internal and unmatchable.
+	if errors.Is(err, quicraft.ErrTransferInProgress) {
 		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {

@@ -394,7 +394,12 @@ func TestIsRetryable(t *testing.T) {
 		{"pending config change", quicraft.ErrRejected, true},
 		{"context deadline", context.DeadlineExceeded, true},
 		{"context canceled", context.Canceled, true},
-		{"leadership transfer in progress", errors.New("raft: leadership transfer in progress"), true},
+		// The real sentinel, not a look-alike built from the same text. It was
+		// errors.New(...) while the engine's error was internal and
+		// unmatchable; since #146 re-exported it, IsRetryable matches by
+		// sentinel and a fixture that only LOOKS like a transfer refusal is
+		// correctly not retried.
+		{"leadership transfer in progress", quicraft.ErrTransferInProgress, true},
 		{"already exists", quicraftAlreadyExists(), false},
 		{"not found", quicraftNodeNotFound(), false},
 		{"last voter", quicraft.ErrRemoveLastVoter, false},

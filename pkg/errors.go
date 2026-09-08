@@ -379,6 +379,25 @@ var (
 	// ErrEmptyAddress is returned when an add carries an empty address. A
 	// member with no address is unreachable and cannot be replicated to.
 	ErrEmptyAddress = raft.ErrEmptyAddress
+
+	// ErrTransferInProgress is returned when a proposal, config change or
+	// linearizable read arrives while a leadership transfer is in flight on
+	// this shard. The replica IS the leader; it is deliberately not accepting
+	// work it may be about to hand off.
+	//
+	// It is re-exported for the reason ErrPendingConfigChange was mapped: an
+	// internal sentinel lives in an internal package, so no caller can match it
+	// with errors.Is and every consumer falls through to its own catch-all,
+	// reporting a retryable rejection as a fatal error. Until this line existed
+	// the only way to recognise it was `strings.Contains(err.Error(), "transfer
+	// in progress")`, which two suites carried (#135) and which
+	// conventions/errors.md §5 names as the shape to avoid.
+	//
+	// It is Temporary: the transfer completes or times out on its own, and the
+	// IDENTICAL request then succeeds. It is NOT MaybeApplied — raft returns it
+	// from handleLeaderPropose and handleReadIndex BEFORE the entry enters the
+	// log, so nothing was submitted and nothing can commit later.
+	ErrTransferInProgress = raft.ErrTransferInProgress
 )
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
@@ -1137,6 +1156,9 @@ var temporaryErrors = [...]error{
 	// Another snapshot holds the shard's single-flight slot, or every
 	// snapshot worker in the pool is occupied.
 	ErrSnapshotInProgress,
+	// A leadership transfer is in flight. It completes or times out without
+	// any caller or operator action, and the identical request then succeeds.
+	ErrTransferInProgress,
 }
 
 // Temporary reports whether err represents a transient condition that may
