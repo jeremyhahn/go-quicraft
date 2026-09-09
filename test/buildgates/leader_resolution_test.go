@@ -527,12 +527,17 @@ var pendingConfigChangeSites = []pendingSite{
 	// site, if there is one, has somewhere to go that fails when it is fixed.
 }
 
-// pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table.
+// pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table,
+// and it is EMPTY.
 //
 // A waiver never belongs here — a waiver is a marker in the file that needs it,
 // and recording one as "deferred" would file a site that is CORRECT as a known
 // violation. What belongs here is a conversion that cannot be made yet, and the
 // entry is the ratchet that fails when it lands.
+//
+// It stays, with its type and its matching machinery, because the next
+// deferred conversion needs somewhere to go that fails when it lands. An empty
+// ratchet is the goal state, not a dead one.
 //
 // #161 held the adapter suite's 21 rows until #131 released
 // contrib/dragonboat/test/integration/helpers_test.go. They are gone: 20 sites
@@ -541,25 +546,13 @@ var pendingConfigChangeSites = []pendingSite{
 // (linearizable_test.go, the failover-without-warmup loop — it retries
 // IsTempError on a fixed slice, which is wider and differently budgeted than
 // any leader-resolving helper).
-var pendingReadSites = []pendingSite{
-	// #162 — syncReadExact in the raft suite's helpers. It is the read twin
-	// of proposer.Pinned: a caller hands it ONE replica and the loop retries
-	// quicraft.Temporary against that replica on purpose, because the
-	// assertion is about that replica's own applied state (Leader
-	// Completeness).
-	//
-	// It is deferred for a reason unlike #161's, which is why it outlived
-	// them: not a file a change could not edit, but a disposition that is not
-	// a gate installation's to pick. A waiver records the site as deliberate; growing
-	// proposer.TryReadWith and routing it there gives the pinned-retry loop
-	// ONE home the way #96 and #133 gave the propose and election budgets one
-	// home each. Both are defensible, they diverge on where the retry lives
-	// rather than on whether this site is correct, and choosing between them
-	// under a gate installation would settle a one-home question as a side
-	// effect of an unrelated change. #162 holds that decision; this row keeps
-	// the gate green and the debt visible until it lands.
-	{file: "test/integration/raft/helpers_test.go", fn: "syncReadExact", call: "SyncRead", count: 1, issue: 162},
-}
+//
+// #162 held the last row: syncReadExact's pinned read, deferred not because a
+// file could not be edited but because the disposition was not a gate
+// installation's to pick. It was settled by growing proposer.TryReadWith and
+// routing the site there, so the pinned-retry loop has one home rather than a
+// waiver blessing a third copy of it.
+var pendingReadSites = []pendingSite{}
 
 // TestIntegrationConfigChangesAreIdempotent fails when an integration test
 // issues a membership change directly — SyncRequestAddNode,

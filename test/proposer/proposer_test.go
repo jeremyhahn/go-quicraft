@@ -185,3 +185,44 @@ func TestIsNotLeaderRejection(t *testing.T) {
 		}
 	}
 }
+
+// TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes is the policy
+// TryReadWith exists to serve (#162).
+//
+// A pinned caller's remedy is "wait, and ask the SAME replica again", so its
+// retryable is quicraft.Temporary rather than IsNotLeaderRejection. The
+// difference is load-bearing for syncReadExact: right after an election the new
+// leader rejects ReadIndex with ErrReadIndexNotReady until it commits its
+// term's no-op, and that error is Temporary but is NOT a not-leader rejection.
+// A TryReadWith wired to IsNotLeaderRejection instead of the caller's predicate
+// would fail on the first such refusal.
+func TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes(t *testing.T) {
+	notReady := quicraft.ErrReadIndexNotReady
+	if IsNotLeaderRejection(notReady) {
+		t.Fatal("ErrReadIndexNotReady is a not-leader rejection, so this test " +
+			"cannot tell the two policies apart any more")
+	}
+	if !quicraft.Temporary(notReady) {
+		t.Fatal("ErrReadIndexNotReady is not Temporary, so the pinned policy " +
+			"would not retry it and syncReadExact's wait is unfounded")
+	}
+
+	var attempts int
+	got, err := drive(Pinned(host), 1, time.Second, quicraft.Temporary,
+		scripted(&attempts, "value", notReady, notReady))
+	if err != nil {
+		t.Fatalf("pinned read with quicraft.Temporary: %v", err)
+	}
+	if got != "value" || attempts != 3 {
+		t.Fatalf("got %q after %d attempt(s), want \"value\" after 3", got, attempts)
+	}
+
+	// The re-resolving policy is the control: it must NOT retry this, or the
+	// two Retryables are the same one and Pinned buys nothing.
+	attempts = 0
+	if _, err := drive(Pinned(host), 1, time.Second, IsNotLeaderRejection,
+		scripted(&attempts, "value", notReady)); err == nil {
+		t.Fatal("IsNotLeaderRejection retried ErrReadIndexNotReady; the pinned " +
+			"and re-resolving policies must differ on exactly this")
+	}
+}

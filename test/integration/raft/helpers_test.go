@@ -814,49 +814,39 @@ const pollInterval = 20 * time.Millisecond
 // a state machine lookup at the confirmed read index) and asserts the value is
 // exactly want.
 //
-// Transient failures are retried until the timeout: right after an election the
-// new leader may briefly reject ReadIndex while it commits its no-op entry.
-// "Transient" is quicraft.Temporary, the same predicate proposeCommitted uses
-// and for the same reason — h is pinned, so the only remedy this loop has is to
-// wait and ask again, and that fixes exactly the conditions Temporary names.
-// A permanent error fails on its first occurrence naming itself.
+// h is PINNED on purpose: the assertion is about THAT replica's own applied
+// state (Leader Completeness), so re-resolving would test something else. That
+// is proposer.Pinned's whole reason for existing, and quicraft.Temporary is the
+// retryable a pinned caller passes — its remedy is "wait, and ask the same
+// replica again", which fixes exactly the conditions Temporary names: right
+// after an election the new leader briefly rejects ReadIndex while it commits
+// its no-op entry.
+//
+// It used to write that loop out by hand, which made it a third copy of retry
+// machinery proposer.drive already implements. #162 grew TryReadWith rather
+// than marking this site with a waiver, so the pinned-retry loop has ONE home
+// the way #96 and #133 gave the propose and election budgets one home each.
 //
 // A read that SUCCEEDS with the wrong value is never retried and fails
 // immediately — an entry that was committed before the read cannot legally
 // change or disappear, so retrying would only hide the violation behind a
-// timeout message.
+// timeout message. That check lives here, after the loop, which is why it
+// cannot be folded into the retryable.
 func syncReadExact(t *testing.T, h *quicraft.Host, shardID uint64, key, want string, timeout time.Duration) {
 	t.Helper()
 	start := time.Now()
-	deadline := start.Add(timeout)
-	retry := time.NewTicker(pollInterval)
-	defer retry.Stop()
-	var lastErr error
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		result, err := h.SyncRead(ctx, shardID, key)
-		cancel()
-		if err == nil {
-			got, ok := result.(string)
-			if !ok {
-				t.Fatalf("SyncRead(shard %d, %q) returned %T, want string", shardID, key, result)
-			}
-			if got != want {
-				t.Fatalf("linearizable read of %q on shard %d = %q, want %q: a committed entry did not survive into the current leader's term (Leader Completeness violated)",
-					key, shardID, got, want)
-			}
-			return
-		}
-		if !quicraft.Temporary(err) {
-			t.Fatalf("linearizable read of %q on shard %d was rejected after %v and not retried: %v",
-				key, shardID, time.Since(start).Round(time.Millisecond), err)
-		}
-		lastErr = err
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %v waiting for a linearizable read of %q on shard %d to succeed: %v",
-				timeout, key, shardID, lastErr)
-		}
-		<-retry.C
+	result, err := proposer.TryReadWith(proposer.Pinned(h), shardID, key, timeout, quicraft.Temporary)
+	if err != nil {
+		t.Fatalf("linearizable read of %q on shard %d failed after %v: %v",
+			key, shardID, time.Since(start).Round(time.Millisecond), err)
+	}
+	got, ok := result.(string)
+	if !ok {
+		t.Fatalf("SyncRead(shard %d, %q) returned %T, want string", shardID, key, result)
+	}
+	if got != want {
+		t.Fatalf("linearizable read of %q on shard %d = %q, want %q: a committed entry did not survive into the current leader's term (Leader Completeness violated)",
+			key, shardID, got, want)
 	}
 }
 
