@@ -80,7 +80,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -99,15 +98,6 @@ const AttemptTimeout = 10 * time.Second
 
 // RetryInterval is how long Drive waits before re-attempting.
 const RetryInterval = 50 * time.Millisecond
-
-// leaderTransferInProgress is the text of the engine's internal
-// raft.ErrTransferInProgress, which handleLeaderPropose returns for EVERY
-// proposal — config changes included — while a leadership transfer is in
-// flight, and which Host.translateProposalError does not map to an exported
-// sentinel. It reaches a caller as an opaque error, so it can only be matched
-// by text here (#146 asks for the mapping). It is produced before the entry
-// enters the log, so it is retryable and never counts as a submission.
-const leaderTransferInProgress = "transfer in progress"
 
 // Confirm answers "is the change I asked for present in m?" against a
 // membership snapshot.
@@ -277,6 +267,13 @@ var retryableSentinels = [...]error{
 	quicraft.ErrCanceled,
 	quicraft.ErrShardNotReady,
 	quicraft.ErrRejected,
+	// A leadership transfer is in flight, so the leader is deliberately not
+	// accepting work it may be about to hand off. It clears when the transfer
+	// completes or times out. This was matched by the text "transfer in
+	// progress" until #146 re-exported the sentinel: the engine returns it for
+	// EVERY proposal, config changes included, and before the entry enters the
+	// log, so it is retryable and never counts as a submission.
+	quicraft.ErrTransferInProgress,
 	context.DeadlineExceeded,
 	context.Canceled,
 }
@@ -298,7 +295,7 @@ func IsRetryable(err error) bool {
 			return true
 		}
 	}
-	return strings.Contains(err.Error(), leaderTransferInProgress)
+	return false
 }
 
 // Drive runs attempt until the requested membership change is in effect, the

@@ -139,7 +139,8 @@ func lockedBytes(n int) int {
 
 // MaxShareSetBytes is the locked memory this package will spend on ONE share
 // set, counted in the PAGES the kernel charges rather than the bytes a caller
-// asks for. Both paths that can allocate a whole set enforce it before they
+// asks for. It is maxShareSetPages pages, so its BYTE value depends on the
+// host's page size (#102). Both paths that can allocate a whole set enforce it before they
 // allocate any of it: SplitProtected against the page-rounded footprint its
 // parameters imply, and UnmarshalShareSet against the page-rounded sum of the
 // undecoded elements (every share value is a substring of its element, so the
@@ -162,36 +163,62 @@ func lockedBytes(n int) int {
 // that has to be torn down — but it no longer stands between a caller and a
 // dead service.
 //
-// # Why 2 MiB, and why it is not 1 MiB any more
+// # Why it is a page count and not a byte count (#102)
 //
-// It was 1 MiB while the accounting summed REQUESTED bytes, and both halves of
-// that were wrong together: the pricing under-counted a 255-share split by
-// ~680x (issue #94), so the cap looked generous while admitting sets that lock
-// far more than it names. Page-rounded, a share set costs at least one page per
-// share, and the arithmetic that fixes the pricing moves the constant with it.
+// It was a fixed 2 << 20, and that number is 512 pages on a 4 KiB-page host
+// only. The budget it expresses is a PAGE budget — every figure the derivation
+// below turns on is a page count — so stating it in the bytes of one particular
+// host made the primitive's headline case fail on every other. On a 16 KiB-page
+// host the 255-share split of a 32-byte root key costs the same 260 pages,
+// which is 4,259,840 bytes and was refused; at 64 KiB it missed by a factor of
+// eight. 64 KiB pages are not exotic — RHEL and CentOS Stream arm64 kernels
+// ship with them — and CI is amd64-only, so no gate could see it.
+//
+// The page size comes from enclave.LockedSize(1), the allocator's own answer,
+// for the reason lockedBytes gives: the page size is the allocator's property,
+// and a second source for it here would be a second answer that drifts.
+//
+// This is a var rather than a const because its value is a property of the
+// host. Every consumer reads it; none uses it in a constant expression.
+//
+// One consequence worth stating plainly. Against the 8 MiB RLIMIT_MEMLOCK a
+// Linux host commonly defaults to, a maximal set is a quarter of the ceiling at
+// 4 KiB pages and FOUR TIMES it at 64 KiB. That is not this cap admitting more
+// than it should: the kernel charges 512 pages either way, so the operator on a
+// large-page host must raise RLIMIT_MEMLOCK. The old constant did not make that
+// cost smaller, it just refused the operation instead of naming the cost.
+//
+// # Why 512 pages, and why it is not 256 any more
+//
+// It was 256 pages (1 MiB) while the accounting summed REQUESTED bytes, and
+// both halves of that were wrong together: the pricing under-counted a
+// 255-share split by ~680x (issue #94), so the cap looked generous while
+// admitting sets that lock far more than it names. Page-rounded, a share set
+// costs at least one page per share, and the arithmetic that fixes the pricing
+// moves the budget with it.
 //
 // The floor is the headline case this primitive exists to serve — the full
-// 255-share split of a 32-byte root key, which is 259 pages (1,060,864 bytes)
-// and no longer fits 1 MiB's 256. A cap that refuses the operation the package
+// 255-share split of a 32-byte root key, which is 259 pages and no longer fits
+// 256. A cap that refuses the operation the package
 // is for is not a cap, it is a bug, so the constant had to rise; what follows is
 // where it was put and why.
 //
-// 2 MiB (512 pages on a 4 KiB-page host) is set at the natural edge of the
-// regime the primitive serves: a split whose ENCODED SHARE FITS ONE PAGE. That
-// is every secret up to 3070 bytes at the full 255 ways, whose peak is 448 pages
-// (1,835,008 bytes) — the largest footprint on that side of the line, and the
-// number 2 MiB is chosen to clear. It also admits the 5-of-5 split of the
-// largest secret the package accepts, 192 pages (786,432 bytes). One byte past
-// that edge every share needs a second page and the footprint jumps: 255 shares
-// of a 3071-byte secret price at 2,879,488 and are refused, as are 255 shares of
-// a 4 KiB secret at 3,141,632 — which is sharing a payload rather than a key.
-// Envelope large payloads under a key that IS this size, exactly as
-// MaxSecretBytes says.
+// 512 pages is set at the natural edge of the regime the primitive serves: a
+// split whose ENCODED SHARE FITS ONE PAGE. That is every secret up to 3070
+// bytes at the full 255 ways, whose peak is 448 pages — the largest footprint
+// on that side of the line, and the number 512 is chosen to clear. It also
+// admits the 5-of-5 split of the largest secret the package accepts, 192 pages.
+// One byte past that edge every share needs a second page and the footprint
+// jumps: 255 shares of a 3071-byte secret price at 703 pages and are refused,
+// as are 255 shares of a 4 KiB secret at 767 — which is sharing a payload
+// rather than a key. Envelope large payloads under a key that IS this size,
+// exactly as MaxSecretBytes says.
 //
-// Against the 8 MiB RLIMIT_MEMLOCK a Linux host commonly defaults to, one
-// maximal share set is a quarter of the ceiling. That is deliberately not a
-// concurrency budget: this bounds ONE call, and a process running several at
-// once — or holding sets after they return — still has to bound itself.
+// Every one of those figures is a page count and holds at any page size, which
+// is the property the byte-valued constant did not have.
+//
+// This bounds ONE call: a process running several at once — or holding sets
+// after they return — still has to bound itself.
 // go-enclave's Allocator is the mechanism for that, and it belongs to whoever
 // owns the process's locked-memory policy, not to this primitive.
 //
@@ -199,7 +226,26 @@ func lockedBytes(n int) int {
 // share with SplitBytes and NewProtectedShare — the policy is then explicitly
 // the caller's, which is where a number that cannot be derived from the scheme
 // belongs.
-const MaxShareSetBytes = 2 << 20
+// enclave.LockedSize(1) rather than lockedBytes(1): lockedBytes prices an
+// unmappable size AGAINST this budget, so reaching for it here is an
+// initialisation cycle. One byte is always mappable, so the guard it adds is
+// not needed at this call site.
+var MaxShareSetBytes = maxShareSetBytesFor(int(enclave.LockedSize(1)))
+
+// maxShareSetPages is the budget itself: the page count every figure in
+// MaxShareSetBytes's derivation is stated in.
+const maxShareSetPages = 512
+
+// maxShareSetBytesFor is the budget in bytes on a host whose page size is
+// pageSize.
+//
+// The derivation is a function rather than an expression inlined above so a
+// test can evaluate it at page sizes this host does not have. On a 4 KiB-page
+// host the derived budget and the fixed 2 << 20 it replaced are the SAME
+// NUMBER, so no assertion on MaxShareSetBytes can tell them apart here; what a
+// test can pin is that the budget scales with the page size, and that is this
+// function.
+func maxShareSetBytesFor(pageSize int) int { return maxShareSetPages * pageSize }
 
 // splitLockedBytes reports the locked memory SplitProtected holds at its peak
 // for these parameters: the random polynomial coefficients, the per-share

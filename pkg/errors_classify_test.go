@@ -23,6 +23,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 )
 
 // sentinelClassification is one row of the exhaustive classification table.
@@ -49,6 +51,10 @@ func sentinelTable() []sentinelClassification {
 		{"ErrShardNotReady", ErrShardNotReady, true},
 		{"ErrNotLeader", ErrNotLeader, true},
 		{"ErrReadIndexNotReady", ErrReadIndexNotReady, true},
+		// Temporary: the transfer completes or times out on its own and the
+		// identical request then succeeds. Produced BEFORE the entry enters
+		// the log, so it is never MaybeApplied.
+		{"ErrTransferInProgress", ErrTransferInProgress, true},
 		{"ErrSnapshotInProgress", ErrSnapshotInProgress, true},
 
 		// --- permanent ---
@@ -407,5 +413,54 @@ func TestNotLeader_AgreesWithTemporary(t *testing.T) {
 		if !Temporary(err) {
 			t.Errorf("Temporary(%v) = false; every not-leader error must be temporary", err)
 		}
+	}
+}
+
+// TestTransferInProgress_IsTemporaryAndNotMaybeApplied is #146.
+//
+// raft.handleLeaderPropose returns ErrTransferInProgress for EVERY proposal
+// type while a leadership transfer is in flight, and handleReadIndex returns it
+// for linearizable reads. It lived in an internal package, so no caller could
+// match it with errors.Is and two suites resorted to
+// strings.Contains(err.Error(), "transfer in progress") — the exact shape
+// conventions/errors.md §5 names.
+//
+// The three properties a caller depends on, pinned here so a future change to
+// the classification has to be deliberate:
+//
+//   - it is matchable by sentinel, wrapped or not;
+//   - Temporary is TRUE — the transfer completes or times out with no operator
+//     or caller action, and the identical request then succeeds;
+//   - MaybeApplied is FALSE — raft returns it before the entry enters the log,
+//     so nothing was submitted and nothing can commit later. A caller that
+//     treated it as maybe-applied would go looking for an entry that does not
+//     exist, which on the config-change path is how "already exists" gets
+//     misread as success.
+func TestTransferInProgress_IsTemporaryAndNotMaybeApplied(t *testing.T) {
+	if !errors.Is(ErrTransferInProgress, raft.ErrTransferInProgress) {
+		t.Fatal("the exported sentinel must BE the engine's error, not a copy of " +
+			"it; a copy matches nothing the engine actually returns")
+	}
+	if !Temporary(ErrTransferInProgress) {
+		t.Error("Temporary(ErrTransferInProgress) = false; a transfer clears on " +
+			"its own and the identical request then succeeds")
+	}
+	if MaybeApplied(ErrTransferInProgress) {
+		t.Error("MaybeApplied(ErrTransferInProgress) = true; it is produced " +
+			"before the entry enters the log, so nothing can commit later")
+	}
+
+	// Wrapped, which is how it reaches a caller through the adapter
+	// (*AdapterError) and through any fmt.Errorf on the way out.
+	wrapped := fmt.Errorf("propose shard 1: %w", ErrTransferInProgress)
+	if !errors.Is(wrapped, ErrTransferInProgress) {
+		t.Error("wrapping broke errors.Is; the substring match this replaces " +
+			"survived wrapping, and the sentinel must too")
+	}
+	if !Temporary(wrapped) {
+		t.Error("wrapping broke Temporary()")
+	}
+	if MaybeApplied(wrapped) {
+		t.Error("wrapping made it MaybeApplied")
 	}
 }

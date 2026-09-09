@@ -226,9 +226,15 @@ the allocator's own error, so `errors.Is` reaches go-enclave's sentinels.
 ### Constants
 
 ```go
-const MaxSecretBytes   = 64 << 10   // 65536 — one secret
-const MaxShareSetBytes = 2 << 20    // 2 MiB — whole-set locked-memory budget, in PAGES
+const MaxSecretBytes = 64 << 10  // 65536 — one secret
+var MaxShareSetBytes             // 512 PAGES — whole-set locked-memory budget
 ```
+
+`MaxShareSetBytes` is a `var`, not a `const`, and its byte value depends on the
+host: it is 512 pages, derived from the allocator's page size at init (issue
+#102). On a 4 KiB-page host that is 2 MiB; on the 64 KiB-page arm64 kernels RHEL
+and CentOS Stream ship, 32 MiB. A consumer reads it; it cannot appear in a
+constant expression.
 
 The share-set maximum is 255, from the GF(2^8) x-coordinate space.
 
@@ -240,8 +246,8 @@ It is counted in the PAGES the kernel charges, not the bytes a caller asks for:
 every region is its own enclave and a 32-byte enclave locks a full page, so a
 figure summed from requested sizes cannot be compared to `RLIMIT_MEMLOCK` at
 all. A full 255-share ceremony over a 32-byte root key therefore costs 259 pages
-(1,060,864 bytes) rather than the ~24 KiB the byte-summed accounting claimed —
-which is why the constant is 2 MiB and not 1 MiB (issue #94). 2 MiB admits every
+rather than the ~24 KiB the byte-summed accounting claimed — which is why the
+budget is 512 pages and not 256 (issue #94). 512 pages admits every
 split whose encoded share fits one page, meaning secrets up to 3,070 bytes at
 the full 255 ways; sharing a 4 KiB *payload* 255 ways does not fit and should be
 enveloped under a key that does.

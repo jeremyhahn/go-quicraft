@@ -1857,8 +1857,10 @@ func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint6
 //
 // quicraft.Temporary is also narrower than the isTransientLeadershipError it
 // replaces here, and deliberately so: that predicate retried ErrCanceled and a
-// bare context cancellation, which no amount of waiting or re-resolving fixes,
-// and matched "transfer in progress" by substring.
+// bare context cancellation, which no amount of waiting or re-resolving fixes.
+// It is no longer narrower on the leadership-transfer case — #146 re-exported
+// ErrTransferInProgress and put it in temporaryErrors, so Temporary now covers
+// by sentinel what that predicate could only reach by substring.
 //
 // Re-proposal is safe for what this writes. A not-leader error can arrive after
 // the entry already reached the log (quicraft.MaybeApplied — the form observed

@@ -240,7 +240,12 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsWithoutSubmissionStillFai
 		"no leader observed":    errNoLeaderObserved,
 		"system busy":           dragonboat.ErrSystemBusy,
 		"pending config change": dragonboat.ErrRejected,
-		"transfer in progress":  &dragonboat.AdapterError{Err: errors.New("raft: leader transfer in progress")},
+		// The real sentinel, not a look-alike built from the same text. This
+		// carried errors.New(...) while the engine's error was internal and
+		// unmatchable; matching it by sentinel (#146) means a fixture that
+		// only LOOKED like a transfer refusal would no longer be retried, so
+		// the fixture has to be the thing it models.
+		"transfer in progress":  &dragonboat.AdapterError{Err: quicraft.ErrTransferInProgress},
 		"refused on first call": errAlreadyExistsHere,
 	}
 	landed := membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil)
