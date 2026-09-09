@@ -1040,6 +1040,17 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		saveErr = snapshotter.SaveSnapshot(ctx, w, node.stopC)
 	}
 	if err := saveErr; err != nil {
+		// Release the epochs frames already sealed under. A state machine that
+		// wrote at least one full chunk before failing has emitted frames, and
+		// each of those pinned its epoch; returning without releasing them
+		// leaves in-flight references no one will ever clear, so
+		// PurgeEpochsBefore can never retire those DEKs and the key material
+		// outlives the process's need for it. The snappy-close path below and
+		// the writer's own fail() cover the other two ways out; this was the
+		// gap between them.
+		if frameW != nil {
+			frameW.ReleasePins()
+		}
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Debug("snapshot: file close failed after save error",
 				"shard_id", req.shardID,

@@ -345,3 +345,80 @@ func TestPinBalance_SaveSnapshot_EncryptFailureReturnsToZero(t *testing.T) {
 	}
 	barrier.assertBalanced(t, "saveSnapshot encrypt failure")
 }
+
+// bulkThenFailSnapshotter writes n bytes successfully and then fails.
+//
+// The size matters: it must be at least one snapshotEncryptChunkSize so the
+// frame writer has actually EMITTED a frame — and therefore pinned an epoch —
+// before the failure. A snapshotter that fails without filling the chunk buffer
+// leaks nothing, and a test built on one would pass against the defect.
+type bulkThenFailSnapshotter struct {
+	snapshotTestSnapshotter
+	bytes int
+	err   error
+}
+
+func (s *bulkThenFailSnapshotter) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
+	return s.SaveSnapshotGated(ctx, w, stopper, nil)
+}
+
+func (s *bulkThenFailSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writer, _ <-chan struct{}, afterCapture func()) error {
+	if afterCapture != nil {
+		defer afterCapture()
+	}
+	payload := make([]byte, s.bytes)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	return s.err
+}
+
+// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero covers the one
+// way out of saveSnapshot that did not release the frame writer's epoch pins.
+//
+// Found in review of the #116 PR. When the state machine's SaveSnapshot returns
+// an error, saveSnapshot returned immediately; any frames already emitted had
+// registered their epoch as in-flight, and nothing ever deregistered them. The
+// effect is not a lost error but a key-lifecycle one: PurgeEpochsBefore can
+// never retire a DEK that still has an in-flight reference, so the key material
+// is retained for the life of the process.
+//
+// It is reachable whenever a state machine writes a full chunk and then fails,
+// which is why the fixture writes snapshotEncryptChunkSize+1 bytes rather than
+// a token payload.
+func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) {
+	snapDir := t.TempDir()
+	cfg := config.Config{ShardID: 12, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+
+	wantErr := errors.New("state machine save failed")
+	snapshotter := &bulkThenFailSnapshotter{
+		bytes: snapshotEncryptChunkSize + 1,
+		err:   wantErr,
+	}
+	snapshotter.lastApplied.Store(200)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	barrier := newPinCountBarrier(newTestBarrier(4))
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, barrier, nil, nil, stopC, nil)
+
+	_, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   12,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	})
+	if err == nil {
+		t.Fatal("saveSnapshot: expected the injected state-machine failure")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want it to wrap %v", err, wantErr)
+	}
+	barrier.assertBalanced(t, "saveSnapshot state-machine failure")
+}
