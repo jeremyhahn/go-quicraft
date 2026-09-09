@@ -14,7 +14,7 @@ Import paths:
 
 ```go
 const MaxSecretBytes    = 64 << 10   // 65536
-const MaxShareSetBytes  = 2 << 20    // 2 MiB — whole-set footprint budget, in PAGES
+var MaxShareSetBytes    = 512 * pageSize  // 512 PAGES — whole-set footprint budget
 
 // Split / combine — struct form (DEPRECATED: string custody)
 func Split(secret []byte, threshold, total int) ([]*Share, error)
@@ -382,7 +382,7 @@ Three obligations come with `ProtectedShare`:
 Because of the second one, the two calls that allocate a whole set price it
 first. `SplitProtected` rejects parameters whose footprint — coefficients,
 the reused scratch, the reused ENCODING scratch, and every returned share value —
-exceeds `MaxShareSetBytes` (2 MiB), since individually legal arguments multiply
+exceeds `MaxShareSetBytes` (512 pages), since individually legal arguments multiply
 into one no host can lock (a 64 KiB secret split 255 ways needs ~16 MiB of
 coefficients alone). The encoding scratch is counted because it is live at the
 peak: go-enclave has no post-fill freeze, so a share's frozen value is built by
@@ -402,7 +402,7 @@ rounding rather than the secret accounting for all of it.
 The constant moved with the arithmetic. A full 255-share ceremony over a
 32-byte root key costs 259 pages (1,060,864 bytes), which does not fit the old
 1 MiB's 256 — a cap that refuses the operation the package exists for is a bug,
-not a policy. 2 MiB sits at the edge of the regime the primitive serves, a
+not a policy. 512 pages sits at the edge of the regime the primitive serves, a
 split whose **encoded share fits one page**: secrets up to 3,070 bytes at the
 full 255 ways, peaking at 1,835,008. One byte past that every share needs a
 second page and the footprint jumps to 2,879,488, which is refused — as is

@@ -1167,3 +1167,64 @@ func TestSplitProtected_AcceptsRealCeremonies(t *testing.T) {
 		})
 	}
 }
+
+// TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize is #102.
+//
+// MaxShareSetBytes was a fixed 2 << 20, which is 512 pages on a 4 KiB-page host
+// and on no other. Every figure in its derivation is a page count, so stating
+// it in the bytes of one particular host made the primitive's headline case —
+// the 255-share split of a 32-byte root key — fail everywhere else: the same
+// 260 pages is 4,259,840 bytes at 16 KiB and 17,039,360 at 64 KiB, both refused
+// by a 2 MiB cap. RHEL and CentOS Stream arm64 ship 64 KiB pages, and CI is
+// amd64-only, so no gate could see it.
+//
+// The test does not need a big-page host, because the quantity that matters is
+// page-size independent. It takes the footprint the REAL implementation prices
+// — no second copy of the formula here — converts it to pages using this host's
+// page size, and then asserts the budget holds at 4 KiB, 16 KiB and 64 KiB.
+func TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize(t *testing.T) {
+	page := lockedBytes(1)
+	if page <= 0 {
+		t.Fatalf("lockedBytes(1) = %d, want this host's page size", page)
+	}
+
+	// The exported value must BE the page budget on this host, whatever its
+	// page size. This is what stops the constant drifting back into bytes.
+	if want := maxShareSetBytesFor(page); MaxShareSetBytes != want {
+		t.Fatalf("MaxShareSetBytes = %d, want %d (%d pages x %d bytes)",
+			MaxShareSetBytes, want, maxShareSetPages, page)
+	}
+
+	// The headline case, priced by the implementation rather than restated.
+	const rootKeyBytes = 32
+	footprint := splitLockedBytes(rootKeyBytes, 255, 255)
+	if footprint%page != 0 {
+		t.Fatalf("splitLockedBytes returned %d, which is not a whole number of "+
+			"%d-byte pages; the budget's page arithmetic assumes it is",
+			footprint, page)
+	}
+	pages := footprint / page
+
+	for _, ps := range []int{4096, 16384, 65536} {
+		budget := maxShareSetBytesFor(ps)
+		cost := pages * ps
+		if cost > budget {
+			t.Errorf("on a %d-byte-page host the 255-share split of a %d-byte root "+
+				"key costs %d pages (%d bytes) against a budget of %d pages (%d bytes): "+
+				"the primitive's headline case is refused",
+				ps, rootKeyBytes, pages, cost, maxShareSetPages, budget)
+		}
+	}
+
+	// And the pre-#102 constant, to show this is a real difference rather than
+	// a restatement: the byte-valued cap refuses that same set on both larger
+	// page sizes.
+	const oldConstant = 2 << 20
+	for _, ps := range []int{16384, 65536} {
+		if pages*ps <= oldConstant {
+			t.Errorf("the 255-share split costs %d bytes at a %d-byte page, which "+
+				"the old %d-byte cap would have admitted; this test is not "+
+				"exercising the defect it was written for", pages*ps, ps, oldConstant)
+		}
+	}
+}
