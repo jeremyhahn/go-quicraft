@@ -75,6 +75,10 @@ LOCAL_PROFILE="$PERF_DIR/$PROFILE_REL"
 REMOTE_PERF="$REMOTE_DIR/test/performance"
 RUN_LOG="$REMOTE_PERF/bench-run.log"
 RUN_PID="$REMOTE_PERF/bench-run.pid"
+# The suite's EXIT STATUS, written by the wrapper below once perfcompare exits.
+# Without it a failed run was indistinguishable from a successful one to this
+# script: wait_for_run returns `tail`'s status, not the benchmark's (#181).
+RUN_RC="$REMOTE_PERF/bench-run.rc"
 
 say() { echo ">> $*"; }
 
@@ -141,14 +145,32 @@ run() {
     exit 1
   fi
 
-  # The cd is confined to a SUBSHELL, and the subshell execs the binary, so $!
-  # is perfcompare's own pid rather than a wrapper's. Confining it matters:
-  # $RUN_PID and $RUN_LOG are relative to the login home, so a cd left in the
-  # foreground would make the pidfile write land somewhere that does not exist
-  # and silently produce no pidfile at all.
+  # The cd is confined to a SUBSHELL. $RUN_PID and $RUN_LOG are relative to the
+  # login home, so a cd left in the foreground would make the pidfile write
+  # land somewhere that does not exist and silently produce no pidfile at all.
+  #
+  # The subshell no longer `exec`s perfcompare: it runs it and then records the
+  # exit status, so $! is a one-line wrapper's pid rather than perfcompare's.
+  # That is deliberate (#181), and it preserves the property the exec was
+  # protecting -- the pidfile must name a process whose death means the run is
+  # over. The wrapper does nothing after perfcompare but write $RUN_RC, so it
+  # dies microseconds later, and `tail --pid` in wait_for_run now returns AFTER
+  # the status file exists rather than racing it.
+  #
+  # A stale $RUN_RC is removed first. Reading a previous run's status would be
+  # worse than reading none, because it looks authoritative.
+  # $RUN_RC is written with a path anchored at $HOME on the target, NOT the
+  # bare relative one. Every other remote path here is relative to the login
+  # home and is used from there, but this one is written from INSIDE the
+  # subshell that has already cd'd into $REMOTE_PERF -- so a relative path
+  # would land at $REMOTE_PERF/$REMOTE_PERF/... and require_run_success, which
+  # reads from the home directory, would never find it. The failure mode is
+  # every run reporting "recorded no exit status", i.e. the gate refusing
+  # everything.
+  ssh "$HOST" "rm -f \"\$HOME/$RUN_RC\""
   ssh "$HOST" "( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
-      exec nohup ./perfcompare --benchtime='$BENCHTIME' --timeout='$PERF_TIMEOUT' \
-        --profile='$PROFILE_REL' $PERF_SYSTEMS ) > '$RUN_LOG' 2>&1 & \
+      nohup sh -c './perfcompare --benchtime=\"$BENCHTIME\" --timeout=\"$PERF_TIMEOUT\" \
+        --profile=\"$PROFILE_REL\" $PERF_SYSTEMS; echo \$? > \"\$HOME/$RUN_RC\"' ) > '$RUN_LOG' 2>&1 & \
     echo \$! > '$RUN_PID'; echo \"PID \$(cat '$RUN_PID')\""
 
   # Confirm it is actually running. Launching and reporting a pid proves only
@@ -193,11 +215,43 @@ generate() {
     ./perfcompare generate --profile="$PROFILE_REL" --systems="$PERF_SYSTEMS" )
 }
 
+# require_run_success refuses to touch the local profile when the suite failed.
+#
+# This is the other half of #181, and the more insidious half. A failed run is
+# not inert: fetch copies the target's results over the local ones and generate
+# rewrites the profile's charts, per-system documents and env.json. On
+# 2026-09-10 a run whose ONLY requested system produced no results still
+# rewrote five charts, three results/*.json, env.json and two documents -- a
+# "refreshed" profile built on no new measurement, which only a git status
+# caught before it was committed.
+#
+# A profile is a published record. When the run that was meant to update it
+# failed, the right outcome is that it stays exactly as it was.
+require_run_success() {
+  local rc
+  rc="$(ssh "$HOST" "cat \"\$HOME/$RUN_RC\" 2>/dev/null" || true)"
+  if [ -z "$rc" ]; then
+    echo "ERROR: the suite recorded no exit status at $RUN_RC on $HOST." >&2
+    echo "       Treating that as a failure: the local profile is UNCHANGED." >&2
+    echo "       Inspect with '$0 status'." >&2
+    exit 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: the suite exited $rc on $HOST. The local profile is UNCHANGED:" >&2
+    echo "       no results fetched, no documents regenerated." >&2
+    echo "       The failing systems are named on the ERROR lines in the log;" >&2
+    echo "       inspect with '$0 status', then re-run when they are addressed." >&2
+    exit "$rc"
+  fi
+  say "suite exited 0"
+}
+
 all() {
   stage
   env_capture
   run
   wait_for_run
+  require_run_success
   fetch
   generate
 }
@@ -210,6 +264,7 @@ case "${1:-all}" in
   wait)     wait_for_run ;;
   status)   status ;;
   fetch)    fetch ;;
+  rc)       require_run_success ;;
   generate) generate ;;
-  *) echo "usage: $0 {all|stage|env|run|wait|status|fetch|generate}" >&2; exit 1 ;;
+  *) echo "usage: $0 {all|stage|env|run|wait|rc|status|fetch|generate}" >&2; exit 1 ;;
 esac
