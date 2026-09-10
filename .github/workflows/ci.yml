@@ -650,6 +650,84 @@ jobs:
   # that silent collapse fail the job instead of passing it.
   # ==========================================================================
 
+  # ==========================================================================
+  # CROSS-ARCHITECTURE BUILD
+  #
+  # Every job in this workflow runs on amd64, and nothing here had ever
+  # compiled this tree for anything else. #102 is what that cost: shamir's
+  # MaxShareSetBytes was a fixed byte count derived for a 4 KiB page, so the
+  # primitive's headline operation -- the 255-share split of a root key -- was
+  # REFUSED on a 16 KiB- or 64 KiB-page host. RHEL and CentOS Stream arm64
+  # kernels ship 64 KiB pages, and it fails at a recovery ceremony, which is
+  # the worst possible moment to discover it.
+  #
+  # WHAT THIS JOB DOES AND DOES NOT CATCH, because the difference matters and a
+  # job that is believed to cover more than it does is worse than none (see the
+  # dependabot.yml note for the last time that happened here).
+  #
+  #   CATCHES: anything that fails to COMPILE or vet for the target -- a build
+  #   tag that only exists for amd64, an assembly file, a type whose size is
+  #   assumed, a syscall or cgo path that is not portable.
+  #
+  #   DOES NOT CATCH: a runtime value that differs by architecture. #102 itself
+  #   would have compiled cleanly here. That class is caught by writing the
+  #   test against the PARAMETER rather than the host -- shamir's budget test
+  #   evaluates its derivation at 4 KiB, 16 KiB and 64 KiB and needs no arm64
+  #   machine at all -- and that is the pattern to copy, not this job.
+  #
+  # Cross-compilation rather than an arm64 runner: no arm64 host is registered
+  # with this Gitea, `go build` needs no emulation, and the alternative (QEMU)
+  # would multiply every test's wall clock for a class this cannot see anyway.
+  # If an arm64 runner is ever registered, running the fast tier on it
+  # supersedes this job rather than joining it.
+  # ==========================================================================
+
+  cross-arch:
+    name: Cross-architecture build (arm64)
+    runs-on: ubuntu-latest
+    # Same staged fail-fast as the rest: a push that cannot lint or build for
+    # the host has nothing to say about another architecture.
+    needs: [lint, build]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The same discovery loop and floor as the modules job, for the same
+      # reason: a `find` that silently matches nothing would make this job pass
+      # by checking an empty set.
+      - name: Build and vet every module for linux/arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          set -uo pipefail
+          MODULE_FLOOR=6
+          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort)"
+          COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
+          echo "Discovered ${COUNT} module(s) for ${GOOS}/${GOARCH}:"
+          printf '%s\n' "${MODULES}"
+          if [ "${COUNT}" -lt "${MODULE_FLOOR}" ]; then
+            echo "FAIL: discovered ${COUNT} modules but expected at least ${MODULE_FLOOR}."
+            echo "If a module was removed on purpose, lower MODULE_FLOOR in the same commit."
+            echo "Otherwise discovery has broken and this gate is verifying nothing."
+            exit 1
+          fi
+          FAILED=""
+          for dir in ${MODULES}; do
+            echo "::group::${dir}"
+            ( cd "${dir}" && go build ./... && go vet ./... ) || FAILED="${FAILED} ${dir}"
+            echo "::endgroup::"
+          done
+          if [ -n "${FAILED}" ]; then
+            echo "FAIL: ${GOOS}/${GOARCH} build or vet failed in:${FAILED}"
+            exit 1
+          fi
+          echo "every module builds and vets for ${GOOS}/${GOARCH}"
+
   modules:
     name: Nested module build + vet
     runs-on: ubuntu-latest
@@ -836,7 +914,7 @@ jobs:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [lint, security, build, test, integration, netfault, errfs, fuzz-seeds, modules, contrib-dragonboat]
+    needs: [lint, security, build, test, integration, netfault, errfs, fuzz-seeds, modules, cross-arch, contrib-dragonboat]
     steps:
       - name: Fail closed on any non-success
         run: |
@@ -851,5 +929,6 @@ jobs:
           check errfs             "${{ needs.errfs.result }}"
           check fuzz-seeds        "${{ needs.fuzz-seeds.result }}"
           check modules           "${{ needs.modules.result }}"
+          check cross-arch        "${{ needs.cross-arch.result }}"
           check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}"
           exit $BAD
