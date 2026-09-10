@@ -43,6 +43,7 @@ import (
 	dbConfig "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/config"
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
+	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 )
 
@@ -77,15 +78,20 @@ const testElectionRTT = 10
 // raftTick is one Raft tick in wall-clock time.
 const raftTick = testRTTMillisecond * time.Millisecond
 
-// electionRound is the longest a SINGLE election attempt can run before the
-// next candidate's timer fires and the attempt is superseded.
+// The election budgets are test/electionbudget's, derived from this suite's
+// testElectionRTT and testRTTMillisecond — the SAME package the root module's
+// four integration suites use (#133).
 //
-// It is TWICE ElectionRTT, not once: raft randomises each replica's election
-// timer over [electionTimeout, 2*electionTimeout) — see
-// raft.randomizedElectionTimeout, r.electionTimeout + r.rng.Intn(...) — so the
-// upper bound on one attempt is two election timeouts' worth of ticks. A
-// budget written against the un-randomised value is half the size it looks.
-const electionRound = 2 * testElectionRTT * raftTick
+// It is importable across the module boundary because it takes two integers
+// and no engine types. That is exactly why test/proposer could not be shared
+// here (#114): its Resolver is typed on *quicraft.Host, which NodeHost does
+// not expose. A budget has no such coupling, so the fifth copy of the
+// derivation is gone rather than merely reduced to four.
+var (
+	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
+	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
+	failoverTimeout       = electionbudget.Failover(testElectionRTT, testRTTMillisecond)
+)
 
 // defaultTimeout is the standard budget for a single Raft operation that is
 // not an election: a proposal round trip, a linearizable read, a membership
@@ -93,69 +99,8 @@ const electionRound = 2 * testElectionRTT * raftTick
 // those wait for an election.
 const defaultTimeout = 15 * time.Second
 
-// coldStartElectionRounds is how many worst-case election rounds
-// leaderElectionTimeout allows a freshly started shard.
-//
-// FOUR of them are the protocol's own worst case for a cold start, and each is
-// bounded by electionRound:
-//
-//   - the QUIC handshake and mTLS exchange between all three hosts, which must
-//     complete before the first RequestVote can even be answered;
-//   - the PreVote round (dbTestShardConfig sets PreVote: true), which precedes
-//     the real one;
-//   - the vote round itself;
-//   - one split-vote retry. On a cold start a split is likely rather than
-//     exceptional: all three replicas arm their election timers within
-//     microseconds of each other, which is the one situation the randomised
-//     timer has the least room to separate.
-//
-// The remaining factor is host saturation, and it is a multiplier rather than
-// an addend. A Raft tick is a goroutine wakeup; on a host oversubscribed k
-// times, a 50ms tick lands roughly k times late, and the whole cold start
-// stretches with it.
-//
-// Measured, with this budget lifted to 120s so the tail was not truncated:
-// eight full runs of this suite under `-race -p 1`, on 24 cores at load
-// average 150-300 (6-12x oversubscribed), gave n=616 cold starts at p50 0.66s,
-// p90 1.09s, p95 1.55s, p99 5.2s and max 10.8s. The distribution is not merely
-// slow, it is heavy-tailed — the common case sits near the four rounds above
-// and a small minority runs an order of magnitude past it. 1.1% exceeded five
-// seconds, which across the ~77 cold starts in one run of this suite is about
-// one failure per run: the rate #115 reports.
-//
-// Thirty rounds is thirty seconds, nearly three times that observed maximum.
-// It is bounded on purpose: a shard that CANNOT elect — a lost quorum, a
-// broken transport, a misconfigured membership — is reported in half a minute
-// rather than at the 1800s suite timeout, and the derivation is verified
-// against exactly that case (a three-member shard with only one replica
-// running fails this wait in 30.0s).
-//
-// The same measurement is why this budget is LARGER than failoverTimeout even
-// though the names suggest otherwise: on the same runs a re-election after a
-// leader was stopped never exceeded 4.8s (n=40), because by then the transport
-// is established and the survivors already know one another. The cold start is
-// the harder of the two and had been given the smaller budget.
-const coldStartElectionRounds = 30
-
-// leaderElectionTimeout is the budget for a shard that has just been started
-// to produce its FIRST leader. See coldStartElectionRounds for the derivation.
-//
-// A cold start is not a re-election and must not be budgeted like one. Every
-// caller of this constant is waiting on a shard that was started moments
-// earlier, so this is the cold-start budget and nothing else; a wait for a
-// SUBSEQUENT leader takes failoverTimeout.
-const leaderElectionTimeout = coldStartElectionRounds * electionRound
-
-// failoverTimeout is the budget for a shard that has already been led to elect
-// a REPLACEMENT leader after the incumbent is stopped or partitioned.
-//
-// Its value is unchanged; it is written in election rounds so that it tracks
-// ElectionRTT and RTTMillisecond alongside leaderElectionTimeout instead of
-// drifting away from them. A failover needs one election timeout for the
-// survivors to notice the silence and one or two rounds to elect, over warm
-// connections — measured max 4.8s under the saturation described above, so
-// twenty rounds is roughly four times the observed worst case.
-const failoverTimeout = 20 * electionRound
+// coldStartElectionRounds keeps the local name this suite's log lines use.
+const coldStartElectionRounds = electionbudget.ColdStartRounds
 
 // membershipTimeout is the budget for one membership change to LAND: to be
 // accepted by whichever replica leads at the time, committed, and confirmed by
@@ -169,7 +114,7 @@ const failoverTimeout = 20 * electionRound
 // derives its membershipTimeout the same way. Each single attempt inside the
 // loop still gets at most defaultTimeout, the budget the converted sites gave
 // their one direct call.
-const membershipTimeout = failoverTimeout + defaultTimeout
+var membershipTimeout = failoverTimeout + defaultTimeout
 
 // leaderTransferRounds is how many worst-case election rounds ONE requested
 // leadership transfer is given to produce the target as leader before the
@@ -206,7 +151,7 @@ const membershipTimeout = failoverTimeout + defaultTimeout
 const leaderTransferRounds = 2
 
 // leaderTransferRound is the wall-clock form of leaderTransferRounds.
-const leaderTransferRound = leaderTransferRounds * electionRound
+var leaderTransferRound = leaderTransferRounds * electionRound
 
 // leaderTransferTimeout bounds the WHOLE transfer, re-requests included: one
 // failover's worth of rounds for the disturbance that lost a request (a
@@ -215,7 +160,7 @@ const leaderTransferRound = leaderTransferRounds * electionRound
 // complete -- a target that will not campaign -- fails here, in this many
 // seconds, rather than at the suite timeout; that case is what the bound is
 // verified against.
-const leaderTransferTimeout = failoverTimeout + leaderTransferRound
+var leaderTransferTimeout = failoverTimeout + leaderTransferRound
 
 // catchUpTimeout is the budget for a replica that rejoins a led shard -- a
 // restarted follower, in TestIntegration_DB_SnapshotRecoveryAfterRestart --
@@ -235,7 +180,7 @@ const leaderTransferTimeout = failoverTimeout + leaderTransferRound
 // failover, then one ordinary operation, in sequence, which is the same sum
 // membershipTimeout is for the same reason. defaultTimeout alone was the
 // second half without the first.
-const catchUpTimeout = failoverTimeout + defaultTimeout
+var catchUpTimeout = failoverTimeout + defaultTimeout
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
