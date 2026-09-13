@@ -175,6 +175,9 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 			// A transient refusal is Raft weather, not a failed benchmark;
 			// requireFloor decides whether there were too many. See
 			// #181 for what b.Fatalf here used to cost.
+			if !tolerable(err) {
+				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
+			}
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
@@ -291,6 +294,9 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 			// A transient refusal is Raft weather, not a failed benchmark;
 			// requireFloor decides whether there were too many. See
 			// #181 for what b.Fatalf here used to cost.
+			if !tolerable(err) {
+				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
+			}
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
@@ -407,6 +413,7 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 
 	var wg sync.WaitGroup
 	var okCount, errCount atomic.Int64
+	var permanent atomic.Pointer[error]
 	wg.Add(numGoroutines)
 
 	for g := 0; g < numGoroutines; g++ {
@@ -424,6 +431,12 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 				proposeCancel()
 				elapsed := time.Since(start)
 				if err != nil {
+					if !tolerable(err) {
+						// A goroutine must not touch b. Keep the FIRST
+						// permanent error; the parent fails on it after Wait.
+						permanent.CompareAndSwap(nil, &err)
+						return
+					}
 					errCount.Add(1)
 					continue
 				}
@@ -434,6 +447,10 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 	}
 
 	wg.Wait()
+
+	if p := permanent.Load(); p != nil {
+		b.Fatalf("permanent error, not Raft weather: %v", *p)
+	}
 
 	// Counted AND checked. This loop tolerated every error and logged the
 	// total, but nothing read it, so a run in which every proposal failed
@@ -755,6 +772,9 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
+			if !tolerable(err) {
+				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
+			}
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
@@ -784,6 +804,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 
 	var wg sync.WaitGroup
 	var okCount, errCount atomic.Int64
+	var permanent atomic.Pointer[error]
 	wg.Add(numGoroutines)
 
 	for g := 0; g < numGoroutines; g++ {
@@ -801,6 +822,12 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 				proposeCancel()
 				elapsed := time.Since(start)
 				if err != nil {
+					if !tolerable(err) {
+						// A goroutine must not touch b. Keep the FIRST
+						// permanent error; the parent fails on it after Wait.
+						permanent.CompareAndSwap(nil, &err)
+						return
+					}
 					errCount.Add(1)
 					continue
 				}
@@ -811,6 +838,10 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 	}
 
 	wg.Wait()
+
+	if p := permanent.Load(); p != nil {
+		b.Fatalf("permanent error, not Raft weather: %v", *p)
+	}
 
 	requireFloor(b, "proposals", int(okCount.Load()), int(errCount.Load()))
 }
@@ -854,6 +885,9 @@ func BenchDragonboatCommitLatencyCluster(b *testing.B, cluster *BenchCluster, re
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
+			if !tolerable(err) {
+				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
+			}
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
@@ -896,6 +930,9 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 		readCancel()
 		elapsed := time.Since(start)
 		if err != nil {
+			if !tolerable(err) {
+				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
+			}
 			errored++
 			b.Logf("SyncRead failed at iteration %d: %v", i, err)
 			continue
@@ -978,6 +1015,22 @@ const maxProposeErrorRate = 0.20
 // propose at all IS a real failure and should stop calibration) and lets the
 // calibrated run, with thousands of attempts, be the one that is judged.
 const minProposeSample = 100
+
+// tolerable reports whether err is transient Raft weather a benchmark loop may
+// count and continue past, as opposed to a real result that must stop the run.
+//
+// The tolerant loops used to count EVERY error, so a permanent failure --
+// ErrPayloadTooBig, ErrRejected, ErrInvalidSession, a state-machine failure --
+// at 5% was published as a clean run with a note. Codex review of the merged
+// tree caught it. The distinction is the one test/proposer already draws and
+// documents: a retry loop may absorb only the conditions that clear on their
+// own, because those are the only ones re-trying can change the answer to.
+// Everything else is the engine answering, and the benchmark must report it.
+//
+// dragonboat.IsTempError is the library's own classification -- "worth
+// retrying with the exact same input" -- and it covers the two failures
+// actually observed on 2026-09-10: ErrShardNotReady and ErrTimeout.
+func tolerable(err error) bool { return dragonboat.IsTempError(err) }
 
 // requireFloor fails the benchmark unless enough of its proposals
 // completed for the recorded latencies to mean anything.

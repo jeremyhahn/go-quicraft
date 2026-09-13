@@ -17,6 +17,8 @@ package dragonboat_perf
 import (
 	"strings"
 	"testing"
+
+	"github.com/jeremyhahn/dragonboat/v4"
 )
 
 // TestProposeFloorVerdict pins #181 at both ends, because the defect had two
@@ -159,5 +161,37 @@ func TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne(t *testing.T) {
 		t.Errorf("maxProposeErrorRate=%.2f is at or above the measured contended "+
 			"rate %.3f: a run measuring the box would be published",
 			maxProposeErrorRate, loadedRate)
+	}
+}
+
+// TestTolerableAdmitsWeatherAndRefusesRealResults pins the boundary the
+// tolerant loops must not cross, found by Codex review of the merged tree.
+//
+// Before this, every error was counted as weather, so a PERMANENT failure at
+// 5% -- a payload the engine refuses, a session it does not know -- was
+// published as a clean run with a note. That is the engine answering, and a
+// benchmark that averages past it reports a throughput the engine never
+// delivered. The rule is test/proposer's: a loop may absorb only the
+// conditions that clear on their own.
+func TestTolerableAdmitsWeatherAndRefusesRealResults(t *testing.T) {
+	// The two failures actually observed on 2026-09-10, which the loops MUST
+	// keep tolerating or #181 comes straight back.
+	for _, err := range []error{dragonboat.ErrShardNotReady, dragonboat.ErrTimeout} {
+		if !tolerable(err) {
+			t.Errorf("tolerable(%v) = false; this is the weather #181 was opened "+
+				"to survive, and refusing it aborts the run on the first transient", err)
+		}
+	}
+	// Real answers from the engine: none of these clears by waiting.
+	for _, err := range []error{
+		dragonboat.ErrPayloadTooBig,
+		dragonboat.ErrRejected,
+		dragonboat.ErrInvalidSession,
+		dragonboat.ErrInvalidOperation,
+	} {
+		if tolerable(err) {
+			t.Errorf("tolerable(%v) = true; a permanent error would be counted as "+
+				"weather and published at up to 20%%", err)
+		}
 	}
 }

@@ -35,7 +35,9 @@ import (
 //
 // The gate parses this file rather than running it, so it costs nothing and
 // needs no cluster. For every function that increments an error counter, it
-// requires a requireFloor call in the same function body.
+// requires both a requireFloor call and a tolerable classification in the
+// same function body -- the floor bounds HOW MANY errors, tolerable bounds
+// WHICH, and a loop with only one of them is wrong in the other direction.
 func TestEveryTolerantLoopIsFloored(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "dragonboat_bench.go", nil, parser.SkipObjectResolution)
@@ -49,7 +51,7 @@ func TestEveryTolerantLoopIsFloored(t *testing.T) {
 		if !ok || fn.Body == nil {
 			continue
 		}
-		var counts, floors bool
+		var counts, floors, stops bool
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.IncDecStmt:
@@ -62,8 +64,13 @@ func TestEveryTolerantLoopIsFloored(t *testing.T) {
 						counts = true
 					}
 				}
-				if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "requireFloor" {
-					floors = true
+				if id, ok := x.Fun.(*ast.Ident); ok {
+					switch id.Name {
+					case "requireFloor":
+						floors = true
+					case "tolerable":
+						stops = true
+					}
 				}
 			}
 			return true
@@ -76,6 +83,11 @@ func TestEveryTolerantLoopIsFloored(t *testing.T) {
 			t.Errorf("%s counts tolerated errors but never calls requireFloor: a run "+
 				"in which every operation failed would report no samples and pass "+
 				"clean (#181)", fn.Name.Name)
+		}
+		if !stops {
+			t.Errorf("%s counts tolerated errors without classifying them through "+
+				"tolerable: a PERMANENT error would be counted as weather and the run "+
+				"published at up to 20%% failures", fn.Name.Name)
 		}
 	}
 	// The gate must be looking at something, or a rename of the counters
