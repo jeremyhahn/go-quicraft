@@ -5205,3 +5205,72 @@ func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testin
 			"change what the state machine wrote", len(roundTripped), len(want))
 	}
 }
+
+// TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext pins
+// the contract inline sealing (#116) nearly broke.
+//
+// MaxSnapshotSize is documented against the state machine's output after
+// compression -- "the actual on-disk size (post-compression when Snappy is
+// enabled)". That was literally the file's size only because the file held
+// plaintext at the point of the check. With sealing inline the file holds
+// framed ciphertext, ~41 bytes larger per 64 KiB chunk, and a stat there
+// measures encryption overhead against a limit that was never defined to
+// include it. A snapshot exactly at the limit -- admitted before, and
+// documented as admitted -- would be refused, and SnapshotTooLargeError.Size
+// would report a number the operator's configuration does not describe.
+//
+// Codex review of the branch found it. The fix measures what the frame writer
+// was handed, which is the old quantity exactly; this test sets the limit to
+// the payload size and asserts the save is admitted with a barrier configured.
+func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *testing.T) {
+	snapDir := t.TempDir()
+	// Two full chunks plus a tail, so there are three frames' worth of AEAD
+	// overhead on disk -- enough that a stat-based check would refuse this.
+	const payload = snapshotEncryptChunkSize*2 + 4096
+
+	cfg := config.Config{ShardID: 14, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+	cfg.MaxSnapshotSize = payload // exactly at the limit, not over
+
+	snapshotter := &bulkSnapshotter{bytes: payload}
+	snapshotter.lastApplied.Store(300)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, newTestBarrier(2), nil, nil, stopC, nil)
+
+	if _, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   14,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	}); err != nil {
+		t.Fatalf("a snapshot whose post-compression size EQUALS MaxSnapshotSize "+
+			"must be admitted with encryption on; the limit is defined against "+
+			"the state machine's output, not the ciphertext: %v", err)
+	}
+
+	// And the on-disk artifact really is larger than the limit, so this test
+	// is exercising the distinction rather than a case where both agree.
+	dataPath := filepath.Join(snapshotSaveDir(snapDir, 14, 1, 300), snapshotDataFile)
+	fi, err := os.Stat(dataPath)
+	if err != nil {
+		t.Fatalf("stat sealed artifact: %v", err)
+	}
+	if uint64(fi.Size()) <= payload {
+		t.Fatalf("sealed artifact is %d bytes, not larger than the %d-byte payload; "+
+			"the test cannot tell a plaintext measurement from a ciphertext one",
+			fi.Size(), payload)
+	}
+	// The LogDB record still carries the on-disk size, which is what sizes a
+	// transfer.
+	snap, err := ldb.GetSnapshot(14, 1)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.FileSize != uint64(fi.Size()) {
+		t.Fatalf("LogDB FileSize = %d, want the on-disk %d", snap.FileSize, fi.Size())
+	}
+}

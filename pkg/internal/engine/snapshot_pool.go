@@ -1140,29 +1140,48 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
-	// Enforce MaxSnapshotSize: reject snapshots that exceed the
-	// configured limit before proceeding with encryption or metadata
-	// persistence. The check is performed after fsync to measure the
-	// actual on-disk size (post-compression if Snappy is enabled).
+	// Enforce MaxSnapshotSize: reject snapshots that exceed the configured
+	// limit before proceeding with metadata persistence.
+	//
+	// The quantity measured is the state machine's output AFTER compression
+	// and BEFORE sealing -- the "post-compression size" the limit is
+	// documented against (docs/multi-group-host/user.md). Before inline
+	// sealing that was simply the file's size, because the file held
+	// plaintext at this point. It no longer does: the file now holds framed
+	// ciphertext, ~41 bytes larger per 64 KiB chunk, so stat would measure
+	// the encryption overhead against a limit that was never defined to
+	// include it -- and a snapshot exactly at the limit, which used to be
+	// admitted, would be refused. The frame writer counts what it was handed,
+	// which is precisely the old measurement. Without a barrier the file is
+	// plaintext and stat is that same number.
+	//
+	// FileSize on the LogDB record, below, stays the stat'd on-disk size:
+	// that field means "bytes at Filepath" and is used to size transfers.
 	if node.cfg.MaxSnapshotSize > 0 {
-		fi, statErr := f.Stat()
-		if statErr != nil {
-			if closeErr := f.Close(); closeErr != nil {
-				slog.Debug("snapshot: file close failed after stat error",
-					"shard_id", req.shardID,
-					"replica_id", req.replicaID,
-					"path", dataPath,
-					"error", closeErr,
-				)
+		var measured uint64
+		if frameW != nil {
+			measured = uint64(frameW.PlaintextBytes())
+		} else {
+			fi, statErr := f.Stat()
+			if statErr != nil {
+				if closeErr := f.Close(); closeErr != nil {
+					slog.Debug("snapshot: file close failed after stat error",
+						"shard_id", req.shardID,
+						"replica_id", req.replicaID,
+						"path", dataPath,
+						"error", closeErr,
+					)
+				}
+				return 0, &SnapshotError{
+					ShardID:   req.shardID,
+					ReplicaID: req.replicaID,
+					Save:      true,
+					Err:       statErr,
+				}
 			}
-			return 0, &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      true,
-				Err:       statErr,
-			}
+			measured = uint64(fi.Size())
 		}
-		if uint64(fi.Size()) > node.cfg.MaxSnapshotSize {
+		if measured > node.cfg.MaxSnapshotSize {
 			if closeErr := f.Close(); closeErr != nil {
 				slog.Debug("snapshot: file close failed before cleanup",
 					"shard_id", req.shardID,
@@ -1174,7 +1193,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			return 0, &SnapshotTooLargeError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
-				Size:      uint64(fi.Size()),
+				Size:      measured,
 				Limit:     node.cfg.MaxSnapshotSize,
 			}
 		}
