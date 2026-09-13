@@ -149,8 +149,22 @@ func requireConflict(t *testing.T, err error) *membershipConflictError {
 // "already exists" / "not found" / "stale" refusal does. The refusal itself
 // is therefore what the loop has to accept, not the first observation.
 
+// postDeliverySubmitted is what the adapter produces when leadership moves
+// AFTER the change reached Raft: the mapped sentinel with quicraft's submission
+// bit intact, exactly as translateError now returns it (#156).
+//
+// These fixtures used a BARE dragonboat.ErrShardNotReady to mean "submitted",
+// which worked only because translateError folded the post-delivery and
+// pre-flight cases into that one sentinel and the helper had to arm the bit for
+// both. With the fold gone a bare ErrShardNotReady means what it says -- the
+// replica refused it, nothing was submitted -- so a fixture that means
+// "submitted" has to say so.
+func postDeliverySubmitted() error {
+	return &quicraft.MaybeAppliedError{Err: dragonboat.ErrShardNotReady}
+}
+
 func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsAfterSubmissionLands(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errAlreadyExistsHere}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errAlreadyExistsHere}}
 	reads := readsOf(
 		membershipOf(nil, nil, nil),
 		membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
@@ -178,7 +192,7 @@ func TestIntegration_DB_ConfigChangeRetry_TimeoutIsASubmission(t *testing.T) {
 }
 
 func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsAtDifferentAddressStillFails(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errAlreadyExistsHere}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errAlreadyExistsHere}}
 	reads := readsOf(membershipOf(map[uint64]dragonboat.Target{10: helperOtherAddr}, nil, nil))
 	err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read)
 	if err == nil {
@@ -219,7 +233,7 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsInAnotherRoleStillFails(t
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errAlreadyExistsHere}}
+			attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errAlreadyExistsHere}}
 			err := driveConfigChange(tc.cc, helperBudget, attempts.attempt, readsOf(tc.m).read)
 			if err == nil {
 				t.Fatal("the replica ID is held in a different ROLE at the same address; that is a conflict, not a landed retry")
@@ -247,6 +261,13 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsWithoutSubmissionStillFai
 		// the fixture has to be the thing it models.
 		"transfer in progress":  &dragonboat.AdapterError{Err: quicraft.ErrTransferInProgress},
 		"refused on first call": errAlreadyExistsHere,
+		// The BARE sentinel, with no submission bit. Before #156 this was
+		// indistinguishable from the post-delivery leadership change --
+		// translateError folded both into ErrShardNotReady -- so the helper had
+		// to arm the submission bit for it and this case could not be
+		// expressed. It is the one an engine that applied a change it reported
+		// as refused PRE-FLIGHT would slip through.
+		"pre-flight not-leader": dragonboat.ErrShardNotReady,
 	}
 	landed := membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil)
 	for name, first := range preflight {
@@ -266,7 +287,7 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsWithoutSubmissionStillFai
 }
 
 func TestIntegration_DB_ConfigChangeRetry_DeleteNotFoundAfterSubmissionLands(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errNotFoundHere}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errNotFoundHere}}
 	gone := membershipOf(nil, nil, nil)
 	delete(gone.Nodes, 2)
 	reads := readsOf(membershipOf(nil, nil, nil), gone) // still present, then gone
@@ -291,7 +312,7 @@ func TestIntegration_DB_ConfigChangeRetry_DeleteNotFoundWithoutSubmissionStillFa
 }
 
 func TestIntegration_DB_ConfigChangeRetry_DeleteStillPresentFails(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errNotFoundHere}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errNotFoundHere}}
 	reads := readsOf(membershipOf(nil, nil, nil)) // replica 2 still a voter
 	err := driveConfigChange(deleteTwo(), helperBudget, attempts.attempt, reads.read)
 	if err == nil {
@@ -304,7 +325,7 @@ func TestIntegration_DB_ConfigChangeRetry_StaleIDAfterSubmissionLands(t *testing
 	// The caller's ConfigChangeID describes the configuration BEFORE its own
 	// change; once that change commits under a new leader, the retry is
 	// refused as stale. Only the read can say the change is the loop's own.
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, dragonboat.ErrStaleConfigChange}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), dragonboat.ErrStaleConfigChange}}
 	reads := readsOf(
 		membershipOf(nil, nil, nil),
 		membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
@@ -331,7 +352,7 @@ func TestIntegration_DB_ConfigChangeRetry_StaleIDWithoutSubmissionFails(t *testi
 }
 
 func TestIntegration_DB_ConfigChangeRetry_StaleIDNotLandedFails(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, dragonboat.ErrStaleConfigChange}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), dragonboat.ErrStaleConfigChange}}
 	reads := readsOf(membershipOf(nil, nil, nil)) // replica 10 absent
 	err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read)
 	if err == nil {
@@ -341,7 +362,7 @@ func TestIntegration_DB_ConfigChangeRetry_StaleIDNotLandedFails(t *testing.T) {
 }
 
 func TestIntegration_DB_ConfigChangeRetry_ReadFailureIsNotEvidence(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrShardNotReady, errAlreadyExistsHere}}
+	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errAlreadyExistsHere}}
 	reads := &scriptedReads{results: []scriptedRead{
 		{err: errNoLeaderObserved},
 		{err: dragonboat.ErrShardNotReady},

@@ -1396,9 +1396,11 @@ func (c *dbTestCluster) waitForClusterLeader(shardID uint64, timeout time.Durati
 //
 // It is harder to recognise through this adapter than through quicraft
 // directly, because translateError folds quicraft's
-// "not leader for shard N, leader unknown" into the bare ErrShardNotReady
-// sentinel (see contrib/dragonboat/errors.go). The failure that reaches a test
-// here says only "shard not ready", with no mention of leadership at all.
+// "not leader for shard N, leader unknown" into the ErrShardNotReady sentinel
+// (see contrib/dragonboat/errors.go) -- bare for the pre-flight refusal, and
+// since #156 wrapped in *quicraft.MaybeAppliedError for the post-delivery one.
+// Either way the failure that reaches a test here says "shard not ready", with
+// no mention of leadership at all.
 //
 // These helpers are this module's own rather than the parent module's
 // test/proposer package. That package is typed on *quicraft.Host, a raw
@@ -1487,8 +1489,14 @@ func (c *dbTestCluster) waitForLeaderHost(shardID uint64, timeout time.Duration)
 // folds quicraft.ErrNotLeader into ErrShardNotReady, which is dragonboat's
 // documented "unknown leader is the most common cause" error and, unlike
 // ErrNotLeader, satisfies IsTempError in a migrated retry loop
-// (contrib/dragonboat/errors.go). ErrShardNotReady is therefore the only shape
-// a not-leader rejection can have here.
+// (contrib/dragonboat/errors.go). ErrShardNotReady is therefore the only
+// SENTINEL a not-leader rejection can have here. Since #156 the post-delivery
+// form keeps quicraft's *MaybeAppliedError wrapper around that sentinel, so it
+// is distinguishable from the pre-flight refusal; this predicate deliberately
+// does not distinguish them, for the reason the parent's test/proposer gives:
+// every command these suites propose is a last-write-wins KV put, idempotent
+// under re-proposal, so retrying a maybe-applied entry is safe. The one place
+// the bit changes a decision is the config-change section below.
 //
 // Two other quicraft errors fold into the same sentinel: ErrDropped (the leader
 // is unavailable or not ready) and ErrReadIndexNotReady (the leader has not yet
@@ -1526,8 +1534,10 @@ func isNotLeaderRejection(err error) bool {
 // declare its own type parameter, and the result type differs per caller.
 //
 // The retryable set is deliberately NOT a parameter. isNotLeaderRejection is
-// the only one this module has: the adapter folds every not-leader shape into
-// ErrShardNotReady, so there is nothing else to distinguish. The parent's
+// the only one this module has: the adapter maps every not-leader shape to the
+// ErrShardNotReady sentinel, and the submission bit the post-delivery form
+// carries since #156 does not change what this loop does with it (see
+// isNotLeaderRejection), so there is nothing else to distinguish. The parent's
 // test/proposer takes a Retryable because it also serves Pinned callers; this
 // module has none, because a site that means one SPECIFIC replica keeps its
 // direct call and says so with a quicraft:direct-propose or
@@ -1814,8 +1824,7 @@ func (c *dbTestCluster) tryReadIndexFromLeader(
 // Idempotent, leader-resolving config changes
 // ---------------------------------------------------------------------------
 //
-// A config change has TWO values a test is tempted to pin and must not, and
-// this adapter hides the second.
+// A config change has TWO values a test is tempted to pin and must not.
 //
 // The first is leadership -- the class the proposal helpers above exist for.
 // #123 is its config-change instance: a SyncRequestAddReplica on a host
@@ -1829,15 +1838,15 @@ func (c *dbTestCluster) tryReadIndexFromLeader(
 //
 // The parent module's test/membership package (#149) is the decision core for
 // this and is not reusable here, for the reason test/proposer was not (#114):
-// its predicates read signals this adapter erases. Its submission bit is
-// quicraft.MaybeApplied, and translateError returns the bare mapped sentinel
-// for anything that errors.Is a mapped error, so the *quicraft.MaybeAppliedError
-// wrapping the post-delivery NotLeaderError arrives here as ErrShardNotReady
-// with the wrapper gone, indistinguishable from the pre-flight refusal. Its
-// resolver is typed on *quicraft.Host, which NodeHost does not expose; its
+// its resolver is typed on *quicraft.Host, which NodeHost does not expose; its
 // Confirm on *quicraft.Membership rather than this adapter's; and it carries
-// no ConfigChangeID, which every converted site here passes. What IS the same
-// is the rule, and the rule is what this section mirrors:
+// no ConfigChangeID, which every converted site here passes. Its submission
+// bit, quicraft.MaybeApplied, IS readable here since #156: translateError
+// rebuilds the *quicraft.MaybeAppliedError wrapper around the mapped sentinel
+// instead of discarding it, so the post-delivery NotLeaderError arrives as
+// ErrShardNotReady with the bit intact, distinguishable from the pre-flight
+// refusal. What is the same is the rule, and the rule is what this section
+// mirrors:
 //
 //	"already exists" / "not found" is success ONLY when (a) an earlier attempt
 //	in the SAME loop was submitted to Raft, AND (b) a LINEARIZABLE membership
@@ -1851,17 +1860,16 @@ func (c *dbTestCluster) tryReadIndexFromLeader(
 // submitted attempt behind it, or one whose change the read cannot find, is
 // the caller's own error and is reported as such.
 //
-// Half (a) is where this module's rule is WIDER than the parent's, by exactly
-// one error, and it has to be. In the parent, submission is quicraft's own bit
+// Half (a) is now the parent's rule exactly: submission is quicraft's own bit
 // or an ErrTimeout, which Sync{Add,Delete}Node can only return after delivery.
-// Here the only shape the post-delivery leadership change has is
-// ErrShardNotReady, so ErrShardNotReady arms the bit as well. The cost is
-// precise: an engine that applied a change it had reported as refused
-// pre-flight would be caught by the parent's helper and not by this one. That
-// is the adapter's erasure rather than this helper's choice, and it is filed
-// against contrib/dragonboat/errors.go. Half (b) is unchanged and carries the
-// weight: a replica ID found in a different role, at a different address, or a
-// delete target still present fails regardless of (a).
+// Until #156 it was WIDER by one error -- the only shape the post-delivery
+// leadership change had here was a bare ErrShardNotReady, so ErrShardNotReady
+// armed the bit too, and an engine that applied a change it had reported as
+// refused pre-flight was caught by the parent's helper and not by this one.
+// A bare ErrShardNotReady now means what it says and arms nothing; see
+// configChangeMaybeSubmitted. Half (b) is unchanged and carries the weight: a
+// replica ID found in a different role, at a different address, or a delete
+// target still present fails regardless of (a).
 
 // configChangeKind selects one of the adapter's four synchronous membership
 // calls.
@@ -2056,17 +2064,24 @@ var errNoLeaderObserved = errors.New("integration: no live replica reports leade
 //     select on ctx.Done() after RequestX returned a live RequestState, or the
 //     deadline sweep completing a registered pending proposal. Both are after
 //     delivery.
-//   - ErrShardNotReady. This is the fold: quicraft's post-delivery
-//     *MaybeAppliedError{NotLeaderError} and its pre-flight NotLeaderError both
-//     translate to this bare sentinel, and so does ErrDropped. The submission
-//     bit therefore has to be armed for all of them; see the section comment
-//     for what that costs and why it is the adapter's to fix.
+//   - quicraft.MaybeApplied. The engine's own bit, which #156 taught
+//     translateError to preserve: it wraps the mapped sentinel in
+//     *quicraft.MaybeAppliedError rather than discarding the wrapper, so the
+//     post-delivery leadership change is now distinguishable here.
+//
+// ErrShardNotReady used to be the second clause, and it was a FOLD rather than
+// a signal: quicraft's post-delivery *MaybeAppliedError{NotLeaderError}, its
+// pre-flight NotLeaderError and ErrDropped all translated to that one bare
+// sentinel, so the submission bit had to be armed for every one of them. The
+// cost was precise — an engine that applied a change it had reported as refused
+// PRE-FLIGHT was caught by the root module's helper and not by this one — and
+// it is gone with the fold.
 //
 // ErrCanceled is deliberately NOT here: an attempt's context is cancelled
 // only after the attempt has returned, so a cancellation seen here submitted
 // nothing.
 func configChangeMaybeSubmitted(err error) bool {
-	return errors.Is(err, dragonboat.ErrTimeout) || errors.Is(err, dragonboat.ErrShardNotReady)
+	return errors.Is(err, dragonboat.ErrTimeout) || quicraft.MaybeApplied(err)
 }
 
 // configChangeRetryableSentinels are the errors one more attempt can change
