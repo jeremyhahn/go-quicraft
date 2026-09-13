@@ -79,6 +79,17 @@ RUN_PID="$REMOTE_PERF/bench-run.pid"
 # Without it a failed run was indistinguishable from a successful one to this
 # script: wait_for_run returns `tail`'s status, not the benchmark's (#181).
 RUN_RC="$REMOTE_PERF/bench-run.rc"
+# RUN_RC_ABS is RUN_RC as a path that means the same thing from ANY directory
+# on the target. The status file is written from inside a subshell that has
+# already cd'd into $REMOTE_PERF, and read back from the login home, so a
+# relative RUN_RC needs anchoring at $HOME -- but only a relative one. The
+# documented REMOTE_DIR override may be absolute (/mnt/bench), and prefixing
+# that gives $HOME//mnt/bench/..., a directory staging never created, so every
+# run would report "no exit status" and the gate would refuse everything.
+case "$RUN_RC" in
+  /*) RUN_RC_ABS="$RUN_RC" ;;
+  *)  RUN_RC_ABS="\$HOME/$RUN_RC" ;;
+esac
 
 say() { echo ">> $*"; }
 
@@ -167,10 +178,10 @@ run() {
   # reads from the home directory, would never find it. The failure mode is
   # every run reporting "recorded no exit status", i.e. the gate refusing
   # everything.
-  ssh "$HOST" "rm -f \"\$HOME/$RUN_RC\""
+  ssh "$HOST" "rm -f \"$RUN_RC_ABS\""
   ssh "$HOST" "( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
       nohup sh -c './perfcompare --benchtime=\"$BENCHTIME\" --timeout=\"$PERF_TIMEOUT\" \
-        --profile=\"$PROFILE_REL\" $PERF_SYSTEMS; echo \$? > \"\$HOME/$RUN_RC\"' ) > '$RUN_LOG' 2>&1 & \
+        --profile=\"$PROFILE_REL\" $PERF_SYSTEMS; echo \$? > \"$RUN_RC_ABS\"' ) > '$RUN_LOG' 2>&1 & \
     echo \$! > '$RUN_PID'; echo \"PID \$(cat '$RUN_PID')\""
 
   # Confirm it is actually running. Launching and reporting a pid proves only
@@ -229,7 +240,7 @@ generate() {
 # failed, the right outcome is that it stays exactly as it was.
 require_run_success() {
   local rc
-  rc="$(ssh "$HOST" "cat \"\$HOME/$RUN_RC\" 2>/dev/null" || true)"
+  rc="$(ssh "$HOST" "cat \"$RUN_RC_ABS\" 2>/dev/null" || true)"
   if [ -z "$rc" ]; then
     echo "ERROR: the suite recorded no exit status at $RUN_RC on $HOST." >&2
     echo "       Treating that as a failure: the local profile is UNCHANGED." >&2

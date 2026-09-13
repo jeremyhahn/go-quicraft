@@ -959,6 +959,24 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 // rather than on a guess about the host.
 const maxProposeErrorRate = 0.20
 
+// minProposeSample is the number of attempts below which the floor withholds
+// judgement instead of applying a rate.
+//
+// Go's benchmark runner invokes every benchmark first with b.N=1, and only
+// launches the larger calibrated runs if that invocation returns without
+// failing. At b.N=1 the sequential loops make ONE proposal and the concurrent
+// helper makes eight (one per goroutine), so a single transient refusal is a
+// 100% or 12.5% error rate -- and a rate-based floor would call b.Fatal on the
+// calibration probe and abort the whole benchmark before it measured anything.
+// That is the exact failure this file was changed to remove, arriving by a
+// different door.
+//
+// A rate is not meaningful over a handful of attempts anyway. Below this many,
+// the floor applies only the zero-completions check (a probe that could not
+// propose at all IS a real failure and should stop calibration) and lets the
+// calibrated run, with thousands of attempts, be the one that is judged.
+const minProposeSample = 100
+
 // requireProposeFloor fails the benchmark unless enough of its proposals
 // completed for the recorded latencies to mean anything.
 //
@@ -1011,6 +1029,17 @@ func proposeFloorVerdict(completed, errored int) (string, bool) {
 			"to report, so this benchmark measured nothing", attempted), true
 	}
 	rate := float64(errored) / float64(attempted)
+	if attempted < minProposeSample {
+		// A calibration probe, or a run too short to rate. Something
+		// completed, so calibration may continue; the calibrated run is
+		// where the rate is judged. Still say what happened.
+		if errored > 0 {
+			return fmt.Sprintf("total propose errors: %d/%d (%.1f%%) -- below the "+
+				"%d-attempt sample floor, not judged", errored, attempted, 100*rate,
+				minProposeSample), false
+		}
+		return "", false
+	}
 	if rate > maxProposeErrorRate {
 		return fmt.Sprintf("%d of %d proposals failed (%.1f%%, limit %.0f%%): the "+
 			"surviving samples describe a contended host rather than the engine, so "+

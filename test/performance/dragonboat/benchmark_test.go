@@ -46,7 +46,12 @@ func BenchmarkProposeThroughput_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatPropose(b, nh, rec)
 
-	suite.AddResult(perfresult.ScenarioProposeSEQWAL, b.N, b.Elapsed(), rec)
+	// rec.Count(), not b.N. The loop now tolerates a bounded share of
+	// transient errors (#181) and records only the proposals that completed,
+	// so b.N overstates completed work by exactly the error count -- up to
+	// 25% at the admission threshold. The cluster variants below already do
+	// this; these two single-host ones were the holdouts.
+	suite.AddResult(perfresult.ScenarioProposeSEQWAL, rec.Count(), b.Elapsed(), rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +120,7 @@ func BenchmarkCommitLatency_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatCommitLatency(b, nh, rec)
 
-	suite.AddResult(perfresult.ScenarioCommitLatencyWAL, b.N, b.Elapsed(), rec)
+	suite.AddResult(perfresult.ScenarioCommitLatencyWAL, rec.Count(), b.Elapsed(), rec)
 }
 
 // ---------------------------------------------------------------------------

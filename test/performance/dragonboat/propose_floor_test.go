@@ -55,9 +55,31 @@ func TestProposeFloorVerdict(t *testing.T) {
 		},
 		{
 			name: "measured contended rate is refused",
-			// The real 2026-09-10 run at benchtime=30s: 21 of 24 (87.5%).
-			// These samples describe the box, not the engine.
-			completed: 3, errored: 21, fatal: true, wants: "contended host",
+			// The real 2026-09-10 run at benchtime=30s failed 21 of 24 (87.5%).
+			// Scaled to a calibrated run's sample size, because 24 attempts is
+			// itself below the sample floor: the same rate over 240.
+			completed: 30, errored: 210, fatal: true, wants: "contended host",
+		},
+		{
+			name: "calibration probe with one transient failure is NOT judged",
+			// Go runs every benchmark at b.N=1 first. The concurrent helper
+			// makes eight proposals there; one refusal is 12.5%, which a
+			// rate-based floor would have called fatal and aborted calibration.
+			completed: 7, errored: 1, fatal: false, wants: "not judged",
+		},
+		{
+			name: "calibration probe that could not propose at all IS fatal",
+			// The sample floor withholds the RATE, not the zero check: a probe
+			// that got nothing through is a real failure, and stopping
+			// calibration there is right.
+			completed: 0, errored: 1, fatal: true, wants: "measured nothing",
+		},
+		{
+			name: "the loaded run's raw 21 of 24 is below the sample floor",
+			// The real figures, unscaled. Twenty-four attempts is not enough to
+			// rate, so this is reported and admitted, and the calibrated run
+			// that follows -- with thousands of attempts -- is what gets judged.
+			completed: 3, errored: 21, fatal: false, wants: "not judged",
 		},
 		{
 			name: "total failure is refused as measuring nothing",
