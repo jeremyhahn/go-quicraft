@@ -164,6 +164,7 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 	b.ReportAllocs()
 	b.SetBytes(int64(len(cmd)))
 
+	var completed, errored int
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		proposeCtx, proposeCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -171,10 +172,17 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
-			b.Fatalf("SyncPropose failed at iteration %d: %v", i, err)
+			// A transient refusal is Raft weather, not a failed benchmark;
+			// requireProposeFloor decides whether there were too many. See
+			// #181 for what b.Fatalf here used to cost.
+			errored++
+			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
+			continue
 		}
+		completed++
 		rec.Record(elapsed)
 	}
+	requireProposeFloor(b, completed, errored)
 }
 
 // BenchDragonboatSyncRead benchmarks linearizable read throughput.
@@ -272,6 +280,7 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 	b.ResetTimer()
 	b.ReportAllocs()
 
+	var completed, errored int
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		proposeCtx, proposeCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -279,10 +288,17 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
-			b.Fatalf("SyncPropose failed at iteration %d: %v", i, err)
+			// A transient refusal is Raft weather, not a failed benchmark;
+			// requireProposeFloor decides whether there were too many. See
+			// #181 for what b.Fatalf here used to cost.
+			errored++
+			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
+			continue
 		}
+		completed++
 		rec.Record(elapsed)
 	}
+	requireProposeFloor(b, completed, errored)
 }
 
 // BenchDragonboatElection benchmarks the Raft election algorithm time,
@@ -390,7 +406,7 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 	b.ReportAllocs()
 
 	var wg sync.WaitGroup
-	var errCount atomic.Int64
+	var okCount, errCount atomic.Int64
 	wg.Add(numGoroutines)
 
 	for g := 0; g < numGoroutines; g++ {
@@ -411,6 +427,7 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 					errCount.Add(1)
 					continue
 				}
+				okCount.Add(1)
 				rec.Record(elapsed)
 			}
 		}(g)
@@ -418,9 +435,10 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 
 	wg.Wait()
 
-	if n := errCount.Load(); n > 0 {
-		b.Logf("concurrent propose: %d errors out of %d ops", n, b.N)
-	}
+	// Counted AND checked. This loop tolerated every error and logged the
+	// total, but nothing read it, so a run in which every proposal failed
+	// reported no samples and passed clean (#181).
+	requireProposeFloor(b, int(okCount.Load()), int(errCount.Load()))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,7 +747,7 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 	b.ReportAllocs()
 	b.SetBytes(int64(len(cmd)))
 
-	var errCount atomic.Int64
+	var completed, errored int
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		proposeCtx, proposeCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -737,15 +755,17 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
-			errCount.Add(1)
+			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
 		}
+		completed++
 		rec.Record(elapsed)
 	}
-	if n := errCount.Load(); n > 0 {
-		b.Logf("total propose errors: %d/%d", n, b.N)
-	}
+	// This loop already tolerated errors and counted them. What it did not do
+	// was check the count, so a run in which EVERY proposal failed reported
+	// zero samples and passed clean (#181).
+	requireProposeFloor(b, completed, errored)
 }
 
 // BenchDragonboatConcurrentProposeFixedCluster benchmarks concurrent
@@ -763,7 +783,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 	b.ReportAllocs()
 
 	var wg sync.WaitGroup
-	var errCount atomic.Int64
+	var okCount, errCount atomic.Int64
 	wg.Add(numGoroutines)
 
 	for g := 0; g < numGoroutines; g++ {
@@ -784,6 +804,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 					errCount.Add(1)
 					continue
 				}
+				okCount.Add(1)
 				rec.Record(elapsed)
 			}
 		}(g)
@@ -791,9 +812,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 
 	wg.Wait()
 
-	if n := errCount.Load(); n > 0 {
-		b.Logf("concurrent propose cluster: %d errors out of %d ops", n, b.N)
-	}
+	requireProposeFloor(b, int(okCount.Load()), int(errCount.Load()))
 }
 
 // BenchDragonboatCommitLatencyCluster benchmarks per-proposal commit
@@ -918,4 +937,119 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 		}
 		rec.Record(elapsed)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Propose-loop error tolerance (#181)
+// ---------------------------------------------------------------------------
+
+// maxProposeErrorRate is the share of a propose loop's iterations that may fail
+// before the loop's recorded latencies stop being worth publishing.
+//
+// The number is measured, not chosen for roundness. The Dragonboat baseline was
+// run twice on 2026-09-10 against a host also serving CI:
+//
+//	benchtime=30s, load ~14-24 on 20 cores   21 of 24 proposals failed  (87%)
+//	benchtime=5s,  load ~3.4 on 20 cores     24 of 399 failed           (6%)
+//
+// The quiet run's 6% is ordinary Raft weather -- a leader election completing,
+// a pipeline draining -- and its surviving samples describe the engine. The
+// loaded run's 87% describes the box. A threshold between them lets the first
+// publish and refuses the second, and it does so on the RUN'S OWN evidence
+// rather than on a guess about the host.
+const maxProposeErrorRate = 0.20
+
+// minProposeSample is the number of attempts below which the floor withholds
+// judgement instead of applying a rate.
+//
+// Go's benchmark runner invokes every benchmark first with b.N=1, and only
+// launches the larger calibrated runs if that invocation returns without
+// failing. At b.N=1 the sequential loops make ONE proposal and the concurrent
+// helper makes eight (one per goroutine), so a single transient refusal is a
+// 100% or 12.5% error rate -- and a rate-based floor would call b.Fatal on the
+// calibration probe and abort the whole benchmark before it measured anything.
+// That is the exact failure this file was changed to remove, arriving by a
+// different door.
+//
+// A rate is not meaningful over a handful of attempts anyway. Below this many,
+// the floor applies only the zero-completions check (a probe that could not
+// propose at all IS a real failure and should stop calibration) and lets the
+// calibrated run, with thousands of attempts, be the one that is judged.
+const minProposeSample = 100
+
+// requireProposeFloor fails the benchmark unless enough of its proposals
+// completed for the recorded latencies to mean anything.
+//
+// # Why this exists at all
+//
+// The two sequential propose loops used to call b.Fatalf on the FIRST error,
+// under a 5-second per-proposal deadline. One transient "request dropped as the
+// shard is not ready" therefore destroyed a whole run, and the Dragonboat
+// baseline could not be measured at all on a host carrying ordinary CI load
+// (#181). Those are precisely the conditions this repository has spent #96,
+// #111, #123, #131 and #161 learning not to treat as failures.
+//
+// # Why a floor and not merely tolerance
+//
+// Tolerance alone replaces a loud failure with a silent one. The concurrent
+// loop already counted its errors and logged them -- and would have reported
+// ZERO successful proposals as a clean pass, because nothing checked. A
+// benchmark that publishes percentiles over no samples is worse than one that
+// crashes, since the number reaches a comparison table.
+//
+// So both halves are here: a transient error no longer aborts the run, and a
+// run that failed to measure the thing it exists to measure fails loudly and
+// says which of the two it was. This is the shape linearizability's
+// minSuccessfulReads floor already uses in the integration suites.
+func requireProposeFloor(b *testing.B, completed, errored int) {
+	b.Helper()
+	note, fatal := proposeFloorVerdict(completed, errored)
+	if note == "" {
+		return
+	}
+	if fatal {
+		b.Fatal(note)
+	}
+	b.Log(note)
+}
+
+// proposeFloorVerdict is requireProposeFloor's decision, separated from the
+// *testing.B it reports through so the thresholds can be tested at their
+// boundaries rather than only exercised by a 30-minute benchmark run.
+//
+// It returns the message to report and whether it is fatal; an empty message
+// means the loop was clean and there is nothing to say.
+func proposeFloorVerdict(completed, errored int) (string, bool) {
+	attempted := completed + errored
+	if attempted == 0 {
+		return "", false // b.N was 0; nothing was asked of the engine.
+	}
+	if completed == 0 {
+		return fmt.Sprintf("every one of %d proposals failed: there are no samples "+
+			"to report, so this benchmark measured nothing", attempted), true
+	}
+	rate := float64(errored) / float64(attempted)
+	if attempted < minProposeSample {
+		// A calibration probe, or a run too short to rate. Something
+		// completed, so calibration may continue; the calibrated run is
+		// where the rate is judged. Still say what happened.
+		if errored > 0 {
+			return fmt.Sprintf("total propose errors: %d/%d (%.1f%%) -- below the "+
+				"%d-attempt sample floor, not judged", errored, attempted, 100*rate,
+				minProposeSample), false
+		}
+		return "", false
+	}
+	if rate > maxProposeErrorRate {
+		return fmt.Sprintf("%d of %d proposals failed (%.1f%%, limit %.0f%%): the "+
+			"surviving samples describe a contended host rather than the engine, so "+
+			"publishing them would put a measurement of this machine's load into a "+
+			"comparison table. Re-run on a quiet host.",
+			errored, attempted, 100*rate, 100*maxProposeErrorRate), true
+	}
+	if errored > 0 {
+		return fmt.Sprintf("total propose errors: %d/%d (%.1f%%)",
+			errored, attempted, 100*rate), false
+	}
+	return "", false
 }
