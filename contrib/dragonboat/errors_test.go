@@ -616,3 +616,89 @@ func BenchmarkTranslateError(b *testing.B) {
 		}
 	})
 }
+
+// TestTranslateError_PreservesTheMaybeAppliedBit is #156.
+//
+// quicraft marks failures that happen AFTER an entry reached Raft by wrapping
+// them in *MaybeAppliedError. translateError used to discard that wrapper and
+// return the bare mapped sentinel, so the post-delivery leadership change and
+// the pre-flight refusal became indistinguishable here — both ErrShardNotReady,
+// both MaybeApplied false.
+//
+// That is not a cosmetic loss. On the config-change path the submission bit is
+// what separates "the leader refused this, nothing happened" from "the leader
+// took it and then lost the shard, so it may still commit", which decides
+// whether a later "already exists" is this caller's own change landing or
+// somebody else's. The adapter's helper had to widen its predicate to cover the
+// fold, and the cost was that an engine applying a change it had reported as
+// refused PRE-FLIGHT went undetected here while the root module caught it.
+func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
+	postDelivery := &quicraft.MaybeAppliedError{Err: &quicraft.NotLeaderError{ShardID: 1}}
+	translated := translateError(postDelivery)
+
+	// The mapping still holds: every existing comparison keeps working,
+	// because errors.Is walks Unwrap.
+	if !errors.Is(translated, ErrShardNotReady) {
+		t.Errorf("errors.Is(%v, ErrShardNotReady) = false; wrapping must not "+
+			"break the sentinel a migrated caller matches on", translated)
+	}
+	// And the bit now survives.
+	if !quicraft.MaybeApplied(translated) {
+		t.Error("quicraft.MaybeApplied = false for a post-delivery failure; the " +
+			"submission bit was discarded by the mapping, which is #156")
+	}
+	// IsTempError is unaffected, since it is errors.Is-based too.
+	if !IsTempError(translated) {
+		t.Error("IsTempError = false; the wrapper must not change temporariness")
+	}
+
+	// The pre-flight refusal is the control: same sentinel, no bit. Without
+	// this the test would pass against an implementation that wrapped
+	// EVERYTHING, which would be just as wrong in the other direction.
+	preFlight := translateError(&quicraft.NotLeaderError{ShardID: 1})
+	if !errors.Is(preFlight, ErrShardNotReady) {
+		t.Errorf("errors.Is(%v, ErrShardNotReady) = false for the pre-flight refusal", preFlight)
+	}
+	if quicraft.MaybeApplied(preFlight) {
+		t.Error("quicraft.MaybeApplied = true for a PRE-FLIGHT refusal; nothing " +
+			"was submitted, and treating it as maybe-applied is what makes a " +
+			"stale \"already exists\" read as success")
+	}
+}
+
+// TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping is the generic
+// half of #156. translateError rebuilds the wrapper for ANY mapped sentinel,
+// not only the not-leader one the focused test above pins, so a mutation that
+// preserved the bit for ErrNotLeader alone would pass that test and silently
+// drop it for a wrapped timeout, a wrapped shard-closed, or whatever quicraft
+// wraps next. Every row of errorMappings is exercised in both directions: the
+// wrapped input keeps the bit and still errors.Is the mapped sentinel, and the
+// bare input is the control that must NOT acquire one.
+func TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping(t *testing.T) {
+	if len(errorMappings) == 0 {
+		t.Fatal("errorMappings is empty; this test would verify nothing")
+	}
+	for _, m := range errorMappings {
+		m := m
+		t.Run(m.quicraftErr.Error(), func(t *testing.T) {
+			wrapped := translateError(&quicraft.MaybeAppliedError{Err: m.quicraftErr})
+			if !errors.Is(wrapped, m.dragonboatErr) {
+				t.Errorf("errors.Is(%v, %v) = false; wrapping must not break the mapping",
+					wrapped, m.dragonboatErr)
+			}
+			if !quicraft.MaybeApplied(wrapped) {
+				t.Errorf("quicraft.MaybeApplied = false for a wrapped %v; the submission "+
+					"bit was discarded by the mapping", m.quicraftErr)
+			}
+
+			bare := translateError(m.quicraftErr)
+			if !errors.Is(bare, m.dragonboatErr) {
+				t.Errorf("errors.Is(%v, %v) = false for the bare input", bare, m.dragonboatErr)
+			}
+			if quicraft.MaybeApplied(bare) {
+				t.Errorf("quicraft.MaybeApplied = true for a BARE %v; nothing was "+
+					"submitted and the mapping must not invent the bit", m.quicraftErr)
+			}
+		})
+	}
+}
