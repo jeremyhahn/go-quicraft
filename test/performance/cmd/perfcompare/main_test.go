@@ -16,8 +16,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -199,13 +202,72 @@ func TestGenerateFailsWhenResultsDirEmpty(t *testing.T) {
 // to run here — which is precisely the condition under test.
 func TestRunBenchmarksFailsWhenSystemProducesNoResults(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // no docker binary reachable
+	profileDir := newProfileDir(t)
 
-	err := runBenchmarks([]string{"--benchtime=1x", "--no-build", "dragonboat"})
+	err := runBenchmarks([]string{"--benchtime=1x", "--no-build", "--profile=" + profileDir, "dragonboat"})
 	if err == nil {
 		t.Fatal("runBenchmarks returned nil after the only requested system produced no results")
 	}
 	if !strings.Contains(err.Error(), "dragonboat") {
 		t.Fatalf("error %q does not name the system that failed", err.Error())
+	}
+
+	// Every run has somewhere to put the container's console, and the run
+	// creates it before starting the container — including this one, which
+	// never got a container started at all.
+	logPath := filepath.Join(profileDir, "logs", "dragonboat.log")
+	if _, statErr := os.Stat(logPath); statErr != nil {
+		t.Fatalf("the run left no container log at %s: %v", logPath, statErr)
+	}
+}
+
+// TestRunContainerPreservesTheWholeConsole is the regression test for the half
+// of #184 that made every other perf failure undiagnosable: the orchestrator
+// captured the container's stdout only to parse the JSON out of it, so a 41 MB
+// run log of a failing container held no "--- FAIL:", no "=== RUN" and no "ok".
+// The container's console must survive verbatim, and the caller must still get
+// the stdout it parses.
+func TestRunContainerPreservesTheWholeConsole(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("no shell to stand in for a container: %v", err)
+	}
+
+	logPath := filepath.Join(t.TempDir(), "dragonboat.log")
+	const script = `echo '=== RUN   BenchmarkProposeThroughput_5N_Dragonboat'
+echo '    benchmark_test.go:141: propose 17 errors in 10000 iterations'
+echo 'raft: node 3 became leader at term 11' >&2
+echo '--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112'
+echo 'FAIL'
+exit 1`
+
+	stdout, err := runContainer(exec.Command("sh", "-c", script), logPath)
+	if err == nil {
+		t.Fatal("runContainer returned nil for a container that exited 1")
+	}
+
+	// The caller still receives stdout: parsing and diagnosis are unaffected.
+	for _, want := range []string{"=== RUN", "--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112"} {
+		if !strings.Contains(string(stdout), want) {
+			t.Fatalf("returned stdout is missing %q:\n%s", want, stdout)
+		}
+	}
+
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read container log: %v", err)
+	}
+	// Both streams, verbatim: the test output AND what the engine printed
+	// while failing.
+	for _, want := range []string{
+		"=== RUN   BenchmarkProposeThroughput_5N_Dragonboat",
+		"    benchmark_test.go:141: propose 17 errors in 10000 iterations",
+		"raft: node 3 became leader at term 11",
+		"--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112",
+		"FAIL",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("container log is missing %q:\n%s", want, body)
+		}
 	}
 }
 
@@ -314,6 +376,49 @@ func TestExtractDiagnosticTruncates(t *testing.T) {
 	}
 }
 
+// TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail is the other half of
+// #184. `go test` prints every relayed b.Errorf BEFORE the "--- FAIL:" naming
+// the benchmark, so a summary that kept the first maxDiagnosticLines matches and
+// stopped cut off at precisely the line the operator needed: the dragonboat run
+// relayed 40 tolerated propose errors and then said "(diagnostic truncated)".
+// The verdict is not expendable; the detail is.
+func TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail(t *testing.T) {
+	lines := []string{"=== RUN   BenchmarkProposeThroughput_5N_Dragonboat"}
+	for i := 0; i < 200; i++ {
+		lines = append(lines, fmt.Sprintf(
+			"    benchmark_test.go:141: propose %d failed: request dropped as the shard is not ready", i))
+	}
+	lines = append(lines,
+		"--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112",
+		"FAIL")
+
+	got := extractDiagnostic(strings.Join(lines, "\n"))
+	if len(got) > maxDiagnosticLines+1 {
+		t.Fatalf("extractDiagnostic returned %d lines; the budget is %d plus a marker",
+			len(got), maxDiagnosticLines)
+	}
+
+	verdictAt := slices.Index(got, "--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112")
+	if verdictAt < 0 {
+		t.Fatalf("the verdict naming the failed benchmark was dropped:\n%s", strings.Join(got, "\n"))
+	}
+	if !slices.Contains(got, "FAIL") {
+		t.Fatalf("the trailing FAIL was dropped:\n%s", strings.Join(got, "\n"))
+	}
+
+	// Detail is still reported, and still in the container's own order: the
+	// verdict reads after the messages that led to it.
+	if !strings.Contains(got[0], "benchmark_test.go:141") {
+		t.Fatalf("first summary line %q is not the first relayed message", got[0])
+	}
+	if verdictAt == 0 {
+		t.Fatal("the verdict was hoisted above the detail it explains")
+	}
+	if !strings.Contains(got[len(got)-1], "truncated") {
+		t.Fatalf("a summary that dropped detail must say so, got %q", got[len(got)-1])
+	}
+}
+
 // TestDockerRunErrorNamesTheReason asserts an exit-status-1 container never
 // reports only "exit status 1".
 func TestDockerRunErrorNamesTheReason(t *testing.T) {
@@ -331,12 +436,100 @@ func TestDockerRunErrorNamesTheReason(t *testing.T) {
 		}
 	}
 
-	bare := &DockerRunError{System: "dragonboat", Err: &exitStatusStub{}}
+	bare := &DockerRunError{
+		System:  "dragonboat",
+		Err:     &exitStatusStub{},
+		LogPath: "profiles/omega/logs/dragonboat.log",
+	}
 	if !strings.Contains(bare.Error(), "no failure lines found") {
 		t.Fatalf("a container with no diagnostics must say so, got %q", bare.Error())
+	}
+	// A container that said nothing the summary understands is exactly when
+	// the operator needs the whole console, so the failure names where it is.
+	if !strings.Contains(bare.Error(), "profiles/omega/logs/dragonboat.log") {
+		t.Fatalf("the failure does not name the container log, got %q", bare.Error())
 	}
 }
 
 type exitStatusStub struct{}
 
 func (e *exitStatusStub) Error() string { return "exit status 1" }
+
+// failAfterWriter accepts n bytes and then fails every write, standing in for
+// a log disk that fills mid-run.
+type failAfterWriter struct {
+	n    int
+	seen int
+	err  error
+}
+
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	if f.seen >= f.n {
+		return 0, f.err
+	}
+	f.seen += len(p)
+	return len(p), nil
+}
+
+// TestConsoleLogKeepsDrainingAndReportsTheFailure pins the two properties a
+// Codex review of #184 found missing from the first cut of the console tee.
+//
+// A short write from the log used to stop os/exec's copier for that stream,
+// and a container with nobody reading its pipe blocks -- so a full log disk
+// turned into a hung benchmark. And a write error was reported nowhere:
+// os/exec drops a copier's error when the process exits non-zero, and a
+// deferred Close drops its own always, so a console truncated exactly where
+// the late `--- FAIL:` lines land was presented as complete. That is #184's
+// defect one layer down.
+//
+// The writer must therefore do two things that pull in opposite directions:
+// never short-write (keep draining), and never hide the failure (report it).
+func TestConsoleLogKeepsDrainingAndReportsTheFailure(t *testing.T) {
+	diskFull := fmt.Errorf("write: no space left on device")
+	sink := &failAfterWriter{n: 10, err: diskFull}
+	c := &consoleLog{w: sink}
+
+	for _, chunk := range []string{"=== RUN   B\n", "relay 1\n", "relay 2\n", "--- FAIL: B\n"} {
+		n, err := c.Write([]byte(chunk))
+		if err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = (%d, %v); the console must keep draining after the "+
+				"log fails, or the container blocks on a full pipe", chunk, n, err)
+		}
+	}
+	if got := c.err(); got == nil {
+		t.Fatal("err() = nil after the log failed; a truncated console would be " +
+			"reported as complete, which is the defect this exists to end")
+	} else if got != diskFull {
+		t.Fatalf("err() = %v, want the FIRST failure %v", got, diskFull)
+	}
+}
+
+// TestRunContainerReportsAnIncompleteLog runs a real process through
+// runContainer with the log pointed at a path that cannot be written past
+// creation, and asserts the incompleteness reaches the caller even though the
+// process itself succeeded.
+func TestRunContainerReportsAnIncompleteLog(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not on PATH")
+	}
+	// /dev/full accepts the open and fails every write with ENOSPC, which is
+	// exactly the disk-full shape without needing a filesystem to fill.
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full not available")
+	}
+
+	cmd := exec.Command("sh", "-c", "echo '=== RUN   B'; echo '--- FAIL: B' >&2; exit 0")
+	out, err := runContainer(cmd, "/dev/full")
+	if err == nil {
+		t.Fatal("runContainer returned nil error with an unwritable log; the " +
+			"console is incomplete and the caller was not told")
+	}
+	if !strings.Contains(err.Error(), "INCOMPLETE") {
+		t.Fatalf("error does not say the log is incomplete: %v", err)
+	}
+	// The container's stdout must still have been captured for parsing --
+	// draining continued past the log failure.
+	if !strings.Contains(string(out), "=== RUN   B") {
+		t.Fatalf("stdout was not captured after the log failed: %q", out)
+	}
+}

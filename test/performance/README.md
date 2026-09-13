@@ -82,6 +82,7 @@ Inside a profile:
 |---|---|---|
 | `env.json` | `capture-env.sh`, on the target | Overwritten by each run; never hand-edited |
 | `results/*.json` | The benchmark run | One file per system; the data of record |
+| `logs/*.log` | The benchmark run | One container console per system, verbatim; overwritten by each run, never committed (`*.log` is ignored) |
 | `charts/*.svg` | The generator | Deleted and recreated freely |
 | `etcd.md`, `dragonboat.md`, `openraft.md` | The generator | **Disposable.** Deleted and recreated freely; edits are lost |
 | `analysis.md` | **You** | **The generator never writes it, ever** |
@@ -132,6 +133,7 @@ test/performance/
     omega/
       env.json           <- captured on omega
       results/*.json     <- one per system
+      logs/*.log         <- one container console per system, verbatim
       charts/*.svg       <- GENERATED
       dragonboat.md      <- GENERATED
       openraft.md        <- GENERATED
@@ -152,6 +154,21 @@ test/performance/
 ```
 
 `profiles/` is data, not build output. `make clean` does not touch it.
+
+### Diagnosing a failed system
+
+A failing container is explained in two places, and you need both.
+
+The run log carries the summary the orchestrator extracts: the relayed
+`b.Errorf` messages and — always, however many messages precede them — the
+`--- FAIL:` lines naming the benchmarks that failed. It ends with the path of
+the full console.
+
+That console is `logs/<system>.log` inside the profile: the container's stdout
+and stderr exactly as it produced them, `=== RUN` lines and all. A remote run
+writes it into the profile **on the bench host**, and `fetch` brings back
+results and `env.json` only, so it stays there. `./run-remote.sh status` lists
+what is on the target and prints the command to read one.
 
 ## System overview
 

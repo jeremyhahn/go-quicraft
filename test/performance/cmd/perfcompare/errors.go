@@ -15,6 +15,7 @@
 package main
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -113,6 +114,7 @@ func (e *MissingResultsError) Error() string {
 type DockerRunError struct {
 	System     string
 	Err        error
+	LogPath    string
 	Diagnostic []string
 }
 
@@ -126,13 +128,17 @@ func (e *DockerRunError) Error() string {
 	if len(e.Diagnostic) == 0 {
 		sb.WriteString("\n  (no failure lines found in container output; " +
 			"the container produced no test diagnostics, which usually means it " +
-			"died before the benchmarks ran — check the container stderr above)")
-		return sb.String()
+			"died before the benchmarks ran)")
+	} else {
+		sb.WriteString("\n  container reported:")
+		for _, line := range e.Diagnostic {
+			sb.WriteString("\n    ")
+			sb.WriteString(line)
+		}
 	}
-	sb.WriteString("\n  container reported:")
-	for _, line := range e.Diagnostic {
-		sb.WriteString("\n    ")
-		sb.WriteString(line)
+	if e.LogPath != "" {
+		sb.WriteString("\n  full container console: ")
+		sb.WriteString(e.LogPath)
 	}
 	return sb.String()
 }
@@ -144,58 +150,109 @@ func (e *DockerRunError) Unwrap() error { return e.Err }
 // bury the summary it is meant to be.
 const maxDiagnosticLines = 40
 
-// diagnosticPrefixes are the line prefixes that carry the reason a Go benchmark
-// binary failed. Test log lines (b.Fatalf output) are indented and matched
-// separately by diagnosticLine.
-var diagnosticPrefixes = []string{
+// verdictPrefixes are the line prefixes that carry the VERDICT: which benchmark
+// failed, or how the binary died. These are what an operator reads first and
+// the summary must never be without them.
+var verdictPrefixes = []string{
 	"--- FAIL",
 	"FAIL",
 	"panic:",
 	"fatal error:",
 	"SIGQUIT",
 	"signal:",
+}
+
+// detailPrefixes carry supporting detail: a message the engine printed on its
+// way to failing. Useful, but expendable when the budget is tight.
+var detailPrefixes = []string{
 	"Error:",
 	"error:",
+}
+
+// diagLine is one extracted line and where it appeared, so the summary can
+// spend its budget by importance and still print in the container's own order.
+type diagLine struct {
+	pos     int
+	text    string
+	verdict bool
 }
 
 // extractDiagnostic pulls the lines that explain a benchmark container failure
 // out of its output: the FAIL markers, the b.Fatalf / b.Errorf messages that
 // precede them, and any panic. Benchmark result rows are dropped.
+//
+// The budget is spent on verdicts first. `go test` prints every relayed message
+// BEFORE the "--- FAIL:" that names the benchmark, so a summary that simply kept
+// the first maxDiagnosticLines matches cut off at exactly the line the operator
+// needed: a run that logged 40 tolerated propose errors reported 40 propose
+// errors and no verdict at all (#184). Detail lines are dropped to make room
+// for verdicts, never the reverse.
 func extractDiagnostic(output string) []string {
-	var found []string
-	for _, line := range strings.Split(output, "\n") {
-		trimmed := strings.TrimRight(line, "\r")
-		if !diagnosticLine(trimmed) {
+	var verdicts, details []diagLine
+	truncated := false
+
+	for pos, raw := range strings.Split(output, "\n") {
+		line := strings.TrimRight(raw, "\r")
+		verdict, ok := classifyDiagnostic(line)
+		if !ok {
 			continue
 		}
-		found = append(found, strings.TrimSpace(trimmed))
-		if len(found) == maxDiagnosticLines {
-			found = append(found, "... (diagnostic truncated)")
-			break
+		entry := diagLine{pos: pos, text: strings.TrimSpace(line), verdict: verdict}
+		// Both slices are capped as they fill so a container that emits
+		// millions of matching lines cannot be read into memory here.
+		switch {
+		case verdict && len(verdicts) < maxDiagnosticLines:
+			verdicts = append(verdicts, entry)
+		case !verdict && len(details) < maxDiagnosticLines:
+			details = append(details, entry)
+		default:
+			truncated = true
 		}
 	}
-	return found
+
+	if room := maxDiagnosticLines - len(verdicts); len(details) > room {
+		details = details[:room]
+		truncated = true
+	}
+
+	found := slices.Concat(verdicts, details)
+	slices.SortFunc(found, func(a, b diagLine) int { return a.pos - b.pos })
+
+	lines := make([]string, 0, len(found)+1)
+	for _, entry := range found {
+		lines = append(lines, entry.text)
+	}
+	if truncated {
+		lines = append(lines, "... (diagnostic truncated; every verdict line above is kept)")
+	}
+	return lines
 }
 
-// diagnosticLine reports whether a line of `go test` output explains a failure.
-func diagnosticLine(line string) bool {
+// classifyDiagnostic reports whether a line of `go test` output explains a
+// failure, and whether it is a verdict rather than supporting detail.
+func classifyDiagnostic(line string) (verdict, ok bool) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return false
+		return false, false
 	}
-	for _, prefix := range diagnosticPrefixes {
+	for _, prefix := range verdictPrefixes {
 		if strings.HasPrefix(trimmed, prefix) {
-			return true
+			return true, true
+		}
+	}
+	for _, prefix := range detailPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return false, true
 		}
 	}
 	// Indented "<file>_test.go:NN: message" lines are the b.Fatalf/b.Errorf
 	// text, which is where the actual reason lives.
 	if line != trimmed && strings.Contains(trimmed, "_test.go:") {
-		return true
+		return false, true
 	}
 	// Indented "<file>.go:NN: message" from a helper package, same idea.
 	if line != trimmed && strings.Contains(trimmed, ".go:") && strings.Contains(trimmed, ": ") {
-		return true
+		return false, true
 	}
-	return false
+	return false, false
 }
