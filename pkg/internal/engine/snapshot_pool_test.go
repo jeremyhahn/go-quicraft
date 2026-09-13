@@ -5049,3 +5049,228 @@ func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
 		}
 	})
 }
+
+// canarySnapshotter writes a recognisable plaintext marker, then enough filler
+// to force at least two frames out of the writer, then calls midSave so a test
+// can inspect snapshot.dat WHILE the save is still running.
+//
+// The filler matters. A canary alone stays inside the frame writer's chunk
+// buffer and the file is still empty at the hook, which would let the test pass
+// for the wrong reason — "nothing on disk yet" rather than "what is on disk is
+// sealed". Writing past the chunk size forces frames to the file first.
+type canarySnapshotter struct {
+	lastApplied uint64
+	canary      []byte
+	filler      []byte
+	midSave     func()
+}
+
+func (s *canarySnapshotter) LastApplied() uint64 { return s.lastApplied }
+
+func (s *canarySnapshotter) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
+	return s.SaveSnapshotGated(ctx, w, stopper, nil)
+}
+
+func (s *canarySnapshotter) SaveSnapshotGated(_ context.Context, w io.Writer, _ <-chan struct{}, afterCapture func()) error {
+	if afterCapture != nil {
+		defer afterCapture()
+	}
+	if _, err := w.Write(s.canary); err != nil {
+		return err
+	}
+	if _, err := w.Write(s.filler); err != nil {
+		return err
+	}
+	if s.midSave != nil {
+		s.midSave()
+	}
+	_, err := w.Write(s.canary)
+	return err
+}
+
+func (s *canarySnapshotter) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
+	_, err := io.ReadAll(r)
+	return err
+}
+
+// TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath is #116.
+//
+// The save path used to write the state machine to the canonical snapshot.dat
+// in the clear, fsync it, and encrypt in place afterwards. Between that fsync
+// and the rename a COMPLETE PLAINTEXT STATE MACHINE was durable under the name
+// every consumer, backup and operator reads — measured live at 206ms and 461ms
+// under load, and permanent after a kill in the window, because the directory
+// is then left with no snapshot.meta and the in-process discard guard never
+// runs.
+//
+// The assertion is deliberately about the CANONICAL PATH DURING THE SAVE, not
+// about the finished artifact. A test that only inspects the result passes just
+// as happily against the old two-step form, because the artifact was correctly
+// encrypted by the time the save returned — the defect was never in the
+// artifact, it was in what the path held on the way there.
+func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	stopC := make(chan struct{})
+	defer close(stopC)
+
+	const (
+		shardID   = 10
+		replicaID = 1
+		index     = 100
+		epoch     = 7
+	)
+
+	canary := bytes.Repeat([]byte("PLAINTEXT-STATE-MACHINE-CANARY!!"), 4)
+	// Two chunks' worth, so frames are on disk by the time midSave runs.
+	filler := bytes.Repeat([]byte{0xA5}, snapshotEncryptChunkSize*2)
+
+	dataPath := filepath.Join(
+		snapshotSaveDir(tmpDir, shardID, replicaID, index),
+		snapshotDataFile,
+	)
+
+	var (
+		midSaveSize      int64
+		midSaveHadCanary bool
+		midSaveStatErr   error
+	)
+	ss := &canarySnapshotter{
+		lastApplied: index,
+		canary:      canary,
+		filler:      filler,
+		midSave: func() {
+			onDisk, err := os.ReadFile(dataPath)
+			if err != nil {
+				midSaveStatErr = err
+				return
+			}
+			midSaveSize = int64(len(onDisk))
+			midSaveHadCanary = bytes.Contains(onDisk, canary)
+		},
+	}
+
+	barrier := newTestBarrier(epoch)
+	ldb := newSnapshotTestLogDB()
+	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
+
+	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
+	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
+
+	if _, err := p.saveSnapshot(snapshotRequest{
+		shardID:   shardID,
+		replicaID: replicaID,
+		node:      node,
+		save:      true,
+	}); err != nil {
+		t.Fatalf("saveSnapshot failed: %v", err)
+	}
+
+	if midSaveStatErr != nil {
+		t.Fatalf("reading %s mid-save: %v", snapshotDataFile, midSaveStatErr)
+	}
+	// Without this the canary check below is vacuous: an empty file trivially
+	// contains no plaintext.
+	if midSaveSize == 0 {
+		t.Fatalf("nothing had reached %s by mid-save, so the plaintext check "+
+			"asserts nothing; the filler is meant to force at least one frame out",
+			snapshotDataFile)
+	}
+	if midSaveHadCanary {
+		t.Fatalf("the canonical %s held the state machine IN THE CLEAR during the "+
+			"save (%d bytes on disk): this is #116, and it is durable under the name "+
+			"every consumer, backup and operator reads", snapshotDataFile, midSaveSize)
+	}
+
+	// And the finished artifact is still readable, so the test cannot pass by
+	// writing something that merely is not the canary.
+	final, err := os.ReadFile(dataPath)
+	if err != nil {
+		t.Fatalf("reading the finished artifact: %v", err)
+	}
+	if bytes.Contains(final, canary) {
+		t.Fatalf("the finished %s holds the state machine in the clear", snapshotDataFile)
+	}
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, shardID, replicaID, index, epoch, barrier)
+	if err != nil {
+		t.Fatalf("decrypting the artifact back: %v", err)
+	}
+	defer func() { _ = os.Remove(plainPath) }()
+	roundTripped, err := os.ReadFile(plainPath)
+	if err != nil {
+		t.Fatalf("reading the decrypted artifact: %v", err)
+	}
+	want := append(append(append([]byte{}, canary...), filler...), canary...)
+	if !bytes.Equal(roundTripped, want) {
+		t.Fatalf("decrypted artifact is %d bytes, want %d: sealing inline must not "+
+			"change what the state machine wrote", len(roundTripped), len(want))
+	}
+}
+
+// TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext pins
+// the contract inline sealing (#116) nearly broke.
+//
+// MaxSnapshotSize is documented against the state machine's output after
+// compression -- "the actual on-disk size (post-compression when Snappy is
+// enabled)". That was literally the file's size only because the file held
+// plaintext at the point of the check. With sealing inline the file holds
+// framed ciphertext, ~41 bytes larger per 64 KiB chunk, and a stat there
+// measures encryption overhead against a limit that was never defined to
+// include it. A snapshot exactly at the limit -- admitted before, and
+// documented as admitted -- would be refused, and SnapshotTooLargeError.Size
+// would report a number the operator's configuration does not describe.
+//
+// Codex review of the branch found it. The fix measures what the frame writer
+// was handed, which is the old quantity exactly; this test sets the limit to
+// the payload size and asserts the save is admitted with a barrier configured.
+func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *testing.T) {
+	snapDir := t.TempDir()
+	// Two full chunks plus a tail, so there are three frames' worth of AEAD
+	// overhead on disk -- enough that a stat-based check would refuse this.
+	const payload = snapshotEncryptChunkSize*2 + 4096
+
+	cfg := config.Config{ShardID: 14, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+	cfg.MaxSnapshotSize = payload // exactly at the limit, not over
+
+	snapshotter := &bulkSnapshotter{bytes: payload}
+	snapshotter.lastApplied.Store(300)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, newTestBarrier(2), nil, nil, stopC, nil)
+
+	if _, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   14,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	}); err != nil {
+		t.Fatalf("a snapshot whose post-compression size EQUALS MaxSnapshotSize "+
+			"must be admitted with encryption on; the limit is defined against "+
+			"the state machine's output, not the ciphertext: %v", err)
+	}
+
+	// And the on-disk artifact really is larger than the limit, so this test
+	// is exercising the distinction rather than a case where both agree.
+	dataPath := filepath.Join(snapshotSaveDir(snapDir, 14, 1, 300), snapshotDataFile)
+	fi, err := os.Stat(dataPath)
+	if err != nil {
+		t.Fatalf("stat sealed artifact: %v", err)
+	}
+	if uint64(fi.Size()) <= payload {
+		t.Fatalf("sealed artifact is %d bytes, not larger than the %d-byte payload; "+
+			"the test cannot tell a plaintext measurement from a ciphertext one",
+			fi.Size(), payload)
+	}
+	// The LogDB record still carries the on-disk size, which is what sizes a
+	// transfer.
+	snap, err := ldb.GetSnapshot(14, 1)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.FileSize != uint64(fi.Size()) {
+		t.Fatalf("LogDB FileSize = %d, want the on-disk %d", snap.FileSize, fi.Size())
+	}
+}

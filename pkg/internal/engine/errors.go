@@ -41,6 +41,13 @@ var (
 	// the configured Config.MaxSnapshotSize limit.
 	ErrSnapshotTooLarge = errors.New("engine: snapshot exceeds MaxSnapshotSize")
 
+	// ErrSnapshotFrameWriterClosed is returned when a snapshot is written to
+	// after its trailing frame has been emitted. It is a caller bug, not a
+	// runtime condition: the artifact is already sealed and complete, and
+	// accepting more bytes would produce one the decrypt side cannot account
+	// for.
+	ErrSnapshotFrameWriterClosed = errors.New("engine: snapshot frame writer is closed")
+
 	// ErrSnapshotMetaCorrupt is returned by ParseSnapshotMeta when a
 	// snapshot.meta image is neither a versioned record nor one of the
 	// recognised pre-magic layouts. It means "these bytes say nothing about

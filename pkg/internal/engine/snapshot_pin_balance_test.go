@@ -345,3 +345,134 @@ func TestPinBalance_SaveSnapshot_EncryptFailureReturnsToZero(t *testing.T) {
 	}
 	barrier.assertBalanced(t, "saveSnapshot encrypt failure")
 }
+
+// bulkThenFailSnapshotter writes n bytes successfully and then fails.
+//
+// The size matters: it must be at least one snapshotEncryptChunkSize so the
+// frame writer has actually EMITTED a frame — and therefore pinned an epoch —
+// before the failure. A snapshotter that fails without filling the chunk buffer
+// leaks nothing, and a test built on one would pass against the defect.
+type bulkThenFailSnapshotter struct {
+	snapshotTestSnapshotter
+	bytes int
+	err   error
+}
+
+func (s *bulkThenFailSnapshotter) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
+	return s.SaveSnapshotGated(ctx, w, stopper, nil)
+}
+
+func (s *bulkThenFailSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writer, _ <-chan struct{}, afterCapture func()) error {
+	if afterCapture != nil {
+		defer afterCapture()
+	}
+	payload := make([]byte, s.bytes)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	if _, err := w.Write(payload); err != nil {
+		return err
+	}
+	return s.err
+}
+
+// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero covers the one
+// way out of saveSnapshot that did not release the frame writer's epoch pins.
+//
+// Found in review of the #116 PR. When the state machine's SaveSnapshot returns
+// an error, saveSnapshot returned immediately; any frames already emitted had
+// registered their epoch as in-flight, and nothing ever deregistered them. The
+// effect is not a lost error but a key-lifecycle one: PurgeEpochsBefore can
+// never retire a DEK that still has an in-flight reference, so the key material
+// is retained for the life of the process.
+//
+// It is reachable whenever a state machine writes a full chunk and then fails,
+// which is why the fixture writes snapshotEncryptChunkSize+1 bytes rather than
+// a token payload.
+func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) {
+	snapDir := t.TempDir()
+	cfg := config.Config{ShardID: 12, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+
+	wantErr := errors.New("state machine save failed")
+	snapshotter := &bulkThenFailSnapshotter{
+		bytes: snapshotEncryptChunkSize + 1,
+		err:   wantErr,
+	}
+	snapshotter.lastApplied.Store(200)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	barrier := newPinCountBarrier(newTestBarrier(4))
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, barrier, nil, nil, stopC, nil)
+
+	_, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   12,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	})
+	if err == nil {
+		t.Fatal("saveSnapshot: expected the injected state-machine failure")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want it to wrap %v", err, wantErr)
+	}
+	barrier.assertBalanced(t, "saveSnapshot state-machine failure")
+}
+
+// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero covers the class of
+// leak three independent reviews of #116 found after the first fix.
+//
+// The first fix released the frame writer's epoch pins on the two error paths
+// it noticed — the state-machine save error and the snappy-close error — and
+// left the deferred release registered late, after fsync, stat, the size check
+// and Close had all succeeded. Four returns sat between the last frame being
+// sealed and that defer, and every one of them dropped the pins on the floor:
+// fsync failure, stat failure, MaxSnapshotSize exceeded, and the deferred
+// writeback error Linux reports at Close.
+//
+// Chasing individual returns is what produced that gap twice. The release is
+// now a single deferred call registered where the pins begin to exist, so it
+// covers every exit by construction. This test pins the property using the one
+// of those four paths a test can trigger deterministically: an artifact that
+// exceeds MaxSnapshotSize.
+//
+// The payload is deliberately larger than one snapshotEncryptChunkSize, so the
+// writer has actually emitted a frame and pinned an epoch before the size check
+// refuses the save. A smaller payload leaks nothing and would pass against the
+// defect.
+func TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero(t *testing.T) {
+	snapDir := t.TempDir()
+	cfg := config.Config{ShardID: 13, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+	// Below the payload, so the save is refused AFTER frames have been sealed.
+	cfg.MaxSnapshotSize = snapshotEncryptChunkSize
+
+	snapshotter := &bulkSnapshotter{bytes: snapshotEncryptChunkSize * 3}
+	snapshotter.lastApplied.Store(200)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	barrier := newPinCountBarrier(newTestBarrier(4))
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, barrier, nil, nil, stopC, nil)
+
+	_, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   13,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	})
+	if err == nil {
+		t.Fatal("saveSnapshot: expected the artifact to exceed MaxSnapshotSize")
+	}
+	var tooLarge *SnapshotTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("error = %T (%v), want *SnapshotTooLargeError", err, err)
+	}
+	barrier.assertBalanced(t, "saveSnapshot MaxSnapshotSize refusal")
+}
