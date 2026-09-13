@@ -330,6 +330,36 @@ func TryRead(
 		})
 }
 
+// TryReadWith is TryRead's general form, and the read twin of TryWith: it
+// resolves the target before every attempt and retries exactly the errors
+// retryable reports true for.
+//
+// It exists for the PINNED read, the same caller TryWith's second policy
+// serves. A test that hands one replica on purpose — because the assertion is
+// about that replica's own applied state, as Leader Completeness is — passes
+// Pinned(h) and quicraft.Temporary: its remedy is "wait, and ask the SAME
+// replica again", which fixes the conditions that clear on their own.
+//
+// Before this existed such a caller had no home in this package and wrote the
+// loop out by hand, which is how test/integration/raft's syncReadExact came to
+// carry a third copy of the retry machinery drive already implements (#162).
+// Try, TryRead, TryWith and TryReadWith are now the four corners of one table —
+// proposal or read, re-resolving or pinned — over a single loop.
+//
+// retryable must not be nil.
+func TryReadWith(
+	resolve Resolver,
+	shardID uint64,
+	query interface{},
+	timeout time.Duration,
+	retryable Retryable,
+) (interface{}, error) {
+	return drive(resolve, shardID, timeout, retryable,
+		func(h *quicraft.Host, budget time.Duration) (interface{}, error) {
+			return readOnce(h, shardID, query, budget)
+		})
+}
+
 // readOnce is the single attempt TryRead is built from: one SyncRead against h
 // with its own deadline, no resolve, no retry.
 func readOnce(
