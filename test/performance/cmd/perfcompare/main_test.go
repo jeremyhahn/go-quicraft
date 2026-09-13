@@ -454,3 +454,82 @@ func TestDockerRunErrorNamesTheReason(t *testing.T) {
 type exitStatusStub struct{}
 
 func (e *exitStatusStub) Error() string { return "exit status 1" }
+
+// failAfterWriter accepts n bytes and then fails every write, standing in for
+// a log disk that fills mid-run.
+type failAfterWriter struct {
+	n    int
+	seen int
+	err  error
+}
+
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	if f.seen >= f.n {
+		return 0, f.err
+	}
+	f.seen += len(p)
+	return len(p), nil
+}
+
+// TestConsoleLogKeepsDrainingAndReportsTheFailure pins the two properties a
+// Codex review of #184 found missing from the first cut of the console tee.
+//
+// A short write from the log used to stop os/exec's copier for that stream,
+// and a container with nobody reading its pipe blocks -- so a full log disk
+// turned into a hung benchmark. And a write error was reported nowhere:
+// os/exec drops a copier's error when the process exits non-zero, and a
+// deferred Close drops its own always, so a console truncated exactly where
+// the late `--- FAIL:` lines land was presented as complete. That is #184's
+// defect one layer down.
+//
+// The writer must therefore do two things that pull in opposite directions:
+// never short-write (keep draining), and never hide the failure (report it).
+func TestConsoleLogKeepsDrainingAndReportsTheFailure(t *testing.T) {
+	diskFull := fmt.Errorf("write: no space left on device")
+	sink := &failAfterWriter{n: 10, err: diskFull}
+	c := &consoleLog{w: sink}
+
+	for _, chunk := range []string{"=== RUN   B\n", "relay 1\n", "relay 2\n", "--- FAIL: B\n"} {
+		n, err := c.Write([]byte(chunk))
+		if err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = (%d, %v); the console must keep draining after the "+
+				"log fails, or the container blocks on a full pipe", chunk, n, err)
+		}
+	}
+	if got := c.err(); got == nil {
+		t.Fatal("err() = nil after the log failed; a truncated console would be " +
+			"reported as complete, which is the defect this exists to end")
+	} else if got != diskFull {
+		t.Fatalf("err() = %v, want the FIRST failure %v", got, diskFull)
+	}
+}
+
+// TestRunContainerReportsAnIncompleteLog runs a real process through
+// runContainer with the log pointed at a path that cannot be written past
+// creation, and asserts the incompleteness reaches the caller even though the
+// process itself succeeded.
+func TestRunContainerReportsAnIncompleteLog(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not on PATH")
+	}
+	// /dev/full accepts the open and fails every write with ENOSPC, which is
+	// exactly the disk-full shape without needing a filesystem to fill.
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("/dev/full not available")
+	}
+
+	cmd := exec.Command("sh", "-c", "echo '=== RUN   B'; echo '--- FAIL: B' >&2; exit 0")
+	out, err := runContainer(cmd, "/dev/full")
+	if err == nil {
+		t.Fatal("runContainer returned nil error with an unwritable log; the " +
+			"console is incomplete and the caller was not told")
+	}
+	if !strings.Contains(err.Error(), "INCOMPLETE") {
+		t.Fatalf("error does not say the log is incomplete: %v", err)
+	}
+	// The container's stdout must still have been captured for parsing --
+	// draining continued past the log failure.
+	if !strings.Contains(string(out), "=== RUN   B") {
+		t.Fatalf("stdout was not captured after the log failed: %q", out)
+	}
+}

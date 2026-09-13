@@ -29,6 +29,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -448,31 +449,78 @@ func runContainer(cmd *exec.Cmd, logPath string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot open container log %s: %w", logPath, err)
 	}
-	defer file.Close()
 
-	console := &syncWriter{w: file}
+	console := &consoleLog{w: file}
 	var stdout bytes.Buffer
 	cmd.Stdout = io.MultiWriter(&stdout, console)
 	cmd.Stderr = io.MultiWriter(os.Stderr, console)
 
-	err = cmd.Run()
-	return stdout.Bytes(), err
+	runErr := cmd.Run()
+
+	// The log's own failures are reported SEPARATELY from the container's
+	// exit, and neither is allowed to hide the other. Two things went wrong
+	// with the obvious `defer file.Close()`:
+	//
+	//   - A write error on the log (disk full, an NFS mount going away) used
+	//     to stop that stream's copier, and a container blocked on a full
+	//     pipe stalls the benchmark. consoleLog keeps draining regardless.
+	//   - os/exec discards a copier's write error when the process also exits
+	//     non-zero, and a deferred Close discards its own error always. So a
+	//     truncated console -- missing exactly the late `--- FAIL:` lines the
+	//     file exists to preserve -- would have been reported as a complete
+	//     one. That is the failure mode #184 was opened for, one layer down.
+	logErr := console.err()
+	if closeErr := file.Close(); closeErr != nil && logErr == nil {
+		logErr = closeErr
+	}
+	if logErr != nil {
+		logErr = fmt.Errorf("container log %s is INCOMPLETE: %w", logPath, logErr)
+		if runErr != nil {
+			return stdout.Bytes(), errors.Join(runErr, logErr)
+		}
+		return stdout.Bytes(), logErr
+	}
+	return stdout.Bytes(), runErr
 }
 
-// syncWriter serializes writes to one destination. os/exec copies stdout and
-// stderr on separate goroutines, and both of a container's streams are teed
-// into the same log file, so without this the two copiers would interleave
-// mid-line.
-type syncWriter struct {
-	mu sync.Mutex
-	w  io.Writer
+// consoleLog serializes both of a container's streams into one file and keeps
+// accepting writes after the file has failed.
+//
+// Serialization: os/exec copies stdout and stderr on separate goroutines, and
+// both are teed into the same log, so without the mutex the two copiers would
+// interleave mid-line.
+//
+// Draining: Write always reports the full length as written, even once the
+// underlying file has errored. Returning the short write instead would make
+// os/exec stop copying that stream, and a container with nobody reading its
+// pipe blocks -- turning a full log disk into a hung benchmark. The first
+// error is kept and surfaced by err() after the process exits, so the
+// operator learns the console is incomplete rather than trusting it.
+type consoleLog struct {
+	mu   sync.Mutex
+	w    io.Writer
+	fail error
 }
 
-// Write implements io.Writer.
-func (s *syncWriter) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.Write(p)
+// Write implements io.Writer. It never short-writes; see the type comment.
+func (c *consoleLog) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fail != nil {
+		return len(p), nil
+	}
+	if _, err := c.w.Write(p); err != nil {
+		c.fail = err
+	}
+	return len(p), nil
+}
+
+// err reports the first write failure, or nil if the whole console reached
+// the file.
+func (c *consoleLog) err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fail
 }
 
 // findRepoRoot walks up from the working directory to find the repository root
