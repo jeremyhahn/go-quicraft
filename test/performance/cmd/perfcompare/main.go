@@ -28,14 +28,17 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfprofile"
@@ -62,6 +65,20 @@ var dockerGoSystems = map[string]dockerGoConfig{
 	"etcd":       {image: "quicraft-bench-etcd", dockerfile: "etcd/Dockerfile"},
 	"dragonboat": {image: "quicraft-bench-dragonboat", dockerfile: "dragonboat/Dockerfile"},
 }
+
+// runConfig carries the options every system's run shares. logDir is where each
+// container's console is written; it is never empty, because a run whose output
+// cannot be read back is a run whose failures cannot be explained.
+type runConfig struct {
+	benchtime string
+	timeout   string
+	noBuild   bool
+	logDir    string
+}
+
+// defaultLogDir holds container consoles for a run made without a profile. With
+// a profile the logs live inside it, beside the results they explain.
+const defaultLogDir = "logs"
 
 func main() {
 	log.SetFlags(0)
@@ -116,8 +133,21 @@ func runBenchmarks(args []string) error {
 		fmt.Printf("Profile: %s (%s)\n", profile.Name(), profile.Dir())
 	}
 
+	cfg := runConfig{
+		benchtime: *benchtime,
+		timeout:   *timeout,
+		noBuild:   *noBuild,
+		logDir:    defaultLogDir,
+	}
+	if profile != nil {
+		cfg.logDir = profile.LogsDir()
+	}
+	if err := os.MkdirAll(cfg.logDir, 0755); err != nil {
+		return err
+	}
+
 	fmt.Printf("Running benchmarks: %s\n", strings.Join(systems, ", "))
-	fmt.Printf("  benchtime=%s  timeout=%s\n\n", *benchtime, *timeout)
+	fmt.Printf("  benchtime=%s  timeout=%s  logs=%s\n\n", *benchtime, *timeout, cfg.logDir)
 
 	table := perfresult.NewComparisonTable()
 	var failed []string
@@ -126,7 +156,7 @@ func runBenchmarks(args []string) error {
 		fmt.Printf("=== %s ===\n", sys)
 		start := time.Now()
 
-		suite, err := runSystem(sys, *benchtime, *timeout, *noBuild)
+		suite, err := runSystem(sys, cfg)
 		if err != nil {
 			log.Printf("ERROR [%s]: %v", sys, err)
 			failed = append(failed, sys)
@@ -261,12 +291,12 @@ func resolveSystems(args []string) ([]string, error) {
 }
 
 // runSystem executes the benchmark for a single system and returns the parsed suite.
-func runSystem(system, benchtime, timeout string, noBuild bool) (*perfresult.BenchmarkSuite, error) {
+func runSystem(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	if _, ok := dockerGoSystems[system]; ok {
-		return runGoDocker(system, benchtime, timeout, noBuild)
+		return runGoDocker(system, cfg)
 	}
 	if system == "openraft" {
-		return runOpenraft(benchtime, timeout, noBuild)
+		return runOpenraft(cfg)
 	}
 	return nil, fmt.Errorf("unknown system: %s", system)
 }
@@ -275,17 +305,17 @@ func runSystem(system, benchtime, timeout string, noBuild bool) (*perfresult.Ben
 // a Docker container, then parses the sentinel-delimited JSON from stdout.
 // Every engine runs with --net=host; QuicRaft additionally runs --privileged
 // so its entrypoint can raise the kernel UDP buffers QUIC needs.
-func runGoDocker(system, benchtime, timeout string, noBuild bool) (*perfresult.BenchmarkSuite, error) {
-	cfg := dockerGoSystems[system]
+func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
+	docker := dockerGoSystems[system]
 
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		return nil, fmt.Errorf("cannot find repo root: %w", err)
 	}
 
-	if !noBuild {
-		fmt.Printf("  building Docker image %s...\n", cfg.image)
-		buildCmd := exec.Command("docker", "build", "-t", cfg.image, "-f", cfg.dockerfile, repoRoot)
+	if !cfg.noBuild {
+		fmt.Printf("  building Docker image %s...\n", docker.image)
+		buildCmd := exec.Command("docker", "build", "-t", docker.image, "-f", docker.dockerfile, repoRoot)
 		buildCmd.Stdout = os.Stdout
 		buildCmd.Stderr = os.Stderr
 		if err := buildCmd.Run(); err != nil {
@@ -294,23 +324,26 @@ func runGoDocker(system, benchtime, timeout string, noBuild bool) (*perfresult.B
 	}
 
 	runArgs := []string{"run", "--rm", "--network=host"}
-	if cfg.privileged {
+	if docker.privileged {
 		runArgs = append(runArgs, "--privileged")
 	}
 	runArgs = append(runArgs, benchTmpMount()...)
-	runArgs = append(runArgs, cfg.image,
+	runArgs = append(runArgs, docker.image,
 		"-test.bench=.", "-test.run=^$",
-		"-test.benchtime="+benchtime, "-test.timeout="+timeout, "-test.v")
+		"-test.benchtime="+cfg.benchtime, "-test.timeout="+cfg.timeout, "-test.v")
 
 	fmt.Printf("  docker %s\n", strings.Join(runArgs, " "))
 	runCmd := exec.Command("docker", runArgs...)
-	runCmd.Stderr = os.Stderr
 
-	output, err := runCmd.Output()
+	logPath := filepath.Join(cfg.logDir, system+".log")
+	fmt.Printf("  container console: %s\n", logPath)
+
+	output, err := runContainer(runCmd, logPath)
 	if err != nil {
 		return nil, &DockerRunError{
 			System:     system,
 			Err:        err,
+			LogPath:    logPath,
 			Diagnostic: extractDiagnostic(string(output)),
 		}
 	}
@@ -342,13 +375,13 @@ func benchTmpMount() []string {
 const openraftImage = "quicraft-openraft-bench"
 
 // runOpenraft builds (unless --no-build) and runs the OpenRaft Docker benchmark.
-func runOpenraft(benchtime, timeout string, noBuild bool) (*perfresult.BenchmarkSuite, error) {
+func runOpenraft(cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		return nil, fmt.Errorf("cannot find repo root: %w", err)
 	}
 
-	if !noBuild {
+	if !cfg.noBuild {
 		fmt.Println("  building Docker image...")
 		buildCmd := exec.Command("docker", "build",
 			"-t", openraftImage,
@@ -368,17 +401,20 @@ func runOpenraft(benchtime, timeout string, noBuild bool) (*perfresult.Benchmark
 	runArgs := []string{"run", "--rm", "--network=host"}
 	runArgs = append(runArgs, benchTmpMount()...)
 	runArgs = append(runArgs, openraftImage,
-		"--benchtime="+benchtime,
-		"--timeout="+timeout,
+		"--benchtime="+cfg.benchtime,
+		"--timeout="+cfg.timeout,
 	)
 	runCmd := exec.Command("docker", runArgs...)
-	runCmd.Stderr = os.Stderr
 
-	output, err := runCmd.Output()
+	logPath := filepath.Join(cfg.logDir, "openraft.log")
+	fmt.Printf("  container console: %s\n", logPath)
+
+	output, err := runContainer(runCmd, logPath)
 	if err != nil {
 		return nil, &DockerRunError{
 			System:     "openraft",
 			Err:        err,
+			LogPath:    logPath,
 			Diagnostic: extractDiagnostic(string(output)),
 		}
 	}
@@ -389,6 +425,54 @@ func runOpenraft(benchtime, timeout string, noBuild bool) (*perfresult.Benchmark
 	}
 
 	return suite, nil
+}
+
+// runContainer runs a benchmark container, returning its stdout for parsing and
+// writing its complete console — stdout and stderr, verbatim — to logPath.
+//
+// The orchestrator only ever wanted the sentinel-delimited JSON, so it read
+// stdout into a buffer and dropped the buffer on the floor when the container
+// failed. Everything `go test -test.v` prints goes to that stdout: every
+// "=== RUN", every relayed b.Errorf, and the "--- FAIL:" naming the benchmark
+// that failed. A 41 MB run log of one such failure therefore contained not one
+// of them (#184), and the container's exit status was the only surviving fact.
+//
+// Stderr is still relayed live to the orchestrator's own stderr, so a run in
+// progress still shows the engines talking; it is teed into the same file so
+// the file is the console as the container produced it, in order.
+//
+// A log that cannot be opened fails the run. There is no quiet fallback: the
+// whole point is that the next failure is explainable.
+func runContainer(cmd *exec.Cmd, logPath string) ([]byte, error) {
+	file, err := os.Create(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open container log %s: %w", logPath, err)
+	}
+	defer file.Close()
+
+	console := &syncWriter{w: file}
+	var stdout bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, console)
+	cmd.Stderr = io.MultiWriter(os.Stderr, console)
+
+	err = cmd.Run()
+	return stdout.Bytes(), err
+}
+
+// syncWriter serializes writes to one destination. os/exec copies stdout and
+// stderr on separate goroutines, and both of a container's streams are teed
+// into the same log file, so without this the two copiers would interleave
+// mid-line.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+// Write implements io.Writer.
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // findRepoRoot walks up from the working directory to find the repository root

@@ -173,8 +173,15 @@ wait_for_run() {
 }
 
 status() {
+  # The container consoles are listed beside the results because a failed run
+  # produces the second and not the first, and they stay on the target: nothing
+  # is fetched for a run that failed. Naming the path here is the difference
+  # between "dragonboat exited 1" and being able to read why (#184).
   ssh "$HOST" "tail -40 '$RUN_LOG' 2>/dev/null; echo '--- results ---'; \
-    ls -la '$REMOTE_PERF/$PROFILE_REL/results/' 2>/dev/null || echo 'none yet'"
+    ls -la '$REMOTE_PERF/$PROFILE_REL/results/' 2>/dev/null || echo 'none yet'; \
+    echo '--- container consoles ---'; \
+    ls -la '$REMOTE_PERF/$PROFILE_REL/logs/' 2>/dev/null || echo 'none yet'"
+  echo ">> read one with: ssh $HOST \"cat $REMOTE_PERF/$PROFILE_REL/logs/<system>.log\""
 }
 
 fetch() {

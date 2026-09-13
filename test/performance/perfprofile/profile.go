@@ -26,6 +26,7 @@
 //
 //	env.json      captured on the target, never edited
 //	results/      one JSON suite per benchmarked system
+//	logs/         one verbatim container console per benchmarked system
 //	charts/       SVG charts, regenerated wholesale
 //	<system>.md   generated comparison documents, deleted and recreated freely
 //	analysis.md   HAND-WRITTEN. The generator never writes it.
@@ -56,6 +57,7 @@ const AnalysisFile = "analysis.md"
 const (
 	resultsDirName = "results"
 	chartsDirName  = "charts"
+	logsDirName    = "logs"
 )
 
 // Profile is one machine profile on disk.
@@ -84,6 +86,12 @@ func (p *Profile) Dir() string { return p.dir }
 // ResultsDir holds one JSON suite per benchmarked system.
 func (p *Profile) ResultsDir() string { return filepath.Join(p.dir, resultsDirName) }
 
+// LogsDir holds one verbatim container console per benchmarked system. A
+// benchmark number is reproducible; the reason a container failed exists only
+// in what it printed while failing, so that text is kept beside the results
+// rather than in the orchestrator's memory.
+func (p *Profile) LogsDir() string { return filepath.Join(p.dir, logsDirName) }
+
 // ChartsDir holds the generated SVG charts.
 func (p *Profile) ChartsDir() string { return filepath.Join(p.dir, chartsDirName) }
 
@@ -107,7 +115,7 @@ func chartRelPath(system string) string {
 
 // EnsureDirs creates the directories a benchmark run writes into.
 func (p *Profile) EnsureDirs() error {
-	for _, dir := range []string{p.dir, p.ResultsDir(), p.ChartsDir()} {
+	for _, dir := range []string{p.dir, p.ResultsDir(), p.ChartsDir(), p.LogsDir()} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
