@@ -141,7 +141,8 @@ test/performance/
       analysis.md        <- HAND-WRITTEN, includes the preserved baseline
   perfprofile/           <- profile layout, env capture parsing, doc generation
   perfresult/            <- shared result types, comparison engine, charts
-  benchutil/             <- shared warmup retry budget (Go harnesses only)
+  benchutil/             <- shared warmup retry budget, and the port
+                            reservation, which delegates to test/netport
   cmd/perfcompare/       <- orchestrator CLI (Docker-based execution)
   quicraft/              <- QuicRaft benchmarks (standalone module)
   etcd/                  <- etcd-io/raft benchmarks (standalone module)

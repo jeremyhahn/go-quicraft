@@ -438,7 +438,7 @@ func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T
 		t.Fatalf("StartReplica on the lone replica failed: %v", err)
 	}
 
-	const budget = 2 * electionRound
+	budget := 2 * electionRound
 	started := time.Now()
 	err := cluster.tryConfigChangeToLeader(addTen(), budget)
 	elapsed := time.Since(started)

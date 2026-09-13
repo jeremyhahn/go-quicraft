@@ -62,32 +62,38 @@ import (
 //
 // # What is scanned
 //
-// integrationRoots, shared with the leader-resolution gates in
-// leader_resolution_test.go: the parent module's integration suites and
-// contrib/dragonboat's. The gate parses rather than compiles, so the module
-// boundary is invisible to it and one implementation covers both trees. See
-// the integrationRoots comment for the full reasoning.
+// portZeroRoots: integrationRoots — the parent module's integration suites and
+// contrib/dragonboat's, shared with the leader-resolution gates in
+// leader_resolution_test.go — plus test/performance. The gate parses rather
+// than compiles, so a module boundary is invisible to it and one
+// implementation covers every tree. See the integrationRoots comment for the
+// full reasoning.
+//
+// test/performance came under the gate with #163, when benchutil stopped
+// carrying a second, TCP-shaped copy of the reservation window and started
+// delegating to test/netport. Until then the rule could not be satisfied there
+// and a gate over it would have been a rule with a hole in it.
 //
 // # What is NOT scanned, and why
 //
 //   - pkg/. A transport unit test binds "127.0.0.1:0" through Config.
 //     ListenAddress and the transport keeps that socket for its lifetime;
 //     nothing is closed and handed on, so the class cannot occur.
-//   - test/performance/. A separate Go module that cannot import test/netport
-//     without a require and a replace directive, so the rule cannot be
-//     satisfied there yet. It has its own reservation window already
-//     (test/performance/benchutil, the TCP twin of test/netport) and its
-//     remaining port-0 call site holds the socket open until the caller binds
-//     rather than closing it. Folding that module onto test/netport is #163;
-//     until then a gate over it would be a rule with a hole in it, which is
-//     worse than a rule with a stated boundary.
 //
-// # No marker
+// # The marker
 //
-// The leader-resolution gates take a //quicraft:direct-propose style marker
-// because a direct proposal is sometimes exactly what a test means. A port-0
-// reservation in these trees never is: netport.MustReserveUDP is strictly
-// better at the same call site, so there is nothing for a marker to excuse.
+// This gate used to argue it needed none: netport.MustReserveUDP is strictly
+// better at the same call site, so there was nothing to excuse. That held while
+// only the integration trees were scanned. It does not hold in
+// test/performance, which has a harness that binds port 0 and KEEPS the
+// listener for the transport's lifetime — the pkg/ shape, in a scanned tree.
+// netport is not better there; it is not applicable, because nothing is closed
+// and handed on.
+//
+// So the gate takes //quicraft:direct-port, on the same terms as the
+// leader-resolution markers: it sits on the line that needs it or at the top of
+// the comment block above it, it carries its own reason, and a bare marker is
+// reported rather than honoured.
 
 // listenFuncs are the calls that bind a local socket from an address argument.
 // The value is the index of that argument.
@@ -108,16 +114,34 @@ type portZeroSite struct {
 	pos  string
 }
 
+// directPortMarker opts one call site out of
+// TestNoPortZeroReservationsInIntegrationTrees. See "The marker" above.
+const directPortMarker = "//quicraft:direct-port"
+
+// portZeroRoots are the trees this gate walks: the two integration trees the
+// leader-resolution gates share, plus test/performance, which joined them in
+// #163.
+//
+// It is a separate list rather than an addition to integrationRoots because
+// test/performance holds benchmarks, not integration tests: the
+// leader-resolution gates have nothing to say about it, and folding it into
+// their root list would put every benchmark under three rules it was never
+// written against.
+var portZeroRoots = append(append([]integrationRoot{}, integrationRoots...),
+	integrationRoot{dir: filepath.Join("..", "performance"), minFiles: 10},
+)
+
 // TestNoPortZeroReservationsInIntegrationTrees fails when a cluster address is
 // taken from the kernel's ephemeral range instead of reserved through
 // test/netport.
 func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 	var (
 		sites   []portZeroSite
+		bare    []string
 		scanned int
 	)
 
-	for _, root := range integrationRoots {
+	for _, root := range portZeroRoots {
 		rootScanned := 0
 		err := filepath.WalkDir(root.dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -131,7 +155,12 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 			// The integration files sit behind build tags, which
 			// parser.ParseFile does not evaluate, so every file is scanned
 			// regardless of which tags CI is running.
-			file, perr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+			//
+			// ParseComments is REQUIRED, not an optimisation to drop: without
+			// it file.Comments is empty, excusedLines finds no markers, and
+			// every //quicraft:direct-port comment is silently ignored while
+			// the gate keeps reporting the site it excuses.
+			file, perr := parser.ParseFile(fset, path, nil, parser.ParseComments)
 			if perr != nil {
 				return perr
 			}
@@ -141,6 +170,9 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 			if rerr != nil {
 				return rerr
 			}
+
+			excused, fileBare := excusedLines(fset, file, directPortMarker)
+			bare = append(bare, fileBare...)
 
 			ast.Inspect(file, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
@@ -157,6 +189,9 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 				}
 				addr, ok := stringLiteral(call.Args[argIdx])
 				if !ok || !isPortZero(addr) {
+					return true
+				}
+				if excused[fset.Position(call.Pos()).Line] {
 					return true
 				}
 				sites = append(sites, portZeroSite{
@@ -183,6 +218,8 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 		scanned += rootScanned
 	}
 
+	reportBareMarkers(t, directPortMarker, bare)
+
 	if len(sites) > 0 {
 		sort.Slice(sites, func(i, j int) bool { return sites[i].pos < sites[j].pos })
 		var b strings.Builder
@@ -195,13 +232,17 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 			"the same pool the kernel assigns to the next port-0 bind and to the local " +
 			"end of every outbound connection. Closing the socket and returning the " +
 			"address leaves nothing holding the port, so another caller can be given it " +
-			"before the host binds (#131). Use netport.MustReserveUDP(t.Fatalf), which " +
-			"allocates outside that range.")
+			"before the host binds (#131). Use netport.MustReserveUDP(t.Fatalf) — or " +
+			"netport.MustReserveTCP for a TCP harness — which allocates outside that " +
+			"range.\n\nIf the socket is KEPT for the listener's lifetime rather than " +
+			"closed and handed on, the class cannot occur and netport is not " +
+			"applicable: say so with a " + directPortMarker + " comment carrying that " +
+			"reason.")
 		t.Fatal(b.String())
 	}
 
-	t.Logf("checked %d files across %d integration trees for port-0 reservations",
-		scanned, len(integrationRoots))
+	t.Logf("checked %d files across %d trees for port-0 reservations",
+		scanned, len(portZeroRoots))
 }
 
 // stringLiteral reports the value of a basic string literal expression.

@@ -33,6 +33,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 )
@@ -171,28 +172,26 @@ func (c *BenchCluster) Leader() *quicraft.Host {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// reservePorts allocates free UDP ports by binding sockets and keeping them
-// open until the caller is ready to use them. This avoids the TOCTOU race
-// condition where a released port gets reassigned by the OS before the
-// application can rebind it. The caller must close all returned sockets
-// immediately before binding the same addresses.
-func reservePorts(b *testing.B, n int) (addrs []string, sockets []net.PacketConn) {
+// reservePorts returns n loopback addresses for hosts that do not exist yet.
+//
+// It used to bind 127.0.0.1:0 for each and hold the socket open until the
+// caller was ready, closing them "immediately before" the transport bound the
+// same addresses. That NARROWED the race rather than removing it: the addresses
+// still came from the kernel's ephemeral range, which is the same pool the
+// kernel draws from for the local end of every outbound connection, so a
+// transport still running from the previous benchmark could be handed one in
+// the close-then-bind window.
+//
+// test/netport removes the class instead: it allocates from a window OUTSIDE
+// the ephemeral range, which the kernel never auto-assigns, so there is no
+// window to be tight about and no socket for the caller to release (#163).
+func reservePorts(b *testing.B, n int) []string {
 	b.Helper()
-	addrs = make([]string, n)
-	sockets = make([]net.PacketConn, n)
-	for i := 0; i < n; i++ {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			// Clean up already-opened sockets on failure.
-			for j := 0; j < i; j++ {
-				sockets[j].Close()
-			}
-			b.Fatalf("failed to reserve port %d: %v", i, err)
-		}
-		addrs[i] = pc.LocalAddr().String()
-		sockets[i] = pc
+	addrs := make([]string, n)
+	for i := range n {
+		addrs[i] = netport.MustReserveUDP(b.Fatalf)
 	}
-	return addrs, sockets
+	return addrs
 }
 
 // SetupQuicRaftCluster creates a multi-node QuicRaft cluster with real
@@ -202,21 +201,12 @@ func reservePorts(b *testing.B, n int) (addrs []string, sockets []net.PacketConn
 func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
-	// Reserve UDP ports by keeping sockets open until we're ready to bind.
-	// This prevents TOCTOU races where released ports get reassigned.
-	addrs, sockets := reservePorts(b, numNodes)
+	addrs := reservePorts(b, numNodes)
 
 	// Build the initial members map: replicaID (1-indexed) -> address.
 	members := make(map[uint64]string, numNodes)
 	for i, addr := range addrs {
 		members[uint64(i+1)] = addr
-	}
-
-	// Release reserved sockets immediately before host creation so the
-	// QUIC transport can bind to the same ports. The tight release-bind
-	// window minimizes the TOCTOU race window.
-	for _, s := range sockets {
-		s.Close()
 	}
 
 	// Generate mTLS material once for the entire cluster so all nodes
@@ -385,17 +375,11 @@ func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int, sha
 func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Reserve ports with sockets held open to prevent TOCTOU races.
-	addrs, sockets := reservePorts(b, numNodes)
+	addrs := reservePorts(b, numNodes)
 
 	members := make(map[uint64]string, numNodes)
 	for j, addr := range addrs {
 		members[uint64(j+1)] = addr
-	}
-
-	// Release sockets immediately before host creation.
-	for _, s := range sockets {
-		s.Close()
 	}
 
 	// Generate mTLS material once for the entire cluster so all nodes
@@ -1118,15 +1102,11 @@ func BenchQuicRaftCommitLatency(b *testing.B, h *quicraft.Host, rec *perfresult.
 func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
-	addrs, sockets := reservePorts(b, numNodes)
+	addrs := reservePorts(b, numNodes)
 
 	members := make(map[uint64]string, numNodes)
 	for i, addr := range addrs {
 		members[uint64(i+1)] = addr
-	}
-
-	for _, s := range sockets {
-		s.Close()
 	}
 
 	// Generate mTLS material once for the entire cluster so all nodes

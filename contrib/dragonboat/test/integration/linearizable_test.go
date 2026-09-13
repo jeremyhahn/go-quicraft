@@ -390,7 +390,7 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// The floor is shorter than the budget by construction; the wait below
 	// relies on it.
 	const concurrentPhaseFloor = 3 * time.Second
-	const concurrentPhaseBudget = coldStartElectionRounds * electionRound
+	concurrentPhaseBudget := coldStartElectionRounds * electionRound
 
 	// readRetryInterval is how long the reader waits after a failed read.
 	//

@@ -104,6 +104,13 @@ func setupTLSTransport() (*tlsTransportState, error) {
 		MinVersion:   tls.VersionTLS13,
 	}
 
+	//quicraft:direct-port the listener is KEPT for the transport's lifetime, so
+	// the reserve-then-rebind class cannot occur here and netport is not
+	// applicable. Nothing is closed and handed on: the socket opened by this
+	// call is the socket the accept loop below serves, and the address peers
+	// are given is read back from it while it is still open. The harnesses that
+	// must name a port BEFORE the server exists -- Dragonboat and etcd's raft
+	// peers -- go through benchutil.MustReserveTCPPort, which is netport.
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
 	if err != nil {
 		return nil, err

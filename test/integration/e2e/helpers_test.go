@@ -46,6 +46,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
@@ -99,81 +100,21 @@ const testElectionRTT = config.DefaultElectionRTT
 // raftTick is one Raft tick in wall-clock time.
 const raftTick = testRTTMillisecond * time.Millisecond
 
-// electionRound is the longest a SINGLE election attempt can run before the
-// next candidate's timer fires and supersedes it.
-//
-// It is TWICE ElectionRTT, not once. Raft randomises each replica's election
-// timer over [electionTimeout, 2*electionTimeout) —
-// randomizedElectionTimeout = electionTimeout + rng.Intn(electionTimeout), see
-// pkg/internal/raft — so the upper bound on one attempt is two election
-// timeouts' worth of ticks. A budget written against the un-randomised value
-// is half the size it appears to be, which is how a "10x headroom" constant
-// turns out to be 5x. Here: 2 * 10 * 50ms = 1s.
-const electionRound = 2 * time.Duration(testElectionRTT) * raftTick
+// The election budgets are test/electionbudget's, derived from this suite's
+// testElectionRTT and testRTTMillisecond. The derivation and the ~60 lines of
+// reasoning behind it — why twice ElectionRTT, why thirty rounds, what was
+// measured on #111 — used to be copied into this file and four others. They
+// live in that package now (#133); the pin test below is the half that cannot
+// move, because it reads THIS suite's config builders.
+var (
+	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
+	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
+	failoverTimeout       = electionbudget.Failover(testElectionRTT, testRTTMillisecond)
+)
 
-// coldStartElectionRounds is how many worst-case election rounds
-// leaderElectionTimeout allows a shard that was started moments ago to produce
-// its FIRST leader.
-//
-// FOUR of them are the protocol's own worst case for a cold start, each
-// bounded by electionRound:
-//
-//   - the QUIC handshake and mTLS exchange between all the hosts, which must
-//     complete before the first RequestVote can even be answered;
-//   - the PreVote round (SetDefaults turns PreVote on), which precedes the
-//     real one;
-//   - the vote round itself;
-//   - one split-vote retry. On a cold start a split is likely rather than
-//     exceptional: every replica arms its election timer within microseconds
-//     of the others, which is the one situation the randomised timer has least
-//     room to separate.
-//
-// The remaining factor is host saturation, and it is a MULTIPLIER rather than
-// an addend. A Raft tick is a goroutine wakeup; on a box oversubscribed k
-// times a 50ms tick lands roughly k times late, and the whole cold start
-// stretches with it.
-//
-// Measured with this budget lifted to 120s so the tail was not truncated:
-// full runs of this suite under -race on 24 cores at load average 120-190
-// (5-8x oversubscribed, the CI runners this box hosts). The distribution is
-// not merely slow, it is heavy-tailed — the common case sits near the four
-// rounds above and a small minority runs an order of magnitude past it. The
-// distribution is recorded on #111.
-//
-// Thirty rounds is thirty seconds. It is BOUNDED on purpose, and the bound is
-// the point of the number rather than an afterthought: a shard that CANNOT
-// elect — a lost quorum, a broken transport, a membership that does not agree
-// — is still reported in half a minute, naming the shard, instead of running
-// to the suite timeout. That case is verified directly rather than assumed:
-// a three-member shard with only one replica running fails this wait in 30.0s.
-//
-// This budget is LARGER than failoverTimeout even though the names suggest the
-// opposite, and that is the correction. A cold start is the HARDER of the two
-// waits: a failover happens over transport that is already established between
-// survivors that already know one another, while a cold start pays for the
-// handshakes first. The easier case had 20s and the harder one had 5s.
-const coldStartElectionRounds = 30
-
-// leaderElectionTimeout is the budget for a freshly started shard to produce
-// its FIRST leader. See coldStartElectionRounds for the derivation.
-//
-// It is a SETUP budget and nothing else. Every one of its call sites waits on
-// a shard started moments earlier, before the test's subject is reached, so a
-// test that exhausts it has asserted nothing at all — which is what made #111
-// worth fixing rather than merely worth widening. A wait for a SUBSEQUENT
-// leader, after one has been stopped or partitioned away, is a different
-// question and takes failoverTimeout.
-const leaderElectionTimeout = coldStartElectionRounds * electionRound
-
-// failoverTimeout is the budget for a shard that has already been led to elect
-// a REPLACEMENT leader after the incumbent is stopped or partitioned away.
-//
-// Its value is unchanged at 20s; it is re-expressed in election rounds so that
-// it tracks ElectionRTT and RTTMillisecond alongside leaderElectionTimeout
-// instead of drifting away from them. A failover needs one election timeout for
-// the survivors to notice the silence and a round or two to elect, over warm
-// connections.
-const failoverTimeout = 20 * electionRound
+// coldStartElectionRounds is re-exposed under its long-standing local name so
+// the suites' log lines keep naming the round count.
+const coldStartElectionRounds = electionbudget.ColdStartRounds
 
 // ---------------------------------------------------------------------------
 // KV Command Encoding
