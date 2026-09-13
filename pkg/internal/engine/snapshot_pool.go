@@ -1023,6 +1023,26 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	if barrier != nil {
 		frameW = newSnapshotFrameWriter(f, barrier, req.shardID, req.replicaID, snapshotIndex)
 		w = frameW
+		// ONE release, registered the moment the pins can start existing.
+		//
+		// Every frame the writer emits pins its epoch, and an epoch with an
+		// in-flight reference is one PurgeEpochsBefore will never retire — so a
+		// leaked pin keeps that DEK in protected memory for the life of the
+		// process. The release therefore has to cover EVERY way out of this
+		// function from here on, and a deferred call is the only construct that
+		// does; the alternative is remembering to release at each of the ten-odd
+		// returns below, which was tried and missed five of them.
+		//
+		// It is deliberately registered BEFORE the first frame rather than after
+		// frameW.Close(): the writer starts pinning as soon as the state machine
+		// fills a chunk, so a return between here and Close would otherwise
+		// leak. releaseAll is idempotent (it nils its own set), so the writer's
+		// internal fail() release and this one cannot double-decrement.
+		//
+		// On the SUCCESS path this runs at function exit, which is after the
+		// metadata file and the LogDB record are durable -- exactly the window
+		// the pins exist to protect.
+		defer frameW.ReleasePins()
 	}
 	var snappyW *snappy.Writer
 	if compression == config.Snappy {
@@ -1040,17 +1060,6 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		saveErr = snapshotter.SaveSnapshot(ctx, w, node.stopC)
 	}
 	if err := saveErr; err != nil {
-		// Release the epochs frames already sealed under. A state machine that
-		// wrote at least one full chunk before failing has emitted frames, and
-		// each of those pinned its epoch; returning without releasing them
-		// leaves in-flight references no one will ever clear, so
-		// PurgeEpochsBefore can never retire those DEKs and the key material
-		// outlives the process's need for it. The snappy-close path below and
-		// the writer's own fail() cover the other two ways out; this was the
-		// gap between them.
-		if frameW != nil {
-			frameW.ReleasePins()
-		}
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Debug("snapshot: file close failed after save error",
 				"shard_id", req.shardID,
@@ -1070,9 +1079,6 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// the frame writer (and through it the file) before fsync.
 	if snappyW != nil {
 		if err := snappyW.Close(); err != nil {
-			if frameW != nil {
-				frameW.ReleasePins()
-			}
 			if closeErr := f.Close(); closeErr != nil {
 				slog.Debug("snapshot: file close failed after snappy flush error",
 					"shard_id", req.shardID,
@@ -1215,12 +1221,6 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// artifact in existence to leak.
 	var epoch uint64
 	if frameW != nil {
-		framePins := frameW.Epochs()
-		defer func() {
-			for _, e := range framePins {
-				barrier.DeregisterInFlightEpoch(e)
-			}
-		}()
 		epoch = frameW.MinEpoch()
 	}
 

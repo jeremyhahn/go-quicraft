@@ -422,3 +422,57 @@ func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) 
 	}
 	barrier.assertBalanced(t, "saveSnapshot state-machine failure")
 }
+
+// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero covers the class of
+// leak three independent reviews of #116 found after the first fix.
+//
+// The first fix released the frame writer's epoch pins on the two error paths
+// it noticed — the state-machine save error and the snappy-close error — and
+// left the deferred release registered late, after fsync, stat, the size check
+// and Close had all succeeded. Four returns sat between the last frame being
+// sealed and that defer, and every one of them dropped the pins on the floor:
+// fsync failure, stat failure, MaxSnapshotSize exceeded, and the deferred
+// writeback error Linux reports at Close.
+//
+// Chasing individual returns is what produced that gap twice. The release is
+// now a single deferred call registered where the pins begin to exist, so it
+// covers every exit by construction. This test pins the property using the one
+// of those four paths a test can trigger deterministically: an artifact that
+// exceeds MaxSnapshotSize.
+//
+// The payload is deliberately larger than one snapshotEncryptChunkSize, so the
+// writer has actually emitted a frame and pinned an epoch before the size check
+// refuses the save. A smaller payload leaks nothing and would pass against the
+// defect.
+func TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero(t *testing.T) {
+	snapDir := t.TempDir()
+	cfg := config.Config{ShardID: 13, ReplicaID: 1, CompactionOverhead: 50}
+	cfg.SetDefaults()
+	// Below the payload, so the save is refused AFTER frames have been sealed.
+	cfg.MaxSnapshotSize = snapshotEncryptChunkSize
+
+	snapshotter := &bulkSnapshotter{bytes: snapshotEncryptChunkSize * 3}
+	snapshotter.lastApplied.Store(200)
+	snapshotter.state.Store(42)
+	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+
+	barrier := newPinCountBarrier(newTestBarrier(4))
+	ldb := newSnapshotTestLogDB()
+	stopC := make(chan struct{})
+	pool := newSnapshotPool(1, ldb, barrier, nil, nil, stopC, nil)
+
+	_, err := pool.saveSnapshot(snapshotRequest{
+		shardID:   13,
+		replicaID: 1,
+		node:      node,
+		save:      true,
+	})
+	if err == nil {
+		t.Fatal("saveSnapshot: expected the artifact to exceed MaxSnapshotSize")
+	}
+	var tooLarge *SnapshotTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("error = %T (%v), want *SnapshotTooLargeError", err, err)
+	}
+	barrier.assertBalanced(t, "saveSnapshot MaxSnapshotSize refusal")
+}
