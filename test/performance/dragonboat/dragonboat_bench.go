@@ -173,7 +173,7 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 		elapsed := time.Since(start)
 		if err != nil {
 			// A transient refusal is Raft weather, not a failed benchmark;
-			// requireProposeFloor decides whether there were too many. See
+			// requireFloor decides whether there were too many. See
 			// #181 for what b.Fatalf here used to cost.
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
@@ -182,7 +182,7 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 		completed++
 		rec.Record(elapsed)
 	}
-	requireProposeFloor(b, completed, errored)
+	requireFloor(b, "proposals", completed, errored)
 }
 
 // BenchDragonboatSyncRead benchmarks linearizable read throughput.
@@ -289,7 +289,7 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 		elapsed := time.Since(start)
 		if err != nil {
 			// A transient refusal is Raft weather, not a failed benchmark;
-			// requireProposeFloor decides whether there were too many. See
+			// requireFloor decides whether there were too many. See
 			// #181 for what b.Fatalf here used to cost.
 			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
@@ -298,7 +298,7 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 		completed++
 		rec.Record(elapsed)
 	}
-	requireProposeFloor(b, completed, errored)
+	requireFloor(b, "proposals", completed, errored)
 }
 
 // BenchDragonboatElection benchmarks the Raft election algorithm time,
@@ -438,7 +438,7 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 	// Counted AND checked. This loop tolerated every error and logged the
 	// total, but nothing read it, so a run in which every proposal failed
 	// reported no samples and passed clean (#181).
-	requireProposeFloor(b, int(okCount.Load()), int(errCount.Load()))
+	requireFloor(b, "proposals", int(okCount.Load()), int(errCount.Load()))
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +765,7 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 	// This loop already tolerated errors and counted them. What it did not do
 	// was check the count, so a run in which EVERY proposal failed reported
 	// zero samples and passed clean (#181).
-	requireProposeFloor(b, completed, errored)
+	requireFloor(b, "proposals", completed, errored)
 }
 
 // BenchDragonboatConcurrentProposeFixedCluster benchmarks concurrent
@@ -812,7 +812,7 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 
 	wg.Wait()
 
-	requireProposeFloor(b, int(okCount.Load()), int(errCount.Load()))
+	requireFloor(b, "proposals", int(okCount.Load()), int(errCount.Load()))
 }
 
 // BenchDragonboatCommitLatencyCluster benchmarks per-proposal commit
@@ -846,7 +846,7 @@ func BenchDragonboatCommitLatencyCluster(b *testing.B, cluster *BenchCluster, re
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	var errCount atomic.Int64
+	var completed, errored int
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		proposeCtx, proposeCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -854,15 +854,16 @@ func BenchDragonboatCommitLatencyCluster(b *testing.B, cluster *BenchCluster, re
 		proposeCancel()
 		elapsed := time.Since(start)
 		if err != nil {
-			errCount.Add(1)
+			errored++
 			b.Logf("SyncPropose failed at iteration %d: %v", i, err)
 			continue
 		}
+		completed++
 		rec.Record(elapsed)
 	}
-	if n := errCount.Load(); n > 0 {
-		b.Logf("total commit latency errors: %d/%d", n, b.N)
-	}
+	// Counted AND checked. The first pass at #181 missed this loop: it
+	// tolerated and logged, and nothing read the count.
+	requireFloor(b, "proposals", completed, errored)
 }
 
 // BenchDragonboatSyncReadCluster benchmarks linearizable read throughput
@@ -887,7 +888,7 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	var errCount atomic.Int64
+	var completed, errored int
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
 		readCtx, readCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -895,15 +896,16 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 		readCancel()
 		elapsed := time.Since(start)
 		if err != nil {
-			errCount.Add(1)
+			errored++
 			b.Logf("SyncRead failed at iteration %d: %v", i, err)
 			continue
 		}
+		completed++
 		rec.Record(elapsed)
 	}
-	if n := errCount.Load(); n > 0 {
-		b.Logf("total sync read errors: %d/%d", n, b.N)
-	}
+	// A linearizable read is leader-bound exactly as a proposal is and fails
+	// on the same transients, so it takes the same floor.
+	requireFloor(b, "reads", completed, errored)
 }
 
 // BenchDragonboatStaleReadCluster benchmarks stale (non-linearizable)
@@ -977,7 +979,7 @@ const maxProposeErrorRate = 0.20
 // calibrated run, with thousands of attempts, be the one that is judged.
 const minProposeSample = 100
 
-// requireProposeFloor fails the benchmark unless enough of its proposals
+// requireFloor fails the benchmark unless enough of its proposals
 // completed for the recorded latencies to mean anything.
 //
 // # Why this exists at all
@@ -1001,9 +1003,9 @@ const minProposeSample = 100
 // run that failed to measure the thing it exists to measure fails loudly and
 // says which of the two it was. This is the shape linearizability's
 // minSuccessfulReads floor already uses in the integration suites.
-func requireProposeFloor(b *testing.B, completed, errored int) {
+func requireFloor(b *testing.B, op string, completed, errored int) {
 	b.Helper()
-	note, fatal := proposeFloorVerdict(completed, errored)
+	note, fatal := proposeFloorVerdict(op, completed, errored)
 	if note == "" {
 		return
 	}
@@ -1013,20 +1015,20 @@ func requireProposeFloor(b *testing.B, completed, errored int) {
 	b.Log(note)
 }
 
-// proposeFloorVerdict is requireProposeFloor's decision, separated from the
+// proposeFloorVerdict is requireFloor's decision, separated from the
 // *testing.B it reports through so the thresholds can be tested at their
 // boundaries rather than only exercised by a 30-minute benchmark run.
 //
 // It returns the message to report and whether it is fatal; an empty message
 // means the loop was clean and there is nothing to say.
-func proposeFloorVerdict(completed, errored int) (string, bool) {
+func proposeFloorVerdict(op string, completed, errored int) (string, bool) {
 	attempted := completed + errored
 	if attempted == 0 {
 		return "", false // b.N was 0; nothing was asked of the engine.
 	}
 	if completed == 0 {
-		return fmt.Sprintf("every one of %d proposals failed: there are no samples "+
-			"to report, so this benchmark measured nothing", attempted), true
+		return fmt.Sprintf("every one of %d %s failed: there are no samples "+
+			"to report, so this benchmark measured nothing", attempted, op), true
 	}
 	rate := float64(errored) / float64(attempted)
 	if attempted < minProposeSample {
@@ -1034,22 +1036,22 @@ func proposeFloorVerdict(completed, errored int) (string, bool) {
 		// completed, so calibration may continue; the calibrated run is
 		// where the rate is judged. Still say what happened.
 		if errored > 0 {
-			return fmt.Sprintf("total propose errors: %d/%d (%.1f%%) -- below the "+
-				"%d-attempt sample floor, not judged", errored, attempted, 100*rate,
+			return fmt.Sprintf("total %s errors: %d/%d (%.1f%%) -- below the "+
+				"%d-attempt sample floor, not judged", op, errored, attempted, 100*rate,
 				minProposeSample), false
 		}
 		return "", false
 	}
 	if rate > maxProposeErrorRate {
-		return fmt.Sprintf("%d of %d proposals failed (%.1f%%, limit %.0f%%): the "+
+		return fmt.Sprintf("%d of %d %s failed (%.1f%%, limit %.0f%%): the "+
 			"surviving samples describe a contended host rather than the engine, so "+
 			"publishing them would put a measurement of this machine's load into a "+
 			"comparison table. Re-run on a quiet host.",
-			errored, attempted, 100*rate, 100*maxProposeErrorRate), true
+			errored, attempted, op, 100*rate, 100*maxProposeErrorRate), true
 	}
 	if errored > 0 {
-		return fmt.Sprintf("total propose errors: %d/%d (%.1f%%)",
-			errored, attempted, 100*rate), false
+		return fmt.Sprintf("total %s errors: %d/%d (%.1f%%)",
+			op, errored, attempted, 100*rate), false
 	}
 	return "", false
 }

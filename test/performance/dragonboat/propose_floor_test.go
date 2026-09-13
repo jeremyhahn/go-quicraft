@@ -102,7 +102,7 @@ func TestProposeFloorVerdict(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			note, fatal := proposeFloorVerdict(tc.completed, tc.errored)
+			note, fatal := proposeFloorVerdict("proposals", tc.completed, tc.errored)
 			if tc.quiet {
 				if note != "" || fatal {
 					t.Fatalf("want silence, got fatal=%v %q", fatal, note)
@@ -119,6 +119,23 @@ func TestProposeFloorVerdict(t *testing.T) {
 				t.Errorf("message does not mention %q: %s", tc.wants, note)
 			}
 		})
+	}
+}
+
+// TestFloorNamesTheOperationItJudged pins that a read loop's failure says
+// "reads", not "proposals". The two missed loops in the first pass at #181
+// included a SyncRead loop; a message calling its failures proposals would
+// send an operator looking at the wrong code path.
+func TestFloorNamesTheOperationItJudged(t *testing.T) {
+	note, fatal := proposeFloorVerdict("reads", 0, 50)
+	if !fatal {
+		t.Fatal("total failure must be fatal regardless of operation")
+	}
+	if !strings.Contains(note, "50 reads failed") {
+		t.Fatalf("message does not name the operation: %s", note)
+	}
+	if strings.Contains(note, "proposal") {
+		t.Fatalf("a read loop's verdict mentions proposals: %s", note)
 	}
 }
 
