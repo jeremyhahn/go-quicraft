@@ -1806,7 +1806,11 @@ export GOWORK=off
 # A substituted AGENT_GIT therefore fails here, with everything it produced
 # still local and retractable. That is a stronger claim than any path check
 # could make -- it holds whatever produced the objects.
-AGENT_GIT      ?= /home/jhahn/sources/automatethethings/software/scripts/agent-git.sh
+# The wrapper is host-local since the company-repo cutover of 2026-09-05
+# (CLAUDE.md, "Identity"); the company repo is no longer checked out beside
+# this one, so the old default resolved to nothing and the recipe stopped at
+# its executable guard on every host.
+AGENT_GIT      ?= /usr/local/bin/agent-git.sh
 override REPO_NAME := go-quicraft
 
 # RELEASE_SIGNERS is the TRUST ANCHOR, and it is `override` for the reason the

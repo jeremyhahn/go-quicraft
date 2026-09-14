@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0-alpha] - 2026-09-13
+
 ### Added
+
+- **`quicraft.ErrTransferInProgress` (#146, #175).** `raft.ErrTransferInProgress`
+  is returned for every proposal type and for linearizable reads while a
+  leadership transfer is in flight, and lived in an internal package, so no
+  caller could `errors.Is` it and every consumer matched the message text. It is
+  re-exported as a `Temporary` sentinel; the text is unchanged.
 
 - **`SoftwareStrategy.KDFParams()` and `NewDeferredSoftwareStrategyWithParams`
   (#72, requested by go-qrdb #156).** Deferred passphrase binding and KDF
@@ -46,10 +54,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The Shamir locked-memory budget is priced in pages, and `MaxShareSetBytes`
-  is 2 MiB (#94).** Consumer-observable: `MaxShareSetBytes` doubles, and a wide
-  split of a multi-kilobyte secret that the old figure admitted is now refused
-  with a `*SplitError`.
+- **A read against a shard whose state machine has failed returns
+  `ErrShardFailed` immediately, on every read path (#185).** After `SM.Apply`
+  returned an error, `SyncRead`, `SyncReadBuf` and `FollowerRead` on that shard
+  waited for the caller's deadline and then reported `quicraft: timeout` — 5m6s
+  under the default — for a read the replica knew at 0s it could not serve. The
+  propose path already refused with `ErrShardFailed`; the read paths now do
+  too, a read already registered when the latch trips is completed with the
+  same error, and the halt is logged once with the state machine's own error.
+  `ErrShardFailed` is deliberately not `Temporary`: the shard stays failed
+  until reloaded, and a retry loop against it would spin forever.
+
+- **`SyncRead` / `ReadIndex` addressed to a campaigning replica is refused
+  with a not-leader error instead of hanging to the deadline (#153).**
+  `stepCandidate` refused a `Propose` but had no `ReadIndex` case, so a read
+  that arrived during the election window was dropped and its caller timed out
+  for what is a `Temporary` not-leader condition.
+
+- **A declined stale snapshot recovery is no longer reported through
+  `EventListener.OnShardFailed` (#129, #126).** The engine already declined a
+  `*SnapshotRecoveryStaleError` without failing the shard; the host then handed
+  the completion's error to the one outward signal that a replica is finished.
+  The shard was healthy and the listener said it was dead.
+
+- **The local snapshot save encrypts as it writes (#116).** `saveSnapshot`
+  wrote the complete state machine to the canonical `snapshot.dat` in the
+  clear, fsynced it, and encrypted it in place afterwards; between the two the
+  plaintext was durable under the name every consumer, backup and operator
+  reads. The state machine now streams through the epoch barrier into the file,
+  the way the InstallSnapshot receive path always did, and `MaxSnapshotSize` is
+  measured on the plaintext the state machine produced rather than on the
+  ciphertext that lands on disk.
+
+- **`contrib/dragonboat`'s `translateError` preserves the `MaybeApplied`
+  marker (#156).** A post-delivery leadership change and a pre-flight refusal
+  both arrived as the bare `ErrShardNotReady`, so an adapter caller could not
+  tell "retry safely" from "may have applied". The mapped sentinel still
+  matches through `errors.Is`.
+
+- **`test/performance` (#181, #184).** The dragonboat baseline tolerates Raft
+  weather (`IsTempError` only, at most 20% of a sample of at least 100) instead
+  of aborting a run on one transient, a failed run stores nothing, every
+  container's console is kept verbatim under the profile, and the quicraft
+  image resolves go-enclave from Gitea through a BuildKit secret that touches
+  no layer, no command line and no log.
+
+- **The Shamir locked-memory budget is priced in pages (#94).** Consumer-
+  observable: `MaxShareSetBytes` grows from the 1 MiB every tag to date has
+  shipped (see the BREAKING entry below for what it is now), and a wide split
+  of a multi-kilobyte secret that the old figure admitted is now refused with a
+  `*SplitError`.
 
   `splitLockedBytes` priced *requested* bytes. go-enclave charges *whole pages* —
   a 32-byte enclave locks 4 KiB — and a 255-share split takes 255 separate
@@ -314,6 +368,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends by one write, because a reset stream is only discovered on the NEXT
   write to it, so pacing sends on that counter deadlocks. Both are noted at the
   call sites so the next reader does not re-derive them.
+
+### Changed — BREAKING: `shamir.MaxShareSetBytes` is a `var` derived from the host page size (#102, #176)
+
+- **`MaxShareSetBytes` is `var MaxShareSetBytes = maxShareSetBytesFor(int(enclave.LockedSize(1)))`
+  — 512 pages of the allocator's own page size — and no longer a `const`.** A
+  consumer that used the symbol in a constant context (an array length, a
+  `const` declaration, a `case` label) stops compiling; one that reads it is
+  unaffected. go-qrdb and go-xkms were grepped and read it only (issues filed
+  on both).
+
+  Every figure in the budget's derivation is a page count, so stating it in one
+  host's bytes made the primitive's headline operation depend on the host: the
+  255-share split of a 32-byte root key is 259 pages, admitted at 4 KiB pages
+  under a 512-page cap and refused at 16 KiB and 64 KiB — and RHEL and CentOS
+  Stream arm64 ship 64 KiB pages. CI is amd64-only, so nothing could catch it.
+
+  **The figure to read twice, checked while cutting this release (#183):**
+  every tag before this one — `v0.9.0-alpha` and `v0.10.0-alpha` included —
+  shipped `const MaxShareSetBytes = 1 << 20`; the `2 << 20` that #94's entry
+  above once described existed only on `main` between #101 and #176 and was
+  never tagged. Priced in pages that 255-share split is 1,060,864 bytes, over
+  a 1 MiB cap by three pages — but the tags did NOT refuse it, because they
+  also carried the byte-summed pricing #94 replaced, which charged that split
+  20,657 bytes for the 1,060,864 it locked. The released behaviour was the
+  opposite failure: the headline case was admitted at 51x under its price, and
+  the cap protected nothing. This release is the first whose cap and pricing
+  agree, on every page size.
 
 ### Changed — BREAKING: `pkg/enclave` is deleted and `Credentials.Secret` is protected memory (#54, #41)
 
