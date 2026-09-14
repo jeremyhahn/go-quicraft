@@ -1,0 +1,432 @@
+{
+  "system": "quicraft",
+  "version": "0.0.0",
+  "timestamp": "2026-09-14T02:03:22Z",
+  "config": {
+    "payload_size": 128,
+    "concurrent_goroutines": 8,
+    "tls": true,
+    "rtt_ms": 1,
+    "election_rtt": 10,
+    "heartbeat_rtt": 1,
+    "node_count": 1
+  },
+  "results": {
+    "commit_latency_3n_wal": {
+      "ops": 17241,
+      "duration_ns": 41761853848,
+      "ops_per_sec": 412.84086819401773,
+      "latency": {
+        "p50_ns": 2201967,
+        "p90_ns": 3632656,
+        "p95_ns": 3876400,
+        "p99_ns": 4316642,
+        "p999_ns": 5500617,
+        "min_ns": 1153302,
+        "max_ns": 16131490,
+        "mean_ns": 2408700,
+        "count": 17241
+      }
+    },
+    "commit_latency_5n_wal": {
+      "ops": 11590,
+      "duration_ns": 41656968077,
+      "ops_per_sec": 278.22476130708054,
+      "latency": {
+        "p50_ns": 3461391,
+        "p90_ns": 4600218,
+        "p95_ns": 4969294,
+        "p99_ns": 5729734,
+        "p999_ns": 7446269,
+        "min_ns": 1338506,
+        "max_ns": 17690627,
+        "mean_ns": 3575787,
+        "count": 11590
+      }
+    },
+    "commit_latency_memory": {
+      "ops": 1707735,
+      "duration_ns": 37915372853,
+      "ops_per_sec": 45040.701739133176,
+      "latency": {
+        "p50_ns": 17448,
+        "p90_ns": 39958,
+        "p95_ns": 48092,
+        "p99_ns": 67781,
+        "p999_ns": 115846,
+        "min_ns": 5287,
+        "max_ns": 13353413,
+        "mean_ns": 21988,
+        "count": 1707735
+      }
+    },
+    "commit_latency_wal": {
+      "ops": 45739,
+      "duration_ns": 35765192013,
+      "ops_per_sec": 1278.8691301692077,
+      "latency": {
+        "p50_ns": 708639,
+        "p90_ns": 1021062,
+        "p95_ns": 1258667,
+        "p99_ns": 1499736,
+        "p999_ns": 2420099,
+        "min_ns": 489064,
+        "max_ns": 15242348,
+        "mean_ns": 781311,
+        "count": 45739
+      }
+    },
+    "election_3n_wal": {
+      "ops": 1713,
+      "duration_ns": 32855887779,
+      "ops_per_sec": 52.13677413078067,
+      "latency": {
+        "p50_ns": 17724168,
+        "p90_ns": 22823437,
+        "p95_ns": 23413998,
+        "p99_ns": 32526450,
+        "p999_ns": 44402637,
+        "min_ns": 11765175,
+        "max_ns": 46835555,
+        "mean_ns": 19180319,
+        "count": 1713
+      }
+    },
+    "election_5n_wal": {
+      "ops": 1798,
+      "duration_ns": 34623787164,
+      "ops_per_sec": 51.929616811804635,
+      "latency": {
+        "p50_ns": 18883792,
+        "p90_ns": 23174465,
+        "p95_ns": 24123057,
+        "p99_ns": 33427921,
+        "p999_ns": 56926265,
+        "min_ns": 12923636,
+        "max_ns": 60825338,
+        "mean_ns": 19256833,
+        "count": 1798
+      }
+    },
+    "election_memory": {
+      "ops": 1891,
+      "duration_ns": 35994719295,
+      "ops_per_sec": 52.53548401091927,
+      "latency": {
+        "p50_ns": 20341683,
+        "p90_ns": 25477668,
+        "p95_ns": 26004084,
+        "p99_ns": 26464959,
+        "p999_ns": 28294790,
+        "min_ns": 10234217,
+        "max_ns": 31536672,
+        "mean_ns": 19034753,
+        "count": 1891
+      }
+    },
+    "election_wal": {
+      "ops": 1868,
+      "duration_ns": 36063076761,
+      "ops_per_sec": 51.798131711826855,
+      "latency": {
+        "p50_ns": 20740706,
+        "p90_ns": 25709180,
+        "p95_ns": 26190723,
+        "p99_ns": 27090562,
+        "p999_ns": 29936175,
+        "min_ns": 10733463,
+        "max_ns": 30691636,
+        "mean_ns": 19305715,
+        "count": 1868
+      }
+    },
+    "propose_conc8_3n_wal": {
+      "ops": 95038,
+      "duration_ns": 41950480936,
+      "ops_per_sec": 2265.48058280883,
+      "latency": {
+        "p50_ns": 3390367,
+        "p90_ns": 4542635,
+        "p95_ns": 4867337,
+        "p99_ns": 5584739,
+        "p999_ns": 8489375,
+        "min_ns": 1273438,
+        "max_ns": 18995379,
+        "mean_ns": 3432874,
+        "count": 95038
+      }
+    },
+    "propose_conc8_5n_wal": {
+      "ops": 133905,
+      "duration_ns": 87769710752,
+      "ops_per_sec": 1525.640210645775,
+      "latency": {
+        "p50_ns": 5112379,
+        "p90_ns": 7005348,
+        "p95_ns": 7622949,
+        "p99_ns": 9118660,
+        "p999_ns": 12419671,
+        "min_ns": 1729226,
+        "max_ns": 24442997,
+        "mean_ns": 5224062,
+        "count": 133905
+      }
+    },
+    "propose_conc8_memory": {
+      "ops": 3757680,
+      "duration_ns": 33307034488,
+      "ops_per_sec": 112819.41060690446,
+      "latency": {
+        "p50_ns": 66331,
+        "p90_ns": 96245,
+        "p95_ns": 106290,
+        "p99_ns": 130620,
+        "p999_ns": 651570,
+        "min_ns": 7597,
+        "max_ns": 19302119,
+        "mean_ns": 70569,
+        "count": 3757680
+      }
+    },
+    "propose_conc8_wal": {
+      "ops": 182000,
+      "duration_ns": 36204835486,
+      "ops_per_sec": 5026.9528243092645,
+      "latency": {
+        "p50_ns": 1500661,
+        "p90_ns": 2015872,
+        "p95_ns": 2071691,
+        "p99_ns": 2223577,
+        "p999_ns": 4098964,
+        "min_ns": 519037,
+        "max_ns": 14992128,
+        "mean_ns": 1589401,
+        "count": 182000
+      }
+    },
+    "propose_seq_3n_wal": {
+      "ops": 16110,
+      "duration_ns": 35463902225,
+      "ops_per_sec": 454.2647308745224,
+      "latency": {
+        "p50_ns": 2011819,
+        "p90_ns": 3445267,
+        "p95_ns": 3762743,
+        "p99_ns": 4275884,
+        "p999_ns": 5086536,
+        "min_ns": 1004161,
+        "max_ns": 15931055,
+        "mean_ns": 2186108,
+        "count": 16110
+      }
+    },
+    "propose_seq_5n_wal": {
+      "ops": 15376,
+      "duration_ns": 43016575580,
+      "ops_per_sec": 357.4436084853968,
+      "latency": {
+        "p50_ns": 2709693,
+        "p90_ns": 3867754,
+        "p95_ns": 4232969,
+        "p99_ns": 5033882,
+        "p999_ns": 6811386,
+        "min_ns": 1233926,
+        "max_ns": 18512248,
+        "mean_ns": 2784962,
+        "count": 15376
+      }
+    },
+    "propose_seq_memory": {
+      "ops": 1818141,
+      "duration_ns": 32871224661,
+      "ops_per_sec": 55311.02107543714,
+      "latency": {
+        "p50_ns": 14542,
+        "p90_ns": 31326,
+        "p95_ns": 38021,
+        "p99_ns": 50853,
+        "p999_ns": 85209,
+        "min_ns": 5333,
+        "max_ns": 14038323,
+        "mean_ns": 17889,
+        "count": 1818141
+      }
+    },
+    "propose_seq_wal": {
+      "ops": 47446,
+      "duration_ns": 36508846975,
+      "ops_per_sec": 1299.5754161310379,
+      "latency": {
+        "p50_ns": 699562,
+        "p90_ns": 1031586,
+        "p95_ns": 1207236,
+        "p99_ns": 1402515,
+        "p999_ns": 2704226,
+        "min_ns": 473245,
+        "max_ns": 14987573,
+        "mean_ns": 768927,
+        "count": 47446
+      }
+    },
+    "stale_read_3n_wal": {
+      "ops": 140327206,
+      "duration_ns": 26612952415,
+      "ops_per_sec": 5272891.327942504,
+      "latency": {
+        "p50_ns": 124,
+        "p90_ns": 138,
+        "p95_ns": 150,
+        "p99_ns": 451,
+        "p999_ns": 3492,
+        "min_ns": 107,
+        "max_ns": 1549460,
+        "mean_ns": 137,
+        "count": 140327206
+      }
+    },
+    "stale_read_5n_wal": {
+      "ops": 135655922,
+      "duration_ns": 26926227764,
+      "ops_per_sec": 5038058.921174622,
+      "latency": {
+        "p50_ns": 127,
+        "p90_ns": 144,
+        "p95_ns": 171,
+        "p99_ns": 471,
+        "p999_ns": 3560,
+        "min_ns": 108,
+        "max_ns": 1501054,
+        "mean_ns": 144,
+        "count": 135655922
+      }
+    },
+    "stale_read_memory": {
+      "ops": 153403645,
+      "duration_ns": 29574821990,
+      "ops_per_sec": 5186967.65281866,
+      "latency": {
+        "p50_ns": 124,
+        "p90_ns": 139,
+        "p95_ns": 149,
+        "p99_ns": 353,
+        "p999_ns": 3497,
+        "min_ns": 106,
+        "max_ns": 11288197,
+        "mean_ns": 139,
+        "count": 153403645
+      }
+    },
+    "stale_read_wal": {
+      "ops": 153961500,
+      "duration_ns": 30421498220,
+      "ops_per_sec": 5060944.036568887,
+      "latency": {
+        "p50_ns": 126,
+        "p90_ns": 141,
+        "p95_ns": 149,
+        "p99_ns": 284,
+        "p999_ns": 3862,
+        "min_ns": 107,
+        "max_ns": 11677953,
+        "mean_ns": 143,
+        "count": 153961500
+      }
+    },
+    "sync_read_3n_wal": {
+      "ops": 247604,
+      "duration_ns": 36621319139,
+      "ops_per_sec": 6761.198280711665,
+      "latency": {
+        "p50_ns": 130082,
+        "p90_ns": 198071,
+        "p95_ns": 247448,
+        "p99_ns": 360465,
+        "p999_ns": 690135,
+        "min_ns": 66259,
+        "max_ns": 3046573,
+        "mean_ns": 144685,
+        "count": 247604
+      }
+    },
+    "sync_read_3n_wal_leaseread": {
+      "ops": 4335907,
+      "duration_ns": 35283695736,
+      "ops_per_sec": 122886.98532155374,
+      "latency": {
+        "p50_ns": 5149,
+        "p90_ns": 9351,
+        "p95_ns": 11823,
+        "p99_ns": 26326,
+        "p999_ns": 84729,
+        "min_ns": 1824,
+        "max_ns": 2143866,
+        "mean_ns": 6376,
+        "count": 4335907
+      }
+    },
+    "sync_read_5n_wal": {
+      "ops": 180543,
+      "duration_ns": 35142821453,
+      "ops_per_sec": 5137.407656396005,
+      "latency": {
+        "p50_ns": 157649,
+        "p90_ns": 319347,
+        "p95_ns": 369986,
+        "p99_ns": 467485,
+        "p999_ns": 975962,
+        "min_ns": 87282,
+        "max_ns": 2771937,
+        "mean_ns": 190576,
+        "count": 180543
+      }
+    },
+    "sync_read_5n_wal_leaseread": {
+      "ops": 2922026,
+      "duration_ns": 30809307538,
+      "ops_per_sec": 94842.31336247957,
+      "latency": {
+        "p50_ns": 6556,
+        "p90_ns": 11565,
+        "p95_ns": 15851,
+        "p99_ns": 37874,
+        "p999_ns": 293981,
+        "min_ns": 1922,
+        "max_ns": 2844597,
+        "mean_ns": 8296,
+        "count": 2922026
+      }
+    },
+    "sync_read_memory": {
+      "ops": 8718826,
+      "duration_ns": 34143177252,
+      "ops_per_sec": 255360.71044733477,
+      "latency": {
+        "p50_ns": 3100,
+        "p90_ns": 6473,
+        "p95_ns": 7811,
+        "p99_ns": 11590,
+        "p999_ns": 21040,
+        "min_ns": 1516,
+        "max_ns": 576544,
+        "mean_ns": 3806,
+        "count": 8718826
+      }
+    },
+    "sync_read_wal": {
+      "ops": 8202846,
+      "duration_ns": 33785682128,
+      "ops_per_sec": 242790.59895617331,
+      "latency": {
+        "p50_ns": 3296,
+        "p90_ns": 6597,
+        "p95_ns": 8232,
+        "p99_ns": 11558,
+        "p999_ns": 21097,
+        "min_ns": 1534,
+        "max_ns": 573295,
+        "mean_ns": 3998,
+        "count": 8202846
+      }
+    }
+  }
+}

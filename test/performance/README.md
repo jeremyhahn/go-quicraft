@@ -12,6 +12,7 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
+| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-09-14; all four systems |
 | [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17; etcd not yet measured |
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18; hardware offline pending repair |
 
