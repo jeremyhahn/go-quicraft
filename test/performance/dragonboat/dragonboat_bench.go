@@ -481,6 +481,36 @@ func (c *BenchCluster) Leader() *dragonboat.NodeHost {
 	return c.Hosts[c.LeaderIdx]
 }
 
+// seed writes key through the cluster's CURRENT leader before a read
+// benchmark times reads of it, on the warmup retry budget, re-resolving the
+// leader before every attempt. The cluster was warm a moment ago, but a
+// 3-node shard on a 112-core host lost its leader between the warmup and
+// the first benchmark (ci-node-2, #184 part 3), and dragonboat does not
+// forward: a proposal addressed to the deposed leader sits for its whole
+// 10s and reports "timeout", which took the run down with it. The retry
+// treats that the way #181 treats every other transient, and LeaderIdx is
+// updated so the loop that follows reads from the leader the seed actually
+// landed on.
+func (c *BenchCluster) seed(b *testing.B, key []byte) {
+	b.Helper()
+	cmd := makeKVCmd(key)
+	err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+		idx, err := waitForDragonboatClusterLeader(c.Hosts, dbShardID, 30*time.Second)
+		if err != nil {
+			return err
+		}
+		c.LeaderIdx = idx
+		leader := c.Hosts[idx]
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = leader.SyncPropose(ctx, leader.GetNoOPSession(dbShardID), cmd)
+		return err
+	})
+	if err != nil {
+		b.Fatalf("seed propose failed after %d attempts: %v", benchutil.WarmupAttempts, err)
+	}
+}
+
 // freeTCPPort reserves a loopback address for a Dragonboat transport listener.
 // Dragonboat binds by address rather than by inherited listener, so the port
 // has to be chosen before the NodeHost exists; benchutil.ReserveTCPPort picks
@@ -906,18 +936,11 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 	b.Helper()
 
 	ctx := context.Background()
-	leader := cluster.Leader()
 
-	// Seed data.
-	session := leader.GetNoOPSession(dbShardID)
+	// Seed data, through whichever host leads NOW.
 	key := []byte("read-key")
-	cmd := makeKVCmd(key)
-	seedCtx, seedCancel := context.WithTimeout(ctx, 10*time.Second)
-	if _, err := leader.SyncPropose(seedCtx, session, cmd); err != nil {
-		seedCancel()
-		b.Fatalf("seed propose failed: %v", err)
-	}
-	seedCancel()
+	cluster.seed(b, key)
+	leader := cluster.Leader()
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -950,19 +973,10 @@ func BenchDragonboatSyncReadCluster(b *testing.B, cluster *BenchCluster, rec *pe
 func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	ctx := context.Background()
-	leader := cluster.Leader()
-
-	// Seed data.
-	session := leader.GetNoOPSession(dbShardID)
+	// Seed data, through whichever host leads NOW.
 	key := []byte("stale-key")
-	cmd := makeKVCmd(key)
-	seedCtx, seedCancel := context.WithTimeout(ctx, 10*time.Second)
-	if _, err := leader.SyncPropose(seedCtx, session, cmd); err != nil {
-		seedCancel()
-		b.Fatalf("seed propose failed: %v", err)
-	}
-	seedCancel()
+	cluster.seed(b, key)
+	leader := cluster.Leader()
 
 	b.ResetTimer()
 	b.ReportAllocs()
