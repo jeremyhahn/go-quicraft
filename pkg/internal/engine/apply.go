@@ -488,6 +488,9 @@ func (w *applyWorker) failInFlightItem(item *applyItem) {
 			w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries, applyErr)
 		}
 		node.failed.Store(true)
+		if w.callback != nil {
+			w.callback.OnShardFailed(node.shardID, applyErr)
+		}
 		node.commitPending.Store(false)
 		node.handleError(applyErr)
 	}
@@ -628,6 +631,9 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 						w.callback.OnProposalFailed(node.shardID, entries, panicErr)
 					}
 					node.failed.Store(true)
+					if w.callback != nil {
+						w.callback.OnShardFailed(node.shardID, panicErr)
+					}
 					node.handleError(panicErr)
 				}
 			}()
@@ -873,6 +879,9 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 		w.callback.OnProposalFailed(node.shardID, entries, applyErr)
 	}
 	node.failed.Store(true)
+	if w.callback != nil {
+		w.callback.OnShardFailed(node.shardID, applyErr)
+	}
 	node.handleError(applyErr)
 }
 

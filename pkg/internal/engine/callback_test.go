@@ -32,6 +32,8 @@ import (
 // all calls for verification.
 type testCallback struct {
 	mu                   sync.Mutex
+	shardFailedCalls     []shardFailedCall
+	shardFailedCount     atomic.Int64
 	appliedCalls         []appliedCall
 	committedCalls       []committedCall
 	leaderCalls          []leaderCall
@@ -109,6 +111,11 @@ type proposalFailedCall struct {
 type readIndexFailedCall struct {
 	shardID uint64
 	keys    []uint64
+	err     error
+}
+
+type shardFailedCall struct {
+	shardID uint64
 	err     error
 }
 
@@ -251,6 +258,21 @@ func (c *testCallback) OnReadIndexFailed(shardID uint64, keys []uint64, err erro
 		err:     err,
 	})
 	c.mu.Unlock()
+}
+
+func (c *testCallback) OnShardFailed(shardID uint64, err error) {
+	c.shardFailedCount.Add(1)
+	c.mu.Lock()
+	c.shardFailedCalls = append(c.shardFailedCalls, shardFailedCall{shardID: shardID, err: err})
+	c.mu.Unlock()
+}
+
+func (c *testCallback) getShardFailedCalls() []shardFailedCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]shardFailedCall, len(c.shardFailedCalls))
+	copy(out, c.shardFailedCalls)
+	return out
 }
 
 func (c *testCallback) getProposalFailedCalls() []proposalFailedCall {
@@ -981,6 +1003,26 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	// The failure must be the SM.Apply error, not a gap rejection.
 	if applyErr.Err == nil || applyErr.Err.Error() != "disk full" {
 		t.Fatalf("ApplyError.Err = %v, want the SM.Apply error", applyErr.Err)
+	}
+
+	// The halt is announced ONCE, with the same error, and only after the
+	// batch's own proposals were completed (#185). OnShardFailed is what
+	// lets the host fail the reads the batch does not account for; if it
+	// fired before OnProposalFailed, the host would drain pendingReads
+	// while the proposals that caused the halt were still unresolved.
+	shardFailed := cb.getShardFailedCalls()
+	if len(shardFailed) != 1 {
+		t.Fatalf("expected exactly 1 OnShardFailed call, got %d", len(shardFailed))
+	}
+	if shardFailed[0].shardID != 42 {
+		t.Errorf("OnShardFailed shardID = %d, want 42", shardFailed[0].shardID)
+	}
+	if !errors.Is(shardFailed[0].err, fc.err) && shardFailed[0].err != fc.err {
+		t.Errorf("OnShardFailed err = %v, want the same *ApplyError the batch was "+
+			"failed with (%v)", shardFailed[0].err, fc.err)
+	}
+	if cb.shardFailedCount.Load() != 1 {
+		t.Errorf("OnShardFailed fired %d times for one halt, want 1", cb.shardFailedCount.Load())
 	}
 }
 

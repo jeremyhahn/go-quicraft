@@ -816,6 +816,9 @@ func (w *commitWorker) failBatchSaveState(saveErr error) {
 		}
 		node.handleError(saveStateErr)
 		failBatchProposals(w.callback, u, saveStateErr)
+		if w.callback != nil {
+			w.callback.OnShardFailed(u.ShardID, saveStateErr)
+		}
 		// Return the pooled committed-entries slice after the callback (which
 		// must not retain them). clearBatch below only zeroes the slot, so
 		// without this every failed batch permanently removes a slice from
@@ -850,6 +853,9 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	node.commitPending.Store(false)
 	node.handleError(commitErr)
 	failBatchProposals(callback, u, commitErr)
+	if callback != nil {
+		callback.OnShardFailed(u.ShardID, commitErr)
+	}
 	// Return the pooled slice only after the callback, which must not
 	// retain the entries beyond the call.
 	u.ReleaseCommittedEntries()

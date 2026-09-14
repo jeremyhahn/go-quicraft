@@ -1884,7 +1884,13 @@ func (c *hostEngineCallback) failShardOnCorruptConfig(shardID, index uint64, kin
 		"error", err,
 	)
 	if node := c.h.engine.GetNode(shardID); node != nil {
-		node.Fail(&CorruptConfigEntryError{ShardID: shardID, Index: index, Kind: kind, Err: err})
+		corrupt := &CorruptConfigEntryError{ShardID: shardID, Index: index, Kind: kind, Err: err}
+		node.Fail(corrupt)
+		// Node.Fail reports to the event listener only; the engine's
+		// OnShardFailed fan-out runs at the engine's own latch sites and does
+		// not see this one. Drain the reads here, or a read pending across
+		// this halt waits for its deadline exactly as #185 describes.
+		c.OnShardFailed(shardID, corrupt)
 	}
 }
 
@@ -2581,6 +2587,58 @@ func (c *hostEngineCallback) OnReadIndexFailed(shardID uint64, keys []uint64, er
 		}
 	}
 	ns.pendingReadsMu.Unlock()
+}
+
+// OnShardFailed fails every read still pending on a shard whose failure latch
+// has just tripped.
+//
+// OnProposalFailed completes the proposals in the batch that caused the halt,
+// but a pending read is not in any batch: it completes only when the OnApplied
+// scan sees lastApplied reach its read index, and a halted shard never applies
+// again. So every read registered before the halt — confirmed by a leader that
+// is still healthy, waiting on an apply that cannot come — would otherwise sit
+// until sweepPendingReads expired it at its deadline with ErrTimeout (#185).
+//
+// The gate in ReadIndex handles reads that arrive AFTER the latch; this is the
+// other half, for the ones already inside. The error is the sentinel rather
+// than the halt's own error for the same reason the propose gate returns it: a
+// caller can match ErrShardFailed and know the shard is offline until reloaded,
+// where the raw *ApplyError would need string-matching to classify.
+func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
+	v, exists := c.h.nodes.Load(shardID)
+	if !exists {
+		return
+	}
+	ns, ok := v.(*nodeState)
+	if !ok {
+		slog.Error("OnShardFailed: nodeState type assertion failed",
+			"shard_id", shardID,
+			"error", &TypeAssertionError{
+				Context:      "OnShardFailed nodeState lookup",
+				ExpectedType: "*nodeState",
+				ActualValue:  v,
+			})
+		return
+	}
+
+	// One log line at the moment of the halt, naming shard and replica and
+	// carrying the state machine's own error, so the read failures that
+	// follow have something to correlate against. The halt's cause reaches
+	// the operator here; the reads carry only the sentinel.
+	slog.Error("shard halted: state machine failed, refusing reads and proposals until the shard is reloaded",
+		"shard_id", shardID,
+		"replica_id", ns.replicaID,
+		"error", err,
+	)
+
+	ns.pendingReadsMu.Lock()
+	defer ns.pendingReadsMu.Unlock()
+	for key, pr := range ns.pendingReads {
+		pr.rs.complete(RequestResult{Err: ErrShardFailed})
+		delete(ns.pendingReads, key)
+		pr.rs.releaseRef()
+		c.h.completePendingOp()
+	}
 }
 
 // translateProposalError converts internal Raft errors to public API errors.
@@ -5021,6 +5079,25 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 		return nil, ErrShardNotReady
 	}
 
+	// Refuse a read against a halted shard, exactly as the propose path does.
+	//
+	// A linearizable read completes only when lastApplied reaches its read
+	// index (the OnApplied scan), and a shard whose failure latch has tripped
+	// never applies again. Without this gate the read was accepted, registered,
+	// confirmed by a leader that is still perfectly healthy, and then waited
+	// for an apply that could not come — returning at the caller's deadline
+	// with ErrTimeout, which points at consensus, the network or a lost leader
+	// and not at the Apply that failed earlier (#185). Measured at 5m6s under
+	// the default deadline, for a read the replica knew at 0s it could not
+	// serve. SyncRead and SyncReadBuf both come through here, so one gate
+	// covers every read.
+	//
+	// ErrShardFailed is a refusal, not a retry hint: it is deliberately not in
+	// temporaryErrors, because the shard stays failed until reloaded.
+	if engNode.IsFailed() {
+		return nil, ErrShardFailed
+	}
+
 	// Generate a unique key for correlating this read request through
 	// the raft pipeline. The key is carried in the ReadIndex message's
 	// Hint field and returned in ReadyToRead.Key. Uses a dedicated
@@ -5044,15 +5121,23 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	ns.pendingReads[readKey] = &pendingRead{rs: rs}
 	ns.pendingReadsMu.Unlock()
 
-	// Close-vs-ReadIndex TOCTOU guard: the host may have begun closing (and
-	// run its pending-request sweeps) between the top-of-ReadIndex closed
-	// check and the store above, which would orphan the RS in a deleted
-	// nodeState's map — a deadline-less caller would then block on
-	// rs.Result() forever. Re-check after registering and roll back if
-	// shutting down. The delete-under-mutex claim makes the rollback
-	// exactly-once relative to a concurrent Close sweep (mirrors
-	// proposeEntry's LoadAndDelete pattern).
-	if h.closed.Load() || ns.stopped.Load() {
+	// TOCTOU guard for the two TERMINAL states that can land between the
+	// checks at the top of ReadIndex and the store above. Either would orphan
+	// the RS in a map nothing will ever drain again — a deadline-less caller
+	// then blocks on rs.Result() forever, and one with a deadline pays all of
+	// it. Re-check after registering and roll back. The delete-under-mutex
+	// claim makes the rollback exactly-once relative to a concurrent drain
+	// (mirrors proposeEntry's LoadAndDelete pattern).
+	//
+	//   - Close/stop: the host's pending-request sweeps may have run between
+	//     the closed check and the store.
+	//   - Failure latch: OnShardFailed may have scanned pendingReads between
+	//     the IsFailed check and the store, found it empty, and returned. The
+	//     failed node stops processing its queue, so no later callback ever
+	//     completes this read (#185, Codex review). Re-checking here means
+	//     either the registration observed the latch or the drain observed
+	//     the entry; there is no interleaving in which neither happens.
+	if h.closed.Load() || ns.stopped.Load() || engNode.IsFailed() {
 		ns.pendingReadsMu.Lock()
 		_, present := ns.pendingReads[readKey]
 		if present {
@@ -5064,8 +5149,11 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 			h.completePendingOp()
 		}
 		// The caller's own reference is dropped whether or not the claim
-		// won; a sweep that beat us drops only its own.
+		// won; a drain that beat us drops only its own.
 		rs.Release()
+		if engNode.IsFailed() {
+			return nil, ErrShardFailed
+		}
 		return nil, ErrClosed
 	}
 
@@ -5215,6 +5303,15 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		return nil, ErrShardNotReady
 	}
 
+	// A halted shard never applies again, so lastApplied is frozen below
+	// committed and the catch-up wait below can never end. Refuse before
+	// entering it, the way ReadIndex does: this loop only checked stop/close,
+	// so a follower read across an SM.Apply failure waited for its deadline
+	// -- or, with context.Background(), forever (#185, Codex review).
+	if engNode.IsFailed() {
+		return nil, ErrShardFailed
+	}
+
 	committed := engNode.CommittedIndex()
 
 	// Fast path: SM has already applied up to the committed index.
@@ -5244,6 +5341,11 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 			}
 			if ns.stopped.Load() || h.closed.Load() {
 				return nil, ErrClosed
+			}
+			// The latch can trip while this read is already waiting; the
+			// entry it is waiting on is the one that failed.
+			if engNode.IsFailed() {
+				return nil, ErrShardFailed
 			}
 			polls++
 			if polls == followerReadFastPolls {

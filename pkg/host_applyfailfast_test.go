@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,12 +69,27 @@ type poisonApplySM struct {
 	panicOnPoison bool
 
 	poisonApplies atomic.Int64
+	// holdPoison, when non-nil, parks Update on the poison entry until it is
+	// closed. poisonHeld, when non-nil, is closed the moment Update parks, so
+	// the test knows the entry is committed and the apply is in flight.
+	holdPoison chan struct{}
+	poisonHeld chan struct{}
 }
 
 func (p *poisonApplySM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	for i := range entries {
 		if bytes.Equal(entries[i].Cmd, poisonCmd) {
 			p.poisonApplies.Add(1)
+			// A test that needs a read PENDING ACROSS the halt parks the
+			// poison apply here: the entry is committed (so a later read
+			// index lands past it) but not yet failed, and the read waits
+			// on lastApplied, which this entry will never advance.
+			if p.holdPoison != nil {
+				if p.poisonHeld != nil {
+					close(p.poisonHeld)
+				}
+				<-p.holdPoison
+			}
 			if p.panicOnPoison {
 				panic(errPoisonedApply)
 			}
@@ -298,5 +314,409 @@ func TestProposalsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	if Temporary(err) {
 		t.Fatal("Temporary(ErrShardFailed) is true; a latched shard does not recover " +
 			"on its own, so a retry loop against it would never terminate")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reads against a latched shard fail fast too (#185)
+// ---------------------------------------------------------------------------
+//
+// The propose path above had its gate; the read path did not. A linearizable
+// read completes only when lastApplied reaches its read index, and a halted
+// shard never applies again — so a SyncRead against a latched shard was
+// accepted, confirmed by a leader that was still perfectly healthy, and then
+// waited for an apply that could not come. It returned at the caller's
+// deadline with ErrTimeout: measured at 5m6s under the default, and at
+// exactly 20.000482s against a 20s context. The message pointed at consensus,
+// the network or a lost leader; the cause was an Apply that had failed
+// earlier, on a healthy key, on the same replica.
+//
+// Both tests assert on LATENCY and not only on the error, for the reason the
+// issue gives: a message-only assertion passes against the old behaviour right
+// up until the deadline expires. The budget-fraction bound is what fails
+// decisively if the read goes back to waiting out its deadline.
+
+// latchTheShard trips the failure latch on shard 1 through a poisoned
+// proposal and waits for the host to report it. Shared by the two read tests.
+func latchTheShard(t *testing.T, h *Host, failed <-chan config.ShardFailedInfo) {
+	t.Helper()
+	trip, cancelTrip := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTrip()
+	if _, err := h.SyncPropose(trip, 1, poisonCmd); err == nil {
+		t.Fatal("SyncPropose of the poisoned command returned nil; the latch never tripped")
+	}
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired: the shard did not latch")
+	}
+}
+
+// parkPoison arms the state machine to park on the poison entry and returns
+// the release. The release is ALSO registered with t.Cleanup, because a test
+// that fails an assertion while the apply is parked has left a goroutine
+// blocked on holdPoison inside SM.Update -- and h.Close in the host's own
+// cleanup then waits on that apply forever, turning an ordinary test failure
+// into a hang until the suite timeout (Codex review of #185). The Once makes
+// the explicit release and the cleanup release safe together.
+func parkPoison(t *testing.T, m *poisonApplySM) (release func()) {
+	t.Helper()
+	m.holdPoison = make(chan struct{})
+	m.poisonHeld = make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(m.holdPoison) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// newLatchableHost builds a single-replica host over a poisonApplySM with the
+// failure listener wired, and elects it.
+func newLatchableHost(t *testing.T) (*Host, *poisonApplySM, chan config.ShardFailedInfo) {
+	t.Helper()
+	failed := make(chan config.ShardFailedInfo, 1)
+	cfg := testHostConfig(t)
+	cfg.EventListener = &config.EventListener{
+		OnShardFailed: func(info config.ShardFailedInfo) {
+			select {
+			case failed <- info:
+			default:
+			}
+		},
+	}
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	machine := &poisonApplySM{}
+	create := func(shardID, replicaID uint64) interface{} { return machine }
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		create, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitForLeader(t, h, 1)
+	return h, machine, failed
+}
+
+// TestReadsAfterTheLatchAreRefusedImmediately covers a read that ARRIVES
+// after the halt: the gate in ReadIndex refuses it before anything is
+// registered, so it returns in microseconds naming the cause.
+func TestReadsAfterTheLatchAreRefusedImmediately(t *testing.T) {
+	h, _, failed := newLatchableHost(t)
+
+	// A read on the healthy shard works, so the refusal below is the latch
+	// and not a broken read path.
+	pre, cancelPre := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPre()
+	if _, err := h.SyncRead(pre, 1, "any-key"); err != nil {
+		t.Fatalf("SyncRead on the healthy shard: %v", err)
+	}
+
+	latchTheShard(t, h, failed)
+
+	const budget = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	start := time.Now()
+	_, err := h.SyncRead(ctx, 1, "any-key")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrShardFailed) {
+		t.Fatalf("SyncRead on a latched shard = %v (%T), want ErrShardFailed", err, err)
+	}
+	if errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SyncRead on a latched shard timed out (%v) instead of being refused; "+
+			"this is #185 — the reader paid the deadline to learn nothing", err)
+	}
+	if elapsed > budget/10 {
+		t.Fatalf("SyncRead on a latched shard took %v of a %v budget; a refusal should "+
+			"be immediate, so this read is still being registered and waited on",
+			elapsed, budget)
+	}
+	if Temporary(err) {
+		t.Fatal("Temporary(ErrShardFailed) is true; a retry loop against a latched " +
+			"shard would never terminate")
+	}
+}
+
+// TestPendingReadsAreFailedWhenTheLatchTrips covers the other half: a read
+// that is already INSIDE — registered and confirmed — when the halt happens.
+// The ReadIndex gate cannot help it. OnShardFailed has to find it in
+// pendingReads and complete it, or it waits for its deadline exactly as
+// before.
+//
+// Getting a read genuinely pending across the halt needs the apply to be held
+// open: on a single replica the poison entry commits and fails in well under a
+// millisecond, and a read issued alongside it simply races it — confirmed
+// before the poison committed, its read index already applied, returning nil
+// and proving nothing. So the state machine parks on the poison entry, the
+// test issues its read once the park is confirmed (the entry is committed, so
+// the read index lands past it and cannot be satisfied), and only then
+// releases the apply to fail.
+func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
+	h, machine, failed := newLatchableHost(t)
+	releasePoison := parkPoison(t, machine)
+
+	const budget = 10 * time.Second
+	trip, cancelTrip := context.WithTimeout(context.Background(), budget)
+	defer cancelTrip()
+	go func() { _, _ = h.SyncPropose(trip, 1, poisonCmd) }()
+
+	// The poison entry is committed and its apply is parked.
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked; the proposal did not commit")
+	}
+
+	// Now the read: its read index is past the parked entry, so it can
+	// complete only when lastApplied advances past the poison — which it
+	// never will.
+	readCtx, cancelRead := context.WithTimeout(context.Background(), budget)
+	defer cancelRead()
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		start := time.Now()
+		_, err := h.SyncRead(readCtx, 1, "any-key")
+		done <- outcome{err: err, elapsed: time.Since(start)}
+	}()
+
+	// Prove the read is genuinely pending rather than already answered.
+	select {
+	case got := <-done:
+		t.Fatalf("the read returned (%v) while the apply was still parked; the "+
+			"fixture did not get it pending across the halt", got.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Release the apply; it fails, the latch trips, OnShardFailed fires.
+	released := time.Now()
+	releasePoison()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired: the shard did not latch")
+	}
+
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(budget + 2*time.Second):
+		t.Fatal("the pending read never returned at all")
+	}
+	sinceHalt := time.Since(released)
+
+	if errors.Is(got.err, ErrTimeout) || errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("a read pending across the halt timed out (%v) after %v; OnShardFailed "+
+			"did not fail it, so it waited for an apply that can never come (#185)",
+			got.err, got.elapsed)
+	}
+	if !errors.Is(got.err, ErrShardFailed) {
+		t.Fatalf("a read pending across the halt = %v (%T), want ErrShardFailed", got.err, got.err)
+	}
+	// Prompt means measured from the halt, not from when the read began: the
+	// read spent 300ms deliberately pending before the release.
+	if sinceHalt > budget/10 {
+		t.Fatalf("a read pending across the halt returned %v after the latch tripped, "+
+			"against a %v budget; it should return the moment the latch trips, not "+
+			"on the next sweep or at its deadline", sinceHalt, budget)
+	}
+}
+
+// TestReadsRacingTheLatchNeverTimeOut hammers the interleaving Codex review
+// found in the first cut of #185: a read that passes the IsFailed check at the
+// top of ReadIndex, then has the latch trip BEFORE its pendingReads entry is
+// stored. OnShardFailed scans an empty map and returns; the failed node stops
+// processing its queue; nothing ever completes the read, and it waits for its
+// deadline.
+//
+// The fix is a post-registration re-check with rollback, the same guard
+// ReadIndex already had for close/stop. The window is a few instructions
+// wide, so it cannot be hit on demand without a hook in production code —
+// which is not worth adding for a test. Instead this parks the poison apply,
+// starts many readers that each issue a read the instant the latch is
+// released, and requires EVERY read to come back as ErrShardFailed well
+// inside its budget. Across enough readers the interleaving is exercised; a
+// single ErrTimeout is the defect.
+func TestReadsRacingTheLatchNeverTimeOut(t *testing.T) {
+	h, machine, failed := newLatchableHost(t)
+	releasePoison := parkPoison(t, machine)
+
+	const budget = 5 * time.Second
+	trip, cancelTrip := context.WithTimeout(context.Background(), budget)
+	defer cancelTrip()
+	go func() { _, _ = h.SyncPropose(trip, 1, poisonCmd) }()
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked")
+	}
+
+	const readers = 64
+	go_ := make(chan struct{})
+	results := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			<-go_
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			_, err := h.SyncRead(ctx, 1, "any-key")
+			results <- err
+		}()
+	}
+
+	// Release the readers and the latch together, so reads land on every
+	// side of the halt: some before the IsFailed check, some between the
+	// check and the store, some after.
+	start := time.Now()
+	close(go_)
+	releasePoison()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+
+	var timedOut, refused, other int
+	for i := 0; i < readers; i++ {
+		select {
+		case err := <-results:
+			switch {
+			case errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded):
+				timedOut++
+			case errors.Is(err, ErrShardFailed):
+				refused++
+			default:
+				other++
+				t.Logf("reader returned %v (%T)", err, err)
+			}
+		case <-time.After(budget + 2*time.Second):
+			t.Fatalf("only %d of %d readers returned", i, readers)
+		}
+	}
+	elapsed := time.Since(start)
+	if timedOut > 0 {
+		t.Fatalf("%d of %d reads racing the latch timed out (%v elapsed): a read "+
+			"registered between the IsFailed check and the drain was orphaned; the "+
+			"post-registration re-check is missing (#185)", timedOut, readers, elapsed)
+	}
+	if other > 0 {
+		t.Fatalf("%d of %d reads returned something other than ErrShardFailed", other, readers)
+	}
+	if refused != readers {
+		t.Fatalf("refused=%d, want %d", refused, readers)
+	}
+	// All 64 must have returned promptly — none waited toward the deadline.
+	if elapsed > budget/2 {
+		t.Fatalf("readers took %v against a %v budget; some waited toward their deadline", elapsed, budget)
+	}
+}
+
+// TestFollowerReadsAgainstALatchedShardFailFast covers the read path the
+// first two cuts of #185 missed. FollowerRead does not go through ReadIndex:
+// it polls lastApplied against CommittedIndex, and a halted shard freezes
+// lastApplied below committed forever, so the wait could never end. With a
+// deadline it returned ErrTimeout; with context.Background() it never
+// returned at all -- which is strictly worse than the original defect.
+//
+// Both halves are exercised on the one fixture: a read that ARRIVES after
+// the halt is refused before entering the wait, and a read that is already
+// INSIDE the wait when the latch trips leaves it on the next poll.
+func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
+	h, machine, failed := newLatchableHost(t)
+	releasePoison := parkPoison(t, machine)
+
+	const budget = 10 * time.Second
+	trip, cancelTrip := context.WithTimeout(context.Background(), budget)
+	defer cancelTrip()
+	go func() { _, _ = h.SyncPropose(trip, 1, poisonCmd) }()
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked")
+	}
+
+	// A follower read issued NOW is inside the wait: the poison entry is
+	// committed (so committed > lastApplied) and parked (so lastApplied will
+	// never catch up). Deadline-less on purpose -- that is the case that hung
+	// forever, and a deadline here would let the test pass by timing out.
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	// FollowerRead captures CommittedIndex at entry and waits for lastApplied
+	// to reach THAT. poisonHeld fires when the apply parks, which is after
+	// the entry was handed to the apply worker but the committed marker can
+	// still be one step behind -- and a read that captures committed=N-1
+	// is legitimately satisfied at N-1 and proves nothing. Wait until the
+	// committed index is past lastApplied, so the read's target is the
+	// entry that will never apply.
+	engNode := h.engine.GetNode(1)
+	ns, err := h.getNode(1)
+	if err != nil {
+		t.Fatalf("getNode: %v", err)
+	}
+	waitFor := time.Now().Add(5 * time.Second)
+	for engNode.CommittedIndex() <= ns.lastApplied.Load() {
+		if time.Now().After(waitFor) {
+			t.Fatalf("committed (%d) never advanced past lastApplied (%d); the poison "+
+				"entry did not commit", engNode.CommittedIndex(), ns.lastApplied.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	inside := make(chan outcome, 1)
+	go func() {
+		start := time.Now()
+		_, err := h.FollowerRead(context.Background(), 1, "any-key")
+		inside <- outcome{err: err, elapsed: time.Since(start)}
+	}()
+	select {
+	case got := <-inside:
+		t.Fatalf("the follower read returned (%v) while the apply was still parked; "+
+			"it should be waiting on lastApplied", got.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	released := time.Now()
+	releasePoison()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+
+	// The read that was inside the wait must leave it promptly.
+	select {
+	case got := <-inside:
+		if !errors.Is(got.err, ErrShardFailed) {
+			t.Fatalf("follower read pending across the halt = %v (%T), want ErrShardFailed", got.err, got.err)
+		}
+		if since := time.Since(released); since > time.Second {
+			t.Fatalf("follower read left its wait %v after the latch tripped; the poll "+
+				"loop should notice within a poll interval", since)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the follower read never returned: with context.Background() and " +
+			"no latch check in the poll loop, this is the hang #185's second review found")
+	}
+
+	// And one that ARRIVES after the halt is refused before the wait.
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	start := time.Now()
+	_, err = h.FollowerRead(ctx, 1, "any-key")
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrShardFailed) {
+		t.Fatalf("follower read after the halt = %v (%T), want ErrShardFailed", err, err)
+	}
+	if elapsed > budget/10 {
+		t.Fatalf("follower read after the halt took %v; it should be refused before entering the wait", elapsed)
 	}
 }

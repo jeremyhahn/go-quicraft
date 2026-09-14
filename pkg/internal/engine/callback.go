@@ -51,6 +51,7 @@ import (
 //     including StopShard. They are NOT ordered relative to the inline methods.
 //   - Invoked INLINE on the producing worker: OnApplied, OnCommitted,
 //     OnReadyToRead, OnProposalFailed, OnReadIndexBatched, OnReadIndexFailed,
+//     OnShardFailed,
 //     OnSnapshotCompleted, OnSnapshotRejected, and OnCampaignSkipped were it
 //     ever invoked (it is not — see its declaration). These resolve
 //     registered client requests and carry happens-before requirements with
@@ -157,4 +158,17 @@ type Callback interface {
 	// prevents orphaned pending reads that would otherwise block until
 	// context deadline timeout. MUST be non-blocking.
 	OnReadIndexFailed(shardID uint64, keys []uint64, err error)
+
+	// OnShardFailed is called at the moment a shard's failure latch trips —
+	// an SM.Apply error, a state-machine panic, or an apply dispatcher panic
+	// — with the error that tripped it. It fires once per halt, after
+	// OnProposalFailed has completed the batch that caused it.
+	//
+	// It exists for the requests the batch does not account for. A pending
+	// linearizable read completes only when lastApplied reaches its read
+	// index, and a halted shard never applies again, so without this every
+	// read registered before the halt blocked until its deadline and then
+	// reported ErrTimeout — pointing the caller at consensus, the network or
+	// a lost leader, none of which was the cause (#185). MUST be non-blocking.
+	OnShardFailed(shardID uint64, err error)
 }

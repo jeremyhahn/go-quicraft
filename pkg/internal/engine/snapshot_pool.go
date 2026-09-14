@@ -549,6 +549,9 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 				"error", err,
 			)
 			req.node.Fail(err)
+			if p.callback != nil {
+				p.callback.OnShardFailed(req.shardID, err)
+			}
 		}
 		req.node.SetRecovering(false)
 		if p.workSignal != nil {
