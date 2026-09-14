@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"os"
@@ -1383,6 +1384,58 @@ type pendingProposal struct {
 	rs       *RequestState
 	deadline time.Time
 
+	// floor is the shard's committed index when this proposal was registered.
+	// The entry this proposal became was appended AFTER that, on the leader,
+	// at an index above everything committed anywhere at the time, so an
+	// applied or committed entry at or below floor cannot be this proposal
+	// no matter what its Key says.
+	//
+	// It has to be checked because entry.Key alone is not unique across a
+	// replica's INCARNATIONS. The key is (replicaID, per-Host sequence), and
+	// the sequence restarts at zero with every NewHost, while the raft log
+	// still carries the previous incarnation's entries under the same keys.
+	// A restart with no snapshot replays that whole log through OnApplied,
+	// and the moment a replayed old entry with key (R, k) met a fresh
+	// proposal registered under (R, k), the fresh proposal was completed
+	// with the OLD entry's result: the caller was told its write had landed
+	// while its entry was still in flight, and a linearizable read issued
+	// on the strength of that acknowledgement returned the value from
+	// before it (#186). Measured: 64 of 64 proposals issued through a
+	// restarted replica during its replay were acknowledged with the old
+	// entry's result. The floor is exact for every entry that was committed
+	// anywhere when the proposal was registered, which is every entry a
+	// replay can deliver, and costs one atomic load.
+	floor uint64
+
+	// cmdLen and cmdHash identify the proposal's payload, for the entries the
+	// floor cannot place: a previous incarnation's entry that was appended
+	// but NOT yet committed when this one registered -- persisted in the WAL
+	// at the restart, or still in flight to the leader -- has an index above
+	// the floor, and commits later, possibly only once this replica is back
+	// to complete the quorum. That is the crash-loop shape: an incarnation
+	// that accepts a handful of proposals and dies mints keys 1..n every
+	// time, so the next one's key n collides with an entry that is about to
+	// commit. Two proposals under one key with the same payload are the
+	// session-less retry of one command, which is at-most-once's problem and
+	// not this one; two with different payloads are told apart here exactly.
+	// The commit path checks it too, except for an entry the log holds
+	// compressed (see ownsCommitted). cmdKnown says the two were recorded;
+	// every registration path records them, and the zero value -- a
+	// proposal built without a payload -- is placed by index alone.
+	//
+	// What this does NOT close, stated so it is not mistaken for an
+	// oversight: two proposals under one reused key with IDENTICAL payloads
+	// (an increment; a session-lifecycle entry, whose Cmd is empty) in the
+	// uncommitted-at-restart window, and a compressed entry on the commit
+	// path. Closing those exactly needs a key that differs across
+	// incarnations -- a persisted incarnation counter in the key, or a
+	// per-Host random base in place of the replica half -- and the key
+	// layout is a documented, tested contract, so that is the owner's call
+	// (#186, follow-up).
+	cmdKnown bool
+	cmdLen   int
+	cmdHash  uint64
+
 	// onFailure runs exactly once, at the completion site that claims this
 	// entry with an error (OnProposalFailed, failPendingRequests, the
 	// deadline sweep). It is NOT run on the applied path: an applied entry
@@ -1412,6 +1465,45 @@ type hostEngineCallback struct {
 // error so clients can distinguish expired sessions from legitimate
 // zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
 // OnApplied's proposal completion so they cannot drift apart.
+// cmdHashSeed keys hashCmd. Per process, which is all the comparison needs:
+// a payload is hashed at registration and compared on the same host.
+var cmdHashSeed = maphash.MakeSeed()
+
+// hashCmd is the payload identity a pending proposal records; see
+// pendingProposal.cmdHash.
+func hashCmd(cmd []byte) uint64 {
+	return maphash.Bytes(cmdHashSeed, cmd)
+}
+
+// mayOwn reports whether entry can be the entry this proposal became by
+// position alone: its index must lie above the floor recorded at
+// registration. See pendingProposal.floor.
+func (pp *pendingProposal) mayOwn(entry proto.Entry) bool {
+	return entry.Index > pp.floor
+}
+
+// owns reports whether entry IS the entry this proposal became: above the
+// floor, and carrying this proposal's payload. Entry is the decompressed
+// form the state machine applied, which is byte-for-byte what was proposed.
+// See pendingProposal.cmdHash.
+func (pp *pendingProposal) owns(entry proto.Entry) bool {
+	if !pp.mayOwn(entry) {
+		return false
+	}
+	return !pp.cmdKnown || (len(entry.Cmd) == pp.cmdLen && hashCmd(entry.Cmd) == pp.cmdHash)
+}
+
+// ownsCommitted is owns for the commit path, where the entry is as the log
+// holds it: with entry compression on, a normal entry's Cmd is the snappy
+// form, which the recorded identity cannot be compared against, so such an
+// entry is placed by index alone. Everything else gets the full check.
+func (pp *pendingProposal) ownsCommitted(entry proto.Entry) bool {
+	if entry.Type&proto.EntryCompressFlag != 0 {
+		return pp.mayOwn(entry)
+	}
+	return pp.owns(entry)
+}
+
 func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
 	rs := pp.rs
 	// Record end-to-end proposal latency (Propose -> OnApplied).
@@ -1520,12 +1612,13 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		// Match by entry.Key (the proposal tracking key set by
 		// Host.Propose) rather than entry.Index (assigned by the raft
 		// state machine).
-		v, ok := ns.pendingProposals.LoadAndDelete(entry.Key)
+		v, ok := ns.pendingProposals.Load(entry.Key)
 		if !ok {
 			continue
 		}
 		pp, ppOK := v.(*pendingProposal)
 		if !ppOK {
+			ns.pendingProposals.CompareAndDelete(entry.Key, v)
 			slog.Error("OnApplied pendingProposal type assertion failed",
 				"shard_id", shardID,
 				"entry_key", entry.Key,
@@ -1534,6 +1627,19 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 					ExpectedType: "*pendingProposal",
 					ActualValue:  v,
 				})
+			continue
+		}
+		if !pp.owns(entry) {
+			// A previous incarnation's entry under a key this one reused: at
+			// or below the floor, or carrying a payload this proposal never
+			// had (see pendingProposal.floor and cmdHash). The proposal stays
+			// pending for the entry that IS its own; nobody is waiting on
+			// this one.
+			continue
+		}
+		if !ns.pendingProposals.CompareAndDelete(entry.Key, v) {
+			// Claimed by a concurrent failure or sweep between the load and
+			// here; that site completed the caller.
 			continue
 		}
 		if hasMembershipChange {
@@ -2464,6 +2570,13 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 		v, ok := ns.pendingProposals.Load(entry.Key)
 		if ok {
 			pp, ppOK := v.(*pendingProposal)
+			if ppOK && !pp.ownsCommitted(entry) {
+				// A previous incarnation's entry under a reused key; see
+				// pendingProposal.floor. Not this proposal's commit, and a
+				// caller waiting on CommittedC for a WAL-durable
+				// acknowledgement must not be told otherwise.
+				continue
+			}
 			if !ppOK {
 				slog.Error("OnCommitted: pendingProposal type assertion failed",
 					"shard_id", shardID,
@@ -3162,6 +3275,22 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	if msgHandler != nil {
 		msgHandler.host = h
 	}
+
+	// A read key only has to be unique among the reads pending on this Host,
+	// but a forwarded ReadIndex is answered by (replica, key), and a restarted
+	// replica is a NEW Host under the SAME replica ID -- the collision
+	// pendingProposal.floor closes for proposals. A read carries no log index
+	// to floor against, so its sequence starts at a random point instead: a
+	// late answer to the previous incarnation's read then lands on a key this
+	// one will never mint, rather than on the small integers both would have
+	// started from. The random bytes are not secret; a failed read here is a
+	// failed host start, which is the honest outcome for an entropy source
+	// that does not work.
+	var readSeed [8]byte
+	if _, err := rand.Read(readSeed[:]); err != nil {
+		return nil, &HostInitError{Field: "read_key_seed", Err: err}
+	}
+	h.readKeySeq.Store(binary.BigEndian.Uint64(readSeed[:]))
 
 	// Wire the engine callback so applied entries and leader changes
 	// flow back to the Host for proposal completion.
@@ -4974,7 +5103,14 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// recycled to the pool until this map entry is removed, even if the
 	// caller releases first (e.g., Sync* timeout).
 	rs.acquireRef()
-	ns.pendingProposals.Store(proposalKey, &pendingProposal{rs: rs, deadline: deadline})
+	ns.pendingProposals.Store(proposalKey, &pendingProposal{
+		rs:       rs,
+		deadline: deadline,
+		floor:    engNode.CommittedIndex(),
+		cmdKnown: true,
+		cmdLen:   len(entry.Cmd),
+		cmdHash:  hashCmd(entry.Cmd),
+	})
 
 	// Close-vs-Propose TOCTOU guard: the host may have begun closing (and run
 	// its pending-request sweeps) between the top-of-Propose closed check and
@@ -9150,6 +9286,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	ns.pendingProposals.Store(proposalKey, &pendingProposal{
 		rs:       rs,
 		deadline: deadline,
+		floor:    engNode.CommittedIndex(),
+		cmdKnown: true,
+		cmdLen:   len(buf),
+		cmdHash:  hashCmd(buf),
 		// An appended-but-never-committed config change (leader deposed,
 		// log truncated) must not leave a registry entry behind for a
 		// replica that never became a member.

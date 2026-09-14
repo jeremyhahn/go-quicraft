@@ -161,6 +161,21 @@ func encodeKVGet(key string) []byte {
 	return []byte(key)
 }
 
+// encodeIndex is the 8-byte big-endian form a put result carries its entry
+// index in; decodeIndex reads it back, 0 for anything else.
+func encodeIndex(index uint64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, index)
+	return buf
+}
+
+func decodeIndex(data []byte) uint64 {
+	if len(data) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(data)
+}
+
 // appendResult is the value the kvStateMachine returns for an opAppend. It
 // carries the FULL post-append value so a caller can compare the result it
 // was handed against the value the model predicts, and so a session retry can
@@ -251,11 +266,29 @@ type kvStateMachine struct {
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
 	applied   atomic.Uint64
+	// lastWrite is the raft index of the entry that last wrote each key: the
+	// provenance a read-your-writes check needs, because a value alone
+	// cannot say whether it is older or newer than the write a client was
+	// just acknowledged for. After RecoverFromSnapshot it is a LOWER BOUND
+	// (the snapshot index) for every key the snapshot carries -- the value
+	// was written at or before that point, which is all the check needs.
+	lastWrite map[string]uint64
+}
+
+// indexedGet is a Lookup query that returns the value AND the index of the
+// write that produced it, as an indexedValue.
+type indexedGet string
+
+// indexedValue is what an indexedGet returns.
+type indexedValue struct {
+	Value string
+	Index uint64 // 0 when the key has never been written
 }
 
 func newKVStateMachine() *kvStateMachine {
 	return &kvStateMachine{
-		data: make(map[string]string),
+		data:      make(map[string]string),
+		lastWrite: make(map[string]uint64),
 	}
 }
 
@@ -299,7 +332,11 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 		case opPut:
 			value := string(entry.Cmd[3+keyLen:])
 			kv.data[key] = value
-			results[i] = sm.Result{Value: uint64(len(value))}
+			kv.lastWrite[key] = entry.Index
+			// Data carries the entry's index so the proposer learns WHERE
+			// its write landed; Value stays the length every existing
+			// caller checks.
+			results[i] = sm.Result{Value: uint64(len(value)), Data: encodeIndex(entry.Index)}
 		case opAppend:
 			token := string(entry.Cmd[3+keyLen:])
 			value := kv.data[key]
@@ -309,6 +346,7 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 				value = value + appendSep + token
 			}
 			kv.data[key] = value
+			kv.lastWrite[key] = entry.Index
 			results[i] = appendResult(value)
 		default:
 			results[i] = sm.Result{Value: 0}
@@ -324,6 +362,11 @@ func (kv *kvStateMachine) ApplyGaps() uint64 {
 
 // Lookup reads a value by key from the KV store.
 func (kv *kvStateMachine) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	if ig, isIndexed := query.(indexedGet); isIndexed {
+		kv.mu.RLock()
+		defer kv.mu.RUnlock()
+		return indexedValue{Value: kv.data[string(ig)], Index: kv.lastWrite[string(ig)]}, nil
+	}
 	key, ok := query.(string)
 	if !ok {
 		keyBytes, isByteSlice := query.([]byte)
@@ -438,6 +481,13 @@ func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, st
 		newData[string(keyBuf)] = string(valBuf)
 	}
 	kv.data = newData
+	// The snapshot does not carry write indices; the snapshot index bounds
+	// every one of them from above, and that bound is what a read-your-writes
+	// check compares against (see lastWrite).
+	kv.lastWrite = make(map[string]uint64, len(newData))
+	for k := range newData {
+		kv.lastWrite[k] = snapshotIndex
+	}
 	return nil
 }
 

@@ -9872,23 +9872,27 @@ func TestHost_SeparateKeySequences_NoCollision(t *testing.T) {
 	}
 	defer h.Close()
 
-	// Advance the proposal counter significantly.
+	// The read sequence starts at a per-Host random seed (#186: a restarted
+	// replica must not mint the keys its previous incarnation minted), so
+	// independence is measured from wherever it started, not from zero.
+	readStart := h.readKeySeq.Load()
+
+	// Advance proposals; reads and snapshots must not move.
 	for i := 0; i < 1000; i++ {
 		h.proposalKeySeq.Add(1)
 	}
 
-	// Read and snapshot counters should still be at zero (independent).
 	readVal := h.readKeySeq.Load()
 	snapVal := h.snapshotKeySeq.Load()
 
-	if readVal != 0 {
-		t.Errorf("readKeySeq = %d, want 0 (independent from proposals)", readVal)
+	if readVal != readStart {
+		t.Errorf("readKeySeq = %d, want %d (independent from proposals)", readVal, readStart)
 	}
 	if snapVal != 0 {
 		t.Errorf("snapshotKeySeq = %d, want 0 (independent from proposals)", snapVal)
 	}
 
-	// Now advance read counter and verify proposal and snapshot are unaffected.
+	// Advance reads; proposals and snapshots must not move.
 	for i := 0; i < 500; i++ {
 		h.readKeySeq.Add(1)
 	}
@@ -9901,6 +9905,33 @@ func TestHost_SeparateKeySequences_NoCollision(t *testing.T) {
 	}
 	if snapVal != 0 {
 		t.Errorf("snapshotKeySeq = %d, want 0 (unaffected by reads)", snapVal)
+	}
+	if got := h.readKeySeq.Load(); got != readStart+500 {
+		t.Errorf("readKeySeq = %d, want %d (seed + 500 reads)", got, readStart+500)
+	}
+}
+
+// TestHost_ReadKeySequenceIsSeededPerHost pins the #186 property for reads:
+// two Hosts -- a replica and its restarted incarnation -- do not start their
+// read sequences at the same point, so a late answer to one incarnation's
+// read cannot land on the other's key.
+func TestHost_ReadKeySequenceIsSeededPerHost(t *testing.T) {
+	seeds := make(map[uint64]bool)
+	for i := 0; i < 3; i++ {
+		cfg := testHostConfig(t)
+		h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+		if err != nil {
+			t.Fatalf("NewHost %d failed: %v", i, err)
+		}
+		seed := h.readKeySeq.Load()
+		h.Close()
+		if seed == 0 {
+			t.Fatalf("host %d: read sequence starts at 0, the value every incarnation would share", i)
+		}
+		if seeds[seed] {
+			t.Fatalf("host %d: read sequence seed %d repeats an earlier host's", i, seed)
+		}
+		seeds[seed] = true
 	}
 }
 
