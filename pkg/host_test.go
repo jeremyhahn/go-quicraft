@@ -9779,159 +9779,29 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix M1: Separate key sequences
+// Request keys (M1, #186)
 // ---------------------------------------------------------------------------
 
-// TestHost_SeparateKeySequences verifies that proposals, reads, and snapshots
-// use independent key sequence counters, so keys from different paths do not
-// collide even when called in interleaved order.
-func TestHost_SeparateKeySequences(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-	waitForLeader(t, h, 1)
-
-	// Baselines. Deltas from these are what independence means, and they hold
-	// whatever the shard did on its way to a leader.
-	propBase := h.proposalKeySeq.Load()
-	readBase := h.readKeySeq.Load()
-	snapBase := h.snapshotKeySeq.Load()
-
-	// Generate keys from each counter.
-	propKey1 := h.proposalKeySeq.Add(1)
-	readKey1 := h.readKeySeq.Add(1)
-	snapKey1 := h.snapshotKeySeq.Add(1)
-
-	propKey2 := h.proposalKeySeq.Add(1)
-	readKey2 := h.readKeySeq.Add(1)
-	snapKey2 := h.snapshotKeySeq.Add(1)
-
-	// Each counter should produce monotonic values.
-	if propKey2 <= propKey1 {
-		t.Errorf("proposal keys not monotonic: %d <= %d", propKey2, propKey1)
-	}
-	if readKey2 <= readKey1 {
-		t.Errorf("read keys not monotonic: %d <= %d", readKey2, readKey1)
-	}
-	if snapKey2 <= snapKey1 {
-		t.Errorf("snapshot keys not monotonic: %d <= %d", snapKey2, snapKey1)
-	}
-
-	// Independence: each Add must advance ITS OWN counter by exactly one, so
-	// the first key from each is one past that counter's own baseline. Fold
-	// the three into one sequence and the second and third Adds return 2 and
-	// 3 instead, which is what this catches. The property was previously
-	// "asserted" with t.Logf, so the whole thing was a shared counter away
-	// from passing.
-	if got := propKey1 - propBase; got != 1 {
-		t.Errorf("first proposal key advanced its counter by %d, want 1 "+
-			"(propKey1=%d, base=%d): the counters are not independent",
-			got, propKey1, propBase)
-	}
-	if got := readKey1 - readBase; got != 1 {
-		t.Errorf("first read key advanced its counter by %d, want 1 "+
-			"(readKey1=%d, base=%d): reads share a counter with proposals",
-			got, readKey1, readBase)
-	}
-	if got := snapKey1 - snapBase; got != 1 {
-		t.Errorf("first snapshot key advanced its counter by %d, want 1 "+
-			"(snapKey1=%d, base=%d): snapshots share a counter with another path",
-			got, snapKey1, snapBase)
-	}
-
-	// And the second round must advance each by exactly one more, which pins
-	// that the Adds above did not simply all land on one counter that was
-	// already at the same value.
-	if got := propKey2 - propKey1; got != 1 {
-		t.Errorf("proposal counter advanced by %d between keys, want 1", got)
-	}
-	if got := readKey2 - readKey1; got != 1 {
-		t.Errorf("read counter advanced by %d between keys, want 1", got)
-	}
-	if got := snapKey2 - snapKey1; got != 1 {
-		t.Errorf("snapshot counter advanced by %d between keys, want 1", got)
-	}
-}
-
-// TestHost_SeparateKeySequences_NoCollision verifies that after a burst of
-// proposals, the read and snapshot key sequences are unaffected.
-func TestHost_SeparateKeySequences_NoCollision(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// The read sequence starts at a per-Host random seed (#186: a restarted
-	// replica must not mint the keys its previous incarnation minted), so
-	// independence is measured from wherever it started, not from zero.
-	readStart := h.readKeySeq.Load()
-
-	// Advance proposals; reads and snapshots must not move.
-	for i := 0; i < 1000; i++ {
-		h.proposalKeySeq.Add(1)
-	}
-
-	readVal := h.readKeySeq.Load()
-	snapVal := h.snapshotKeySeq.Load()
-
-	if readVal != readStart {
-		t.Errorf("readKeySeq = %d, want %d (independent from proposals)", readVal, readStart)
-	}
-	if snapVal != 0 {
-		t.Errorf("snapshotKeySeq = %d, want 0 (independent from proposals)", snapVal)
-	}
-
-	// Advance reads; proposals and snapshots must not move.
-	for i := 0; i < 500; i++ {
-		h.readKeySeq.Add(1)
-	}
-
-	propVal := h.proposalKeySeq.Load()
-	snapVal = h.snapshotKeySeq.Load()
-
-	if propVal != 1000 {
-		t.Errorf("proposalKeySeq = %d, want 1000 (unaffected by reads)", propVal)
-	}
-	if snapVal != 0 {
-		t.Errorf("snapshotKeySeq = %d, want 0 (unaffected by reads)", snapVal)
-	}
-	if got := h.readKeySeq.Load(); got != readStart+500 {
-		t.Errorf("readKeySeq = %d, want %d (seed + 500 reads)", got, readStart+500)
-	}
-}
-
-// TestHost_ReadKeySequenceIsSeededPerHost pins the #186 property for reads:
-// two Hosts -- a replica and its restarted incarnation -- do not start their
-// read sequences at the same point, so a late answer to one incarnation's
-// read cannot land on the other's key.
-func TestHost_ReadKeySequenceIsSeededPerHost(t *testing.T) {
-	seeds := make(map[uint64]bool)
-	for i := 0; i < 3; i++ {
-		cfg := testHostConfig(t)
-		h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
-		if err != nil {
-			t.Fatalf("NewHost %d failed: %v", i, err)
+// TestRequestKeysNeverRepeatAndAreNeverZero pins the two properties every
+// pending-request map depends on. Keys used to come from three independent
+// counters (M1: proposals, reads and snapshots must not share a sequence);
+// they are now random 64-bit draws from one generator (#186: a counter
+// restarts with the Host, and a restarted replica minted its previous
+// incarnation's keys while replaying that incarnation's log). One generator
+// serves all three paths, so the old cross-path independence is subsumed by
+// the draw: a million keys, no repeat, no zero.
+func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
+	const draws = 1 << 20
+	seen := make(map[uint64]struct{}, draws)
+	for i := 0; i < draws; i++ {
+		key := nextRequestKey()
+		if key == 0 {
+			t.Fatalf("draw %d minted key 0, which marks an entry nothing is waiting on", i)
 		}
-		seed := h.readKeySeq.Load()
-		h.Close()
-		if seed == 0 {
-			t.Fatalf("host %d: read sequence starts at 0, the value every incarnation would share", i)
+		if _, dup := seen[key]; dup {
+			t.Fatalf("draw %d repeated key %d", i, key)
 		}
-		if seeds[seed] {
-			t.Fatalf("host %d: read sequence seed %d repeats an earlier host's", i, seed)
-		}
-		seeds[seed] = true
+		seen[key] = struct{}{}
 	}
 }
 

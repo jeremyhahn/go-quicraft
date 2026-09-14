@@ -663,36 +663,26 @@ func TestNewHost_ExportedTransportDisabledSkipsTransport(t *testing.T) {
 // client received a success and A's RESULT VALUE for an operation it never
 // issued, and B's real entry later found no pending proposal at all.
 func TestProposalKeysAreUniqueAcrossTheShard(t *testing.T) {
-	hostA, hostB := &Host{}, &Host{}
-	const replicaA, replicaB = uint64(1), uint64(2)
-
+	// Three hosts stand in for replicas A and B and for A's next incarnation
+	// -- a new Host under the same replica ID, which is the case that broke
+	// (#186). Keys are random draws, so uniqueness across hosts and across
+	// incarnations is the same property, and neither the replica ID nor a
+	// persisted counter is involved: a Host literal with no state at all
+	// mints keys as well as a started one.
+	hosts := map[string]*Host{"A": {}, "B": {}, "A-restarted": {}}
 	seen := map[uint64]string{}
-	for range 64 {
-		ka := hostA.nextProposalKey(replicaA)
-		kb := hostB.nextProposalKey(replicaB)
-		for id, key := range map[string]uint64{"A": ka, "B": kb} {
+	for range 1 << 16 {
+		for id := range hosts {
+			key := nextRequestKey()
+			if key == 0 {
+				t.Fatalf("host %s minted key 0, which marks an entry nothing is waiting on", id)
+			}
 			if prev, dup := seen[key]; dup {
-				t.Fatalf("replicas %s and %s both minted proposal key %d: an entry "+
-					"proposed by one completes the other's unrelated pending request",
-					prev, id, key)
+				t.Fatalf("hosts %s and %s both minted key %d: an entry proposed by one "+
+					"completes the other's unrelated pending request", prev, id, key)
 			}
 			seen[key] = id
 		}
-	}
-
-	// The replica ID must be recoverable, which is what makes the halves
-	// non-overlapping rather than merely unlikely to collide.
-	if got := hostA.nextProposalKey(replicaA) >> proposalKeySeqBits; got != replicaA {
-		t.Fatalf("replica ID half = %d, want %d", got, replicaA)
-	}
-
-	// A wrapped sequence stays within its own replica's half, so it can never
-	// collide with another replica no matter how long the host runs.
-	hostA.proposalKeySeq.Store(1<<proposalKeySeqBits - 1)
-	wrapped := hostA.nextProposalKey(replicaA)
-	if got := wrapped >> proposalKeySeqBits; got != replicaA {
-		t.Fatalf("a wrapped sequence escaped its replica's half: key %d has replica "+
-			"half %d, want %d", wrapped, got, replicaA)
 	}
 }
 

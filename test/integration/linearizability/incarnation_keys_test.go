@@ -28,10 +28,10 @@ import (
 // TestRestart_ProposalKeysDoNotCollideAcrossIncarnations is the mechanism
 // behind #186, isolated.
 //
-// A proposal is matched back to its caller by entry.Key, minted as
-// (replicaID, per-host sequence). The sequence lives in the Host, so a
-// restarted replica -- a NEW Host for the SAME replica ID -- mints the same
-// keys its previous incarnation minted, while the raft log still carries the
+// A proposal is matched back to its caller by entry.Key. The key used to be
+// (replicaID, per-host sequence), and the sequence lived in the Host, so a
+// restarted replica -- a NEW Host for the SAME replica ID -- minted the same
+// keys its previous incarnation minted, while the raft log still carried the
 // previous incarnation's entries under those keys. A restart with no
 // snapshot replays the whole log through OnApplied, and the moment a
 // replayed old entry with key (R, k) meets a fresh proposal registered under
@@ -40,7 +40,12 @@ import (
 // a linearizable read issued on the strength of that acknowledgement
 // returns the value from before it. That is the soak's Illegal history.
 //
-// The shape here makes the collision certain rather than lucky. Padding
+// Keys are random 64-bit draws now and every pending proposal carries a
+// floor (see pendingProposal), so this test is the regression net: it
+// built the collision out of the old counter, and it must stay quiet
+// however keys are minted.
+//
+// The shape here made the collision certain rather than lucky. Padding
 // entries go first so the replay takes long enough for the new proposals to
 // register; then the follower proposes `keyed` entries, so the old (R, 1..N)
 // keys sit late in the log; then the follower is restarted and the same

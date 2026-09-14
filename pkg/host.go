@@ -21,9 +21,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/maphash"
 	"io"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1390,51 +1390,17 @@ type pendingProposal struct {
 	// applied or committed entry at or below floor cannot be this proposal
 	// no matter what its Key says.
 	//
-	// It has to be checked because entry.Key alone is not unique across a
-	// replica's INCARNATIONS. The key is (replicaID, per-Host sequence), and
-	// the sequence restarts at zero with every NewHost, while the raft log
-	// still carries the previous incarnation's entries under the same keys.
-	// A restart with no snapshot replays that whole log through OnApplied,
-	// and the moment a replayed old entry with key (R, k) met a fresh
-	// proposal registered under (R, k), the fresh proposal was completed
-	// with the OLD entry's result: the caller was told its write had landed
-	// while its entry was still in flight, and a linearizable read issued
-	// on the strength of that acknowledgement returned the value from
-	// before it (#186). Measured: 64 of 64 proposals issued through a
-	// restarted replica during its replay were acknowledged with the old
-	// entry's result. The floor is exact for every entry that was committed
-	// anywhere when the proposal was registered, which is every entry a
-	// replay can deliver, and costs one atomic load.
+	// This is the second line of defence behind nextRequestKey's random draw,
+	// and the exact one: a key repeats across incarnations only by a 2^-64
+	// accident, but an entry at or below the floor is provably not this
+	// proposal's, whatever its key. It was the first fix for #186 -- the
+	// keys were (replicaID, per-Host sequence) then, and a restarted replica
+	// minted its previous incarnation's keys while replaying that
+	// incarnation's log, so 64 of 64 proposals issued through a restarting
+	// replica were acknowledged with an old entry's result -- and it stays
+	// because it costs one atomic load and turns a probabilistic guarantee
+	// into a certain one for every entry a replay can deliver.
 	floor uint64
-
-	// cmdLen and cmdHash identify the proposal's payload, for the entries the
-	// floor cannot place: a previous incarnation's entry that was appended
-	// but NOT yet committed when this one registered -- persisted in the WAL
-	// at the restart, or still in flight to the leader -- has an index above
-	// the floor, and commits later, possibly only once this replica is back
-	// to complete the quorum. That is the crash-loop shape: an incarnation
-	// that accepts a handful of proposals and dies mints keys 1..n every
-	// time, so the next one's key n collides with an entry that is about to
-	// commit. Two proposals under one key with the same payload are the
-	// session-less retry of one command, which is at-most-once's problem and
-	// not this one; two with different payloads are told apart here exactly.
-	// The commit path checks it too, except for an entry the log holds
-	// compressed (see ownsCommitted). cmdKnown says the two were recorded;
-	// every registration path records them, and the zero value -- a
-	// proposal built without a payload -- is placed by index alone.
-	//
-	// What this does NOT close, stated so it is not mistaken for an
-	// oversight: two proposals under one reused key with IDENTICAL payloads
-	// (an increment; a session-lifecycle entry, whose Cmd is empty) in the
-	// uncommitted-at-restart window, and a compressed entry on the commit
-	// path. Closing those exactly needs a key that differs across
-	// incarnations -- a persisted incarnation counter in the key, or a
-	// per-Host random base in place of the replica half -- and the key
-	// layout is a documented, tested contract, so that is the owner's call
-	// (#186, follow-up).
-	cmdKnown bool
-	cmdLen   int
-	cmdHash  uint64
 
 	// onFailure runs exactly once, at the completion site that claims this
 	// entry with an error (OnProposalFailed, failPendingRequests, the
@@ -1465,43 +1431,10 @@ type hostEngineCallback struct {
 // error so clients can distinguish expired sessions from legitimate
 // zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
 // OnApplied's proposal completion so they cannot drift apart.
-// cmdHashSeed keys hashCmd. Per process, which is all the comparison needs:
-// a payload is hashed at registration and compared on the same host.
-var cmdHashSeed = maphash.MakeSeed()
-
-// hashCmd is the payload identity a pending proposal records; see
-// pendingProposal.cmdHash.
-func hashCmd(cmd []byte) uint64 {
-	return maphash.Bytes(cmdHashSeed, cmd)
-}
-
-// mayOwn reports whether entry can be the entry this proposal became by
-// position alone: its index must lie above the floor recorded at
-// registration. See pendingProposal.floor.
-func (pp *pendingProposal) mayOwn(entry proto.Entry) bool {
-	return entry.Index > pp.floor
-}
-
-// owns reports whether entry IS the entry this proposal became: above the
-// floor, and carrying this proposal's payload. Entry is the decompressed
-// form the state machine applied, which is byte-for-byte what was proposed.
-// See pendingProposal.cmdHash.
+// owns reports whether entry can be the entry this proposal became: its index
+// must lie above the floor recorded at registration. See pendingProposal.floor.
 func (pp *pendingProposal) owns(entry proto.Entry) bool {
-	if !pp.mayOwn(entry) {
-		return false
-	}
-	return !pp.cmdKnown || (len(entry.Cmd) == pp.cmdLen && hashCmd(entry.Cmd) == pp.cmdHash)
-}
-
-// ownsCommitted is owns for the commit path, where the entry is as the log
-// holds it: with entry compression on, a normal entry's Cmd is the snappy
-// form, which the recorded identity cannot be compared against, so such an
-// entry is placed by index alone. Everything else gets the full check.
-func (pp *pendingProposal) ownsCommitted(entry proto.Entry) bool {
-	if entry.Type&proto.EntryCompressFlag != 0 {
-		return pp.mayOwn(entry)
-	}
-	return pp.owns(entry)
+	return entry.Index > pp.floor
 }
 
 func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
@@ -1630,11 +1563,9 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			continue
 		}
 		if !pp.owns(entry) {
-			// A previous incarnation's entry under a key this one reused: at
-			// or below the floor, or carrying a payload this proposal never
-			// had (see pendingProposal.floor and cmdHash). The proposal stays
-			// pending for the entry that IS its own; nobody is waiting on
-			// this one.
+			// An entry that predates this proposal under its key (see
+			// pendingProposal.floor). The proposal stays pending for the
+			// entry that IS its own; nobody is waiting on this one.
 			continue
 		}
 		if !ns.pendingProposals.CompareAndDelete(entry.Key, v) {
@@ -2570,8 +2501,8 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 		v, ok := ns.pendingProposals.Load(entry.Key)
 		if ok {
 			pp, ppOK := v.(*pendingProposal)
-			if ppOK && !pp.ownsCommitted(entry) {
-				// A previous incarnation's entry under a reused key; see
+			if ppOK && !pp.owns(entry) {
+				// An entry that predates this proposal under its key; see
 				// pendingProposal.floor. Not this proposal's commit, and a
 				// caller waiting on CommittedC for a WAL-durable
 				// acknowledgement must not be told otherwise.
@@ -2917,17 +2848,14 @@ type Host struct {
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
-	closeErr       error
-	proposalKeySeq atomic.Uint64 // sequence half of the proposal key; see nextProposalKey
-	readKeySeq     atomic.Uint64 // monotonic key generator for read request tracking
-	snapshotKeySeq atomic.Uint64 // monotonic key generator for snapshot request tracking
-	pendingOps     atomic.Int64  // tracks outstanding pending operations for drain
-	keyRotStopC    chan struct{} // closed to stop the key rotation goroutine
-	keyRotDone     chan struct{} // closed when the key rotation goroutine exits
-	sweepStopC     chan struct{} // closed to stop the pending proposal sweeper goroutine
-	sweepDone      chan struct{} // closed when the sweeper goroutine exits
-	drainC         chan struct{} // closed when pendingOps reaches 0 during drain
-	drainCMu       sync.Mutex    // protects drainC creation
+	closeErr    error
+	pendingOps  atomic.Int64  // tracks outstanding pending operations for drain
+	keyRotStopC chan struct{} // closed to stop the key rotation goroutine
+	keyRotDone  chan struct{} // closed when the key rotation goroutine exits
+	sweepStopC  chan struct{} // closed to stop the pending proposal sweeper goroutine
+	sweepDone   chan struct{} // closed when the sweeper goroutine exits
+	drainC      chan struct{} // closed when pendingOps reaches 0 during drain
+	drainCMu    sync.Mutex    // protects drainC creation
 	// fsys routes snapshot persistence I/O. nil means the real filesystem;
 	// only tests set it (withSnapshotFS), so the injection never reaches the
 	// public API.
@@ -3275,22 +3203,6 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	if msgHandler != nil {
 		msgHandler.host = h
 	}
-
-	// A read key only has to be unique among the reads pending on this Host,
-	// but a forwarded ReadIndex is answered by (replica, key), and a restarted
-	// replica is a NEW Host under the SAME replica ID -- the collision
-	// pendingProposal.floor closes for proposals. A read carries no log index
-	// to floor against, so its sequence starts at a random point instead: a
-	// late answer to the previous incarnation's read then lands on a key this
-	// one will never mint, rather than on the small integers both would have
-	// started from. The random bytes are not secret; a failed read here is a
-	// failed host start, which is the honest outcome for an entropy source
-	// that does not work.
-	var readSeed [8]byte
-	if _, err := rand.Read(readSeed[:]); err != nil {
-		return nil, &HostInitError{Field: "read_key_seed", Err: err}
-	}
-	h.readKeySeq.Store(binary.BigEndian.Uint64(readSeed[:]))
 
 	// Wire the engine callback so applied entries and leader changes
 	// flow back to the Host for proposal completion.
@@ -4989,10 +4901,6 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 // ProposeWithSession, and proposeSession. It handles rate limiting,
 // engine node validation, key generation, pending map registration,
 // delivery, and queue-full cleanup.
-// proposalKeySeqBits is the width of the sequence half of a proposal key. The
-// remaining high bits carry the proposing replica's ID.
-const proposalKeySeqBits = 32
-
 // pendingDeadline returns the deadline to record for a pending request issued
 // under ctx. A context WITHOUT a deadline is clamped to
 // defaultPendingRequestTimeout from now rather than recorded as the zero time,
@@ -5012,30 +4920,37 @@ func pendingDeadlineWithin(ctx context.Context, backstop time.Duration) time.Tim
 	return time.Now().Add(backstop)
 }
 
-// nextProposalKey mints a proposal key that is unique across the SHARD, not just
-// across this host.
+// nextRequestKey mints the key a pending request -- a proposal, a read, a
+// snapshot -- is tracked under: a random 64-bit value, never zero.
 //
-// entry.Key is how an applied entry is matched back to the pending RequestState
-// that proposed it (hostEngineCallback.OnApplied), and the entry carries the key
-// through the raft log to every replica. A per-host counter therefore collides
-// by construction: every host in the shard mints 1, 2, 3, ... so replica B, with
-// its own request pending under key 7, would complete that caller the moment it
-// applied replica A's unrelated entry that also carries key 7 -- handing B's
-// client a success and A's RESULT VALUE for an operation it never issued, while
-// B's real entry later finds no pending proposal at all.
+// entry.Key is how an applied entry is matched back to the pending
+// RequestState that proposed it (hostEngineCallback.OnApplied), and the entry
+// carries the key through the raft log to every replica, so the key must not
+// repeat across HOSTS -- replica B, holding key 7 for its own request, must
+// not complete that caller with replica A's unrelated entry 7 -- and must not
+// repeat across INCARNATIONS of one host either. That second requirement is
+// #186: the key used to be (replicaID, per-Host sequence), unique across hosts
+// by construction, and a restarted replica -- a new Host under the same
+// replica ID, its sequence back at zero -- minted exactly the keys its
+// previous incarnation had left in the log. A snapshot-less restart replays
+// that log through OnApplied, and a replayed old entry completed the fresh
+// proposal registered under its key with the old entry's result. A counter
+// cannot be made incarnation-unique without persisting something or
+// narrowing the replica half; a random draw needs neither, and it is what
+// dragonboat does (keyGenerator.nextKey is rand.Uint64). Uniqueness is now
+// probabilistic at 2^-64 per pair of keys, the guarantee a UUID gives, over a
+// population that is only ever the requests currently pending. The draw comes
+// from math/rand/v2's process-wide generator, which is safe for concurrent
+// use and seeded from the OS; it is not secret and need not be.
 //
-// The replica ID is the shard-local identity that makes the key unique: it is
-// distinct for every replica in the shard by definition, so (replicaID,
-// sequence) cannot collide between hosts. The sequence occupies the low
-// proposalKeySeqBits and may wrap; that is harmless, because a key only has to
-// be unique among the proposals CURRENTLY pending on this host, and every
-// pending proposal carries a deadline after which the sweeper removes it —
-// supplied by the caller's context or, for a deadline-less context, clamped to
-// defaultPendingRequestTimeout at registration. Config validation bounds
-// ReplicaID so the two halves cannot overlap.
-func (h *Host) nextProposalKey(replicaID uint64) uint64 {
-	seq := h.proposalKeySeq.Add(1) & (1<<proposalKeySeqBits - 1)
-	return replicaID<<proposalKeySeqBits | seq
+// Zero is reserved: an entry with Key 0 is one nothing is waiting on
+// (OnCommitted skips it), so a drawn zero is drawn again.
+func nextRequestKey() uint64 {
+	for {
+		if key := mathrand.Uint64(); key != 0 {
+			return key
+		}
+	}
 }
 
 func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, entry proto.Entry) (*RequestState, error) {
@@ -5084,7 +4999,7 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// the commit/apply pipeline. The key is set on the entry before
 	// delivery and preserved through the raft log, so the OnApplied
 	// callback can match applied entries back to pending RequestStates.
-	proposalKey := h.nextProposalKey(ns.replicaID)
+	proposalKey := nextRequestKey()
 	entry.Key = proposalKey
 
 	// Create request state with the deadline from the context, clamped to
@@ -5107,9 +5022,6 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 		rs:       rs,
 		deadline: deadline,
 		floor:    engNode.CommittedIndex(),
-		cmdKnown: true,
-		cmdLen:   len(entry.Cmd),
-		cmdHash:  hashCmd(entry.Cmd),
 	})
 
 	// Close-vs-Propose TOCTOU guard: the host may have begun closing (and run
@@ -5238,7 +5150,7 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	// the raft pipeline. The key is carried in the ReadIndex message's
 	// Hint field and returned in ReadyToRead.Key. Uses a dedicated
 	// counter separate from proposals and snapshots to avoid contention.
-	readKey := h.readKeySeq.Add(1)
+	readKey := nextRequestKey()
 
 	deadline := pendingDeadline(ctx)
 	rs := newRequestState(ns.requestPool, readKey, deadline, h.metrics != nil)
@@ -6148,7 +6060,7 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 
 	// Generate a unique key for tracking this snapshot request.
 	// Uses a dedicated counter separate from proposals and reads.
-	snapshotKey := h.snapshotKeySeq.Add(1)
+	snapshotKey := nextRequestKey()
 
 	// A snapshot save is local work sized by the state machine, not by the
 	// commit path, so it gets the snapshot backstop rather than the shorter
@@ -9271,7 +9183,7 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		return nil, &HostInitError{Field: "config_change_marshal", Err: marshalErr}
 	}
 
-	proposalKey := h.nextProposalKey(ns.replicaID)
+	proposalKey := nextRequestKey()
 
 	deadline := pendingDeadline(ctx)
 	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
@@ -9287,9 +9199,6 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		rs:       rs,
 		deadline: deadline,
 		floor:    engNode.CommittedIndex(),
-		cmdKnown: true,
-		cmdLen:   len(buf),
-		cmdHash:  hashCmd(buf),
 		// An appended-but-never-committed config change (leader deposed,
 		// log truncated) must not leave a registry entry behind for a
 		// replica that never became a member.
