@@ -677,6 +677,21 @@ PROFILE_DIR = profiles/$(PERF_PROFILE)
 # Internal: common perfcompare flags.
 PERF_FLAGS = --benchtime=$(BENCHTIME) --timeout=$(PERF_TIMEOUT) $(PERF_EXTRA)
 
+# Internal: module credentials for the image builds. The quicraft benchmark
+# image runs `go mod download` inside a container, and go-enclave lives on
+# Gitea, so the build needs the four variables of
+# ../handbook/software/conventions/dependency-resolution.md section 6. They
+# come from the job environment when a runner injected them; otherwise from
+# the gitignored .devcontainer/.env, which holds that section's block
+# verbatim. perfcompare turns them into the BuildKit secret the Dockerfile
+# mounts, and run-remote.sh carries them to the bench host over stdin, so the
+# token is never on a command line or in an image. Absent both, the build
+# resolves github.com/jeremyhahn/* from the public proxy only and says so.
+MODULE_AUTH_ENV = if [ -z "$${GIT_CONFIG_KEY_0:-}" ] && [ -f $(CURDIR)/.devcontainer/.env ]; then \
+	set -a; . $(CURDIR)/.devcontainer/.env; set +a; fi;
+# Internal: every local perfcompare invocation, credentials staged.
+PERFCOMPARE = cd $(PERF_DIR) && $(MODULE_AUTH_ENV) ./perfcompare
+
 # Internal: refuse to touch a nameless profile. Writing results into a directory
 # whose machine nobody recorded is how a number ends up uninterpretable.
 REQUIRE_PROFILE = @if [ -z "$(PERF_PROFILE)" ]; then \
@@ -693,27 +708,27 @@ perf-build:
 # ----------------------------------------------------------------------------
 .PHONY: perf-quicraft
 perf-quicraft: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) quicraft
+	$(PERFCOMPARE) $(PERF_FLAGS) quicraft
 
 .PHONY: perf-etcd
 perf-etcd: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) etcd
+	$(PERFCOMPARE) $(PERF_FLAGS) etcd
 
 .PHONY: perf-dragonboat
 perf-dragonboat: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) dragonboat
+	$(PERFCOMPARE) $(PERF_FLAGS) dragonboat
 
 .PHONY: perf-openraft
 perf-openraft: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) openraft
+	$(PERFCOMPARE) $(PERF_FLAGS) openraft
 
 .PHONY: perf-compare
 perf-compare: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) $(SYSTEMS)
+	$(PERFCOMPARE) $(PERF_FLAGS) $(SYSTEMS)
 
 .PHONY: perf-compare-all
 perf-compare-all: perf-build
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) all
+	$(PERFCOMPARE) $(PERF_FLAGS) all
 
 # ----------------------------------------------------------------------------
 # Profile pipeline: run into a profile, then generate that profile's documents.
@@ -725,7 +740,7 @@ perf-compare-all: perf-build
 .PHONY: perf-run
 perf-run: perf-build
 	$(REQUIRE_PROFILE)
-	cd $(PERF_DIR) && ./perfcompare $(PERF_FLAGS) --profile=$(PROFILE_DIR) $(PERF_SYSTEMS)
+	$(PERFCOMPARE) $(PERF_FLAGS) --profile=$(PROFILE_DIR) $(PERF_SYSTEMS)
 
 # Regenerates <system>.md and every chart in the profile from its stored JSON.
 # analysis.md is hand-written and is never touched.
@@ -766,6 +781,7 @@ perf-remote:
 	$(REQUIRE_PROFILE)
 	@if [ -z "$(PERF_HOST)" ]; then \
 		echo "PERF_HOST is required (e.g. PERF_HOST=user@host)"; exit 1; fi
+	$(MODULE_AUTH_ENV) \
 	PERF_HOST=$(PERF_HOST) PERF_PROFILE=$(PERF_PROFILE) PERF_SYSTEMS=$(PERF_SYSTEMS) \
 		BENCHTIME=$(BENCHTIME) PERF_TIMEOUT=$(PERF_TIMEOUT) \
 		$(PERF_DIR)/run-remote.sh all

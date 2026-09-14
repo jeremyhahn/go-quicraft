@@ -315,12 +315,8 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 	}
 
 	if !cfg.noBuild {
-		fmt.Printf("  building Docker image %s...\n", docker.image)
-		buildCmd := exec.Command("docker", "build", "-t", docker.image, "-f", docker.dockerfile, repoRoot)
-		buildCmd.Stdout = os.Stdout
-		buildCmd.Stderr = os.Stderr
-		if err := buildCmd.Run(); err != nil {
-			return nil, fmt.Errorf("docker build failed: %w", err)
+		if err := buildImage(docker.image, docker.dockerfile, repoRoot); err != nil {
+			return nil, err
 		}
 	}
 
@@ -357,6 +353,71 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 	return suite, nil
 }
 
+// moduleAuthEnv names both the BuildKit secret the benchmark Dockerfiles mount
+// for `go mod download` and the environment variable that carries its payload.
+// One name at every entrypoint that builds an image, shared with the sibling
+// repositories' images, so no two paths to the same image can disagree about
+// how it authenticates.
+const moduleAuthEnv = "GOMODAUTH"
+
+// moduleAuthVars are the four variables of dependency-resolution.md section 6,
+// in the order the payload lists them. GIT_CONFIG_KEY_0 is the one that
+// decides presence: without the rewrite there is nothing to authenticate.
+var moduleAuthVars = [...]string{"GOPRIVATE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
+
+// moduleAuth returns the payload the Dockerfiles source before `go mod
+// download`: GOPRIVATE and the git environment-config rewrite that sends
+// github.com/jeremyhahn/* to Gitea with a token, as K='V' lines. It is taken
+// verbatim from GOMODAUTH when a caller has already composed it, and otherwise
+// assembled from the four variables a Gitea Actions runner injects (or an
+// operator exports). Empty when neither is present -- the correct shape for
+// a public build, which resolves from the proxy alone -- so the same image
+// builds inside and outside the Gitea network.
+func moduleAuth(getenv func(string) string) string {
+	if payload := getenv(moduleAuthEnv); payload != "" {
+		return payload
+	}
+	if getenv("GIT_CONFIG_KEY_0") == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, k := range moduleAuthVars {
+		fmt.Fprintf(&b, "%s='%s'\n", k, strings.ReplaceAll(getenv(k), "'", `'\''`))
+	}
+	return b.String()
+}
+
+// buildImage builds one benchmark image with the repository root as its
+// context. Module credentials, when present, reach `go mod download` as a
+// BuildKit secret: mounted for that one RUN, sourced, and never exported into
+// a layer, so the token appears in neither the image, its metadata, nor a
+// command line -- the payload travels to the docker CLI through its
+// environment, not an argument. The secret is optional at both ends, and a
+// Dockerfile that does not mount it ignores it, so every image is built the
+// same way. Which way was taken is printed, because a build that resolved
+// from the proxy when it needed Gitea fails later with an error that reads
+// like a missing repository.
+func buildImage(image, dockerfile, root string) error {
+	fmt.Printf("  building Docker image %s...\n", image)
+	args := []string{"build", "-t", image, "-f", dockerfile}
+	env := os.Environ()
+	if payload := moduleAuth(os.Getenv); payload != "" {
+		args = append(args, "--secret", "id=gomodauth,env="+moduleAuthEnv)
+		env = append(env, moduleAuthEnv+"="+payload)
+		fmt.Println("  module credentials: mounted as a build secret")
+	} else {
+		fmt.Println("  module credentials: none; github.com/jeremyhahn/* resolves from the public proxy only")
+	}
+	cmd := exec.Command("docker", append(args, root)...)
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker build %s failed: %w", image, err)
+	}
+	return nil
+}
+
 // benchTmpMount returns docker run arguments that bind-mount a host scratch
 // directory (BENCH_TMPDIR) into the container at /bench-tmp and point TMPDIR at
 // it. Every engine writes its WAL through the testing temp dir (Go's
@@ -383,16 +444,8 @@ func runOpenraft(cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	}
 
 	if !cfg.noBuild {
-		fmt.Println("  building Docker image...")
-		buildCmd := exec.Command("docker", "build",
-			"-t", openraftImage,
-			"-f", "openraft/Dockerfile",
-			repoRoot,
-		)
-		buildCmd.Stdout = os.Stdout
-		buildCmd.Stderr = os.Stderr
-		if err := buildCmd.Run(); err != nil {
-			return nil, fmt.Errorf("docker build failed: %w", err)
+		if err := buildImage(openraftImage, "openraft/Dockerfile", repoRoot); err != nil {
+			return nil, err
 		}
 	}
 

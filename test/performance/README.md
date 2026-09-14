@@ -187,6 +187,44 @@ All benchmarks run inside Docker containers with `--net=host` (QuicRaft also
 uses `--privileged` for UDP buffer tuning). Systems are benchmarked sequentially
 to avoid interference.
 
+### Module credentials for the image builds
+
+The quicraft image runs `go mod download` inside its build, and go-enclave is
+an internal Gitea module: with no credentials the container reaches for
+github.com, where it is not, and the build dies at `could not read Username`
+(#184). The build takes the four variables of
+`../handbook/software/conventions/dependency-resolution.md` §6 from the
+environment of whatever invoked it:
+
+```
+GOPRIVATE=github.com/jeremyhahn/*
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=url.http://x:<read-only token>@git.example.internal/jeremyhahn/.insteadOf
+GIT_CONFIG_VALUE_0=https://github.com/jeremyhahn/
+```
+
+A Gitea Actions runner injects them; on a workstation put that block, verbatim,
+in `.devcontainer/.env` and every `perf-*` target reads it. That file is
+ignored by git, excluded from every Docker build context (`.dockerignore` —
+six Dockerfiles `COPY . .`), and excluded from the tree `run-remote.sh` stages
+onto the bench host; `test/buildgates` pins all three.
+`perfcompare` hands them to `docker build` as a BuildKit secret mounted for the
+single `RUN go mod download` and never exported into a layer; `run-remote.sh`
+carries them to the bench host over ssh's stdin. The token is therefore never
+on a command line, in an image, or in a run log on either machine. Both ends
+report which way the build went, once:
+
+```
+  module credentials: mounted as a build secret
+  module credentials: none; github.com/jeremyhahn/* resolves from the public proxy only
+```
+
+The second line is correct outside the Gitea network and a build failure
+inside it. The secret mount needs BuildKit, i.e. the `docker-buildx` plugin on
+the machine that builds (`apt install docker-buildx` on Ubuntu); the legacy
+builder rejects the Dockerfile outright with `the --mount option requires
+BuildKit`.
+
 ## This is not the regression gate
 
 These tables are a single run per system on one machine. `make bench-compare`

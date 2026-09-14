@@ -34,3 +34,8 @@ go.work.sum
 # hold -- a correctly pinned golangci-lint built by an older Go cannot analyse
 # this module at all (#118).
 .tools/
+
+# Module credentials for the benchmark image builds: the four variables of
+# ../handbook/software/conventions/dependency-resolution.md section 6, read by
+# the perf-* targets. A token lives in no checkout, ever (version-control.md 4).
+.devcontainer/.env

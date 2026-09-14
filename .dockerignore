@@ -39,3 +39,10 @@ go.work.sum
 .claude/
 .cursor/
 .codex/
+
+# Module credentials for the benchmark image builds (test/performance/README.md).
+# Six Dockerfiles COPY the whole context, so without this line the token the
+# BuildKit secret exists to keep out of every layer would be copied into every
+# layer by the COPY that precedes the secret mount. .gitignore protects git
+# only; this is the docker half, and test/buildgates pins the two together.
+.devcontainer/.env

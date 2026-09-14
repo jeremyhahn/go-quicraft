@@ -93,6 +93,30 @@ esac
 
 say() { echo ">> $*"; }
 
+# module_auth prints the module credentials of THIS environment as the lines a
+# shell sources, with perfcompare's precedence: a composed GOMODAUTH payload
+# verbatim (it is already sourceable K='V' lines), else the four variables of
+# dependency-resolution.md section 6, and only when the rewrite that makes
+# them a credential is set. Values are taken as they are -- a Gitea token, a
+# host:port and a glob carry no whitespace or quotes, and a value that did
+# would be the wrong value. Reports presence on stderr by shape, never by
+# content.
+module_auth() {
+  if [ -n "${GOMODAUTH:-}" ]; then
+    say "module credentials: forwarding the composed GOMODAUTH payload to $HOST over stdin" >&2
+    printf '%s\n' "$GOMODAUTH"
+    return 0
+  fi
+  if [ -z "${GIT_CONFIG_KEY_0:-}" ]; then
+    say "module credentials: none in this environment; the bench host builds against the public proxy only" >&2
+    return 0
+  fi
+  say "module credentials: forwarding the 4 variables to $HOST over stdin" >&2
+  for k in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+    printf '%s=%s\n' "$k" "${!k:-}"
+  done
+}
+
 stage() {
   # Refuse to stage over an active run: rsync --delete below would clobber the
   # suite's working tree mid-flight.
@@ -118,7 +142,12 @@ stage() {
   # context by it. The profiles tree is excluded in both directions — on the
   # target it is output only, so --delete can never reach back and destroy a
   # stored result or a hand-written analysis.
+  # The credential file is excluded, and any copy an earlier staging left is
+  # removed by hand: rsync ignores .gitignore, and --delete never touches an
+  # excluded path on the receiver, so an exclude alone would leave a stale
+  # token sitting on the bench host. The run's credentials cross on stdin.
   rsync -a --delete \
+    --exclude '.devcontainer/.env' \
     --exclude 'test/performance/openraft/target/' \
     --exclude 'test/performance/profiles/' \
     --exclude 'test/performance/perfcompare' \
@@ -127,6 +156,7 @@ stage() {
     --exclude '.build-cache/' \
     --exclude 'test/performance/bench-run.log' \
     "$REPO_ROOT/" "$HOST:$REMOTE_DIR/"
+  ssh "$HOST" "rm -f '$REMOTE_DIR/.devcontainer/.env'"
   scp -q "$PERF_DIR/perfcompare.remote" "$HOST:$REMOTE_PERF/perfcompare"
   ssh "$HOST" "chmod +x '$REMOTE_PERF/perfcompare' '$REMOTE_PERF/capture-env.sh'"
   rm -f "$PERF_DIR/perfcompare.remote"
@@ -179,9 +209,19 @@ run() {
   # every run reporting "recorded no exit status", i.e. the gate refusing
   # everything.
   ssh "$HOST" "rm -f \"$RUN_RC_ABS\""
-  ssh "$HOST" "( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
+  # Module credentials cross to the bench host on ssh's STDIN, never its
+  # command line: the quicraft image's `go mod download` needs Gitea to reach
+  # go-enclave (#184), and the four variables of dependency-resolution.md
+  # section 6 are exported here when a runner injected them or the operator
+  # did. The remote shell sources stdin under set -a before launching, so the
+  # token lands in perfcompare's environment and nowhere else -- not in `ps` on
+  # either host, not in a file, not in the run log. With no credentials the
+  # pipe is empty, sourcing it is a no-op, and the build resolves from the
+  # public proxy only; module_auth reports which, once, in this log.
+  module_auth | ssh "$HOST" "set -a; . /dev/stdin; set +a; \
+    ( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
       nohup sh -c './perfcompare --benchtime=\"$BENCHTIME\" --timeout=\"$PERF_TIMEOUT\" \
-        --profile=\"$PROFILE_REL\" $PERF_SYSTEMS; echo \$? > \"$RUN_RC_ABS\"' ) > '$RUN_LOG' 2>&1 & \
+        --profile=\"$PROFILE_REL\" $PERF_SYSTEMS; echo \$? > \"$RUN_RC_ABS\"' ) > '$RUN_LOG' 2>&1 < /dev/null & \
     echo \$! > '$RUN_PID'; echo \"PID \$(cat '$RUN_PID')\""
 
   # Confirm it is actually running. Launching and reporting a pid proves only

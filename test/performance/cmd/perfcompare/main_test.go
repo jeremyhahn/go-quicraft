@@ -533,3 +533,94 @@ func TestRunContainerReportsAnIncompleteLog(t *testing.T) {
 		t.Fatalf("stdout was not captured after the log failed: %q", out)
 	}
 }
+
+// TestModuleAuthIsTheSectionSixPayload pins the three shapes: a runner-injected
+// environment becomes the four K='V' lines the Dockerfile sources, a
+// pre-composed GOMODAUTH passes through untouched, and nothing means nothing --
+// the public build must not receive a secret made of empty strings.
+func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
+	const token = "9f3c0deadbeef"
+	runner := map[string]string{
+		"GOPRIVATE":          "github.com/jeremyhahn/*",
+		"GIT_CONFIG_COUNT":   "1",
+		"GIT_CONFIG_KEY_0":   "url.http://x:" + token + "@git.example.internal/jeremyhahn/.insteadOf",
+		"GIT_CONFIG_VALUE_0": "https://github.com/jeremyhahn/",
+	}
+	getenv := func(m map[string]string) func(string) string {
+		return func(k string) string { return m[k] }
+	}
+
+	got := moduleAuth(getenv(runner))
+	want := "GOPRIVATE='github.com/jeremyhahn/*'\n" +
+		"GIT_CONFIG_COUNT='1'\n" +
+		"GIT_CONFIG_KEY_0='url.http://x:" + token + "@git.example.internal/jeremyhahn/.insteadOf'\n" +
+		"GIT_CONFIG_VALUE_0='https://github.com/jeremyhahn/'\n"
+	if got != want {
+		t.Fatalf("runner environment:\n got %q\nwant %q", got, want)
+	}
+
+	if got := moduleAuth(getenv(map[string]string{moduleAuthEnv: "GOPRIVATE='x'\n", "GIT_CONFIG_KEY_0": "ignored"})); got != "GOPRIVATE='x'\n" {
+		t.Fatalf("a composed payload must pass through verbatim, got %q", got)
+	}
+	if got := moduleAuth(getenv(map[string]string{"GOPRIVATE": "github.com/jeremyhahn/*"})); got != "" {
+		t.Fatalf("GOPRIVATE without a rewrite is not a credential, got %q", got)
+	}
+	if got := moduleAuth(getenv(map[string]string{"GIT_CONFIG_KEY_0": "it's"})); !strings.Contains(got, `GIT_CONFIG_KEY_0='it'\''s'`) {
+		t.Fatalf("a quote in a value must survive sourcing, got %q", got)
+	}
+}
+
+// TestBuildImageKeepsTheTokenOffTheCommandLine stands a shell script in for
+// docker and checks the contract #184 sets for the fix: the token reaches the
+// build as a secret through the CLI's environment and appears in no argument,
+// and a build with no credentials asks for no secret at all.
+func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("no shell to stand in for docker: %v", err)
+	}
+	bin := t.TempDir()
+	argv := filepath.Join(bin, "argv")
+	payload := filepath.Join(bin, "payload")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argv + "\nprintf '%s' \"$GOMODAUTH\" > " + payload + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	const token = "9f3c0deadbeef"
+	t.Setenv(moduleAuthEnv, "")
+	t.Setenv("GOPRIVATE", "github.com/jeremyhahn/*")
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@git.example.internal/jeremyhahn/.insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/jeremyhahn/")
+
+	if err := buildImage("quicraft-bench-quicraft", "quicraft/Dockerfile", "/repo"); err != nil {
+		t.Fatalf("buildImage: %v", err)
+	}
+	args, _ := os.ReadFile(argv)
+	if !strings.Contains(string(args), "--secret\nid=gomodauth,env="+moduleAuthEnv+"\n") {
+		t.Fatalf("the secret was not requested from the environment:\n%s", args)
+	}
+	if strings.Contains(string(args), token) {
+		t.Fatalf("the token is on the docker command line:\n%s", args)
+	}
+	got, _ := os.ReadFile(payload)
+	if !strings.Contains(string(got), "GIT_CONFIG_KEY_0='url.http://x:"+token+"@") {
+		t.Fatalf("the payload did not reach docker's environment: %q", got)
+	}
+
+	// No credentials: no secret, and nothing left over from the last build.
+	for _, k := range moduleAuthVars {
+		t.Setenv(k, "")
+	}
+	if err := buildImage("quicraft-bench-etcd", "etcd/Dockerfile", "/repo"); err != nil {
+		t.Fatalf("buildImage without credentials: %v", err)
+	}
+	args, _ = os.ReadFile(argv)
+	if strings.Contains(string(args), "--secret") {
+		t.Fatalf("a build without credentials asked for a secret:\n%s", args)
+	}
+	if got, _ := os.ReadFile(payload); len(got) != 0 {
+		t.Fatalf("a build without credentials carried a payload: %q", got)
+	}
+}
