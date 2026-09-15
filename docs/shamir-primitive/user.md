@@ -37,6 +37,7 @@ creds, err := seal.NewCredentials(key)
 if err != nil {
     return err
 }
+defer creds.Secret.Destroy() // caller-owned: Unseal does not destroy it
 if err := barrier.Unseal(ctx, strategy, creds); err != nil {
     return fmt.Errorf("reconstruction did not produce the root key: %w", err)
 }
