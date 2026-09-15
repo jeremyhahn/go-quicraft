@@ -15,8 +15,9 @@
 # absent one: it stops anyone from building the real thing.
 #
 # All work happens on the Gitea plane, so the watcher has to run there. This
-# script is that watcher. It runs the exact command CLAUDE.md tells a developer
-# to run, over every module, on a schedule -- so drift shows up on its own
+# script is that watcher. It runs the `go list -m -u` CLAUDE.md names as the
+# per-module primitive, over every module, on a schedule -- so drift shows
+# up on its own
 # rather than when a CVE breaks the nightly Trivy gate, which is how the last
 # six bumps were found (#50 and #86).
 #
@@ -61,8 +62,9 @@ test -n "$mods" || {
 status=0
 
 for dir in $mods; do
-	# The exact command from CLAUDE.md and from issue #86's verification
-	# section. Kept character-for-character so the thing CI runs and the
+	# The `go list -m -u` from CLAUDE.md and from issue #86's verification
+	# section, with one addition explained next. CLAUDE.md tells a developer
+	# to run THIS SCRIPT (`make deps-check`), so the thing CI runs and the
 	# thing a developer is told to run cannot answer differently.
 	#
 	# Its exit status is CHECKED. `go list -m -u` prints nothing to stdout
@@ -73,8 +75,16 @@ for dir in $mods; do
 	# vacuous gate conventions/devops.md §1 calls worse than no gate, and it
 	# was caught here only because a negative test went green when it should
 	# have gone red. Failure to look is exit 2, never a pass.
+	# A module replaced by a DIRECTORY has no update: the directory is the
+	# source, and the newest tag `go list -m -u` still reports for it is a
+	# statement about the registry, not about this build. Every nested
+	# module here replaces the root that way (`=> ../..`), and the nightly
+	# was red on `go-quicraft v0.0.0 -> v0.11.0-alpha` for as long as a tag
+	# existed to report (#188). deps-latest skips the same shape the same
+	# way. The replacement path rides along as a fourth field and is judged
+	# below; a replacement by another module VERSION is still checked.
 	if ! raw=$(cd "$dir" && go list -m -u \
-		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{end}}' \
+		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}' \
 		all 2>&1); then
 		echo "deps-check: 'go list -m -u' failed in $dir; refusing to report a pass" >&2
 		printf '%s\n' "$raw" | sed 's/^/    /' >&2
@@ -87,6 +97,11 @@ for dir in $mods; do
 	while IFS= read -r line; do
 		test -n "$line" || continue
 		path=${line%% *}
+		case "$line" in
+		*' -> '*' '.*|*' -> '*' '/*)
+			echo "ok   $dir: ${line% *}  [replaced by a directory]"
+			continue ;;
+		esac
 
 		# Exempt iff the comment block immediately above this module's
 		# require line says DOCUMENTED PIN. Any non-comment, non-blank

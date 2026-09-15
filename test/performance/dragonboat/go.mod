@@ -7,43 +7,6 @@ require (
 	github.com/jeremyhahn/go-quicraft/test/performance v0.0.0
 )
 
-// The benchmark measures a FORK of dragonboat, github.com/jeremyhahn/
-// dragonboat/v4, and now says so in the import paths rather than disguising it
-// as upstream. The fork exists because the benchmark needs a dragonboat that
-// compiles against PebbleDB v1.1.5, which upstream v4.0.0 does not.
-//
-// This used to require github.com/lni/dragonboat/v4 and redirect it with
-//
-//	github.com/lni/dragonboat/v4 => ../../../../dragonboat
-//
-// a replace that escaped the repository altogether: it resolved only on a
-// machine that happened to have the fork checked out four levels up, and
-// failed on every clean checkout. Nothing caught it, because the CI job meant
-// to build the nested modules never expanded its matrix and silently rebuilt
-// the root module instead — the release gate was the first to build this for
-// real, and it stopped there.
-//
-// Pinning the fork by version rather than replacing upstream with it is not
-// just tidier, it is the only form that works: once the fork declares its own
-// module path, its internal imports resolve under that path too, and a
-// `replace lni => jeremyhahn` makes go load one module version under two
-// different paths, which is an error.
-//
-// The fork is published in two places on purpose, and both serve the same
-// commit, so the one go.sum entry verifies either way. Public consumers
-// resolve github.com/jeremyhahn/dragonboat/v4 from GitHub through
-// proxy.golang.org. Development machines and the CI runner set
-// GOPRIVATE=github.com/jeremyhahn/* and rewrite that prefix to the internal
-// Gitea, so they resolve it from the mirror there instead — which is why CI
-// failed with "repository not found" until the fork was mirrored, despite the
-// GitHub repository being public.
-//
-// The perf module is unpublished, so that one still resolves from the sibling
-// directory.
-replace github.com/jeremyhahn/go-quicraft/test/performance => ../
-
-replace github.com/jeremyhahn/go-quicraft => ../../..
-
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/VictoriaMetrics/metrics v1.18.1 // indirect
@@ -101,10 +64,47 @@ require (
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/valyala/fastrand v1.1.0 // indirect
 	github.com/valyala/histogram v1.2.0 // indirect
-	golang.org/x/crypto v0.56.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
-	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+// The benchmark measures a FORK of dragonboat, github.com/jeremyhahn/
+// dragonboat/v4, and now says so in the import paths rather than disguising it
+// as upstream. The fork exists because the benchmark needs a dragonboat that
+// compiles against PebbleDB v1.1.5, which upstream v4.0.0 does not.
+//
+// This used to require github.com/lni/dragonboat/v4 and redirect it with
+//
+//	github.com/lni/dragonboat/v4 => ../../../../dragonboat
+//
+// a replace that escaped the repository altogether: it resolved only on a
+// machine that happened to have the fork checked out four levels up, and
+// failed on every clean checkout. Nothing caught it, because the CI job meant
+// to build the nested modules never expanded its matrix and silently rebuilt
+// the root module instead — the release gate was the first to build this for
+// real, and it stopped there.
+//
+// Pinning the fork by version rather than replacing upstream with it is not
+// just tidier, it is the only form that works: once the fork declares its own
+// module path, its internal imports resolve under that path too, and a
+// `replace lni => jeremyhahn` makes go load one module version under two
+// different paths, which is an error.
+//
+// The fork is published in two places on purpose, and both serve the same
+// commit, so the one go.sum entry verifies either way. Public consumers
+// resolve github.com/jeremyhahn/dragonboat/v4 from GitHub through
+// proxy.golang.org. Development machines and the CI runner set
+// GOPRIVATE=github.com/jeremyhahn/* and rewrite that prefix to the internal
+// Gitea, so they resolve it from the mirror there instead — which is why CI
+// failed with "repository not found" until the fork was mirrored, despite the
+// GitHub repository being public.
+//
+// The perf module is unpublished, so that one still resolves from the sibling
+// directory.
+replace github.com/jeremyhahn/go-quicraft/test/performance => ../
+
+replace github.com/jeremyhahn/go-quicraft => ../../..
