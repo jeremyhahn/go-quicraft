@@ -386,6 +386,7 @@ import (
     "os"
     "path/filepath"
 
+    "github.com/jeremyhahn/go-enclave"
     quicraft "github.com/jeremyhahn/go-quicraft/pkg"
     "github.com/jeremyhahn/go-quicraft/pkg/config"
     "github.com/jeremyhahn/go-quicraft/pkg/seal"
@@ -450,18 +451,21 @@ func main() {
     }
 
     // Software sealing strategy -- derives wrapping key from passphrase via Argon2id.
-    // The passphrase is a []byte, not a string, so it can be wiped after use.
+    // The strategy copies the passphrase into protected memory; the []byte you
+    // handed it stays yours to wipe, which is why it is a []byte and not a string.
     passphrase := []byte("operator-passphrase")
     strategy, err := seal.NewSoftwareStrategy(passphrase)
     if err != nil {
         log.Fatal(err)
     }
+    enclave.Wipe(passphrase)
 
     // Initialize generates the root key, derives epoch 1 DEK, and seals
-    // the root key for persistent storage. Call once per cluster.
-    if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{
-        Secret: passphrase,
-    }); err != nil {
+    // the root key for persistent storage. Call once per cluster. A strategy
+    // bound to its passphrase at construction ignores Credentials; the deferred
+    // form (seal.NewDeferredSoftwareStrategy) reads them per call, built with
+    // seal.NewCredentials, which moves the secret into protected memory.
+    if err := barrier.Initialize(context.Background(), strategy, seal.Credentials{}); err != nil {
         log.Fatal(err)
     }
 
@@ -556,9 +560,7 @@ strategy, err := seal.NewSoftwareStrategy(passphrase)
 if err != nil {
     log.Fatal(err)
 }
-if err := barrier.Unseal(context.Background(), strategy, seal.Credentials{
-    Secret: passphrase,
-}); err != nil {
+if err := barrier.Unseal(context.Background(), strategy, seal.Credentials{}); err != nil {
     log.Fatal(err) // Wrong passphrase, corrupted key, or brute-force backoff
 }
 

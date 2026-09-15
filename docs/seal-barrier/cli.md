@@ -1,6 +1,6 @@
 # Seal & Barrier — CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: this feature is reachable only as a Go package.**

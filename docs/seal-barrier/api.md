@@ -1,7 +1,7 @@
 # Seal & Barrier — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-09-02
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -48,7 +48,8 @@ func (c *BarrierConfig) GetNonceTracking() bool
 
 `MustNewBarrier` panics instead of returning an error and is for
 compile-time-constant configs only. `NewEpochBarrier` / `MustNewEpochBarrier`
-are `var` aliases of the same functions, and `EpochBarrier` is a type alias of
+are functions that call the same constructors — not `var` aliases, which every
+importer could reassign (#95, #117) — and `EpochBarrier` is a type alias of
 `Barrier`.
 
 ### Capability: first boot — create the root key
@@ -363,11 +364,14 @@ type BarrierConfig   = seal.BarrierConfig
 type Credentials     = seal.Credentials
 type SealedRootKey   = seal.SealedRootKey
 type SealingStrategy = seal.SealingStrategy
-var  NewBarrier      = seal.NewBarrier
-var  MustNewBarrier  = seal.MustNewBarrier
+func NewBarrier(config BarrierConfig) (*Barrier, error)   // calls seal.NewBarrier
+func MustNewBarrier(config BarrierConfig) *Barrier        // calls seal.MustNewBarrier
+func NewCredentials(secret []byte) (Credentials, error)   // calls seal.NewCredentials, consuming secret
 ```
 
-Aliases only. No cipher code lives there. New code should import `pkg/seal`.
+Type aliases and forwarding functions only — functions, not `var`s holding
+function values, for the reason at `NewEpochBarrier` (#95, #117). No cipher
+code lives there. New code should import `pkg/seal`.
 
 ## Versioning and deprecation
 

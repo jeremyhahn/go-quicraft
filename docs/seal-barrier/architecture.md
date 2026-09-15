@@ -1,7 +1,7 @@
 # Seal & Barrier — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` (and the `pkg/crypto`
-> compatibility shim) · Last verified: 2026-08-19
+> compatibility shim) · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem

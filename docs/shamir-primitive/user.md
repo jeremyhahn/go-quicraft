@@ -1,6 +1,6 @@
 # Shamir Primitive — Usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for a developer building a key-custody layer on top of this
@@ -31,8 +31,13 @@ key, err := shamir.CombineBytes(values, threshold)
 if err != nil {
     return err                       // structurally invalid share set
 }
-// The real check: use the key. Unseal fails on a wrong key.
-if err := barrier.Unseal(ctx, strategy, seal.Credentials{Secret: key}); err != nil {
+// The real check: use the key. Unseal fails on a wrong key. NewCredentials
+// moves the key into protected memory and wipes the slice it was handed.
+creds, err := seal.NewCredentials(key)
+if err != nil {
+    return err
+}
+if err := barrier.Unseal(ctx, strategy, creds); err != nil {
     return fmt.Errorf("reconstruction did not produce the root key: %w", err)
 }
 ```

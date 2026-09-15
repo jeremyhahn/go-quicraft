@@ -1,7 +1,7 @@
 # Seal & Barrier — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-09-02
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/seal`
@@ -14,10 +14,14 @@ Import path: `github.com/jeremyhahn/go-quicraft/pkg/seal`
 func NewBarrier(config BarrierConfig) (*Barrier, error)
 func MustNewBarrier(config BarrierConfig) *Barrier   // panics; constant configs only
 
-// Aliases retained for readability at call sites — same types, same functions.
-type EpochBarrier   = Barrier
-var  NewEpochBarrier     = NewBarrier
-var  MustNewEpochBarrier = MustNewBarrier
+// Aliases retained for readability at call sites — same type, and FUNCTIONS
+// that call the originals. Not `var NewEpochBarrier = NewBarrier`: an exported
+// function variable in a crypto package is writable by every importer, so an
+// init() in a transitive dependency could substitute the constructor for the
+// barrier that holds the root key (#95, #117).
+type EpochBarrier = Barrier
+func NewEpochBarrier(config BarrierConfig) (*Barrier, error)
+func MustNewEpochBarrier(config BarrierConfig) *Barrier
 
 func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, creds Credentials) error
 func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error
@@ -428,7 +432,7 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrCiphertextTooShort` | below the minimum frame length |
 | `ErrUnsealBackoff` | brute-force backoff active |
 | `ErrPurgeCurrentEpoch` | tried to purge the active epoch |
-| `ErrEpochInFlight` | tried to purge an epoch with in-flight references |
+| (no error) | an epoch with in-flight references is **skipped** by `PurgeEpochsBefore`, not refused — the caller deregisters and purges again later |
 | `ErrNoStatePersister` | `Rotate`, or a purging `PurgeEpochsBefore`, with no persister |
 | `ErrUnsupportedHKDFVersion` | blob names a DEK-derivation layout this build lacks |
 | `ErrInvocationLimitExceeded` | SP 800-38D budget reached for the epoch |

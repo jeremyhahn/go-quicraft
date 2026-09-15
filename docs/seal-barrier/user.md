@@ -1,6 +1,6 @@
 # Seal & Barrier — Usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for someone embedding go-quicraft and turning on at-rest
@@ -61,6 +61,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/jeremyhahn/go-enclave"
+	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
@@ -125,7 +127,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer strategy.Close()
-	creds := seal.Credentials{Secret: passphrase}
+	enclave.Wipe(passphrase) // the strategy holds its own protected copy
+	creds := seal.Credentials{} // ignored by a strategy bound at construction
 
 	blob, err := os.ReadFile(blobPath)
 	switch {
@@ -156,7 +159,7 @@ func main() {
 		log.Fatal("barrier cannot authenticate positional context")
 	}
 
-	host, err := quicraft.NewHost(hostCfg, quicraft.WithBarrier(barrier))
+	host, err := quicraft.NewHost(hostCfg, quicraft.WithBarrier(barrier)) // hostCfg: see multi-group-host/user.md
 	// ...
 }
 ```
@@ -165,10 +168,15 @@ To move the blob somewhere other than a file — a Raft-backed KV store, a
 database row, a KMS entry — replace the body of `persistSealedState` and the
 `os.ReadFile`. Nothing else changes.
 
-**On the passphrase**: `Credentials.Secret` is a `[]byte` rather than a `string`
-specifically so you can wipe it. Reading it from an environment variable defeats
-that, because the value is already an immutable string in the process. Read it
-from a pipe, a prompt, or an agent socket if the distinction matters to you.
+**On the passphrase**: it is a `[]byte` rather than a `string` specifically so
+you can wipe it — the strategy copies it into protected memory and leaves your
+slice to you. Reading it from an environment variable defeats that, because the
+value is already an immutable string in the process. Read it from a pipe, a
+prompt, or an agent socket if the distinction matters to you. A strategy bound
+at construction ignores `Credentials`; the deferred form reads
+`Credentials.Secret` per call, which is a `*enclave.SealedEnclave` built with
+`seal.NewCredentials(secret)` — that call moves the secret into protected
+memory and wipes the slice it was given (#41).
 
 ## Task: wire the barrier into a Host
 
