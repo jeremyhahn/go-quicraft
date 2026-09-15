@@ -543,6 +543,38 @@ func (e *SnapshotReceiveError) Unwrap() error {
 	return e.Err
 }
 
+// SnapshotChunkError is the cause inside a SnapshotReceiveError with Op
+// "validate" when the chunk set a sender delivered is not one snapshot:
+// a chunk whose identity fields disagree with chunk 0, a ChunkCount that
+// disagrees with what arrived, an ID out of range or repeated, or an ID
+// missing from the set. ChunkID is the offending chunk (or the missing one)
+// and ChunkCount the number received; Reason says which rule failed.
+type SnapshotChunkError struct {
+	ChunkID    uint64
+	ChunkCount uint64
+	Reason     string
+}
+
+// Error returns a human-readable description of the chunk-set defect.
+func (e *SnapshotChunkError) Error() string {
+	return fmt.Sprintf("quicraft: snapshot chunk %d of %d: %s", e.ChunkID, e.ChunkCount, e.Reason)
+}
+
+// SnapshotSizeMismatchError is the cause inside a SnapshotReceiveError with
+// Op "validate" when the bytes reassembled from a snapshot's chunks do not
+// add up to the FileSize the first chunk declared: a chunk was truncated in
+// transit, or the declared size was forged. Either way the artifact is not
+// used.
+type SnapshotSizeMismatchError struct {
+	Declared uint64
+	Actual   uint64
+}
+
+// Error returns a human-readable description of the size mismatch.
+func (e *SnapshotSizeMismatchError) Error() string {
+	return fmt.Sprintf("quicraft: snapshot reassembled size %d does not match declared FileSize %d", e.Actual, e.Declared)
+}
+
 // SnapshotFailedError reports a snapshot operation the engine's snapshot pool
 // could not complete. It is the public face of the engine-internal snapshot
 // error: RequestSnapshot's RequestState used to carry that internal error

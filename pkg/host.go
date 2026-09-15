@@ -8712,7 +8712,10 @@ func (h *Host) RequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, p
 	if policy.MaxWitnesses < 0 {
 		return nil, &HostInitError{
 			Field: "witness_policy",
-			Err:   fmt.Errorf("MaxWitnesses must be >= 0, got %d", policy.MaxWitnesses),
+			Err: &config.ValidationError{
+				Field:   "MaxWitnesses",
+				Message: fmt.Sprintf("must be >= 0, got %d", policy.MaxWitnesses),
+			},
 		}
 	}
 	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{

@@ -1236,8 +1236,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			ShardID:   shardID,
 			ReplicaID: replicaID,
 			Op:        "validate",
-			Err: fmt.Errorf("reassembled size %d does not match declared FileSize %d",
-				totalSize, first.FileSize),
+			Err:       &SnapshotSizeMismatchError{Declared: first.FileSize, Actual: totalSize},
 		}
 	}
 
@@ -1829,12 +1828,12 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 	first := &chunks[0]
 	n := uint64(len(chunks))
 
-	validateErr := func(format string, args ...any) ([]*proto.SnapshotChunk, error) {
+	validateErr := func(chunkID uint64, reason string) ([]*proto.SnapshotChunk, error) {
 		return nil, &SnapshotReceiveError{
 			ShardID:   first.ShardID,
 			ReplicaID: first.ReplicaID,
 			Op:        "validate",
-			Err:       fmt.Errorf(format, args...),
+			Err:       &SnapshotChunkError{ChunkID: chunkID, ChunkCount: n, Reason: reason},
 		}
 	}
 
@@ -1849,10 +1848,9 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 			c.Term != first.Term ||
 			c.Epoch != first.Epoch ||
 			c.OnDiskIndex != first.OnDiskIndex {
-			return validateErr(
-				"chunk %d identity mismatch with chunk 0 "+
+			return validateErr(c.ChunkID, fmt.Sprintf(
+				"identity mismatch with chunk 0 "+
 					"(shard %d/%d replica %d/%d from %d/%d index %d/%d term %d/%d epoch %d/%d ondisk %d/%d)",
-				c.ChunkID,
 				c.ShardID, first.ShardID,
 				c.ReplicaID, first.ReplicaID,
 				c.From, first.From,
@@ -1860,21 +1858,19 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 				c.Term, first.Term,
 				c.Epoch, first.Epoch,
 				c.OnDiskIndex, first.OnDiskIndex,
-			)
+			))
 		}
 
 		if c.ChunkCount != n {
-			return validateErr(
-				"chunk %d declares ChunkCount %d but %d chunks were received",
-				c.ChunkID, c.ChunkCount, n)
+			return validateErr(c.ChunkID, fmt.Sprintf(
+				"declares ChunkCount %d but %d chunks were received", c.ChunkCount, n))
 		}
 
 		if c.ChunkID >= n {
-			return validateErr(
-				"chunk ID %d out of range for %d chunks", c.ChunkID, n)
+			return validateErr(c.ChunkID, "chunk ID out of range")
 		}
 		if ordered[c.ChunkID] != nil {
-			return validateErr("duplicate chunk ID %d", c.ChunkID)
+			return validateErr(c.ChunkID, "duplicate chunk ID")
 		}
 		ordered[c.ChunkID] = c
 	}
@@ -1882,7 +1878,7 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 	// Every slot must be filled; a nil slot means a missing ChunkID (gap).
 	for id := range ordered {
 		if ordered[id] == nil {
-			return validateErr("missing chunk ID %d of %d", id, n)
+			return validateErr(uint64(id), "missing chunk ID")
 		}
 	}
 
