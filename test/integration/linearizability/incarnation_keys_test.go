@@ -124,6 +124,10 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// Restart the follower: a new Host, the same replica ID, and a full-log
 	// replay ahead of it that will park at the gate entry.
 	parked, release := gateApply(t, gateKey)
+	// Deferred AFTER cluster.close was, so it runs BEFORE it: Host.Close
+	// waits for the parked Update, and a failure while parked would
+	// otherwise wedge the shutdown ahead of the t.Cleanup that also releases.
+	defer release()
 	cluster.stopNode(followerIdx)
 	cluster.restartNode(followerIdx, shardID)
 	cluster.hostsMu.RLock()
@@ -143,6 +147,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		firstAt   uint64 = ^uint64(0)
 		inFlight  atomic.Int64
 		wg        sync.WaitGroup
+		stop      = make(chan struct{}) // closed to stop the proposers early
 	)
 	// A restarted follower refuses proposals until it knows the leader; it
 	// learns that from the leader's first AppendEntries, which the parked
@@ -168,7 +173,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 				inFlight.Add(-1)
 				cancel()
 				if err != nil {
-					time.Sleep(time.Millisecond)
+					pause(time.Millisecond, stop)
 					continue
 				}
 				mu.Lock()
@@ -203,19 +208,24 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// Wait until every proposer is inside SyncPropose at once -- a refusal
 	// returns immediately, so a proposer that stays inside for a while has
 	// been accepted -- then let the replay through.
-	allIn := time.Now().Add(failoverTimeout)
+	allIn := time.NewTimer(failoverTimeout)
+	defer allIn.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
 	for stable := 0; stable < 10; {
-		if inFlight.Load() == keyed {
-			stable++
-		} else {
-			stable = 0
-		}
-		if time.Now().After(allIn) {
+		select {
+		case <-tick.C:
+			if inFlight.Load() == keyed {
+				stable++
+			} else {
+				stable = 0
+			}
+		case <-allIn.C:
+			close(stop)
 			release()
 			wg.Wait()
 			t.Fatalf("only %d of %d proposals were in flight at once within %v; the collision window was never exercised", inFlight.Load(), keyed, failoverTimeout)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	release()
 	wg.Wait()
