@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,6 +83,23 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		}
 	}
 
+	// A gate entry goes in just before the keyed ones. When the follower
+	// restarts, its replay parks at this entry -- with the old (R, 1..keyed)
+	// entries still ahead of it -- until the new proposals are registered.
+	// That is what makes the collision a certainty rather than a race
+	// against the machine's speed (#187: on the CI runner the replay of
+	// 20,000 entries finished before the first proposal was accepted).
+	const gateKey = "gate"
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+		//quicraft:direct-propose the leader is resolved once above; this is the gate entry
+		_, err := leader.SyncPropose(ctx, shardID, encodeKVPut(gateKey, "closed"))
+		cancel()
+		if err != nil {
+			t.Fatalf("gate entry: %v", err)
+		}
+	}
+
 	// The follower's first incarnation mints (R, 1..keyed) for these.
 	for i := range keyed {
 		ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
@@ -103,13 +121,19 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		t.Fatal("could not read the leader's applied index before the restart")
 	}
 
-	// Restart the follower: a new Host, the same replica ID, a sequence that
-	// starts over, and a full-log replay ahead of it.
+	// Restart the follower: a new Host, the same replica ID, and a full-log
+	// replay ahead of it that will park at the gate entry.
+	parked, release := gateApply(t, gateKey)
 	cluster.stopNode(followerIdx)
 	cluster.restartNode(followerIdx, shardID)
 	cluster.hostsMu.RLock()
 	follower = cluster.hosts[followerIdx]
 	cluster.hostsMu.RUnlock()
+	select {
+	case <-parked:
+	case <-time.After(failoverTimeout):
+		t.Fatalf("the restarted follower's replay did not reach the gate entry within %v", failoverTimeout)
+	}
 
 	const newValue = "new-value" // 9 bytes; "old" is 3
 	var (
@@ -117,14 +141,15 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		falseAcks []string
 		accepted  int
 		firstAt   uint64 = ^uint64(0)
+		inFlight  atomic.Int64
 		wg        sync.WaitGroup
 	)
-	// A restarted follower refuses proposals until it knows the leader, and
-	// it learns the leader from the same AppendEntries that re-commits the
-	// log it is about to replay. Every proposer therefore retries the honest
-	// refusals and records how far the replay had got when it was accepted:
-	// the test only means something if acceptance came before the replay
-	// ended.
+	// A restarted follower refuses proposals until it knows the leader; it
+	// learns that from the leader's first AppendEntries, which the parked
+	// apply does not delay. Every proposer retries the honest refusals; an
+	// accepted proposal then sits pending -- the follower cannot apply it
+	// while parked -- so once all of them are in flight at once, all of
+	// them were registered during the replay. The gate is released then.
 	for i := range keyed {
 		wg.Add(1)
 		go func(i int) {
@@ -137,8 +162,10 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 					appliedAtSubmit = info.LastApplied
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+				inFlight.Add(1)
 				//quicraft:direct-propose the restarted follower is the subject
 				res, err := follower.SyncPropose(ctx, shardID, encodeKVPut(key, newValue))
+				inFlight.Add(-1)
 				cancel()
 				if err != nil {
 					time.Sleep(time.Millisecond)
@@ -173,8 +200,26 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 			}
 		}(i)
 	}
+	// Wait until every proposer is inside SyncPropose at once -- a refusal
+	// returns immediately, so a proposer that stays inside for a while has
+	// been accepted -- then let the replay through.
+	allIn := time.Now().Add(failoverTimeout)
+	for stable := 0; stable < 10; {
+		if inFlight.Load() == keyed {
+			stable++
+		} else {
+			stable = 0
+		}
+		if time.Now().After(allIn) {
+			release()
+			wg.Wait()
+			t.Fatalf("only %d of %d proposals were in flight at once within %v; the collision window was never exercised", inFlight.Load(), keyed, failoverTimeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	release()
 	wg.Wait()
-	t.Logf("restarted follower: %d of %d proposals accepted; the earliest was submitted with the replay at applied=%d of a log that ended at %d before the restart", accepted, keyed, firstAt, logEnd)
+	t.Logf("restarted follower: %d of %d proposals accepted; the earliest was submitted with the replay parked at applied=%d of a log that ended at %d before the restart", accepted, keyed, firstAt, logEnd)
 	// The test means nothing unless a reused key met the replay: at least one
 	// proposal must have been accepted while the follower's applied marker
 	// was still inside the pre-restart log. If the replay had finished first,
@@ -184,7 +229,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		t.Fatal("no proposal was accepted by the restarted follower; the collision window was never exercised")
 	}
 	if firstAt >= logEnd {
-		t.Fatalf("every proposal was accepted after the replay had passed the pre-restart log end (%d >= %d); the collision window was never exercised", firstAt, logEnd)
+		t.Fatalf("a proposal was accepted after the replay had passed the pre-restart log end (%d >= %d), which the gate should have made impossible", firstAt, logEnd)
 	}
 	if len(falseAcks) > 0 {
 		t.Fatalf("%d of %d proposals through the restarted replica were acknowledged for an entry that was not theirs:\n  %s",

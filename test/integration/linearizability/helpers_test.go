@@ -275,6 +275,58 @@ type kvStateMachine struct {
 	lastWrite map[string]uint64
 }
 
+// applyGates parks kvStateMachine.Update on a put to a chosen key, for a test
+// that needs a replay to stand still: a restarted replica replays its whole
+// log, and the only way to be certain something happens DURING that replay
+// -- rather than to race it against the machine's speed, which is how #187
+// failed on the CI runner -- is to stop the replay at a known entry until
+// the something is done. Armed by gateApply before the entry is proposed,
+// released by the function it returns. Keyed by the KV key, process-wide,
+// because the state machine that parks is created inside StartShard by a
+// factory the test does not hold.
+var applyGates sync.Map
+
+type applyGate struct {
+	parked      chan struct{} // closed when an Update reaches the gate
+	release     chan struct{} // closed to let it through
+	parkOnce    sync.Once
+	releaseOnce sync.Once
+}
+
+// gateApply arms a gate on key. The first put to key that any kvStateMachine
+// in this process applies parks until release is called; parked is closed
+// when it does. release is idempotent and also registered with t.Cleanup,
+// so a failed assertion while parked fails the test instead of hanging the
+// host's Close behind an apply that never returns.
+func gateApply(t *testing.T, key string) (parked <-chan struct{}, release func()) {
+	t.Helper()
+	g := &applyGate{parked: make(chan struct{}), release: make(chan struct{})}
+	if _, loaded := applyGates.LoadOrStore(key, g); loaded {
+		t.Fatalf("an apply gate on %q is already armed", key)
+	}
+	release = func() {
+		g.releaseOnce.Do(func() {
+			applyGates.Delete(key)
+			close(g.release)
+		})
+	}
+	t.Cleanup(release)
+	return g.parked, release
+}
+
+// parkAtGate is Update's side of gateApply. It runs with kv.mu held, so a
+// parked replica answers no Lookup until released; the tests that park read
+// from another replica.
+func parkAtGate(key string) {
+	v, ok := applyGates.Load(key)
+	if !ok {
+		return
+	}
+	g := v.(*applyGate)
+	g.parkOnce.Do(func() { close(g.parked) })
+	<-g.release
+}
+
 // indexedGet is a Lookup query that returns the value AND the index of the
 // write that produced it, as an indexedValue.
 type indexedGet string
@@ -333,6 +385,7 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 			value := string(entry.Cmd[3+keyLen:])
 			kv.data[key] = value
 			kv.lastWrite[key] = entry.Index
+			parkAtGate(key)
 			// Data carries the entry's index so the proposer learns WHERE
 			// its write landed; Value stays the length every existing
 			// caller checks.
