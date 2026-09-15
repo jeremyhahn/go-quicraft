@@ -1384,11 +1384,15 @@ type pendingProposal struct {
 	rs       *RequestState
 	deadline time.Time
 
-	// floor is the shard's committed index when this proposal was registered.
-	// The entry this proposal became was appended AFTER that, on the leader,
-	// at an index above everything committed anywhere at the time, so an
-	// applied or committed entry at or below floor cannot be this proposal
-	// no matter what its Key says.
+	// floor is the shard's committed index as last published to the host
+	// when this proposal was registered (Node.CommittedIndex, an atomic the
+	// step worker stores once per cycle). The entry this proposal became was
+	// appended AFTER that, on the leader, at an index above everything
+	// committed anywhere at the time, so an applied or committed entry at or
+	// below floor cannot be this proposal no matter what its Key says. The
+	// published marker can lag the peer's own commit by the cycle in
+	// progress, so this is a bound, not the instant's value: it makes the
+	// replay case certain and leaves the rest to the random draw.
 	//
 	// This is the second line of defence behind nextRequestKey's random draw,
 	// and the exact one: a key repeats across incarnations only by a 2^-64
@@ -1399,7 +1403,8 @@ type pendingProposal struct {
 	// incarnation's log, so 64 of 64 proposals issued through a restarting
 	// replica were acknowledged with an old entry's result -- and it stays
 	// because it costs one atomic load and turns a probabilistic guarantee
-	// into a certain one for every entry a replay can deliver.
+	// into a certain one for every entry a replay can deliver -- a replay
+	// starts from a marker published long before any proposal registers.
 	floor uint64
 
 	// onFailure runs exactly once, at the completion site that claims this

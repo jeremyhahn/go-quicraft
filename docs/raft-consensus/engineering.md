@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-08-19
+> `pkg/internal/invariant` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are **internal** and not importable from outside the module.
@@ -1166,7 +1166,15 @@ Rejected with `ErrReadIndexNotReady`.
 
 **Leader transfer guard** (PhD 6.4.1): `ErrTransferInProgress` while a transfer
 is active. The old leader must not serve reads because the transfer target may
-begin committing writes at any moment.
+begin committing writes at any moment. The sentinel is exported as
+`quicraft.ErrTransferInProgress` and is `Temporary` (#175), so a caller matches
+it with `errors.Is` rather than by message text.
+
+**A campaigning replica refuses, it does not drop** (#153): `stepCandidate`
+answers a `ReadIndex` with the same not-leader error it gives a `Propose`. It
+used to fall through to the default case and drop the message, so a read that
+arrived during the election window hung to its deadline and reported a timeout
+for what is a `Temporary` not-leader condition.
 
 **Role-mismatch guard**: `ErrWitnessRoleMismatch` on both the leader and
 follower paths. A replica the configuration lists as a witness has been
@@ -1207,10 +1215,11 @@ batch N does not block batch N+1 that already has quorum.
 requests to `r.leaderID`. When the leader's quorum confirms, it emits
 `ReadIndexResp` back to the originating follower, identified by `pending.from`.
 `handleReadIndexResp` refuses a response from anyone but `r.leaderID`
-(`ErrReadIndexRespNotFromLeader`): the correlation key is a plain monotonic
-counter (`Host.readKeySeq`) and is therefore guessable, so a response from
-another sender would serve a read at an index of the sender's choosing with no
-quorum ever run. It deliberately does NOT check `msg.LogIndex` against the
+(`ErrReadIndexRespNotFromLeader`): the correlation key is a random 64-bit
+draw (`nextRequestKey`, #186) rather than the guessable counter it once was,
+but the check stands on its own: a response from another sender would serve a
+read at an index of the sender's choosing with no quorum ever run, whatever
+the key. It deliberately does NOT check `msg.LogIndex` against the
 local committed index, because the leader answers with ITS committed index,
 which is by construction at or ahead of the follower's; that gap is the point
 of ReadIndex, and the follower waits for `lastApplied` to reach the returned
@@ -1267,7 +1276,8 @@ through the engine and Host layers to complete the caller's request:
 Host.ReadIndex(shardID)
   |
   +-- reject if this replica is a witness (ErrInvalidOperation)
-  +-- generate readKey (Host.readKeySeq, monotonic uint64)
+  +-- refuse at once with ErrShardFailed if the failure latch has tripped (#185)
+  +-- generate readKey (nextRequestKey: a random 64-bit draw, never zero)
   +-- create pendingRead{rs: RequestState} in ns.pendingReads map
   +-- enqueue readKey on the node's readIndexQ (ErrSystemBusy if full)
   +-- wake step worker
@@ -2345,7 +2355,7 @@ Step worker re-processes shard (inner loop)
 
 **Error paths**:
 - SaveState exhausts retries OR shutdown cancels mid-backoff: `failBatchSaveState` marks node failed, clears commitPending, reports SaveStateError to handleError, fails pending proposals (OnProposalFailed)
-- Peer.Commit fails (log gap): commitPending cleared, CommitError to handleError, batch continues
+- Peer.Commit fails (log gap): `failCommit` marks node failed, clears commitPending, reports CommitError to handleError, fails pending proposals and drains pending reads (OnProposalFailed, OnShardFailed)
 - DecompressEntries fails: fail-fast — `failApply` marks node failed, reports ApplyError, fails pending proposals; lastApplied NOT advanced; step worker skips shard until operator intervention
 - SM.Apply fails: fail-fast — same `failApply` path as decompression (shard offline on first error, no retry counting)
 - SM.Apply panics: recovered, node failed, SMPanicError to handleError, step worker skips node
@@ -2356,7 +2366,7 @@ Step worker re-processes shard (inner loop)
 | Type                      | Trigger                                 | Effect                    |
 |---------------------------|-----------------------------------------|---------------------------|
 | `SaveStateError`          | SaveState retries exhausted / shutdown  | node.failed = true        |
-| `CommitError`             | Peer.Commit() fails (log gap)           | commitPending cleared     |
+| `CommitError`             | Peer.Commit() fails (log gap)           | node.failed = true        |
 | `ApplyError`              | SM.Apply or decompression fails         | node.failed = true        |
 | `SMPanicError`            | SM.Apply panics (recovered)             | node.failed = true        |
 | `SnapshotDuplicateError`  | Snapshot already in-flight for shard    | Request rejected          |
@@ -2365,9 +2375,9 @@ Step worker re-processes shard (inner loop)
 | `SnapshotTooLargeError`   | Snapshot exceeds MaxSnapshotSize        | Snapshot dir cleaned up   |
 | `MessageHandleError`      | Peer.Handle() returns error             | Logged at slog.Warn       |
 
-Sentinels: `ErrShardFailed` (shard taken offline; `SMPanicError` matches it via `errors.Is`. `ApplyError` and `SaveStateError` also set `node.failed` but are distinct typed errors), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
+Sentinels: `ErrShardFailed` (shard taken offline; `SMPanicError` matches it via `errors.Is`. `ApplyError`, `SaveStateError` and `CommitError` also set `node.failed` but are distinct typed errors), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
 
-`SMPanicError` is the only type that matches `ErrShardFailed`, so an SM panic is the only apply failure a caller outside the module sees as the public `ErrShardFailed`. An `SM.Apply` error that is *returned* rather than panicked produces an `ApplyError`, which carries no `Is` method: it reaches the caller wrapping the state machine's own error, which is the more specific answer. Both fail the shard identically.
+Two different things reach a caller as the public `ErrShardFailed`. The proposal or read that was in flight when the latch tripped is completed with the error that tripped it: `SMPanicError` matches `ErrShardFailed`, while a *returned* `SM.Apply` error produces an `ApplyError`, which carries no `Is` method and reaches the caller wrapping the state machine's own error — the more specific answer. Every request that arrives AFTER the latch tripped, whatever tripped it, is refused with the bare `ErrShardFailed` sentinel at the gate: `Propose`, `ReadIndex` (so `SyncRead`/`SyncReadBuf`) and `FollowerRead` all check `Node.IsFailed` first (#185). All failures latch identically; only the error the in-flight request sees differs.
 
 ### Interfaces
 

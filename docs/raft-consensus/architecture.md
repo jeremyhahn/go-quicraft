@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-08-19
+> `pkg/internal/invariant` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -129,23 +129,28 @@ at all. It **requires `CheckQuorum` and `ElectionRTT >= 5`** and is rejected
 with `ErrLeaseReadRequiresCheckQuorum` otherwise — a lease without quorum
 checking is a linearizability violation waiting for a partition.
 
-## Proposal keys are not a bare counter
+## Request keys are random draws, and applied entries are placed by index too
 
-`proposalKey = replicaID<<proposalKeySeqBits | proposalKeySeq.Add(1)`.
-
-The replica ID is packed into the high bits so two hosts in the same shard
-cannot mint the same key. Every host counts 1, 2, 3, …, so a plain sequence
-would let replica B complete its own pending request the moment it applied
-replica A's unrelated entry carrying the same key.
-
-Reads use a **separate** counter (`readKeySeq`), and snapshots a third, so the
-three request classes do not contend.
+`entry.Key` is a random 64-bit value from `nextRequestKey` (`math/rand/v2`,
+never zero), the same draw for proposals, reads and snapshots. It used to be
+`(replicaID, per-Host sequence)`: unique across hosts by construction, and
+exactly what repeated across a host's incarnations — a restarted replica minted
+its previous incarnation's keys while replaying that incarnation's log, and a
+replayed entry completed a fresh proposal with an old result (#186). Behind the
+draw, every pending proposal records the committed index as last published to
+the host at registration as a floor; `OnApplied` and `OnCommitted` refuse an
+entry at or below it, so an entry that was committed and published before the
+proposal existed is never mistaken for it, whatever its key says. The published
+marker can lag the peer's commit by the step cycle in progress, so this is a
+bound that makes the replay case certain, not a guarantee for every entry
+committed before registration.
 
 ## Lock-free where it is measured, mutexed where it is not
 
 Deliberately lock-free:
 
-- `proposalKeySeq` / `readKeySeq` / `snapshotKeySeq` — separate `atomic.Uint64`s.
+- Request keys — random draws from `math/rand/v2`'s process-wide generator,
+  which is lock-free for callers; there is no per-Host counter to contend on.
 - `Node.commitPending` and `Node.lastApplied` — **padded to 128 bytes** (the
   prefetch-adjacent line pair on x86 and ARM) to prevent false sharing between
   the step worker that reads them and the apply worker that writes them.

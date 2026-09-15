@@ -1,7 +1,7 @@
 # Raft Consensus — Usage
 
 > **Status: NORMATIVE** · Scope: consensus behavior as an embedder experiences
-> it, through `pkg.Host` · Last verified: 2026-08-19
+> it, through `pkg.Host` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 This page is about making consensus behave: proposing, reading, tuning timing,

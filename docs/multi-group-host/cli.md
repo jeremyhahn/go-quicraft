@@ -1,7 +1,7 @@
 # Multi-Group Host — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg`, `pkg/config` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: go-quicraft ships no binaries.**

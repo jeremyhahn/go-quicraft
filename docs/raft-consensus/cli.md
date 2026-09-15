@@ -1,7 +1,7 @@
 # Raft Consensus — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
-> `pkg/internal/engine` · Last verified: 2026-08-19
+> `pkg/internal/engine` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: this feature is reachable only as a Go package, and its

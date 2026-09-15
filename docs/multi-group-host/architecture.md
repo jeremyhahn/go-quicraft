@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — the `Host`, its options,
 > `RequestState`, `Membership`, `ShardInfo`, the error and metrics vocabulary,
-> and `pkg/config` · Last verified: 2026-08-19
+> and `pkg/config` · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 The `Host` is the single exported entry point of this library: one per process,
@@ -131,10 +131,11 @@ Host.Propose()
   v
 Host.proposeEntry()
   | Global rate limiter, then per-shard rate limiter
-  | proposalKey = replicaID<<proposalKeySeqBits | proposalKeySeq.Add(1)
+  | proposalKey = nextRequestKey()   — a random 64-bit draw, never zero
   | entry.Key = proposalKey
   | rs = newRequestState(ns.requestPool, proposalKey, deadline)
-  | ns.pendingProposals.Store(proposalKey, &pendingProposal{rs, deadline})
+  | ns.pendingProposals.Store(proposalKey, &pendingProposal{rs, deadline,
+  |     floor: engNode.CommittedIndex()})
   | engNode.DeliverProposal([]proto.Entry{entry}) — MPSC proposalQ, non-blocking
   | engine.NotifyWork(shardID)
   v
@@ -165,11 +166,28 @@ Host.OnApplied() callback
 Client ← rs.Result() unblocks
 ```
 
-The proposal key is not a bare counter. It packs the replica ID into the high
-bits so that two hosts in the same shard cannot mint the same key: every host
-counts 1, 2, 3, ..., so a plain sequence would let replica B complete its own
-pending request the moment it applied replica A's unrelated entry carrying the
-same key. See `Host.nextProposalKey`.
+The request key is a random 64-bit draw, not a counter. `entry.Key` travels
+through the raft log to every replica and is how an applied entry is matched
+back to the caller waiting on it, so it must not repeat across hosts — replica B
+must not complete its own pending request with replica A's unrelated entry —
+and it must not repeat across **incarnations** of one host either. It used to
+be `(replicaID, per-Host sequence)`, unique across hosts by construction; a
+restarted replica is a new `Host` under the same replica ID with the sequence
+back at zero, and a snapshot-less restart replays the whole log through
+`OnApplied`, so a replayed old entry completed the fresh proposal registered
+under its key with the old entry's result — the caller was told its write had
+landed while its entry was still in flight (#186). A random draw from
+`math/rand/v2` needs no persistence and is what dragonboat does; uniqueness is
+probabilistic at 2^-64 per pair over the requests currently pending. Behind it,
+`pendingProposal.floor` records the committed index as last published to the
+host at registration (`Node.CommittedIndex`, an atomic the step worker stores
+once per cycle), and `OnApplied` and `OnCommitted` refuse an entry at or below
+it: whatever its key, an entry that was committed and published before the
+proposal registered cannot be that proposal. The marker can lag the peer's own
+commit by the cycle that is in progress, so the floor is a bound rather than
+the instant's value — it makes the replay case certain, which is the case that
+happened, and leaves the rest to the draw. See `nextRequestKey` and
+`pendingProposal.owns`.
 
 ### Read Path (Linearizable)
 
@@ -180,7 +198,8 @@ Client
   v
 Host.ReadIndex()
   | Witnesses rejected here (ErrInvalidOperation) — they store no log data
-  | readKey = readKeySeq.Add(1)   [dedicated counter, not proposalKeySeq]
+  | Refused at once with ErrShardFailed if the shard's failure latch tripped
+  | readKey = nextRequestKey()   [the same random draw proposals use]
   | ns.pendingReads[readKey] = &pendingRead{rs}   (under ns.pendingReadsMu)
   | engNode.DeliverReadIndex(readKey) — MPSC readIndexQ
   | engine.NotifyWork(shardID)
@@ -198,6 +217,9 @@ Engine Step Worker
 callback.OnReadyToRead(shardID, []ReadyToRead)
   | Resolve batchKey and every alias registered against it
   | If lastApplied >= readIndex: rs.complete immediately
+  | If the failure latch trips while the read is pending: OnShardFailed
+  |   drains it with ErrShardFailed (#185) — a halted shard never applies
+  |   again, so a read waiting on it would otherwise wait for its deadline
   | Else: wait for OnApplied
   v
 Host.SyncRead() continues
@@ -348,8 +370,9 @@ pending client requests and have happens-before requirements against
 
 ### Lock-Free Synchronization
 
-- `Host.proposalKeySeq` / `readKeySeq` / `snapshotKeySeq`: separate
-  `atomic.Uint64` counters so the three request classes do not contend
+- Request keys: random draws from `math/rand/v2`'s process-wide generator
+  (`nextRequestKey`), lock-free for callers; there is no per-Host counter to
+  contend on
 - `Node.commitPending` and `Node.lastApplied`: padded to 128 bytes (the
   prefetch-adjacent line pair on x86 and ARM) to prevent false sharing between
   the step worker, which reads them, and the apply worker, which writes them

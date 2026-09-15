@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, and the `Host` methods that drive them ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

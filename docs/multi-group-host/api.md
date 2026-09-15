@@ -1,7 +1,7 @@
 # Multi-Group Host — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` and `pkg/config` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -204,7 +204,7 @@ Submits a ReadIndex request to confirm leadership via heartbeat quorum. Returns 
 
 Witnesses cannot serve reads (`ErrInvalidOperation`). Observers and followers forward the ReadIndex to the leader.
 
-**Errors:** `ErrCanceled` / `ErrTimeout` (context already done), `ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrInvalidOperation` (witness), `ErrShardNotReady`, `ErrSystemBusy` (read queue full). There is no entry-size or per-shard rate-limit check on this path. `ErrReadIndexNotReady` arrives on the `RequestState` rather than from this call when the leader has not yet committed an entry in its current term.
+**Errors:** `ErrCanceled` / `ErrTimeout` (context already done), `ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrInvalidOperation` (witness), `ErrShardNotReady`, `ErrShardFailed` (the state-machine failure latch has tripped — returned at once, before the read is registered, and to a read already pending when the latch trips; a halted shard never applies again, so the read could otherwise only time out, #185), `ErrSystemBusy` (read queue full). There is no entry-size or per-shard rate-limit check on this path. `ErrReadIndexNotReady` arrives on the `RequestState` rather than from this call when the leader has not yet committed an entry in its current term.
 
 #### SyncRead
 
@@ -267,7 +267,7 @@ Reads local state after waiting for the local state machine to apply up to this 
 
 The wait polls at 1 ms for the first 50 attempts, then backs off to 20 ms. It terminates on shard or host shutdown even when `ctx` carries no deadline.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrInvalidOperation` (witness), `ErrTimeout` / `ErrCanceled` from `ctx`.
+**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrShardFailed` (latched shard, at once — see `ReadIndex`), `ErrInvalidOperation` (witness), `ErrTimeout` / `ErrCanceled` from `ctx`.
 
 #### QueryLocalNode
 
@@ -962,7 +962,7 @@ retry once a transient condition clears without operator or caller
 intervention. It is true for exactly these: `ErrBusy` (and therefore
 `ErrSystemBusy`, which is a `*BusyError`), `ErrTimeout`, `ErrAborted`,
 `ErrDropped`, `ErrShardNotStarted`, `ErrShardNotReady`, `ErrNotLeader`,
-`ErrReadIndexNotReady`, `ErrSnapshotInProgress`.
+`ErrReadIndexNotReady`, `ErrSnapshotInProgress`, `ErrTransferInProgress`.
 
 **Everything else is permanent, including errors this package never produced.**
 Retrying a permanent failure forever turns one bad request into sustained load
@@ -1978,7 +1978,7 @@ Holds per-type optional callbacks. Only non-nil callbacks are invoked. Callbacks
 
 | Callback             | Info Type          | Fired When                                  |
 |----------------------|--------------------|---------------------------------------------|
-| `OnShardFailed`      | `ShardFailedInfo`  | Shard encountered fatal error               |
+| `OnShardFailed`      | `ShardFailedInfo`  | A fatal error was reported for the shard. Fired when the failure latch trips (SM error or panic, commit or save-state failure, snapshot recovery failure, corrupt committed config) AND for two failures that do not latch: a snapshot save that failed, and a `GetUpdate` error on the step worker. So the event does not by itself mean the shard is offline — `GetShardInfo` reports the latch. NOT fired for a stale snapshot recovery the engine declined: the shard is healthy and already past that snapshot (#129) |
 | `OnLogDBDiskWarning` | `DiskInfo`         | WAL disk usage crossed warning threshold    |
 | `OnLogDBDiskFull`    | `DiskInfo`         | WAL disk usage crossed full threshold       |
 
