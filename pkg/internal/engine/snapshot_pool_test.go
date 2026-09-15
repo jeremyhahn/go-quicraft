@@ -1492,14 +1492,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	for i := range original {
 		original[i] = byte(i % 251)
 	}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	// Encrypt.
-	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
+	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
 
 	// Verify encrypted file differs from original.
 	encrypted, _ := os.ReadFile(dataPath)
@@ -1550,12 +1543,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	for i := range original {
 		original[i] = byte((i * 7) % 251)
 	}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
+	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
 
 	// Capture the encrypted bytes for an exact before/after comparison.
 	ciphertextBefore, err := os.ReadFile(dataPath)
@@ -1732,14 +1720,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 		original[i] = byte((i * 3) % 251)
 	}
 	dataPath := filepath.Join(tmpDir, snapshotDataFile)
-	if err := os.WriteFile(dataPath, original, 0o600); err != nil {
-		t.Fatalf("write plaintext failed: %v", err)
-	}
-
-	minEpoch, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
-	if err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
+	minEpoch := sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
 	// First frame was sealed at epoch 5 (before the rotation), so the recorded
 	// epoch must be the minimum, 5 — NOT the post-rotation CurrentEpoch of 6.
 	if minEpoch != 5 {
@@ -1763,55 +1744,6 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 	if !bytes.Equal(plain, original) {
 		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(plain), len(original))
 	}
-}
-
-func TestSnapshotPool_EncryptFile_AtomicPreservesOriginalOnFailure(t *testing.T) {
-	tmpDir := t.TempDir()
-	// Use a barrier that fails on the second encrypt call (second chunk).
-	barrier := &failAfterNBarrier{
-		testBarrier: newTestBarrier(1),
-		failAfter:   1, // succeed on first chunk, fail on second
-	}
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Create a multi-chunk file so the second chunk triggers the error.
-	dataPath := filepath.Join(tmpDir, "atomic-encrypt.dat")
-	original := make([]byte, snapshotEncryptChunkSize*2)
-	for i := range original {
-		original[i] = byte(i % 199)
-	}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	// Encrypt should fail on the second chunk.
-	_, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected encrypt to fail on second chunk")
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-
-	// Original file must be preserved intact (atomic write guarantees this).
-	preserved, readErr := os.ReadFile(dataPath)
-	if readErr != nil {
-		t.Fatalf("read preserved file failed: %v", readErr)
-	}
-	if len(preserved) != len(original) {
-		t.Fatalf("preserved length = %d, want %d", len(preserved), len(original))
-	}
-	for i := range original {
-		if preserved[i] != original[i] {
-			t.Fatalf("preserved file corrupted at byte %d: got %d, want %d",
-				i, preserved[i], original[i])
-		}
-	}
-
-	// Verify no temp files left behind.
-	assertNoTempFiles(t, tmpDir)
 }
 
 func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
@@ -1880,33 +1812,6 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 	}
 
 	// Verify no temp files left behind.
-	assertNoTempFiles(t, tmpDir)
-}
-
-func TestSnapshotPool_EncryptFile_AtomicTempCleanup(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	barrier.sealed = true // Sealed barrier causes Encrypt to return error
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	dataPath := filepath.Join(tmpDir, "temp-cleanup.dat")
-	if err := os.WriteFile(dataPath, []byte("test data"), 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	// Encrypt should fail because barrier is sealed.
-	_, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected encrypt to fail with sealed barrier")
-	}
-
-	// Original file must still exist.
-	if _, err := os.Stat(dataPath); err != nil {
-		t.Fatalf("original file should still exist: %v", err)
-	}
-
-	// No temp files should remain.
 	assertNoTempFiles(t, tmpDir)
 }
 
@@ -3215,69 +3120,6 @@ func TestSnapshotPool_SaveSnapshot_MembershipMultiNode(t *testing.T) {
 // I.8: Streaming encrypt/decrypt tests (memory amplification fix)
 // ---------------------------------------------------------------------------
 
-// TestSnapshotPool_EncryptFile_StreamingMultiChunk verifies that the
-// streaming encryptSnapshotFile correctly processes files larger than a
-// single snapshotEncryptChunkSize without loading the entire file into
-// memory. Validates round-trip correctness with varied chunk boundaries.
-func TestSnapshotPool_EncryptFile_StreamingMultiChunk(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Create a file spanning 5 chunks plus a partial final chunk to
-	// exercise boundary handling in the streaming read loop.
-	dataPath := filepath.Join(tmpDir, "streaming-encrypt.dat")
-	original := make([]byte, snapshotEncryptChunkSize*5+7777)
-	for i := range original {
-		original[i] = byte((i * 13) % 251)
-	}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	// Encrypt.
-	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
-
-	// Encrypted file should differ and be larger due to framing overhead.
-	encrypted, readErr := os.ReadFile(dataPath)
-	if readErr != nil {
-		t.Fatalf("read encrypted file failed: %v", readErr)
-	}
-	if len(encrypted) <= len(original) {
-		t.Fatal("encrypted file should be larger than original due to framing")
-	}
-
-	// Decrypt to a sibling and verify round-trip integrity. The source
-	// dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 5, barrier)
-	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
-	}
-
-	decrypted, readErr := os.ReadFile(plainPath)
-	if readErr != nil {
-		t.Fatalf("read decrypted file failed: %v", readErr)
-	}
-	if len(decrypted) != len(original) {
-		t.Fatalf("decrypted length = %d, want %d", len(decrypted), len(original))
-	}
-	for i := range original {
-		if decrypted[i] != original[i] {
-			t.Fatalf("mismatch at byte %d: got %d, want %d", i, decrypted[i], original[i])
-		}
-	}
-
-	// Remove the sibling, then confirm no stray temp files remain. The
-	// source dataPath (snapshot.dat-style, not .tmp) is intentionally left.
-	if err := os.Remove(plainPath); err != nil {
-		t.Fatalf("remove decrypted sibling failed: %v", err)
-	}
-	assertNoTempFiles(t, tmpDir)
-}
-
 // TestSnapshotPool_EncryptFile_StreamingSingleByte verifies encrypt/decrypt
 // round-trip for a file smaller than snapshotEncryptChunkSize (single
 // partial read).
@@ -3289,13 +3131,7 @@ func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
 
 	dataPath := filepath.Join(tmpDir, "single-byte.dat")
 	original := []byte{0x42}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
+	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
@@ -3324,13 +3160,7 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 	for i := range original {
 		original[i] = byte(i % 199)
 	}
-	if err := os.WriteFile(dataPath, original, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	if _, _, err := p.encryptSnapshotFile(dataPath, 1, 1, 1, barrier); err != nil {
-		t.Fatalf("encrypt failed: %v", err)
-	}
+	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 2, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
@@ -3348,26 +3178,6 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 		if decrypted[i] != original[i] {
 			t.Fatalf("mismatch at byte %d: got %d, want %d", i, decrypted[i], original[i])
 		}
-	}
-}
-
-// TestSnapshotPool_EncryptFile_MissingFile verifies that encryptSnapshotFile
-// returns a SnapshotEncryptError when the source file does not exist.
-func TestSnapshotPool_EncryptFile_MissingFile(t *testing.T) {
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	_, _, err := p.encryptSnapshotFile("/nonexistent/path/snapshot.dat", 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-	if encErr.Op != "read" {
-		t.Errorf("Op = %q, want %q", encErr.Op, "read")
 	}
 }
 
@@ -4975,12 +4785,7 @@ func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
 		original[i] = byte(i*13 + 2)
 	}
 	dataPath := filepath.Join(tmpDir, snapshotDataFile)
-	if err := os.WriteFile(dataPath, original, 0o600); err != nil {
-		t.Fatalf("write plaintext: %v", err)
-	}
-	if _, _, err := p.encryptSnapshotFile(dataPath, shardID, replicaID, index, barrier); err != nil {
-		t.Fatalf("encryptSnapshotFile: %v", err)
-	}
+	sealSnapshotFile(t, dataPath, original, shardID, replicaID, index, barrier)
 
 	// Positive: the artifact's own identity opens it.
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, shardID, replicaID, index, 3, barrier)
@@ -5273,4 +5078,30 @@ func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *te
 	if snap.FileSize != uint64(fi.Size()) {
 		t.Fatalf("LogDB FileSize = %d, want the on-disk %d", snap.FileSize, fi.Size())
 	}
+}
+
+// sealSnapshotFile writes plaintext to path through snapshotFrameWriter -- the
+// sealed artifact exactly as saveSnapshot produces it since #116 -- and
+// returns the epoch the artifact would record. The tests that read an
+// artifact back (decryptSnapshotToSibling, the frame-context binding, the
+// mixed-epoch minimum) build their input here, so they exercise the writer
+// that is actually on the save path.
+func sealSnapshotFile(t *testing.T, path string, plaintext []byte, shardID, replicaID, index uint64, barrier SnapshotBarrier) uint64 {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("sealSnapshotFile: open %s: %v", path, err)
+	}
+	w := newSnapshotFrameWriter(f, barrier, shardID, replicaID, index)
+	defer w.ReleasePins()
+	if _, err := w.Write(plaintext); err != nil {
+		t.Fatalf("sealSnapshotFile: write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("sealSnapshotFile: close writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("sealSnapshotFile: close file: %v", err)
+	}
+	return w.MinEpoch()
 }

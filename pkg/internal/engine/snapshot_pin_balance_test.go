@@ -19,8 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -140,101 +138,84 @@ func (b *pinCountBarrier) snapshotCountsLocked() string {
 
 var _ SnapshotBarrier = (*pinCountBarrier)(nil)
 
-// writeMultiChunkPlaintext writes a plaintext file spanning several encrypt
-// chunks so the frame loop runs more than once.
-func writeMultiChunkPlaintext(t *testing.T, path string, chunks int) {
-	t.Helper()
-	data := make([]byte, snapshotEncryptChunkSize*chunks+321)
-	for i := range data {
-		data[i] = byte(i*11 + 5)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write plaintext: %v", err)
-	}
-}
-
-// TestPinBalance_EncryptSnapshotFile_SuccessHandsOffExactlyOnePinPerEpoch
-// proves the SUCCESS contract of the encrypt loop: every epoch it sealed a
-// frame under is held with a net count of exactly ONE when the call returns
-// (not zero — the caller must be able to rely on the pin surviving until its
-// durable record exists — and not two, which the caller's single release would
-// leave leaked forever).
-func TestPinBalance_EncryptSnapshotFile_SuccessHandsOffExactlyOnePinPerEpoch(t *testing.T) {
-	dir := t.TempDir()
-	// Rotate after the first frame so the file spans TWO epochs; this is the
-	// mixed-epoch case the commit exists to protect.
+// TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch proves the
+// SUCCESS contract of the frame writer, which is the save path since #116:
+// every epoch it sealed a frame under is held with a net count of exactly
+// ONE when Close returns -- not zero, because saveSnapshot relies on the pin
+// surviving until the artifact's durable record exists, and not two, which
+// its single deferred ReleasePins would leave leaked forever.
+func TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch(t *testing.T) {
+	// Rotate after the first frame so the artifact spans TWO epochs; this is
+	// the mixed-epoch case the pins exist to protect.
 	inner := &rotateAfterNBarrier{testBarrier: newTestBarrier(5), rotateAfter: 1}
 	barrier := newPinCountBarrier(inner)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	dataPath := filepath.Join(dir, snapshotDataFile)
-	writeMultiChunkPlaintext(t, dataPath, 3)
-
-	minEpoch, pins, err := p.encryptSnapshotFile(dataPath, 2, 1, 42, barrier)
-	if err != nil {
-		t.Fatalf("encryptSnapshotFile: %v", err)
+	w := newSnapshotFrameWriter(io.Discard, barrier, 2, 1, 42)
+	if _, err := w.Write(make([]byte, snapshotEncryptChunkSize*3)); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	if minEpoch != 5 {
-		t.Fatalf("min epoch = %d, want 5", minEpoch)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
+	if got := w.MinEpoch(); got != 5 {
+		t.Fatalf("min epoch = %d, want 5", got)
+	}
+	pins := w.Epochs()
 	if len(pins) < 2 {
-		t.Fatalf("fixture: %d pins returned, want the multi-epoch path (>=2): %s",
+		t.Fatalf("fixture: %d epochs pinned, want the multi-epoch path (>=2): %s",
 			len(pins), barrier.snapshotCounts())
 	}
-
-	// Exactly one pin per returned epoch, and no duplicates in the set.
+	// Exactly one pin per epoch, and no duplicates in the set.
 	seen := map[uint64]bool{}
 	for _, e := range pins {
 		if seen[e] {
-			t.Fatalf("epoch %d returned twice in the pin set; the caller releases once "+
-				"per element, so a duplicate is a permanent leak: %v", e, pins)
+			t.Fatalf("epoch %d pinned twice; a single release would leave it leaked: %v", e, pins)
 		}
 		seen[e] = true
 		if got := barrier.held(e); got != 1 {
-			t.Fatalf("epoch %d held %d times after a successful encrypt, want exactly 1: %s",
+			t.Fatalf("epoch %d held %d times after a successful save, want exactly 1: %s",
 				e, got, barrier.snapshotCounts())
 		}
 	}
-
-	// The caller's release must bring every epoch back to zero.
-	for _, e := range pins {
-		barrier.DeregisterInFlightEpoch(e)
+	// The one release saveSnapshot defers brings every epoch back to zero.
+	w.ReleasePins()
+	barrier.assertBalanced(t, "frame writer success + ReleasePins")
+	if left := w.Epochs(); len(left) != 0 {
+		t.Fatalf("epochs still reported after release: %v", left)
 	}
-	barrier.assertBalanced(t, "encryptSnapshotFile success + caller release")
 }
 
-// TestPinBalance_EncryptSnapshotFile_ErrorReleasesEverythingAndReturnsNoPins
-// covers the whole error family of the engine encrypt loop. Every in-loop and
-// post-loop failure (encrypt, write_frame, write_data, read, sync, close,
-// rename, sync_dir) routes through the single encErrOf helper, so proving the
-// helper releases and returns a nil set proves the family: the caller receives
-// nothing to release, so there is neither a leak nor a double-free.
-func TestPinBalance_EncryptSnapshotFile_ErrorReleasesEverythingAndReturnsNoPins(t *testing.T) {
-	dir := t.TempDir()
-	// Seal one frame successfully (pinning its epoch), then fail: the loop is
-	// holding a pin at the moment the error occurs.
+// TestPinBalance_FrameWriter_ErrorReleasesEverythingAndReportsNoEpochs covers
+// the writer's whole failure family: a sealing failure and both write
+// failures route through the single fail helper, so proving it releases and
+// leaves Epochs empty proves the family -- the caller has nothing to release,
+// so there is neither a leak nor a double-free, and its deferred ReleasePins
+// is a no-op.
+func TestPinBalance_FrameWriter_ErrorReleasesEverythingAndReportsNoEpochs(t *testing.T) {
+	// Seal one frame successfully (pinning its epoch), then fail: the writer
+	// is holding a pin at the moment the error occurs.
 	inner := &failAfterNBarrier{testBarrier: newTestBarrier(7), failAfter: 1}
 	barrier := newPinCountBarrier(inner)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	dataPath := filepath.Join(dir, snapshotDataFile)
-	writeMultiChunkPlaintext(t, dataPath, 3)
-
-	_, pins, err := p.encryptSnapshotFile(dataPath, 2, 1, 42, barrier)
+	w := newSnapshotFrameWriter(io.Discard, barrier, 2, 1, 42)
+	_, err := w.Write(make([]byte, snapshotEncryptChunkSize*3))
 	if err == nil {
-		t.Fatal("encryptSnapshotFile: expected the injected encrypt failure")
+		err = w.Close()
 	}
-	if pins != nil {
-		t.Errorf("error return handed back %v; a non-nil set on error is a DOUBLE-FREE, "+
-			"since the loop already released them", pins)
+	if err == nil {
+		t.Fatal("expected the injected sealing failure")
+	}
+	if pins := w.Epochs(); len(pins) != 0 {
+		t.Errorf("Epochs after a failure = %v; a non-empty set is a DOUBLE-FREE once the caller releases it", pins)
 	}
 	if barrier.regs == 0 {
 		t.Fatalf("fixture: nothing was ever pinned, so the release is untested: %s",
 			barrier.snapshotCounts())
 	}
-	barrier.assertBalanced(t, "encryptSnapshotFile error")
+	barrier.assertBalanced(t, "frame writer error")
+	// The caller's deferred release finds nothing to do and stays balanced.
+	w.ReleasePins()
+	barrier.assertBalanced(t, "frame writer error + ReleasePins")
 }
 
 // bulkSnapshotter writes enough bytes to span several encrypt chunks, so a

@@ -1,7 +1,7 @@
 # Snapshots — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-08-19
+> import/export and re-encryption · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the frame format, the AAD layout and the scope fence are in
@@ -126,7 +126,7 @@ workers, so a large save or recover cannot stall step, commit or apply.
 | `ErrSnapshotBarrierSealed` | a non-nil barrier on either side is sealed | **Yes** — never falls through to plaintext |
 | `ErrSnapshotEncryptedBarrierUnavailable` | an encrypted artifact with no barrier to open it | Yes |
 | `*SnapshotFailedError` | the save failed | Yes |
-| `*SnapshotTooLargeError` | the artifact exceeds `MaxSnapshotSize` (4 GB) | Yes |
+| `*SnapshotTooLargeError` | the state machine's output exceeds `MaxSnapshotSize` (4 GB), measured after compression and before sealing | Yes |
 | `*SnapshotSendError` / `*SnapshotReceiveError` | the transfer failed | Yes |
 | `*SnapshotArtifactError` | the artifact is malformed or fails verification | Yes |
 | `*SnapshotOptionError` (`ErrInvalidSnapshotOption`) | `SnapshotOption.Validate` rejected the request | Yes |
@@ -164,7 +164,7 @@ Per shard, on `config.Config`:
 |---|---|---|
 | `SnapshotEntries` | 100000 | applied entries between automatic snapshots. **Zero does not disable it** — zero means "unset" and selects the default. Assign `config.SnapshotsDisabled` for manual-only. |
 | `CompactionOverhead` | 5000 | entries retained after the compaction a snapshot triggers |
-| `MaxSnapshotSize` | 4 GB | maximum snapshot file size |
+| `MaxSnapshotSize` | 4 GB | maximum snapshot size, measured on the state machine's output after compression and before sealing — not the framed ciphertext on disk |
 
 Never snapshotting also means never reclaiming snapshot directories, never
 purging an old epoch's DEK, and never invoking the at-rest barrier.

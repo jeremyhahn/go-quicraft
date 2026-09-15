@@ -4,7 +4,7 @@
 > import/export and re-encryption — `pkg/snapshot_*.go`,
 > `pkg/internal/engine/snapshot_pool.go`, `pkg/internal/engine/snapshot_meta.go`,
 > the snapshot paths of `pkg/internal/transport` and `pkg/logdb` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -69,6 +69,16 @@ leader's ciphertext — would require every replica to share key material, which
 is precisely the property the per-node barrier design refuses. Nodes cannot
 decrypt each other's at-rest data, and that stays true through a snapshot
 transfer.
+
+### Rejected: write plaintext, then encrypt in place
+
+The save used to write the state machine's bytes to the canonical
+`snapshot.dat` in the clear, fsync them, and encrypt the file in place
+afterwards. Between the fsync and the rename a complete plaintext state machine
+was durable under the name every consumer, backup and operator reads — the one
+path in this feature that had that window, while the receive path always sealed
+inline from memory (#116). The writer now seals each 64 KB frame as the state
+machine hands it over; the plaintext exists only in the writer's buffer.
 
 ### Rejected: in-place decryption for recovery
 
@@ -157,11 +167,13 @@ capability rather than part of the `Barrier` interface.
  SAVE
    apply worker: appliedIndex crosses SnapshotEntries
         ▼ snapshot pool worker
-   PrepareSnapshot (tiers 1,2) ─▶ SM.SaveSnapshot(w) ─▶ plaintext file
-        ▼
-   encryptSnapshotFile: stream 64 KB chunks ─▶ EncryptWithEpochPinnedContext
-        ▼ temp file ─▶ fsync ─▶ rename ─▶ fsync dir
-   snapshot.meta ─▶ LogDB.SaveSnapshot ─▶ log compaction below index
+   PrepareSnapshot (tiers 1,2) ─▶ SM.SaveSnapshot(w)
+        w = [snappy ─▶] snapshotFrameWriter ─▶ snapshot.dat
+            64 KB of plaintext per frame, sealed under the pinned epoch
+            AS IT IS WRITTEN: no plaintext is ever durable on disk (#116)
+        ▼ fsync ─▶ MaxSnapshotSize on the PLAINTEXT the writer consumed
+   snapshot.meta (Epoch = lowest frame epoch) ─▶ LogDB.SaveSnapshot
+        ─▶ epoch pins released ─▶ log compaction below index
 
  TRANSFER
    leader: decryptSnapshotToSibling ─▶ plaintext temp
@@ -205,8 +217,11 @@ era still recovers as if complete. Snapshots taken by this build are verified.
 
 ## Component boundaries
 
-- **`pkg/internal/engine/snapshot_pool.go`** — the pool, `encryptSnapshotFile`,
+- **`pkg/internal/engine/snapshot_pool.go`** — the pool, `saveSnapshot`,
   `decryptSnapshotToSibling`, recovery.
+- **`pkg/internal/engine/snapshot_frame_writer.go`** — `snapshotFrameWriter`,
+  the `io.Writer` the state machine saves into: frames, epoch pins, the lowest
+  frame epoch, and the plaintext count the size limit is measured on.
 - **`pkg/internal/engine/snapshot_meta.go`** — `SnapshotAAD`,
   `NewSnapshotAAD`, `SnapshotFrameAADLen`, the metadata record.
 - **`pkg/snapshot_*.go`** — the public `SnapshotOption`, `ImportOption`,

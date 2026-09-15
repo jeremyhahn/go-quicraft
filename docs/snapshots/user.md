@@ -1,7 +1,7 @@
 # Snapshots — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-08-19
+> import/export and re-encryption · Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 Snapshots happen automatically. You reach this feature when you need to tune
@@ -175,7 +175,9 @@ Unseal the barrier.
 barrier to open it. Usually a data directory moved to a node configured without
 encryption, or configured with a different algorithm.
 
-**`*SnapshotTooLargeError`** — the artifact exceeds `MaxSnapshotSize` (4 GB).
+**`*SnapshotTooLargeError`** — the state machine's output exceeds
+`MaxSnapshotSize` (4 GB), measured after compression and before at-rest
+sealing, so the limit means the same thing with and without a barrier.
 Either your state is genuinely that large, in which case raise the limit and
 think about `DiskStateMachine`, or `SaveSnapshot` is writing more than it needs.
 
