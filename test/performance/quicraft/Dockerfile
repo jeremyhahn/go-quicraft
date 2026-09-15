@@ -14,6 +14,10 @@ WORKDIR /src/test/performance/quicraft
 # metadata, nor a command line. The payload is the four variables of that
 # section as K=V lines; set -a exports them for the git that go invokes.
 #
+# The binary is stamped with the project's VERSION file, copied in with the
+# context, so a stored result names the release it measured -- the same
+# value `make build` stamps into every other binary (#189).
+#
 # The mount is optional at both ends. With no secret the build resolves
 # github.com/jeremyhahn/* from the public proxy only, which is the correct
 # shape for a build outside the Gitea network. Requires BuildKit (the
@@ -26,7 +30,10 @@ RUN --mount=type=secret,id=gomodauth \
     else \
       echo "==> go mod download: no module credentials mounted; github.com/jeremyhahn/* resolves from the public proxy only"; \
     fi; \
-    go mod download && go test -c -tags=benchmark -o /bench-quicraft .
+    go mod download && \
+    go test -c -tags=benchmark \
+      -ldflags "-X github.com/jeremyhahn/go-quicraft/test/performance/benchutil.Version=$(cat /src/VERSION)" \
+      -o /bench-quicraft .
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates procps && rm -rf /var/lib/apt/lists/*

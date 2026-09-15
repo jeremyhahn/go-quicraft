@@ -17,10 +17,12 @@
 package etcd_perf
 
 import (
+	"log"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 )
 
@@ -34,7 +36,17 @@ const concurrentGoroutines = 8
 
 // suite is the global BenchmarkSuite populated by benchmark functions
 // and serialized to stdout in TestMain.
-var suite = perfresult.NewBenchmarkSuite("etcd", "v3.7.0")
+var suite = newEtcdSuite()
+
+func newEtcdSuite() *perfresult.BenchmarkSuite {
+	// The version is the etcd raft module this binary links, from its build
+	// info, so the recorded version follows the go.mod pin (#189).
+	version, err := benchutil.ModuleVersion("go.etcd.io/raft/v3")
+	if err != nil {
+		log.Fatal(err)
+	}
+	return perfresult.NewBenchmarkSuite("etcd", version)
+}
 
 // ---------------------------------------------------------------------------
 // Throughput Benchmarks (WAL)

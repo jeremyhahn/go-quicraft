@@ -17,19 +17,30 @@
 package dragonboat_perf_test
 
 import (
+	"log"
 	"os"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	perf "github.com/jeremyhahn/go-quicraft/test/performance/dragonboat"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 )
 
 // suite is the global benchmark suite populated by each benchmark and
 // serialized to stdout by TestMain after all benchmarks complete.
-var suite = perfresult.NewBenchmarkSuite("dragonboat", "v4.0.0")
+var suite = newDragonboatSuite()
 
-func init() {
-	suite.Config.TLS = true
+func newDragonboatSuite() *perfresult.BenchmarkSuite {
+	// The version is the dragonboat this binary links, from its build info,
+	// so a go.mod pin bump cannot leave the recorded version behind: the
+	// literal this replaces said v4.0.0 while v4.0.1 was linked (#189).
+	version, err := benchutil.ModuleVersion("github.com/jeremyhahn/dragonboat/v4")
+	if err != nil {
+		log.Fatal(err)
+	}
+	s := perfresult.NewBenchmarkSuite("dragonboat", version)
+	s.Config.TLS = true
+	return s
 }
 
 // concurrentGoroutines is the number of goroutines for concurrent benchmarks.
