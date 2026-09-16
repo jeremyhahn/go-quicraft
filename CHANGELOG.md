@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SnapshotChunkError` and `SnapshotSizeMismatchError` (#193).** The three
+  `fmt.Errorf` strings left in `pkg` were the refusals inside a
+  `SnapshotReceiveError{Op: "validate"}` — a chunk set that is not one snapshot
+  (identity mismatch with chunk 0, a `ChunkCount` that disagrees with what
+  arrived, an ID out of range, repeated or missing) and a reassembled size that
+  does not match the declared `FileSize` — and `RequestUpdateWitnessPolicy`'s
+  refusal of a negative `MaxWitnesses`, now a `config.ValidationError`. Each
+  stays inside the wrapper it was in, so every existing `errors.Is`/`errors.As`
+  result is unchanged; the cause is reachable one level down. `pkg` is at zero
+  `fmt.Errorf`.
+
+### Fixed
+
+- **A restarted replica no longer acknowledges a proposal with a previous
+  incarnation's entry (#186).** Request keys were `(replicaID, per-Host
+  sequence)`; a restarted replica — a new `Host` under the same replica ID,
+  its sequence back at zero — minted exactly the keys its previous incarnation
+  had left in the raft log, and a snapshot-less restart replays that whole log
+  through `OnApplied`. A replayed old entry completed the fresh proposal
+  registered under its key with the old entry's result: the caller was told
+  its write had landed while its entry was still in flight, and a
+  linearizable read on the strength of that acknowledgement returned the
+  value from before it. Seen once in 27 rolling-restart soaks as a porcupine
+  `Illegal`; reproduced 64 of 64 in isolation. Request keys are now random
+  64-bit draws from `math/rand/v2` (never zero; what dragonboat does), one
+  generator for proposals, reads and snapshots, and every pending proposal
+  records the committed index as last published at registration as a floor
+  that `OnApplied` and `OnCommitted` check before claiming an entry. Nothing on
+  the wire or on disk changes: `entry.Key` was always an opaque `uint64`.
+
+- **Every benchmark records the version it actually measured (#189).** The
+  quicraft benchmark recorded `0.0.0`; dragonboat's and etcd's versions were
+  literals, and dragonboat's had already drifted from its `go.mod` pin. The
+  quicraft binary is stamped from the root `VERSION` file (with a repository
+  fallback for bare runs, and an error rather than a placeholder outside
+  one); dragonboat and etcd report the module their binary links.
+
+- **The dragonboat read benchmarks seed through the leader that leads now
+  (#184).** A one-shot seed to a leader that had just moved reported
+  `timeout` and took the run down; the seed retries through a re-resolved
+  leader on the warmup budget. With it, the first complete four-system
+  capture — `profiles/ci-node-2` — is on record.
+
+- **Dependencies (#188).** `golang.org/x/crypto` v0.57.0, `x/sync` v0.23.0,
+  `x/sys` v0.48.0 (read before bumping: a go.mod update, a panic on negative
+  semaphore capacity, constants and cpu detection). `scripts/deps-check.sh`
+  no longer reports a directory-replaced module as lagging behind the
+  registry's newest tag, which had kept the nightly red since 2026-09-11.
+
+### Changed
+
+- **`encryptSnapshotFile` is removed from the engine (#190).** It had no
+  production caller since the snapshot save started sealing inline (#116);
+  the tests that built artifacts with it now build them through the frame
+  writer that is on the save path. Documentation for snapshots,
+  multi-group-host, raft-consensus, seal-barrier, compatibility and testing
+  was re-verified against the tree and restamped (#190, #191, #192, #194);
+  the README's barrier examples compile again — `seal.Credentials{Secret:
+  []byte}` had not since #83 — and its testing figures are measured at this
+  tree. The ten `Get`-prefixed `Host` methods are recorded as a deliberate
+  exception to the naming rule (owner ruling 2026-09-15).
+
 ## [0.11.0-alpha] - 2026-09-13
 
 ### Added
