@@ -219,9 +219,9 @@ func TestReadSuiteFromOutputMissingBeginSentinel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing begin sentinel")
 	}
-	var noSentinel *ErrNoSentinel
+	var noSentinel *NoSentinelError
 	if !errors.As(err, &noSentinel) {
-		t.Fatalf("expected ErrNoSentinel, got %T: %v", err, err)
+		t.Fatalf("expected NoSentinelError, got %T: %v", err, err)
 	}
 }
 
@@ -231,9 +231,9 @@ func TestReadSuiteFromOutputMissingEndSentinel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing end sentinel")
 	}
-	var noSentinel *ErrNoSentinel
+	var noSentinel *NoSentinelError
 	if !errors.As(err, &noSentinel) {
-		t.Fatalf("expected ErrNoSentinel, got %T: %v", err, err)
+		t.Fatalf("expected NoSentinelError, got %T: %v", err, err)
 	}
 }
 
@@ -242,9 +242,9 @@ func TestReadSuiteFromOutputEmptyInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
-	var noSentinel *ErrNoSentinel
+	var noSentinel *NoSentinelError
 	if !errors.As(err, &noSentinel) {
-		t.Fatalf("expected ErrNoSentinel, got %T: %v", err, err)
+		t.Fatalf("expected NoSentinelError, got %T: %v", err, err)
 	}
 }
 
@@ -254,9 +254,9 @@ func TestReadSuiteFromOutputMalformedJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for malformed JSON")
 	}
-	var parseErr *ErrParseFailure
+	var parseErr *ParseFailureError
 	if !errors.As(err, &parseErr) {
-		t.Fatalf("expected ErrParseFailure, got %T: %v", err, err)
+		t.Fatalf("expected ParseFailureError, got %T: %v", err, err)
 	}
 }
 
@@ -332,7 +332,7 @@ func TestCoreAndAllScenariosNotEmpty(t *testing.T) {
 type errWriter struct{}
 
 func (ew *errWriter) Write([]byte) (int, error) {
-	return 0, &ErrParseFailure{Detail: "write failed"}
+	return 0, &ParseFailureError{Detail: "write failed"}
 }
 
 func TestWriteSuiteToWriterError(t *testing.T) {
@@ -350,8 +350,8 @@ func TestWriteSuiteToStdoutCompiles(t *testing.T) {
 }
 
 func TestErrorTypes(t *testing.T) {
-	t.Run("ErrNoResults", func(t *testing.T) {
-		err := &ErrNoResults{}
+	t.Run("NoResultsError", func(t *testing.T) {
+		err := &NoResultsError{}
 		msg := err.Error()
 		if msg == "" {
 			t.Fatal("expected non-empty error message")
@@ -361,8 +361,8 @@ func TestErrorTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrParseFailure", func(t *testing.T) {
-		err := &ErrParseFailure{Detail: "bad json"}
+	t.Run("ParseFailureError", func(t *testing.T) {
+		err := &ParseFailureError{Detail: "bad json"}
 		msg := err.Error()
 		if msg == "" {
 			t.Fatal("expected non-empty error message")
@@ -372,8 +372,8 @@ func TestErrorTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoSentinel", func(t *testing.T) {
-		err := &ErrNoSentinel{}
+	t.Run("NoSentinelError", func(t *testing.T) {
+		err := &NoSentinelError{}
 		msg := err.Error()
 		if msg == "" {
 			t.Fatal("expected non-empty error message")
@@ -383,8 +383,8 @@ func TestErrorTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrSystemUnknown", func(t *testing.T) {
-		err := &ErrSystemUnknown{System: "myraft"}
+	t.Run("UnknownSystemError", func(t *testing.T) {
+		err := &UnknownSystemError{System: "myraft"}
 		msg := err.Error()
 		if msg == "" {
 			t.Fatal("expected non-empty error message")
@@ -404,7 +404,7 @@ type limitWriter struct {
 func (lw *limitWriter) Write(p []byte) (int, error) {
 	remaining := lw.limit - lw.written
 	if remaining <= 0 {
-		return 0, &ErrParseFailure{Detail: "limit exceeded"}
+		return 0, &ParseFailureError{Detail: "limit exceeded"}
 	}
 	n := len(p)
 	if n > remaining {

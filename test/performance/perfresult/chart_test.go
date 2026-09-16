@@ -79,9 +79,9 @@ func TestGenerateSystemChartNoResults(t *testing.T) {
 		t.Fatal("expected error for suite with no results")
 	}
 
-	var noResults *ErrNoResults
+	var noResults *NoResultsError
 	if !errors.As(err, &noResults) {
-		t.Fatalf("expected ErrNoResults, got %T: %v", err, err)
+		t.Fatalf("expected NoResultsError, got %T: %v", err, err)
 	}
 }
 
@@ -172,9 +172,9 @@ func TestGenerateComparisonChartNoResults(t *testing.T) {
 		t.Fatal("expected error for empty suites")
 	}
 
-	var noResults *ErrNoResults
+	var noResults *NoResultsError
 	if !errors.As(err, &noResults) {
-		t.Fatalf("expected ErrNoResults, got %T: %v", err, err)
+		t.Fatalf("expected NoResultsError, got %T: %v", err, err)
 	}
 }
 

@@ -66,11 +66,11 @@ type EtcdCluster struct {
 	Nodes []*etcdClusterNode
 }
 
-// ErrNoLeader indicates that no node in the cluster currently reports
+// NoLeaderError indicates that no node in the cluster currently reports
 // itself as the raft leader.
-type ErrNoLeader struct{}
+type NoLeaderError struct{}
 
-func (e ErrNoLeader) Error() string {
+func (e NoLeaderError) Error() string {
 	return "no leader available in cluster"
 }
 
@@ -91,7 +91,7 @@ func clusterElectionTick(numNodes int) int {
 
 // CurrentLeaderNode polls all nodes' Status() and returns the node
 // that currently reports itself as the raft leader. Returns nil and
-// ErrNoLeader if no node is currently the leader.
+// NoLeaderError if no node is currently the leader.
 func (c *EtcdCluster) CurrentLeaderNode() (*etcdClusterNode, error) {
 	for _, cn := range c.Nodes {
 		status := cn.node.Status()
@@ -99,7 +99,7 @@ func (c *EtcdCluster) CurrentLeaderNode() (*etcdClusterNode, error) {
 			return cn, nil
 		}
 	}
-	return nil, ErrNoLeader{}
+	return nil, NoLeaderError{}
 }
 
 // waitForLeader polls all nodes until one reports itself as the current
@@ -119,7 +119,7 @@ func (c *EtcdCluster) waitForLeader(timeout time.Duration) (*etcdClusterNode, er
 		}
 		select {
 		case <-deadline.C:
-			return nil, ErrNoLeader{}
+			return nil, NoLeaderError{}
 		case <-ticker.C:
 		}
 	}

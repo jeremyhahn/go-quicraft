@@ -101,7 +101,7 @@ func GenerateSystemChart(suite *BenchmarkSuite, outPath string) error {
 
 	scenarios := collectPresentScenarios(map[string]*BenchmarkSuite{suite.System: suite})
 	if len(scenarios) == 0 {
-		return &ErrNoResults{}
+		return &NoResultsError{}
 	}
 
 	// Compute dynamic height.
@@ -217,7 +217,7 @@ func GenerateComparisonChart(suites map[string]*BenchmarkSuite, outPath string) 
 
 	scenarios := collectPresentScenarios(suites)
 	if len(scenarios) == 0 {
-		return &ErrNoResults{}
+		return &NoResultsError{}
 	}
 
 	systems := orderedSystemKeys(suites)

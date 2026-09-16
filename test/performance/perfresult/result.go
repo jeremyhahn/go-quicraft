@@ -285,7 +285,7 @@ func WriteSuiteToStdout(s *BenchmarkSuite) error {
 func WriteSuiteTo(w io.Writer, s *BenchmarkSuite) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
-		return &ErrParseFailure{Detail: fmt.Sprintf("marshal: %v", err)}
+		return &ParseFailureError{Detail: fmt.Sprintf("marshal: %v", err)}
 	}
 
 	if _, err := fmt.Fprintln(w, SentinelBegin); err != nil {
@@ -308,11 +308,11 @@ func WriteSuiteTo(w io.Writer, s *BenchmarkSuite) error {
 func ReadSuiteFromOutput(output []byte) (*BenchmarkSuite, error) {
 	beginIdx := bytes.Index(output, []byte(SentinelBegin))
 	if beginIdx < 0 {
-		return nil, &ErrNoSentinel{}
+		return nil, &NoSentinelError{}
 	}
 	endIdx := bytes.Index(output[beginIdx:], []byte(SentinelEnd))
 	if endIdx < 0 {
-		return nil, &ErrNoSentinel{}
+		return nil, &NoSentinelError{}
 	}
 
 	jsonData := output[beginIdx+len(SentinelBegin) : beginIdx+endIdx]
@@ -320,7 +320,7 @@ func ReadSuiteFromOutput(output []byte) (*BenchmarkSuite, error) {
 
 	var suite BenchmarkSuite
 	if err := json.Unmarshal(jsonData, &suite); err != nil {
-		return nil, &ErrParseFailure{Detail: fmt.Sprintf("unmarshal: %v", err)}
+		return nil, &ParseFailureError{Detail: fmt.Sprintf("unmarshal: %v", err)}
 	}
 
 	return &suite, nil

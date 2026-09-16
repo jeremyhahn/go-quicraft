@@ -14,36 +14,36 @@
 
 package perfresult
 
-// ErrNoResults indicates that no benchmark results were collected.
-type ErrNoResults struct{}
+// NoResultsError indicates that no benchmark results were collected.
+type NoResultsError struct{}
 
-func (e *ErrNoResults) Error() string {
+func (e *NoResultsError) Error() string {
 	return "no benchmark results collected"
 }
 
-// ErrParseFailure indicates that JSON parsing of benchmark output failed.
-type ErrParseFailure struct {
+// ParseFailureError indicates that JSON parsing of benchmark output failed.
+type ParseFailureError struct {
 	Detail string
 }
 
-func (e *ErrParseFailure) Error() string {
+func (e *ParseFailureError) Error() string {
 	return "failed to parse benchmark output: " + e.Detail
 }
 
-// ErrNoSentinel indicates that the sentinel markers were not found
+// NoSentinelError indicates that the sentinel markers were not found
 // in the benchmark output.
-type ErrNoSentinel struct{}
+type NoSentinelError struct{}
 
-func (e *ErrNoSentinel) Error() string {
+func (e *NoSentinelError) Error() string {
 	return "sentinel markers not found in benchmark output"
 }
 
-// ErrSystemUnknown indicates that the specified benchmark system
+// UnknownSystemError indicates that the specified benchmark system
 // is not registered.
-type ErrSystemUnknown struct {
+type UnknownSystemError struct {
 	System string
 }
 
-func (e *ErrSystemUnknown) Error() string {
+func (e *UnknownSystemError) Error() string {
 	return "unknown benchmark system: " + e.System
 }
