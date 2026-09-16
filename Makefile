@@ -1887,6 +1887,7 @@ release-alpha:
 	"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
 	"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
 	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
+	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)"
 	@want="agent-$$REL_REPO"; got="$$(git log -1 --format='%an')"; \
 	test "$$got" = "$$want" || { echo "ERROR: the release commit is authored by '$$got', not '$$want'. AGENT_GIT did not write as this repo's agent; nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; exit 1; }
 	@test "$$(git cat-file -t "$$REL_VERSION")" = tag || { echo "ERROR: $$REL_VERSION is a lightweight tag; releases are annotated and signed. Nothing has been pushed."; exit 1; }
@@ -1895,8 +1896,8 @@ release-alpha:
 	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-commit HEAD >/dev/null 2>&1 || { echo "ERROR: the release commit's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
 	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-tag "$$REL_VERSION" >/dev/null 2>&1 || { echo "ERROR: tag $$REL_VERSION's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
 	exit $$rc
-	"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION"
-	@echo "Released $$REL_VERSION (signed, annotated, single tag pushed)"
+	"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION"
+	@echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically)"
 
 deps-latest:
 	@GOWORK=off sh -c ' \
