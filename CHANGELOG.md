@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0-alpha] - 2026-09-16
+
 ### Added
 
 - **`SnapshotChunkError` and `SnapshotSizeMismatchError` (#193).** The three
@@ -51,6 +53,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timeout` and took the run down; the seed retries through a re-resolved
   leader on the warmup budget. With it, the first complete four-system
   capture — `profiles/ci-node-2` — is on record.
+
+- **The release cuts the `test/performance` module tag in lockstep (#195).**
+  `release-alpha` only ever pushed the root tag, so
+  `github.com/jeremyhahn/go-quicraft/test/performance@vX.Y.Z` never existed;
+  go-qrdb's four `test/performance/*` modules resolved it only from a warm
+  module cache. The nested tag is now cut on the same commit and pushed
+  atomically with the root's. (`test/performance/v0.0.0`, which those modules
+  pin today, was deleted by mistake on 2026-09-15 and restored at its original
+  commit with a byte-identical module hash on 2026-09-16.)
+
+- **The transport test fixture dials on its own budget (#196).**
+  `TestGetConnectionReusesExisting` timed out at 5.01s dialing loopback on a
+  saturated CI runner. Production's 5s dial bound is a liveness budget backed
+  by Raft retransmission; a test that dials directly has none, so the
+  internal transport `Config` gains `DialTimeout` (default unchanged, validated
+  positive, and `HandshakeIdleTimeout` follows it) and the fixture runs with
+  60s. Two tests whose subject is a dial that must fail opt back into the
+  production figure.
 
 - **Dependencies (#188).** `golang.org/x/crypto` v0.57.0, `x/sync` v0.23.0,
   `x/sys` v0.48.0 (read before bumping: a go.mod update, a panic on negative
