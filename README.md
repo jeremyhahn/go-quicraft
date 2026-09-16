@@ -619,34 +619,37 @@ the same way whether it found something or could not reach the service. Run
 
 ## Testing
 
-QuicRaft has 6,500+ test functions and 37 fuzz targets across 27 packages.
+QuicRaft has 7,500+ test functions and 37 fuzz targets across 32 packages
+(24 of them under `pkg`).
 
 ### Test Coverage
 
 The Makefile enforces one floor, `COVER_MIN = 91`, and applies it to every
 coverage target rather than tuning a threshold per package. The module total
-clears it. Several packages measured on their own do not:
+clears it. Two library packages measured on their own do not:
 
 | Package | Coverage |
 |---------|----------|
 | `pkg/internal/registry` | 78.4% |
-| `pkg/internal/transport` | 88.8% |
-| `pkg/internal/engine` | 89.1% |
-| `pkg/logdb/waldb` | 89.2% |
-| `pkg/logdb` | 90.0% |
-| `pkg/batch` | 90.5% |
-| `pkg` | 90.8% |
-| **Module total** | **91.2%** |
+| `pkg/logdb` | 89.1% |
+| `pkg/internal/engine` | 90.6% |
+| `pkg/internal/transport` | 91.1% |
+| `pkg/logdb/waldb` | 91.9% |
+| `pkg` | 92.3% |
+| **Module total** | **92.4%** |
 
-Measured at 0.5.1-alpha with `go test -coverprofile ./...`, which is the scope
+Measured at 0.11.0-alpha with `go test -coverprofile ./...`, which is the scope
 `make coverage` uses: no build tags, so the integration and fault-injection
-suites are excluded and only the code they exercise indirectly shows up.
+suites are excluded and only the code they exercise indirectly shows up. The
+`test/*` helper packages (proposer, errfs, membership, netport, lockedmem)
+score lower on their own because their callers are the tagged suites.
 
-`pkg/internal/registry` is 37 statements, so a single uncovered line moves it
-several points. The gaps that matter are the WAL, the QUIC transport and the
-engine pipeline, and they are worth stating rather than rounding away: those
-are the layers whose failure modes are hardest to recover from. Raising them is
-tracked work, not a settled state.
+`pkg/internal/registry` is small enough that a single uncovered line moves it
+several points, and its two uncovered methods (`RegisterIfAbsent`,
+`CompareAndRegister`) are exercised by `pkg`'s message-handler tests rather
+than its own. The WAL, the QUIC transport and the engine pipeline — the layers
+whose failure modes are hardest to recover from — now clear the floor on their
+own.
 
 ```bash
 # Unit tests (run on host)
