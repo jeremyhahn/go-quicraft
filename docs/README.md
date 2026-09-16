@@ -1,5 +1,8 @@
 # QuicRaft Documentation
 
+> **Status: REFERENCE** · Scope: the index of this repository's documentation ·
+> Last verified: 2026-09-15
+
 Technical documentation for the QuicRaft multi-group Raft consensus library.
 
 Documentation follows the **feature-folder convention**: every implemented

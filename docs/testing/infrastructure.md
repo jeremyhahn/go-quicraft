@@ -1,5 +1,9 @@
 # Testing Infrastructure
 
+> **Status: NORMATIVE** · Scope: go-quicraft's test suites, build tags, injectors
+> and gates — `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-09-15
+> Conflicts with this document are defects. Fix them here first.
+
 This document describes the frameworks: what each suite is built out of, which
 build tag gates it, and why the gates are shaped the way they are. For the
 day-to-day commands and unit-test patterns, see [Testing Overview](overview.md).
@@ -52,10 +56,10 @@ Four packages under `test/integration/`, all behind `//go:build integration`:
 
 | Package | Tests | Covers |
 |---------|-------|--------|
-| `raft/` | 30 | Elections, replication, failover, snapshots, multi-shard, 3N and 5N |
-| `host/` | 43 | Public Host API, LeaseRead, membership change, rolling restart, snapshot under load |
-| `e2e/` | 63 | Cluster formation, partitions, quorum loss, barrier encryption, node replacement |
-| `linearizability/` | 19 | Porcupine verification and the chaos soaks |
+| `raft/` | 31 | Elections, replication, failover, snapshots, multi-shard, 3N and 5N |
+| `host/` | 45 (+1 under `quicraft_netfault`) | Public Host API, LeaseRead, membership change, rolling restart, snapshot under load, reads against a halted shard |
+| `e2e/` | 60 (+5 under `quicraft_netfault`) | Cluster formation, partitions, quorum loss, barrier encryption, node replacement |
+| `linearizability/` | 26 | Porcupine verification, the chaos soaks, the read-your-writes soak and the incarnation-key reproduction (#186) |
 
 `make integration-test` builds the devcontainer and runs all four inside it.
 `make ci-integration` runs the same suite on the host, byte-identical to the
@@ -246,7 +250,7 @@ through an explicit `stop(nil)`, so the artefact has no way to occur there
 
 ### Linearizability
 
-`test/integration/linearizability`, Porcupine-based, 19 tests. Clients issue
+`test/integration/linearizability`, Porcupine-based, 26 tests. Clients issue
 alternating put/get operations against a KV state machine while faults are
 applied, and the recorded history is checked for a valid sequential ordering.
 
@@ -483,14 +487,15 @@ Full rationale and interpretation guidance:
 [Benchmark Regression Testing](../testing/benchmarking.md) and
 [Performance Architecture](../multi-group-host/engineering.md).
 
-## Numbers, as of 0.5.1-alpha
+## Numbers, as of 0.11.0-alpha
 
-- ~6,300 top-level test functions across the 25 packages under `pkg/`
-- 155 integration test functions (151 under `integration`, 4 more under
+- ~6,500 top-level test functions across the 24 packages under `pkg/`
+  (7,553 across the module)
+- 168 integration test functions (162 under `integration`, 6 more under
   `quicraft_netfault`)
-- 37 fuzz targets, all seeded, 39 committed corpus files
+- 37 fuzz targets in six packages, all seeded, 39 committed corpus files
 - 36 errfs tests: 23 injecting into the WAL and LogDB, 13 testing the injector
-- 19 linearizability tests, 7 netfault injector tests
+- 26 linearizability tests, 7 netfault injector tests
 - Coverage floor: 91%, one threshold, enforced by the Makefile and again in CI
 
 Counts drift. Regenerate them with `git grep -cE '^func Test'` rather than

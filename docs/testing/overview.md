@@ -1,5 +1,8 @@
 # Testing Overview
 
+> **Status: REFERENCE** · Scope: how this repository's suites are organised and
+> run — `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-09-15
+
 ## Philosophy
 
 Tests are written to catch real regressions, not to pad coverage numbers. Two
@@ -44,7 +47,8 @@ Unit tests:
 ### Integration and E2E Tests
 
 Four packages under `test/integration/`, all gated by `//go:build integration`:
-`raft/` (30 tests), `host/` (43), `e2e/` (63) and `linearizability/` (19).
+`raft/` (31 tests), `host/` (45), `e2e/` (60, plus 6 more behind
+`quicraft_netfault`) and `linearizability/` (26).
 There is no bootstrap suite and no `integration-test-bootstrap` target.
 
 | Makefile Target                  | Suite                     | Description                              |

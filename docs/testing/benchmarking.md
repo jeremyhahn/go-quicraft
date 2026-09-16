@@ -1,5 +1,8 @@
 # Benchmark Regression Testing
 
+> **Status: REFERENCE** · Scope: `make bench-compare` / `make bench-baseline` and
+> `scripts/bench-compare.sh` · Last verified: 2026-09-15
+
 CLAUDE.md requires that any change to the hot path (append, replicate, apply) be
 benchmarked. This document describes the harness that makes that requirement
 enforceable, and -- just as importantly -- explains why the obvious way of doing
