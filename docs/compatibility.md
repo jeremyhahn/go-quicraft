@@ -1,7 +1,7 @@
 # Compatibility and Upgrades
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-08-19
+> Last verified: 2026-09-15
 > Conflicts with this document are defects. Fix them here first.
 
 This is a **cross-feature** document. It spans `pkg/proto`, the WAL,
@@ -49,7 +49,10 @@ exact version and upgrade deliberately.
 release pipelines never completed, so neither was published. Both tags stay
 where they are rather than being moved: module versions are immutable, go-qrdb
 had already recorded `v0.4.0-alpha` in its `go.sum`, and repointing a checksummed
-tag fails a downstream build with a security error. **Depend on `v0.5.1-alpha`.**
+tag fails a downstream build with a security error. Of that pair, depend on
+`v0.5.1-alpha`; the current release is **`v0.11.0-alpha`** (2026-09-13), and a
+consumer moving to it from anything before `v0.11.0-alpha` takes the `pkg/enclave`
+deletion and the `Credentials.Secret` retype described in the CHANGELOG (#54, #41).
 
 `v0.5.1-alpha` carries identical library content to `v0.5.0-alpha` plus two
 fixes to the release gate itself, so the breaking format changes described in
