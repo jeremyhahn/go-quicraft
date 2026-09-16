@@ -30,6 +30,20 @@ add/remove. Everything else below is the supporting vocabulary for those — the
 proposal and read paths that drive a started shard, the lifecycle that starts
 and stops the process, and the types those signatures name.
 
+### Naming: the `Get` prefix is a recorded exception
+
+`go-style.md` says getters take no `Get` prefix. Ten `Host` methods carry one
+— `GetNewSession`, `GetNewSessionWithOwner`, `GetNoOPSession`,
+`GetShardMembership`, `GetShardInfo`, `GetLeaderID`, `GetLeaderIDAndTerm`,
+`GetNodeHostInfo`, `GetLogReader`, `GetLogRange` — and they are kept on
+purpose (owner ruling 2026-09-15). Four are dragonboat's own names, which is
+what `contrib/dragonboat` exists to present, and go-qrdb calls three of them
+directly. There is no deprecation policy in the portfolio, so a rename would
+be a breaking MINOR with no alias period, bought for convention alone. New
+methods do not take the prefix; these ten are the exception, not a pattern.
+The `config` getters over `*bool` fields with defaults (`GetCheckQuorum`,
+`GetPreVote`, `GetOrderedConfigChange`, `GetNonceTracking`) are protobuf-style
+optional-field accessors and are not getters in the convention's sense.
 
 Source: `github.com/jeremyhahn/go-quicraft/pkg`
 
