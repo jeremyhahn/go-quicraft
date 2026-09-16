@@ -36,7 +36,8 @@ const (
 	// connectionCleanupInterval is how often stale connections are checked.
 	connectionCleanupInterval = 30 * time.Second
 
-	// dialTimeout is the maximum time for a single dial attempt.
+	// dialTimeout is the default maximum time for a single dial attempt;
+	// Config.DialTimeout overrides it (test fixtures do, production does not).
 	dialTimeout = 5 * time.Second
 
 	// streamOpenTimeout is the maximum time for a single OpenStreamSync on
@@ -164,7 +165,7 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 	// eviction and re-dial, which is self-correcting.
 	dialEpoch := t.knownPeerEpoch(target)
 
-	ctx, cancel := context.WithTimeout(t.shutdownCtx, dialTimeout)
+	ctx, cancel := context.WithTimeout(t.shutdownCtx, t.cfg.DialTimeout)
 	defer cancel()
 
 	clientTLS := t.tlsPair.client.Clone()

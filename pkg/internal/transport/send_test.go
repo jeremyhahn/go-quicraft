@@ -2190,7 +2190,9 @@ func TestSendBatch_WithMetricsAndDebugLogging(t *testing.T) {
 // the QUIC dial to fail immediately.
 
 func TestSendBatch_DirectWriteErrorViaConnectionClose(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
+	// The re-dial to the stopped peer must fail, and fail on production's
+	// budget; see withProductionDialBudget.
+	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler(), withProductionDialBudget)
 	defer cleanup()
 
 	t2Addr := t2.Addr().String()

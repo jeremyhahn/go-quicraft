@@ -755,3 +755,25 @@ func TestAcceptLoop_GlobalConnectionLimitRejects(t *testing.T) {
 	default:
 	}
 }
+
+// TestConfigValidate_RejectsNegativeDialTimeout pins that a DialTimeout below
+// zero is refused at construction rather than producing a transport whose
+// every dial context is already expired (#196). Zero is the "use the default"
+// value and is filled in by SetDefaults before Validate sees it.
+func TestConfigValidate_RejectsNegativeDialTimeout(t *testing.T) {
+	cfg := Config{ListenAddress: "127.0.0.1:0", MTLSConfig: testMTLSConfig(t)}
+	cfg.SetDefaults()
+	if cfg.DialTimeout != dialTimeout {
+		t.Fatalf("SetDefaults left DialTimeout = %v, want the %v default", cfg.DialTimeout, dialTimeout)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("defaulted config must validate, got %v", err)
+	}
+	cfg.DialTimeout = -1
+	if err := cfg.Validate(); !errors.Is(err, ErrInvalidDialTimeout) {
+		t.Fatalf("Validate with negative DialTimeout = %v, want ErrInvalidDialTimeout", err)
+	}
+	if _, err := NewQUICTransport(cfg, newTestHandler(), registry.NewRegistry()); !errors.Is(err, ErrInvalidDialTimeout) {
+		t.Fatalf("NewQUICTransport with negative DialTimeout = %v, want ErrInvalidDialTimeout", err)
+	}
+}

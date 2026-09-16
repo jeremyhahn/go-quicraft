@@ -183,6 +183,10 @@ var (
 	// ErrInvalidMaxSnapshotReceiveRate is returned when MaxSnapshotReceiveRate <= 0.
 	ErrInvalidMaxSnapshotReceiveRate = errors.New("transport: max snapshot receive rate must be > 0")
 
+	// ErrInvalidDialTimeout is returned when DialTimeout is negative after
+	// defaulting: a transport whose every dial context is born expired.
+	ErrInvalidDialTimeout = errors.New("transport: dial timeout must be > 0")
+
 	// ErrInvalidMaxConcurrentSnapshotRecv is returned when MaxConcurrentSnapshotRecv <= 0.
 	ErrInvalidMaxConcurrentSnapshotRecv = errors.New("transport: max concurrent snapshot recv must be > 0")
 
@@ -374,6 +378,19 @@ type Config struct {
 	// the leader still holds and reuses it. Default: 30s.
 	StreamReadIdleTimeout time.Duration
 
+	// DialTimeout bounds one dial attempt: the QUIC handshake with mTLS to a
+	// peer that has no live connection. A dial that expires drops the batch
+	// it was for, and Raft retransmits, so the production figure is a
+	// liveness budget, not a correctness one. Default: dialTimeout (5s).
+	//
+	// It is configurable for one reason. A test that calls the dial path
+	// directly has no retransmission behind it: a handshake that exceeds the
+	// budget fails the test outright, and under CI saturation (-race,
+	// coverage, every package in parallel) a cold loopback handshake has
+	// been traced at 4.3s (#142) and past 5s (#196). The test fixture
+	// therefore runs with a wider budget; nothing in production sets this.
+	DialTimeout time.Duration
+
 	// RevocationConfig holds optional certificate revocation checking
 	// configuration. When non-nil, a revocation.Checker is created and
 	// wired into the TLS VerifyConnection callback to reject revoked peer
@@ -421,6 +438,9 @@ func connectionReceiveWindow(maxMessageRecvMemory int64, maxIncomingConns int) u
 func (c *Config) SetDefaults() {
 	if c.StreamPoolSize == 0 {
 		c.StreamPoolSize = defaultStreamPoolSize
+	}
+	if c.DialTimeout == 0 {
+		c.DialTimeout = dialTimeout
 	}
 	if c.MaxStreamPoolSize == 0 {
 		c.MaxStreamPoolSize = defaultMaxStreamPoolSize
@@ -477,6 +497,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxSnapshotReceiveRate <= 0 {
 		return ErrInvalidMaxSnapshotReceiveRate
+	}
+	if c.DialTimeout <= 0 {
+		return ErrInvalidDialTimeout
 	}
 	if c.MaxConcurrentSnapshotRecv <= 0 {
 		return ErrInvalidMaxConcurrentSnapshotRecv

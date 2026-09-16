@@ -540,8 +540,13 @@ func NewQUICTransport(
 	}
 
 	qcfg := &quic.Config{
-		MaxIdleTimeout:             30 * time.Second,
-		HandshakeIdleTimeout:       5 * time.Second,
+		MaxIdleTimeout: 30 * time.Second,
+		// The handshake idle limit follows the dial budget: quic-go abandons
+		// a handshake that idles this long and caps the whole handshake at
+		// twice it, so a dial context wider than this could never be
+		// reached. Production's DialTimeout is the 5s this always was; the
+		// test fixture's wider budget widens both together (#196).
+		HandshakeIdleTimeout:       cfg.DialTimeout,
 		MaxIncomingStreams:         int64(maxIncomingStreams),
 		MaxIncomingUniStreams:      -1,
 		KeepAlivePeriod:            10 * time.Second,

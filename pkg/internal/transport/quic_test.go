@@ -161,6 +161,23 @@ func transportPair(t testing.TB, deploymentID uint64) (
 // non-default transport tuning (benchmarks, in particular) reuse the same
 // loopback + mTLS + registry setup instead of building their own.
 // Returns (sender, receiver, cleanup).
+// testDialTimeout is the dial budget the transport pair fixture runs with.
+// Production's 5s is a liveness budget backed by Raft retransmission; a test
+// that dials directly has no retransmission, so a handshake slowed past 5s by
+// CI saturation failed the test rather than the batch (#196: 5.01s on a
+// loaded runner, a Makefile-only commit; #142 had traced 4.3s before). The
+// budget here is wide enough that only a broken transport reaches it. Tests
+// that need the production figure -- the first-contact bound, the shutdown
+// promptness check -- build their own Config and get the default.
+const testDialTimeout = 60 * time.Second
+
+// withProductionDialBudget is the fixture option for a test whose subject is a
+// dial that must FAIL -- a stopped peer, a port nothing listens on. Such a test
+// waits for the handshake to give up, and it should give up on production's
+// terms: 60s would turn a five-second failure path into a minute. Two tests
+// use it; a test that dials a live peer never should.
+func withProductionDialBudget(c *Config) { c.DialTimeout = dialTimeout }
+
 func transportPairWith(
 	t testing.TB,
 	deploymentID uint64,
@@ -177,11 +194,13 @@ func transportPairWith(
 		ListenAddress: "127.0.0.1:0",
 		DeploymentID:  deploymentID,
 		MTLSConfig:    mtls,
+		DialTimeout:   testDialTimeout,
 	}
 	cfg2 := Config{
 		ListenAddress: "127.0.0.1:0",
 		DeploymentID:  deploymentID,
 		MTLSConfig:    mtls,
+		DialTimeout:   testDialTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg1)

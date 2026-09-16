@@ -1101,7 +1101,9 @@ func TestSendSnapshot_SuccessWithWriteDeadlines(t *testing.T) {
 // This ensures that Stop() -> ShutdownAndWait() does not block after
 // a failed snapshot send.
 func TestSendSnapshot_TrackerReleasedOnWriteError(t *testing.T) {
-	t1, _, _, _, cleanup := transportPair(t, 42)
+	// The dial to a port nothing listens on must fail, and fail on
+	// production's budget; see withProductionDialBudget.
+	t1, _, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler(), withProductionDialBudget)
 	defer cleanup()
 
 	// Register a target that resolves but will not respond to snapshots.
