@@ -191,32 +191,51 @@ func newJoiningEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node 
 
 // TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot pins the join
 // bootstrap window. A shard started with join=true and empty initial members
-// registers no addresses, so requiring a registry entry for the SENDER rejects
-// the leader's bootstrap snapshot — the only message that can deliver the
+// holds no membership, so the committed-membership binding rejects the
+// leader's bootstrap snapshot — the only message that can deliver the
 // membership — and blocks catch-up permanently.
 //
-// What the fix authorizes, and nothing more: for a shard the Host itself
-// marked joining, the sender's address may come from the membership the
-// snapshot carries INSTEAD of the registry, and it must still be covered by
-// the connection's verified peer certificate. The window closes on the first
-// accepted snapshot.
+// What the window authorizes, and nothing more: for a shard the Host itself
+// marked joining, a sender named by the JOIN ANCHOR the operator started the
+// shard with (Config.MemberIdentities) is admitted when the connection's
+// authenticated identity is the one the anchor binds it to. The snapshot's own
+// membership is not consulted — it used to be, and it let any certificate
+// holder bootstrap a joiner (#197 A). The window closes on the first accepted
+// snapshot.
 func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	const leaderAddr = "127.0.0.1:7001"
+	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
+	const strangerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
 
 	f := newSnapshotReceiveFixture(t, nil)
 	node := newJoiningEngineNode(t, 1, 2)
 	f.engine.LoadNode(node)
 	t.Cleanup(func() { f.engine.UnloadNode(1) })
 	f.host.markShardJoining(1)
+	f.host.setShardAnchor(1, map[uint64]string{1: leaderID})
 
 	addrs := map[uint64]string{1: leaderAddr, 2: "127.0.0.1:7002"}
 	chunks := snapshotChunkFor(1, 2, 1, 500, 10, addrs, []byte("bootstrap-membership"))
+	for i := range chunks {
+		chunks[i].Membership.Identities = map[uint64]string{1: leaderID, 2: fixtureIdentity}
+	}
 
-	// Only the address the snapshot claims for the sender is covered by the
-	// connection certificate: authorization stays bound to the QUIC peer.
-	certCovers := certCovering(leaderAddr)
+	// A holder of a valid cluster certificate that covers the leader's
+	// address but is not the leader's keypair: the shape that used to
+	// bootstrap a joiner. Refused.
+	err := f.handler.HandleSnapshot(chunks, certCoveringAs(strangerID, leaderAddr))
+	var authErr *UnauthorizedMessageError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("a snapshot from a certificate holder the join anchor does not name "+
+			"was accepted (%v): any host with a cluster certificate could bootstrap "+
+			"a joining shard", err)
+	}
+	if f.host.isShardJoining(1) != true {
+		t.Fatal("the join window closed on a refused snapshot")
+	}
 
-	if err := f.handler.HandleSnapshot(chunks, certCovers); err != nil {
+	// The anchored leader, on a connection carrying its identity.
+	if err := f.handler.HandleSnapshot(chunks, certCoveringAs(leaderID, leaderAddr)); err != nil {
 		t.Fatalf("joining replica rejected its own bootstrap snapshot: %v", err)
 	}
 	if _, getErr := f.logdb.GetSnapshot(1, 2); getErr != nil {

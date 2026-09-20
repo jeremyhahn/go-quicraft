@@ -183,7 +183,7 @@ Source: `pkg/config/config.go`
 | `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Join-only: never list it in the `StartShard` members map — see below |
 | `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only). Join-only: never list it in the `StartShard` members map — see below |
 | `Witness` | WitnessConfig | zero | Bootstrap seed for the shard's replicated witness policy. After bootstrap the policy lives in `proto.Membership` |
-| `MemberIdentities` | map[uint64]string | `nil` | Bootstrap seed for committed node identities. **Every founder must pass an identical map** |
+| `MemberIdentities` | map[uint64]string | `nil` | **Required on a host with a transport.** Founders: the committed node identity of every member, an identical map on each. Joiners: the anchor — the replicas the bootstrap snapshot may come from. Any start: entries beyond the members map are the operator anchor, how a restarted replica that missed an `AddNode` is told who now leads |
 | `CheckQuorum` | *bool | `nil` = enabled | Leader steps down on quorum loss (safety-critical). Set with `config.BoolPtr(false)` to disable |
 | `PreVote` | *bool | `nil` = enabled | Pre-vote prevents disruptive elections (safety-critical). Set with `config.BoolPtr(false)` to disable |
 | `ElectionRTT` | uint64 | `10` | Election timeout in RTT multiples (must be >= 5) |
@@ -267,7 +267,6 @@ Source: `pkg/config/transportconfig.go`
 | `Enable0RTT` | bool | `false` | QUIC 0-RTT (replayable; trusted networks only) |
 | `DisableCompression` | bool | `false` | Disable message batch compression |
 | `TransportDisabled` | bool | `false` | Single-node mode. Set by `WithoutTransport()`; relaxes the mTLS requirement |
-| `RequireMemberIdentity` | bool | `false` | Drop quorum-bearing traffic from members with no committed node identity. See [Compatibility](../compatibility.md#enabling-requirememberidentity) before enabling |
 
 ### MTLSConfig
 
@@ -886,7 +885,7 @@ Source: `pkg/host.go`
 
 `Host.Drain()` transitions the host into drain mode:
 
-1. Sets `draining` flag atomically via `CompareAndSwap` (idempotent -- second call returns immediately)
+1. Sets the `draining` flag, then elects ONE drain attempt through a `sync.Once`; a concurrent second caller (`Close`, typically) blocks until that attempt finishes and returns the same result, and a call after it has finished returns the recorded result at once
 2. New `Propose()` and `ReadIndex()` calls return `ErrDraining`
 3. Takes a fast path and returns immediately when no operations are pending
 4. Otherwise blocks on a channel that `completePendingOp` closes when the pending-operation counter reaches zero -- event-driven, not polled -- against a single `ShutdownTimeout` timer

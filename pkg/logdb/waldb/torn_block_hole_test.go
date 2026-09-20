@@ -243,14 +243,14 @@ func TestSegment_ZeroPaddingBoundaryIsExact(t *testing.T) {
 		second := bytes.Repeat([]byte{0x5A}, 100)
 
 		file := make([]byte, blockSize+recordHeaderSize+len(second))
-		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, first)
+		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, 0, first)
 		if err != nil {
 			t.Fatalf("encodeRecord(first): %v", err)
 		}
 		if got := blockSize - n; got != recordHeaderSize+1 {
 			t.Fatalf("fixture: zero run is %d bytes, want %d", got, recordHeaderSize+1)
 		}
-		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, second); err != nil {
+		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, 0, second); err != nil {
 			t.Fatalf("encodeRecord(second): %v", err)
 		}
 		path := filepath.Join(dir, segmentFilename(1))
@@ -313,11 +313,11 @@ func TestSegment_RepairOffsetIsTheFirstHoleNotTheLast(t *testing.T) {
 	//          would latch onto.
 	// Block 2: data, which is what turns the zeros below into holes at all.
 	file := make([]byte, 3*blockSize)
-	firstHole, err := encodeRecord(file[0:blockSize], RecordFull, 0, payload)
+	firstHole, err := encodeRecord(file[0:blockSize], RecordFull, 0, 0, payload)
 	if err != nil {
 		t.Fatalf("encodeRecord(block 0): %v", err)
 	}
-	if _, err := encodeRecord(file[2*blockSize:], RecordFull, 0, payload); err != nil {
+	if _, err := encodeRecord(file[2*blockSize:], RecordFull, 0, 0, payload); err != nil {
 		t.Fatalf("encodeRecord(block 2): %v", err)
 	}
 	if blockSize-firstHole <= recordHeaderSize {
@@ -410,14 +410,14 @@ func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
 	t.Run("zero_remainder_is_padding", func(t *testing.T) {
 		dir := t.TempDir()
 		file := make([]byte, 2*blockSize)
-		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, payload)
+		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, 0, payload)
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}
 		if blockSize-n != remainder {
 			t.Fatalf("fixture: remainder is %d bytes, want %d", blockSize-n, remainder)
 		}
-		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, payload); err != nil {
+		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, 0, payload); err != nil {
 			t.Fatalf("encodeRecord(block 1): %v", err)
 		}
 		path := filepath.Join(dir, segmentFilename(1))
@@ -445,12 +445,12 @@ func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
 	t.Run("interior_non_zero_remainder_stops_recovery", func(t *testing.T) {
 		dir := t.TempDir()
 		file := make([]byte, 2*blockSize)
-		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, payload)
+		n, err := encodeRecord(file[0:blockSize], RecordFull, 0, 0, payload)
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}
 		copy(file[n:blockSize], []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01})
-		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, payload); err != nil {
+		if _, err := encodeRecord(file[blockSize:], RecordFull, 0, 0, payload); err != nil {
 			t.Fatalf("encodeRecord(block 1): %v", err)
 		}
 		path := filepath.Join(dir, segmentFilename(1))
@@ -492,7 +492,7 @@ func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
 	t.Run("trailing_non_zero_remainder_is_truncated", func(t *testing.T) {
 		dir := t.TempDir()
 		buf := make([]byte, blockSize)
-		n, err := encodeRecord(buf, RecordFull, 0, payload)
+		n, err := encodeRecord(buf, RecordFull, 0, 0, payload)
 		if err != nil {
 			t.Fatalf("encodeRecord: %v", err)
 		}

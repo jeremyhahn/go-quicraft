@@ -17,6 +17,7 @@ package netport
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -464,7 +465,10 @@ func TestParsePortRange(t *testing.T) {
 // PID the kernel can produce, including the multiplication overflowing.
 func TestStartOffsetStaysInTheWindow(t *testing.T) {
 	const span = 4536
-	for _, pid := range []int{0, 1, 2, 999, 4194304, 1 << 22, 1<<31 - 1, 1<<62 - 1} {
+	// The largest PID is math.MaxInt rather than a 62-bit literal so the
+	// table compiles on a 32-bit int; the overflow case is still exercised
+	// because the product with the scramble constant exceeds 32 bits.
+	for _, pid := range []int{0, 1, 2, 999, 4194304, 1 << 22, 1<<31 - 1, math.MaxInt} {
 		off := startOffset(pid, span)
 		if off < 0 || off >= span {
 			t.Fatalf("startOffset(%d, %d) = %d, outside [0, %d)", pid, span, off, span)

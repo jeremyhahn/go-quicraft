@@ -141,6 +141,19 @@ type RequestState struct {
 	// committedDone prevents double-commitNotify. The first call wins;
 	// subsequent calls are no-ops.
 	committedDone atomic.Bool
+
+	// session is the Session whose series this request holds in flight, nil
+	// for every request that is not a session-managed proposal. sessionSeries
+	// is that series. Whichever of complete-with-error or Release runs first
+	// swaps the pointer out and releases the reservation; a successful
+	// completion leaves it for Session.ProposalCompleted, which releases the
+	// same series, so the later Release finds either nil or a series the
+	// session has already moved past. Set by proposeEntry BEFORE the request
+	// is registered — a completion can run the moment it is, and one that
+	// found no binding would leave the reservation held — and reset by
+	// newRequestState.
+	session       atomic.Pointer[Session]
+	sessionSeries atomic.Uint64
 }
 
 // NewRequestStatePool creates a sync.Pool that produces RequestState objects
@@ -179,6 +192,8 @@ func newRequestState(pool *sync.Pool, key uint64, deadline time.Time, trackLaten
 	rs.outstanding.Store(0)
 	rs.completed.Store(false)
 	rs.committedDone.Store(false)
+	rs.session.Store(nil)
+	rs.sessionSeries.Store(0)
 	// Drain any stale result from a previous use.
 	select {
 	case <-rs.completedC:
@@ -262,9 +277,15 @@ func (rs *RequestState) ApplyResultC() <-chan RequestResult {
 	return rs.completedC
 }
 
-// Release marks the RequestState as released by the caller. Release is
-// idempotent; subsequent calls are safe no-ops. After Release, Result
-// returns ErrReleased and ResultC returns nil.
+// Release marks the RequestState as released by the caller. It is called
+// EXACTLY ONCE, by the caller that holds the RequestState. The object is
+// pooled, so a second call is a use-after-free whether it comes later or
+// concurrently: once the first call has recycled the object and a new
+// request has been built on it, nothing can tell a stale second call from
+// that request's own, and a caller descheduled before its first instruction
+// is exactly that stale call. The pin below narrows the concurrent window
+// to that one interleaving — it cannot close it, and no pooled design can.
+// After Release, Result returns ErrReleased and ResultC returns nil.
 //
 // The object is NOT returned to the pool until both the caller has
 // released it AND every pending-map reference has been removed (see
@@ -275,10 +296,38 @@ func (rs *RequestState) ApplyResultC() <-chan RequestResult {
 // it. The late OnApplied/sweep removes the final reference and recycles
 // the object then.
 func (rs *RequestState) Release() {
+	// Pin the object first, then elect the releaser. The pin is an extra
+	// outstanding reference taken while released is still false, so the
+	// object cannot be recycled under it: tryRecycle needs released set,
+	// which only the CAS below does, and the pin holds the count above zero
+	// until the releaser has finished — in particular across releaseSession,
+	// which the last pending-map releaseRef could otherwise recycle out from
+	// under. A second caller that has already pinned when the first one
+	// wins loses the CAS and touches nothing else; one that has not yet
+	// executed its pin is the use-after-free the contract above excludes.
+	rs.outstanding.Add(1)
 	if !rs.released.CompareAndSwap(false, true) {
+		rs.releaseRef()
 		return
 	}
-	rs.tryRecycle()
+	rs.releaseSession()
+	rs.releaseRef()
+}
+
+// bindSession records that this request holds series in flight on session.
+// Called once, by proposeEntry, before registration.
+func (rs *RequestState) bindSession(session *Session, series uint64) {
+	rs.sessionSeries.Store(series)
+	rs.session.Store(session)
+}
+
+// releaseSession releases the session reservation this request holds, if it
+// still holds one. Safe to call from both the completion and the caller
+// goroutine: the pointer swap elects exactly one releaser.
+func (rs *RequestState) releaseSession() {
+	if s := rs.session.Swap(nil); s != nil {
+		s.endProposal(rs.sessionSeries.Load())
+	}
 }
 
 // acquireRef records that a pending map now holds a reference to this
@@ -306,7 +355,8 @@ func (rs *RequestState) releaseRef() {
 // acquireRef (which is only safe at registration time, before the object
 // is published to a pending map), tryAcquireRef is safe on an object that
 // may be racing recycling: it never increments from zero, and a nonzero
-// count means a pending-map reference still pins the object, so it cannot
+// count means a pending-map reference — or Release's own pin, which holds
+// the count only until the releaser has finished — still pins the object, so it cannot
 // reach tryRecycle's pool.Put — or newRequestState's counter reset — while
 // the new reference is held. An unconditional Add(1) here could instead
 // land on an object already recycled into the pool; if newRequestState
@@ -368,6 +418,13 @@ func (rs *RequestState) complete(result RequestResult) {
 	}
 	if !rs.completed.CompareAndSwap(false, true) {
 		return // already completed
+	}
+	// A failed session proposal releases its series BEFORE the caller can
+	// see the error, because the documented recovery is to retry with the
+	// same session, and that retry must be admitted. A successful one keeps
+	// the reservation until ProposalCompleted advances the series.
+	if result.Err != nil {
+		rs.releaseSession()
 	}
 	select {
 	case rs.completedC <- result:

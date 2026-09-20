@@ -106,7 +106,10 @@
 // asymmetry is why the assertion is >= and not ==.
 package proto
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // WireVersion is the TRANSPORT wire format version. It is written as the first
 // 8 bytes of MessageBatch and into SnapshotChunk.BinVer. Receivers validate it
@@ -163,6 +166,42 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 // size hint and paid for the growth (9.8x), which is the regression the test
 // catches.
 const MaxDecodeMemoryFactor = 8
+
+// MaxTerm is the exclusive upper bound on a Raft term this library adopts from
+// a peer, admits into a snapshot, or opens from persisted state; MaxLogIndex is
+// the same bound for a log index. Nothing bounds either in the wire encoding —
+// both are plain uint64 fields — and the protocol does arithmetic on both:
+// becomeCandidate increments the term, and a restored snapshot's index is the
+// base of Index+1 for the log's first index, every remote's next index and the
+// in-memory log marker. At math.MaxUint64 each of those WRAPS to zero. A term
+// that wrapped lets a replica vote a second time in a term it already voted in
+// (Election Safety), and an index that wrapped puts the log's floor at 0 while
+// the state machine and persisted snapshot sit at the ceiling — and because a
+// snapshot is written to LogDB before raft restores it, the poisoned position
+// survives restart.
+//
+// The two are enforced where each value is ADMITTED: raft.step refuses a wire
+// term at or above MaxTerm; snapshot admission (the transport's chunk
+// validation, raft's InstallSnapshot handler and both LogDB SaveSnapshot and
+// SaveState implementations) refuses a snapshot whose Index or Term is out of
+// range via Snapshot.CheckBounds; and a leader refuses proposals once its log
+// has reached MaxLogIndex. InstallSnapshot is delivered process-locally after
+// the artifact is on disk, so it never passes raft.step's wire gate — which is
+// why the snapshot bound is enforced on its own path rather than inherited.
+//
+// Opening persisted state is held to a HIGHER ceiling (raft.persistedCeiling,
+// a few below math.MaxUint64), not to these bounds: state admitted just below
+// them can be moved by local transitions — the candidate's increment, the
+// leader's no-op — and refusing it at open would turn a legitimate restart into
+// a permanent failure. The headroom between the two is what those transitions
+// spend.
+//
+// A term advances by one per election and an index by one per entry, so no
+// cluster reaches this range by running; only a peer naming it can.
+const (
+	MaxTerm     uint64 = math.MaxUint64 - 1024
+	MaxLogIndex uint64 = math.MaxUint64 - 1024
+)
 
 // MaxAddressLength is the maximum byte length of a node address string
 // in membership changes and config change proposals. Enforced during

@@ -69,10 +69,35 @@ func (s roleState) String() string {
 // term it already voted in) or parks it at a term it can never advance past,
 // removing a voter permanently. One message, either way.
 //
-// A term advances by one per election, so no cluster reaches this range by
-// running. The reserved band is wide enough that arithmetic near it stays
-// obviously safe rather than exactly safe.
-const maxAdoptableTerm = math.MaxUint64 - 1024
+// It is proto.MaxTerm under this package's name: the same bound governs
+// snapshot admission (proto.MaxLogIndex is its index twin), and the two must
+// not drift.
+//
+// RESIDUAL, accepted: a term ONE below the bound is adopted, and the campaign
+// it leads to — at exactly the bound — is refused by every peer, so a shard
+// driven to maxAdoptableTerm-1 can never elect again. No bound avoids this;
+// wherever the line is drawn, the term just below it has no campaignable
+// successor. What matters is who can draw the shard there: only a BOUND sender
+// — a member the configuration names, on its own keypair — since the receive
+// gate admits nothing else, and a member is trusted for liveness by Raft's own
+// assumptions (it can equally stop voting or stop responding). A term reached
+// by running is ~2^64 elections away. The bound therefore closes what an
+// unauthenticated or unnamed peer could do — wrap a term, or strand a voter —
+// and leaves what a compromised member can do where Raft leaves it.
+const maxAdoptableTerm = proto.MaxTerm
+
+// persistedCeiling is the exclusive upper bound on a term or log index this
+// replica will OPEN with, and it is deliberately higher than the admission
+// bound: state that was admitted just below proto.MaxTerm / proto.MaxLogIndex
+// can still move by local transitions — becomeCandidate's increment stops at
+// maxAdoptableTerm, becomeLeader appends its no-op at lastIndex+1, and
+// proposals are refused from proto.MaxLogIndex on (handleLeaderPropose) — so
+// an open check at the admission bound would refuse state the replica itself
+// produced legitimately and turn a restart into a permanent failure. What the
+// open check must refuse is only what the arithmetic cannot survive: a value
+// within a few of math.MaxUint64, where +1 wraps to 0. Everything the local
+// transitions can reach from admitted state sits far below it.
+const persistedCeiling = math.MaxUint64 - 8
 
 // MaxVotingMembers is the maximum number of voting members (remotes +
 // witnesses + self) a shard supports, bounded by the ReadIndex ackBits
@@ -479,6 +504,15 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 	}
 	seed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
 
+	// Refuse to open persisted state the protocol cannot do arithmetic on.
+	// Every admission path bounds these before they are written (see
+	// proto.MaxTerm), so a value here means data from a build that did not,
+	// or a damaged store; either way the only remedy is wipe and resync, and
+	// the shard must fail to start rather than run at the ceiling.
+	if err := checkPersistedBounds(logdb); err != nil {
+		return nil, err
+	}
+
 	rl := newRaftLog(logdb)
 	state, membership := logdb.NodeState()
 
@@ -558,6 +592,34 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 	}
 
 	return r, nil
+}
+
+// checkPersistedBounds refuses recovered state whose term or log position
+// lies at or above proto.MaxTerm / proto.MaxLogIndex. See newRaft.
+func checkPersistedBounds(logdb LogReader) error {
+	ss := logdb.Snapshot()
+	if ss.Index >= persistedCeiling {
+		slog.Error("refusing to open: persisted snapshot index is at the ceiling",
+			"snapshot_index", ss.Index)
+		return proto.ErrLogIndexOutOfRange
+	}
+	if ss.Term >= persistedCeiling {
+		slog.Error("refusing to open: persisted snapshot term is at the ceiling",
+			"snapshot_term", ss.Term)
+		return proto.ErrTermOutOfRange
+	}
+	state, _ := logdb.NodeState()
+	if state.Term >= persistedCeiling {
+		slog.Error("refusing to open: persisted term is at the ceiling",
+			"term", state.Term)
+		return proto.ErrTermOutOfRange
+	}
+	if _, lastIdx := logdb.IndexRange(); lastIdx >= persistedCeiling {
+		slog.Error("refusing to open: persisted log extends to the ceiling",
+			"last_index", lastIdx)
+		return proto.ErrLogIndexOutOfRange
+	}
+	return nil
 }
 
 // initRemotes initializes remote tracking from a membership configuration.
@@ -855,6 +917,20 @@ func (r *raft) becomePreCandidate() {
 // have to be unwound rather than declined.
 func (r *raft) becomeLeader() error {
 	invariant.Assert(r.state != follower, "follower cannot become leader directly")
+	// Leadership appends a no-op at lastIndex+1; a log already at the
+	// admission bound has no room for it, and a leader that could not append
+	// could not commit anything at its term anyway. Declined before any
+	// field is written, like the voting-set check below, so the caller seats
+	// the replica as a follower and nothing is unwound. Unreachable by
+	// running; enforced so the bound holds on every append path.
+	if r.log.lastIndex() >= proto.MaxLogIndex {
+		slog.Error("refusing leadership: the log has reached the protocol's index bound and the leadership no-op cannot be appended",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"last_index", r.log.lastIndex(),
+			"term", r.term)
+		return proto.ErrLogIndexOutOfRange
+	}
 	if n := r.votingBitCount(); n > maxVotingMembers {
 		slog.Error("refusing leadership: voting set exceeds the ReadIndex ackBits word, this shard cannot serve linearizable reads and must not lead",
 			"shard", r.shardID,
@@ -2175,6 +2251,18 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 	if r.transferTarget != noNode {
 		return ErrTransferInProgress
 	}
+	// The log stops growing at the admission bound. A leader whose log would
+	// pass proto.MaxLogIndex with this batch — unreachable by running,
+	// reachable only from admitted state just below it — must not append it,
+	// or the local transitions would carry the index toward the ceiling the
+	// open check refuses. The whole batch is judged, not the current last
+	// index: the engine batches queued proposals, so one check on the
+	// starting point would let a batch straddle the bound. Unreachable in
+	// practice; enforced because the bound is load-bearing for the arithmetic
+	// everywhere else.
+	if last := r.log.lastIndex(); last >= proto.MaxLogIndex || uint64(len(msg.Entries)) > proto.MaxLogIndex-last {
+		return proto.ErrLogIndexOutOfRange
+	}
 
 	// Sanitize entry types before any state mutation. The leader assigns
 	// Term/Index but never inspected Type, so a follower-forwarded wire Propose
@@ -2670,6 +2758,32 @@ func (r *raft) handleAppend(msg proto.Message) error {
 			LogIndex: r.log.committed,
 		})
 		return nil
+	}
+
+	// The admission bound holds for replicated entries as it does for
+	// proposed ones (handleLeaderPropose): a batch whose last entry would sit
+	// above proto.MaxLogIndex is refused outright, or a leader that admitted
+	// state just below the bound could carry a follower's log to the ceiling
+	// the open check refuses. The message's own indexes are checked, not the
+	// local last index, since a conflicting append replaces the tail: the
+	// batch ends at LogIndex+len(Entries). Dropped without a response, as an
+	// unreadable batch is; the leader retries and gets the same answer.
+	if n := uint64(len(msg.Entries)); n > 0 && (msg.LogIndex >= proto.MaxLogIndex || n > proto.MaxLogIndex-msg.LogIndex) {
+		return proto.ErrLogIndexOutOfRange
+	}
+	// And the term bound: an entry's term can never exceed the term of the
+	// leader replicating it (a leader appends at its own term and forwards
+	// older entries at theirs), and msg.Term itself passed the ceiling check
+	// in step. An entry term above msg.Term is a corrupt or hostile batch;
+	// persisting it would poison lastTerm across restarts — a candidate with
+	// a real log could never be up to date against it — and let this replica,
+	// leading later, append entries with decreasing terms. Refused whole,
+	// before the log is touched; an entry with term 0 has no leader that
+	// could have written it and is refused too.
+	for i := range msg.Entries {
+		if term := msg.Entries[i].Term; term == 0 || term > msg.Term {
+			return proto.ErrTermOutOfRange
+		}
 	}
 
 	lastIdx, ok, truncated, err := r.log.tryAppend(msg.LogIndex, msg.LogTerm, msg.Entries)
@@ -3345,6 +3459,20 @@ func snapshotVotingBitCount(m proto.Membership, self uint64) int {
 // same bound — so the cost of refusing is zero and the sender is by definition
 // buggy or hostile.
 func (r *raft) handleSnapshot(msg proto.Message) error {
+	// A peer-chosen position, so a check that fails the MESSAGE rather than an
+	// invariant (see pkg/internal/invariant). The transport's chunk validation
+	// and LogDB admission have already applied the same predicate; this is
+	// the last gate before the position becomes the log's arithmetic base.
+	if err := msg.Snapshot.CheckBounds(); err != nil {
+		slog.Error("dropped install snapshot whose position is outside the protocol range",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"snapshot_index", msg.Snapshot.Index,
+			"snapshot_term", msg.Snapshot.Term,
+			"error", err)
+		return err
+	}
 	if bits := snapshotVotingBitCount(msg.Snapshot.Membership, r.replicaID); bits > maxVotingMembers {
 		slog.Error("dropped install snapshot naming more voting members than the ReadIndex ackBits word can address",
 			"shard", r.shardID,

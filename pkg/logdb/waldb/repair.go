@@ -23,12 +23,13 @@ import (
 
 // Operator-authorized repair of a WAL that recovery refuses to open.
 //
-// Recovery fails closed on ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption
-// and ErrRecordSequenceRegression. The first two mean the same thing: records
-// ABOVE the damage were already acknowledged — proved by a durability generation
-// above them, or by the segment not being the highest-numbered one — so
-// prefix-truncating past them would silently destroy committed entries and roll
-// term/vote backwards. The third means the bytes above the damage carry a
+// Recovery fails closed on ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption,
+// ErrAcknowledgedDataLost and ErrRecordSequenceRegression. The first three mean
+// the same thing: acknowledged records lie in or above the damage — proved by a
+// durability generation above them, by the segment not being the highest-
+// numbered one, or by the survivors' generation start sitting above the damage
+// — so prefix-truncating would silently destroy committed entries and roll
+// term/vote backwards. The fourth means the bytes above the damage carry a
 // generation this writer cannot have produced, so recovery cannot classify them
 // at all. That posture is right, and nothing here changes it — Open still
 // refuses, every time, on its own.
@@ -114,7 +115,8 @@ type RepairResult struct {
 // at the cost of every record above TruncateAt.
 //
 // It is the documented exit from ErrMidSegmentCorruption,
-// ErrNonFinalSegmentCorruption and ErrRecordSequenceRegression. It must be run
+// ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
+// ErrRecordSequenceRegression. It must be run
 // with the database CLOSED — no
 // process may hold the directory — and the node it belongs to should be treated
 // as having lost its most recent writes until it has caught up from its peers.

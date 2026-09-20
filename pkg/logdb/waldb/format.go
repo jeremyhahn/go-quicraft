@@ -91,8 +91,9 @@ const (
 	//
 	// Earlier development commits wrote a 7-byte chunk header under other
 	// numbers, and those bytes are gone with the dev directories that held
-	// them. Today's framing is the 11-byte header
-	// [CRC32:4][Len:2][Type:1][DurSeq:4].
+	// them, as are the 11-byte-header segments written before the generation
+	// start was added (#197). Today's framing is the 15-byte header
+	// [CRC32:4][Len:2][Type:1][DurSeq:4][GenStart:4].
 	walFormatVersion uint32 = 1
 
 	// walFormatSize is the exact on-disk length of the marker.

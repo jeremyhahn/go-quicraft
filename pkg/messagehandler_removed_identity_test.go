@@ -143,28 +143,24 @@ func TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard(t *testing.T)
 	}
 }
 
-// TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone pins the
-// address-only residual, deliberately and explicitly.
+// TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone pins that
+// an empty authenticated identity is never matched against a tombstone.
 //
-// A connection whose peer certificate yields NO identity — the pre-identity
-// deployment the whole compatibility fallback exists for — must fall through to
-// the gates that can judge it, not be matched against a tombstone it cannot be
-// told apart from. An empty-matches-empty rule would deny every such peer on any
-// shard that had ever removed a member, which is a shard-wide outage rather than
-// a security improvement.
-//
-// The cost of that choice is the residual: on a shard whose members carry no
-// committed identities, RemovedIdentities is empty and the removal deny-list
-// remains exactly what it was — a check on the claimed msg.From, evadable by
-// naming another ID. There is no replicated fact available to close it.
+// A connection whose peer certificate yields NO identity cannot be told apart
+// from any other such connection, so an empty-matches-empty rule would classify
+// every identity-less peer as a removed one on any shard that had ever removed
+// a member. Such a peer is refused anyway — a member is authorized by its
+// committed identity and by nothing else (#197 A) — but it must be refused for
+// the reason that is TRUE (missing_identity), not reported as a removed member
+// trying to sneak back, which is the label an operator alerts on.
 func TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone(t *testing.T) {
 	const memberAddr = "127.0.0.1:5002"
 	ms := tombstonedShardMembership()
-	// Replica 2 has no committed identity on this shard, so it is judged on its
-	// committed address — the compatibility path.
+	// Replica 2 has no committed identity on this shard.
 	delete(ms.Identities, 2)
 
-	eng, handler := fromGateRig(t, ms, map[uint64]string{2: memberAddr})
+	eng, handler, metrics := identityRig(t, ms)
+	handler.host.registry.Register(1, 2, memberAddr)
 	batch := proto.MessageBatch{
 		SourceAddress: memberAddr,
 		Requests: []proto.Message{
@@ -175,10 +171,14 @@ func TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone(t *testi
 	if err := handler.HandleMessage(batch, certCovering(memberAddr)); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	if len(eng.delivered) != 1 {
-		t.Fatalf("delivered %d messages from an identity-less member of a shard "+
-			"holding a tombstone, want 1: an empty authenticated identity must not "+
-			"match a tombstoned one, or every pre-identity deployment loses its "+
-			"shard the first time a member is removed", len(eng.delivered))
+	if len(eng.delivered) != 0 {
+		t.Fatalf("delivered %d messages from an identity-less member: a member is "+
+			"authorized by its identity and by nothing else", len(eng.delivered))
+	}
+	if got := metrics.lastReason(); got != dropMissingIdentity {
+		t.Fatalf("drop reason = %q, want %q: an empty authenticated identity was "+
+			"matched against a tombstone, so every identity-less peer on a shard "+
+			"that has ever removed a member reads as a removed member sneaking back",
+			got, dropMissingIdentity)
 	}
 }

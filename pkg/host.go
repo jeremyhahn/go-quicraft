@@ -23,12 +23,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1403,8 +1405,10 @@ type pendingProposal struct {
 	// incarnation's log, so 64 of 64 proposals issued through a restarting
 	// replica were acknowledged with an old entry's result -- and it stays
 	// because it costs one atomic load and turns a probabilistic guarantee
-	// into a certain one for every entry a replay can deliver -- a replay
-	// starts from a marker published long before any proposal registers.
+	// into a certain one for every entry a replay can deliver -- the marker
+	// is seeded from the recovered log when the engine Node is built
+	// (engine.NewNode), before StartShard returns, so no proposal can
+	// register against a floor the replay has not already cleared.
 	floor uint64
 
 	// onFailure runs exactly once, at the completion site that claims this
@@ -1431,17 +1435,17 @@ type hostEngineCallback struct {
 	h *Host
 }
 
-// completeProposal delivers an applied entry's result to the caller waiting
-// on pp.rs, translating the reserved ResultSessionExpired value into an
-// error so clients can distinguish expired sessions from legitimate
-// zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
-// OnApplied's proposal completion so they cannot drift apart.
 // owns reports whether entry can be the entry this proposal became: its index
 // must lie above the floor recorded at registration. See pendingProposal.floor.
 func (pp *pendingProposal) owns(entry proto.Entry) bool {
 	return entry.Index > pp.floor
 }
 
+// completeProposal delivers an applied entry's result to the caller waiting
+// on pp.rs, translating the reserved ResultSessionExpired value into an
+// error so clients can distinguish expired sessions from legitimate
+// zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
+// OnApplied's proposal completion so they cannot drift apart.
 func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
 	rs := pp.rs
 	// Record end-to-end proposal latency (Propose -> OnApplied).
@@ -1879,6 +1883,22 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 			ns.nodes[cc.ReplicaID] = cc.Address
 			ns.nodesMu.Unlock()
 			c.h.registry.Register(shardID, cc.ReplicaID, cc.Address)
+			// The entry that binds THIS replica's identity is learned here
+			// when it was committed after the snapshot a restart recovered
+			// from — the one window checkRecoveredIdentities cannot see. A
+			// binding this host does not present means every peer refuses
+			// its traffic from now on; that cannot be refused at this point,
+			// so it is said as loudly as a log can.
+			if own := c.h.NodeIdentity(); cc.ReplicaID == ns.cfg.ReplicaID && own != "" &&
+				cc.NodeIdentity != "" && cc.NodeIdentity != own {
+				slog.Error("quicraft: the committed identity for this replica is not the one this host "+
+					"presents; every peer will refuse its messages — restore the keypair, or remove and re-add the replica",
+					"shard", shardID,
+					"replica", cc.ReplicaID,
+					"committed_identity", cc.NodeIdentity,
+					"host_identity", own,
+				)
+			}
 		case proto.RemoveNode:
 			// Capture the address BEFORE the registry entry is dropped: a
 			// RemoveNode config change carries no Address (RequestRemoveNode
@@ -2535,13 +2555,16 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 			// push a bogus WAL-durable notification into it. Instead, pin
 			// the RS with tryAcquireRef (safe against recycling — it never
 			// increments from zero), then re-verify the map still holds
-			// the SAME pendingProposal. Keys are host-wide monotonic and
-			// never reused, so a matching re-Load proves the entry — and
-			// therefore the map's own reference — was held continuously
-			// across the acquire, i.e. the pinned RS is still this
-			// request's. If the verify fails the request was claimed (or
-			// the count belonged to a recycled successor); drop the
-			// balanced reference and skip.
+			// the SAME pendingProposal. The comparison is on POINTER
+			// identity (v2 != v below), not on the key: keys are random
+			// 64-bit draws since #186, so a repeat is possible in principle,
+			// but a re-registration under a repeated key allocates a new
+			// pendingProposal and fails the identity test. A matching
+			// re-Load therefore proves the entry — and the map's own
+			// reference — was held continuously across the acquire, i.e.
+			// the pinned RS is still this request's. If the verify fails
+			// the request was claimed (or the count belonged to a recycled
+			// successor); drop the balanced reference and skip.
 			if !pp.rs.tryAcquireRef() {
 				continue
 			}
@@ -2861,6 +2884,11 @@ type Host struct {
 	sweepDone   chan struct{} // closed when the sweeper goroutine exits
 	drainC      chan struct{} // closed when pendingOps reaches 0 during drain
 	drainCMu    sync.Mutex    // protects drainC creation
+	// drainOnce elects the one Drain attempt and JOINS every other caller on
+	// it, exactly as stopOnce does for Close. drainErr is written inside the
+	// Once and published by it, so every caller reports the same outcome.
+	drainOnce sync.Once
+	drainErr  error
 	// fsys routes snapshot persistence I/O. nil means the real filesystem;
 	// only tests set it (withSnapshotFS), so the injection never reaches the
 	// public API.
@@ -2868,11 +2896,17 @@ type Host struct {
 
 	// joiningShards holds the shards started with join=true whose bootstrap
 	// snapshot has not arrived yet (map[uint64]struct{}). Such a shard has no
-	// membership and no registered peer addresses, so the leader's first
-	// snapshot — the only carrier of the full membership — cannot be
-	// authorized against the registry. The entry is removed as soon as a
-	// snapshot is accepted for the shard, closing the window.
+	// membership; the operator anchor (anchorIdentity) is what authorizes the
+	// leader's first snapshot and the messages before it. The entry is removed
+	// as soon as a snapshot is accepted for the shard, closing the window.
 	joiningShards sync.Map
+
+	// anchors holds each loaded shard's OPERATOR ANCHOR
+	// (map[uint64]map[uint64]string: replica ID -> node identity), a copy of
+	// the Config.MemberIdentities the shard was started with. It is the third
+	// source the receive gate's sender binding consults; see anchorIdentity.
+	// Set at StartShard and removed with the shard.
+	anchors sync.Map
 
 	// importLocks serialises ImportSnapshot per shard
 	// (map[uint64]chan struct{}, each of capacity one).
@@ -2945,11 +2979,262 @@ func (h *Host) clearShardJoining(shardID uint64) {
 	h.joiningShards.Delete(shardID)
 }
 
+// checkRecoveredIdentities holds a restart to the configuration it recovered.
+// validateMemberIdentities runs before recovery and sees only the caller's
+// map; this runs after it and sees the committed bindings, which are what
+// every peer authorizes against.
+//
+// Two things are refused. This host must present the identity the shard
+// committed for its replica: a changed keypair would start cleanly and then
+// have every message refused by every peer, indefinitely, with nothing local
+// saying why — the remedy is to restore the keypair, or remove and re-add the
+// replica. And the operator anchor must not contradict a committed binding:
+// an anchor entry for a committed member with a different identity is a typo
+// the committed binding would silently win over, and an anchor entry binding
+// a committed member's identity to ANOTHER replica ID would let that member's
+// keypair send as the second ID — the anchor admits senders the committed
+// configuration does not know, so nothing else would catch it.
+//
+// What it sees is the configuration recovery handed StartShard — the
+// snapshot's, or the founding entry's when there is no snapshot yet — so a
+// binding committed AFTER that point is outside its view. That window has
+// its own backstops at the moment the binding is learned: the receive gate
+// asks the committed configuration, current at every message, before the
+// pending configuration or the anchor may admit a sender
+// (Peer.IdentityHolder), and applyMembershipRouting reports a committed
+// binding for this replica that the host does not present. Folding the
+// committed tail here instead would read the whole log on every restart of a
+// shard that never snapshots (the StartShard latency regression
+// reconstructShardMembership exists to avoid).
+//
+// An anchor entry whose identity the shard has since REMOVED is tolerated,
+// at WARN: the founding map is documented as identical across founders and
+// supplied on every start, so after any RemoveNode every remaining founder's
+// map names the removed replica, and refusing it would turn a routine
+// removal into a start failure on the next rolling restart. The entry is
+// inert — the removed-identity deny-list runs before the anchor is consulted
+// (Peer.IsRemovedIdentity in authorizeInbound) — so nothing is admitted by it.
+func (h *Host) checkRecoveredIdentities(cfg config.Config, m proto.Membership) error {
+	refuse := func(id uint64, reason string) error {
+		return &InvalidMemberError{ShardID: cfg.ShardID, ReplicaID: id, Reason: reason}
+	}
+	if committed := m.Identities[cfg.ReplicaID]; committed != "" && committed != h.NodeIdentity() {
+		return refuse(cfg.ReplicaID, fmt.Sprintf("the committed identity for this replica is %s but "+
+			"this host presents %s; every peer would refuse it — restore the keypair, or remove "+
+			"and re-add the replica", committed, h.NodeIdentity()))
+	}
+	holder := make(map[string]uint64, len(m.Identities))
+	for id, identity := range m.Identities {
+		holder[identity] = id
+	}
+	removed := make(map[string]uint64, len(m.RemovedIdentities))
+	for id, identity := range m.RemovedIdentities {
+		removed[identity] = id
+	}
+	for _, id := range slices.Sorted(maps.Keys(cfg.MemberIdentities)) {
+		identity := cfg.MemberIdentities[id]
+		if committed := m.Identities[id]; committed != "" && committed != identity {
+			return refuse(id, fmt.Sprintf("Config.MemberIdentities names %s for a replica whose "+
+				"committed identity is %s", identity, committed))
+		}
+		if other, ok := holder[identity]; ok && other != id {
+			return refuse(id, fmt.Sprintf("Config.MemberIdentities binds the committed identity "+
+				"of replica %d to replica %d; one keypair cannot be two members", other, id))
+		}
+		if r, ok := removed[identity]; ok {
+			slog.Warn("quicraft: Config.MemberIdentities names an identity this shard has removed; "+
+				"the entry is inert (the removal deny-list is consulted first) and can be dropped",
+				"shard", cfg.ShardID,
+				"replica", id,
+				"removed_replica", r,
+			)
+		}
+	}
+	return nil
+}
+
+// anchorsRemoteReplica reports whether cfg.MemberIdentities names a replica
+// other than cfg.ReplicaID — one a first-start joiner could take its
+// bootstrap from. Its own entry vouches for no sender.
+func anchorsRemoteReplica(cfg config.Config) bool {
+	return namesRemoteReplica(cfg.MemberIdentities, cfg.ReplicaID)
+}
+
+// namesRemoteReplica reports whether a replica-keyed map names a replica
+// other than self.
+func namesRemoteReplica(byReplica map[uint64]string, self uint64) bool {
+	for id := range byReplica {
+		if id != self {
+			return true
+		}
+	}
+	return false
+}
+
 // isShardJoining reports whether a shard is still in its join bootstrap
 // window: started with join=true and not yet given a snapshot.
 func (h *Host) isShardJoining(shardID uint64) bool {
 	_, ok := h.joiningShards.Load(shardID)
 	return ok
+}
+
+// validateMemberIdentities checks the FORM of Config.MemberIdentities on a
+// host that requires identities, on every start: this host's own entry must
+// be its identity, no identity may be bound to two replicas, no entry may be
+// empty, and replica 0 is never named. Whether the map must COVER the members
+// map is a bootstrap question (requireFoundersIdentified), and whether a
+// joiner needs an anchor is judged once recovery has said whether this is a
+// first start (anchorsRemoteReplica); a restart is instead held to what it
+// recovered (checkRecoveredIdentities). Every refusal is a typed
+// InvalidMemberError so the caller learns which replica.
+func (h *Host) validateMemberIdentities(cfg config.Config) error {
+	for replicaID, identity := range cfg.MemberIdentities {
+		if replicaID == 0 {
+			// Zero is the reserved no-replica ID, refused by every bootstrap
+			// map and config change; an anchor entry for it would vouch for
+			// a sender claiming From == 0, which raft does not uniformly
+			// refuse.
+			return &InvalidMemberError{
+				ShardID: cfg.ShardID,
+				Reason:  "Config.MemberIdentities names replica ID 0, which is reserved",
+			}
+		}
+		if identity == "" {
+			return &InvalidMemberError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: replicaID,
+				Reason:    "Config.MemberIdentities names the replica with an empty node identity",
+			}
+		}
+	}
+	// This host's OWN entry must be this host's identity. A typo or a stale
+	// value there is committed into the bootstrap entry and every peer then
+	// refuses this replica's traffic as identity_mismatch for the life of the
+	// shard — silently, if the others still form a quorum. It is the one
+	// identity the host can check itself, so it does.
+	if self, ok := cfg.MemberIdentities[cfg.ReplicaID]; ok {
+		if own := h.NodeIdentity(); own != "" && self != own {
+			return &InvalidMemberError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: cfg.ReplicaID,
+				Reason: "Config.MemberIdentities names this replica with an identity that " +
+					"is not this host's (Host.NodeIdentity); peers would refuse every " +
+					"message it sends",
+			}
+		}
+	}
+	// One identity is one keypair; two replicas holding it would be one host
+	// with two votes, which is the forgery identities exist to defeat and the
+	// shape a later add refuses (ErrDuplicateMemberIdentity). The bootstrap
+	// entry does not run that validator, so it is asked here.
+	if a, b, dup := duplicateIdentity(cfg.MemberIdentities); dup {
+		return &InvalidMemberError{
+			ShardID:   cfg.ShardID,
+			ReplicaID: b,
+			Reason: fmt.Sprintf("node identity is already held by replica %d; one keypair "+
+				"cannot be two members of a shard", a),
+		}
+	}
+	return nil
+}
+
+// requireFoundersIdentified enforces the founders' coverage at BOOTSTRAP: the
+// members map seeds the shard's first configuration, and on a host with a
+// transport every founder is admitted with its identity or not at all. It is
+// asked only where that seeding happens — on a restart the members map is
+// ignored in favour of the recovered configuration, so a founder that dropped
+// a since-removed replica from its map must not be refused for it.
+func requireFoundersIdentified(cfg config.Config, members map[uint64]string) error {
+	for _, replicaID := range slices.Sorted(maps.Keys(members)) {
+		if cfg.MemberIdentities[replicaID] == "" {
+			return &InvalidMemberError{
+				ShardID:   cfg.ShardID,
+				ReplicaID: replicaID,
+				Address:   members[replicaID],
+				Reason: "no node identity in Config.MemberIdentities; a member is admitted " +
+					"with its identity or not at all on a host with a transport",
+			}
+		}
+	}
+	return nil
+}
+
+// duplicateIdentity reports two replica IDs (lower first) that identities
+// binds to one identity, and whether there are any. Deterministic — the
+// lowest-numbered pair — so a refusal reads the same on every run.
+func duplicateIdentity(identities map[uint64]string) (uint64, uint64, bool) {
+	ids := make([]uint64, 0, len(identities))
+	for id, identity := range identities {
+		if identity != "" {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	seen := make(map[string]uint64, len(ids))
+	for _, id := range ids {
+		if first, dup := seen[identities[id]]; dup {
+			return first, id, true
+		}
+		seen[identities[id]] = id
+	}
+	return 0, 0, false
+}
+
+// anchorIdentity returns the node identity the OPERATOR ANCHOR — the
+// config.Config.MemberIdentities the shard was started with — binds replicaID
+// to, and whether it names that replica at all.
+//
+// The anchor is the third and last thing that can vouch for a sender the
+// committed and pending configurations do not name (see
+// hostMessageHandler.senderBinding), and it stands for the life of the shard,
+// not only for the join window it was first introduced for. A joiner needs it
+// because it holds no configuration at all. An ESTABLISHED replica needs it
+// for the one case the pending configuration cannot cover: it was down while
+// a member was added and elected, so its own log never received the AddNode
+// that would admit the new leader, and nothing it holds names the replica now
+// leading its shard. Restarting it with a Config.MemberIdentities that names
+// that leader is the remedy, and it is one an operator's provisioning system
+// has at hand — the current membership's identities — without wiping the
+// replica. The anchor vouches for identities the operator asserted, exactly as
+// the founding map does; a removed identity is refused by the tombstone check
+// before the anchor is consulted.
+func (h *Host) anchorIdentity(shardID, replicaID uint64) (string, bool) {
+	v, ok := h.anchors.Load(shardID)
+	if !ok {
+		return "", false
+	}
+	anchor, _ := v.(map[uint64]string)
+	identity, ok := anchor[replicaID]
+	if !ok || identity == "" {
+		return "", false
+	}
+	return identity, true
+}
+
+// setShardAnchor records the operator anchor for a shard being started; see
+// anchorIdentity. An empty map records nothing, so a shard without one (a
+// host without a transport) answers unknown for every replica.
+func (h *Host) setShardAnchor(shardID uint64, identities map[uint64]string) {
+	if anchor := copyIdentityMap(identities); anchor != nil {
+		h.anchors.Store(shardID, anchor)
+	}
+}
+
+// identitiesOf restricts identities to the replicas members names — what a
+// founder's bootstrap entry commits. An anchor entry for a replica outside
+// the members map is operator trust for the receive gate, not membership
+// state, and must not be written into index 1 for a replica no role holds.
+func identitiesOf(members, identities map[uint64]string) map[uint64]string {
+	var out map[uint64]string
+	for id := range members {
+		if identity := identities[id]; identity != "" {
+			if out == nil {
+				out = make(map[uint64]string, len(members))
+			}
+			out[id] = identity
+		}
+	}
+	return out
 }
 
 // IsShardJoining reports whether shardID is still in its join bootstrap
@@ -3372,6 +3657,15 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrInvalidConfig
 	}
 
+	// The identity requirement is a property of the wire boundary: the
+	// receive-side gate authorizes a member by its committed identity and by
+	// nothing else, so a host with a transport must not admit a member it
+	// could never hear from. The host decides, not the caller — see
+	// config.Config.RequireMemberIdentities — and the same flag reaches the
+	// leader's propose-time validator through the peer's config, so a later
+	// AddNode, forwarded or local, is held to the same rule.
+	cfg.RequireMemberIdentities = h.transport != nil
+
 	// Validate the initial members map when not joining an existing
 	// cluster. A non-joining shard requires at least one member, and
 	// the local replica must be included.
@@ -3528,6 +3822,16 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// is also cheap to fix and impossible to miss.
 	if err := h.verifyMemberCertificateExclusivity(members); err != nil {
 		return err
+	}
+
+	// With the certificates known to be per-node, every member must be
+	// admitted with the identity that certificate proves. Checked after the
+	// SAN rule so a deployment with both defects is told about the one it has
+	// to re-issue certificates for first.
+	if cfg.RequireMemberIdentities {
+		if err := h.validateMemberIdentities(cfg); err != nil {
+			return err
+		}
 	}
 
 	// Resolve this shard's at-rest barrier before anything is written for it.
@@ -3715,7 +4019,38 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		}
 	}
 
+	// A joiner on its FIRST start holds no configuration, so it must be given
+	// the replicas it may take its bootstrap snapshot from. An established
+	// replica restarted with join=true (a supported convention: its
+	// configuration is durable and it needs no bootstrap) is judged on what it
+	// recovered, and needs no anchor.
+	// The anchor must name a replica OTHER than this one: its own entry is
+	// checked by validateMemberIdentities but vouches for no sender. A
+	// members map that names other replicas seeds them into the joiner's
+	// configuration with their identities and serves the same purpose; one
+	// that names only the joiner itself does not, and a joiner with neither
+	// would start cleanly and refuse every message and the bootstrap
+	// snapshot as unknown_member, forever.
+	if cfg.RequireMemberIdentities && join && nothingRecovered &&
+		!namesRemoteReplica(nodesCopy, cfg.ReplicaID) && !anchorsRemoteReplica(cfg) {
+		return &InvalidMemberError{
+			ShardID:   cfg.ShardID,
+			ReplicaID: cfg.ReplicaID,
+			Reason: "a joining replica must name at least one OTHER replica to accept its " +
+				"bootstrap snapshot from (Config.MemberIdentities is the anchor)",
+		}
+	}
+
 	if nothingRecovered && (!join || len(nodesCopy) > 0) {
+		// The members map is about to seed the configuration; every founder
+		// in it needs its identity. Asked here and not earlier because on a
+		// restart the map is ignored and must not be held to a standard the
+		// recovered configuration has since moved past.
+		if cfg.RequireMemberIdentities {
+			if err := requireFoundersIdentified(cfg, nodesCopy); err != nil {
+				return err
+			}
+		}
 		// Seed the replicated witness policy from this node's config. This
 		// is the ONLY point where config.WitnessConfig enters the shard:
 		// from here on the policy lives in replicated membership state
@@ -3725,9 +4060,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// MemberIdentities is seeded the same way and for the same reason: it is
 		// replicated state from here on, and every founder must supply an
 		// IDENTICAL map or their index-1 entries diverge (Membership marshals
-		// with sorted keys, so identical input gives identical bytes). Supplying
-		// none is the pre-identity behaviour and leaves the receive-side gate on
-		// the committed-address fallback for this shard.
+		// with sorted keys, so identical input gives identical bytes). Behind a
+		// transport validateMemberIdentities has already required an entry for
+		// every founder; a transportless host may supply none, since nothing
+		// crosses the wire there.
 		// The session policy is seeded here for exactly the same reason as the
 		// witness policy, and this is likewise the ONLY point where
 		// config.Config's session limits enter the shard. From here on they
@@ -3739,7 +4075,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// produces a divergent index-1 entry.
 		initialMembership := proto.Membership{
 			Addresses:                  nodesCopy,
-			Identities:                 copyIdentityMap(cfg.MemberIdentities),
+			Identities:                 identitiesOf(nodesCopy, cfg.MemberIdentities),
 			MaxWitnesses:               uint64(max(0, cfg.Witness.MaxWitnesses)),
 			RequireFullReplicaMajority: cfg.Witness.GetRequireFullReplicaMajority(),
 		}
@@ -3801,6 +4137,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				effectiveNodes[id] = addr
 			}
 		}
+		if cfg.RequireMemberIdentities {
+			if err := h.checkRecoveredIdentities(cfg, m); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Create the Raft peer. NewPeer validates the config and
@@ -3817,7 +4158,6 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// is necessarily empty here.
 	if join {
 		peer.MarkJoining()
-		h.markShardJoining(cfg.ShardID)
 	}
 
 	// Create the managed state machine (RSM) from the factory.
@@ -4214,6 +4554,16 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrShardAlreadyExists
 	}
 	h.activeNodes.Add(1)
+	// The receive gate's host-side state for this shard — the join window and
+	// the operator anchor — is recorded only once the shard is PUBLISHED, so
+	// a concurrent StartShard that loses the race above, or a start that
+	// fails before this point, leaves nothing behind for a loaded shard to
+	// vouch with. The raft-side join flag (peer.MarkJoining) is on the peer
+	// this call owns and needs no such care.
+	if join {
+		h.markShardJoining(cfg.ShardID)
+	}
+	h.setShardAnchor(cfg.ShardID, cfg.MemberIdentities)
 
 	// Save bootstrap info if we have a LogDB and this is not a join.
 	if h.logdb != nil && !join {
@@ -4235,6 +4585,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			// close.
 			ns.stopped.Store(true)
 			h.nodes.Delete(cfg.ShardID)
+			h.clearShardJoining(cfg.ShardID)
+			h.anchors.Delete(cfg.ShardID)
 			h.activeNodes.Add(-1)
 			return ErrLogDBWrite
 		}
@@ -4460,6 +4812,7 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) er
 	// The join bootstrap window belongs to the loaded shard; a stopped shard
 	// must not leave a relaxed snapshot authorization behind.
 	h.clearShardJoining(shardID)
+	h.anchors.Delete(shardID)
 
 	// Remove nodeState last, after the engine is fully unloaded, all pending
 	// items have been resolved, and the registry/join state is cleaned up. No
@@ -4779,7 +5132,7 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 	}
 
 	entry := proto.Entry{Cmd: cmd}
-	return h.proposeEntry(ctx, ns, shardID, entry)
+	return h.proposeEntry(ctx, ns, shardID, entry, nil)
 }
 
 // ProposeWithSession submits a session-managed proposal with at-most-once
@@ -4793,6 +5146,16 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 //
 // On error, the session state is unchanged and the proposal may be retried
 // with the same session.
+//
+// A session serves ONE proposal at a time. The entry is stamped with the
+// session's current series number, and the state machine treats every entry
+// with the same (ClientID, SeriesID) as a retransmission of one command —
+// which is what makes the retry above safe, and what makes a second
+// CONCURRENT proposal on the same session unsafe: only one of the two would
+// be applied and both would report success. The series is therefore reserved
+// for the returned RequestState, and a second call while it is held returns
+// ErrSessionBusy. The reservation is released by ProposalCompleted, by an
+// error result, or by RequestState.Release, whichever comes first.
 //
 // It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
 // sm.DiskStateMachine and the session is session-managed, for the reason given
@@ -4864,13 +5227,24 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 		return nil, h.buildNotLeaderError(ns)
 	}
 
+	// Reserve the series before the entry is built from it, so that the
+	// number stamped on the entry is the one this request holds. (A NO-OP
+	// session never reaches here: ValidForProposal refused it above.) From
+	// here the reservation belongs to proposeEntry: it releases on every
+	// failure of its own, before or after the request is bound, so there is
+	// exactly one release per reservation — a second one here would clear
+	// the reservation a concurrent caller took in between.
+	series, ok := session.beginCurrentProposal()
+	if !ok {
+		return nil, ErrSessionBusy
+	}
 	entry := proto.Entry{
 		Cmd:         cmd,
 		ClientID:    session.ClientID(),
-		SeriesID:    session.SeriesID(),
+		SeriesID:    series,
 		RespondedTo: session.RespondedTo(),
 	}
-	return h.proposeEntry(ctx, ns, shardID, entry)
+	return h.proposeEntry(ctx, ns, shardID, entry, session)
 }
 
 // SyncProposeWithSession blocks until a session-managed proposal is applied.
@@ -4958,7 +5332,21 @@ func nextRequestKey() uint64 {
 	}
 }
 
-func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, entry proto.Entry) (*RequestState, error) {
+func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, entry proto.Entry, session *Session) (rs *RequestState, err error) {
+	// The caller reserved entry.SeriesID on session (nil for a sessionless
+	// proposal) and this function owns releasing it on failure. Until the
+	// request is bound (bindSession below) nothing else can release it, so a
+	// failure before that point releases here; after it, the failure paths
+	// call rs.Release, which releases through the binding — and a release for
+	// a series the session has already moved past is a no-op, so the two can
+	// never double-release.
+	bound := false
+	defer func() {
+		if err != nil && session != nil && !bound {
+			session.endProposal(entry.SeriesID)
+		}
+	}()
+
 	// Check global rate limiter.
 	if globalRL := h.engine.GlobalRateLimiter(); globalRL != nil && globalRL.RateLimited() {
 		return nil, ErrSystemBusy
@@ -5011,7 +5399,15 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// defaultPendingRequestTimeout when the caller supplied none so the sweeper
 	// can always reclaim this entry.
 	deadline := pendingDeadline(ctx)
-	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
+	rs = newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
+	// Bound to the session BEFORE the request is registered: from the moment
+	// it is in the pending map a completion can run, and an error completion
+	// is what releases the session's series. Binding after registration left
+	// a window where that release found nothing to release.
+	if session != nil {
+		rs.bindSession(session, entry.SeriesID)
+		bound = true
+	}
 
 	// Track this operation for drain notification.
 	h.addPendingOp()
@@ -5734,7 +6130,7 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 		RespondedTo: session.RespondedTo(),
 		OwnerID:     session.OwnerID(),
 	}
-	return h.proposeEntry(ctx, ns, session.ShardID(), entry)
+	return h.proposeEntry(ctx, ns, session.ShardID(), entry, nil)
 }
 
 // GetNoOPSession returns a no-op session for proposals that do not require
@@ -6628,6 +7024,7 @@ type importOptions struct {
 	dataDirSet    bool
 	membership    map[uint64]string
 	membershipSet bool
+	identities    map[uint64]string
 }
 
 // WithImportMembership REPLACES the membership carried by the artifact with the
@@ -6676,6 +7073,12 @@ type importOptions struct {
 // The importing replica must appear in the map. Importing a configuration that
 // excludes the very replica doing the import produces a replica that cannot
 // participate in the shard it just restored, which is never what was meant.
+//
+// Identities travel separately (WithImportMemberIdentities). A survivor the
+// artifact already holds an identity for keeps it; a survivor it does not —
+// a replica that moved to a new keypair as part of the recovery — must be
+// given one, because on a host with a transport every member of the restored
+// configuration must have an identity or the import is refused.
 func WithImportMembership(members map[uint64]string) ImportOption {
 	return func(o *importOptions) {
 		// Copy: the caller's map must not be able to change under the import,
@@ -6689,8 +7092,26 @@ func WithImportMembership(members map[uint64]string) ImportOption {
 	}
 }
 
+// WithImportMemberIdentities supplies node identities for the imported
+// membership — the artifact's own, or the one WithImportMembership rewrites it
+// to — replica ID to the value each node reports from Host.NodeIdentity. A
+// supplied entry overrides the identity the artifact holds for that replica;
+// the artifact's identity is kept for any member left out. It is how an
+// artifact exported without identities is completed for a host that requires
+// them. An entry for a replica the resulting membership holds no role for is
+// refused (ImportMembershipInvalidError), as is one for a replica whose
+// identity the artifact's tombstones hold.
+func WithImportMemberIdentities(identities map[uint64]string) ImportOption {
+	return func(o *importOptions) {
+		o.identities = copyIdentityMap(identities)
+	}
+}
+
 // importMembershipFor materialises the caller's options and resolves the
-// membership the imported snapshot should record.
+// membership the imported snapshot should record, then applies the host's
+// identity-admission policy to it: on a host with a transport every active
+// member of the configuration the shard will restart into must have an
+// identity, whether the configuration is the artifact's own or a rewrite.
 //
 // Split out of ImportSnapshot only to keep that function under the cyclomatic
 // limit; it sits at the threshold and this was the branch that tipped it.
@@ -6698,12 +7119,124 @@ func importMembershipFor(
 	shardID, replicaID uint64,
 	artifact proto.Membership,
 	opts []ImportOption,
+	requireIdentities bool,
 ) (proto.Membership, error) {
 	var iopts importOptions
 	for _, opt := range opts {
 		opt(&iopts)
 	}
-	return resolveImportMembership(shardID, replicaID, artifact, iopts)
+	ms, err := resolveImportMembership(shardID, replicaID, artifact, iopts)
+	if err != nil {
+		return proto.Membership{}, err
+	}
+	if requireIdentities {
+		if id, missing := firstMemberWithoutIdentity(ms); missing {
+			return proto.Membership{}, &ImportMembershipInvalidError{
+				ShardID: shardID, ReplicaID: replicaID,
+				Reason: fmt.Sprintf("replica %d has no node identity; a member is authorized "+
+					"by its identity and by nothing else, so it could never be heard from "+
+					"(WithImportMemberIdentities)", id),
+			}
+		}
+	}
+	// One keypair, one member — the rule every add enforces
+	// (ErrDuplicateMemberIdentity) and a rewrite bypasses, so it is asked here
+	// whatever the host's posture: a configuration that binds one identity to
+	// two voters gives the holder two votes.
+	if a, b, dup := duplicateIdentity(ms.Identities); dup {
+		return proto.Membership{}, &ImportMembershipInvalidError{
+			ShardID: shardID, ReplicaID: replicaID,
+			Reason: fmt.Sprintf("replicas %d and %d hold the same node identity; one keypair "+
+				"cannot be two members of a shard", a, b),
+		}
+	}
+	// An identity the shard removed stays removed — the rule every add
+	// enforces (ErrRemovedMemberIdentity). The tombstones are the artifact's:
+	// a rewrite does not carry them into the new configuration, but it must
+	// not be the way a removed keypair gets back in either.
+	if id, removed := identityRemovedByArtifact(ms, artifact.RemovedIdentities); id != 0 {
+		return proto.Membership{}, &ImportMembershipInvalidError{
+			ShardID: shardID, ReplicaID: replicaID,
+			Reason: fmt.Sprintf("replica %d holds a node identity this shard removed (replica %d's); "+
+				"a removed keypair is not re-admitted by import", id, removed),
+		}
+	}
+	return ms, nil
+}
+
+// identityRemovedByArtifact reports the lowest-numbered active member of ms
+// whose identity is one the artifact's tombstones hold, and the removed
+// replica it belonged to.
+func identityRemovedByArtifact(ms proto.Membership, removedIdentities map[uint64]string) (member uint64, removed uint64) {
+	if len(removedIdentities) == 0 {
+		return 0, 0
+	}
+	holder := make(map[string]uint64, len(removedIdentities))
+	for id, identity := range removedIdentities {
+		holder[identity] = id
+	}
+	var hits []uint64
+	for _, roles := range []map[uint64]string{ms.Addresses, ms.Observers, ms.Witnesses} {
+		for id := range roles {
+			if _, ok := holder[ms.Identities[id]]; ok {
+				hits = append(hits, id)
+			}
+		}
+	}
+	if len(hits) == 0 {
+		return 0, 0
+	}
+	member = slices.Min(hits)
+	return member, holder[ms.Identities[member]]
+}
+
+// refuseStrayIdentities refuses a supplied identity whose replica the
+// resulting membership does not name (named reports whether it does). The
+// lowest such replica is reported, so the refusal is deterministic across
+// runs like every neighbouring check.
+func refuseStrayIdentities(shardID, replicaID uint64, identities map[uint64]string, named func(uint64) bool, which string) error {
+	var stray []uint64
+	for id, identity := range identities {
+		if identity != "" && !named(id) {
+			stray = append(stray, id)
+		}
+	}
+	if len(stray) == 0 {
+		return nil
+	}
+	return &ImportMembershipInvalidError{
+		ShardID: shardID, ReplicaID: replicaID,
+		Reason: fmt.Sprintf("an identity is supplied for replica %d, which %s", slices.Min(stray), which),
+	}
+}
+
+// holdsRole reports whether the membership names replicaID in an active role
+// — voter, observer or witness.
+func holdsRole(ms proto.Membership, replicaID uint64) bool {
+	for _, roles := range []map[uint64]string{ms.Addresses, ms.Observers, ms.Witnesses} {
+		if _, ok := roles[replicaID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// firstMemberWithoutIdentity reports the lowest-numbered active member — voter,
+// observer or witness — the membership holds no identity for, and whether there
+// is one. Lowest-numbered so the refusal is deterministic across runs.
+func firstMemberWithoutIdentity(ms proto.Membership) (uint64, bool) {
+	var missing []uint64
+	for _, roles := range []map[uint64]string{ms.Addresses, ms.Observers, ms.Witnesses} {
+		for id := range roles {
+			if ms.Identities[id] == "" {
+				missing = append(missing, id)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return 0, false
+	}
+	return slices.Min(missing), true
 }
 
 // resolveImportMembership returns the membership the imported snapshot should
@@ -6719,7 +7252,35 @@ func resolveImportMembership(
 	iopts importOptions,
 ) (proto.Membership, error) {
 	if !iopts.membershipSet {
-		return artifact, nil
+		if len(iopts.identities) == 0 {
+			return artifact, nil
+		}
+		// Identities supplied without a rewrite complete the ARTIFACT's own
+		// membership: an artifact exported by a build that did not require
+		// identities has none, and the import is refused behind a transport
+		// until they are supplied. The supplied value wins per replica.
+		// An entry for a replica the artifact holds no role for is refused
+		// rather than dropped: it is the map an operator keyed by the
+		// intended NEW replica IDs and then forgot WithImportMembership for,
+		// and persisting it would bind a keypair to a non-member — which
+		// every later add of that keypair then trips over as a duplicate.
+		if err := refuseStrayIdentities(shardID, replicaID, iopts.identities,
+			func(id uint64) bool { return holdsRole(artifact, id) },
+			"the artifact's membership holds no role for; supply WithImportMembership to change the membership"); err != nil {
+			return proto.Membership{}, err
+		}
+		out := artifact
+		out.Identities = copyIdentityMap(artifact.Identities)
+		for id, identity := range iopts.identities {
+			if identity == "" {
+				continue
+			}
+			if out.Identities == nil {
+				out.Identities = make(map[uint64]string, len(iopts.identities))
+			}
+			out.Identities[id] = identity
+		}
+		return out, nil
 	}
 	if len(iopts.membership) == 0 {
 		return proto.Membership{}, &ImportMembershipInvalidError{
@@ -6757,6 +7318,17 @@ func resolveImportMembership(
 		}
 	}
 
+	// The same rule for a rewrite: an identity keyed by a replica the new
+	// membership does not name is the map keyed by the OLD replica IDs, and
+	// dropping it silently would report the survivors as identity-less (or,
+	// for a reused ID, import a stale artifact binding) while the operator
+	// believes identities were supplied.
+	if err := refuseStrayIdentities(shardID, replicaID, iopts.identities,
+		func(id uint64) bool { _, ok := iopts.membership[id]; return ok },
+		"the rewritten membership does not name"); err != nil {
+		return proto.Membership{}, err
+	}
+
 	// Policy travels with the shard, membership does not. ConfigChangeID is
 	// carried over so the recovered configuration is not ordered BEFORE the one
 	// the artifact recorded.
@@ -6765,9 +7337,16 @@ func resolveImportMembership(
 		MaxWitnesses:               artifact.MaxWitnesses,
 		RequireFullReplicaMajority: artifact.RequireFullReplicaMajority,
 		Addresses:                  make(map[uint64]string, len(iopts.membership)),
+		Identities:                 make(map[uint64]string, len(iopts.membership)),
 	}
 	for id, addr := range iopts.membership {
 		out.Addresses[id] = addr
+		// The supplied identity wins; a survivor keeps the artifact's.
+		if identity := iopts.identities[id]; identity != "" {
+			out.Identities[id] = identity
+		} else if identity := artifact.Identities[id]; identity != "" {
+			out.Identities[id] = identity
+		}
 	}
 	out.SetSessionPolicy(artifact.SessionPolicy())
 
@@ -6928,9 +7507,22 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// staged. A rejected override is an operator typo in a disaster-recovery
 	// runbook, and the operator should learn that without first having a
 	// partially written snapshot tree to reason about.
-	recoveredMembership, err := importMembershipFor(shardID, replicaID, header.Membership, opts)
+	recoveredMembership, err := importMembershipFor(shardID, replicaID, header.Membership, opts,
+		h.transport != nil)
 	if err != nil {
 		return err
+	}
+	// The importing replica's own committed identity must be this host's, for
+	// the same reason StartShard checks its own entry: a wrong value here is
+	// persisted and every peer refuses this replica afterwards.
+	if own := h.NodeIdentity(); own != "" {
+		if self := recoveredMembership.Identities[replicaID]; self != "" && self != own {
+			return &ImportMembershipInvalidError{
+				ShardID: shardID, ReplicaID: replicaID,
+				Reason: "the importing replica's identity in the membership is not this " +
+					"host's (Host.NodeIdentity); peers would refuse every message it sends",
+			}
+		}
 	}
 
 	// Serialise imports for this shard. Everything from here on reasons about
@@ -7767,6 +8359,7 @@ func (h *Host) Close() error {
 			h.failPendingRequests(ns, ErrClosed)
 			stoppedNodes = append(stoppedNodes, ns)
 			h.nodes.Delete(shardID)
+			h.anchors.Delete(shardID)
 			h.activeNodes.Add(-1)
 			return true
 		})
@@ -7847,20 +8440,38 @@ func (h *Host) Close() error {
 // as the first step of a graceful shutdown sequence. Callers that need to
 // resume accepting proposals must create a new Host instance.
 //
-// Drain is idempotent: calling it multiple times is safe. The second call
-// returns immediately since draining is already true and all pending work
-// was either already drained or will be drained by the first call.
+// Drain is idempotent, and every caller gets the SAME answer: there is one
+// drain attempt, and a concurrent second caller blocks until it has finished
+// and then returns its result. This is what makes Drain a join barrier for
+// Close, which calls it first: a Close that raced an in-progress Drain used
+// to get nil back immediately, tear the engine down while that drain was
+// still waiting, fail the in-flight work with ErrClosed — which drove
+// pendingOps to zero and released the FIRST caller with nil as well — and so
+// both reported a clean graceful shutdown after accepted work had been
+// aborted. A call after the attempt has completed returns its recorded result
+// without waiting.
 //
 // The implementation is event-driven: instead of polling at fixed intervals,
 // it uses an atomic counter (pendingOps) decremented by operation completion
 // callbacks. When the counter reaches 0, a notification channel is closed.
 func (h *Host) Drain() error {
-	// Set draining flag. If already draining, return immediately since
-	// the initial Drain() call is handling the drain wait.
-	if !h.draining.CompareAndSwap(false, true) {
-		return nil
-	}
+	// The flag goes up before the Once so that new work is refused from the
+	// instant ANY caller asks for a drain, not from when the elected attempt
+	// gets scheduled. It is never cleared: see the irreversibility note.
+	h.draining.Store(true)
 
+	// sync.Once.Do does not return until f has completed, for EVERY caller —
+	// the losers of the election wait here for the winner's attempt and then
+	// read the drainErr it published.
+	h.drainOnce.Do(func() {
+		h.drainErr = h.drainOnceLocked()
+	})
+	return h.drainErr
+}
+
+// drainOnceLocked is the single drain attempt Drain elects through drainOnce.
+// It waits for pendingOps to reach zero or for ShutdownTimeout to expire.
+func (h *Host) drainOnceLocked() error {
 	// Fast path: no pending operations.
 	if h.pendingOps.Load() <= 0 {
 		return nil
@@ -8459,9 +9070,12 @@ func (h *Host) NodeIdentity() string {
 // SyncGetShardMembership().ConfigChangeID to ensure ordered config
 // changes. Pass 0 to skip the ordering check.
 //
-// It commits NO node identity for the replica, which leaves that replica on the
-// committed-ADDRESS binding at every peer's receive gate — the pre-identity
-// behaviour, and the weaker one. Prefer RequestAddNodeWithIdentity.
+// It commits NO node identity for the replica. On a host with a transport that
+// is refused with ErrMemberIdentityRequired unless the configuration already
+// holds an identity for the replica (a role change), because a member is
+// authorized by its identity and by nothing else; use
+// RequestAddNodeWithIdentity. It remains the form for a transportless host,
+// where nothing crosses the wire.
 func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
 	return h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
 }
@@ -8477,8 +9091,8 @@ func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, ad
 // certificate useless for asserting this replica's msg.From, and what lets the
 // replica move to a new address without its votes and acks going uncounted.
 //
-// An empty identity is accepted and means "commit no identity", which is
-// exactly RequestAddNode.
+// An empty identity means "commit no identity", which is exactly
+// RequestAddNode, with the same refusal behind a transport.
 //
 // CONSIDERED AND REJECTED: capturing the identity from the joining node's own
 // connection instead of taking it as an argument. It reads as the more
@@ -8515,6 +9129,14 @@ func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, repl
 	addr, identity string, configChangeIndex uint64) error {
 
 	rs, err := h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	return awaitConfigChange(ctx, rs, err)
+}
+
+// awaitConfigChange is the body every Sync* membership call shares: it takes
+// the (RequestState, error) pair its asynchronous form returned, waits for the
+// change to commit, and maps the context's own expiry to ErrTimeout /
+// ErrCanceled. A submission error is returned as it was.
+func awaitConfigChange(ctx context.Context, rs *RequestState, err error) error {
 	if err != nil {
 		return err
 	}
@@ -8549,23 +9171,7 @@ func (h *Host) RequestRemoveNode(ctx context.Context, shardID, replicaID uint64,
 // The context must carry a deadline or timeout to bound the wait.
 func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
 	rs, err := h.RequestAddNode(ctx, shardID, replicaID, addr, configChangeIndex)
-	if err != nil {
-		return err
-	}
-	defer rs.Release()
-
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return result.Err
-		}
-		return nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestDeleteNode removes a replica from the shard's membership and
@@ -8600,23 +9206,16 @@ func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uin
 // The context must carry a deadline or timeout to bound the wait.
 func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
 	rs, err := h.RequestAddObserver(ctx, shardID, replicaID, addr, configChangeIndex)
-	if err != nil {
-		return err
-	}
-	defer rs.Release()
+	return awaitConfigChange(ctx, rs, err)
+}
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return result.Err
-		}
-		return nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+// SyncRequestAddObserverWithIdentity is SyncRequestAddObserver carrying the
+// observer's node identity; see RequestAddNodeWithIdentity.
+func (h *Host) SyncRequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64,
+	addr, identity string, configChangeIndex uint64) error {
+
+	rs, err := h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestAddWitness adds a voting witness to a shard and blocks
@@ -8625,29 +9224,24 @@ func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID ui
 // The context must carry a deadline or timeout to bound the wait.
 func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
 	rs, err := h.RequestAddWitness(ctx, shardID, replicaID, addr, configChangeIndex)
-	if err != nil {
-		return err
-	}
-	defer rs.Release()
+	return awaitConfigChange(ctx, rs, err)
+}
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return result.Err
-		}
-		return nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+// SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the
+// witness's node identity; see RequestAddNodeWithIdentity.
+func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64,
+	addr, identity string, configChangeIndex uint64) error {
+
+	rs, err := h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	return awaitConfigChange(ctx, rs, err)
 }
 
 // RequestAddObserver requests adding a non-voting observer to a shard.
 // Observers receive log entries but do not participate in quorum.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID.
+// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// host with a transport refuses as RequestAddNode does; use
+// RequestAddObserverWithIdentity there.
 func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
 	return h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
 }
@@ -8674,7 +9268,9 @@ func (h *Host) RequestAddObserverWithIdentity(ctx context.Context, shardID, repl
 // RequestAddWitness requests adding a voting witness to a shard.
 // Witnesses participate in quorum but do not store a state machine.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID.
+// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// host with a transport refuses as RequestAddNode does; use
+// RequestAddWitnessWithIdentity there.
 func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
 	return h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
 }

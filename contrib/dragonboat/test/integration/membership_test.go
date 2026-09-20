@@ -54,7 +54,7 @@ func TestIntegration_DB_AsyncRequestAddReplica(t *testing.T) {
 	//quicraft:direct-config-change the async RequestState/ResultC contract is under
 	// test: the assertion reads the result the request produces, which a synchronous
 	// idempotent helper would consume
-	rs, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59999", configChangeID, defaultTimeout)
+	rs, err := leaderHost.RequestAddReplicaWithIdentity(1, 10, "127.10.0.1:59999", dbIdentityFor(10), configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("RequestAddReplica failed: %v", err)
 	}

@@ -87,6 +87,24 @@ func (c logRecoveryCase) reachableFromRecovery() bool {
 	return true
 }
 
+// outsideProtocolRange reports whether the case describes persisted state
+// newRaft refuses to open at all (#197 C): a snapshot, term or log tail at the
+// ceiling (persistedCeiling), where +1 wraps. newRaftLog is still total over
+// it -- the log constructor does not take the decision -- but no raft instance
+// is ever built on it, so the probe property has nothing to run against.
+func (c logRecoveryCase) outsideProtocolRange() bool {
+	if c.snapshotIndex >= persistedCeiling || c.snapshotTerm >= persistedCeiling {
+		return true
+	}
+	if c.stateTerm >= persistedCeiling {
+		return true
+	}
+	if c.entryCount > 0 && c.firstIndex+c.entryCount-1 >= persistedCeiling {
+		return true
+	}
+	return false
+}
+
 func (c logRecoveryCase) String() string {
 	return fmt.Sprintf("entries=[%d,%d)@t%d snapshot=%d@t%d commit=%d term=%d reachable=%t",
 		c.firstIndex, c.firstIndex+c.entryCount, c.entryTerm,
@@ -187,6 +205,17 @@ func checkProbeAcknowledgements(tb testing.TB, c logRecoveryCase, lr *testLogRea
 
 	cfg := raftTestCfg(adversarialShardID, adversarialSelfID)
 	r, err := newRaft(cfg, lr)
+	if c.outsideProtocolRange() {
+		// The ceiling case used to be tolerated here as "unreachable, but
+		// handleAppend must be total over it", with a note that the
+		// markerIndex overflow made the replica ack the ceiling index. That
+		// overflow is #197 C, and the answer is no longer tolerance: such a
+		// store fails to open.
+		if !errors.Is(err, proto.ErrLogIndexOutOfRange) && !errors.Is(err, proto.ErrTermOutOfRange) {
+			tb.Fatalf("%s: newRaft = %v, want the store refused as outside the protocol range", c, err)
+		}
+		return
+	}
 	if err != nil {
 		tb.Fatalf("%s: newRaft: %v", c, err)
 	}
@@ -370,8 +399,10 @@ func TestLogRecoveryPathologicalCases(t *testing.T) {
 		{
 			// Snapshot index at the uint64 ceiling. Unreachable (it needs
 			// 2^64 entries) and excluded from the frontier assertions by
-			// reachableFromRecovery, but newRaftLog must still be total over
-			// it: newInMemory's markerIndex = lastIndex+1 overflows to 0 here.
+			// reachableFromRecovery. newRaftLog must still be total over it
+			// -- newInMemory's markerIndex = lastIndex+1 overflows to 0 here
+			// -- and newRaft refuses to open it (outsideProtocolRange), which
+			// is what keeps that overflow from ever driving a replica.
 			name: "snapshot-index-max",
 			c: logRecoveryCase{
 				snapshotIndex: ^uint64(0), snapshotTerm: 1,

@@ -43,21 +43,19 @@ import (
 // binding too, and is therefore worth nothing.
 // ---------------------------------------------------------------------------
 
-// identityRig is fromGateRig with a configurable RequireMemberIdentity posture.
-// It returns the recording deliverer, the handler, and the metrics sink the
-// drop reasons land in, because the reason — not the mere absence of a delivery
-// — is what distinguishes this gate from the one it replaced.
-func identityRig(t *testing.T, ms proto.Membership, requireIdentity bool) (
+// identityRig is fromGateRig with a metrics sink. It returns the recording
+// deliverer, the handler, and the sink the drop reasons land in, because the
+// reason — not the mere absence of a delivery — is what distinguishes this gate
+// from the one it replaced.
+func identityRig(t *testing.T, ms proto.Membership) (
 	*recordingDeliverer, *hostMessageHandler, *dropReasonMetrics) {
 	t.Helper()
 
 	node := newEngineNodeWithFullMembership(t, 1, 1, ms)
 	eng := &recordingDeliverer{node: node}
 	metrics := &dropReasonMetrics{}
-	hostCfg := config.HostConfig{}
-	hostCfg.TransportConfig.RequireMemberIdentity = requireIdentity
 	host := &Host{
-		cfg:      hostCfg,
+		cfg:      config.HostConfig{},
 		registry: registry.NewRegistry(),
 		metrics:  metrics,
 	}
@@ -100,7 +98,7 @@ func TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom(t *t
 
 	for _, msgType := range quorumBearingTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
-			eng, handler, metrics := identityRig(t, ms, false)
+			eng, handler, metrics := identityRig(t, ms)
 
 			// Sanity: the fixture really is the hard case. If the certificate
 			// did not cover the victim's address the address binding would
@@ -136,7 +134,7 @@ func TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom(t *t
 	// The attacker speaking as ITSELF is admitted. Without this the test would
 	// pass against a gate that refused everything.
 	t.Run("own_identity_admitted", func(t *testing.T) {
-		eng, handler, _ := identityRig(t, ms, false)
+		eng, handler, _ := identityRig(t, ms)
 		batch := proto.MessageBatch{
 			SourceAddress: attackerAddr,
 			Requests: []proto.Message{
@@ -181,7 +179,7 @@ func TestHandleMessage_IdentitySurvivesAnAddressChange(t *testing.T) {
 
 	for _, msgType := range quorumBearingTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
-			eng, handler, metrics := identityRig(t, ms, false)
+			eng, handler, metrics := identityRig(t, ms)
 
 			if recovered.Authorizes(committedAddr) {
 				t.Fatal("fixture: the recovered replica's certificate must NOT cover " +
@@ -207,44 +205,25 @@ func TestHandleMessage_IdentitySurvivesAnAddressChange(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_MissingIdentityFollowsTheConfiguredMode pins Part B: what
-// happens to a replica the configuration records NO identity for.
-//
-// Both postures must be exercised, and both must be observable in the drop
-// reason. Asserting only the strict case would leave the compatible default
-// untested, and a default that silently refused everything would brick every
-// existing cluster on upgrade.
-func TestHandleMessage_MissingIdentityFollowsTheConfiguredMode(t *testing.T) {
+// TestHandleMessage_MissingIdentityIsRefused pins Part B: a replica the
+// configuration records NO identity for is refused, and the refusal is
+// observable in the drop reason. There used to be a configurable fallback to
+// the committed address (TransportConfig.RequireMemberIdentity, default off);
+// admission now requires the identity on every host with a transport, and the
+// fallback was removed with it (#197 A).
+func TestHandleMessage_MissingIdentityIsRefused(t *testing.T) {
 	const legacyAddr = "10.0.0.2:5001"
 	// No Identities map at all: the shape of every membership written before
-	// identities existed, and of every shard whose operator supplied none.
+	// identities were required.
 	ms := proto.Membership{
 		Addresses: map[uint64]string{1: "10.0.0.1:5001", 2: legacyAddr},
 	}
 	// The peer holds the right address and no identity the shard knows about,
-	// which is exactly a correctly-behaving un-migrated member.
+	// which is exactly what the address fallback used to admit.
 	legacyPeer := certCovering(legacyAddr)
 
-	t.Run("compatible_default_falls_back_to_the_address", func(t *testing.T) {
-		eng, handler, metrics := identityRig(t, ms, false)
-		batch := proto.MessageBatch{
-			SourceAddress: legacyAddr,
-			Requests: []proto.Message{
-				{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp, Term: 5},
-			},
-		}
-		if err := handler.HandleMessage(batch, legacyPeer); err != nil {
-			t.Fatalf("HandleMessage: %v", err)
-		}
-		if len(eng.delivered) != 1 {
-			t.Fatalf("a member with no committed identity was refused under the "+
-				"compatible default (reason %q): every existing cluster would lose "+
-				"quorum on upgrade", metrics.lastReason())
-		}
-	})
-
-	t.Run("strict_mode_refuses_it", func(t *testing.T) {
-		eng, handler, metrics := identityRig(t, ms, true)
+	t.Run("no_identity_is_refused_whatever_the_address", func(t *testing.T) {
+		eng, handler, metrics := identityRig(t, ms)
 		batch := proto.MessageBatch{
 			SourceAddress: legacyAddr,
 			Requests: []proto.Message{
@@ -255,22 +234,24 @@ func TestHandleMessage_MissingIdentityFollowsTheConfiguredMode(t *testing.T) {
 			t.Fatalf("HandleMessage: %v", err)
 		}
 		if len(eng.delivered) != 0 {
-			t.Fatal("RequireMemberIdentity admitted a member with no committed identity " +
-				"on the strength of its address alone")
+			t.Fatal("a member with no committed identity was admitted on the strength " +
+				"of its address alone: that is the fallback a wildcard certificate " +
+				"satisfies for every member at once")
 		}
 		if got := metrics.lastReason(); got != dropMissingIdentity {
 			t.Fatalf("drop reason = %q, want %q: an operator must be able to tell "+
-				"an un-migrated member from a forged one", got, dropMissingIdentity)
+				"a configuration written without identities from a forged sender",
+				got, dropMissingIdentity)
 		}
 	})
 
-	t.Run("strict_mode_still_admits_a_migrated_member", func(t *testing.T) {
+	t.Run("a_member_with_an_identity_is_admitted", func(t *testing.T) {
 		const migratedID = "spki:4444444444444444444444444444444444444444444444444444444444444444"
 		migrated := proto.Membership{
 			Addresses:  map[uint64]string{1: "10.0.0.1:5001", 2: legacyAddr},
 			Identities: map[uint64]string{2: migratedID},
 		}
-		eng, handler, metrics := identityRig(t, migrated, true)
+		eng, handler, metrics := identityRig(t, migrated)
 		batch := proto.MessageBatch{
 			SourceAddress: legacyAddr,
 			Requests: []proto.Message{
@@ -281,7 +262,7 @@ func TestHandleMessage_MissingIdentityFollowsTheConfiguredMode(t *testing.T) {
 			t.Fatalf("HandleMessage: %v", err)
 		}
 		if len(eng.delivered) != 1 {
-			t.Fatalf("the strict mode refused a fully migrated member (reason %q)",
+			t.Fatalf("a member with a committed identity was refused (reason %q)",
 				metrics.lastReason())
 		}
 	})
@@ -307,14 +288,14 @@ func TestCommittedSenderBinding_IdentityIgnoresAddressEvidence(t *testing.T) {
 	node := newEngineNodeWithFullMembership(t, 1, 1, ms)
 
 	// Right keypair, certificate covers nothing at all.
-	value, reason := committedSenderBinding(node, 2, certCoveringAs(committedID), false)
+	value, reason := committedSenderBinding(node, 2, certCoveringAs(committedID))
 	if reason != "" {
 		t.Fatalf("matching identity refused with reason %q (value %q): the address is "+
 			"not an authorization input once an identity is committed", reason, value)
 	}
 
 	// Wrong keypair, certificate covers the committed address.
-	value, reason = committedSenderBinding(node, 2, certCoveringAs("spki:deadbeef", addr), false)
+	value, reason = committedSenderBinding(node, 2, certCoveringAs("spki:deadbeef", addr))
 	if reason != dropIdentityMismatch {
 		t.Fatalf("mismatching identity behind a covering certificate: reason %q (value %q), "+
 			"want %q — falling back to the address here would reopen the whole hole",
@@ -322,7 +303,7 @@ func TestCommittedSenderBinding_IdentityIgnoresAddressEvidence(t *testing.T) {
 	}
 
 	// No identity presented at all (a peer with no verified leaf).
-	if _, reason = committedSenderBinding(node, 2, certCovering(addr), false); reason != dropIdentityMismatch {
+	if _, reason = committedSenderBinding(node, 2, certCovering(addr)); reason != dropIdentityMismatch {
 		t.Fatalf("a peer presenting NO identity was judged %q, want %q", reason, dropIdentityMismatch)
 	}
 }

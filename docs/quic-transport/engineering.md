@@ -1323,7 +1323,6 @@ is dropped at Debug level and counted as `unresolved_target`.
 | `Enable0RTT`                    | bool          | false          | 0-RTT reconnection; replayable, and the receive path refuses 0-RTT frames anyway |
 | `DisableCompression`            | bool          | false          | Disable Snappy compression           |
 | `TransportDisabled`             | bool          | false          | Skip mTLS validation and skip building the transport (same effect as `WithoutTransport()`) |
-| `RequireMemberIdentity`         | bool          | false          | Drop quorum-bearing traffic from members with no committed node identity, instead of falling back to the address check |
 
 The internal `transport.Config` adds two fields the public struct does not
 expose directly: `ListenAddress` and `AdvertiseAddress`, both supplied by the
@@ -1418,7 +1417,7 @@ The four worth alerting on:
 |---|---|---|
 | ERROR | mTLS handshake refused | a certificate problem, a wrong CA, or a peer whose leaf covers the local node (`refuseInboundPromiscuousCert`) |
 | ERROR | revocation source unavailable under enforcement | `ErrNoRevocationSources` — connections are being refused, and that is the intended behavior |
-| WARN | a message dropped for an unauthorized sender | `RequireMemberIdentity` is on and a peer has no committed identity |
+| WARN | a message dropped for an unauthorized sender | the peer's authenticated identity is not the one committed for the replica it claims, or the configuration holds none for it |
 | WARN | frame rejected for a foreign wire version | two binaries from different builds |
 | WARN | inbound connection refused at a limit | `MaxIncomingConnections` or `MaxConnectionsPerIP` |
 

@@ -67,7 +67,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	// bootstrapped shard that ID is 0, which the adapter documents as "do not
 	// check", so this first change is the unchecked path and produces the
 	// first non-zero ID.
-	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", initialID, membershipTimeout)
+	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", dbIdentityFor(10), initialID, membershipTimeout)
 	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d landed", initialID)
 
 	freshID := cluster.membershipFromLeader(t, 1, membershipTimeout).ConfigChangeID
@@ -78,7 +78,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 
 	// A change against the fresh, non-zero ID must land. This is the ordered
 	// path proper, and it leaves freshID stale.
-	cluster.addReplicaToLeader(t, 1, 11, "127.10.0.1:59998", freshID, membershipTimeout)
+	cluster.addReplicaToLeader(t, 1, 11, "127.10.0.1:59998", dbIdentityFor(11), freshID, membershipTimeout)
 	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d landed", freshID)
 
 	// A change against the now-stale ID must be refused, and refused FOR
@@ -93,7 +93,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 		staleCtx, staleCancel := context.WithTimeout(context.Background(), defaultTimeout)
 		defer staleCancel()
 		//quicraft:direct-config-change a stale ConfigChangeID must be REFUSED; the refusal is the assertion, and a helper that re-resolved and retried would retry the very answer under test
-		staleErr = cluster.waitForLeaderHost(1, failoverTimeout).SyncRequestAddReplica(staleCtx, 1, 12, "127.10.0.1:59997", freshID)
+		staleErr = cluster.waitForLeaderHost(1, failoverTimeout).SyncRequestAddReplicaWithIdentity(staleCtx, 1, 12, "127.10.0.1:59997", dbIdentityFor(12), freshID)
 		return !isNotLeaderRejection(staleErr)
 	})
 	if staleErr == nil {
@@ -181,7 +181,7 @@ func TestIntegration_DB_SyncRequestAddReplica(t *testing.T) {
 
 	// Add replica 10 at a dummy address, through the current leader, and
 	// confirmed by a linearizable read.
-	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", membership.ConfigChangeID, membershipTimeout)
+	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", dbIdentityFor(10), membership.ConfigChangeID, membershipTimeout)
 
 	// Verify the membership now includes replica 10.
 	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
@@ -211,7 +211,7 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	// Add non-voting replica 20 at a dummy address, through the current
 	// leader, and confirmed by a linearizable read showing it NON-VOTING at
 	// that address -- a voter or a witness at the same ID is a conflict.
-	cluster.addNonVotingToLeader(t, 1, 20, "127.10.0.1:59998", membership.ConfigChangeID, membershipTimeout)
+	cluster.addNonVotingToLeader(t, 1, 20, "127.10.0.1:59998", dbIdentityFor(20), membership.ConfigChangeID, membershipTimeout)
 
 	// Verify the membership now includes non-voting replica 20.
 	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
@@ -331,7 +331,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	//quicraft:direct-config-change this change must enter THIS leader's log, the one
 	// whose apply loop is parked: it is the first half of the overlap under test, and
 	// a helper that re-resolved could submit it to a replica whose latch is not armed
-	rs1, err := leaderHost.RequestAddReplica(1, 10, "127.10.0.1:59990", configChangeID, defaultTimeout)
+	rs1, err := leaderHost.RequestAddReplicaWithIdentity(1, 10, "127.10.0.1:59990", dbIdentityFor(10), configChangeID, defaultTimeout)
 	if err != nil {
 		t.Fatalf("first RequestAddReplica failed: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	//quicraft:direct-config-change the overlap's REJECTION is the test; an idempotent
 	// helper retries ErrRejected (a pending config change clears on its own) and would
 	// wait out the very latch this assertion exists to observe
-	rs2, secondErr := leaderHost.RequestAddReplica(1, 11, "127.10.0.1:59991", configChangeID, defaultTimeout)
+	rs2, secondErr := leaderHost.RequestAddReplicaWithIdentity(1, 11, "127.10.0.1:59991", dbIdentityFor(11), configChangeID, defaultTimeout)
 	if secondErr != nil {
 		// The submission path may reject synchronously; it must still be a
 		// rejection and not some unrelated failure.
@@ -421,8 +421,8 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	//quicraft:direct-config-change positive control: an ErrRejected here means the latch
 	// stuck armed after the rejection, which is the finding, and the idempotent helper
 	// would retry it away as a pending config change
-	if addErr := leaderHost.SyncRequestAddReplica(seqCtx, 1, 11, "127.10.0.1:59991",
-		updatedMembership.ConfigChangeID); addErr != nil {
+	if addErr := leaderHost.SyncRequestAddReplicaWithIdentity(seqCtx, 1, 11, "127.10.0.1:59991",
+		dbIdentityFor(11), updatedMembership.ConfigChangeID); addErr != nil {
 		t.Fatalf("sequential config change after the first applied must succeed, got: %v", addErr)
 	}
 

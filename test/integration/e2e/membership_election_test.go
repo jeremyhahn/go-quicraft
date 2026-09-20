@@ -67,7 +67,7 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	const newReplicaID uint64 = 4
 
 	newAddr := freePort(t)
-	hostCfg := testHostConfig(t, newAddr, cluster.mtls)
+	hostCfg := testHostConfig(t, newAddr, cluster.ca.Leaf(t))
 	newHost, err := quicraft.NewHost(hostCfg)
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
@@ -84,6 +84,7 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	// cluster (4 members, 2 live nodes, quorum=3).
 	createFn, newTracker := kvCreateFunc()
 	scfg := testShardConfig(shardID, newReplicaID)
+	scfg.MemberIdentities = cluster.identities()
 	if err := newHost.StartShard(nil, true, createFn, scfg); err != nil {
 		t.Fatalf("StartShard(join=true) for replica=%d failed: %v", newReplicaID, err)
 	}
@@ -102,7 +103,7 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	// only after an attempt in this same loop was genuinely submitted AND a
 	// linearizable membership read shows replica 4 as a voter at newAddr; an
 	// add that never lands still fails, within the same budget.
-	syncAddNode(t, cluster, shardID, newReplicaID, newAddr, failoverTimeout)
+	syncAddNode(t, cluster, shardID, newReplicaID, newAddr, newHost.NodeIdentity(), failoverTimeout)
 	t.Logf("membership change succeeded after leader election")
 
 	// Wait for the cluster to stabilize with 4 members.

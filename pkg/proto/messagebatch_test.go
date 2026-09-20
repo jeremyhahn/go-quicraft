@@ -508,8 +508,10 @@ func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
 	}
 	// Written through a variable so the shift is not a constant expression,
 	// which would fail to compile on a 32-bit platform before the skip runs.
-	one := 1
-	fourGB := one << 32
+	// Shifted through a uint64 so vet's shift check passes on a 32-bit int
+	// as well; the skip above already guarantees the conversion is lossless.
+	one := uint64(1)
+	fourGB := int(one << 32)
 
 	for _, tc := range []struct {
 		name   string

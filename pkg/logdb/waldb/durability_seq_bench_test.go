@@ -85,7 +85,7 @@ func benchEncodeRecord(b *testing.B, payloadLen int) {
 	var seq uint32
 
 	for b.Loop() {
-		if _, err := encodeRecord(buf, RecordFull, seq, payload); err != nil {
+		if _, err := encodeRecord(buf, RecordFull, seq, 0, payload); err != nil {
 			b.Fatalf("encodeRecord: %v", err)
 		}
 		seq++

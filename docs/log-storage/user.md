@@ -92,18 +92,9 @@ distinguishes those.
 
 ## Task: check a node after every restart
 
-Two calls. Both are silent if you do not make them, and one of them is the only
-signal that a node came back short.
-
-```go
-if residuals := db.RecoveryResiduals(); len(residuals) > 0 {
-    // The node MAY have come back shorter than the log it acknowledged.
-    // This is a page, not a log line.
-}
-```
-
-Empty on a clean recovery, non-empty exactly when durability could not be
-proven for some suffix.
+One call, silent if you do not make it. (A node that may have come back shorter
+than the log it acknowledged does not open at all — see the next task — so
+there is no "came back short" signal to poll for.)
 
 ```go
 nodes, err := db.ListNodeInfo()
@@ -118,6 +109,11 @@ and names what it found:
 - `ErrMidSegmentCorruption` / `ErrNonFinalSegmentCorruption` — a bad record
   somewhere other than the tail of the last segment. This is not an interrupted
   write; it is corruption of data that was acknowledged.
+- `ErrAcknowledgedDataLost` — a bad record at the tail of the last segment,
+  with only the in-flight batch above it, but the damage begins *below* the
+  acknowledged end that batch's records name. An interrupted write cannot do
+  that (a lost page reverts to its fsynced content); media damage or tampering
+  can. Opening would bring the node up shorter than the log it acknowledged.
 - `ErrRecordSequenceRegression` — the durability sequence went backwards.
 
 Only after you have decided the data loss is acceptable:

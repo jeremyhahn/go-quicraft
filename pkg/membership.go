@@ -89,11 +89,13 @@ type Membership struct {
 	// It is the key every peer authorizes that replica's quorum-bearing
 	// messages with, in place of its address.
 	//
-	// It is SPARSE. A replica absent from it has no committed identity and is
-	// authorized by its committed address instead, or refused outright when
-	// TransportConfig.RequireMemberIdentity is set. Reading it is how an
-	// operator verifies a migration is complete before tightening that
-	// setting: every entry in Nodes, Observers and Witnesses must appear here.
+	// On a shard bootstrapped by this build behind a transport it is COMPLETE:
+	// admission requires an identity for every member
+	// (config.Config.RequireMemberIdentities). A replica absent from it has no
+	// committed identity and every message it sends is refused
+	// ("missing_identity"); the only way to hold such a configuration is data
+	// written by a build that did not require identities, or a shard on a host
+	// without a transport, where nothing crosses the wire.
 	//
 	// Seeded at bootstrap from Config.MemberIdentities; changed via
 	// Host.RequestAddNodeWithIdentity and its observer/witness variants.

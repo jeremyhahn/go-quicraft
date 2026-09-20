@@ -343,8 +343,11 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	// host that starts the same shard with the same initial members.
 	// This mimics the stopped node coming back online after losing
 	// its partition.
+	// The returning node presents the LEAF it had before: the shard's
+	// committed identity for this replica is that keypair, and a host with a
+	// fresh one would be refused by every peer as an identity mismatch.
 	addr := freePort(t)
-	hostCfg := testHostConfig(t, addr, cluster.mtls)
+	hostCfg := testHostConfig(t, addr, cluster.leaves[thirdStop])
 	newHost, hostErr := quicraft.NewHost(hostCfg)
 	if hostErr != nil {
 		t.Fatalf("NewHost for recovery node failed: %v", hostErr)
@@ -366,6 +369,7 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 
 	createFn, newTracker := kvCreateFunc()
 	scfg := testShardConfig(1, recoveredReplicaID)
+	scfg.MemberIdentities = cluster.identities()
 	if startErr := newHost.StartShard(members, false, createFn, scfg); startErr != nil {
 		newHost.Close()
 		t.Fatalf("StartShard for recovery node failed: %v", startErr)

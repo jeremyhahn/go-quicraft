@@ -19,20 +19,12 @@ package e2e_test
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
-	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -50,6 +42,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -679,82 +672,6 @@ func kvCreateFunc() (sm.CreateFunc, *smTracker) {
 // Host Construction Helpers
 // ---------------------------------------------------------------------------
 
-// testMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf certificate
-// pair for integration test mTLS. All nodes in a cluster must share the same
-// return value so they can verify each other's certificates.
-func testMTLSConfig(t *testing.T) *config.MTLSConfig {
-	t.Helper()
-
-	// Generate CA key pair.
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate CA key: %v", err)
-	}
-
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create CA cert: %v", err)
-	}
-
-	caCert, err := x509.ParseCertificate(caCertDER)
-	if err != nil {
-		t.Fatalf("parse CA cert: %v", err)
-	}
-
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	// Generate leaf key pair signed by the CA.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate leaf key: %v", err)
-	}
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-			CommonName:   "localhost",
-		},
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback, net.IPv6zero},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	leafCertDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create leaf cert: %v", err)
-	}
-
-	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDER})
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		t.Fatalf("marshal leaf key: %v", err)
-	}
-	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyDER})
-
-	return &config.MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   leafCertPEM,
-		Key:    leafKeyPEM,
-	}
-}
-
 // testHostConfig creates a valid HostConfig for E2E testing. Each call
 // gets unique temp directories via t.TempDir(). The mtls parameter
 // configures mandatory mTLS for the QUIC transport; all nodes in a
@@ -822,8 +739,41 @@ type testCluster struct {
 	configs  []config.HostConfig
 	trackers []*smTracker
 	stopped  []atomic.Bool // tracks which nodes have been stopped
-	mtls     *config.MTLSConfig
-	t        *testing.T
+	// ca issues every host's leaf; leaves holds each host's own leaf — its
+	// own KEYPAIR, and so its own node identity — so a host brought back
+	// for a replica presents the identity the shard committed for it. See
+	// test/testpki.
+	ca     *testpki.CA
+	leaves []*config.MTLSConfig
+	// ids holds each host's node identity, recorded when the host was first
+	// built. It is a property of the leaf, so it survives a stop and a
+	// restart, and a founder's Config.MemberIdentities has to name EVERY
+	// member of the shard — stopped ones included.
+	ids []string
+	t   *testing.T
+}
+
+// identities maps every replica ID (index+1) to the node identity its host
+// reports: what a shard's Config.MemberIdentities has to name, and the join
+// anchor a new node is started with.
+func (c *testCluster) identities() map[uint64]string {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	ids := make(map[uint64]string, len(c.ids))
+	for i, id := range c.ids {
+		ids[uint64(i+1)] = id
+	}
+	return ids
+}
+
+// nodeIdentities reads each host's identity in order, for a cluster that has
+// just been built.
+func nodeIdentities(hosts []*quicraft.Host) []string {
+	ids := make([]string, len(hosts))
+	for i, h := range hosts {
+		ids[i] = h.NodeIdentity()
+	}
+	return ids
 }
 
 // nodeHostDir returns the NodeHostDir the host at idx was constructed with. It
@@ -847,7 +797,8 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
 	const maxRetries = 3
-	mtls := testMTLSConfig(t)
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
 	hosts := make([]*quicraft.Host, numNodes)
 	configs := make([]config.HostConfig, numNodes)
@@ -858,7 +809,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		var cfg config.HostConfig
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			cfg = testHostConfig(t, addr, mtls)
+			cfg = testHostConfig(t, addr, leaves[i])
 			var err error
 			h, err = quicraft.NewHost(cfg)
 			if err == nil {
@@ -883,7 +834,9 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		addrs:   addrs,
 		configs: configs,
 		stopped: make([]atomic.Bool, numNodes),
-		mtls:    mtls,
+		ca:      ca,
+		leaves:  leaves,
+		ids:     nodeIdentities(hosts),
 		t:       t,
 	}
 	setDiagCluster(t, c)
@@ -982,6 +935,7 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 		trackers[i] = tracker
 
 		scfg := testShardConfig(shardID, replicaID)
+		scfg.MemberIdentities = c.identities()
 		if err := h.StartShard(members, false, createFn, scfg); err != nil {
 			c.t.Fatalf("StartShard[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1653,6 +1607,7 @@ func (c *testCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID, r
 		trackers[i] = tracker
 
 		scfg := cfgFn(shardID, replicaID)
+		scfg.MemberIdentities = c.identities()
 		if err := h.StartShard(members, false, createFn, scfg); err != nil {
 			c.t.Fatalf("StartShard[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1682,10 +1637,12 @@ func addNodeToCluster(
 ) addNodeResult {
 	t.Helper()
 
-	// Create a new host on a fresh port, reusing the cluster's mTLS config
-	// so the new node can verify and be verified by existing peers.
+	// Create a new host on a fresh port under its own leaf from the cluster's
+	// CA — its own keypair, its own identity — so existing peers verify it
+	// and it verifies them.
 	addr := freePort(t)
-	hostCfg := testHostConfig(t, addr, cluster.mtls)
+	leaf := cluster.ca.Leaf(t)
+	hostCfg := testHostConfig(t, addr, leaf)
 	h, err := quicraft.NewHost(hostCfg, opts...)
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
@@ -1702,12 +1659,14 @@ func addNodeToCluster(
 			h.Close()
 		}
 	}()
-	syncAddNode(t, cluster, shardID, newReplicaID, addr, membershipTimeout)
+	syncAddNode(t, cluster, shardID, newReplicaID, addr, h.NodeIdentity(), membershipTimeout)
 	added = true
 
-	// Start the shard in join mode on the new host.
+	// Start the shard in join mode on the new host, anchored to the live
+	// members: the bootstrap snapshot may come from whichever of them leads.
 	createFn, tracker := kvCreateFunc()
 	scfg := cfgFn(shardID, newReplicaID)
+	scfg.MemberIdentities = cluster.identities()
 	if err := h.StartShard(nil, true, createFn, scfg); err != nil {
 		added = false
 		t.Fatalf("StartShard(join=true) for replica=%d failed: %v", newReplicaID, err)
@@ -1721,6 +1680,8 @@ func addNodeToCluster(
 	cluster.configs = append(cluster.configs, hostCfg)
 	cluster.trackers = append(cluster.trackers, tracker)
 	cluster.stopped = append(cluster.stopped, atomic.Bool{})
+	cluster.leaves = append(cluster.leaves, leaf)
+	cluster.ids = append(cluster.ids, h.NodeIdentity())
 	cluster.hostsMu.Unlock()
 
 	return addNodeResult{
@@ -1744,9 +1705,9 @@ func addNodeToCluster(
 // moved it to test/membership so the host and linearizability suites could
 // share it, and #145 retired this suite's copy. This is the binding of that
 // decision to testCluster.leaderHost, nothing more.
-func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr string, timeout time.Duration) {
+func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr, identity string, timeout time.Duration) {
 	t.Helper()
-	membership.AddNode(t, cluster.leaderHost, shardID, replicaID, addr, timeout)
+	membership.AddNode(t, cluster.leaderHost, shardID, replicaID, addr, identity, timeout)
 }
 
 // syncDeleteNode removes a replica through whichever node is CURRENTLY the
@@ -2237,7 +2198,8 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 	t.Helper()
 
 	const maxRetries = 3
-	mtls := testMTLSConfig(t)
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
 	hosts := make([]*quicraft.Host, numNodes)
 	configs := make([]config.HostConfig, numNodes)
@@ -2268,7 +2230,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		var cfg config.HostConfig
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			cfg = testHostConfig(t, addr, mtls)
+			cfg = testHostConfig(t, addr, leaves[i])
 			h, err = quicraft.NewHost(cfg, quicraft.WithBarrier(b))
 			if err == nil {
 				break
@@ -2291,7 +2253,9 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		addrs:   addrs,
 		configs: configs,
 		stopped: make([]atomic.Bool, numNodes),
-		mtls:    mtls,
+		ca:      ca,
+		leaves:  leaves,
+		ids:     nodeIdentities(hosts),
 		t:       t,
 	}
 	return &barrierTestCluster{

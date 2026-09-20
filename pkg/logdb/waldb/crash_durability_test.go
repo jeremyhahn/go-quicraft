@@ -682,33 +682,35 @@ func TestCrashFS_RemovalDurability(t *testing.T) {
 //   - Drop the batch's FIRST page — the one straddling the boundary between
 //     acknowledged bytes and the batch. The clean prefix then ends in the
 //     acknowledged generation while the survivors carry the next one, so an
-//     fdatasync completed somewhere inside the destroyed bytes. Recovery still
-//     truncates (refusing here would refuse the commonest power loss there is),
-//     but the node may now be shorter than the log it promised its peers, and
-//     that has to be reported: see DB.RecoveryResiduals.
+//     fdatasync completed somewhere inside the destroyed bytes. The survivors'
+//     GENERATION START says exactly where: at the hole, because the lost page
+//     reverted to its durable content and the acknowledged bytes on it are
+//     intact. Recovery truncates, provably — this used to be a "residual" the
+//     operator was told to reconcile by hand (#197 D).
 //
 // The companion direction — the SAME hole shape, but with survivors whose
 // generations prove a completed fdatasync ABOVE the damage, which must refuse
-// to open — is TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable.
+// to open — is TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable; and
+// damage that begins BELOW the acknowledged end the survivors name is
+// TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed.
 func TestWALCrashDurability_PartialWritebackLeavesDataAboveAHole(t *testing.T) {
 	cases := []struct {
 		name string
 		// pageOffset selects the dropped page relative to the first page the
 		// in-flight batch wrote to.
-		pageOffset   int
-		wantResidual bool
+		pageOffset int
 	}{
-		{name: "InteriorPageLost", pageOffset: 1, wantResidual: false},
-		{name: "BatchHeadPageLost", pageOffset: 0, wantResidual: true},
+		{name: "InteriorPageLost", pageOffset: 1},
+		{name: "BatchHeadPageLost", pageOffset: 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			partialWritebackCase(t, tc.pageOffset, tc.wantResidual)
+			partialWritebackCase(t, tc.pageOffset)
 		})
 	}
 }
 
-func partialWritebackCase(t *testing.T, pageOffset int, wantResidual bool) {
+func partialWritebackCase(t *testing.T, pageOffset int) {
 	const (
 		root      = "/mnt/partial-writeback"
 		blockSize = 1024
@@ -851,80 +853,112 @@ func partialWritebackCase(t *testing.T, pageOffset int, wantResidual bool) {
 		}
 	}
 
-	// The residual signal. A node that came up across a completed fdatasync may
-	// be missing entries it already acknowledged to peers, and it cannot tell
-	// at runtime: it serves reads and accepts writes exactly as a healthy node
-	// does. A log line is not a signal — nothing polls it — so recovery has to
-	// leave the fact where an operator (or the host's health reporting) can
-	// find it hours later.
-	residuals := reopened.RecoveryResiduals()
-	if !wantResidual {
-		if len(residuals) != 0 {
-			t.Fatalf("recovery raised %d residual(s) for damage that lies wholly "+
-				"inside ONE unsynced generation: %+v. No fdatasync completed above "+
-				"or inside it, so nothing acknowledged was lost, and reporting one "+
-				"here would make an ordinary power loss look like data loss on "+
-				"every boot", len(residuals), residuals)
-		}
-		return
-	}
-	if len(residuals) == 0 {
-		t.Fatal("recovery truncated ACROSS a completed fdatasync — the records " +
-			"above the damage carry a generation the clean prefix never reached, " +
-			"so acknowledged records were destroyed with it — and reported " +
-			"nothing: RecoveryResiduals() is empty, so this node comes up " +
-			"potentially shorter than the log it promised its peers with no " +
-			"programmatic signal of any kind")
-	}
-	if len(residuals) != 1 {
-		t.Fatalf("want exactly 1 residual, got %d: %+v", len(residuals), residuals)
-	}
-	r := residuals[0]
-	if want := int(shardID % DefaultShardCount); r.StorageShardIndex != want {
-		t.Fatalf("residual names WAL shard %d, want %d", r.StorageShardIndex, want)
-	}
-	if r.SurvivingGeneration <= r.PrefixGeneration {
-		t.Fatalf("residual reports surviving generation %d not above prefix "+
-			"generation %d; that gap IS the evidence and must be reported",
-			r.SurvivingGeneration, r.PrefixGeneration)
-	}
-	if r.CleanEnd <= 0 || r.CleanEnd >= int64(len(image)) {
-		t.Fatalf("residual clean end %d is outside the segment (%d bytes)",
-			r.CleanEnd, len(image))
-	}
-	var found bool
-	for _, n := range r.Nodes {
-		if n.ShardID != shardID || n.ReplicaID != replicaID {
-			continue
-		}
-		found = true
-		if n.FirstIndex != first || n.LastIndex != first+span-1 {
-			t.Fatalf("residual reports surviving range [%d,%d] for shard %d "+
-				"replica %d, but the node actually came up with [%d,%d]: an "+
-				"operator cannot tell which entries are at risk from a range "+
-				"that is not the node's own", n.FirstIndex, n.LastIndex,
-				shardID, replicaID, first, first+span-1)
-		}
-	}
-	if !found {
-		t.Fatalf("residual lists %d replica range(s), none of them the replica "+
-			"whose log was damaged (shard %d replica %d): %+v",
-			len(r.Nodes), shardID, replicaID, r.Nodes)
-	}
-
-	// The signal must survive whatever the caller does next. It reports what
-	// the OPEN found, and an operator may only look hours later.
+	// The repaired node is a working node: it takes the next batch and a
+	// compaction like any other.
 	if err := save(reopened, acked+1, 2); err != nil {
 		t.Fatalf("SaveState after repair: %v", err)
 	}
 	if err := reopened.Compact(shardID, replicaID); err != nil {
 		t.Fatalf("Compact after repair: %v", err)
 	}
-	if after := reopened.RecoveryResiduals(); len(after) != len(residuals) {
-		t.Fatalf("the residual was cleared by subsequent successful operations "+
-			"(%d -> %d): the condition it reports is not repaired by anything the "+
-			"node can do to itself, so nothing may clear it",
-			len(residuals), len(after))
+}
+
+// TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed is the case the
+// generation start exists to catch (#197 D): the same single-generation
+// survivors as an ordinary interrupted write, but the damage begins BELOW the
+// acknowledged end those survivors name, so the fdatasync that opened their
+// generation had acknowledged bytes the damage destroyed. No crash produces
+// this — a lost writeback leaves an fsynced page at its persisted content — so
+// it is written directly into the segment image as media damage would be: the
+// last acknowledged record's tail is zeroed, leaving the in-flight batch's
+// survivors intact above it. Recovery must refuse to open with
+// ErrAcknowledgedDataLost rather than come up shorter than the log it promised.
+func TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed(t *testing.T) {
+	const (
+		root      = "/mnt/acked-damage"
+		blockSize = 1024
+		maxFile   = 1 << 20
+		shardID   = 1
+		replicaID = 7
+	)
+	dir := filepath.Join(root, "wal")
+	cfs := newCrashFS(root)
+
+	db, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	save := func(db *DB, from, count uint64) error {
+		entries := make([]logdb.Entry, 0, count)
+		for i := uint64(0); i < count; i++ {
+			entries = append(entries, crashDurEntry(shardID, from+i, 1))
+		}
+		return db.SaveState([]logdb.Update{{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			State:     logdb.State{Term: 1, Vote: 2, Commit: from + count - 1},
+			Entries:   entries,
+		}})
+	}
+	// Several acknowledged generations, then one in-flight batch that is cut
+	// at its fdatasync with EVERY page retained: the image is a complete,
+	// undamaged log whose tail is one unsynced generation.
+	var acked uint64
+	for b := 0; b < 6; b++ {
+		if err := save(db, acked+1, 2); err != nil {
+			t.Fatalf("acked batch %d: %v", b, err)
+		}
+		acked += 2
+	}
+	segPath := onlySegmentPath(t, cfs, filepath.Join(dir, shardDirName(int(shardID%DefaultShardCount))))
+	var once sync.Once
+	cfs.setHook(func(op crashOp, path string) {
+		if op != crashOpSync || path != segPath {
+			return
+		}
+		once.Do(func() {
+			cfs.setWriteback(blockSize, func(string, int) bool { return true })
+			cfs.Crash()
+		})
+	})
+	if err := save(db, acked+1, 8); err == nil {
+		t.Fatal("the batch whose fdatasync was interrupted returned success")
+	}
+	cfs.setHook(nil)
+
+	// Find the acknowledged end the survivors name — every chunk of the
+	// in-flight generation carries it — and destroy the bytes just below it.
+	image := readWholeFile(t, cfs, segPath)
+	ackedEnd := int64(-1)
+	for off := int64(0); off+recordHeaderSize <= int64(len(image)); off++ {
+		_, _, seq, genStart, _, derr := decodeRecord(image[off:])
+		if derr != nil {
+			continue
+		}
+		if int64(genStart) > 0 && int64(genStart) <= off && seq > 0 {
+			ackedEnd = int64(genStart)
+		}
+	}
+	if ackedEnd <= int64(recordHeaderSize) {
+		t.Fatalf("could not locate the in-flight generation's start in the image (%d)", ackedEnd)
+	}
+	damageAt := ackedEnd - 8
+	damageFile(t, cfs, segPath, damageAt, 8)
+
+	_, err = Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+	if err == nil {
+		t.Fatalf("Open succeeded over damage that begins %d bytes below the acknowledged "+
+			"end %d: the node came up shorter than the log it acknowledged", ackedEnd-damageAt, ackedEnd)
+	}
+	if !errors.Is(err, ErrAcknowledgedDataLost) {
+		t.Fatalf("Open = %v, want ErrAcknowledgedDataLost", err)
+	}
+	var sce *SegmentCorruptionError
+	if !errors.As(err, &sce) {
+		t.Fatalf("Open error does not carry a *SegmentCorruptionError for Repair: %v", err)
+	}
+	if sce.CleanEnd <= 0 || sce.CleanEnd > damageAt {
+		t.Fatalf("clean end %d is not at or below the damage at %d", sce.CleanEnd, damageAt)
 	}
 }
 
@@ -977,6 +1011,23 @@ func pageSpan(writes []crashWrite, pageSize int) (lo, hi int, ok bool) {
 		}
 	}
 	return lo, hi, ok
+}
+
+// damageFile zeroes n bytes of a modelled file at off, durably, the way media
+// damage under acknowledged data presents to the next open.
+func damageFile(t *testing.T, cfs *crashFS, path string, off int64, n int) {
+	t.Helper()
+	f, err := cfs.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatalf("OpenFile(%s): %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(make([]byte, n), off); err != nil {
+		t.Fatalf("WriteAt(%s, %d): %v", path, off, err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("Sync(%s): %v", path, err)
+	}
 }
 
 // readWholeFile reads a modelled file in full.
@@ -1304,5 +1355,192 @@ func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
 	if st.Term != 1 || st.Commit != 1 {
 		t.Fatalf("shard A hard state = %+v after a failed batch and a crash, want "+
 			"term 1 commit 1: the failed batch's state was resurrected", st)
+	}
+}
+
+// TestWALCrashDurability_ClosingMarkIsDurable pins that a segment closed by
+// rotation or by a clean shutdown carries nothing unsynced. Sync appends its
+// mark AFTER its fdatasync, so the mark closing a segment's last generation is
+// the one unsynced thing such a segment would hold; a later power loss tearing
+// it in its writeback window would fail its CRC, and once the segment is
+// non-final — rotation makes it so at once, a restart that writes a new
+// segment makes it so later — recovery refuses damage in it
+// (ErrNonFinalSegmentCorruption) precisely because a non-final segment is
+// durable end to end. Rotation's idle Sync fdatasyncs the mark; segment.Close
+// fdatasyncs once more for the clean shutdown that never rotates. Either way:
+// crash with every unsynced page dropped, and the closed segment must still
+// end in its mark and the WAL must open on both acknowledged batches.
+func TestWALCrashDurability_ClosingMarkIsDurable(t *testing.T) {
+	const (
+		blockSize = 1024
+		maxFile   = 1 << 20
+		shardID   = 1
+		replicaID = 7
+	)
+	for _, tc := range []struct {
+		name  string
+		close func(t *testing.T, db *DB, cfs *crashFS, dir string) *DB
+	}{
+		{"rotation", func(t *testing.T, db *DB, _ *crashFS, _ string) *DB {
+			rotateShard(t, db, shardID)
+			return db
+		}},
+		{"clean shutdown then restart", func(t *testing.T, db *DB, cfs *crashFS, dir string) *DB {
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			db2, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			return db2
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := "/mnt/closing-mark"
+			dir := filepath.Join(root, "wal")
+			cfs := newCrashFS(root)
+			db, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			save := func(db *DB, from, count uint64) {
+				t.Helper()
+				entries := make([]logdb.Entry, 0, count)
+				for i := uint64(0); i < count; i++ {
+					entries = append(entries, crashDurEntry(shardID, from+i, 1))
+				}
+				if err := db.SaveState([]logdb.Update{{
+					ShardID:   shardID,
+					ReplicaID: replicaID,
+					State:     logdb.State{Term: 1, Vote: 2, Commit: from + count - 1},
+					Entries:   entries,
+				}}); err != nil {
+					t.Fatalf("SaveState(%d..): %v", from, err)
+				}
+			}
+			save(db, 1, 3)
+			shardDir := filepath.Join(dir, shardDirName(int(shardID%DefaultShardCount)))
+			seg0 := onlySegmentPath(t, cfs, shardDir)
+			db = tc.close(t, db, cfs, dir)
+			save(db, 4, 3)
+
+			// Power loss with NOTHING unsynced retained.
+			cfs.setWriteback(blockSize, func(string, int) bool { return false })
+			cfs.Crash()
+
+			image := readWholeFile(t, cfs, seg0)
+			var lastType byte
+			var lastSeq uint32
+			for off := 0; off+recordHeaderSize <= len(image); {
+				_, typ, seq, _, n, derr := decodeRecord(image[off:])
+				if derr != nil {
+					break
+				}
+				lastType, lastSeq = typ, seq
+				off += n
+			}
+			if lastType != RecordSyncMark {
+				t.Fatalf("the closed segment's last durable chunk is type %d (generation %d), want the "+
+					"sync mark; it was left unsynced and a torn one would refuse the open", lastType, lastSeq)
+			}
+
+			db2, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+			if err != nil {
+				t.Fatalf("Open after the crash: %v", err)
+			}
+			defer db2.Close()
+			first, last, err := db2.EntryRange(shardID, replicaID)
+			if err != nil {
+				t.Fatalf("EntryRange: %v", err)
+			}
+			if first != 1 || last != 6 {
+				t.Fatalf("recovered entries [%d, %d], want [1, 6]: both acknowledged batches", first, last)
+			}
+		})
+	}
+}
+
+// TestWALCrashDurability_RecoveryMakesTheFinalMarkDurable pins the third
+// path by which a segment becomes non-final: not rotation, not a clean
+// shutdown, but a PROCESS crash and restart. Sync writes its mark after its
+// fdatasync, so after the last acknowledged batch the mark sits in the page
+// cache; a SIGKILL keeps it there, the restart replays it read-only, and the
+// next write creates a higher segment — making the old one non-final while
+// its mark was never fsynced. A later power loss tearing that mark would
+// then be refused as non-final damage with nothing acknowledged lost.
+// recover fdatasyncs the highest surviving segment before that can happen.
+func TestWALCrashDurability_RecoveryMakesTheFinalMarkDurable(t *testing.T) {
+	const (
+		root      = "/mnt/recovery-mark"
+		blockSize = 1024
+		maxFile   = 1 << 20
+		shardID   = 1
+		replicaID = 7
+	)
+	dir := filepath.Join(root, "wal")
+	cfs := newCrashFS(root)
+	open := func() *DB {
+		t.Helper()
+		db, err := Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return db
+	}
+	save := func(db *DB, from, count uint64) {
+		t.Helper()
+		entries := make([]logdb.Entry, 0, count)
+		for i := uint64(0); i < count; i++ {
+			entries = append(entries, crashDurEntry(shardID, from+i, 1))
+		}
+		if err := db.SaveState([]logdb.Update{{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			State:     logdb.State{Term: 1, Vote: 2, Commit: from + count - 1},
+			Entries:   entries,
+		}}); err != nil {
+			t.Fatalf("SaveState(%d..): %v", from, err)
+		}
+	}
+
+	db := open()
+	save(db, 1, 3)
+	shardDir := filepath.Join(dir, shardDirName(int(shardID%DefaultShardCount)))
+	seg0 := onlySegmentPath(t, cfs, shardDir)
+	// Process crash: the DB is abandoned without Close; the page cache (the
+	// live image) survives.
+
+	db2 := open()
+	// The restart writes, which creates a higher segment; segment 0 is
+	// non-final from here on.
+	save(db2, 4, 3)
+
+	// Power loss with NOTHING unsynced retained.
+	cfs.setWriteback(blockSize, func(string, int) bool { return false })
+	cfs.Crash()
+
+	image := readWholeFile(t, cfs, seg0)
+	var lastType byte
+	for off := 0; off+recordHeaderSize <= len(image); {
+		_, typ, _, _, n, derr := decodeRecord(image[off:])
+		if derr != nil {
+			break
+		}
+		lastType = typ
+		off += n
+	}
+	if lastType != RecordSyncMark {
+		t.Fatalf("the segment recovery rotated past does not end in a durable sync mark (last chunk type %d); "+
+			"a torn mark there is refused as non-final damage", lastType)
+	}
+	db3 := open()
+	defer db3.Close()
+	first, last, err := db3.EntryRange(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("EntryRange: %v", err)
+	}
+	if first != 1 || last != 6 {
+		t.Fatalf("recovered entries [%d, %d], want [1, 6]", first, last)
 	}
 }

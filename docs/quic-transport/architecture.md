@@ -150,11 +150,12 @@ compared against the committed membership binding. It is deliberately an SPKI
 pin rather than a SPIFFE URI SAN because four downstream products issue these
 certificates and none of them agree on a naming scheme.
 
-Where no identity is committed for a sender, the fallback is a SAN check against
-the committed Raft address. `TransportConfig.RequireMemberIdentity` (default
-`false`) drops such messages instead. A peer whose leaf also covers the local
-node's host is refused at connection setup — a certificate that can impersonate
-you is not a certificate you accept from someone else.
+Where no identity is committed for a sender, the message is dropped
+(`missing_identity`); there is no address fallback, and admission requires the
+identity on every host with a transport (`config.Config.RequireMemberIdentities`).
+A peer whose leaf also covers the local node's host is refused at connection
+setup — a certificate that can impersonate you is not a certificate you accept
+from someone else.
 
 ### Revocation fails closed
 

@@ -95,17 +95,15 @@ Leave `Enable0RTT` off unless you have thought about it. **0-RTT data is
 replayable**, and the round trip it saves is once per connection, not once per
 message.
 
-## Task: decide on `RequireMemberIdentity`
+## Task: give every member its identity
 
-| Setting | Behavior for a sender with no committed identity |
-|---|---|
-| `false` (default) | fall back to a SAN check against the committed Raft address |
-| `true` | drop the message |
-
-`true` is the stronger posture and is what a new cluster should run. Turning it
-on for a **live** cluster is a sequenced migration: every member must have a
-committed identity first, or you partition the cluster from itself. The
-procedure is in [`../compatibility.md`](../compatibility.md).
+A member is authorized by its committed node identity and by nothing else; a
+sender the configuration holds no identity for has every message dropped. So
+every host needs its own keypair, and every admission — the founding map, the
+join anchor, every later add — names the identity the node reports from
+`Host.NodeIdentity()`. There is no setting: the requirement follows from the
+host having a transport at all. The procedure is in
+[`../compatibility.md`](../compatibility.md).
 
 ## Task: watch the right signals
 
@@ -311,9 +309,9 @@ revoked". Fix the source rather than setting `AllowSoftFail`.
 check is installed as `VerifyConnection`, not `VerifyPeerCertificate`,
 specifically so resumed sessions are checked too. Look elsewhere.
 
-**Messages dropped as unauthorized** — `RequireMemberIdentity` is on and the
-sender has no committed identity, or the committed SPKI does not match the leaf
-it presented. A certificate reissued with a **new key** changes the SPKI and
+**Messages dropped as unauthorized** — the sender has no committed identity
+(a configuration written by a build that did not require one; wipe and
+re-bootstrap), or the committed SPKI does not match the leaf it presented. A certificate reissued with a **new key** changes the SPKI and
 therefore the identity; reissuing with the same key does not.
 
 **Heartbeats look delayed under load** — they should not be. Stream 0 is

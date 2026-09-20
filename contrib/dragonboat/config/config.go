@@ -113,6 +113,16 @@ type Config struct {
 	// in elections and quorum but does not maintain a state machine.
 	IsWitness bool
 
+	// MemberIdentities has no dragonboat counterpart. It is quicraft's
+	// config.Config.MemberIdentities passed through unchanged: the node
+	// identity (NodeHost.NodeIdentity) of every initial member for a
+	// founding replica, and the join anchor — the replicas a joining replica
+	// will accept its bootstrap snapshot from — for join=true. A NodeHost
+	// with a transport refuses to start a shard without it, because quicraft
+	// authorizes a member by its identity and by nothing else; a NodeHost
+	// started WithoutTransport does not need it.
+	MemberIdentities map[uint64]string
+
 	// Quiesce enables quiescence for idle shards, reducing CPU usage
 	// when there are no pending proposals.
 	Quiesce bool
@@ -286,5 +296,6 @@ func (c Config) ToQuicraft() qcConfig.Config {
 		EntryCompressionType:    c.EntryCompressionType,
 		Quiesce:                 c.Quiesce,
 		MaxEntrySize:            c.MaxEntrySize,
+		MemberIdentities:        c.MemberIdentities,
 	}
 }

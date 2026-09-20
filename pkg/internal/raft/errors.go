@@ -217,6 +217,15 @@ var (
 	// still need distinct keypairs. See membership.identityHolder.
 	ErrDuplicateMemberIdentity = errors.New("raft: node identity already held by another member of this shard")
 
+	// ErrMemberIdentityRequired is returned at propose time when a config
+	// change would admit a member that carries no node identity into a shard
+	// whose local policy requires one (config.Config.RequireMemberIdentities,
+	// which the Host sets on every shard behind a transport). The receive-side
+	// gate authorizes a member by its committed identity and by nothing else,
+	// so an identity-less member would be one whose every message is dropped:
+	// a voter counted in every quorum that can never be heard from.
+	ErrMemberIdentityRequired = errors.New("raft: a member must be admitted with its node identity")
+
 	// ErrRemovedMemberIdentity is returned when a config change would bind a
 	// node identity this shard has already committed a REMOVAL for, under any
 	// replica ID.

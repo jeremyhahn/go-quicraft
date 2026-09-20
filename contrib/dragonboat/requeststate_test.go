@@ -861,11 +861,26 @@ func TestWrapRequestStateWithCancel_DoubleRelease(t *testing.T) {
 
 	rs := WrapRequestStateWithCancel(inner, cancel, false)
 	rs.Release()
-	// Second release should call cancel again (cancel funcs are idempotent).
-	// This verifies no panic on double release.
+	// A second Release is absorbed by the adapter: the inner object is pooled
+	// and may already belong to another request, so nothing — not even the
+	// context cancel, which the first call already ran — is repeated.
 	rs.Release()
-	if callCount != 2 {
-		t.Errorf("cancel called %d times, expected 2 (idempotent)", callCount)
+	if callCount != 1 {
+		t.Errorf("cancel called %d times, expected 1 (the second Release is a no-op)", callCount)
+	}
+}
+
+// TestSysOpState_DoubleReleaseReachesInnerOnce pins the same rule for the
+// system-operation wrapper: only the first Release reaches the inner
+// RequestState, which a second call could otherwise find recycled.
+func TestSysOpState_DoubleReleaseReachesInnerOnce(t *testing.T) {
+	pool := quicraft.NewRequestStatePool()
+	inner := pool.Get().(*quicraft.RequestState)
+	s := &SysOpState{inner: inner}
+	s.Release()
+	s.Release()
+	if !s.released.Load() {
+		t.Fatal("released not recorded")
 	}
 }
 

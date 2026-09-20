@@ -196,12 +196,13 @@ func TestSegment_StopsAtFirstCorruption(t *testing.T) {
 // of resurrecting post-hole records, and marks the segment as stopped at
 // corruption so higher-numbered segments are not replayed either.
 //
-// Every record here is written before the ONE trailing Sync, so the whole
-// segment is a single durability generation and nothing in it was ever
-// acknowledged. That is deliberate — it is the interrupted-write half of the
-// property — and the evidence flags are asserted rather than ignored, so this
-// test also fails if the generation check ever starts refusing a WAL that a
-// power loss legitimately produces. The acknowledged half lives in
+// No record here is ever Synced (Close flushes them to the file without an
+// fdatasync), so the whole segment is a single durability generation with no
+// sync mark and nothing in it was ever acknowledged. That is deliberate — it
+// is the interrupted-write half of the property — and the evidence flags are
+// asserted rather than ignored, so this test also fails if the generation
+// check ever starts refusing a WAL that a power loss legitimately produces.
+// The acknowledged half lives in
 // TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable.
 func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
 	dir := t.TempDir()
@@ -217,9 +218,6 @@ func TestSegment_StopsAtZeroFilledHole(t *testing.T) {
 		if _, err := seg.Write(bytes.Repeat([]byte{byte(i + 1)}, 200)); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
-	}
-	if err := seg.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
 	}
 	if err := seg.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -515,16 +513,16 @@ func TestSegment_DiscardPendingResetsFlushWatermark(t *testing.T) {
 }
 
 // writeHoleFixture builds a segment whose records are written one per Sync
-// (syncPerRecord) or all under a single trailing Sync, zeroes one whole block in
-// the middle of it, and returns the pristine record set alongside the reopened
-// segment's scan.
+// (syncPerRecord) or with no Sync at all — the batch whose fdatasync never
+// returned — zeroes one whole block in the middle of it, and returns the
+// pristine record set alongside the reopened segment's scan.
 //
 // syncPerRecord is the whole variable under test. Every completed Sync closes a
-// durability generation and stamps the next record with a higher one, so
-// syncPerRecord=true produces a segment where recovery can PROVE each record was
-// acknowledged, and syncPerRecord=false one where it can prove none of them was.
-// The identical byte damage means opposite things in the two, and the returned
-// segment carries the verdict in its flags.
+// durability generation, appends a sync mark and stamps the next record with a
+// higher generation, so syncPerRecord=true produces a segment where recovery
+// can PROVE each record was acknowledged, and syncPerRecord=false one where it
+// can prove none of them was. The identical byte damage means opposite things
+// in the two, and the returned segment carries the verdict in its flags.
 func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, holeBlock int, syncPerRecord bool) (want [][]byte, got [][]byte, cleanEnd int64, rs *segment) {
 	t.Helper()
 	seg, _, err := createSegment(defaultFS(), dir, id, blockSize, 8*1024*1024)
@@ -541,11 +539,6 @@ func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, h
 			if err := seg.Sync(); err != nil {
 				t.Fatalf("Sync %d: %v", i, err)
 			}
-		}
-	}
-	if !syncPerRecord {
-		if err := seg.Sync(); err != nil {
-			t.Fatalf("Sync: %v", err)
 		}
 	}
 	if err := seg.Close(); err != nil {

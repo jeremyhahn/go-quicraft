@@ -41,7 +41,7 @@ import (
 
 // membershipAliases is the complete set of raft sentinels pkg/errors.go
 // re-exports for the membership-change API. Adding a re-export without adding
-// it here leaves it unguarded, which is the state all seven were in.
+// it here leaves it unguarded, which is the state all seven originals were in.
 var membershipAliases = []struct {
 	name     string
 	exported error
@@ -54,9 +54,10 @@ var membershipAliases = []struct {
 	{"ErrTooManyVotingMembers", ErrTooManyVotingMembers, raft.ErrTooManyVotingMembers},
 	{"ErrZeroReplicaID", ErrZeroReplicaID, raft.ErrZeroReplicaID},
 	{"ErrEmptyAddress", ErrEmptyAddress, raft.ErrEmptyAddress},
+	{"ErrMemberIdentityRequired", ErrMemberIdentityRequired, raft.ErrMemberIdentityRequired},
 }
 
-// TestMembershipAliasesAreTheRaftValues pins the IDENTITY of the seven
+// TestMembershipAliasesAreTheRaftValues pins the IDENTITY of the
 // re-exports against the raft sentinels they alias.
 //
 // This is the assertion that cannot be made from outside the module, and it is
@@ -96,7 +97,7 @@ func TestMembershipAliasesAreTheRaftValues(t *testing.T) {
 	}
 }
 
-// TestMembershipAliasesAreDistinct stops the table above from passing on seven
+// TestMembershipAliasesAreDistinct stops the table above from passing on
 // names bound to one value. errors.Is(x, x) is true for any x, so a copy-paste
 // that pointed two aliases at the same sentinel would satisfy every identity
 // assertion while making the two rejections indistinguishable to a caller.

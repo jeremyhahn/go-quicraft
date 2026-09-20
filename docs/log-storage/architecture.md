@@ -120,7 +120,7 @@ medium.
 
  restart ─▶ Open ─▶ replay every segment of every shard, in order
                     ─▶ barrier.Decrypt ─▶ rebuild every in-memory map
-                    ─▶ RecoveryResiduals() reports anything it could not prove
+                    ─▶ refuses to open (fail closed) rather than come up short
 ```
 
 Nothing here crosses a host boundary. The only process boundary is the
@@ -179,8 +179,7 @@ three hops to two. See
   are **deliberately separate types from `pkg/proto`'s**, to keep serialization
   and persistence independently changeable. It also declares the capability
   interfaces the engine probes for: `AtRestProtectedLogDB`, `EpochAwareLogDB`,
-  `PerBarrierEpochAwareLogDB`, `BarrierShardEnumerator`,
-  `RecoveryResidualReporter`.
+  `PerBarrierEpochAwareLogDB`, `BarrierShardEnumerator`.
 - **`pkg/logdb/waldb`** — the durable implementation, the `FS`/`File`
   abstraction, `DiskMonitor`, `Repair` and `Reencrypt`.
 - **`pkg/logdb/memdb`** — the in-memory implementation.

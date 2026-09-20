@@ -103,11 +103,10 @@ rolling membership change from an attack.
 
 | Reason | What it means |
 |---|---|
-| `"unknown_member"` | the benign config-change window — a voter added by a change this replica has not applied yet. **Rises and falls on its own.** |
+| `"unknown_member"` | no configuration this replica holds — committed, pending in its own log, or `Config.MemberIdentities` — names the sender. Transient during a membership change; **persistent** means this replica missed the config change that added the sender: restart it with a `Config.MemberIdentities` that names the leader. |
 | `"identity_mismatch"` | **the strongest signal here.** Committed membership records a node identity for the claimed replica and the connection presented a different one, so the sender does not hold that replica's private key. A forged `From`, or a stale identity after a key rotation. **Never routine.** |
-| `"missing_identity"` | the shard records no identity and `RequireMemberIdentity` is set. A migration gap, not an attack — commit the identity. |
-| `"address_mismatch"` | fallback path: a certificate that does not cover the committed address |
-| `"shared_address"` | fallback path: one address given to two active members |
+| `"missing_identity"` | the shard records no identity for a replica the configuration names. Admission requires one on every host with a transport, so this is a configuration written by a build that did not; wipe and re-bootstrap. |
+| `"address_mismatch"`, `"shared_address"` | retired with the address fallback (#197); the label values are not reallocated |
 | `"removed_replica"` | a node that has not noticed it was removed |
 | `"misrouted"` | a message for a shard this replica does not hold |
 

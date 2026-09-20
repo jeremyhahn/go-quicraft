@@ -38,10 +38,10 @@ func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, repl
 | Permission | none in this library; the caller must be talking to the leader |
 
 `identity` is the SPKI pin the transport derives from the peer's mTLS leaf:
-`"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`. **Prefer the
-`WithIdentity` form.** Without a committed identity the transport falls back to
-a SAN check against the committed address, and
-`TransportConfig.RequireMemberIdentity` cannot be turned on.
+`"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`, the value the node
+reports from `Host.NodeIdentity()`. **It is required** on a host with a
+transport: the identity-less forms return `ErrMemberIdentityRequired`, and a
+member is authorized by its committed identity and by nothing else.
 
 ### Capability: add an observer or a witness
 
@@ -162,7 +162,7 @@ func proto.ConfigChangeTypeName(t uint64) string
 | `OrderedConfigChange` | `config.Config` | `*bool`, nil = **enabled** | serialize membership changes |
 | `IsObserver` / `IsWitness` | `config.Config` | false | **mutually exclusive** |
 | `Witness` | `config.Config` | `WitnessConfig{}` | bootstrap seed only |
-| `RequireMemberIdentity` | `config.TransportConfig` | **false** | drop messages from senders with no committed identity |
+| `MemberIdentities` | `config.Config` | `nil` | required on a host with a transport: every founder's members (join=false), at least one anchor replica (join=true); entries beyond the members map are the operator anchor the receive gate consults for a sender no configuration names |
 
 ## Versioning and deprecation
 
@@ -174,7 +174,7 @@ func proto.ConfigChangeTypeName(t uint64) string
   [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md).
 - The WAL has a **third** discriminator on the same layout,
   `membershipSectionVersion`.
-- `RequireMemberIdentity` defaults to `false` for clusters whose membership
-  predates committed identities. Enabling it on a live cluster is a sequenced
-  migration — see [`../compatibility.md`](../compatibility.md).
+- `RequireMemberIdentity` was removed in 0.13.0-alpha (#197): identities are
+  required at admission and there is no address fallback — see
+  [`../compatibility.md`](../compatibility.md).
 - Nothing here is deprecated.

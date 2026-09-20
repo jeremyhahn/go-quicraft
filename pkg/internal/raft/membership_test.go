@@ -1856,3 +1856,66 @@ func TestVoteGrantedWhenTheConfigurationIsIncomplete(t *testing.T) {
 		}
 	}
 }
+
+// TestValidate_RequireIdentitiesRefusesIdentitylessAdds pins the local
+// admission policy (#197 A): under requireIdentities every add of a NET-NEW
+// member must carry a node identity, at validate time only — the apply path
+// still applies whatever committed — and a role change for a member the
+// configuration already holds an identity for may leave the field empty.
+func TestValidate_RequireIdentitiesRefusesIdentitylessAdds(t *testing.T) {
+	base := proto.Membership{
+		Addresses:  map[uint64]string{1: "a1"},
+		Identities: map[uint64]string{1: "spki:1"},
+	}
+	m := newMembershipWithPolicy(base, true)
+
+	for _, cc := range []proto.ConfigChange{
+		{Type: proto.AddNode, ReplicaID: 2, Address: "a2"},
+		{Type: proto.AddNonVoting, ReplicaID: 3, Address: "a3"},
+		{Type: proto.AddWitness, ReplicaID: 4, Address: "a4"},
+	} {
+		if err := m.validate(cc); !errors.Is(err, ErrMemberIdentityRequired) {
+			t.Fatalf("validate(%v without identity) = %v, want ErrMemberIdentityRequired", cc.Type, err)
+		}
+		withID := cc
+		withID.NodeIdentity = "spki:" + string(rune('0'+cc.ReplicaID))
+		if err := m.validate(withID); err != nil {
+			t.Fatalf("validate(%v with identity) = %v, want nil", cc.Type, err)
+		}
+		// The apply path never refuses a committed entry.
+		if err := m.apply(cc, cc.ReplicaID); err != nil {
+			t.Fatalf("apply(%v without identity) = %v, want nil: a committed change always applies", cc.Type, err)
+		}
+	}
+
+	// A promotion of a member that already holds an identity may omit it.
+	held := newMembershipWithPolicy(proto.Membership{
+		Addresses:  map[uint64]string{1: "a1"},
+		Observers:  map[uint64]string{5: "a5"},
+		Identities: map[uint64]string{1: "spki:1", 5: "spki:5"},
+	}, true)
+	if err := held.validate(proto.ConfigChange{Type: proto.AddNode, ReplicaID: 5, Address: "a5"}); err != nil {
+		t.Fatalf("promoting an identified observer without restating its identity = %v, want nil", err)
+	}
+
+	// Without the policy the identity-less add is admitted, as before.
+	lax := newMembershipWithPolicy(base, false)
+	if err := lax.validate(proto.ConfigChange{Type: proto.AddNode, ReplicaID: 2, Address: "a2"}); err != nil {
+		t.Fatalf("validate without the policy = %v, want nil", err)
+	}
+
+	// The policy survives the replacements Peer performs.
+	lr := newTestLogReaderWithMembership(map[uint64]string{1: "a1"})
+	cfg := raftTestCfg(1, 1)
+	cfg.RequireMemberIdentities = true
+	p, err := NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	if !p.membership.requireIdentities || !p.newMembership(base).requireIdentities {
+		t.Fatal("the peer's membership does not carry the identity policy")
+	}
+	if err := p.ValidateConfigChange(proto.ConfigChange{Type: proto.AddNode, ReplicaID: 2, Address: "a2"}); !errors.Is(err, ErrMemberIdentityRequired) {
+		t.Fatalf("Peer.ValidateConfigChange without identity = %v, want ErrMemberIdentityRequired", err)
+	}
+}

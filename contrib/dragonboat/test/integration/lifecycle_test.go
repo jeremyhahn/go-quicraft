@@ -67,7 +67,7 @@ func TestIntegration_DB_StopAndRestartShard(t *testing.T) {
 	// Restart the shard on the same follower node (join=true since already bootstrapped).
 	replicaID := uint64(followerIdx + 1)
 	createFn, newTracker := dbKVCreateFunc()
-	cfg := dbTestShardConfig(1, replicaID)
+	cfg := cluster.shardConfig(1, replicaID)
 	if err := followerHost.StartReplica(nil, true, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica (rejoin) failed: %v", err)
 	}
@@ -92,9 +92,9 @@ func TestIntegration_DB_StopAndRestartShard(t *testing.T) {
 // all data for a stopped shard/replica pair. Matches dragonboat's
 // TestRemoveNodeDataRemovesAllNodeData.
 func TestIntegration_DB_RemoveNodeData(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -106,6 +106,7 @@ func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -148,9 +149,9 @@ func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 // fails when the shard is still running. Matches dragonboat's
 // TestRemoveNodeDataWillFailWhenNodeIsStillRunning.
 func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -161,6 +162,7 @@ func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -177,9 +179,9 @@ func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
 // remains stable and is returned correctly. Matches dragonboat's
 // TestNodeHostIDIsStatic.
 func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -202,9 +204,9 @@ func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 // results for existing and non-existing shard/replica pairs. Matches
 // dragonboat's TestNodeHostHasNodeInfo.
 func TestIntegration_DB_HasNodeInfo(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -221,6 +223,7 @@ func TestIntegration_DB_HasNodeInfo(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -240,9 +243,9 @@ func TestIntegration_DB_HasNodeInfo(t *testing.T) {
 // TestIntegration_DB_StopShard verifies StopShard stops a running shard
 // and StopReplica stops a specific replica.
 func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -253,6 +256,7 @@ func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -283,9 +287,9 @@ func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
 // TestIntegration_DB_StartDuplicateReplica verifies that starting a
 // shard that is already running returns an error.
 func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -296,6 +300,7 @@ func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("first StartReplica failed: %v", startErr)
 	}
@@ -316,9 +321,9 @@ func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
 // TestIntegration_DB_UsingClosedNodeHost verifies that various
 // operations on a closed NodeHost return errors.
 func TestIntegration_DB_UsingClosedNodeHost(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -370,9 +375,9 @@ func TestIntegration_DB_NewNodeHost_InvalidConfig(t *testing.T) {
 // TestIntegration_DB_NodeHostID_CustomID verifies that setting
 // NodeHostID in NodeHostConfig produces that exact ID from nh.ID().
 func TestIntegration_DB_NodeHostID_CustomID(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NodeHostID = "custom-test-host-id-12345"
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())

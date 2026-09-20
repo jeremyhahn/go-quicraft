@@ -9,8 +9,8 @@ privately until a fix is available.
 
 | Version | Supported |
 |---------|-----------|
-| `0.5.x-alpha` | Yes -- fixes land on the latest `0.5.x-alpha` |
-| `0.4.x-alpha` and earlier | No |
+| The newest `0.x-alpha` minor (`v0.12.0-alpha` at the time of writing; `git tag --sort=-v:refname` is authoritative) | Yes -- fixes land there, as the next `0.x` release |
+| Every earlier minor | No |
 
 QuicRaft is **alpha software**. There is no long-term support branch and no
 backporting: a security fix is released as the next `0.x` version, and
@@ -145,18 +145,18 @@ breached, so they are listed here:
   to start without an mTLS config (`ErrMTLSConfigRequired`). None of that is
   adjustable. What *is* yours is which CAs you put in the pool and which
   certificates you issue against them.
-- Commit node identities (`Config.MemberIdentities` at bootstrap,
-  `Host.RequestAddNodeWithIdentity` thereafter) and then enable
-  `TransportConfig.RequireMemberIdentity` (default `false`). An identity is the
-  SHA-256 of the peer leaf's SubjectPublicKeyInfo, taken from the verified TLS
-  handshake. Without committed identities a sender falls back to the
-  committed-address check, which a removed replica evades by naming a different
-  replica ID.
-- Avoid wildcard or shared-SAN certificates. A certificate covering every
-  member's address lets its holder assert any member's identity on the
-  address-only path. (`refuseInboundPromiscuousCert` catches the case where the
-  peer's leaf also covers the local node's host, but it cannot see certificates
-  that only overlap two *other* members.)
+- Give every member its node identity (`Config.MemberIdentities` at bootstrap
+  and as the operator anchor, `Host.RequestAddNodeWithIdentity` thereafter).
+  An identity is the SHA-256 of the peer leaf's SubjectPublicKeyInfo, taken
+  from the verified TLS handshake, and it is the ONLY thing a member is
+  authorized by: a host with a transport refuses to admit a member without
+  one, and a sender no configuration names is dropped. There is no address
+  fallback and no switch.
+- Issue one keypair per host. Two hosts sharing a leaf share an identity, and
+  one identity cannot be committed for two replicas
+  (`ErrDuplicateMemberIdentity`). Avoid wildcard or shared-SAN certificates for
+  the same reason (`refuseInboundPromiscuousCert` catches the case where the
+  peer's leaf also covers the local node's host).
 - Configure a barrier. `seal.NoneStrategy` is not encryption.
 - Set `BarrierConfig.StatePersister`. Without it the barrier cannot rotate
   (`ErrNoStatePersister`), the load-generation fence is inert, and the first

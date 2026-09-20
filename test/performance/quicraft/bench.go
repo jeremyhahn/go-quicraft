@@ -16,15 +16,7 @@ package quicraft_perf
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
-	"math/big"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,6 +28,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 const (
@@ -65,87 +58,6 @@ const (
 	// not include one-time pipeline initialization. Shared across all engines.
 	commitLatencyWarmup = 100
 )
-
-// benchMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf certificate
-// pair suitable for localhost benchmarks. The returned MTLSConfig contains
-// PEM-encoded CA cert, node cert, and private key. All nodes in a cluster
-// must share the same CA to verify each other, so generate this once and
-// pass it to all HostConfig structs in the cluster.
-func benchMTLSConfig(b *testing.B) *config.MTLSConfig {
-	b.Helper()
-
-	// Generate CA key pair.
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		b.Fatalf("generate CA key: %v", err)
-	}
-
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Benchmark"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		b.Fatalf("create CA cert: %v", err)
-	}
-
-	caCert, err := x509.ParseCertificate(caCertDER)
-	if err != nil {
-		b.Fatalf("parse CA cert: %v", err)
-	}
-
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	// Generate leaf key and cert signed by CA.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		b.Fatalf("generate leaf key: %v", err)
-	}
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Benchmark"},
-			CommonName:   "localhost",
-		},
-		DNSNames:    []string{"localhost"},
-		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback, net.IPv6zero},
-		NotBefore:   time.Now().Add(-1 * time.Minute),
-		NotAfter:    time.Now().Add(1 * time.Hour),
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageServerAuth,
-			x509.ExtKeyUsageClientAuth,
-		},
-		BasicConstraintsValid: true,
-	}
-
-	leafCertDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		b.Fatalf("create leaf cert: %v", err)
-	}
-
-	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDER})
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		b.Fatalf("marshal leaf key: %v", err)
-	}
-	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyDER})
-
-	return &config.MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   leafCertPEM,
-		Key:    leafKeyPEM,
-	}
-}
 
 // BenchCluster holds a multi-node QuicRaft cluster for benchmarks.
 type BenchCluster struct {
@@ -209,14 +121,17 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		members[uint64(i+1)] = addr
 	}
 
-	// Generate mTLS material once for the entire cluster so all nodes
-	// share the same CA and can verify each other.
-	mtls := benchMTLSConfig(b)
+	// One CA for the cluster so the nodes verify each other, one leaf per
+	// node: a host with a transport is admitted by its node identity, which
+	// is its leaf's key, so the leaves must differ and the founding map must
+	// name each one (Config.MemberIdentities).
+	ca := testpki.NewCA(b)
 
 	// Create hosts with real QUIC transport (no WithoutTransport).
 	hosts := make([]*quicraft.Host, numNodes)
 	for i := 0; i < numNodes; i++ {
 		dir := b.TempDir()
+		mtls := ca.Leaf(b)
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
@@ -249,10 +164,15 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		return newQuicraftKVSM()
 	})
 
+	identities := make(map[uint64]string, numNodes)
+	for i, h := range hosts {
+		identities[uint64(i+1)] = h.NodeIdentity()
+	}
 	for i, h := range hosts {
 		shardCfg := config.Config{
-			ShardID:   quicraftShardID,
-			ReplicaID: uint64(i + 1),
+			ShardID:          quicraftShardID,
+			ReplicaID:        uint64(i + 1),
+			MemberIdentities: identities,
 		}
 		shardCfg.SetDefaults()
 
@@ -384,7 +304,7 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 
 	// Generate mTLS material once for the entire cluster so all nodes
 	// share the same CA and can verify each other.
-	mtls := benchMTLSConfig(b)
+	ca := testpki.NewCA(b)
 
 	// Create hosts once outside the benchmark loop. This is transport
 	// infrastructure setup (TLS, QUIC, workers) and should not be
@@ -392,6 +312,7 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 	hosts := make([]*quicraft.Host, numNodes)
 	for j := 0; j < numNodes; j++ {
 		dir := b.TempDir()
+		mtls := ca.Leaf(b)
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
@@ -426,6 +347,10 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
+	identities := make(map[uint64]string, numNodes)
+	for j, h := range hosts {
+		identities[uint64(j+1)] = h.NodeIdentity()
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -436,8 +361,9 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 		// Start shard on all hosts.
 		for j, h := range hosts {
 			shardCfg := config.Config{
-				ShardID:   quicraftShardID,
-				ReplicaID: uint64(j + 1),
+				ShardID:          quicraftShardID,
+				ReplicaID:        uint64(j + 1),
+				MemberIdentities: identities,
 			}
 			shardCfg.SetDefaults()
 
@@ -695,7 +621,7 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		NumWorkers:            4,
 		MaxApplyWorkers:       4,
 		TransportConfig: config.TransportConfig{
-			MTLSConfig:         benchMTLSConfig(b),
+			MTLSConfig:         testpki.NewCA(b).Leaf(b),
 			DisableCompression: true,
 		},
 	}
@@ -710,8 +636,9 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 	})
 
 	shardCfg := config.Config{
-		ShardID:   quicraftShardID,
-		ReplicaID: quicraftReplicaID,
+		ShardID:          quicraftShardID,
+		ReplicaID:        quicraftReplicaID,
+		MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
 	}
 	shardCfg.SetDefaults()
 
@@ -754,7 +681,7 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		NumWorkers:            4,
 		MaxApplyWorkers:       4,
 		TransportConfig: config.TransportConfig{
-			MTLSConfig:         benchMTLSConfig(b),
+			MTLSConfig:         testpki.NewCA(b).Leaf(b),
 			DisableCompression: true,
 		},
 	}
@@ -769,8 +696,9 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 	})
 
 	shardCfg := config.Config{
-		ShardID:   quicraftShardID,
-		ReplicaID: quicraftReplicaID,
+		ShardID:          quicraftShardID,
+		ReplicaID:        quicraftReplicaID,
+		MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
 	}
 	shardCfg.SetDefaults()
 
@@ -948,7 +876,7 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		NumWorkers:            4,
 		MaxApplyWorkers:       4,
 		TransportConfig: config.TransportConfig{
-			MTLSConfig:         benchMTLSConfig(b),
+			MTLSConfig:         testpki.NewCA(b).Leaf(b),
 			DisableCompression: true,
 		},
 	}
@@ -972,8 +900,9 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 
 	for i := 0; i < b.N; i++ {
 		shardCfg := config.Config{
-			ShardID:   quicraftShardID,
-			ReplicaID: quicraftReplicaID,
+			ShardID:          quicraftShardID,
+			ReplicaID:        quicraftReplicaID,
+			MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
 		}
 		shardCfg.SetDefaults()
 
@@ -1016,7 +945,7 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 		NumWorkers:            4,
 		MaxApplyWorkers:       4,
 		TransportConfig: config.TransportConfig{
-			MTLSConfig:         benchMTLSConfig(b),
+			MTLSConfig:         testpki.NewCA(b).Leaf(b),
 			DisableCompression: true,
 		},
 	}
@@ -1040,8 +969,9 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 
 	for i := 0; i < b.N; i++ {
 		shardCfg := config.Config{
-			ShardID:   quicraftShardID,
-			ReplicaID: quicraftReplicaID,
+			ShardID:          quicraftShardID,
+			ReplicaID:        quicraftReplicaID,
+			MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
 		}
 		shardCfg.SetDefaults()
 
@@ -1109,13 +1039,13 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		members[uint64(i+1)] = addr
 	}
 
-	// Generate mTLS material once for the entire cluster so all nodes
-	// share the same CA and can verify each other.
-	mtls := benchMTLSConfig(b)
+	// One CA for the cluster, one leaf (identity) per node.
+	ca := testpki.NewCA(b)
 
 	hosts := make([]*quicraft.Host, numNodes)
 	for i := 0; i < numNodes; i++ {
 		dir := b.TempDir()
+		mtls := ca.Leaf(b)
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
@@ -1146,11 +1076,16 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		return newQuicraftKVSM()
 	})
 
+	identities := make(map[uint64]string, numNodes)
+	for i, h := range hosts {
+		identities[uint64(i+1)] = h.NodeIdentity()
+	}
 	for i, h := range hosts {
 		shardCfg := config.Config{
-			ShardID:   quicraftShardID,
-			ReplicaID: uint64(i + 1),
-			LeaseRead: true,
+			ShardID:          quicraftShardID,
+			ReplicaID:        uint64(i + 1),
+			LeaseRead:        true,
+			MemberIdentities: identities,
 		}
 		shardCfg.SetDefaults()
 

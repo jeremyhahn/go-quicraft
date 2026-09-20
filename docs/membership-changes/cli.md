@@ -45,7 +45,7 @@ group; something else decides what the group should be.
 | `OrderedConfigChange` | `config.Config` | `*bool`, nil = **enabled**. Leave it. |
 | `IsObserver` / `IsWitness` | `config.Config` | mutually exclusive; set at `StartShard` |
 | `Witness` (`MaxWitnesses`, `RequireFullReplicaMajority`) | `config.Config` | **bootstrap seed only** — change it live through `RequestUpdateWitnessPolicy` |
-| `RequireMemberIdentity` | `config.TransportConfig` | `false` by default; enabling it on a live cluster is a sequenced migration |
+| `MemberIdentities` | `config.Config` | required on a host with a transport: every founder's members, or a joiner's anchor |
 
 ## The two calls an operator procedure is actually built from
 

@@ -71,9 +71,9 @@ func TestIntegration_DB_ProposalsWorkWhenRateLimited(t *testing.T) {
 // up backpressure in the proposal pipeline, allowing the rate limiter
 // to detect that the in-memory log size exceeds MaxInMemLogSize.
 func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -94,6 +94,7 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 		CheckQuorum:     true,
 		MaxInMemLogSize: 129, // smallest legal value -- extremely aggressive
 	}
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}

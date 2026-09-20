@@ -112,7 +112,7 @@ const (
 )
 
 func addTen() configChange {
-	return configChange{kind: addReplica, shardID: 1, replicaID: 10, addr: helperTestAddr, configChangeID: 7}
+	return configChange{kind: addReplica, shardID: 1, replicaID: 10, addr: helperTestAddr, identity: dbIdentityFor(10), configChangeID: 7}
 }
 
 func deleteTwo() configChange {
@@ -221,12 +221,12 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsInAnotherRoleStillFails(t
 			role: roleWitness,
 		},
 		"non-voting requested, voter present": {
-			cc:   configChange{kind: addNonVoting, shardID: 1, replicaID: 10, addr: helperTestAddr, configChangeID: 7},
+			cc:   configChange{kind: addNonVoting, shardID: 1, replicaID: 10, addr: helperTestAddr, identity: dbIdentityFor(10), configChangeID: 7},
 			m:    membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
 			role: roleVoter,
 		},
 		"witness requested, non-voting present": {
-			cc:   configChange{kind: addWitness, shardID: 1, replicaID: 10, addr: helperTestAddr, configChangeID: 7},
+			cc:   configChange{kind: addWitness, shardID: 1, replicaID: 10, addr: helperTestAddr, identity: dbIdentityFor(10), configChangeID: 7},
 			m:    membershipOf(nil, map[uint64]dragonboat.Target{10: helperTestAddr}, nil),
 			role: roleNonVoting,
 		},
@@ -455,7 +455,7 @@ func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T
 		members[uint64(i+1)] = addr
 	}
 	createFn, _ := dbKVCreateFunc()
-	if err := cluster.hosts[0].StartReplica(members, false, createFn, dbTestShardConfig(1, 1)); err != nil {
+	if err := cluster.hosts[0].StartReplica(members, false, createFn, cluster.shardConfig(1, 1)); err != nil {
 		t.Fatalf("StartReplica on the lone replica failed: %v", err)
 	}
 
@@ -487,8 +487,8 @@ func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T
 // built on it is wrong by that factor -- exactly the drift the derivation
 // replaced a literal to prevent. This is the only place that can notice.
 func TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
-	if got := dbTestNodeHostConfig(t, "127.10.0.5:1", mtls).RTTMillisecond; got != testRTTMillisecond {
+	pki := dbTestPKIFor(t)
+	if got := dbTestNodeHostConfig(t, "127.10.0.5:1", pki.leaf(t)).RTTMillisecond; got != testRTTMillisecond {
 		t.Fatalf("dbTestNodeHostConfig sets RTTMillisecond=%d but the budgets are derived "+
 			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
 			"thinks it is", got, uint64(testRTTMillisecond), electionRound)

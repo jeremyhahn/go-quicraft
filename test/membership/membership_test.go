@@ -425,7 +425,9 @@ func TestTry_NoLeaderExhaustsBudgetWithoutAHost(t *testing.T) {
 	}
 
 	for name, try := range map[string]func() error{
-		"add":    func() error { return membership.TryAddNode(noLeader, 1, 11, "127.0.0.1:1", 300*time.Millisecond) },
+		"add": func() error {
+			return membership.TryAddNode(noLeader, 1, 11, "127.0.0.1:1", "spki:11", 300*time.Millisecond)
+		},
 		"delete": func() error { return membership.TryDeleteNode(noLeader, 1, 11, 300*time.Millisecond) },
 	} {
 		t.Run(name, func(t *testing.T) {

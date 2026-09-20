@@ -132,7 +132,9 @@ func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
 				{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp},
 			},
 		}
-		if err := handler.HandleMessage(batch, certCovering(memberAddr)); err != nil {
+		// The member's own keypair: newEngineNodeWithMembership commits
+		// fixtureIdentity for every member, and that is what the gate reads.
+		if err := handler.HandleMessage(batch, certCoveringAs(fixtureIdentity, memberAddr)); err != nil {
 			t.Fatalf("HandleMessage = %v", err)
 		}
 		if len(eng.delivered) != 1 {

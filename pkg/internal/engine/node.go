@@ -391,6 +391,15 @@ func NewNode(
 		listener:    listener,
 		stopC:       make(chan struct{}),
 	}
+	// Seed the published log markers from the peer's recovered log before
+	// anyone else can read them. publishLogMarkers otherwise first runs on the
+	// step worker's first tick, and until then CommittedIndex reports 0. The
+	// host records that value as a pending proposal's committed-index floor
+	// (#186), so a proposal registered between StartReplica returning and the
+	// first tick had floor 0 and rested on the random key alone against a
+	// replayed entry — the exact restart window #186 was about. Nothing owns
+	// the peer yet, so reading it here is as race-free as the worker path.
+	n.publishLogMarkers()
 	return n
 }
 
@@ -632,6 +641,20 @@ func (n *Node) publishLogMarkers() {
 	committed, processed := n.peer.LogMarkers()
 	n.committedIndex.Store(committed)
 	n.processedIndex.Store(processed)
+	// Same owner, same moment: the pending configuration the receive gate
+	// consults is derived from the log this goroutine just moved.
+	n.peer.PublishPendingConfig()
+}
+
+// PendingMemberIdentity returns the node identity a config-carrying entry in
+// this replica's log admits replicaID with, above the committed configuration,
+// and whether there is one. See raft.Peer.PendingMemberIdentity. Safe from any
+// goroutine.
+func (n *Node) PendingMemberIdentity(replicaID uint64) (string, bool) {
+	if n.peer == nil {
+		return "", false
+	}
+	return n.peer.PendingMemberIdentity(replicaID)
 }
 
 // LogMarkers returns the last committed and processed markers published by
@@ -876,6 +899,26 @@ func (n *Node) IsRemovedIdentity(identity string) bool {
 		return false
 	}
 	return n.peer.IsRemovedIdentity(identity)
+}
+
+// PendingRemoval reports whether a RemoveNode entry above the applied
+// configuration removes replicaID or the holder of identity; see
+// raft.Peer.PendingRemoval. False when the peer is nil.
+func (n *Node) PendingRemoval(replicaID uint64, identity string) bool {
+	if n.peer == nil {
+		return false
+	}
+	return n.peer.PendingRemoval(replicaID, identity)
+}
+
+// IdentityHolder reports the replica the committed configuration binds the
+// given node identity to; see raft.Peer.IdentityHolder. False when the peer is
+// nil.
+func (n *Node) IdentityHolder(identity string) (uint64, bool) {
+	if n.peer == nil {
+		return 0, false
+	}
+	return n.peer.IdentityHolder(identity)
 }
 
 // DiagPipeline is a point-in-time snapshot of a node's pipeline state.

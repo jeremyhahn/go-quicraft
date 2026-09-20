@@ -104,7 +104,7 @@ func (o *Options) Validate() error {
 	if o.BlockSize < recordHeaderSize+1 || !isPowerOfTwo(o.BlockSize) {
 		return ErrInvalidBlockSize
 	}
-	if o.MaxFileSize <= 0 {
+	if o.MaxFileSize <= 0 || o.MaxFileSize > maxSegmentFileSize {
 		return ErrInvalidMaxFileSize
 	}
 	if o.MaxBatchSize <= 0 {

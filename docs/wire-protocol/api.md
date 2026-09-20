@@ -131,7 +131,19 @@ const MaxEntriesPerMessage           = 10000
 const MaxMembershipEntries           = 10000
 const MaxDecodeMemoryFactor          = 8
 const HeartbeatMessageSize           = messageFixedSize + 4 + 8   // 100 bytes
+const MaxTerm                 uint64 = math.MaxUint64 - 1024
+const MaxLogIndex             uint64 = math.MaxUint64 - 1024
 ```
+
+`MaxTerm` and `MaxLogIndex` are protocol bounds rather than decode limits: the
+codec accepts any `uint64`, and the values are refused where they are ADMITTED
+— `raft.step` for a wire term, `Snapshot.CheckBounds` on every snapshot
+admission path (chunk validation, LogDB `SaveSnapshot` and `SaveState`,
+`handleSnapshot`), and a leader's proposals once its log reaches
+`MaxLogIndex` — with `ErrTermOutOfRange` / `ErrLogIndexOutOfRange`. Persisted
+state is refused at open only at the ceiling itself, a few below `MaxUint64`;
+the headroom between the two is what local `term+1` / `index+1` transitions
+spend without ever wrapping.
 
 `MaxMessagesPerBatch`, `MaxEntriesPerMessage` and `MaxMembershipEntries` are
 **exported because they are properties of the wire protocol, not of the

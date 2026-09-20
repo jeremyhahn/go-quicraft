@@ -103,9 +103,10 @@ commit loop is measurable.
 - `IncSnapshotsRejected`: `"shutdown"`, `"concurrency_limit"`,
   `"memory_budget"`, `"liveness"`, `"malformed"`, `"io_error"`, `"policy"`.
   `shardID` is **0** when the transfer was rejected before its header parsed.
-- `IncUnauthorizedMessageDropped`: `"removed_replica"`, `"misrouted"`,
-  `"unknown_member"`, `"address_mismatch"`, `"shared_address"`,
-  `"identity_mismatch"`, `"missing_identity"`.
+- `IncUnauthorizedMessageDropped`: `"removed_replica"`, `"removed_identity"`,
+  `"misrouted"`, `"unknown_member"`, `"identity_mismatch"`,
+  `"missing_identity"`. (`"address_mismatch"` and `"shared_address"` were
+  retired with the address fallback in #197 and are not reallocated.)
 
 **Implementations must treat `reason` as a metric label and must not derive new
 label values from it.**

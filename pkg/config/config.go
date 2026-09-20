@@ -256,34 +256,73 @@ type Config struct {
 	// in replicated membership state; see WitnessConfig.
 	Witness WitnessConfig
 
-	// MemberIdentities seeds the shard's replicated NODE IDENTITIES at
-	// bootstrap, mapping replica ID to the identity value that node reports
-	// through Host.NodeIdentity. It is the bootstrap counterpart of the
-	// identity argument on Host.RequestAddNodeWithIdentity, and the same
-	// lifecycle applies: this is the ONLY point where it enters the shard, and
-	// from here on it lives in replicated membership state (log, snapshot, WAL)
-	// and changes only through committed config changes.
+	// MemberIdentities maps replica ID to the stable NODE IDENTITY that node
+	// reports through Host.NodeIdentity — the SHA-256 of its certificate's
+	// SubjectPublicKeyInfo. It has two roles, decided by StartShard's join
+	// argument:
 	//
-	// Its effect is on the RECEIVE-SIDE SENDER GATE. A replica named here is
-	// authorized by its identity — a value derived from its keypair, which no
-	// other holder of a valid cluster certificate can present — instead of by
-	// its committed address, which a wildcard or shared-SAN certificate covers
-	// for every member at once. A replica NOT named here falls back to the
-	// address check, or is refused outright when
-	// TransportConfig.RequireMemberIdentity is set.
+	//   - FOUNDING (join=false): it seeds the shard's replicated identities. It
+	//     is the bootstrap counterpart of the identity argument on
+	//     Host.RequestAddNodeWithIdentity, and the same lifecycle applies: this
+	//     is the ONLY point where it enters the shard, and from here on it
+	//     lives in replicated membership state (log, snapshot, WAL) and changes
+	//     only through committed config changes. Every founding member must be
+	//     given an IDENTICAL map: the bootstrap entry at log index 1 is built
+	//     from it, byte-identically on each founder, and founders that disagree
+	//     produce a divergent index-1 entry that Log Matching never reconciles
+	//     — the same rule that already applies to the members map and to
+	//     Witness.
 	//
-	// Every FOUNDING member (join=false) must be given an IDENTICAL map. The
-	// bootstrap entry at log index 1 is built from it, byte-identically on each
-	// founder, and founders that disagree produce a divergent index-1 entry
-	// that Log Matching never reconciles — the same rule that already applies
-	// to the members map and to Witness.
+	//   - ANCHOR (every start, and the whole of a join=true start): it is the
+	//     OPERATOR ANCHOR — replicas this host vouches for, each bound to the
+	//     identity the connection must present, consulted by the receive gate
+	//     for a sender neither the committed configuration nor a pending
+	//     config change in this replica's own log names. A joiner holds no
+	//     configuration at all, so the anchor is the only thing that can say
+	//     who may hand it one: before it existed, any host holding a valid
+	//     cluster certificate could bootstrap a joining shard. An established
+	//     replica that was down while a member was added and elected holds no
+	//     entry for that leader either; restarting it with a map that names
+	//     the leader is how its operator vouches for it, without a wipe. Name
+	//     the current leader at least, or every member if leadership may move;
+	//     an entry naming a replica that never sends costs nothing, and an
+	//     entry for a replica outside a founder's members map is anchor only —
+	//     it is not written into the bootstrap entry. A removed identity is
+	//     refused by the tombstone before the anchor is consulted.
 	//
-	// Leaving it nil is the pre-identity behaviour and is fully supported. It
-	// cannot be populated automatically: an identity has to be collected from
-	// each node out of band, because learning it from the peer's own connection
+	// Its effect on an established shard is on the RECEIVE-SIDE SENDER GATE. A
+	// member is authorized by its identity — a value derived from its keypair,
+	// which no other holder of a valid cluster certificate can present — and by
+	// nothing else; its address is routing metadata. There is no address
+	// fallback: a member the configuration holds no identity for has its
+	// quorum-bearing and leader-originated traffic dropped.
+	//
+	// It is therefore REQUIRED on every host that has a transport
+	// (RequireMemberIdentities, which the Host sets from that fact): a founder
+	// must name every member of the members map, a joiner must name at least
+	// one anchor replica, no identity may be bound to two replicas, and every
+	// later add must carry an identity. It cannot
+	// be populated automatically: an identity has to be collected from each
+	// node out of band, because learning it from the peer's own connection
 	// would let a promiscuous-certificate holder register itself as any replica
 	// — the very attack identities close.
 	MemberIdentities map[uint64]string
+
+	// RequireMemberIdentities makes every path that ADMITS a member into this
+	// shard's configuration refuse one that carries no node identity:
+	// StartShard's founding map and anchor, and every AddNode,
+	// AddObserver and AddWitness the leader is asked to append — including a
+	// config change forwarded from another replica, which never passed the
+	// proposing host's API. It is validate-only: a committed entry is never
+	// refused on the apply path, or replicas would diverge.
+	//
+	// The Host SETS it from whether it has a transport, overriding whatever
+	// the caller put here: the requirement is a property of the wire boundary
+	// — the receive-side gate authorizes a member by identity and by nothing
+	// else — and a host with no transport (WithoutTransport) has no wire
+	// boundary for it to matter at. A bare raft, or a test driving one, may
+	// set it explicitly.
+	RequireMemberIdentities bool
 
 	// CheckQuorum enables the leader to step down if it cannot reach a
 	// quorum within an election timeout. Defaults to true when nil.

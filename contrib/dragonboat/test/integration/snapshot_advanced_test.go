@@ -313,7 +313,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 
 	// Create the 4th node on a new NodeHost.
 	newAddr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, newAddr, cluster.mtls)
+	nhConfig := dbTestNodeHostConfig(t, newAddr, cluster.pki.leaf(t))
 	newHost, nhErr := dragonboat.NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
 	)
@@ -328,13 +328,16 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	// most: the replica is about to be STARTED at that address, so an
 	// "already exists" for replica 4 elsewhere would be a real conflict.
 	const newReplicaID = 4
-	cluster.addReplicaToLeader(t, 1, newReplicaID, newAddr, membership.ConfigChangeID, membershipTimeout)
+	cluster.addReplicaToLeader(t, 1, newReplicaID, newAddr, newHost.NodeIdentity(), membership.ConfigChangeID, membershipTimeout)
 	t.Logf("replica %d added to membership at address %s", newReplicaID, newAddr)
 
 	// Start the replica on the new NodeHost (join=true since it was
 	// added to an existing cluster).
 	createFn, newTracker := dbKVCreateFunc()
 	cfg := dbTestShardConfigWithSnapshot(1, newReplicaID, 10, 5)
+	// A first-start joiner holds no configuration: the founders' identities
+	// are its anchor for the snapshot that brings it one.
+	cfg.MemberIdentities = cluster.identities()
 	if startErr := newHost.StartReplica(nil, true, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica on 4th node failed: %v", startErr)
 	}

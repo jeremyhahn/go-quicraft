@@ -506,7 +506,7 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 			best = int64(blockStart)
 		}
 		for pos := 0; pos+recordHeaderSize < len(block) && block[pos] != 0; {
-			_, recType, _, n, err := decodeRecord(block[pos:])
+			_, recType, _, _, n, err := decodeRecord(block[pos:])
 			if err != nil {
 				t.Fatalf("segment already corrupt at offset %d before tearing: %v",
 					blockStart+pos, err)

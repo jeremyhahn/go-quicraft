@@ -196,6 +196,8 @@ Submits an asynchronous session-managed proposal for at-most-once delivery. The 
 
 On error the session state is untouched, so the same session can retry the same command; that is the point of the session.
 
+A session serves **one proposal at a time**. The entry is stamped with the session's current series number, and the state machine treats every entry with the same `(ClientID, SeriesID)` as a retransmission of one command — the property that makes the retry safe, and the reason a second *concurrent* proposal on the same session is unsafe: only one of the two would run and both would report success. The series is reserved for the returned `RequestState`, and a second call while it is held returns `ErrSessionBusy` (`Temporary`). The reservation is released by `ProposalCompleted`, by an error result, or by `RequestState.Release`, whichever comes first.
+
 Returns `ErrSessionsUnsupportedOnDisk` on a shard whose state machine is an `sm.DiskStateMachine`. A no-op session is unaffected. See [Sessions and on-disk state machines](#sessions-and-on-disk-state-machines).
 
 #### SyncProposeWithSession
@@ -384,9 +386,7 @@ That closes two holes at once. A wildcard or shared-SAN certificate no longer le
 
 The identity has to come from outside the cluster -- from the operator or the provisioning system that issued the certificate. It is deliberately not captured from the joining node's own connection: the only evidence available at that point is the certificate's address coverage, so a holder of a promiscuous certificate could claim the target's address and have its own identity committed for that replica ID, locking the legitimate node out with the very mechanism meant to protect it. A node is also customarily added before it is started, so there is often no connection to capture.
 
-An empty `identity` commits no identity and is exactly the non-identity variant. Bootstrap-time identities are seeded through `config.Config.MemberIdentities`.
-
-Set `TransportConfig.RequireMemberIdentity` only after `Membership.Identities` covers every entry in `Nodes`, `Observers` and `Witnesses`; until then, uncovered replicas are refused rather than falling back to the address check.
+An empty `identity` is exactly the non-identity variant, and on a host with a transport both are refused with `ErrMemberIdentityRequired`: a member is authorized by its committed identity and by nothing else, so it is admitted with one or not at all (`config.Config.RequireMemberIdentities`, which the Host sets from whether it has a transport). Bootstrap-time identities are seeded through `config.Config.MemberIdentities`; entries beyond the members map, and the whole map on a `join=true` start, are the operator anchor — the replicas this host vouches for when no configuration it holds names the sender, which is what admits the leader's bootstrap snapshot to a joiner.
 
 #### Witness Policy
 
@@ -679,7 +679,7 @@ func (h *Host) Drain() error
 func (h *Host) IsDraining() bool
 ```
 
-`Drain` transitions to drain mode: new proposals, ReadIndex requests, session operations and config changes are rejected with `ErrDraining`. In-flight work is allowed to complete. Blocks until all pending proposals, reads, and snapshots complete, or `ShutdownTimeout` expires (`ErrShutdownTimeout`). Idempotent.
+`Drain` transitions to drain mode: new proposals, ReadIndex requests, session operations and config changes are rejected with `ErrDraining`. In-flight work is allowed to complete. Blocks until all pending proposals, reads, and snapshots complete, or `ShutdownTimeout` expires (`ErrShutdownTimeout`). Idempotent, and every caller gets the same answer: there is one drain attempt, and a concurrent caller joins it rather than returning early.
 
 Drain is **irreversible**. There is no resume; a host that needs to accept proposals again has to be recreated. The wait is event-driven off a pending-operation counter, not a poll loop.
 
@@ -941,7 +941,7 @@ The committed cluster membership for a shard, returned by `Host.SyncGetShardMemb
 
 Note the naming: `MaxSessionsPerClient` is the **response-cache depth**, how many cached results one session retains for duplicate detection. It does not limit sessions. `MaxSessionsPerOwner` is the per-principal session cap and `MaxTotalSessions` the shard-wide one.
 
-**`Identities` is how you verify an identity migration is complete.** Every entry in `Nodes`, `Observers` and `Witnesses` must appear here before you set `TransportConfig.RequireMemberIdentity`; until then, a replica absent from the map is authorized by its committed address instead, or refused outright once that setting is on.
+**`Identities` is complete on any shard this build bootstrapped behind a transport**: every entry in `Nodes`, `Observers` and `Witnesses` appears here, because admission requires it. A replica absent from the map has every message refused (`missing_identity`); the only way to hold such a configuration is data written by a build that did not require identities, or a host started `WithoutTransport()`.
 
 ## Error Types
 
@@ -1076,6 +1076,7 @@ All sentinel errors declared here use the `"quicraft:"` prefix. Check with `erro
 | `ErrInvalidOperation`       | Invalid for the current state, e.g. a witness read or propose |
 | `ErrInvalidSMType`          | `CreateFunc` returned a type implementing none of the SM interfaces |
 | `ErrInvalidSession`         | Wrong shard, or a no-op session used for a session operation |
+| `ErrSessionBusy`            | The session already has a proposal in flight; `Temporary`   |
 | `ErrInvalidRange`           | Log query with `firstIndex >= lastIndex` or `maxSize == 0`   |
 | `ErrInvalidMember`          | Sentinel form of `*InvalidMemberError`                       |
 | `ErrEntryTooLarge`          | Sentinel form of `*EntryTooLargeError`                       |
@@ -1552,11 +1553,9 @@ These are counted rather than only logged because every increment is either a mi
 
 | `reason`            | Meaning                                                                                    |
 |---------------------|--------------------------------------------------------------------------------------------|
-| `unknown_member`    | The benign config-change window: a voter added by a change this replica has not applied yet. It rises and falls on its own |
+| `unknown_member`    | No configuration this replica holds (committed, pending in its own log, or `Config.MemberIdentities`) names the sender. Transient during a membership change; persistent means this replica missed the change that added the sender — restart it with a map that names the leader |
 | `identity_mismatch` | The strongest signal here. Committed membership records a node identity for the claimed replica and the connection presented a different one, so the sender does not hold that replica's private key. A forged `From`, or a stale identity after a key rotation. Never routine |
-| `missing_identity`  | The shard records no identity for a replica and `RequireMemberIdentity` is set. A migration gap, not an attack -- commit the identity with `RequestAddNodeWithIdentity` |
-| `address_mismatch`  | Fallback path: the certificate does not cover the committed address                        |
-| `shared_address`    | Fallback path: one address is configured for two active members                            |
+| `missing_identity`  | The shard records no identity for a replica the configuration names. Admission requires one on every host with a transport, so this is a configuration written by a build that did not; wipe and re-bootstrap |
 | `removed_replica`   | The sender was removed from the shard                                                      |
 | `misrouted`         | The message names a shard this host does not serve                                         |
 
@@ -1689,7 +1688,8 @@ Source: `pkg/config/config.go`
 | `IsObserver`             | `bool`           | `false`        | Non-voting learner. Join-only, see below |
 | `IsWitness`              | `bool`           | `false`        | Voting member with no state machine. Join-only, see below |
 | `Witness`                | `WitnessConfig`  | zero value     | Seeds the shard's replicated witness policy at bootstrap |
-| `MemberIdentities`       | `map[uint64]string` | `nil`       | Seeds the shard's replicated node identities at bootstrap |
+| `MemberIdentities`       | `map[uint64]string` | `nil`       | Founders: seeds the replicated node identities, every member named. Joiners: the anchor. Any entry beyond the members map is operator trust for the receive gate. Required on a host with a transport |
+| `RequireMemberIdentities` | `bool`          | set by the Host | `true` on every shard behind a transport: admission refuses an identity-less member |
 | `CheckQuorum`            | `*bool`          | `nil` = on     | Leader steps down on quorum loss. Disabling is unsafe |
 | `PreVote`                | `*bool`          | `nil` = on     | Pre-vote extension. Disabling is unsafe  |
 | `OrderedConfigChange`    | `*bool`          | `nil` = on     | Serialize membership changes             |
@@ -1766,7 +1766,6 @@ Source: `pkg/config/transportconfig.go`
 |--------------------------------|--------------------|-------------|-----------------------------------|
 | `MTLSConfig`                   | `*MTLSConfig`      | `nil`       | CA cert plus either a PEM `Cert`/`Key` pair or a pre-built `*tls.Certificate`. Required unless `TransportDisabled` |
 | `RevocationConfig`             | `*RevocationConfig`| `nil`       | CRL paths, OCSP responder, check interval, fail-open/closed mode |
-| `RequireMemberIdentity`        | `bool`             | `false`     | Refuse a member with no committed node identity instead of falling back to the address check |
 | `StreamPoolSize`               | `int`              | `16`        | QUIC streams per connection       |
 | `MaxStreamPoolSize`            | `int`              | `256`       | Upper bound for the stream pool   |
 | `MaxStreamsPerConnection`      | `int`              | `256`       | QUIC stream limit advertised per connection |

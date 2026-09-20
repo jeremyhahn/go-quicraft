@@ -365,12 +365,10 @@ func startOffset(pid, span int) int {
 	}
 	// A small multiplicative scramble, so PIDs allocated close together (which
 	// is what a test runner does) start far apart rather than adjacent.
-	const scramble = 2654435761
-	h := (pid * scramble) % span
-	if h < 0 {
-		h += span
-	}
-	return h
+	// Typed and multiplied in uint64 so the constant fits on a 32-bit int
+	// platform and the product cannot go negative.
+	const scramble uint64 = 2654435761
+	return int((uint64(pid) * scramble) % uint64(span))
 }
 
 // parsePortRange parses the two whitespace-separated values of

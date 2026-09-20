@@ -72,6 +72,14 @@ type Peer struct {
 	// recv goroutine reading them for per-shard authorization.
 	membershipSnap atomic.Pointer[membershipSnapshot]
 
+	// pendingSnap is the published PENDING configuration: every member a
+	// config-carrying entry in this replica's log admits with an identity,
+	// above the applied configuration. Read by the transport receive
+	// goroutine (PendingMemberIdentity) for a sender the committed
+	// configuration does not name yet; written only by the step worker
+	// (PublishPendingConfig). nil when nothing is pending.
+	pendingSnap atomic.Pointer[pendingConfig]
+
 	// prevState records the hard state from the last GetUpdate call.
 	// Used by hasStateChanged to detect whether the engine needs to
 	// persist new hard state.
@@ -235,7 +243,7 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 		r:          r,
 		cfg:        cfg,
 		logReader:  logReader,
-		membership: newMembership(ms),
+		membership: newMembershipWithPolicy(ms, cfg.RequireMemberIdentities),
 		prevState:  r.hardState(),
 		shardID:    cfg.ShardID,
 		replicaID:  cfg.ReplicaID,
@@ -337,6 +345,131 @@ func (p *Peer) resolveStaleStartupConfig() bool {
 	}
 	p.staleConfigThrough = 0
 	return true
+}
+
+// pendingConfig is one published view of raftLog.pendingAdds: the adds above
+// the applied (or apply-refused) configuration, plus the two version marks that
+// decide whether a republish is needed.
+type pendingConfig struct {
+	version        uint64
+	configChangeID uint64
+	// committed is the commit index the view was resolved against: a
+	// removal counts only once committed, and the commit index moves
+	// without a log mutation, so it is part of the short-circuit key — but
+	// only while something is pending; with nothing recorded the view is
+	// empty at every commit index, and re-publishing it per cycle would
+	// allocate for nothing.
+	committed uint64
+	adds      map[uint64]string
+	// removed is every replica a pending RemoveNode removes, with the
+	// identity the shard bound for it: the one a pending add below the
+	// removal carried, else the committed one at publish time. Both are
+	// indexed so the gate can refuse by claimed ID and by authenticated
+	// identity, as the committed tombstones are.
+	removed           map[uint64]string
+	removedIdentities map[string]uint64
+}
+
+// PublishPendingConfig publishes the pending configuration — the members
+// config-carrying entries in this replica's own log admit, with their
+// identities, above the applied configuration — for PendingMemberIdentity.
+//
+// It MUST run on the step worker goroutine, the raft log's owner; the engine
+// calls it wherever it publishes the log markers. It is cheap on the hot
+// path: the log counts mutations to its pending set, so unless that count or
+// the applied configuration moved since the last publish nothing is rebuilt.
+func (p *Peer) PublishPendingConfig() {
+	l := p.r.log
+	// The fold marker, not configChangeID: an entry the apply path REFUSED
+	// (a removed replica re-added, a bootstrap entry off index 1) does not
+	// advance configChangeID, and its add must stop being pending the moment
+	// it has been offered to apply, or a refused entry would admit its
+	// identity for as long as no later change applied.
+	applied := max(p.membership.configChangeID, p.configFoldedThrough)
+	// The first publish classifies the recovered log above the applied
+	// configuration; every later one finds pendingSeeded set.
+	l.seedPendingAdds(applied)
+	cur := p.pendingSnap.Load()
+	if cur != nil && cur.version == l.pendingVersion && cur.configChangeID == applied &&
+		(cur.committed == l.committed || len(l.pendingAdds) == 0) {
+		return
+	}
+	// Entries at or below the applied configuration have been folded into
+	// it (or refused) and can never be pending again; forget them here, on
+	// the owner's goroutine, so the map is bounded by the pending window
+	// rather than by the shard's whole history of config changes.
+	l.prunePendingThrough(applied)
+	view := l.pendingIdentities(applied)
+	if view == nil {
+		if cur == nil && l.pendingVersion == 0 {
+			return
+		}
+		// Nothing pending, but the marks moved: publish an empty view so the
+		// next call short-circuits on them.
+		p.pendingSnap.Store(&pendingConfig{version: l.pendingVersion, configChangeID: applied, committed: l.committed})
+		return
+	}
+	snap := &pendingConfig{version: l.pendingVersion, configChangeID: applied, committed: l.committed, adds: view.adds}
+	if len(view.removed) > 0 {
+		snap.removed = make(map[uint64]string, len(view.removed))
+		snap.removedIdentities = make(map[string]uint64, len(view.removed))
+		for id, identity := range view.removed {
+			if identity == "" {
+				identity = p.membership.identities[id]
+			}
+			snap.removed[id] = identity
+			if identity != "" {
+				snap.removedIdentities[identity] = id
+			}
+		}
+	}
+	p.pendingSnap.Store(snap)
+}
+
+// PendingRemoval reports whether a COMMITTED RemoveNode entry in this
+// replica's log ABOVE the applied configuration removes replicaID, or removes
+// the replica that holds identity. It is the receive gate's FIRST question,
+// asked before the committed binding, the pending adds and the anchor: the
+// removal will tombstone the replica the moment it is folded, and a replica
+// restarting with that removal still unfolded — seeded from its
+// committed-but-unfolded tail — must not admit the removed member in the
+// meantime, by either name it could use. An uncommitted removal does not
+// count; see raftLog.pendingIdentities for why revoking on one can wedge the
+// shard.
+//
+// Safe for concurrent use; it reads the snapshot PublishPendingConfig stored.
+func (p *Peer) PendingRemoval(replicaID uint64, identity string) bool {
+	snap := p.pendingSnap.Load()
+	if snap == nil {
+		return false
+	}
+	if _, ok := snap.removed[replicaID]; ok {
+		return true
+	}
+	if identity != "" {
+		if _, ok := snap.removedIdentities[identity]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingMemberIdentity returns the node identity a config-carrying entry in
+// this replica's log commits for replicaID ABOVE the applied configuration,
+// and whether there is one. It is the receive gate's second question about a
+// sender the committed configuration does not name: a lagging replica holds
+// the AddNode that admits the new leader before it has committed it, and that
+// entry — which reached this log through a bound sender — names the identity
+// the leader's connection must present.
+//
+// Safe for concurrent use; it reads the snapshot PublishPendingConfig stored.
+func (p *Peer) PendingMemberIdentity(replicaID uint64) (string, bool) {
+	snap := p.pendingSnap.Load()
+	if snap == nil || snap.adds == nil {
+		return "", false
+	}
+	identity, ok := snap.adds[replicaID]
+	return identity, ok && identity != ""
 }
 
 // publishMembership creates an immutable snapshot of the current mutable
@@ -796,7 +929,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 		restored := pending != nil && pending != pendingBefore
 		joining := p.joining.Load()
 		if restored || joining || ss.Membership.ConfigChangeID > p.membership.configChangeID {
-			p.membership = newMembership(ss.Membership)
+			p.membership = p.newMembership(ss.Membership)
 			// The adopted membership covers every config change up to the
 			// snapshot's index, so the fold marker moves with it. Without this the
 			// on-demand fold would re-scan a window the snapshot already answered —
@@ -961,11 +1094,20 @@ func (p *Peer) validateProposedConfigChange(cc proto.ConfigChange) error {
 func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 	var m *membership
 	if snap := p.membershipSnap.Load(); snap == nil {
-		m = newMembership(proto.Membership{})
+		m = p.newMembership(proto.Membership{})
 	} else {
-		m = newMembership(snap.toProto())
+		m = p.newMembership(snap.toProto())
 	}
 	return m.validate(cc)
+}
+
+// newMembership builds a membership from replicated state under this peer's
+// LOCAL admission policy. Every site that replaces p.membership — snapshot
+// adoption, the initial-membership entry, the validation copy — goes through
+// here so the policy survives the replacement; it is local configuration, not
+// something the replicated state carries.
+func (p *Peer) newMembership(ms proto.Membership) *membership {
+	return newMembershipWithPolicy(ms, p.cfg.RequireMemberIdentities)
 }
 
 // membershipVotingBitCount returns how many ReadIndex ackBits positions the
@@ -1235,7 +1377,7 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 			)
 			return false, ErrCorruptConfigEntry
 		}
-		p.membership = newMembership(ms)
+		p.membership = p.newMembership(ms)
 		return true, nil
 	case proto.EntryConfigChange:
 		// A zero-length payload is left as the silent no-op it has always been.
@@ -2128,6 +2270,25 @@ func (p *Peer) IsRemovedIdentity(identity string) bool {
 		return false
 	}
 	return snap.isRemovedIdentity(identity)
+}
+
+// IdentityHolder reports the replica the COMMITTED configuration binds the
+// given node identity to, and whether there is one. The receive gate asks it
+// before admitting a sender on the strength of a non-committed source — the
+// pending configuration or the operator anchor — because those sources name
+// senders the committed configuration does not know, so a keypair the
+// committed configuration already binds to another replica could otherwise be
+// admitted under a second ID. The committed configuration is what every peer
+// authorizes against, and it is current at the moment of the question, which
+// no start-time check can be. False when nothing is committed yet.
+//
+// Safe for concurrent access from any goroutine.
+func (p *Peer) IdentityHolder(identity string) (uint64, bool) {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return 0, false
+	}
+	return snap.identityHolder(identity)
 }
 
 // DiagRaftState returns diagnostic raft state for debugging pipeline stalls.

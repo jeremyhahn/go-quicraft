@@ -62,7 +62,6 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg/config`
 | `Enable0RTT` | `bool` | **false** | QUIC 0-RTT. **0-RTT data is replayable.** |
 | `DisableCompression` | `bool` | false | for benchmarking |
 | `TransportDisabled` | `bool` | false | set by `WithoutTransport()` |
-| `RequireMemberIdentity` | `bool` | **false** | drop messages from a sender with no committed identity, instead of falling back to a SAN check against the committed Raft address |
 
 ### `MTLSConfig`
 
@@ -137,7 +136,7 @@ body:
   for the pre-release period along with every other format in the repository.
 - **Bump it whenever any type reachable from `MessageBatch` or `SnapshotChunk`
   changes layout**, including the embedded persisted ones. It is a supremum.
-- Nothing here is deprecated.
-- `RequireMemberIdentity` defaults to `false` for compatibility with clusters
-  whose membership predates committed identities. Enabling it on a live cluster
-  is a sequenced migration — see [`../compatibility.md`](../compatibility.md).
+- Nothing here is deprecated. `RequireMemberIdentity` was removed in
+  0.13.0-alpha (#197): a member is authorized by its committed identity and by
+  nothing else, and admission requires the identity on every host with a
+  transport — see [`../compatibility.md`](../compatibility.md).

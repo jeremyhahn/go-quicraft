@@ -265,6 +265,17 @@ var (
 	// for a session operation.
 	ErrInvalidSession = errors.New("quicraft: invalid session")
 
+	// ErrSessionBusy is returned by ProposeWithSession and
+	// SyncProposeWithSession when the session already has a proposal in
+	// flight. A session carries ONE series number at a time, and the state
+	// machine treats every entry stamped with the same (ClientID, SeriesID)
+	// as a retransmission of one command: it applies the first and answers
+	// the rest with its result. Two concurrent proposals on one session
+	// therefore used to both report success while only one of them ran.
+	// The second is refused instead; it may be resubmitted once the first
+	// has completed (ProposalCompleted, an error result, or Release).
+	ErrSessionBusy = errors.New("quicraft: session has a proposal in flight")
+
 	// ErrSnapshotSizeMismatch is returned when the snapshot file size
 	// on disk does not match the expected FileSize from the message.
 	ErrSnapshotSizeMismatch = errors.New("quicraft: snapshot file size mismatch")
@@ -379,6 +390,14 @@ var (
 	// ErrEmptyAddress is returned when an add carries an empty address. A
 	// member with no address is unreachable and cannot be replicated to.
 	ErrEmptyAddress = raft.ErrEmptyAddress
+
+	// ErrMemberIdentityRequired is returned by RequestAddNode,
+	// RequestAddObserver and RequestAddWitness — the identity-less forms — on
+	// a host with a transport, and by their WithIdentity forms given an empty
+	// identity. A member is authorized by its committed node identity and by
+	// nothing else, so admitting one without would seat a voter that can never
+	// be heard from. See config.Config.RequireMemberIdentities.
+	ErrMemberIdentityRequired = raft.ErrMemberIdentityRequired
 
 	// ErrTransferInProgress is returned when a proposal, config change or
 	// linearizable read arrives while a leadership transfer is in flight on
@@ -1191,6 +1210,9 @@ var temporaryErrors = [...]error{
 	// A leadership transfer is in flight. It completes or times out without
 	// any caller or operator action, and the identical request then succeeds.
 	ErrTransferInProgress,
+	// The session's in-flight proposal completes, fails or is released on
+	// its own, and the identical proposal then reserves the series.
+	ErrSessionBusy,
 }
 
 // Temporary reports whether err represents a transient condition that may

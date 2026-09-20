@@ -683,12 +683,21 @@ jobs:
   # ==========================================================================
 
   cross-arch:
-    name: Cross-architecture build (arm64)
+    name: Cross-architecture build (${{ matrix.goarch }})
     runs-on: ubuntu-latest
     # Same staged fail-fast as the rest: a push that cannot lint or build for
     # the host has nothing to say about another architecture.
     needs: [lint, build]
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 is the second 64-bit production target. 386 is the 32-bit
+        # canary the security-review checklist names: an untyped constant
+        # such as 2654435761 or 2*1024*1024*1024 in an int context compiles
+        # on amd64 and fails here, and the test files are where they hide,
+        # which is why this vets rather than only builds (#197).
+        goarch: [arm64, "386"]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -699,10 +708,10 @@ jobs:
       # The same discovery loop and floor as the modules job, for the same
       # reason: a `find` that silently matches nothing would make this job pass
       # by checking an empty set.
-      - name: Build and vet every module for linux/arm64
+      - name: Build and vet every module for linux/${{ matrix.goarch }}
         env:
           GOOS: linux
-          GOARCH: arm64
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -uo pipefail
           MODULE_FLOOR=6

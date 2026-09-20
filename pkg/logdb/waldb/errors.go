@@ -123,8 +123,10 @@ var (
 	// ErrEmptyWALDir is returned when Options.WALDir is empty.
 	ErrEmptyWALDir = errors.New("waldb: WAL directory must not be empty")
 
-	// ErrInvalidMaxFileSize is returned when Options.MaxFileSize is not positive.
-	ErrInvalidMaxFileSize = errors.New("waldb: max file size must be positive")
+	// ErrInvalidMaxFileSize is returned when Options.MaxFileSize is not
+	// positive or exceeds the 4 GiB - 1 a chunk's generation-start offset can
+	// name (see record.go).
+	ErrInvalidMaxFileSize = errors.New("waldb: max file size must be positive and at most 4 GiB - 1")
 
 	// ErrSegmentTooSmallForEntry is returned when a segment spans fewer than
 	// two blocks, leaving no usable record payload at all. A large BATCH is

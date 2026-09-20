@@ -233,11 +233,6 @@ whether records reach durable storage in cleartext. The three values are
 command to disk in the clear. A barrier running `StrategyNone` reports
 `AtRestUnprotected`.
 
-`RecoveryResidualReporter.RecoveryResiduals() []logdb.RecoveryResidual` reports
-the one successful-recovery outcome a node cannot simply carry on from: it came
-back holding a log that may be strictly shorter than the one it acknowledged to
-its peers. See [Generation-boundary residuals](#generation-boundary-residuals).
-
 ### LogDB Metrics Interface
 
 The `waldb.LogDBMetrics` interface enables latency and throughput monitoring:
@@ -314,7 +309,6 @@ type walShard struct {
     committedSegmentHWM uint64                             // highest fully committed segment ID
     minWriteEpoch       uint64                             // epoch floor across live records
     segmentEpochs       map[uint64]uint64                  // per-segment minimum epoch
-    residuals           []logdb.RecoveryResidual           // set once by recover()
 }
 
 type nodeKey struct {
@@ -366,15 +360,14 @@ type segment struct {
     noSync      bool
     recordSeq     atomic.Uint64 // logical records committed; rollback-aware
     durabilitySeq uint32        // Syncs COMPLETED; stamped into every chunk
+    genStart      uint32        // acknowledged end when the last Sync returned; stamped into every chunk
     closed        bool
 
     // Recovery verdict, set by ReadAll.
-    stoppedAtCorruption        bool
-    ackedDataAfterCorruption   bool
-    sequenceRegression         bool
-    generationBoundaryInDamage bool
-    prefixGeneration           uint32
-    survivingGeneration        uint32
+    stoppedAtCorruption      bool
+    ackedDataAfterCorruption bool
+    sequenceRegression       bool
+    acknowledgedDataLost     bool // survivors' genStart lies above the damage
 }
 ```
 
@@ -383,12 +376,12 @@ Production defaults from `waldb/options.go`:
 | Parameter      | Default            | Option            | Description                                              |
 |----------------|--------------------|-------------------|----------------------------------------------------------|
 | `BlockSize`    | 32768 (32 KiB)     | `WithBlockSize`   | WAL block size; power of two, at least `recordHeaderSize+1` |
-| `MaxFileSize`  | 67108864 (64 MiB)  | `WithMaxFileSize` | Segment rotation threshold                               |
+| `MaxFileSize`  | 67108864 (64 MiB)  | `WithMaxFileSize` | Segment rotation threshold; at most 4 GiB − 1 (the chunk generation-start offset is 32-bit) |
 | `MaxBatchSize` | 67108864 (64 MiB)  | none              | Maximum single write batch, validated but not plumbed into `dbOptions` |
 | `NoSync`       | false              | `WithNoSync`      | Disables `fdatasync`. Tests only                         |
 
 `Options.Validate` rejects an empty `WALDir`, a `BlockSize` that is not a power
-of two or is smaller than `recordHeaderSize+1`, and a non-positive `MaxFileSize`
+of two or is smaller than `recordHeaderSize+1`, and a non-positive (or above 4 GiB − 1) `MaxFileSize`
 or `MaxBatchSize`. The remaining `Open` options (`WithBarrier`, `WithFS`,
 `WithMetrics`, `WithDiskMonitorOpts`) carry no default beyond nil.
 
@@ -435,18 +428,24 @@ rather than as legitimate padding.
 Records are encoded as chunks within blocks. The chunk format follows the LevelDB/Pebble log format with CRC32 integrity:
 
 ```
-Chunk Header (11 bytes):
-+----------+---------+------+------------+-----------------+
-| CRC32: 4 | Len:  2 | Type | DurSeq:  4 | Payload: N      |
-+----------+---------+------+------------+-----------------+
+Chunk Header (15 bytes):
++----------+---------+------+------------+--------------+-----------------+
+| CRC32: 4 | Len:  2 | Type | DurSeq:  4 | GenStart:  4 | Payload: N      |
++----------+---------+------+------------+--------------+-----------------+
 ```
 
 From `waldb/record.go`:
 
 ```go
-const recordHeaderSize = 11 // [CRC32:4][Length:2][Type:1][DurSeq:4]
+const recordHeaderSize = 15 // [CRC32:4][Length:2][Type:1][DurSeq:4][GenStart:4]
 const maxRecordDataLen = (1 << 16) - 1 // 65535 bytes
 ```
+
+`GenStart` is the file offset at which the chunk's durability generation began
+— the acknowledged end when the `fdatasync` that closed the previous generation
+returned — and is what makes the interrupted-write verdict exact (see
+[Recovery](#recovery)). It bounds a segment file at 4 GiB − 1
+(`ErrInvalidMaxFileSize` above that).
 
 The CRC32 uses the Castagnoli polynomial (`crc32.Castagnoli`), which is hardware-accelerated via SSE4.2 on amd64 processors. The checksum covers the type byte, the durability sequence and the payload data (`buf[6:totalLen]`), not the CRC or length fields themselves. `Length` is the payload length only and excludes the header. A chunk's payload is capped at `maxRecordDataLen` even when the block has more room, because the length field is two bytes; `segment.Write` and `bytesNeeded` apply the identical cap so a block size of 64 KiB or more still frames correctly.
 
@@ -488,12 +487,15 @@ const (
     RecordFirst  byte = 2  // first chunk of a multi-chunk record
     RecordMiddle byte = 3  // middle chunk of a multi-chunk record
     RecordLast   byte = 4  // last chunk of a multi-chunk record
+    RecordSyncMark byte = 5  // header-only witness appended after every completed fdatasync
 )
 ```
 
 A logical record that fits within the remaining block space is written as a single `RecordFull` chunk. A record too large for the remaining space is split across blocks: the first piece is `RecordFirst`, intermediate pieces are `RecordMiddle`, and the final piece is `RecordLast`.
 
-The accepted range is exactly `RecordFull..RecordLast`, and `isValidRecordType` rejects anything else as corruption before the CRC is even checked. Keeping the set tight is deliberate: a never-written type in the range would make a random or forged header byte likelier to pass that pre-CRC screen.
+`RecordSyncMark` carries no record. `Sync` appends one, stamped with the generation it just opened and the acknowledged end, immediately after the `fdatasync` returns, and writes it through to the file (one `WriteAt`, no second `fdatasync`). It exists so the segment's *final* generation has the higher-generation witness every earlier generation gets from the records that follow it; see [The sync mark](#the-sync-mark). `ReadAll` never replays it. It starts only where a full header fits, so the padding it can force is shorter than a header and reads as block padding, and `CanFit` keeps `syncMarkReserve` (a mark plus that padding) free below `MaxFileSize` so a mark never lands past the limit.
+
+The accepted range is exactly `RecordFull..RecordSyncMark`, and `isValidRecordType` rejects anything else as corruption before the CRC is even checked. Keeping the set tight is deliberate: a never-written type in the range would make a random or forged header byte likelier to pass that pre-CRC screen.
 
 Every chunk of one logical record carries the same durability generation. `Write` runs under the shard lock and never syncs, so no `Sync` can land between a record's chunks and a multi-block record is wholly inside the in-flight generation or wholly below it. That is what makes a torn multi-block write a clean suffix in generation terms instead of a straddle recovery would have to guess at.
 
@@ -937,7 +939,7 @@ The yield approach prevents excessive context switching on idle systems (Gosched
 
 All reads are served from in-memory maps. The WAL is never read during normal operation.
 
-Every reader (`IterateEntries`, `ReadState`, `EntryRange`, `GetSnapshot`, `GetBootstrap`, `CompactedTo`, `ListNodeInfo`, `MinLiveEpoch`, `RecoveryResiduals`) takes `dataMu.RLock` and **no** `mu` at all. With 16 WAL shards serving 10k+ Raft groups, taking `mu` for a read would stall every group hashing to that shard for the duration of a batch's `fdatasync`.
+Every reader (`IterateEntries`, `ReadState`, `EntryRange`, `GetSnapshot`, `GetBootstrap`, `CompactedTo`, `ListNodeInfo`, `MinLiveEpoch`) takes `dataMu.RLock` and **no** `mu` at all. With 16 WAL shards serving 10k+ Raft groups, taking `mu` for a read would stall every group hashing to that shard for the duration of a batch's `fdatasync`.
 
 ### In-Memory Index
 
@@ -1423,11 +1425,12 @@ A shard opened by a failed `Open` unlinks the segment that open created, if it h
 1. Read `blockSize` bytes at the current offset
 2. For each position in the block:
    - If the byte is zero and all remaining bytes are zero, this is EOF padding
-   - If fewer than `recordHeaderSize` (11) bytes remain, skip to next block
+   - If fewer than `recordHeaderSize` (15) bytes remain, skip to next block
    - Call `decodeRecord` to parse CRC, length, type, durability sequence, and payload
    - If CRC verification fails, discard any partial multi-chunk record and skip to the next block boundary
 3. Reassemble multi-chunk records: `RecordFirst` starts accumulation, `RecordMiddle` appends, `RecordLast` completes and emits
 4. `RecordFull` is emitted as a complete record immediately
+5. `RecordSyncMark` emits nothing; its generation has already been folded into the clean prefix's, which is its whole testimony
 
 A real I/O error from the block read (EIO, a permission failure, a failing sector) is **not** treated as end of data. It returns `*SegmentReadError` wrapped in `*RecoveryError`. Combined with prefix-only validity it would otherwise masquerade as data loss and drop all higher segments. That holds however many bytes came back: a short read carrying an error is still an error, and processing its prefix would stride a whole block forward and replay the following blocks with neither a hole nor a corruption recorded.
 
@@ -1498,28 +1501,15 @@ Truncating at all is what stops the corrupt tail being frozen forever. Without i
 
 **What this changed.** The torn multi-block write above is now repaired automatically. It was the reachable-from-a-routine-crash case, and the one for which a single-node deployment had no good exit.
 
-**Residuals, stated plainly.** The generation proves *when a completed fdatasync separated two records*, and nothing else. Four cases remain:
+**What the generation start adds (#197).** The generation alone proves *when a completed fdatasync separated two records*, and nothing else. In particular, when the surviving records carry a generation *higher* than the clean prefix's, it can say that a completed `fdatasync` happened somewhere in the destroyed bytes — but not whether any acknowledged byte was among them. The ordinary power loss that drops the in-flight batch's leading page produces exactly that shape with nothing acknowledged lost (the page reverts to its fsynced content), and media damage that begins a few bytes lower produces it with acknowledged records gone. Recovery used to truncate both and report a "residual" for the operator to reconcile by hand. Every chunk now also carries `GenStart`, the file offset at which its generation began, i.e. the acknowledged end when the `fdatasync` that closed the previous generation returned. Any survivor above the damage therefore names the acknowledged end exactly, and `ReadAll` compares it with the corruption offset: at or below it, the damage began at or above the acknowledged end — an interrupted write, truncate; above it, the `fdatasync` that opened the survivors' generation had acknowledged bytes the damage destroyed — `ErrAcknowledgedDataLost`, fail closed, `Repair` is the exit. There is no residual left to report, and `RecoveryResiduals` is gone with it.
 
-- **Rot inside the final, in-flight batch** is truncated rather than refused. Reaching it needs rot AND a crash before anything else was written, since any later batch would raise the segment's generation and expose the damage as interior.
-- **A generation boundary inside the damaged region.** When the surviving records carry a generation *higher* than the clean prefix's, a completed `fdatasync` happened somewhere in the destroyed bytes, and any older-generation record the damage swallowed had been acknowledged — whether one existed is precisely what the destroyed bytes would have said. Recovery truncates anyway, because a crash cannot produce this shape from acknowledged bytes: a partial write to a page that already holds fsynced data leaves that page at its previously persisted content if the writeback is lost, so an interrupted write's damage begins at or above the acknowledged end. Refusing would instead refuse the ordinary case where the lost page starts exactly at a batch boundary — the common shape of the failure this scheme exists to repair. Media damage that straddles the boundary is the residual, and it logs a named `WARN` telling the operator to reconcile the node against its peers rather than passing silently.
+**The sync mark (#197, second-round).** The generation start still left the segment's *final* generation unprotected, and the gap was wider than "rot during a crash". A generation is proven closed only by a chunk of a higher generation, and the last generation of a segment has none unless something was written after it: an idle node, a clean shutdown, a segment rotated away all leave a fully acknowledged final generation with nothing above it. Rot inside it then presents exactly as a torn tail — every survivor carries the segment's highest generation, and its `GenStart` lies at or below the damage — and recovery would truncate records this node had acknowledged. So `Sync`, after its `fdatasync` returns, appends one `RecordSyncMark` chunk stamped with the generation it just opened and the acknowledged end, written through to the file at once without a second `fdatasync`. Whenever the mark survives, damage inside the final generation takes the same fail-closed path interior damage does: surviving records plus the mark span a completed `fdatasync` (`ErrMidSegmentCorruption`), or the mark alone names an acknowledged end above the damage (`ErrAcknowledgedDataLost`). The mark is not itself synced, and that is the design: if it does not survive — a crash inside the writeback window after the last `fdatasync` — the file is byte-for-byte what a batch whose `fdatasync` never returned leaves behind, and truncating is the right verdict for that window. A `Sync` that acknowledges nothing new — no `Write` since the last completed one, which is what `rotateSegment`'s closing `Sync` is after a batch's own — neither advances the generation nor appends a mark: `CanFit` reserved room for exactly one mark per acknowledged write, and an unconditional second one would land past `MaxFileSize` (and, at `maxDurabilitySeq`, wrap the counter). `DiscardPending` clears the same flag, since the checkpoint it rolls back to lies above the previous batch's mark. Rotation's idle `Sync` still fdatasyncs, which is what puts the last batch's mark on the medium; `segment.Close` fdatasyncs once more for the segment a clean shutdown closes without rotating, because a mark torn in its writeback window would fail its CRC, and once a restart has written a later segment that damage is refused as non-final. Recovery closes the third path: after a *process* crash the last batch's mark is still in the page cache, is replayed from there, and the next write creates a higher segment — so `recover` fdatasyncs the highest surviving segment before returning, and a segment can only ever become non-final with its mark on the medium. `rotateSegment` therefore still leaves every non-final segment ending in a mark, the one its last batch appended; recovery names damage there `ErrNonFinalSegmentCorruption` ahead of the evidence verdicts, because "not the highest segment" is the structural statement an operator can act on. The cost is one 15-byte `WriteAt` per `fdatasync` (`wbytes/op` in `BenchmarkSaveNodeState` goes from 56 to 71); the `fdatasync` dominates it by three orders of magnitude, and the A/B on the same NVMe bench node (three 2-second repetitions per arm) is inside the run-to-run noise: 570–677 µs/op before, 498–666 µs/op after.
+
+**Residuals, stated plainly.** Three cases remain:
+
+- **Rot inside the final generation when its sync mark did not persist** is truncated rather than refused. Reaching it needs rot AND a crash inside the writeback window after the last `fdatasync`, since a mark that reached the medium exposes the damage as interior.
 - **A zero-filled hole with data after it** is classified by the SAME generation evidence as a failed CRC. The two classifiers share one verdict: `ReadAll` records the hole as the corruption point and lets the post-corruption sweep gather the durability generations of whatever still decodes above it, exactly as it does for a checksum failure (`segment.go`, "Data after a zero hole"). A crash cannot produce a hole under acknowledged data in the first place — writes are strictly ascending in file offset, so a block lying below a later generation was covered by that generation's `fdatasync` and its pages cannot revert to zeros — so a hole whose survivors span a completed `fdatasync` is media damage or tampering, and gets the fail-closed answer the CRC path gives.
 - **`noSync` mode** (tests only) issues no `fdatasync`, so every record in such a segment carries generation 0 and truncation is always permitted. That is correct rather than a hole — nothing in a segment that was never synced was ever acknowledged — but it means a test that wants recovery to see acknowledged data must let the syncs run.
-
-### Generation-boundary residuals
-
-The second of those cases is the one an operator has to be told about, so it is carried out of `ReadAll` as structured data rather than left in a log line. `waldb.DB` implements `logdb.RecoveryResidualReporter`:
-
-```go
-if r, ok := db.(logdb.RecoveryResidualReporter); ok {
-    for _, res := range r.RecoveryResiduals() { ... }
-}
-```
-
-Each `logdb.RecoveryResidual` reports the storage shard index (the WAL directory index in `[0, 16)`, **not** a Raft ShardID), the segment ID, the byte offset it was truncated to, the two generations that straddle the destroyed region (`SurvivingGeneration` is always strictly greater than `PrefixGeneration`, and that gap is the evidence an fsync completed inside the damage), and `Nodes`: every replica whose log lives in that storage shard, with the index range that survived. `Nodes` is a **superset** of the truly affected replicas, because the destroyed bytes cannot say which replicas they belonged to, so every replica sharing the shard is reported rather than guessed at.
-
-Treat a non-empty report as an operational fault requiring intervention, not a warning. The replica is not corrupt and not degraded in any way it can detect at runtime: it serves reads and accepts writes while missing entries it previously promised. The condition is only ever resolved from outside, by reconciling the replica against its peers or rebuilding it from a snapshot.
-
-The report is a property of the **open**, fixed once recovery completed. Nothing a caller does clears it. It does not survive the process either, because recovery repaired the damage on disk and a later open of the same store reports nothing, so a caller that needs the fact to outlive the process must record it when it observes it.
 
 ### Recovery Error Reference
 
@@ -1531,6 +1521,7 @@ The report is a property of the **open**, fixed once recovery completed. Nothing
 | `ErrWALFormatMissing` | The directory holds segments but no marker, so it predates the marker (and the durability sequence) | Wipe the data directory and re-sync. Opening anyway would misparse every chunk and truncate the log to zero |
 | `ErrRecordSequenceRegression` (`*SegmentCorruptionError`) | A record above the damage carries a durability generation lower than the clean prefix — bytes this WAL cannot have written | Re-sync from peers, or authorize `waldb.Repair`. Treat the device as suspect |
 | `ErrMidSegmentCorruption` (`*SegmentCorruptionError`) | Damage below records that a completed `fdatasync` had already acknowledged (they span more than one durability generation) | Re-sync from peers, or authorize `waldb.Repair` — see below |
+| `ErrAcknowledgedDataLost` (`*SegmentCorruptionError`) | Damage that begins BELOW the acknowledged end the surviving in-flight records name (their generation start lies above the corruption offset) | Re-sync from peers, or authorize `waldb.Repair` — see below |
 | `ErrNonFinalSegmentCorruption` (`*SegmentCorruptionError`) | Damage in a segment that is not the highest-numbered one | Re-sync from peers, or authorize `waldb.Repair` — see below |
 | `*SegmentReadError` (wrapped in `*RecoveryError`) | A real I/O error (EIO, a failing sector) during the block scan | Hardware fault. Treat the disk as suspect; re-sync from peers |
 | `*WALDecryptError` | A record failed AEAD authentication during replay | Wrong barrier, wrong key epoch, or tampering. Do not retry without the context-AAD |
@@ -1677,7 +1668,6 @@ The `test/errfs` package provides `ErrorFS` for fault simulation. It wraps a rea
 | `waldb/index.go`       | In-memory sorted index with binary search       |
 | `waldb/compaction.go`  | Segment garbage collection                      |
 | `waldb/reencrypt.go`   | `Reencrypt` logical WAL migration between barriers |
-| `waldb/residual.go`    | Generation-boundary residual capture and `DB.RecoveryResiduals` |
 | `waldb/copy.go`        | Deep copies of Snapshot/Membership/Bootstrap on the read boundary |
 | `waldb/options.go`     | Configuration defaults and validation           |
 | `waldb/errors.go`      | Typed error definitions                         |
@@ -1688,7 +1678,6 @@ The `test/errfs` package provides `ErrorFS` for fault simulation. It wraps a rea
 | `logdb/logdb.go`       | LogDB interface, optional interfaces, `EntryOverheadBytes` |
 | `logdb/types.go`       | Storage-layer types (Entry, State, etc.)        |
 | `logdb/errors.go`      | LogDB sentinel errors                           |
-| `logdb/residual.go`    | `RecoveryResidual` and `RecoveryResidualReporter` |
 | `logdb/reader.go`      | LogReader and the term ring buffer              |
 | `logdb/memdb/`         | In-memory LogDB used by tests and the conformance suite |
 | `engine/commit.go`     | Commit worker with group commit pattern         |
@@ -1727,7 +1716,6 @@ When using barrier encryption:
 - Inject errors via custom FS implementations to test failure paths
 - Monitor segment creation/deletion rates to tune compaction
 - Verify `ListNodeInfo()` after crash recovery matches the expected set of shards
-- Check `RecoveryResiduals()` after an open. It is empty on a clean recovery and non-empty exactly when the node may have come back shorter than the log it acknowledged
 
 ## Observability
 
@@ -1765,8 +1753,7 @@ filling the volume.
 | Level | Event | Why it matters |
 |---|---|---|
 | ERROR | fsync failure poisoning the DB (`ErrDBPoisoned`) | the store has stopped accepting writes. A failed `fdatasync` may leave the kernel marking dirty pages clean without writing them, so continuing would acknowledge data that is not there. |
-| ERROR | recovery residuals present after `Open` | the node may have come back **shorter than the log it acknowledged**. `RecoveryResiduals()` is empty on a clean recovery and non-empty exactly then. Check it. |
-| ERROR | mid-segment or non-final-segment corruption | `ErrMidSegmentCorruption` / `ErrNonFinalSegmentCorruption` — recovery refuses to guess; see [Recovery](#recovery) and `Repair`. |
+| ERROR | corruption under acknowledged data | `ErrMidSegmentCorruption` / `ErrNonFinalSegmentCorruption` / `ErrAcknowledgedDataLost` — recovery refuses to guess; see [Recovery](#recovery) and `Repair`. |
 | WARN | disk-usage warning threshold crossed | the volume is filling |
 | WARN | WAL decrypt failure during replay | fatal to the open by design; silently skipping records would be undetected data loss |
 

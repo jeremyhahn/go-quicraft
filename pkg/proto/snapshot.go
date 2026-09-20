@@ -237,6 +237,21 @@ func (s *Snapshot) IsEmpty() bool {
 	return s.Index == 0 && s.Term == 0
 }
 
+// CheckBounds reports whether the snapshot's log position lies inside the
+// range the protocol can do arithmetic on: ErrLogIndexOutOfRange when Index is
+// at or above MaxLogIndex, ErrTermOutOfRange when Term is at or above MaxTerm,
+// nil otherwise. It is the one predicate every snapshot admission path applies
+// (see MaxTerm); a zero position is not its concern — IsEmpty answers that.
+func (s *Snapshot) CheckBounds() error {
+	if s.Index >= MaxLogIndex {
+		return ErrLogIndexOutOfRange
+	}
+	if s.Term >= MaxTerm {
+		return ErrTermOutOfRange
+	}
+	return nil
+}
+
 // hasContentBeyondPosition reports whether any field other than Index and Term
 // is populated. Together with IsEmpty it identifies the one contradictory shape
 // this type can hold: content with no log position, which the containing

@@ -117,30 +117,38 @@ func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing
 	}
 }
 
-// TestHandleMessage_LeaderOriginatedFromAnUnnamedReplicaStillReaches is the
-// LIVENESS control, and it is the reason the binding is not simply the
-// quorum-bearing one.
+// TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches is the
+// LIVENESS control, and the reason the binding consults the PENDING
+// configuration as well as the committed one (#197 B).
 //
 // This replica's committed configuration names only replicas 1 and 2. The shard
-// has since added replica 4 and elected it, but that config change has not
-// replicated here yet — which is the ordinary state of a lagging follower.
-// Replica 4's Replicate and Heartbeat are the only things that can repair it. If
-// they are refused because the configuration does not name the sender, the
-// replica can never catch up: that is the member allow-list, and round 10 turned
-// it into a permanently leaderless shard.
-func TestHandleMessage_LeaderOriginatedFromAnUnnamedReplicaStillReaches(t *testing.T) {
+// has since added replica 4 and elected it. The AddNode that admits 4 reached
+// this replica from leader 2 and sits in its log, uncommitted — the ordinary
+// state of a lagging follower. Replica 4's Replicate and Heartbeat are the only
+// things that can commit it. If they are refused because the COMMITTED
+// configuration does not name the sender, the replica can never catch up: that
+// is the member allow-list, and round 10 turned it into a permanently leaderless
+// shard. If they were admitted because NO configuration names the sender, any
+// certificate holder could be replica 4 — the hole #197 B closed. The pending
+// entry, with the identity it carries, is the fact between the two.
+func TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches(t *testing.T) {
 	const selfAddr, knownAddr, newLeaderAddr = "127.0.0.1:5001", "127.0.0.1:5002", "127.0.0.1:5004"
+	const newLeaderID = "spki:4444444444444444444444444444444444444444444444444444444444444444"
 	ms := proto.Membership{
 		Addresses:  map[uint64]string{1: selfAddr, 2: knownAddr},
 		Identities: map[uint64]string{1: "identity-1", 2: "identity-2"},
 	}
-	newLeaderCert := certCoveringAs("identity-4", newLeaderAddr)
+	newLeaderCert := certCoveringAs(newLeaderID, newLeaderAddr)
 
 	for _, msgType := range leaderOriginatedTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
 			eng, handler := fromGateRig(t, ms, map[uint64]string{2: knownAddr})
 			if _, ok := eng.node.MemberBinding(4); ok {
 				t.Fatal("fixture: the committed configuration must NOT name replica 4")
+			}
+			appendPendingAdd(t, eng.node, 2, 9, 4, newLeaderAddr, newLeaderID)
+			if eng.node.IsMember(4) {
+				t.Fatal("fixture: the AddNode must be pending, not applied")
 			}
 
 			batch := proto.MessageBatch{
@@ -153,22 +161,26 @@ func TestHandleMessage_LeaderOriginatedFromAnUnnamedReplicaStillReaches(t *testi
 				t.Fatalf("HandleMessage: %v", err)
 			}
 			if len(eng.delivered) != 1 {
-				t.Fatalf("a %s from a leader this replica's configuration does not "+
-					"name yet was dropped (%d delivered): a lagging replica can no "+
-					"longer be brought up to date, which is the wedge the deny-list "+
-					"model exists to avoid", proto.MessageTypeName(msgType),
+				t.Fatalf("a %s from a leader this replica's own log admits but has not "+
+					"committed was dropped (%d delivered): a lagging replica can no "+
+					"longer be brought up to date, which is the wedge the pending "+
+					"configuration exists to avoid", proto.MessageTypeName(msgType),
 					len(eng.delivered))
 			}
 		})
 	}
 }
 
-// TestHandleMessage_LeaderOriginatedAddressPathStillBinds covers a shard with
-// NO committed identities — the pre-identity compatibility path. The binding
-// falls back to the committed address, exactly as it does for quorum-bearing
-// types, so a certificate that does not cover the leader's committed address
-// cannot speak as the leader.
-func TestHandleMessage_LeaderOriginatedAddressPathStillBinds(t *testing.T) {
+// TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused covers a shard
+// whose configuration names the leader WITHOUT an identity. There used to be an
+// address path here — the binding fell back to the committed address — and it
+// was what a wildcard or shared-SAN certificate satisfied for every member at
+// once. Admission now requires the identity, the fallback is gone, and a
+// leader-originated message from an identity-less member is refused whichever
+// certificate carries it: a configuration in this shape was written by a build
+// that did not require identities, and the remedy is re-bootstrap, not a weaker
+// gate (#197 A).
+func TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{Addresses: map[uint64]string{
 		1: "127.0.0.1:5001",
@@ -192,22 +204,26 @@ func TestHandleMessage_LeaderOriginatedAddressPathStillBinds(t *testing.T) {
 			}
 			if len(eng.delivered) != 0 {
 				t.Fatalf("a %s claiming the leader's From was accepted behind a "+
-					"certificate that does not cover the leader's COMMITTED address",
+					"certificate that does not cover the leader's committed address",
 					proto.MessageTypeName(msgType))
 			}
 
-			// POSITIVE CONTROL.
+			// The real leader's certificate covers its address and proves no
+			// identity the configuration holds: refused too, for the reason
+			// that is true.
 			if err := handler.HandleMessage(proto.MessageBatch{
 				SourceAddress: leaderAddr,
 				Requests: []proto.Message{{
 					ShardID: 1, From: 2, To: 1, Type: msgType, Term: 9, Commit: 4,
 				}},
 			}, leaderCert); err != nil {
-				t.Fatalf("HandleMessage (control): %v", err)
+				t.Fatalf("HandleMessage (identity-less leader): %v", err)
 			}
-			if len(eng.delivered) != 1 {
-				t.Fatalf("the REAL leader's %s was dropped on the address path "+
-					"(%d delivered)", proto.MessageTypeName(msgType), len(eng.delivered))
+			if len(eng.delivered) != 0 {
+				t.Fatalf("a %s from a member the configuration holds no identity for "+
+					"was admitted on its address (%d delivered): that is the fallback a "+
+					"promiscuous certificate satisfies for every member",
+					proto.MessageTypeName(msgType), len(eng.delivered))
 			}
 		})
 	}
@@ -323,14 +339,15 @@ func TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity(t *testing.T) 
 	}
 }
 
-// TestLearnSourceAddress_AddressOnlyShardKeepsTheOldOverwriteRule is the
-// compatibility control. A shard with no committed identities has nothing to key
-// the overwrite on, and matching the certificate against the COMMITTED address
-// would refuse exactly the member that moved — taking the RequestVote that has
-// to teach voters where to send the grant with it. The pre-identity behaviour is
-// therefore left in place, and this test says so out loud so the residual is not
-// mistaken for an oversight.
-func TestLearnSourceAddress_AddressOnlyShardKeepsTheOldOverwriteRule(t *testing.T) {
+// TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed is the closure of
+// the residual the previous version of this test documented. A shard whose
+// configuration held no identity for a member let ANY certificate holder naming
+// that member re-point its routing entry — and receive its share of the shard's
+// Replicate traffic (#197 A). The overwrite now requires the committed identity;
+// with none committed, nobody may replace the entry, and the member that moved
+// is reached again through the config change that commits its identity and new
+// address, which is the same remedy an identity-less shard needs anyway.
+func TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed(t *testing.T) {
 	const victimAddr, victimNewAddr = "127.0.0.1:5002", "127.0.0.1:6002"
 	ms := proto.Membership{Addresses: map[uint64]string{
 		1: "127.0.0.1:5001",
@@ -346,10 +363,10 @@ func TestLearnSourceAddress_AddressOnlyShardKeepsTheOldOverwriteRule(t *testing.
 	}, certCovering(victimNewAddr)); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	if got, err := handler.host.registry.Resolve(1, 2); err != nil || got != victimNewAddr {
-		t.Fatalf("replica 2's routing entry is %q (err %v), want %q: on a shard "+
-			"with no committed identities the overwrite must keep working, or a "+
-			"member that moved is unreachable for the life of the partition",
-			got, err, victimNewAddr)
+	if got, err := handler.host.registry.Resolve(1, 2); err != nil || got != victimAddr {
+		t.Fatalf("replica 2's routing entry is %q (err %v), want %q: a member the "+
+			"configuration holds no identity for had its route re-pointed by a "+
+			"certificate holder that proved nothing about it",
+			got, err, victimAddr)
 	}
 }

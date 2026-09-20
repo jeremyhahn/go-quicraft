@@ -113,138 +113,6 @@ func deliverSnapshotControl(eng snapshotCtrlDeliverer, shardID uint64, msg proto
 	}
 }
 
-// nonQuorumBearingMessages is the allow-list of message types whose acceptance
-// cannot hand a sender a QUORUM OUTCOME it did not earn. Every type NOT listed
-// is gated, so a message type added later is bound to committed membership by
-// default instead of silently escaping the sender binding HandleMessage applies.
-//
-// Membership is decided by what a single accepted message BUYS, not by
-// direction. Each exemption below names the raft handler that proves it:
-//
-//   - Replicate (raft.handleAppend) and Heartbeat (raft.handleHeartbeat) are
-//     leader-to-follower pushes. Both install a leader and can advance this
-//     replica's commit index, which is why they are the most dangerous
-//     exemptions on the list — but they are also the messages a lagging replica
-//     needs from a leader its configuration does not name yet, and gating them
-//     outright is the member allow-list that wedged replicas out of their own
-//     shard. They are exempt from THIS gate and bound by the weaker
-//     leader-originated one instead; see leaderOriginatedMessages.
-//   - RequestVote and RequestPreVote (raft.handleVoteRequest) are
-//     candidate-to-voter REQUESTS. They are answered, never tallied; the grants
-//     they induce are the responses, and those ARE gated. Exempt so a member
-//     that recovered at a new address can still campaign during quorum loss,
-//     when no config change can commit its new address.
-//   - Quiesce (raft.handleQuiesceMessage) only changes tick intervals.
-//   - Propose (stepLeader/stepFollower Propose case) and ReadIndex
-//     (raft.handleLeaderReadIndex / handleFollowerReadIndex) are
-//     follower-to-leader forwards of client work; RateLimit
-//     (raft.handleLeaderRateLimit) is advisory follower state.
-//
-// Everything else is gated. The four tallied response types are the reason the
-// gate exists: ReplicateResp and HeartbeatResp advance the match index and the
-// ReadIndex ack count, RequestVoteResp and RequestPreVoteResp feed the vote
-// tally. ReadIndexResp and TimeoutNow are gated for the same reason even though
-// nothing counts them:
-//
-//   - ReadIndexResp (raft.handleReadIndexResp) is the WIRE ENCODING of a
-//     completed heartbeat-quorum round. One accepted message resolves a pending
-//     linearizable read at an index of the sender's choosing, and the
-//     correlation key is a plain monotonic counter, so a forged response is a
-//     stale read with no quorum ever run. It only ever answers a request this
-//     replica addressed to a leader it took from the configuration, so binding
-//     it to committed membership costs no first-contact liveness.
-//   - TimeoutNow (raft.handleTimeoutNow) is the campaign entry point that
-//     bypasses both PreVote and the CheckQuorum leader lease. It is
-//     leader-originated by construction, so committed-membership binding is
-//     exactly right, and repeated forged copies would otherwise hold a shard in
-//     a permanent election storm.
-//
-// So is every process-local control type (InstallSnapshot, SnapshotStatus,
-// Unreachable, LeaderTransfer), which a peer must never be able to send at all
-// — raft refuses them from the wire, and gating them here refuses them one
-// layer earlier.
-var nonQuorumBearingMessages = map[uint64]struct{}{
-	proto.Replicate:      {},
-	proto.Heartbeat:      {},
-	proto.RequestVote:    {},
-	proto.RequestPreVote: {},
-	proto.Quiesce:        {},
-	proto.Propose:        {},
-	proto.ReadIndex:      {},
-	proto.RateLimit:      {},
-}
-
-// isQuorumBearing reports whether accepting msgType can hand the sender a
-// quorum outcome — a tallied vote or ack, or the wire form of one — and
-// therefore whether HandleMessage must bind msg.From to the authenticated peer
-// before delivering it.
-//
-// Unknown and future types answer true. Failing closed costs at most a dropped
-// message on a path raft ignores anyway; failing open costs a forged quorum.
-func isQuorumBearing(msgType uint64) bool {
-	_, exempt := nonQuorumBearingMessages[msgType]
-	return !exempt
-}
-
-// leaderOriginatedMessages is the set of types only an ESTABLISHED LEADER ever
-// sends. They are not tallied, so they are not quorum-bearing — but they are the
-// two messages that install a leader and advance a follower's commit index, and
-// leaving them with no sender binding at all made msg.From a value the sender
-// simply chose.
-//
-// The residual that used to be recorded in authorizeInbound argued the exemption
-// was bounded because impersonating a leader means beating raft's term and
-// log-matching rules. That covers Replicate, which has a log-match bar. It does
-// NOT cover Heartbeat, which carries no prevLogIndex, no prevLogTerm and no
-// entries, and yet set r.leaderID and committed up to a Commit index the sender
-// named. One frame from any holder of a CA-valid certificate — a node the shard
-// had already REMOVED included, because the deny-list is evaluated on the
-// CLAIMED From — committed a follower's minority-replicated tail, which a
-// legitimate leader elected from the majority then truncates. That is a State
-// Machine Safety violation, not a liveness inconvenience.
-//
-// So they are bound, but at a DIFFERENT strictness than the quorum-bearing
-// types, and the difference is one specific verdict:
-//
-//   - The configuration NAMES msg.From: the full committedSenderBinding
-//     applies — identity where one is committed, address otherwise. An
-//     identity/address mismatch, a shared address, a missing identity under the
-//     strict posture: all refused. This is the whole forgery surface, because
-//     impersonating a member is what a forger needs to do. It costs no liveness
-//     at all: a replica whose configuration names the sender already holds the
-//     evidence, and a member that moved keeps its identity.
-//
-//   - The configuration does NOT name msg.From (dropUnknownMember): ADMITTED.
-//     This is the lagging-replica case and the reason the exemption existed —
-//     a follower legitimately has not yet applied the config change that added
-//     the current leader, and refusing here is precisely the member allow-list
-//     that round 10 turned into a permanently leaderless shard. What survives is
-//     bounded on the raft side rather than here: raft.handleHeartbeat refuses a
-//     From that is not the leader it already recognises for the term, and
-//     advances the commit index only to an index whose entry carries the CURRENT
-//     term — a fact this replica proved for itself when handleAppend log-matched
-//     the entry in. An unnamed sender can therefore still cost a term bump and an
-//     election delay, which is exactly what the RequestVote exemption below
-//     already concedes to any certificate holder and cannot be closed without
-//     giving up first contact.
-//
-// InstallSnapshot is leader-originated too and is NOT here: it is process-local
-// on this path (the snapshot receiver injects it) and HandleSnapshot binds its
-// sender through committedSenderBinding with no unknown-member allowance beyond
-// the documented join window.
-var leaderOriginatedMessages = map[uint64]struct{}{
-	proto.Replicate: {},
-	proto.Heartbeat: {},
-}
-
-// isLeaderOriginated reports whether msgType is one only an established leader
-// sends, and therefore whether HandleMessage must bind msg.From to the
-// authenticated peer whenever committed membership names msg.From at all.
-func isLeaderOriginated(msgType uint64) bool {
-	_, ok := leaderOriginatedMessages[msgType]
-	return ok
-}
-
 // HandleMessage delivers each message in the batch to the engine's
 // per-shard inbox and signals the step worker that work is available.
 //
@@ -252,14 +120,11 @@ func isLeaderOriginated(msgType uint64) bool {
 // binding, and the routing-address learning that follows it — lives in
 // authorizeInbound. This is the loop and the delivery.
 //
-// Messages to unloaded shards are delivered without membership checks. This
-// allows bootstrap messages and messages that trigger shard loading to flow
-// through. The shard's raft state machine provides its own term-based and
-// log-based rejection for unauthorized messages once the shard is loaded. A
-// QUORUM-BEARING message is the exception and is refused outright when the shard
-// is not loaded: it is only ever an answer to a request this replica sent, which
-// a shard with no loaded node cannot have sent, and there is no committed
-// membership to authorize it against.
+// Every message is bound to a replica the receiver can vouch for — by the
+// committed configuration, the pending configuration in its own log, or the
+// operator anchor — before it is delivered (senderBinding); there are no
+// type-based exemptions. A message for a shard that is not loaded here is
+// dropped: there is nothing to bind it to and nothing to deliver it into.
 func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transport.PeerAuth) error {
 	for i := range batch.Requests {
 		msg := &batch.Requests[i]
@@ -333,16 +198,13 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// Both are monotone deny-lists over committed state, so neither can wrongly
 	// refuse a legitimate peer; see raft.Peer.IsRemoved and IsRemovedIdentity.
 	//
-	// RESIDUAL: on a shard whose members carry NO committed identities there is
-	// nothing for check 2 to consult, and check 1 is evadable exactly as before.
-	// No replicated fact exists to close it there — the configuration has nothing
-	// to compare an authenticated connection against — so the remedy is
-	// operational: commit identities (Config.MemberIdentities,
-	// RequestAddNodeWithIdentity) and, once migrated,
-	// TransportConfig.RequireMemberIdentity.
+	// A member the configuration holds no identity for cannot be evaluated by
+	// check 2 and is refused by the sender binding below (dropMissingIdentity);
+	// admission (config.Config.RequireMemberIdentities) is what keeps such a
+	// member out of the configuration in the first place.
 	//
-	// When node is nil (shard not loaded locally) the message is allowed through
-	// because it may be a bootstrap or shard-loading trigger.
+	// A nil node (shard not loaded locally) passes the two tombstone checks
+	// and is then dropped below: there is nothing to bind the sender to.
 	node := h.engine.GetNode(msg.ShardID)
 	if node != nil && node.IsRemoved(msg.From) {
 		slog.Warn("rejected message from removed replica",
@@ -361,6 +223,24 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 			"type", proto.MessageTypeName(msg.Type),
 		)
 		h.countUnauthorizedDrop(msg.ShardID, msg.From, dropRemovedIdentity)
+		return false
+	}
+	// The PENDING tombstone: a RemoveNode this replica holds, committed but
+	// above its applied configuration. It will be the committed tombstone the
+	// moment it is folded, and a replica that restarted with it unfolded must
+	// not admit the removed member meanwhile, by claimed ID or by keypair,
+	// through the committed binding, a pending add below the removal, or the
+	// anchor. Counted with the committed tombstones: same fact, one index
+	// earlier. (An uncommitted removal is not consulted — see
+	// raft.Peer.PendingRemoval.)
+	if node != nil && node.PendingRemoval(msg.From, peer.Identity) {
+		slog.Warn("rejected message from a replica a pending config change removes",
+			"shard", msg.ShardID,
+			"claimed_from", msg.From,
+			"identity", peer.Identity,
+			"type", proto.MessageTypeName(msg.Type),
+		)
+		h.countUnauthorizedDrop(msg.ShardID, msg.From, dropRemovedReplica)
 		return false
 	}
 
@@ -383,144 +263,99 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 		return false
 	}
 
+	// A shard that is not loaded here has no configuration to bind a sender
+	// to and no inbox to deliver into: the engine drops the message anyway.
+	// Refused quietly — it is not an authorization failure, the shard is
+	// simply not here.
+	if node == nil {
+		slog.Debug("dropped message for a shard that is not loaded",
+			"shard", msg.ShardID,
+			"from", msg.From,
+			"type", proto.MessageTypeName(msg.Type),
+		)
+		return false
+	}
+
 	// Bind msg.From — the replica ID raft counts toward election and commit
-	// quorum — to the authenticated peer, for the message types raft TALLIES.
+	// quorum, installs as leader, appends proposals for, and answers votes to
+	// — to the authenticated peer, for EVERY message type.
 	//
 	// From travels in-band and is otherwise trusted verbatim. mTLS authenticates
-	// the HOST (the node certificate's SANs cover its address), not the replica
-	// ID, and neither gate above binds the two: the deny-list inspects the
-	// CLAIMED From, so it does not even stop a replica this shard has already
-	// REMOVED from asserting a live member's ID. Without this check any host
-	// holding a valid cluster certificate can open a normal mTLS connection and
-	// send ReplicateResp{From: 2}, ReplicateResp{From: 3}, ... Each is accepted
-	// and counted, so the leader advances commitIndex over entries no follower
-	// holds — a State Machine Safety violation that loses committed data at the
-	// next leader change — and a forged RequestVoteResp wins an election from a
-	// minority.
+	// the HOST, not the replica ID, and neither gate above binds the two: the
+	// deny-list inspects the CLAIMED From, so it does not even stop a replica
+	// this shard has already REMOVED from asserting a live member's ID. Without
+	// this check any host holding a valid cluster certificate can open a normal
+	// mTLS connection and send ReplicateResp{From: 2}, ReplicateResp{From: 3},
+	// ... Each is accepted and counted, so the leader advances commitIndex over
+	// entries no follower holds — a State Machine Safety violation that loses
+	// committed data at the next leader change — a forged RequestVoteResp wins
+	// an election from a minority, a Heartbeat at a higher term installs the
+	// sender as leader and steps the real one down (repeated, it holds the
+	// shard leaderless), a RequestVote at a higher term forces an election, and
+	// a forwarded Propose has the leader append a command a stranger wrote.
 	//
-	// The rule: a quorum-bearing message is accepted only when the peer that
-	// sent it is the replica the shard's COMMITTED MEMBERSHIP calls msg.From.
-	// committedSenderBinding decides that, and the evidence it uses depends on
-	// what the configuration recorded:
+	// The rule: a message is accepted only when the peer that sent it IS the
+	// replica msg.From names, and there are exactly three ways to be that
+	// replica (senderBinding decides, in this order):
 	//
-	//   - A member with a committed NODE IDENTITY is bound to that identity —
-	//     the SHA-256 of its leaf's public key, proved by the mTLS handshake.
-	//     Nothing else is checked; the address is routing metadata.
-	//   - A member with none falls back to the older chain, replica ID ->
-	//     committed address -> certificate. config.TransportConfig's
-	//     RequireMemberIdentity refuses that fallback outright for operators
-	//     who have finished migrating.
+	//   1. The COMMITTED configuration names msg.From with a node identity,
+	//      and the connection's authenticated identity is that identity.
+	//   2. A config-carrying entry in THIS replica's own log — appended but not
+	//      yet applied — admits msg.From with an identity, and the connection
+	//      presents it. This is the lagging-replica case: a follower that holds
+	//      the AddNode for the new leader but has not committed it must still
+	//      admit that leader's Replicate and Heartbeat, or it can never catch
+	//      up. It is safe because the entry reached this log through a sender
+	//      bound by this same rule, so the pending configuration is as
+	//      trustworthy as the committed one, and because it binds the IDENTITY
+	//      the entry carries rather than a bare replica ID.
+	//   3. The operator anchor — the Config.MemberIdentities the shard was
+	//      started with — names msg.From with the identity the connection
+	//      presents. A joiner has no configuration at all, so the anchor is
+	//      the only thing that can say who may bring it one; an established
+	//      replica that missed the AddNode for the leader now serving its
+	//      shard is vouched for the same way, by a restart with a current
+	//      map, rather than by a wipe.
 	//
-	// Every link but the last is consensus state either way. A replica the
-	// configuration does not name at all is a drop, not a first contact: a
-	// quorum outcome only makes sense as the answer to a request this replica
-	// sent, and it addresses those from the configuration.
+	// There used to be type-based exemptions — leader-originated pushes and
+	// vote requests from a replica ID the configuration did not name were
+	// admitted, so a lagging replica could be brought up to date — and they
+	// were what let any certificate holder move a shard's term, install itself
+	// as leader on followers, and have proposals appended (#197 B). The pending
+	// configuration replaces them with a fact this replica holds itself.
+	//
+	// What this costs: a replica that never received the config change adding
+	// the new leader — it was down when the change committed and the old
+	// leader is gone — refuses that leader until a replica its configuration
+	// DOES name leads, or it is restarted with a Config.MemberIdentities that
+	// names the new leader (source 3). The shard itself has quorum without it
+	// (the change committed on a majority); it is that replica's own liveness,
+	// it is logged as unknown_member for as long as it lasts, and it was the
+	// price of closing a hole that cost every shard its availability to any
+	// certificate holder.
 	//
 	// It is deliberately NOT `committed == batch.SourceAddress`. SourceAddress
-	// is the peer's own ADVERTISED address (AdvertiseAddress, else the bound
-	// local address, else ListenAddress) while the committed address is what the
-	// operator handed StartShard or RequestAddNode — two independently sourced
-	// strings for one host, and a certificate legitimately carries several SANs,
-	// so node5.example.com:5001 and 10.0.0.5:5001 can both be cert-valid and
-	// unequal. String equality there drops every quorum-bearing message from
-	// that member forever and presents as a network partition over a healthy
-	// network. It also buys nothing: SourceAddress is a value the SENDER
-	// chooses, so a forger simply claims the victim's address.
-	//
-	// LIVENESS: for a member with a committed identity there is NO address
-	// coupling left, and the cost this gate used to carry is gone. A replica
-	// that recovers at a new address — an ephemeral port, a rescheduled
-	// container, a machine replaced — keeps its keypair, so its identity is
-	// unchanged and its quorum-bearing responses keep being counted with no
-	// config change at all. That matters most exactly when it is hardest: during
-	// quorum loss no config change CAN commit, and under the address-only gate a
-	// shard with a member back at a new address did not self-heal. For a member
-	// with NO committed identity the old cost still applies, and it is one more
-	// reason to commit identities.
-	//
-	// RESIDUAL, stated without overstatement. Binding to a committed identity
-	// removes address-based From forgery, including by a wildcard-certificate
-	// holder. It does NOT make committed membership unreachable from the wire.
-	// What remains, after the leader-originated binding closed the largest hole:
-	//
-	//   - Replicate and Heartbeat no longer accept a From the configuration
-	//     names but the connection cannot prove (see leaderOriginatedMessages),
-	//     so leader IMPERSONATION is closed on a shard whose members carry
-	//     committed identities. What is still admitted is a leader-originated
-	//     push from a replica ID the configuration does not name AT ALL, which
-	//     is the lagging-replica case the deny-list model exists to serve. Such
-	//     a sender can still make this replica adopt a higher term and name it
-	//     leader for one election timeout — an availability cost, not a safety
-	//     one: raft.handleHeartbeat will not advance the commit index onto a log
-	//     tail from an older term, and raft.handleAppend still has to satisfy
-	//     log matching. The same term-bump is reachable through the RequestVote
-	//     exemption, which cannot be closed without breaking campaigning during
-	//     quorum loss, so this costs nothing that is not already conceded.
-	//   - The removal deny-list is now evaluated on the AUTHENTICATED identity as
-	//     well as the claimed From (see the two gates above), so a removed
-	//     replica can no longer evade its tombstone by naming a different ID —
-	//     the case that used to slip through was a leader-originated push under
-	//     an ID the configuration does not name at all, which this class
-	//     deliberately admits. What remains is the ADDRESS-ONLY shard: with no
-	//     committed identities there is nothing for that gate to consult, and the
-	//     claimed-From evasion is exactly as it was. No replicated fact can close
-	//     it there; the remedy is to commit identities.
-	//   - InstallSnapshot carries a full Membership that replaces the
-	//     configuration wholesale. HandleSnapshot binds its sender through the
-	//     SAME predicate as this one, so it is no longer the one-step rewrite it
-	//     was; the join-window exception in snapshotSenderAddress is the
-	//     remaining unauthenticated first contact, and it is address-based
-	//     because a joining replica has no committed state to check against.
+	// is the peer's own ADVERTISED address, and the certificate is matched on
+	// the identity, not the address; a member that moves keeps its identity.
 	//
 	// The ways this can fail are logged and counted SEPARATELY (see the
 	// drop-reason constants), because they mean different things: the ordinary
 	// config-change window (unknown_member), a forged or stale identity
-	// (identity_mismatch), an un-migrated member under the strict mode
-	// (missing_identity), and the two address-path failures. Reporting them as
-	// one number leaves an operator unable to tell a rolling membership change
-	// from an attack.
-	//
-	// CONSIDERED AND REJECTED: a grace path admitting a msg.From present in the
-	// PENDING (proposed but uncommitted) configuration, to shorten the
-	// unknown_member window. Uncommitted entries are exactly the state that can
-	// still be truncated away by a new leader, and they arrive by replication
-	// from a peer — so authorizing against them reintroduces "the sender can
-	// influence what authorizes it", which is the hole this gate closed. The
-	// window is bounded by one round of replication and costs liveness only for
-	// messages that raft would tally; waiting for the commit is the point.
-	//
-	// The leader-originated class (Replicate, Heartbeat) runs the SAME predicate
-	// with exactly one verdict downgraded: dropUnknownMember is admitted, because
-	// a replica whose configuration lags cannot yet name the leader that would
-	// bring it up to date, and refusing there is the wedge round 10 produced.
-	// Every other verdict — a configured replica the connection cannot prove it
-	// is — is refused identically. See leaderOriginatedMessages.
-	gated, leaderOriginated := isQuorumBearing(msg.Type), isLeaderOriginated(msg.Type)
-	if gated || leaderOriginated {
-		committed, reason := committedSenderBinding(node, msg.From, peer, h.requireMemberIdentity())
-		// Written as "refuse, EXCEPT the one downgraded verdict" because that is
-		// exactly what the comment above states and what the security argument
-		// rests on: leader-originated traffic admits dropUnknownMember and
-		// nothing else. De Morgan's equivalent, !leaderOriginated || reason !=
-		// dropUnknownMember, reads as two independent permissions and hides that
-		// the exception is a single named verdict.
-		//nolint:staticcheck // QF1001: the negated form mirrors the documented single-verdict downgrade
-		if reason != "" && !(leaderOriginated && reason == dropUnknownMember) {
-			class := "quorum-bearing"
-			if leaderOriginated {
-				class = "leader-originated"
-			}
-			slog.Warn("rejected "+class+" message: "+unauthorizedDropDescriptions[reason],
-				"shard", msg.ShardID,
-				"from", msg.From,
-				"committed", committed,
-				"source", sourceAddress,
-				"type", proto.MessageTypeName(msg.Type),
-				"reason", reason,
-			)
-			h.countUnauthorizedDrop(msg.ShardID, msg.From, reason)
-			return false
-		}
+	// (identity_mismatch), and a configuration written without identities
+	// (missing_identity). Reporting them as one number leaves an operator unable
+	// to tell a rolling membership change from an attack.
+	committed, reason := h.senderBinding(node, msg.ShardID, msg.From, peer)
+	if reason != "" {
+		slog.Warn("rejected message: "+unauthorizedDropDescriptions[reason],
+			"shard", msg.ShardID,
+			"from", msg.From,
+			"committed", committed,
+			"source", sourceAddress,
+			"type", proto.MessageTypeName(msg.Type),
+			"reason", reason,
+		)
+		h.countUnauthorizedDrop(msg.ShardID, msg.From, reason)
+		return false
 	}
 
 	// The PRE-LEARN routing mapping, read before learning can mutate it, so
@@ -528,22 +363,6 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// an authorization input — see the gate above.
 	h.learnFromSource(node, msg, h.registeredAddress(msg.ShardID, msg.From), sourceAddress, peer)
 	return true
-}
-
-// requireMemberIdentity reports the host's configured posture for a member with
-// no committed node identity: true refuses its quorum-bearing traffic outright,
-// false falls back to the committed-address check. See
-// config.TransportConfig.RequireMemberIdentity for what each costs.
-//
-// A handler with no host wired (unit-test paths) reports false, matching the
-// zero value of the config field: the strict mode is an explicit operator
-// decision, and inventing it here would make a fake host stricter than a real
-// one configured identically.
-func (h *hostMessageHandler) requireMemberIdentity() bool {
-	if h.host == nil {
-		return false
-	}
-	return h.host.cfg.TransportConfig.RequireMemberIdentity
 }
 
 // committedSenderBinding decides whether the peer that sent this message is the
@@ -556,55 +375,36 @@ func (h *hostMessageHandler) requireMemberIdentity() bool {
 // turned a poisoned routing entry into snapshot install rights and therefore
 // into a rewrite of the very membership this predicate reads.
 //
-// There are two answers it can give, and which one applies is decided by the
-// COMMITTED CONFIGURATION, never by the sender:
+// There is one binding, and the COMMITTED CONFIGURATION decides it, never the
+// sender: when the configuration records a node identity for replicaID, the
+// connection's AUTHENTICATED identity must equal it, and that is the ONLY check
+// performed. The address is routing metadata and is not an authorization input.
+// This closes all three holes the address scheme had: a promiscuous certificate
+// proves nothing about a public key it does not hold; two replicas at one
+// address still have two keypairs; and — the liveness win — a member that
+// recovers at a NEW address keeps its identity, so its quorum-bearing responses
+// keep being counted with no config change at all. The address gate dropped
+// them until a config change committed, which during quorum loss is never.
 //
-//  1. IDENTITY (the durable binding). When the configuration records a node
-//     identity for replicaID, the connection's AUTHENTICATED identity must equal
-//     it, and that is the ONLY check performed. The address becomes routing
-//     metadata and stops being an authorization input entirely. This closes all
-//     three holes the address scheme had: a promiscuous certificate proves
-//     nothing about a public key it does not hold; two replicas at one address
-//     still have two keypairs; and — the liveness win — a member that recovers
-//     at a NEW address keeps its identity, so its quorum-bearing responses keep
-//     being counted with no config change at all. The address gate dropped them
-//     until a config change committed, which during quorum loss is never.
-//
-//  2. ADDRESS (the compatibility binding). When the configuration records NO
-//     identity — a shard bootstrapped before identities existed, or by an
-//     operator who supplied none — the old chain applies: replica ID ->
-//     committed address -> certificate. It is weaker in exactly the ways
-//     described above, which is why RequireMemberIdentity exists to refuse it.
-//
-// The fallback is chosen per REPLICA, not per shard or per host, so committing
-// an identity for one member hardens that member immediately without waiting
-// for the rest.
+// A member the configuration records NO identity for is refused
+// (dropMissingIdentity). There used to be a per-replica fallback to the old
+// chain, replica ID -> committed address -> certificate, kept for shards
+// bootstrapped before identities existed; admission now requires the identity
+// on every host with a transport (config.Config.RequireMemberIdentities), so
+// the only way to reach this branch is a configuration written by a build that
+// did not, and the answer to that is wipe and re-bootstrap, not a weaker gate.
 //
 // A nil node — the shard is not loaded here — is always unbound. There is no
 // committed membership to authorize against, and a quorum outcome can only ever
 // answer a request a loaded shard sent, so there is nothing to let through.
 //
-// An address the configuration does not hold EXCLUSIVELY is unbound on the
-// address path, and reported as such. A certificate is matched on the address
-// alone, so two active replicas at one address collapse that chain: the single
-// host behind it authenticates as both. Validation refuses to create that
-// configuration (raft.membership.addressHolder), but a shard seeded through
-// StartShard or restored from an older snapshot can already be in it, so the
-// receive path fails closed rather than assuming validation ran. The identity
-// path does not consult exclusivity at all — it is not matched on an address,
-// and duplicate identities are refused at config-change time
-// (raft.ErrDuplicateMemberIdentity).
-//
-// It returns the committed value it judged (the identity when it judged one,
-// otherwise the address; empty when there is neither) and the REASON to refuse,
-// empty when the sender is bound. Returning the reason rather than a bool is
-// what keeps the log line, the metric label and the decision in one place for
-// both callers; they used to be assembled separately at each drop site, and
-// that is how the snapshot path came to be judged on weaker evidence than the
-// message path.
-func committedSenderBinding(node *engine.Node, replicaID uint64,
-	peer transport.PeerAuth, requireIdentity bool) (string, string) {
-
+// It returns the committed identity it judged (empty when the configuration
+// holds none) and the REASON to refuse, empty when the sender is bound.
+// Returning the reason rather than a bool is what keeps the log line, the
+// metric label and the decision in one place for both callers; they used to be
+// assembled separately at each drop site, and that is how the snapshot path
+// came to be judged on weaker evidence than the message path.
+func committedSenderBinding(node *engine.Node, replicaID uint64, peer transport.PeerAuth) (string, string) {
 	if node == nil {
 		return "", dropUnknownMember
 	}
@@ -612,90 +412,84 @@ func committedSenderBinding(node *engine.Node, replicaID uint64,
 	if !ok || binding.Address == "" {
 		return "", dropUnknownMember
 	}
-	if binding.Identity != "" {
-		// Constant-time comparison is deliberately NOT used. Both values are
-		// public: the committed one is replicated to every member and the
-		// presented one is the hash of a public key the peer just transmitted
-		// in its certificate. There is no secret to leak by timing, and a
-		// timing-safe compare here would imply one exists.
-		if peer.Identity != binding.Identity {
-			return binding.Identity, dropIdentityMismatch
-		}
-		return binding.Identity, ""
-	}
-	if requireIdentity {
+	if binding.Identity == "" {
 		return "", dropMissingIdentity
 	}
-	if !binding.Exclusive {
-		return binding.Address, dropSharedAddress
+	// Constant-time comparison is deliberately NOT used. Both values are
+	// public: the committed one is replicated to every member and the
+	// presented one is the hash of a public key the peer just transmitted in
+	// its certificate. There is no secret to leak by timing, and a timing-safe
+	// compare here would imply one exists.
+	if peer.Identity != binding.Identity {
+		return binding.Identity, dropIdentityMismatch
 	}
-	if !peer.Authorizes(binding.Address) {
-		return binding.Address, dropAddressMismatch
-	}
-	return binding.Address, ""
+	return binding.Identity, ""
 }
 
-// snapshotSenderAddress resolves the address an inbound snapshot's claimed
-// sender must be authenticated as, and reports the reason to reject when it
-// cannot be. An empty reason means the returned address is authorized.
+// senderBinding decides whether the peer that sent a message or a snapshot IS
+// the replica it claims to be, and reports the committed value it judged and
+// the reason to refuse (empty when the sender is bound). It is THE sender
+// predicate: HandleMessage and HandleSnapshot both call it, so the two paths
+// cannot drift apart. They did once — the message path was moved off the
+// mutable address registry while the snapshot path was left resolving it,
+// which turned a poisoned routing entry into snapshot install rights.
 //
-// The primary path is committedSenderAddress — the SAME predicate the message
-// path applies, so a snapshot cannot be admitted on weaker evidence than a
-// HeartbeatResp. That matters more here than anywhere else: the snapshot
-// replaces both the state machine and the committed membership the message-path
-// gate reads.
+// Three sources can vouch for a sender, consulted in this order and each
+// binding the connection's authenticated IDENTITY, never an address:
 //
-// The join-window exception is the only registry-free, membership-free path,
-// and it is deliberately narrow. A shard started with join=true holds no
-// configuration at all: the leader's bootstrap snapshot is the only thing that
-// can deliver one, yet it is the very message being authorized. The address
-// then comes from the membership the snapshot itself carries and must still be
-// covered by the connection's VERIFIED peer certificate — the binding stays
-// anchored to the authenticated QUIC peer, only the source of the address
-// changes. Three conditions fence it in:
+//  1. The committed configuration (committedSenderBinding).
+//  2. The pending configuration: a config-carrying entry in this replica's own
+//     log, above the applied configuration, that admits the sender with an
+//     identity (engine.Node.PendingMemberIdentity). See authorizeInbound for
+//     why that is sound.
+//  3. The operator anchor: the Config.MemberIdentities the shard was started
+//     with, each entry bound to an identity (Host.anchorIdentity). A joiner
+//     holds no configuration, so nothing else can say who may hand it one —
+//     including who may send the bootstrap snapshot, the very message that
+//     used to authorize itself by the membership it carried (#197 A). An
+//     established replica that was down while a member was added and elected
+//     holds neither a committed nor a pending entry for that leader, and the
+//     anchor is how its operator vouches for it without wiping the replica.
+//     The committed configuration must hold NO entry for the sender to reach
+//     here: a named sender is judged on that entry and never falls through.
 //
-//   - The committed membership must hold NO address for the sender. A sender it
-//     DOES name is judged on that address alone and never falls through here,
-//     so the exception cannot be used to speak for a configured replica.
-//   - The host must still be inside the join window, which closes for the life
-//     of the process on the first accepted snapshot.
-//   - Raft must independently agree the local configuration is incomplete
-//     (Peer.IsJoining). The host flag and the raft flag are set together at
-//     StartShard, and raft clears its own as soon as the configuration names
-//     the leader — at which point the primary path succeeds and the exception
-//     is not needed.
-//
-// What this does NOT do is stop the exception from adopting a membership: a
-// snapshot accepted here is delivered OriginLocal and raft.Peer.Handle adopts
-// its configuration unconditionally for a joining replica. Any host holding a
-// valid cluster certificate can therefore be the one that bootstraps a joining
-// shard, once, before any legitimate leader reaches it. Nothing available at
-// this point can distinguish them: the replica has no committed state, and the
-// operator supplied no expected-leader address to StartShard(join=true). The
-// closures are an operator-supplied join anchor or replica-ID-bound
-// certificates; both are out of scope here.
-func (h *hostMessageHandler) snapshotSenderAddress(node *engine.Node, shardID, fromReplicaID uint64,
-	claimedMembership proto.Membership, peer transport.PeerAuth) (string, string) {
+// A sender none of them names is refused (dropUnknownMember); a sender one of
+// them names on a connection carrying a different identity is refused as
+// identity_mismatch.
+func (h *hostMessageHandler) senderBinding(node *engine.Node, shardID, from uint64,
+	peer transport.PeerAuth) (string, string) {
 
-	committed, reason := committedSenderBinding(node, fromReplicaID, peer, h.requireMemberIdentity())
-	if reason == "" {
-		return committed, ""
-	}
-	// Only "the configuration does not name this sender" falls through to the
-	// join window. A sender it DOES name has been judged on its committed
-	// address and is refused on that answer, so the exception can never be used
-	// to speak for a configured replica or to sidestep a shared address.
+	committed, reason := committedSenderBinding(node, from, peer)
 	if reason != dropUnknownMember {
-		return "", reason
+		return committed, reason
 	}
-	claimed := claimedMembership.Addresses[fromReplicaID]
-	if claimed == "" || !h.host.isShardJoining(shardID) || !node.IsJoining() {
+	if node == nil {
 		return "", dropUnknownMember
 	}
-	if !peer.Authorizes(claimed) {
-		return "", dropAddressMismatch
+	// The pending configuration and the anchor name senders the committed
+	// configuration does not know. Neither may admit a keypair the committed
+	// configuration binds to ANOTHER replica — that member would be sending
+	// as a second ID — and the committed configuration is asked at the
+	// moment of the question, so a member added after the last snapshot is
+	// covered where a start-time check of the anchor could not see it.
+	if holder, ok := node.IdentityHolder(peer.Identity); ok && holder != from {
+		return "", dropIdentityMismatch
 	}
-	return claimed, ""
+	if identity, ok := node.PendingMemberIdentity(from); ok {
+		if peer.Identity != identity {
+			return identity, dropIdentityMismatch
+		}
+		return identity, ""
+	}
+	if h.host != nil {
+		if anchor, ok := h.host.anchorIdentity(shardID, from); ok {
+			if peer.Identity != anchor {
+				return anchor, dropIdentityMismatch
+			}
+			return anchor, ""
+		}
+	}
+	return "", dropUnknownMember
 }
 
 // registeredAddress returns the address the routing registry currently holds
@@ -721,11 +515,14 @@ func (h *hostMessageHandler) registeredAddress(shardID, replicaID uint64) string
 // operator. dropUnknownMember is the benign config-change window: msg.From is a
 // replica this host's committed configuration does not name YET, which is the
 // normal state of a replica between a config change committing elsewhere and
-// replicating here — it rises and falls on its own. dropAddressMismatch is a
-// sender the configuration DOES name, arriving behind a certificate that does
-// not cover its committed address: either a forged From, or a member whose
-// address the operator changed without a config change. One aggregate counter
-// makes an attack indistinguishable from a rolling membership change.
+// replicating here — it rises and falls on its own. dropIdentityMismatch is a
+// sender the configuration DOES name, arriving on a connection whose
+// authenticated identity is not the one committed for it: a forged From, or a
+// stale identity after a key rotation. One aggregate counter makes an attack
+// indistinguishable from a rolling membership change.
+//
+// address_mismatch and shared_address were the address fallback's two
+// failures. The fallback is gone (#197); the labels are not reallocated.
 const (
 	dropRemovedReplica = "removed_replica"
 	// dropRemovedIdentity is kept apart from dropRemovedReplica because the two
@@ -738,8 +535,6 @@ const (
 	dropRemovedIdentity  = "removed_identity"
 	dropMisrouted        = "misrouted"
 	dropUnknownMember    = "unknown_member"
-	dropAddressMismatch  = "address_mismatch"
-	dropSharedAddress    = "shared_address"
 	dropIdentityMismatch = "identity_mismatch"
 	dropMissingIdentity  = "missing_identity"
 )
@@ -751,11 +546,9 @@ var unauthorizedDropDescriptions = map[string]string{
 	dropRemovedReplica:   "the shard has committed a removal for this replica",
 	dropRemovedIdentity:  "the connection's authenticated node identity is one the shard has committed a removal for, whatever replica ID it claims",
 	dropMisrouted:        "addressed to a different replica of this shard",
-	dropUnknownMember:    "the committed membership does not name this replica",
-	dropAddressMismatch:  "the peer certificate does not cover this replica's committed address",
-	dropSharedAddress:    "another active member claims the same committed address, so the certificate cannot tell them apart",
+	dropUnknownMember:    "no configuration this replica holds names the sender (not committed, not pending in its own log, not in Config.MemberIdentities); if this persists for a leader, this replica missed the config change that added it — restart it with a Config.MemberIdentities that names the leader",
 	dropIdentityMismatch: "the connection's authenticated node identity is not the one committed membership assigns this replica",
-	dropMissingIdentity:  "committed membership records no node identity for this replica and RequireMemberIdentity is set",
+	dropMissingIdentity:  "committed membership records no node identity for this replica; a member is authorized by its identity and by nothing else",
 }
 
 // countUnauthorizedDrop records a message this handler refused, when metrics
@@ -803,22 +596,24 @@ func (h *hostMessageHandler) countUnauthorizedDrop(shardID, from uint64, reason 
 //     a config change — and an identity survives the move, so the proof is
 //     available exactly when the overwrite is needed. See
 //     routingOverwriteAuthorized.
-//   - Otherwise an address is learned only while THIS replica's own
-//     configuration is incomplete (it is still joining), and even then only to
-//     fill a mapping that does not exist yet.
+//   - Any other sender that reached here — one the pending configuration or
+//     the operator anchor vouched for, since senderBinding admits nothing
+//     else — may FILL a mapping that does not exist yet, never replace one.
+//     This is what lets a joiner record the leader it must ack, and what lets
+//     the lagging or restarted replica the pending configuration and the
+//     anchor exist for reply to the leader they admit: a leader admitted
+//     inbound whose responses cannot be routed back never sees its match
+//     index advance, so the replica can never commit the entry that would
+//     name it, and the admission bought nothing.
 //
-// The second clause is deliberately about the LOCAL replica, not the sender:
-// the legitimate first-contact case is "I do not know who the members are yet",
-// not "the sender claims to be someone". That keeps an established replica from
-// recording addresses for arbitrary replica IDs a peer invents — unbounded
-// registry growth — while still letting a joiner record the leader it must ack.
+// Only bound senders reach this function, so unbounded registry growth from
+// invented replica IDs is not a concern here: every mapping written is for a
+// replica some configuration this replica holds — committed, pending, or the
+// anchor — has named.
 func (h *hostMessageHandler) learnFromSource(node *engine.Node, msg *proto.Message,
 	registered, sourceAddress string, peer transport.PeerAuth) {
 
 	if node == nil || sourceAddress == "" || !peer.Authorizes(sourceAddress) {
-		return
-	}
-	if !node.IsMember(msg.From) && !node.IsJoining() {
 		return
 	}
 	h.learnSourceAddress(msg.ShardID, msg.From, registered, sourceAddress,
@@ -838,28 +633,19 @@ func (h *hostMessageHandler) learnFromSource(node *engine.Node, msg *proto.Messa
 // streamed to a replica the configuration never named. That is exfiltration
 // from a shard the sender is not a member of, not a liveness dent.
 //
-// The test is therefore the same evidence the receive gate uses, minus the
-// address fallback:
-//
-//   - A committed IDENTITY must equal the connection's authenticated one. This
-//     is strictly stronger than the old rule and costs the recovered-at-a-new-
-//     address case nothing, because the identity is a property of the keypair
-//     and not of where the replica is running.
-//   - NO committed identity leaves the pre-identity behaviour in place. The
-//     alternative — matching the certificate against the COMMITTED address —
-//     would refuse exactly the member that moved, and with it the RequestVote
-//     that has to teach voters where to send the grant during quorum loss. The
-//     residual is the old one (an address-only shard's routing is re-pointable
-//     by any certificate holder naming a member) and its closure is committing
-//     identities, which is also what config.TransportConfig.RequireMemberIdentity
-//     exists to push.
+// The test is therefore the same evidence the receive gate uses: the
+// committed IDENTITY must equal the connection's authenticated one. This costs
+// the recovered-at-a-new-address case nothing, because the identity is a
+// property of the keypair and not of where the replica is running. A member
+// the configuration holds NO identity for may not have its route replaced by
+// anyone: the pre-identity rule let any certificate holder naming a member
+// re-point that member's traffic at itself (#197), and admission now requires
+// the identity, so such a member only exists in a configuration written by a
+// build that did not.
 func routingOverwriteAuthorized(node *engine.Node, replicaID uint64, peer transport.PeerAuth) bool {
 	binding, ok := node.MemberBinding(replicaID)
-	if !ok {
+	if !ok || binding.Identity == "" {
 		return false
-	}
-	if binding.Identity == "" {
-		return true
 	}
 	return peer.Identity == binding.Identity
 }
@@ -1067,12 +853,31 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	if node.IsRemovedIdentity(peer.Identity) {
 		return reject("the connection's authenticated node identity is one the shard removed")
 	}
+	if node.PendingRemoval(fromReplicaID, peer.Identity) {
+		return reject("a committed config change this replica has not yet applied removes the sender")
+	}
 	if h.host.registry == nil {
 		return reject("no registry to record the sender address")
 	}
-	senderAddr, reason := h.snapshotSenderAddress(node, shardID, fromReplicaID, first.Membership, peer)
-	if reason != "" {
+	if _, reason := h.senderBinding(node, shardID, fromReplicaID, peer); reason != "" {
 		return reject(reason)
+	}
+	// The snapshot REPLACES this replica's committed membership, and for a
+	// joiner it is the only one it will ever hold. A binding in it for THIS
+	// replica that is not the identity this host presents — the AddNode that
+	// admitted the joiner carried a mistyped identity — would be adopted
+	// silently, and every peer would then refuse the joiner's acks for the
+	// life of the shard with nothing local saying why. It is the one binding
+	// the host can check itself, so it is checked before anything is
+	// persisted, as StartShard and applyMembershipRouting check it on their
+	// paths. The remedy is the same as theirs: fix the keypair, or remove and
+	// re-add the replica with the right identity.
+	if own := h.host.NodeIdentity(); own != "" {
+		if committed := first.Membership.Identities[replicaID]; committed != "" && committed != own {
+			return reject(fmt.Sprintf("the snapshot's membership binds this replica to identity %s "+
+				"but this host presents %s; every peer would refuse it — remove and re-add the "+
+				"replica with the identity it presents", committed, own))
+		}
 	}
 
 	// Serialize concurrent receives of the same snapshot. snapshotDir is
@@ -1679,12 +1484,16 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		// The bootstrap snapshot carries the full membership, so the join
 		// window closes here and cannot reopen for the life of the process.
 		// The Register is ROUTING only — it is how this replica reaches the
-		// leader before any config change of its own commits. It is expressly
-		// NOT what authorizes the leader's retransmissions: those, like every
-		// later snapshot for this shard, go through the committed membership
-		// the snapshot below is about to install. Authorization stopped
-		// reading the registry precisely because this write exists.
-		h.host.registry.Register(shardID, fromReplicaID, senderAddr)
+		// leader before any config change of its own commits, and the address
+		// comes from the membership of a snapshot whose sender the join anchor
+		// has just authenticated. It is expressly NOT what authorizes the
+		// leader's retransmissions: those, like every later snapshot for this
+		// shard, go through the committed membership the snapshot below is
+		// about to install. Authorization stopped reading the registry
+		// precisely because this write exists.
+		if senderAddr := first.Membership.Addresses[fromReplicaID]; senderAddr != "" {
+			h.host.registry.Register(shardID, fromReplicaID, senderAddr)
+		}
 		h.host.clearShardJoining(shardID)
 	}
 
@@ -1834,6 +1643,21 @@ func validateSnapshotChunks(chunks []proto.SnapshotChunk) ([]*proto.SnapshotChun
 			ReplicaID: first.ReplicaID,
 			Op:        "validate",
 			Err:       &SnapshotChunkError{ChunkID: chunkID, ChunkCount: n, Reason: reason},
+		}
+	}
+
+	// The position every chunk must agree on is checked ONCE, on chunk 0,
+	// before the agreement loop: a set that agrees on a position the protocol
+	// cannot do arithmetic on is refused as one defect, not as the same defect
+	// once per chunk. It is the sentinel the bound is defined with, wrapped in
+	// the validate error like every other refusal here, so errors.Is finds
+	// proto.ErrLogIndexOutOfRange / proto.ErrTermOutOfRange one level down.
+	if err := (&proto.Snapshot{Index: first.Index, Term: first.Term}).CheckBounds(); err != nil {
+		return nil, &SnapshotReceiveError{
+			ShardID:   first.ShardID,
+			ReplicaID: first.ReplicaID,
+			Op:        "validate",
+			Err:       err,
 		}
 	}
 

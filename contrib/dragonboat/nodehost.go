@@ -783,6 +783,15 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 	// Auto-advancing would break duplicate detection: the session's
 	// series ID would already be incremented before the duplicate
 	// proposal is re-submitted, bypassing at-most-once enforcement.
+	//
+	// Release runs before the caller's ProposalCompleted, and Release ends
+	// the session's in-flight reservation (quicraft.ErrSessionBusy) — the
+	// adapter cannot hold it open across the return without breaking the
+	// contract above. The reservation therefore covers only the window in
+	// which this call is in flight; a second SyncPropose on the same session
+	// issued between this return and ProposalCompleted carries the same
+	// series and is answered as a retransmission, which is dragonboat's own
+	// rule for a session used before it was advanced.
 	rs, err := nh.host.ProposeWithSession(ctx, session.Inner(), cmd)
 	if err != nil {
 		return dbSM.Result{}, translateError(err)
@@ -1178,6 +1187,53 @@ func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaI
 	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
 }
 
+// SyncRequestAddReplicaWithIdentity is SyncRequestAddReplica carrying the node
+// identity quicraft commits for the new replica (its NodeHost.NodeIdentity).
+// It has no dragonboat counterpart: a NodeHost with a transport refuses the
+// identity-less form with quicraft.ErrMemberIdentityRequired, because
+// quicraft authorizes a member by its identity and by nothing else.
+func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
+	if _, err := timeoutFromContext(ctx); err != nil {
+		return err
+	}
+	if !dbConfig.IsValidAddress(target) {
+		return ErrInvalidAddress
+	}
+	return translateError(nh.host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+}
+
+// SyncRequestAddNonVotingWithIdentity is SyncRequestAddNonVoting carrying the
+// node identity; see SyncRequestAddReplicaWithIdentity.
+func (nh *NodeHost) SyncRequestAddNonVotingWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
+	if _, err := timeoutFromContext(ctx); err != nil {
+		return err
+	}
+	if !dbConfig.IsValidAddress(target) {
+		return ErrInvalidAddress
+	}
+	return translateError(nh.host.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+}
+
+// SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the node
+// identity; see SyncRequestAddReplicaWithIdentity.
+func (nh *NodeHost) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
+	if _, err := timeoutFromContext(ctx); err != nil {
+		return err
+	}
+	if !dbConfig.IsValidAddress(target) {
+		return ErrInvalidAddress
+	}
+	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+}
+
+// NodeIdentity returns this NodeHost's stable node identity — the value
+// peers must have committed for it (Config.MemberIdentities at bootstrap, the
+// *WithIdentity adds afterwards) before they count its messages. It is empty
+// for a NodeHost started WithoutTransport.
+func (nh *NodeHost) NodeIdentity() string {
+	return nh.host.NodeIdentity()
+}
+
 // SyncRequestAddNonVoting adds a non-voting observer replica and blocks
 // until the membership change is committed.
 func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replicaID uint64, target Target, configChangeIndex uint64) error {
@@ -1232,13 +1288,24 @@ func (nh *NodeHost) RequestLeaderTransfer(shardID, targetReplicaID uint64) error
 // nil RequestState and a non-nil error, instead of failing later through
 // RequestState.ResultC.
 // Returns a RequestState that resolves when the config change is committed.
+//
+// It commits no node identity for the replica, which a NodeHost with a
+// transport refuses (quicraft.ErrMemberIdentityRequired); use
+// RequestAddReplicaWithIdentity there. See NodeHost.NodeIdentity.
 func (nh *NodeHost) RequestAddReplica(shardID, replicaID uint64, target Target, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
+	return nh.RequestAddReplicaWithIdentity(shardID, replicaID, target, "", configChangeIndex, timeout)
+}
+
+// RequestAddReplicaWithIdentity is RequestAddReplica with the node identity the
+// shard should commit for the replica — the value that node reports from
+// NodeHost.NodeIdentity. See quicraft.Host.RequestAddNodeWithIdentity.
+func (nh *NodeHost) RequestAddReplicaWithIdentity(shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1247,13 +1314,21 @@ func (nh *NodeHost) RequestAddReplica(shardID, replicaID uint64, target Target, 
 }
 
 // RequestAddNonVoting requests adding a non-voting observer asynchronously.
+// It commits no node identity, which a NodeHost with a transport refuses; use
+// RequestAddNonVotingWithIdentity there.
 func (nh *NodeHost) RequestAddNonVoting(shardID, replicaID uint64, target Target, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
+	return nh.RequestAddNonVotingWithIdentity(shardID, replicaID, target, "", configChangeIndex, timeout)
+}
+
+// RequestAddNonVotingWithIdentity is RequestAddNonVoting with the node identity
+// the shard should commit for the observer.
+func (nh *NodeHost) RequestAddNonVotingWithIdentity(shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddObserver(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1266,14 +1341,21 @@ func (nh *NodeHost) RequestAddNonVoting(shardID, replicaID uint64, target Target
 // invalid against the current membership (e.g. removing the last full
 // replica, or a witness policy violation) is rejected synchronously with a
 // nil RequestState and a non-nil error, instead of failing later through
-// RequestState.ResultC.
+// RequestState.ResultC. It commits no node identity, which a NodeHost with a
+// transport refuses; use RequestAddWitnessWithIdentity there.
 func (nh *NodeHost) RequestAddWitness(shardID, replicaID uint64, target Target, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
+	return nh.RequestAddWitnessWithIdentity(shardID, replicaID, target, "", configChangeIndex, timeout)
+}
+
+// RequestAddWitnessWithIdentity is RequestAddWitness with the node identity the
+// shard should commit for the witness.
+func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddWitness(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
 	if err != nil {
 		cancel()
 		return nil, translateError(err)

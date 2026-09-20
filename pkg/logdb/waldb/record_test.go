@@ -29,7 +29,7 @@ func TestEncodeDecodeSmallRecord(t *testing.T) {
 	data := []byte("hello world")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, 0, data)
+	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestEncodeDecodeSmallRecord(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize+len(data))
 	}
 
-	decoded, recType, _, consumed, err := decodeRecord(buf)
+	decoded, recType, _, _, consumed, err := decodeRecord(buf)
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -61,12 +61,12 @@ func TestEncodeDecodeLargeRecord(t *testing.T) {
 	}
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, 0, data)
+	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
 
-	decoded, recType, _, consumed, err := decodeRecord(buf[:n])
+	decoded, recType, _, _, consumed, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestEncodeBufferTooSmall(t *testing.T) {
 	data := []byte("too big for this buffer")
 	buf := make([]byte, recordHeaderSize) // no room for data
 
-	_, err := encodeRecord(buf, RecordFull, 0, data)
+	_, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != ErrBufferTooSmall {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrBufferTooSmall)
 	}
@@ -104,7 +104,7 @@ func TestEncodeBufferExactFit(t *testing.T) {
 	data := []byte("exact")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	n, err := encodeRecord(buf, RecordFull, 0, data)
+	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestEncodeBufferExactFit(t *testing.T) {
 func TestEncodeEmptyData(t *testing.T) {
 	buf := make([]byte, recordHeaderSize)
 
-	n, err := encodeRecord(buf, RecordFull, 0, nil)
+	n, err := encodeRecord(buf, RecordFull, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestEncodeEmptyData(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
 	}
 
-	decoded, recType, _, consumed, err := decodeRecord(buf[:n])
+	decoded, recType, _, _, consumed, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestEncodeEmptyData(t *testing.T) {
 func TestEncodeEmptySliceData(t *testing.T) {
 	buf := make([]byte, recordHeaderSize)
 
-	n, err := encodeRecord(buf, RecordFull, 0, []byte{})
+	n, err := encodeRecord(buf, RecordFull, 0, 0, []byte{})
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestEncodeEmptySliceData(t *testing.T) {
 		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
 	}
 
-	decoded, _, _, _, err := decodeRecord(buf[:n])
+	decoded, _, _, _, _, err := decodeRecord(buf[:n])
 	if err != nil {
 		t.Fatalf("decodeRecord: unexpected error: %v", err)
 	}
@@ -180,12 +180,12 @@ func TestAllRecordTypes(t *testing.T) {
 			data := []byte("type test")
 			buf := make([]byte, recordHeaderSize+len(data))
 
-			n, err := encodeRecord(buf, tc.typ, 0, data)
+			n, err := encodeRecord(buf, tc.typ, 0, 0, data)
 			if err != nil {
 				t.Fatalf("encodeRecord(%s): unexpected error: %v", tc.name, err)
 			}
 
-			_, recType, _, _, err := decodeRecord(buf[:n])
+			_, recType, _, _, _, err := decodeRecord(buf[:n])
 			if err != nil {
 				t.Fatalf("decodeRecord(%s): unexpected error: %v", tc.name, err)
 			}
@@ -202,17 +202,17 @@ func TestInvalidRecordType(t *testing.T) {
 	buf := make([]byte, recordHeaderSize+10)
 	data := []byte("bad type")
 
-	_, err := encodeRecord(buf, 0, 0, data)
+	_, err := encodeRecord(buf, 0, 0, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 
-	_, err = encodeRecord(buf, 6, 0, data)
+	_, err = encodeRecord(buf, 6, 0, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 
-	_, err = encodeRecord(buf, 255, 0, data)
+	_, err = encodeRecord(buf, 255, 0, 0, data)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
@@ -223,7 +223,7 @@ func TestInvalidRecordType(t *testing.T) {
 func TestDecodeBufferTooSmall(t *testing.T) {
 	buf := make([]byte, recordHeaderSize-1)
 
-	_, _, _, _, err := decodeRecord(buf)
+	_, _, _, _, _, err := decodeRecord(buf)
 	if err != ErrCorruptedRecord {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrCorruptedRecord)
 	}
@@ -236,13 +236,13 @@ func TestDecodePayloadTruncated(t *testing.T) {
 	data := []byte("truncated")
 	buf := make([]byte, recordHeaderSize+len(data))
 
-	_, err := encodeRecord(buf, RecordFull, 0, data)
+	_, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: unexpected error: %v", err)
 	}
 
 	// Truncate the buffer so the payload is incomplete.
-	_, _, _, _, err = decodeRecord(buf[:recordHeaderSize+len(data)-3])
+	_, _, _, _, _, err = decodeRecord(buf[:recordHeaderSize+len(data)-3])
 	if err != ErrCorruptedRecord {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrCorruptedRecord)
 	}
@@ -266,14 +266,14 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf[0:4], crc)
 	binary.LittleEndian.PutUint16(buf[4:6], uint16(len(data)))
 
-	_, _, _, _, err := decodeRecord(buf)
+	_, _, _, _, _, err := decodeRecord(buf)
 	if err != ErrInvalidRecordType {
 		t.Fatalf("decodeRecord: error = %v, want %v", err, ErrInvalidRecordType)
 	}
 }
 
 // TestRecordHeaderSize confirms the header size constant matches the spec:
-// [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] = 11 bytes.
+// [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] + [GenStart:4] = 15 bytes.
 //
 // The constant is pinned rather than derived because it IS the on-disk format:
 // changing it leaves every previously written segment unreadable. Under the
@@ -283,8 +283,36 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 // deliberate: an accidental edit to recordHeaderSize would silently make this
 // build unable to read segments it wrote an hour ago.
 func TestRecordHeaderSize(t *testing.T) {
-	if recordHeaderSize != 11 {
-		t.Fatalf("recordHeaderSize = %d, want 11", recordHeaderSize)
+	if recordHeaderSize != 15 {
+		t.Fatalf("recordHeaderSize = %d, want 15", recordHeaderSize)
+	}
+}
+
+// TestRecordGenerationStartRoundTrip pins that the generation start is
+// carried per chunk, covered by the CRC, and decoded exactly (#197 D).
+func TestRecordGenerationStartRoundTrip(t *testing.T) {
+	buf := make([]byte, 64)
+	payload := []byte("payload")
+	for _, genStart := range []uint32{0, 1, 4096, 1<<32 - 1} {
+		n, err := encodeRecord(buf, RecordFull, 3, genStart, payload)
+		if err != nil {
+			t.Fatalf("encodeRecord(genStart=%d): %v", genStart, err)
+		}
+		data, recType, seq, got, consumed, err := decodeRecord(buf[:n])
+		if err != nil {
+			t.Fatalf("decodeRecord(genStart=%d): %v", genStart, err)
+		}
+		if got != genStart || seq != 3 || recType != RecordFull || consumed != n || string(data) != "payload" {
+			t.Fatalf("round trip = (gen %d seq %d type %d n %d %q), want (gen %d seq 3 type Full n %d payload)",
+				got, seq, recType, consumed, data, genStart, n)
+		}
+		// A flipped bit in the generation start must fail the CRC rather than
+		// move the acknowledged end.
+		buf[7+recordSeqSize] ^= 0x01
+		if _, _, _, _, _, err := decodeRecord(buf[:n]); err == nil {
+			t.Fatalf("a corrupted generation start decoded cleanly at genStart=%d", genStart)
+		}
+		buf[7+recordSeqSize] ^= 0x01
 	}
 }
 
@@ -314,11 +342,11 @@ func crc32Checksum(data []byte) uint32 {
 func TestDecodeRecord_CRCMismatch(t *testing.T) {
 	data := []byte("payload-under-checksum")
 	buf := make([]byte, recordHeaderSize+len(data))
-	n, err := encodeRecord(buf, RecordFull, 0x11223344, data)
+	n, err := encodeRecord(buf, RecordFull, 0x11223344, 0, data)
 	if err != nil {
 		t.Fatalf("encodeRecord: %v", err)
 	}
-	if _, _, _, _, err := decodeRecord(buf[:n]); err != nil {
+	if _, _, _, _, _, err := decodeRecord(buf[:n]); err != nil {
 		t.Fatalf("fixture: the intact record does not decode: %v", err)
 	}
 
@@ -328,7 +356,7 @@ func TestDecodeRecord_CRCMismatch(t *testing.T) {
 		copy(corrupt, buf[:n])
 		corrupt[i] ^= 0x01
 
-		_, _, _, _, err := decodeRecord(corrupt)
+		_, _, _, _, _, err := decodeRecord(corrupt)
 		if err == nil {
 			t.Fatalf("a single flipped bit at offset %d decoded as a valid record: "+
 				"that byte is not covered by the checksum, so the medium can change "+
@@ -363,7 +391,7 @@ func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
 	const durSeq = uint32(0x0A0B0C0D)
 	data := []byte("x")
 	buf := make([]byte, recordHeaderSize+len(data))
-	if _, err := encodeRecord(buf, RecordFull, durSeq, data); err != nil {
+	if _, err := encodeRecord(buf, RecordFull, durSeq, 0, data); err != nil {
 		t.Fatalf("encodeRecord: %v", err)
 	}
 
@@ -377,7 +405,7 @@ func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
 			"counted as payload", got, len(data))
 	}
 
-	_, _, gotSeq, consumed, err := decodeRecord(buf)
+	_, _, gotSeq, _, consumed, err := decodeRecord(buf)
 	if err != nil {
 		t.Fatalf("decodeRecord: %v", err)
 	}

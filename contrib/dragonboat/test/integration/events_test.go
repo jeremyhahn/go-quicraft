@@ -143,10 +143,10 @@ var _ raftio.ISystemEventListener = (*testSystemEventListener)(nil)
 // on a single-node cluster.
 func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 	listener := &testRaftEventListener{}
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
 
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.RaftEventListener = listener
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
@@ -161,6 +161,7 @@ func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 	}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica failed: %v", err)
 	}
@@ -200,10 +201,10 @@ func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 // ready on a single-node cluster.
 func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 	sysListener := &testSystemEventListener{}
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
 
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
@@ -218,6 +219,7 @@ func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 	}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica failed: %v", err)
 	}
@@ -250,10 +252,10 @@ func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 // stopped on a single-node cluster.
 func TestIntegration_DB_SystemEventListener_NodeUnloaded(t *testing.T) {
 	sysListener := &testSystemEventListener{}
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
 
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
@@ -268,6 +270,7 @@ func TestIntegration_DB_SystemEventListener_NodeUnloaded(t *testing.T) {
 	}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica failed: %v", err)
 	}

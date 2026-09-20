@@ -111,6 +111,17 @@ var (
 	// always covers a real log index, so the value is a construction bug at the
 	// sender rather than anything a peer should be asked to interpret.
 	ErrSnapshotWithoutPosition = errors.New("proto: snapshot has content but no log position")
+
+	// ErrLogIndexOutOfRange is returned by Snapshot.CheckBounds when the
+	// snapshot's Index is at or above MaxLogIndex, and by raft when persisted
+	// state names such an index. See MaxLogIndex.
+	ErrLogIndexOutOfRange = errors.New("proto: log index at or above MaxLogIndex")
+
+	// ErrTermOutOfRange is returned by Snapshot.CheckBounds when the snapshot's
+	// Term is at or above MaxTerm, by raft when persisted state names such a
+	// term, and by raft for a replicated batch carrying an entry whose term
+	// is 0 or exceeds the replicating leader's. See MaxTerm.
+	ErrTermOutOfRange = errors.New("proto: term out of range")
 )
 
 // UnsupportedMembershipVersionError is returned when a persisted Membership

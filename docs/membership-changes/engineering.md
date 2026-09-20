@@ -363,11 +363,10 @@ default" rather than "off". Use `config.BoolPtr(false)` to disable deliberately.
 `proto.UpdateWitnessPolicy`. A per-node policy value would let replicas disagree
 about which config changes are legal.
 
-Transport-side, on `config.TransportConfig`:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `RequireMemberIdentity` | `false` | drop messages from a sender with no committed identity, instead of falling back to a SAN check against the committed Raft address |
+`Config.MemberIdentities` is the founding map's identities (join=false) or the
+join anchor (join=true), and `Config.RequireMemberIdentities` — set by the Host
+from whether it has a transport — makes every admission require one; there is
+no transport-side switch any more.
 
 ## Persistence
 

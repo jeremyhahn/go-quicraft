@@ -32,9 +32,9 @@ import (
 // the ResultC aggregate channel. This validates the two-phase
 // notification pipeline: WAL-durable commit then state machine apply.
 func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NotifyCommit = true
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
@@ -47,6 +47,7 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -111,9 +112,9 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 // complete normally. This ensures the disabled path does not produce a
 // spurious commit notification or block the apply pipeline.
 func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	// NotifyCommit defaults to false; do not set it.
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
@@ -126,6 +127,7 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}

@@ -160,9 +160,9 @@ func TestIntegration_DB_LeaderInfoIsReported(t *testing.T) {
 // proposals and reads on shards that aren't ready return errors.
 // Matches dragonboat's TestDroppedRequestsAreReported.
 func TestIntegration_DB_DroppedRequestsOnInvalidShard(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -315,9 +315,9 @@ func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 // TestIntegration_DB_GetNodeHostRegistry verifies that
 // GetNodeHostRegistry returns nil/false since quicraft doesn't support gossip.
 func TestIntegration_DB_GetNodeHostRegistry(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -338,9 +338,9 @@ func TestIntegration_DB_GetNodeHostRegistry(t *testing.T) {
 // TestIntegration_DB_GetNodeUser verifies GetNodeUser returns a
 // functional INodeUser for proposal and read operations.
 func TestIntegration_DB_GetNodeUser(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -359,6 +359,7 @@ func TestIntegration_DB_GetNodeUser(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -427,6 +428,7 @@ func TestIntegration_DB_SnapshotRecoveryAfterRestart(t *testing.T) {
 	replicaID := uint64(followerIdx + 1)
 	createFn, newTracker := dbKVCreateFunc()
 	cfg := snapshotCfg(1, replicaID)
+	cfg.MemberIdentities = cluster.identities()
 	if err := followerHost.StartReplica(nil, true, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica (rejoin) failed: %v", err)
 	}

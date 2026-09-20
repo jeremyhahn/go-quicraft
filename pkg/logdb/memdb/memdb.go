@@ -129,6 +129,13 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	// partly happened.
 	for i := range updates {
 		u := &updates[i]
+		// A snapshot travels through SaveState as well as SaveSnapshot, and
+		// the protocol bound has to hold on both doors (see SaveSnapshot).
+		if u.Snapshot.Index > 0 {
+			if err := u.Snapshot.CheckBounds(); err != nil {
+				return err
+			}
+		}
 		if len(u.Entries) == 0 {
 			continue
 		}
@@ -546,6 +553,15 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 	// on, and matches the SaveState path, which has always required Index > 0.
 	if snapshot.Index == 0 {
 		return logdb.ErrSnapshotOutOfDate
+	}
+	// The other end of the range: a position at or above proto.MaxLogIndex /
+	// proto.MaxTerm is refused before it can become durable, because raft
+	// restores a saved snapshot on restart and its Index+1 arithmetic wraps
+	// there. Same predicate as raft.handleSnapshot and the chunk validator;
+	// LogDB is the one that makes the poisoning survive a restart, so it
+	// cannot rely on the callers having applied it.
+	if err := snapshot.CheckBounds(); err != nil {
+		return err
 	}
 
 	return m.withNode(shardID, replicaID, func(nd *nodeData) error {

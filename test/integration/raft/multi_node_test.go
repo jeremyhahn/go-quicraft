@@ -24,6 +24,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -59,11 +60,13 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		addrs[i] = netport.MustReserveUDP(t.Fatalf)
 	}
 
-	mtls := testMTLSConfig(t)
+	// One CA, one leaf — one keypair, one node identity — per host; see
+	// test/testpki.
+	ca := testpki.NewCA(t)
 	hosts := make([]*quicraft.Host, numNodes)
 	nodeHostDirs := make([]string, numNodes)
 	for i := range numNodes {
-		cfg := testHostConfig(t, addrs[i], mtls)
+		cfg := testHostConfig(t, addrs[i], ca.Leaf(t))
 		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg)
 		if err != nil {
@@ -95,6 +98,12 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 		members[replicaID] = addr
 	}
 
+	// Every founder names every member's identity: the same map on each.
+	identities := make(map[uint64]string, len(c.hosts))
+	for i, h := range c.hosts {
+		identities[uint64(i+1)] = h.NodeIdentity()
+	}
+
 	trackers := make([]*smTracker, len(c.hosts))
 	for i, h := range c.hosts {
 		replicaID := uint64(i + 1)
@@ -102,6 +111,7 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 		trackers[i] = tracker
 
 		scfg := testShardConfig(shardID, replicaID)
+		scfg.MemberIdentities = identities
 		if err := h.StartShard(members, false, createFn, scfg); err != nil {
 			c.t.Fatalf("StartShard[%d] failed: %v", i, err)
 		}

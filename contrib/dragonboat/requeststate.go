@@ -509,8 +509,18 @@ func (rs *RequestState) ResultC() chan RequestResult {
 // object immediately; a bridge goroutine still selecting on the recycled
 // result channel would race the pool and could steal the result of a new
 // request that was handed the recycled object.
+//
+// Only the FIRST call reaches the inner object. Dragonboat callers may call
+// Release more than once (the v4 contract tolerated it), but the inner
+// RequestState is pooled: a second call after the first returned could find
+// the object already reissued to another request and release THAT one. The
+// adapter's own released flag absorbs the repeats.
 func (rs *RequestState) Release() {
 	rs.mu.Lock()
+	if rs.released {
+		rs.mu.Unlock()
+		return
+	}
 	rs.released = true
 	rs.mu.Unlock()
 	if rs.doneC != nil {
@@ -598,6 +608,9 @@ func newAsyncOpRequestState(cancel context.CancelFunc, op func() RequestResult) 
 type SysOpState struct {
 	inner *quicraft.RequestState
 
+	// released elects the one Release call that reaches inner.
+	released atomic.Bool
+
 	// completedC is closed when the system operation finishes.
 	completedC chan struct{}
 
@@ -666,8 +679,12 @@ func (s *SysOpState) ResultC() <-chan struct{} {
 // goroutine to exit. After Release, the channels returned by CompletedC
 // and ResultC should not be used. The bridge goroutine is waited for
 // before the inner RequestState is released, so it can never observe the
-// recycled inner object (see RequestState.Release for the hazard).
+// recycled inner object (see RequestState.Release for the hazard). Only the
+// first call reaches the inner object, for the reason given there.
 func (s *SysOpState) Release() {
+	if !s.released.CompareAndSwap(false, true) {
+		return
+	}
 	if s.doneC != nil {
 		s.doneOnce.Do(func() { close(s.doneC) })
 	}

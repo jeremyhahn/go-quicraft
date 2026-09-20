@@ -90,9 +90,9 @@ transport derives from the mTLS leaf:
 ```
 
 Inbound messages are checked against that committed binding. Where no identity
-is committed for a sender, the fallback is a SAN check against the committed
-Raft address; `TransportConfig.RequireMemberIdentity` (default `false`) drops
-such messages instead.
+is committed for a sender, the message is dropped; admission requires the
+identity on every host with a transport, so such a configuration was written by
+a build that did not.
 
 The SPKI pin is deliberately not a SPIFFE URI SAN, because four downstream
 products issue these certificates and none of them agree on a naming scheme. A

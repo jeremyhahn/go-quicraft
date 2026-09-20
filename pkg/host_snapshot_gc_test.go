@@ -92,10 +92,7 @@ func TestSnapshotReceive_ReclaimsSupersededSnapshotDirectories(t *testing.T) {
 			ChunkSize:  uint64(len(payload)),
 			FileSize:   uint64(len(payload)),
 			Data:       payload,
-			Membership: proto.Membership{Addresses: map[uint64]string{
-				replicaID: "127.0.0.1:6001",
-				fromID:    "127.0.0.1:6002",
-			}},
+			Membership: snapshotPathMembership(replicaID, fromID),
 		}}
 		if err := handler.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
 			t.Fatalf("HandleSnapshot at index %d: %v", index, err)

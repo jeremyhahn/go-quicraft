@@ -122,6 +122,7 @@ const quicraft.SeriesIDForRegister       uint64 = math.MaxUint64 - 1
 | Error | Meaning |
 |---|---|
 | `ErrSessionsUnsupportedOnDisk` | client sessions are not supported on on-disk state machines |
+| `ErrSessionBusy` | the session already has a proposal in flight; one series at a time (`Temporary`) |
 | `*SessionError` | registration or lookup failed |
 | `*SessionExpiredError` | the session expired; `sm.ResultSessionExpired` is the reserved `Result.Value` the RSM layer signals it with |
 

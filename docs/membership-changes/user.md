@@ -44,24 +44,28 @@ err := host.SyncRequestAddNodeWithIdentity(ctx, shardID,
     replicaID, "node4.example.com:4001", identity, m.ConfigChangeID)
 ```
 
-Then start the shard **on the new node** with `join = true`:
+Then start the shard **on the new node** with `join = true`, anchored to the
+replicas it may take its bootstrap snapshot from — the leader at least:
 
 ```go
+cfg.MemberIdentities = map[uint64]string{leaderReplicaID: leaderIdentity}
 err := newHost.StartShard(nil, true, createFn, cfg)   // join, empty member map
 ```
 
 The order matters: add first, then start. A node started with `join = true`
 before the cluster knows about it has nobody to catch up from.
 
-`identity` is the SPKI pin the transport derives from the peer's mTLS leaf:
+`identity` is the SPKI pin the transport derives from the peer's mTLS leaf, the
+value the new node reports from `Host.NodeIdentity()`:
 
 ```
 "spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))
 ```
 
-**Prefer the `WithIdentity` form.** Without a committed identity the transport
-falls back to a SAN check against the committed address, and you can never turn
-on `RequireMemberIdentity`.
+**The identity is required** on a host with a transport: `RequestAddNode`
+without one returns `ErrMemberIdentityRequired`, and a joiner started without
+an anchor is refused. A member is authorized by its committed identity and by
+nothing else.
 
 ## Task: add an observer or a witness
 
@@ -123,20 +127,6 @@ err := host.SyncRequestUpdateWitnessPolicy(ctx, shardID, policy, m.ConfigChangeI
 policy is replicated state and changes only through this call — a per-node value
 would let replicas disagree about which config changes are legal.
 
-## Task: turn on `RequireMemberIdentity`
-
-On a new cluster, just set it. On a **live** cluster it is a sequenced
-migration:
-
-1. Add a committed identity for every existing member (re-issue the membership
-   entries with `RequestAddNodeWithIdentity`).
-2. Verify every member has one.
-3. Only then set `TransportConfig.RequireMemberIdentity = true` and restart
-   nodes.
-
-Turning it on before step 2 partitions the cluster from itself. The full
-procedure is in [`../compatibility.md`](../compatibility.md).
-
 ## Task: check who is in the shard
 
 ```go
@@ -163,7 +153,8 @@ ReadIndex.
 
 **A newly added node never catches up** — check, in order: was it added *before*
 it was started with `join = true`; does its certificate SAN cover the address
-you advertised; is `RequireMemberIdentity` on with no committed identity for it.
+you advertised; does the identity you committed for it match the one it reports
+from `NodeIdentity()` (`identity_mismatch` in the drop counter).
 `host.DiagRemotes(shardID)` shows whether the leader is replicating to it at
 all.
 

@@ -1,7 +1,7 @@
 # Compatibility and Upgrades
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-09-15
+> Last verified: 2026-09-16
 > Conflicts with this document are defects. Fix them here first.
 
 This is a **cross-feature** document. It spans `pkg/proto`, the WAL,
@@ -20,8 +20,9 @@ upgrade actually involves today.
 `pkg/internal/engine/snapshot_meta.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`,
 `VERSION`
 
-The current version is **0.6.1-alpha**, published 2026-08-17. It breaks both `0.4.x`
-and `0.5.x` on-disk data; see the upgrade section below.
+The current release is **0.12.0-alpha**, published 2026-09-16; `0.13.0-alpha` is in
+preparation on `release/0.13.0-alpha` (#197). Every minor before it has broken
+on-disk data at least once; see the upgrade section below.
 
 ## Stability guarantee
 
@@ -50,7 +51,7 @@ release pipelines never completed, so neither was published. Both tags stay
 where they are rather than being moved: module versions are immutable, go-qrdb
 had already recorded `v0.4.0-alpha` in its `go.sum`, and repointing a checksummed
 tag fails a downstream build with a security error. Of that pair, depend on
-`v0.5.1-alpha`; the current release is **`v0.11.0-alpha`** (2026-09-13), and a
+`v0.5.1-alpha`; the current release is **`v0.12.0-alpha`** (2026-09-16), and a
 consumer moving to it from anything before `v0.11.0-alpha` takes the `pkg/enclave`
 deletion and the `Credentials.Secret` retype described in the CHANGELOG (#54, #41).
 
@@ -297,14 +298,28 @@ records are written in — and it is read before a single segment byte is.
 
 | Version | Chunk header | Status |
 |---|---|---|
-| 1 | 11 bytes: CRC32, length, type, durability sequence | Current |
+| 1 | 15 bytes: CRC32, length, type, durability sequence, generation start | Current |
 | anything else | — | **Refused** — `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`, naming both versions) |
 
 Like every other number here it is pinned at 1 for the pre-release period: the
 chunk framing HAS changed during development — an earlier 7-byte header carried
-no durability sequence — and under the pinning policy that change was made in
-place, with the dev directories that held the old framing wiped rather than
+no durability sequence, and `0.13.0-alpha` grew the 11-byte header to 15 with
+the generation start (#197) — and under the pinning policy each change was made
+in place, with the dev directories that held the old framing wiped rather than
 migrated.
+
+**What a `0.12.x` directory does under `0.13.0-alpha`, stated plainly.** The
+marker passes (both write 1). Every chunk then fails the CRC computed over the
+new header range, so `ReadAll` sees corruption at offset 0 with nothing
+decodable above it — the exact shape of a torn first batch in a final segment —
+and recovery does what it does for that shape: it **truncates the segment to
+zero and opens successfully**, at WARN level (`stopping WAL recovery at first
+corrupt record … offset=0`, `truncated corrupt WAL segment … clean_end=0`). The
+node comes up with an EMPTY log and no hard state: term and vote regress, so a
+quorum member upgraded in place can vote twice in one term. Nothing in the
+file can tell the two layouts apart, which is why the policy is what it is:
+**stop the node, wipe its WAL and NodeHost directories, upgrade, re-sync from
+peers — one replica at a time, never a majority in place.**
 
 **The marker did once catch a real skew, and it no longer does.** Builds before
 `0.4.0-alpha` wrote version **2**; `0.4.0-alpha` renumbered it to 1 under the
@@ -541,7 +556,7 @@ and a panic in an exported constructor takes down the embedding process.
 rather than a safety requirement: `NewBarrier` applies the same rules and
 returns the same error identity, so skipping it no longer risks a panic.
 
-## Node identities and `RequireMemberIdentity`
+## Node identities are mandatory
 
 ### What changed
 
@@ -560,83 +575,100 @@ left three holes:
   quorum-bearing responses dropped until a config change committed, and during
   quorum loss no config change can commit.
 
-Committed membership now records a **node identity** per replica, and where one
-is present it is the only thing checked. The identity is
-`sha256(leaf.RawSubjectPublicKeyInfo)`, rendered `spki:<hex>` — a hash of the
-node's PUBLIC KEY, so only the holder of the matching private key can present
-it, and it is unchanged by certificate renewal on the same keypair.
+Committed membership records a **node identity** per replica, and it is the
+ONLY thing checked. The identity is `sha256(leaf.RawSubjectPublicKeyInfo)`,
+rendered `spki:<hex>` — a hash of the node's PUBLIC KEY, so only the holder of
+the matching private key can present it, and it is unchanged by certificate
+renewal on the same keypair.
+
+Since 0.13.0-alpha (#197) the identity is **required at admission** on every
+host that has a transport, and there is **no address fallback** on the receive
+path:
+
+- `StartShard(join=false)` requires `Config.MemberIdentities` to name every
+  member of the members map (`*InvalidMemberError`, naming the replica), with
+  this host's own entry equal to its `NodeIdentity()`, no identity bound to two
+  replicas, and no entry for replica ID 0.
+- `StartShard(join=true)` on a FIRST start requires it to name at least one
+  replica — the **anchor**, the replicas the joiner will accept its bootstrap
+  snapshot from, each bound to the identity that connection must present. An
+  established replica restarted with `join=true` recovers its configuration
+  and needs no anchor. The snapshot's own
+  membership is no longer consulted for authorization; it used to be, which let
+  any holder of a cluster certificate bootstrap a joining shard. On any start,
+  entries beyond the members map are the **operator anchor**: the receive gate
+  consults it for a sender no configuration the replica holds names, which is
+  how a replica that was down while a member was added and elected is told, on
+  restart, who now leads — without a wipe.
+- `RequestAddNode`, `RequestAddObserver` and `RequestAddWitness` — the
+  identity-less forms — return `ErrMemberIdentityRequired`; use the
+  `*WithIdentity` forms. The rule is enforced by the leader's propose-time
+  validator too, so a config change forwarded from another replica is held to
+  it (`config.Config.RequireMemberIdentities`, which the Host sets on every
+  shard behind a transport).
+- `ImportSnapshot` refuses a configuration with an identity-less active member;
+  a `WithImportMembership` rewrite supplies them through
+  `WithImportMemberIdentities`.
+- A member the committed configuration holds no identity for has every message
+  dropped (reason `missing_identity`), and nobody may re-point its routing entry.
+  `TransportConfig.RequireMemberIdentity`, which used to make this optional, is
+  gone.
+
+A host started `WithoutTransport()` has no wire boundary and none of this
+applies to it.
 
 Three consequences an operator should plan around:
 
 1. A wildcard certificate no longer lets its holder assert another member's
-   `msg.From`, for any replica whose identity is committed.
-2. A member with a committed identity can move to a new address and keep its
-   votes and acks counted, with no config change. The liveness cost the address
-   binding carried is gone for migrated members.
+   `msg.From`, or bootstrap a joining replica.
+2. A member can move to a new address and keep its votes and acks counted, with
+   no config change. The liveness cost the address binding carried is gone.
 3. Inbound connections whose certificate ALSO covers this node's own host are
-   now refused at the transport, before a stream is opened. Peers that share
-   this node's machine (same host, or any loopback address) are exempt, because
-   no certificate policy can separate them. **A cluster running one wildcard or
+   refused at the transport, before a stream is opened. Peers that share this
+   node's machine (same host, or any loopback address) are exempt, because no
+   certificate policy can separate them. **A cluster running one wildcard or
    shared-SAN certificate across DISTINCT hosts will stop connecting** — that is
    the intended effect, and it is the same precondition `StartShard` has always
-   asserted about the local certificate.
+   asserted about the local certificate. Every host needs its own keypair; two
+   hosts sharing one share an identity, and the membership validator refuses to
+   commit an identity twice (`ErrDuplicateMemberIdentity`).
 
-### Migrating an existing cluster
-
-Existing clusters have no committed identities and keep working unchanged: a
-replica with no recorded identity falls back to the committed-address check.
-`RequireMemberIdentity` defaults to **false** for exactly that reason.
-
-The migration is per-replica and needs no downtime:
+### Bootstrapping and growing a cluster
 
 1. **Collect.** On each node, read `Host.NodeIdentity()`. It is a hash of a
    public key — safe to log, print, and put in configuration management. Record
-   the replica ID it belongs to.
-2. **Commit, one replica at a time.** On the shard leader, re-issue the add for
-   each existing member with its identity attached:
+   the replica ID it belongs to. It cannot be inferred or learned — deriving it
+   from the peer's own connection would let a promiscuous-certificate holder
+   register ITSELF as any replica, which is worse than no identity at all — so
+   it must be supplied by an operator or the provisioning system that issued
+   the certificate.
+2. **Found.** Pass `Config.MemberIdentities` to `StartShard` on every founding
+   member, with an IDENTICAL map — the bootstrap entry at log index 1 is built
+   from it, and founders that disagree produce a divergent entry that Log
+   Matching never reconciles. This is the same rule that already applies to the
+   members map and to `Config.Witness`.
+3. **Grow.** Add a replica with its identity:
 
    ```go
    err := leader.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID,
        addr, identity, membership.ConfigChangeID)
    ```
 
-   `AddNode` for a replica the configuration already names updates it in place —
-   it is not a re-join, and it produces no tombstone. Use
-   `RequestAddObserverWithIdentity` and `RequestAddWitnessWithIdentity` for
-   observers and witnesses. Take a fresh `ConfigChangeID` from
-   `SyncGetShardMembership` before each call.
-3. **Verify.** `SyncGetShardMembership` reports the identity for every member.
-   Watch the `unauthorized_message_dropped` counter: reason
-   `identity_mismatch` means a committed identity does not match the keypair
-   the peer is actually presenting, which is either a stale identity or a
-   forgery. It is never normal.
-4. **Tighten,** once and only once every member of every shard on a host has a
-   committed identity: set
-   `HostConfig.TransportConfig.RequireMemberIdentity = true` and restart that
-   host. See [Enabling `RequireMemberIdentity`](#enabling-requirememberidentity)
-   for the order to do it in.
-
-Bootstrapping a NEW cluster skips all of it: pass
-`Config.MemberIdentities` to `StartShard`. Every founding member must be given
-an IDENTICAL map — the bootstrap entry at log index 1 is built from it, and
-founders that disagree produce a divergent entry that Log Matching never
-reconciles. This is the same rule that already applies to the members map and to
-`Config.Witness`.
-
-### What each posture costs
-
-| `RequireMemberIdentity` | A member WITH an identity | A member WITHOUT one |
-|---|---|---|
-| `false` (default) | Authorized by identity. Wildcard certificates cannot assert it; address changes are free | Authorized by its committed address. A wildcard-certificate holder can still assert its `msg.From` |
-| `true` | Same | **Quorum-bearing traffic dropped** (reason `missing_identity`). Enabling it before every member is migrated costs the shard its quorum |
-
-The default is a compatibility choice, not a security preference. An identity
-cannot be inferred or learned — deriving it from the peer's own connection would
-let a promiscuous-certificate holder register ITSELF as any replica, which is
-worse than no identity at all — so it must be supplied by an operator.
-Defaulting to `true` would brick every existing cluster on upgrade and every new
-cluster whose operator has not yet met the field, which produces a setting that
-gets switched off rather than satisfied.
+   and start it with `join=true` and `Config.MemberIdentities` naming the
+   current leader at least — every existing member if leadership may move
+   before the join completes; an entry that never sends the snapshot costs
+   nothing. Keep every replica's map current with the membership: a replica
+   restarted with a map that names the current leader is admitted to it even
+   if it missed the `AddNode` that elected it. Use `RequestAddObserverWithIdentity` and
+   `RequestAddWitnessWithIdentity` for observers and witnesses. Take a fresh
+   `ConfigChangeID` from `SyncGetShardMembership` before each call.
+4. **Verify.** `SyncGetShardMembership` reports the identity for every member.
+   Watch the `unauthorized_message_dropped` counter: reason `identity_mismatch`
+   means a committed identity does not match the keypair the peer is actually
+   presenting, which is either a stale identity or a forgery. It is never
+   normal. Reason `missing_identity` means a configuration written by a build
+   that did not require identities; the remedy is wipe and re-bootstrap, as for
+   every other pre-release format change.
 
 ### Identities across a restart
 
@@ -701,29 +733,6 @@ through the live handle, deliberately: `waldb` answers `GetSnapshot` and
 `ReadState` from an in-memory map that `SaveSnapshot` fills from the caller's
 value, so a save/read pair inside one process never reaches the record encoding
 and would pass against a backend that serialized nothing.
-
-### Enabling `RequireMemberIdentity`
-
-Step 4 of the migration above is safe once every member carries a committed
-identity. The order still matters:
-
-1. Finish committing an identity for **every member of every shard on the
-   host**, and confirm it with `SyncGetShardMembership`.
-2. **Restart one host and re-check `SyncGetShardMembership`**, ideally for a
-   shard whose log has been compacted past its config changes. This is what
-   distinguishes identities that are merely committed from identities that are
-   durable, and it costs one restart.
-3. Set `RequireMemberIdentity = true` on that host and restart it. Watch
-   `unauthorized_message_dropped`: any `missing_identity` means a member on that
-   host is not migrated and the flag went on too early. Roll it back rather than
-   waiting — the reason is a member whose quorum traffic is being discarded.
-4. Repeat per host. There is no need to change every host at once: the flag is a
-   local receive-side posture, and a strict host and a permissive host
-   interoperate.
-
-The flag is per HOST, but the condition it asserts is per SHARD: a host running
-several shards refuses un-migrated members on all of them, so every shard it
-hosts must be fully migrated before it is tightened.
 
 ## Upgrade path
 
@@ -806,7 +815,7 @@ value in every one of them:
 | Check | Verdict on a 0.4.x directory |
 |---|---|
 | `WALFORMAT` marker version | **Passes.** Both builds write 1 |
-| WAL chunk framing (11-byte header) | **Passes.** Unchanged since 0.4.0 |
+| WAL chunk framing (15-byte header) | **Fails.** The generation-start field was added in place in 0.13.0-alpha (#197); every earlier segment fails its chunk CRC at offset 0 |
 | `Membership` section version byte | **Passes.** Both builds write 1 |
 | `MessageBatch.BinVer` on the wire | **Passes.** Both builds stamp `WireVersion` = 1 |
 | **WAL payload type byte** | **Refuses.** `0x07` and `0x0a` are retired and left unallocated, so a record carrying either fails replay with `ErrUnknownPayloadType` |

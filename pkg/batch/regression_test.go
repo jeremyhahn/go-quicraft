@@ -702,8 +702,14 @@ func TestFlush_ByteCapSplitsBatch(t *testing.T) {
 // read back. The aggregator's payload is a committed Raft entry, so the whole
 // batch would be permanently undecodable on every replica.
 func TestEncodeBatch_RejectsOverMaxInt32(t *testing.T) {
-	// Never written to, so this costs address space rather than memory.
-	oversized := make([]byte, math.MaxInt32+1)
+	if math.MaxInt < math.MaxInt64 {
+		t.Skip("int is 32-bit on this platform; a MaxInt32+1 slice is unrepresentable")
+	}
+	// Never written to, so this costs address space rather than memory. The
+	// length goes through a variable so the constant expression does not
+	// overflow int on a 32-bit build before the skip above can run.
+	n := math.MaxInt32
+	oversized := make([]byte, n+1)
 
 	encoded, err := EncodeBatch([][]byte{[]byte("ok"), oversized})
 	if err == nil {

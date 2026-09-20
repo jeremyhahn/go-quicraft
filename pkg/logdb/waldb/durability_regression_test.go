@@ -377,6 +377,10 @@ func writeMultiBlockSegment(t *testing.T, db *DB, shardID uint64) {
 //
 // Replica 1's entry is written first, so it lands in block 0 and survives a
 // tear at block 1.
+//
+// SaveState does complete the batch's fdatasync, which appends a sync mark;
+// a caller modelling the batch as still in flight removes it with
+// dropSyncMark after closing the DB.
 func writeSingleGenerationSegment(t *testing.T, db *DB, shardID uint64) {
 	t.Helper()
 	updates := make([]logdb.Update, 0, 15)
@@ -665,6 +669,7 @@ func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	dropSyncMark(t, seg0Path, blockSize)
 
 	sizeBefore := statSize(t, seg0Path)
 	corruptSegmentBlock(t, seg0Path, blockSize)
@@ -771,6 +776,7 @@ func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	dropSyncMark(t, seg0Path, blockSize)
 
 	corruptSegmentBlock(t, seg0Path, blockSize)
 	sizeBefore := statSize(t, seg0Path)

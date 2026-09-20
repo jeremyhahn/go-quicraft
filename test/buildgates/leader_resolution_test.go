@@ -131,12 +131,17 @@ var configChangeCalls = map[string]bool{
 	"SyncRequestAddWitness":          true,
 	// dragonboat.NodeHost (contrib/dragonboat/nodehost.go). RequestAddWitness
 	// and SyncRequestAddWitness are spelled the same in both modules.
-	"RequestAddReplica":        true,
-	"SyncRequestAddReplica":    true,
-	"RequestAddNonVoting":      true,
-	"SyncRequestAddNonVoting":  true,
-	"RequestDeleteReplica":     true,
-	"SyncRequestDeleteReplica": true,
+	"RequestAddReplica":                   true,
+	"RequestAddReplicaWithIdentity":       true,
+	"SyncRequestAddReplica":               true,
+	"SyncRequestAddReplicaWithIdentity":   true,
+	"RequestAddNonVoting":                 true,
+	"RequestAddNonVotingWithIdentity":     true,
+	"SyncRequestAddNonVoting":             true,
+	"SyncRequestAddNonVotingWithIdentity": true,
+	"SyncRequestAddWitnessWithIdentity":   true,
+	"RequestDeleteReplica":                true,
+	"SyncRequestDeleteReplica":            true,
 }
 
 // linearizableReadCalls are the methods that serve a read THROUGH the leader,

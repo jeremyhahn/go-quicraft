@@ -637,6 +637,37 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
+// testIdentity is the node identity a unit test commits for replicaID: the
+// well-formed "spki:" + 64-hex shape, distinct per replica, and unrelated to
+// any real keypair. A host with a transport refuses to admit a member without
+// one (config.Config.RequireMemberIdentities), so every StartShard and
+// RequestAddNode on such a host in this package goes through these.
+func testIdentity(replicaID uint64) string {
+	return fmt.Sprintf("spki:%064x", replicaID)
+}
+
+// testIdentities maps every replica in members to its testIdentity.
+func testIdentities(members map[uint64]string) map[uint64]string {
+	ids := make(map[uint64]string, len(members))
+	for id := range members {
+		ids[id] = testIdentity(id)
+	}
+	return ids
+}
+
+// testShardConfigWithIdentities is testShardConfig with MemberIdentities
+// covering every replica in members, for hosts that have a transport. The
+// local replica's entry must be the HOST's own identity — StartShard checks
+// its own entry against Host.NodeIdentity — so the host is a parameter.
+func testShardConfigWithIdentities(h *Host, shardID, replicaID uint64, members map[uint64]string) config.Config {
+	c := testShardConfig(shardID, replicaID)
+	c.MemberIdentities = testIdentities(members)
+	if _, self := members[replicaID]; self {
+		c.MemberIdentities[replicaID] = h.NodeIdentity()
+	}
+	return c
+}
+
 // waitForLeader waits until the engine's Raft peer for the given shard
 // becomes leader via single-node self-election. For a single-node cluster
 // the election completes within ~20ms (election timeout 10 ticks at 1ms).
@@ -7652,8 +7683,10 @@ func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
 
 	// markShardJoining mirrors what StartShard(members, join=true, ...) does
 	// internally when this host joins the shard as a dynamically added
-	// replica with no initial membership of its own.
+	// replica with no initial membership of its own: the join anchor names
+	// the replica the bootstrap snapshot may come from and its identity.
 	h.markShardJoining(shardID)
+	h.setShardAnchor(shardID, map[uint64]string{fromReplicaID: fixtureIdentity})
 	if !h.isShardJoining(shardID) {
 		t.Fatal("isShardJoining = false immediately after markShardJoining, want true")
 	}
@@ -7691,6 +7724,10 @@ func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
 				Addresses: map[uint64]string{
 					localReplicaID: "127.0.0.1:6001",
 					fromReplicaID:  "127.0.0.1:6002",
+				},
+				Identities: map[uint64]string{
+					localReplicaID: fixtureIdentity,
+					fromReplicaID:  fixtureIdentity,
 				},
 			},
 		},
@@ -15383,7 +15420,7 @@ func TestProposeEntry_ShardNotReady(t *testing.T) {
 	h.engine.UnloadNode(1)
 
 	ctx := context.Background()
-	_, err = h.proposeEntry(ctx, ns, 1, proto.Entry{})
+	_, err = h.proposeEntry(ctx, ns, 1, proto.Entry{}, nil)
 	if !errors.Is(err, ErrShardNotReady) {
 		t.Fatalf("expected ErrShardNotReady, got %v", err)
 	}
@@ -19149,7 +19186,7 @@ func TestProposeEntry_DroppedProposalFiresEvent(t *testing.T) {
 			}
 		}
 		// Immediately propose while queue may still be full.
-		_, propErr = h.proposeEntry(ctx, ns, 1, entry)
+		_, propErr = h.proposeEntry(ctx, ns, 1, entry, nil)
 		if propErr != nil {
 			break
 		}

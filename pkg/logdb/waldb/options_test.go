@@ -152,7 +152,9 @@ func TestValidateNegativeBlockSize(t *testing.T) {
 // TestValidateInvalidMaxFileSize verifies that Validate fails when MaxFileSize
 // is zero or negative.
 func TestValidateInvalidMaxFileSize(t *testing.T) {
-	tests := []int64{0, -1, -1024 * 1024}
+	// Non-positive, and above what a chunk's 32-bit generation-start offset
+	// can name (#197 D).
+	tests := []int64{0, -1, -1024 * 1024, maxSegmentFileSize + 1, 1 << 33}
 	for _, mfs := range tests {
 		o := &Options{
 			WALDir:       "/tmp/wal",

@@ -119,7 +119,8 @@ func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters
 	ldb := memdb.New()
 	lr := logdb.NewLogReader(shardID, replicaID, ldb)
 	ms := proto.Membership{
-		Addresses: voters,
+		Addresses:  voters,
+		Identities: fixtureIdentities(voters),
 	}
 	lr.ApplySnapshot(proto.Snapshot{
 		Index:      0,
@@ -383,13 +384,30 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 // authorizeAllSenders is a PeerAuth that authorizes any address. Used by tests
 // that exercise behaviour PAST the sender-binding check.
 //
-// It carries no Identity, which is deliberate: a membership with committed
-// identities is not authorized by address at all, so a test that wants the
-// permissive fixture must also use a membership with no identities. Giving it a
-// blanket identity would silently satisfy the identity gate for every replica
-// and turn these tests vacuous the moment identities are involved.
+// It presents fixtureIdentity, the one identity every member of a fixture
+// membership built by newEngineNodeWithMembership or snapshotPathMembership
+// holds, so it satisfies the identity gate for every replica those fixtures
+// name — which is what "authorize all senders" means now that a member is
+// authorized by its identity and by nothing else. A test about FORGERY must not
+// use it: build the membership with distinct identities (certCoveringAs) so the
+// attacker's keypair is not the victim's.
 var authorizeAllSenders = transport.PeerAuth{
+	Identity:          fixtureIdentity,
 	AuthorizesAddress: func(string) bool { return true },
+}
+
+// fixtureIdentity is the node identity the permissive fixtures commit for
+// every member. A real identity is "spki:" plus a SHA-256 hex digest; the
+// value only has to be well-formed and shared.
+const fixtureIdentity = "spki:f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+
+// fixtureIdentities gives every replica in voters the fixtureIdentity.
+func fixtureIdentities(voters map[uint64]string) map[uint64]string {
+	ids := make(map[uint64]string, len(voters))
+	for id := range voters {
+		ids[id] = fixtureIdentity
+	}
+	return ids
 }
 
 // The committed addresses authorizeSnapshotPath installs. They are named
@@ -419,11 +437,13 @@ const (
 // membership and then authorizes anything else is a race, not a failure.
 // snapshot_durability_test.go's recvFixture carries the same guard.
 func snapshotPathMembership(localReplicaID, fromReplicaID uint64) proto.Membership {
+	addrs := map[uint64]string{
+		localReplicaID: snapshotPathLocalAddr,
+		fromReplicaID:  snapshotPathSenderAddr,
+	}
 	return proto.Membership{
-		Addresses: map[uint64]string{
-			localReplicaID: snapshotPathLocalAddr,
-			fromReplicaID:  snapshotPathSenderAddr,
-		},
+		Addresses:  addrs,
+		Identities: fixtureIdentities(addrs),
 	}
 }
 
@@ -2448,50 +2468,104 @@ func authorizationRigRecordingJoining(t *testing.T, ms proto.Membership) (*hostM
 	return handler, node, rec
 }
 
-// TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration is the
-// regression for the wedge the member allow-list caused.
+// appendPendingAdd puts an UNCOMMITTED AddNode(replicaID, identity) into the
+// node's raft log, the way a lagging follower holds one: replicated from the
+// leader the configuration already names (leaderID, at term), appended, not
+// yet committed. It then publishes the pending configuration the receive gate
+// reads, as the step worker would on its next cycle. The log must be empty
+// before the call (the entry lands at index 1).
+func appendPendingAdd(t *testing.T, node *engine.Node, leaderID, term, replicaID uint64, addr, identity string) {
+	t.Helper()
+	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: replicaID, Address: addr, NodeIdentity: identity}
+	cmd := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(cmd); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	err := node.Peer().Handle(proto.Message{
+		Type: proto.Replicate, From: leaderID, To: node.ReplicaID(), ShardID: 1, Term: term,
+		LogIndex: 0, LogTerm: 0, Commit: 0, Origin: proto.OriginRemote,
+		Entries: []proto.Entry{{Index: 1, Term: term, Type: proto.EntryConfigChange, Cmd: cmd}},
+	})
+	if err != nil {
+		t.Fatalf("Handle(Replicate with AddNode): %v", err)
+	}
+	node.Peer().PublishPendingConfig()
+	if got, ok := node.PendingMemberIdentity(replicaID); !ok || got != identity {
+		t.Fatalf("fixture: pending identity for replica %d = (%q, %v), want (%q, true)", replicaID, got, ok, identity)
+	}
+}
+
+// TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange is the
+// regression for the wedge the member allow-list caused, in the form that is
+// sound (#197 B).
 //
 // A replica's configuration lags by design. Replica 5 is added to the shard and
-// becomes leader while this host is behind, so the local configuration still
-// reads {1,2}. Under an allow-list every Heartbeat, Replicate and
-// InstallSnapshot from leader 5 was dropped -- including the very messages that
-// would have delivered the config change naming 5 -- so the replica was deaf to
-// its own leader for the life of the process while the shard silently ran with
-// reduced redundancy, and nothing re-opened the window.
-//
-// Authorization is now a removed-tombstone deny-list: monotone, so it cannot go
-// stale in the unsafe direction. Same model as etcd (EtcdServer.Process rejects
-// only a "message from removed member") and hashicorp/raft (no sender-membership
-// test on appendEntries at all).
-func TestHostMessageHandler_AcceptsSenderAbsentFromAStaleConfiguration(t *testing.T) {
+// becomes leader while this host is behind: the local COMMITTED configuration
+// still reads {1,2}, but the AddNode that admits 5 — replicated here by the old
+// leader — sits in this replica's own log, uncommitted. Under an allow-list
+// every Heartbeat and Replicate from leader 5 was dropped, so the replica was
+// deaf to its own leader for the life of the process. Under the old
+// unknown-member exemption ANY certificate holder naming replica 5 was
+// admitted, which was the hole. The pending configuration is the fact between
+// the two: this replica's own log names 5 and the identity it must present.
+func TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange(t *testing.T) {
+	const newLeaderAddr = "127.0.0.1:5005"
+	const newLeaderID = "spki:5555555555555555555555555555555555555555555555555555555555555555"
+	const strangerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
 	handler, node, rec := authorizationRigRecording(t, proto.Membership{
-		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: fixtureIdentity},
 	})
-
 	if node.IsRemoved(5) {
 		t.Fatal("fixture: replica 5 must not carry a removal tombstone")
 	}
 
-	batch := proto.MessageBatch{
-		SourceAddress: "127.0.0.1:5005",
-		Requests: []proto.Message{
-			{ShardID: 1, From: 5, To: 1, Type: proto.Heartbeat, Term: 9},
-		},
-	}
-	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage: %v", err)
+	heartbeat := func() proto.MessageBatch {
+		return proto.MessageBatch{
+			SourceAddress: newLeaderAddr,
+			Requests:      []proto.Message{{ShardID: 1, From: 5, To: 1, Type: proto.Heartbeat, Term: 9}},
+		}
 	}
 
+	// Before the AddNode is in the log, 5 is a stranger whatever it presents.
+	if err := handler.HandleMessage(heartbeat(), certCoveringAs(newLeaderID, newLeaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("a heartbeat from a replica no configuration — committed or pending — names was delivered")
+	}
+
+	// The old leader (2) replicates AddNode(5) here; it is appended, not committed.
+	appendPendingAdd(t, node, 2, 9, 5, newLeaderAddr, newLeaderID)
+	if node.IsMember(5) {
+		t.Fatal("fixture: the AddNode must be pending, not applied")
+	}
+
+	// A certificate holder naming 5 without 5's keypair is still a stranger.
+	if err := handler.HandleMessage(heartbeat(), certCoveringAs(strangerID, newLeaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("a heartbeat claiming the pending member's From was delivered from a " +
+			"connection that does not hold the identity the AddNode commits")
+	}
+
+	// Leader 5 itself: admitted on the strength of this replica's own log.
+	if err := handler.HandleMessage(heartbeat(), certCoveringAs(newLeaderID, newLeaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
 	// rec.DeliveredCount, not a DiagState().InboxLen re-read: the recording
 	// wrapper observes delivery synchronously at the DeliverMessage call
-	// HandleMessage makes directly, in this goroutine, before it returns --
-	// so there is no race against the engine's background worker draining
-	// the same message out of the live queue a re-read would otherwise poll
 	// (go-quicraft#26).
 	if rec.DeliveredCount() == 0 {
-		t.Fatal("the heartbeat from leader 5 was dropped because our configuration " +
-			"does not name it yet: this replica can never learn the config change " +
-			"that adds 5, so it stays deaf to its own leader permanently")
+		t.Fatal("the heartbeat from leader 5 was dropped although this replica's own " +
+			"log holds the AddNode that admits it: the replica stays deaf to its " +
+			"own leader and can never commit that entry")
+	}
+	if got, err := handler.host.registry.Resolve(1, 5); err != nil || got != newLeaderAddr {
+		t.Fatalf("routing for the pending leader = (%q, %v), want (%q, nil): admitted but "+
+			"unreachable, so the replica can never ack the entry that names it",
+			got, err, newLeaderAddr)
 	}
 }
 
@@ -2525,6 +2599,63 @@ func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 	}
 }
 
+// TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor pins the third
+// source of the sender binding for an ESTABLISHED replica: it was down while
+// replica 8 was added and elected, so neither its committed configuration nor
+// its log names 8. Its operator restarted it with a Config.MemberIdentities
+// that does, and on that — bound to 8's identity — 8's heartbeats are admitted
+// and the replica catches up without a wipe.
+func TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor(t *testing.T) {
+	const leaderAddr = "127.0.0.1:5008"
+	const leaderID = "spki:8888888888888888888888888888888888888888888888888888888888888888"
+	const strangerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
+	handler, node, rec := authorizationRigRecording(t, proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: fixtureIdentity},
+	})
+	if node.IsJoining() {
+		t.Fatal("fixture: an established replica, not a joiner")
+	}
+	heartbeat := proto.MessageBatch{
+		SourceAddress: leaderAddr,
+		Requests:      []proto.Message{{ShardID: 1, From: 8, To: 1, Type: proto.Heartbeat, Term: 9}},
+	}
+
+	// No anchor: 8 is a stranger.
+	if err := handler.HandleMessage(heartbeat, certCoveringAs(leaderID, leaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("a heartbeat from a replica no configuration names was delivered")
+	}
+
+	handler.host.setShardAnchor(1, map[uint64]string{8: leaderID})
+
+	// Anchored, wrong keypair: still a stranger.
+	if err := handler.HandleMessage(heartbeat, certCoveringAs(strangerID, leaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("the anchor admitted a connection that does not hold the anchored identity")
+	}
+
+	// Anchored, the leader's own keypair: admitted.
+	if err := handler.HandleMessage(heartbeat, certCoveringAs(leaderID, leaderAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() == 0 {
+		t.Fatal("the heartbeat from an anchored leader was dropped: the restarted replica " +
+			"cannot be told who leads except by a wipe")
+	}
+	// Admitted inbound is not enough: the reply has to be routable, or the
+	// leader never sees this replica's ack and the entry that would name it
+	// never commits.
+	if got, err := handler.host.registry.Resolve(1, 8); err != nil || got != leaderAddr {
+		t.Fatalf("routing for the anchored leader = (%q, %v), want (%q, nil): admitted but "+
+			"unreachable, so the replica can never ack it", got, err, leaderAddr)
+	}
+}
+
 // TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress is the regression
 // for the bootstrap deadlock a strict membership gate on address learning
 // causes.
@@ -2536,6 +2667,12 @@ func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 // change and add-node integration test times out at exactly this point.
 func TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress(t *testing.T) {
 	_, handler, node := authorizationRigJoining(t, proto.Membership{})
+	// The join anchor is what admits the leader while the joiner holds no
+	// configuration: the operator started the shard naming replica 1 and the
+	// identity its connection must present (authorizeAllSenders presents
+	// fixtureIdentity).
+	handler.host.markShardJoining(1)
+	handler.host.setShardAnchor(1, map[uint64]string{1: fixtureIdentity})
 
 	if node.IsMember(1) {
 		t.Fatal("fixture: a joining replica must know no members")
@@ -2568,7 +2705,8 @@ func TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress(t *testing.T) {
 // an established member's traffic at itself.
 func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testing.T) {
 	_, handler, _ := authorizationRig(t, proto.Membership{
-		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: fixtureIdentity},
 	})
 	handler.host.registry.Register(1, 2, "127.0.0.1:5002")
 
@@ -2593,12 +2731,148 @@ func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testin
 			"address to %q: shard traffic for replica 2 now goes to it", got)
 	}
 
-	// And a MEMBER may still overwrite, which recovery at a new address needs.
+	// And a MEMBER may still overwrite, which recovery at a new address needs —
+	// on the strength of its committed identity, which authorizeAllSenders
+	// presents.
 	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
 	if got, _ := handler.host.registry.Resolve(1, 2); got != "127.0.0.1:6666" {
 		t.Fatalf("a member could not update its own address (got %q): a replica "+
 			"recovering at a new address stays unreachable during quorum loss", got)
+	}
+}
+
+// TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID pins the
+// gate in front of the non-committed sources: neither the operator anchor nor
+// the pending configuration may admit a keypair the COMMITTED configuration
+// binds to another replica, or that member would be sending as a second ID.
+// Asked of the committed configuration at the moment of the message, so a
+// member added after the snapshot a restart recovered from is covered where
+// the start-time anchor check could not see it.
+func TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID(t *testing.T) {
+	const memberAddr = "127.0.0.1:5002"
+	const memberID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
+	handler, node, rec := authorizationRigRecording(t, proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: memberID},
+	})
+	asEight := proto.MessageBatch{
+		SourceAddress: memberAddr,
+		Requests:      []proto.Message{{ShardID: 1, From: 8, To: 1, Type: proto.Heartbeat, Term: 9}},
+	}
+
+	// The anchor binds replica 2's committed keypair to replica 8.
+	handler.host.setShardAnchor(1, map[uint64]string{8: memberID})
+	if err := handler.HandleMessage(asEight, certCoveringAs(memberID, memberAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("the anchor admitted replica 2's keypair as replica 8")
+	}
+	handler.host.anchors.Delete(1)
+
+	// So does a pending AddNode(8) carrying that keypair.
+	appendPendingAdd(t, node, 1, 9, 8, memberAddr, memberID)
+	if _, ok := node.PendingMemberIdentity(8); !ok {
+		t.Fatal("fixture: the pending add for replica 8 was not published")
+	}
+	if err := handler.HandleMessage(asEight, certCoveringAs(memberID, memberAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("the pending configuration admitted replica 2's keypair as replica 8")
+	}
+
+	// The keypair is still admitted as the replica that holds it.
+	asTwo := proto.MessageBatch{
+		SourceAddress: memberAddr,
+		Requests:      []proto.Message{{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat, Term: 9}},
+	}
+	if err := handler.HandleMessage(asTwo, certCoveringAs(memberID, memberAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() == 0 {
+		t.Fatal("the committed member's own heartbeat was dropped")
+	}
+}
+
+// appendPendingRemoval puts a COMMITTED but not yet applied
+// RemoveNode(replicaID) into the node's log at index 1 the way
+// appendPendingAdd puts an add there (the leader's Commit covers it; the
+// apply path that would fold it is not driven), and publishes the pending
+// configuration. An uncommitted removal is deliberately not a pending
+// tombstone — see raft.Peer.PendingRemoval.
+func appendPendingRemoval(t *testing.T, node *engine.Node, leaderID, term, replicaID uint64) {
+	t.Helper()
+	cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: replicaID}
+	cmd := make([]byte, cc.Size())
+	if _, err := cc.MarshalTo(cmd); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	err := node.Peer().Handle(proto.Message{
+		Type: proto.Replicate, From: leaderID, To: node.ReplicaID(), ShardID: 1, Term: term,
+		LogIndex: 0, LogTerm: 0, Commit: 1, Origin: proto.OriginRemote,
+		Entries: []proto.Entry{{Index: 1, Term: term, Type: proto.EntryConfigChange, Cmd: cmd}},
+	})
+	if err != nil {
+		t.Fatalf("Handle(Replicate with RemoveNode): %v", err)
+	}
+	node.Peer().PublishPendingConfig()
+	if !node.PendingRemoval(replicaID, "") {
+		t.Fatalf("fixture: the pending removal of replica %d was not published", replicaID)
+	}
+}
+
+// TestHostMessageHandler_PendingRemovalRefusesTheMemberByEveryName pins the
+// pending tombstone at the gate: a RemoveNode this replica holds above its
+// applied configuration refuses the removed member before the committed
+// binding, the anchor or the snapshot path can admit it — by the ID it was
+// removed under and by the keypair it held, under any claimed ID.
+func TestHostMessageHandler_PendingRemovalRefusesTheMemberByEveryName(t *testing.T) {
+	const memberAddr = "127.0.0.1:5002"
+	const memberID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
+	handler, node, rec := authorizationRigRecording(t, proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr, 3: "127.0.0.1:5003"},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: memberID, 3: fixtureIdentity},
+	})
+	heartbeatFrom := func(from uint64) proto.MessageBatch {
+		return proto.MessageBatch{
+			SourceAddress: memberAddr,
+			Requests:      []proto.Message{{ShardID: 1, From: from, To: 1, Type: proto.Heartbeat, Term: 9}},
+		}
+	}
+	// RemoveNode(2) replicated by the leader, not yet applied. (Appended
+	// before any delivery: the append drives the peer from this goroutine,
+	// which must not race the step worker over a delivered message. The
+	// committed member's admission without the removal is pinned by
+	// TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID.)
+	appendPendingRemoval(t, node, 3, 9, 2)
+	if node.IsRemoved(2) {
+		t.Fatal("fixture: the removal must still be pending, not committed")
+	}
+
+	// By its own ID.
+	if err := handler.HandleMessage(heartbeatFrom(2), certCoveringAs(memberID, memberAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("a member with a pending removal was admitted under its own ID through the committed binding")
+	}
+	// By its keypair under an anchored ID.
+	handler.host.setShardAnchor(1, map[uint64]string{8: memberID})
+	if err := handler.HandleMessage(heartbeatFrom(8), certCoveringAs(memberID, memberAddr)); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if rec.DeliveredCount() != 0 {
+		t.Fatal("a member with a pending removal was admitted under an anchored ID with its keypair")
+	}
+	// And on the snapshot path.
+	chunks := []proto.SnapshotChunk{{
+		ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 9, ChunkID: 0, ChunkCount: 1, Data: []byte("x"),
+	}}
+	var authErr *UnauthorizedMessageError
+	if err := handler.HandleSnapshot(chunks, certCoveringAs(memberID, memberAddr)); !errors.As(err, &authErr) {
+		t.Fatalf("HandleSnapshot from a member with a pending removal = %v, want *UnauthorizedMessageError", err)
 	}
 }

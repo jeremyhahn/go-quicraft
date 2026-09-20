@@ -103,6 +103,14 @@ type membershipSnapshot struct {
 	// reason: everything on a published snapshot is immutable after
 	// construction.
 	removedIdentitySet map[string]struct{}
+	// identityHolders is identities INVERTED: committed identity to the
+	// replica that holds it. The receive path asks it once per inbound
+	// message a non-committed source (the pending configuration or the
+	// operator anchor) would admit, to refuse a keypair the committed
+	// configuration already binds to ANOTHER replica; see
+	// Peer.IdentityHolder. Built once per membership change, like
+	// removedIdentitySet.
+	identityHolders map[string]uint64
 	// configChangeID is the log index of the most recently applied config change.
 	configChangeID uint64
 	// sharedAddresses holds every address more than one ACTIVE member claims,
@@ -196,6 +204,17 @@ func (s *membershipSnapshot) isRemovedIdentity(identity string) bool {
 	return removed
 }
 
+// identityHolder reports the replica the committed configuration binds
+// identity to, and whether there is one. Safe for concurrent reads because the
+// snapshot maps are never modified after construction.
+func (s *membershipSnapshot) identityHolder(identity string) (uint64, bool) {
+	if identity == "" {
+		return 0, false
+	}
+	id, ok := s.identityHolders[identity]
+	return id, ok
+}
+
 // toProto converts the snapshot to a proto.Membership value. The maps
 // are deep-copied to prevent external mutation of the immutable snapshot.
 func (s *membershipSnapshot) toProto() proto.Membership {
@@ -284,6 +303,12 @@ type membership struct {
 	// trails commit, so a value that changed mid-log would be observed at a
 	// replica-local point in the log. See rsm.StateMachine.sessionPolicyFn.
 	sessionPolicy proto.SessionPolicy
+	// requireIdentities is LOCAL admission policy, not replicated state: when
+	// set, validate refuses to admit a member that carries no node identity
+	// (config.Config.RequireMemberIdentities). It is never consulted on the
+	// apply path and is not carried into snapshots — a committed entry is
+	// applied whatever it carries, so replicas never diverge on it.
+	requireIdentities bool
 }
 
 // newMembership creates a membership from a proto.Membership. The maps are
@@ -303,6 +328,14 @@ func newMembership(m proto.Membership) *membership {
 	}
 }
 
+// newMembershipWithPolicy is newMembership under a local identity-admission
+// policy; see membership.requireIdentities.
+func newMembershipWithPolicy(m proto.Membership, requireIdentities bool) *membership {
+	mem := newMembership(m)
+	mem.requireIdentities = requireIdentities
+	return mem
+}
+
 // snapshot creates an immutable membershipSnapshot from the current mutable
 // state. All maps are deep-copied so the snapshot is safe for concurrent
 // reads while the mutable membership continues to be modified by the step
@@ -316,12 +349,30 @@ func (m *membership) snapshot() *membershipSnapshot {
 		identities:                 copyStringMap(m.identities),
 		removedIdentities:          copyStringMap(m.removedIdentities),
 		removedIdentitySet:         invertIdentities(m.removedIdentities),
+		identityHolders:            identityHoldersOf(m.identities),
 		configChangeID:             m.configChangeID,
 		maxWitnesses:               m.maxWitnesses,
 		requireFullReplicaMajority: m.requireFullReplicaMajority,
 		sessionPolicy:              m.sessionPolicy,
 		sharedAddresses:            m.sharedAddresses(),
 	}
+}
+
+// identityHoldersOf builds the identity-keyed holder index for a
+// replica-ID-keyed identity map, or nil when it holds no identity. Empty
+// identities are skipped for the reason invertIdentities skips them.
+func identityHoldersOf(m map[uint64]string) map[string]uint64 {
+	var holders map[string]uint64
+	for id, identity := range m {
+		if identity == "" {
+			continue
+		}
+		if holders == nil {
+			holders = make(map[string]uint64, len(m))
+		}
+		holders[identity] = id
+	}
+	return holders
 }
 
 // invertIdentities builds the identity-keyed lookup set for a replica-ID-keyed
@@ -546,6 +597,14 @@ func (m *membership) identityHolder(identity string) (uint64, bool) {
 // Peer.IsRemovedIdentity on every peer — a voter counted in every quorum that
 // can never be heard from. See ErrRemovedMemberIdentity.
 func validateMemberIdentity(m *membership, cc proto.ConfigChange) error {
+	// Under the mandatory-identity policy a member enters the configuration
+	// WITH its identity or not at all. An add that names a replica the
+	// configuration already holds an identity for (an observer promotion, a
+	// role change) may leave the field empty — recordIdentity leaves the
+	// existing binding alone — so only a net-new binding is refused.
+	if m.requireIdentities && cc.NodeIdentity == "" && m.identities[cc.ReplicaID] == "" {
+		return ErrMemberIdentityRequired
+	}
 	if holder, dup := m.identityHolder(cc.NodeIdentity); dup && holder != cc.ReplicaID {
 		return ErrDuplicateMemberIdentity
 	}

@@ -455,15 +455,6 @@ type walShard struct {
 	// monitor is configured.
 	diskMon *DiskMonitor
 
-	// residuals records every generation-boundary residual this shard's
-	// recovery raised (see logdb.RecoveryResidual). It is written ONLY by
-	// recover(), which runs before the shard is reachable from any DB, and is
-	// read-only for the rest of the shard's life: nothing clears it, because a
-	// node that came up shorter than the log it acknowledged stays that way
-	// until an operator reconciles it, and the operator may not look for hours.
-	// Read under dataMu.RLock like any other served state.
-	residuals []logdb.RecoveryResidual
-
 	// Per-node entry indexes for range queries and compaction tracking.
 	// The map itself is protected by dataMu; each index has its own lock.
 	indexes map[nodeKey]*index
@@ -582,7 +573,7 @@ func validateOpenOptions(dir string, o dbOptions) error {
 	if o.blockSize < recordHeaderSize+1 || !isPowerOfTwo(o.blockSize) {
 		return ErrInvalidBlockSize
 	}
-	if o.maxFileSize <= 0 {
+	if o.maxFileSize <= 0 || o.maxFileSize > maxSegmentFileSize {
 		return ErrInvalidMaxFileSize
 	}
 	if o.maxFileSize/int64(o.blockSize) < 2 {
@@ -981,8 +972,13 @@ func (s *walShard) recover() error {
 	}
 	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
 
-	// Replay each segment to rebuild all in-memory state.
+	// Replay each segment to rebuild all in-memory state. highest is the
+	// highest-numbered segment that survives recovery on disk: the last one
+	// replayed clean, or the repaired one recovery stopped at (the segments
+	// above it are discarded).
+	var highest uint64
 	for i, segID := range segIDs {
+		highest = segID
 		cleanEnd, err := s.replaySegment(segID)
 		if err != nil {
 			// Bytes above the damage that this writer cannot have produced.
@@ -991,6 +987,17 @@ func (s *walShard) recover() error {
 			if errors.Is(err, errRecordSequenceRegression) {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrRecordSequenceRegression)}
+			}
+			// A segment that is NOT the highest-numbered one was fdatasynced in
+			// full before any higher one was created (rotateSegment), so
+			// damage anywhere in it is under acknowledged data by
+			// construction, whatever the survivors above it say. Named as
+			// such ahead of the evidence-based verdicts: the rotation's
+			// closing sync mark makes those read "acknowledged" too, and the
+			// structural statement is the one an operator can act on.
+			if i != len(segIDs)-1 && isCorruptionVerdict(err) {
+				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
+					segID, cleanEnd, ErrNonFinalSegmentCorruption)}
 			}
 			// Corruption below records that a completed fdatasync already
 			// acknowledged is never an interrupted write, not even in the final
@@ -1001,26 +1008,23 @@ func (s *walShard) recover() error {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrMidSegmentCorruption)}
 			}
+			// Corruption that begins BELOW the acknowledged end the surviving
+			// records name. The survivors are a single unsynced generation —
+			// the shape of an interrupted write — but their generation start
+			// proves the fdatasync that opened it acknowledged bytes inside the
+			// damage. Same posture as the mid-segment case, its own name.
+			if errors.Is(err, errAcknowledgedDataLost) {
+				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
+					segID, cleanEnd, ErrAcknowledgedDataLost)}
+			}
 			if errors.Is(err, errRecoveryTruncated) {
 				// Prefix-truncation is correct ONLY for a torn tail, which can
-				// exist only in the HIGHEST-numbered segment: rotateSegment
-				// fdatasyncs a segment in full before any higher one is created,
-				// so a non-final segment was already durably acked end to end.
-				// Corruption there is bit rot / a lying fsync / tampering — NOT a
-				// torn tail — and every segment above it holds committed entries
-				// and hard state. Truncating it and discarding the higher
-				// segments would silently lose committed data and regress
-				// term/vote (two votes in one term). Fail-stop instead and let
-				// the operator restore from snapshot/peers, the same posture
-				// WALDecryptError and ErrUnknownPayloadType already take.
-				if i != len(segIDs)-1 {
-					return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
-						segID, cleanEnd, ErrNonFinalSegmentCorruption)}
-				}
-				// Corruption in the FINAL segment with NOTHING decodable after
-				// it (the mid-segment case was rejected above) is a legal torn
-				// tail: this segment's clean prefix is recovered; do NOT replay
-				// higher segments (prefix-validity rule).
+				// exist only in the HIGHEST-numbered segment; the non-final
+				// case was refused above. Corruption in the FINAL segment with
+				// nothing acknowledged decodable after it (the mid-segment
+				// cases were rejected above) is a legal torn tail: this
+				// segment's clean prefix is recovered; do NOT replay higher
+				// segments (prefix-validity rule).
 				//
 				// The repair runs HIGH TO LOW, and the order is a crash-safety
 				// requirement, not a preference.
@@ -1087,11 +1091,41 @@ func (s *walShard) recover() error {
 		s.advanceCommittedHWM(segID)
 	}
 
-	// Every segment has been replayed, so the per-replica ranges the residual
-	// report names are the ranges the node is actually coming up with.
-	s.finalizeResiduals()
+	// The highest segment replayed clean, and the next write will create a
+	// higher one (ensureActiveSegment), making it NON-FINAL — which recovery
+	// holds to be durable end to end. After a PROCESS crash it is not quite:
+	// Sync writes its mark after its fdatasync, so the last acknowledged
+	// batch's mark may still be sitting in the page cache, replayed from
+	// there just now and never fsynced (rotation's idle Sync and
+	// segment.Close cover the paths that go through the writer; this one
+	// does not). A later power loss tearing that mark in its writeback window
+	// would then be refused as ErrNonFinalSegmentCorruption with nothing
+	// acknowledged lost. One fdatasync here, before the segment can become
+	// non-final, closes that; under noSync nothing is durable anyway.
+	if len(segIDs) > 0 && !s.opts.noSync {
+		if err := s.syncSegmentFile(highest); err != nil {
+			return err
+		}
+	}
 
 	return s.reconcileCompactionFloors()
+}
+
+// syncSegmentFile fdatasyncs a segment file by name. See recover.
+func (s *walShard) syncSegmentFile(segID uint64) error {
+	name := filepath.Join(s.dir, segmentFilename(segID))
+	f, err := s.fs.OpenFile(name, os.O_RDWR, 0600)
+	if err != nil {
+		return &RecoveryError{SegmentID: segID, Err: err}
+	}
+	if sErr := f.Sync(); sErr != nil {
+		_ = f.Close()
+		return &RecoveryError{SegmentID: segID, Err: sErr}
+	}
+	if cErr := f.Close(); cErr != nil {
+		return &RecoveryError{SegmentID: segID, Err: cErr}
+	}
+	return nil
 }
 
 // reconcileCompactionFloors repairs (or refuses) a recovered state whose entry
@@ -1404,30 +1438,38 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 		return cleanEnd, errMidSegmentCorruption
 	}
 
+	// The records above the corruption are one unsynced generation, but that
+	// generation BEGAN above the corruption offset: the fdatasync that opened
+	// it acknowledged bytes the damage destroyed. Fail-stop, exactly as for
+	// the case above; the sentinel is distinct because the evidence is.
+	if readSeg.acknowledgedDataLost {
+		return cleanEnd, errAcknowledgedDataLost
+	}
+
 	// If ReadAll halted at a corrupt/torn record, this segment's clean prefix
 	// has been replayed but everything after the corruption — INCLUDING all
 	// higher-numbered segments — must NOT be replayed (a WAL is valid only as
 	// a prefix). Signal recover() to stop the segment loop here. Reaching this
 	// point means the durability generations either found nothing above the
 	// damage or placed everything there in the segment's final unsynced batch,
-	// so the truncation recover() performs discards no acknowledged record.
+	// AND that batch began at or below the damage, so the truncation recover()
+	// performs provably discards no acknowledged record.
 	if readSeg.stoppedAtCorruption {
-		// The truncation is licensed, but it is not always free: when the
-		// records above the damage all carry a generation HIGHER than anything
-		// in the clean prefix, an fsync completed inside the bytes that were
-		// destroyed, and whatever older-generation records it acknowledged are
-		// gone. Recovery proceeds by design; the fact must not evaporate with
-		// the log line that announces it.
-		if readSeg.generationBoundaryInDamage {
-			s.noteGenerationBoundaryResidual(segID, cleanEnd,
-				readSeg.prefixGeneration, readSeg.survivingGeneration)
-		}
 		slog.Warn("waldb: halting recovery after corruption; later segments skipped",
 			"segment_id", segID)
 		return cleanEnd, errRecoveryTruncated
 	}
 
 	return cleanEnd, nil
+}
+
+// isCorruptionVerdict reports whether err is one of replaySegment's verdicts
+// on damage found in a segment — as opposed to an I/O error, a decrypt
+// failure or a malformed payload, which recover reports as themselves.
+func isCorruptionVerdict(err error) bool {
+	return errors.Is(err, errRecoveryTruncated) ||
+		errors.Is(err, errMidSegmentCorruption) ||
+		errors.Is(err, errAcknowledgedDataLost)
 }
 
 // errRecoveryTruncated signals that replaySegment halted at a corrupt record.
@@ -1440,6 +1482,12 @@ var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 // were acknowledged. recover() turns it into ErrNonFinalSegmentCorruption's
 // sibling, ErrMidSegmentCorruption, and fails the open.
 var errMidSegmentCorruption = errors.New("waldb: corruption with acknowledged data after it")
+
+// errAcknowledgedDataLost signals that replaySegment halted at a corrupt
+// record whose surviving records name an acknowledged end ABOVE the
+// corruption offset. recover() turns it into ErrAcknowledgedDataLost and fails
+// the open.
+var errAcknowledgedDataLost = errors.New("waldb: corruption below the acknowledged end")
 
 // errRecordSequenceRegression signals that replaySegment found, above a
 // corruption, a record whose durability generation is LOWER than one already
@@ -1468,6 +1516,26 @@ var ErrNonFinalSegmentCorruption = errors.New("waldb: corruption in a non-final 
 // fail-stops instead; restore from snapshot/peers.
 var ErrMidSegmentCorruption = errors.New("waldb: WAL corruption with acknowledged records after it; not an interrupted write — committed data would be lost — restore from snapshot/peers")
 
+// ErrAcknowledgedDataLost is returned (wrapped in a RecoveryError) when
+// recovery finds corruption whose surviving records — all of one unsynced
+// generation, the shape of an ordinary interrupted write — carry a generation
+// start ABOVE the corruption offset. Every chunk records the file offset at
+// which its durability generation began, which is the acknowledged end when
+// the fdatasync that closed the previous generation returned; a start above
+// the damage therefore proves that fdatasync acknowledged bytes the damage
+// destroyed. An interrupted write cannot produce this: a lost writeback leaves
+// an fsynced page at its persisted content, so its damage begins at or above
+// the acknowledged end. This is media damage or tampering under acknowledged
+// data. Truncating would bring the node up holding a strictly shorter log than
+// the one it acknowledged to its peers (Log Matching / Leader Completeness)
+// and possibly a stale vote it could cast again (Election Safety), so recovery
+// fail-stops; restore from snapshot/peers, or authorize the loss with Repair.
+//
+// Before the generation start was recorded, this shape was indistinguishable
+// from the leading-page loss of an ordinary power cut, and recovery truncated
+// both while reporting a "residual" for the operator to reconcile by hand.
+var ErrAcknowledgedDataLost = errors.New("waldb: WAL corruption below the acknowledged end; records this node reported durable were destroyed — restore from snapshot/peers")
+
 // ErrRecordSequenceRegression is returned (wrapped in a RecoveryError) when
 // recovery finds, above a corruption, a record whose durability generation is
 // LOWER than one already replayed below it. A segment's generation counter only
@@ -1489,7 +1557,8 @@ var ErrRecordSequenceRegression = errors.New("waldb: WAL record durability seque
 // that an operator who decides the loss is acceptable can authorize exactly that
 // truncation and nothing wider. It unwraps to the sentinel it was built with, so
 // errors.Is checks against ErrMidSegmentCorruption,
-// ErrNonFinalSegmentCorruption and ErrRecordSequenceRegression all work.
+// ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
+// ErrRecordSequenceRegression all work.
 //
 // It used to be reachable from an ordinary power loss, because a torn
 // multi-block write and rot below acknowledged data were indistinguishable. The
@@ -1506,8 +1575,8 @@ type SegmentCorruptionError struct {
 	// and the only offset Repair will accept for this segment.
 	CleanEnd int64
 
-	// Err is ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption or
-	// ErrRecordSequenceRegression.
+	// Err is ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption,
+	// ErrAcknowledgedDataLost or ErrRecordSequenceRegression.
 	Err error
 }
 
@@ -2458,16 +2527,18 @@ func (s *walShard) ensureActiveSegment() error {
 }
 
 // rotateSegment syncs, closes the current active segment, and creates a new
-// one. The explicit Sync before Close ensures all data written to the old
-// segment is on stable storage (fdatasync) before the new segment begins
-// receiving writes. Without this, a crash after rotation could lose the
-// old segment's last records that were only in the OS page cache.
+// one. The explicit Sync before Close acknowledges every record written to
+// the old segment (fdatasync) and appends the sync mark that closes its last
+// generation; Close then fdatasyncs once more so that mark is on the medium
+// too, because a non-final segment must carry nothing unsynced — recovery
+// refuses damage in one on exactly that guarantee. Without the first, a crash
+// after rotation could lose the old segment's last records that were only
+// in the OS page cache; without the second, a mark torn in its writeback
+// window would make an ordinary crash a refused open.
 func (s *walShard) rotateSegment() error {
 	if s.activeSegment != nil {
-		// Sync to stable storage BEFORE closing. Close only flushes
-		// the block buffer to the OS page cache and truncates; it does
-		// NOT call fdatasync. In batchMode, this is the only path that
-		// ensures the old segment's data survives a crash.
+		// Sync to stable storage BEFORE closing. In batchMode, this is the
+		// path that ensures the old segment's data survives a crash.
 		if !s.opts.noSync {
 			if err := s.activeSegment.Sync(); err != nil {
 				if s.poison != nil {
@@ -2484,8 +2555,13 @@ func (s *walShard) rotateSegment() error {
 			// ensureActiveSegment. The data is already durable from the
 			// Sync above; a failed flush rewrites bytes Sync persisted,
 			// and a failed truncate only leaves pre-allocated zero space,
-			// which replays to nothing.
+			// which replays to nothing. A failed closing fdatasync is the
+			// exception: it is a Sync failure by another name, and gets
+			// the same fail-stop.
 			s.activeSegment = nil
+			if errors.Is(err, errSegmentCloseSync) && s.poison != nil {
+				s.poison(err)
+			}
 			slog.Warn("waldb: segment close failed during rotation; discarding segment handle",
 				"dir", s.dir,
 				"segment_id", s.activeSegmentID,
@@ -3080,6 +3156,13 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 	// on: every mutator of it holds shard.mu as well.
 	for i := range updates {
 		u := &updates[i]
+		// A snapshot travels through SaveState as well as SaveSnapshot, and
+		// the protocol bound has to hold on both doors (see SaveSnapshot).
+		if u.Snapshot.Index > 0 {
+			if err := u.Snapshot.CheckBounds(); err != nil {
+				return err
+			}
+		}
 		if len(u.Entries) == 0 {
 			continue
 		}
@@ -4426,6 +4509,15 @@ func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) e
 	// Index > 0.
 	if snapshot.Index == 0 {
 		return logdb.ErrSnapshotOutOfDate
+	}
+	// The other end of the range: a position at or above proto.MaxLogIndex /
+	// proto.MaxTerm is refused before it can become durable, because raft
+	// restores a saved snapshot on restart and its Index+1 arithmetic wraps
+	// there. Same predicate as raft.handleSnapshot and the chunk validator;
+	// LogDB is the one that makes the poisoning survive a restart, so it
+	// cannot rely on the callers having applied it.
+	if err := snapshot.CheckBounds(); err != nil {
+		return err
 	}
 
 	shard.mu.Lock()

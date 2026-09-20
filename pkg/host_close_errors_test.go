@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
@@ -132,6 +133,65 @@ func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 		t.Fatalf("Host.Close with an operation that outlives the drain = %v, want it "+
 			"to carry ErrShutdownTimeout. Returning nil tells the application its "+
 			"shutdown was clean when work it accepted was dropped", closeErr)
+	}
+}
+
+// TestHostDrain_ConcurrentCallersJoinTheSameAttempt pins that a second Drain
+// — Close's, in the case that matters — waits for the attempt already in
+// progress and reports ITS result, instead of returning nil immediately. The
+// second caller used to see draining=true and return success at once, so a
+// Close racing an explicit Drain proceeded to tear the engine down under the
+// first drain and both reported a clean shutdown after aborting accepted work.
+func TestHostDrain_ConcurrentCallersJoinTheSameAttempt(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	// One operation that outlives the whole test: the elected attempt waits
+	// out ShutdownTimeout, and every joined caller must wait with it.
+	h.addPendingOp()
+
+	const callers = 4
+	type outcome struct {
+		err     error
+		elapsed time.Duration
+	}
+	results := make(chan outcome, callers)
+	start := time.Now()
+	for range callers {
+		go func() {
+			err := h.Drain()
+			results <- outcome{err: err, elapsed: time.Since(start)}
+		}()
+	}
+	for i := range callers {
+		got := <-results
+		if !errors.Is(got.err, ErrShutdownTimeout) {
+			t.Fatalf("Drain caller %d = %v, want ErrShutdownTimeout: every caller must "+
+				"report the one attempt's outcome", i, got.err)
+		}
+		// A caller that returned before the attempt could possibly have
+		// timed out did not join it. Half the timeout is a generous bound.
+		if got.elapsed < cfg.ShutdownTimeout/2 {
+			t.Fatalf("Drain caller %d returned after %v, before the attempt's %v "+
+				"timeout could elapse: it did not wait for the drain in progress",
+				i, got.elapsed, cfg.ShutdownTimeout)
+		}
+	}
+
+	// A call after the attempt has completed returns the recorded result
+	// without waiting again.
+	before := time.Now()
+	if err := h.Drain(); !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Drain after completion = %v, want the recorded ErrShutdownTimeout", err)
+	}
+	if waited := time.Since(before); waited > cfg.ShutdownTimeout/2 {
+		t.Fatalf("Drain after completion waited %v; the recorded result should return at once", waited)
+	}
+	// Close joins the same attempt and carries its error, as before.
+	if err := h.Close(); !errors.Is(err, ErrShutdownTimeout) {
+		t.Fatalf("Close after a timed-out drain = %v, want ErrShutdownTimeout", err)
 	}
 }
 

@@ -86,7 +86,16 @@ type segment struct {
 	// let a later batch reuse a generation whose records were already durable —
 	// which is precisely the proof the counter exists to carry.
 	durabilitySeq uint32
-	closed        bool
+	// unsynced reports that a Write has landed since the last completed
+	// Sync. A Sync with nothing new to acknowledge still issues its fdatasync
+	// but neither opens a generation nor appends a sync mark: there is
+	// nothing for the mark to witness, CanFit reserved room for exactly one
+	// mark per acknowledged write (syncMarkReserve), and rotateSegment's
+	// closing Sync ordinarily follows the batch's own Sync directly — an
+	// unconditional mark there would land past the reserve and, at
+	// maxDurabilitySeq, wrap the counter CanFit guards.
+	unsynced bool
+	closed   bool
 	// stoppedAtCorruption is set by ReadAll when it halts at a corrupt/torn
 	// record (as opposed to a clean zero-filled EOF). Recovery uses it to stop
 	// replaying any HIGHER-numbered segment: a WAL is valid only as a prefix,
@@ -115,30 +124,39 @@ type segment struct {
 	// file, or tampering. Recovery fails closed on its own sentinel rather than
 	// guessing which. See ErrRecordSequenceRegression.
 	sequenceRegression bool
-	// generationBoundaryInDamage is set by ReadAll when it truncates a segment
-	// whose SURVIVING records all carry a generation strictly HIGHER than any
-	// generation in the clean prefix. A completed fdatasync therefore happened
-	// somewhere inside the bytes the damage destroyed, and any older-generation
-	// record that was swallowed there had been ACKNOWLEDGED. The truncation
-	// still goes ahead — see the reasoning at the end of ReadAll — so the node
-	// may come up holding a strictly shorter log than the one it promised its
-	// peers.
+	// genStart is the file offset at which the CURRENT durability generation
+	// began: the acknowledged end when the fdatasync that closed the previous
+	// generation returned (fileOffset+blockOffset at that moment), 0 for a
+	// fresh segment. It is stamped into every chunk alongside durabilitySeq
+	// and moves only in Sync, for the same reason durabilitySeq does — it
+	// records a fact about the medium, so DiscardPending must not rewind it.
+	// See record.go for what recovery does with it.
+	genStart uint32
+	// acknowledgedDataLost is set by ReadAll when the chunks surviving above
+	// a corruption carry a generation start ABOVE the corruption offset: the
+	// generation they belong to began past the damage, so the fdatasync that
+	// closed the previous generation acknowledged bytes the damage destroyed.
+	// This is the exact form of the verdict the sequence alone could only
+	// approximate (it could say a completed fdatasync lay inside the damage,
+	// not whether any acknowledged byte did). Recovery fails closed on it —
+	// see ErrAcknowledgedDataLost — because the node would otherwise come up
+	// holding a strictly shorter log than the one it promised its peers.
 	//
-	// It is deliberately NOT an error: turning it into one would refuse the
-	// ordinary interrupted write whose lost page starts exactly at a batch
-	// boundary, which is the common shape this scheme exists to repair. It is
-	// instead the one outcome of recovery that the operator has to be told
-	// about, so it is carried out of ReadAll rather than left in a log line.
-	// See walShard.noteGenerationBoundaryResidual and DB.RecoveryResiduals.
-	generationBoundaryInDamage bool
-	// prefixGeneration and survivingGeneration are the two generations that
-	// straddle the destroyed region, valid only when
-	// generationBoundaryInDamage is set. survivingGeneration is strictly
-	// greater than prefixGeneration, and every generation between them (if
-	// any) was written entirely inside the damage.
-	prefixGeneration    uint32
-	survivingGeneration uint32
+	// The ordinary interrupted write that loses the in-flight batch's leading
+	// page is NOT this: the page reverts to its durable content, so the hole
+	// begins at or above the acknowledged end and the survivors' genStart is
+	// at or below the corruption offset. That case truncates, as it always
+	// did, and now provably rather than on the argument that a crash cannot
+	// destroy fsynced pages.
+	acknowledgedDataLost bool
 }
+
+// errSegmentCloseSync marks a Close whose closing fdatasync failed. The
+// records were acknowledged by earlier Syncs; what may not have reached the
+// medium is the final sync mark, and after a failed fdatasync nothing about
+// the file can be established (fsyncgate), so rotateSegment poisons the DB
+// on it exactly as it does for a failed Sync.
+var errSegmentCloseSync = errors.New("waldb: segment close fdatasync failed")
 
 // segmentFilename returns the canonical filename for a given segment ID.
 // Format: %06d.log (e.g., "000001.log").
@@ -247,7 +265,7 @@ func (s *segment) Write(data []byte) (uint64, error) {
 		// is either wholly inside the in-flight generation or wholly below it.
 		// That is what makes a torn multi-block write a clean suffix in
 		// generation terms rather than a straddle ReadAll would have to guess at.
-		n, err := encodeRecord(s.blockBuf[s.blockOffset:], chunkType, s.durabilitySeq, chunk)
+		n, err := encodeRecord(s.blockBuf[s.blockOffset:], chunkType, s.durabilitySeq, s.genStart, chunk)
 		if err != nil {
 			return 0, err
 		}
@@ -255,6 +273,7 @@ func (s *segment) Write(data []byte) (uint64, error) {
 		isFirst = false
 	}
 
+	s.unsynced = true
 	seq := s.recordSeq.Add(1)
 	return seq, nil
 }
@@ -297,10 +316,13 @@ func (s *segment) CanFit(dataLen int) error {
 	// rotate to a new segment and retry forever (which would exhaust the
 	// SaveState retry budget and fail the node); the error tells the caller the
 	// record itself must be split.
-	if int64(needed) > s.maxFileSize {
+	// The record itself must leave room for the sync mark the Sync that
+	// acknowledges it will append (syncMarkReserve), or the mark could land
+	// past maxFileSize. Both bounds include it.
+	if int64(needed)+syncMarkReserve > s.maxFileSize {
 		return ErrRecordTooLarge
 	}
-	if s.fileOffset+int64(s.blockOffset)+int64(needed) > s.maxFileSize {
+	if s.fileOffset+int64(s.blockOffset)+int64(needed)+syncMarkReserve > s.maxFileSize {
 		return ErrSegmentFull
 	}
 	return nil
@@ -407,7 +429,9 @@ func (s *segment) flushBlock() error {
 // recovery can tell the two apart. The counter is advanced only AFTER the
 // fdatasync returns, because that return is the whole proof — bumping it first
 // would mark the next batch as "separated by a completed sync" from records
-// that a failed sync leaves in limbo.
+// that a failed sync leaves in limbo. A Sync that acknowledges nothing new
+// (no Write since the last completed one) closes no generation and appends
+// no mark; see unsynced.
 //
 // Under noSync (tests only) no fdatasync is issued and NOTHING in the segment is
 // durable, so there is no generation to close and the counter does not move.
@@ -429,8 +453,40 @@ func (s *segment) Sync() error {
 	if err := s.f.Sync(); err != nil {
 		return err
 	}
+	if !s.unsynced {
+		return nil
+	}
+	s.unsynced = false
 	s.durabilitySeq++
-	return nil
+	// Everything below this offset is now acknowledged; the next generation
+	// begins here. flushBlock above made blockOffset the flushed watermark, and
+	// CanFit keeps fileOffset+blockOffset within maxSegmentFileSize.
+	s.genStart = uint32(s.fileOffset + int64(s.blockOffset))
+	return s.writeSyncMark()
+}
+
+// writeSyncMark appends the RecordSyncMark chunk that opens the generation a
+// completed Sync just began, and writes it through to the file. It is the
+// witness that lets the generation BELOW it — the one the fdatasync just
+// acknowledged — be told apart from a torn tail when nothing else is ever
+// written after it; see record.go. The mark is not itself synced: if it is
+// lost, recovery is exactly where it was without it.
+//
+// A mark starts only where a full header fits, so the padding it can force is
+// shorter than a header and ReadAll reads it as block padding, never as a
+// hole. CanFit's syncMarkReserve guarantees the room below maxFileSize.
+func (s *segment) writeSyncMark() error {
+	if s.blockSize-s.blockOffset < recordHeaderSize {
+		if err := s.padAndFlushBlock(); err != nil {
+			return err
+		}
+	}
+	n, err := encodeRecord(s.blockBuf[s.blockOffset:], RecordSyncMark, s.durabilitySeq, s.genStart, nil)
+	if err != nil {
+		return err
+	}
+	s.blockOffset += n
+	return s.flushBlock()
 }
 
 // ReadAll reads all valid records from the segment sequentially. This is the
@@ -461,7 +517,10 @@ func (s *segment) Sync() error {
 //   - They are all the SAME generation, and it is the segment's highest. Then
 //     nothing above the damage has a completed Sync behind it: this is the one
 //     batch that was still in flight, an ordinary interrupted write. Truncate to
-//     the clean prefix, exactly as a torn tail always did.
+//     the clean prefix, exactly as a torn tail always did. A generation that
+//     WAS acknowledged never presents this way for long: the Sync that closed
+//     it appended a sync mark of the next generation (writeSyncMark), and a
+//     surviving mark is the higher generation the first case needs.
 //   - Nothing decodes above the damage at all. The classic torn tail; truncate.
 //
 // The second case is the one this scheme exists for, and it is NOT rare: a batch
@@ -610,10 +669,11 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 			// is what settles that.
 			//
 			// segment.Write starts a chunk only when at least recordHeaderSize+1
-			// bytes are free, and a chunk occupies every byte it claims, so the
-			// walk can only ever arrive here with 1..recordHeaderSize-1 bytes
-			// left when the writer padded them — and padAndFlushBlock pads with
-			// ZEROS. An all-zero remainder is therefore the legal case, and it
+			// bytes are free (writeSyncMark, whose chunk is exactly a header,
+			// when recordHeaderSize are), and a chunk occupies every byte it
+			// claims, so the walk can only ever arrive here with
+			// 1..recordHeaderSize-1 bytes left when the writer padded them —
+			// and padAndFlushBlock pads with ZEROS. An all-zero remainder is therefore the legal case, and it
 			// has already been taken by the branch above, which breaks. Reaching
 			// this point means the remainder is short AND contains a non-zero
 			// byte, which is a shape no writer of this segment can produce.
@@ -660,7 +720,7 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 				break
 			}
 
-			data, recType, durSeq, consumed, err := decodeRecord(block[pos:])
+			data, recType, durSeq, _, consumed, err := decodeRecord(block[pos:])
 			if err != nil {
 				s.stoppedAtCorruption = true
 				corruptOffset = offset + int64(pos)
@@ -731,6 +791,13 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 					records = append(records, rec)
 					partial = nil
 				}
+
+			case RecordSyncMark:
+				// Evidence only: its generation has already raised
+				// prefixMaxSeq above, which is the whole of its testimony.
+				// It carries no record and never lands inside one — Write
+				// emits every chunk of a record in one call and never syncs
+				// between them — so partial is left alone.
 			}
 
 			pos += consumed
@@ -742,54 +809,50 @@ func (s *segment) ReadAll() ([][]byte, int64, error) {
 	// The sweep reached end of file without the generations ever settling the
 	// question against truncation: either nothing decoded above the damage at
 	// all, or everything that did belongs to the single generation that was
-	// still in flight. Both are interrupted writes. Report the clean-prefix end
-	// so recovery can repair the segment there.
+	// still in flight. Both are interrupted writes — PROVIDED the damage begins
+	// at or above the acknowledged end, which the survivors' generation start
+	// now states exactly. Report the clean-prefix end so recovery can repair the
+	// segment there, or fail closed when acknowledged bytes lie in the damage.
 	if corruptOffset >= 0 {
+		if ev.found && int64(ev.genStart) > corruptOffset {
+			// The survivors' generation began ABOVE the corruption offset, so
+			// the fdatasync that opened it acknowledged every byte below
+			// genStart — including the bytes from corruptOffset up to it, which
+			// are destroyed. A crash cannot produce this (a lost writeback
+			// leaves an fsynced page at its persisted content, so an
+			// interrupted write's damage begins at or above the acknowledged
+			// end); this is media damage or tampering under acknowledged data,
+			// and truncating would silently shorten the log this node promised
+			// its peers. The verdict is the same as ackedDataAfterCorruption's
+			// and carries its own name so an operator can tell the two apart.
+			s.acknowledgedDataLost = true
+			slog.Error("waldb: corruption begins BELOW the acknowledged end that the "+
+				"records surviving above it name; the fdatasync that opened their "+
+				"generation had acknowledged bytes the damage destroyed — refusing "+
+				"to open rather than come up shorter than the log this node promised",
+				"segment_id", s.id,
+				"dir", s.dir,
+				"corrupt_offset", corruptOffset,
+				"acknowledged_end", ev.genStart,
+				"prefix_generation", prefixMaxSeq,
+				"surviving_generation", ev.minSeq,
+				"clean_prefix_records", len(records),
+			)
+			return records, corruptOffset, nil
+		}
 		if ev.found {
-			slog.Warn("waldb: corruption is followed only by records from the "+
-				"segment's final, unsynced generation; no completed fdatasync sits "+
-				"above the damage, so nothing there was ever acknowledged — "+
-				"treating it as an interrupted write and truncating to the clean prefix",
+			slog.Warn("waldb: corruption is followed only by records from one unsynced "+
+				"generation whose start lies at or below the damage; nothing above the "+
+				"damage was ever acknowledged — treating it as an interrupted write and "+
+				"truncating to the clean prefix",
 				"segment_id", s.id,
 				"dir", s.dir,
 				"corrupt_offset", corruptOffset,
 				"generation", ev.minSeq,
+				"generation_start", ev.genStart,
 				"prefix_generation", prefixMaxSeq,
 				"clean_prefix_records", len(records),
 			)
-			// The survivors' generation is HIGHER than the clean prefix's, so a
-			// completed fdatasync happened somewhere inside the destroyed region.
-			// Any record of the older generation that the damage swallowed was
-			// acknowledged by that sync — and whether there was one is exactly
-			// what the destroyed bytes would have said.
-			//
-			// The truncation still goes ahead, and that is deliberate. A crash
-			// cannot produce this from acknowledged bytes: a partial write to a
-			// page that already holds fsynced data leaves the page at its
-			// previously persisted content if the writeback is lost, so the
-			// damage of an interrupted write begins at or above the acknowledged
-			// end. Refusing here would instead refuse the ordinary case where the
-			// lost page starts exactly at the batch boundary, which is the common
-			// shape of the very failure this scheme exists to repair.
-			//
-			// What is left is media damage that happens to straddle the boundary,
-			// and for that the operator gets a named warning rather than silence.
-			// See docs/storage/wal.md, "Residuals".
-			if ev.minSeq > prefixMaxSeq {
-				s.generationBoundaryInDamage = true
-				s.prefixGeneration = prefixMaxSeq
-				s.survivingGeneration = ev.minSeq
-				slog.Error("waldb: a durability generation boundary lies INSIDE the "+
-					"damaged region; if any record of the older generation was lost "+
-					"there it had been acknowledged, and this node is now shorter than "+
-					"the log it promised — reconcile it against its peers",
-					"segment_id", s.id,
-					"dir", s.dir,
-					"corrupt_offset", corruptOffset,
-					"prefix_generation", prefixMaxSeq,
-					"surviving_generation", ev.minSeq,
-				)
-			}
 		}
 		return records, corruptOffset, nil
 	}
@@ -805,12 +868,19 @@ type durabilityEvidence struct {
 	found  bool
 	minSeq uint32
 	maxSeq uint32
+	// genStart is the generation start carried by the survivors, the highest
+	// seen. Every chunk of one generation carries the same value, and a
+	// higher generation's is never lower, so the maximum is the acknowledged
+	// end the survivors testify to; taking it — rather than the first seen —
+	// makes a CRC-collision false positive err toward failing closed.
+	genStart uint32
 }
 
-// observe folds one surviving chunk's generation into the evidence.
-func (e *durabilityEvidence) observe(seq uint32) {
+// observe folds one surviving chunk's generation and generation start into
+// the evidence.
+func (e *durabilityEvidence) observe(seq, genStart uint32) {
 	if !e.found {
-		e.found, e.minSeq, e.maxSeq = true, seq, seq
+		e.found, e.minSeq, e.maxSeq, e.genStart = true, seq, seq, genStart
 		return
 	}
 	if seq < e.minSeq {
@@ -818,6 +888,9 @@ func (e *durabilityEvidence) observe(seq uint32) {
 	}
 	if seq > e.maxSeq {
 		e.maxSeq = seq
+	}
+	if genStart > e.genStart {
+		e.genStart = genStart
 	}
 }
 
@@ -845,12 +918,12 @@ func (s *segment) gatherEvidence(block []byte, blockStart int64, from int, prefi
 		from = 0
 	}
 	for at := from; at+recordHeaderSize <= len(block); {
-		_, _, durSeq, consumed, err := decodeRecord(block[at:])
+		_, _, durSeq, genStart, consumed, err := decodeRecord(block[at:])
 		if err != nil {
 			at++
 			continue
 		}
-		ev.observe(durSeq)
+		ev.observe(durSeq, genStart)
 
 		// A generation BELOW the clean prefix's cannot come from this writer:
 		// the counter only ever rises within a segment. Something else put
@@ -894,8 +967,20 @@ func (s *segment) gatherEvidence(block []byte, blockStart int64, from int, prefi
 	return false
 }
 
-// Close flushes any pending block data and closes the underlying file.
-// After Close, all operations return ErrClosed.
+// Close flushes any pending block data, makes the file durable, truncates it
+// to its written size and closes it. After Close, all operations return
+// ErrClosed.
+//
+// The fdatasync is what makes the segment's LAST sync mark durable. Sync
+// writes the mark after its own fdatasync returns, so the mark of the final
+// generation is the one unsynced thing a closed segment would otherwise
+// carry — and a non-final segment must carry nothing unsynced, because
+// recovery refuses damage there (ErrNonFinalSegmentCorruption) on exactly
+// that guarantee. A mark torn by a power loss inside its writeback window
+// would fail its CRC and turn an ordinary crash into a refused open. One
+// fdatasync per segment lifetime buys that back; under noSync there is no
+// durability to speak of and none is issued. A failure is reported as
+// errSegmentCloseSync so the caller can fail-stop on it as it does for Sync.
 func (s *segment) Close() error {
 	if s.closed {
 		return ErrClosed
@@ -912,6 +997,18 @@ func (s *segment) Close() error {
 			)
 		}
 		return err
+	}
+	if !s.noSync {
+		if err := s.f.Sync(); err != nil {
+			if closeErr := s.f.Close(); closeErr != nil {
+				slog.Debug("waldb: file close failed after sync error",
+					"segment_id", s.id,
+					"dir", s.dir,
+					"error", closeErr,
+				)
+			}
+			return fmt.Errorf("%w: %w", errSegmentCloseSync, err)
+		}
 	}
 
 	// Truncate the file to the actual written size to reclaim pre-allocated
@@ -1010,6 +1107,13 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int, cl
 	// next flush must still write.
 	s.flushed = cleanBlockOffset
 	s.recordSeq.Store(cleanRecordCount)
+	// The checkpoint is a position the previous batch's Sync had already
+	// acknowledged (it is captured before a batch begins, above that Sync's
+	// mark), so nothing below it is waiting on a Sync; the rolled-back bytes
+	// were the only unsynced ones. Leaving the flag set would let the next
+	// idle Sync open a generation for nothing and append a mark CanFit
+	// reserved no room for.
+	s.unsynced = false
 	return nil
 }
 

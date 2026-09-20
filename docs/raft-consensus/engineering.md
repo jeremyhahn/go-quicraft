@@ -406,9 +406,10 @@ forces a term advance whenever no leader lease is live.
 
 ### Term Ceiling
 
-`maxAdoptableTerm = math.MaxUint64 - 1024` is an exclusive upper bound on a
-term this replica will adopt from the wire (`ErrTermCeilingExceeded`), with the
-same bound repeated in `becomeCandidate` where the increment happens. Nothing
+`maxAdoptableTerm` (= `proto.MaxTerm` = `math.MaxUint64 - 1024`) is an
+exclusive upper bound on a term this replica will adopt from the wire
+(`ErrTermCeilingExceeded`), with the same bound repeated in `becomeCandidate`
+where the increment happens. Nothing
 bounds `Term` in the wire encoding, and adopting one near the ceiling is
 unrecoverable in two ways: `becomeCandidate` does `term++`, so a node parked at
 the maximum WRAPS to term 0 on its next campaign, after which it can vote a
@@ -416,6 +417,22 @@ second time in a term it already voted in; and even without the wrap, a node
 driven to the ceiling can never campaign again, so one message permanently
 removes a voter. Terms advance by one per election, so no cluster reaches this
 range by running.
+
+The same bound, and its index twin `proto.MaxLogIndex`, govern **snapshot
+admission and persisted state** (#197). `InstallSnapshot` is delivered
+process-locally once the artifact is on disk, so it never meets `step()`'s wire
+gate, and a snapshot at `Index = MaxUint64` used to restore cleanly and then
+wrap `markerIndex`, `firstIndex` and every remote's `next` to 0 — durably,
+because LogDB had already recorded it. `proto.Snapshot.CheckBounds` is applied
+at every door: the transport's chunk validation, both LogDB `SaveSnapshot`
+implementations, `handleSnapshot` (`proto.ErrLogIndexOutOfRange` /
+`proto.ErrTermOutOfRange`, logged at ERROR — a peer-chosen value fails the
+message, never an invariant), both LogDBs' `SaveState` batch path, and a leader
+refuses proposals once its log has reached `proto.MaxLogIndex`. `newRaft`
+refuses to open persisted state only at the CEILING (`persistedCeiling`, a few
+below `math.MaxUint64`, where `+1` wraps): state admitted just below the bounds
+can be moved by local transitions, and an open check at the admission bound
+would refuse state the replica produced itself.
 
 ### Randomized Election Timeout
 

@@ -48,7 +48,7 @@ func testTransportHostConfig(t *testing.T) config.HostConfig {
 func assertTransportHostServesShard(t *testing.T, h *Host) {
 	t.Helper()
 	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); err != nil {
 		t.Fatalf("StartShard: %v", err)
 	}
 	waitForLeader(t, h, 1)

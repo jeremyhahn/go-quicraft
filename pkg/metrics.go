@@ -126,8 +126,8 @@ type SecurityMetrics interface {
 	// because the sender failed shard-membership authorization.
 	//
 	// reason comes from a closed set defined by the message handler:
-	// "removed_replica", "misrouted", "unknown_member", "address_mismatch",
-	// "shared_address", "identity_mismatch", "missing_identity". The split is
+	// "removed_replica", "removed_identity", "misrouted", "unknown_member",
+	// "identity_mismatch", "missing_identity". The split is
 	// operational, not cosmetic — one aggregate counter cannot tell a rolling
 	// membership change from an attack:
 	//
@@ -139,13 +139,13 @@ type SecurityMetrics interface {
 	//     connection presented a different one, so the sender does not hold
 	//     that replica's private key. It is a forged From or a stale identity
 	//     after a key rotation; it is never routine.
-	//   - "missing_identity" means the shard records no identity for a replica
-	//     and RequireMemberIdentity is set. It is a migration gap, not an
-	//     attack: commit the identity (Host.RequestAddNodeWithIdentity).
-	//   - "address_mismatch" and "shared_address" are the fallback path's two
-	//     failures, for replicas with no committed identity — a certificate
-	//     that does not cover the committed address, and a configuration that
-	//     gives one address to two active members.
+	//   - "missing_identity" means the shard records no identity for a
+	//     replica the configuration names. Admission requires one on every
+	//     host with a transport, so this is a configuration written by a
+	//     build that did not; the remedy is wipe and re-bootstrap.
+	//   - "address_mismatch" and "shared_address" were the address fallback's
+	//     two failures. The fallback is gone (#197); the label values are
+	//     retired and not reallocated.
 	IncUnauthorizedMessageDropped(shardID, from uint64, reason string)
 
 	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped

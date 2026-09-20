@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"log/slog"
+	"slices"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/invariant"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -105,25 +106,334 @@ type raftLog struct {
 	// conflicting append) is likewise safe and transient: processed advances
 	// past the index as the log is applied.
 	confChangeIndex uint64
+
+	// pendingAdds is every (replica, identity) a config-carrying entry IN THIS
+	// LOG admits, keyed by the entry's index. It is the PENDING configuration
+	// the receive gate consults for a sender the committed configuration does
+	// not name yet (Peer.PendingMemberIdentity): a replica whose configuration
+	// lags — it holds the AddNode that admits the new leader but has not
+	// committed it — can admit that leader's Replicate and Heartbeat on the
+	// strength of its own log, bound to the identity the entry carries,
+	// instead of admitting any certificate holder that names an unknown
+	// replica ID.
+	//
+	// It is exact, not a bound like confChangeIndex: maintained by
+	// noteConfigChanges as entries enter the log, trimmed by dropPendingAbove
+	// when a conflicting append truncates them, cleared by restore, and seeded
+	// from the recovered UNCOMMITTED tail by newRaftLog. Keyed by index rather
+	// than by replica so that truncating a later entry for a replica leaves an
+	// earlier surviving entry for the same replica in force; the reader takes
+	// the highest surviving index per replica above the applied configuration.
+	//
+	// A RemoveNode is recorded here too (pendingAdd.remove), because adds and
+	// removals are folded in log order and the gate must see them in the same
+	// order: a removal above an add cancels the add, and a removal above the
+	// applied configuration is a pending tombstone the gate refuses BEFORE it
+	// consults the committed binding, the pending adds or the anchor. Without
+	// it a restart that seeds the committed-but-unfolded stretch would re-admit
+	// a member the shard had removed, for as long as the replay took to reach
+	// the removal — the hole the pending configuration exists to close.
+	pendingAdds map[uint64][]pendingAdd
+	// pendingVersion counts every mutation of pendingAdds, so a publisher can
+	// tell whether a new snapshot is needed without comparing maps.
+	pendingVersion uint64
+	// pendingSeeded records that seedPendingAdds has classified the recovered
+	// log once; see PublishPendingConfig.
+	pendingSeeded bool
+}
+
+// pendingAdd is one (replica, identity) a config-carrying entry admits — or,
+// with remove set, one replica a RemoveNode entry removes (identity empty:
+// the identity it held is whatever the configuration bound below the entry).
+type pendingAdd struct {
+	replicaID uint64
+	identity  string
+	remove    bool
+}
+
+// pendingView is the pending configuration resolved above an applied
+// configuration: the identity each pending add commits, and the replicas a
+// pending removal removes, each with the identity the pending adds below it
+// bound (empty when the binding is committed, which the reader resolves
+// against the committed configuration).
+type pendingView struct {
+	adds    map[uint64]string
+	removed map[uint64]string
 }
 
 // noteConfigChanges raises confChangeIndex to cover any config-carrying entry in
 // the batch — an incremental EntryConfigChange or the bootstrap
-// EntryInitialMembership, both of which define membership. The type mask is
-// required: a compressed entry carries proto.EntryCompressFlag alongside its
-// base type.
+// EntryInitialMembership, both of which define membership — and records in
+// pendingAdds every member such an entry admits with a node identity. The type
+// mask is required: a compressed entry carries proto.EntryCompressFlag
+// alongside its base type.
 //
-// Including the bootstrap entry is for consistency with the rest of the
-// config-change gating; it is not load-bearing, because the bootstrap entry only
-// ever occupies index 1 and commits before any replica can lead, and newRaftLog
-// already seeds confChangeIndex = lastIndex() conservatively on recovery.
+// Including the bootstrap entry in the bound is for consistency with the rest
+// of the config-change gating; it is not load-bearing there, because the
+// bootstrap entry only ever occupies index 1 and commits before any replica can
+// lead, and newRaftLog already seeds confChangeIndex = lastIndex()
+// conservatively on recovery. For pendingAdds it IS load-bearing: a replica
+// that joined with a partial configuration and replicates entry 1 from the
+// leader holds, in that entry, the identities of the members it has not yet
+// committed.
+//
+// A payload that does not decode is skipped here and refused where it matters:
+// the propose-time gate never appends one, and the apply path faults the shard
+// on it. Recording nothing for it is the safe direction.
 func (l *raftLog) noteConfigChanges(entries []proto.Entry) {
 	for i := range entries {
-		t := entries[i].Type & proto.EntryTypeMask
-		if (t == proto.EntryConfigChange || t == proto.EntryInitialMembership) &&
-			entries[i].Index > l.confChangeIndex {
-			l.confChangeIndex = entries[i].Index
+		e := &entries[i]
+		switch e.Type & proto.EntryTypeMask {
+		case proto.EntryConfigChange:
+			if e.Index > l.confChangeIndex {
+				l.confChangeIndex = e.Index
+			}
+			var cc proto.ConfigChange
+			if _, err := cc.UnmarshalFrom(e.Cmd); err != nil {
+				continue
+			}
+			switch cc.Type {
+			case proto.AddNode, proto.AddNonVoting, proto.AddWitness:
+				if cc.NodeIdentity != "" {
+					l.recordPendingAdd(cc.ReplicaID, cc.NodeIdentity, e.Index)
+				}
+			case proto.RemoveNode:
+				l.recordPendingRemoval(cc.ReplicaID, e.Index)
+			}
+		case proto.EntryInitialMembership:
+			if e.Index > l.confChangeIndex {
+				l.confChangeIndex = e.Index
+			}
+			ms, err := initialMembershipFromEntry(*e)
+			if err != nil {
+				continue
+			}
+			// Only an identity that belongs to an ACTIVE role admits anyone.
+			// The identities map is sparse and independently keyed, so an
+			// entry could name an ID no role holds; recording it would
+			// authorize that keypair under an arbitrary replica ID until the
+			// entry applied.
+			for id, identity := range ms.Identities {
+				if identity == "" {
+					continue
+				}
+				if _, ok := ms.Addresses[id]; !ok {
+					if _, ok := ms.Observers[id]; !ok {
+						if _, ok := ms.Witnesses[id]; !ok {
+							continue
+						}
+					}
+				}
+				l.recordPendingAdd(id, identity, e.Index)
+			}
 		}
+	}
+}
+
+// recordPendingAdd records that the entry at index admits replicaID with
+// identity.
+func (l *raftLog) recordPendingAdd(replicaID uint64, identity string, index uint64) {
+	if l.pendingAdds == nil {
+		l.pendingAdds = make(map[uint64][]pendingAdd)
+	}
+	l.pendingAdds[index] = append(l.pendingAdds[index], pendingAdd{replicaID: replicaID, identity: identity})
+	l.pendingVersion++
+}
+
+// recordPendingRemoval records that the entry at index removes replicaID.
+func (l *raftLog) recordPendingRemoval(replicaID uint64, index uint64) {
+	if l.pendingAdds == nil {
+		l.pendingAdds = make(map[uint64][]pendingAdd)
+	}
+	l.pendingAdds[index] = append(l.pendingAdds[index], pendingAdd{replicaID: replicaID, remove: true})
+	l.pendingVersion++
+}
+
+// dropPendingAbove forgets every pending add recorded from an entry above
+// index: those entries are being truncated by a conflicting append, and the
+// entries that replace them re-record their own through noteConfigChanges. An
+// earlier entry for the same replica, below the cut, stays in force.
+func (l *raftLog) dropPendingAbove(index uint64) {
+	for at := range l.pendingAdds {
+		if at > index {
+			delete(l.pendingAdds, at)
+			l.pendingVersion++
+		}
+	}
+}
+
+// prunePendingThrough forgets every pending add recorded from an entry at or
+// below index: the configuration has been folded through it, so the add is
+// either committed membership now or was refused, and neither is pending.
+func (l *raftLog) prunePendingThrough(index uint64) {
+	for at := range l.pendingAdds {
+		if at <= index {
+			delete(l.pendingAdds, at)
+			l.pendingVersion++
+		}
+	}
+}
+
+// pendingIdentities resolves the pending changes above applied, in log
+// order, into one verdict per replica: the identity its highest surviving
+// add commits, or its removal. A removal above an add cancels the add; an
+// add above a removal (a replica removed and re-added, which the apply path
+// refuses for an identity it removed) supersedes it. nil when nothing is
+// pending.
+//
+// Only a COMMITTED removal (index at or below committed) counts. An add is
+// admission — fail-open, and an uncommitted one costs nothing if the entry
+// is truncated — but a removal is revocation, and revoking a current member
+// on an entry consensus has not reached can wedge the shard: in a two-voter
+// shard the leader that appended RemoveNode(B) would refuse B's very ack of
+// it, so the entry never commits and no quorum can form. The removal binds
+// the gate from the moment it is committed, which is the moment it can no
+// longer be truncated, until it is folded.
+func (l *raftLog) pendingIdentities(applied uint64) *pendingView {
+	if len(l.pendingAdds) == 0 {
+		return nil
+	}
+	indexes := make([]uint64, 0, len(l.pendingAdds))
+	for at := range l.pendingAdds {
+		if at > applied {
+			indexes = append(indexes, at)
+		}
+	}
+	if len(indexes) == 0 {
+		return nil
+	}
+	slices.Sort(indexes)
+	view := &pendingView{}
+	for _, at := range indexes {
+		for _, change := range l.pendingAdds[at] {
+			if change.remove {
+				if at > l.committed {
+					continue
+				}
+				// The identity the removal tombstones is the one a pending
+				// add below it bound; a committed binding is resolved by the
+				// reader, which sees the committed configuration.
+				identity := ""
+				if view.adds != nil {
+					identity = view.adds[change.replicaID]
+					delete(view.adds, change.replicaID)
+				}
+				if view.removed == nil {
+					view.removed = make(map[uint64]string)
+				}
+				view.removed[change.replicaID] = identity
+				continue
+			}
+			if view.adds == nil {
+				view.adds = make(map[uint64]string)
+			}
+			view.adds[change.replicaID] = change.identity
+			if view.removed != nil {
+				delete(view.removed, change.replicaID)
+			}
+		}
+	}
+	if view.adds == nil && view.removed == nil {
+		return nil
+	}
+	return view
+}
+
+// clearPendingAdds forgets every pending add: the log is being replaced by a
+// snapshot whose membership becomes the committed configuration.
+func (l *raftLog) clearPendingAdds() {
+	if len(l.pendingAdds) == 0 {
+		return
+	}
+	l.pendingAdds = nil
+	l.pendingVersion++
+}
+
+// pendingSeedBudget bounds the bytes seedPendingAdds reads from the COMMITTED
+// tail at construction. The read blocks StartShard, and a shard that never
+// snapshots has a committed tail that is its whole log; reading all of it on
+// every restart is the StartShard-latency regression
+// reconstructShardMembership was rewritten to avoid. Within the budget the
+// restart gate is exactly as wide as it was before the restart; past it the
+// unfolded remainder is left to the replay, and the gate is narrower until
+// the replay reaches it. A variable only so a test can lower it.
+var pendingSeedBudget uint64 = 64 << 20
+
+// seedPendingAdds classifies the recovered log above the FOLDED configuration
+// once, at construction, so the receive gate admits after the restart what it
+// admitted before it: every config change this replica holds that the
+// configuration it applied does not yet reflect.
+//
+// Two stretches of the log qualify. The uncommitted tail (committed,
+// lastIndex] — a config change appended but not yet committed when the
+// replica went down — is read whole; it is bounded by the replication
+// window. The committed-but-unfolded stretch (applied, committed] — a
+// snapshot's configuration predates the AddNode that admitted the current
+// leader, and the replay that folds it is paced on the state machine — is
+// read up to pendingSeedBudget: without it a follower restarting from that
+// snapshot refuses its own leader (unknown_member) until the replay reaches
+// the entry, which a slow on-disk state machine with a long backlog can
+// stretch past an election timeout. Whatever the first PublishPendingConfig
+// finds already folded, it prunes, so seeding a committed entry costs
+// nothing when the replay is ahead.
+//
+// The reader caps any one read at its slice limit and returns the short
+// result as success, so each stretch is read from the last index seen until
+// it is exhausted. A read failure is logged and the rest left unclassified,
+// which only costs the admission this seed provides.
+//
+// It runs once, from the first PublishPendingConfig, above the configuration
+// applied by then: for an on-disk state machine that is what
+// SetProcessedIndex folded, which is often the whole committed stretch, and
+// reading it again here would cost StartShard the read for no gate benefit.
+func (l *raftLog) seedPendingAdds(applied uint64) {
+	if l.pendingSeeded {
+		return
+	}
+	l.pendingSeeded = true
+	last := l.lastIndex()
+	from := max(applied, l.processed)
+	if last <= from {
+		return
+	}
+	// The committed-but-unfolded stretch, under the budget.
+	var read uint64
+	next := from + 1
+	for next <= l.committed && next <= last {
+		if read >= pendingSeedBudget {
+			slog.Warn("the recovered committed tail exceeds the pending-config seed budget; "+
+				"a config change above the budget admits its member only once the replay folds it",
+				"from", next,
+				"committed", l.committed,
+				"budget_bytes", pendingSeedBudget)
+			break
+		}
+		entries, err := l.entries(next, min(l.committed, last)+1, pendingSeedBudget-read)
+		if err != nil || len(entries) == 0 {
+			slog.Warn("could not classify the recovered committed tail for pending config changes",
+				"from", next,
+				"to", l.committed,
+				"error", err)
+			break
+		}
+		l.noteConfigChanges(entries)
+		for i := range entries {
+			read += uint64(entries[i].Size())
+		}
+		next = entries[len(entries)-1].Index + 1
+	}
+	// The uncommitted tail, whole.
+	for next = max(next, l.committed+1); next <= last; {
+		entries, err := l.entries(next, last+1, 0)
+		if err != nil || len(entries) == 0 {
+			slog.Warn("could not classify the recovered uncommitted tail for pending config changes",
+				"from", next,
+				"to", last,
+				"error", err)
+			return
+		}
+		l.noteConfigChanges(entries)
+		next = entries[len(entries)-1].Index + 1
 	}
 }
 
@@ -280,6 +590,11 @@ func newRaftLog(logdb LogReader) *raftLog {
 	// proposals until the recovered tail has been applied, and costs nothing
 	// once it has (see confChangeIndex).
 	l.confChangeIndex = l.lastIndex()
+	// The pending configuration is seeded by the first PublishPendingConfig,
+	// not here: an on-disk state machine's SetProcessedIndex runs between
+	// NewPeer and the node's first publish and folds the committed stretch
+	// itself, and seeding above what it folded reads only what the gate can
+	// use. See seedPendingAdds.
 	return l
 }
 
@@ -603,6 +918,11 @@ func (l *raftLog) tryAppend(prevLogIndex, prevLogTerm uint64, ents []proto.Entry
 	// beyond the log end), which is a simple extension, not a
 	// truncation. Only real overwrites require membership rebuild.
 	isOverwrite := conflictIdx <= l.lastIndex()
+	if isOverwrite {
+		// The entries from conflictIdx on are gone; whatever they admitted
+		// is no longer in this log. The replacements re-record their own.
+		l.dropPendingAbove(conflictIdx - 1)
+	}
 	// Append from the conflict point onward.
 	offset := conflictIdx - ents[0].Index
 	l.append(ents[offset:])
@@ -781,6 +1101,7 @@ func (l *raftLog) restore(ss proto.Snapshot) {
 	// adopts it, so every config change at or below ss.Index has taken effect
 	// and every entry above it was just discarded. Nothing is pending.
 	l.confChangeIndex = 0
+	l.clearPendingAdds()
 }
 
 // getConflictIndex finds where the given entries first conflict with the

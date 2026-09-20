@@ -160,11 +160,16 @@ func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 	)
 	path := writeSegmentRecords(t, dir, 2, blockSize, total, recSize)
 
-	// Corrupt a record in the LAST block that holds data. Close() truncated
-	// the file to the written size, so nothing follows it at all.
-	size := statSize(t, path)
-	lastBlockStart := ((size - 1) / blockSize) * blockSize
-	flipByteAt(t, path, lastBlockStart+8)
+	// The fixture synced the last record, so a sync mark follows it; a torn
+	// tail is the record whose sync never returned, which leaves no mark.
+	// Remove it, then corrupt the record that is now the file's last chunk —
+	// Close() truncated the file to the written size, so nothing follows it.
+	dropSyncMark(t, path, blockSize)
+	last, typ := lastChunk(t, path, blockSize)
+	if typ != RecordFull {
+		t.Fatalf("fixture: last chunk is type %d, want a full record", typ)
+	}
+	flipByteAt(t, path, last+8)
 
 	seg := openSegmentForTest(t, dir, 2, blockSize)
 	defer seg.Close()
@@ -183,8 +188,8 @@ func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 		t.Fatalf("torn tail recovered %d of %d records; want a non-empty clean prefix",
 			len(records), total)
 	}
-	if cleanEnd < lastBlockStart {
-		t.Fatalf("clean end %d is below the corrupt block start %d", cleanEnd, lastBlockStart)
+	if cleanEnd != last {
+		t.Fatalf("clean end %d is not the corrupt record's offset %d", cleanEnd, last)
 	}
 }
 
@@ -356,7 +361,7 @@ func lastBlockRecordOffsets(t *testing.T, path string, blockSize int) (blockStar
 	blockStart = ((int64(len(data)) - 1) / int64(blockSize)) * int64(blockSize)
 	block := data[blockStart:]
 	for pos := 0; pos+recordHeaderSize <= len(block); {
-		_, _, _, n, err := decodeRecord(block[pos:])
+		_, _, _, _, n, err := decodeRecord(block[pos:])
 		if err != nil {
 			break
 		}
@@ -619,6 +624,7 @@ func TestRecovery_ZeroHoleInsideOneGenerationStillBoots(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	dropSyncMark(t, seg0Path, blockSize)
 
 	sizeBefore := statSize(t, seg0Path)
 	zeroBlockAt(t, seg0Path, blockSize, blockSize)

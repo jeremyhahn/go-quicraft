@@ -107,7 +107,7 @@ func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 		2: "node-b.raft.test:5000",
 		3: "node-c.raft.test:5000",
 	}
-	startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
+	startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members))
 	if startErr == nil {
 		t.Fatal("StartShard accepted a wildcard certificate covering every peer; " +
 			"a single compromised replica can speak for every node")
@@ -137,7 +137,7 @@ func TestStartShard_AcceptsPerNodeCertificate(t *testing.T) {
 		2: "node-b.raft.test:5000",
 		3: "node-c.raft.test:5000",
 	}
-	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); startErr != nil {
 		t.Fatalf("StartShard rejected a correctly issued per-node certificate: %v", startErr)
 	}
 }
@@ -161,7 +161,7 @@ func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 		2: "127.0.0.1:5001",
 		3: "127.0.0.1:5002",
 	}
-	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); startErr != nil {
 		t.Fatalf("StartShard rejected co-located replicas: %v", startErr)
 	}
 }
@@ -187,7 +187,7 @@ func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 	// The seed node of a grow-by-join cluster: itself only. StartShard's
 	// check is vacuous here, which is the point.
 	members := map[uint64]string{1: "node-a.raft.test:5000"}
-	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); startErr != nil {
 		t.Fatalf("StartShard rejected the seed configuration: %v", startErr)
 	}
 	waitForLeader(t, h, 1)
@@ -195,7 +195,7 @@ func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, addErr := h.RequestAddNode(ctx, 1, 2, "node-b.raft.test:5000", 0)
+	_, addErr := h.RequestAddNodeWithIdentity(ctx, 1, 2, "node-b.raft.test:5000", testIdentity(2), 0)
 	if addErr == nil {
 		t.Fatal("RequestAddNode accepted a peer this node's own wildcard " +
 			"certificate covers: every in-band transport authorization " +
@@ -228,8 +228,8 @@ func TestRequestAddNode_AcceptsUncoveredPeerUnderPerNodeCertificate(t *testing.T
 	}
 	defer h.Close()
 
-	if startErr := h.StartShard(map[uint64]string{1: "node-a.raft.test:5000"},
-		false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	seed := map[uint64]string{1: "node-a.raft.test:5000"}
+	if startErr := h.StartShard(seed, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, seed)); startErr != nil {
 		t.Fatalf("StartShard: %v", startErr)
 	}
 	waitForLeader(t, h, 1)
@@ -237,7 +237,7 @@ func TestRequestAddNode_AcceptsUncoveredPeerUnderPerNodeCertificate(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rs, addErr := h.RequestAddNode(ctx, 1, 2, "node-b.raft.test:5000", 0)
+	rs, addErr := h.RequestAddNodeWithIdentity(ctx, 1, 2, "node-b.raft.test:5000", testIdentity(2), 0)
 	if addErr != nil {
 		t.Fatalf("RequestAddNode rejected an uncovered peer under a per-node "+
 			"certificate: %v", addErr)
@@ -256,8 +256,8 @@ func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 	}
 	defer h.Close()
 
-	if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"},
-		false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	seed := map[uint64]string{1: "127.0.0.1:5000"}
+	if startErr := h.StartShard(seed, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, seed)); startErr != nil {
 		t.Fatalf("StartShard: %v", startErr)
 	}
 	waitForLeader(t, h, 1)
@@ -265,7 +265,7 @@ func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rs, addErr := h.RequestAddNode(ctx, 1, 2, "127.0.0.1:5001", 0)
+	rs, addErr := h.RequestAddNodeWithIdentity(ctx, 1, 2, "127.0.0.1:5001", testIdentity(2), 0)
 	if addErr != nil {
 		t.Fatalf("RequestAddNode rejected a co-located replica: %v", addErr)
 	}
@@ -300,7 +300,7 @@ func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 		2: "node-b.raft.test:5000",
 		3: "node-b.raft.test:5000", // the same host, seeded twice
 	}
-	startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
+	startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members))
 	if startErr == nil {
 		t.Fatal("StartShard accepted two replica IDs at one address: the single host " +
 			"behind it authenticates as both, so it holds two votes and two match " +
@@ -330,7 +330,7 @@ func TestStartShard_AllowsColocatedRepliasOnDistinctPorts(t *testing.T) {
 		2: "127.0.0.1:5001",
 		3: "127.0.0.1:5002",
 	}
-	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); startErr != nil {
 		t.Fatalf("StartShard rejected co-located replicas on distinct ports: %v", startErr)
 	}
 }
@@ -358,7 +358,7 @@ func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 		2: "node-b.raft.test:5000",
 		3: "NODE-B.RAFT.TEST:5000", // the same endpoint, spelled differently
 	}
-	startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
+	startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members))
 	if startErr == nil {
 		t.Fatal("StartShard accepted two spellings of one address: the certificate " +
 			"cannot tell the two replica IDs apart, so the single host behind them " +

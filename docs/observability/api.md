@@ -102,7 +102,7 @@ with `waldb.WithMetrics`.
 |---|---|---|
 | `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected` | `shardID` and `to` are **both 0** for `protocol_violation` |
 | `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy` | `shardID` is **0** when rejected before the header parsed |
-| `IncUnauthorizedMessageDropped` | `removed_replica`, `misrouted`, `unknown_member`, `address_mismatch`, `shared_address`, `identity_mismatch`, `missing_identity` | — |
+| `IncUnauthorizedMessageDropped` | `removed_replica`, `removed_identity`, `misrouted`, `unknown_member`, `identity_mismatch`, `missing_identity` | — |
 
 The security split is **operational, not cosmetic**: one aggregate counter
 cannot tell a rolling membership change from an attack.

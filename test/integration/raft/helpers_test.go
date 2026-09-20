@@ -19,19 +19,11 @@ package raft_test
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -458,82 +450,6 @@ var _ sm.StateMachine = (*counterStateMachine)(nil)
 // ---------------------------------------------------------------------------
 // Host construction helpers
 // ---------------------------------------------------------------------------
-
-// testMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf certificate
-// pair for integration test mTLS. All nodes in a cluster must share the same
-// return value so they can verify each other's certificates.
-func testMTLSConfig(t *testing.T) *config.MTLSConfig {
-	t.Helper()
-
-	// Generate CA key pair.
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate CA key: %v", err)
-	}
-
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create CA cert: %v", err)
-	}
-
-	caCert, err := x509.ParseCertificate(caCertDER)
-	if err != nil {
-		t.Fatalf("parse CA cert: %v", err)
-	}
-
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	// Generate leaf key pair signed by the CA.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate leaf key: %v", err)
-	}
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-			CommonName:   "localhost",
-		},
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback, net.IPv6zero},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	leafCertDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create leaf cert: %v", err)
-	}
-
-	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDER})
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		t.Fatalf("marshal leaf key: %v", err)
-	}
-	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyDER})
-
-	return &config.MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   leafCertPEM,
-		Key:    leafKeyPEM,
-	}
-}
 
 // testHostConfig creates a valid HostConfig for integration testing.
 // Each call gets unique temp directories via t.TempDir().

@@ -3,7 +3,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.27.0-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.6.1--alpha-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.12.0--alpha-orange.svg)](VERSION)
 
 A multi-group Raft consensus library for Go with QUIC transport and at-rest encryption.
 
@@ -355,9 +355,19 @@ hostCfg := config.HostConfig{
     },
 }
 
+// Every member's node identity -- the value each node reports from
+// host.NodeIdentity(), a hash of its certificate's public key -- collected
+// out of band. A member is authorized by this and by nothing else, so a
+// host with a transport refuses to start a shard without one for every
+// member. Every founder passes the SAME map.
 shardCfg := config.Config{
     ShardID:   1,
     ReplicaID: 1, // 2 on node2, 3 on node3
+    MemberIdentities: map[uint64]string{
+        1: "spki:...", // node1's host.NodeIdentity()
+        2: "spki:...",
+        3: "spki:...",
+    },
 }
 
 host, _ := quicraft.NewHost(hostCfg)

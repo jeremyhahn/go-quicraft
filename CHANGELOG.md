@@ -7,6 +7,299 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Everything below landed on `release/0.13.0-alpha` and resolves the
+2026-09-16 whole-project production-readiness review (#197). Wipe every dev
+data directory before upgrading: the WAL chunk framing changed in place.
+
+### Changed — BREAKING: a member is admitted with its node identity or not at all (#197 A)
+
+- **`TransportConfig.RequireMemberIdentity` is removed, and with it the
+  address fallback on the receive path.** A member is authorized by its
+  committed node identity and by nothing else; a sender the configuration
+  holds no identity for has every message dropped (`missing_identity`) and
+  nobody may re-point its routing entry. The default-off flag was a
+  compatibility choice that left every address-only shard open to any holder
+  of a cluster certificate asserting a member's `From`, re-pointing a member's
+  replication stream at itself, and bootstrapping a joining replica.
+- **Identities are required at every admission on a host with a transport**
+  (`config.Config.RequireMemberIdentities`, which the Host sets from that
+  fact): `StartShard(join=false)` refuses a founding map with a member missing
+  from `Config.MemberIdentities` (`*InvalidMemberError` naming it);
+  `StartShard(join=true)` refuses an empty **join anchor**;
+  `RequestAddNode`, `RequestAddObserver` and `RequestAddWitness` — the
+  identity-less forms — return `ErrMemberIdentityRequired`, and the leader's
+  propose-time validator applies the same rule to a config change forwarded
+  from another replica (`raft.ErrMemberIdentityRequired`); `ImportSnapshot`
+  refuses a configuration with an identity-less active member, and a
+  `WithImportMembership` rewrite supplies them through the new
+  `WithImportMemberIdentities`. A host started `WithoutTransport()` keeps the
+  old ergonomics: it has no wire boundary.
+- **`Config.MemberIdentities` is also the operator anchor**: on a `join=true`
+  start, the replicas the joiner will accept its bootstrap snapshot — and every
+  message before it — from, each bound to the identity that connection must
+  present (the bootstrap snapshot used to be authorized against the membership
+  it carried itself, so any host holding a valid cluster certificate could be
+  the one that bootstrapped a joining shard); on any start, entries beyond the
+  members map, which the receive gate consults for a sender no configuration
+  the replica holds names. Entries outside a founder's members map are not
+  written into the bootstrap entry, and one identity bound to two replicas is
+  refused at bootstrap and at import as it is at every add.
+- `SyncRequestAddObserverWithIdentity` and `SyncRequestAddWitnessWithIdentity`
+  join `SyncRequestAddNodeWithIdentity`; the four `Sync*` membership wrappers
+  share one body. `contrib/dragonboat` gains `Config.MemberIdentities`,
+  `NodeHost.NodeIdentity` and the three `SyncRequestAdd*WithIdentity` methods,
+  because dragonboat's API cannot express an identity and a `NodeHost` with a
+  transport now needs one.
+- The `address_mismatch` and `shared_address` drop reasons are retired with
+  the fallback; the label values are not reallocated.
+- The integration suites issue one leaf — one keypair, one identity — per host
+  from a per-cluster CA (`test/testpki`), replacing four copies of a generator
+  that handed every host the same leaf.
+
+### Changed — BREAKING: every inbound message is bound to a replica the receiver can vouch for (#197 B)
+
+- The receive gate used to exempt leader-originated pushes (`Replicate`,
+  `Heartbeat`), vote requests and forwarded client work from the sender
+  binding, so a lagging replica could be brought up to date by a leader its
+  configuration did not name yet. The exemption admitted any holder of a
+  cluster certificate: a `Heartbeat` at a higher term installed it as leader
+  on every follower and stepped the real leader down (repeated, it held the
+  shard leaderless indefinitely), a `RequestVote` forced an election, and a
+  forwarded `Propose` had the leader append a command a stranger wrote.
+- Every message type is now bound, and three facts a replica holds itself can
+  vouch for a sender, each binding the connection's identity: the **committed**
+  configuration; the **pending** configuration — a config-carrying entry in
+  this replica's own log, appended but not yet applied, that admits the sender
+  with an identity (`raft.Peer.PendingMemberIdentity`, published with the log
+  markers); and the **operator anchor** (`Config.MemberIdentities`). The
+  lagging follower that holds the `AddNode` for the new leader admits that
+  leader on the strength of its own log; nothing else does.
+- Cost, stated plainly: a replica that never received the config change
+  adding the new leader refuses that leader (`unknown_member`, persistently)
+  until a replica its configuration names leads, or it is restarted with a
+  `Config.MemberIdentities` that names the leader. The shard itself has quorum
+  without it.
+- Sixth- to tenth-round review: a restart is held to the identities it
+  recovered — this host must present the identity the shard committed for
+  its replica (a changed keypair used to start cleanly and then be refused
+  by every peer, indefinitely, with nothing local saying why), and an
+  operator anchor may neither contradict a committed binding nor bind a
+  committed member's identity to a second replica ID. The start-time check
+  sees the configuration recovery hands `StartShard` (the snapshot's, or
+  the founding entry's), so the receive gate additionally asks the committed
+  configuration — current at every message — before the pending
+  configuration or the anchor may admit a sender: a keypair the committed
+  configuration binds to another replica is refused under a second ID
+  (`identity_mismatch`), a committed binding for this replica that the
+  host does not present is reported at ERROR when it is learned, and a
+  snapshot whose membership binds this replica to an identity the host does
+  not present is refused before it is persisted (eleventh-round review) —
+  for a joiner that snapshot is the only membership it will ever hold. An anchor
+  entry naming a since-removed identity is tolerated at WARN (the removal
+  deny-list runs first), since every founder's map names it after a routine
+  `RemoveNode`; and the founders' coverage rule is asked only at bootstrap,
+  where the members map seeds the configuration — on a restart the map is
+  ignored and a stale one is no longer refused. The pending-config seed
+  reads the whole recovered uncommitted tail, not the reader's first
+  slice-capped read, and — under a 64 MiB budget, since the read blocks
+  `StartShard` and a shard that never snapshots has its whole log there —
+  the committed stretch the applied configuration does not yet reflect, so a
+  follower restarting from a snapshot that predates the `AddNode` of its
+  current leader admits that leader as it did before the restart instead of
+  refusing it until the replay folds the entry (eleventh-round review).
+  `RemoveNode` entries are recorded in the same pending set and resolved in
+  log order (twelfth-round review): a removal above an add cancels the add,
+  and a COMMITTED removal above the applied configuration is a pending
+  tombstone the receive gate and the snapshot path refuse FIRST — by the
+  removed ID and by the keypair it held — so seeding the committed stretch
+  cannot re-admit a member the shard removed while the replay is still short
+  of the removal. An uncommitted removal revokes nobody (thirteenth-round
+  review): in a two-voter shard the leader that appended `RemoveNode(B)`
+  would otherwise refuse B's very ack of it and the shard would stay
+  leaderless; the published view is keyed on the commit index so a removal
+  binds the moment it commits. The seed runs from the first
+  `PublishPendingConfig`, above the configuration applied by then, so an
+  on-disk state machine's `SetProcessedIndex` — which folds the committed
+  stretch itself — is not followed by a second read of it in `StartShard`
+  (fourteenth-round review). A first-start joiner must name a replica other than
+  itself, in its anchor or in its members map — a map naming only the
+  joiner seeds nobody who could deliver the bootstrap snapshot, and the
+  joiner would start cleanly and refuse everything as `unknown_member`
+  (fourteenth-round review); an import refuses an active identity the
+  artifact's tombstones hold, on either path, and `WithImportMemberIdentities`
+  refuses an entry for a replica the resulting membership does not name — on
+  the artifact's own membership (the map keyed by intended new IDs with
+  `WithImportMembership` forgotten, which would otherwise bind a keypair to a
+  non-member that every later add of that keypair trips over as a duplicate)
+  and on a rewrite (the map keyed by the old IDs, which would otherwise be
+  dropped into a misleading "no identity" refusal); the lowest stray replica
+  is named. `RequestAddNode`/`Observer`/`Witness` docs no longer describe an
+  address fallback.
+- Fifth-round review (documentation and one restart path): the anchor is a
+  FIRST-start requirement — an established replica restarted with `join=true`
+  recovers its configuration and needs none; `SECURITY.md`, the
+  `proto.Membership` and `logdb.Membership` doc comments and the WAL
+  engineering doc no longer describe the address fallback or the removed
+  fields. A proposal batch is judged whole against
+  `proto.MaxLogIndex`, and leadership is declined at the bound (the no-op has
+  nowhere to go), so no append path crosses it. Accepted residual, documented
+  on `maxAdoptableTerm`: a term one below the bound has no campaignable
+  successor — true of any bound — and only a bound member can drive a shard
+  there, which is a liveness trust Raft already places in members.
+- Fourth-round review: `StartShard` and `ImportSnapshot` check this host's
+  OWN entry against `Host.NodeIdentity`, since a typo there is committed and
+  every peer then refuses the replica silently; replica ID 0 is refused in
+  `MemberIdentities`; a sender the pending configuration or the anchor
+  admitted may fill a missing routing entry, since a leader admitted inbound
+  whose responses cannot be routed back never sees the replica's ack; folded
+  pending adds are forgotten, bounding the map by the pending window; and
+  `RequestState.Release` releases the session binding before publishing
+  `released`, closing a data race with a concurrent recycle.
+- Third-round review: `WithImportMemberIdentities` completes the artifact's
+  own membership as well as a rewrite; the join window and operator anchor
+  are recorded only once the shard is published, so a losing concurrent
+  `StartShard` or a failed start leaves nothing a loaded shard vouches with;
+  pending adds are keyed by entry index, so cutting a later entry for a
+  replica leaves an earlier surviving entry for it in force.
+- Second-round review: `Update.Snapshot` through `SaveState` is held to the
+  snapshot bound on both LogDBs; a bootstrap entry's identities admit only the
+  replicas an active role holds; `proposeEntry` owns the session reservation's
+  release, so a failure after registration cannot release it twice and clear
+  a concurrent caller's; a pending add ages out once its entry has been
+  offered to apply, refused or not.
+
+### Changed — BREAKING: WAL chunk header carries the generation start; `MaxFileSize` is at most 4 GiB − 1 (#197 D)
+
+- Every WAL chunk records the file offset at which its durability generation
+  began — the acknowledged end when the fdatasync that closed the previous
+  generation returned. Recovery can now decide the interrupted-write question
+  **exactly**: damage that begins at or above the acknowledged end is an
+  interrupted write and truncates, provably; damage that begins below it
+  destroyed acknowledged bytes and the open fails with
+  `ErrAcknowledgedDataLost` (a `*SegmentCorruptionError`, so `Repair` remains
+  the operator's exit). The generation sequence alone could only say that an
+  fdatasync lay inside the damage, and recovery truncated across it and
+  reported a "residual" for the operator to reconcile by hand — for a shape
+  an ordinary power loss also produces.
+- `logdb.RecoveryResidual`, `logdb.RecoveryResidualReporter` and
+  `waldb.DB.RecoveryResiduals` are removed: there is nothing left to report.
+- Sixth-round review: `Sync` appends a header-only `RecordSyncMark` chunk after
+  its fdatasync returns, stamped with the generation it opened and the
+  acknowledged end, written through without a second fdatasync. A generation
+  is proven closed only by a higher-generation chunk, and a segment's FINAL
+  generation had none when nothing followed it — an idle node, a clean
+  shutdown, a rotated segment — so rot inside a fully acknowledged final
+  generation read as a torn tail and truncated. With the mark it takes the
+  fail-closed path; without it (a crash inside the writeback window after the
+  last fdatasync) the file is what an unfinished batch leaves, and truncating
+  is right. `CanFit` keeps room for the mark below `MaxFileSize`, a Sync
+  that acknowledges nothing new (rotation's, after a batch's own, or one
+  after a rollback) opens no generation and appends none, `segment.Close`
+  fdatasyncs once more so a segment closed by a clean shutdown carries
+  nothing unsynced (a mark torn in its writeback window would otherwise be
+  refused as non-final damage once a later segment existed), recovery
+  fdatasyncs the highest surviving segment before the next write can create
+  a higher one — the segment a PROCESS crash left with its last mark in the
+  page cache (fourteenth-round review) — and damage in a non-final segment
+  is named `ErrNonFinalSegmentCorruption` ahead of the evidence verdicts.
+- The chunk header grows from 11 to 15 bytes in place (`walFormatVersion`
+  stays 1 under the pre-release pinning policy). **A `0.12.x` data directory
+  opened by this build is NOT refused: every chunk fails the new CRC, which
+  reads as a torn first batch, and recovery truncates the segment to zero and
+  comes up with an empty log and no hard state** — a term/vote regression, so
+  a quorum member upgraded in place can vote twice in one term. Stop the
+  node, wipe its WAL and NodeHost directories, upgrade, re-sync from peers,
+  one replica at a time; see `docs/compatibility.md` §WALFORMAT.
+  `WithMaxFileSize` above 4 GiB − 1 is `ErrInvalidMaxFileSize`.
+
+### Changed — contrib/dragonboat (#197 A)
+
+- `NodeHost.RequestAddReplicaWithIdentity`, `RequestAddNonVotingWithIdentity`
+  and `RequestAddWitnessWithIdentity` — the asynchronous forms of the
+  `Sync*WithIdentity` methods, which a NodeHost with a transport needs since
+  the identity-less forms are refused there (twelfth-round review). The
+  adapter's integration fixtures issue one leaf per NodeHost from a shared
+  test CA (`test/testpki`) and pass founding, join and add identities
+  through; `test/performance/quicraft` does the same. The
+  `//quicraft:direct-config-change` build gate knows the new methods.
+
+### Changed — BREAKING: a session serves one proposal at a time (#197 E)
+
+- `ProposeWithSession` reserves the session's series number for the returned
+  `RequestState`; a second concurrent call returns the new `ErrSessionBusy`
+  (`Temporary`). Two concurrent proposals used to carry the same
+  `(ClientID, SeriesID)`, the state machine applied the first and answered the
+  second with the first's result, and both callers were told their command
+  ran. The reservation is released by `ProposalCompleted`, by an error result
+  — before the caller sees it, since the documented recovery is a retry on the
+  same session — or by `RequestState.Release`.
+- `ProposeWithSession` re-checks the series it claimed: `ProposalCompleted`
+  advances the series and only then releases the reservation, so a claim
+  that raced it could hold the previous series and the proposal would have
+  been answered as that command's retransmission without being applied
+  (ninth-round review).
+- `Session.ValidForProposal` refuses a session still at series 0 — one built
+  with `NewSession` and never registered, or registered without
+  `PrepareForPropose` — so `ProposeWithSession` returns `ErrInvalidSession`
+  for it: 0 is the reservation's idle value, and a session at 0 could admit
+  two concurrent proposals both stamped 0 (sixth-round review). `Release` on
+  a `RequestState` pins the object before electing the releaser, so the
+  session binding cannot be recycled out from under the release; `Release`
+  is called exactly once — a second call, later or concurrent, is a
+  use-after-free on a pooled object, as it always was (tenth-round review). The dragonboat adapter's
+  `RequestState.Release`/`SysOpState.Release` absorb repeated calls
+  themselves, and its `SyncPropose` documents that the reservation covers the
+  in-flight window only, since dragonboat's contract has the caller advance
+  the session after the return.
+
+### Added
+
+- `proto.MaxTerm` and `proto.MaxLogIndex` (`math.MaxUint64 - 1024`), with
+  `Snapshot.CheckBounds`, `proto.ErrLogIndexOutOfRange` and
+  `proto.ErrTermOutOfRange` (#197 C). A snapshot's index and term were
+  unbounded; `InstallSnapshot` is delivered process-locally after the artifact
+  is on disk, so it never met `step()`'s wire term ceiling, and a snapshot at
+  `Index = MaxUint64` restored cleanly and then wrapped the log's first index
+  and every remote's next index to 0 — durably, because LogDB had already
+  recorded it. The bound is applied at the transport's chunk validation, both
+  LogDB `SaveSnapshot` and `SaveState` implementations and
+  `raft.handleSnapshot`, a leader refuses proposals once its log reaches
+  the bound, and a follower refuses a `Replicate` whose batch would end
+  above it (twelfth-round review), so no replicated append carries a log
+  past the bound either, and refuses a batch carrying an entry whose term is
+  0 or exceeds the replicating leader's (thirteenth-round review,
+  `proto.ErrTermOutOfRange`), which would otherwise poison `lastTerm` on
+  disk. `newRaft` refuses to open persisted state only at the ceiling
+  itself (`persistedCeiling`, a few below `MaxUint64`): state admitted just
+  below the bound can be moved by local transitions, and an open check at the
+  admission bound would refuse state the replica produced itself (third-round
+  review). `raft.maxAdoptableTerm` is `proto.MaxTerm` under its own name.
+- `ErrMemberIdentityRequired`, `ErrSessionBusy`, `waldb.ErrAcknowledgedDataLost`,
+  `WithImportMemberIdentities`, `config.Config.RequireMemberIdentities`.
+- The cross-architecture CI job is a matrix over `arm64` and `386` (#197 I):
+  a 32-bit build failed in `test/netport` on an untyped constant in an `int`
+  context, and `vet` failed in three test files on constants that only fit a
+  64-bit `int`.
+
+### Fixed
+
+- **A concurrent `Drain` joins the attempt in progress instead of returning
+  nil (#197 F).** The second caller saw `draining=true` and returned success
+  at once; when it was `Close`, it tore the engine down under the first drain,
+  failed the in-flight work with `ErrClosed` — which drove `pendingOps` to zero
+  and released the first caller with nil too — and both reported a clean
+  graceful shutdown after accepted work had been aborted. `Drain` now elects
+  one attempt through a `sync.Once`, exactly as `Close` does.
+- **`Node.CommittedIndex` is seeded from the recovered log at construction
+  (#197 G).** It read 0 until the step worker's first tick, so a proposal
+  registered between `StartShard` returning and that tick carried a
+  committed-index floor of 0 (#186) and rested on the random key alone
+  against a replayed entry.
+- Release hygiene (#197 J): README badge, `docs/compatibility.md` and
+  `SECURITY.md` named releases up to six minors old as current;
+  `transportconfig.go` cited a documentation path that does not exist; two
+  `host.go` comments described the pre-#186 key scheme.
+
 ## [0.12.0-alpha] - 2026-09-16
 
 ### Added

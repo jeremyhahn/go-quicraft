@@ -18,20 +18,10 @@ package integration_test
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +35,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -934,111 +925,31 @@ func dbGatedKVCreateFunc(release <-chan struct{}) (dbSM.CreateStateMachineFunc, 
 // mTLS Helpers
 // ---------------------------------------------------------------------------
 
-// dbTestMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf
-// certificate pair, writes them to temporary files, and returns the
-// file paths and PEM data for the dragonboat adapter's file-based
-// mTLS configuration.
-type dbMTLSFiles struct {
-	CAFile   string
-	CertFile string
-	KeyFile  string
+// dbMTLSFiles is one node's mTLS material on disk, for the adapter's
+// file-based NodeHostConfig. Every leaf is a distinct node identity
+// (NodeHost.NodeIdentity), which is what a host with a transport is admitted
+// by; a shared leaf is a shared identity and is refused at StartReplica.
+type dbMTLSFiles = testpki.Files
+
+// dbTestPKI is the CA of one test cluster; every host in it takes its own
+// leaf from here (leaf). A host that restarts must be given the same files
+// again to keep the identity the shard committed for it.
+type dbTestPKI struct {
+	ca  *testpki.CA
+	dir string
 }
 
-func dbTestMTLSFiles(t *testing.T) dbMTLSFiles {
+func dbTestPKIFor(t *testing.T) *dbTestPKI {
 	t.Helper()
-
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate CA key: %v", err)
-	}
-
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft DB Adapter Test"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create CA cert: %v", err)
-	}
-
-	caCert, err := x509.ParseCertificate(caCertDER)
-	if err != nil {
-		t.Fatalf("parse CA cert: %v", err)
-	}
-
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate leaf key: %v", err)
-	}
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft DB Adapter Test"},
-			CommonName:   "localhost",
-		},
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback, net.IPv6zero},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	leafCertDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create leaf cert: %v", err)
-	}
-
-	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDER})
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		t.Fatalf("marshal leaf key: %v", err)
-	}
-	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyDER})
-
-	// Write PEM data to temporary files for the adapter's file-based mTLS.
-	dir := t.TempDir()
-	caFile := filepath.Join(dir, "ca.pem")
-	certFile := filepath.Join(dir, "cert.pem")
-	keyFile := filepath.Join(dir, "key.pem")
-
-	if err := os.WriteFile(caFile, caCertPEM, 0600); err != nil {
-		t.Fatalf("write CA file: %v", err)
-	}
-	if err := os.WriteFile(certFile, leafCertPEM, 0600); err != nil {
-		t.Fatalf("write cert file: %v", err)
-	}
-	if err := os.WriteFile(keyFile, leafKeyPEM, 0600); err != nil {
-		t.Fatalf("write key file: %v", err)
-	}
-
-	return dbMTLSFiles{
-		CAFile:   caFile,
-		CertFile: certFile,
-		KeyFile:  keyFile,
-	}
+	return &dbTestPKI{ca: testpki.NewCA(t), dir: t.TempDir()}
 }
 
-// ---------------------------------------------------------------------------
-// Host Construction Helpers
-// ---------------------------------------------------------------------------
+// leaf issues a fresh leaf for one host.
+func (p *dbTestPKI) leaf(t *testing.T) dbMTLSFiles {
+	t.Helper()
+	return p.ca.LeafFiles(t, p.dir)
+}
 
-// freePort returns a loopback address for a host that does not exist yet,
-// reserved so that nothing else can be handed the same port before the host
-// binds it. It used to bind 127.0.0.1:0 and close the socket, which is #131.
-// test/netport carries the reasoning and the measurements.
 func freePort(t *testing.T) string {
 	t.Helper()
 	return netport.MustReserveUDP(t.Fatalf)
@@ -1104,8 +1015,25 @@ type dbTestCluster struct {
 	addrs    []string
 	trackers []*dbSMTracker
 	stopped  []atomic.Bool
-	mtls     dbMTLSFiles
+	pki      *dbTestPKI
 	t        *testing.T
+}
+
+// identities is Config.MemberIdentities for a shard whose replica i+1 is
+// served by host i, for every host.
+func (c *dbTestCluster) identities() map[uint64]string {
+	ids := make(map[uint64]string, len(c.hosts))
+	for i, nh := range c.hosts {
+		ids[uint64(i+1)] = nh.NodeIdentity()
+	}
+	return ids
+}
+
+// shardConfig is dbTestShardConfig with the cluster's identities filled in.
+func (c *dbTestCluster) shardConfig(shardID, replicaID uint64) dbConfig.Config {
+	cfg := dbTestShardConfig(shardID, replicaID)
+	cfg.MemberIdentities = c.identities()
+	return cfg
 }
 
 // newDBTestCluster creates an N-node cluster using the dragonboat
@@ -1114,7 +1042,7 @@ func newDBTestCluster(t *testing.T, numNodes int) *dbTestCluster {
 	t.Helper()
 
 	const maxRetries = 3
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addrs := make([]string, numNodes)
 	hosts := make([]*dragonboat.NodeHost, numNodes)
 
@@ -1123,7 +1051,7 @@ func newDBTestCluster(t *testing.T, numNodes int) *dbTestCluster {
 		var addr string
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+			nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 			var err error
 			nh, err = dragonboat.NewNodeHostWithOptions(nhConfig,
 				quicraft.WithMemoryLogDB(),
@@ -1147,7 +1075,7 @@ func newDBTestCluster(t *testing.T, numNodes int) *dbTestCluster {
 		hosts:   hosts,
 		addrs:   addrs,
 		stopped: make([]atomic.Bool, numNodes),
-		mtls:    mtls,
+		pki:     pki,
 		t:       t,
 	}
 }
@@ -1172,7 +1100,7 @@ func (c *dbTestCluster) startShard(shardID uint64) []*dbSMTracker {
 		createFn, tracker := dbKVCreateFunc()
 		trackers[i] = tracker
 
-		cfg := dbTestShardConfig(shardID, replicaID)
+		cfg := c.shardConfig(shardID, replicaID)
 		if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 			c.t.Fatalf("StartReplica[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1205,6 +1133,7 @@ func (c *dbTestCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID,
 		trackers[i] = tracker
 
 		cfg := cfgFn(shardID, replicaID)
+		cfg.MemberIdentities = c.identities()
 		if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 			c.t.Fatalf("StartReplica[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1244,6 +1173,7 @@ func (c *dbTestCluster) startGatedShard(
 		gated[i] = gatedTracker
 
 		cfg := cfgFn(shardID, replicaID)
+		cfg.MemberIdentities = c.identities()
 		if err := nh.StartReplica(members, false, createFn, cfg); err != nil {
 			c.t.Fatalf("StartReplica[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1275,7 +1205,7 @@ func (c *dbTestCluster) startConcurrentShard(shardID uint64) []*dbConcurrentSMTr
 		createFn, tracker := dbConcurrentKVCreateFunc()
 		trackers[i] = tracker
 
-		cfg := dbTestShardConfig(shardID, replicaID)
+		cfg := c.shardConfig(shardID, replicaID)
 		if err := nh.StartConcurrentReplica(members, false, createFn, cfg); err != nil {
 			c.t.Fatalf("StartConcurrentReplica[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1303,7 +1233,7 @@ func (c *dbTestCluster) startOnDiskShard(shardID uint64) []*dbOnDiskSMTracker {
 		createFn, tracker := dbOnDiskKVCreateFunc()
 		trackers[i] = tracker
 
-		cfg := dbTestShardConfig(shardID, replicaID)
+		cfg := c.shardConfig(shardID, replicaID)
 		if err := nh.StartOnDiskReplica(members, false, createFn, cfg); err != nil {
 			c.t.Fatalf("StartOnDiskReplica[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1925,7 +1855,16 @@ type configChange struct {
 	shardID        uint64
 	replicaID      uint64
 	addr           dragonboat.Target
+	identity       string // the node identity an add commits; see dbIdentityFor
 	configChangeID uint64
+}
+
+// dbIdentityFor is the node identity a test commits for a replica that no
+// host serves — an add whose target never starts. It has the shape of a real
+// one (NodeIdentity is "spki:" plus 64 hex digits) and is distinct per
+// replica, since one keypair cannot be two members.
+func dbIdentityFor(replicaID uint64) string {
+	return fmt.Sprintf("spki:%064x", replicaID)
 }
 
 // String renders the change the way the converted sites used to log it.
@@ -1943,13 +1882,13 @@ func (cc configChange) String() string {
 // gate in test/buildgates knows them by the marker.
 var configChangeSubmitters = map[configChangeKind]func(context.Context, *dragonboat.NodeHost, configChange) error{
 	addReplica: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
-		return nh.SyncRequestAddReplica(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+		return nh.SyncRequestAddReplicaWithIdentity(ctx, cc.shardID, cc.replicaID, cc.addr, cc.identity, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
 	},
 	addNonVoting: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
-		return nh.SyncRequestAddNonVoting(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+		return nh.SyncRequestAddNonVotingWithIdentity(ctx, cc.shardID, cc.replicaID, cc.addr, cc.identity, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
 	},
 	addWitness: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
-		return nh.SyncRequestAddWitness(ctx, cc.shardID, cc.replicaID, cc.addr, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
+		return nh.SyncRequestAddWitnessWithIdentity(ctx, cc.shardID, cc.replicaID, cc.addr, cc.identity, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
 	},
 	deleteReplica: func(ctx context.Context, nh *dragonboat.NodeHost, cc configChange) error {
 		return nh.SyncRequestDeleteReplica(ctx, cc.shardID, cc.replicaID, cc.configChangeID) //quicraft:direct-config-change the single attempt driveConfigChange is built from
@@ -2275,23 +2214,23 @@ func (c *dbTestCluster) configChangeToLeader(t *testing.T, cc configChange, budg
 
 // addReplicaToLeader adds replicaID as a voting member at addr, against
 // configChangeID, and fails the test unless the change lands.
-func (c *dbTestCluster) addReplicaToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+func (c *dbTestCluster) addReplicaToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, identity string, configChangeID uint64, budget time.Duration) {
 	t.Helper()
-	c.configChangeToLeader(t, configChange{kind: addReplica, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+	c.configChangeToLeader(t, configChange{kind: addReplica, shardID: shardID, replicaID: replicaID, addr: addr, identity: identity, configChangeID: configChangeID}, budget)
 }
 
 // addNonVotingToLeader adds replicaID as a non-voting member at addr, against
 // configChangeID, and fails the test unless the change lands.
-func (c *dbTestCluster) addNonVotingToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+func (c *dbTestCluster) addNonVotingToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, identity string, configChangeID uint64, budget time.Duration) {
 	t.Helper()
-	c.configChangeToLeader(t, configChange{kind: addNonVoting, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+	c.configChangeToLeader(t, configChange{kind: addNonVoting, shardID: shardID, replicaID: replicaID, addr: addr, identity: identity, configChangeID: configChangeID}, budget)
 }
 
 // addWitnessToLeader adds replicaID as a witness at addr, against
 // configChangeID, and fails the test unless the change lands.
-func (c *dbTestCluster) addWitnessToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, configChangeID uint64, budget time.Duration) {
+func (c *dbTestCluster) addWitnessToLeader(t *testing.T, shardID, replicaID uint64, addr dragonboat.Target, identity string, configChangeID uint64, budget time.Duration) {
 	t.Helper()
-	c.configChangeToLeader(t, configChange{kind: addWitness, shardID: shardID, replicaID: replicaID, addr: addr, configChangeID: configChangeID}, budget)
+	c.configChangeToLeader(t, configChange{kind: addWitness, shardID: shardID, replicaID: replicaID, addr: addr, identity: identity, configChangeID: configChangeID}, budget)
 }
 
 // deleteReplicaToLeader removes replicaID, against configChangeID, and fails

@@ -63,6 +63,53 @@ type Session struct {
 	ownerID     uint64
 	seriesID    atomic.Uint64
 	respondedTo atomic.Uint64
+
+	// inFlight holds the series number of the proposal currently reserved
+	// on this session, or 0 when none is. A session carries ONE series at a
+	// time: ProposeWithSession stamps the entry with the current seriesID
+	// and the state machine treats every entry with the same (clientID,
+	// seriesID) as a retransmission of one command, applying the first and
+	// answering the rest with its result. Without the reservation two
+	// concurrent proposals both reported success while one of them was
+	// silently discarded as a duplicate. beginProposal claims the series,
+	// endProposal releases exactly that series, and a release for any other
+	// series is a no-op, so a late Release of a completed request cannot
+	// clear the reservation of the proposal that followed it.
+	inFlight atomic.Uint64
+}
+
+// beginProposal reserves series for a proposal and reports whether it did.
+// It fails when another proposal is in flight on this session.
+func (s *Session) beginProposal(series uint64) bool {
+	return s.inFlight.CompareAndSwap(0, series)
+}
+
+// beginCurrentProposal reserves the session's CURRENT series and returns it.
+// Reading the series and claiming it are two steps, and ProposalCompleted
+// can run between them — it advances the series and only then releases the
+// reservation — so a claim that succeeded may hold a series the session has
+// moved past. Such a proposal would carry the previous command's series and
+// be answered as its retransmission without being applied. The claim is
+// therefore re-checked against the series after it is taken and, if the
+// session has moved on, released and taken again for the new series.
+func (s *Session) beginCurrentProposal() (uint64, bool) {
+	for {
+		series := s.seriesID.Load()
+		if !s.beginProposal(series) {
+			return 0, false
+		}
+		if s.seriesID.Load() == series {
+			return series, true
+		}
+		s.endProposal(series)
+	}
+}
+
+// endProposal releases the reservation held for series. Releasing a series
+// that is not the one reserved is a no-op: the reservation has already moved
+// on, and this call belongs to the request that held it.
+func (s *Session) endProposal(series uint64) {
+	s.inFlight.CompareAndSwap(series, 0)
 }
 
 // newSession creates a Session for the given shard and client, owned by
@@ -153,9 +200,11 @@ func (s *Session) RespondedTo() uint64 {
 // registration completes, the caller invokes this to advance the seriesID
 // to SeriesIDFirstProposal so subsequent proposals use the normal range.
 //
-// Thread safety: seriesID uses atomic.Uint64 to support concurrent use.
-// However, concurrent proposals on the same session are discouraged because
-// responses may arrive out of order.
+// Thread safety: the fields are atomics, so the Session may be read from
+// any goroutine, but it serves ONE proposal at a time. ProposeWithSession
+// refuses a second concurrent proposal with ErrSessionBusy — see inFlight —
+// because both would carry the same series number and the state machine
+// would apply only one of them.
 func (s *Session) PrepareForPropose() {
 	s.seriesID.Store(SeriesIDFirstProposal)
 }
@@ -170,6 +219,9 @@ func (s *Session) PrepareForPropose() {
 // breaking the respondedTo == seriesID-1 invariant under concurrent
 // completions. The monotonic advance mirrors SetRespondedTo and keeps
 // respondedTo pinned to the highest completed series.
+//
+// It also releases the reservation ProposeWithSession took for the completed
+// series, so the next proposal on this session is admitted.
 func (s *Session) ProposalCompleted() {
 	for {
 		current := s.seriesID.Load()
@@ -180,6 +232,7 @@ func (s *Session) ProposalCompleted() {
 					break
 				}
 			}
+			s.endProposal(current)
 			return
 		}
 	}
@@ -210,14 +263,22 @@ func (s *Session) ValidForSessionOp(shardID uint64) bool {
 // shard. Specifically:
 //   - The shard must match the session's shard
 //   - The session must not be a no-op session (clientID != 0)
-//   - The seriesID must be in the normal proposal range (not register/unregister)
+//   - The seriesID must be in the normal proposal range: at least
+//     SeriesIDFirstProposal (a session that was never registered, or whose
+//     registration has not been followed by PrepareForPropose, still carries
+//     0) and neither of the register/unregister sentinels
 //   - The respondedTo must not exceed seriesID (invariant: respondedTo <= seriesID)
+//
+// Series 0 is refused for the reservation's sake as much as the protocol's:
+// inFlight uses 0 for "nothing reserved", so a session at series 0 could
+// admit two concurrent proposals, both stamped 0 — the double admission
+// ErrSessionBusy exists to prevent.
 func (s *Session) ValidForProposal(shardID uint64) bool {
 	if s.shardID != shardID || s.clientID == noOPClientID {
 		return false
 	}
 	sid := s.seriesID.Load()
-	if sid == SeriesIDForRegister || sid == SeriesIDForUnregister {
+	if sid < SeriesIDFirstProposal || sid == SeriesIDForRegister || sid == SeriesIDForUnregister {
 		return false
 	}
 	return s.respondedTo.Load() <= sid

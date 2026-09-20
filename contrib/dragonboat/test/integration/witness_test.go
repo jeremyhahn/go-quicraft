@@ -47,7 +47,7 @@ func TestIntegration_DB_SyncRequestAddWitness(t *testing.T) {
 	// Add witness replica 30 at a dummy address, through the current leader,
 	// and confirmed by a linearizable read showing it as a WITNESS at that
 	// address -- a voter or a non-voting member at the same ID is a conflict.
-	cluster.addWitnessToLeader(t, 1, 30, "127.10.0.1:59990", membership.ConfigChangeID, membershipTimeout)
+	cluster.addWitnessToLeader(t, 1, 30, "127.10.0.1:59990", dbIdentityFor(30), membership.ConfigChangeID, membershipTimeout)
 
 	// Re-read membership and verify witness replica 30 is present.
 	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
@@ -86,7 +86,7 @@ func TestIntegration_DB_RequestAddWitness_Async(t *testing.T) {
 	//quicraft:direct-config-change the async RequestState/ResultC contract is under
 	// test: the assertion reads the result the request produces, which a synchronous
 	// idempotent helper would consume
-	rs, addErr := leaderHost.RequestAddWitness(1, 31, "127.10.0.1:59991", membership.ConfigChangeID, defaultTimeout)
+	rs, addErr := leaderHost.RequestAddWitnessWithIdentity(1, 31, "127.10.0.1:59991", dbIdentityFor(31), membership.ConfigChangeID, defaultTimeout)
 	if addErr != nil {
 		t.Fatalf("RequestAddWitness failed: %v", addErr)
 	}

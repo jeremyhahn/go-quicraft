@@ -19,17 +19,9 @@ package linearizability_test
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"fmt"
 	"io"
-	"math/big"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +35,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -632,79 +625,6 @@ func kvCreateFunc() (sm.CreateFunc, *smTracker) {
 // Host Construction Helpers
 // ---------------------------------------------------------------------------
 
-// testMTLSConfig generates an ephemeral ECDSA P-256 CA and leaf certificate
-// pair for integration test mTLS.
-func testMTLSConfig(t *testing.T) *config.MTLSConfig {
-	t.Helper()
-
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate CA key: %v", err)
-	}
-
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-		},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	caCertDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create CA cert: %v", err)
-	}
-
-	caCert, err := x509.ParseCertificate(caCertDER)
-	if err != nil {
-		t.Fatalf("parse CA cert: %v", err)
-	}
-
-	caCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertDER})
-
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate leaf key: %v", err)
-	}
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			Organization: []string{"QuicRaft Test"},
-			CommonName:   "localhost",
-		},
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback, net.IPv6zero},
-		NotBefore:             time.Now().Add(-1 * time.Minute),
-		NotAfter:              time.Now().Add(1 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	leafCertDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create leaf cert: %v", err)
-	}
-
-	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertDER})
-	leafKeyDER, err := x509.MarshalECPrivateKey(leafKey)
-	if err != nil {
-		t.Fatalf("marshal leaf key: %v", err)
-	}
-	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyDER})
-
-	return &config.MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   leafCertPEM,
-		Key:    leafKeyPEM,
-	}
-}
-
 // testHostConfig creates a valid HostConfig for linearizability testing.
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
@@ -767,8 +687,27 @@ type testCluster struct {
 	configs  []config.HostConfig
 	trackers []*smTracker
 	stopped  []atomic.Bool
-	mtls     *config.MTLSConfig
-	t        *testing.T
+	// ca issues every host's leaf — its own keypair, its own node identity
+	// (see test/testpki); configs keeps each host's leaf for its restart. ids
+	// holds each host's identity, recorded when the host was first built: a
+	// property of the leaf, so it survives a stop, and a founder's
+	// Config.MemberIdentities has to name every member — stopped ones too.
+	ca  *testpki.CA
+	ids []string
+	t   *testing.T
+}
+
+// identities maps every replica ID (index+1) to the node identity its host
+// reports: what a shard's Config.MemberIdentities has to name, and the join
+// anchor a new node is started with.
+func (c *testCluster) identities() map[uint64]string {
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	ids := make(map[uint64]string, len(c.ids))
+	for i, id := range c.ids {
+		ids[uint64(i+1)] = id
+	}
+	return ids
 }
 
 // newTestCluster creates an N-node cluster with real QUIC transport.
@@ -776,7 +715,8 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
 	const maxRetries = 3
-	mtls := testMTLSConfig(t)
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
 	hosts := make([]*quicraft.Host, numNodes)
 	configs := make([]config.HostConfig, numNodes)
@@ -787,7 +727,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		var cfg config.HostConfig
 		for attempt := range maxRetries {
 			addr = freePort(t)
-			cfg = testHostConfig(t, addr, mtls)
+			cfg = testHostConfig(t, addr, leaves[i])
 			var err error
 			h, err = quicraft.NewHost(cfg)
 			if err == nil {
@@ -806,12 +746,17 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		configs[i] = cfg
 	}
 
+	ids := make([]string, numNodes)
+	for i, h := range hosts {
+		ids[i] = h.NodeIdentity()
+	}
 	return &testCluster{
 		hosts:   hosts,
 		addrs:   addrs,
 		configs: configs,
 		stopped: make([]atomic.Bool, numNodes),
-		mtls:    mtls,
+		ca:      ca,
+		ids:     ids,
 		t:       t,
 	}
 }
@@ -842,6 +787,7 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 		trackers[i] = tracker
 
 		scfg := testShardConfig(shardID, replicaID)
+		scfg.MemberIdentities = c.identities()
 		if err := h.StartShard(members, false, createFn, scfg); err != nil {
 			c.t.Fatalf("StartShard[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -969,6 +915,7 @@ func (c *testCluster) restartNode(idx int, shardID uint64) {
 	createFn, tracker := kvCreateFunc()
 	replicaID := uint64(idx + 1)
 	scfg := testShardConfig(shardID, replicaID)
+	scfg.MemberIdentities = c.identities()
 
 	if err := h.StartShard(c.members(), false, createFn, scfg); err != nil {
 		h.Close()
@@ -995,6 +942,7 @@ func (c *testCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID, r
 		createFn, tracker := kvCreateFunc()
 		trackers[i] = tracker
 		scfg := cfgFn(shardID, replicaID)
+		scfg.MemberIdentities = c.identities()
 		if err := h.StartShard(members, false, createFn, scfg); err != nil {
 			c.t.Fatalf("StartShard[%d] shard=%d failed: %v", i, shardID, err)
 		}
@@ -1010,7 +958,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 	c.t.Helper()
 
 	addr := freePort(c.t)
-	cfg := testHostConfig(c.t, addr, c.mtls)
+	cfg := testHostConfig(c.t, addr, c.ca.Leaf(c.t))
 	h, err := quicraft.NewHost(cfg)
 	if err != nil {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
@@ -1024,14 +972,16 @@ func (c *testCluster) addNode(shardID uint64) int {
 	// election leaves leaderHost returning nil for a few ticks; the loop asks
 	// again rather than sampling once, and still fails — loudly — if the
 	// change has not landed within membershipTimeout. See test/membership.
-	if err := membership.TryAddNode(c.leaderHost, shardID, newReplicaID, addr, membershipTimeout); err != nil {
+	if err := membership.TryAddNode(c.leaderHost, shardID, newReplicaID, addr, h.NodeIdentity(), membershipTimeout); err != nil {
 		h.Close()
 		c.t.Fatalf("addNode: %v", err)
 	}
 
-	// Start the shard in join mode on the new host.
+	// Start the shard in join mode on the new host, anchored to the
+	// existing members: the bootstrap snapshot may come from whichever leads.
 	createFn, tracker := kvCreateFunc()
 	scfg := testShardConfig(shardID, newReplicaID)
+	scfg.MemberIdentities = c.identities()
 	if err := h.StartShard(nil, true, createFn, scfg); err != nil {
 		h.Close()
 		c.t.Fatalf("addNode: StartShard(join=true) replica=%d failed: %v", newReplicaID, err)
@@ -1045,6 +995,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 	c.configs = append(c.configs, cfg)
 	c.trackers = append(c.trackers, tracker)
 	c.stopped = append(c.stopped, atomic.Bool{})
+	c.ids = append(c.ids, h.NodeIdentity())
 	c.hostsMu.Unlock()
 
 	return idx

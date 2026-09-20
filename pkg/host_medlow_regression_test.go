@@ -409,7 +409,7 @@ func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	rollbacks, sweeperWins := 0, 0
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) && sweeperWins < wantSweeperWins {
-		rs, propErr := h.proposeEntry(expiredCtx, ns, 1, proto.Entry{Type: proto.EntryNormal, Cmd: []byte("x")})
+		rs, propErr := h.proposeEntry(expiredCtx, ns, 1, proto.Entry{Type: proto.EntryNormal, Cmd: []byte("x")}, nil)
 		// ErrDropped is the queue-overflow answer; ErrSystemBusy is the
 		// global rate limiter, which is not what is being exercised here.
 		if !errors.Is(propErr, ErrDropped) {

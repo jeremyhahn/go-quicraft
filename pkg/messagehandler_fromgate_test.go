@@ -215,8 +215,11 @@ func TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom(t *
 // quorum-bearing message delivered. A gate that fails this stops the shard from
 // committing or electing at all.
 func TestHandleMessage_ConfiguredMemberQuorumTrafficStillFlows(t *testing.T) {
-	const memberAddr = "127.0.0.1:5002"
-	ms := proto.Membership{Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr}}
+	const memberAddr, memberID = "127.0.0.1:5002", "spki:2222222222222222222222222222222222222222222222222222222222222222"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr},
+		Identities: map[uint64]string{2: memberID},
+	}
 
 	for _, msgType := range quorumBearingTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
@@ -228,7 +231,7 @@ func TestHandleMessage_ConfiguredMemberQuorumTrafficStillFlows(t *testing.T) {
 					{ShardID: 1, From: 2, To: 1, Type: msgType, Term: 5},
 				},
 			}
-			if err := handler.HandleMessage(batch, certCovering(memberAddr)); err != nil {
+			if err := handler.HandleMessage(batch, certCoveringAs(memberID, memberAddr)); err != nil {
 				t.Fatalf("HandleMessage: %v", err)
 			}
 			if len(eng.delivered) != 1 {
@@ -258,10 +261,15 @@ func TestHandleMessage_ConfiguredMemberQuorumTrafficStillFlows(t *testing.T) {
 func TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned(t *testing.T) {
 	const committedAddr = "node5.example.com:5001"
 	const advertisedAddr = "10.0.0.5:5001"
-	ms := proto.Membership{Addresses: map[uint64]string{1: "127.0.0.1:5001", 5: committedAddr}}
+	const memberID = "spki:5555555555555555555555555555555555555555555555555555555555555555"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 5: committedAddr},
+		Identities: map[uint64]string{5: memberID},
+	}
 
-	// One host, one certificate, two SANs: both spellings verify.
-	bothSpellings := certCovering(committedAddr, advertisedAddr)
+	// One host, one keypair, one certificate, two SANs: both spellings verify,
+	// and the identity is the same whichever the peer advertises.
+	bothSpellings := certCoveringAs(memberID, committedAddr, advertisedAddr)
 
 	for _, msgType := range quorumBearingTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
@@ -286,20 +294,24 @@ func TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned(t *t
 	}
 }
 
-// TestHandleMessage_MemberAtAnUncoveredAddressIsRefused pins the LIVENESS COST
-// the binding accepts on purpose, so it is a deliberate decision rather than an
-// accident someone silently "fixes" later.
+// TestHandleMessage_MemberAtANewAddressIsStillCounted pins the liveness WIN the
+// identity binding buys, so it is not lost to a later "tightening".
 //
 // A member that comes back at an address its certificate does not cover — a
-// genuinely new host, not a second spelling of the same one — has its
-// quorum-bearing traffic refused until a config change carrying the new address
-// COMMITS. During quorum loss no config change can commit, so such a shard does
-// not self-heal and an operator has to intervene. Routing is unaffected: this
-// host can still SEND to the moved peer.
-func TestHandleMessage_MemberAtAnUncoveredAddressIsRefused(t *testing.T) {
+// genuinely new host — keeps its keypair, so its identity is unchanged and its
+// quorum-bearing traffic keeps being counted with no config change at all. The
+// address binding this replaced refused it until a config change carrying the
+// new address COMMITTED, and during quorum loss no config change can commit,
+// so such a shard did not self-heal. Routing relearns from the same traffic.
+func TestHandleMessage_MemberAtANewAddressIsStillCounted(t *testing.T) {
 	const committedAddr, movedAddr = "10.0.0.5:5001", "10.0.0.9:6001"
-	ms := proto.Membership{Addresses: map[uint64]string{1: "127.0.0.1:5001", 5: committedAddr}}
-	movedCert := certCovering(movedAddr)
+	const memberID = "spki:5555555555555555555555555555555555555555555555555555555555555555"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 5: committedAddr},
+		Identities: map[uint64]string{5: memberID},
+	}
+	// The certificate covers only the NEW address; the keypair is the same.
+	movedCert := certCoveringAs(memberID, movedAddr)
 
 	eng, handler := fromGateRig(t, ms, nil)
 
@@ -314,32 +326,14 @@ func TestHandleMessage_MemberAtAnUncoveredAddressIsRefused(t *testing.T) {
 			t.Fatalf("HandleMessage: %v", err)
 		}
 	}
-	if len(eng.delivered) != 0 {
-		t.Fatalf("%d quorum-bearing messages from a member at an address its certificate "+
-			"does not cover were delivered, want 0", len(eng.delivered))
-	}
-	// A refused message teaches nothing — learning runs only after the gate, so
-	// a dropped message can never establish the address that would admit it.
-	if got, err := handler.host.registry.Resolve(1, 5); err == nil {
-		t.Fatalf("a refused quorum-bearing message taught routing %q for replica 5", got)
-	}
-
-	// Routing DOES relearn from the member's exempt traffic — its RequestVote
-	// when it campaigns — so this host can still reach the moved peer even
-	// though it will not count what the peer says back. That is the split the
-	// design rests on: routing is learnable, acceptance is not.
-	campaign := proto.MessageBatch{
-		SourceAddress: movedAddr,
-		Requests: []proto.Message{
-			{ShardID: 1, From: 5, To: 1, Type: proto.RequestVote, Term: 6},
-		},
-	}
-	if err := handler.HandleMessage(campaign, movedCert); err != nil {
-		t.Fatalf("HandleMessage(campaign): %v", err)
+	if len(eng.delivered) != len(quorumBearingTypes) {
+		t.Fatalf("%d of %d quorum-bearing messages from a member at a new address were "+
+			"delivered: the member kept its keypair, so nothing about it changed",
+			len(eng.delivered), len(quorumBearingTypes))
 	}
 	if got, err := handler.host.registry.Resolve(1, 5); err != nil || got != movedAddr {
 		t.Fatalf("routing for replica 5 = (%q, %v), want (%q, nil): the moved member is "+
-			"unreachable as well as uncounted", got, err, movedAddr)
+			"counted but unreachable", got, err, movedAddr)
 	}
 }
 
@@ -347,14 +341,19 @@ func TestHandleMessage_MemberAtAnUncoveredAddressIsRefused(t *testing.T) {
 // half, and the reason the gate is scoped to quorum-bearing types only.
 //
 // A replica joining a shard starts with an EMPTY configuration and an empty
-// registry: it knows no members, so a binding on the leader's Replicate would
-// drop the very message the join depends on. Replicate carries a term raft
-// validates and hands the sender no quorum outcome, so it stays on the
-// pre-existing path — the joiner records the leader's address AND steps the
-// message, which is what makes the ack possible.
+// registry: it knows no members, so a binding on the committed configuration
+// alone would drop the very message the join depends on. The join anchor the
+// operator started the shard with names the leader and its identity, and on
+// that the joiner records the leader's address AND steps the message, which is
+// what makes the ack possible.
 func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	const leaderAddr = "127.0.0.1:5001"
+	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
 	handler, node, rec := authorizationRigRecordingJoining(t, proto.Membership{})
+	// The join anchor names the leader and its identity; nothing else can,
+	// because the joiner holds no configuration.
+	handler.host.markShardJoining(1)
+	handler.host.setShardAnchor(1, map[uint64]string{1: leaderID})
 
 	if node.IsMember(1) {
 		t.Fatal("fixture: a joining replica must know no members")
@@ -369,7 +368,7 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 			{ShardID: 1, From: 1, To: 1, Type: proto.Replicate, Term: 3},
 		},
 	}
-	if err := handler.HandleMessage(batch, certCovering(leaderAddr)); err != nil {
+	if err := handler.HandleMessage(batch, certCoveringAs(leaderID, leaderAddr)); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
 
@@ -450,18 +449,22 @@ func TestHandleMessage_LearnCannotAuthorizeItsOwnMessage(t *testing.T) {
 // nothing. Committed membership changes only through consensus.
 func TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate(t *testing.T) {
 	const victimAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5099"
-	ms := proto.Membership{Addresses: map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: victimAddr,
-	}}
-	attackerCert := certCovering(attackerAddr)
+	const victimID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
+	const attackerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: victimAddr},
+		Identities: map[uint64]string{2: victimID},
+	}
+	attackerCert := certCoveringAs(attackerID, attackerAddr)
 
 	eng, handler := fromGateRig(t, ms, map[uint64]string{2: victimAddr})
 
 	// Step 1: an exempt message claiming replica 2's From. It is delivered
-	// (raft validates its term and it hands the sender no quorum outcome) and it
-	// DOES re-point the routing entry — asserted, so the test cannot pass
-	// vacuously by the poisoning silently failing.
+	// (raft validates its term and it hands the sender no quorum outcome). It
+	// used to re-point the routing entry too, on an address-only shard; with
+	// the victim's identity committed the overwrite is refused as well, and
+	// that is asserted so a regression in routingOverwriteAuthorized shows up
+	// here rather than only in the exfiltration test.
 	poison := proto.MessageBatch{
 		SourceAddress: attackerAddr,
 		Requests: []proto.Message{
@@ -471,9 +474,9 @@ func TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate(t *testing.T) 
 	if err := handler.HandleMessage(poison, attackerCert); err != nil {
 		t.Fatalf("HandleMessage(poison): %v", err)
 	}
-	if got, err := handler.host.registry.Resolve(1, 2); err != nil || got != attackerAddr {
-		t.Fatalf("fixture: the registry was not poisoned (resolved %q, err %v), so this "+
-			"test would pass without proving anything", got, err)
+	if got, err := handler.host.registry.Resolve(1, 2); err != nil || got != victimAddr {
+		t.Fatalf("the registry was re-pointed to %q (err %v) by a peer that does not "+
+			"hold replica 2's committed identity", got, err)
 	}
 
 	// Step 2: the quorum-bearing follow-up the poisoning was meant to unlock.
@@ -553,17 +556,22 @@ func TestHandleMessage_QuorumBearingRefusedForUnloadedShard(t *testing.T) {
 // Both paths now resolve the sender through committedSenderAddress.
 func TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5001", "127.0.0.1:5099"
-	ms := proto.Membership{Addresses: map[uint64]string{
-		1: leaderAddr,
-		2: "127.0.0.1:5002",
-	}}
-	attackerCert := certCovering(attackerAddr)
+	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
+	const attackerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: leaderAddr, 2: "127.0.0.1:5002"},
+		Identities: map[uint64]string{1: leaderID},
+	}
+	attackerCert := certCoveringAs(attackerID, attackerAddr)
 
 	eng, handler := fromGateRig(t, ms, map[uint64]string{1: leaderAddr})
 
-	// Step 1: poison the routing entry for the leader. This SUCCEEDS — routing
-	// stays learnable on purpose — and is asserted so the test cannot pass by
-	// the poisoning silently failing.
+	// Step 1: try to poison the routing entry for the leader. On an
+	// address-only shard this used to SUCCEED (routing stayed learnable); with
+	// the leader's identity committed the overwrite is refused too. Either
+	// way the snapshot path below must not consult the registry, so the
+	// registry is driven to whichever value it will take and the step-2
+	// assertion stands on the committed membership alone.
 	poison := proto.MessageBatch{
 		SourceAddress: attackerAddr,
 		Requests: []proto.Message{
@@ -573,10 +581,13 @@ func TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot(t *testing.T) 
 	if err := handler.HandleMessage(poison, attackerCert); err != nil {
 		t.Fatalf("HandleMessage(poison): %v", err)
 	}
-	if got, err := handler.host.registry.Resolve(1, 1); err != nil || got != attackerAddr {
-		t.Fatalf("fixture: the registry was not poisoned (resolved %q, err %v), so the "+
-			"snapshot step below would prove nothing", got, err)
+	if got, err := handler.host.registry.Resolve(1, 1); err != nil || got != leaderAddr {
+		t.Fatalf("the registry was re-pointed to %q (err %v) by a peer that does not "+
+			"hold the leader's committed identity", got, err)
 	}
+	// Poison it directly, the way a registry write from any other source
+	// would, so the snapshot step proves the path does not read it.
+	handler.host.registry.Register(1, 1, attackerAddr)
 
 	// Step 2: the snapshot the poisoning was meant to unlock, carrying a
 	// membership that hands the attacker the shard.
@@ -659,106 +670,83 @@ func TestHandleMessage_SharedCommittedAddressFailsClosed(t *testing.T) {
 	}
 }
 
-// quorumBearingClassification is the EXHAUSTIVE expected classification of every
-// message type proto defines. The table is driven off proto's own type space
-// (see TestIsQuorumBearing_EveryKnownMessageTypeIsClassified), so a type added
-// later fails this test until someone decides which side of the gate it is on —
-// which is the only mechanism that stops a new response type from silently
-// escaping the sender binding, as ReadIndexResp and TimeoutNow both did.
+// TestHandleMessage_EveryMessageTypeIsBoundToASender drives the sender binding
+// off proto's OWN type space rather than off any list in the handler, so it
+// cannot pass by testing the author's answer against itself.
 //
-// Every EXEMPT entry names the raft handler that proves acceptance hands the
-// sender no quorum outcome. "gated" needs no such proof: it is the default and
-// the safe direction.
-var quorumBearingClassification = map[uint64]struct {
-	gated  bool
-	reason string
-}{
-	// --- exempt: peer-to-peer traffic that buys the sender nothing tallied ---
-	proto.Replicate: {false, "raft.handleAppend: appends and commits, never tallied. " +
-		"Exempt from THIS gate so a replica whose configuration lags can still hear " +
-		"the leader that would bring it up to date — and bound instead by the " +
-		"leader-originated binding, which refuses a From the configuration NAMES " +
-		"but the connection cannot prove (see leaderOriginatedMessages)"},
-	proto.Heartbeat: {false, "raft.handleHeartbeat: advances commit, never tallied. " +
-		"Exempt from this gate for the same lag reason as Replicate, and bound by " +
-		"the leader-originated binding for the same forgery reason"},
-	proto.RequestVote: {false, "raft.handleVoteRequest: answered, never tallied. Exempt so " +
-		"a member that recovered at a new address can still campaign during quorum loss"},
-	proto.RequestPreVote: {false, "raft.handleVoteRequest: answered, never tallied, and " +
-		"PreVote does not advance terms"},
-	proto.Quiesce:   {false, "raft.handleQuiesceMessage: changes tick intervals only"},
-	proto.Propose:   {false, "stepLeader/stepFollower Propose: client work forwarded to the leader"},
-	proto.ReadIndex: {false, "raft.handleLeaderReadIndex: a REQUEST for a quorum round, not its result"},
-	proto.RateLimit: {false, "raft.handleLeaderRateLimit: advisory follower log-size feedback"},
+// There used to be an exempt list here — types whose acceptance "could not hand
+// the sender a quorum outcome" — and it was exactly the set a certificate
+// holder could use to move a shard's term (RequestVote), install itself as
+// leader (Heartbeat), and have commands appended (a forwarded Propose). Every
+// type is bound now (#197 B): a sender the committed configuration, the pending
+// configuration and the join anchor all fail to name is refused whatever it
+// sends, and an unrecognised type is refused with the rest. The positive
+// control is the same message from a configured member on its own connection.
+func TestHandleMessage_EveryMessageTypeIsBoundToASender(t *testing.T) {
+	const memberAddr, strangerAddr = "127.0.0.1:5002", "127.0.0.1:5099"
+	const memberID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
+	const strangerID = "spki:9999999999999999999999999999999999999999999999999999999999999999"
+	ms := proto.Membership{
+		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr},
+		Identities: map[uint64]string{1: fixtureIdentity, 2: memberID},
+	}
 
-	// --- gated: accepting one hands the sender a quorum outcome ---
-	proto.ReplicateResp:      {true, "tallied: advances matchIndex and commitIndex"},
-	proto.HeartbeatResp:      {true, "tallied: advances the ReadIndex ack count"},
-	proto.RequestVoteResp:    {true, "tallied: feeds the vote count"},
-	proto.RequestPreVoteResp: {true, "tallied: feeds the pre-vote count"},
-	proto.ReadIndexResp:      {true, "the wire encoding of a COMPLETED heartbeat quorum round"},
-	proto.TimeoutNow:         {true, "the campaign entry point that bypasses PreVote and CheckQuorum"},
-
-	// --- gated: process-local types no peer may send at all ---
-	proto.InstallSnapshot: {true, "process-local; raft.step refuses it from the wire"},
-	proto.SnapshotStatus:  {true, "process-local; raft.step refuses it from the wire"},
-	proto.Unreachable:     {true, "process-local; raft.step refuses it from the wire"},
-	proto.LeaderTransfer:  {true, "process-local; raft.step refuses it from the wire"},
-
-	// --- gated: local tick/event types that never travel ---
-	proto.LocalTick:         {true, "local: engine tick"},
-	proto.Election:          {true, "local: election trigger"},
-	proto.LeaderHeartbeat:   {true, "local: heartbeat trigger"},
-	proto.ConfigChangeEvent: {true, "local: config change event"},
-	proto.NoOP:              {true, "local: no-op"},
-	proto.Ping:              {true, "local: liveness probe"},
-	proto.Pong:              {true, "local: liveness probe reply"},
-	proto.CheckQuorum:       {true, "local: quorum check trigger"},
-	proto.BatchedReadIndex:  {true, "local: batched read index trigger"},
-	proto.SnapshotReceived:  {true, "local: snapshot receive notification"},
-}
-
-// TestIsQuorumBearing_EveryKnownMessageTypeIsClassified drives the
-// classification off proto's OWN type space rather than off the handler's list,
-// so it cannot pass by testing the author's answer against itself.
-//
-// This is the test that would have caught ReadIndexResp and TimeoutNow: both
-// were on the exempt list with a one-line justification about DIRECTION
-// ("leader-to-follower answers/commands"), and direction is not the property
-// that matters. Requiring a named raft handler per exemption is what forces the
-// question "what does accepting this actually buy the sender?".
-func TestIsQuorumBearing_EveryKnownMessageTypeIsClassified(t *testing.T) {
 	// proto assigns message types from a small dense range; scan well past it so
-	// a newly added constant is discovered here instead of slipping through.
+	// a newly added constant is covered here instead of slipping through, and
+	// probe one value proto does not define at all.
 	const scanLimit = 256
-	seen := 0
+	types := []uint64{9999}
 	for msgType := uint64(0); msgType < scanLimit; msgType++ {
-		name := proto.MessageTypeName(msgType)
-		if name == fmt.Sprintf("Unknown(%d)", msgType) {
-			continue // not a type proto defines
-		}
-		seen++
-		want, ok := quorumBearingClassification[msgType]
-		if !ok {
-			t.Errorf("%s (%d) is defined by proto but not classified here. Decide which "+
-				"side of the sender binding it belongs on: if accepting one can hand the "+
-				"sender a quorum outcome it must be GATED, and if not, name the raft "+
-				"handler that proves it", name, msgType)
-			continue
-		}
-		if got := isQuorumBearing(msgType); got != want.gated {
-			t.Errorf("isQuorumBearing(%s) = %v, want %v — %s", name, got, want.gated, want.reason)
+		if proto.MessageTypeName(msgType) != fmt.Sprintf("Unknown(%d)", msgType) {
+			types = append(types, msgType)
 		}
 	}
-	if seen != len(quorumBearingClassification) {
-		t.Errorf("classified %d types but proto defines %d in [0,%d): the table has an "+
-			"entry for a type proto no longer has", len(quorumBearingClassification), seen, scanLimit)
+	if len(types) < 10 {
+		t.Fatalf("scanned only %d message types; the type space has moved", len(types))
 	}
 
-	// An unrecognised type must fail closed.
-	if !isQuorumBearing(9999) {
-		t.Error("an unknown message type was classified as non-quorum-bearing; a " +
-			"response type added later would escape the sender binding")
+	for _, msgType := range types {
+		name := proto.MessageTypeName(msgType)
+		t.Run(name, func(t *testing.T) {
+			eng, handler := fromGateRig(t, ms, map[uint64]string{2: memberAddr})
+
+			// A stranger naming a replica ID the configuration does not hold.
+			stranger := proto.MessageBatch{
+				SourceAddress: strangerAddr,
+				Requests: []proto.Message{
+					{ShardID: 1, From: 99, To: 1, Type: msgType, Term: 5},
+				},
+			}
+			if err := handler.HandleMessage(stranger, certCoveringAs(strangerID, strangerAddr)); err != nil {
+				t.Fatalf("HandleMessage(stranger): %v", err)
+			}
+			if len(eng.delivered) != 0 {
+				t.Fatalf("a %s from a replica no configuration names was delivered", name)
+			}
+			// The same stranger claiming a member's ID.
+			forged := stranger
+			forged.Requests = []proto.Message{{ShardID: 1, From: 2, To: 1, Type: msgType, Term: 5}}
+			if err := handler.HandleMessage(forged, certCoveringAs(strangerID, strangerAddr)); err != nil {
+				t.Fatalf("HandleMessage(forged): %v", err)
+			}
+			if len(eng.delivered) != 0 {
+				t.Fatalf("a %s claiming member 2's From was delivered from a connection "+
+					"that does not hold member 2's identity", name)
+			}
+			// POSITIVE CONTROL: the member itself.
+			genuine := proto.MessageBatch{
+				SourceAddress: memberAddr,
+				Requests:      []proto.Message{{ShardID: 1, From: 2, To: 1, Type: msgType, Term: 5}},
+			}
+			if err := handler.HandleMessage(genuine, certCoveringAs(memberID, memberAddr)); err != nil {
+				t.Fatalf("HandleMessage(genuine): %v", err)
+			}
+			if len(eng.delivered) != 1 {
+				t.Fatalf("a %s from a configured member on its own connection was "+
+					"dropped (%d delivered): the gate refuses traffic it must not",
+					name, len(eng.delivered))
+			}
+		})
 	}
 }
 

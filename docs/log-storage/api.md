@@ -79,7 +79,6 @@ each one it implements enables a capability rather than changing a contract.
 | `EpochAwareLogDB` | `MinLiveEpoch() (uint64, error)`, the safe-purge floor for barrier DEKs. `0` with a nil error means no encrypted records, or no barrier. |
 | `PerBarrierEpochAwareLogDB` | `MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)`, the same restricted to one barrier's records |
 | `BarrierShardEnumerator` | enumerating which shards are behind which barrier |
-| `RecoveryResidualReporter` | `RecoveryResiduals()` — non-empty exactly when the node may have come back **shorter than the log it acknowledged** |
 
 The three-value form is a fail-safe contract callers **must** honour before
 purging any DEK:
@@ -101,7 +100,7 @@ the caller installed — compared by identity.
 ### Storage-layer types
 
 `Entry`, `State`, `Membership`, `Snapshot`, `Bootstrap`, `Update`, `NodeInfo`,
-`LogRange`, `RecoveryResidual`, `ResidualNodeRange`.
+`LogRange`.
 
 These are **separate types from `pkg/proto`'s**, deliberately, so serialization
 and persistence stay independently changeable. `CopyEntryCmd(e Entry) Entry`

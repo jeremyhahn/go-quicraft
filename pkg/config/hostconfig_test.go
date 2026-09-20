@@ -98,8 +98,8 @@ func TestHostConfig_SetDefaults(t *testing.T) {
 		if hc.ShutdownTimeout != 10*time.Second {
 			t.Errorf("ShutdownTimeout = %v, want 10s", hc.ShutdownTimeout)
 		}
-		if hc.MaxTotalInMemLogSize != 2*1024*1024*1024 {
-			t.Errorf("MaxTotalInMemLogSize = %d, want %d", hc.MaxTotalInMemLogSize, 2*1024*1024*1024)
+		if want := uint64(2 * 1024 * 1024 * 1024); hc.MaxTotalInMemLogSize != want {
+			t.Errorf("MaxTotalInMemLogSize = %d, want %d", hc.MaxTotalInMemLogSize, want)
 		}
 	})
 

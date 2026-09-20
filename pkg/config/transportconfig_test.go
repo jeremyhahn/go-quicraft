@@ -163,9 +163,9 @@ func TestTransportConfig_SetDefaults(t *testing.T) {
 			t.Errorf("MaxConcurrentSnapshotReceives = %d, want 8",
 				tc.MaxConcurrentSnapshotReceives)
 		}
-		if tc.MaxSnapshotReceiveMemory != 2*1024*1024*1024 {
+		if want := int64(2 * 1024 * 1024 * 1024); tc.MaxSnapshotReceiveMemory != want {
 			t.Errorf("MaxSnapshotReceiveMemory = %d, want %d",
-				tc.MaxSnapshotReceiveMemory, 2*1024*1024*1024)
+				tc.MaxSnapshotReceiveMemory, want)
 		}
 		if tc.MaxDecompressedSize != 128*1024*1024 {
 			t.Errorf("MaxDecompressedSize = %d, want %d",

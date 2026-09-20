@@ -14,7 +14,10 @@
 
 package logdb
 
-import "github.com/jeremyhahn/go-quicraft/pkg/config"
+import (
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
 
 // LogDB-layer types define the storage-specific structures used by the
 // persistence layer. These are separate from proto types to maintain a
@@ -116,9 +119,8 @@ type Membership struct {
 	// Identities maps replica IDs to the committed cryptographic node
 	// identity the receive-side gate authorizes a claimed msg.From against
 	// (see proto.Membership.Identities). It is a single map spanning every
-	// role, and it is SPARSE: a replica with no entry falls back to the
-	// committed-address check, or is refused outright under
-	// TransportConfig.RequireMemberIdentity.
+	// role, and on a shard bootstrapped behind a transport it is complete: a
+	// replica with no entry has every message refused.
 	//
 	// It MUST survive the snapshot-metadata round-trip, for the same reason
 	// the session fields on Entry must survive the WAL one. Identities reach
@@ -179,6 +181,14 @@ type Snapshot struct {
 	// value is config.NoCompression, which matches both the package default
 	// and every record written before this field existed.
 	Compression config.CompressionType
+}
+
+// CheckBounds is proto.Snapshot.CheckBounds for the storage-layer type: it
+// refuses a position at or above proto.MaxLogIndex / proto.MaxTerm with the
+// same sentinels, so a LogDB can apply the one protocol bound before a
+// snapshot becomes durable without converting the type to do it.
+func (s *Snapshot) CheckBounds() error {
+	return (&proto.Snapshot{Index: s.Index, Term: s.Term}).CheckBounds()
 }
 
 // Bootstrap contains the initial cluster configuration used to

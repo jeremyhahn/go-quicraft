@@ -244,12 +244,13 @@ type Membership struct {
 	// consensus path as the address — is what makes it unforgeable by an
 	// inbound message.
 	//
-	// It is SPARSE and may be empty. A shard bootstrapped before identities
-	// existed, or by an operator who supplied none, has no entry for its
-	// members, and the receive-side gate then falls back to the committed
-	// ADDRESS check for those replicas (or refuses them outright under
-	// TransportConfig.RequireMemberIdentity). A missing entry is therefore a
-	// compatibility state, never a permission.
+	// On any shard bootstrapped behind a transport it is COMPLETE: admission
+	// requires an identity for every member (config.Config.RequireMemberIdentities),
+	// and the receive-side gate authorizes a member by this map and by nothing
+	// else. A replica with no entry has every message refused; the only way
+	// to hold such a configuration is data written by a build that did not
+	// require identities, or a host without a transport, where nothing
+	// crosses the wire. A missing entry is never a permission.
 	Identities map[uint64]string
 	// RemovedIdentities maps the replica IDs in Removed to the node identity
 	// the configuration held for them AT THE MOMENT OF REMOVAL. It is the
@@ -293,15 +294,11 @@ type Membership struct {
 	//
 	// # Residual: address-only shards
 	//
-	// It is SPARSE, for the same reason Identities is: a shard whose members
-	// carry no committed identity records nothing here when they are removed,
-	// and the deny-list for that shard remains what it always was — a check on
-	// the claimed msg.From, evadable by naming another ID. Nothing inside
-	// replicated state can fix that, because there is no authenticated fact
-	// about the connection for the configuration to be asked about. The remedy
-	// is to commit identities (Config.MemberIdentities at bootstrap,
-	// Host.RequestAddNodeWithIdentity thereafter) and, once migrated,
-	// TransportConfig.RequireMemberIdentity.
+	// It is as complete as Identities is: every member admitted behind a
+	// transport carries an identity, so every removal records one here. A
+	// member removed from a configuration written without identities leaves
+	// no entry, and the deny-list for it is the claimed-msg.From check alone;
+	// such a configuration is wiped and re-bootstrapped rather than migrated.
 	RemovedIdentities map[uint64]string
 }
 

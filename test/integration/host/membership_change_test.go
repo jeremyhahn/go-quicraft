@@ -397,3 +397,46 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 
 	t.Logf("membership change with snapshot catch-up complete: all data verified")
 }
+
+// TestHostAPI_MembershipChange_RemoveFollowerFromTwoVoters is the regression
+// for an uncommitted removal revoking a current member. In a two-voter shard
+// the RemoveNode(B) the leader appends commits only with B's own ack; had the
+// leader's receive gate honoured the removal before it was committed, that
+// ack would have been refused, the entry could never commit, and the shard
+// would have stayed leaderless — across restarts, since the uncommitted tail
+// is re-seeded. The removal must commit through B's ack, and the survivor
+// must go on serving alone.
+func TestHostAPI_MembershipChange_RemoveFollowerFromTwoVoters(t *testing.T) {
+	cluster := newTestCluster(t, 2)
+	t.Cleanup(func() { cluster.close() })
+
+	const shardID uint64 = 1
+	trackers := cluster.startShard(shardID)
+	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	initialData := proposeNEntries(t, cluster, trackers, shardID, 3, "two-voters")
+	verifyAllData(t, cluster, trackers, shardID, initialData)
+
+	followerIdx := 1 - leaderIdx
+	followerReplicaID := uint64(followerIdx + 1)
+	membership.DeleteNode(t, cluster.leaderHost, shardID, followerReplicaID, membershipTimeout)
+
+	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
+	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 1, membershipTimeout)
+	cluster.stopNode(followerIdx)
+
+	// The lone survivor leads and serves.
+	postRemoveData := proposeNEntries(t, cluster, trackers, shardID, 3, "lone-voter")
+	for key, expectedVal := range postRemoveData {
+		waitForCondition(t, membershipTimeout, fmt.Sprintf("survivor SyncRead key=%q", key), func() bool {
+			rCtx, rCancel := context.WithTimeout(context.Background(), defaultTimeout)
+			defer rCancel()
+			//quicraft:direct-read the lone survivor IS the subject
+			got, err := cluster.hosts[leaderIdx].SyncRead(rCtx, shardID, key)
+			if err != nil {
+				return false
+			}
+			val, ok := got.(string)
+			return ok && val == expectedVal
+		})
+	}
+}

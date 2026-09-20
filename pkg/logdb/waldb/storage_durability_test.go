@@ -734,3 +734,49 @@ func TestOpen_FailedOpenDoesNotAccumulateEmptySegments(t *testing.T) {
 		}
 	}
 }
+
+// TestRotateSegment_ClosingSyncFailurePoisons pins the fail-stop on the
+// closing fdatasync segment.Close issues: it is what puts the segment's last
+// sync mark on the medium, and after a failed fdatasync nothing about the
+// file can be established, so rotateSegment poisons the DB on it exactly as
+// it does for a failed Sync. The first Sync of the rotation (the one that
+// acknowledges the records and appends the mark) is allowed through; the
+// closing one fails.
+func TestRotateSegment_ClosingSyncFailurePoisons(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(8*1024))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const nodeA, replicaID = uint64(1), uint64(1)
+	if err := db.SaveEntries(nodeA, replicaID, []logdb.Entry{
+		{Index: 1, Term: 1, Cmd: make([]byte, 4000)},
+	}); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	simulated := errors.New("simulated EIO on the closing fdatasync")
+	shard := db.getShard(nodeA)
+	shard.mu.Lock()
+	shard.activeSegment.f = &failingSyncFile{File: shard.activeSegment.f, syncErr: simulated, failAfter: 1}
+	shard.mu.Unlock()
+
+	// Overflow the segment: rotation's Sync succeeds, Close's fdatasync fails.
+	err = db.SaveEntries(nodeA, replicaID, []logdb.Entry{
+		{Index: 2, Term: 1, Cmd: make([]byte, 4000)},
+	})
+	if err == nil {
+		t.Fatal("SaveEntries: expected failure when the rotation's closing fdatasync fails")
+	}
+	if !errors.Is(err, errSegmentCloseSync) || !errors.Is(err, simulated) {
+		t.Fatalf("SaveEntries error = %v, want errSegmentCloseSync wrapping the injected failure", err)
+	}
+	if !db.poisoned.Load() {
+		t.Fatal("DB not poisoned after the closing fdatasync failed; a Sync failure by another name must fail-stop")
+	}
+	if err := db.SaveEntries(nodeA, replicaID, makeEntries(3, 1, 1)); !errors.Is(err, ErrDBPoisoned) {
+		t.Fatalf("SaveEntries after poison = %v, want ErrDBPoisoned", err)
+	}
+}

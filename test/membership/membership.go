@@ -425,15 +425,18 @@ func resolved(
 	return attempt, read
 }
 
-// TryAddNode adds replicaID as a voting member at addr through whichever
-// replica leads shardID at each attempt, and returns nil once a linearizable
-// read of the membership shows it there. It is AddNode's error-returning
-// form, for callers with resources to release before failing the test.
-func TryAddNode(resolve proposer.Resolver, shardID, replicaID uint64, addr string, budget time.Duration) error {
+// TryAddNode adds replicaID as a voting member at addr, committing identity
+// as its node identity (the value the new node reports from Host.NodeIdentity;
+// required on a host with a transport, see config.Config.RequireMemberIdentities),
+// through whichever replica leads shardID at each attempt, and returns nil once
+// a linearizable read of the membership shows it there. It is AddNode's
+// error-returning form, for callers with resources to release before failing
+// the test.
+func TryAddNode(resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) error {
 	attempt, read := resolved(resolve, shardID, func(ctx context.Context, h *quicraft.Host) error {
-		return h.SyncRequestAddNode(ctx, shardID, replicaID, addr, 0) //quicraft:direct-config-change the single attempt Drive is built from
+		return h.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, 0) //quicraft:direct-config-change the single attempt Drive is built from
 	})
-	desc := fmt.Sprintf("SyncRequestAddNode(replica=%d, addr=%s)", replicaID, addr)
+	desc := fmt.Sprintf("SyncRequestAddNodeWithIdentity(replica=%d, addr=%s)", replicaID, addr)
 	return Drive(desc, budget, attempt, read, AddNodeLanded(replicaID, addr))
 }
 
@@ -450,9 +453,9 @@ func TryDeleteNode(resolve proposer.Resolver, shardID, replicaID uint64, budget 
 
 // AddNode is TryAddNode for the test goroutine: it fails the test on any
 // error.
-func AddNode(t *testing.T, resolve proposer.Resolver, shardID, replicaID uint64, addr string, budget time.Duration) {
+func AddNode(t *testing.T, resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) {
 	t.Helper()
-	if err := TryAddNode(resolve, shardID, replicaID, addr, budget); err != nil {
+	if err := TryAddNode(resolve, shardID, replicaID, addr, identity, budget); err != nil {
 		t.Fatal(err)
 	}
 }

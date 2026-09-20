@@ -894,38 +894,80 @@ joiner never runs it. The enforcing counterpart is on the receive path
 (`refuseInboundPromiscuousCert`). See
 [QUIC Transport](../quic-transport/engineering.md#per-node-sans-are-a-hard-deployment-precondition).
 
-### Joining is not an authorization bypass
+### Every sender is bound to a replica it can prove it is
 
-Per-shard authorization is a **removed-node tombstone deny-list**, the model
-etcd and Consul use, not a member allow-list. A shard records the replicas (and
-node identities) whose removal it has committed, and refuses their traffic. It
-does not require a replica to have been pre-approved before it may talk.
+Per-shard authorization first refuses the replicas (and node identities) whose
+removal the shard has committed — the tombstone deny-list etcd and Consul use —
+and then binds **every** inbound message's `From` to the authenticated peer.
+There are exactly three facts a replica holds that can vouch for a sender, and
+each binds the connection's identity, never an address (`senderBinding`,
+`#197 B`):
 
-That is deliberate and it is what makes joining work at all. A replica joining a
-shard starts with an empty configuration: it does not yet know the leader is a
-member. If it could not record the leader's address it could not send its
-`ReplicateResp` back, the leader would never advance its match index, and the
-join would never complete.
+1. The **committed** configuration names the sender with a node identity, and
+   the connection presents it.
+2. The **pending** configuration does: a config-carrying entry in this
+   replica's own log, appended but not yet applied, admits the sender with an
+   identity — and a committed `RemoveNode` there, above the applied
+   configuration, is a pending tombstone refused before anything else is
+   consulted, by the removed ID and by the keypair it held
+   (`Peer.PendingRemoval`), because adds and removals are folded in log
+   order and the gate sees them in the same order. An uncommitted removal
+   revokes nobody: admission on an entry that may be truncated costs
+   nothing, revocation on one can wedge the shard. This is the lagging follower that holds the `AddNode` for the new
+   leader before committing it; it must admit that leader's `Replicate` and
+   `Heartbeat` or it can never catch up. The entry reached this log through a
+   sender bound by the same rule, so the pending configuration is as
+   trustworthy as the committed one.
+3. The **operator anchor** does: the replicas the operator started this shard
+   with (`Config.MemberIdentities`) and their identities. A joiner holds no
+   configuration, so nothing else can say who may bring it one — the leader's
+   `Replicate` it must ack, and the bootstrap snapshot itself. An established
+   replica that was down while a member was added and elected holds no entry
+   for that leader either, and a restart with a map naming it is how its
+   operator vouches for it without a wipe. On such a restart the map is held
+   to what was recovered (`checkRecoveredIdentities`): it may not name a
+   different identity for a committed member, nor bind a committed member's
+   identity to a second replica ID — the anchor admits senders the committed
+   configuration does not know, so that entry would let one keypair send as
+   two replicas — and the host itself must present the identity the shard
+   committed for its replica, or the start is refused rather than every peer
+   refusing the replica with nothing local saying why. That check sees the
+   configuration recovery handed `StartShard`; bindings committed after it
+   are covered at the moment they matter — the receive gate asks the
+   committed configuration (`Peer.IdentityHolder`) before the pending
+   configuration or the anchor may admit a sender, so a keypair the
+   committed configuration binds to one replica is never admitted as
+   another, and a committed binding for this replica that the host does not
+   present is reported at ERROR when it is applied. An anchor entry whose
+   identity the shard has since removed is inert (the removal deny-list runs
+   first) and tolerated at WARN, because every founder's map names it after
+   a routine `RemoveNode`.
 
-The separation that keeps this safe is between **routing** and
+There used to be type-based exemptions — leader-originated pushes and vote
+requests from an unknown replica ID were admitted so a lagging replica could be
+brought up to date — and they let any holder of a cluster certificate move a
+shard's term, install itself as leader on followers, re-point routing, and have
+forwarded proposals appended. The pending configuration replaces them with a
+fact the replica holds itself. The cost is a replica that never received the
+config change adding the new leader: it refuses that leader until a replica its
+configuration does name leads, or it is restarted with a
+`Config.MemberIdentities` that names the leader; the shard itself has quorum
+without it.
+
+The separation that keeps routing live is between **routing** and
 **authorization**:
 
-- Routing state is learnable. `learnFromSource` records a sender's address for
-  the return path, but only when that address is covered by the sender's
-  verified certificate. A poisoned routing entry is a liveness problem — the
-  real member is black-holed until a config change or its own later traffic
-  corrects the entry — never an admission decision.
-- Authorization is not learnable at all. `authorizeInbound` binds every
-  quorum-bearing message to the **committed** membership: to the peer's
-  authenticated node identity where the shard has committed one, and otherwise
-  to its committed address as covered by the peer certificate. Drops are counted
-  by reason (`removed_replica`, `removed_identity`, `misrouted`,
-  `unknown_member`, `address_mismatch`, `shared_address`, `identity_mismatch`,
-  `missing_identity`), because one aggregate counter cannot tell a rolling
-  membership change from an attack.
+- Routing state is learnable, from bound messages only. `learnFromSource`
+  records a bound sender's address for the return path, and may REPLACE an
+  established entry only on the strength of the committed identity. A joiner
+  records the anchored leader's address so it can ack.
+- Authorization is not learnable at all. Drops are counted by reason
+  (`removed_replica`, `removed_identity`, `misrouted`, `unknown_member`,
+  `identity_mismatch`, `missing_identity`), because one aggregate counter
+  cannot tell a rolling membership change from an attack.
 
-See [Compatibility](../compatibility.md) for node identities and
-`RequireMemberIdentity`.
+See [Compatibility](../compatibility.md) for node identities and why they are
+required at admission.
 
 ### Forming a cluster automatically (go-qrdb)
 

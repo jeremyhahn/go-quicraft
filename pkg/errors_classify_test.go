@@ -91,6 +91,7 @@ func sentinelTable() []sentinelClassification {
 		{"ErrStopped", ErrStopped, false},
 		{"ErrDraining", ErrDraining, false},
 		{"ErrInvalidSession", ErrInvalidSession, false},
+		{"ErrSessionBusy", ErrSessionBusy, true},
 		{"ErrSnapshotSizeMismatch", ErrSnapshotSizeMismatch, false},
 		{"ErrSnapshotCorrupt", ErrSnapshotCorrupt, false},
 		{"ErrEntropyDegenerate", ErrEntropyDegenerate, false},
@@ -115,6 +116,7 @@ func sentinelTable() []sentinelClassification {
 		{"ErrTooManyVotingMembers", ErrTooManyVotingMembers, false},
 		{"ErrZeroReplicaID", ErrZeroReplicaID, false},
 		{"ErrEmptyAddress", ErrEmptyAddress, false},
+		{"ErrMemberIdentityRequired", ErrMemberIdentityRequired, false},
 		// A malformed health value in a decoded document does not become
 		// well-formed by decoding it again.
 		{"ErrInvalidShardHealth", ErrInvalidShardHealth, false},

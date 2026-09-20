@@ -51,7 +51,7 @@ All configuration, set by the embedding application:
 |---|---|---|
 | certificates | `MTLSConfig` | the transport refuses to start without one |
 | revocation | `RevocationConfig` | **fails closed by default**; a mode with no usable source refuses connections rather than admitting them |
-| sender authorization | `RequireMemberIdentity` | `false` falls back to a SAN check against the committed Raft address; `true` drops messages from senders with no committed identity |
+| sender authorization | (none) | a member is authorized by its committed node identity and by nothing else; every admission requires one (`config.Config.MemberIdentities`, the `*WithIdentity` adds) |
 | 0-RTT | `Enable0RTT` | off by default because **0-RTT data is replayable** |
 | inbound limits | `MaxIncomingConnections`, `MaxConnectionsPerIP` | at the ceiling, new peers are refused |
 | receive memory | `MaxMessageReceiveMemory` | a **wire-byte** budget; multiply by 8 for heap |

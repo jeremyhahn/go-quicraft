@@ -1565,22 +1565,22 @@ func TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality(t *testing.T) {
 
 // TestPrometheus_UnauthorizedMessageMetric_ReasonsAreSeparateSeries pins the
 // operational split. "unknown_member" is the benign config-change window and
-// "address_mismatch" is a sender the configuration names arriving behind the
-// wrong certificate; an operator alerting on the second must not have the first
-// summed into it.
+// "identity_mismatch" is a sender the configuration names arriving on a
+// connection with the wrong identity; an operator alerting on the second must
+// not have the first summed into it.
 func TestPrometheus_UnauthorizedMessageMetric_ReasonsAreSeparateSeries(t *testing.T) {
 	c := newPerShardTestCollector()
 	const shard = uint64(3)
 	c.IncUnauthorizedMessageDropped(shard, 2, dropUnknownMember)
 	c.IncUnauthorizedMessageDropped(shard, 2, dropUnknownMember)
-	c.IncUnauthorizedMessageDropped(shard, 9, dropAddressMismatch)
+	c.IncUnauthorizedMessageDropped(shard, 9, dropIdentityMismatch)
 
 	mf := gatherMetric(t, c.Registry, "quicraft_security_unauthorized_messages_dropped_total")
 	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": dropUnknownMember}); v != 2 {
 		t.Fatalf("unknown_member counter = %v, want 2", v)
 	}
-	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": dropAddressMismatch}); v != 1 {
-		t.Fatalf("address_mismatch counter = %v, want 1: a forged From is being summed "+
+	if v := counterValue(t, mf, map[string]string{"shard_id": "3", "reason": dropIdentityMismatch}); v != 1 {
+		t.Fatalf("identity_mismatch counter = %v, want 1: a forged From is being summed "+
 			"into the benign config-change window", v)
 	}
 }

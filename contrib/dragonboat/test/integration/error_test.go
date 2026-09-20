@@ -30,9 +30,9 @@ import (
 // TestIntegration_DB_ProposeOnClosedNodeHost verifies that SyncPropose
 // returns an error when called on a closed NodeHost.
 func TestIntegration_DB_ProposeOnClosedNodeHost(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -43,6 +43,7 @@ func TestIntegration_DB_ProposeOnClosedNodeHost(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -156,7 +157,8 @@ func TestIntegration_DB_GetLeaderID_InvalidShard(t *testing.T) {
 // TestIntegration_DB_StaleRead_Uninitialized verifies that StaleRead on
 // a shard that has not been started returns an appropriate error.
 func TestIntegration_DB_StaleRead_Uninitialized(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
+	mtls := pki.leaf(t)
 	addr := freePort(t)
 	nhConfig := dbConfig.NodeHostConfig{
 		WALDir:         t.TempDir(),
@@ -281,9 +283,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 		//quicraft:direct-config-change the deadline-less CONTEXT is the subject: the
 		// adapter refuses it before anything is routed, and the idempotent helper
 		// builds its own bounded context per attempt so it cannot express this input
-		err := leaderHost.SyncRequestAddReplica(ctx, 1, 99, "127.10.0.1:59999", 0)
+		err := leaderHost.SyncRequestAddReplicaWithIdentity(ctx, 1, 99, "127.10.0.1:59999", dbIdentityFor(99), 0)
 		if err == nil {
-			t.Fatal("SyncRequestAddReplica should reject context without deadline")
+			t.Fatal("SyncRequestAddReplicaWithIdentity should reject context without deadline")
 		}
 		if !isDeadlineErr(err) {
 			t.Fatalf("expected ErrDeadlineNotSet or ErrTimeout, got: %v", err)
@@ -307,9 +309,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 		//quicraft:direct-config-change the deadline-less CONTEXT is the subject: the
 		// adapter refuses it before anything is routed, and the idempotent helper
 		// builds its own bounded context per attempt so it cannot express this input
-		err := leaderHost.SyncRequestAddNonVoting(ctx, 1, 99, "127.10.0.1:59999", 0)
+		err := leaderHost.SyncRequestAddNonVotingWithIdentity(ctx, 1, 99, "127.10.0.1:59999", dbIdentityFor(99), 0)
 		if err == nil {
-			t.Fatal("SyncRequestAddNonVoting should reject context without deadline")
+			t.Fatal("SyncRequestAddNonVotingWithIdentity should reject context without deadline")
 		}
 		if !isDeadlineErr(err) {
 			t.Fatalf("expected ErrDeadlineNotSet or ErrTimeout, got: %v", err)
@@ -347,7 +349,7 @@ func TestIntegration_DB_InvalidAddressIsRejected(t *testing.T) {
 	//quicraft:direct-config-change an address without a port must be REFUSED by the
 	// adapter before anything is routed (dbConfig.IsValidAddress): nothing is ever
 	// submitted, so there is nothing for an idempotent helper to retry or confirm
-	addErr := leaderHost.SyncRequestAddReplica(addCtx, 1, 100, "a1", membership.ConfigChangeID)
+	addErr := leaderHost.SyncRequestAddReplicaWithIdentity(addCtx, 1, 100, "a1", dbIdentityFor(100), membership.ConfigChangeID)
 	if addErr == nil {
 		t.Fatal("SyncRequestAddReplica with invalid address should return error")
 	}
@@ -361,9 +363,9 @@ func TestIntegration_DB_InvalidAddressIsRejected(t *testing.T) {
 // stopping a shard and calling RemoveData, attempting to StartReplica again
 // fails with ErrReplicaRemoved.
 func TestIntegration_DB_RestartWithRemovedData_Rejected(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -375,6 +377,7 @@ func TestIntegration_DB_RestartWithRemovedData_Rejected(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}
@@ -410,9 +413,9 @@ func TestIntegration_DB_RestartWithRemovedData_Rejected(t *testing.T) {
 // method. After proposing data and stopping the shard, SyncRemoveData should
 // successfully remove the shard data, confirmed by HasNodeInfo returning false.
 func TestIntegration_DB_SyncRemoveData(t *testing.T) {
-	mtls := dbTestMTLSFiles(t)
+	pki := dbTestPKIFor(t)
 	addr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, addr, mtls)
+	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
 	if err != nil {
@@ -424,6 +427,7 @@ func TestIntegration_DB_SyncRemoveData(t *testing.T) {
 	members := map[uint64]dragonboat.Target{1: addr}
 	createFn, _ := dbKVCreateFunc()
 	cfg := dbTestShardConfig(1, 1)
+	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
 	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
 		t.Fatalf("StartReplica failed: %v", startErr)
 	}

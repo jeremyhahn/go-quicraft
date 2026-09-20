@@ -247,7 +247,7 @@ func TestSnapshotRecoveryKeepsTheQuorumGateBoundToIdentities(t *testing.T) {
 			ldb, reopen := backend.open(t)
 			recovered := recoveredMembership(t, ldb, reopen, identityProtoMembership())
 
-			eng, handler, metrics := identityRig(t, recovered, false)
+			eng, handler, metrics := identityRig(t, recovered)
 
 			// The attacker holds a valid cluster certificate that COVERS the
 			// victim's committed address. Withholding that would make the test
@@ -295,7 +295,7 @@ func TestSnapshotRecoveryKeepsTheLegitimateHolderAuthorized(t *testing.T) {
 			ldb, reopen := backend.open(t)
 			recovered := recoveredMembership(t, ldb, reopen, identityProtoMembership())
 
-			eng, handler, metrics := identityRig(t, recovered, false)
+			eng, handler, metrics := identityRig(t, recovered)
 
 			batch := proto.MessageBatch{
 				SourceAddress: victimAddr,
@@ -314,12 +314,11 @@ func TestSnapshotRecoveryKeepsTheLegitimateHolderAuthorized(t *testing.T) {
 	}
 }
 
-// TestSnapshotRecoveryUnderStrictModeKeepsMembersAuthorized pins the posture
-// the whole gap blocked. Under RequireMemberIdentity a member whose identity
-// did not survive recovery has its quorum-bearing traffic dropped outright, so
-// this is the assertion that says strict mode is safe to enable across a
-// restart.
-func TestSnapshotRecoveryUnderStrictModeKeepsMembersAuthorized(t *testing.T) {
+// TestSnapshotRecoveryKeepsMembersAuthorized pins the posture the whole gap
+// blocked. A member whose identity did not survive recovery has its
+// quorum-bearing traffic dropped outright (there is no address fallback), so
+// this is the assertion that says a restart does not cost the shard its quorum.
+func TestSnapshotRecoveryKeepsMembersAuthorized(t *testing.T) {
 	const victimAddr = "10.0.0.2:5001"
 	victimID := identityProtoMembership().Identities[2]
 
@@ -328,7 +327,7 @@ func TestSnapshotRecoveryUnderStrictModeKeepsMembersAuthorized(t *testing.T) {
 			ldb, reopen := backend.open(t)
 			recovered := recoveredMembership(t, ldb, reopen, identityProtoMembership())
 
-			eng, handler, metrics := identityRig(t, recovered, true)
+			eng, handler, metrics := identityRig(t, recovered)
 
 			batch := proto.MessageBatch{
 				SourceAddress: victimAddr,
@@ -340,7 +339,7 @@ func TestSnapshotRecoveryUnderStrictModeKeepsMembersAuthorized(t *testing.T) {
 				t.Fatalf("HandleMessage: %v", err)
 			}
 			if len(eng.delivered) != 1 {
-				t.Fatalf("under RequireMemberIdentity a fully migrated member was dropped "+
+				t.Fatalf("a member with a committed identity was dropped "+
 					"after snapshot recovery (reason %q): the shard loses quorum on every "+
 					"restart until the identities survive the snapshot round-trip",
 					metrics.lastReason())

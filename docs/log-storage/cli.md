@@ -51,17 +51,11 @@ Everything is configuration passed at `Open` by the embedding application:
 | encryption | `WithBarrier` | the barrier must be initialized **and unsealed** before `Open` |
 | instrumentation | `WithMetrics` | write and fsync latency are what separate "slow disk" from "slow pipeline" |
 
-## Two things to check after every restart
+## One thing to check after every restart
 
-Neither is a command; both are one call, and both are silent if you do not make
-them.
-
-```go
-residuals := db.RecoveryResiduals() // empty on a clean recovery
-```
-
-Non-empty means the node **may have come back shorter than the log it
-acknowledged**. That is the condition worth paging on.
+Not a command; one call, silent if you do not make it. (A node that may have
+come back shorter than the log it acknowledged does not open — `Open` fails with
+`ErrAcknowledgedDataLost` — so there is nothing to poll for on that front.)
 
 ```go
 protection := db.AtRestProtection()
