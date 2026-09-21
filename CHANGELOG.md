@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0-alpha] - 2026-09-21
+
 Everything below landed on `release/0.13.0-alpha` and resolves the
 2026-09-16 whole-project production-readiness review (#197). Wipe every dev
 data directory before upgrading: the WAL chunk framing changed in place.
