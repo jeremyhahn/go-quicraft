@@ -604,6 +604,36 @@ jobs:
       - name: Run errfs suite
         run: go test -race -count=1 -tags=quicraft_errfs ./test/errfs/...
 
+  zero-rtt:
+    name: 0-RTT replay policy [no -race]
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The ONLY job that drops -race, and it drops it for one reason: the
+      # detector fires on quic-go's own client connection, which
+      # TestSnapshotOver0RTTRejected must drive through DialAddrEarly to make
+      # its bytes early data. quic-go writes Conn.peerParams from the
+      # connection's run goroutine (connection.go:2375) and reads it when a
+      # stream is opened (connection.go:2932) with nothing guarding the
+      # field; v0.62.0 is the newest release and the field is private, so the
+      # race is neither fixable nor synchronizable from here (#199). No
+      # production path is exposed: dialConnection uses Dial, never
+      # DialEarly, and Enable0RTT is default-off.
+      #
+      # Without this job the policy would go untested everywhere, since every
+      # other test command in this file and in the Makefile uses -race. The
+      # test itself skips under the detector, so `-run` matching it in the
+      # race-enabled Test job is a no-op rather than a duplicate.
+      - name: Run the 0-RTT tests without the race detector
+        run: go test -count=1 -run '0RTT' ./pkg/internal/transport/
+
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz]
     runs-on: ubuntu-latest
@@ -923,7 +953,7 @@ jobs:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [lint, security, build, test, integration, netfault, errfs, fuzz-seeds, modules, cross-arch, contrib-dragonboat]
+    needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat]
     steps:
       - name: Fail closed on any non-success
         run: |
@@ -936,6 +966,7 @@ jobs:
           check integration       "${{ needs.integration.result }}"
           check netfault          "${{ needs.netfault.result }}"
           check errfs             "${{ needs.errfs.result }}"
+          check zero-rtt          "${{ needs.zero-rtt.result }}"
           check fuzz-seeds        "${{ needs.fuzz-seeds.result }}"
           check modules           "${{ needs.modules.result }}"
           check cross-arch        "${{ needs.cross-arch.result }}"

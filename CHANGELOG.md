@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The 0-RTT replay-policy test no longer fails the race detector on a
+  quic-go race (#199).** `TestSnapshotOver0RTTRejected` dials a client with
+  `DialAddrEarly` and opens a stream before the handshake completes, because
+  that is what makes its bytes early data. quic-go writes `Conn.peerParams`
+  from the connection's `run` goroutine when the server's transport
+  parameters arrive and reads it when a stream is opened, with nothing
+  guarding the field, so the detector reports a race on ITS object — the one
+  that failed the first `v0.13.0-alpha` release at Publish. `v0.62.0` is the
+  newest release and the field is private, so the race is neither fixable nor
+  synchronizable from here. No production path is exposed: `dialConnection`
+  uses `Dial`, never `DialEarly`, and `Enable0RTT` is default-off. The test
+  now skips under the detector and runs in a dedicated no-race job in CI and
+  in the release gates — the policy keeps its real resumed handshake, real
+  receiver and real rejection, and it is the only place in this repository
+  where `-race` is dropped.
+
 ## [0.13.0-alpha] - 2026-09-21
 
 Everything below landed on `release/0.13.0-alpha` and resolves the

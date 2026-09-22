@@ -626,6 +626,26 @@ func TestConnectionReceiveWindowDerivedFromMessageBudget(t *testing.T) {
 // on early data. The check is defense-in-depth (0-RTT is default-off), which is
 // exactly why it needs a test — nothing else would notice it regressing.
 func TestSnapshotOver0RTTRejected(t *testing.T) {
+	// Skipped under the race detector, and run instead by CI's dedicated
+	// "0-RTT replay policy [no -race]" job (#199). The race is quic-go's,
+	// not ours: on the client connection this test dials, quic-go writes
+	// c.peerParams from the connection's run goroutine when the server's
+	// transport parameters arrive (connection.go:2375) and reads
+	// c.peerParams.InitialMaxStreamData* from the goroutine opening a
+	// stream (connection.go:2932), with nothing guarding the field. v0.62.0
+	// is the newest release, so there is nothing to upgrade to, and the
+	// field is private, so nothing here can synchronize it.
+	//
+	// The test cannot avoid it either: early data is early data only if the
+	// stream is opened before the handshake completes, which is the racy
+	// read. No production path is exposed — dialConnection uses Dial, never
+	// DialEarly (recv.go), and Enable0RTT is default-off — so the detector
+	// is objecting to a third-party race that only this foreign-client
+	// stand-in can provoke.
+	if raceEnabled {
+		t.Skip("quic-go's Conn.peerParams race (connection.go:2375 write vs :2932 read) " +
+			"fails the detector on the client this test dials; run by CI's no-race 0-RTT job (#199)")
+	}
 	mtls := testMTLSConfig(t)
 	rec := &dropRecorder{}
 	receiver, err := NewQUICTransport(Config{

@@ -477,6 +477,27 @@ jobs:
       - name: Run errfs suite
         run: go test -race -count=1 -tags=quicraft_errfs ./test/errfs/...
 
+  zero-rtt:
+    name: Gate - 0-RTT replay policy [no -race]
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Publish's own `go test -race ./...` cannot cover this policy: the
+      # test skips under the detector because the race is quic-go's, on the
+      # client connection the test dials through DialAddrEarly (#199). This
+      # gate is where a release verifies that a snapshot arriving as 0-RTT
+      # early data is refused, so the guarantee is not merely asserted in the
+      # CHANGELOG.
+      - name: Run the 0-RTT tests without the race detector
+        run: go test -count=1 -run '0RTT' ./pkg/internal/transport/
+
   fuzz:
     name: Gate - fuzz ${{ matrix.package }}
     runs-on: ubuntu-latest
@@ -621,7 +642,7 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing publishes until every gate above is green. This is the whole
     # point of the restructuring: the tag is the artifact, and it is permanent.
-    needs: [validate, lint, security, trivy, integration, netfault, errfs, fuzz, modules, contrib-dragonboat]
+    needs: [validate, lint, security, trivy, integration, netfault, errfs, zero-rtt, fuzz, modules, contrib-dragonboat]
     timeout-minutes: 30
     steps:
       - name: Checkout
