@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1-alpha] - 2026-09-22
+
+Supersedes `v0.13.0-alpha`, which was tagged but never published: its
+release run stopped at Publish on the quic-go race below. The code is the
+`0.13.0-alpha` section's plus this one fix; nothing in the library changed.
+
 ### Fixed
 
 - **The 0-RTT replay-policy test no longer fails the race detector on a
