@@ -43,7 +43,7 @@ The transport is implemented in `pkg/internal/transport/` as a concrete
 `QUICTransport` type. There is no `Transport` interface: the engine holds
 `*QUICTransport` directly, because there is one implementation and the send path
 is hot. The underlying QUIC library is
-[quic-go](https://github.com/quic-go/quic-go) **v0.62.0** (see `go.mod`).
+[quic-go](https://github.com/quic-go/quic-go) **v0.63.0** (see `go.mod`).
 **v0.60.0 is a hard floor**, not merely the current pin: below it, packet
 protection is built with the general `cipher.NewGCM` and a process panics under
 `GODEBUG=fips140=only`. See

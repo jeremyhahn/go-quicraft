@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`quic-go` v0.62.0 → v0.63.0.** Its breaking changes are confined to
+  `http3`, which nothing here imports; the one core fix is `quicvarint`
+  decoding a complete varint returned alongside `io.EOF`, also unused here.
+  The FIPS path the transport documents was re-read from the new source
+  rather than assumed — `aeadAESGCMTLS13` still dispatches to
+  `aeadAESGCMTLS13FIPS140` under `fips140.Enabled()`, the `go:linkname` to
+  `crypto/tls.aeadAESGCMTLS13` is unchanged, and the module still declares
+  `go 1.26.0` — and `make verify-fips` passes under `GODEBUG=fips140=only`.
+  The `Conn.peerParams` race behind #199 is still present at the same two
+  lines, so that workaround stays. `contrib/dragonboat` and
+  `test/performance/quicraft` carry the bump as an indirect requirement.
+- **`porcupine` v1.3.0 → v1.3.1**, a direct root dependency that the nightly
+  Dependency freshness gate reported lagging. The source diff is two
+  changes: `NondeterministicModel`'s hash closure captures `Hash` once
+  instead of re-reading the field per call, and the visualizer's tooltip sets
+  `textContent` instead of `innerHTML`.
+
+### Fixed
+
+- **`TestRestart_ProposalKeysDoNotCollideAcrossIncarnations` no longer fails
+  on a leader change it did not cause.** It resolved the leader once and
+  drove 20,000 padding proposals, the gate entry, and a post-restart
+  verification read straight at that host; on a loaded CI runner (run 18403)
+  leadership moved during the padding and the next proposal was refused
+  `not leader for shard 1, leader unknown` — a correct refusal the test
+  reported as a failure. Nothing about proposal keys was involved. The
+  padding, the gate and the read now go through `test/proposer`'s
+  re-resolving loop; the keyed proposals, whose follower IS the subject,
+  are pinned to it with `quicraft.Temporary`, the package's policy for that
+  caller. The pre-restart log end is read from the follower's own applied
+  index, which covers every keyed entry because a proposal is completed by
+  its proposer's own apply. The `quicraft:direct-propose` markers that
+  justified the pinned sites with "the leader is resolved once above" are
+  gone: that is the pattern the package exists to replace.
+
 ## [0.13.1-alpha] - 2026-09-22
 
 Supersedes `v0.13.0-alpha`, which was tagged but never published: its

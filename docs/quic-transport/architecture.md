@@ -285,7 +285,7 @@ general `cipher.NewGCM`, which `fips140=only` declines, so a process panicked
 constructing the initial AEAD before any handshake.
 
 `quic-go` **v0.60.0** fixed this by constructing packet-protection AEADs through
-Go's TLS 1.3 AES-GCM implementation instead of the general API. In v0.62.0 it is
+Go's TLS 1.3 AES-GCM implementation instead of the general API. In v0.63.0 it is
 `internal/handshake/cipher_suite.go`, whose `aeadAESGCMTLS13` dispatches to
 `aeadAESGCMTLS13FIPS140` when `crypto/fips140.Enabled()` — the same approved path
 `crypto/tls` uses for its own records, for the same construction. The old record
@@ -302,8 +302,8 @@ than discovering:
 - The primitive executing is `crypto/tls`'s own AES-GCM, inside the Go
   Cryptographic Module. The linkname changes who can call it, not what it is.
 - It therefore depends on a **Go toolchain** that has that symbol, not only on a
-  `quic-go` version. `quic-go` v0.62.0 declares `go 1.26.0`; this repository
-  pins 1.26.7.
+  `quic-go` version. `quic-go` v0.63.0 declares `go 1.26.0`; this repository
+  pins 1.27.0.
 - It is explicitly a stopgap. `quic-go`'s own comment cites
   [golang/go#79219](https://github.com/golang/go/issues/79219) and the pending
   `NewGCMForQUIC` constructor; when the standard library exports one, the
@@ -311,7 +311,8 @@ than discovering:
   gate against, not to assume through — which `make verify-fips` does on every
   nightly run.
 
-go-quicraft moved to v0.62.0 in #85.
+go-quicraft moved to v0.62.0 in #85, and to v0.63.0 on 2026-09-22 with the
+dispatch, the linkname and the `go` directive above re-read from its source.
 Measured on 2026-09-03 with real QUIC handshakes over loopback:
 
 | | v0.59.1 | v0.62.0 |
@@ -371,7 +372,7 @@ a limit of the library.
 
 Four things, all of them checkable:
 
-1. `quic-go` **≥ v0.60.0** — go-quicraft pins v0.62.0.
+1. `quic-go` **≥ v0.60.0** — go-quicraft pins v0.63.0.
 2. Build with **`-tags fips`**. Measured caveat, so the reason is not mistaken
    for the curve list: Go filters X25519 out of the offer under `fips140` mode
    by itself, and `TestHandshakeCurves` passes untagged under `only`. What the

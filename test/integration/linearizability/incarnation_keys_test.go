@@ -24,6 +24,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
 // TestRestart_ProposalKeysDoNotCollideAcrossIncarnations is the mechanism
@@ -69,18 +72,23 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 
 	followerIdx := (leaderIdx + 1) % numNodes
 	cluster.hostsMu.RLock()
-	leader, follower := cluster.hosts[leaderIdx], cluster.hosts[followerIdx]
+	follower := cluster.hosts[followerIdx]
 	cluster.hostsMu.RUnlock()
 
-	// Padding through the leader: no follower-minted keys in this stretch.
+	// Padding through whichever replica leads AT EACH PROPOSAL, never the
+	// leader observed above: 20,000 sequential writes span many election
+	// timeouts, and on a loaded runner leadership moves inside that stretch.
+	// A pinned leader then answers "not leader, leader unknown" and the test
+	// failed on an election the cluster handled correctly (CI run 18403).
+	// Who leads does not matter to the shape; that the entries are NOT
+	// follower-minted does, and a leader proposing on its own replica mints
+	// its own keys. If the new leader is the follower, its padding keys are
+	// minted under a different incarnation's draws and collide with nothing
+	// the assertion reads. A retried padding put may apply twice
+	// (quicraft.MaybeApplied); it is a last-write-wins put and only lengthens
+	// the replay.
 	for i := range padding {
-		ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
-		//quicraft:direct-propose the leader is resolved once above; this is bulk padding
-		_, err := leader.SyncPropose(ctx, shardID, encodeKVPut(fmt.Sprintf("pad-%d", i%256), "p"))
-		cancel()
-		if err != nil {
-			t.Fatalf("padding %d: %v", i, err)
-		}
+		proposeToLeader(t, cluster, shardID, encodeKVPut(fmt.Sprintf("pad-%d", i%256), "p"), proposeTimeout)
 	}
 
 	// A gate entry goes in just before the keyed ones. When the follower
@@ -89,36 +97,37 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// That is what makes the collision a certainty rather than a race
 	// against the machine's speed (#187: on the CI runner the replay of
 	// 20,000 entries finished before the first proposal was accepted).
+	// Re-resolved for the same reason as the padding. A retry that applies
+	// the gate put twice is harmless: the replay parks at the FIRST one, which
+	// still lies ahead of every keyed entry, and release disarms the gate
+	// before the second is applied.
 	const gateKey = "gate"
-	{
-		ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
-		//quicraft:direct-propose the leader is resolved once above; this is the gate entry
-		_, err := leader.SyncPropose(ctx, shardID, encodeKVPut(gateKey, "closed"))
-		cancel()
-		if err != nil {
-			t.Fatalf("gate entry: %v", err)
-		}
-	}
+	proposeToLeader(t, cluster, shardID, encodeKVPut(gateKey, "closed"), proposeTimeout)
 
-	// The follower's first incarnation mints (R, 1..keyed) for these.
+	// The follower's first incarnation mints (R, 1..keyed) for these, so they
+	// are PINNED to it: the follower is the subject, and re-resolving would put
+	// some other replica's keys in the log. Pinned with quicraft.Temporary is
+	// the package's policy for that caller -- wait and ask the SAME replica
+	// again, which clears the not-leader window an election opens while the
+	// follower learns the successor it forwards to.
 	for i := range keyed {
-		ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
-		//quicraft:direct-propose the follower is the subject: its keys must land in the log
-		_, err := follower.SyncPropose(ctx, shardID, encodeKVPut(fmt.Sprintf("k-%d", i), "old"))
-		cancel()
-		if err != nil {
+		if _, err := proposer.TryWith(proposer.Pinned(follower), shardID,
+			encodeKVPut(fmt.Sprintf("k-%d", i), "old"), proposeTimeout, quicraft.Temporary); err != nil {
 			t.Fatalf("keyed %d through follower: %v", i, err)
 		}
 	}
 
 	// Where the log ends before the restart: every pre-restart entry, the
 	// (R, 1..keyed) ones included, lies at or below this index.
+	// Read from the follower itself: TryWith returned only after each
+	// keyed entry was APPLIED there, so its LastApplied covers them all, and
+	// it needs no leader to answer.
 	logEnd := uint64(0)
-	if info, err := leader.GetShardInfo(shardID); err == nil {
+	if info, err := follower.GetShardInfo(shardID); err == nil {
 		logEnd = info.LastApplied
 	}
 	if logEnd == 0 {
-		t.Fatal("could not read the leader's applied index before the restart")
+		t.Fatal("could not read the follower's applied index before the restart")
 	}
 
 	// Restart the follower: a new Host, the same replica ID, and a full-log
@@ -188,10 +197,15 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 					mu.Unlock()
 					return
 				}
-				ctx, cancel = context.WithTimeout(context.Background(), readTimeout)
-				//quicraft:direct-read on the leader, to check the acknowledgement rather than the follower
-				got, readErr := leader.SyncRead(ctx, shardID, encodeKVGet(key))
-				cancel()
+				// A linearizable read through whichever replica leads NOW, to
+				// check the acknowledgement independently of the follower that
+				// gave it. Not the leader observed before the restart: a
+				// 20,000-entry replay lies between the two, and a deposed
+				// leader that has not learned its successor refuses the read.
+				// An ack arrives only after the gate is released (the parked
+				// follower cannot apply), so even a follower that has since
+				// won the shard is a correct reader here.
+				got, readErr := proposer.TryRead(cluster.leaderHost, shardID, encodeKVGet(key), readTimeout)
 				if readErr != nil {
 					t.Errorf("read after ack of %s: %v", key, readErr)
 					return

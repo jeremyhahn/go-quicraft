@@ -622,7 +622,7 @@ jobs:
       # its bytes early data. quic-go writes Conn.peerParams from the
       # connection's run goroutine (connection.go:2375) and reads it when a
       # stream is opened (connection.go:2932) with nothing guarding the
-      # field; v0.62.0 is the newest release and the field is private, so the
+      # field; it is unfixed through v0.63.0, the newest release, and the field is private, so the
       # race is neither fixable nor synchronizable from here (#199). No
       # production path is exposed: dialConnection uses Dial, never
       # DialEarly, and Enable0RTT is default-off.

@@ -187,7 +187,7 @@ checking at all. That is a security tradeoff, not a FIPS one — see
 Four requirements. Three are what make it approved-only; the second is defence
 in depth, and you want it anyway:
 
-1. **`quic-go` ≥ v0.60.0.** go-quicraft pins v0.62.0. Below v0.60.0 the process
+1. **`quic-go` ≥ v0.60.0.** go-quicraft pins v0.63.0. Below v0.60.0 the process
    panics constructing the initial AEAD, before any handshake.
 2. **`-tags fips`.** Not for the curve list — Go filters X25519 out of the
    offered groups under `fips140` mode on its own, and an untagged build
@@ -333,7 +333,7 @@ read, so a peer cannot make this process allocate by asserting a size.
 **A process panics inside the QUIC library under `GODEBUG=fips140=only`** —
 your `quic-go` is older than v0.60.0. That version routes packet protection
 through Go's approved TLS 1.3 AES-GCM; before it, constructing the initial AEAD
-panics before any handshake. go-quicraft pins v0.62.0, so this means a
+panics before any handshake. go-quicraft pins v0.63.0, so this means a
 `replace` directive or a stale `go.sum` in the embedding module.
 
 **A process panics with `crypto/sha1: use of SHA-1 is not allowed` under

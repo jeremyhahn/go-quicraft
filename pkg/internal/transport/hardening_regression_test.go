@@ -632,8 +632,8 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 	// c.peerParams from the connection's run goroutine when the server's
 	// transport parameters arrive (connection.go:2375) and reads
 	// c.peerParams.InitialMaxStreamData* from the goroutine opening a
-	// stream (connection.go:2932), with nothing guarding the field. v0.62.0
-	// is the newest release, so there is nothing to upgrade to, and the
+	// stream (connection.go:2932), with nothing guarding the field. It is
+	// unfixed through v0.63.0, the newest release, at those same lines, and the
 	// field is private, so nothing here can synchronize it.
 	//
 	// The test cannot avoid it either: early data is early data only if the
