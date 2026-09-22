@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2-alpha] - 2026-09-22
+
 ### Changed
 
 - **`quic-go` v0.62.0 → v0.63.0.** Its breaking changes are confined to
