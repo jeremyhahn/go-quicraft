@@ -51,6 +51,34 @@ var (
 	// an internal state transition such as leadership change.
 	ErrAborted = errors.New("quicraft: operation aborted")
 
+	// ErrAtRestEncryptionUnspecified is returned by NewHost when the host
+	// neither configures at-rest encryption (WithBarrier or
+	// WithShardBarriers) nor declares WithoutEncryption. Without it, the
+	// omission of an option would store every command and snapshot as
+	// plaintext with nothing to say so.
+	ErrAtRestEncryptionUnspecified = errors.New(
+		"quicraft: at-rest encryption is unspecified: configure WithBarrier " +
+			"or WithShardBarriers, or declare WithoutEncryption")
+
+	// ErrAtRestEncryptionConflict is returned by NewHost when
+	// WithoutEncryption is combined with WithBarrier or WithShardBarriers.
+	ErrAtRestEncryptionConflict = errors.New(
+		"quicraft: WithoutEncryption cannot be combined with WithBarrier " +
+			"or WithShardBarriers")
+
+	// ErrBarrierPlaintextLogDB is returned by NewHost when WithBarrier is
+	// configured together with a caller-supplied LogDB that does not encrypt
+	// at rest. The host-wide barrier is wired only into the DEFAULT WAL, so a
+	// supplied waldb.Open(dir) would store every proposed command in plaintext
+	// while snapshots were encrypted — the state a stated encryption choice
+	// must never reach. The LogDB must report logdb.AtRestBarrierEncrypted or
+	// logdb.AtRestNonDurable; one that declares nothing is treated as
+	// unprotected.
+	ErrBarrierPlaintextLogDB = errors.New(
+		"quicraft: WithBarrier with a supplied LogDB requires that LogDB to be " +
+			"encrypted at rest (logdb.AtRestProtectedLogDB reporting barrier_encrypted " +
+			"or non_durable); this LogDB would store plaintext")
+
 	// ErrShardBarriersPlaintextWAL is returned by NewHost when
 	// WithShardBarriers is configured but the resulting WAL would hold
 	// plaintext: the default WAL takes a single host-wide barrier, so
@@ -243,6 +271,13 @@ var (
 	// ErrSnapshotInProgress is returned when a snapshot is already
 	// in progress for the shard.
 	ErrSnapshotInProgress = errors.New("quicraft: snapshot already in progress")
+
+	// ErrImportInProgress is returned by StartShard when an ImportSnapshot
+	// for the same shard is in progress. An import records a snapshot and
+	// compacts the log beneath it, so a node started over the shard's durable
+	// state mid-import would run on a log removed underneath it. The identical
+	// StartShard succeeds once the import returns.
+	ErrImportInProgress = errors.New("quicraft: snapshot import in progress for shard")
 
 	// ErrStopped is returned when an operation is interrupted because the
 	// shard or the engine stopped underneath it — a snapshot save or recovery
@@ -1207,6 +1242,9 @@ var temporaryErrors = [...]error{
 	// Another snapshot holds the shard's single-flight slot, or every
 	// snapshot worker in the pool is occupied.
 	ErrSnapshotInProgress,
+	// An ImportSnapshot for the shard is in progress; StartShard succeeds once
+	// it returns.
+	ErrImportInProgress,
 	// A leadership transfer is in flight. It completes or times out without
 	// any caller or operator action, and the identical request then succeeds.
 	ErrTransferInProgress,

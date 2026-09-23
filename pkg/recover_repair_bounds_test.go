@@ -57,7 +57,7 @@ func TestRecoverLogReader_RepairNeverAcceptsAGapTheSnapshotDoesNotCover(t *testi
 		t.Fatalf("fixture: expected a holed index, got %v", err)
 	}
 
-	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

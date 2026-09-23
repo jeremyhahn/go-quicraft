@@ -106,7 +106,9 @@ func (osSnapshotFS) MkdirAll(path string, perm fs.FileMode) error {
 // rename depends on it, because such a path is entitled to delete what it
 // created on failure.
 func (osSnapshotFS) MkdirTemp(dir, pattern string) (string, error) {
-	return os.MkdirTemp(dir, pattern)
+	// The directories made here are staging directories that are published
+	// by rename, so they get the snapshot tree's mode, not MkdirTemp's 0700.
+	return engine.MkdirStageDir(dir, pattern)
 }
 
 // Rename renames oldpath to newpath.

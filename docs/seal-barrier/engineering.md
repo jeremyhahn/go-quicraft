@@ -210,14 +210,17 @@ type Barrier interface {
     DeregisterInFlightEpoch(epoch uint64)
     CurrentEpoch() uint64
     ShouldRotateKey() bool
+    EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 }
 ```
 
-`EncryptWithEpochPinnedContext` is deliberately **not** in it. It is an optional
-capability (`atomicEpochPinner`) the at-rest encrypt loops use when the barrier
-provides it, sealing a frame and pinning its epoch under one lock. A `Barrier`
-without it still works, with a narrow window in which `Rotate` plus
-`PurgeEpochsBefore` can drop the DEK of a frame already sealed into the artifact.
+`EncryptWithEpochPinnedContext` is **required**. It seals a frame and registers
+its epoch in-flight under one lock, and every at-rest snapshot frame is sealed
+through it. Until 0.14.0 it was an optional capability, and a `Barrier` without
+it fell back to pin-before / encrypt / pin-after, leaving a window in which
+`Rotate` plus `PurgeEpochsBefore` could drop the DEK of a frame already sealed
+into the artifact. A custom `Barrier` must implement it atomically: sealing and
+then registering in two steps reopens exactly that window.
 
 ## 2. Invariants
 

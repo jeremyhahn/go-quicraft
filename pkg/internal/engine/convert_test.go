@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -707,5 +708,26 @@ func TestProtoSnapshotToLogDB_CarriesEveryConvertibleField(t *testing.T) {
 	if config.Snappy == config.NoCompression {
 		t.Fatal("config.Snappy equals NoCompression; the Compression assertion " +
 			"cannot distinguish a carried field from a dropped one")
+	}
+}
+
+// TestProtoSnapshotToLogDB_RecordsTheDirectory pins the convention a LogDB
+// snapshot record follows: Filepath names the artifact's DIRECTORY, while a
+// proto snapshot's names its data file. The two-phase snapshot receive lets
+// the record converted from raft's Update be the first one written, so a
+// verbatim copy made every reader open <dir>/snapshot.dat/snapshot.dat.
+func TestProtoSnapshotToLogDB_RecordsTheDirectory(t *testing.T) {
+	dir := filepath.Join("/data", "snapshots", "shard-1", "replica-2", "snapshot-00000000000000000500")
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"data file", filepath.Join(dir, snapshotDataFile), dir},
+		{"already a directory", dir, dir},
+		{"empty", "", ""},
+	} {
+		ps := proto.Snapshot{Index: 500, Term: 3, Filepath: tc.in}
+		if got := protoSnapshotToLogDB(&ps).Filepath; got != tc.want {
+			t.Errorf("%s: Filepath = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

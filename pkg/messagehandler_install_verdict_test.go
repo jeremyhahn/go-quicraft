@@ -1,0 +1,297 @@
+// Copyright 2026 Jeremy Hahn
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package quicraft
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
+
+// These pin the confirmation review's findings against the two-phase receive
+// (HIGH-1, MEDIUM-1): a verdict of "abandoned" never licenses deleting an
+// artifact raft may have adopted, an install never crosses to a reloaded
+// shard's new node, and a failed shard's receive does not wait forever.
+
+func verdictTestChunks(shardID, localReplicaID, fromReplicaID, index uint64) []proto.SnapshotChunk {
+	return []proto.SnapshotChunk{{
+		ShardID: shardID, ReplicaID: localReplicaID, From: fromReplicaID,
+		Index: index, Term: 4, ChunkID: 0, ChunkCount: 1,
+		Data:       []byte("payload"),
+		Membership: snapshotPathMembership(localReplicaID, fromReplicaID),
+	}}
+}
+
+// stopAfterDeliver injects the install, then stops the node — the first half
+// of UnloadNode — before the step worker necessarily steps it.
+type stopAfterDeliver struct {
+	engineDeliverer
+	node *engine.Node
+}
+
+func (d *stopAfterDeliver) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	ok := d.engineDeliverer.DeliverLocalTo(node, msg)
+	if msg.Type == proto.InstallSnapshot {
+		d.node.Stop()
+	}
+	return ok
+}
+
+// TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact: a
+// node stopped after the install is delivered used to be stepped anyway
+// (the step worker skipped only FAILED nodes) and adopt it, while the receive,
+// told "abandoned", deleted the artifact raft now depended on. A stopped node
+// now adopts nothing, and "abandoned" keeps the artifact.
+func TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	node := eng.GetNode(shardID)
+	handler := &hostMessageHandler{engine: &stopAfterDeliver{engineDeliverer: eng, node: node}, host: h}
+
+	err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	var recvErr *SnapshotReceiveError
+	if !errors.As(err, &recvErr) || recvErr.Op != "install" {
+		t.Fatalf("HandleSnapshot = %v, want the abandoned install reported", err)
+	}
+	// Give a stray step every chance to happen.
+	time.Sleep(300 * time.Millisecond)
+	if got := node.CommittedIndex(); got >= snapIndex {
+		t.Fatalf("a stopped node adopted snapshot %d (committed %d)", snapIndex, got)
+	}
+	if _, statErr := os.Stat(node.SnapshotSaveDir(snapIndex)); statErr != nil {
+		t.Fatalf("the artifact was deleted on an abandoned verdict: %v", statErr)
+	}
+}
+
+// swappingDeliverer reloads the shard — unload the node, load a fresh one on
+// the same snapshot base — just before the install is injected, as a
+// StopShard/StartShard racing a long receive would.
+type swappingDeliverer struct {
+	engineDeliverer
+	eng     *engine.Engine
+	newNode *engine.Node
+	once    sync.Once
+}
+
+func (d *swappingDeliverer) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot {
+		d.once.Do(func() {
+			d.eng.UnloadNode(msg.ShardID)
+			d.eng.LoadNode(d.newNode)
+		})
+	}
+	return d.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
+// TestHandleSnapshot_ReloadDuringReceiveNeverReachesTheNewNode: delivery by
+// shard ID handed the install to the reloaded shard's NEW node, which adopted
+// it while the receive — waiting on the old node — deleted the artifact. The
+// install now goes to exactly the node its verdict is awaited on, and a
+// stopped node accepts nothing, so the new node never sees it.
+func TestHandleSnapshot_ReloadDuringReceiveNeverReachesTheNewNode(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	old := eng.GetNode(shardID)
+
+	voters := snapshotPathMembership(localReplicaID, fromReplicaID).Addresses
+	lr := logdb.NewLogReader(shardID, localReplicaID, memdb.New())
+	if err := lr.ApplySnapshot(proto.Snapshot{Membership: proto.Membership{Addresses: voters, Identities: fixtureIdentities(voters)}}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	cfg := config.Config{ShardID: shardID, ReplicaID: localReplicaID}
+	cfg.SetDefaults()
+	peer, err := raft.NewPeer(cfg, lr, nil)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	fresh := engine.NewNode(peer, nil, lr, cfg, nil, old.SnapshotDir(), nil)
+
+	handler := &hostMessageHandler{engine: &swappingDeliverer{engineDeliverer: eng, eng: eng, newNode: fresh}, host: h}
+	if err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders); err == nil {
+		t.Fatal("HandleSnapshot succeeded although its node was unloaded before the install could reach it")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := fresh.CommittedIndex(); got >= snapIndex {
+		t.Fatalf("the reloaded shard's new node adopted snapshot %d (committed %d) from a receive awaiting the old node", snapIndex, got)
+	}
+}
+
+// TestHandleSnapshot_FailedShardReturnsAtOnce: a failed shard steps nothing,
+// so its install never got a verdict and the receive blocked — holding a
+// host-wide transport receive slot and its memory budget — until an operator
+// reloaded the shard.
+func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	handler := &hostMessageHandler{engine: eng, host: h}
+	eng.GetNode(shardID).Fail(errors.New("latched for the test"))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, 900), authorizeAllSenders)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("HandleSnapshot accepted a snapshot for a failed shard")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleSnapshot still blocked 2s after a snapshot arrived for a failed shard")
+	}
+}
+
+// TestHandleSnapshot_StoppingShardStagesNothing: a stopped incarnation may
+// still hold an adopted-but-unrecorded install in its commit pipeline, and
+// that install's artifact is retained, unrecorded, at the canonical path. A
+// same-index retry against the stopping node used to reach the publish step,
+// which reclaims any unrecorded directory there as an orphan — moments before
+// the old pipeline's record naming it lands. The receive is refused before
+// staging anything; the retry waits for the next incarnation, which UnloadNode
+// releases only once the old one can no longer write LogDB.
+func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	node := eng.GetNode(shardID)
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	// The first receive's retained artifact.
+	retained := node.SnapshotSaveDir(snapIndex)
+	if err := os.MkdirAll(retained, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	marker := filepath.Join(retained, "adopted")
+	if err := os.WriteFile(marker, []byte("adopted, record in flight"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	node.Stop()
+
+	err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	var unauthorized *UnauthorizedMessageError
+	if !errors.As(err, &unauthorized) {
+		t.Fatalf("HandleSnapshot = %v, want the stopping shard refused", err)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("the retained artifact was reclaimed by a receive on a stopping shard: %v", statErr)
+	}
+}
+
+// stopThenRefuse stops the node the moment the install is offered and refuses
+// the delivery: the shape of a StopShard landing between a receive's publish
+// and its injection.
+type stopThenRefuse struct {
+	engineDeliverer
+}
+
+func (d *stopThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot {
+		node.Stop()
+		return false
+	}
+	return d.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
+// TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory: a receive that
+// published and then failed used to discard the canonical directory
+// unconditionally. On a node stopped in between, that directory may be named
+// by a record the stopped incarnation's commit pipeline is still writing — its
+// own adopted install at this index, which this receive's publish replaced —
+// so the discard takes the write lease, and a stopped node keeps it.
+func TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	node := eng.GetNode(shardID)
+	handler := &hostMessageHandler{engine: &stopThenRefuse{engineDeliverer: eng}, host: h}
+
+	err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	var recvErr *SnapshotReceiveError
+	if !errors.As(err, &recvErr) || recvErr.Op != "deliver_install" {
+		t.Fatalf("HandleSnapshot = %v, want the refused delivery reported", err)
+	}
+	if _, statErr := os.Stat(node.SnapshotSaveDir(snapIndex)); statErr != nil {
+		t.Fatalf("the published directory was discarded on a stopped node: %v", statErr)
+	}
+}
+
+// recordThenRefuse stands in for a local save that publishes and records the
+// receive's index while the receive is in flight, after which the install is
+// refused.
+type recordThenRefuse struct {
+	engineDeliverer
+	record func(dir string)
+	dir    string
+}
+
+func (d *recordThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot {
+		d.record(d.dir)
+		return false
+	}
+	return d.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
+// TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords: the write lease
+// is shared, so a local save can publish and record the very index a receive
+// published while the receive awaited its verdict. The failed receive's
+// discard then deleted the artifact LogDB named, with the log below it already
+// compacted. The discard now runs under the snapshot-directory lock and keeps
+// a directory the record names.
+func TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	node := eng.GetNode(shardID)
+	dir := node.SnapshotSaveDir(snapIndex)
+
+	var once sync.Once // the delivery is retried; the racing save records once
+	d := &recordThenRefuse{engineDeliverer: eng, dir: dir, record: func(dir string) {
+		once.Do(func() {
+			if err := h.logdb.SaveSnapshot(shardID, localReplicaID, logdb.Snapshot{
+				Index: snapIndex, Term: 4, Filepath: dir,
+			}); err != nil {
+				t.Errorf("recording the racing save: %v", err)
+			}
+		})
+	}}
+	handler := &hostMessageHandler{engine: d, host: h}
+
+	err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	var recvErr *SnapshotReceiveError
+	if !errors.As(err, &recvErr) || recvErr.Op != "deliver_install" {
+		t.Fatalf("HandleSnapshot = %v, want the refused delivery reported", err)
+	}
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Fatalf("DATA LOSS: the failed receive discarded the directory LogDB records: %v", statErr)
+	}
+}

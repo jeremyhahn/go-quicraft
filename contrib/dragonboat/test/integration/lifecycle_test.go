@@ -96,7 +96,7 @@ func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestIntegration_DB_HasNodeInfo(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -325,7 +325,7 @@ func TestIntegration_DB_UsingClosedNodeHost(t *testing.T) {
 	addr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestIntegration_DB_NodeHostID_CustomID(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NodeHostID = "custom-test-host-id-12345"
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}

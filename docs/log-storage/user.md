@@ -17,15 +17,22 @@ sizing and monitoring a data directory, and recovering one that came back wrong.
 ## Task: choose a store
 
 ```go
-// Durable, the production choice. HostConfig.WALDir is where it lives.
-host, err := quicraft.NewHost(cfg)
+// Durable, the production choice. HostConfig.WALDir is where it lives; the
+// barrier encrypts it at rest (see ../seal-barrier/user.md).
+host, err := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
 
 // In-memory. Tests, development, ephemeral nodes, benchmarks.
-host, err := quicraft.NewHost(cfg, quicraft.WithMemoryLogDB())
+host, err := quicraft.NewHost(cfg, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 
 // Your own logdb.LogDB implementation.
-host, err := quicraft.NewHost(cfg, quicraft.WithLogDB(myStore))
+host, err := quicraft.NewHost(cfg, quicraft.WithLogDB(myStore), quicraft.WithoutEncryption())
 ```
+
+Every host states its at-rest encryption: `WithBarrier` or `WithShardBarriers`
+to encrypt, or `WithoutEncryption` to store plaintext. `NewHost` refuses a host
+that states neither (`ErrAtRestEncryptionUnspecified`) and one that states both
+(`ErrAtRestEncryptionConflict`), so plaintext at rest is never reached by
+leaving an option out.
 
 A nil `LogDB` disables persistence entirely, and the engine then inlines
 `Peer.Commit` and cuts the pipeline from three hops to two — faster, and with no

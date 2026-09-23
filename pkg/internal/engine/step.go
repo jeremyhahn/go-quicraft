@@ -16,7 +16,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -107,8 +109,21 @@ type stepWorker struct {
 	// and that is precisely the window in which GetUpdate has already advanced
 	// prevState. Same goroutine discipline as enqueuingNode.
 	extractedNode *Node
-	inboxBuf      []proto.Message // reusable buffer for draining node inboxes
-	proposeBuf    []proto.Entry   // reusable buffer for batching inbox proposals
+
+	// inboxNode and inboxStep record whose drained inbox is being stepped and
+	// which message of inboxBuf is in raft's hands. A drained message exists
+	// nowhere else, so a panic mid-drain loses the rest of the batch; raft
+	// tolerates lost messages, but a local InstallSnapshot has a receive
+	// waiting on its verdict that would otherwise wait until the shard stops.
+	// See answerDroppedInstalls. Same goroutine discipline as enqueuingNode.
+	inboxNode *Node
+	inboxStep int
+	// inboxCommittedBefore is raft's committed index just before the local
+	// install at inboxStep was stepped, so a panic can still tell adoption.
+	inboxCommittedBefore uint64
+
+	inboxBuf   []proto.Message // reusable buffer for draining node inboxes
+	proposeBuf []proto.Entry   // reusable buffer for batching inbox proposals
 	// commitProposeBuf is a SEPARATE reusable buffer for the commit-pending
 	// drain. It must not share proposeBuf: within one iteration the step worker
 	// drains proposals into proposeBuf and steps a Propose message that ALIASES
@@ -579,14 +594,25 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 // It only ever compares LOCAL-origin installs: filterSnapshots drops wire-origin
 // InstallSnapshot before it reaches here, so a forged high index on the wire can
 // never evict the legitimate local install from this highest-index-wins buffer.
-func (w *stepWorker) deferSnapshot(shardID uint64, msg proto.Message) {
+//
+// An install evicted by a strictly newer one is never stepped, so the receive
+// path awaiting its verdict is told it was superseded rather than left
+// waiting; the same holds for the arriving install when an equal-or-newer one
+// is already buffered.
+func (w *stepWorker) deferSnapshot(node *Node, shardID uint64, msg proto.Message) {
 	buf := w.deferredSnapshots[shardID]
 	if len(buf) == 0 {
 		w.deferredSnapshots[shardID] = append(buf[:0], msg)
 		return
 	}
-	if msg.Snapshot.Index >= buf[0].Snapshot.Index {
+	switch {
+	case msg.Snapshot.Index > buf[0].Snapshot.Index:
+		node.signalInstallVerdict(buf[0].Snapshot.Index, InstallVerdict{Outcome: InstallSuperseded})
 		buf[0] = msg
+	case msg.Snapshot.Index == buf[0].Snapshot.Index:
+		buf[0] = msg // the same install again; its awaited verdict is still pending
+	default:
+		node.signalInstallVerdict(msg.Snapshot.Index, InstallVerdict{Outcome: InstallSuperseded})
 	}
 	w.deferredSnapshots[shardID] = buf[:1]
 }
@@ -596,7 +622,7 @@ func (w *stepWorker) deferSnapshot(shardID uint64, msg proto.Message) {
 // The input slice is filtered in place into a fresh header, so the caller
 // must use the returned slice. When msgs holds no snapshot it is returned
 // unchanged and nothing is allocated.
-func (w *stepWorker) filterSnapshots(shardID uint64, msgs []proto.Message) []proto.Message {
+func (w *stepWorker) filterSnapshots(shardID uint64, node *Node, msgs []proto.Message) []proto.Message {
 	hasSnapshot := false
 	for i := range msgs {
 		if msgs[i].Type == proto.InstallSnapshot {
@@ -631,7 +657,7 @@ func (w *stepWorker) filterSnapshots(shardID uint64, msgs []proto.Message) []pro
 				)
 				continue
 			}
-			w.deferSnapshot(shardID, msgs[i])
+			w.deferSnapshot(node, shardID, msgs[i])
 		} else {
 			filtered = append(filtered, msgs[i])
 		}
@@ -652,14 +678,35 @@ func (w *stepWorker) filterSnapshots(shardID uint64, msgs []proto.Message) []pro
 func (w *stepWorker) drainAndHandleInbox(shardID uint64, node *Node, recovering bool) {
 	w.inboxBuf = node.DrainInbox(w.inboxBuf)
 	if recovering {
-		w.inboxBuf = w.filterSnapshots(shardID, w.inboxBuf)
+		w.inboxBuf = w.filterSnapshots(shardID, node, w.inboxBuf)
 	}
+	// Cleared explicitly after the loop, never by a defer: a deferred clear
+	// would run during a panic's unwind, before the recovery that reads it.
+	w.inboxNode = node
 	for i := range w.inboxBuf {
+		w.inboxStep = i
 		var handleStart time.Time
 		if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 			handleStart = time.Now()
 		}
-		if err := node.peer.Handle(w.inboxBuf[i]); err != nil {
+		msg := &w.inboxBuf[i]
+		localInstall := msg.Type == proto.InstallSnapshot && msg.Origin == proto.OriginLocal
+		if localInstall && node.IsStopped() {
+			// Being unloaded: a stopped node adopts nothing. Its waiting
+			// receive was already answered InstallAbandoned by Stop.
+			continue
+		}
+		if localInstall {
+			// Poisoned first, so a panic inside LogMarkers itself cannot be
+			// classified against a previous install's reading.
+			w.inboxCommittedBefore = math.MaxUint64
+			w.inboxCommittedBefore, _ = node.peer.LogMarkers()
+		}
+		err := node.peer.Handle(*msg)
+		if localInstall {
+			node.signalInstallVerdict(msg.Snapshot.Index, installVerdictFor(node, msg.Snapshot.Index, w.inboxCommittedBefore, err))
+		}
+		if err != nil {
 			slog.Warn("peer.Handle failed",
 				"shard_id", shardID,
 				"replica_id", node.ReplicaID(),
@@ -677,6 +724,110 @@ func (w *stepWorker) drainAndHandleInbox(shardID uint64, node *Node, recovering 
 			)
 		}
 	}
+	w.inboxNode = nil
+}
+
+// answerDroppedInstalls answers every local InstallSnapshot a panic dropped
+// from the inbox batch being stepped, so its waiting receive returns instead
+// of holding a transport receive slot until the shard stops.
+//
+// Installs after the one in raft's hands were never stepped and are answered
+// InstallSuperseded, exactly as an install evicted from the deferred buffer
+// is: raft never saw them, their artifacts are discarded, and the leader
+// re-sends. The one in raft's hands is classified by raft's committed index,
+// as a completed step is: moved past the snapshot means raft ADOPTED it, and
+// the receive records it and recovers. Otherwise the panic interrupted an
+// install whose effect on raft is unknown — part of a restore may have run —
+// so the node is failed, the same terminal state a failed Peer.Commit
+// reaches; that answers the receive InstallAbandoned, which keeps the
+// artifact, and refuses every later receive until the shard is reloaded.
+// Answering "abandoned" on a node that kept running would instead let a
+// retry at the same index reclaim an artifact raft may be about to record.
+//
+// Runs on the step-worker goroutine inside the panic recovery, so it must not
+// panic itself: a panic in a deferred function after recover() ends the
+// process. The peer is read only when the pre-step reading was taken, and
+// through a recover of its own.
+func (w *stepWorker) answerDroppedInstalls(cause error) {
+	node := w.inboxNode
+	if node == nil {
+		return
+	}
+	w.inboxNode = nil
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("answering dropped snapshot installs panicked",
+				"shard_id", node.shardID, "panic", fmt.Sprint(r))
+		}
+	}()
+	if w.inboxStep >= len(w.inboxBuf) {
+		return
+	}
+	for i := w.inboxStep + 1; i < len(w.inboxBuf); i++ {
+		if msg := &w.inboxBuf[i]; msg.Type == proto.InstallSnapshot && msg.Origin == proto.OriginLocal {
+			node.signalInstallVerdict(msg.Snapshot.Index, InstallVerdict{Outcome: InstallSuperseded})
+		}
+	}
+	inHand := &w.inboxBuf[w.inboxStep]
+	if inHand.Type != proto.InstallSnapshot || inHand.Origin != proto.OriginLocal {
+		return
+	}
+	index := inHand.Snapshot.Index
+	// Already answered: the panic came AFTER the step returned (a logging
+	// call, the classification itself), so the step's own verdict stands and
+	// raft's state is known. A stopped node is being unloaded, and failing it
+	// would report — by shard ID — to whichever incarnation follows.
+	if !node.awaitingInstall(index) || node.IsStopped() {
+		return
+	}
+	if w.inboxCommittedBefore < index && committedReached(node, index) {
+		node.signalInstallVerdict(index, InstallVerdict{Outcome: InstallAdopted})
+		return
+	}
+	// The failure is reported by shard ID, so it is made under the node's
+	// write lease: UnloadNode cannot complete — and no next incarnation can
+	// exist to receive the report — until it is released, and a node stopped
+	// since the check above refuses the lease and is left alone.
+	// It is only TRIED: this is a step worker, which must never block behind
+	// an unload waiting for a long-running lease holder.
+	if !node.TryAcquireWriteLease() {
+		return
+	}
+	defer node.ReleaseWriteLease()
+	slog.Error("step worker panicked inside a snapshot install; failing the shard",
+		"shard_id", node.shardID, "replica_id", node.replicaID,
+		"snapshot_index", index, "error", cause)
+	node.Fail(cause)
+	if w.callback != nil {
+		w.callback.OnShardFailed(node.shardID, cause)
+	}
+}
+
+// committedReached reports whether raft's committed index is at or past index,
+// and false if reading it panics: it runs inside a panic recovery.
+func committedReached(node *Node, index uint64) (reached bool) {
+	defer func() {
+		if recover() != nil {
+			reached = false
+		}
+	}()
+	committed, _ := node.peer.LogMarkers()
+	return committed >= index
+}
+
+// installVerdictFor classifies what stepping a local InstallSnapshot at index
+// did. Raft ADOPTED it exactly when its committed index moved from below index
+// to at or above it — both the restore and the log-matches branch of
+// handleSnapshot do that — and DECLINED it when it returned no error but was
+// already at or past the snapshot. Any error is a refusal.
+func installVerdictFor(node *Node, index, committedBefore uint64, err error) InstallVerdict {
+	if err != nil {
+		return InstallVerdict{Outcome: InstallRefused, Err: err}
+	}
+	if committedAfter, _ := node.peer.LogMarkers(); committedBefore < index && committedAfter >= index {
+		return InstallVerdict{Outcome: InstallAdopted}
+	}
+	return InstallVerdict{Outcome: InstallDeclined}
 }
 
 // enqueueForCommit splits update messages by persistence ordering and
@@ -1139,7 +1290,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// (per-shard on the step worker) instead of re-delivered to the
 	// inbox. The buffer is re-injected into the inbox when commitPending
 	// clears and the normal processReady path runs.
-	w.inboxBuf = w.filterSnapshots(shardID, w.inboxBuf)
+	w.inboxBuf = w.filterSnapshots(shardID, node, w.inboxBuf)
 	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.commitProposeBuf) == 0 {
 		return
 	}

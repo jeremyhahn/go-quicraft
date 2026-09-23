@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"os"
@@ -88,6 +89,9 @@ type snapshotTestLogDB struct {
 	mu        sync.Mutex
 	snapshots map[uint64]logdb.Snapshot // keyed by shardID
 	removedTo uint64                    // last compaction index passed to RemoveEntriesTo
+	// nodeInfos is what ListNodeInfo reports: every (shard, replica) with
+	// durable state, loaded or not. Empty unless a test sets it.
+	nodeInfos []logdb.NodeInfo
 }
 
 func newSnapshotTestLogDB() *snapshotTestLogDB {
@@ -157,7 +161,11 @@ func (db *snapshotTestLogDB) GetSnapshot(shardID, _ uint64) (logdb.Snapshot, err
 
 func (db *snapshotTestLogDB) RemoveNodeData(_, _ uint64) error { return nil }
 
-func (db *snapshotTestLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) { return nil, nil }
+func (db *snapshotTestLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return append([]logdb.NodeInfo(nil), db.nodeInfos...), nil
+}
 
 func (db *snapshotTestLogDB) SaveBootstrap(_, _ uint64, _ logdb.Bootstrap) error { return nil }
 
@@ -785,6 +793,87 @@ func TestSnapshotPool_SetCallback(t *testing.T) {
 	}
 }
 
+// orderedCallback records the order OnSnapshotCompleted and OnLogCompacted
+// arrive in, on top of testCallback's own bookkeeping.
+type orderedCallback struct {
+	*testCallback
+	mu    sync.Mutex
+	order []string
+}
+
+func (c *orderedCallback) OnSnapshotCompleted(shardID uint64, index uint64, err error) {
+	c.mu.Lock()
+	c.order = append(c.order, "completed")
+	c.mu.Unlock()
+	c.testCallback.OnSnapshotCompleted(shardID, index, err)
+}
+
+func (c *orderedCallback) OnLogCompacted(shardID, replicaID uint64, compaction LogCompaction) {
+	c.mu.Lock()
+	c.order = append(c.order, "compacted")
+	c.mu.Unlock()
+	c.testCallback.OnLogCompacted(shardID, replicaID, compaction)
+}
+
+// TestSnapshotPool_DeliversLogCompactionAfterCompletion drives saves through
+// the pool worker and pins the delivery contract listeners depend on:
+// OnLogCompacted arrives once, AFTER OnSnapshotCompleted (so the snapshot is
+// seen before the compaction it enabled), with the index compaction ran
+// through — and not at all for a save within CompactionOverhead.
+func TestSnapshotPool_DeliversLogCompactionAfterCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		overhead uint64
+		want     []compactionCall
+		order    []string
+	}{
+		{"compacts past the overhead", 10,
+			[]compactionCall{{shardID: 7, replicaID: 1, compaction: LogCompaction{Index: 32, Reader: true, LogDB: true}}},
+			[]string{"completed", "compacted"}},
+		{"within the overhead compacts nothing", 100, nil, []string{"completed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stopC := make(chan struct{})
+			defer close(stopC)
+			cb := &orderedCallback{testCallback: newTestCallback()}
+			p := newSnapshotPool(2, newSnapshotTestLogDB(), nil, cb, nil, stopC, nil)
+			var wg sync.WaitGroup
+			p.start(&wg)
+
+			cfg := config.Config{ShardID: 7, ReplicaID: 1, CompactionOverhead: tc.overhead}
+			node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(42), t.TempDir(), nil)
+			// A reader that can really advance: compaction is reported only when
+			// the save moves its marker.
+			node.logReader = advancingReader(t, 7, 1, newSnapshotTestLogDB(), 42)
+			if err := p.requestSnapshot(snapshotRequest{shardID: 7, replicaID: 1, node: node, save: true}); err != nil {
+				t.Fatalf("requestSnapshot: %v", err)
+			}
+			awaitSnapshotResult(t, p, "snapshot")
+
+			got := cb.getCompactionCalls()
+			if len(got) != len(tc.want) {
+				t.Fatalf("OnLogCompacted calls = %+v, want %+v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("OnLogCompacted[%d] = %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+			cb.mu.Lock()
+			order := append([]string(nil), cb.order...)
+			cb.mu.Unlock()
+			if len(order) != len(tc.order) {
+				t.Fatalf("callback order = %v, want %v", order, tc.order)
+			}
+			for i := range order {
+				if order[i] != tc.order[i] {
+					t.Fatalf("callback order = %v, want %v", order, tc.order)
+				}
+			}
+		})
+	}
+}
+
 func TestSnapshotPool_CallbackFiredOnSave(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -1167,14 +1256,15 @@ func (b *testBarrier) encryptForEpoch(plaintext []byte, epoch uint64) []byte {
 	return out
 }
 
-// sealFrameAt builds one snapshot frame exactly as encryptSnapshotFile would:
+// sealFrameAt builds one snapshot frame exactly as the frame writer would:
 // sealed at the given epoch and bound to the artifact identity
-// (shardID, replicaID, index) plus the frame's 0-based ordinal. Tests that
-// hand-assemble a snapshot.dat must use it, or the frames carry no positional
-// binding and the decrypt side correctly rejects them.
-func (b *testBarrier) sealFrameAt(plaintext []byte, epoch, shardID, replicaID, index, seq uint64) []byte {
+// (shardID, replicaID, index), the frame's 0-based ordinal, and whether it is
+// the artifact's terminal frame. Tests that hand-assemble a snapshot.dat must
+// use it, or the frames carry no positional binding and the decrypt side
+// correctly rejects them.
+func (b *testBarrier) sealFrameAt(plaintext []byte, epoch, shardID, replicaID, index, seq uint64, final bool) []byte {
 	aad := NewSnapshotAAD(shardID, replicaID, index, aadCapability{supports: true})
-	return appendTestAADTag(b.encryptForEpoch(plaintext, epoch), aad.Frame(seq))
+	return appendTestAADTag(b.encryptForEpoch(plaintext, epoch), aad.Frame(seq, final))
 }
 
 func (b *testBarrier) Decrypt(dst, ciphertext []byte) ([]byte, error) {
@@ -1666,8 +1756,8 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 	// Two distinct plaintext chunks; frame 1 sealed at epoch 5, frame 2 at 6.
 	chunk1 := bytes.Repeat([]byte{0xA1}, 128)
 	chunk2 := bytes.Repeat([]byte{0xB2}, 200)
-	enc1 := barrier.sealFrameAt(chunk1, 5, 1, 1, 1, 0)
-	enc2 := barrier.sealFrameAt(chunk2, 6, 1, 1, 1, 1)
+	enc1 := barrier.sealFrameAt(chunk1, 5, 1, 1, 1, 0, false)
+	enc2 := barrier.sealFrameAt(chunk2, 6, 1, 1, 1, 1, true)
 
 	dataPath := filepath.Join(tmpDir, snapshotDataFile)
 	var fileData []byte
@@ -1761,7 +1851,7 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 	for i := range chunk1 {
 		chunk1[i] = byte(i % 37)
 	}
-	enc1 := barrier.sealFrameAt(chunk1, 1, 1, 1, 1, 0)
+	enc1 := barrier.sealFrameAt(chunk1, 1, 1, 1, 1, 0, false)
 	var frameBuf [4]byte
 	binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(enc1)))
 
@@ -2843,25 +2933,59 @@ func TestSnapshotEncryptError_Unwrap(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_DecryptFile_EmptyFile(t *testing.T) {
+// TestSnapshotPool_DecryptFile_EmptyFileIsTruncation pins that a sealed
+// artifact with no frames is refused. The writer always emits a terminal
+// frame, so an empty encrypted snapshot.dat can only be one truncated to
+// nothing, and decrypting it to an empty state machine would silently discard
+// every entry the snapshot held.
+func TestSnapshotPool_DecryptFile_EmptyFileIsTruncation(t *testing.T) {
 	tmpDir := t.TempDir()
 	barrier := newTestBarrier(1)
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	// Write an empty file.
 	dataPath := filepath.Join(tmpDir, "empty.dat")
 	if err := os.WriteFile(dataPath, []byte{}, 0o644); err != nil {
 		t.Fatalf("write empty file failed: %v", err)
 	}
-
-	// Decrypting an empty source should succeed and yield an empty sibling.
 	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	if !errors.Is(err, ErrSnapshotCorrupt) {
+		t.Fatalf("decrypt of a frameless artifact = %v, want ErrSnapshotCorrupt", err)
+	}
+	if plainPath != "" {
+		t.Fatalf("expected empty path on error, got %q", plainPath)
+	}
+}
+
+// TestSnapshotPool_DecryptFile_EmptyPlaintextRoundTrips is the other half: a
+// state machine that writes nothing still produces an artifact, one empty
+// terminal frame, and it decrypts back to nothing.
+func TestSnapshotPool_DecryptFile_EmptyPlaintextRoundTrips(t *testing.T) {
+	tmpDir := t.TempDir()
+	barrier := newTestBarrier(1)
+	stopC := make(chan struct{})
+	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
+
+	var sealed bytes.Buffer
+	epoch, pinned, err := SealSnapshotFrames(barrier, 1, 1, 1, bytes.NewReader(nil), &sealed)
 	if err != nil {
-		t.Fatalf("decrypt empty file failed: %v", err)
+		t.Fatalf("SealSnapshotFrames(empty): %v", err)
+	}
+	for _, e := range pinned {
+		barrier.DeregisterInFlightEpoch(e)
+	}
+	if epoch == 0 || sealed.Len() == 0 {
+		t.Fatalf("empty plaintext sealed to epoch %d, %d bytes; want one terminal frame", epoch, sealed.Len())
+	}
+	dataPath := filepath.Join(tmpDir, "empty-plaintext.dat")
+	if err := os.WriteFile(dataPath, sealed.Bytes(), 0o644); err != nil {
+		t.Fatalf("write sealed file failed: %v", err)
+	}
+	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, epoch, barrier)
+	if err != nil {
+		t.Fatalf("decrypt of an empty-plaintext artifact failed: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(plainPath) })
-
 	plain, readErr := os.ReadFile(plainPath)
 	if readErr != nil {
 		t.Fatalf("read decrypted sibling failed: %v", readErr)
@@ -4680,18 +4804,25 @@ func (c aadCapability) IsPlaintextMode() bool { return c.plaintext }
 // anywhere, so it can only be reproduced from code — which makes an accidental
 // field reorder a silent, total loss of every existing encrypted snapshot.
 func TestSnapshotAAD_Layout(t *testing.T) {
-	got := NewSnapshotAAD(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, aadCapability{supports: true}).
-		Frame(0x3132333435363738)
-	want := append([]byte("QRSNAP1"),
+	aad := NewSnapshotAAD(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, aadCapability{supports: true})
+	prefix := append([]byte("QRSNAP1"),
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
 		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
 		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38)
-	if len(want) != SnapshotFrameAADLen {
-		t.Fatalf("fixture is %d bytes, SnapshotFrameAADLen = %d", len(want), SnapshotFrameAADLen)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("context = %x, want %x", got, want)
+	// Terminal first, then non-terminal from the SAME builder: the flag byte
+	// lives in a reused scratch buffer, so the second call must clear it.
+	for _, tc := range []struct {
+		final bool
+		flag  byte
+	}{{true, 0x01}, {false, 0x00}} {
+		want := append(append([]byte{}, prefix...), tc.flag)
+		if len(want) != SnapshotFrameAADLen {
+			t.Fatalf("fixture is %d bytes, SnapshotFrameAADLen = %d", len(want), SnapshotFrameAADLen)
+		}
+		if got := aad.Frame(0x3132333435363738, tc.final); !bytes.Equal(got, want) {
+			t.Fatalf("Frame(final=%v) = %x, want %x", tc.final, got, want)
+		}
 	}
 }
 
@@ -4703,17 +4834,21 @@ func TestSnapshotAAD_DistinctPerPosition(t *testing.T) {
 		name                      string
 		shardID, replicaID, index uint64
 		seq                       uint64
+		final                     bool
 	}{
-		{"base", 1, 2, 3, 4},
-		{"shard", 2, 2, 3, 4},
-		{"replica", 1, 3, 3, 4},
-		{"index", 1, 2, 4, 4},
-		{"seq", 1, 2, 3, 5},
+		{"base", 1, 2, 3, 4, false},
+		{"shard", 2, 2, 3, 4, false},
+		{"replica", 1, 3, 3, 4, false},
+		{"index", 1, 2, 4, 4, false},
+		{"seq", 1, 2, 3, 5, false},
+		// The terminal flag is what makes a truncated artifact fail: the frame
+		// sealed as non-terminal must not authenticate as the last one.
+		{"final", 1, 2, 3, 4, true},
 		// The classic delimiter-free ambiguity: adjacent fields borrowing a
 		// digit from one another. Fixed-width fields make it impossible.
-		{"shift", 1, 2, 30, 4},
+		{"shift", 1, 2, 30, 4, false},
 	} {
-		key := string(NewSnapshotAAD(tc.shardID, tc.replicaID, tc.index, aadCapability{supports: true}).Frame(tc.seq))
+		key := string(NewSnapshotAAD(tc.shardID, tc.replicaID, tc.index, aadCapability{supports: true}).Frame(tc.seq, tc.final))
 		if prev, dup := seen[key]; dup {
 			t.Fatalf("%s and %s produce identical context bytes", tc.name, prev)
 		}
@@ -4735,7 +4870,7 @@ func TestSnapshotAAD_UnbindableBarrierSuppressesContext(t *testing.T) {
 		{"plaintext mode", aadCapability{plaintext: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if ctx := NewSnapshotAAD(1, 2, 3, tc.barrier).Frame(4); ctx != nil {
+			if ctx := NewSnapshotAAD(1, 2, 3, tc.barrier).Frame(4, false); ctx != nil {
 				t.Fatalf("produced a %d-byte context; the barrier would reject it "+
 					"with ErrHardwareMode and every snapshot save would fail", len(ctx))
 			}
@@ -4747,7 +4882,7 @@ func TestSnapshotAAD_UnbindableBarrierSuppressesContext(t *testing.T) {
 // CAN authenticate caller AAD gets the positional binding regardless of whether
 // it encrypts in software or delegates to hardware.
 func TestSnapshotAAD_CapableBarrierBindsContext(t *testing.T) {
-	ctx := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true}).Frame(4)
+	ctx := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true}).Frame(4, false)
 	if len(ctx) != SnapshotFrameAADLen {
 		t.Fatalf("context = %d bytes, want %d", len(ctx), SnapshotFrameAADLen)
 	}
@@ -4757,8 +4892,8 @@ func TestSnapshotAAD_CapableBarrierBindsContext(t *testing.T) {
 // property of the bulk encrypt/decrypt path.
 func TestSnapshotAAD_FrameReusesScratchBuffer(t *testing.T) {
 	aad := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true})
-	first := aad.Frame(0)
-	second := aad.Frame(1)
+	first := aad.Frame(0, false)
+	second := aad.Frame(1, true)
 	if &first[0] != &second[0] {
 		t.Fatal("Frame allocated a new buffer per call; the snapshot bulk path would " +
 			"allocate once per frame")
@@ -4944,7 +5079,20 @@ func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testin
 		canary:      canary,
 		filler:      filler,
 		midSave: func() {
-			onDisk, err := os.ReadFile(dataPath)
+			// The save stages: mid-save the canonical name must not exist
+			// yet, and the bytes being written live in the stage.
+			if _, err := os.Stat(dataPath); !os.IsNotExist(err) {
+				midSaveStatErr = fmt.Errorf("canonical %s exists mid-save (stat err %v)", snapshotDataFile, err)
+				return
+			}
+			staged, err := filepath.Glob(filepath.Join(filepath.Dir(filepath.Dir(dataPath)),
+				SaveStageDirPrefix+"*", snapshotDataFile))
+			if err != nil || len(staged) != 1 {
+				midSaveStatErr = fmt.Errorf("found %d staged %s files (glob err %v), want 1",
+					len(staged), snapshotDataFile, err)
+				return
+			}
+			onDisk, err := os.ReadFile(staged[0])
 			if err != nil {
 				midSaveStatErr = err
 				return
@@ -5104,4 +5252,40 @@ func sealSnapshotFile(t *testing.T, path string, plaintext []byte, shardID, repl
 		t.Fatalf("sealSnapshotFile: close file: %v", err)
 	}
 	return w.MinEpoch()
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *testBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *failAfterNBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *rotateAfterNBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
 }

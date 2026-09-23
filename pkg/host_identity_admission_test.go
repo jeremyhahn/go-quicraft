@@ -40,7 +40,7 @@ import (
 // names the replica that is not.
 func TestStartShard_TransportHostRequiresFounderIdentities(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestStartShard_TransportHostRequiresFounderIdentities(t *testing.T) {
 // the bootstrap entry for a replica no role holds.
 func TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstra
 // names only the joiner itself, since its own entry vouches for no sender.
 func TestStartShard_TransportHostRequiresJoinAnchor(t *testing.T) {
 	cfg := sanHostConfig(t, "node-b.raft.test:5000", "node-b.raft.test")
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestStartShard_TransportHostRequiresJoinAnchor(t *testing.T) {
 func TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 	cfg.WALDir, cfg.NodeHostDir = t.TempDir(), t.TempDir()
-	h, err := NewHost(cfg)
+	h, err := NewHost(cfg, WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor(t *testing.T) 
 		t.Fatalf("Close: %v", err)
 	}
 
-	restarted, err := NewHost(cfg)
+	restarted, err := NewHost(cfg, WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost (restart): %v", err)
 	}
@@ -245,7 +245,7 @@ func TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor(t *testing.T) 
 // at the API, and the WithIdentity form is admitted.
 func TestRequestAddNode_TransportHostRequiresIdentity(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestImportMembershipFor_RequiresIdentitiesBehindATransport(t *testing.T) {
 func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 	cfg.WALDir, cfg.NodeHostDir = t.TempDir(), t.TempDir()
-	h, err := NewHost(cfg)
+	h, err := NewHost(cfg, WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 	var inv *InvalidMemberError
 	restart := func(t *testing.T, hostCfg config.HostConfig, anchor map[uint64]string) error {
 		t.Helper()
-		restarted, err := NewHost(hostCfg)
+		restarted, err := NewHost(hostCfg, WithoutEncryption())
 		if err != nil {
 			t.Fatalf("NewHost (restart): %v", err)
 		}
@@ -501,7 +501,7 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 	// members map is ignored, so a stale map naming a replica the identities
 	// no longer cover must not be refused — that is every remaining
 	// founder's map after a RemoveNode, on its next rolling restart.
-	restarted, err := NewHost(cfg)
+	restarted, err := NewHost(cfg, WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost (restart): %v", err)
 	}
@@ -547,7 +547,7 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 // every peer refuse the joiner's acks for the life of the shard.
 func TestHandleSnapshot_RefusesABindingThisHostDoesNotPresent(t *testing.T) {
 	cfg := sanHostConfig(t, "node-b.raft.test:5000", "node-b.raft.test")
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

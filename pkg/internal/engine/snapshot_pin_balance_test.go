@@ -457,3 +457,15 @@ func TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero(t *testing.T) {
 	}
 	barrier.assertBalanced(t, "saveSnapshot MaxSnapshotSize refusal")
 }
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *pinCountBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}

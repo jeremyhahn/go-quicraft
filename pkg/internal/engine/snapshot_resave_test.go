@@ -191,7 +191,7 @@ var errRecordRead = errors.New("resave test: snapshot record read failed")
 
 // recordReadFailLogDB fails GetSnapshot once armed and otherwise behaves like
 // the in-memory fixture. Every read the save path makes — the non-advancing
-// guard AND the discardSaveDir backstop — goes through this one method, which
+// guard AND the publishStagedSave backstop — goes through this one method, which
 // is why a fail-OPEN guard defeats both layers at once.
 type recordReadFailLogDB struct {
 	*snapshotTestLogDB
@@ -208,11 +208,10 @@ func (db *recordReadFailLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.Sna
 // TestSaveSnapshot_RecordReadErrorFailsClosed asserts that a save whose LogDB
 // record cannot be READ refuses to run.
 //
-// Falling through on the read error reopens the recorded snapshot.dat with
-// O_TRUNC, which is exactly what this guard exists to prevent — and
-// discardSaveDir, the second line of defence, consults the record through the
-// SAME call, so one persistent read error defeats both layers: truncate the
-// recorded artifact, then delete it.
+// Falling through on the read error would run a save whose publish must then
+// decide whether the canonical directory is the recorded one — and
+// publishStagedSave, the second line of defence, consults the record through
+// the SAME call, so one persistent read error defeats both layers.
 func TestSaveSnapshot_RecordReadErrorFailsClosed(t *testing.T) {
 	var wrapper *recordReadFailLogDB
 	f := newResaveFixtureDB(t, 400, func(base *snapshotTestLogDB) logdb.LogDB {
@@ -301,6 +300,144 @@ func TestSaveSnapshot_MissingRecordedArtifactIsRebuilt(t *testing.T) {
 	}
 }
 
+// TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe: a rebuild
+// keeps the existing LogDB record — LogDB rejects a same-index update — so
+// recovery reads the rebuilt bytes through the OLD record's encryption and
+// compression. Rebuilding in a format the record does not describe (here: the
+// shard switched to Snappy since the recorded snapshot was taken) produced an
+// artifact that reported success and could never be recovered. It is refused.
+func TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe(t *testing.T) {
+	f := newResaveFixture(t, 250)
+	if _, err := f.pool.saveSnapshot(f.req); err != nil {
+		t.Fatalf("first saveSnapshot: %v", err)
+	}
+	saveDir := f.saveDirFor(250)
+	if err := os.RemoveAll(saveDir); err != nil {
+		t.Fatalf("remove the recorded artifact: %v", err)
+	}
+	f.node.cfg.SnapshotCompressionType = config.Snappy
+
+	index, err := f.pool.saveSnapshot(f.req)
+	if err != nil || index != 0 {
+		t.Fatalf("rebuild in a mismatched format: index=%d err=%v, want the no-op 0 / nil", index, err)
+	}
+	if _, statErr := os.Stat(saveDir); !os.IsNotExist(statErr) {
+		t.Fatalf("an artifact the record cannot describe was published at %s (stat err %v)", saveDir, statErr)
+	}
+	rec, recErr := f.ldb.GetSnapshot(f.req.shardID, f.req.replicaID)
+	if recErr != nil || rec.Compression != config.NoCompression {
+		t.Fatalf("the record changed: %+v (err %v)", rec, recErr)
+	}
+}
+
+// TestSaveSnapshot_RebuildRefusesWhatTheRecordCannotDescribe: a rebuild keeps
+// the surviving record, and recovery reads the rebuilt artifact through it —
+// its path and the FileSize it measures the file against. A rebuild whose
+// output size differs (the same state serialized differently), or whose
+// record names a directory the rebuild does not write, reported success and
+// left an artifact recovery could never read. Both are refused.
+func TestSaveSnapshot_RebuildRefusesWhatTheRecordCannotDescribe(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		tamper func(*logdb.Snapshot, string)
+	}{
+		{"recorded size differs", func(rec *logdb.Snapshot, _ string) { rec.FileSize++ }},
+		{"recorded path is not the rebuild's", func(rec *logdb.Snapshot, saveDir string) {
+			rec.Filepath = filepath.Join(filepath.Dir(saveDir), "legacy-snapshot-250")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newResaveFixture(t, 250)
+			if _, err := f.pool.saveSnapshot(f.req); err != nil {
+				t.Fatalf("first saveSnapshot: %v", err)
+			}
+			saveDir := f.saveDirFor(250)
+			if err := os.RemoveAll(saveDir); err != nil {
+				t.Fatalf("remove the recorded artifact: %v", err)
+			}
+			f.ldb.mu.Lock()
+			rec := f.ldb.snapshots[f.req.shardID]
+			tt.tamper(&rec, saveDir)
+			f.ldb.snapshots[f.req.shardID] = rec
+			f.ldb.mu.Unlock()
+
+			index, err := f.pool.saveSnapshot(f.req)
+			if err != nil || index != 0 {
+				t.Fatalf("rebuild the record cannot describe: index=%d err=%v, want the no-op 0 / nil", index, err)
+			}
+			if _, statErr := os.Stat(saveDir); !os.IsNotExist(statErr) {
+				t.Fatalf("an artifact the record cannot describe was published at %s (stat err %v)", saveDir, statErr)
+			}
+			if stages, _ := filepath.Glob(filepath.Join(filepath.Dir(saveDir), SaveStageDirPrefix+"*")); len(stages) != 0 {
+				t.Fatalf("the refused rebuild left its stage behind: %v", stages)
+			}
+		})
+	}
+}
+
+// TestSaveSnapshot_RebuildAcceptsALegacyUnknownSize: a record with FileSize 0
+// predates size recording — recovery does not validate it and restart
+// re-measures the file — so it must not refuse the rebuild that repairs a
+// shard upgraded with such a record and then missing its artifact.
+func TestSaveSnapshot_RebuildAcceptsALegacyUnknownSize(t *testing.T) {
+	f := newResaveFixture(t, 250)
+	if _, err := f.pool.saveSnapshot(f.req); err != nil {
+		t.Fatalf("first saveSnapshot: %v", err)
+	}
+	saveDir := f.saveDirFor(250)
+	if err := os.RemoveAll(saveDir); err != nil {
+		t.Fatalf("remove the recorded artifact: %v", err)
+	}
+	f.ldb.mu.Lock()
+	rec := f.ldb.snapshots[f.req.shardID]
+	rec.FileSize = 0
+	f.ldb.snapshots[f.req.shardID] = rec
+	f.ldb.mu.Unlock()
+
+	index, err := f.pool.saveSnapshot(f.req)
+	if err != nil || index != 250 {
+		t.Fatalf("rebuild under a legacy size-unknown record: index=%d err=%v, want 250 / nil", index, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(saveDir, snapshotDataFile)); statErr != nil {
+		t.Fatalf("the missing artifact was not rebuilt: %v", statErr)
+	}
+}
+
+// TestSaveSnapshot_RebuildRefreshesTheLogReaderSize: a shard restarted with
+// its artifact missing loads its log reader with the recorded path and size 0,
+// and a rebuild cannot re-create the reader's snapshot at the same index —
+// so the reader kept declaring 0 and every send of the rebuilt artifact failed
+// its declared-size check until the next restart. The rebuild refreshes the
+// declared size.
+func TestSaveSnapshot_RebuildRefreshesTheLogReaderSize(t *testing.T) {
+	f := newResaveFixture(t, 250)
+	lr := logdb.NewLogReader(f.req.shardID, f.req.replicaID, f.ldb)
+	f.node.logReader = lr
+	if _, err := f.pool.saveSnapshot(f.req); err != nil {
+		t.Fatalf("first saveSnapshot: %v", err)
+	}
+	saveDir := f.saveDirFor(250)
+	fi, err := os.Stat(filepath.Join(saveDir, snapshotDataFile))
+	if err != nil {
+		t.Fatalf("stat the artifact: %v", err)
+	}
+	if err := os.RemoveAll(saveDir); err != nil {
+		t.Fatalf("remove the recorded artifact: %v", err)
+	}
+	// What a restart with the artifact missing leaves: the path, size 0.
+	if err := lr.RefreshSnapshotFileSize(250, 0); err != nil {
+		t.Fatalf("simulate the restart's size-0 load: %v", err)
+	}
+
+	if index, err := f.pool.saveSnapshot(f.req); err != nil || index != 250 {
+		t.Fatalf("rebuild: index=%d err=%v, want 250 / nil", index, err)
+	}
+	if got := lr.Snapshot().FileSize; got != uint64(fi.Size()) {
+		t.Fatalf("the log reader declares %d bytes for the rebuilt artifact of %d: every send of it would fail",
+			got, fi.Size())
+	}
+}
+
 // TestSaveSnapshot_FirstSaveProceedsWithNoRecord pins the branch the fixture
 // used to hide: every real LogDB reports "no snapshot yet" as ErrNoSnapshot,
 // not as a zero record with a nil error, and the guard must read that as "this
@@ -321,30 +458,108 @@ func TestSaveSnapshot_FirstSaveProceedsWithNoRecord(t *testing.T) {
 	}
 }
 
-// TestDiscardSaveDir_RefusesLogDBRecordedDirectory asserts the backstop: the
-// discard helper never removes the directory the durable LogDB record names,
-// whatever path reaches it.
-func TestDiscardSaveDir_RefusesLogDBRecordedDirectory(t *testing.T) {
+// TestPublishStagedSave_NeverReplacesTheRecordedDirectory asserts the backstop:
+// publishing a staged save never replaces the recorded directory (except to
+// rebuild it) or one a receive has claimed, and does replace an orphan.
+func TestPublishStagedSave_NeverReplacesTheRecordedDirectory(t *testing.T) {
 	f := newResaveFixture(t, 80)
 	if _, err := f.pool.saveSnapshot(f.req); err != nil {
 		t.Fatalf("saveSnapshot: %v", err)
 	}
-	saveDir := f.saveDirFor(80)
+	recorded := f.saveDirFor(80)
+	stageWith := func(t *testing.T, content string) string {
+		t.Helper()
+		stage, err := MkdirStageDir(filepath.Dir(recorded), SaveStageDirPattern)
+		if err != nil {
+			t.Fatalf("MkdirStageDir: %v", err)
+		}
+		if wErr := os.WriteFile(filepath.Join(stage, snapshotDataFile), []byte(content), 0o600); wErr != nil {
+			t.Fatalf("write stage: %v", wErr)
+		}
+		return stage
+	}
+	occupy := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
+			t.Fatalf("mkdir: %v", mkErr)
+		}
+		if wErr := os.WriteFile(filepath.Join(dir, snapshotDataFile), []byte(content), 0o600); wErr != nil {
+			t.Fatalf("write: %v", wErr)
+		}
+	}
+	read := func(dir string) string {
+		got, _ := os.ReadFile(filepath.Join(dir, snapshotDataFile))
+		return string(got)
+	}
+	f.node.LockSnapshotDir()
+	defer f.node.UnlockSnapshotDir()
 
-	f.pool.discardSaveDir(saveDir, f.req)
-
-	if _, err := os.Stat(filepath.Join(saveDir, snapshotDataFile)); err != nil {
-		t.Fatalf("DATA LOSS: discardSaveDir removed the snapshot LogDB records: %v", err)
+	// The RECORDED directory is refused.
+	if err := f.pool.publishStagedSave(stageWith(t, "save"), recorded, 80, f.req, false); !errors.Is(err, ErrSnapshotIndexNotAdvanced) {
+		t.Fatalf("publishStagedSave onto the recorded directory = %v, want ErrSnapshotIndexNotAdvanced", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(recorded, snapshotDataFile)); statErr != nil {
+		t.Fatalf("DATA LOSS: publishing a staged save replaced the snapshot LogDB records: %v", statErr)
 	}
 
-	// A directory LogDB does NOT name is still removed.
-	orphan := f.saveDirFor(81)
-	if err := os.MkdirAll(orphan, 0o750); err != nil {
-		t.Fatalf("mkdir orphan: %v", err)
+	// A CLAIMED occupant — a receive's published artifact awaiting raft's
+	// verdict, unrecorded now and recorded a moment from now — is refused.
+	claimed := f.saveDirFor(81)
+	occupy(t, claimed, "received")
+	f.node.ClaimSnapshotDir(81)
+	if err := f.pool.publishStagedSave(stageWith(t, "save"), claimed, 81, f.req, false); !errors.Is(err, ErrSnapshotIndexNotAdvanced) {
+		t.Fatalf("publishStagedSave over a claimed occupant = %v, want ErrSnapshotIndexNotAdvanced", err)
 	}
-	f.pool.discardSaveDir(orphan, f.req)
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Fatalf("discardSaveDir left an unrecorded directory behind: %v", err)
+	if got := read(claimed); got != "received" {
+		t.Fatalf("the claimed occupant was replaced (holds %q)", got)
+	}
+
+	// An unclaimed, unrecorded occupant is an ORPHAN and is replaced: a
+	// quiescent shard keeps re-saving at that index, and GC never reclaims
+	// the newest directory.
+	f.node.ReleaseSnapshotDir(81)
+	if err := f.pool.publishStagedSave(stageWith(t, "save"), claimed, 81, f.req, false); err != nil {
+		t.Fatalf("publishStagedSave over an orphan: %v", err)
+	}
+	if got := read(claimed); got != "save" {
+		t.Fatalf("the orphan was not replaced (holds %q)", got)
+	}
+
+	// And the rebuild of the RECORDED directory is allowed.
+	if err := f.pool.publishStagedSave(stageWith(t, "rebuilt"), recorded, 80, f.req, true); err != nil {
+		t.Fatalf("rebuild publish: %v", err)
+	}
+	if got := read(recorded); got != "rebuilt" {
+		t.Fatalf("the rebuild was not published (holds %q)", got)
+	}
+}
+
+// TestPublishStagedSave_RefusesADirectoryARecoveryIsReading: a recovery whose
+// record names no path falls back to the newest directory on disk, which can
+// be unrecorded and unclaimed — exactly what the save replaces as an orphan.
+// A pinned directory is refused instead.
+func TestPublishStagedSave_RefusesADirectoryARecoveryIsReading(t *testing.T) {
+	f := newResaveFixture(t, 80)
+	dir := f.saveDirFor(95)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, snapshotDataFile), []byte("being recovered"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stage, err := MkdirStageDir(filepath.Dir(dir), SaveStageDirPattern)
+	if err != nil {
+		t.Fatalf("MkdirStageDir: %v", err)
+	}
+
+	f.node.LockSnapshotDir()
+	defer f.node.UnlockSnapshotDir()
+	f.node.PinSnapshotDir(dir)
+	if pErr := f.pool.publishStagedSave(stage, dir, 95, f.req, false); !errors.Is(pErr, ErrSnapshotIndexNotAdvanced) {
+		t.Fatalf("publishStagedSave over a pinned directory = %v, want ErrSnapshotIndexNotAdvanced", pErr)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, snapshotDataFile)); string(got) != "being recovered" {
+		t.Fatalf("the directory a recovery is reading was replaced (holds %q)", got)
 	}
 }
 
@@ -386,22 +601,38 @@ func TestSaveSnapshot_MetadataErrorLeavesNoDirectory(t *testing.T) {
 	cfg := config.Config{ShardID: 5, ReplicaID: 2, CompactionOverhead: 10}
 	cfg.SetDefaults()
 
-	node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(150), snapDir, nil)
+	saveDir := snapshotSaveDir(snapDir, 5, 2, 150)
+	stagePattern := filepath.Join(filepath.Dir(saveDir), SaveStageDirPrefix+"*")
+	// Mid-save, occupy snapshot.meta inside the save's stage with a directory,
+	// so the metadata write fails after the data file is complete.
+	ss := &canarySnapshotter{
+		lastApplied: 150,
+		canary:      []byte("state"),
+		midSave: func() {
+			stages, err := filepath.Glob(stagePattern)
+			if err != nil || len(stages) != 1 {
+				t.Errorf("found %d save stages (glob err %v), want 1", len(stages), err)
+				return
+			}
+			if err := os.MkdirAll(filepath.Join(stages[0], snapshotMetadataFile), 0o750); err != nil {
+				t.Errorf("pre-create meta as directory: %v", err)
+			}
+		},
+	}
+	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
 	stopC := make(chan struct{})
 	defer close(stopC)
 	pool := newSnapshotPool(1, newSnapshotTestLogDB(), nil, nil, nil, stopC, nil)
-
-	saveDir := snapshotSaveDir(snapDir, 5, 2, 150)
-	if err := os.MkdirAll(filepath.Join(saveDir, snapshotMetadataFile), 0o750); err != nil {
-		t.Fatalf("pre-create meta as directory: %v", err)
-	}
 
 	req := snapshotRequest{shardID: 5, replicaID: 2, node: node, save: true}
 	if _, err := pool.saveSnapshot(req); err == nil {
 		t.Fatal("saveSnapshot must fail when the metadata write fails")
 	}
 	if _, err := os.Stat(saveDir); !os.IsNotExist(err) {
-		t.Fatalf("a metadata failure left its directory behind (%s): %v", saveDir, err)
+		t.Fatalf("a metadata failure published its directory (%s): %v", saveDir, err)
+	}
+	if stages, _ := filepath.Glob(stagePattern); len(stages) != 0 {
+		t.Fatalf("a metadata failure left its staging directory behind: %v", stages)
 	}
 }
 

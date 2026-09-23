@@ -123,7 +123,7 @@ new peers are simply refused.
 ## Task: run without a transport
 
 ```go
-host, err := quicraft.NewHost(cfg, quicraft.WithoutTransport())
+host, err := quicraft.NewHost(cfg, quicraft.WithoutTransport(), quicraft.WithoutEncryption())
 ```
 
 Single-node embedded deployments and tests. The QUIC transport is not

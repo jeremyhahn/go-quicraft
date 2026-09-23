@@ -303,7 +303,7 @@ and asserts nothing else can win that term.
 unit tests and Host benchmarks skip WAL overhead:
 
 ```go
-h, err := quicraft.NewHost(cfg, quicraft.WithMemoryLogDB(), quicraft.WithoutTransport())
+h, err := quicraft.NewHost(cfg, quicraft.WithMemoryLogDB(), quicraft.WithoutTransport(), quicraft.WithoutEncryption())
 ```
 
 `mockLogDB` in `pkg/host_test.go` is lighter still, with injectable errors for

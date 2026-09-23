@@ -7,6 +7,287 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Implements the production-readiness rulings of 2026-09-23 that change the
+code or the docs (R1, R2, R3, R8, R9, R10), and the fixes from the
+whole-project review of that work by Claude and Codex (R11). **Three breaking
+changes**, which is why this is a MINOR release: every `NewHost` must now state
+its at-rest encryption, the at-rest snapshot frame format changed in place (the
+format version stays pinned under the pre-release policy), and a custom
+`Barrier` must implement `EncryptWithEpochPinnedContext`.
+**Wipe every dev data directory before upgrading**: an encrypted snapshot
+written by 0.13.x does not authenticate under the new frame context.
+
+### Changed — BREAKING: at-rest encryption is a stated choice, never a default (R3)
+
+- **`NewHost` refuses a host that states no at-rest encryption.** A host
+  built without `WithBarrier` used to store its Raft log and snapshots as
+  plaintext with no error and no warning — the code called it "the legitimate
+  unencrypted deployment". Every host now passes `WithBarrier`,
+  `WithShardBarriers`, or the new `WithoutEncryption()`; `NewHost` returns
+  `ErrAtRestEncryptionUnspecified` for none of them and
+  `ErrAtRestEncryptionConflict` for `WithoutEncryption` combined with a
+  barrier option. The check runs before anything touches the disk, so a refused
+  host leaves no directories behind. This is the same shape as the
+  mandatory-identities ruling and `WithoutTransport()`.
+- **The dragonboat adapter:** `NewNodeHost`, the drop-in constructor, keeps
+  Dragonboat's behaviour and declares it (`WithoutEncryption`, documented on
+  the constructor); `NewNodeHostWithOptions` passes the decision to its
+  caller, and returns the refusal wrapped in `NodeHostConstructionError`.
+- Embedders (go-qrdb, go-xkms, go-quicbaas, go-trusted-ca) need a one-line
+  opt-in when they take this version.
+
+### Changed — BREAKING (on disk): snapshot tail truncation is detected (R1)
+
+- **Every at-rest snapshot frame's context gains a terminal flag**
+  (`SnapshotFrameAADLen` 39 → 40 bytes; magic `QRSNAP1` unchanged, changed in
+  place). The frame writer holds each full chunk back until more plaintext
+  proves it is not the last, and `Close` always emits a terminal frame. The
+  one reader, `engine.OpenSnapshotFrames`, reads a frame ahead and
+  authenticates the frame the file ends on as terminal. A snapshot that lost
+  trailing frames, or had frames spliced after its terminal frame from a longer
+  artifact of the same identity, now fails authentication instead of
+  restoring a shorter state machine; one truncated to nothing is refused as
+  `ErrSnapshotCorrupt`. SECURITY.md listed this as an accepted limit.
+- **One encoder, one decoder.** `host.go` carried its own copies of the frame
+  encoder and decoder, and `pkg` its own `epochPinner` identical to the
+  engine's but for one word in a comment. Both paths now go through
+  `engine.SealSnapshotFrames` and `engine.OpenSnapshotFrames`, and
+  `pkg/epoch_pinner.go` is gone, so the encrypt and decrypt sides cannot drift
+  apart again. A test fixture that hand-rolled a third encoder now seals
+  through the production one.
+- A source I/O error while reading a snapshot is reported as the source's
+  error, no longer as `ErrSnapshotCorrupt`, so an operator is not told to
+  discard an artifact that is intact.
+
+### Fixed
+
+- **`OnLogCompacted` and `OnLogDBCompacted` fired after every snapshot,
+  including ones that compacted nothing.** A save within `CompactionOverhead`
+  (5000 entries by default) compacts nothing, and a failed LogDB removal is
+  only logged — yet both events fired unconditionally, telling a listener that
+  storage had been reclaimed when it had not. The engine now reports what
+  compaction actually did (`LogCompaction`) through a new
+  `Callback.OnLogCompacted`, delivered after `OnSnapshotCompleted`;
+  `OnLogCompacted` fires only when the log was compacted and
+  `OnLogDBCompacted` only when the LogDB step succeeded too.
+
+### Added
+
+- **`config.EventShardInfo.Index`**: the index a compaction ran through, set
+  for the two compaction events and 0 for every other. The dragonboat
+  adapter's `LogCompacted`/`LogDBCompacted` now carry it in `EntryInfo.Index`,
+  which was hardcoded to 0 behind two TODOs — the last TODOs in the tree.
+
+### Fixed — whole-project review (R11)
+
+Two independent whole-project reviews (Claude and Codex) of the change set
+above. Where they overlapped they agreed; every finding below was confirmed
+against the code before it was fixed, and each fix has a test that fails
+without it.
+
+- **A stated barrier did not cover a caller-supplied log (both reviews,
+  HIGH).** The host-wide barrier is wired only into the default WAL, and the
+  plaintext-log check ran only for per-shard barriers, so `WithBarrier` plus
+  `WithLogDB(waldb.Open(dir))` encrypted snapshots and wrote every proposed
+  command to disk in cleartext. It now requires that LogDB to report
+  `barrier_encrypted` or `non_durable`, refusing otherwise with the new
+  `ErrBarrierPlaintextLogDB`.
+- **A DEK purge could strand a stopped shard's snapshot forever (Codex,
+  HIGH).** The purge floor's completeness guard read only the snapshot bases of
+  loaded shards, but every shard has its own base, so a stopped shard's
+  artifacts were never seen and a co-hosted shard's rotation could purge the
+  key its recorded snapshot needs — its restart then fails closed on decrypt,
+  permanently. The floor now also counts every unloaded shard's LogDB-recorded
+  snapshot epoch (per-barrier through the resolver, so the optional
+  `BarrierShardEnumerator` is no longer relied on), and purges nothing when the
+  LogDB cannot enumerate its shards. A stopped shard's older, superseded
+  snapshots are not counted and may become undecryptable (accepted).
+- **The snapshot receive was durable before raft decided (Claude, MEDIUM).**
+  It recorded the snapshot, raised the log floor and queued recovery on
+  DELIVERY of the install, and raft can still refuse one that passed every host
+  check — a sender deposed mid-stream, a membership raft cannot address. The
+  refused snapshot stayed recorded and the queued recovery failed the shard.
+  The receive is now two-phase: the step worker reports raft's verdict on each
+  locally injected install (`Node.AwaitInstallVerdict`), and only an adopted
+  install is recorded, floored and recovered; anything else discards the
+  unrecorded directory. It surfaced a latent bug: a snapshot record converted
+  from raft's `Update` named the data FILE where every reader expects the
+  directory — masked while the host always recorded first.
+  A confirmation round by both reviewers then found, independently, that the
+  first version could still delete a snapshot raft had adopted: an install
+  delivered by shard ID could reach a reloaded shard's NEW node, a stopped
+  node could still be stepped, and "abandoned" discarded the artifact although
+  it does not prove the install was never stepped. The install now goes to
+  exactly the node its verdict is awaited on (`Engine.DeliverLocalTo`), a
+  stopped node adopts nothing, and an abandoned verdict keeps the artifact.
+  A receive for a failed shard also waited forever, holding a host-wide
+  receive slot: every failure now goes through one path that answers waiting
+  receives, and a failed shard's receive is refused up front.
+  A third round found the rest of the incarnation boundary. Recovery was
+  queued on whichever node held the shard after adoption, not the one that
+  adopted; it now goes to the adopting node. A recovered step-worker panic
+  lost the drained inbox and left its install's receive waiting; the recovery
+  now answers each dropped install: adopted if raft's committed index says so,
+  superseded for those never stepped, and — for an install whose step the
+  panic interrupted, leaving raft's state unknown — the shard is failed, as a
+  failed `Peer.Commit` fails it; an install already answered when the panic
+  hit, or a stopped node, is left alone.
+- **A stopped shard could write LogDB after its unload returned (Codex,
+  HIGH).** `UnloadNode` told the commit worker asynchronously, so a batch
+  holding the old incarnation's update could reach `SaveState` after
+  `StartShard` had loaded the new one — an old vote landing over the new
+  incarnation's HardState, or an adopted snapshot recorded against an artifact
+  a retry had already reclaimed. The commit-side unload is now a fence
+  `UnloadNode` waits on, and an update from an unloaded incarnation still
+  queued behind it is dropped before `SaveState` together with its ordered
+  messages, exactly as a crash before the fsync. The pipeline's incarnation
+  guards — commit admission, the post-`SaveState` commit guard and the apply
+  dispatcher — now test whether `UnloadNode` marked the node, not whether it
+  stopped: `Engine.Stop` stops every node long before the commit and apply
+  tiers exit, so the stop-based guards had been discarding the shutdown
+  drain's committed, durable work and failing its proposals (this predates
+  the release). The snapshot receive's own durable
+  writes — publishing its directory, recording an adopted install, raising the
+  log floor, and discarding a published directory after a failure — run
+  under a per-node write lease that `UnloadNode` also waits out; a stopped
+  node's published directory is kept rather than discarded, and a receive for
+  a stopping shard is refused before it stages anything; a join window is
+  cleared under the same lease. A local snapshot save now STAGES, as a receive
+  does: the capture, `snapshot.meta` and the export are written into a
+  `.save-*` directory of its own, and only the publish — renaming it onto
+  `snapshot-<index>`, the LogDB record, the log reader's marker, the entries
+  removed below it and the GC — runs under the lease. A save running past its
+  node's stop could otherwise write into or discard the next incarnation's
+  received snapshot at the same index, or compact under its log reader; and
+  holding the lease across the user state machine's capture instead made
+  `UnloadNode` wait on user code, deadlocking a `SaveSnapshot` that waited on
+  a proposal to its own shard. (A state machine that ignores the stopper
+  still delays `StopShard` at its own `Close`, which must wait for an
+  in-flight stream — now stated in the `pkg/sm` contract.) Saves and receives
+  also serialize on a per-node snapshot-directory lock, since the lease is
+  shared. A receive claims its published index until it settles; a save
+  never replaces a claimed directory or the recorded one (except its own
+  rebuild target), but does replace an unclaimed, unrecorded orphan — a
+  quiescent shard re-saves at the same index, and GC never reclaims the
+  newest directory. A failed receive keeps a directory LogDB records. Every
+  guard that spares the recorded snapshot now FAILS CLOSED on an unreadable
+  record — a receive's publish refuses, the snapshot GC reclaims nothing —
+  where one transient read error used to let them delete it. A snapshot
+  recovery pins the directory it chose until it has read it, so the GC a newer
+  receive or save runs meanwhile cannot delete it underneath. A rebuild is
+  also refused when the record names a different path than the rebuild
+  writes, or when the rebuilt file's size differs from a known recorded
+  `FileSize` recovery verifies (a legacy `FileSize` of 0 — size unknown —
+  still permits the repair). A successful rebuild now refreshes the size the
+  log reader declares for that snapshot (`LogReader.RefreshSnapshotFileSize`):
+  a shard restarted with the artifact missing loads it as 0, and every send
+  of the rebuilt artifact failed its size check until the next restart. A publish that would replace an unrecorded
+  directory also refuses one a recovery is reading.
+- **`ImportSnapshot` could commit underneath a running shard (Codex, HIGH;
+  predates this release).** The import checked that the shard was stopped
+  before taking the shard's import lock, and `StartShard` only tried that lock
+  for its staging sweep. A start could build a live node from the old log
+  while the import recorded a snapshot and compacted that log beneath it.
+  `StartShard` now holds the import lock for its whole start and refuses with
+  the new transient `ErrImportInProgress` while an import runs (a concurrent
+  duplicate start gets the transient `ErrShardNotReady` for as long as the
+  first holds its start — even after it has published its node — since the
+  first may yet fail and withdraw it); the import re-checks, once it holds the lock, that the shard is
+  stopped and still has the replica it resolved. An import into a shard with
+  data for more than one replica on this host is refused rather than landing
+  under whichever one `ListNodeInfo` happened to list first. A
+  rebuild whose recorded format no longer matches the shard's encryption or
+  compression is refused rather than written in a format the record cannot
+  describe. Staged directories are created with the documented mode 0750
+  under the process umask, like every other snapshot directory (they had
+  been 0700, and the rename that publishes them keeps the mode). A save on a stopped node
+  publishes nothing and removes its stage; a crash's orphaned stage is swept
+  by `StartShard`, and a save never replaces a directory LogDB records. The
+  host's snapshot callbacks now hand their `EventListener` fan-out to the
+  listener dispatcher instead of calling user code inline on a snapshot
+  worker, as the engine callback contract requires — a listener calling
+  `StopShard` from `OnShardFailed` or `OnSnapshotRecovered` would otherwise
+  deadlock against the recovery's lease. A recovery whose node stopped under it is
+  abandoned, failed or not, rather than reported: the reports resolve by shard
+  ID and would have failed, or completed the snapshot requests of, the
+  incarnation that replaced it. An apply dispatcher that panicked and was
+  stopped during its restart delay now still drains and joins — unless its
+  unwind already did, when a second run could start a per-shard goroutine
+  after the join. The shard-ID reports that follow a stop check — a failed or
+  abandoned recovery, a step panic's shard failure — are made under the
+  node's write lease, so no unload completes between the check and the
+  report.
+  Known, and predating this release: `Engine.Stop` can still fail the
+  proposals of a committed item when a shard's apply channel is full at the
+  moment the apply tier stops (the stop branch that keeps a stuck shard from
+  wedging shutdown), and in memory mode when the step tier's stop races the
+  apply hand-off. With a WAL both are crash-equivalent: the entries are
+  durable and are applied on restart.
+- **A `StopShard` racing `Host.Close` could close a state machine mid-Apply
+  (Codex, HIGH; predates this release).** An apply-side unload that arrived
+  once the engine was stopping was acknowledged at once, and that ack is what
+  lets the host close the shard's state machine — while the shutdown drain
+  could still be inside its `Apply`. It is now acknowledged only once the
+  stopping dispatcher has joined every per-shard goroutine.
+- **BREAKING: atomic seal-and-pin is part of the `Barrier` contract (Codex,
+  MEDIUM).** Only the built-in barrier sealed a frame and pinned its epoch
+  under one lock; a custom `Barrier` fell back to pin-before / encrypt /
+  pin-after, leaving a window in which `Rotate` plus `PurgeEpochsBefore` could
+  drop the DEK of a frame about to be persisted. `EncryptWithEpochPinnedContext`
+  is now required and the fallback is gone.
+- **Compaction events for a marker another snapshot had already moved (both
+  reviews, LOW).** A compaction is reported only when this save advanced the
+  reader's marker — not when `ErrCompacted` said an earlier snapshot, receive
+  or import already had, and not when the marker already sat exactly at the
+  compaction index, which `Compact` answers with a nil no-op. The new
+  `LogReader.CompactTo` reports whether the marker moved, under the same lock.
+- **Accepted (Claude, LOW):** snapshot frames carry nothing unique to one
+  artifact, so two artifacts of the same identity can exchange frames — with
+  disk write access and a retained copy, R2's threat class. Documented.
+- `TestWrapSysOpState_Release` raced its own wrapper goroutine and timed out
+  under load; it now releases the inner state before wrapping it.
+
+### Changed — gates and coverage (R9, R10)
+
+- **Per-package coverage gate.** A module total can clear its floor while one
+  package sits far below it: `pkg/internal/registry` was at 78.4% under a
+  91.3% total. `scripts/check-coverage-packages.sh` fails the build if any
+  package under `pkg/` is below the threshold. CI runs it at
+  `COVERAGE_THRESHOLD` (90), the total's floor, which the 2026-09-02 ruling set
+  for signal; `make coverage-packages` holds the 91% target locally.
+- **Coverage raised on the four packages below 91%**, with tests aimed at the
+  contracts rather than the percentage: `registry` 78.4 → 100%
+  (`RegisterIfAbsent`'s one-winner race, `CompareAndRegister`'s late-rollback
+  loss), `logdb` 89.2 → 97.9% (`GetRangeCopy` never aliasing the step worker's
+  buffers; `PersistBootstrap` registering nothing when the durable write
+  fails), `engine` 90.6 → 91.4% (the new frame code's error paths; the nil-peer
+  gate conventions, where `MemberBinding` must fail closed),
+  `transport` 90.9 → 91.4% (`PeerAuth.Authorizes` failing closed,
+  `decodeCharge` saturating instead of wrapping to unlimited budget).
+- **Hot path benchmarked against 0.12.0** (`make bench-compare
+  BASELINE=v0.12.0-alpha` on ci-node-2, raft/engine/proto, 8 interleaved
+  rounds): no significant change. One apparent +31.6% on `PeerTick` came from
+  an 8-round sample on a host at load average 24; 20 rounds put it at
+  180.1 ns → 161.1 ns, p=0.758, and the tick path's code is unchanged since
+  0.12.0.
+- **Releases verify FIPS at runtime.** `release.yml` only built the FIPS
+  variant; `make verify-fips` (`GODEBUG=fips140=only`) ran in the nightly
+  alone, so a release could ship on a day it was red. It is now a release gate
+  alongside the others.
+
+### Documented (R2, R8)
+
+- **At-rest rollback of the WAL is a stated limit.** Someone who can write the
+  data directory can remove trailing records and their sync mark, producing
+  exactly what a crash inside the writeback window leaves; no in-file format
+  can tell them apart, and closing it needs a trusted monotonic anchor off the
+  disk. Raft's safety assumes stable storage, so write access to a data
+  directory is compromise of that replica. SECURITY.md and
+  `docs/seal-barrier/architecture.md` now say so.
+- The "planned post-v1.0 enhancement" for observer self-advertisement is gone
+  from the docs; the limitation and its workaround (a stable advertised
+  `RaftAddress`) stay.
+
 ## [0.13.2-alpha] - 2026-09-22
 
 ### Changed

@@ -560,7 +560,7 @@ func countSyncMap(m *sync.Map) int {
 func newTestHost(t *testing.T) *Host {
 	t.Helper()
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("newTestHost: NewHost failed: %v", err)
 	}
@@ -773,7 +773,7 @@ func waitForLogEntry(t *testing.T, h *Host, shardID uint64) LogRange {
 
 func TestNewHost_ValidConfig(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestNewHost_ValidConfig(t *testing.T) {
 func TestNewHost_InvalidConfig_EmptyWALDir(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.WALDir = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err == nil {
 		t.Fatal("NewHost should fail with empty WALDir")
 	}
@@ -802,7 +802,7 @@ func TestNewHost_InvalidConfig_EmptyWALDir(t *testing.T) {
 func TestNewHost_InvalidConfig_EmptyListenAddress(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.ListenAddress = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err == nil {
 		t.Fatal("NewHost should fail with empty ListenAddress")
 	}
@@ -812,7 +812,7 @@ func TestNewHost_InvalidConfig_ZeroDeploymentID(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.DeploymentID = 0
 	cfg.AllowZeroDeploymentID = false
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err == nil {
 		t.Fatal("NewHost should fail with zero DeploymentID")
 	}
@@ -821,7 +821,7 @@ func TestNewHost_InvalidConfig_ZeroDeploymentID(t *testing.T) {
 func TestNewHost_WithLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -835,7 +835,7 @@ func TestNewHost_WithLogDB(t *testing.T) {
 func TestNewHost_WithMetrics(t *testing.T) {
 	cfg := testHostConfig(t)
 	m := NoOpMetricsCollector{}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithMetrics(m), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithMetrics(m), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -861,7 +861,7 @@ func TestNewHost_HostIDPersistence(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.NodeHostDir = dir
 
-	h1, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h1, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -869,7 +869,7 @@ func TestNewHost_HostIDPersistence(t *testing.T) {
 	h1.Close()
 
 	// Create second host with same dir.
-	h2, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h2, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost (second) failed: %v", err)
 	}
@@ -885,7 +885,7 @@ func TestNewHost_OverrideHostID(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.HostID = "custom-host-id"
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -902,7 +902,7 @@ func TestNewHost_OverrideHostID(t *testing.T) {
 
 func TestStartShard_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -923,7 +923,7 @@ func TestStartShard_Success(t *testing.T) {
 func TestStartShard_WithLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -948,7 +948,7 @@ func TestStartShard_WithLogDB(t *testing.T) {
 func TestStartShard_Join_NoBootstrap(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -972,7 +972,7 @@ func TestStartShard_Join_NoBootstrap(t *testing.T) {
 
 func TestStartShard_DuplicateShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -993,7 +993,7 @@ func TestStartShard_DuplicateShard(t *testing.T) {
 
 func TestStartShard_ZeroShardID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1009,7 +1009,7 @@ func TestStartShard_ZeroShardID(t *testing.T) {
 
 func TestStartShard_ZeroReplicaID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1025,7 +1025,7 @@ func TestStartShard_ZeroReplicaID(t *testing.T) {
 
 func TestStartShard_NilCreateFunc(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1041,7 +1041,7 @@ func TestStartShard_NilCreateFunc(t *testing.T) {
 
 func TestStartShard_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1057,7 +1057,7 @@ func TestStartShard_ClosedHost(t *testing.T) {
 
 func TestStartShard_InvalidSMType(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1076,7 +1076,7 @@ func TestStartShard_InvalidSMType(t *testing.T) {
 
 func TestStartShard_NilSMReturn(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1099,7 +1099,7 @@ func TestStartShard_NilSMReturn(t *testing.T) {
 
 func TestStopShard_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1121,7 +1121,7 @@ func TestStopShard_Success(t *testing.T) {
 
 func TestStopShard_NotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1135,7 +1135,7 @@ func TestStopShard_NotFound(t *testing.T) {
 
 func TestStopShard_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1153,7 +1153,7 @@ func TestStopShard_ClosedHost(t *testing.T) {
 
 func TestPropose_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1167,7 +1167,7 @@ func TestPropose_ClosedHost(t *testing.T) {
 
 func TestPropose_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1181,7 +1181,7 @@ func TestPropose_ShardNotFound(t *testing.T) {
 
 func TestPropose_EntryTooLarge(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1203,7 +1203,7 @@ func TestPropose_EntryTooLarge(t *testing.T) {
 
 func TestPropose_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1222,7 +1222,7 @@ func TestPropose_NotLeader(t *testing.T) {
 
 func TestPropose_AsLeader_ReturnsRequestState(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1251,7 +1251,7 @@ func TestPropose_AsLeader_ReturnsRequestState(t *testing.T) {
 
 func TestSyncPropose_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1269,7 +1269,7 @@ func TestSyncPropose_ClosedHost(t *testing.T) {
 
 func TestSyncRead_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1283,7 +1283,7 @@ func TestSyncRead_ClosedHost(t *testing.T) {
 
 func TestSyncRead_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1301,7 +1301,7 @@ func TestSyncRead_ShardNotFound(t *testing.T) {
 
 func TestReadIndex_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1315,7 +1315,7 @@ func TestReadIndex_ClosedHost(t *testing.T) {
 
 func TestReadIndex_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1341,7 +1341,7 @@ func TestReadIndex_Success(t *testing.T) {
 
 func TestQueryLocalNode_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1355,7 +1355,7 @@ func TestQueryLocalNode_ClosedHost(t *testing.T) {
 
 func TestQueryLocalNode_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1373,7 +1373,7 @@ func TestQueryLocalNode_ShardNotFound(t *testing.T) {
 
 func TestStaleRead_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1387,7 +1387,7 @@ func TestStaleRead_ClosedHost(t *testing.T) {
 
 func TestStaleRead_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1405,7 +1405,7 @@ func TestStaleRead_ShardNotFound(t *testing.T) {
 
 func TestGetNewSession_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1439,7 +1439,7 @@ func TestGetNewSession_Success(t *testing.T) {
 
 func TestGetNewSession_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1453,7 +1453,7 @@ func TestGetNewSession_ClosedHost(t *testing.T) {
 
 func TestGetNewSession_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1471,7 +1471,7 @@ func TestGetNewSession_ShardNotFound(t *testing.T) {
 
 func TestRegisterSession_PreservesClientID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1506,7 +1506,7 @@ func TestRegisterSession_PreservesClientID(t *testing.T) {
 
 func TestRegisterSession_NilSession(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1523,7 +1523,7 @@ func TestRegisterSession_NilSession(t *testing.T) {
 
 func TestRegisterSession_ZeroClientID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1542,7 +1542,7 @@ func TestRegisterSession_ZeroClientID(t *testing.T) {
 
 func TestRegisterSession_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1558,7 +1558,7 @@ func TestRegisterSession_ClosedHost(t *testing.T) {
 
 func TestRegisterSession_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1581,7 +1581,7 @@ func TestRegisterSession_ShardNotFound(t *testing.T) {
 
 func TestCloseSession_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1620,7 +1620,7 @@ func TestCloseSession_Success(t *testing.T) {
 
 func TestCloseSession_NilSession(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1638,7 +1638,7 @@ func TestCloseSession_NilSession(t *testing.T) {
 
 func TestCloseSession_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1657,7 +1657,7 @@ func TestCloseSession_ClosedHost(t *testing.T) {
 
 func TestGetNoOPSession_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1684,7 +1684,7 @@ func TestGetNoOPSession_Success(t *testing.T) {
 
 func TestGetShardInfo_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1721,7 +1721,7 @@ func TestGetShardInfo_Success(t *testing.T) {
 
 func TestGetShardInfo_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1735,7 +1735,7 @@ func TestGetShardInfo_ClosedHost(t *testing.T) {
 
 func TestGetShardInfo_NotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1753,7 +1753,7 @@ func TestGetShardInfo_NotFound(t *testing.T) {
 
 func TestGetLeaderID_WithLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1778,7 +1778,7 @@ func TestGetLeaderID_WithLeader(t *testing.T) {
 
 func TestGetLeaderID_NoLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1802,7 +1802,7 @@ func TestGetLeaderID_NoLeader(t *testing.T) {
 
 func TestGetLeaderID_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1816,7 +1816,7 @@ func TestGetLeaderID_ClosedHost(t *testing.T) {
 
 func TestGetLeaderID_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1834,7 +1834,7 @@ func TestGetLeaderID_ShardNotFound(t *testing.T) {
 
 func TestGetLeaderIDAndTerm_ConsistentValues(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1862,7 +1862,7 @@ func TestGetLeaderIDAndTerm_ConsistentValues(t *testing.T) {
 
 func TestGetLeaderIDAndTerm_NoLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1889,7 +1889,7 @@ func TestGetLeaderIDAndTerm_NoLeader(t *testing.T) {
 
 func TestGetLeaderIDAndTerm_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1903,7 +1903,7 @@ func TestGetLeaderIDAndTerm_ClosedHost(t *testing.T) {
 
 func TestGetLeaderIDAndTerm_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1921,7 +1921,7 @@ func TestGetLeaderIDAndTerm_ShardNotFound(t *testing.T) {
 
 func TestRequestLeaderTransfer_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1935,7 +1935,7 @@ func TestRequestLeaderTransfer_ClosedHost(t *testing.T) {
 
 func TestRequestLeaderTransfer_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1953,7 +1953,7 @@ func TestRequestLeaderTransfer_NotLeader(t *testing.T) {
 
 func TestRequestLeaderTransfer_AsLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1973,7 +1973,7 @@ func TestRequestLeaderTransfer_AsLeader(t *testing.T) {
 
 func TestRequestLeaderTransfer_InvalidTargets(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2005,7 +2005,7 @@ func TestRequestLeaderTransfer_InvalidTargets(t *testing.T) {
 
 func TestRequestSnapshot_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2019,7 +2019,7 @@ func TestRequestSnapshot_ClosedHost(t *testing.T) {
 
 func TestRequestSnapshot_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2041,7 +2041,7 @@ func TestRequestSnapshot_Success(t *testing.T) {
 
 func TestRequestSnapshot_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2059,7 +2059,7 @@ func TestRequestSnapshot_ShardNotFound(t *testing.T) {
 
 func TestGetNodeHostInfo_Empty(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2076,7 +2076,7 @@ func TestGetNodeHostInfo_Empty(t *testing.T) {
 
 func TestGetNodeHostInfo_WithShards(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2101,7 +2101,7 @@ func TestGetNodeHostInfo_WithLogDB(t *testing.T) {
 		{ShardID: 1, ReplicaID: 1},
 		{ShardID: 2, ReplicaID: 1},
 	}
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2117,7 +2117,7 @@ func TestGetNodeHostInfo_SkipLogInfo(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2135,7 +2135,7 @@ func TestGetNodeHostInfo_SkipLogInfo(t *testing.T) {
 
 func TestClose_Idempotent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2155,7 +2155,7 @@ func TestClose_Idempotent(t *testing.T) {
 
 func TestClose_StopsAllShards(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2180,7 +2180,7 @@ func TestClose_StopsAllShards(t *testing.T) {
 func TestClose_ClosesLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2213,7 +2213,7 @@ func TestClose_SealsBarrier(t *testing.T) {
 
 func TestClose_ConcurrentSafety(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2235,7 +2235,7 @@ func TestClose_ConcurrentSafety(t *testing.T) {
 
 func TestIsSealed_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2298,7 +2298,7 @@ func TestEmergencySeal_SealsBarrier(t *testing.T) {
 
 func TestEmergencySeal_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2364,7 +2364,7 @@ func TestEmergencySeal_ProposalFailsAfterSeal(t *testing.T) {
 
 func TestUpdateNodeLeader_SetsFields(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2393,7 +2393,7 @@ func TestUpdateNodeLeader_SetsFields(t *testing.T) {
 
 func TestUpdateNodeLeader_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2409,7 +2409,7 @@ func TestUpdateNodeLeader_NonExistentShard(t *testing.T) {
 
 func TestNodeState_LastApplied_SetsField(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2439,7 +2439,7 @@ func TestNodeState_LastApplied_SetsField(t *testing.T) {
 
 func TestNodeState_LastApplied_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2454,7 +2454,7 @@ func TestNodeState_LastApplied_NonExistentShard(t *testing.T) {
 
 func TestNodeState_Health_SetsField(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2480,7 +2480,7 @@ func TestNodeState_Health_SetsField(t *testing.T) {
 
 func TestNodeState_Health_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2553,7 +2553,7 @@ func TestLoadOrGenerateHostID_GeneratesAndPersists(t *testing.T) {
 
 func TestMultipleShardsOnHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2590,7 +2590,7 @@ func TestMultipleShardsOnHost(t *testing.T) {
 
 func TestHost_ConcurrentOperations(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2660,7 +2660,7 @@ func TestHost_ConcurrentOperations(t *testing.T) {
 
 func TestBuildNotLeaderError_WithLeaderAddress(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2705,7 +2705,7 @@ func TestBuildNotLeaderError_WithLeaderAddress(t *testing.T) {
 
 func TestBuildNotLeaderError_NoKnownLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2735,7 +2735,7 @@ func TestBuildNotLeaderError_NoKnownLeader(t *testing.T) {
 
 func TestSyncRead_TimesOutWhenLeaderNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2759,7 +2759,7 @@ func TestSyncRead_TimesOutWhenLeaderNotReady(t *testing.T) {
 
 func TestStaleRead_ReturnsResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2781,7 +2781,7 @@ func TestStaleRead_ReturnsResult(t *testing.T) {
 
 func TestQueryLocalNode_ReturnsResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2807,7 +2807,7 @@ func TestQueryLocalNode_ReturnsResult(t *testing.T) {
 
 func TestSyncPropose_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2825,7 +2825,7 @@ func TestSyncPropose_NotLeader(t *testing.T) {
 
 func TestSyncPropose_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2843,7 +2843,7 @@ func TestSyncPropose_ShardNotFound(t *testing.T) {
 
 func TestSyncPropose_WithResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2886,7 +2886,7 @@ func TestClose_LogDBCloseError(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
 	db.closeErr = errors.New("logdb close error")
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2903,7 +2903,7 @@ func TestClose_LogDBCloseError(t *testing.T) {
 
 func TestReadIndex_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2921,7 +2921,7 @@ func TestReadIndex_ShardNotFound(t *testing.T) {
 
 func TestCloseSession_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2940,7 +2940,7 @@ func TestCloseSession_ShardNotFound(t *testing.T) {
 
 func TestRequestLeaderTransfer_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -2997,7 +2997,7 @@ func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 
 func TestSyncPropose_HappyPath(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3081,7 +3081,7 @@ var _ sm.DiskStateMachine = (*mockOnDiskSM)(nil)
 
 func TestStartShard_ConcurrentSM(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3108,7 +3108,7 @@ func TestStartShard_ConcurrentSM(t *testing.T) {
 
 func TestStartShard_OnDiskSM(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3227,7 +3227,7 @@ func TestClose_BarrierAlreadySealedIsNotError(t *testing.T) {
 
 func TestFailPendingRequests_CompletesAllPendingWithError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3316,7 +3316,7 @@ func TestFailPendingRequests_CompletesAllPendingWithError(t *testing.T) {
 
 func TestFailPendingRequests_IdempotentOnEmptyMaps(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3332,7 +3332,7 @@ func TestFailPendingRequests_IdempotentOnEmptyMaps(t *testing.T) {
 
 func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3375,7 +3375,7 @@ func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
 // B's channel.
 func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3450,7 +3450,7 @@ func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 // Host.Close().
 func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3508,7 +3508,7 @@ func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 // regardless of timing. This is a stress test for the TOCTOU fix.
 func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3656,7 +3656,7 @@ func TestLoadOrGenerateHostID_FixesPermissions(t *testing.T) {
 
 func TestGetNode_StoppedNode(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3683,7 +3683,7 @@ func TestGetNode_StoppedNode(t *testing.T) {
 
 func TestSyncPropose_CompletedResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3731,7 +3731,7 @@ func TestNewHost_NodeHostDirCreateFail(t *testing.T) {
 	// Use an invalid path that can't be created.
 	cfg.NodeHostDir = "/dev/null/impossible/path"
 
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err == nil {
 		t.Fatal("NewHost should fail when NodeHostDir cannot be created")
 	}
@@ -3749,7 +3749,7 @@ func TestNewHost_WALDirCreateFail(t *testing.T) {
 	// NodeHostDir is valid, but WALDir is not.
 	cfg.WALDir = "/dev/null/impossible/wal/path"
 
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err == nil {
 		t.Fatal("NewHost should fail when WALDir cannot be created")
 	}
@@ -3777,7 +3777,7 @@ func (f *failBootstrapLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap 
 func TestStartShard_LogDBBootstrapError(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := &failBootstrapLogDB{mockLogDB: *newMockLogDB()}
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3802,7 +3802,7 @@ func TestStartShard_LogDBBootstrapError(t *testing.T) {
 
 func TestHostEngineCallback_OnApplied_CompletesProposal(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3829,7 +3829,7 @@ func TestHostEngineCallback_OnApplied_CompletesProposal(t *testing.T) {
 
 func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3866,7 +3866,7 @@ func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 
 func TestHostEngineCallback_OnApplied_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3885,7 +3885,7 @@ func TestHostEngineCallback_OnApplied_NonexistentShard(t *testing.T) {
 // legitimate zero-value results (PhD Figure 6.1, step 3).
 func TestHostEngineCallback_OnApplied_SessionExpired(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -3945,7 +3945,7 @@ func TestHostEngineCallback_OnApplied_SessionExpired(t *testing.T) {
 // a normal result, each entry is handled correctly.
 func TestHostEngineCallback_OnApplied_SessionExpired_MixedBatch(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4009,7 +4009,7 @@ func TestHostEngineCallback_OnApplied_SessionExpired_MixedBatch(t *testing.T) {
 
 func TestHostEngineCallback_OnLeaderUpdated_SetsLeaderState(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4038,7 +4038,7 @@ func TestHostEngineCallback_OnLeaderUpdated_SetsLeaderState(t *testing.T) {
 
 func TestHostEngineCallback_OnLeaderUpdated_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4051,7 +4051,7 @@ func TestHostEngineCallback_OnLeaderUpdated_NonexistentShard(t *testing.T) {
 
 func TestHostEngineCallback_OnLeaderUpdated_FailsPendingOnLeadershipLoss(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4102,7 +4102,7 @@ func TestHostEngineCallback_OnLeaderUpdated_FailsPendingOnLeadershipLoss(t *test
 
 func TestHostEngineCallback_OnLeaderUpdated_KeepsPendingOnSelfLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4140,7 +4140,7 @@ func TestHostEngineCallback_OnLeaderUpdated_KeepsPendingOnSelfLeader(t *testing.
 
 func TestMultipleConcurrentProposals_Complete(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4191,7 +4191,7 @@ func TestMultipleConcurrentProposals_Complete(t *testing.T) {
 
 func TestStopShard_FailsPendingProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4227,7 +4227,7 @@ func TestStopShard_FailsPendingProposals(t *testing.T) {
 
 func TestReadIndex_WitnessReturnsInvalidOperation(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4252,7 +4252,7 @@ func TestReadIndex_WitnessReturnsInvalidOperation(t *testing.T) {
 
 func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4319,7 +4319,7 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 
 func TestOnReadyToRead_CompletesReadWhenApplied(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4369,7 +4369,7 @@ func TestOnReadyToRead_CompletesReadWhenApplied(t *testing.T) {
 
 func TestOnReadyToRead_WaitsForApplyThenCompletes(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4447,7 +4447,7 @@ func TestOnReadyToRead_WaitsForApplyThenCompletes(t *testing.T) {
 
 func TestOnReadyToRead_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4460,7 +4460,7 @@ func TestOnReadyToRead_NonexistentShard(t *testing.T) {
 
 func TestOnReadyToRead_UnknownKeyIgnored(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4496,7 +4496,7 @@ func TestOnReadyToRead_UnknownKeyIgnored(t *testing.T) {
 // together with the batchKey in a single OnReadyToRead call.
 func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4571,7 +4571,7 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 // the fixed ordering (OnReadIndexBatched before Handle(ReadIndex)).
 func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4646,7 +4646,7 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 
 func TestOnLeaderUpdated_FailsPendingReads(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4709,7 +4709,7 @@ func TestOnLeaderUpdated_FailsPendingReads(t *testing.T) {
 
 func TestOnLeaderUpdated_KeepsPendingReadsOnSelfLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4746,7 +4746,7 @@ func TestOnLeaderUpdated_KeepsPendingReadsOnSelfLeader(t *testing.T) {
 
 func TestStopShard_FailsPendingReads(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4780,7 +4780,7 @@ func TestStopShard_FailsPendingReads(t *testing.T) {
 
 func TestOnApplied_CompletesConfirmedReadOnlyWhenCaughtUp(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4841,7 +4841,7 @@ func TestOnApplied_CompletesConfirmedReadOnlyWhenCaughtUp(t *testing.T) {
 
 func TestOnApplied_IgnoresUnconfirmedReads(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4891,7 +4891,7 @@ func TestOnApplied_IgnoresUnconfirmedReads(t *testing.T) {
 
 func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4915,6 +4915,7 @@ func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 	// Call OnSnapshotCompleted with success.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 
 	// Verify RS completed with Value=100.
 	select {
@@ -4941,7 +4942,7 @@ func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 
 func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4965,6 +4966,7 @@ func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
 	testErr := errors.New("snapshot failed")
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 0, testErr)
+	flushListeners(t, cb)
 
 	select {
 	case result := <-rs.ResultC():
@@ -4989,7 +4991,7 @@ func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
 
 func TestOnSnapshotCompleted_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -4998,6 +5000,7 @@ func TestOnSnapshotCompleted_NonexistentShard(t *testing.T) {
 	// Should not panic for a shard that does not exist.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(999, 100, nil)
+	flushListeners(t, cb)
 }
 
 func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
@@ -5011,7 +5014,7 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5025,6 +5028,7 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 200, nil)
+	flushListeners(t, cb)
 
 	if !called.Load() {
 		t.Fatal("OnSnapshotCreated callback was not called")
@@ -5040,40 +5044,75 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
 	}
 }
 
-func TestOnSnapshotCompleted_FiresOnLogCompacted(t *testing.T) {
+// TestOnSnapshotCompleted_FiresNoCompactionEvents pins that a snapshot's
+// completion alone says nothing about compaction. It used to fire
+// OnLogCompacted and OnLogDBCompacted after every successful save, including
+// saves within CompactionOverhead that compacted nothing, so a listener was
+// told storage had been reclaimed when it had not.
+func TestOnSnapshotCompleted_FiresNoCompactionEvents(t *testing.T) {
 	cfg := testHostConfig(t)
-	var called atomic.Bool
-	var capturedInfo config.EventShardInfo
+	var fired atomic.Int64
 	cfg.EventListener = &config.EventListener{
-		OnLogCompacted: func(info config.EventShardInfo) {
-			capturedInfo = info
-			called.Store(true)
-		},
+		OnLogCompacted:   func(config.EventShardInfo) { fired.Add(1) },
+		OnLogDBCompacted: func(config.EventShardInfo) { fired.Add(1) },
 	}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
 	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
+	addTestNodeState(h, 1, 1)
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 150, nil)
+	flushListeners(t, cb)
+	if n := fired.Load(); n != 0 {
+		t.Fatalf("OnSnapshotCompleted fired %d compaction event(s); only OnLogCompacted may", n)
+	}
+}
 
-	if !called.Load() {
-		t.Fatal("OnLogCompacted callback was not called")
+// TestOnLogCompacted_FiresWithTheCompactedIndex pins the event contract: the
+// reader event carries the index compaction ran through, and the LogDB event
+// fires only when the LogDB step succeeded too.
+func TestOnLogCompacted_FiresWithTheCompactedIndex(t *testing.T) {
+	cfg := testHostConfig(t)
+	var reader, logdb []config.EventShardInfo
+	cfg.EventListener = &config.EventListener{
+		OnLogCompacted:   func(info config.EventShardInfo) { reader = append(reader, info) },
+		OnLogDBCompacted: func(info config.EventShardInfo) { logdb = append(logdb, info) },
 	}
-	if capturedInfo.ShardID != 1 {
-		t.Errorf("EventShardInfo.ShardID = %d, want 1", capturedInfo.ShardID)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
 	}
-	if capturedInfo.ReplicaID != 1 {
-		t.Errorf("EventShardInfo.ReplicaID = %d, want 1", capturedInfo.ReplicaID)
+	defer h.Close()
+	cb := &hostEngineCallback{h: h}
+
+	cb.OnLogCompacted(1, 7, engine.LogCompaction{Index: 95, Reader: true, LogDB: true})
+	flushListeners(t, cb)
+	want := config.EventShardInfo{ShardID: 1, ReplicaID: 7, Index: 95}
+	if len(reader) != 1 || reader[0] != want {
+		t.Fatalf("OnLogCompacted events = %+v, want exactly %+v", reader, want)
+	}
+	if len(logdb) != 1 || logdb[0] != want {
+		t.Fatalf("OnLogDBCompacted events = %+v, want exactly %+v", logdb, want)
+	}
+
+	// The LogDB step failed: the reader compacted, storage was not reclaimed.
+	cb.OnLogCompacted(1, 7, engine.LogCompaction{Index: 120, Reader: true})
+	flushListeners(t, cb)
+	if len(reader) != 2 || reader[1].Index != 120 {
+		t.Fatalf("OnLogCompacted events = %+v, want a second at index 120", reader)
+	}
+	if len(logdb) != 1 {
+		t.Fatalf("OnLogDBCompacted fired for a LogDB step that failed: %+v", logdb)
+	}
+
+	// Nothing compacted: no event at all.
+	cb.OnLogCompacted(1, 7, engine.LogCompaction{})
+	flushListeners(t, cb)
+	if len(reader) != 2 || len(logdb) != 1 {
+		t.Fatalf("a no-op compaction fired events: reader %+v, logdb %+v", reader, logdb)
 	}
 }
 
@@ -5088,7 +5127,7 @@ func TestOnSnapshotCompleted_ErrorFiresOnShardFailed(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5103,6 +5142,7 @@ func TestOnSnapshotCompleted_ErrorFiresOnShardFailed(t *testing.T) {
 	snapErr := errors.New("disk full")
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 0, snapErr)
+	flushListeners(t, cb)
 
 	if !called.Load() {
 		t.Fatal("OnShardFailed callback was not called")
@@ -5122,7 +5162,7 @@ func TestOnSnapshotCompleted_NilEventListener(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.EventListener = nil
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5137,12 +5177,14 @@ func TestOnSnapshotCompleted_NilEventListener(t *testing.T) {
 	// Should not panic with nil EventListener.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 	cb.OnSnapshotCompleted(1, 0, errors.New("test error"))
+	flushListeners(t, cb)
 }
 
 func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5169,6 +5211,7 @@ func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 300, nil)
+	flushListeners(t, cb)
 
 	// All three should be completed with Value=300.
 	for i, rs := range []*RequestState{rs1, rs2, rs3} {
@@ -5199,7 +5242,7 @@ func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
 
 func TestRequestSnapshot_SnapshotInProgress(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5239,7 +5282,7 @@ func TestRequestSnapshot_SnapshotInProgress(t *testing.T) {
 
 func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5290,7 +5333,7 @@ func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 // failPendingRequests vs failPendingClientRequests.
 func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5337,6 +5380,7 @@ func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	// forever. The save must still be able to complete it normally, with the
 	// real snapshot index.
 	cb.OnSnapshotCompleted(1, 512, nil)
+	flushListeners(t, cb)
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
@@ -5372,7 +5416,7 @@ func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 
 func TestExportSnapshot_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5387,7 +5431,7 @@ func TestExportSnapshot_ClosedHost(t *testing.T) {
 
 func TestExportSnapshot_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5403,7 +5447,7 @@ func TestExportSnapshot_ShardNotFound(t *testing.T) {
 func TestExportSnapshot_NoSnapshotInLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5426,7 +5470,7 @@ func TestExportSnapshot_NoSnapshotInLogDB(t *testing.T) {
 func TestExportSnapshot_IndexZero(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5451,7 +5495,7 @@ func TestExportSnapshot_IndexZero(t *testing.T) {
 func TestExportSnapshot_EmptyFilepath(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5476,7 +5520,7 @@ func TestExportSnapshot_EmptyFilepath(t *testing.T) {
 func TestExportSnapshot_FileNotOnDisk(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5504,7 +5548,7 @@ func TestExportSnapshot_FileNotOnDisk(t *testing.T) {
 func TestExportSnapshot_Success(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5575,7 +5619,7 @@ func buildSnapshotArtifact(t *testing.T, index, term, onDiskIndex uint64, memb p
 
 func TestImportSnapshot_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5589,7 +5633,7 @@ func TestImportSnapshot_ClosedHost(t *testing.T) {
 
 func TestImportSnapshot_ShardRunning(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5610,7 +5654,7 @@ func TestImportSnapshot_ShardRunning(t *testing.T) {
 func TestImportSnapshot_ShardNotFoundInLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5631,7 +5675,7 @@ func TestImportSnapshot_Success(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5685,7 +5729,7 @@ func TestImportSnapshot_VerifiesSnapshotDirStructure(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 5, ReplicaID: 3}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5727,7 +5771,7 @@ func TestImportSnapshot_MultipleShardNodes(t *testing.T) {
 	}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5751,7 +5795,7 @@ func TestImportSnapshot_MultipleShardNodes(t *testing.T) {
 func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5826,7 +5870,7 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5932,7 +5976,7 @@ func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 // the original Index/Term/Membership.
 func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -5978,7 +6022,7 @@ func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
 	// cross-host restore). h2 is bootstrapped for shard 1 / replica 1 so
 	// ImportSnapshot can resolve the replicaID, but has no prior snapshot.
 	cfg2 := testHostConfig(t)
-	h2, err := NewHost(cfg2, WithMemoryLogDB(), WithoutTransport())
+	h2, err := NewHost(cfg2, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost (h2) failed: %v", err)
 	}
@@ -6018,7 +6062,7 @@ func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
 func TestExportSnapshot_LargeData(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6064,7 +6108,7 @@ func TestImportSnapshot_ListNodeInfoError(t *testing.T) {
 	db.listNodeInfoErr = errors.New("logdb: I/O error")
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6087,7 +6131,7 @@ func TestImportSnapshot_SaveSnapshotError(t *testing.T) {
 	db.saveSnapshotErr = errors.New("logdb: write failed")
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6112,7 +6156,7 @@ func TestImportSnapshot_ReplicaIDZeroReturnsShardNotFound(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 0}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6133,7 +6177,7 @@ func TestOnSnapshotCompleted_SuccessDoesNotFireOnShardFailed(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6147,6 +6191,7 @@ func TestOnSnapshotCompleted_SuccessDoesNotFireOnShardFailed(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 
 	if shardFailedCalled.Load() {
 		t.Error("OnShardFailed should NOT be called on success")
@@ -6166,7 +6211,7 @@ func TestOnSnapshotCompleted_ErrorDoesNotFireOnSnapshotCreated(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6180,6 +6225,7 @@ func TestOnSnapshotCompleted_ErrorDoesNotFireOnSnapshotCreated(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 0, errors.New("test error"))
+	flushListeners(t, cb)
 
 	if snapshotCreatedCalled.Load() {
 		t.Error("OnSnapshotCreated should NOT be called on error")
@@ -6191,7 +6237,7 @@ func TestOnSnapshotCompleted_ErrorDoesNotFireOnSnapshotCreated(t *testing.T) {
 
 func TestOnSnapshotCompleted_NoPendingSnapshotsIsNoOp(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6206,7 +6252,9 @@ func TestOnSnapshotCompleted_NoPendingSnapshotsIsNoOp(t *testing.T) {
 	// No pending snapshots registered. Should not panic.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 	cb.OnSnapshotCompleted(1, 0, errors.New("error"))
+	flushListeners(t, cb)
 }
 
 // errReader is a reader that always returns an error on Read.
@@ -6225,7 +6273,7 @@ func TestImportSnapshot_CopyError(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6249,7 +6297,7 @@ func TestImportSnapshot_CopyError(t *testing.T) {
 
 func TestStartShard_ConfigValidationError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6270,7 +6318,7 @@ func TestStartShard_ConfigValidationError(t *testing.T) {
 
 func TestSyncPropose_ResultError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6298,7 +6346,7 @@ func TestSyncPropose_ResultError(t *testing.T) {
 
 func TestPropose_InboxFull(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6352,7 +6400,7 @@ func TestPropose_InboxFull(t *testing.T) {
 
 func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -6661,7 +6709,7 @@ func TestHost_KeyRotationLoop_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.KeyRotationInterval = 1 * time.Second
 	// No barrier configured - rotation loop should not start.
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7021,7 +7069,7 @@ func TestKeyRotationLoop_RestartsAfterPanic(t *testing.T) {
 
 func TestHost_Drain_RejectsProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7048,7 +7096,7 @@ func TestHost_Drain_RejectsProposals(t *testing.T) {
 
 func TestHost_Drain_RejectsReadIndex(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7072,7 +7120,7 @@ func TestHost_Drain_RejectsReadIndex(t *testing.T) {
 
 func TestHost_Drain_WaitsForInFlight(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7128,7 +7176,7 @@ func TestHost_Drain_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
 	// Use a very short shutdown timeout for testing.
 	cfg.ShutdownTimeout = 200 * time.Millisecond
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7157,7 +7205,7 @@ func TestHost_Drain_Timeout(t *testing.T) {
 
 func TestHost_Drain_Idempotent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7176,7 +7224,7 @@ func TestHost_Drain_Idempotent(t *testing.T) {
 
 func TestHost_IsDraining(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7197,7 +7245,7 @@ func TestHost_IsDraining(t *testing.T) {
 
 func TestHost_Close_CallsDrain(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7214,7 +7262,7 @@ func TestHost_Close_CallsDrain(t *testing.T) {
 
 func TestHost_Drain_EmptyHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7228,7 +7276,7 @@ func TestHost_Drain_EmptyHost(t *testing.T) {
 
 func TestHost_Drain_WaitsForPendingReads(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7273,7 +7321,7 @@ func TestHost_Drain_WaitsForPendingReads(t *testing.T) {
 
 func TestHost_Drain_WaitsForPendingSnapshots(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7322,7 +7370,7 @@ func TestHost_Drain_WaitsForPendingSnapshots(t *testing.T) {
 
 func TestHealthCheck_AllHealthy(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7354,7 +7402,7 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 
 func TestHealthCheck_NoShards(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7401,7 +7449,7 @@ func TestHealthCheck_BarrierSealed(t *testing.T) {
 
 func TestHealthCheck_ShardError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7425,7 +7473,7 @@ func TestHealthCheck_ShardError(t *testing.T) {
 
 func TestHealthCheck_DiskFull(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7454,7 +7502,7 @@ func TestHealthCheck_DiskFull(t *testing.T) {
 func TestHealthCheck_NilDiskFull(t *testing.T) {
 	// Test that DiskOK defaults to true when diskFull pointer is nil.
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7499,7 +7547,7 @@ func TestHealthCheck_SealedTakesPrecedence(t *testing.T) {
 
 func TestRequestAddNode_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7514,7 +7562,7 @@ func TestRequestAddNode_HostClosed(t *testing.T) {
 
 func TestRequestAddNode_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7529,7 +7577,7 @@ func TestRequestAddNode_ShardNotFound(t *testing.T) {
 
 func TestRequestAddNode_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7551,7 +7599,7 @@ func TestRequestAddNode_NotLeader(t *testing.T) {
 
 func TestRequestAddNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7578,7 +7626,7 @@ func TestRequestAddNode_Success(t *testing.T) {
 
 func TestRequestRemoveNode_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7593,7 +7641,7 @@ func TestRequestRemoveNode_HostClosed(t *testing.T) {
 
 func TestRequestRemoveNode_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7614,7 +7662,7 @@ func TestRequestRemoveNode_NotLeader(t *testing.T) {
 
 func TestRequestRemoveNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7751,7 +7799,7 @@ func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
 
 func TestSyncRequestAddNode_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7766,7 +7814,7 @@ func TestSyncRequestAddNode_HostClosed(t *testing.T) {
 
 func TestSyncRequestAddNode_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7781,7 +7829,7 @@ func TestSyncRequestAddNode_ShardNotFound(t *testing.T) {
 
 func TestSyncRequestAddNode_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7802,7 +7850,7 @@ func TestSyncRequestAddNode_NotLeader(t *testing.T) {
 
 func TestSyncRequestAddNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7831,7 +7879,7 @@ func TestSyncRequestAddNode_Success(t *testing.T) {
 
 func TestSyncRequestAddNode_ContextTimeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7863,7 +7911,7 @@ func TestSyncRequestAddNode_ContextTimeout(t *testing.T) {
 
 func TestSyncRequestDeleteNode_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7878,7 +7926,7 @@ func TestSyncRequestDeleteNode_HostClosed(t *testing.T) {
 
 func TestSyncRequestDeleteNode_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7893,7 +7941,7 @@ func TestSyncRequestDeleteNode_ShardNotFound(t *testing.T) {
 
 func TestSyncRequestDeleteNode_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7914,7 +7962,7 @@ func TestSyncRequestDeleteNode_NotLeader(t *testing.T) {
 
 func TestSyncRequestDeleteNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7942,7 +7990,7 @@ func TestSyncRequestDeleteNode_Success(t *testing.T) {
 
 func TestSyncRequestDeleteNode_ContextTimeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7970,7 +8018,7 @@ func TestSyncRequestDeleteNode_ContextTimeout(t *testing.T) {
 
 func TestRequestAddObserver_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -7985,7 +8033,7 @@ func TestRequestAddObserver_HostClosed(t *testing.T) {
 
 func TestRequestAddObserver_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8012,7 +8060,7 @@ func TestRequestAddObserver_Success(t *testing.T) {
 
 func TestRequestAddWitness_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8027,7 +8075,7 @@ func TestRequestAddWitness_HostClosed(t *testing.T) {
 
 func TestRequestAddWitness_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8058,7 +8106,7 @@ func TestRequestAddWitness_Success(t *testing.T) {
 
 func TestRequestAddNode_ShardNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8088,7 +8136,7 @@ func TestRequestAddNode_ShardNotReady(t *testing.T) {
 
 func TestRequestAddNode_StaleConfigChangeID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8125,7 +8173,7 @@ func TestRequestAddNode_StaleConfigChangeID(t *testing.T) {
 func TestRequestAddNode_ZeroConfigChangeIDSkipsCheck(t *testing.T) {
 	// Passing configChangeIndex=0 skips the staleness check.
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8148,7 +8196,7 @@ func TestRequestAddNode_ZeroConfigChangeIDSkipsCheck(t *testing.T) {
 
 func TestRequestRemoveNode_StaleConfigChangeID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8174,7 +8222,7 @@ func TestRequestRemoveNode_StaleConfigChangeID(t *testing.T) {
 
 func TestRecoverLogReader_NilLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithoutTransport())
+	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8193,7 +8241,7 @@ func TestRecoverLogReader_NilLogDB(t *testing.T) {
 func TestRecoverLogReader_FirstBoot(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8275,7 +8323,7 @@ func TestRecoverLogReader_WithPersistedState(t *testing.T) {
 		entryCount: 50,
 	}
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8324,7 +8372,7 @@ func TestRecoverLogReader_SnapshotError(t *testing.T) {
 		err:       errBoom,
 	}
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8352,7 +8400,7 @@ func (s *snapshotErrorLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.Snaps
 
 func TestSyncGetShardMembership_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8366,7 +8414,7 @@ func TestSyncGetShardMembership_ClosedHost(t *testing.T) {
 
 func TestSyncGetShardMembership_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8380,7 +8428,7 @@ func TestSyncGetShardMembership_ShardNotFound(t *testing.T) {
 
 func TestSyncGetShardMembership_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8413,7 +8461,7 @@ func TestSyncGetShardMembership_Success(t *testing.T) {
 
 func TestSyncGetShardMembership_Draining(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8441,7 +8489,7 @@ func TestSyncGetShardMembership_Draining(t *testing.T) {
 
 func TestGetShardMembership_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8455,7 +8503,7 @@ func TestGetShardMembership_ClosedHost(t *testing.T) {
 
 func TestGetShardMembership_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8469,7 +8517,7 @@ func TestGetShardMembership_ShardNotFound(t *testing.T) {
 
 func TestGetShardMembership_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8504,7 +8552,7 @@ func TestGetShardMembership_Success(t *testing.T) {
 
 func TestGetShardMembership_MapsNotNil(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8677,7 +8725,7 @@ func TestProtoMembershipToPublic_NoAliasing(t *testing.T) {
 
 func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8728,7 +8776,7 @@ func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 
 func TestGetShardInfo_PendingZeroWithNoMap(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8753,7 +8801,7 @@ func TestGetShardInfo_PendingZeroWithNoMap(t *testing.T) {
 
 func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8855,7 +8903,7 @@ func TestBuildWALOptions_DiskFullRecoveryWithEventListener(t *testing.T) {
 
 func TestHost_Close_CompletesPendingProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8895,7 +8943,7 @@ func TestHost_Close_CompletesPendingProposals(t *testing.T) {
 
 func TestHost_Close_CompletesPendingReads(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8927,7 +8975,7 @@ func TestHost_Close_CompletesPendingReads(t *testing.T) {
 
 func TestHost_Close_CompletesPendingSnapshots(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -8959,7 +9007,7 @@ func TestHost_Close_CompletesPendingSnapshots(t *testing.T) {
 
 func TestHost_Close_UnblocksConcurrentWaiters(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9038,7 +9086,7 @@ func TestHost_Close_UnblocksConcurrentWaiters(t *testing.T) {
 
 func TestHost_Close_NoPendingNoError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9064,7 +9112,7 @@ func TestHost_Close_NoPendingNoError(t *testing.T) {
 // implementations that may block on the stopper during long recovery.
 func TestStopShard_ClosesOpenStopper(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9107,7 +9155,7 @@ func TestStopShard_ClosesOpenStopper(t *testing.T) {
 // (once succeeding, once returning ErrShardNotFound) should not panic.
 func TestStopShard_OpenStopperClosedOnce(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9134,7 +9182,7 @@ func TestStopShard_OpenStopperClosedOnce(t *testing.T) {
 // the openStopper channel for every loaded shard.
 func TestHost_Close_ClosesOpenStoppers(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9187,7 +9235,7 @@ func TestNewHost_DoesNotMutateGlobalLogger(t *testing.T) {
 	originalHandler := slog.Default().Handler()
 
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9213,7 +9261,7 @@ func TestNewHost_WithLogger_UsesProvidedLogger(t *testing.T) {
 	}))
 
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithLogger(customLogger))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithLogger(customLogger), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9239,7 +9287,7 @@ func TestNewHost_DefaultLogger_DoesNotMutateGlobal(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.LogConfig.Level = config.LogLevelDebug
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9273,7 +9321,7 @@ func TestImportSnapshot_MonotonicCounter(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9325,7 +9373,7 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 	}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9444,7 +9492,7 @@ func TestTransportSender_Wait_NoInFlight(t *testing.T) {
 // returns the context error when the context is already canceled.
 func TestRequestLeaderTransfer_CanceledContext(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9474,7 +9522,7 @@ func TestRequestLeaderTransfer_CanceledContext(t *testing.T) {
 // has already expired.
 func TestRequestLeaderTransfer_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9508,7 +9556,7 @@ func TestImportSnapshot_CanceledContext(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9537,7 +9585,7 @@ func TestImportSnapshot_DeadlineExceeded(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9564,7 +9612,7 @@ func TestImportSnapshot_DeadlineExceeded(t *testing.T) {
 // reaches zero during drain mode.
 func TestHost_Drain_EventDrivenNotification(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9612,7 +9660,7 @@ func TestHost_Drain_EventDrivenNotification(t *testing.T) {
 // does not panic when called more times than addPendingOp (defensive coding).
 func TestHost_Drain_CompletePendingOpIdempotent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9652,7 +9700,7 @@ func TestHost_Drain_CompletePendingOpIdempotent(t *testing.T) {
 // membership, adding new nodes and removing stale ones.
 func TestReconcileMembershipFromPeer_AddsAndRemovesNodes(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9695,7 +9743,7 @@ func TestReconcileMembershipFromPeer_AddsAndRemovesNodes(t *testing.T) {
 // reconcileMembershipFromPeer is a no-op when the engine node doesn't exist.
 func TestReconcileMembershipFromPeer_NoEngine(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9724,7 +9772,7 @@ func TestReconcileMembershipFromPeer_NoEngine(t *testing.T) {
 // reconcileMembershipFromPeer callback.
 func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9755,6 +9803,7 @@ func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 	// Call OnSnapshotCompleted with success.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 
 	// Verify stale node was removed. The Peer's membership only has replica 1.
 	ns.nodesMu.RLock()
@@ -9772,7 +9821,7 @@ func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 // reconciliation is NOT called on snapshot error.
 func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9802,6 +9851,7 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 	// Call OnSnapshotCompleted with error. Reconciliation should NOT happen.
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 0, errors.New("snapshot failed"))
+	flushListeners(t, cb)
 
 	// Verify stale node was NOT removed (reconciliation skipped on error).
 	ns.nodesMu.RLock()
@@ -9853,7 +9903,7 @@ func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 func TestHost_Close_WaitsForSnapshotSends(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.ShutdownTimeout = 2 * time.Second
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9876,7 +9926,7 @@ func TestHost_Close_WaitsForSnapshotSends(t *testing.T) {
 // ConfigChangeIndex field in the returned ShardInfo.
 func TestBuildShardInfo_ConfigChangeIndex(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9904,7 +9954,7 @@ func TestBuildShardInfo_ConfigChangeIndex(t *testing.T) {
 // ConfigChangeIndex is 0 when no membership change has been applied.
 func TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9931,7 +9981,7 @@ func TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange(t *testing.T) {
 // EntryConfigChange entry.
 func TestOnApplied_SetsConfigChangeIndex(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -9980,7 +10030,7 @@ func TestOnApplied_SetsConfigChangeIndex(t *testing.T) {
 // entries.
 func TestOnApplied_ConfigChangeIndex_IgnoresNormalEntries(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -10320,7 +10370,7 @@ func TestProposeWithSession_RegisterMode(t *testing.T) {
 
 func TestProposeWithSession_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -10540,7 +10590,7 @@ func TestSyncProposeWithSession_ContextCanceled(t *testing.T) {
 
 func TestSyncProposeWithSession_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11355,7 +11405,7 @@ func TestHostEngineCallback_OnCampaignLaunched_WithListener(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11383,7 +11433,7 @@ func TestHostEngineCallback_OnCampaignLaunched_WithListener(t *testing.T) {
 func TestHostEngineCallback_OnCampaignLaunched_NilListener(t *testing.T) {
 	cfg := testHostConfig(t)
 	// No EventListener configured.
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11399,7 +11449,7 @@ func TestHostEngineCallback_OnCampaignLaunched_NilCallback(t *testing.T) {
 	// EventListener set but OnCampaignLaunched is nil.
 	cfg.EventListener = &config.EventListener{}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11429,7 +11479,7 @@ func TestHostEngineCallback_OnCampaignSkipped_WithListener(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11456,7 +11506,7 @@ func TestHostEngineCallback_OnCampaignSkipped_WithListener(t *testing.T) {
 
 func TestHostEngineCallback_OnCampaignSkipped_NilListener(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11471,7 +11521,7 @@ func TestHostEngineCallback_OnCampaignSkipped_NilCallback(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.EventListener = &config.EventListener{}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11501,7 +11551,7 @@ func TestHostEngineCallback_OnSnapshotRejected_WithListener(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11525,7 +11575,7 @@ func TestHostEngineCallback_OnSnapshotRejected_WithListener(t *testing.T) {
 
 func TestHostEngineCallback_OnSnapshotRejected_NilListener(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11540,7 +11590,7 @@ func TestHostEngineCallback_OnSnapshotRejected_NilCallback(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.EventListener = &config.EventListener{}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11557,7 +11607,7 @@ func TestHostEngineCallback_OnSnapshotRejected_NilCallback(t *testing.T) {
 
 func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11606,7 +11656,7 @@ func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 // deliver a notification it holds no reference for.
 func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11651,7 +11701,7 @@ func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) 
 // never observe a committedC notification. Run under -race.
 func TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11723,7 +11773,7 @@ func TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress(t *testing.
 
 func TestHostEngineCallback_OnCommitted_SkipsZeroKey(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11763,7 +11813,7 @@ func TestHostEngineCallback_OnCommitted_SkipsZeroKey(t *testing.T) {
 
 func TestHostEngineCallback_OnCommitted_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11776,7 +11826,7 @@ func TestHostEngineCallback_OnCommitted_NonexistentShard(t *testing.T) {
 
 func TestHostEngineCallback_OnCommitted_NilPendingProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11794,7 +11844,7 @@ func TestHostEngineCallback_OnCommitted_NilPendingProposals(t *testing.T) {
 
 func TestHostEngineCallback_OnCommitted_UnmatchedKey(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11816,7 +11866,7 @@ func TestHostEngineCallback_OnCommitted_UnmatchedKey(t *testing.T) {
 
 func TestHost_DiagPipelineState_ReturnsState(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11849,7 +11899,7 @@ func TestHost_DiagPipelineState_ReturnsState(t *testing.T) {
 
 func TestHost_DiagPipelineState_NonexistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -11899,7 +11949,7 @@ func (b *rotatingBarrier) ShouldRotateKey() bool { return false }
 // when no barrier is configured.
 func TestRotateBarrierKey_NilBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12102,7 +12152,7 @@ func TestBarrier_ShouldRotateKey_NoRotationWhenFalse(t *testing.T) {
 
 func TestHost_QueryRaftLog_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12192,7 +12242,7 @@ func TestHost_QueryRaftLog_ClosedHost(t *testing.T) {
 
 func TestHost_QueryRaftLog_MaxSize(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12241,7 +12291,7 @@ func TestHost_QueryRaftLog_CanceledContext(t *testing.T) {
 
 func TestHost_GetLogRange_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12296,7 +12346,7 @@ func TestHost_GetLogRange_ClosedHost(t *testing.T) {
 // succeed, proving the loop did not exit permanently.
 func TestPendingSweepLoop_PanicRecovery(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12379,7 +12429,7 @@ func TestPendingSweepLoopOnce_NormalReturnsFalse(t *testing.T) {
 // leaks or deadlocks.
 func TestPendingSweepLoop_NormalShutdown(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12408,7 +12458,7 @@ func TestPendingSweepLoop_NormalShutdown(t *testing.T) {
 // the pendingOps counter below zero.
 func TestCompletePendingOp_DoubleCompletionDoesNotGoNegative(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12437,7 +12487,7 @@ func TestCompletePendingOp_DoubleCompletionDoesNotGoNegative(t *testing.T) {
 // panic on drainC.
 func TestCompletePendingOp_DoubleCompletionDuringDrain(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12473,7 +12523,7 @@ func TestCompletePendingOp_DoubleCompletionDuringDrain(t *testing.T) {
 // completePendingOp when the counter is already at zero is a no-op.
 func TestCompletePendingOp_ZeroCounterStaysAtZero(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12495,7 +12545,7 @@ func TestCompletePendingOp_ZeroCounterStaysAtZero(t *testing.T) {
 // counter values.
 func TestCompletePendingOp_ConcurrentDoubleCompletion(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12535,7 +12585,7 @@ func TestCompletePendingOp_ConcurrentDoubleCompletion(t *testing.T) {
 // receiving the applied result.
 func TestSyncPropose_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12572,7 +12622,7 @@ func TestSyncPropose_Success(t *testing.T) {
 // (PhD 6.4 ReadIndex warmup) without inventing a throwaway payload.
 func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12631,7 +12681,7 @@ func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 // when the context deadline expires before the proposal is applied.
 func TestSyncPropose_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12664,7 +12714,7 @@ func TestSyncPropose_Timeout(t *testing.T) {
 // when the context is canceled before the proposal is applied.
 func TestSyncPropose_Canceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12694,7 +12744,7 @@ func TestSyncPropose_Canceled(t *testing.T) {
 // a value, then read it back via SyncRead (ReadIndex -> wait -> Lookup).
 func TestSyncRead_LeaderReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12732,7 +12782,7 @@ func TestSyncRead_LeaderReady(t *testing.T) {
 // when the context deadline expires.
 func TestSyncRead_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12763,7 +12813,7 @@ func TestSyncRead_Timeout(t *testing.T) {
 // snapshot on a single-node cluster with committed entries is accepted.
 func TestRequestSnapshot_AsyncAccepted(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12804,7 +12854,7 @@ func TestRequestSnapshot_AsyncAccepted(t *testing.T) {
 // on a non-existent shard returns ErrShardNotFound.
 func TestRequestSnapshot_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12822,7 +12872,7 @@ func TestRequestSnapshot_InvalidShard(t *testing.T) {
 // and verify the returned snapshot index.
 func TestSyncRequestSnapshot_FullPipeline(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12862,7 +12912,7 @@ func TestSyncRequestSnapshot_FullPipeline(t *testing.T) {
 // returns ErrTimeout when the context deadline expires.
 func TestSyncRequestSnapshot_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12895,7 +12945,7 @@ func TestSyncRequestSnapshot_Timeout(t *testing.T) {
 // transfer to self is a no-op (the peer returns nil).
 func TestRequestLeaderTransfer_SelfTransfer(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12923,7 +12973,7 @@ func TestRequestLeaderTransfer_SelfTransfer(t *testing.T) {
 // transfer on a non-existent shard returns an error.
 func TestRequestLeaderTransfer_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12944,7 +12994,7 @@ func TestRequestLeaderTransfer_InvalidShard(t *testing.T) {
 // valid pipeline state for a loaded shard.
 func TestDiagPipelineState_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12982,7 +13032,7 @@ func TestDiagPipelineState_Success(t *testing.T) {
 // an error for a non-existent shard.
 func TestDiagPipelineState_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -12998,7 +13048,7 @@ func TestDiagPipelineState_InvalidShard(t *testing.T) {
 // error for a non-existent shard.
 func TestDiagRaftState_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13014,7 +13064,7 @@ func TestDiagRaftState_InvalidShard(t *testing.T) {
 // for a loaded shard.
 func TestDiagRemotes_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13040,7 +13090,7 @@ func TestDiagRemotes_Success(t *testing.T) {
 // TestDiagRemotes_InvalidShard verifies error for non-existent shard.
 func TestDiagRemotes_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13068,7 +13118,7 @@ func TestDiagRemotes_InvalidShard(t *testing.T) {
 // asserted nothing when it failed, and passed with the branch deleted.
 func TestTranslateProposalError_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13130,7 +13180,7 @@ func TestTranslateProposalError_NotLeader(t *testing.T) {
 // and then properly closed via CloseSession on a running shard.
 func TestGetNewSession_AndCloseSession(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13169,7 +13219,7 @@ func TestGetNewSession_AndCloseSession(t *testing.T) {
 // error for a non-existent shard.
 func TestGetNewSession_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13192,7 +13242,7 @@ func TestGetNewSession_InvalidShard(t *testing.T) {
 // a running shard and checking that the Nodes map is populated.
 func TestSyncGetShardMembership_ReturnsNodes(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13221,7 +13271,7 @@ func TestSyncGetShardMembership_ReturnsNodes(t *testing.T) {
 // TestSyncGetShardMembership_InvalidShard verifies error for non-existent shard.
 func TestSyncGetShardMembership_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13244,7 +13294,7 @@ func TestSyncGetShardMembership_InvalidShard(t *testing.T) {
 // from the local state machine without consensus.
 func TestQueryLocalNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13280,7 +13330,7 @@ func TestQueryLocalNode_Success(t *testing.T) {
 // TestQueryLocalNode_ShardNotFound verifies error for non-existent shard.
 func TestQueryLocalNode_NonExistent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13301,7 +13351,7 @@ func TestQueryLocalNode_NonExistent(t *testing.T) {
 // consensus.
 func TestStaleRead_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13335,7 +13385,7 @@ func TestStaleRead_Success(t *testing.T) {
 // TestStaleRead_ShardNotFound verifies error for non-existent shard.
 func TestStaleRead_NonExistent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13356,7 +13406,7 @@ func TestStaleRead_NonExistent(t *testing.T) {
 // after a shard has been started and data persisted.
 func TestHasNodeInfo_ExistingShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13379,7 +13429,7 @@ func TestHasNodeInfo_ExistingShard(t *testing.T) {
 // for a shard that has never been started.
 func TestHasNodeInfo_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13394,7 +13444,7 @@ func TestHasNodeInfo_NonExistentShard(t *testing.T) {
 // reader for a loaded shard.
 func TestGetLogReader_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13418,7 +13468,7 @@ func TestGetLogReader_Success(t *testing.T) {
 // TestGetLogReader_ShardNotFound verifies error for non-existent shard.
 func TestGetLogReader_NonExistent(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13438,7 +13488,7 @@ func TestGetLogReader_NonExistent(t *testing.T) {
 // the shard has been stopped.
 func TestRemoveData_AfterStopShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13465,7 +13515,7 @@ func TestRemoveData_AfterStopShard(t *testing.T) {
 // TestSyncRemoveData_AfterStopShard verifies the synchronous RemoveData variant.
 func TestSyncRemoveData_AfterStopShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13493,7 +13543,7 @@ func TestSyncRemoveData_AfterStopShard(t *testing.T) {
 // TestStopReplica_Success verifies that StopReplica stops the shard.
 func TestStopReplica_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13518,7 +13568,7 @@ func TestStopReplica_Success(t *testing.T) {
 // session succeeds and produces a result.
 func TestProposeWithSession_MultipleProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13576,7 +13626,7 @@ func TestProposeWithSession_MultipleProposals(t *testing.T) {
 // for a running shard.
 func TestGetShardInfo_ReturnsValidInfo(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13605,7 +13655,7 @@ func TestGetShardInfo_ReturnsValidInfo(t *testing.T) {
 // TestGetShardInfo_ShardNotFound verifies error for non-existent shard.
 func TestGetShardInfo_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13625,7 +13675,7 @@ func TestGetShardInfo_ShardNotFound(t *testing.T) {
 // ErrInvalidOperation.
 func TestCloseSession_NilSessionReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13648,7 +13698,7 @@ func TestCloseSession_NilSessionReturnsError(t *testing.T) {
 // shard returns ErrInvalidSession.
 func TestCloseSession_InvalidSession(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13686,7 +13736,7 @@ func TestCloseSession_InvalidSession(t *testing.T) {
 // non-nil session with the expected shard ID.
 func TestGetNoOPSession_HasCorrectShardID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13709,7 +13759,7 @@ func TestGetNoOPSession_HasCorrectShardID(t *testing.T) {
 // on the same host and each elects a leader independently.
 func TestStartMultipleShards(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13748,7 +13798,7 @@ func TestStartMultipleShards(t *testing.T) {
 // TestHost_ID verifies that the Host has a non-empty generated ID.
 func TestHost_ID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13762,7 +13812,7 @@ func TestHost_ID(t *testing.T) {
 // TestHost_RaftAddress verifies that RaftAddress returns the configured address.
 func TestHost_RaftAddress(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13782,7 +13832,7 @@ func TestHost_RaftAddress(t *testing.T) {
 // after proposals have been committed.
 func TestGetShardInfo_AfterPropose(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13827,7 +13877,7 @@ func TestGetShardInfo_AfterPropose(t *testing.T) {
 // on a non-existent shard returns an error.
 func TestSyncRequestAddObserver_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13846,7 +13896,7 @@ func TestSyncRequestAddObserver_InvalidShard(t *testing.T) {
 // on a non-existent shard returns an error.
 func TestSyncRequestAddWitness_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13865,7 +13915,7 @@ func TestSyncRequestAddWitness_InvalidShard(t *testing.T) {
 // a running shard is accepted (the request goes through Raft).
 func TestRequestAddNode_WithConfigChangeID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13904,7 +13954,7 @@ func TestRequestAddNode_WithConfigChangeID(t *testing.T) {
 // node from a non-existent shard returns an error.
 func TestRequestRemoveNode_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -13924,7 +13974,7 @@ func TestRequestRemoveNode_InvalidShard(t *testing.T) {
 // remove a node using the current ConfigChangeID is accepted by the leader.
 func TestRequestRemoveNode_WithConfigChangeID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14076,7 +14126,7 @@ func TestLogdbMembershipToProto_EmptyMaps(t *testing.T) {
 // ErrReadIndexOverloaded from the raft layer is translated to ErrSystemBusy.
 func TestTranslateProposalError_ReadIndexOverloaded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14111,7 +14161,7 @@ func TestTranslateProposalError_ReadIndexOverloaded(t *testing.T) {
 // RequestAborted instead of RequestRejected.
 func TestTranslateProposalError_PendingConfigChange(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14138,7 +14188,7 @@ func TestTranslateProposalError_PendingConfigChange(t *testing.T) {
 // are returned as-is without wrapping.
 func TestTranslateProposalError_PassThrough(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14168,7 +14218,7 @@ func TestTranslateProposalError_PassThrough(t *testing.T) {
 // submits a config change and blocks until the result arrives.
 func TestSyncRequestAddObserver_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14201,7 +14251,7 @@ func TestSyncRequestAddObserver_Success(t *testing.T) {
 // submits a config change and blocks until the result arrives.
 func TestSyncRequestAddWitness_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14555,7 +14605,7 @@ func TestBuildWALOptions_DiskWarningNoFullCallback(t *testing.T) {
 // returns ErrDraining when the host is draining.
 func TestProposeSession_DrainingReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14586,7 +14636,7 @@ func TestProposeSession_DrainingReturnsError(t *testing.T) {
 // returns ErrClosed when the host is closed.
 func TestProposeSession_ClosedReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14618,7 +14668,7 @@ func TestProposeSession_ClosedReturnsError(t *testing.T) {
 // the context is canceled (not timed out).
 func TestSyncRead_Canceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14648,7 +14698,7 @@ func TestSyncRead_Canceled(t *testing.T) {
 // calls peer.MarkJoining() and skips bootstrap saving.
 func TestStartShard_JoinMarksJoining(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14678,7 +14728,7 @@ func TestStartShard_JoinMarksJoining(t *testing.T) {
 // MetricsCollector is provided.
 func TestNewHost_WithMetricsAndBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14697,7 +14747,7 @@ func TestNewHost_WithMetricsAndBarrier(t *testing.T) {
 // ErrClosed when called on a closed host.
 func TestRequestSnapshot_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14719,7 +14769,7 @@ func TestRequestSnapshot_ClosedHostReturnsError(t *testing.T) {
 // single-node cluster after the leader is elected and data is proposed.
 func TestSyncRead_SuccessImmediate(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14767,7 +14817,7 @@ func TestSyncRead_SuccessImmediate(t *testing.T) {
 // SyncGetShardMembership on a draining host returns ErrDraining.
 func TestSyncGetShardMembership_DrainingReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14790,7 +14840,7 @@ func TestSyncGetShardMembership_DrainingReturnsError(t *testing.T) {
 // GetNewSession on a draining host returns ErrDraining.
 func TestGetNewSession_DrainingReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14822,7 +14872,7 @@ func TestGetNewSession_DrainingReturnsError(t *testing.T) {
 // returns ErrCanceled when the context is canceled (not timed out).
 func TestSyncRequestSnapshot_Canceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14845,7 +14895,7 @@ func TestSyncRequestSnapshot_Canceled(t *testing.T) {
 // returns ErrTimeout when the context deadline is exceeded.
 func TestSyncRequestAddObserver_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14866,7 +14916,7 @@ func TestSyncRequestAddObserver_Timeout(t *testing.T) {
 // returns ErrTimeout when the context deadline is exceeded.
 func TestSyncRequestAddWitness_Timeout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14891,7 +14941,7 @@ func TestSyncRequestAddWitness_Timeout(t *testing.T) {
 // number of active shards after start and stop operations.
 func TestShardCount_AfterStartAndStop(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14925,7 +14975,7 @@ func TestShardCount_AfterStartAndStop(t *testing.T) {
 // returns an error when the target shard does not exist.
 func TestSyncPropose_InvalidShardReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14948,7 +14998,7 @@ func TestSyncPropose_InvalidShardReturnsError(t *testing.T) {
 // returns ErrCanceled when the context is canceled (not timed out).
 func TestSyncRequestAddObserver_Canceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -14978,7 +15028,7 @@ func TestSyncRequestAddObserver_Canceled(t *testing.T) {
 // returns ErrCanceled when the context is canceled.
 func TestSyncRequestAddWitness_Canceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15009,7 +15059,7 @@ func TestSyncRequestAddWitness_Canceled(t *testing.T) {
 // SyncRequestSnapshot returns ErrCanceled when the context is canceled.
 func TestSyncRequestSnapshot_ContextCanceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15040,7 +15090,7 @@ func TestSyncRequestSnapshot_ContextCanceled(t *testing.T) {
 // when the context deadline is exceeded waiting for ReadIndex confirmation.
 func TestSyncRead_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15071,7 +15121,7 @@ func TestSyncRead_DeadlineExceeded(t *testing.T) {
 // returns ErrClosed when the host has been closed.
 func TestCloseSession_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15093,7 +15143,7 @@ func TestCloseSession_ClosedHostReturnsError(t *testing.T) {
 // ErrCanceled when the context is canceled (not timed out).
 func TestSyncPropose_ContextCanceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15123,7 +15173,7 @@ func TestSyncPropose_ContextCanceled(t *testing.T) {
 // SyncGetShardMembership returns ErrCanceled when the context is canceled.
 func TestSyncGetShardMembership_ContextCanceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15152,7 +15202,7 @@ func TestSyncGetShardMembership_ContextCanceled(t *testing.T) {
 // RequestLeaderTransfer returns ErrClosed when the host is closed.
 func TestRequestLeaderTransfer_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15169,7 +15219,7 @@ func TestRequestLeaderTransfer_ClosedHostReturnsError(t *testing.T) {
 // RequestLeaderTransfer returns ErrCanceled when the context is canceled.
 func TestRequestLeaderTransfer_ContextCanceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15204,7 +15254,7 @@ func TestNewHost_DefaultLogDB(t *testing.T) {
 		ListenAddress: "127.0.0.1:5000",
 		DeploymentID:  1,
 	}
-	h, err := NewHost(cfg, WithoutTransport())
+	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost with default LogDB failed: %v", err)
 	}
@@ -15223,7 +15273,7 @@ func TestNewHost_DefaultLogDB(t *testing.T) {
 // ErrShardNotReady when the engine node does not exist for the shard.
 func TestRequestSnapshot_ShardNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15255,7 +15305,7 @@ func TestRequestSnapshot_ShardNotReady(t *testing.T) {
 // path: snapshot restore, hard state restore, and entry range restore.
 func TestRecoverLogReader_WithSnapshotAndEntries(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15319,7 +15369,7 @@ func TestRecoverLogReader_WithSnapshotAndEntries(t *testing.T) {
 // pendingProposals sync.Map.
 func TestDiagPipelineState_WithPendingProposals(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15362,7 +15412,7 @@ func TestDiagPipelineState_WithPendingProposals(t *testing.T) {
 // returning ErrSnapshotInProgress (exercise the submit rejection path).
 func TestRequestSnapshot_DoubleCallInProgress(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15401,7 +15451,7 @@ func TestRequestSnapshot_DoubleCallInProgress(t *testing.T) {
 // ErrShardNotReady when the engine node does not exist.
 func TestProposeEntry_ShardNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15434,7 +15484,7 @@ func TestProposeEntry_ShardNotReady(t *testing.T) {
 // ErrTimeout when the context deadline is exceeded.
 func TestSyncPropose_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15472,7 +15522,7 @@ func TestNewHost_DefaultLogDB_WithMetrics(t *testing.T) {
 		ListenAddress: "127.0.0.1:5000",
 		DeploymentID:  1,
 	}
-	h, err := NewHost(cfg, WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost with default LogDB + metrics failed: %v", err)
 	}
@@ -15494,7 +15544,7 @@ func TestNewHost_DefaultLogDB_WithMetrics(t *testing.T) {
 // returns ErrClosed when the host is closed.
 func TestImportSnapshot_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15515,7 +15565,7 @@ func TestImportSnapshot_ClosedHostReturnsError(t *testing.T) {
 // SyncGetShardMembership returns ErrClosed when the host is closed.
 func TestSyncGetShardMembership_ClosedReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15536,7 +15586,7 @@ func TestSyncGetShardMembership_ClosedReturnsError(t *testing.T) {
 // ErrClosed when the host is closed.
 func TestGetNewSession_ClosedReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15557,7 +15607,7 @@ func TestGetNewSession_ClosedReturnsError(t *testing.T) {
 // path specifically when the deadline expires during the pipeline wait.
 func TestSyncProposeWithSession_DeadlineExceededPath(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15589,7 +15639,7 @@ func TestSyncProposeWithSession_DeadlineExceededPath(t *testing.T) {
 // returns ErrClosed when the host has been closed.
 func TestQueryLocalNode_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15609,7 +15659,7 @@ func TestQueryLocalNode_ClosedHostReturnsError(t *testing.T) {
 // ErrClosed when the host has been closed.
 func TestStaleRead_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15629,7 +15679,7 @@ func TestStaleRead_ClosedHostReturnsError(t *testing.T) {
 // false when the host has been closed.
 func TestHasNodeInfo_ClosedHostReturnsFalse(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15648,7 +15698,7 @@ func TestHasNodeInfo_ClosedHostReturnsFalse(t *testing.T) {
 // returns ErrTimeout when the context deadline expires waiting for commit.
 func TestSyncRequestAddNode_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15681,7 +15731,7 @@ func TestSyncRequestAddNode_DeadlineExceeded(t *testing.T) {
 // SyncRequestDeleteNode returns ErrTimeout when the deadline expires.
 func TestSyncRequestDeleteNode_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15714,7 +15764,7 @@ func TestSyncRequestDeleteNode_DeadlineExceeded(t *testing.T) {
 // returns ErrInvalidOperation when the session is nil.
 func TestCloseSession_NilSession_ReturnsInvalidOp(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15741,7 +15791,7 @@ func TestCloseSession_NilSession_ReturnsInvalidOp(t *testing.T) {
 // ReplicaNotFoundError when the replicaID doesn't match.
 func TestStopReplica_WrongReplicaID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15769,7 +15819,7 @@ func TestStopReplica_WrongReplicaID(t *testing.T) {
 // returns a ReplicaNotFoundError when the replicaID doesn't match.
 func TestRequestCompaction_WrongReplicaID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15796,7 +15846,7 @@ func TestRequestCompaction_WrongReplicaID(t *testing.T) {
 // ShardNotStoppedError when the shard is still loaded on the host.
 func TestRemoveData_ShardStillActive(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15823,7 +15873,7 @@ func TestRemoveData_ShardStillActive(t *testing.T) {
 // ErrTimeout when the context deadline is already expired.
 func TestSyncRemoveData_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15848,7 +15898,7 @@ func TestSyncRemoveData_DeadlineExceeded(t *testing.T) {
 // not the leader and has no known leader.
 func TestRequestLeaderTransfer_NotLeaderNoLeaderID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15882,7 +15932,7 @@ func TestRequestLeaderTransfer_NotLeaderNoLeaderID(t *testing.T) {
 // nil (shard just loaded but engine not yet spun up).
 func TestRequestLeaderTransfer_ShardNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -15986,7 +16036,7 @@ func TestBuildWALOptions_CallbacksZeroDiskSize(t *testing.T) {
 // incorrect configChangeIndex triggers a StaleConfigChangeError.
 func TestRequestConfigChange_StaleConfigChangeID(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16016,7 +16066,7 @@ func TestRequestConfigChange_StaleConfigChangeID(t *testing.T) {
 // proposeSession returns a NotLeaderError when the node has no known leader.
 func TestProposeSession_NoLeaderReturnsNotLeaderError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16050,7 +16100,7 @@ func TestProposeSession_NoLeaderReturnsNotLeaderError(t *testing.T) {
 // confirmation followed by SM.Lookup on the caught-up state machine.
 func TestSyncRead_SuccessEndToEnd(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16093,7 +16143,7 @@ func TestSyncRead_SuccessEndToEnd(t *testing.T) {
 // returns ErrClosed when the host has been closed.
 func TestExportSnapshot_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16113,7 +16163,7 @@ func TestExportSnapshot_ClosedHostReturnsError(t *testing.T) {
 // returns ErrClosed when the host has been closed.
 func TestGetLogReader_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16133,7 +16183,7 @@ func TestGetLogReader_ClosedHostReturnsError(t *testing.T) {
 // RequestCompaction returns ErrClosed when the host has been closed.
 func TestRequestCompaction_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16153,7 +16203,7 @@ func TestRequestCompaction_ClosedHostReturnsError(t *testing.T) {
 // ErrClosed when the host has been closed.
 func TestRemoveData_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16173,7 +16223,7 @@ func TestRemoveData_ClosedHostReturnsError(t *testing.T) {
 // ErrClosed when the host has been closed.
 func TestStopReplica_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16195,7 +16245,7 @@ func TestStopReplica_ClosedHostReturnsError(t *testing.T) {
 // and file size (lines 3543-3548 in host.go).
 func TestRecoverLogReader_WithSnapshotFilepath(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16266,7 +16316,7 @@ func TestRecoverLogReader_WithSnapshotFilepath(t *testing.T) {
 // file, calls RecoverFromSnapshot on the SM, and closes it cleanly.
 func TestStartShard_SnapshotRecovery(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16342,7 +16392,7 @@ func TestStartShard_WithEventListener(t *testing.T) {
 			// just covering the field initialization
 		},
 	}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16375,7 +16425,7 @@ func TestStartShard_WithEventListener(t *testing.T) {
 // the c.h.metrics != nil branch in OnApplied (line 636 in host.go).
 func TestSyncPropose_WithMetrics(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16405,7 +16455,7 @@ func TestSyncPropose_WithMetrics(t *testing.T) {
 // the c.h.metrics != nil branch in OnReadyToRead (line 742 in host.go).
 func TestSyncRead_WithMetrics(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16444,7 +16494,7 @@ func TestSyncRead_WithMetrics(t *testing.T) {
 // RequestSnapshot -> snapshot worker -> OnSnapshotCompleted -> result.
 func TestSyncRequestSnapshot_Success(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16482,7 +16532,7 @@ func TestSyncRequestSnapshot_Success(t *testing.T) {
 // immediately when there are no pending operations.
 func TestDrain_NoPendingOps(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16501,7 +16551,7 @@ func TestDrain_NoPendingOps(t *testing.T) {
 // the correct membership for a running shard without going through Raft.
 func TestGetShardMembership_ReturnsNodes(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16531,7 +16581,7 @@ func TestGetShardMembership_ReturnsNodes(t *testing.T) {
 // returns ErrInvalidSession when the session is nil.
 func TestProposeWithSession_NilSessionReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16551,7 +16601,7 @@ func TestProposeWithSession_NilSessionReturnsError(t *testing.T) {
 // ErrInvalidSession when the session's shardID doesn't match the target.
 func TestCloseSession_WrongShardInSession(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16583,7 +16633,7 @@ func TestCloseSession_WrongShardInSession(t *testing.T) {
 // path in SyncPropose when the context is canceled (not deadline exceeded).
 func TestSyncPropose_CancelReturnsCanceled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16613,7 +16663,7 @@ func TestSyncPropose_CancelReturnsCanceled(t *testing.T) {
 // write data to disk, update LogDB, and verify the snapshot is persisted.
 func TestImportSnapshot_FullPipeline(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16648,7 +16698,7 @@ func TestImportSnapshot_FullPipeline(t *testing.T) {
 // returns ErrInvalidOperation when the shard is still running.
 func TestImportSnapshot_ShardRunningReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16675,7 +16725,7 @@ func TestImportSnapshot_ShardRunningReturnsError(t *testing.T) {
 // metrics enabled, covering the OnSnapshotCompleted metrics branch.
 func TestRequestSnapshot_WithMetrics(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16708,7 +16758,7 @@ func TestRequestSnapshot_WithMetrics(t *testing.T) {
 // returns true for a node that has been bootstrapped.
 func TestHasNodeInfo_ExistingNodeReturnsTrue(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16732,7 +16782,7 @@ func TestHasNodeInfo_ExistingNodeReturnsTrue(t *testing.T) {
 // TestQueryLocalNode_ReturnsQueryResult verifies QueryLocalNode on a running shard.
 func TestQueryLocalNode_ReturnsQueryResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16758,7 +16808,7 @@ func TestQueryLocalNode_ReturnsQueryResult(t *testing.T) {
 // TestStaleRead_ReturnsQueryResult verifies StaleRead on a running shard.
 func TestStaleRead_ReturnsQueryResult(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16804,7 +16854,7 @@ func TestShardHealth_UnmarshalJSON_InvalidJSON(t *testing.T) {
 // path in SyncRead that returns the lookup result.
 func TestSyncRead_SuccessWithReadIndex(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -16933,7 +16983,7 @@ func TestNoopSender_ImplementsMessageSender(t *testing.T) {
 // from the raft layer is translated to ErrNotLeader with leader info.
 func TestTranslateProposalError_NotLeaderError(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -16985,7 +17035,7 @@ func TestTranslateProposalError_NotLeaderError(t *testing.T) {
 // NotLeaderError without leader info is translated correctly.
 func TestTranslateProposalError_NotLeaderError_NoLeader(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -17039,7 +17089,7 @@ func TestTranslateProposalError_NotLeaderError_NoLeader(t *testing.T) {
 // the pendingOps counter.
 func TestAddPendingOp_IncrementsCounter(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -17068,7 +17118,7 @@ func TestAddPendingOp_IncrementsCounter(t *testing.T) {
 // safe to call concurrently from multiple goroutines.
 func TestAddPendingOp_ConcurrentIncrement(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -17719,7 +17769,7 @@ func TestTranslateProposalError_ReadIndexNotReady(t *testing.T) {
 
 func TestStopShard_WithMetrics(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -18004,7 +18054,7 @@ func TestSyncGetShardMembership_Timeout(t *testing.T) {
 func TestNewHost_WALLogDB_Validates(t *testing.T) {
 	cfg := testHostConfig(t)
 	// Do not pass WithMemoryLogDB or WithLogDB - use default WAL path.
-	h, err := NewHost(cfg, WithoutTransport())
+	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost with default WAL LogDB failed: %v", err)
 	}
@@ -18026,7 +18076,7 @@ func TestStopShard_WithEventListener(t *testing.T) {
 			unloadedCalled.Store(true)
 		},
 	}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -18055,7 +18105,7 @@ func TestGetNodeHostInfo_LogDBError(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
 	db.listNodeInfoErr = errors.New("logdb error")
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -18231,7 +18281,7 @@ func TestOnSnapshotCompleted_SnapshotRecovery(t *testing.T) {
 			}
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18241,6 +18291,7 @@ func TestOnSnapshotCompleted_SnapshotRecovery(t *testing.T) {
 	cb := &hostEngineCallback{h: h}
 	// index=0 means recovery.
 	cb.OnSnapshotCompleted(1, 0, nil)
+	flushListeners(t, cb)
 
 	if !recoveryCalled {
 		t.Error("OnSnapshotRecovered was not called for index=0 snapshot")
@@ -18258,7 +18309,7 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCompacted(t *testing.T) {
 			}
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18267,32 +18318,10 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCompacted(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnSnapshotCompleted(1, 42, nil)
+	flushListeners(t, cb)
 
 	if !compactedCalled {
 		t.Error("OnSnapshotCompacted was not called")
-	}
-}
-
-func TestOnSnapshotCompleted_FiresOnLogDBCompacted(t *testing.T) {
-	logDBCompactedCalled := false
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnLogDBCompacted: func(info config.EventShardInfo) {
-			logDBCompactedCalled = true
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	t.Cleanup(func() { h.Close() })
-	addTestNodeState(h, 1, 1)
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 10, nil)
-
-	if !logDBCompactedCalled {
-		t.Error("OnLogDBCompacted was not called")
 	}
 }
 
@@ -18314,7 +18343,7 @@ func TestRemoveData_FiresOnNodeDeleted(t *testing.T) {
 			}
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18583,7 +18612,7 @@ func TestOnLeaderUpdated_BecameLeaderWithEventListener(t *testing.T) {
 			leaderEventFired = true
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18614,7 +18643,7 @@ func TestOnApplied_MembershipChangeFiresEvent(t *testing.T) {
 			membershipChanged = true
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18710,7 +18739,7 @@ func TestClose_FiresOnNodeHostShuttingDown(t *testing.T) {
 			shutdownCalled = true
 		},
 	}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -18740,7 +18769,7 @@ func TestDrain_IdempotentSecondCall(t *testing.T) {
 
 func TestClose_IdempotentSecondCall(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -19146,7 +19175,7 @@ func TestProposeEntry_DroppedProposalFiresEvent(t *testing.T) {
 			dropped.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19274,7 +19303,7 @@ func TestPendingSweepLoopOnce_StopChannel(t *testing.T) {
 	// Create a dedicated host with its own sweep channels to avoid
 	// racing with the background sweeper started by NewHost.
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19303,7 +19332,7 @@ func TestPendingSweepLoopOnce_StopChannel(t *testing.T) {
 
 func TestKeyRotationLoopOnce_StopChannel(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19517,7 +19546,7 @@ func TestOnCampaignLaunched_WithListener(t *testing.T) {
 			fired.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19546,7 +19575,7 @@ func TestOnCampaignSkipped_WithListener(t *testing.T) {
 			fired.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19567,7 +19596,7 @@ func TestOnSnapshotRejected_WithListener(t *testing.T) {
 			fired.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19690,7 +19719,7 @@ func TestOnLeaderUpdated_BecameLeaderLogsAndFiresEvent(t *testing.T) {
 			eventFired.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -19724,7 +19753,7 @@ func TestOnLeaderUpdated_LostLeadershipFiresEvent(t *testing.T) {
 			lostFired.Store(true)
 		},
 	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -20281,6 +20310,7 @@ func TestOnSnapshotCompleted_BadNodeStateType(t *testing.T) {
 
 	// Should not panic, just return after logging.
 	cb.OnSnapshotCompleted(1, 100, nil)
+	flushListeners(t, cb)
 }
 
 // ---------------------------------------------------------------------------
@@ -20605,7 +20635,7 @@ func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 	// only the EPOCH differs between them, which is the property under test.
 	aad := engine.NewSnapshotAAD(testSnapShardID, testSnapReplicaID, testSnapIndex, barrier)
 	p1 := []byte("frame-one-sealed-before-rotation")
-	c1, e1, err := barrier.EncryptWithEpochContext(nil, p1, aad.Frame(0))
+	c1, e1, err := barrier.EncryptWithEpochContext(nil, p1, aad.Frame(0, false))
 	if err != nil {
 		t.Fatalf("EncryptWithEpochContext(1) failed: %v", err)
 	}
@@ -20613,7 +20643,7 @@ func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 		t.Fatalf("Rotate failed: %v", rotErr)
 	}
 	p2 := []byte("frame-two-sealed-after-rotation-at-a-higher-epoch")
-	c2, e2, err := barrier.EncryptWithEpochContext(nil, p2, aad.Frame(1))
+	c2, e2, err := barrier.EncryptWithEpochContext(nil, p2, aad.Frame(1, true))
 	if err != nil {
 		t.Fatalf("EncryptWithEpochContext(2) failed: %v", err)
 	}
@@ -21034,7 +21064,7 @@ func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 func TestStartShard_MissingSnapshotFileIsFatal(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21130,7 +21160,7 @@ var _ sm.DiskStateMachine = (*recordingOnDiskSM)(nil)
 func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21241,7 +21271,7 @@ func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
 func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21307,7 +21337,7 @@ func TestStartShard_OnDiskSM_SeedsAppliedMarker(t *testing.T) {
 func TestStartShard_FreshStart_NoSeed(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21365,7 +21395,7 @@ func TestStartShard_FreshStart_NoSeed(t *testing.T) {
 func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21438,7 +21468,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 func TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21473,7 +21503,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap_MissingDataFatal(t *testing.T) {
 // shards must not be opened.
 func TestStartShardRejectedWhileDraining(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21592,7 +21622,7 @@ var _ sm.DiskStateMachine = (*fileBackedOnDiskSM)(nil)
 // recovers the persisted state from the same DataDir-rooted location.
 func TestStartShard_OnDiskSM_DataDir_RootsUnderDataDir(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21683,7 +21713,7 @@ func TestStartShard_OnDiskSM_DataDir_RootsUnderDataDir(t *testing.T) {
 // identical to the pre-change behavior.
 func TestStartShard_OnDiskSM_NoDataDir_DefaultLayout(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21733,7 +21763,7 @@ func (m *gatedStateMachine) Close(_ context.Context) error {
 // bricks the next host start on the same DataDir.
 func TestStartShard_LosesRaceWithClose(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -21860,4 +21890,40 @@ func TestShardHealth_ReportsSnapshotGates(t *testing.T) {
 	} else if info.Health != ShardHealthy {
 		t.Fatalf("health after the gates cleared = %v, want healthy", info.Health)
 	}
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *mockBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *errorBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *testHostBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
 }

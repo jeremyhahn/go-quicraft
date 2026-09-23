@@ -383,6 +383,10 @@ func validateNodeHostConfig(cfg *dbConfig.NodeHostConfig) error {
 // compatible configuration to quicraft's HostConfig, then constructing
 // a quicraft Host with in-memory LogDB and no transport for test
 // isolation, or full transport for production use.
+//
+// Like Dragonboat, the host stores its Raft log and snapshots UNENCRYPTED at
+// rest (quicraft.WithoutEncryption). To encrypt, use NewNodeHostWithOptions
+// with quicraft.WithBarrier.
 func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 	if err := validateNodeHostConfig(&nhConfig); err != nil {
 		return nil, err
@@ -393,7 +397,11 @@ func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 		return nil, &NodeHostConstructionError{Reason: "config conversion", Err: err}
 	}
 
-	host, err := quicraft.NewHost(qcCfg)
+	// Dragonboat has no at-rest encryption, so the drop-in constructor keeps
+	// Dragonboat's behaviour and declares it: the Raft log and snapshots are
+	// stored as plaintext. NewNodeHostWithOptions is the way to encrypt, by
+	// passing quicraft.WithBarrier.
+	host, err := quicraft.NewHost(qcCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		return nil, &NodeHostConstructionError{Reason: "host creation", Err: err}
 	}
@@ -418,6 +426,11 @@ func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 // extension beyond the standard Dragonboat v4 API. It provides access
 // to QuicRaft-native capabilities such as WithMemoryLogDB() and
 // WithoutTransport() that have no Dragonboat equivalent.
+//
+// opts must state the host's at-rest encryption: quicraft.WithBarrier (or
+// WithShardBarriers) to encrypt, or quicraft.WithoutEncryption to store
+// plaintext. quicraft.NewHost refuses opts that state neither, and the error
+// is returned wrapped in a NodeHostConstructionError.
 func NewNodeHostWithOptions(nhConfig dbConfig.NodeHostConfig, opts ...quicraft.HostOption) (*NodeHost, error) {
 	if err := validateNodeHostConfig(&nhConfig); err != nil {
 		return nil, err

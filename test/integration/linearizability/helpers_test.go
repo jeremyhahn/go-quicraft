@@ -729,7 +729,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 			addr = freePort(t)
 			cfg = testHostConfig(t, addr, leaves[i])
 			var err error
-			h, err = quicraft.NewHost(cfg)
+			h, err = quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 			if err == nil {
 				break
 			}
@@ -907,7 +907,7 @@ func (c *testCluster) restartNode(idx int, shardID uint64) {
 	}
 
 	cfg := c.configs[idx]
-	h, err := quicraft.NewHost(cfg)
+	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		c.t.Fatalf("restartNode[%d]: NewHost failed: %v", idx, err)
 	}
@@ -959,7 +959,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 
 	addr := freePort(c.t)
 	cfg := testHostConfig(c.t, addr, c.ca.Leaf(c.t))
-	h, err := quicraft.NewHost(cfg)
+	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
 	}

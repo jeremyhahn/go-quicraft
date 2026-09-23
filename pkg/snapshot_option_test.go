@@ -208,7 +208,7 @@ func TestHost_RequestSnapshot_ShardNotFound(t *testing.T) {
 
 func TestHost_RequestSnapshot_ClosedHost(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

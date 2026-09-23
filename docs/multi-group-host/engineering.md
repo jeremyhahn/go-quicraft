@@ -48,6 +48,12 @@ rather than a version mismatch.
 ```
 NewHost(cfg, opts...)
   |
+  |  0. Refuse an unstated or conflicting at-rest encryption choice
+  |     - none of WithBarrier / WithShardBarriers / WithoutEncryption:
+  |       ErrAtRestEncryptionUnspecified
+  |     - WithoutEncryption with a barrier option: ErrAtRestEncryptionConflict
+  |     - checked before step 3, so a refused host creates no directories
+  |
   |  1. cfg.SetDefaults() + cfg.Validate()
   |     - Reject empty WALDir, NodeHostDir, RaftAddress, ListenAddress
   |     - Reject DeploymentID 0 unless AllowZeroDeploymentID
@@ -755,14 +761,69 @@ StopShard(shardID)
   |  3. Remove from h.nodes map
   |
   |  4. engine.UnloadNode(shardID)
+  |     node.Stop() -- stopC closed; awaited installs answered
+  |     node.awaitWriteLeases() -- a snapshot receive's writes finish
   |     stepWorker.unloadNode(shardID) -- remove from worker partition
-  |     applyWorker.requestUnload(shardID) -- close per-shard channel
+  |     commitWorker.requestUnload(shardID) -- fence, waited on (below)
+  |     applyWorker.requestUnload(shardID) -- close per-shard channel, waited on
   |     engine.allNodes delete
   |
   |  5. Remove registry entries for all shard members
   |
   |  6. Fire OnNodeUnloaded event
 ```
+
+### Commit Fence on StopShard
+
+`UnloadNode` waits for the commit worker to take the unload, and the worker
+takes membership changes only between batches. When the wait returns, no batch
+that could hold the stopped incarnation's update is still inside `SaveState`,
+and an update of that incarnation still queued in `commitC` is dropped when it
+is admitted to a batch, before `SaveState` and together with its ordered
+messages — exactly as a crash before the fsync would lose it. A `StartShard`
+that follows therefore reads a LogDB the old incarnation can no longer write:
+without the fence, an old vote could land over the new incarnation's
+HardState, or an adopted snapshot could be recorded against a directory a
+retried receive had already reclaimed.
+
+Every incarnation guard in the pipeline — commit admission, the
+post-`SaveState` commit guard and the apply dispatcher — asks whether the node
+was **unloaded**, which `UnloadNode` marks before it stops the node, and not
+whether it stopped. `Engine.Stop` stops every node too, long before the commit
+and apply tiers exit, but no incarnation can follow a shutdown, so its drain
+keeps persisting, committing and applying; a stop-based guard could not tell
+the two apart and discarded the drain's committed work.
+
+Two shutdown paths still drop committed items, deliberately: a dispatcher
+blocked on a full per-shard channel takes the stop branch when the apply tier
+stops (so a stuck shard cannot wedge `Engine.Stop`), and in memory mode the
+step tier's stop can race its own apply hand-off. Their proposals are failed.
+With a WAL both are crash-equivalent — the entries are durable and are applied
+on the next start.
+
+The commit pipeline is not the only writer. A local snapshot save captures
+the state machine into a `.save-*` staging directory of its own, then
+publishes it: renames it onto `snapshot-<index>` — the directory a snapshot
+receive publishes into at that index — records it, moves the log reader's
+marker, removes the entries below it and reclaims superseded directories. Only
+the publish runs under the node's write lease (below); the capture is user
+code, and `UnloadNode` never waits on it (the state machine's own `Close`
+still waits for an in-flight stream, which is why a `SaveSnapshot` must honor
+its stopper). Because the lease is shared, saves and receives serialize on a
+separate per-node snapshot-directory lock, taken after the lease: a save never
+replaces a directory it did not make, and a failed receive keeps a directory
+LogDB records. A save on a stopped node publishes
+nothing, and `StartShard` sweeps a crash's orphaned stages. A
+snapshot receive publishes its
+directory and, once raft adopts the install, records it in LogDB, raises the
+log floor and reclaims superseded directories — all on the incarnation's
+behalf, from a transport goroutine. Each of those steps runs under the node's
+write lease (`Node.AcquireWriteLease`), which is refused once the node has
+stopped, and `UnloadNode` waits for any lease already held right after it
+stops the node. A recovery that then fails because its node stopped is
+abandoned by the snapshot pool rather than reported as a failed restore: the
+callbacks that report one resolve by shard ID, and would land on the next
+incarnation.
 
 ### Apply Goroutine Drain on StopShard
 

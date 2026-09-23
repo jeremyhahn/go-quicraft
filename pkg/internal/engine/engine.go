@@ -430,15 +430,30 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// behind the gated apply.
 	node := e.GetNode(shardID)
 	if node != nil {
+		// Marked before it stops, so no tier can see the stop without the
+		// reason: the pipeline's incarnation guards drop an unloaded
+		// incarnation's work, and keep an engine shutdown's.
+		node.unloaded.Store(true)
 		node.Stop()
+		// A snapshot receive writing on this incarnation's behalf — its
+		// publish, or the record of an install raft adopted — finishes before
+		// a new incarnation can load LogDB and the snapshot tree.
+		node.awaitWriteLeases()
 	}
 
 	e.stepWorkers[workerID].unloadNode(shardID)
 
-	// Signal the commit worker to skip Peer.Commit for this shard.
-	// This prevents in-flight commitItems from calling Commit on a
-	// torn-down node.
-	e.commitWorkers[workerID].requestUnload(shardID)
+	// Signal the commit worker to skip Peer.Commit for this shard, and WAIT
+	// until it has taken the change: from then on no SaveState for this
+	// incarnation is running or can start (see commitWorker.requestUnload).
+	// A StartShard that follows therefore reads a LogDB the stopped
+	// incarnation can no longer write to — an old HardState landing after the
+	// new one loaded could otherwise grant a second vote in the same term.
+	// Before Start there is no commit goroutine and nothing in flight.
+	unloaded := e.commitWorkers[workerID].requestUnload(shardID)
+	if e.started.Load() {
+		e.commitWorkers[workerID].awaitMembership(unloaded)
+	}
 
 	// Unload the apply side and WAIT for completion. The request is
 	// processed by the dispatcher goroutine (preserving the single-owner
@@ -447,8 +462,10 @@ func (e *Engine) UnloadNode(shardID uint64) {
 	// wait is bounded by the current SM.Apply batch — deliberately no
 	// timeout, because abandoning the wait would reintroduce the
 	// apply-racing-Close use-after-close this exists to prevent. During
-	// engine shutdown the request is acked immediately and Engine.Stop
-	// owns the join instead. Before Start there is no dispatcher goroutine
+	// engine shutdown the stopping dispatcher owns the join, and the wait
+	// ends when it has joined every per-shard goroutine — never sooner, or a
+	// StopShard racing Host.Close would close a state machine the shutdown
+	// drain is still applying to. Before Start there is no dispatcher goroutine
 	// to rendezvous with and nothing can be in flight, so the apply-side
 	// unload is skipped entirely.
 	if e.started.Load() {
@@ -520,6 +537,19 @@ func (e *Engine) DeliverMessage(shardID uint64, msg proto.Message) bool {
 func (e *Engine) DeliverLocal(shardID uint64, msg proto.Message) bool {
 	node := e.lookupNode(shardID, "DeliverLocal")
 	if node == nil {
+		return false
+	}
+	return node.DeliverLocal(msg)
+}
+
+// DeliverLocalTo injects a process-local message into exactly node, rather
+// than whatever node currently holds its shard. The snapshot receive path uses
+// it for an install whose verdict it awaits on that node: delivering by shard
+// ID lets a StopShard/StartShard during the receive hand the install to the
+// NEW node, which adopts it while the receive, waiting on the old one, is told
+// it was abandoned. A stopped node accepts nothing.
+func (e *Engine) DeliverLocalTo(node *Node, msg proto.Message) bool {
+	if node == nil || node.IsStopped() {
 		return false
 	}
 	return node.DeliverLocal(msg)
@@ -654,6 +684,13 @@ const workerPanicRestartDelay = 100 * time.Millisecond
 // on panic. If the dispatcher panics (during dispatch() or drain()), the
 // loop logs the panic with a full stack trace and restarts after a brief
 // delay. The loop exits cleanly when the apply stop channel is closed.
+//
+// A shutdown that arrives while a panicked dispatcher is down does not end the
+// loop directly: the dispatcher runs ONE more time, and its own stop path
+// drains applyC and joins every per-shard goroutine (shutdownIfStopping, which
+// run defers, so it runs even if that last run panics too). Returning straight
+// away skipped the join — leaving per-shard goroutines running into Close and
+// joinedC open, so an UnloadNode waiting on it hung forever.
 func (e *Engine) runApplyWorkerLoop(aw *applyWorker) {
 	for {
 		panicked := e.runApplyWorkerOnce(aw)
@@ -663,6 +700,7 @@ func (e *Engine) runApplyWorkerLoop(aw *applyWorker) {
 		// Check for shutdown before restarting.
 		select {
 		case <-aw.stopC:
+			e.finishStoppedApplyWorker(aw)
 			return
 		default:
 		}
@@ -670,10 +708,28 @@ func (e *Engine) runApplyWorkerLoop(aw *applyWorker) {
 		select {
 		case <-aw.stopC:
 			t.Stop()
+			e.finishStoppedApplyWorker(aw)
 			return
 		case <-t.C:
 		}
 	}
+}
+
+// finishStoppedApplyWorker runs a panicked dispatcher's stop path once more —
+// drain applyC, join every per-shard goroutine, close joinedC — unless the
+// panicked run already joined. That happens when stopC closed while the panic
+// was unwinding: the run's deferred shutdownIfStopping joined and closed
+// joinedC, and running the dispatcher again could start a per-shard goroutine
+// after joinedC had promised there were none. In that case applyC is NOT
+// drained: its committed batches are left unapplied, as a crash leaves them,
+// and are applied from the WAL on the next start.
+func (e *Engine) finishStoppedApplyWorker(aw *applyWorker) {
+	select {
+	case <-aw.joinedC:
+		return
+	default:
+	}
+	e.runApplyWorkerOnce(aw)
 }
 
 // runApplyWorkerOnce runs the apply worker dispatcher and recovers from panics.
@@ -879,6 +935,10 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 			// WAL too. Wider window than clearStepCommitPending above — a panic
 			// in processCallbacks unwinds before the hand-off even starts.
 			sw.discardExtractedUpdate()
+			// A receive waiting on a local install the panic dropped from
+			// the inbox is answered rather than left waiting for the shard
+			// to stop.
+			sw.answerDroppedInstalls(panicErr)
 		}
 	}()
 	sw.run()
@@ -893,6 +953,19 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 // tick instead of dropped.
 func (e *Engine) ListenerNotificationsDropped() uint64 {
 	return e.listeners.droppedCount()
+}
+
+// DispatchListener hands fn — a fan-out to user EventListener code — to the
+// listener dispatcher, which runs it on a goroutine holding no engine lock, in
+// FIFO order with the engine's own notifications. It is how a Callback
+// implementation meets the contract for its INLINE methods (see Callback):
+// user code reached from one of them could otherwise call a synchronous Host
+// API such as StopShard on a goroutine the unload has to wait for. It reports
+// false, counted in ListenerNotificationsDropped, when the queue is full; the
+// notification is then dropped, as the engine drops its own. Once the engine
+// has stopped, fn runs inline, since no worker remains to deadlock with.
+func (e *Engine) DispatchListener(fn func()) bool {
+	return e.listeners.dispatch(fn)
 }
 
 // WorkSignal returns the work signal for external notification.

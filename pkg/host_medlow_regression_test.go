@@ -208,7 +208,7 @@ func TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases(t *testing.T) {
 func TestPendingRegistration_CloseRace_CallerNeverOrphaned(t *testing.T) {
 	for iter := 0; iter < 8; iter++ {
 		cfg := testHostConfig(t)
-		h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+		h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 		if err != nil {
 			t.Fatalf("NewHost failed: %v", err)
 		}
@@ -288,7 +288,7 @@ func (f *stashBootstrapLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap
 func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := &stashBootstrapLogDB{mockLogDB: *newMockLogDB()}
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 // pendingOps always balances back to exactly zero.
 func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

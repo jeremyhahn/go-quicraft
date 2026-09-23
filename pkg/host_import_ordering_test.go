@@ -59,7 +59,7 @@ func TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots(t *testing.
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

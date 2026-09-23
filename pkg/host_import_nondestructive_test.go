@@ -81,6 +81,8 @@ func newLiveImportFixture(t *testing.T, withBarrier bool) *liveImportFixture {
 	opts := []HostOption{WithLogDB(db), WithoutTransport()}
 	if withBarrier {
 		opts = append(opts, WithBarrier(createTestBarrier(t)))
+	} else {
+		opts = append(opts, WithoutEncryption())
 	}
 	h, err := NewHost(cfg, opts...)
 	if err != nil {

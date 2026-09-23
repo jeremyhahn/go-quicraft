@@ -85,8 +85,10 @@ jobs:
       # the QUIC transport, which is the slowest tree in the run and the reason
       # this job's timeout has headroom. It is also where go-quicraft#24's
       # flake now lands (10s waitBatch timeout under runner contention, worse
-      # under FIPS mode's non-X25519 key exchange); running here off the push
-      # path is that issue's mitigation and #24 remains open for a real fix.
+      # under FIPS mode's non-X25519 key exchange). Running here off the push
+      # path was that issue's mitigation; #24 was closed on it, not on a fix.
+      # release.yml runs the same gate, so a release pays the flake's rerun
+      # cost rather than shipping without the approved-only proof.
       - name: Approved-only gate
         run: make verify-fips
 

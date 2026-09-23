@@ -21,7 +21,7 @@ import (
 )
 
 // TestGCSnapshotDirs_RefusesToDeleteTheRecordedDirectory pins the guard
-// discardSaveDir has always had and GC did not.
+// the save path has always had (now in publishStagedSave) and GC did not.
 //
 // GC selects victims by INDEX ORDER alone. Higher-indexed directories that are
 // unusable — partial receives left by a crash, for instance — therefore push

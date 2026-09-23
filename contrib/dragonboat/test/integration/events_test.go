@@ -149,7 +149,7 @@ func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.RaftEventListener = listener
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestIntegration_DB_SystemEventListener_NodeUnloaded(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}

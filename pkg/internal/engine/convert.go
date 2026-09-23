@@ -18,6 +18,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"path/filepath"
 )
 
 // protoEntryToLogDB converts a proto.Entry to a logdb.Entry. All fields
@@ -121,6 +122,22 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 	return result
 }
 
+// snapshotRecordPath converts a proto snapshot's Filepath, which names the
+// artifact's DATA FILE (<dir>/snapshot.dat, the file the send path opens), to
+// the DIRECTORY a LogDB snapshot record names; every reader of a record joins
+// snapshot.dat back on. The receive path records the directory itself, and
+// before the receive became two-phase its record was always written first, so
+// the one this conversion produced from raft's Update was discarded as out of
+// date. Now it can be written first, and a record naming the file makes every
+// reader open <dir>/snapshot.dat/snapshot.dat. A path that does not name the
+// data file is already a directory and is kept.
+func snapshotRecordPath(protoPath string) string {
+	if filepath.Base(protoPath) == snapshotDataFile {
+		return filepath.Dir(protoPath)
+	}
+	return protoPath
+}
+
 // protoSnapshotToLogDB converts a proto.Snapshot to a logdb.Snapshot.
 //
 // Compression is carried, and it could not be until proto.Snapshot grew the
@@ -135,7 +152,7 @@ func protoSnapshotToLogDB(s *proto.Snapshot) logdb.Snapshot {
 		Index:       s.Index,
 		Term:        s.Term,
 		Membership:  protoMembershipToLogDB(&s.Membership),
-		Filepath:    s.Filepath,
+		Filepath:    snapshotRecordPath(s.Filepath),
 		FileSize:    s.FileSize,
 		OnDiskIndex: s.OnDiskIndex,
 		Epoch:       s.Epoch,

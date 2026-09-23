@@ -563,7 +563,7 @@ func (h panicOnMembershipChangedHandler) WithGroup(string) slog.Handler      { r
 // this asserts the registration SURVIVES the panic.
 func TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithLogger(slog.New(panicOnMembershipChangedHandler{})))
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithLogger(slog.New(panicOnMembershipChangedHandler{})), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

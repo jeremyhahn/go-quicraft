@@ -811,7 +811,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 			addr = freePort(t)
 			cfg = testHostConfig(t, addr, leaves[i])
 			var err error
-			h, err = quicraft.NewHost(cfg)
+			h, err = quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 			if err == nil {
 				break
 			}
@@ -1628,6 +1628,11 @@ type addNodeResult struct {
 // addNodeToCluster creates a new host, requests a membership addition from
 // the leader, and starts the shard in join mode. The new host is appended
 // to the cluster's hosts/addrs/trackers/stopped slices.
+//
+// opts state the new host's at-rest encryption. With none it declares
+// WithoutEncryption, like the cluster's own hosts; a caller passing options
+// must include WithBarrier (or WithoutEncryption) itself, and NewHost refuses
+// one that does not.
 func addNodeToCluster(
 	t *testing.T,
 	cluster *testCluster,
@@ -1643,6 +1648,9 @@ func addNodeToCluster(
 	addr := freePort(t)
 	leaf := cluster.ca.Leaf(t)
 	hostCfg := testHostConfig(t, addr, leaf)
+	if len(opts) == 0 {
+		opts = []quicraft.HostOption{quicraft.WithoutEncryption()}
+	}
 	h, err := quicraft.NewHost(hostCfg, opts...)
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)

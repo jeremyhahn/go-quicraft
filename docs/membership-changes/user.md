@@ -176,9 +176,7 @@ guess one.
 and documented: there is **no self-advertisement**. The leader learns addresses
 only from committed config changes, so a replica that moves needs an
 operator-issued change. Use a stable advertised `RaftAddress` — the documented
-workaround — rather than expecting the cluster to rediscover it. Periodic
-self-advertisement for non-voting members is a planned post-v1.0 enhancement,
-not present today.
+workaround — rather than expecting the cluster to rediscover it.
 
 **Nothing evicts a node that is down** — correct. There is no failure detector
 that removes members, deliberately: an automatic eviction during a partition is

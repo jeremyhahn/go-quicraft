@@ -587,3 +587,31 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		}
 	})
 }
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *rotatingRecordBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
+// the real barrier seals and pins in ONE step under its own lock, so a frame
+// can never exist unpinned. It records that pin for the assertions without
+// registering it a second time — the real barrier already holds it, and the
+// caller's release goes through DeregisterInFlightEpoch as before.
+func (p *pinRecordingBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := p.Barrier.EncryptWithEpochPinnedContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	p.mu.Lock()
+	p.registered = append(p.registered, epoch)
+	p.mu.Unlock()
+	return ct, epoch, nil
+}

@@ -16,7 +16,9 @@ package registry
 
 import (
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -356,4 +358,114 @@ func BenchmarkRegistryResolve_Concurrent(b *testing.B) {
 			r.Resolve(5, 5)
 		}
 	})
+}
+
+// TestRegisterIfAbsentStoresOnlyWhenAbsent pins the establish-but-never-replace
+// contract address learning depends on: the first call stores and reports it,
+// a later call with a DIFFERENT address keeps the original and says so.
+func TestRegisterIfAbsentStoresOnlyWhenAbsent(t *testing.T) {
+	r := NewRegistry()
+	got, stored := r.RegisterIfAbsent(1, 2, "a:1")
+	if !stored || got != "a:1" {
+		t.Fatalf("first RegisterIfAbsent = (%q, %v), want (\"a:1\", true)", got, stored)
+	}
+	got, stored = r.RegisterIfAbsent(1, 2, "b:2")
+	if stored || got != "a:1" {
+		t.Fatalf("second RegisterIfAbsent = (%q, %v), want the kept (\"a:1\", false)", got, stored)
+	}
+	if addr, err := r.Resolve(1, 2); err != nil || addr != "a:1" {
+		t.Fatalf("Resolve = (%q, %v), want a:1: the established mapping was replaced", addr, err)
+	}
+	if c := r.Count(); c != 1 {
+		t.Fatalf("Count = %d, want 1", c)
+	}
+}
+
+// TestRegisterIfAbsentConcurrentHasOneWinner is the race the function exists
+// to close: many concurrent first-contacts for one (shard, replica), each
+// with its own address. Exactly one may store, and every caller must be told
+// the winner's address, never its own losing one.
+func TestRegisterIfAbsentConcurrentHasOneWinner(t *testing.T) {
+	r := NewRegistry()
+	const racers = 64
+	var (
+		wg      sync.WaitGroup
+		winners atomic.Int64
+		results [racers]string
+	)
+	start := make(chan struct{})
+	for i := range racers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			got, stored := r.RegisterIfAbsent(7, 9, fmt.Sprintf("racer-%d:1", i))
+			if stored {
+				winners.Add(1)
+			}
+			results[i] = got
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if w := winners.Load(); w != 1 {
+		t.Fatalf("%d callers stored an address, want exactly 1", w)
+	}
+	final, err := r.Resolve(7, 9)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	for i, got := range results {
+		if got != final {
+			t.Fatalf("racer %d was told %q, but the registry holds %q", i, got, final)
+		}
+	}
+	if c := r.Count(); c != 1 {
+		t.Fatalf("Count = %d, want 1", c)
+	}
+}
+
+// TestCompareAndRegisterSwapsOnlyOnMatch pins the rollback-restore contract: a
+// speculative mapping is restored to its prior value only while it still holds
+// the speculative value, and a mapping a later change already claimed wins.
+func TestCompareAndRegisterSwapsOnlyOnMatch(t *testing.T) {
+	r := NewRegistry()
+	r.Register(1, 2, "speculative:1")
+	if !r.CompareAndRegister(1, 2, "speculative:1", "prior:1") {
+		t.Fatal("CompareAndRegister did not swap a matching entry")
+	}
+	if addr, _ := r.Resolve(1, 2); addr != "prior:1" {
+		t.Fatalf("after swap Resolve = %q, want prior:1", addr)
+	}
+	// A later change claimed the entry: the late rollback must lose.
+	r.Register(1, 2, "committed:1")
+	if r.CompareAndRegister(1, 2, "speculative:1", "prior:1") {
+		t.Fatal("CompareAndRegister swapped an entry that no longer held the expected value")
+	}
+	if addr, _ := r.Resolve(1, 2); addr != "committed:1" {
+		t.Fatalf("late rollback overwrote the committed mapping: Resolve = %q", addr)
+	}
+	// An absent entry is never created by a compare.
+	if r.CompareAndRegister(3, 4, "", "x:1") {
+		t.Fatal("CompareAndRegister created an entry that did not exist")
+	}
+	if c := r.Count(); c != 1 {
+		t.Fatalf("Count = %d, want 1: CompareAndRegister must not change it", c)
+	}
+}
+
+// TestCompareAndRemoveKeepsAMappingThatMoved is CompareAndRemove's losing
+// branch: a rollback must not delete a mapping the apply path overwrote.
+func TestCompareAndRemoveKeepsAMappingThatMoved(t *testing.T) {
+	r := NewRegistry()
+	r.Register(1, 2, "applied:1")
+	if r.CompareAndRemove(1, 2, "speculative:1") {
+		t.Fatal("CompareAndRemove deleted a mapping that no longer held the expected value")
+	}
+	if addr, err := r.Resolve(1, 2); err != nil || addr != "applied:1" {
+		t.Fatalf("Resolve = (%q, %v), want the applied mapping intact", addr, err)
+	}
+	if c := r.Count(); c != 1 {
+		t.Fatalf("Count = %d, want 1", c)
+	}
 }

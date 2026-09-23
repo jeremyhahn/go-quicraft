@@ -153,7 +153,7 @@ func TestConfigInLog_BootstrapWritesInitialMembershipEntry(t *testing.T) {
 	const shardID, replicaID uint64 = 70, 1
 	db := memdb.New()
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestConfigInLog_MembershipReconstructsFromLogOnRestart(t *testing.T) {
 
 	// First boot: bootstrap with the true single-voter configuration.
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

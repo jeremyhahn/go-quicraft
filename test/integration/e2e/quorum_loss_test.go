@@ -348,7 +348,7 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	// fresh one would be refused by every peer as an identity mismatch.
 	addr := freePort(t)
 	hostCfg := testHostConfig(t, addr, cluster.leaves[thirdStop])
-	newHost, hostErr := quicraft.NewHost(hostCfg)
+	newHost, hostErr := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if hostErr != nil {
 		t.Fatalf("NewHost for recovery node failed: %v", hostErr)
 	}

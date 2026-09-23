@@ -24,49 +24,40 @@ package engine
 //   - Pinning only the MINIMUM epoch leaves an INTERMEDIATE epoch exposed once
 //     two rotations land during one encrypt loop. Every distinct epoch is pinned.
 //   - EncryptWithEpoch releases the barrier lock before returning, so a rotation
-//     plus a purge can complete in the gap before the caller pins the returned
-//     epoch. When the barrier implements atomicEpochPinner, the seal and the pin
-//     happen under one lock and no purge can interleave; otherwise the loop falls
-//     back to pin-before + pin-after, which covers everything except that gap.
+//     plus a purge could complete in the gap before the caller pinned the
+//     returned epoch. Every frame is therefore sealed with
+//     EncryptWithEpochPinnedContext, which seals and pins under one lock, so no
+//     purge can interleave. It is part of the barrier contract, not an optional
+//     capability: the pin-before + pin-after fallback it replaced left exactly
+//     that gap open for any barrier that did not implement it.
 //
 // Each distinct epoch is pinned exactly once, so the caller releases each
 // exactly once via releaseAll — after the snapshot's epoch is durably recorded.
 // Not safe for concurrent use; one pinner belongs to one encrypt loop.
 type epochPinner struct {
 	barrier SnapshotBarrier
-	atomic  atomicEpochPinner
-	hasAtom bool
 	seen    map[uint64]struct{}
 	order   []uint64
 }
 
 // newEpochPinner returns a pinner for one encrypt loop over barrier.
 func newEpochPinner(barrier SnapshotBarrier) *epochPinner {
-	a, ok := barrier.(atomicEpochPinner)
 	return &epochPinner{
 		barrier: barrier,
-		atomic:  a,
-		hasAtom: ok,
 		seen:    make(map[uint64]struct{}),
 	}
 }
 
-// track records an epoch this pinner is now responsible for releasing.
-// alreadyPinned reports whether the barrier has already taken the reference (the
-// atomic path); a duplicate reference is released immediately so the count stays
-// at exactly one per distinct epoch.
-func (p *epochPinner) track(epoch uint64, alreadyPinned bool) {
+// track records an epoch the barrier has just pinned on this pinner's behalf.
+// A duplicate reference is released immediately, so the count stays at exactly
+// one per distinct epoch.
+func (p *epochPinner) track(epoch uint64) {
 	if epoch == 0 {
 		return
 	}
 	if _, dup := p.seen[epoch]; dup {
-		if alreadyPinned {
-			p.barrier.DeregisterInFlightEpoch(epoch)
-		}
+		p.barrier.DeregisterInFlightEpoch(epoch)
 		return
-	}
-	if !alreadyPinned {
-		p.barrier.RegisterInFlightEpoch(epoch)
 	}
 	p.seen[epoch] = struct{}{}
 	p.order = append(p.order, epoch)
@@ -80,22 +71,11 @@ func (p *epochPinner) track(epoch uint64, alreadyPinned bool) {
 // byte-identical to the epoch-only binding and is what a hardware-mode barrier
 // requires.
 func (p *epochPinner) sealFrame(plain, contextAAD []byte) ([]byte, uint64, error) {
-	if p.hasAtom {
-		ct, epoch, err := p.atomic.EncryptWithEpochPinnedContext(nil, plain, contextAAD)
-		if err != nil {
-			return nil, 0, err
-		}
-		p.track(epoch, true)
-		return ct, epoch, nil
-	}
-	// Pin the current epoch before sealing so it cannot be purged in between,
-	// then pin the epoch actually used in case a rotation landed mid-call.
-	p.track(p.barrier.CurrentEpoch(), false)
-	ct, epoch, err := p.barrier.EncryptWithEpochContext(nil, plain, contextAAD)
+	ct, epoch, err := p.barrier.EncryptWithEpochPinnedContext(nil, plain, contextAAD)
 	if err != nil {
 		return nil, 0, err
 	}
-	p.track(epoch, false)
+	p.track(epoch)
 	return ct, epoch, nil
 }
 

@@ -239,7 +239,7 @@ func TestImportSnapshot_DiscoversDataDirFromBootstrapRecord(t *testing.T) {
 
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestImportSnapshot_RejectsDataDirContradictingTheRecord(t *testing.T) {
 
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -391,7 +391,7 @@ func TestImportSnapshot_LegacyBootstrapRecordWithoutDataDir(t *testing.T) {
 			Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
 		}
 		db.mu.Unlock()
-		h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+		h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 		if err != nil {
 			t.Fatalf("NewHost failed: %v", err)
 		}
@@ -472,7 +472,7 @@ func TestStartShard_BootstrapRecordMarksDataDirRecorded(t *testing.T) {
 			const shardID, replicaID uint64 = 45, 1
 			cfg := testHostConfig(t)
 			db := memdb.New()
-			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost failed: %v", err)
 			}
@@ -515,7 +515,7 @@ func TestImportSnapshot_FailsClosedWhenLayoutIsUnknown(t *testing.T) {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

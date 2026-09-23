@@ -25,12 +25,22 @@ import (
 //
 // The frame layout — `[4-byte LE length][AEAD frame]` per
 // snapshotEncryptChunkSize chunk, each frame bound to (shardID, replicaID,
-// index) plus its 0-based ordinal — has to be produced identically by every
-// path that writes an artifact, because every path's output is read back by
-// the same decrypt side. It used to be written out twice: once in
-// encryptSnapshotFile, once on the receive path. This is the one
-// implementation; both drive it, and encryptSnapshotFile is now a copy through
-// it rather than a second copy of it.
+// index), its 0-based ordinal, and whether it is the last — has to be produced
+// identically by every path that writes an artifact, because every path's
+// output is read back by the same decrypt side (OpenSnapshotFrames). This is
+// the one implementation: the local save path drives it directly, and every
+// other writer, in this package and the host's, goes through
+// SealSnapshotFrames.
+//
+// # The terminal frame
+//
+// Exactly one frame is sealed as the last (SnapshotAAD's Final flag), which is
+// what lets the reader detect tail truncation. A full chunk is therefore NOT
+// emitted the moment it fills: it is held until more plaintext arrives, which
+// proves it is not the last, or until Close, which proves it is. Close always
+// emits a terminal frame — an empty one if the plaintext was empty or ended on
+// a chunk boundary already emitted — so every sealed artifact has one, and a
+// reader can refuse an artifact truncated to nothing.
 //
 // # What it closes (#116)
 //
@@ -63,10 +73,10 @@ type snapshotFrameWriter struct {
 	pins *epochPinner
 	aad  *SnapshotAAD
 
-	// buf accumulates plaintext until it holds a full chunk. A frame is
-	// emitted only when the buffer fills or on Close, so the chunking is
-	// identical to the read-then-encrypt form's and does not depend on how the
-	// state machine happens to size its writes.
+	// buf accumulates plaintext until it holds a full chunk. A full chunk is
+	// emitted when more plaintext arrives (it is then known not to be the
+	// last) and the remainder on Close as the terminal frame, so the chunking
+	// does not depend on how the state machine happens to size its writes.
 	buf []byte
 	n   int
 
@@ -96,8 +106,8 @@ func newSnapshotFrameWriter(
 	}
 }
 
-// Write accepts plaintext, sealing and emitting a frame each time a full chunk
-// accumulates.
+// Write accepts plaintext, sealing and emitting the held full chunk each time
+// more plaintext arrives behind it.
 //
 // It reports the number of plaintext bytes consumed, so it satisfies io.Writer
 // for a state machine that knows nothing about framing.
@@ -110,22 +120,25 @@ func (w *snapshotFrameWriter) Write(p []byte) (int, error) {
 	}
 	consumed := 0
 	for len(p) > 0 {
+		// A full buffer is emitted only now, once plaintext behind it proves it
+		// is not the artifact's last frame.
+		if w.n == len(w.buf) {
+			if err := w.emit(false); err != nil {
+				return consumed, err
+			}
+		}
 		n := copy(w.buf[w.n:], p)
 		w.n += n
 		p = p[n:]
 		consumed += n
 		w.plain += int64(n)
-		if w.n == len(w.buf) {
-			if err := w.emit(); err != nil {
-				return consumed, err
-			}
-		}
 	}
 	return consumed, nil
 }
 
-// Close emits the trailing partial frame, if any. It does NOT close dst: the
-// caller owns the file and still has to fsync it.
+// Close emits the terminal frame: whatever plaintext is held, which may be a
+// full chunk, a partial one, or nothing. It does NOT close dst: the caller
+// owns the file and still has to fsync it.
 //
 // Close is idempotent so a deferred Close after an explicit one is harmless.
 func (w *snapshotFrameWriter) Close() error {
@@ -136,20 +149,18 @@ func (w *snapshotFrameWriter) Close() error {
 		return nil
 	}
 	w.closed = true
-	if w.n > 0 {
-		return w.emit()
-	}
-	return nil
+	return w.emit(true)
 }
 
-// emit seals the buffered plaintext as one frame and writes it.
+// emit seals the buffered plaintext as one frame and writes it. final marks the
+// artifact's terminal frame.
 //
 // On any failure it releases every epoch pinned so far and latches the error,
 // so a caller that keeps writing gets the FIRST failure rather than a later,
 // less informative one — and so the pins cannot be leaked by a caller that
 // abandons the writer on error.
-func (w *snapshotFrameWriter) emit() error {
-	ct, epoch, err := w.pins.sealFrame(w.buf[:w.n], w.aad.Frame(w.seq))
+func (w *snapshotFrameWriter) emit(final bool) error {
+	ct, epoch, err := w.pins.sealFrame(w.buf[:w.n], w.aad.Frame(w.seq, final))
 	if err != nil {
 		return w.fail(&SnapshotEncryptError{Op: "encrypt", Err: err})
 	}
@@ -192,8 +203,9 @@ func (w *snapshotFrameWriter) ReleasePins() { w.pins.releaseAll() }
 // on its own, but the single recorded epoch has to be the minimum or the
 // DEK-purge floor can drop a key a retained frame still needs.
 //
-// It is 0 when nothing was written, which the caller reads as "no frames" and
-// treats the same way it treats a plaintext artifact.
+// It is 0 until a frame has been sealed — before Close for an artifact that
+// never filled a chunk, and after a failure. A closed writer has sealed at
+// least the terminal frame, so its MinEpoch is the recorded epoch.
 func (w *snapshotFrameWriter) MinEpoch() uint64 { return w.minEpoch }
 
 // Epochs is every epoch a frame was sealed under, for the caller to hold
@@ -204,3 +216,26 @@ func (w *snapshotFrameWriter) Epochs() []uint64 { return w.pins.epochs() }
 // PlaintextBytes is how much plaintext the writer consumed, which is what the
 // artifact would have measured under the old write-then-encrypt form.
 func (w *snapshotFrameWriter) PlaintextBytes() int64 { return w.plain }
+
+// SealSnapshotFrames seals everything src yields into dst as one snapshot
+// artifact: the frames the local save path writes, terminal frame included.
+// It is the form for a caller that has the plaintext as a stream rather than
+// writing it piecemeal — re-encryption on receipt, import, the host's
+// re-encrypt path.
+//
+// It returns the artifact's recorded (minimum) epoch and every epoch a frame
+// was sealed under, pinned, for the caller to release once the recorded epoch
+// is durable. On any failure it releases the pins itself and returns 0 and
+// nil, so a caller never has to tell which pins a failed seal took.
+func SealSnapshotFrames(barrier SnapshotBarrier, shardID, replicaID, index uint64,
+	src io.Reader, dst io.Writer) (uint64, []uint64, error) {
+	w := newSnapshotFrameWriter(dst, barrier, shardID, replicaID, index)
+	if _, err := io.Copy(w, src); err != nil {
+		w.ReleasePins()
+		return 0, nil, err
+	}
+	if err := w.Close(); err != nil {
+		return 0, nil, err
+	}
+	return w.MinEpoch(), w.Epochs(), nil
+}

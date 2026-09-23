@@ -16,12 +16,13 @@ package quicraft
 
 import (
 	"errors"
+	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -121,6 +122,15 @@ func (d *refusingInstallDeliverer) DeliverLocal(shardID uint64, msg proto.Messag
 	return d.engineDeliverer.DeliverLocal(shardID, msg)
 }
 
+// DeliverLocalTo refuses the InstallSnapshot on the node-bound path as well:
+// it is the one the receive now injects its awaited install through.
+func (d *refusingInstallDeliverer) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot {
+		return false
+	}
+	return d.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
 func (d *refusingInstallDeliverer) RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error {
 	d.mu.Lock()
 	d.recoveryRequests++
@@ -134,8 +144,12 @@ func (d *refusingInstallDeliverer) RequestSnapshotRecovery(shardID, replicaID ui
 // never advanced to the snapshot index, so recoverSnapshot refused to move
 // the node markers (SnapshotRecoveryBehindError) — and because the sender was
 // told the transfer succeeded, the leader never re-sent and the follower
-// never recovered. The receive must fail instead, while KEEPING the persisted
-// artifacts so the leader's retry is answered from LogDB by the dedup branch.
+// never recovered. The receive must fail instead.
+//
+// Under the two-phase receive (whole-project review, M1) nothing is recorded
+// until raft ADOPTS the install, so a failed delivery leaves no LogDB record
+// and no artifact: the leader's retry is received afresh rather than answered
+// from a record of a snapshot raft never saw.
 func TestHandleSnapshot_FailedInstallDeliveryFailsReceive(t *testing.T) {
 	eng, h, _ := newMedlowHandlerFixture(t)
 
@@ -181,18 +195,84 @@ func TestHandleSnapshot_FailedInstallDeliveryFailsReceive(t *testing.T) {
 		t.Errorf("queued %d recovery requests after a failed install; want 0", requests)
 	}
 
-	// The artifacts must survive: LogDB already references the directory and
-	// the leader's re-send is answered from it by the dedup branch.
-	ss, getErr := h.logdb.GetSnapshot(shardID, localReplicaID)
-	if getErr != nil {
-		t.Fatalf("LogDB record missing after a failed install: %v", getErr)
-	}
-	if ss.Index != snapIndex {
-		t.Fatalf("persisted snapshot index = %d, want %d", ss.Index, snapIndex)
+	// Nothing may be durable: raft never saw the install.
+	if ss, getErr := h.logdb.GetSnapshot(shardID, localReplicaID); !errors.Is(getErr, logdb.ErrNoSnapshot) {
+		t.Fatalf("GetSnapshot after a failed install = (%+v, %v), want ErrNoSnapshot: "+
+			"a snapshot raft never saw was recorded", ss, getErr)
 	}
 	node := eng.GetNode(shardID)
-	dataPath := filepath.Join(node.SnapshotSaveDir(snapIndex), "snapshot.dat")
-	if _, statErr := os.Stat(dataPath); statErr != nil {
-		t.Fatalf("snapshot.dat removed after a failed install; LogDB now points at nothing: %v", statErr)
+	if _, statErr := os.Stat(node.SnapshotSaveDir(snapIndex)); !os.IsNotExist(statErr) {
+		t.Fatalf("snapshot directory left behind after a failed install (stat err %v)", statErr)
+	}
+}
+
+// countingRecoveryDeliverer forwards everything and counts recovery requests.
+type countingRecoveryDeliverer struct {
+	engineDeliverer
+
+	mu               sync.Mutex
+	recoveryRequests int
+}
+
+func (d *countingRecoveryDeliverer) RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error {
+	d.mu.Lock()
+	d.recoveryRequests++
+	d.mu.Unlock()
+	return d.engineDeliverer.RequestSnapshotRecovery(shardID, replicaID, node)
+}
+
+// TestHandleSnapshot_RaftRefusalLeavesNothingDurable is the whole-project
+// review finding M1. The receive path used to record the snapshot in LogDB,
+// raise the log floor to it and queue state-machine recovery BEFORE raft had
+// decided on the install — and raft can still refuse one that passed every
+// host check (a sender deposed mid-stream; here, a membership naming more
+// voters than raft's ReadIndex ack word can address, which only raft checks).
+// A refused install then left a recorded snapshot, a raised floor and a queued
+// recovery the log could never reach, failing the shard. Under the two-phase
+// receive nothing is durable until raft adopts the install.
+func TestHandleSnapshot_RaftRefusalLeavesNothingDurable(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+
+	counting := &countingRecoveryDeliverer{engineDeliverer: eng}
+	handler := &hostMessageHandler{engine: counting, host: h}
+
+	// One voter more than raft can address; this replica and the sender among them.
+	voters := make(map[uint64]string, 65)
+	for id := uint64(1); id <= 65; id++ {
+		voters[id] = fmt.Sprintf("127.0.0.%d:5000", id)
+	}
+	voters[localReplicaID] = snapshotPathLocalAddr
+	voters[fromReplicaID] = snapshotPathSenderAddr
+	chunks := []proto.SnapshotChunk{{
+		ShardID: shardID, ReplicaID: localReplicaID, From: fromReplicaID,
+		Index: snapIndex, Term: 4, ChunkID: 0, ChunkCount: 1,
+		Data:       []byte("a snapshot raft will refuse"),
+		Membership: proto.Membership{Addresses: voters},
+	}}
+
+	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
+	var recvErr *SnapshotReceiveError
+	if !errors.As(err, &recvErr) || recvErr.Op != "install" {
+		t.Fatalf("HandleSnapshot = %v, want a SnapshotReceiveError with Op \"install\" (raft's refusal)", err)
+	}
+
+	if ss, getErr := h.logdb.GetSnapshot(shardID, localReplicaID); !errors.Is(getErr, logdb.ErrNoSnapshot) {
+		t.Fatalf("GetSnapshot = (%+v, %v), want ErrNoSnapshot: a snapshot raft refused was recorded", ss, getErr)
+	}
+	node := eng.GetNode(shardID)
+	if _, statErr := os.Stat(node.SnapshotSaveDir(snapIndex)); !os.IsNotExist(statErr) {
+		t.Fatalf("snapshot directory left behind after raft refused it (stat err %v)", statErr)
+	}
+	counting.mu.Lock()
+	requests := counting.recoveryRequests
+	counting.mu.Unlock()
+	if requests != 0 {
+		t.Fatalf("queued %d recovery requests for a snapshot raft refused; want 0", requests)
+	}
+	if node.IsFailed() {
+		t.Fatal("the shard failed over a snapshot raft simply refused")
 	}
 }

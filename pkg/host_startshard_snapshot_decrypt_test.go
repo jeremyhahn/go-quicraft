@@ -409,6 +409,8 @@ func TestStartShard_LocalSnapshotRecovery_FailsClosedWithoutBarrier(t *testing.T
 						t.Fatalf("Seal: %v", sealErr)
 					}
 					opts = append(opts, WithBarrier(b))
+				} else {
+					opts = append(opts, WithoutEncryption())
 				}
 				h, err := NewHost(testHostConfig(t), opts...)
 				if err != nil {
@@ -601,7 +603,7 @@ func TestExportImportSnapshot_RoundTripRecoversPlaintext(t *testing.T) {
 			// imported artifact is plaintext (Epoch 0) by construction.
 			dstDB := newMockLogDB()
 			dstDB.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
-			dst, err := NewHost(testHostConfig(t), WithLogDB(dstDB), WithoutTransport())
+			dst, err := NewHost(testHostConfig(t), WithLogDB(dstDB), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost(dst): %v", err)
 			}

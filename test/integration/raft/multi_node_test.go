@@ -68,7 +68,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	for i := range numNodes {
 		cfg := testHostConfig(t, addrs[i], ca.Leaf(t))
 		nodeHostDirs[i] = cfg.NodeHostDir
-		h, err := quicraft.NewHost(cfg)
+		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
 			// Clean up any previously created hosts.
 			for j := 0; j < i; j++ {

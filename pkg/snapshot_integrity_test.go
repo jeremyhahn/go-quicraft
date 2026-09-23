@@ -97,11 +97,12 @@ func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 }
 
 // TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot is the end-to-end
-// regression for the critical chain. The first delivery's InstallSnapshot is
-// refused (a persistently full inbox), so the artifacts persist but raft never
-// installed them; the leader's re-send then takes the DEDUP branch, which used
-// to rebuild the install from the persisted record's FileSize — 0, because the
-// receive path never set it — while pointing at a non-empty file. The
+// regression for the critical chain. The leader re-sends a snapshot this
+// replica already holds, so the receive takes the DEDUP branch, which used to
+// rebuild the install from the persisted record's FileSize — 0, because the
+// receive path never set it — while pointing at a non-empty file. (Under the
+// two-phase receive a record exists only once raft adopted the snapshot, so
+// the first receive here is a successful one.) The
 // resulting LogReader snapshot ({Filepath: set, FileSize: 0}) made this node
 // stream a single metadata-only chunk once it became leader, erasing the
 // receiving follower's state.
@@ -114,17 +115,18 @@ func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 
 	payload := bytes.Repeat([]byte("dedup-regression-body"), 128)
+	// The snapshot carries the real membership: once raft adopts it, it IS the
+	// committed membership, and the re-send below must still come from a member.
 	chunks := []proto.SnapshotChunk{{
 		ShardID: shardID, ReplicaID: localReplicaID, From: fromReplicaID,
 		Index: snapIndex, Term: 9, ChunkID: 0, ChunkCount: 1, Data: payload,
+		Membership: snapshotPathMembership(localReplicaID, fromReplicaID),
 	}}
 
-	// First delivery: the install is refused, so the receive fails while the
-	// artifacts and the LogDB record survive for the leader's retry.
-	refusing := &refusingInstallDeliverer{engineDeliverer: eng}
-	first := &hostMessageHandler{engine: refusing, host: h}
-	if err := first.HandleSnapshot(chunks, authorizeAllSenders); err == nil {
-		t.Fatal("first HandleSnapshot reported success despite a refused install")
+	// First delivery: raft adopts the snapshot and the receive records it.
+	first := &hostMessageHandler{engine: eng, host: h}
+	if err := first.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
+		t.Fatalf("first HandleSnapshot: %v", err)
 	}
 
 	// Leader re-send: the dedup branch answers it from the persisted snapshot.
@@ -272,7 +274,7 @@ func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {
 			payload := []byte("cross-config export/import payload")
 
 			srcDB := newMockLogDB()
-			src, err := NewHost(testHostConfig(t), WithLogDB(srcDB), WithoutTransport())
+			src, err := NewHost(testHostConfig(t), WithLogDB(srcDB), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost(src): %v", err)
 			}
@@ -290,7 +292,7 @@ func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {
 
 			dstDB := newMockLogDB()
 			dstDB.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
-			dst, err := NewHost(testHostConfig(t), WithLogDB(dstDB), WithoutTransport())
+			dst, err := NewHost(testHostConfig(t), WithLogDB(dstDB), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost(dst): %v", err)
 			}

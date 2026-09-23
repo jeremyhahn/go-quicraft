@@ -208,8 +208,9 @@ its own pool of `max(NumWorkers/2, 2)` workers, separate from step, commit and
 apply. If consensus stalls during a save, look at disk saturation rather than at
 worker scheduling.
 
-**Trailing frames of an at-rest snapshot were removed and nothing noticed** —
-that is a known, documented limit: the AAD binds each frame's position but not
-how many follow, so a truncated artifact's surviving frames still authenticate.
-In-transit truncation *is* detected, via the declared chunk count. At rest it is
-not, and closing it would need a frame count folded into every frame's context.
+**A snapshot fails to decrypt after trailing bytes were lost** — that is the
+truncation check working. Every frame's context marks whether it is the
+artifact's last, so a snapshot that lost frames off its end (or had frames
+appended) fails authentication rather than restoring a shorter state machine,
+and an encrypted `snapshot.dat` with no frames at all is refused as
+`ErrSnapshotCorrupt`. Restore from another replica rather than repairing it.

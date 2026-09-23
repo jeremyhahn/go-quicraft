@@ -154,11 +154,11 @@ delivers, and dropping it lets the next DEK purge orphan the artifact's key.
 ### The AAD helper
 
 ```go
-const engine.SnapshotFrameAADLen = 39
+const engine.SnapshotFrameAADLen = 40
 func engine.NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier) *SnapshotAAD
 ```
 
-`pkg/internal/engine` is internal. Named here because the 39-byte layout is part
+`pkg/internal/engine` is internal. Named here because the 40-byte layout is part
 of the on-disk format contract, not because it is callable — see
 [`architecture.md`](architecture.md).
 

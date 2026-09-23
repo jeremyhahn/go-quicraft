@@ -149,6 +149,5 @@ and log replication in `docs/00 §R`.
 - **No self-advertisement.** An observer or witness that restarts at a **new**
   address cannot teach the leader its location; that needs an operator-issued
   config change. The documented workaround is a stable advertised
-  `RaftAddress`. Periodic self-advertisement is recorded as a planned
-  post-v1.0 enhancement, not present today.
+  `RaftAddress`.
 - **No cross-shard membership.** Each shard's configuration is its own.

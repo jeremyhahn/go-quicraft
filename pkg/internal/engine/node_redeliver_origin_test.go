@@ -149,7 +149,7 @@ func TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft(t *testing.T) {
 		t.Fatal("DeliverLocal was refused")
 	}
 	drained := node.DrainInbox(nil)
-	sw.deferSnapshot(1, drained[0])
+	sw.deferSnapshot(node, 1, drained[0])
 
 	sw.redeliverDeferredSnapshots(1, node)
 	if got := len(sw.deferredSnapshots[1]); got != 0 {

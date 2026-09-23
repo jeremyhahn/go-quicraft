@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -362,6 +363,54 @@ type Node struct {
 	// double-close and panic; today the sole caller is engine.Stop's serial
 	// teardown, but this makes the contract explicit and race-proof).
 	stopOnce sync.Once
+
+	// installMu guards installVerdicts: the verdict each locally injected
+	// InstallSnapshot is waiting on, keyed by snapshot index. See
+	// AwaitInstallVerdict.
+	installMu       sync.Mutex
+	installVerdicts map[uint64]chan InstallVerdict
+
+	// leaseMu admits the durable writes a snapshot receive makes on this
+	// incarnation's behalf — publishing its directory, recording an adopted
+	// install, raising the log floor — and lets UnloadNode wait them out. A
+	// lease is a read lock taken only while the node is not stopped;
+	// awaitWriteLeases takes the write lock once stopC is closed, so when it
+	// returns no lease is held and none can be granted.
+	leaseMu sync.RWMutex
+
+	// snapshotDirMu serializes the changes a local save and a snapshot receive
+	// make to the shard's canonical snapshot-<index> directories and to its
+	// LogDB snapshot record: a save's publish and record, a receive's publish,
+	// its record of an adopted install, and a failed receive's discard. (The
+	// commit worker also records a snapshot raft adopted, from the Update,
+	// outside this lock; it names the same directory the adopting receive
+	// published and claims, and a non-advancing record is a no-op.) The write
+	// lease is SHARED — it fences UnloadNode, not one writer from another — so
+	// without this a save could replace a receive's published directory while
+	// the receive awaited raft's verdict, or a declined receive could discard
+	// the directory a save had just recorded. Taken after the write lease when
+	// both are held, never before, so the two cannot deadlock.
+	snapshotDirMu sync.Mutex
+
+	// claimedSnapshotDirs holds the indexes whose canonical directory a
+	// snapshot receive has published and not yet settled — recorded, or
+	// discarded after raft declined it. A save must not replace such a
+	// directory, though no record names it yet; it may replace any OTHER
+	// unrecorded occupant, which is an orphan. Guarded by snapshotDirMu.
+	claimedSnapshotDirs map[uint64]struct{}
+
+	// pinnedSnapshotDirs counts, per cleaned directory, the snapshot
+	// recoveries reading it; the snapshot GC spares every one. Guarded by
+	// snapshotDirMu.
+	pinnedSnapshotDirs map[string]int
+
+	// unloaded is set by UnloadNode before it stops the node: this
+	// incarnation is being torn down while the engine keeps running, and a
+	// new incarnation of the shard may follow. A node stopped by Engine.Stop
+	// alone is never marked, so the shutdown drain keeps persisting,
+	// committing and applying its work. The pipeline's incarnation guards
+	// read this rather than stopC, which both kinds of stop close.
+	unloaded atomic.Bool
 }
 
 // NewNode creates a new engine Node for the given shard. The node must
@@ -611,8 +660,160 @@ func (n *Node) IsFailed() bool {
 //
 // Idempotent, and safe from any goroutine.
 func (n *Node) Fail(err error) {
-	n.failed.Store(true)
+	n.markFailed()
 	n.handleError(err)
+}
+
+// markFailed is the ONE way a node becomes failed. A failed node's step worker
+// never steps another message, so every install waiting on a verdict is
+// answered InstallAbandoned here; setting the flag anywhere else would leave
+// a snapshot receive blocked holding a transport receive slot until the shard
+// was reloaded. The flag is stored before the abandon takes installMu, so an
+// AwaitInstallVerdict that takes installMu afterwards sees it and answers at
+// once.
+func (n *Node) markFailed() {
+	n.failed.Store(true)
+	n.abandonInstallVerdicts()
+}
+
+// AcquireWriteLease admits one durable write made on this incarnation's
+// behalf outside the engine's own pipeline, and reports false once the node
+// has stopped. A true result must be paired with exactly one
+// ReleaseWriteLease, and the holder must not acquire another lease before
+// releasing it: a nested acquire deadlocks against a waiting UnloadNode.
+func (n *Node) AcquireWriteLease() bool {
+	n.leaseMu.RLock()
+	if n.IsStopped() {
+		n.leaseMu.RUnlock()
+		return false
+	}
+	return true
+}
+
+// TryAcquireWriteLease is AcquireWriteLease for a caller that must never
+// block — a step worker, which owns a whole partition of shards. It also
+// reports false when an unload is already waiting for the leases to drain:
+// that wait begins only after Stop, so the node is stopping, and blocking
+// behind it would stall every shard on the worker for as long as the holder
+// runs. A true result must be paired with exactly one ReleaseWriteLease.
+func (n *Node) TryAcquireWriteLease() bool {
+	if !n.leaseMu.TryRLock() {
+		return false
+	}
+	if n.IsStopped() {
+		n.leaseMu.RUnlock()
+		return false
+	}
+	return true
+}
+
+// ReleaseWriteLease ends a lease granted by AcquireWriteLease.
+func (n *Node) ReleaseWriteLease() {
+	n.leaseMu.RUnlock()
+}
+
+// LockSnapshotDir takes the shard's snapshot-directory lock (see the
+// snapshotDirMu field). The caller must already hold a write lease, and must
+// release the lock with UnlockSnapshotDir before releasing the lease.
+func (n *Node) LockSnapshotDir() {
+	n.snapshotDirMu.Lock()
+}
+
+// UnlockSnapshotDir releases the lock taken by LockSnapshotDir.
+func (n *Node) UnlockSnapshotDir() {
+	n.snapshotDirMu.Unlock()
+}
+
+// ClaimSnapshotDir records that a snapshot receive has published the
+// canonical directory for index and has not yet settled it. The caller holds
+// the snapshot-directory lock.
+func (n *Node) ClaimSnapshotDir(index uint64) {
+	if n.claimedSnapshotDirs == nil {
+		n.claimedSnapshotDirs = make(map[uint64]struct{})
+	}
+	n.claimedSnapshotDirs[index] = struct{}{}
+}
+
+// ReleaseSnapshotDir ends a claim taken by ClaimSnapshotDir. The caller holds
+// the snapshot-directory lock.
+func (n *Node) ReleaseSnapshotDir(index uint64) {
+	delete(n.claimedSnapshotDirs, index)
+}
+
+// snapshotDirClaimed reports whether a receive holds a claim on index. The
+// caller holds the snapshot-directory lock.
+func (n *Node) snapshotDirClaimed(index uint64) bool {
+	_, ok := n.claimedSnapshotDirs[index]
+	return ok
+}
+
+// PinSnapshotDir marks dir as being read by a snapshot recovery, so the
+// snapshot GC spares it until UnpinSnapshotDir. Recovery chooses the directory
+// the LogDB record names at that moment and reads it by path for its whole
+// length; a receive or save recording a newer snapshot meanwhile would
+// otherwise GC it underneath the recovery and fail the shard. The caller
+// holds the snapshot-directory lock; pins nest.
+func (n *Node) PinSnapshotDir(dir string) {
+	if n.pinnedSnapshotDirs == nil {
+		n.pinnedSnapshotDirs = make(map[string]int)
+	}
+	n.pinnedSnapshotDirs[filepath.Clean(dir)]++
+}
+
+// UnpinSnapshotDir ends one pin taken by PinSnapshotDir. The caller holds the
+// snapshot-directory lock.
+func (n *Node) UnpinSnapshotDir(dir string) {
+	dir = filepath.Clean(dir)
+	if n.pinnedSnapshotDirs[dir] <= 1 {
+		delete(n.pinnedSnapshotDirs, dir)
+		return
+	}
+	n.pinnedSnapshotDirs[dir]--
+}
+
+// PinnedSnapshotDirs returns the directories recoveries are reading, for the
+// snapshot GC to spare. The caller holds the snapshot-directory lock.
+func (n *Node) PinnedSnapshotDirs() []string {
+	dirs := make([]string, 0, len(n.pinnedSnapshotDirs))
+	for dir := range n.pinnedSnapshotDirs {
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+// IsSnapshotDirPinned reports whether a recovery is reading dir. A publish
+// that would replace an unrecorded occupant of a canonical name must refuse
+// a pinned one: a recovery falls back to the newest directory on disk when
+// the record names none, so what it reads can be unrecorded. The caller holds
+// the snapshot-directory lock.
+func (n *Node) IsSnapshotDirPinned(dir string) bool {
+	return n.pinnedSnapshotDirs[filepath.Clean(dir)] > 0
+}
+
+// awaitWriteLeases returns once no write lease is held. Called after Stop, it
+// is a fence: every lease granted before stopC closed has been released, and
+// none can be granted after.
+func (n *Node) awaitWriteLeases() {
+	n.leaseMu.Lock()
+	//nolint:staticcheck // SA2001: an empty critical section is the point; see above.
+	n.leaseMu.Unlock()
+}
+
+// isUnloaded reports whether UnloadNode has begun tearing this incarnation
+// down. See the unloaded field.
+func (n *Node) isUnloaded() bool {
+	return n.unloaded.Load()
+}
+
+// IsStopped reports whether Stop has been called: the node is being unloaded
+// and must not adopt anything further.
+func (n *Node) IsStopped() bool {
+	select {
+	case <-n.stopC:
+		return true
+	default:
+		return false
+	}
 }
 
 // CommittedIndex returns the last known committed log index.
@@ -1063,4 +1264,108 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		close(n.stopC)
 	})
+	n.abandonInstallVerdicts()
+}
+
+// InstallOutcome is what raft did with a locally injected InstallSnapshot.
+type InstallOutcome uint8
+
+const (
+	// InstallAdopted means raft took the snapshot as its log's new base: the
+	// committed index moved to the snapshot index, so the state machine must
+	// be recovered from it and the snapshot recorded.
+	InstallAdopted InstallOutcome = iota + 1
+	// InstallDeclined means raft stepped the install without error but
+	// adopted nothing, because it was already at or past the snapshot.
+	InstallDeclined
+	// InstallRefused means raft refused the install with an error: its
+	// sender is not the current leader, or its position or membership is out
+	// of bounds. Err carries the reason.
+	InstallRefused
+	// InstallSuperseded means the install was dropped before it was stepped:
+	// a newer install for the shard displaced it, or a recovered step-worker
+	// panic lost it from the inbox batch. Raft never saw it.
+	InstallSuperseded
+	// InstallAbandoned means the node stopped or failed, or a recovered
+	// step-worker panic interrupted the install's own step, so no verdict will
+	// come. It does NOT prove raft never stepped the install: a step already
+	// in progress may have adopted it. A caller must therefore keep the
+	// artifact, never discard it, on this outcome.
+	InstallAbandoned
+)
+
+// InstallVerdict reports what became of a locally injected InstallSnapshot.
+type InstallVerdict struct {
+	Outcome InstallOutcome
+	Err     error
+}
+
+// AwaitInstallVerdict registers interest in raft's verdict on the
+// InstallSnapshot at index, which the caller is about to inject with
+// DeliverLocal. The snapshot receive path makes a received snapshot durable —
+// its LogDB record, the log floor, the state-machine recovery — only once
+// raft has ADOPTED it, because raft can still refuse or decline an install
+// that passed the host's own checks. Exactly one verdict is delivered on the
+// returned channel, which is buffered, so the step worker never blocks on a
+// caller that has gone away. A caller whose delivery fails must call
+// CancelInstallVerdict.
+func (n *Node) AwaitInstallVerdict(index uint64) <-chan InstallVerdict {
+	ch := make(chan InstallVerdict, 1)
+	n.installMu.Lock()
+	defer n.installMu.Unlock()
+	// A node that is stopped or failed steps nothing more, so no verdict can
+	// come; answer now rather than register a wait nothing will end. Both
+	// states are set before their abandon takes installMu, so this check
+	// cannot miss one that the abandon has already run for.
+	if n.failed.Load() || n.IsStopped() {
+		ch <- InstallVerdict{Outcome: InstallAbandoned}
+		return ch
+	}
+	if n.installVerdicts == nil {
+		n.installVerdicts = make(map[uint64]chan InstallVerdict)
+	}
+	if prev, ok := n.installVerdicts[index]; ok {
+		prev <- InstallVerdict{Outcome: InstallSuperseded}
+	}
+	n.installVerdicts[index] = ch
+	return ch
+}
+
+// CancelInstallVerdict withdraws the registration for index without a
+// verdict: the caller could not inject the install.
+func (n *Node) CancelInstallVerdict(index uint64) {
+	n.installMu.Lock()
+	defer n.installMu.Unlock()
+	delete(n.installVerdicts, index)
+}
+
+// signalInstallVerdict delivers v to the caller awaiting the install at
+// index, if any. Installs nobody awaits — the dedup path's re-deliveries —
+// are ignored.
+func (n *Node) signalInstallVerdict(index uint64, v InstallVerdict) {
+	n.installMu.Lock()
+	defer n.installMu.Unlock()
+	if ch, ok := n.installVerdicts[index]; ok {
+		delete(n.installVerdicts, index)
+		ch <- v
+	}
+}
+
+// awaitingInstall reports whether a receive is still waiting on the verdict
+// for the install at index: false once it has been answered or cancelled.
+func (n *Node) awaitingInstall(index uint64) bool {
+	n.installMu.Lock()
+	defer n.installMu.Unlock()
+	_, ok := n.installVerdicts[index]
+	return ok
+}
+
+// abandonInstallVerdicts answers every awaited install with InstallAbandoned.
+func (n *Node) abandonInstallVerdicts() {
+	n.installMu.Lock()
+	defer n.installMu.Unlock()
+	for index, ch := range n.installVerdicts {
+		delete(n.installVerdicts, index)
+		ch <- InstallVerdict{Outcome: InstallAbandoned}
+	}
 }

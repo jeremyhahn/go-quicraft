@@ -56,11 +56,15 @@ func sentinelTable() []sentinelClassification {
 		// the log, so it is never MaybeApplied.
 		{"ErrTransferInProgress", ErrTransferInProgress, true},
 		{"ErrSnapshotInProgress", ErrSnapshotInProgress, true},
+		{"ErrImportInProgress", ErrImportInProgress, true},
 
 		// --- permanent ---
 		{"ErrClosed", ErrClosed, false},
 		{"ErrCanceled", ErrCanceled, false},
 		{"ErrRejected", ErrRejected, false},
+		{"ErrAtRestEncryptionUnspecified", ErrAtRestEncryptionUnspecified, false},
+		{"ErrAtRestEncryptionConflict", ErrAtRestEncryptionConflict, false},
+		{"ErrBarrierPlaintextLogDB", ErrBarrierPlaintextLogDB, false},
 		{"ErrShardBarriersPlaintextWAL", ErrShardBarriersPlaintextWAL, false},
 		{"ErrShardBarrierUnresolved", ErrShardBarrierUnresolved, false},
 		{"ErrShardBarrierLogDBMismatch", ErrShardBarrierLogDBMismatch, false},

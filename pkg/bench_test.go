@@ -73,7 +73,7 @@ func benchWaitForLeader(b *testing.B, h *Host, shardID uint64) {
 func benchNewHost(b *testing.B) *Host {
 	b.Helper()
 	cfg := benchHostConfig(b)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		b.Fatalf("NewHost failed: %v", err)
 	}

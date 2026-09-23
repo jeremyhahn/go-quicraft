@@ -225,7 +225,7 @@ func TestOperationsAfterCloseReturnErrClosed(t *testing.T) {
 The `memdb` package (`pkg/logdb/memdb/`) provides a complete `logdb.LogDB` implementation backed by Go maps. Used wherever tests need LogDB without WAL overhead:
 
 ```go
-h, err := quicraft.NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+h, err := quicraft.NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 ```
 
 The `mockLogDB` in `pkg/host_test.go` provides an even lighter mock with injectable errors for testing Host-level error paths.
@@ -431,7 +431,7 @@ Host benchmarks use `WithMemoryLogDB()` and `WithoutTransport()` to isolate the 
 ```go
 func benchNewHost(b *testing.B) *Host {
     cfg := benchHostConfig(b)
-    h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+    h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
     if err != nil { b.Fatalf("NewHost failed: %v", err) }
     b.Cleanup(func() { h.Close() })
     return h

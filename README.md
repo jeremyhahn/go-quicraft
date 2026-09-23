@@ -3,7 +3,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.27.0-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.12.0--alpha-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.14.0--alpha-orange.svg)](VERSION)
 
 A multi-group Raft consensus library for Go with QUIC transport and at-rest encryption.
 
@@ -91,7 +91,7 @@ func main() {
         },
     }
 
-    host, err := quicraft.NewHost(hostCfg, quicraft.WithoutTransport())
+    host, err := quicraft.NewHost(hostCfg, quicraft.WithoutTransport(), quicraft.WithoutEncryption())
     if err != nil {
         log.Fatal(err)
     }
@@ -370,7 +370,7 @@ shardCfg := config.Config{
     },
 }
 
-host, _ := quicraft.NewHost(hostCfg)
+host, _ := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg)
 ```
 
@@ -634,32 +634,30 @@ QuicRaft has 7,500+ test functions and 37 fuzz targets across 32 packages
 
 ### Test Coverage
 
-The Makefile enforces one floor, `COVER_MIN = 91`, and applies it to every
-coverage target rather than tuning a threshold per package. The module total
-clears it. Two library packages measured on their own do not:
+The Makefile enforces one floor, `COVER_MIN = 91`, and every package under
+`pkg/` now clears it on its own, not just the module total. The lowest:
 
 | Package | Coverage |
 |---------|----------|
-| `pkg/internal/registry` | 78.4% |
-| `pkg/logdb` | 89.1% |
-| `pkg/internal/engine` | 90.6% |
-| `pkg/internal/transport` | 91.1% |
-| `pkg/logdb/waldb` | 91.9% |
-| `pkg` | 92.3% |
-| **Module total** | **92.4%** |
+| `pkg/internal/engine` | 91.4% |
+| `pkg/internal/transport` | 91.4% |
+| `pkg/logdb/waldb` | 92.0% |
+| `pkg` | 92.6% |
+| `pkg/crypto/shamir` | 92.9% |
+| **Module total** | **92.5%** |
 
-Measured at 0.11.0-alpha with `go test -coverprofile ./...`, which is the scope
+Measured at 0.14.0-alpha with `go test -coverprofile ./...`, which is the scope
 `make coverage` uses: no build tags, so the integration and fault-injection
 suites are excluded and only the code they exercise indirectly shows up. The
 `test/*` helper packages (proposer, errfs, membership, netport, lockedmem)
-score lower on their own because their callers are the tagged suites.
+score lower on their own because their callers are the tagged suites, and are
+outside the gate.
 
-`pkg/internal/registry` is small enough that a single uncovered line moves it
-several points, and its two uncovered methods (`RegisterIfAbsent`,
-`CompareAndRegister`) are exercised by `pkg`'s message-handler tests rather
-than its own. The WAL, the QUIC transport and the engine pipeline — the layers
-whose failure modes are hardest to recover from — now clear the floor on their
-own.
+A total can hide a package: `pkg/internal/registry` sat at 78.4% under a 91.3%
+total until 0.14.0. `scripts/check-coverage-packages.sh` reads the same profile
+and fails on any package under `pkg/` below its threshold. CI runs it at the
+total's floor, and `make coverage-packages` holds every package to
+`COVER_MIN` locally.
 
 ```bash
 # Unit tests (run on host)

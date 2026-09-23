@@ -197,6 +197,9 @@ type EventShardInfo struct {
 	ReplicaID uint64
 	LeaderID  uint64
 	Term      uint64
+	// Index is the log index a compaction ran through, set for
+	// OnLogCompacted and OnLogDBCompacted and 0 for every other event.
+	Index uint64
 }
 
 // SnapshotInfo describes a snapshot lifecycle event.

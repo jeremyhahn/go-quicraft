@@ -3544,8 +3544,8 @@ func (r *raft) handleSnapshot(msg proto.Message) error {
 		r.log.pendingSnapshot() == nil {
 		// Log matches at snapshot point; advance commit AND the
 		// processed marker. The engine restores the state machine from
-		// the received snapshot (HandleSnapshot always requests SM
-		// recovery after delivering InstallSnapshot), so every entry at
+		// the received snapshot (HandleSnapshot requests SM recovery for
+		// every install raft adopts, this branch included), so every entry at
 		// or below ss.Index is already represented in the recovered
 		// state. Leaving processed behind would re-emit those entries
 		// to the apply worker and double-apply them on top of the

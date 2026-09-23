@@ -736,6 +736,24 @@ func (lr *LogReader) Snapshot() proto.Snapshot {
 	return lr.snapshot
 }
 
+// RefreshSnapshotFileSize sets the FileSize of the snapshot the reader
+// already records at index. It exists for one caller: a local save that
+// REBUILT a missing artifact at the recorded index. Such a save cannot go
+// through CreateSnapshot — a non-advancing index is refused — so without this
+// the reader kept the size it was loaded with, which is 0 when the artifact
+// was missing at start, and every send of the rebuilt snapshot failed its
+// declared-size check until a restart re-measured the file. Any other index
+// is refused with ErrSnapshotOutOfDate.
+func (lr *LogReader) RefreshSnapshotFileSize(index, fileSize uint64) error {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	if index == 0 || lr.snapshot.Index != index {
+		return ErrSnapshotOutOfDate
+	}
+	lr.snapshot.FileSize = fileSize
+	return nil
+}
+
 // Compact removes entries up to and including the given index by
 // advancing the marker. After compaction, entries at or below index
 // are no longer available and requests for them return ErrCompacted.
@@ -744,20 +762,31 @@ func (lr *LogReader) Snapshot() proto.Snapshot {
 // a single Lock scope to maintain the invariant that markerTerm always
 // corresponds to markerIndex.
 func (lr *LogReader) Compact(index uint64) error {
+	_, err := lr.CompactTo(index)
+	return err
+}
+
+// CompactTo is Compact that also reports whether the marker MOVED. Compacting
+// at the current marker is a nil no-op, so a nil error alone does not prove a
+// compaction happened; a caller that reports compactions — the snapshot pool,
+// for OnLogCompacted — needs this answer, taken under the same lock as the
+// compaction rather than by reading the marker before and after, which a
+// concurrent ApplySnapshot could move in between.
+func (lr *LogReader) CompactTo(index uint64) (bool, error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
 	if index < lr.markerIndex {
-		return ErrCompacted
+		return false, ErrCompacted
 	}
 	if index > lr.lastIndex() {
-		return ErrUnavailable
+		return false, ErrUnavailable
 	}
 
 	// Look up the term at the compaction point before updating the marker.
 	// We need to read the term while the current state is still valid.
 	term, err := lr.termLocked(index)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Atomically advance the marker and update the cached term.
@@ -775,7 +804,7 @@ func (lr *LogReader) Compact(index uint64) error {
 			delete(lr.entryCache, k)
 		}
 	}
-	return nil
+	return i > 0, nil
 }
 
 // logdbEntriesToProtoReuse converts logdb entries to proto entries using

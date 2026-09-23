@@ -38,7 +38,7 @@ cfg := config.HostConfig{
     DeploymentID:  1,
 }
 
-host, err := quicraft.NewHost(cfg, quicraft.WithoutTransport())
+host, err := quicraft.NewHost(cfg, quicraft.WithoutTransport(), quicraft.WithoutEncryption())
 // ...
 shardCfg := config.Config{ShardID: 1, ReplicaID: 1}
 members := map[uint64]string{1: "127.0.0.1:63001"}
@@ -333,7 +333,7 @@ Enable with `WithMetrics`:
 
 ```go
 collector := quicraft.NewPrometheusMetricsCollector()
-host, _ := quicraft.NewHost(cfg, quicraft.WithMetrics(collector))
+host, _ := quicraft.NewHost(cfg, quicraft.WithMetrics(collector), quicraft.WithoutEncryption())
 
 // Serve metrics via an HTTP handler:
 http.Handle("/metrics", promhttp.HandlerFor(collector.Registry, promhttp.HandlerOpts{}))
@@ -974,6 +974,7 @@ starts last**:
 
 ```
 NewHost()
+  0. Refuse an unstated or conflicting at-rest encryption choice
   1. Construct LogDB, barrier, registry, message handler
   2. Wire msgHandler.host, msgHandler.engine, the engine callback,
      and the per-shard import locker
@@ -1040,8 +1041,7 @@ the synchronous form is `SyncRequestDeleteNode`. There is no
 > a **stable advertised `RaftAddress`** (not an ephemeral port). A voting
 > replica self-heals an address change on its next election timeout; a
 > non-voting member relies on its address being stable or on an operator
-> re-issuing the config change. (A periodic self-advertisement for non-voting
-> members is a planned post-v1.0 enhancement.)
+> re-issuing the config change.
 
 `OrderedConfigChange` serializes membership changes so only one is in-flight at a time, as required by the Raft specification. It is a `*bool` whose nil zero value means enabled, so the default needs no configuration; disabling it is `OrderedConfigChange: config.BoolPtr(false)` and is UNSAFE.
 

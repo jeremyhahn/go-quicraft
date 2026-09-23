@@ -199,7 +199,7 @@ func TestWithSnapshotFS_RoutesHostSnapshotIO(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfs := newCrashFS(cfg.NodeHostDir)
 
-	def, err := NewHost(cfg, WithoutTransport(), WithLogDB(memdb.New()))
+	def, err := NewHost(cfg, WithoutTransport(), WithLogDB(memdb.New()), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestWithSnapshotFS_RoutesHostSnapshotIO(t *testing.T) {
 	}
 
 	cfg2 := testHostConfig(t)
-	injected, err := NewHost(cfg2, WithoutTransport(), WithLogDB(memdb.New()), withSnapshotFS(cfs))
+	injected, err := NewHost(cfg2, WithoutTransport(), WithLogDB(memdb.New()), withSnapshotFS(cfs), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost with injected filesystem: %v", err)
 	}
@@ -713,7 +713,7 @@ func TestImportSnapshot_SurvivesCrashAfterSuccess(t *testing.T) {
 	db.mu.Unlock()
 
 	cfs := newCrashFS(cfg.NodeHostDir)
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs))
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

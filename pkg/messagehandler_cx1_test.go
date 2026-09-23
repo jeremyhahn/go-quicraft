@@ -49,6 +49,15 @@ func (c *capturingEngineDeliverer) DeliverLocal(shardID uint64, msg proto.Messag
 	return c.engineDeliverer.DeliverLocal(shardID, msg)
 }
 
+// DeliverLocalTo captures the node-bound injection path, which is the one the
+// snapshot receive now uses for the install whose verdict it awaits.
+func (c *capturingEngineDeliverer) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	c.mu.Lock()
+	c.delivered = append(c.delivered, msg)
+	c.mu.Unlock()
+	return c.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
 // firstInstallSnapshot returns the first InstallSnapshot message delivered to
 // the raft layer, which is the message that seeds the LogReader's snapshot
 // record and therefore what this node would stream as leader.

@@ -83,9 +83,16 @@ Creates a Host with the given configuration. Validates the config, creates or lo
 | `WithMemoryLogDB()`        | --                                 | In-memory LogDB (benchmarks, CI, ephemeral nodes)         |
 | `WithBarrier(b)`           | `Barrier`                          | Host-wide at-rest encryption. Must be initialized and unsealed |
 | `WithShardBarriers(fn)`    | `func(shardID uint64) Barrier`     | Per-shard at-rest encryption. See below                  |
+| `WithoutEncryption()`      | --                                 | Declares plaintext at rest. Conflicts with the two above  |
 | `WithMetrics(c)`           | `MetricsCollector`                 | Metrics collection                                        |
 | `WithLogger(l)`            | `*slog.Logger`                     | Custom logger. Default: built from `LogConfig`            |
 | `WithoutTransport()`       | --                                 | No-op sender; messages are dropped. Single-node testing only |
+
+**At-rest encryption is stated, never defaulted.** Every host passes
+`WithBarrier`, `WithShardBarriers`, or `WithoutEncryption`. `NewHost` returns
+`ErrAtRestEncryptionUnspecified` for a host that passes none of them, and
+`ErrAtRestEncryptionConflict` for `WithoutEncryption` combined with either
+barrier option. The check runs before anything touches the disk.
 
 **`WithShardBarriers`** seals each shard under its own barrier, so one tenant's key purge can never remove an epoch another tenant's snapshots still reference. The resolver returning `nil` for a shard falls back to the `WithBarrier` barrier; when there is no host-wide barrier, the miss fails closed with `ErrShardBarrierUnresolved` rather than writing that one tenant in plaintext. Key rotation for per-shard barriers is the caller's responsibility -- the host's rotation loop only rotates the `WithBarrier` barrier.
 
@@ -2287,7 +2294,7 @@ if status.Status != "ok" {
 metrics := quicraft.NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{
     PerShardMetrics: true,
 })
-host, err := quicraft.NewHost(hostCfg, quicraft.WithMetrics(metrics))
+host, err := quicraft.NewHost(hostCfg, quicraft.WithMetrics(metrics), quicraft.WithoutEncryption())
 if err != nil {
     return err
 }

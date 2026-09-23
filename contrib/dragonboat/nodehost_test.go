@@ -88,7 +88,7 @@ func newTestNodeHost(t *testing.T) *NodeHost {
 
 	nh, err := NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
-		quicraft.WithoutTransport(),
+		quicraft.WithoutTransport(), quicraft.WithoutEncryption(),
 	)
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions: %v", err)
@@ -1434,7 +1434,7 @@ func TestNodeHost_Close_Idempotent(t *testing.T) {
 	}
 	nh, err := NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
-		quicraft.WithoutTransport(),
+		quicraft.WithoutTransport(), quicraft.WithoutEncryption(),
 	)
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions: %v", err)
@@ -2626,7 +2626,7 @@ func TestNodeHost_NewNodeHostWithOptions_Success(t *testing.T) {
 	}
 	nh, err := NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
-		quicraft.WithoutTransport(),
+		quicraft.WithoutTransport(), quicraft.WithoutEncryption(),
 	)
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions: %v", err)

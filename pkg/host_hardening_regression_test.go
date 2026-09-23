@@ -642,7 +642,7 @@ func TestNewHost_ExportedTransportDisabledSkipsTransport(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.TransportConfig.TransportDisabled = true
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -714,7 +714,7 @@ func TestConfigRejectsReplicaIDThatWouldTruncateTheProposalKey(t *testing.T) {
 // while still appending the entry would satisfy the error check alone.
 func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

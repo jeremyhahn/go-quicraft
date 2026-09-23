@@ -16,14 +16,15 @@ package engine
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +55,17 @@ type SnapshotBarrier interface {
 	// is byte-identical to EncryptWithEpoch. Snapshot frames always supply the
 	// positional context built by NewSnapshotAAD.
 	EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+
+	// EncryptWithEpochPinnedContext is EncryptWithEpochContext that also
+	// registers the epoch it sealed under as in-flight, in ONE atomic step
+	// under the barrier's own lock; the caller must DeregisterInFlightEpoch it.
+	//
+	// It is required, not optional. EncryptWithEpoch releases the lock before
+	// returning, so a Rotate followed by PurgeEpochsBefore could otherwise
+	// complete in the gap before the caller pinned the returned epoch —
+	// purging the DEK of ciphertext about to be persisted, which would then be
+	// permanently undecryptable.
+	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 
 	// Decrypt decrypts ciphertext using the epoch embedded in the ciphertext
 	// prefix. Returns the plaintext.
@@ -98,20 +110,6 @@ type SnapshotBarrier interface {
 	// PurgeEpochsBefore removes DEKs for epochs strictly less than minEpoch.
 	// Returns the number of epochs actually purged.
 	PurgeEpochsBefore(minEpoch uint64) (int, error)
-}
-
-// atomicEpochPinner is an OPTIONAL capability a SnapshotBarrier may implement:
-// seal a frame and register the epoch it sealed under as in-flight in ONE atomic
-// step, under the barrier's own lock.
-//
-// EncryptWithEpoch releases that lock before returning, so a Rotate followed by
-// PurgeEpochsBefore can complete in the gap before the caller pins the returned
-// epoch — dropping the DEK of an already-sealed frame and making the snapshot
-// permanently undecryptable. Doing both under one lock closes that window.
-// encryptSnapshotFile uses it when available and falls back to
-// pin-before + pin-after otherwise.
-type atomicEpochPinner interface {
-	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 }
 
 // snapshotRequest is sent to the snapshot pool to request a snapshot
@@ -375,6 +373,94 @@ func (p *snapshotPool) abandonRequest(req snapshotRequest) {
 	}
 }
 
+// settleRecovery acts on how a recovery request ended — abandoned because its
+// node stopped (the caller was refused the node's write lease), declined as
+// stale, or failed — and lowers the recovering gate. It
+// reports whether the recovery was abandoned, in which case no callback may
+// report it.
+func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bool) (abandoned bool) {
+	var stale *SnapshotRecoveryStaleError
+	switch {
+	case stopped:
+		// Its node stopped under it — whether the restore then failed or not.
+		// A failure is the unload, not a failed restore, and a success
+		// restored a state machine that is discarded with the node; either
+		// way its successor recovers from the LogDB record on start. Failing
+		// the node, or reporting to callbacks that resolve by shard ID, would
+		// land on that successor instead: a spurious shard failure, or its
+		// pending snapshot requests completed with this recovery's result.
+		abandoned = true
+		slog.Info("snapshot recovery abandoned: the node stopped",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"error", err,
+		)
+	case errors.As(err, &stale):
+		// NOT a shard failure, and nothing to do.
+		//
+		// recoveryBlockedByLog produces this refusal BEFORE the recovering
+		// gate is raised and before RecoverFromSnapshot is called, so the
+		// state machine has not been touched. The reasoning below — a
+		// possibly half-restored state machine — does not apply to it.
+		//
+		// It is also a NORMAL condition rather than a fault. A leader that
+		// has just been elected rebuilds every remote's next index, and a
+		// rejection walk-down can drive one below the compacted floor, so it
+		// ships an InstallSnapshot to a follower that is not actually behind.
+		// raft.handleSnapshot rejects that snapshot itself ("snapshot
+		// rejected, behind committed index") and answers with the follower's
+		// real committed index, which is how the leader learns to stop
+		// sending it. The snapshot receive path queues recovery only for an
+		// install raft ADOPTED, so that case no longer reaches the pool from
+		// a receive; the dedup path's re-delivery of an already-recorded
+		// snapshot still can, and a restart racing a new commit can too.
+		//
+		// The state machine is at or past the snapshot index, so it already
+		// holds everything that snapshot represents: declining IS the correct
+		// and complete action. Failing the shard here turned a race the
+		// protocol handles by itself into a dead shard (#106).
+		slog.Info("snapshot recovery declined: the state machine is already past "+
+			"this snapshot, and raft rejected it too",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"snapshot_index", stale.SnapshotIndex,
+			"last_applied", stale.LastApplied,
+		)
+	case err != nil:
+		// A FAILED restore must fail the shard, not resume applies on it.
+		//
+		// StateMachine.RecoverFromSnapshot now stages the session table so
+		// a failure cannot leave sessions and user state at different
+		// indexes — but the USER state machine is still free to have
+		// mutated itself before returning an error. sm.StateMachine
+		// documents all-or-nothing only for Update, not for
+		// RecoverFromSnapshot, and the engine has no way to roll a user SM
+		// back. Resuming the apply pipeline against a possibly
+		// half-restored state machine applies committed entries onto an
+		// undefined base — divergence with every Raft invariant intact.
+		//
+		// Failing the shard is the same terminal state a permanent
+		// SaveState failure reaches. Recovery is an operator action:
+		// restart the shard, which builds a fresh state machine instance
+		// and replays from the last good snapshot.
+		slog.Error("snapshot recovery failed; failing the shard rather "+
+			"than resuming applies on a possibly half-restored state machine",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"error", err,
+		)
+		req.node.Fail(err)
+		if p.callback != nil {
+			p.callback.OnShardFailed(req.shardID, err)
+		}
+	}
+	req.node.SetRecovering(false)
+	if p.workSignal != nil {
+		p.workSignal.Notify(req.shardID)
+	}
+	return abandoned
+}
+
 // handleRequest processes a single snapshot request with panic recovery.
 // On panic, all per-shard cleanup is performed and the callback is
 // notified so the shard is not permanently wedged.
@@ -479,10 +565,13 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 			return
 		}
 	}
-	var index uint64
+	var (
+		index      uint64
+		compaction LogCompaction
+	)
 	err := blocked
 	if err == nil {
-		index, err = p.handleSnapshot(req)
+		index, compaction, err = p.handleSnapshot(req)
 	}
 
 	// Mark that the snapshot operation itself finished, so a later panic is
@@ -493,70 +582,24 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// (success or error). Signal the work signal so the step
 	// worker re-evaluates this node immediately rather than
 	// waiting for the next tick.
+	// Every outcome is reported by shard ID — a failed node, the completion
+	// that resolves the shard's pending snapshot requests, the compaction
+	// event — so it is settled and reported under the node's write lease.
+	// UnloadNode cannot complete while it is held, so no next incarnation
+	// exists to receive a report meant for this one; a node that has stopped
+	// refuses the lease, and its request is abandoned — its own pending
+	// requests are failed by the teardown instead. The host dispatches every
+	// user EventListener fan-out from these callbacks, so no user code runs
+	// under the lease. The release is deferred so a panicking callback cannot
+	// leak the lease and hang the unload. A save's own lease was released
+	// when it returned, so this is never a nested acquire.
+	leased := req.node.AcquireWriteLease()
+	if leased {
+		defer req.node.ReleaseWriteLease()
+	}
+	abandoned := !leased
 	if !req.save {
-		var stale *SnapshotRecoveryStaleError
-		if errors.As(err, &stale) {
-			// NOT a shard failure, and nothing to do.
-			//
-			// recoveryBlockedByLog produces this refusal BEFORE the recovering
-			// gate is raised and before RecoverFromSnapshot is called, so the
-			// state machine has not been touched. The reasoning below — a
-			// possibly half-restored state machine — does not apply to it.
-			//
-			// It is also a NORMAL condition rather than a fault. A leader that
-			// has just been elected rebuilds every remote's next index, and a
-			// rejection walk-down can drive one below the compacted floor, so it
-			// ships an InstallSnapshot to a follower that is not actually behind.
-			// raft.handleSnapshot rejects that snapshot itself ("snapshot
-			// rejected, behind committed index") and answers with the follower's
-			// real committed index, which is how the leader learns to stop
-			// sending it. The host queues state-machine recovery on DELIVERY of
-			// the InstallSnapshot, not on raft ACCEPTING it, so the pool still
-			// receives a request for a snapshot raft has already discarded.
-			//
-			// The state machine is at or past the snapshot index, so it already
-			// holds everything that snapshot represents: declining IS the correct
-			// and complete action. Failing the shard here turned a race the
-			// protocol handles by itself into a dead shard (#106).
-			slog.Info("snapshot recovery declined: the state machine is already past "+
-				"this snapshot, and raft rejected it too",
-				"shard_id", req.shardID,
-				"replica_id", req.replicaID,
-				"snapshot_index", stale.SnapshotIndex,
-				"last_applied", stale.LastApplied,
-			)
-		} else if err != nil {
-			// A FAILED restore must fail the shard, not resume applies on it.
-			//
-			// StateMachine.RecoverFromSnapshot now stages the session table so
-			// a failure cannot leave sessions and user state at different
-			// indexes — but the USER state machine is still free to have
-			// mutated itself before returning an error. sm.StateMachine
-			// documents all-or-nothing only for Update, not for
-			// RecoverFromSnapshot, and the engine has no way to roll a user SM
-			// back. Resuming the apply pipeline against a possibly
-			// half-restored state machine applies committed entries onto an
-			// undefined base — divergence with every Raft invariant intact.
-			//
-			// Failing the shard is the same terminal state a permanent
-			// SaveState failure reaches. Recovery is an operator action:
-			// restart the shard, which builds a fresh state machine instance
-			// and replays from the last good snapshot.
-			slog.Error("snapshot recovery failed; failing the shard rather "+
-				"than resuming applies on a possibly half-restored state machine",
-				"shard_id", req.shardID,
-				"replica_id", req.replicaID,
-				"error", err,
-			)
-			req.node.Fail(err)
-			if p.callback != nil {
-				p.callback.OnShardFailed(req.shardID, err)
-			}
-		}
-		req.node.SetRecovering(false)
-		if p.workSignal != nil {
-			p.workSignal.Notify(req.shardID)
-		}
+		abandoned = p.settleRecovery(req, err, !leased)
 	}
 	result := snapshotResult{
 		shardID:   req.shardID,
@@ -580,8 +623,13 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// told its backup succeeded before its export directory exists. Both slots
 	// stay claimed across the callback, so no later request can be admitted
 	// until it has drained.
-	if p.callback != nil {
+	if p.callback != nil && !abandoned {
 		p.callback.OnSnapshotCompleted(req.shardID, index, err)
+		// After the completion, so a listener sees the snapshot before the
+		// compaction it made possible, and still inside the held slots.
+		if err == nil && compaction.Reader {
+			p.callback.OnLogCompacted(req.shardID, req.replicaID, compaction)
+		}
 	}
 	// Release the slots so the next request for this shard can be accepted.
 	p.inFlight.Delete(req.shardID)
@@ -603,66 +651,16 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 }
 
 // handleSnapshot executes a single snapshot save or recover operation.
-// Returns the snapshot index for save operations, or 0 for recovers.
-func (p *snapshotPool) handleSnapshot(req snapshotRequest) (uint64, error) {
+// Returns the snapshot index and what log compaction did for save operations,
+// or 0 and no compaction for recovers.
+func (p *snapshotPool) handleSnapshot(req snapshotRequest) (uint64, LogCompaction, error) {
 	if req.save {
-		return p.saveSnapshot(req)
+		return p.saveSnapshotCompacting(req)
 	}
 	err := p.recoverSnapshot(req)
-	return 0, err
+	return 0, LogCompaction{}, err
 }
 
-// discardSaveDir removes a snapshot save directory whose save failed before
-// the directory became self-describing (data file plus snapshot.meta). It is
-// used on the failure paths that run while the data file still holds
-// plaintext, or holds an artifact that must not be retained; a removal failure
-// is logged and otherwise ignored because the caller is already returning an
-// error.
-//
-// It REFUSES to remove a directory the durable LogDB record names. A save that
-// resolves to an already-recorded directory (same shard, same replica, same
-// index) is a re-save of an existing snapshot, and removing it would delete the
-// artifact LogDB points at while the log covered by it has already been
-// compacted — on a single-node deployment, permanent state loss. saveSnapshot
-// makes such a re-save an early no-op, so this is a second, unconditional
-// backstop for any future caller that reaches here with a recorded directory.
-func (p *snapshotPool) discardSaveDir(saveDir string, req snapshotRequest) {
-	if p.logdb != nil {
-		if rec, err := p.logdb.GetSnapshot(req.shardID, req.replicaID); err == nil &&
-			rec.Index != 0 && rec.Filepath != "" &&
-			filepath.Clean(rec.Filepath) == filepath.Clean(saveDir) {
-			slog.Error("snapshot: refusing to discard the save directory LogDB records",
-				"shard_id", req.shardID,
-				"replica_id", req.replicaID,
-				"path", saveDir,
-				"recorded_index", rec.Index,
-			)
-			return
-		}
-	}
-	if err := os.RemoveAll(saveDir); err != nil {
-		slog.Debug("snapshot: discard of save directory failed",
-			"shard_id", req.shardID,
-			"replica_id", req.replicaID,
-			"path", saveDir,
-			"error", err,
-		)
-	}
-}
-
-// recordedArtifactExists reports whether the snapshot.dat named by a durable
-// LogDB snapshot record is still on disk.
-//
-// It is the second half of the non-advancing-save guard: the record alone does
-// not prove the artifact survived. A directory removed by operator cleanup or a
-// partial restore leaves a record pointing at nothing, and skipping the re-save
-// on the record alone would make that permanent — the shard could then only be
-// repaired by streaming from a peer, which a single-node deployment does not
-// have.
-//
-// It fails CLOSED on an unmeasurable path (anything but "does not exist"):
-// reporting "gone" there would let a transient EIO reopen the live artifact
-// with O_TRUNC, which is the outcome the guard exists to prevent.
 func recordedArtifactExists(rec logdb.Snapshot) bool {
 	if rec.Filepath == "" {
 		// A metadata-only record (a witness snapshot) has no artifact to lose.
@@ -674,17 +672,27 @@ func recordedArtifactExists(rec logdb.Snapshot) bool {
 	return true
 }
 
-// saveSnapshot saves the state machine state to a snapshot directory,
+// saveSnapshot is saveSnapshotCompacting for callers that need only the
+// index: the tests that drive a save directly. The pool's own path uses the
+// full form so the compaction outcome reaches OnLogCompacted.
+func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
+	index, _, err := p.saveSnapshotCompacting(req)
+	return index, err
+}
+
+// saveSnapshotCompacting saves the state machine state to a snapshot directory,
 // writes metadata, persists snapshot info to LogDB, garbage collects
 // old snapshots, and compacts the log. Returns the snapshot index on
-// success.
+// success, and what log compaction did (see LogCompaction; the zero value when
+// nothing was compacted).
 //
 //nolint:gocyclo // snapshot save is a multi-phase operation: create, write, persist, compact, cleanup
-func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
+func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogCompaction, error) {
+	var compaction LogCompaction
 	node := req.node
 	snapshotter := node.Snapshotter()
 	if snapshotter == nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -694,7 +702,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 
 	// Cheap early-out: nothing applied yet means nothing to snapshot.
 	if snapshotter.LastApplied() == 0 {
-		return 0, nil
+		return 0, LogCompaction{}, nil
 	}
 
 	// A CONFIGURED barrier that is SEALED means encryption is temporarily
@@ -708,7 +716,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// reason: the shard would be the only one written in plaintext.
 	barrier, barrierErr := p.barrierForShard(req.shardID)
 	if barrierErr != nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -716,7 +724,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 	if barrier != nil && barrier.IsSealed() {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -737,7 +745,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	release := func() { releaseOnce.Do(func() { node.SetSaving(false) }) }
 	defer release()
 	if !node.WaitForApplyDrain(node.StopC()) {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -754,7 +762,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// term (which would corrupt raft log matching on InstallSnapshot).
 	snapshotIndex := snapshotter.LastApplied()
 	if snapshotIndex == 0 {
-		return 0, nil
+		return 0, LogCompaction{}, nil
 	}
 
 	// A non-advancing index is a NO-OP, and it must be decided here, before any
@@ -789,6 +797,10 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// rebuildingRecordedArtifact marks the one non-advancing save that must
 	// still run: the record survived but its artifact did not.
 	rebuildingRecordedArtifact := false
+	// rebuildFileSize is the FileSize the surviving record carries. A rebuild
+	// keeps that record, and recovery rejects an artifact whose size differs
+	// from it, so a rebuild publishes only a file of exactly that size.
+	var rebuildFileSize uint64
 	if p.logdb != nil {
 		rec, recErr := p.logdb.GetSnapshot(req.shardID, req.replicaID)
 		switch {
@@ -796,13 +808,13 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			// No record yet: this is the FIRST save. Proceed.
 		case recErr != nil:
 			// The record state is UNKNOWN, and this branch exists precisely to
-			// keep a recorded artifact from being reopened with O_TRUNC. Falling
-			// through on a read error would do exactly that — and discardSaveDir,
-			// the second line of defence, reads the record through the SAME call,
-			// so one persistent read error defeats both layers: truncate the
-			// recorded artifact, then delete it. Fail the save instead; the
-			// snapshot on disk stays intact and the next attempt retries.
-			return 0, &SnapshotError{
+			// keep a recorded artifact from being replaced. Falling through on
+			// a read error would run a save whose publish then has to decide
+			// whether the canonical directory is recorded — through the SAME
+			// call — so one persistent read error would leave the whole
+			// decision to a guess. Fail the save instead; the snapshot on disk
+			// stays intact and the next attempt retries.
+			return 0, LogCompaction{}, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      true,
@@ -814,7 +826,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			// exportPath, and the LogDB record could not be advanced to describe
 			// one.
 			if req.exportPath != "" {
-				return 0, &SnapshotError{
+				return 0, LogCompaction{}, &SnapshotError{
 					ShardID:   req.shardID,
 					ReplicaID: req.replicaID,
 					Save:      true,
@@ -829,7 +841,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"snapshot_index", snapshotIndex,
 					"recorded_index", rec.Index,
 				)
-				return 0, nil
+				return 0, LogCompaction{}, nil
 			case rec.Index != snapshotIndex:
 				// The artifact is gone, but a save at THIS index resolves to a
 				// different directory than the one the record names, so it would
@@ -842,7 +854,40 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"recorded_index", rec.Index,
 					"recorded_path", rec.Filepath,
 				)
-				return 0, nil
+				return 0, LogCompaction{}, nil
+			case filepath.Clean(rec.Filepath) != filepath.Clean(snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)):
+				// The record names a directory other than the one a save at this
+				// index publishes into — a legacy or relocated layout. Rebuilding
+				// the canonical one would leave the record naming the still-missing
+				// original, and LogDB cannot be re-pointed at the same index.
+				slog.Error("snapshot: recorded snapshot artifact is missing and its recorded path is not the one a rebuild writes",
+					"shard_id", req.shardID,
+					"replica_id", req.replicaID,
+					"snapshot_index", snapshotIndex,
+					"recorded_path", rec.Filepath,
+				)
+				return 0, LogCompaction{}, nil
+			case (rec.Epoch == 0) != (barrier == nil) || rec.Compression != node.cfg.SnapshotCompressionType:
+				// The record survived but its artifact did not, and the
+				// artifact cannot be rebuilt to match it. A rebuild keeps the
+				// record — LogDB rejects a same-index update — so recovery
+				// reads the new bytes through the OLD record's format: an
+				// encrypted rebuild under a plaintext record (Epoch 0) is never
+				// decrypted, and a Snappy rebuild under a NoCompression record
+				// is fed to the state machine compressed. The encryption or
+				// compression setting has changed since that snapshot was
+				// taken, so only a snapshot at a NEW index can repair this.
+				slog.Error("snapshot: recorded snapshot artifact is missing and cannot be rebuilt in its recorded format",
+					"shard_id", req.shardID,
+					"replica_id", req.replicaID,
+					"snapshot_index", snapshotIndex,
+					"recorded_path", rec.Filepath,
+					"recorded_epoch", rec.Epoch,
+					"recorded_compression", rec.Compression,
+					"barrier_configured", barrier != nil,
+					"compression", node.cfg.SnapshotCompressionType,
+				)
+				return 0, LogCompaction{}, nil
 			default:
 				// The record survived but its artifact did not (operator
 				// cleanup, a partial restore). Skipping on the record alone
@@ -858,6 +903,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				// the rebuilt frames need, and recoverLogReader re-measures the
 				// file on the next restart.
 				rebuildingRecordedArtifact = true
+				rebuildFileSize = rec.FileSize
 				slog.Warn("snapshot: rebuilding the recorded snapshot artifact, which is missing from disk",
 					"shard_id", req.shardID,
 					"replica_id", req.replicaID,
@@ -924,7 +970,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// deferred release re-opens the gate). The save is refused rather than
 	// recorded wrong, and the next trigger takes it.
 	if membership.ConfigChangeID > snapshotIndex {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -937,11 +983,34 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
-	// Create snapshot directory using the standard naming convention:
-	// <snapshotDir>/shard-<N>/replica-<N>/snapshot-<index>
-	saveDir := snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)
-	if err := os.MkdirAll(saveDir, 0o750); err != nil {
-		return 0, &SnapshotError{
+	// STAGE, then publish. The save writes its artifact — the capture,
+	// snapshot.meta, the export — into a staging directory of its own, and
+	// only the publish below, which renames it onto the canonical
+	// snapshot-<index> name and records it, runs under the node's write lease.
+	//
+	// The canonical directory is shared with a snapshot receive at the same
+	// index, so writing there needs the lease UnloadNode waits out. Holding it
+	// across the capture, as an earlier form did, made UnloadNode wait for the
+	// user state machine — and a SaveSnapshot that waited on a proposal to its
+	// own shard then deadlocked, since UnloadNode is what fails that proposal.
+	// (A state machine that IGNORES the stopper still delays StopShard, at
+	// its own Close, which must wait for an in-flight stream; that is the
+	// stopper contract in pkg/sm, and was always so.) Nothing any other writer
+	// can see is touched before the publish, so the capture needs no fence. A save
+	// whose node stops meanwhile is refused the lease and publishes nothing.
+	canonicalDir := snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)
+	stageParent := filepath.Dir(canonicalDir)
+	if err := os.MkdirAll(stageParent, 0o750); err != nil {
+		return 0, LogCompaction{}, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       err,
+		}
+	}
+	stageDir, err := MkdirStageDir(stageParent, SaveStageDirPattern)
+	if err != nil {
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -949,34 +1018,36 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 
-	// EVERY failure from here until the directory is self-describing discards
-	// the whole save directory, and it is enforced by ONE deferred guard rather
-	// than a discard call per branch: a directory holding snapshot.dat with no
-	// snapshot.meta beside it is classified UNEVALUABLE by readSnapshotEpoch,
-	// which makes the DEK purge floor fail safe and suppresses epoch purging
-	// HOST-WIDE (single-barrier mode) for as long as it exists — and before the
-	// encrypt runs those bytes are a partial PLAINTEXT copy of the state machine
-	// that only the success path's GC would ever reclaim. Leaving the enforcement
-	// to individual branches is exactly how four early returns (SM save, snappy
-	// close, fsync, stat) came to leak one such directory per failed trigger; the
-	// defer means a future early return cannot reintroduce the leak.
-	//
-	// recorded flips as soon as writeSnapshotMetadata succeeds: from that point
-	// the directory describes itself, later failures leave a valid (unrecorded)
-	// artifact, and GC reclaims it.
-	recorded := false
+	// EVERY way out before the publish removes the staging directory, and one
+	// deferred guard enforces it rather than a removal per branch — which is
+	// how four early returns once came to leak a directory apiece. The stage
+	// is this save's own and no record can name it, so removing it needs no
+	// lease and cannot destroy anything else. Before the frame writer runs,
+	// its bytes are a partial PLAINTEXT copy of the state machine; the name
+	// keeps it out of GC and the purge-floor scan, so nothing else would ever
+	// reclaim it short of a restart's sweep.
+	published := false
 	defer func() {
-		if !recorded {
-			p.discardSaveDir(saveDir, req)
+		if published {
+			return
+		}
+		if rmErr := os.RemoveAll(stageDir); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("snapshot: failed to remove an unpublished save staging directory",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"path", stageDir,
+				"error", rmErr,
+			)
 		}
 	}()
+	saveDir := stageDir
 
 	// Open data file. The engine.Snapshotter interface accepts io.Writer,
 	// and *os.File satisfies io.Writer, so we manage the file here.
 	dataPath := filepath.Join(saveDir, snapshotDataFile)
 	f, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1071,7 +1142,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				"error", closeErr,
 			)
 		}
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1090,7 +1161,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"error", closeErr,
 				)
 			}
-			return 0, &SnapshotError{
+			return 0, LogCompaction{}, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      true,
@@ -1116,7 +1187,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"error", closeErr,
 				)
 			}
-			return 0, &SnapshotError{
+			return 0, LogCompaction{}, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      true,
@@ -1135,7 +1206,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				"error", closeErr,
 			)
 		}
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1175,7 +1246,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 						"error", closeErr,
 					)
 				}
-				return 0, &SnapshotError{
+				return 0, LogCompaction{}, &SnapshotError{
 					ShardID:   req.shardID,
 					ReplicaID: req.replicaID,
 					Save:      true,
@@ -1193,7 +1264,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"error", closeErr,
 				)
 			}
-			return 0, &SnapshotTooLargeError{
+			return 0, LogCompaction{}, &SnapshotTooLargeError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Size:      measured,
@@ -1212,7 +1283,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// one SyncDir, encryptSnapshotFile and writeSnapshotMetadata use. Nothing
 	// references the directory yet, so the deferred discard guard reclaims it.
 	if closeErr := f.Close(); closeErr != nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1258,17 +1329,13 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		// Nothing references this directory yet (no LogDB record, no LogReader
 		// entry), so the deferred guard discards it. This is the LAST point at
 		// which the directory is not yet self-describing.
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
 			Err:       err,
 		}
 	}
-	// The directory now describes itself: keep it from here on, even when a
-	// later step fails. GC reclaims it if it is never recorded.
-	recorded = true
-
 	// Make the directory entries durable BEFORE recording the snapshot in
 	// LogDB. The data and metadata files are fsynced above, but the
 	// directory entries created by MkdirAll, the file creates, and the
@@ -1279,7 +1346,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// single-node deployment would lose the snapshot and the compacted
 	// entries it covers.
 	if err := SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1292,8 +1359,8 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// durable, recorded and published — skipping compaction and epoch purge —
 	// on an export error; doing it here means an export failure fails a snapshot
 	// that is not yet visible, and the caller's retry re-takes it cleanly. The
-	// canonical snapshot.dat is fsynced and self-describing at this point, so a
-	// failure leaves a valid (unrecorded) directory GC reclaims.
+	// staged snapshot.dat is fsynced and self-describing at this point, and a
+	// failure removes the unpublished stage.
 	//
 	// The export is PLAINTEXT: exportSnapshotBackup decrypts an encrypted
 	// artifact and records Epoch 0, because the export lands OUTSIDE every DEK
@@ -1310,7 +1377,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			Epoch:       epoch,
 			Compression: compression,
 		}); exportErr != nil {
-			return 0, &SnapshotError{
+			return 0, LogCompaction{}, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      true,
@@ -1324,11 +1391,10 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// set makes this replica stream an empty snapshot once it becomes leader,
 	// so an artifact that cannot be MEASURED fails the save rather than being
 	// recorded at size 0 — the same fail-closed rule the recovery and import
-	// paths apply. The directory is self-describing by now, so the failure
-	// leaves a valid unrecorded artifact for GC to reclaim.
+	// paths apply. The stage is still unpublished, so the failure removes it.
 	fi, statErr := os.Stat(dataPath)
 	if statErr != nil {
-		return 0, &SnapshotError{
+		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
@@ -1336,6 +1402,71 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 		}
 	}
 	fileSize := uint64(fi.Size())
+	// A recorded FileSize of 0 is the legacy "size unknown", which recovery
+	// does not validate and restart re-measures, so it constrains nothing.
+	if rebuildingRecordedArtifact && rebuildFileSize != 0 && fileSize != rebuildFileSize {
+		// The state machine serialized the same state to a different size —
+		// map order, a compression block boundary. Recovery measures the file
+		// against the record it keeps, so this artifact could never be read;
+		// publishing it would report a repair that is not one. The stage is
+		// removed, and a snapshot at the next index repairs the shard.
+		slog.Error("snapshot: rebuilt artifact does not match the recorded size and cannot replace it",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"snapshot_index", snapshotIndex,
+			"recorded_size", rebuildFileSize,
+			"rebuilt_size", fileSize,
+		)
+		return 0, LogCompaction{}, nil
+	}
+
+	// PUBLISH, under the node's write lease. From here the save writes state
+	// another writer can see — the canonical directory a receive at the same
+	// index publishes into, the LogDB record, the log reader's marker and the
+	// entries below it, the GC — so UnloadNode waits it out; none of it runs
+	// user code, so the wait is short. A node that has stopped refuses the
+	// lease: the save publishes nothing, and its stage is removed. The release
+	// is deferred after the stage guard, so it runs first; the guard needs no
+	// lease, since the stage is this save's own.
+	if !node.AcquireWriteLease() {
+		return 0, LogCompaction{}, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       ErrStopped,
+		}
+	}
+	defer node.ReleaseWriteLease()
+	// And under the snapshot-directory lock: the publish, the record, the log
+	// reader and the GC form one step no receive can interleave with (see
+	// Node.snapshotDirMu). It is released explicitly once the GC is done — the
+	// log compaction and epoch purge after it touch neither the directories
+	// nor the record, and a receive should not queue behind them — and by the
+	// deferred call on every earlier return, before the lease.
+	node.LockSnapshotDir()
+	unlockSnapshotDir := sync.OnceFunc(node.UnlockSnapshotDir)
+	defer unlockSnapshotDir()
+	if err := p.publishStagedSave(stageDir, canonicalDir, snapshotIndex, req, rebuildingRecordedArtifact); err != nil {
+		return 0, LogCompaction{}, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       err,
+		}
+	}
+	published = true
+	saveDir = canonicalDir
+	dataPath = filepath.Join(saveDir, snapshotDataFile)
+	// The rename is durable only once the parent directory is fsynced, and
+	// the record below must never name a directory a crash could still undo.
+	if err := SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
+		return 0, LogCompaction{}, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       err,
+		}
+	}
 
 	// Persist snapshot metadata to LogDB, including the current cluster
 	// membership. Without membership, ReadState on restart returns empty
@@ -1356,7 +1487,7 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			// already names this directory and its artifact is back on disk, so
 			// the rejection is the expected outcome of a repair, not a failure.
 			if !rebuildingRecordedArtifact || !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-				return 0, &SnapshotError{
+				return 0, LogCompaction{}, &SnapshotError{
 					ShardID:   req.shardID,
 					ReplicaID: req.replicaID,
 					Save:      true,
@@ -1376,7 +1507,22 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// region. The LogReader stores the snapshot metadata (including
 	// Filepath and FileSize) and serves it via Snapshot() when
 	// inmem.snapshot is nil.
-	if lr := node.LogReader(); lr != nil {
+	//
+	// A REBUILD cannot: the reader already records this index, and a
+	// non-advancing CreateSnapshot is refused. It refreshes the recorded
+	// snapshot's size instead — the reader was loaded with 0 when the artifact
+	// was missing at start, and the send path refuses a file whose size
+	// differs from what the reader declares.
+	if lr := node.LogReader(); lr != nil && rebuildingRecordedArtifact {
+		if err := lr.RefreshSnapshotFileSize(snapshotIndex, fileSize); err != nil {
+			slog.Warn("LogReader did not take the rebuilt snapshot's size; sends of it fail until restart",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"snapshot_index", snapshotIndex,
+				"error", err,
+			)
+		}
+	} else if lr != nil {
 		if err := lr.CreateSnapshot(proto.Snapshot{
 			ShardID:    req.shardID,
 			ReplicaID:  req.replicaID,
@@ -1421,20 +1567,29 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 				// the LogReader never installed. The artifact is durable and
 				// recorded; only the discretionary follow-up work is skipped, and
 				// the next snapshot retries it.
-				return snapshotIndex, nil
+				return snapshotIndex, compaction, nil
 			}
 		}
 	}
 
-	// Garbage collect old snapshot directories.
-	if gcErr := gcSnapshotDirs(node.SnapshotDir(), req.shardID, req.replicaID,
-		p.recordedSnapshotDir(req.shardID, req.replicaID)); gcErr != nil {
+	// Garbage collect old snapshot directories — unless the record cannot be
+	// read, when there is no telling which directory GC must spare.
+	if recorded, recErr := p.recordedSnapshotDir(req.shardID, req.replicaID); recErr != nil {
+		slog.Warn("snapshot GC skipped: the snapshot record cannot be read",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"error", recErr,
+		)
+	} else if gcErr := gcSnapshotDirs(node.SnapshotDir(), req.shardID, req.replicaID, recorded,
+		node.PinnedSnapshotDirs()...); gcErr != nil {
 		slog.Warn("snapshot GC failed",
 			"shard_id", req.shardID,
 			"replica_id", req.replicaID,
 			"error", gcErr,
 		)
 	}
+
+	unlockSnapshotDir()
 
 	// Update the node's last snapshot index.
 	node.lastSnapshotIndex.Store(snapshotIndex)
@@ -1455,9 +1610,16 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 			// reverse order fails with ErrCompacted and silently leaves
 			// markerIndex stale, so raft keeps probing for entries the
 			// LogDB has already discarded.
+			// advanced records whether THIS save moved the marker. Only then did
+			// it compact anything: ErrCompacted means an earlier snapshot, a
+			// received one or an import already took the marker past
+			// compactIndex, and a nil reader cannot say either way, so neither
+			// is reported to OnLogCompacted.
+			advanced := false
 			if lr := node.LogReader(); lr != nil {
-				if lrErr := lr.Compact(compactIndex); lrErr != nil &&
-					!errors.Is(lrErr, logdb.ErrCompacted) {
+				moved, lrErr := lr.CompactTo(compactIndex)
+				advanced = lrErr == nil && moved
+				if lrErr != nil && !errors.Is(lrErr, logdb.ErrCompacted) {
 					slog.Warn("log reader compaction failed, skipping LogDB removal",
 						"shard_id", req.shardID,
 						"replica_id", req.replicaID,
@@ -1472,10 +1634,11 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					// the whole removal and let the next snapshot retry against a
 					// marker it can advance. ErrCompacted is not an error here: it
 					// means the marker is already at or past compactIndex.
-					return snapshotIndex, nil
+					return snapshotIndex, compaction, nil
 				}
 			}
-			if removeErr := p.logdb.RemoveEntriesTo(req.shardID, req.replicaID, compactIndex); removeErr != nil {
+			removeErr := p.logdb.RemoveEntriesTo(req.shardID, req.replicaID, compactIndex)
+			if removeErr != nil {
 				slog.Warn("log compaction remove failed",
 					"shard_id", req.shardID,
 					"replica_id", req.replicaID,
@@ -1483,12 +1646,20 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 					"error", removeErr,
 				)
 			}
-			if compactErr := p.logdb.Compact(req.shardID, req.replicaID); compactErr != nil {
+			compactErr := p.logdb.Compact(req.shardID, req.replicaID)
+			if compactErr != nil {
 				slog.Warn("log compaction failed",
 					"shard_id", req.shardID,
 					"replica_id", req.replicaID,
 					"error", compactErr,
 				)
+			}
+			if advanced {
+				compaction = LogCompaction{
+					Index:  compactIndex,
+					Reader: true,
+					LogDB:  removeErr == nil && compactErr == nil,
+				}
 			}
 		}
 	}
@@ -1498,7 +1669,46 @@ func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	// snapshot or WAL segment is zeroed from memory.
 	p.purgeOldEpochs(node.SnapshotDir(), req.shardID, req.replicaID)
 
-	return snapshotIndex, nil
+	return snapshotIndex, compaction, nil
+}
+
+// publishStagedSave renames a save's staged artifact onto its canonical
+// snapshot-<index> directory. The caller holds the node's write lease and its
+// snapshot-directory lock.
+//
+// An occupant of the canonical name is replaced only when it is an orphan —
+// no receive claims it (Node.ClaimSnapshotDir) and no LogDB record names it —
+// or when it is the recorded artifact this save is rebuilding. A claimed
+// directory is a receive's published artifact still awaiting raft's verdict:
+// unrecorded now and possibly recorded a moment later, so the record alone
+// cannot tell it from an orphan. A recorded one is raft's. Both are refused
+// with ErrSnapshotIndexNotAdvanced. A true orphan — a crash between a save's
+// rename and its record, or a failed receive's leftovers — is replaced; a
+// quiescent shard keeps re-saving at the same index, so refusing it would
+// block that shard's snapshots for good, and GC never reclaims the newest
+// directory. A record that cannot be read fails the publish closed.
+func (p *snapshotPool) publishStagedSave(stageDir, canonicalDir string, index uint64, req snapshotRequest, rebuilding bool) error {
+	if _, statErr := os.Stat(canonicalDir); statErr == nil {
+		if req.node.snapshotDirClaimed(index) || req.node.IsSnapshotDirPinned(canonicalDir) {
+			return ErrSnapshotIndexNotAdvanced
+		}
+		if p.logdb != nil {
+			rec, recErr := p.logdb.GetSnapshot(req.shardID, req.replicaID)
+			switch {
+			case errors.Is(recErr, logdb.ErrNoSnapshot):
+			case recErr != nil:
+				return recErr
+			case filepath.Clean(rec.Filepath) == filepath.Clean(canonicalDir) && !rebuilding:
+				return ErrSnapshotIndexNotAdvanced
+			}
+		}
+		if rmErr := os.RemoveAll(canonicalDir); rmErr != nil {
+			return rmErr
+		}
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	return os.Rename(stageDir, canonicalDir)
 }
 
 // peerLogMarkers returns the Raft log's committed and processed markers as
@@ -1640,55 +1850,34 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	if p.logdb == nil {
 		return nil
 	}
-	logdbSnap, err := p.logdb.GetSnapshot(req.shardID, req.replicaID)
-	switch {
-	case errors.Is(err, logdb.ErrNoSnapshot):
-		// "No snapshot" is the documented no-op, not a failure. Every real
-		// LogDB (memdb, waldb) reports it as this sentinel rather than a zero
-		// record, so lumping it in with a genuine read error below failed
-		// recovery on every replica that has never snapshotted.
-		return nil
-	case err != nil:
-		return &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      false,
-			Err:       err,
-		}
-	case logdbSnap.Index == 0:
+	// Choose the artifact and PIN it, under the snapshot-directory lock, so
+	// the GC a receive or save runs after recording a newer snapshot cannot
+	// delete it while this recovery reads it by path (Node.PinSnapshotDir).
+	// The lock is held only for the choice: verification and decryption read
+	// the whole file, and receives must not queue behind them.
+	node.LockSnapshotDir()
+	logdbSnap, snapshotDir, artifactIndex, err := p.chooseRecoverySnapshot(req)
+	if err == nil && snapshotDir != "" {
+		node.PinSnapshotDir(snapshotDir)
+	}
+	node.UnlockSnapshotDir()
+	if err != nil {
+		return err
+	}
+	if snapshotDir == "" {
 		return nil // no snapshot to recover
 	}
+	defer func() {
+		node.LockSnapshotDir()
+		node.UnpinSnapshotDir(snapshotDir)
+		node.UnlockSnapshotDir()
+	}()
 
 	// Evaluate both apply-frontier bounds BEFORE the snapshotter is touched.
 	// Running RecoverFromSnapshot first and checking afterwards leaves the
 	// state machine replaced by a snapshot whose markers were then refused.
 	if err := recoveryBlockedByLog(req, logdbSnap.Index); err != nil {
 		return err
-	}
-
-	// Determine snapshot directory. Prefer the filepath stored in LogDB
-	// metadata; fall back to discovering the latest directory on disk.
-	//
-	// artifactIndex tracks the index of the directory ACTUALLY being read, not
-	// the one LogDB recorded. The two agree on the recorded-filepath branch
-	// (the directory is named snapshot-<Index>), but the discovery branch picks
-	// the newest directory on disk, which may be a different index — and that
-	// directory's frames were sealed under ITS OWN index. Using logdbSnap.Index
-	// as the frame context there would fail authentication on a valid artifact.
-	snapshotDir := logdbSnap.Filepath
-	artifactIndex := logdbSnap.Index
-	if snapshotDir == "" {
-		dir, dirIndex, dirErr := latestSnapshotDir(node.SnapshotDir(), req.shardID, req.replicaID)
-		if dirErr != nil {
-			return &SnapshotError{
-				ShardID:   req.shardID,
-				ReplicaID: req.replicaID,
-				Save:      false,
-				Err:       dirErr,
-			}
-		}
-		snapshotDir = dir
-		artifactIndex = dirIndex
 	}
 
 	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
@@ -1879,6 +2068,52 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	return nil
 }
 
+// chooseRecoverySnapshot reads the snapshot record and resolves the directory
+// a recovery reads, returning an empty directory when there is nothing to
+// recover. The caller holds the snapshot-directory lock.
+//
+// artifactIndex tracks the index of the directory ACTUALLY being read, not
+// the one LogDB recorded. The two agree on the recorded-filepath branch (the
+// directory is named snapshot-<Index>), but the discovery branch picks the
+// newest directory on disk, which may be a different index — and that
+// directory's frames were sealed under ITS OWN index. Using the record's index
+// as the frame context there would fail authentication on a valid artifact.
+func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapshot, string, uint64, error) {
+	logdbSnap, err := p.logdb.GetSnapshot(req.shardID, req.replicaID)
+	switch {
+	case errors.Is(err, logdb.ErrNoSnapshot):
+		// "No snapshot" is the documented no-op, not a failure. Every real
+		// LogDB (memdb, waldb) reports it as this sentinel rather than a zero
+		// record, so lumping it in with a genuine read error below failed
+		// recovery on every replica that has never snapshotted.
+		return logdb.Snapshot{}, "", 0, nil
+	case err != nil:
+		return logdb.Snapshot{}, "", 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       err,
+		}
+	case logdbSnap.Index == 0:
+		return logdb.Snapshot{}, "", 0, nil
+	}
+	// Prefer the filepath stored in LogDB metadata; fall back to discovering
+	// the latest directory on disk.
+	if logdbSnap.Filepath != "" {
+		return logdbSnap, logdbSnap.Filepath, logdbSnap.Index, nil
+	}
+	dir, dirIndex, dirErr := latestSnapshotDir(req.node.SnapshotDir(), req.shardID, req.replicaID)
+	if dirErr != nil {
+		return logdb.Snapshot{}, "", 0, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       dirErr,
+		}
+	}
+	return logdbSnap, dir, dirIndex, nil
+}
+
 // decryptSnapshotToSibling reads the encrypted snapshot data file and writes
 // its decrypted plaintext to a NEW sibling temp file in the same directory,
 // returning that temp file's path. It does NOT modify or replace the source
@@ -1945,60 +2180,16 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, shardID, replicaID,
 		}
 	}()
 
-	// Read and decrypt each frame. Frame format: [4-byte LE length][data]. An
-	// empty source yields an immediate EOF and an empty plaintext temp file,
-	// which RecoverFromSnapshot treats as a no-op — matching the prior behavior.
-	var frameLenBuf [4]byte
-	// Frames are read strictly sequentially from offset 0, so the ordinal the
-	// encrypt loop stamped into each frame's context is simply the count.
-	aad := NewSnapshotAAD(shardID, replicaID, index, barrier)
-	var seq uint64
-	for {
-		_, readErr := io.ReadFull(srcFile, frameLenBuf[:])
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
-		}
-		frameLen := binary.LittleEndian.Uint32(frameLenBuf[:])
-		// A frame is exactly one encrypted plaintext chunk
-		// (snapshotEncryptChunkSize) plus AEAD framing overhead (epoch + algID
-		// + nonce + tag, < 256 bytes). Reject a corrupt/oversized length prefix
-		// before allocating, so a damaged frame header cannot trigger a
-		// multi-GB allocation during recovery.
-		if frameLen > snapshotEncryptChunkSize+maxSnapshotFrameOverhead {
-			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
-		}
-
-		frame := make([]byte, frameLen)
-		if _, readErr = io.ReadFull(srcFile, frame); readErr != nil {
-			return "", &SnapshotEncryptError{Op: "decrypt", Err: ErrSnapshotCorrupt}
-		}
-
-		// Decrypt using the epoch embedded in each frame's ciphertext header
-		// rather than the single recorded snapshot epoch. A snapshot saved
-		// concurrently with a key rotation can contain frames at different
-		// epochs (earlier chunks at E, later chunks at E+1); recording one
-		// epoch and decrypting every frame with it would fail AEAD on the
-		// mismatched frames. barrier.Decrypt reads the embedded epoch and
-		// selects the correct DEK, matching the WAL replay path. The recorded
-		// epoch parameter is advisory only (it gates whether decryption is
-		// attempted at all, and pins the DEK-purge floor at the minimum frame
-		// epoch so no frame's DEK is purged while the snapshot is retained).
-		//
-		// The frame's positional context is required, unconditionally: a frame
-		// that authenticates only under a different ordinal or a different
-		// artifact identity is rejected, never retried with a weaker AAD.
-		plaintext, decErr := barrier.DecryptWithContext(nil, frame, aad.Frame(seq))
-		if decErr != nil {
-			return "", &SnapshotEncryptError{Op: "decrypt", Err: decErr}
-		}
-		seq++
-
-		if _, err := tmpFile.Write(plaintext); err != nil {
-			return "", &SnapshotEncryptError{Op: "write", Err: err}
-		}
+	// Every frame is authenticated against its position, its artifact
+	// identity and whether it is the terminal frame; see OpenSnapshotFrames.
+	// Each frame carries its own epoch in its header and decrypts under that
+	// epoch's DEK, so an artifact spanning a mid-save key rotation reads back
+	// whole. The recorded epoch parameter is advisory only: it gates whether
+	// decryption is attempted at all, and pins the DEK-purge floor at the
+	// minimum frame epoch so no frame's DEK is purged while the snapshot is
+	// retained.
+	if _, err := OpenSnapshotFrames(barrier, shardID, replicaID, index, srcFile, tmpFile); err != nil {
+		return "", err
 	}
 
 	if err := tmpFile.Sync(); err != nil {
@@ -2183,18 +2374,14 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 
 	nodes := p.nodes()
 
-	// Completeness guard (C3): the floor below is a MINIMUM over LOADED shards
-	// only, but a StopShard'd shard keeps its encrypted snapshot on disk while
-	// dropping out of p.nodes(). In single-barrier mode that stopped shard's
-	// DEK is still needed, so a co-hosted shard rotating keys must not purge
-	// below the stopped shard's retained epoch — doing so durably destroys the
-	// DEK and makes the stopped shard's StartShard fail closed on decrypt
-	// forever. The per-barrier floor has an analogous guard (MED-2). Here there
-	// is no shard-set enumerator, so the on-disk snapshot tree IS the authority:
-	// any shard/replica directory no loaded node accounts for means the loaded
-	// set is incomplete and the floor may sit above an epoch some artifact still
-	// needs. Fail safe (do not purge) on that, or on any enumeration error.
-	if !p.loadedSnapshotTreeAccounted(nodes) {
+	// A StopShard'd shard keeps its encrypted snapshot on disk while dropping
+	// out of p.nodes(), and in single-barrier mode its DEK is still needed:
+	// purging below its epoch makes its StartShard fail closed on decrypt,
+	// forever. Every shard has its OWN snapshot base (…/snapshots/shard-N, or
+	// its DataDir), so no scan of the loaded shards' bases can see it. The
+	// LogDB can: it records every shard's latest snapshot, loaded or not.
+	unloadedMin, ok := p.unloadedSnapshotFloor(nodes, func(uint64) (bool, error) { return true, nil })
+	if !ok {
 		return 0, false
 	}
 
@@ -2208,7 +2395,7 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 		scan.report("global")
 		return 0, false
 	}
-	snapshotMinEpoch := scan.minEpoch
+	snapshotMinEpoch := minNonZero(scan.minEpoch, unloadedMin)
 
 	// Determine the global WAL floor. The LogDB is per-host, so MinLiveEpoch
 	// already spans all shards (verified: waldb.DB.MinLiveEpoch ranges all
@@ -2273,77 +2460,79 @@ func engineLogDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
 	return p.AtRestProtection()
 }
 
-// loadedSnapshotTreeAccounted reports whether every shard/replica directory that
-// exists on disk under any loaded node's snapshot base directory is accounted
-// for by a currently-loaded node. It is the global (single-barrier) analogue of
-// the per-barrier completeness guard (MED-2): the global floor is a minimum over
-// LOADED shards only, so an on-disk shard/replica directory that no loaded node
-// owns — a StopShard'd shard whose encrypted snapshot is still on disk — may
-// hold artifacts sealed under an epoch the floor would purge. Since every shard
-// shares the one process-wide barrier here, that purge is host-wide data loss.
+// unloadedSnapshotFloor returns the minimum recorded snapshot epoch over every
+// (shard, replica) the LogDB holds state for that is not among the loaded
+// nodes and that include accepts, and whether that minimum is known.
 //
-// The tree is enumerated at most two levels deep (shard-*/replica-*) under each
-// DISTINCT loaded base directory. Any enumeration error is treated as
-// unaccounted (fail safe): an unreadable tree cannot be proven free of a stopped
-// shard's directory.
-func (p *snapshotPool) loadedSnapshotTreeAccounted(nodes []*Node) bool {
-	// Group the loaded nodes by their snapshot base directory, recording the
-	// shard-N/replica-M directory name each one owns.
-	accounted := make(map[string]map[string]struct{})
-	for _, node := range nodes {
-		base := node.SnapshotDir()
-		set := accounted[base]
-		if set == nil {
-			set = make(map[string]struct{})
-			accounted[base] = set
-		}
-		key := filepath.Join(
-			fmt.Sprintf("shard-%d", node.ShardID()),
-			fmt.Sprintf("replica-%d", node.ReplicaID()),
+// The LogDB is the authority for shards that are not loaded: it records every
+// shard's latest snapshot and the epoch it was sealed at, wherever the shard's
+// snapshot tree lives. That record is the snapshot a restart recovers from, so
+// counting it is what keeps a purge from stranding the shard. A stopped shard's
+// OLDER retained snapshots are superseded and not counted; a purge may leave
+// them undecryptable (owner ruling, 2026-09-23).
+//
+// It fails safe: an enumeration error, a record that cannot be read, or an
+// include that cannot decide returns ok == false, and the caller must not
+// purge. A nil LogDB has no durable records and contributes nothing.
+func (p *snapshotPool) unloadedSnapshotFloor(loaded []*Node,
+	include func(shardID uint64) (bool, error)) (uint64, bool) {
+	if p.logdb == nil {
+		return 0, true
+	}
+	infos, err := p.logdb.ListNodeInfo()
+	if err != nil {
+		slog.Warn("epoch purge skipped: the LogDB could not enumerate its shards, "+
+			"so a stopped shard's snapshot epoch cannot be accounted",
+			"error", err,
 		)
-		set[key] = struct{}{}
+		return 0, false
 	}
+	type replicaKey struct{ shardID, replicaID uint64 }
+	isLoaded := make(map[replicaKey]struct{}, len(loaded))
+	for _, node := range loaded {
+		isLoaded[replicaKey{node.ShardID(), node.ReplicaID()}] = struct{}{}
+	}
+	var floor uint64
+	for _, info := range infos {
+		if _, ok := isLoaded[replicaKey{info.ShardID, info.ReplicaID}]; ok {
+			continue // scanned from its snapshot tree by the caller
+		}
+		counted, incErr := include(info.ShardID)
+		if incErr != nil {
+			return 0, false
+		}
+		if !counted {
+			continue
+		}
+		snap, snapErr := p.logdb.GetSnapshot(info.ShardID, info.ReplicaID)
+		if errors.Is(snapErr, logdb.ErrNoSnapshot) {
+			continue // nothing recorded, nothing to strand
+		}
+		if snapErr != nil {
+			slog.Warn("epoch purge skipped: a stopped shard's snapshot record could not be read",
+				"shard_id", info.ShardID,
+				"replica_id", info.ReplicaID,
+				"error", snapErr,
+			)
+			return 0, false
+		}
+		floor = minNonZero(floor, snap.Epoch)
+	}
+	return floor, true
+}
 
-	for base, set := range accounted {
-		shardEntries, err := os.ReadDir(base)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue // base not yet created: nothing on disk to strand
-			}
-			return false // cannot prove the tree holds no unaccounted shard
-		}
-		for _, shardEntry := range shardEntries {
-			if !shardEntry.IsDir() || !strings.HasPrefix(shardEntry.Name(), "shard-") {
-				continue
-			}
-			shardPath := filepath.Join(base, shardEntry.Name())
-			replicaEntries, err := os.ReadDir(shardPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
-				return false
-			}
-			for _, replicaEntry := range replicaEntries {
-				if !replicaEntry.IsDir() || !strings.HasPrefix(replicaEntry.Name(), "replica-") {
-					continue
-				}
-				key := filepath.Join(shardEntry.Name(), replicaEntry.Name())
-				if _, ok := set[key]; ok {
-					continue
-				}
-				// An on-disk shard/replica directory no loaded node owns. Its
-				// retained encrypted snapshots may need DEKs the loaded-only
-				// floor would purge, so purging must not proceed.
-				slog.Warn("epoch purge suppressed: on-disk snapshot directory has no loaded shard; "+
-					"a purge could destroy a DEK the stopped shard still needs",
-					"path", filepath.Join(shardPath, replicaEntry.Name()),
-				)
-				return false
-			}
-		}
+// minNonZero returns the smaller of a and b, treating 0 as "no constraint".
+func minNonZero(a, b uint64) uint64 {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
 	}
-	return true
 }
 
 // perBarrierSafePurgeFloor computes the minimum barrier epoch still required by
@@ -2372,8 +2561,11 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 
 	// Snapshot the currently-loaded shards mapped to the target barrier, indexed
 	// by shard ID so the completeness guard below can check membership.
+	// One snapshot of the loaded set, used for both the target's own shards
+	// and the unloaded-shard accounting below, so the two cannot disagree.
+	allLoaded := p.nodes()
 	loadedForTarget := make(map[uint64]*Node)
-	for _, node := range p.nodes() {
+	for _, node := range allLoaded {
 		nodeBarrier, barrierErr := p.barrierForShard(node.ShardID())
 		if barrierErr != nil {
 			// A loaded shard whose barrier cannot be resolved may or may not
@@ -2409,6 +2601,19 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		}
 	}
 
+	// Shards mapped to the target that are NOT loaded — the enumerator above
+	// is optional, and its absence cannot mean the loaded set is complete.
+	// The resolver is a function of shardID, so an unloaded shard's barrier is
+	// as resolvable as a loaded one's; one that cannot be resolved can neither
+	// be counted nor excluded, which declines the purge.
+	unloadedMin, ok := p.unloadedSnapshotFloor(allLoaded, func(shardID uint64) (bool, error) {
+		b, err := p.barrierForShard(shardID)
+		return b == target, err
+	})
+	if !ok {
+		return 0, false
+	}
+
 	// (a) Snapshot floor restricted to shards mapped to the target barrier. A
 	// directory belonging to a DIFFERENT barrier is never scanned here, so an
 	// indeterminate directory under barrier B cannot suppress purging for
@@ -2422,7 +2627,7 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		scan.report("barrier")
 		return 0, false // fail safe: this barrier has an indeterminate directory
 	}
-	snapshotMinEpoch := scan.minEpoch
+	snapshotMinEpoch := minNonZero(scan.minEpoch, unloadedMin)
 
 	// (b) WAL floor restricted to the target barrier's records. When a LogDB
 	// is present it MUST support per-barrier epoch queries; a plain
@@ -2740,6 +2945,80 @@ func IsSnapshotRecvStage(name string) bool {
 // Errors are logged and counted through the same reporting path a failed
 // scratch sweep uses; a failed cleanup must not abort startup.
 func SweepStaleRecvStageDirs(baseDir string, shardID, replicaID uint64) {
+	sweepStageDirs(baseDir, shardID, replicaID, IsSnapshotRecvStage, "InstallSnapshot receive")
+}
+
+// Snapshot SAVE staging-directory naming. A local save captures the state
+// machine into a directory of its own and publishes it onto the canonical
+// "snapshot-<index>" name with one rename under the node's write lease, the
+// receive's discipline and for the same reason: the canonical directory is
+// shared with a snapshot receive at the same index, and a save that wrote
+// there directly had to hold the lease — which UnloadNode waits out — across
+// the user state machine's capture, so a state machine that ignored the
+// stopper, or waited on its own shard, could hang StopShard forever.
+//
+// It gets its own prefix, like the receive, because its liveness proof is
+// the same one: only Host.StartShard, before the shard's node exists to take
+// a save, may sweep it. A save of a PREVIOUS incarnation still capturing when
+// that sweep runs loses its stage and fails — it could not have published
+// anyway, since its stopped node refuses the lease.
+const (
+	// SaveStageDirPrefix marks a directory a local snapshot save stages its
+	// artifact in. The name deliberately cannot parse as "snapshot-<index>",
+	// so listSnapshotDirs, snapshot GC and the DEK purge-floor scan all skip
+	// a half-written save.
+	SaveStageDirPrefix = ".save-"
+
+	// SaveStageDirPattern is the os.MkdirTemp pattern for a save staging
+	// directory. Every save must build its name from this.
+	SaveStageDirPattern = SaveStageDirPrefix + "*"
+)
+
+// IsSnapshotSaveStage reports whether a directory entry name is a save
+// staging directory. It is the single matcher the sweeper uses, so a name that
+// can be CREATED is by construction a name that can be RECLAIMED.
+func IsSnapshotSaveStage(name string) bool {
+	return strings.HasPrefix(name, SaveStageDirPrefix)
+}
+
+// MkdirStageDir creates a staging directory under parent from pattern, as
+// os.MkdirTemp does — the last "*" in pattern is replaced by a random string,
+// retried on collision — but with the snapshot tree's documented mode 0750
+// under the process umask, as MkdirAll gives every other snapshot directory.
+// os.MkdirTemp creates 0700, and a staged directory is published by RENAME,
+// which keeps its mode: every save, receive and import would otherwise
+// publish a canonical snapshot directory the operator's group cannot traverse.
+// Chmod after MkdirTemp is no answer either — it ignores the umask.
+func MkdirStageDir(parent, pattern string) (string, error) {
+	prefix, suffix := pattern, ""
+	if i := strings.LastIndex(pattern, "*"); i >= 0 {
+		prefix, suffix = pattern[:i], pattern[i+1:]
+	}
+	for range 10000 {
+		dir := filepath.Join(parent, prefix+strconv.FormatUint(uint64(rand.Uint32()), 10)+suffix)
+		err := os.Mkdir(dir, 0o750)
+		if err == nil {
+			return dir, nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+	}
+	return "", &os.PathError{Op: "mkdirstage", Path: filepath.Join(parent, pattern), Err: os.ErrExist}
+}
+
+// SweepStaleSaveStageDirs removes the save staging directories a crash left
+// in a shard/replica's snapshot tree. The caller must ensure no save of the
+// shard can publish — Host.StartShard, before the shard's node exists; see
+// SaveStageDirPrefix.
+func SweepStaleSaveStageDirs(baseDir string, shardID, replicaID uint64) {
+	sweepStageDirs(baseDir, shardID, replicaID, IsSnapshotSaveStage, "snapshot save")
+}
+
+// sweepStageDirs removes every directory in a shard/replica's snapshot tree
+// whose name the matcher claims, logging each reclaim under what. Failures are
+// logged and counted, never returned: a failed cleanup must not abort startup.
+func sweepStageDirs(baseDir string, shardID, replicaID uint64, match func(string) bool, what string) {
 	base := snapshotBaseDir(baseDir, shardID, replicaID)
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -2749,7 +3028,7 @@ func SweepStaleRecvStageDirs(baseDir string, shardID, replicaID uint64) {
 		return
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() || !IsSnapshotRecvStage(entry.Name()) {
+		if !entry.IsDir() || !match(entry.Name()) {
 			continue
 		}
 		stalePath := filepath.Join(base, entry.Name())
@@ -2757,7 +3036,7 @@ func SweepStaleRecvStageDirs(baseDir string, shardID, replicaID uint64) {
 			noteStaleDecryptSweepFailure(stalePath, "remove_all", rmErr)
 			continue
 		}
-		slog.Warn("snapshot: reclaimed an orphaned InstallSnapshot receive staging directory",
+		slog.Warn("snapshot: reclaimed an orphaned "+what+" staging directory",
 			"path", stalePath,
 			"shard_id", shardID,
 			"replica_id", replicaID,
@@ -3390,14 +3669,16 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 // not know it. It is never removed: GC selects by index order alone, so an
 // unusable higher-indexed directory (a partial receive left by a crash) can
 // push the recorded one into the removal window, and deleting it leaves the
-// LogDB record pointing at nothing.
-func GCSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) error {
-	return gcSnapshotDirs(baseDir, shardID, replicaID, recorded)
+// LogDB record pointing at nothing. spare lists further cleaned directories
+// that must not be removed — those a recovery is reading
+// (Node.PinnedSnapshotDirs).
+func GCSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string, spare ...string) error {
+	return gcSnapshotDirs(baseDir, shardID, replicaID, recorded, spare...)
 }
 
 // gcSnapshotDirs removes old snapshot directories, keeping only the
 // most recent maxSnapshotsRetained. Returns nil if no cleanup is needed.
-func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) error {
+func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string, spare ...string) error {
 	dirs, err := listSnapshotDirs(baseDir, shardID, replicaID)
 	if err != nil {
 		return err
@@ -3411,7 +3692,7 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) 
 	// index order alone, so higher-indexed directories that are unusable —
 	// e.g. partial receives left by a crash — push the recorded one into the
 	// removal window, and deleting it leaves the LogDB record pointing at
-	// nothing. discardSaveDir has had this guard since it was written; GC,
+	// nothing. The save's publish (publishStagedSave) has the same guard; GC,
 	// which removes far more directories, did not.
 	toRemove := dirs[:len(dirs)-maxSnapshotsRetained]
 	for _, d := range toRemove {
@@ -3421,6 +3702,12 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) 
 				"replica_id", replicaID,
 				"path", d.path,
 			)
+			continue
+		}
+		// Likewise a directory a recovery is reading (Node.PinSnapshotDir):
+		// it chose the recorded snapshot of its moment, and a newer record
+		// landing since does not make that artifact safe to delete under it.
+		if slices.Contains(spare, filepath.Clean(d.path)) {
 			continue
 		}
 		if err := os.RemoveAll(d.path); err != nil {
@@ -3434,17 +3721,24 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string) 
 	return SyncDir(snapshotBaseDir(baseDir, shardID, replicaID))
 }
 
-// recordedSnapshotDir returns the cleaned path LogDB records for the node, or
-// "" when there is none or it cannot be read. A read failure yields "" rather
-// than an error: GC must not be blocked by an unreadable record, and the
-// consequence of not knowing is only that the guard above does not fire.
-func (p *snapshotPool) recordedSnapshotDir(shardID, replicaID uint64) string {
+// recordedSnapshotDir returns the cleaned path LogDB records for the node: ""
+// with a nil error when there is no record (or no LogDB), and an error when
+// the record cannot be read. An unreadable record is NOT "no record": the GC
+// guard it feeds exists to spare the recorded directory, and treating a read
+// error as "none" let one transient failure delete it.
+func (p *snapshotPool) recordedSnapshotDir(shardID, replicaID uint64) (string, error) {
 	if p.logdb == nil {
-		return ""
+		return "", nil
 	}
 	rec, err := p.logdb.GetSnapshot(shardID, replicaID)
-	if err != nil || rec.Filepath == "" {
-		return ""
+	if errors.Is(err, logdb.ErrNoSnapshot) {
+		return "", nil
 	}
-	return filepath.Clean(rec.Filepath)
+	if err != nil {
+		return "", err
+	}
+	if rec.Filepath == "" {
+		return "", nil
+	}
+	return filepath.Clean(rec.Filepath), nil
 }

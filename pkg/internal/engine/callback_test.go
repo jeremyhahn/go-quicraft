@@ -43,6 +43,7 @@ type testCallback struct {
 	leaderCallCount      atomic.Int64
 	readyCount           atomic.Int64
 	snapshotCalls        []snapshotCall
+	compactionCalls      []compactionCall
 	snapshotCallCount    atomic.Int64
 	campaignCalls        []campaignCall
 	campaignCount        atomic.Int64
@@ -185,6 +186,30 @@ func (c *testCallback) OnSnapshotCompleted(shardID uint64, index uint64, err err
 		err:     err,
 	})
 	c.mu.Unlock()
+}
+
+// compactionCall records one OnLogCompacted delivery.
+type compactionCall struct {
+	shardID    uint64
+	replicaID  uint64
+	compaction LogCompaction
+}
+
+func (c *testCallback) OnLogCompacted(shardID, replicaID uint64, compaction LogCompaction) {
+	c.mu.Lock()
+	c.compactionCalls = append(c.compactionCalls, compactionCall{
+		shardID:    shardID,
+		replicaID:  replicaID,
+		compaction: compaction,
+	})
+	c.mu.Unlock()
+}
+
+// getCompactionCalls returns a copy of every OnLogCompacted delivery so far.
+func (c *testCallback) getCompactionCalls() []compactionCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]compactionCall(nil), c.compactionCalls...)
 }
 
 func (c *testCallback) OnCampaignLaunched(shardID, replicaID, term uint64) {

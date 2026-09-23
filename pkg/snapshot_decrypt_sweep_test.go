@@ -65,7 +65,7 @@ func orphanDecryptTemp(t *testing.T, dir, prefix string) string {
 // one whose in-process owner removes it) is reclaimed at the next StartShard.
 func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

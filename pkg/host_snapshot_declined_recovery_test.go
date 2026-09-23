@@ -145,6 +145,7 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure(t *testing.
 			// saved index. Neither reaches the success branches here, because
 			// every case is an error.
 			cb.OnSnapshotCompleted(1, 0, tt.err)
+			flushListeners(t, cb)
 
 			got := rec.reports()
 			if tt.wantReport && len(got) == 0 {
@@ -188,6 +189,7 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered(t *te
 	cb.OnSnapshotCompleted(1, 0, &engine.SnapshotRecoveryStaleError{
 		ShardID: 1, ReplicaID: 2, SnapshotIndex: 31, LastApplied: 34,
 	})
+	flushListeners(t, cb)
 
 	if failed != 0 {
 		t.Errorf("OnShardFailed fired %d times for a declined recovery, want 0", failed)

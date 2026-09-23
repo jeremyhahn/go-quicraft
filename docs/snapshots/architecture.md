@@ -114,7 +114,7 @@ nonce, so a file written across a key rotation still reads.
 Epoch-only AAD would let an attacker reorder chunks, substitute chunks from
 another snapshot at the same epoch, or truncate the stream without failing
 per-chunk authentication. Every frame therefore binds a positional context built
-by `engine.NewSnapshotAAD` — `SnapshotFrameAADLen` is **39 bytes**:
+by `engine.NewSnapshotAAD` — `SnapshotFrameAADLen` is **40 bytes**:
 
 ```
  off  size  field
@@ -123,8 +123,9 @@ by `engine.NewSnapshotAAD` — `SnapshotFrameAADLen` is **39 bytes**:
   15     8  ReplicaID
   23     8  SnapshotIndex
   31     8  ChunkSeq          (0-based ordinal within snapshot.dat)
+  39     1  Final             (1 on the artifact's last frame, else 0)
 
-AAD = [Epoch:8 little-endian] || context      = 47 bytes
+AAD = [Epoch:8 little-endian] || context      = 48 bytes
 ```
 
 Every field is fixed-width and big-endian with no delimiters, so no two distinct
@@ -136,30 +137,35 @@ wrong `SnapshotIndex` (cross-snapshot substitution) and a wrong
 cannot bind must not be handed a context: the write **fails closed** rather than
 silently dropping the binding.
 
-### Truncation is not covered, and the two places it can happen are guarded differently
+### Truncation is detected in both places it can happen, by different means
 
 - **In transit**: the stream header declares a `ChunkCount` and the receiver
   refuses a transfer where `len(chunks) != hdr.ChunkCount`, where the count is
   zero, or where the stream was marked truncated. A separate
   `maxAdmissibleChunkCount` bound rejects an inflated declared count *before*
   any memory is committed.
-- **At rest**: there is **no equivalent**. `snapshot.dat` is a bare sequence of
-  length-prefixed frames with no frame count and no terminal marker, and
-  `ChunkSeq` names a frame's position but not how many follow. An attacker with
-  write access can drop trailing frames and every surviving frame still
-  authenticates; a reader that stops at EOF sees a complete, shorter snapshot.
-  Closing this needs a count folded into every frame's context or a
-  distinguishable final frame, and **neither is implemented.**
+- **At rest**: the `Final` flag. Exactly one frame of every sealed artifact is
+  sealed as the last: the frame writer holds a full chunk back until more
+  plaintext proves it is not, and `Close` always emits a terminal frame, an
+  empty one if need be. `engine.OpenSnapshotFrames`, the only reader, reads one
+  frame ahead and authenticates the frame after which the file ends as the
+  last. A truncated artifact therefore fails on the frame it now ends with,
+  which was sealed non-terminal; frames spliced after a terminal frame from a
+  longer artifact of the same identity fail on that terminal frame; and an
+  artifact truncated to nothing is refused as `ErrSnapshotCorrupt`, since a
+  sealed artifact always has at least one frame. A barrier that cannot bind
+  caller context gets no positional binding and so only the zero-frame rule.
 
 ### The epoch-pinning window
 
 `EncryptWithEpochPinnedContext` seals a frame **and** registers its epoch
 in-flight under one lock. Without that atomicity, a concurrent `Rotate` plus
 `PurgeEpochsBefore` between the seal and the pin can drop the DEK of a frame
-already written into the artifact. A barrier that does not implement the pinner
-still works, via a pin-before / encrypt / pin-after sequence that leaves the
-window narrow rather than closed — which is why the method is an optional
-capability rather than part of the `Barrier` interface.
+already written into the artifact. The method is therefore part of the
+`Barrier` interface, not an optional capability: until 0.14.0 a barrier without
+it fell back to pin-before / encrypt / pin-after, which left that window narrow
+rather than closed, and a custom barrier that missed the optional method was
+exposed to it.
 
 ## Data flow
 
@@ -167,20 +173,23 @@ capability rather than part of the `Barrier` interface.
  SAVE
    apply worker: appliedIndex crosses SnapshotEntries
         ▼ snapshot pool worker
-   PrepareSnapshot (tiers 1,2) ─▶ SM.SaveSnapshot(w)
+   PrepareSnapshot (tiers 1,2) ─▶ SM.SaveSnapshot(w)      [into .save-* stage]
         w = [snappy ─▶] snapshotFrameWriter ─▶ snapshot.dat
             64 KB of plaintext per frame, sealed under the pinned epoch
             AS IT IS WRITTEN: no plaintext is ever durable on disk (#116)
         ▼ fsync ─▶ MaxSnapshotSize on the PLAINTEXT the writer consumed
-   snapshot.meta (Epoch = lowest frame epoch) ─▶ LogDB.SaveSnapshot
-        ─▶ epoch pins released ─▶ log compaction below index
+   snapshot.meta (Epoch = lowest frame epoch) ─▶ [export]
+        ▼ under the node's write lease: rename stage ─▶ snapshot-<index>
+   LogDB.SaveSnapshot ─▶ epoch pins released ─▶ log compaction below index
 
  TRANSFER
    leader: decryptSnapshotToSibling ─▶ plaintext temp
         ─▶ 2 MB chunks over QUIC (mTLS) ─▶ follower
-   follower: reassemble ─▶ snapshot.dat + fsync ─▶ snapshot.meta
-        ─▶ LogDB.SaveSnapshot ─▶ RequestSnapshotRecovery
-        ─▶ re-encrypt under the RECEIVER'S barrier
+   follower: reassemble ─▶ re-encrypt under the RECEIVER'S barrier
+        ─▶ staged snapshot.dat + snapshot.meta, fsync ─▶ publish the dir
+        ─▶ InstallSnapshot to raft ─▶ await raft's verdict
+             adopted:  LogDB.SaveSnapshot ─▶ log floor ─▶ RequestSnapshotRecovery
+             refused / declined / superseded: discard the unrecorded dir
         ─▶ SnapshotReceived back to the leader's inbox
 
  RECOVER
@@ -189,6 +198,35 @@ capability rather than part of the `Barrier` interface.
         ─▶ SM.RecoverFromSnapshot(r)     [always plaintext]
         ─▶ update lastApplied, lastSnapshotIndex ─▶ remove the temp file
 ```
+
+**The receive is two-phase.** Everything durable about a received snapshot
+beyond its own directory — the LogDB record, the log floor raised to it,
+reclaiming older directories, the state-machine recovery — waits for raft to
+ADOPT the install, which the step worker reports back per install. Raft can
+refuse one that passed every host check (its sender deposed while the stream
+was in flight, a position or membership out of bounds) or decline one it is
+already past; either way the unrecorded directory is discarded and nothing
+else changed. Until 0.14.0 those steps ran on delivery, so a refused snapshot
+stayed recorded with the floor raised under it and a recovery queued that the
+log could never catch up to, and the shard failed. Once raft has adopted the
+install the artifact is never rolled back: a record that cannot then be
+written fails the shard instead, and a restart replays the log.
+
+The verdict is bound to one shard incarnation. The install is injected into,
+and recovery queued on, exactly the node the verdict is awaited on — never
+whichever node holds the shard ID by then. A node that stops or fails, or a
+step-worker panic that interrupts the install's own step (which also fails
+the node), answers **abandoned**, and that does not prove raft never stepped it, so the directory
+is kept rather than discarded: if the stopped incarnation's commit pipeline
+records it, the next start recovers from it; if not, it is an orphan the next
+receive or GC reclaims. The next receive cannot race that record: a receive
+for a stopping shard is refused before staging anything, its publish and its
+post-adoption writes run under the node's write lease, and `UnloadNode` does
+not return until the stopped incarnation can no longer write LogDB (see the
+commit fence in the multi-group-host engineering doc). Installs a panic
+dropped before they were stepped answer **superseded** and are discarded; an
+install whose step the panic interrupted fails the shard, because raft's state
+after a partial restore is unknown.
 
 `DataHash` is computed over the file **as stored** — before decryption and
 before decompression — so it verifies the artifact rather than its

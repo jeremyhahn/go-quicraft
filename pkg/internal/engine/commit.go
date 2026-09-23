@@ -61,9 +61,14 @@ type applyItem struct {
 // commit worker would then skip Peer.Commit forever, so the restarted
 // replica would persist and vote (even win elections) while applying
 // nothing. A single channel makes the sequence FIFO by construction.
+//
+// done, when set, is closed once the commit worker goroutine has applied the
+// change. The goroutine applies membership only BETWEEN batches, so a closed
+// done also proves that no batch in progress when it was sent is still running.
 type shardMembership struct {
 	shardID uint64
 	unload  bool
+	done    chan struct{}
 }
 
 // commitWorker writes Updates to LogDB using a drain-then-batch pattern
@@ -212,18 +217,17 @@ func (w *commitWorker) run() {
 			w.applyMembership(m)
 			continue
 		case item := <-w.commitC:
-			w.batch = append(w.batch[:0], item.update)
-			w.batchNodes = append(w.batchNodes[:0], item.node)
-			if w.metrics != nil {
-				w.commitTimes[item.update.ShardID] = item.createdAt
-			}
-			w.captureOrderedMsgs(item)
+			w.batch = w.batch[:0]
+			w.batchNodes = w.batchNodes[:0]
+			w.admit(item)
 			// Yield to let other step workers produce items before
 			// draining. Under load this increases batch size; when
 			// idle Gosched returns immediately with zero overhead.
 			w.yieldFn()
 			w.drainCommitC()
-			w.processBatch()
+			if len(w.batch) > 0 {
+				w.processBatch()
+			}
 		}
 	}
 }
@@ -237,14 +241,13 @@ func (w *commitWorker) drainAndProcess() {
 	for {
 		select {
 		case item := <-w.commitC:
-			w.batch = append(w.batch[:0], item.update)
-			w.batchNodes = append(w.batchNodes[:0], item.node)
-			if w.metrics != nil {
-				w.commitTimes[item.update.ShardID] = item.createdAt
-			}
-			w.captureOrderedMsgs(item)
+			w.batch = w.batch[:0]
+			w.batchNodes = w.batchNodes[:0]
+			w.admit(item)
 			w.drainCommitC()
-			w.processBatch()
+			if len(w.batch) > 0 {
+				w.processBatch()
+			}
 		default:
 			return
 		}
@@ -258,16 +261,47 @@ func (w *commitWorker) drainCommitC() {
 	for {
 		select {
 		case item := <-w.commitC:
-			w.batch = append(w.batch, item.update)
-			w.batchNodes = append(w.batchNodes, item.node)
-			if w.metrics != nil {
-				w.commitTimes[item.update.ShardID] = item.createdAt
-			}
-			w.captureOrderedMsgs(item)
+			w.admit(item)
 		default:
 			return
 		}
 	}
+}
+
+// admit adds one commitItem to the batch, or drops it when it belongs to an
+// unloaded shard incarnation.
+//
+// Dropping is what keeps an unloaded incarnation from writing LogDB after
+// UnloadNode returns. The unload fence (requestUnload) proves only that no
+// batch in progress when it was sent is still running; an item still queued in
+// commitC is admitted later, and by then a new incarnation of the same shard
+// may have loaded. Its update was never made durable, so dropping it is
+// exactly a crash before the fsync: its ordered messages — the ones that
+// promise durability, such as a vote grant — are dropped with it and never
+// sent, and the free-order ones already sent promise nothing. The check is at
+// admission rather than beside the post-SaveState guards because ordered
+// messages are gathered per shard ID here, where an old and a new
+// incarnation's would otherwise merge.
+//
+// The test is Node.isUnloaded, not the node's stopC: Engine.Stop stops every
+// node long before the commit tier exits, and no incarnation can follow a
+// shutdown, so the shutdown drain keeps persisting.
+func (w *commitWorker) admit(item *commitItem) {
+	if item.node.isUnloaded() {
+		slog.Warn("update dropped for unloaded shard incarnation",
+			"worker", w.workerID,
+			"shard", item.update.ShardID,
+		)
+		item.update.ReleaseCommittedEntries()
+		item.node.commitPending.Store(false)
+		return
+	}
+	w.batch = append(w.batch, item.update)
+	w.batchNodes = append(w.batchNodes, item.node)
+	if w.metrics != nil {
+		w.commitTimes[item.update.ShardID] = item.createdAt
+	}
+	w.captureOrderedMsgs(item)
 }
 
 // captureOrderedMsgs copies ordered messages from a commitItem into
@@ -466,12 +500,11 @@ func (w *commitWorker) processBatch() {
 		// Incarnation guard, mirroring the apply dispatcher. The unloaded set is
 		// shardID-keyed and cannot distinguish a stale old-incarnation item from
 		// a fresh one after a rapid StopShard->StartShard. The node's own stopC
-		// can: an item whose node has stopped while the engine is still running
-		// belongs to a torn-down incarnation, and Commit on its peer would race
-		// the teardown. During engine shutdown every node's stopC is closed, so
-		// gate on the worker's own stopC staying OPEN to keep the shutdown drain
-		// committing.
-		if chanClosed(node.StopC()) && !chanClosed(w.stopC) {
+		// can: an item whose node UnloadNode has begun tearing down belongs to
+		// a torn-down incarnation, and Commit on its peer would race the
+		// teardown. A node stopped only by Engine.Stop is not unloaded, so the
+		// shutdown drain keeps committing (see Node.isUnloaded).
+		if node.isUnloaded() {
 			slog.Warn("commit skipped for stopped shard incarnation",
 				"worker", w.workerID,
 				"shard", u.ShardID,
@@ -807,7 +840,7 @@ func failBatchProposals(callback Callback, u proto.Update, err error) {
 func (w *commitWorker) failBatchSaveState(saveErr error) {
 	for i, u := range w.batch {
 		node := w.batchNodes[i]
-		node.failed.Store(true)
+		node.markFailed()
 		node.commitPending.Store(false)
 		saveStateErr := &SaveStateError{
 			ShardID:   u.ShardID,
@@ -849,7 +882,7 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	}
 	slog.Warn("commit Peer.Commit failed, shard marked failed",
 		"shard", u.ShardID, "replica", u.ReplicaID, "error", err)
-	node.failed.Store(true)
+	node.markFailed()
 	node.commitPending.Store(false)
 	node.handleError(commitErr)
 	failBatchProposals(callback, u, commitErr)
@@ -914,9 +947,12 @@ func (w *commitWorker) clearBatch() {
 func (w *commitWorker) applyMembership(m shardMembership) {
 	if m.unload {
 		w.unloaded.add(m.shardID)
-		return
+	} else {
+		w.unloaded.remove(m.shardID)
 	}
-	w.unloaded.remove(m.shardID)
+	if m.done != nil {
+		close(m.done)
+	}
 }
 
 // drainUnloadReload non-blocking drains all pending unload and reload
@@ -936,10 +972,33 @@ func (w *commitWorker) drainUnloadReload() {
 }
 
 // requestUnload sends a shard removal request to the commit worker via
-// the membership channel. Safe for concurrent use by the Host goroutine.
-func (w *commitWorker) requestUnload(shardID uint64) {
+// the membership channel and returns a channel closed once the worker has
+// applied it. Safe for concurrent use by the Host goroutine.
+//
+// The returned channel is what makes an unload a fence rather than a hint: the
+// worker applies membership only between batches, so once it closes, no batch
+// that could still hold the stopped incarnation's update is mid-SaveState, and
+// every later batch drops that update at admission (see admit). Without the
+// fence, an old incarnation's HardState, entries or adopted snapshot could be
+// written AFTER a new incarnation of the same shard had loaded LogDB.
+//
+// Wait on it with awaitMembership, which also gives up when the worker stops.
+func (w *commitWorker) requestUnload(shardID uint64) <-chan struct{} {
+	done := make(chan struct{})
 	select {
-	case w.membershipC <- shardMembership{shardID: shardID, unload: true}:
+	case w.membershipC <- shardMembership{shardID: shardID, unload: true, done: done}:
+	case <-w.stopC:
+		close(done)
+	}
+	return done
+}
+
+// awaitMembership waits until done closes or the worker is stopped. A stopped
+// worker is draining its final batches for an engine shutdown, which no new
+// incarnation can race.
+func (w *commitWorker) awaitMembership(done <-chan struct{}) {
+	select {
+	case <-done:
 	case <-w.stopC:
 	}
 }

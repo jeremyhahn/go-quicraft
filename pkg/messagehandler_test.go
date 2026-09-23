@@ -952,7 +952,7 @@ func TestHostMessageHandler_HandleSnapshot_NilLogDB(t *testing.T) {
 
 func TestWithoutTransport_DisablesTransport(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1049,7 +1049,7 @@ func TestBuildTransportConfig_DefaultValues(t *testing.T) {
 
 func TestHost_CloseWithTransportDisabled(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -1843,8 +1843,12 @@ func (f *failingSaveSnapshotLogDB) SaveSnapshot(shardID, replicaID uint64, snaps
 
 // TestHostMessageHandler_HandleSnapshot_LogDBSaveError verifies that when
 // the LogDB SaveSnapshot call fails, the handler returns a
-// SnapshotReceiveError with op="logdb_save" and cleans up the snapshot
-// directory.
+// SnapshotReceiveError with op="logdb_save".
+//
+// Under the two-phase receive the record is written only after raft ADOPTED
+// the install, so the failure cannot be answered by rolling back: raft now
+// depends on the artifact. The directory is kept and the shard is failed, as
+// a failed SaveState fails it; a restart replays the log.
 func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -1911,10 +1915,12 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 		t.Errorf("SnapshotReceiveError.Err = %v, want %v", snapErr.Err, saveErr)
 	}
 
-	// Snapshot directory should be cleaned up after the error.
-	snapshotDir := handler.engine.GetNode(5).SnapshotSaveDir(200)
-	if _, statErr := os.Stat(snapshotDir); !os.IsNotExist(statErr) {
-		t.Fatal("snapshot directory should have been removed after logdb save error")
+	node := handler.engine.GetNode(5)
+	if _, statErr := os.Stat(node.SnapshotSaveDir(200)); statErr != nil {
+		t.Fatalf("snapshot directory removed after raft adopted it: %v", statErr)
+	}
+	if !node.IsFailed() {
+		t.Fatal("shard still serving after the adopted snapshot could not be recorded")
 	}
 }
 

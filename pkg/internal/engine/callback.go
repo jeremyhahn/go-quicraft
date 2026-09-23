@@ -94,6 +94,14 @@ type Callback interface {
 	// snapshot log index on success, or 0 on error. MUST be non-blocking.
 	OnSnapshotCompleted(shardID uint64, index uint64, err error)
 
+	// OnLogCompacted is called by the snapshot pool worker, immediately after
+	// OnSnapshotCompleted, when a snapshot save compacted the log. It is NOT
+	// called when the save compacted nothing — the snapshot index was within
+	// CompactionOverhead, or the log reader's marker could not advance — so a
+	// listener is never told about a compaction that did not happen. MUST be
+	// non-blocking.
+	OnLogCompacted(shardID, replicaID uint64, compaction LogCompaction)
+
 	// OnCampaignLaunched is called when the raft state machine starts an
 	// election (pre-vote or real vote), and is DELIVERED BY THE LISTENER
 	// DISPATCHER rather than on the step worker. This is a COLD path --
@@ -171,4 +179,20 @@ type Callback interface {
 	// reported ErrTimeout — pointing the caller at consensus, the network or
 	// a lost leader, none of which was the cause (#185). MUST be non-blocking.
 	OnShardFailed(shardID uint64, err error)
+}
+
+// LogCompaction reports what a snapshot save's log compaction actually did.
+type LogCompaction struct {
+	// Index is the log index compaction ran through: the snapshot index less
+	// CompactionOverhead. It is non-zero only when Reader is true.
+	Index uint64
+	// Reader reports that THIS save advanced the log reader's compaction
+	// marker to Index, so raft no longer reads the entries at or below it. A
+	// marker an earlier snapshot, receive or import had already taken past
+	// Index is not a compaction by this save, and is not reported.
+	Reader bool
+	// LogDB reports that the LogDB also removed and compacted the entries
+	// through Index. It is false when either step failed; the failure is
+	// logged and the next snapshot retries.
+	LogDB bool
 }

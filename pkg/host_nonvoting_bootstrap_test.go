@@ -154,7 +154,7 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 
 			cfg := testHostConfig(t)
 			db := memdb.New()
-			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost failed: %v", err)
 			}
@@ -323,7 +323,7 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 
 			cfg := testHostConfig(t)
 			db := memdb.New()
-			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost failed: %v", err)
 			}

@@ -499,9 +499,9 @@ func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
 const snapshotAADMagic = "QRSNAP1"
 
 // SnapshotFrameAADLen is the exact length of the context every snapshot frame
-// is bound to: the magic followed by four big-endian uint64 fields. Every field
-// is fixed width, so no delimiter is needed and no two distinct identities can
-// produce the same bytes.
+// is bound to: the magic, four big-endian uint64 fields, and the terminal
+// flag. Every field is fixed width, so no delimiter is needed and no two
+// distinct positions can produce the same bytes.
 //
 //	off  size  field
 //	  0     7  magic "QRSNAP1"
@@ -509,13 +509,23 @@ const snapshotAADMagic = "QRSNAP1"
 //	 15     8  ReplicaID
 //	 23     8  SnapshotIndex
 //	 31     8  ChunkSeq (0-based ordinal within snapshot.dat)
-const SnapshotFrameAADLen = len(snapshotAADMagic) + 4*8
+//	 39     1  Final (1 on the artifact's last frame, 0 on every other)
+//
+// Final is what makes TAIL TRUNCATION detectable. The ordinal alone binds a
+// frame to its position, but a shortened artifact is still a sequence of
+// frames at consecutive ordinals, every one of which authenticates. With the
+// flag, exactly one frame was sealed as the last, and a reader that decrypts
+// the frame it finds last under Final=1 fails authentication whenever frames
+// after it were dropped. Appending a frame after the terminal one fails the
+// same way in reverse.
+const SnapshotFrameAADLen = len(snapshotAADMagic) + 4*8 + 1
 
 const (
 	snapshotAADShardOff   = len(snapshotAADMagic)
 	snapshotAADReplicaOff = snapshotAADShardOff + 8
 	snapshotAADIndexOff   = snapshotAADReplicaOff + 8
 	snapshotAADSeqOff     = snapshotAADIndexOff + 8
+	snapshotAADFinalOff   = snapshotAADSeqOff + 8
 )
 
 // noContextAADOnce bounds the capability warning to a single record per
@@ -603,16 +613,23 @@ func NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier)
 	return a
 }
 
-// Frame returns the context for the frame at 0-based ordinal seq. The returned
-// slice aliases the builder's scratch buffer and is only valid until the next
-// call; the barrier folds it into the AEAD AAD and never retains it.
+// Frame returns the context for the frame at 0-based ordinal seq; final
+// reports whether it is the artifact's last frame. The returned slice aliases
+// the builder's scratch buffer and is only valid until the next call; the
+// barrier folds it into the AEAD AAD and never retains it.
 //
 // It returns nil when the barrier cannot bind context, which is byte-identical
-// to what that barrier does with no context at all.
-func (a *SnapshotAAD) Frame(seq uint64) []byte {
+// to what that barrier does with no context at all. Such a deployment gets no
+// positional binding and therefore no truncation detection beyond the
+// structural rule that an artifact holds at least one frame.
+func (a *SnapshotAAD) Frame(seq uint64, final bool) []byte {
 	if a.suppress {
 		return nil
 	}
 	binary.BigEndian.PutUint64(a.buf[snapshotAADSeqOff:], seq)
+	a.buf[snapshotAADFinalOff] = 0
+	if final {
+		a.buf[snapshotAADFinalOff] = 1
+	}
 	return a.buf[:]
 }

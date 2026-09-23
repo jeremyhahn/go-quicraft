@@ -35,9 +35,10 @@ func (r *recordingDeliverer) DeliverMessage(_ uint64, msg proto.Message) bool {
 	r.delivered = append(r.delivered, msg)
 	return true
 }
-func (r *recordingDeliverer) DeliverLocal(_ uint64, _ proto.Message) bool { return true }
-func (r *recordingDeliverer) NotifyWork(_ uint64)                         {}
-func (r *recordingDeliverer) GetNode(_ uint64) *engine.Node               { return r.node }
+func (r *recordingDeliverer) DeliverLocal(_ uint64, _ proto.Message) bool         { return true }
+func (r *recordingDeliverer) DeliverLocalTo(_ *engine.Node, _ proto.Message) bool { return true }
+func (r *recordingDeliverer) NotifyWork(_ uint64)                                 {}
+func (r *recordingDeliverer) GetNode(_ uint64) *engine.Node                       { return r.node }
 func (r *recordingDeliverer) RequestSnapshotRecovery(_, _ uint64, _ *engine.Node) error {
 	return nil
 }

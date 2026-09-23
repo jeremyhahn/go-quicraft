@@ -17,6 +17,7 @@ package engine
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -744,4 +745,76 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 		t.Fatalf("BarrierA failed to decrypt its own snapshot post-rotation: %v", err)
 	}
 	_ = os.Remove(plainA)
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *tenantBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier is Codex
+// review finding #2 on the per-barrier path, where the shard enumerator is
+// OPTIONAL: without it the floor used to scan loaded shards only. In the
+// production layout each shard has its own snapshot base, so a stopped shard's
+// artifacts were invisible and its DEK purgeable. The LogDB's records must
+// now hold each barrier's floor at its own stopped shard's epoch — and ONLY
+// its own: the resolver attributes an unloaded shard to its barrier, so
+// tenant B's older stopped shard must not lower tenant A's floor.
+func TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier(t *testing.T) {
+	root := t.TempDir()
+	base := func(shardID uint64) string {
+		return filepath.Join(root, "snapshots", fmt.Sprintf("shard-%d", shardID))
+	}
+	bA := newTenantBarrier(1, 9)
+	bB := newTenantBarrier(2, 9)
+
+	ldb := newPerBarrierTestLogDB() // no shardsByBarrier: the enumerator knows nothing
+	ldb.floors[bA] = 8
+	ldb.floors[bB] = 9
+
+	stopC := make(chan struct{})
+	defer close(stopC)
+	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
+	p.shardBarriers = func(shardID uint64) SnapshotBarrier {
+		switch shardID {
+		case 1, 3:
+			return bA
+		case 2, 4:
+			return bB
+		}
+		return nil
+	}
+	// Loaded: shard 3 (A) at epoch 8 and shard 2 (B) at epoch 9.
+	writeShardSnapshot(t, base(3), 3, 1, 300, 8)
+	writeShardSnapshot(t, base(2), 2, 1, 300, 9)
+	wireSnapshotNodes(p, snapshotDirNode(base(3), 3, 1), snapshotDirNode(base(2), 2, 1))
+
+	// Stopped: shard 1 (A) recorded at epoch 7, shard 4 (B) at epoch 2.
+	writeShardSnapshot(t, base(1), 1, 1, 100, 7)
+	writeShardSnapshot(t, base(4), 4, 1, 100, 2)
+	for shardID, epoch := range map[uint64]uint64{1: 7, 4: 2} {
+		if err := ldb.SaveSnapshot(shardID, 1, logdb.Snapshot{Index: 100, Epoch: epoch}); err != nil {
+			t.Fatalf("SaveSnapshot(%d): %v", shardID, err)
+		}
+	}
+	ldb.nodeInfos = []logdb.NodeInfo{
+		{ShardID: 1, ReplicaID: 1}, {ShardID: 2, ReplicaID: 1},
+		{ShardID: 3, ReplicaID: 1}, {ShardID: 4, ReplicaID: 1},
+	}
+
+	if floorA, ok := p.perBarrierSafePurgeFloor(bA); !ok || floorA != 7 {
+		t.Fatalf("perBarrierSafePurgeFloor(A) = (%d, %v), want (7, true): stopped shard 1's "+
+			"epoch-7 snapshot must hold A's floor, and B's stopped shard must not lower it", floorA, ok)
+	}
+	if floorB, ok := p.perBarrierSafePurgeFloor(bB); !ok || floorB != 2 {
+		t.Fatalf("perBarrierSafePurgeFloor(B) = (%d, %v), want (2, true): stopped shard 4's "+
+			"epoch-2 snapshot must hold B's floor", floorB, ok)
+	}
 }

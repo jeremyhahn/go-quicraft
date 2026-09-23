@@ -1054,7 +1054,7 @@ func newDBTestCluster(t *testing.T, numNodes int) *dbTestCluster {
 			nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 			var err error
 			nh, err = dragonboat.NewNodeHostWithOptions(nhConfig,
-				quicraft.WithMemoryLogDB(),
+				quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption(),
 			)
 			if err == nil {
 				break

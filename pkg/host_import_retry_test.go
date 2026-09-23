@@ -82,7 +82,7 @@ func TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry(t *testing.
 	cfg := testHostConfig(t)
 	real := memdb.New()
 	db := &flakySaveSnapshotDB{LogDB: real, remaining: 1}
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestImportSnapshot_PostPublishFailuresRollBackThePublish(t *testing.T) {
 			cfg := testHostConfig(t)
 			db := memdb.New()
 			cfs := newCrashFS(cfg.NodeHostDir)
-			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs))
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost failed: %v", err)
 			}
@@ -257,7 +257,7 @@ func TestImportSnapshot_CrashAtEveryStepLeavesAConsistentTree(t *testing.T) {
 		cfg := testHostConfig(t)
 		db := memdb.New()
 		cfs := newCrashFS(cfg.NodeHostDir)
-		h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs))
+		h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs), WithoutEncryption())
 		if err != nil {
 			t.Fatalf("NewHost failed: %v", err)
 		}

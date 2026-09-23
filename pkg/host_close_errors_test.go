@@ -96,7 +96,7 @@ func TestStopShard_ReportsStateMachineCloseFailure(t *testing.T) {
 // state machine flush was invisible to the caller.
 func TestHostClose_JoinsStateMachineCloseFailure(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestHostClose_JoinsStateMachineCloseFailure(t *testing.T) {
 // nil return says the opposite.
 func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 // first drain and both reported a clean shutdown after aborting accepted work.
 func TestHostDrain_ConcurrentCallersJoinTheSameAttempt(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestHostDrain_ConcurrentCallersJoinTheSameAttempt(t *testing.T) {
 // and every shard must still be closed so no on-disk file lock is stranded.
 func TestHostClose_JoinsEveryShardsCloseFailure(t *testing.T) {
 	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

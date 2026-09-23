@@ -796,7 +796,7 @@ hostCfg := config.HostConfig{
     },
 }
 
-host, err := quicraft.NewHost(hostCfg)
+host, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 if err != nil {
     return err
 }

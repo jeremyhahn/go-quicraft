@@ -221,8 +221,11 @@ and imposes no floor"). Any error is treated exactly like `known == false`.
 
 `BarrierShardEnumerator.ShardsForBarrier(barrier any) ([]uint64, bool)` reports
 the complete shard set mapped to a barrier when that set is fixed and
-enumerable, so the snapshot pool can verify its retained-snapshot scan covered
-every shard before purging a shared barrier's DEKs.
+enumerable. It is an extra, stricter check: when it answers, the snapshot pool
+declines to purge that barrier while any mapped shard is unloaded. It is not
+what makes a stopped shard safe — the pool accounts for every unloaded shard
+through `ListNodeInfo` and `GetSnapshot`, which every `LogDB` implements, and
+declines to purge when `ListNodeInfo` fails.
 
 `AtRestProtectedLogDB.AtRestProtection() logdb.AtRestProtection` declares
 whether records reach durable storage in cleartext. The three values are

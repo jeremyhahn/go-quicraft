@@ -148,7 +148,7 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 			},
 		}
 
-		h, err := quicraft.NewHost(hostCfg)
+		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
 			// Clean up already-created hosts on failure.
 			for j := 0; j < i; j++ {
@@ -329,7 +329,7 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 			},
 		}
 
-		h, err := quicraft.NewHost(hostCfg)
+		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
 			for k := 0; k < j; k++ {
 				hosts[k].Close()
@@ -626,7 +626,7 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		},
 	}
 
-	h, err := quicraft.NewHost(hostCfg)
+	h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		b.Fatalf("quicraft.NewHost failed: %v", err)
 	}
@@ -686,7 +686,7 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		},
 	}
 
-	h, err := quicraft.NewHost(hostCfg, quicraft.WithMemoryLogDB())
+	h, err := quicraft.NewHost(hostCfg, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		b.Fatalf("quicraft.NewHost (memory) failed: %v", err)
 	}
@@ -881,7 +881,7 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		},
 	}
 
-	h, err := quicraft.NewHost(hostCfg)
+	h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		b.Fatalf("NewHost failed: %v", err)
 	}
@@ -950,7 +950,7 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 		},
 	}
 
-	h, err := quicraft.NewHost(hostCfg, quicraft.WithMemoryLogDB())
+	h, err := quicraft.NewHost(hostCfg, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		b.Fatalf("NewHost (memory) failed: %v", err)
 	}
@@ -1062,7 +1062,7 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 			},
 		}
 
-		h, err := quicraft.NewHost(hostCfg)
+		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()

@@ -250,9 +250,12 @@ func TestConvertEventListeners_SystemEvents(t *testing.T) {
 	}
 
 	// LogCompacted
-	el.OnLogCompacted(qcConfig.EventShardInfo{ShardID: 16, ReplicaID: 26})
+	el.OnLogCompacted(qcConfig.EventShardInfo{ShardID: 16, ReplicaID: 26, Index: 4100})
 	if len(sl.logCompactedCalls) != 1 {
 		t.Fatalf("expected 1 LogCompacted call, got %d", len(sl.logCompactedCalls))
+	}
+	if got := sl.logCompactedCalls[0]; got.ShardID != 16 || got.ReplicaID != 26 || got.Index != 4100 {
+		t.Errorf("LogCompacted info = %+v, want shard 16 replica 26 index 4100", got)
 	}
 
 	// NodeHostShuttingDown
@@ -307,12 +310,12 @@ func TestConvertEventListeners_SystemEvents(t *testing.T) {
 	}
 
 	// LogDBCompacted
-	el.OnLogDBCompacted(qcConfig.EventShardInfo{ShardID: 22, ReplicaID: 32})
+	el.OnLogDBCompacted(qcConfig.EventShardInfo{ShardID: 22, ReplicaID: 32, Index: 5200})
 	if len(sl.logDBCompactedCalls) != 1 {
 		t.Fatalf("expected 1 LogDBCompacted call, got %d", len(sl.logDBCompactedCalls))
 	}
-	if sl.logDBCompactedCalls[0].ShardID != 22 || sl.logDBCompactedCalls[0].ReplicaID != 32 {
-		t.Errorf("LogDBCompacted info mismatch: %+v", sl.logDBCompactedCalls[0])
+	if got := sl.logDBCompactedCalls[0]; got.ShardID != 22 || got.ReplicaID != 32 || got.Index != 5200 {
+		t.Errorf("LogDBCompacted info = %+v, want shard 22 replica 32 index 5200", got)
 	}
 }
 

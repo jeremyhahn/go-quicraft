@@ -96,7 +96,7 @@ func sanHostConfig(t *testing.T, raftAddress string, dnsNames ...string) config.
 func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 func TestStartShard_AcceptsPerNodeCertificate(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestStartShard_AcceptsPerNodeCertificate(t *testing.T) {
 func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 func TestRequestAddNode_AcceptsUncoveredPeerUnderPerNodeCertificate(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestRequestAddNode_AcceptsUncoveredPeerUnderPerNodeCertificate(t *testing.T
 func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 func TestStartShard_AllowsColocatedRepliasOnDistinctPorts(t *testing.T) {
 	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestStartShard_AllowsColocatedRepliasOnDistinctPorts(t *testing.T) {
 func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 
-	h, err := NewHost(cfg, WithMemoryLogDB())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
 	}
 
 	// A host with no transport has no certificate and therefore no identity.
-	noTransport, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	noTransport, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost(WithoutTransport) failed: %v", err)
 	}

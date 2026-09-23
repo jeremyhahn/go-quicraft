@@ -47,7 +47,7 @@ func newImportFixture(t *testing.T) *importFixture {
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 5, ReplicaID: 3}}
 	db.mu.Unlock()
 
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

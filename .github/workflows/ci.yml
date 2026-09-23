@@ -458,6 +458,17 @@ jobs:
           fi
           echo "VERDICT: COVERAGE_OK"
 
+      # The total can clear its floor while one package sits far below it:
+      # pkg/internal/registry was at 78.4% under a 91.3% total, averaged away
+      # by every other package's surplus. Same profile, same threshold as the
+      # total, applied to each package under pkg/. The threshold is the total's
+      # on purpose — the owner's 2026-09-02 ruling set it for signal, and a
+      # per-package gate at the 91% target would give timing-dependent packages
+      # only tenths of a point of headroom. `make coverage-packages` enforces
+      # the 91% target locally.
+      - name: Gate on per-package coverage
+        run: scripts/check-coverage-packages.sh coverage.out ${{ env.COVERAGE_THRESHOLD }} github.com/jeremyhahn/go-quicraft/pkg
+
       # always(), not failure(): a passing run's log is what you compare the next
       # failure against.
       #

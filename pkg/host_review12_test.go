@@ -193,7 +193,7 @@ func TestRecoverLogReader_StatFailureFailsClosed(t *testing.T) {
 
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(),
-		withSnapshotFS(statFailFS{}))
+		withSnapshotFS(statFailFS{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestImportSnapshot_StatFailureFailsClosed(t *testing.T) {
 
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(),
-		withSnapshotFS(statFailFS{}))
+		withSnapshotFS(statFailFS{}), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestRecoverLogReader_MissingArtifactStillRecordsThePath(t *testing.T) {
 func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}

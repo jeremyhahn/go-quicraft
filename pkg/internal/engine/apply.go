@@ -172,6 +172,15 @@ type applyWorker struct {
 	membershipC     chan applyMembershipRequest // ordered unload/reload requests handled by the dispatcher
 	stopC           chan struct{}
 
+	// joinedC closes once a stopping dispatcher has joined every per-shard
+	// goroutine (shutdownIfStopping). An unload that finds stopC already
+	// closed waits on it rather than being acknowledged at once: the ack is
+	// what lets the host close the shard's state machine, and until the join
+	// the engine's shutdown drain may still be inside that state machine's
+	// Apply.
+	joinedC  chan struct{}
+	joinOnce sync.Once
+
 	// inFlight holds the applyItem the dispatcher has received from applyC but
 	// not yet handed to a per-shard goroutine. Set on receive, cleared after the
 	// hand-off. On a dispatcher panic the recovery discards it (fail-the-node)
@@ -219,6 +228,7 @@ func newApplyWorker(
 		// rendezvous too — see requestReload.
 		membershipC: make(chan applyMembershipRequest),
 		stopC:       stopC,
+		joinedC:     make(chan struct{}),
 		metrics:     metrics,
 	}
 }
@@ -316,6 +326,7 @@ func (w *applyWorker) shutdownIfStopping() {
 	// All per-shard goroutines have exited, so closing done keeps the
 	// synchronous-unload contract truthful; without the ack a concurrent
 	// UnloadNode would block forever on its done channel.
+	w.joinOnce.Do(func() { close(w.joinedC) })
 	w.ackPendingUnloads()
 }
 
@@ -386,13 +397,13 @@ func (w *applyWorker) dispatch(item *applyItem) {
 	// Incarnation guard. Each StartShard builds a distinct *Node with its own
 	// stopC; the unloaded set is shardID-keyed and cannot tell a stale
 	// old-incarnation item from a fresh one after a rapid StopShard->StartShard.
-	// The node's own stopC does: an item whose node has stopped while the engine
-	// is still running belongs to a torn-down incarnation and must not reach a
-	// state machine that StopShard has already closed (use-after-close) or a new
-	// incarnation's SM (double-apply). During engine shutdown every node's stopC
-	// is closed, so gate on the worker's own stopC staying OPEN to preserve the
-	// shutdown drain that must still apply committed entries.
-	if item.node != nil && chanClosed(item.node.StopC()) && !chanClosed(w.stopC) {
+	// The node itself does: an item whose node UnloadNode has begun tearing
+	// down belongs to a torn-down incarnation and must not reach a state
+	// machine that StopShard has already closed (use-after-close) or a new
+	// incarnation's SM (double-apply). A node stopped only by Engine.Stop is not
+	// unloaded, so the shutdown drain still applies committed entries — the
+	// node's stopC could not tell the two apart, since both close it.
+	if item.node != nil && item.node.isUnloaded() {
 		slog.Warn("apply dispatch skipped for stopped shard incarnation",
 			"worker", w.workerID,
 			"shard", shardID,
@@ -487,7 +498,7 @@ func (w *applyWorker) failInFlightItem(item *applyItem) {
 		if w.callback != nil {
 			w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries, applyErr)
 		}
-		node.failed.Store(true)
+		node.markFailed()
 		if w.callback != nil {
 			w.callback.OnShardFailed(node.shardID, applyErr)
 		}
@@ -499,18 +510,6 @@ func (w *applyWorker) failInFlightItem(item *applyItem) {
 	// path stays safe for unit tests that construct a worker without a pool.
 	if w.applyPool != nil {
 		releaseApplyItem(w.applyPool, item)
-	}
-}
-
-// chanClosed reports whether a struct{} channel has been closed, without
-// blocking. Used to distinguish a per-shard StopShard (node stopC closed while
-// the worker's own stopC is open) from engine-wide shutdown.
-func chanClosed(c <-chan struct{}) bool {
-	select {
-	case <-c:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -630,7 +629,7 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 					if w.callback != nil {
 						w.callback.OnProposalFailed(node.shardID, entries, panicErr)
 					}
-					node.failed.Store(true)
+					node.markFailed()
 					if w.callback != nil {
 						w.callback.OnShardFailed(node.shardID, panicErr)
 					}
@@ -878,7 +877,7 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 	if w.callback != nil {
 		w.callback.OnProposalFailed(node.shardID, entries, applyErr)
 	}
-	node.failed.Store(true)
+	node.markFailed()
 	if w.callback != nil {
 		w.callback.OnShardFailed(node.shardID, applyErr)
 	}
@@ -893,15 +892,18 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 // in the dispatcher goroutine's select loop, preserving the single-owner
 // invariant on shardChans.
 //
-// When the engine is stopping (stopC closed), done is closed immediately:
-// Engine.Stop owns the join in that case — it waits for the apply workers,
-// which in turn wait for every per-shard goroutine, before returning.
+// When the engine is stopping (stopC closed), the stopping dispatcher owns the
+// join, and the returned channel is joinedC: it closes once every per-shard
+// goroutine has exited, the same point Engine.Stop waits for.
 func (w *applyWorker) requestUnload(shardID uint64) <-chan struct{} {
 	done := make(chan struct{})
 	select {
 	case w.membershipC <- applyMembershipRequest{shardID: shardID, unload: true, done: done}:
 	case <-w.stopC:
-		close(done)
+		// The engine is stopping, and its drain owns the per-shard goroutines.
+		// Acknowledging now let a StopShard racing Host.Close close the state
+		// machine while that drain was still inside its Apply.
+		return w.joinedC
 	}
 	return done
 }

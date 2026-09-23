@@ -242,9 +242,7 @@ func ConvertEventListeners(raft IRaftEventListener, sys ISystemEventListener) *q
 			sys.LogCompacted(EntryInfo{
 				ShardID:   info.ShardID,
 				ReplicaID: info.ReplicaID,
-				// TODO: QuicRaft's EventShardInfo does not carry a compaction
-				// index. EntryInfo.Index is always 0 until QuicRaft adds an
-				// Index field to EventShardInfo for compaction events.
+				Index:     info.Index,
 			})
 		}
 
@@ -252,9 +250,7 @@ func ConvertEventListeners(raft IRaftEventListener, sys ISystemEventListener) *q
 			sys.LogDBCompacted(EntryInfo{
 				ShardID:   info.ShardID,
 				ReplicaID: info.ReplicaID,
-				// TODO: QuicRaft's EventShardInfo does not carry a compaction
-				// index. EntryInfo.Index is always 0 until QuicRaft adds an
-				// Index field to EventShardInfo for compaction events.
+				Index:     info.Index,
 			})
 		}
 	}

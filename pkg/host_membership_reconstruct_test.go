@@ -256,7 +256,7 @@ func TestStartShard_MissingBootstrapEntryFailsClosed(t *testing.T) {
 		t.Fatalf("SaveState: %v", err)
 	}
 
-	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

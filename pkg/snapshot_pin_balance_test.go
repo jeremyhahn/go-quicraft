@@ -279,12 +279,12 @@ func TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch(t
 	b.assertBalanced(t, "encryptSnapshotFrames success + caller release")
 }
 
-// atomicPinCountingBarrier is a countingBarrier that ALSO implements the
-// optional atomicEpochPinner capability, so the encrypt loop takes the atomic
-// seal-and-pin path. The barrier itself takes the in-flight reference (as the
-// real seal.Barrier does under its own lock), which is exactly the path whose
-// accounting differs: the pinner must NOT re-register, and must release a
-// duplicate reference when the same epoch is sealed twice.
+// atomicPinCountingBarrier is a countingBarrier whose seal-and-pin behaves as
+// the real seal.Barrier's does: the barrier itself takes the in-flight
+// reference under its own lock, with every seal, and it rotates on a schedule.
+// That is the path whose accounting matters: the pinner must NOT re-register,
+// and must release the duplicate reference when the same epoch is sealed
+// twice.
 type atomicPinCountingBarrier struct {
 	*countingBarrier
 	rotateEvery int // seal a new epoch every N frames (0 = never rotate)
@@ -352,10 +352,11 @@ func TestPinBalance_AtomicPath_BalancesAndDedups(t *testing.T) {
 }
 
 // TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases walks all four
-// error returns of the loop — EncryptWithEpoch, the frame-length write, the
-// ciphertext write, and the source read — each of which has its own inline
-// unpinAll(). Each must leave the accounting flat AND return a nil pin set, so
-// the caller has nothing to release a second time.
+// error returns of a seal — EncryptWithEpoch, the frame-length write, the
+// ciphertext write, and the source read. The first three release inside the
+// frame writer, the last in engine.SealSnapshotFrames. Each must leave the
+// accounting flat AND return a nil pin set, so the caller has nothing to
+// release a second time.
 func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 	errInjected := errors.New("injected")
 
@@ -391,7 +392,10 @@ func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 			name: "read_error",
 			run: func(b Barrier) (uint64, []uint64, error) {
 				var out bytes.Buffer
-				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &pinErrReader{remaining: snapshotEncryptChunkSize, err: errInjected}, &out)
+				// One byte past a chunk: the writer holds a full chunk back until
+				// more plaintext proves it is not the terminal frame, so exactly
+				// one chunk would seal nothing before the error arrived.
+				return encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &pinErrReader{remaining: snapshotEncryptChunkSize + 1, err: errInjected}, &out)
 			},
 		},
 	}
@@ -700,4 +704,28 @@ func TestPinBalance_HandleSnapshot_WriteFailureReturnsToZero(t *testing.T) {
 		t.Fatalf("fixture: nothing pinned: %s", b.counts())
 	}
 	b.assertBalanced(t, "HandleSnapshot write failure")
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *rotatingMockBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
+}
+
+// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
+// whatever it injects or counts in either still takes effect on the pinned path
+// the frame writer now always uses.
+func (b *countingBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	b.RegisterInFlightEpoch(epoch)
+	return ct, epoch, nil
 }

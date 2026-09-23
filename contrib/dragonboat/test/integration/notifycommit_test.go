@@ -37,7 +37,7 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NotifyCommit = true
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	// NotifyCommit defaults to false; do not set it.
 
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB())
+	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}

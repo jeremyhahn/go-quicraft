@@ -114,8 +114,9 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 //
 // It returns the destination's MINIMUM at-rest epoch across the written frames,
 // which the host records as the migrated snapshot's Epoch so the DEK-purge
-// floor protects every frame. The epoch is 0 for an empty source or a plaintext
-// destination.
+// floor protects every frame. The epoch is 0 for a plaintext destination; a
+// sealed destination always has at least its terminal frame, so an empty
+// plaintext source still yields a real epoch.
 //
 // While the source is decrypted, every epoch referenced by its frames is
 // pinned on srcBarrier via RegisterInFlightEpoch so a concurrent

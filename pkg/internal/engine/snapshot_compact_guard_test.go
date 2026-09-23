@@ -15,9 +15,11 @@
 package engine
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // TestSaveSnapshot_CompactFailureSkipsLogDBRemoval is the H3 regression test.
@@ -95,4 +97,133 @@ func TestSaveSnapshot_CompactSuccessStillRemovesEntries(t *testing.T) {
 		t.Fatalf("RemoveEntriesTo ran with index %d, want 190: log compaction must "+
 			"still happen when nothing blocked the marker", removedTo)
 	}
+}
+
+// removeFailingLogDB fails RemoveEntriesTo and passes everything else through.
+type removeFailingLogDB struct{ logdb.LogDB }
+
+var errRemoveRefused = errors.New("injected RemoveEntriesTo failure")
+
+func (removeFailingLogDB) RemoveEntriesTo(_, _, _ uint64) error { return errRemoveRefused }
+
+// advancingReader returns a log reader holding entries 1..last at term 1, so
+// Compact to any index at or below last really advances its marker.
+func advancingReader(t *testing.T, shardID, replicaID uint64, db logdb.LogDB, last uint64) *logdb.LogReader {
+	t.Helper()
+	lr := logdb.NewLogReader(shardID, replicaID, db)
+	entries := make([]proto.Entry, last)
+	for i := range entries {
+		entries[i] = proto.Entry{Index: uint64(i) + 1, Term: 1}
+	}
+	if err := lr.Append(entries); err != nil {
+		t.Fatalf("LogReader.Append: %v", err)
+	}
+	return lr
+}
+
+// TestSaveSnapshot_ReportsWhatCompactionDid pins the outcome the pool hands to
+// OnLogCompacted, which is what the host's compaction events report: a
+// compaction is reported only when THIS save advanced the reader's marker.
+// The listener used to hear "compacted" for every case below.
+func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
+	t.Run("compacted", func(t *testing.T) {
+		f := newResaveFixture(t, 200)
+		f.node.logReader = advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if want := (LogCompaction{Index: 190, Reader: true, LogDB: true}); got != want {
+			t.Fatalf("compaction = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("LogDB step failed", func(t *testing.T) {
+		f := newResaveFixtureDB(t, 200, func(db *snapshotTestLogDB) logdb.LogDB {
+			return removeFailingLogDB{db}
+		})
+		f.node.logReader = advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if want := (LogCompaction{Index: 190, Reader: true}); got != want {
+			t.Fatalf("compaction = %+v, want %+v: storage was not reclaimed", got, want)
+		}
+	})
+	t.Run("marker already past", func(t *testing.T) {
+		// Review finding L1: an earlier snapshot, a receive or an import took
+		// the marker past compactIndex, so Compact answers ErrCompacted and
+		// this save compacted nothing — yet it was reported at index 190.
+		f := newResaveFixture(t, 200)
+		lr := advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
+		if err := lr.Compact(195); err != nil {
+			t.Fatalf("pre-compacting the reader: %v", err)
+		}
+		f.node.logReader = lr
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if got != (LogCompaction{}) {
+			t.Fatalf("compaction = %+v, want none: the marker was already past 190", got)
+		}
+	})
+	t.Run("marker exactly at compactIndex", func(t *testing.T) {
+		// Confirmation review LOW-1: Compact at the current marker is a nil
+		// no-op, so a nil error alone reported a compaction that moved nothing
+		// — reachable when a received snapshot set the marker to S and a later
+		// save lands at exactly S + CompactionOverhead.
+		f := newResaveFixture(t, 200)
+		lr := advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
+		if err := lr.Compact(190); err != nil {
+			t.Fatalf("pre-compacting the reader: %v", err)
+		}
+		f.node.logReader = lr
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if got != (LogCompaction{}) {
+			t.Fatalf("compaction = %+v, want none: the marker was already at 190", got)
+		}
+	})
+	t.Run("no reader", func(t *testing.T) {
+		f := newResaveFixture(t, 200)
+		f.node.logReader = nil
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if got != (LogCompaction{}) {
+			t.Fatalf("compaction = %+v, want none: a nil reader proves nothing advanced", got)
+		}
+	})
+	t.Run("reader marker could not advance", func(t *testing.T) {
+		f := newResaveFixture(t, 200)
+		f.node.logReader = logdb.NewLogReader(f.req.shardID, f.req.replicaID, f.ldb)
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if got != (LogCompaction{}) {
+			t.Fatalf("compaction = %+v, want none: the removal was skipped", got)
+		}
+	})
+	t.Run("within CompactionOverhead", func(t *testing.T) {
+		f := newResaveFixture(t, 8) // overhead is 10
+		f.node.logReader = advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 8)
+		_, got, err := f.pool.saveSnapshotCompacting(f.req)
+		if err != nil {
+			t.Fatalf("saveSnapshotCompacting: %v", err)
+		}
+		if got != (LogCompaction{}) {
+			t.Fatalf("compaction = %+v, want none below the overhead", got)
+		}
+		f.ldb.mu.Lock()
+		removedTo := f.ldb.removedTo
+		f.ldb.mu.Unlock()
+		if removedTo != 0 {
+			t.Fatalf("RemoveEntriesTo(%d) ran within the overhead", removedTo)
+		}
+	})
 }

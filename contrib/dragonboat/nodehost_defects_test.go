@@ -48,7 +48,7 @@ func newTestNodeHostWithConfig(t *testing.T, nhConfig dbConfig.NodeHostConfig) *
 	t.Helper()
 	nh, err := NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
-		quicraft.WithoutTransport(),
+		quicraft.WithoutTransport(), quicraft.WithoutEncryption(),
 	)
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions: %v", err)
@@ -133,7 +133,7 @@ func TestNodeHost_RemoveData_GuardSurvivesRestart(t *testing.T) {
 
 	nh1, err := NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(),
-		quicraft.WithoutTransport(),
+		quicraft.WithoutTransport(), quicraft.WithoutEncryption(),
 	)
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions: %v", err)
@@ -458,7 +458,7 @@ func TestNewNodeHost_RejectsInvalidConfig(t *testing.T) {
 			}
 
 			nh, err = NewNodeHostWithOptions(cfg,
-				quicraft.WithMemoryLogDB(), quicraft.WithoutTransport())
+				quicraft.WithMemoryLogDB(), quicraft.WithoutTransport(), quicraft.WithoutEncryption())
 			if err == nil {
 				nh.Close()
 				t.Fatal("NewNodeHostWithOptions accepted an invalid config")

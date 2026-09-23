@@ -315,7 +315,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	newAddr := freePort(t)
 	nhConfig := dbTestNodeHostConfig(t, newAddr, cluster.pki.leaf(t))
 	newHost, nhErr := dragonboat.NewNodeHostWithOptions(nhConfig,
-		quicraft.WithMemoryLogDB(),
+		quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption(),
 	)
 	if nhErr != nil {
 		t.Fatalf("NewNodeHostWithOptions for 4th node failed: %v", nhErr)

@@ -83,21 +83,35 @@ privileges the defect grants:
 **Out of scope.** These are documented behaviours, not vulnerabilities. Please
 read the linked material before reporting:
 
-- **A plaintext barrier (`seal.None`) provides no at-rest confidentiality or
-  integrity.** Snapshot artifacts in particular have no integrity check under
-  it. See [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md).
+- **A host declared `WithoutEncryption()`, or one whose barrier is plaintext
+  (`seal.None`), provides no at-rest confidentiality or integrity.** Snapshot
+  artifacts in particular have no integrity check under it. Plaintext is never
+  reached by omission: `NewHost` refuses a host that neither configures a
+  barrier nor makes that declaration. See [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md).
 - **DEK confidentiality after a purge is GC-bounded, not enclave-bounded.**
   `PurgeEpochsBefore` revokes the capability to decrypt; it is not
   crypto-shredding, and neither the standard library nor `x/crypto` offers a
   key-wipe API for a constructed AEAD.
-- **At-rest tail truncation is not detected by the AEAD.** The positional
-  context AAD binds each WAL record and snapshot frame to its own position, so
-  reorder and splice fail authentication, but nothing names the total frame
-  count. Dropping trailing frames leaves every survivor authentic. This is
-  known and documented in
-  [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md); a report
-  restating the property adds nothing, but a concrete exploitation path that
-  turns it into a safety or confidentiality violation is welcome.
+- **At-rest rollback of the WAL is not detected.** Someone who can write a
+  replica's data directory can remove the WAL's trailing records together
+  with the sync mark after them, and the result is byte-for-byte what a crash
+  inside the writeback window leaves, so recovery truncates as it would for
+  the crash. No in-file format can separate the two; that needs a trusted
+  monotonic anchor outside the disk (a hardware counter, or peers). Raft's
+  safety assumes stable storage, so treat write access to a data directory as
+  compromise of that replica. Snapshots are different: every frame's context
+  carries a terminal flag, so a truncated or extended snapshot fails
+  authentication, and one truncated to nothing is refused. See
+  [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md); a
+  report restating the WAL property adds nothing, but a path that exploits it
+  WITHOUT write access to the data directory is welcome.
+- **Frames can be spliced between two snapshot artifacts of the same
+  identity.** A frame's context binds shard, replica, snapshot index, ordinal
+  and terminal flag, but nothing unique to one artifact, so two artifacts
+  sealed under the same key at the same identity (a rebuild re-save, or a local
+  save and a receive at one index) can exchange frames. Doing so needs write
+  access to the data directory and a retained copy of the other artifact —
+  the same threat class as the WAL rollback above, and accepted with it.
 - **CRC32-C in the WAL detects accidental corruption only.** It is not a
   tamper control; an adversary with disk access can recompute it. Tamper
   protection comes from the barrier's AEAD.

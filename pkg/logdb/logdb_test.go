@@ -593,3 +593,21 @@ func TestEntriesBelowCompactionFloorError(t *testing.T) {
 		t.Fatalf("errors.As through a wrapper lost the detail: %+v", detail)
 	}
 }
+
+// TestAtRestProtectionString pins every rendering, including an
+// out-of-range value, since these strings reach structured logs and errors.
+func TestAtRestProtectionString(t *testing.T) {
+	for _, tc := range []struct {
+		p    AtRestProtection
+		want string
+	}{
+		{AtRestUnprotected, "unprotected"},
+		{AtRestNonDurable, "non_durable"},
+		{AtRestBarrierEncrypted, "barrier_encrypted"},
+		{AtRestProtection(250), "invalid"},
+	} {
+		if got := tc.p.String(); got != tc.want {
+			t.Errorf("AtRestProtection(%d).String() = %q, want %q", tc.p, got, tc.want)
+		}
+	}
+}

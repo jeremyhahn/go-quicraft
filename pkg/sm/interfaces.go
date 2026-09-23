@@ -63,7 +63,10 @@ type StateMachine interface {
 
 	// SaveSnapshot writes the entire state machine state to the writer.
 	// The stopper channel signals cancellation; the implementation should
-	// periodically check it and return early if closed.
+	// periodically check it and return early if closed. Stopping the shard
+	// cannot close the state machine while a save is still streaming, so an
+	// implementation that ignores the stopper delays StopShard and Host.Close
+	// for as long as it runs.
 	SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
 
 	// RecoverFromSnapshot restores the state machine state from the reader,
@@ -100,7 +103,9 @@ type ConcurrentStateMachine interface {
 
 	// SaveSnapshot writes the state captured by PrepareSnapshot to the writer.
 	// The snapshotCtx parameter is the value returned by PrepareSnapshot.
-	// The stopper channel signals cancellation.
+	// The stopper channel signals cancellation; as for the regular form, an
+	// implementation that ignores it delays StopShard and Host.Close for as
+	// long as it runs.
 	SaveSnapshot(ctx context.Context, snapshotCtx interface{}, w io.Writer, stopper <-chan struct{}) error
 
 	// RecoverFromSnapshot restores state from the reader, replacing all

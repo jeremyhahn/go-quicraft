@@ -755,8 +755,10 @@ func writeEncryptedSnapshotFile(t *testing.T, b Barrier, path string, plaintext 
 // writeEncryptedSnapshotFileFor is writeEncryptedSnapshotFile under an explicit
 // artifact identity, for tests whose artifact is later read back through a
 // production path that derives the identity from the shard/replica/index it
-// actually holds. Every frame carries the SAME positional context the
-// production encrypt loop stamps, so the two sides agree.
+// actually holds. It seals through the production encoder, so the fixture is
+// the format the decrypt side reads, terminal frame included, rather than a
+// copy of it. The epochs the seal pinned are released once the file is
+// written, as a caller does once its recorded epoch is durable.
 func writeEncryptedSnapshotFileFor(t *testing.T, b Barrier, path string, plaintext []byte,
 	shardID, replicaID, index uint64) {
 	t.Helper()
@@ -765,31 +767,12 @@ func writeEncryptedSnapshotFileFor(t *testing.T, b Barrier, path string, plainte
 		t.Fatalf("create encrypted file: %v", err)
 	}
 	defer func() { _ = f.Close() }()
-
-	// Encrypt in 64KB chunks (matching snapshotEncryptChunkSize).
-	const chunkSize = 64 * 1024
-	offset := 0
-	var frameBuf [4]byte
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, b)
-	var seq uint64
-	for offset < len(plaintext) {
-		end := offset + chunkSize
-		if end > len(plaintext) {
-			end = len(plaintext)
-		}
-		encrypted, _, encErr := b.EncryptWithEpochContext(nil, plaintext[offset:end], aad.Frame(seq))
-		if encErr != nil {
-			t.Fatalf("barrier.EncryptWithEpochContext: %v", encErr)
-		}
-		seq++
-		binary.LittleEndian.PutUint32(frameBuf[:], uint32(len(encrypted)))
-		if _, err := f.Write(frameBuf[:]); err != nil {
-			t.Fatalf("write frame len: %v", err)
-		}
-		if _, err := f.Write(encrypted); err != nil {
-			t.Fatalf("write encrypted data: %v", err)
-		}
-		offset = end
+	_, pinned, err := encryptSnapshotFrames(b, shardID, replicaID, index, bytes.NewReader(plaintext), f)
+	if err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	for _, e := range pinned {
+		b.DeregisterInFlightEpoch(e)
 	}
 }
 

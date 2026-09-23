@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
 // mustParseSnapshotMeta decodes a snapshot.meta image or fails the test. Tests
@@ -483,5 +484,65 @@ func TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier(t *testing.T) {
 	p.purgeOldEpochs("", 2, 1)
 	if bB.PurgeCallCount() == 0 {
 		t.Fatal("barrier B never purged: an unrelated barrier's legacy directory disabled it")
+	}
+}
+
+// TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase is the Codex review
+// finding #2, in the PRODUCTION layout: every shard has its own snapshot base
+// (…/snapshots/shard-N), so a stopped shard's artifacts sit under a base no
+// loaded node owns. The floor used to scan loaded bases only and came out at
+// the loaded shard's epoch 8 — purging epoch 7, which the stopped shard's
+// recorded snapshot needs, and making its restart fail closed on decrypt
+// forever. The LogDB's record of that snapshot must hold the floor at 7.
+func TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase(t *testing.T) {
+	root := t.TempDir()
+	baseStopped := filepath.Join(root, "snapshots", "shard-1")
+	baseLoaded := filepath.Join(root, "snapshots", "shard-2")
+	barrier := newTestBarrier(9)
+	ldb := newEpochAwareTestLogDB(8) // the live WAL is at epoch 8
+
+	stopC := make(chan struct{})
+	defer close(stopC)
+	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
+
+	// Shard 1 was stopped with an epoch-7 snapshot on disk and on record.
+	writeShardSnapshot(t, baseStopped, 1, 1, 100, 7)
+	if err := ldb.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Epoch: 7}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	// Shard 2 is loaded, with an epoch-8 snapshot in its own base.
+	writeShardSnapshot(t, baseLoaded, 2, 1, 200, 8)
+	wireSnapshotNodes(p, snapshotDirNode(baseLoaded, 2, 1))
+	ldb.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}, {ShardID: 2, ReplicaID: 1}}
+
+	floor, ok := p.globalSafePurgeFloor()
+	if !ok || floor != 7 {
+		t.Fatalf("globalSafePurgeFloor = (%d, %v), want (7, true): the stopped shard's "+
+			"recorded epoch-7 snapshot must hold the floor", floor, ok)
+	}
+}
+
+// failingListLogDB fails ListNodeInfo: the LogDB cannot say which shards
+// exist, so a stopped shard cannot be accounted.
+type failingListLogDB struct{ *epochAwareTestLogDB }
+
+func (failingListLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
+	return nil, errors.New("injected ListNodeInfo failure")
+}
+
+// TestGlobalSafePurgeFloor_DeclinesWhenShardsCannotBeEnumerated is the
+// fail-safe half: an unknown shard set cannot be proven free of a stopped
+// shard's snapshot, so nothing is purged.
+func TestGlobalSafePurgeFloor_DeclinesWhenShardsCannotBeEnumerated(t *testing.T) {
+	baseLoaded := filepath.Join(t.TempDir(), "snapshots", "shard-2")
+	stopC := make(chan struct{})
+	defer close(stopC)
+	p := newSnapshotPool(2, failingListLogDB{newEpochAwareTestLogDB(8)}, newTestBarrier(9), nil, nil, stopC, nil)
+	writeShardSnapshot(t, baseLoaded, 2, 1, 200, 8)
+	wireSnapshotNodes(p, snapshotDirNode(baseLoaded, 2, 1))
+
+	if floor, ok := p.globalSafePurgeFloor(); ok {
+		t.Fatalf("globalSafePurgeFloor = (%d, true) although the LogDB could not enumerate "+
+			"its shards; a stopped shard's DEK could be purged", floor)
 	}
 }

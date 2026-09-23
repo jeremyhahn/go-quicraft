@@ -140,7 +140,7 @@ pass one:
 
 | Consumer | Context | Layout |
 |---|---|---|
-| Snapshot frames | 39 bytes (`SnapshotFrameAADLen`) | `"QRSNAP1"(7) ‖ ShardID:8 ‖ ReplicaID:8 ‖ SnapshotIndex:8 ‖ ChunkSeq:8`, big-endian |
+| Snapshot frames | 40 bytes (`SnapshotFrameAADLen`) | `"QRSNAP1"(7) ‖ ShardID:8 ‖ ReplicaID:8 ‖ SnapshotIndex:8 ‖ ChunkSeq:8 ‖ Final:1`, big-endian |
 | WAL records | 30 bytes | `"QRWAL1"(6) ‖ WALShardIdx:8 ‖ SegmentID:8 ‖ RecordSeq:8`, big-endian |
 
 Both are magic-tagged, fixed-width and delimiter-free, so no two distinct
@@ -157,18 +157,59 @@ would be the vulnerability.
 directory with an independent `%06d.log` ID space and all of them share one
 barrier, so `(SegmentID, RecordSeq)` alone is not unique.
 
-### What positional AAD does not cover: tail truncation
+### Tail truncation: detected for snapshots, a rollback for the WAL
 
-Nothing in the AAD names the number of frames or the total length, so every
-surviving frame of a shortened artifact still authenticates and a reader that
-stops at EOF sees a complete, shorter artifact. **Neither consumer compensates
-today.** The snapshot receive path checks a declared `ChunkCount` for the
-*network* transfer only; the WAL relies on its own durability-sequence recovery
-rules. At-rest tail truncation of either artifact is not detected by the AEAD.
+Positional AAD alone does not name how many frames an artifact holds, so every
+surviving frame of a shortened artifact still authenticates at its own ordinal.
+The two consumers close that differently, because they are different kinds of
+artifact.
 
-Closing it needs a frame count folded into every context, or a distinguishable
-terminal frame. Neither is implemented, and this is stated as a limit rather
-than a footnote.
+**Snapshots carry a terminal flag.** The last byte of every snapshot frame's
+context is `Final`: 1 on exactly one frame, the artifact's last, and 0 on every
+other. The frame writer holds a full chunk back until more plaintext proves it
+is not the last, so `Close` always emits a terminal frame (an empty one when
+the plaintext was empty or ended on a chunk boundary). The one reader,
+`engine.OpenSnapshotFrames`, reads a frame ahead to decide which frame it is
+authenticating as the last. So:
+
+- **Truncated**: the frame the artifact now ends on was sealed with `Final=0`
+  and fails authentication when read as the last.
+- **Extended**: an artifact's terminal frame followed by frames spliced in from
+  a longer artifact of the same identity — whose ordinals line up — fails on the
+  terminal frame, read as non-terminal.
+- **Truncated to nothing**: no frame is left to authenticate, so a sealed
+  artifact with no frames is refused structurally as `ErrSnapshotCorrupt`.
+
+A barrier that cannot bind caller context (a delegated encryptor without AAD
+support, or plaintext mode) gets no positional binding and therefore no
+truncation detection beyond the structural zero-frame rule; that capability is
+resolved once per deployment, never per artifact.
+
+**The WAL's case is a rollback, and no in-file format can detect it.** A WAL
+legitimately loses its unacknowledged tail in a crash, and the recovery rules
+(`GenStart`, the sync mark) exist precisely to tell that apart from lost
+acknowledged data. An attacker with write access to the disk who removes
+trailing records *and* the sync mark after them produces bytes identical to a
+crash inside the writeback window, so recovery truncates as it would for the
+crash. Telling the two apart needs a trusted, monotonic record of the
+acknowledged end kept somewhere the attacker cannot rewrite — a hardware
+monotonic counter (a TPM NV index, via go-xkms), or confirmation from peers.
+Both are outside this layer, and the limit is stated rather than papered over:
+**at-rest rollback of the WAL by someone who can write the disk is not
+detected**. The consequence is not bounded by Raft: its safety argument assumes
+stable storage, and a replica rolled back past what it acknowledged may have
+forgotten entries it counted toward a commit, or a vote it cast in the current
+term. Treat write access to a replica's data directory as equivalent to
+compromising that replica.
+
+**Cross-artifact splicing is accepted on the same grounds.** A snapshot frame's
+context carries nothing unique to one artifact, so two artifacts sealed under
+one key at the same `(shard, replica, index)` — a rebuild re-save, or a local
+save and a receive at one index — can exchange frames, and a spliced file still
+authenticates frame by frame. It needs write access to the data directory and a
+retained copy of the other artifact, which is the rollback threat above. A
+per-artifact random value folded into the context would close it, and was
+considered and declined for that reason (2026-09-23).
 
 ## Delegated (hardware) mode — total, by design
 

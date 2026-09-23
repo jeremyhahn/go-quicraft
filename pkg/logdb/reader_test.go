@@ -3929,3 +3929,134 @@ func TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails(t *testing.T)
 		t.Fatalf("Term(1) after a successful bootstrap = (%d, %v), want (3, nil)", term, err)
 	}
 }
+
+// TestLogReaderGetRangeCopyIsPrivate pins the contract Host.QueryRaftLog
+// relies on to read the log from an arbitrary goroutine: every returned Cmd is
+// the caller's own copy, so neither a later GetRange (which reuses the step
+// worker's buffers) nor a caller mutating its result can reach the other.
+func TestLogReaderGetRangeCopyIsPrivate(t *testing.T) {
+	db := newMemLogDB()
+	const shardID, replicaID uint64 = 1, 1
+	lr := NewLogReader(shardID, replicaID, db)
+	db.addEntries(shardID, replicaID, makeEntries(1, 4, 1))
+	mustSetRange(t, lr, 1, 4)
+
+	copied, err := lr.GetRangeCopy(1, 5, 0)
+	if err != nil {
+		t.Fatalf("GetRangeCopy: %v", err)
+	}
+	if len(copied) != 4 {
+		t.Fatalf("GetRangeCopy returned %d entries, want 4", len(copied))
+	}
+	// A step-worker read through the reused buffers must not disturb the copy.
+	shared, err := lr.GetRange(1, 5, 0)
+	if err != nil {
+		t.Fatalf("GetRange: %v", err)
+	}
+	for i := range shared {
+		for j := range shared[i].Cmd {
+			shared[i].Cmd[j] = 'X'
+		}
+	}
+	for i, e := range copied {
+		if string(e.Cmd) != "test-cmd" {
+			t.Fatalf("copy[%d].Cmd = %q after the shared buffer was overwritten: the copy aliases it", i, e.Cmd)
+		}
+	}
+	// And mutating the copy must not reach the reader's own state.
+	copied[0].Cmd[0] = 'Z'
+	again, err := lr.GetRangeCopy(1, 2, 0)
+	if err != nil {
+		t.Fatalf("GetRangeCopy: %v", err)
+	}
+	if again[0].Cmd[0] == 'Z' {
+		t.Fatal("mutating one GetRangeCopy result changed the next one")
+	}
+}
+
+// TestLogReaderGetRangeCopyPropagatesRangeErrors covers the error path: a
+// range the reader does not hold returns the error and no entries.
+func TestLogReaderGetRangeCopyPropagatesRangeErrors(t *testing.T) {
+	lr := NewLogReader(1, 1, newMemLogDB())
+	if got, err := lr.GetRangeCopy(10, 20, 0); err == nil || got != nil {
+		t.Fatalf("GetRangeCopy over an absent range = (%v, %v), want (nil, error)", got, err)
+	}
+}
+
+// TestLogReaderPersistBootstrapRegistersNothingOnWriteFailure pins the
+// durable-first ordering: when the LogDB refuses the bootstrap write, the
+// reader must not report a range the LogDB does not hold.
+func TestLogReaderPersistBootstrapRegistersNothingOnWriteFailure(t *testing.T) {
+	db := newMemLogDB()
+	lr := NewLogReader(1, 1, db)
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	first, last := lr.IndexRange()
+	err := lr.PersistBootstrap([]proto.Entry{{Index: 1, Term: 1}}, proto.State{Term: 1, Commit: 1})
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("PersistBootstrap on a closed LogDB = %v, want ErrClosed", err)
+	}
+	if f, l := lr.IndexRange(); f != first || l != last {
+		t.Fatalf("IndexRange moved from (%d, %d) to (%d, %d) after a failed durable write", first, last, f, l)
+	}
+	if st, _ := lr.NodeState(); st.Term != 0 || st.Commit != 0 {
+		t.Fatalf("NodeState = %+v after a failed durable write, want the zero state", st)
+	}
+}
+
+// TestLogReaderPersistBootstrapEmptyIsNoop covers the empty-input guard.
+func TestLogReaderPersistBootstrapEmptyIsNoop(t *testing.T) {
+	db := newMemLogDB()
+	lr := NewLogReader(1, 1, db)
+	if err := lr.PersistBootstrap(nil, proto.State{Term: 9}); err != nil {
+		t.Fatalf("PersistBootstrap(nil) = %v, want nil", err)
+	}
+	if st, _ := lr.NodeState(); st.Term != 0 {
+		t.Fatalf("NodeState.Term = %d after an empty bootstrap, want 0", st.Term)
+	}
+}
+
+// TestLogReaderCompactToReportsWhetherTheMarkerMoved pins CompactTo's answer:
+// moving the marker is true, compacting at the current marker is a nil no-op
+// that reports false (Compact's own contract), and below it is ErrCompacted.
+func TestLogReaderCompactToReportsWhetherTheMarkerMoved(t *testing.T) {
+	lr := NewLogReader(1, 1, newMemLogDB())
+	if err := lr.Append(makeProtoEntries(1, 10, 1)); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if moved, err := lr.CompactTo(5); err != nil || !moved {
+		t.Fatalf("CompactTo(5) = (%v, %v), want (true, nil)", moved, err)
+	}
+	if moved, err := lr.CompactTo(5); err != nil || moved {
+		t.Fatalf("CompactTo(5) at the marker = (%v, %v), want (false, nil)", moved, err)
+	}
+	if moved, err := lr.CompactTo(3); !errors.Is(err, ErrCompacted) || moved {
+		t.Fatalf("CompactTo(3) below the marker = (%v, %v), want (false, ErrCompacted)", moved, err)
+	}
+}
+
+// TestLogReaderRefreshSnapshotFileSize: a rebuilt artifact at the recorded
+// index cannot go through CreateSnapshot, which refuses a non-advancing
+// index, so the reader's declared size is refreshed in place — for exactly
+// the recorded index and no other.
+func TestLogReaderRefreshSnapshotFileSize(t *testing.T) {
+	lr := NewLogReader(1, 1, newMemLogDB())
+	if err := lr.CreateSnapshot(proto.Snapshot{Index: 40, Term: 2, Filepath: "/snap/40", FileSize: 0}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if err := lr.RefreshSnapshotFileSize(40, 4096); err != nil {
+		t.Fatalf("RefreshSnapshotFileSize at the recorded index: %v", err)
+	}
+	if got := lr.Snapshot().FileSize; got != 4096 {
+		t.Fatalf("FileSize = %d, want 4096", got)
+	}
+	for _, index := range []uint64{0, 39, 41} {
+		if err := lr.RefreshSnapshotFileSize(index, 1); !errors.Is(err, ErrSnapshotOutOfDate) {
+			t.Fatalf("RefreshSnapshotFileSize(%d) = %v, want ErrSnapshotOutOfDate", index, err)
+		}
+	}
+	if got := lr.Snapshot().FileSize; got != 4096 {
+		t.Fatalf("a refused refresh changed FileSize to %d", got)
+	}
+}

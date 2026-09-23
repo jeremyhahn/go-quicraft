@@ -149,7 +149,7 @@ func TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot(t *testing.T) {
 		t.Fatalf("fixture: expected a holed index (ErrLogGapDetected), got %v", err)
 	}
 
-	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestRecoverLogReader_FailsClosedOnGapWithNoSnapshot(t *testing.T) {
 		t.Fatalf("seed gap: %v", err)
 	}
 
-	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestRecoverLogReader_ReportsRepairFailureNotTheGap(t *testing.T) {
 		t.Fatalf("seed above snapshot: %v", err)
 	}
 
-	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport())
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

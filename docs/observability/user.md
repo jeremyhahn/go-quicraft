@@ -19,7 +19,7 @@ no logger and no listener runs fine and tells you nothing.
 
 ```go
 c := quicraft.NewPrometheusMetricsCollector()
-host, err := quicraft.NewHost(cfg, quicraft.WithMetrics(c))
+host, err := quicraft.NewHost(cfg, quicraft.WithMetrics(c), quicraft.WithoutEncryption())
 
 // The library serves nothing. You expose the registry:
 http.Handle("/metrics", promhttp.HandlerFor(c.Registry, promhttp.HandlerOpts{}))
@@ -90,7 +90,7 @@ logger := config.NewLogger(config.LogConfig{
     Format: config.LogFormatJSON,
     Level:  config.LogLevelInfo,
 })
-host, err := quicraft.NewHost(cfg, quicraft.WithLogger(logger))
+host, err := quicraft.NewHost(cfg, quicraft.WithLogger(logger), quicraft.WithoutEncryption())
 ```
 
 Or install a process default with `config.SetDefaultLogger(cfg)`. The library

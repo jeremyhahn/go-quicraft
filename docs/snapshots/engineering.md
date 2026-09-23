@@ -40,7 +40,7 @@ func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index ui
     srcBarrier, dstBarrier Barrier) (uint64, error)
 
 // AAD, from the engine package
-const engine.SnapshotFrameAADLen = 39
+const engine.SnapshotFrameAADLen = 40
 func engine.NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier) *SnapshotAAD
 ```
 
@@ -75,9 +75,25 @@ fails authentication and **there is no weaker retry**.
 **Frames are pinned while in use.** Every epoch a snapshot's frames reference is
 registered in-flight (`RegisterInFlightEpoch`) across encryption, decryption for
 send, and re-encryption, so a concurrent `PurgeEpochsBefore` cannot drop a DEK
-mid-operation. `EncryptWithEpochPinnedContext` does the seal and the pin under
-one lock; a barrier without that optional capability gets a pin-before /
-encrypt / pin-after sequence, which narrows the window rather than closing it.
+mid-operation. Every frame is sealed with `EncryptWithEpochPinnedContext`, which
+does the seal and the pin under one lock. It is part of the `Barrier` contract:
+the pin-before / encrypt / pin-after fallback for barriers without it only
+narrowed the window, and was removed in 0.14.0.
+
+**The purge floor counts shards that are not loaded.** A DEK may be purged
+only below the minimum epoch every retained artifact still needs. That minimum
+is taken over three things: the snapshot directories of every loaded shard;
+the LogDB's recorded snapshot for every `(shard, replica)` it holds state for
+that is **not** loaded; and the WAL's live floor. The middle term exists
+because each shard has its own snapshot base (`…/snapshots/shard-N`, or its
+`DataDir`), so no scan of loaded shards can see a stopped shard's tree — and
+before 0.14.0 none did, which let a co-hosted shard's rotation purge the DEK a
+stopped shard's snapshot needed, failing its restart forever. On the per-shard
+barrier path each unloaded shard is attributed through the barrier resolver,
+which is a function of the shard ID. If `ListNodeInfo` fails, or a record
+cannot be read, nothing is purged. The record is the snapshot a restart
+recovers from; a stopped shard's *older*, superseded snapshots are not counted
+and may become undecryptable after a purge, which is accepted.
 
 **Pin balance is an invariant, not an optimization.** Every
 `RegisterInFlightEpoch` has a matching `DeregisterInFlightEpoch` on every path,

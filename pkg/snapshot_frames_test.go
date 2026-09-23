@@ -637,3 +637,114 @@ func TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected(t *testing.T) {
 		t.Fatal("an epoch-only frame decrypted: the reader fell back to a weaker AAD")
 	}
 }
+
+// TestSnapshotFrameAAD_TailTruncationIsDetected pins the property the terminal
+// frame exists for. Every frame of a shortened artifact still authenticates
+// under its own ordinal, so without a terminal flag a reader that stops at EOF
+// sees a complete, shorter snapshot. With it, whichever frame the truncated
+// artifact now ends on was sealed as non-terminal and fails authentication
+// when read as the last.
+func TestSnapshotFrameAAD_TailTruncationIsDetected(t *testing.T) {
+	b := createTestBarrier(t)
+	var enc bytes.Buffer
+	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(multiFramePlaintext()), &enc); err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	frames := splitSnapshotFrames(t, enc.Bytes())
+	if len(frames) < 3 {
+		t.Fatalf("fixture produced %d frames, want the multi-frame path", len(frames))
+	}
+	for keep := 1; keep < len(frames); keep++ {
+		var dec bytes.Buffer
+		truncated := joinSnapshotFrames(frames[:keep])
+		if _, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(truncated), &dec); err == nil {
+			t.Fatalf("artifact truncated to %d of %d frames decrypted cleanly (%d bytes)",
+				keep, len(frames), dec.Len())
+		}
+	}
+}
+
+// TestSnapshotFrameAAD_TruncationToNothingIsCorrupt covers the one truncation
+// the AEAD cannot see, because no frame is left to authenticate: a sealed
+// artifact always carries a terminal frame, so an empty one is damage.
+func TestSnapshotFrameAAD_TruncationToNothingIsCorrupt(t *testing.T) {
+	b := createTestBarrier(t)
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(nil), &dec); !errors.Is(err, ErrSnapshotCorrupt) {
+		t.Fatalf("decryptSnapshotFrames(empty) = %v, want ErrSnapshotCorrupt", err)
+	}
+}
+
+// TestSnapshotFrameAAD_FrameAfterTerminalIsRejected is truncation's mirror.
+// A frame copied to the end fails on its ordinal alone, so the case the
+// terminal flag adds is a SPLICE of two artifacts under the same identity:
+// the short artifact's frames followed by the long one's remaining frames,
+// whose ordinals line up exactly. Every frame then authenticates by position,
+// and only the short artifact's terminal frame, now read as non-terminal,
+// can fail.
+func TestSnapshotFrameAAD_FrameAfterTerminalIsRejected(t *testing.T) {
+	b := createTestBarrier(t)
+	seal := func(size int, salt byte) [][]byte {
+		t.Helper()
+		plain := make([]byte, size)
+		for i := range plain {
+			plain[i] = byte(i) ^ salt
+		}
+		var enc bytes.Buffer
+		if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
+			t.Fatalf("encryptSnapshotFrames: %v", err)
+		}
+		return splitSnapshotFrames(t, enc.Bytes())
+	}
+	short := seal(2*snapshotEncryptChunkSize+10, 0x11) // 3 frames
+	long := seal(4*snapshotEncryptChunkSize+10, 0x22)  // 5 frames
+	if len(short) != 3 || len(long) != 5 {
+		t.Fatalf("fixture produced %d and %d frames, want 3 and 5", len(short), len(long))
+	}
+	spliced := joinSnapshotFrames(append(append([][]byte{}, short...), long[len(short):]...))
+	var dec bytes.Buffer
+	if _, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(spliced), &dec); err == nil {
+		t.Fatal("frames spliced after another artifact's terminal frame decrypted cleanly")
+	}
+}
+
+// TestSnapshotFrameAAD_ChunkBoundaryAndEmptyRoundTrip covers the lengths the
+// held-back terminal frame has to get right: plaintext ending exactly on a
+// chunk boundary (the last full chunk is the terminal frame, with no empty
+// frame after it) and empty plaintext (one empty terminal frame).
+func TestSnapshotFrameAAD_ChunkBoundaryAndEmptyRoundTrip(t *testing.T) {
+	b := createTestBarrier(t)
+	for _, tc := range []struct {
+		name   string
+		size   int
+		frames int
+	}{
+		{"empty", 0, 1},
+		{"one byte", 1, 1},
+		{"exactly one chunk", snapshotEncryptChunkSize, 1},
+		{"exactly two chunks", 2 * snapshotEncryptChunkSize, 2},
+		{"two chunks and one byte", 2*snapshotEncryptChunkSize + 1, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plain := make([]byte, tc.size)
+			for i := range plain {
+				plain[i] = byte(i*13 + 5)
+			}
+			var enc bytes.Buffer
+			if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
+				t.Fatalf("encryptSnapshotFrames: %v", err)
+			}
+			if got := len(splitSnapshotFrames(t, enc.Bytes())); got != tc.frames {
+				t.Fatalf("sealed %d bytes into %d frames, want %d", tc.size, got, tc.frames)
+			}
+			var dec bytes.Buffer
+			n, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(enc.Bytes()), &dec)
+			if err != nil {
+				t.Fatalf("decryptSnapshotFrames: %v", err)
+			}
+			if n != uint64(tc.size) || !bytes.Equal(dec.Bytes(), plain) {
+				t.Fatalf("round trip returned %d bytes (reported %d), want %d", dec.Len(), n, tc.size)
+			}
+		})
+	}
+}

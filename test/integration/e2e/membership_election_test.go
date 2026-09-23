@@ -68,7 +68,7 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 
 	newAddr := freePort(t)
 	hostCfg := testHostConfig(t, newAddr, cluster.ca.Leaf(t))
-	newHost, err := quicraft.NewHost(hostCfg)
+	newHost, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}

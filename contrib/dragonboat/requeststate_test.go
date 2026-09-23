@@ -736,8 +736,14 @@ func TestWrapSysOpState_Release(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
 
-	sysOp := WrapSysOpState(inner)
+	// Release BEFORE wrapping, so the wrapper's goroutine is certain to see a
+	// released state (ResultC == nil) and complete at once. Releasing after
+	// wrapping raced that goroutine: when it read ResultC first it held a live
+	// channel a released, never-completed request never closes, and the test
+	// timed out under load. In production a SysOpState releases its own inner
+	// state through sysOp.Release, which also stops that goroutine.
 	inner.Release()
+	sysOp := WrapSysOpState(inner)
 
 	// Wait for completion.
 	select {

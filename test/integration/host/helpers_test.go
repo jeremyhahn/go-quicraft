@@ -627,7 +627,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	for i := range numNodes {
 		cfg := testHostConfig(t, addrs[i], leaves[i])
 		nodeHostDirs[i] = cfg.NodeHostDir
-		h, err := quicraft.NewHost(cfg)
+		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
 			// Clean up any previously created hosts.
 			for j := 0; j < i; j++ {
@@ -1490,7 +1490,7 @@ func addNodeToCluster(
 	addr := freePort(t)
 	leaf := cluster.ca.Leaf(t)
 	hostCfg := testHostConfig(t, addr, leaf)
-	h, err := quicraft.NewHost(hostCfg)
+	h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}
@@ -1577,7 +1577,7 @@ const snapshotDataFileName = "snapshot.dat"
 // artifact in it is FINISHED: snapshot-<020d index> (engine snapshotSaveDir).
 const publishedSnapshotDirPrefix = "snapshot-"
 
-// The two names a snapshot directory can carry BEFORE it is published. Each is
+// The three names a snapshot directory can carry BEFORE it is published. Each is
 // a directory a writer creates for itself, fills, and then renames onto the
 // canonical snapshot-<index> name in one step, so the canonical name only ever
 // holds a complete artifact. Both are deliberately unparsable as
@@ -1595,17 +1595,15 @@ const publishedSnapshotDirPrefix = "snapshot-"
 //     engine.SweepStaleRecvStageDirs.
 //   - engine.ImportStageDirPrefix, ".import-": Host.ImportSnapshot stages
 //     here and publishes by rename. Swept by engine.SweepStaleImportStageDirs.
-//
-// engine.SaveEncryptTempPrefix, ".encrypt-", is NOT in this set because it is
-// not a directory: it names the scratch FILE (".encrypt-*.tmp") a local save
-// encrypts into INSIDE an already-published snapshot-<index> directory before
-// renaming it over snapshot.dat. A scratch file never carries the payload name
-// this scan matches on, so the walk never sees one. The local-save window in
-// which snapshot.dat exists in a published directory but is not yet finished
-// is #108's, and it is judged by snapshot.meta (PR #119), not by the name.
+//   - engine.SaveStageDirPrefix, ".save-": a LOCAL snapshot save stages here
+//     — the capture, snapshot.meta, the export — and publishes by rename
+//     under the node's write lease. Swept by engine.SweepStaleSaveStageDirs.
+//     A save in progress when a scan runs is therefore found here, never as
+//     an unfinished snapshot.dat inside a published directory.
 const (
 	recvStageDirPrefix   = ".recv-"
 	importStageDirPrefix = ".import-"
+	saveStageDirPrefix   = ".save-"
 )
 
 // isSnapshotStagingDir reports whether name is a snapshot directory that has
@@ -1615,7 +1613,8 @@ const (
 // artifact (#130), which is the receive-path twin of #108.
 func isSnapshotStagingDir(name string) bool {
 	return strings.HasPrefix(name, recvStageDirPrefix) ||
-		strings.HasPrefix(name, importStageDirPrefix)
+		strings.HasPrefix(name, importStageDirPrefix) ||
+		strings.HasPrefix(name, saveStageDirPrefix)
 }
 
 // snapshotArtifacts returns the path of every PUBLISHED snapshot data file
@@ -1890,7 +1889,7 @@ func newTestClusterWithRestart(t *testing.T, numNodes int) (*testCluster, []node
 	for i := range numNodes {
 		walDir := t.TempDir()
 		nodeHostDir := t.TempDir()
-		h, err := quicraft.NewHost(hostConfigAt(walDir, nodeHostDir, addrs[i], leaves[i]))
+		h, err := quicraft.NewHost(hostConfigAt(walDir, nodeHostDir, addrs[i], leaves[i]), quicraft.WithoutEncryption())
 		if err != nil {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
@@ -1942,7 +1941,7 @@ func restartNode(
 
 	// Create a new host reusing the same data directories, address and LEAF:
 	// the identity the shard committed for this replica is the leaf's keypair.
-	h, err := quicraft.NewHost(hostConfigAt(nc.walDir, nc.nodeHostDir, nc.addr, cluster.leaves[idx]))
+	h, err := quicraft.NewHost(hostConfigAt(nc.walDir, nc.nodeHostDir, nc.addr, cluster.leaves[idx]), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("restartNode[%d] NewHost failed: %v", idx, err)
 	}
@@ -2039,6 +2038,7 @@ func TestSnapshotScanJudgesOnlyPublishedArtifacts(t *testing.T) {
 	staging := []string{
 		payload(recvStageDirPrefix + "2503549359"),
 		payload(importStageDirPrefix + "1180032867"),
+		payload(saveStageDirPrefix + "4100006199"),
 	}
 
 	found := snapshotArtifacts(t, replica)

@@ -864,6 +864,13 @@ endef
 coverage: | $(COVER_DIR)
 	$(call run-coverage,total,./...)
 
+# coverage-packages holds EVERY package under pkg/ to COVER_MIN, from the same
+# profile `coverage` writes, so no package can hide under the total's average.
+# CI runs the same script at COVERAGE_THRESHOLD (see ci.yml's per-package gate).
+.PHONY: coverage-packages
+coverage-packages: coverage
+	scripts/check-coverage-packages.sh $(COVER_DIR)/total.out $(COVER_MIN) github.com/jeremyhahn/go-quicraft/pkg
+
 .PHONY: coverage-proto
 coverage-proto: | $(COVER_DIR)
 	$(call run-coverage,proto,$(PKG_PROTO))

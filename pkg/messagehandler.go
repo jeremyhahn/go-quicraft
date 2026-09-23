@@ -43,6 +43,7 @@ import (
 type engineDeliverer interface {
 	DeliverMessage(shardID uint64, msg proto.Message) bool
 	DeliverLocal(shardID uint64, msg proto.Message) bool
+	DeliverLocalTo(node *engine.Node, msg proto.Message) bool
 	NotifyWork(shardID uint64)
 	GetNode(shardID uint64) *engine.Node
 	RequestSnapshotRecovery(shardID, replicaID uint64, node *engine.Node) error
@@ -101,9 +102,20 @@ const (
 // false when delivery still failed after all attempts (shard unloaded, or a
 // persistently saturated inbox).
 func deliverSnapshotControl(eng snapshotCtrlDeliverer, shardID uint64, msg proto.Message) bool {
+	return deliverWithRetry(
+		func() bool { return eng.DeliverLocal(shardID, msg) },
+		func() { eng.NotifyWork(shardID) },
+	)
+}
+
+// deliverWithRetry makes one delivery attempt per snapshotCtrlDeliverBackoff,
+// up to snapshotCtrlDeliverAttempts, and wakes the shard's worker on success.
+// It is the one retry loop for snapshot control messages, whichever way they
+// are addressed.
+func deliverWithRetry(deliver func() bool, notify func()) bool {
 	for attempt := 0; ; attempt++ {
-		if eng.DeliverLocal(shardID, msg) {
-			eng.NotifyWork(shardID)
+		if deliver() {
+			notify()
 			return true
 		}
 		if attempt >= snapshotCtrlDeliverAttempts-1 {
@@ -825,6 +837,21 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	if node == nil {
 		return reject("shard not loaded")
 	}
+	// A failed shard steps nothing more, so its install would never get a
+	// verdict; refuse before staging anything rather than hold a transport
+	// receive slot and its memory budget for nothing.
+	if node.IsFailed() {
+		return reject("shard failed")
+	}
+	// A stopped incarnation likewise adopts nothing more — and it may still
+	// have an adopted-but-unrecorded install of its own in the commit
+	// pipeline, whose retained directory this receive's publish step would
+	// reclaim as an orphan moments before the record naming it lands. The
+	// receive waits for the incarnation that follows: UnloadNode does not
+	// return until the stopped one can no longer write LogDB.
+	if node.IsStopped() {
+		return reject("shard stopping")
+	}
 	// Destination check, mirroring the msg.To check in HandleMessage. The
 	// target ReplicaID travels in-band and is otherwise trusted verbatim,
 	// yet everything downstream keys off it: a foreign value splits the
@@ -1104,15 +1131,52 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// is durably recorded, after which nothing here may remove anything.
 	ownedDir := stageDir
 	var committed bool
+	// retain keeps an UNRECORDED artifact that raft may nonetheless have
+	// adopted: a verdict of InstallAbandoned does not prove the install was
+	// never stepped. It is left as an orphan for the publish step and the GC.
+	var retain bool
 	defer func() {
-		if !committed {
-			if err := fsys.RemoveAll(ownedDir); err != nil {
-				slog.Debug("snapshot directory cleanup failed",
+		if committed || retain {
+			return
+		}
+		// Discarding the PUBLISHED directory is a write on the incarnation's
+		// behalf, like the publish itself, and takes its write lease. A node
+		// stopped since the publish may have an adopted install of its own
+		// in flight in its commit pipeline whose record names this very path
+		// (this receive replaced that artifact when it published); deleting
+		// it now would leave the record naming nothing. So on a stopped node
+		// the directory is kept, an orphan the next incarnation's receive or
+		// GC reclaims once UnloadNode has settled the record either way.
+		if ownedDir == snapshotDir {
+			if !node.AcquireWriteLease() {
+				slog.Info("snapshot directory kept: the shard stopped before the "+
+					"failed receive could discard it",
 					"shard", shardID,
 					"replica", replicaID,
-					"dir", ownedDir,
-					"error", err)
+					"dir", ownedDir)
+				return
 			}
+			defer node.ReleaseWriteLease()
+			// And under the snapshot-directory lock, checking the record
+			// first: a local save may have published and recorded this very
+			// index while the receive awaited raft's verdict, and what sits
+			// here is then the recorded artifact, not this receive's.
+			node.LockSnapshotDir()
+			defer node.UnlockSnapshotDir()
+			if h.host.snapshotRecordMayName(shardID, replicaID, ownedDir) {
+				slog.Info("snapshot directory kept: LogDB records it (or cannot say)",
+					"shard", shardID,
+					"replica", replicaID,
+					"dir", ownedDir)
+				return
+			}
+		}
+		if err := fsys.RemoveAll(ownedDir); err != nil {
+			slog.Debug("snapshot directory cleanup failed",
+				"shard", shardID,
+				"replica", replicaID,
+				"dir", ownedDir,
+				"error", err)
 		}
 	}()
 
@@ -1275,56 +1339,100 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		}
 	}
 
-	// Publish. The rename is what makes the canonical name appear, and it
-	// appears already complete: data written, fsynced and closed, metadata
-	// beside it.
-	//
-	// A destination that already exists here is provably NOT the snapshot LogDB
-	// records. The dedup branch above returned for every existing.Index >=
-	// snapshotIndex, so the recorded snapshot — if there is one — is at a LOWER
-	// index and therefore under a DIFFERENT directory name. The guard is kept
-	// anyway and fails closed, because it also covers the paths that reach here
-	// without having consulted LogDB at all: a nil LogDB, or a read that
-	// returned ErrNoSnapshot while the tree still holds the artifact. Deleting
-	// the shard's live snapshot would leave LogDB pointing at nothing, which
-	// makes the shard unstartable and makes every leader re-send hit the dedup
-	// branch — a permanent wedge.
-	if recorded := h.host.recordedSnapshotPath(shardID, replicaID); recorded != "" &&
-		recorded == filepath.Clean(snapshotDir) {
+	// Publish under this incarnation's write lease. A stopped incarnation may
+	// still have an adopted-but-unrecorded install of its own at this index in
+	// the commit pipeline, retained at this very path; reclaiming it as an
+	// orphan below while that record lands would leave LogDB naming a
+	// directory this receive replaced — or, once this receive is declined,
+	// deleted. The lease is refused once the node stops, and UnloadNode waits
+	// for a lease already held, so the publish finishes before any new
+	// incarnation can exist.
+	if !node.AcquireWriteLease() {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
 			Op:        "publish",
-			Err:       ErrSnapshotDestinationRecorded,
+			Err:       ErrShardNotReady,
 		}
 	}
-	// os.Rename onto a non-empty directory fails, so an orphaned destination is
-	// cleared first. It is an orphan by the argument above: no LogDB record
-	// names it.
-	if _, statErr := fsys.Stat(snapshotDir); statErr == nil {
-		slog.Warn("snapshot receive is replacing an unrecorded snapshot directory "+
-			"left by an earlier failed transfer",
-			"shard", shardID,
-			"replica", replicaID,
-			"dir", snapshotDir,
-		)
-		if rmErr := fsys.RemoveAll(snapshotDir); rmErr != nil {
+	if publishErr := func() error {
+		defer node.ReleaseWriteLease()
+		// Under the snapshot-directory lock too: the recorded-destination
+		// check below and the rename must not interleave with a local save's
+		// publish and record (see engine.Node.LockSnapshotDir).
+		node.LockSnapshotDir()
+		defer node.UnlockSnapshotDir()
+		// Publish. The rename is what makes the canonical name appear, and it
+		// appears already complete: data written, fsynced and closed, metadata
+		// beside it.
+		//
+		// A destination that already exists here is provably NOT the snapshot LogDB
+		// records. The dedup branch above returned for every existing.Index >=
+		// snapshotIndex, so the recorded snapshot — if there is one — is at a LOWER
+		// index and therefore under a DIFFERENT directory name. The guard is kept
+		// anyway and fails closed, because it also covers the paths that reach here
+		// without having consulted LogDB at all: a nil LogDB, or a read that
+		// returned ErrNoSnapshot while the tree still holds the artifact. Deleting
+		// the shard's live snapshot would leave LogDB pointing at nothing, which
+		// makes the shard unstartable and makes every leader re-send hit the dedup
+		// branch — a permanent wedge.
+		// An UNREADABLE record fails closed as well: it might name this very
+		// directory, which a local save can have published and recorded since
+		// the dedup lookup above.
+		// Nor one a recovery is reading: with no recorded path it falls back to
+		// the newest directory on disk, which can be unrecorded.
+		if h.host.snapshotRecordMayName(shardID, replicaID, snapshotDir) || node.IsSnapshotDirPinned(snapshotDir) {
 			return &SnapshotReceiveError{
 				ShardID:   shardID,
 				ReplicaID: replicaID,
 				Op:        "publish",
-				Err:       rmErr,
+				Err:       ErrSnapshotDestinationRecorded,
 			}
 		}
-	}
-	if renameErr := fsys.Rename(stageDir, snapshotDir); renameErr != nil {
-		return &SnapshotReceiveError{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Op:        "publish",
-			Err:       renameErr,
+		// os.Rename onto a non-empty directory fails, so an orphaned destination is
+		// cleared first. It is an orphan by the argument above: no LogDB record
+		// names it.
+		if _, statErr := fsys.Stat(snapshotDir); statErr == nil {
+			slog.Warn("snapshot receive is replacing an unrecorded snapshot directory "+
+				"left by an earlier failed transfer",
+				"shard", shardID,
+				"replica", replicaID,
+				"dir", snapshotDir,
+			)
+			if rmErr := fsys.RemoveAll(snapshotDir); rmErr != nil {
+				return &SnapshotReceiveError{
+					ShardID:   shardID,
+					ReplicaID: replicaID,
+					Op:        "publish",
+					Err:       rmErr,
+				}
+			}
 		}
+		if renameErr := fsys.Rename(stageDir, snapshotDir); renameErr != nil {
+			return &SnapshotReceiveError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Op:        "publish",
+				Err:       renameErr,
+			}
+		}
+		// Claim the index until this receive settles: until raft's verdict
+		// the directory is unrecorded, and a local save at the same index
+		// would otherwise take it for an orphan and replace it.
+		node.ClaimSnapshotDir(snapshotIndex)
+		return nil
+	}(); publishErr != nil {
+		return publishErr
 	}
+	// Released when the receive returns — recorded, discarded or retained by
+	// then. The lock is taken without a lease: this changes no directory and
+	// no record, so an unload need not wait for it, and it waits for nothing
+	// but the lock itself.
+	defer func() {
+		node.LockSnapshotDir()
+		node.ReleaseSnapshotDir(snapshotIndex)
+		node.UnlockSnapshotDir()
+	}()
 	// Ownership has transferred: the canonical directory IS the directory this
 	// receive created, so the failure path may now discard it — and must, since
 	// the staging name no longer exists.
@@ -1349,141 +1457,11 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		}
 	}
 
-	// Save snapshot metadata to LogDB so the node can recover from it.
-	if h.host.logdb != nil {
-		// Carry the full membership unconditionally, including the
-		// replicated witness policy, the committed node identities and the
-		// replicated session policy: gating on Addresses/ConfigChangeID
-		// would discard a policy-only membership, and dropping any of the
-		// replicated fields would persist this snapshot with state that
-		// disagrees with every peer after a restart — a zeroed witness
-		// quorum, an identity-free configuration authorized by address
-		// alone, or an unset session policy whose apply path falls back to
-		// this node's own Config.
-		//
-		// This is the ONLY membership a replica bootstrapped by an
-		// InstallSnapshot has: its log has been compacted past the
-		// EntryInitialMembership that would otherwise carry these.
-		membership := logdb.Membership{
-			ConfigChangeID:             first.Membership.ConfigChangeID,
-			MaxWitnesses:               first.Membership.MaxWitnesses,
-			RequireFullReplicaMajority: first.Membership.RequireFullReplicaMajority,
-			SessionExpiryEntries:       first.Membership.SessionExpiryEntries,
-			MaxTotalSessions:           first.Membership.MaxTotalSessions,
-			MaxSessionsPerClient:       first.Membership.MaxSessionsPerClient,
-			MaxSessionsPerOwner:        first.Membership.MaxSessionsPerOwner,
-			Addresses:                  copyMapUint64String(first.Membership.Addresses),
-			Observers:                  copyMapUint64String(first.Membership.Observers),
-			Witnesses:                  copyMapUint64String(first.Membership.Witnesses),
-			Removed:                    copyMapUint64Bool(first.Membership.Removed),
-			Identities:                 copyMapUint64String(first.Membership.Identities),
-			RemovedIdentities:          copyMapUint64String(first.Membership.RemovedIdentities),
-		}
-		logdbSnap := logdb.Snapshot{
-			Index:       snapshotIndex,
-			Term:        snapshotTerm,
-			Membership:  membership,
-			Filepath:    snapshotDir,
-			FileSize:    onDiskSize,
-			OnDiskIndex: first.OnDiskIndex,
-			// Record the RECEIVER's at-rest epoch (from re-encryption above), not
-			// the wire epoch (first.Epoch is 0 — the sender streamed plaintext).
-			// recoverSnapshot decrypts under this node's barrier at this epoch.
-			Epoch: recvEpoch,
-			// Record the compression of the bytes actually on disk, classified
-			// above, so recoverSnapshot builds its reader chain from the
-			// artifact rather than from this node's own config.
-			Compression: recvCompression,
-		}
-		if saveErr := h.host.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil {
-			return &SnapshotReceiveError{
-				ShardID:   shardID,
-				ReplicaID: replicaID,
-				Op:        "logdb_save",
-				Err:       saveErr,
-			}
-		}
-		// Advance the log compaction floor to the snapshot index, exactly as the
-		// local save path (engine snapshotPool) and ImportSnapshot do.
-		//
-		// Without this, a follower that fell behind and caught up via
-		// InstallSnapshot keeps its OLD entries below the snapshot and then
-		// resumes replication above it, so its durable entry index becomes
-		// {1..k} U {N+1..M}: a HOLE. EntryRange checks the stored count against
-		// the first..last span, correctly reports ErrLogGapDetected, and
-		// recoverLogReader turns that into a StartShard failure — so the replica
-		// is permanently unstartable after the next restart. There is no
-		// self-heal (SnapshotEntries has no default, so this replica never
-		// compacts on its own) and no repair path (RequestCompaction on an
-		// unloaded shard only runs segment GC). This is reachable through
-		// entirely normal operation: leader compacts, follower lags, follower
-		// catches up, follower restarts.
-		//
-		// The snapshot subsumes every index at or below it, so removing them
-		// loses nothing. It is done AFTER the snapshot record is durable: a crash
-		// in between leaves the pre-existing shape (recoverable by the next
-		// successful receive or a local snapshot), whereas removing first would
-		// discard entries with no snapshot recorded to cover them.
-		// NON-FATAL, and the placement is the reason: this runs inside the block
-		// that precedes committed = true, so returning an error here would send
-		// the deferred rollback through RemoveAll on the very directory the
-		// SaveSnapshot one line above already durably recorded. That destroys a
-		// committed snapshot: the shard then cannot start (its LogDB record points
-		// at a deleted directory) and every leader re-send is refused by the dedup
-		// branch — a permanent wedge, the exact failure this floor advance exists
-		// to prevent.
-		//
-		// Failing to advance the floor is recoverable and self-healing: the
-		// snapshot is durably recorded, so the hole left below it is precisely the
-		// shape recoverLogReader repairs on the next start, and the next
-		// successful receive or local snapshot advances the floor anyway.
-		if rmErr := h.host.logdb.RemoveEntriesTo(shardID, replicaID, snapshotIndex); rmErr != nil {
-			slog.Warn("snapshot recorded but the log floor advance failed; the entry "+
-				"index is left holed below the snapshot and will be repaired on the next "+
-				"recovery",
-				"shard", shardID,
-				"replica", replicaID,
-				"snapshot_index", snapshotIndex,
-				"error", rmErr)
-		}
-	}
-
-	// The snapshot file is fsynced and the LogDB record is written, so the
-	// on-disk artifacts must survive from here on regardless of what happens
-	// to the raft install or the state-machine recovery below: LogDB now
-	// points at this directory, and the dedup branch above answers the
-	// leader's re-send from it.
-	committed = true
-
-	// Reclaim the shard's superseded snapshot directories now that this one is
-	// durably recorded, so retention is computed against the set INCLUDING it.
-	//
-	// The receive path creates one directory per InstallSnapshot and, until
-	// this call, reclaimed none of them: saveSnapshot was the only caller of
-	// the GC, and a shard with SnapshotEntries == 0 — a supported setting with
-	// no default, so the out-of-the-box state — never runs saveSnapshot at all.
-	// A follower that repeatedly fell behind the leader's compaction floor
-	// therefore accumulated one full state-machine image per catch-up forever,
-	// and every retained directory folds into the host-wide DEK purge floor, so
-	// those images also stopped co-hosted shards from ever purging an epoch key.
-	//
-	// NON-FATAL for the same reason the log-floor advance above is: the
-	// snapshot is recorded and the transfer succeeded. Failing to reclaim disk
-	// costs space, and the next successful receive or local save runs the GC
-	// again.
-	if gcErr := engine.GCSnapshotDirs(node.SnapshotDir(), shardID, replicaID,
-		h.host.recordedSnapshotPath(shardID, replicaID)); gcErr != nil {
-		slog.Warn("snapshot recorded but reclaiming superseded snapshot directories failed",
-			"shard", shardID,
-			"replica", replicaID,
-			"snapshot_index", snapshotIndex,
-			"error", gcErr)
-	}
-
-	if h.host.isShardJoining(shardID) {
+	joining := h.host.isShardJoining(shardID)
+	if joining {
 		// The bootstrap snapshot carries the full membership, so the join
-		// window closes here and cannot reopen for the life of the process.
-		// The Register is ROUTING only — it is how this replica reaches the
+		// window closes once raft adopts it (below) and cannot reopen for the
+		// life of the process. The Register is ROUTING only — it is how this replica reaches the
 		// leader before any config change of its own commits, and the address
 		// comes from the membership of a snapshot whose sender the join anchor
 		// has just authenticated. It is expressly NOT what authorizes the
@@ -1494,7 +1472,6 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		if senderAddr := first.Membership.Addresses[fromReplicaID]; senderAddr != "" {
 			h.host.registry.Register(shardID, fromReplicaID, senderAddr)
 		}
-		h.host.clearShardJoining(shardID)
 	}
 
 	// Deliver the InstallSnapshot to the local raft layer so it updates
@@ -1533,14 +1510,26 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			OnDiskIndex: first.OnDiskIndex,
 		},
 	}
-	if !deliverSnapshotControl(h.engine, shardID, installMsg) {
-		// Fatal for this transfer. Without the install, raft never advances
-		// its committed index to the snapshot index, so queuing state-machine
-		// recovery would only produce a SnapshotRecoveryBehindError and the
-		// node markers would stay behind. Reporting success here would stop
-		// the leader from re-sending, leaving the follower permanently
-		// unrecovered; report failure instead so the leader retries and the
-		// dedup branch above re-delivers the install from LogDB.
+	// Two-phase from here (whole-project review, M1). Nothing above made this
+	// snapshot durable beyond its own directory: the LogDB record, the log
+	// floor, reclaiming older directories and the state-machine recovery all
+	// wait for raft's verdict on the install. Raft can still refuse an install
+	// that passed every check above — its sender deposed since the stream
+	// began, a position or membership out of bounds — or decline one it is
+	// already past. Recording and recovering on DELIVERY left a refused
+	// snapshot durably recorded, the log floor raised under it and a recovery
+	// queued that the log could never catch up to, failing the shard.
+	// Delivered to exactly the node the verdict is awaited on: by shard ID a
+	// StopShard/StartShard during this receive would hand the install to the
+	// NEW node, which adopts it while this receive waits on the old one.
+	verdictC := node.AwaitInstallVerdict(snapshotIndex)
+	if !deliverWithRetry(
+		func() bool { return h.engine.DeliverLocalTo(node, installMsg) },
+		func() { h.engine.NotifyWork(shardID) },
+	) {
+		node.CancelInstallVerdict(snapshotIndex)
+		// Fatal for this transfer: nothing is recorded, so the leader's
+		// re-send is received afresh.
 		slog.Error("failed to deliver InstallSnapshot to raft",
 			"shard", shardID,
 			"replica", replicaID,
@@ -1553,6 +1542,214 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			Err:       ErrSystemBusy,
 		}
 	}
+	var verdict engine.InstallVerdict
+	select {
+	case verdict = <-verdictC:
+	case <-node.StopC():
+		verdict = engine.InstallVerdict{Outcome: engine.InstallAbandoned}
+	}
+	switch verdict.Outcome {
+	case engine.InstallAdopted:
+	case engine.InstallDeclined:
+		// Raft is already at or past this snapshot; the unrecorded artifact
+		// is discarded by the deferred rollback.
+		slog.Info("snapshot receive declined: raft is already at or past it",
+			"shard", shardID,
+			"replica", replicaID,
+			"index", snapshotIndex,
+		)
+		return nil
+	case engine.InstallRefused:
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "install",
+			Err:       verdict.Err,
+		}
+	case engine.InstallSuperseded:
+		// Dropped before it was stepped — evicted for a newer install, or
+		// lost to a recovered step-worker panic: raft never saw it, so the
+		// unrecorded artifact is discarded.
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "install",
+			Err:       ErrSystemBusy,
+		}
+	default: // InstallAbandoned: the shard stopped or failed, or its step panicked
+		// No verdict will come, and that does NOT prove the install was never
+		// stepped — a step in progress when the node stopped may have adopted
+		// it, and raft's own record would then name this directory. So the
+		// artifact is kept, never discarded: unrecorded, it is an orphan the
+		// publish step and the GC reclaim; recorded, the shard recovers from
+		// it on its next start.
+		retain = true
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "install",
+			Err:       ErrSystemBusy,
+		}
+	}
+	// Adopted. Record it under the adopting incarnation's write lease: the
+	// LogDB record, the log floor and the GC below must not land after
+	// UnloadNode has returned and a new incarnation has loaded LogDB — its
+	// raft never adopted this snapshot, and its log reader would have entries
+	// removed underneath it. A node stopped since its verdict is treated as
+	// abandoned: its own commit pipeline records the adoption or drops it,
+	// and either way the artifact is kept.
+	if !node.AcquireWriteLease() {
+		retain = true
+		return &SnapshotReceiveError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Op:        "install",
+			Err:       ErrSystemBusy,
+		}
+	}
+	// From this point the artifact is raft's, and no failure below may send
+	// the rollback through RemoveAll on it.
+	committed = true
+
+	if recordErr := func() error {
+		defer node.ReleaseWriteLease()
+		node.LockSnapshotDir()
+		defer node.UnlockSnapshotDir()
+		// Save snapshot metadata to LogDB so the node can recover from it.
+		if h.host.logdb != nil {
+			// Carry the full membership unconditionally, including the
+			// replicated witness policy, the committed node identities and the
+			// replicated session policy: gating on Addresses/ConfigChangeID
+			// would discard a policy-only membership, and dropping any of the
+			// replicated fields would persist this snapshot with state that
+			// disagrees with every peer after a restart — a zeroed witness
+			// quorum, an identity-free configuration authorized by address
+			// alone, or an unset session policy whose apply path falls back to
+			// this node's own Config.
+			//
+			// This is the ONLY membership a replica bootstrapped by an
+			// InstallSnapshot has: its log has been compacted past the
+			// EntryInitialMembership that would otherwise carry these.
+			membership := logdb.Membership{
+				ConfigChangeID:             first.Membership.ConfigChangeID,
+				MaxWitnesses:               first.Membership.MaxWitnesses,
+				RequireFullReplicaMajority: first.Membership.RequireFullReplicaMajority,
+				SessionExpiryEntries:       first.Membership.SessionExpiryEntries,
+				MaxTotalSessions:           first.Membership.MaxTotalSessions,
+				MaxSessionsPerClient:       first.Membership.MaxSessionsPerClient,
+				MaxSessionsPerOwner:        first.Membership.MaxSessionsPerOwner,
+				Addresses:                  copyMapUint64String(first.Membership.Addresses),
+				Observers:                  copyMapUint64String(first.Membership.Observers),
+				Witnesses:                  copyMapUint64String(first.Membership.Witnesses),
+				Removed:                    copyMapUint64Bool(first.Membership.Removed),
+				Identities:                 copyMapUint64String(first.Membership.Identities),
+				RemovedIdentities:          copyMapUint64String(first.Membership.RemovedIdentities),
+			}
+			logdbSnap := logdb.Snapshot{
+				Index:       snapshotIndex,
+				Term:        snapshotTerm,
+				Membership:  membership,
+				Filepath:    snapshotDir,
+				FileSize:    onDiskSize,
+				OnDiskIndex: first.OnDiskIndex,
+				// Record the RECEIVER's at-rest epoch (from re-encryption above), not
+				// the wire epoch (first.Epoch is 0 — the sender streamed plaintext).
+				// recoverSnapshot decrypts under this node's barrier at this epoch.
+				Epoch: recvEpoch,
+				// Record the compression of the bytes actually on disk, classified
+				// above, so recoverSnapshot builds its reader chain from the
+				// artifact rather than from this node's own config.
+				Compression: recvCompression,
+			}
+			// Raft has adopted this snapshot. On its restore branch the commit
+			// worker records the same snapshot from raft's Update, and may have
+			// done so already: a record at this index or later is this snapshot
+			// recorded, not a failure. Any other failure cannot be answered by
+			// rolling back — raft now depends on this artifact — so it fails the
+			// shard, as a failed SaveState does; a restart replays the log, whose
+			// entries below the snapshot are still in place.
+			if saveErr := h.host.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil &&
+				!errors.Is(saveErr, logdb.ErrSnapshotOutOfDate) {
+				node.Fail(saveErr)
+				return &SnapshotReceiveError{
+					ShardID:   shardID,
+					ReplicaID: replicaID,
+					Op:        "logdb_save",
+					Err:       saveErr,
+				}
+			}
+			// Advance the log compaction floor to the snapshot index, exactly as the
+			// local save path (engine snapshotPool) and ImportSnapshot do.
+			//
+			// Without this, a follower that fell behind and caught up via
+			// InstallSnapshot keeps its OLD entries below the snapshot and then
+			// resumes replication above it, so its durable entry index becomes
+			// {1..k} U {N+1..M}: a HOLE. EntryRange checks the stored count against
+			// the first..last span, correctly reports ErrLogGapDetected, and
+			// recoverLogReader turns that into a StartShard failure — so the replica
+			// is permanently unstartable after the next restart. There is no
+			// self-heal (SnapshotEntries has no default, so this replica never
+			// compacts on its own) and no repair path (RequestCompaction on an
+			// unloaded shard only runs segment GC). This is reachable through
+			// entirely normal operation: leader compacts, follower lags, follower
+			// catches up, follower restarts.
+			//
+			// The snapshot subsumes every index at or below it, so removing them
+			// loses nothing. It is done AFTER the snapshot record is durable: a crash
+			// in between leaves the pre-existing shape (recoverable by the next
+			// successful receive or a local snapshot), whereas removing first would
+			// discard entries with no snapshot recorded to cover them.
+			// NON-FATAL, and the placement is the reason: this runs inside the block
+			// that precedes committed = true, so returning an error here would send
+			// the deferred rollback through RemoveAll on the very directory the
+			// SaveSnapshot one line above already durably recorded. That destroys a
+			// committed snapshot: the shard then cannot start (its LogDB record points
+			// at a deleted directory) and every leader re-send is refused by the dedup
+			// branch — a permanent wedge, the exact failure this floor advance exists
+			// to prevent.
+			//
+			// Failing to advance the floor is recoverable and self-healing: the
+			// snapshot is durably recorded, so the hole left below it is precisely the
+			// shape recoverLogReader repairs on the next start, and the next
+			// successful receive or local snapshot advances the floor anyway.
+			if rmErr := h.host.logdb.RemoveEntriesTo(shardID, replicaID, snapshotIndex); rmErr != nil {
+				slog.Warn("snapshot recorded but the log floor advance failed; the entry "+
+					"index is left holed below the snapshot and will be repaired on the next "+
+					"recovery",
+					"shard", shardID,
+					"replica", replicaID,
+					"snapshot_index", snapshotIndex,
+					"error", rmErr)
+			}
+		}
+
+		// Reclaim the shard's superseded snapshot directories now that this one is
+		// durably recorded, so retention is computed against the set INCLUDING it.
+		//
+		// The receive path creates one directory per InstallSnapshot and, until
+		// this call, reclaimed none of them: saveSnapshot was the only caller of
+		// the GC, and a shard with SnapshotEntries == 0 — a supported setting with
+		// no default, so the out-of-the-box state — never runs saveSnapshot at all.
+		// A follower that repeatedly fell behind the leader's compaction floor
+		// therefore accumulated one full state-machine image per catch-up forever,
+		// and every retained directory folds into the host-wide DEK purge floor, so
+		// those images also stopped co-hosted shards from ever purging an epoch key.
+		//
+		// NON-FATAL for the same reason the log-floor advance above is: the
+		// snapshot is recorded and the transfer succeeded. Failing to reclaim disk
+		// costs space, and the next successful receive or local save runs the GC
+		// again.
+		h.host.gcShardSnapshots(node.SnapshotDir(), shardID, replicaID, node.PinnedSnapshotDirs()...)
+		// Inside the lease with the record: a join window is keyed by shard ID,
+		// and once this incarnation stops, the window may already belong to
+		// the next one.
+		if joining {
+			h.host.clearShardJoining(shardID)
+		}
+		return nil
+	}(); recordErr != nil {
+		return recordErr
+	}
 
 	// Trigger snapshot recovery on the engine node. The engine's snapshot
 	// pool handles the actual SM.RecoverFromSnapshot call. This must not
@@ -1563,11 +1760,16 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// until the slot frees; if the retry budget is exhausted, report the
 	// transfer failed so the leader re-sends and the dedup branch above
 	// re-arms recovery from the persisted snapshot.
-	engNode := h.engine.GetNode(shardID)
-	if engNode != nil {
-		if err := h.requestRecoveryWithRetry(shardID, replicaID, engNode); err != nil {
-			return err
-		}
+	//
+	// On the node that ADOPTED the install, not whichever node holds the shard
+	// now: after a StopShard/StartShard in between, the new node's raft never
+	// adopted this snapshot, so a recovery queued on it waits for a log that
+	// will not reach the index and fails the shard. A recovery on an adopting
+	// node that has since stopped is abandoned by the snapshot pool without
+	// failing or reporting anything, and the next start recovers from the
+	// record.
+	if err := h.requestRecoveryWithRetry(shardID, replicaID, node); err != nil {
+		return err
 	}
 
 	// Note: The sender side (transportSender.doSendSnapshot) already delivers

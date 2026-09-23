@@ -20,7 +20,7 @@ socket inside someone else's process.
 
 ```go
 c := quicraft.NewPrometheusMetricsCollector()
-host, _ := quicraft.NewHost(cfg, quicraft.WithMetrics(c))
+host, _ := quicraft.NewHost(cfg, quicraft.WithMetrics(c), quicraft.WithoutEncryption())
 
 // The embedder serves it:
 http.Handle("/metrics", promhttp.HandlerFor(c.Registry, promhttp.HandlerOpts{}))

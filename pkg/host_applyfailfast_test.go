@@ -171,7 +171,7 @@ func TestApplyFailureFailsTheShardWithoutRetrying(t *testing.T) {
 				},
 			}
 
-			h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+			h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 			if err != nil {
 				t.Fatalf("NewHost: %v", err)
 			}
@@ -252,7 +252,7 @@ func TestProposalsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 		},
 	}
 
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -383,7 +383,7 @@ func newLatchableHost(t *testing.T) (*Host, *poisonApplySM, chan config.ShardFai
 			}
 		},
 	}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport())
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}

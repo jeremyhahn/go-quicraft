@@ -141,6 +141,17 @@ type Barrier interface {
 	// byte-identical to EncryptWithEpoch.
 	EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
 
+	// EncryptWithEpochPinnedContext is EncryptWithEpochContext that also
+	// registers the epoch it sealed under as in-flight, in ONE atomic step
+	// under the barrier's own lock; the caller must DeregisterInFlightEpoch it.
+	//
+	// It is required, not optional. EncryptWithEpoch releases the lock before
+	// returning, so a Rotate followed by PurgeEpochsBefore could otherwise
+	// complete in the gap before the caller pinned the returned epoch —
+	// purging the DEK of ciphertext about to be persisted, which would then be
+	// permanently undecryptable.
+	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
+
 	// DecryptForEpoch decrypts ciphertext using a specific epoch's DEK.
 	DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
 
@@ -182,35 +193,16 @@ type Barrier interface {
 	ShouldRotateKey() bool
 }
 
-// atomicEpochPinner is an OPTIONAL capability a Barrier may implement: seal a
-// frame and register the epoch it sealed under as in-flight in ONE atomic step,
-// under the barrier's own lock.
-//
-// It exists because EncryptWithEpoch releases that lock before returning, so a
-// Rotate followed by PurgeEpochsBefore can complete in the gap before the caller
-// pins the returned epoch — dropping the DEK of a frame that is already sealed
-// into the artifact and making the snapshot permanently undecryptable. Doing both
-// under one lock closes that window entirely.
-//
-// The at-rest encrypt loops use it when available and fall back to
-// pin-before + pin-after otherwise, so a Barrier implementation that does not
-// provide it keeps working (with the narrower residual window).
-//
-// The caller must DeregisterInFlightEpoch the returned epoch once the artifact's
-// epoch is durably recorded, exactly as for a manual RegisterInFlightEpoch.
-type atomicEpochPinner interface {
-	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
-}
-
 // hostOptions holds optional dependencies injected via HostOption functions.
 type hostOptions struct {
-	logdb            logdb.LogDB
-	barrier          Barrier
-	shardBarriers    func(shardID uint64) Barrier
-	metrics          MetricsCollector
-	logger           *slog.Logger
-	disableTransport bool
-	fsys             snapshotFS
+	logdb             logdb.LogDB
+	barrier           Barrier
+	shardBarriers     func(shardID uint64) Barrier
+	metrics           MetricsCollector
+	logger            *slog.Logger
+	disableTransport  bool
+	withoutEncryption bool
+	fsys              snapshotFS
 }
 
 // HostOption configures optional Host dependencies.
@@ -314,6 +306,23 @@ func WithLogger(l *slog.Logger) HostOption {
 	}
 }
 
+// WithoutEncryption declares that this host stores its Raft log and its
+// snapshots UNENCRYPTED at rest.
+//
+// NewHost refuses a host that neither configures at-rest encryption
+// (WithBarrier or WithShardBarriers) nor makes this declaration: plaintext at
+// rest is a deployment decision, and a host that reached it by omitting an
+// option would give no sign that it had. Anyone with read access to the data
+// directories can then read every proposed command and every snapshot.
+//
+// Use it for tests, benchmarks and deployments whose storage is protected by
+// other means. It cannot be combined with WithBarrier or WithShardBarriers.
+func WithoutEncryption() HostOption {
+	return func(o *hostOptions) {
+		o.withoutEncryption = true
+	}
+}
+
 // WithoutTransport disables the QUIC transport layer. Messages are
 // silently dropped via a no-op sender. Use for single-node testing
 // only, where no remote message delivery is needed.
@@ -408,17 +417,17 @@ func logDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
 // in-memory LogDB writes no file, so there is no at-rest artifact to protect
 // and no crash-surviving copy of a user command. That is a property of the
 // STORE, not a property of the caller having passed WithLogDB.
-func requireEncryptedLogDB(db logdb.LogDB) error {
+func requireEncryptedLogDB(db logdb.LogDB, refusal error) error {
 	if db == nil {
 		// The default WAL is about to be created and no barrier was configured
 		// for it, so it would write plaintext segments.
-		return ErrShardBarriersPlaintextWAL
+		return refusal
 	}
 	switch logDBAtRestProtection(db) {
 	case logdb.AtRestBarrierEncrypted, logdb.AtRestNonDurable:
 		return nil
 	default:
-		return ErrShardBarriersPlaintextWAL
+		return refusal
 	}
 }
 
@@ -878,73 +887,27 @@ func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string,
 // epoch for all of them would fail AEAD authentication on the mismatched
 // frames. Shared by the transport send path (decryptSnapshotForSend) and the
 // ExportSnapshot API so both emit identical plaintext.
-// encryptSnapshotFrames reads plaintext snapshot data from src and writes it to
-// dst as a sequence of frames [4-byte LE length][AEAD ciphertext], one per
-// snapshotEncryptChunkSize-byte chunk, encrypted under the given barrier's
-// current epoch DEK. It returns the MINIMUM epoch across the frames (a
-// concurrent rotation can advance the epoch mid-stream), which the caller
-// records as the snapshot's at-rest epoch so the DEK-purge floor protects every
-// frame. The frame format matches engine.snapshotPool.encryptSnapshotFile and is
-// decryptable by decryptSnapshotFrames / the recover path, so a snapshot
+// encryptSnapshotFrames seals the plaintext snapshot data src yields into dst
+// through engine.SealSnapshotFrames, the one implementation of the frame
+// format the local save path writes: [4-byte LE length][AEAD ciphertext] per
+// chunk, each frame bound to the artifact identity (shardID, replicaID,
+// index), its ordinal, and whether it is the terminal frame. The output is
+// what decryptSnapshotFrames and the recover path read, so a snapshot
 // RE-ENCRYPTED on receipt under the RECEIVER's own (per-node) barrier recovers
 // correctly with that same barrier — the basis for per-node at-rest encryption
 // of received snapshots without any shared cross-node key.
-// It PINS every epoch it seals a frame under (not just the minimum) as in-flight
-// on the barrier, and returns that set so the caller can release it AFTER the
-// snapshot is durably recorded. Pinning each frame's epoch — before the seal via
-// CurrentEpoch and again after via the reported epoch — is what stops a
-// concurrent key rotation + PurgeEpochsBefore from dropping the DEK of an
-// INTERMEDIATE frame epoch (which the min-only pin left exposed once two
-// rotations landed mid-loop), which would leave the snapshot undecryptable. The
-// caller MUST DeregisterInFlightEpoch every returned epoch once its durable
-// record exists. On error, all pins this call took are released before return.
 //
-// Every frame is additionally bound to its POSITION — the artifact's
-// (shardID, replicaID, index) plus the frame's 0-based ordinal — through the
-// AEAD context AAD (engine.NewSnapshotAAD), so a frame cannot be replayed at
-// another ordinal, another snapshot index, or another shard sharing the
-// host-wide barrier. The binding is unconditional and has no weaker fallback.
+// It returns the MINIMUM epoch across the frames (a concurrent rotation can
+// advance the epoch mid-stream), which the caller records as the snapshot's
+// at-rest epoch so the DEK-purge floor protects every frame, and every epoch a
+// frame was sealed under, PINNED as in-flight on the barrier. The caller MUST
+// DeregisterInFlightEpoch each one once the snapshot's durable record exists;
+// pinning every frame's epoch rather than the minimum is what stops a
+// concurrent rotate + PurgeEpochsBefore from dropping an intermediate frame's
+// DEK. On error, every pin this call took is released before it returns.
 func encryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, []uint64, error) {
-	chunkBuf := make([]byte, snapshotEncryptChunkSize)
-	var frameLenBuf [4]byte
-	var minEpoch uint64
-	pins := newEpochPinner(barrier)
-	// One builder for the whole artifact; Frame reuses its scratch buffer, so
-	// the AAD costs no per-frame allocation on this bulk path.
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier)
-	var seq uint64
-	for {
-		n, readErr := src.Read(chunkBuf)
-		if n > 0 {
-			ct, epoch, encErr := pins.sealFrame(chunkBuf[:n], aad.Frame(seq))
-			if encErr != nil {
-				pins.releaseAll()
-				return 0, nil, encErr
-			}
-			seq++
-			if minEpoch == 0 || epoch < minEpoch {
-				minEpoch = epoch
-			}
-			binary.LittleEndian.PutUint32(frameLenBuf[:], uint32(len(ct)))
-			if _, werr := dst.Write(frameLenBuf[:]); werr != nil {
-				pins.releaseAll()
-				return 0, nil, werr
-			}
-			if _, werr := dst.Write(ct); werr != nil {
-				pins.releaseAll()
-				return 0, nil, werr
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			pins.releaseAll()
-			return 0, nil, readErr
-		}
-	}
-	return minEpoch, pins.epochs(), nil
+	return engine.SealSnapshotFrames(barrier, shardID, replicaID, index, src, dst)
 }
 
 // reencryptReceivedSnapshot re-encrypts a just-written PLAINTEXT snapshot.dat at
@@ -1053,49 +1016,20 @@ func reencryptReceivedSnapshot(fsys snapshotFS, path string, shardID, replicaID,
 	return epoch, pinned, nil
 }
 
-// decryptSnapshotFrames reproduces the positional context the encrypt side
-// stamped into every frame. Frames are read strictly sequentially from offset
-// 0, so the ordinal is simply the count; shardID/replicaID/index MUST be the
-// identity the artifact was sealed under. A mismatch fails authentication and
-// is never retried with a weaker (epoch-only) AAD.
+// decryptSnapshotFrames authenticates and decrypts a sealed snapshot artifact
+// through engine.OpenSnapshotFrames, the one reader of the format: every frame
+// is checked against its ordinal, the artifact identity (shardID, replicaID,
+// index) it was sealed under, and whether it is the terminal frame, so a
+// spliced, reordered or tail-truncated artifact fails. A mismatch is never
+// retried with a weaker (epoch-only) AAD. Damage to the artifact is reported
+// as ErrSnapshotCorrupt.
 func decryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, error) {
-	var frameLenBuf [4]byte
-	var totalSize uint64
-	aad := engine.NewSnapshotAAD(shardID, replicaID, index, barrier)
-	var seq uint64
-	for {
-		_, readErr := io.ReadFull(src, frameLenBuf[:])
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return 0, readErr
-		}
-		frameLen := binary.LittleEndian.Uint32(frameLenBuf[:])
-		// Reject a corrupt/oversized length prefix before allocating. A frame
-		// is one encrypted 64 KiB chunk plus small AEAD framing overhead.
-		if frameLen > maxSnapshotFrameLen {
-			return 0, ErrSnapshotCorrupt
-		}
-
-		frame := make([]byte, frameLen)
-		if _, readErr = io.ReadFull(src, frame); readErr != nil {
-			return 0, readErr
-		}
-
-		plaintext, decErr := barrier.DecryptWithContext(nil, frame, aad.Frame(seq))
-		if decErr != nil {
-			return 0, decErr
-		}
-		seq++
-
-		if _, writeErr := dst.Write(plaintext); writeErr != nil {
-			return 0, writeErr
-		}
-		totalSize += uint64(len(plaintext))
+	n, err := engine.OpenSnapshotFrames(barrier, shardID, replicaID, index, src, dst)
+	if errors.Is(err, engine.ErrSnapshotCorrupt) {
+		return 0, ErrSnapshotCorrupt
 	}
-	return totalSize, nil
+	return n, err
 }
 
 // notifySnapshotStatus injects a SnapshotStatus message into the
@@ -2233,6 +2167,52 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 	}
 }
 
+// OnLogCompacted fires the log compaction events for a snapshot save that
+// actually compacted, each carrying the index compaction ran through. It is
+// delivered after OnSnapshotCompleted, so a listener sees OnSnapshotCreated
+// before the compaction it enabled. OnLogDBCompacted fires only when the
+// LogDB also removed the entries: a LogDB step that failed was logged and is
+// retried by the next snapshot, and reporting it would claim storage was
+// reclaimed when it was not.
+func (c *hostEngineCallback) OnLogCompacted(shardID, replicaID uint64, compaction engine.LogCompaction) {
+	el := c.h.cfg.EventListener
+	if el == nil || !compaction.Reader {
+		return
+	}
+	info := config.EventShardInfo{ShardID: shardID, ReplicaID: replicaID, Index: compaction.Index}
+	c.dispatchListener("OnLogCompacted", shardID, func() {
+		if el.OnLogCompacted != nil {
+			el.OnLogCompacted(info)
+		}
+		if compaction.LogDB && el.OnLogDBCompacted != nil {
+			el.OnLogDBCompacted(info)
+		}
+	})
+}
+
+// dispatchListener runs a fan-out to user EventListener code on the engine's
+// listener dispatcher. The snapshot callbacks are invoked INLINE on a snapshot
+// pool worker, and the engine.Callback contract forbids fanning them out to
+// user code without dispatching: a listener is free to call StopShard, and an
+// unload can wait for that very worker — a recovery reports while holding the
+// node's write lease, which UnloadNode waits out — so an inline listener
+// calling StopShard would wait on itself forever. Without an engine (unit
+// fixtures) there is no worker to deadlock with, and fn runs inline.
+func (c *hostEngineCallback) dispatchListener(event string, shardID uint64, fn func()) {
+	if c.h.engine == nil {
+		fn()
+		return
+	}
+	if !c.h.engine.DispatchListener(fn) {
+		// Dropped, as the engine drops its own notifications on a full queue
+		// (counted in ListenerNotificationsDropped); named here so an operator
+		// can tell WHICH event a shard never delivered.
+		slog.Error("listener notification dropped: the EventListener is not consuming",
+			"event", event,
+			"shard_id", shardID)
+	}
+}
+
 // OnSnapshotCompleted processes snapshot completion callbacks from the
 // engine snapshot pool. It completes any pending snapshot RequestState
 // and fires the OnSnapshotCreated event listener if configured.
@@ -2282,73 +2262,69 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 		c.reconcileMembershipFromPeer(shardID, ns)
 	}
 
-	// Fire event listener callbacks.
+	// Fire event listener callbacks — dispatched, never inline: see
+	// dispatchListener.
 	if el := c.h.cfg.EventListener; el != nil {
-		if err == nil && index > 0 {
-			// Successful snapshot save.
-			if el.OnSnapshotCreated != nil {
-				el.OnSnapshotCreated(config.SnapshotInfo{
-					ShardID:   shardID,
-					ReplicaID: ns.replicaID,
-					Index:     index,
-				})
-			}
-			if el.OnSnapshotCompacted != nil {
-				el.OnSnapshotCompacted(config.SnapshotInfo{
-					ShardID:   shardID,
-					ReplicaID: ns.replicaID,
-					Index:     index,
-				})
-			}
-			if el.OnLogCompacted != nil {
-				el.OnLogCompacted(config.EventShardInfo{
-					ShardID:   shardID,
-					ReplicaID: ns.replicaID,
-				})
-			}
-			if el.OnLogDBCompacted != nil {
-				el.OnLogDBCompacted(config.EventShardInfo{
-					ShardID:   shardID,
-					ReplicaID: ns.replicaID,
-				})
-			}
-		}
-		if err == nil && index == 0 {
-			// Successful snapshot recovery (index is 0 for recovers).
-			if el.OnSnapshotRecovered != nil {
-				el.OnSnapshotRecovered(config.SnapshotInfo{
-					ShardID:   shardID,
-					ReplicaID: ns.replicaID,
-				})
-			}
-		}
-		// A DECLINED stale recovery is NOT a failed shard, and reporting it as
-		// one is the same defect #113 fixed one layer down (#126).
-		//
-		// The engine refuses a recovery whose snapshot is not ahead of the
-		// apply frontier, and since #113 it DECLINES that refusal rather than
-		// failing the node: recoveryBlockedByLog produces it before the
-		// recovering gate is raised and before RecoverFromSnapshot runs, so the
-		// state machine is untouched and already at or past the snapshot index.
-		// engine.Node.Fail is never called and the replica keeps serving.
-		//
-		// The pool still reports the refusal as the completion's error, and
-		// must: a declined recovery is not a SUCCESSFUL one either, and
-		// treating it as success would fire OnSnapshotRecovered and reconcile
-		// membership from a snapshot nothing ever restored. What must not
-		// happen is handing that same error to OnShardFailed, which is the only
-		// outward report that a replica makes no further progress without an
-		// operator StopShard/StartShard. A false one is not cosmetic: an
-		// operator acts on it, and a harness that fast-fails on it aborts a
-		// healthy run — which is exactly how #126 was observed, with the
-		// engine's own "snapshot recovery declined" line in the same log.
-		if err != nil && el.OnShardFailed != nil && !declinedStaleRecovery(err) {
-			el.OnShardFailed(config.ShardFailedInfo{
+		replicaID := ns.replicaID
+		c.dispatchListener("OnSnapshotCompleted", shardID, func() { fireSnapshotListeners(el, shardID, replicaID, index, err) })
+	}
+}
+
+// fireSnapshotListeners delivers a snapshot completion to the user's
+// EventListener. It runs on the listener dispatcher (see dispatchListener).
+func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index uint64, err error) {
+	if err == nil && index > 0 {
+		// Successful snapshot save.
+		if el.OnSnapshotCreated != nil {
+			el.OnSnapshotCreated(config.SnapshotInfo{
 				ShardID:   shardID,
-				ReplicaID: ns.replicaID,
-				Err:       err,
+				ReplicaID: replicaID,
+				Index:     index,
 			})
 		}
+		if el.OnSnapshotCompacted != nil {
+			el.OnSnapshotCompacted(config.SnapshotInfo{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Index:     index,
+			})
+		}
+	}
+	if err == nil && index == 0 {
+		// Successful snapshot recovery (index is 0 for recovers).
+		if el.OnSnapshotRecovered != nil {
+			el.OnSnapshotRecovered(config.SnapshotInfo{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+			})
+		}
+	}
+	// A DECLINED stale recovery is NOT a failed shard, and reporting it as
+	// one is the same defect #113 fixed one layer down (#126).
+	//
+	// The engine refuses a recovery whose snapshot is not ahead of the
+	// apply frontier, and since #113 it DECLINES that refusal rather than
+	// failing the node: recoveryBlockedByLog produces it before the
+	// recovering gate is raised and before RecoverFromSnapshot runs, so the
+	// state machine is untouched and already at or past the snapshot index.
+	// engine.Node.Fail is never called and the replica keeps serving.
+	//
+	// The pool still reports the refusal as the completion's error, and
+	// must: a declined recovery is not a SUCCESSFUL one either, and
+	// treating it as success would fire OnSnapshotRecovered and reconcile
+	// membership from a snapshot nothing ever restored. What must not
+	// happen is handing that same error to OnShardFailed, which is the only
+	// outward report that a replica makes no further progress without an
+	// operator StopShard/StartShard. A false one is not cosmetic: an
+	// operator acts on it, and a harness that fast-fails on it aborts a
+	// healthy run — which is exactly how #126 was observed, with the
+	// engine's own "snapshot recovery declined" line in the same log.
+	if err != nil && el.OnShardFailed != nil && !declinedStaleRecovery(err) {
+		el.OnShardFailed(config.ShardFailedInfo{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Err:       err,
+		})
 	}
 }
 
@@ -2918,6 +2894,14 @@ type Host struct {
 	// evaluated against a tree the other call is midway through changing. The
 	// lock makes the check-then-write sequence atomic per shard.
 	importLocks sync.Map
+
+	// startingShards holds the shard IDs a StartShard is between its early
+	// duplicate check and its return (map[uint64]struct{}). StartShard holds
+	// the shard's import lock for that span too, so without this a second,
+	// concurrent start of the same shard found the lock taken and was told an
+	// import was in progress; claiming the start first lets it report the
+	// transient ErrShardNotReady, and leaves ErrImportInProgress to imports.
+	startingShards sync.Map
 }
 
 // acquireImportLock takes the shard's exclusive import lock, waiting until it
@@ -2967,6 +2951,34 @@ func (h *Host) tryAcquireImportLock(shardID uint64) (func(), bool) {
 	default:
 		return nil, false
 	}
+}
+
+// lockStoppedShardForImport takes the shard's import lock and then re-checks,
+// under it, that the shard is still stopped, returning the release.
+//
+// ImportSnapshot's preflight runs before the lock, and StartShard holds the
+// lock for its whole start: a shard started between the two is running by the
+// time the lock is free, and importing underneath it would compact the log a
+// live node reads. While the lock is held, no start can begin.
+func (h *Host) lockStoppedShardForImport(ctx context.Context, shardID, replicaID uint64) (func(), error) {
+	release, err := h.acquireImportLock(ctx, shardID)
+	if err != nil {
+		return nil, err
+	}
+	lockedReplicaID, err := h.importPreflight(ctx, shardID)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	// The import resolved its membership and paths from the replica the
+	// first, unlocked preflight found. A start and stop in between can have
+	// re-bootstrapped the shard under another replica; importing under the
+	// stale one would write a record and tree no incarnation reads.
+	if lockedReplicaID != replicaID {
+		release()
+		return nil, ErrInvalidOperation
+	}
+	return release, nil
 }
 
 // markShardJoining records that a shard is in its join bootstrap window.
@@ -3258,6 +3270,17 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		opt(options)
 	}
 
+	// At-rest encryption is a decision the caller states, never one it
+	// reaches by omission. Checked before anything touches the disk, so a
+	// refused host leaves no directories behind.
+	encrypted := options.barrier != nil || options.shardBarriers != nil
+	switch {
+	case options.withoutEncryption && encrypted:
+		return nil, ErrAtRestEncryptionConflict
+	case !options.withoutEncryption && !encrypted:
+		return nil, ErrAtRestEncryptionUnspecified
+	}
+
 	// Propagate transport disabled state to the config before validation
 	// so that MTLSConfig is only required when transport is enabled.
 	if options.disableTransport {
@@ -3317,7 +3340,17 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// waldb.Open(walDir) -- the exact state this refusal exists to prevent,
 	// reached by the one-line change an integrator makes to relocate the WAL.
 	if options.shardBarriers != nil && options.barrier == nil {
-		if err := requireEncryptedLogDB(options.logdb); err != nil {
+		if err := requireEncryptedLogDB(options.logdb, ErrShardBarriersPlaintextWAL); err != nil {
+			return nil, err
+		}
+	}
+	// The same holds for the host-wide barrier, which is wired ONLY into the
+	// default WAL built below. A caller-supplied LogDB never receives it, so
+	// WithBarrier plus waldb.Open(dir) — the one-line change that relocates the
+	// WAL — encrypted the snapshots and wrote every proposed command to disk in
+	// plaintext, with nothing to say so. A stated encryption must cover the log.
+	if options.barrier != nil && options.logdb != nil {
+		if err := requireEncryptedLogDB(options.logdb, ErrBarrierPlaintextLogDB); err != nil {
 			return nil, err
 		}
 	}
@@ -3861,8 +3894,37 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// below, but this catches the common case without doing expensive
 	// peer/SM initialization.
 	if _, loaded := h.nodes.Load(cfg.ShardID); loaded {
+		// A start that has published its node can still fail and withdraw
+		// it (a failed bootstrap save rolls it back), so while that start
+		// holds its claim the shard is starting, not running.
+		if _, starting := h.startingShards.Load(cfg.ShardID); starting {
+			return ErrShardNotReady
+		}
 		return ErrShardAlreadyExists
 	}
+
+	// Hold the shard's import lock for the whole start, before its durable
+	// state is read. An import records a snapshot and removes the log beneath
+	// it; one that passed its stopped-shard check and is still writing would
+	// otherwise commit underneath the node this call is about to build from
+	// the OLD log, leaving raft, the log reader, the record and the compaction
+	// floor mutually inconsistent. The import re-checks that the shard is not
+	// running once it holds this lock, so it sees this start and refuses. It
+	// is only TRIED: a start must not queue behind a multi-gigabyte restore,
+	// and the caller retries the identical call.
+	// Another start of this shard is in progress. It may still fail, so this
+	// is not ErrShardAlreadyExists — a caller that reads that as "running"
+	// would never start the shard — but the transient ErrShardNotReady: the
+	// retry sees the outcome, a running shard or a free one.
+	if _, starting := h.startingShards.LoadOrStore(cfg.ShardID, struct{}{}); starting {
+		return ErrShardNotReady
+	}
+	defer h.startingShards.Delete(cfg.ShardID)
+	releaseImportLock, importIdle := h.tryAcquireImportLock(cfg.ShardID)
+	if !importIdle {
+		return ErrImportInProgress
+	}
+	defer releaseImportLock()
 
 	// Copy the members map to avoid aliasing.
 	nodesCopy := make(map[uint64]string, len(members))
@@ -4190,15 +4252,9 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// purge-floor scan), so without this sweep the exposure is permanent.
 	//
 	// A live staging directory is indistinguishable from an orphaned one by
-	// name, so the sweep runs only when this call can prove no import is in
-	// flight for the shard: the per-shard import lock. Taking it is a TRY —
-	// StartShard must not block behind a multi-gigabyte restore, and an import
-	// that is running owns its staging directory and removes it itself on
-	// failure.
-	if release, ok := h.tryAcquireImportLock(cfg.ShardID); ok {
-		engine.SweepStaleImportStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
-		release()
-	}
+	// name, so the sweep runs only where no import can be in flight: this
+	// call holds the shard's import lock for the whole start (above).
+	engine.SweepStaleImportStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
 
 	// Reclaim an InstallSnapshot receive staging directory orphaned by a crash.
 	// A receive removes its own on every error return, so only a kill leaves
@@ -4212,6 +4268,9 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// is distinct from the import one, whose sweeper reclaims under the import
 	// lock while the shard is running.
 	engine.SweepStaleRecvStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
+	// A local save stages the same way, under its own prefix, and the same
+	// argument holds: no node, no save that could still publish.
+	engine.SweepStaleSaveStageDirs(snapshotDir, cfg.ShardID, cfg.ReplicaID)
 
 	// The state machine reads the shard's REPLICATED session policy, and falls
 	// back to this node's configuration only while none is known — a shard
@@ -7439,6 +7498,13 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // recorded in LogDB so the next StartShard recovers the SAME logical
 // snapshot. The context is checked for cancellation at key blocking points.
 //
+// It returns an error wrapping ErrInvalidOperation when the shard is running
+// — including one started while this call waited for the shard's import lock
+// — and when this host holds data for more than one replica of the shard, in
+// which case the stale replica's data must be removed (RemoveData) first: the
+// shard-only API cannot tell which replica the operator means. While an import
+// runs, StartShard of the same shard is refused with ErrImportInProgress.
+//
 // The artifact is written to the canonical snapshot path — the same
 // shardSnapshotBaseDir + engine.SnapshotSaveDir construction StartShard, the
 // snapshot pool and the receive path use — so it is visible to snapshot garbage
@@ -7529,7 +7595,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// the shard's recorded snapshot and its on-disk tree, and both are resolved
 	// from the artifact's index, so a second concurrent import of the same
 	// index would otherwise interleave with this one's checks.
-	release, err := h.acquireImportLock(ctx, shardID)
+	release, err := h.lockStoppedShardForImport(ctx, shardID, replicaID)
 	if err != nil {
 		return err
 	}
@@ -7797,12 +7863,22 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	if err != nil {
 		return 0, err
 	}
+	// The shard must have exactly ONE replica on this host. ListNodeInfo is
+	// built from a map, so "the first" of several is a different replica on
+	// each call; a shard restarted under a new replica ID without removing
+	// the old one's data has two records, and an import would land under one
+	// of them at random. Refuse the ambiguity instead: the operator removes
+	// the stale replica's data (RemoveData) and imports again.
 	var replicaID uint64
 	for _, ni := range nodes {
-		if ni.ShardID == shardID {
-			replicaID = ni.ReplicaID
-			break
+		if ni.ShardID != shardID {
+			continue
 		}
+		if replicaID != 0 && ni.ReplicaID != replicaID {
+			return 0, fmt.Errorf("%w: shard %d has data for more than one replica on this host (%d and %d); "+
+				"remove the stale replica's data before importing", ErrInvalidOperation, shardID, replicaID, ni.ReplicaID)
+		}
+		replicaID = ni.ReplicaID
 	}
 	if replicaID == 0 {
 		return 0, ErrShardNotFound
@@ -7840,9 +7916,16 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 // durable work as failed — and for the import there is no way to retry, because
 // the snapshot index and directory now exist. Failing to reclaim disk loses no
 // correctness and the next snapshot runs the GC again.
-func (h *Host) gcShardSnapshots(baseDir string, shardID, replicaID uint64) {
-	if err := engine.GCSnapshotDirs(baseDir, shardID, replicaID,
-		h.recordedSnapshotPath(shardID, replicaID)); err != nil {
+func (h *Host) gcShardSnapshots(baseDir string, shardID, replicaID uint64, spare ...string) {
+	recorded, recErr := h.recordedSnapshotPath(shardID, replicaID)
+	if recErr != nil {
+		// Without the record there is no telling which directory GC must
+		// spare, so it reclaims nothing this time.
+		h.logger.Warn("snapshot GC skipped: the snapshot record cannot be read",
+			"shard_id", shardID, "replica_id", replicaID, "error", recErr)
+		return
+	}
+	if err := engine.GCSnapshotDirs(baseDir, shardID, replicaID, recorded, spare...); err != nil {
 		h.logger.Warn("snapshot recorded, but reclaiming the superseded snapshot "+
 			"directories failed; they will be reclaimed by a later snapshot",
 			"shard_id", shardID, "replica_id", replicaID, "error", err)
@@ -10808,21 +10891,38 @@ func copyWithContextN(ctx context.Context, dst io.Writer, src io.Reader) (int64,
 }
 
 // recordedSnapshotPath returns the cleaned snapshot directory LogDB records for
-// the node, or "" when there is none or it cannot be read.
+// the node: "" with a nil error when there is no record (or no LogDB), and an
+// error when the record cannot be read.
 //
-// It exists so snapshot GC can refuse to delete the directory the durable
-// record points at. A read failure yields "" rather than an error: GC must not
-// be blocked by an unreadable record, and the only consequence of not knowing
-// is that the guard does not fire.
-func (h *Host) recordedSnapshotPath(shardID, replicaID uint64) string {
+// It exists so the snapshot GC and a receive's publish can refuse to delete
+// the directory the durable record points at, and an unreadable record is
+// therefore NOT "no record". Mapping a read error to "" made both fail open —
+// deleting the recorded snapshot, whose log below it may already be
+// compacted, on one transient read error. A caller that cannot learn the
+// record must not remove anything the record might name.
+func (h *Host) recordedSnapshotPath(shardID, replicaID uint64) (string, error) {
 	if h.logdb == nil {
-		return ""
+		return "", nil
 	}
 	rec, err := h.logdb.GetSnapshot(shardID, replicaID)
-	if err != nil || rec.Filepath == "" {
-		return ""
+	if errors.Is(err, logdb.ErrNoSnapshot) {
+		return "", nil
 	}
-	return filepath.Clean(rec.Filepath)
+	if err != nil {
+		return "", err
+	}
+	if rec.Filepath == "" {
+		return "", nil
+	}
+	return filepath.Clean(rec.Filepath), nil
+}
+
+// snapshotRecordMayName reports whether the shard's LogDB snapshot record
+// names dir — or might: a record that cannot be read is answered true, so a
+// caller about to delete dir keeps it instead.
+func (h *Host) snapshotRecordMayName(shardID, replicaID uint64, dir string) bool {
+	recorded, err := h.recordedSnapshotPath(shardID, replicaID)
+	return err != nil || (recorded != "" && recorded == filepath.Clean(dir))
 }
 
 // StateMachineHash returns a hash of this replica's applied state machine

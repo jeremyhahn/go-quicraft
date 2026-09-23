@@ -42,7 +42,7 @@ func TestStartShard_ClosesStateMachineOnFailure(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
 	db.saveBootstrapErr = errors.New("injected SaveBootstrap failure")
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport())
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
