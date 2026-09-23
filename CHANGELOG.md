@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0-alpha] - 2026-09-23
+
 Implements the production-readiness rulings of 2026-09-23 that change the
 code or the docs (R1, R2, R3, R8, R9, R10), and the fixes from the
 whole-project review of that work by Claude and Codex (R11). **Three breaking
