@@ -295,3 +295,50 @@ func TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords(t *testing.T) {
 		t.Fatalf("DATA LOSS: the failed receive discarded the directory LogDB records: %v", statErr)
 	}
 }
+
+// claimProbe records, when the install is offered to raft, whether the
+// receive holds its claim on the index — the claim must span the wait for
+// raft's verdict, during which the published directory is unrecorded.
+type claimProbe struct {
+	engineDeliverer
+	index   uint64
+	claimed bool
+	checked bool
+}
+
+func (d *claimProbe) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
+	if msg.Type == proto.InstallSnapshot && !d.checked {
+		d.checked = true
+		node.LockSnapshotDir()
+		d.claimed = node.IsSnapshotDirClaimed(d.index)
+		node.UnlockSnapshotDir()
+	}
+	return d.engineDeliverer.DeliverLocalTo(node, msg)
+}
+
+// TestHandleSnapshot_ClaimsItsIndexUntilSettled: a receive's published
+// directory is unrecorded until raft's verdict, and a local save at the same
+// index treats an unclaimed, unrecorded directory as an orphan to replace. The
+// receive claims its index from the publish until it returns.
+func TestHandleSnapshot_ClaimsItsIndexUntilSettled(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	const snapIndex = uint64(900)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	node := eng.GetNode(shardID)
+	probe := &claimProbe{engineDeliverer: eng, index: snapIndex}
+	handler := &hostMessageHandler{engine: probe, host: h}
+
+	_ = handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	if !probe.checked {
+		t.Fatal("the install was never offered to raft; the probe proves nothing")
+	}
+	if !probe.claimed {
+		t.Fatal("the receive awaited raft's verdict without claiming its index: a local save could replace its published directory")
+	}
+	node.LockSnapshotDir()
+	defer node.UnlockSnapshotDir()
+	if node.IsSnapshotDirClaimed(snapIndex) {
+		t.Fatal("the receive left its claim behind: saves at that index would be refused for the incarnation's life")
+	}
+}

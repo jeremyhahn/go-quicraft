@@ -736,11 +736,11 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 
 	// --- cross-barrier isolation: BarrierB cannot decrypt BarrierA's snapshot ---
 	dataPathA := snapshotSaveDir(baseDir, 5, 1, 200) + "/" + snapshotDataFile
-	if _, err := p2.decryptSnapshotToSibling(dataPathA, 5, 1, 200, 2, bB); err == nil {
+	if _, err := p2.decryptSnapshotToScratch(filepath.Dir(dataPathA), dataPathA, 5, 1, 200, 2, bB); err == nil {
 		t.Fatal("BarrierB decrypted BarrierA's snapshot — per-tenant isolation breached")
 	}
 	// And BarrierA still decrypts its own snapshot correctly post-rotation.
-	plainA, err := p2.decryptSnapshotToSibling(dataPathA, 5, 1, 200, 2, bA)
+	plainA, err := p2.decryptSnapshotToScratch(filepath.Dir(dataPathA), dataPathA, 5, 1, 200, 2, bA)
 	if err != nil {
 		t.Fatalf("BarrierA failed to decrypt its own snapshot post-rotation: %v", err)
 	}

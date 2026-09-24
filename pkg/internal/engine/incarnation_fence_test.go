@@ -464,6 +464,67 @@ func TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain(t *testing.T) {
 	}
 }
 
+// TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards: a
+// dispatcher blocked on a FULL shard channel used to abandon the committed
+// item the moment the engine began stopping, failing proposals whose entries
+// were committed and durable. The shard goroutine keeps consuming during
+// shutdown, so the item is delivered; it is discarded only when that
+// goroutine has exited and can read nothing more.
+func TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards(t *testing.T) {
+	newWorker := func(t *testing.T) (*applyWorker, *testCallback, chan *applyItem, chan struct{}, chan struct{}) {
+		t.Helper()
+		cb := &testCallback{}
+		stopC := make(chan struct{})
+		aw := newApplyWorker(0, make(chan *applyItem, 1), &sync.Pool{New: func() interface{} { return &applyItem{} }},
+			1, &sync.WaitGroup{}, cb, nil, NewWorkSignal(1), stopC, nil)
+		shardCh := make(chan *applyItem, 1)
+		shardCh <- &applyItem{} // full
+		exited := make(chan struct{})
+		aw.shardChans[1] = shardCh
+		aw.shardExits[1] = exited
+		return aw, cb, shardCh, stopC, exited
+	}
+	item := func() *applyItem {
+		return &applyItem{node: newFenceTestNode(1), update: proto.Update{ShardID: 1, CommittedEntries: []proto.Entry{{Index: 7, Key: 3}}}}
+	}
+
+	t.Run("engine stopping: delivered once the shard reads", func(t *testing.T) {
+		aw, cb, shardCh, stopC, _ := newWorker(t)
+		done := make(chan struct{})
+		go func() {
+			aw.dispatch(item())
+			close(done)
+		}()
+		close(stopC)
+		select {
+		case <-done:
+			t.Fatal("the dispatcher gave up on a committed item because the engine is stopping")
+		case <-time.After(50 * time.Millisecond):
+		}
+		<-shardCh // the live shard goroutine reads
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the committed item was never delivered")
+		}
+		if n := len(cb.getProposalFailedCalls()); n != 0 {
+			t.Fatalf("the shutdown drain failed %d committed proposals", n)
+		}
+		if got := <-shardCh; got == nil || got.update.ShardID != 1 {
+			t.Fatal("the delivered item is not the committed one")
+		}
+	})
+
+	t.Run("shard goroutine exited: discarded", func(t *testing.T) {
+		aw, cb, _, _, exited := newWorker(t)
+		close(exited)
+		aw.dispatch(item())
+		if n := len(cb.getProposalFailedCalls()); n != 1 {
+			t.Fatalf("OnProposalFailed fired %d times for an item no goroutine can apply, want 1", n)
+		}
+	})
+}
+
 // TestStepWorker_AnsweredInstallNeverFailsTheNode: a panic AFTER the install's
 // step returned — in a log call, or the classification itself — leaves raft's
 // state known and the verdict already delivered; the recovery must not fail a
@@ -728,6 +789,60 @@ func TestGCSnapshotDirs_SparesADirectoryARecoveryIsReading(t *testing.T) {
 		t.Fatalf("pins left after the unpin: %v", got)
 	}
 	node.UnlockSnapshotDir()
+}
+
+// pinCheckingSnapshotter records, from inside RecoverFromSnapshot, whether the
+// directory being recovered is pinned — the pin must span the read.
+type pinCheckingSnapshotter struct {
+	*snapshotTestSnapshotter
+	node   *Node
+	dir    string
+	pinned bool
+	called bool
+}
+
+func (s *pinCheckingSnapshotter) RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error {
+	s.called = true
+	s.node.LockSnapshotDir()
+	s.pinned = s.node.IsSnapshotDirPinned(s.dir)
+	s.node.UnlockSnapshotDir()
+	return s.snapshotTestSnapshotter.RecoverFromSnapshot(ctx, r, stopper)
+}
+
+// TestRecoverSnapshot_PinsItsDirectoryWhileReading: the GC honours pins
+// (above); this pins that recoverSnapshot actually TAKES one for the
+// directory it reads, holds it across the state machine's read, and releases
+// it after.
+func TestRecoverSnapshot_PinsItsDirectoryWhileReading(t *testing.T) {
+	const shardID, replicaID uint64 = 12, 1
+	stopC := make(chan struct{})
+	defer close(stopC)
+	ldb := newSnapshotTestLogDB()
+	seedRecoverableSnapshot(t, ldb, shardID, replicaID, 100, 3, 100)
+	rec, err := ldb.GetSnapshot(shardID, replicaID)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	ss := &pinCheckingSnapshotter{snapshotTestSnapshotter: newSnapshotTestSnapshotter(0), dir: rec.Filepath}
+	node, peer := newRecoveryTestNode(t, shardID, replicaID, ss)
+	ss.node = node
+	installSnapshotIntoLog(t, node, peer, 100, 3)
+
+	p := newSnapshotPool(1, ldb, nil, nil, nil, stopC, nil)
+	if err := p.recoverSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node}); err != nil {
+		t.Fatalf("recoverSnapshot: %v", err)
+	}
+	if !ss.called {
+		t.Fatal("the state machine was never asked to recover; the probe proves nothing")
+	}
+	if !ss.pinned {
+		t.Fatal("the recovery read its directory unpinned: a concurrent GC could delete it underneath")
+	}
+	node.LockSnapshotDir()
+	defer node.UnlockSnapshotDir()
+	if node.IsSnapshotDirPinned(rec.Filepath) {
+		t.Fatal("the recovery left its directory pinned")
+	}
 }
 
 // TestEngine_StoppedApplyWorkerIsNotRerunAfterItsJoin: a dispatcher whose

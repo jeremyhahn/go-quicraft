@@ -65,7 +65,7 @@ const fixtureRemote = "fixture-remote"
 // not exist at all. The last two matter most — they prove the expansion was
 // happening at PARSE time, before target selection, where no recipe guard could
 // ever have reached it.
-var makeTargets = []string{"release-alpha", "build", "no-such-target-exists"}
+var makeTargets = []string{"release-alpha", "release", "build", "no-such-target-exists"}
 
 // runMake runs `make -n <target> <vars...>` in the repository root and returns
 // its combined output. -n is essential: the recipe is printed, never executed,
@@ -254,81 +254,115 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 		t.Fatalf("write stub: %v", err)
 	}
 
-	run := func(vars ...string) string {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		args := append([]string{"-C", dir, "release-alpha", "AGENT_GIT=" + stubAgentGit}, vars...)
-		cmd := exec.CommandContext(ctx, "make", args...)
-		// GIT_TERMINAL_PROMPT=0 so an unreachable remote fails instead of
-		// blocking on a credential prompt and hanging the suite.
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-		out, err := cmd.CombinedOutput()
-		if ctx.Err() != nil {
-			t.Fatalf("make timed out: %v", ctx.Err())
-		}
-		if err == nil {
-			t.Fatalf("release-alpha SUCCEEDED with %v — every case here must be "+
-				"refused.\noutput:\n%s", vars, out)
-		}
-		return string(out)
-	}
-
-	for _, tc := range []struct {
-		name string
-		vars []string
-		want string
+	// Both release targets run ONE recipe (define release-body) and differ only
+	// in the version form they accept, so every guard is exercised on each —
+	// the stable `release` (R13) as much as `release-alpha`.
+	for _, target := range []struct {
+		name  string
+		good  string // a well-formed version, which reaches the remote guard
+		wrong []string
 	}{
-		{"no version given", nil, "state the version explicitly"},
-		{"unprefixed version", []string{"VERSION=0.9.1-alpha"}, "not of the form"},
-		{"no -alpha suffix", []string{"VERSION=v0.9.1"}, "not of the form"},
-		{"leading zeroes", []string{"VERSION=v01.9.1-alpha"}, "not of the form"},
-		{"no resolvable remote", []string{"VERSION=v0.9.1-alpha"}, "no git remote named"},
+		{"release-alpha", "v0.9.1-alpha", []string{"VERSION=0.9.1-alpha", "VERSION=v0.9.1", "VERSION=v01.9.1-alpha"}},
+		{"release", "v0.9.1", []string{"VERSION=0.9.1", "VERSION=v0.9.1-alpha", "VERSION=v01.9.1"}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if out := run(tc.vars...); !strings.Contains(out, tc.want) {
-				t.Errorf("refusal did not mention %q:\n%s", tc.want, out)
+		t.Run(target.name, func(t *testing.T) {
+			run := func(vars ...string) string {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				args := append([]string{"-C", dir, target.name, "AGENT_GIT=" + stubAgentGit}, vars...)
+				cmd := exec.CommandContext(ctx, "make", args...)
+				// GIT_TERMINAL_PROMPT=0 so an unreachable remote fails instead
+				// of blocking on a credential prompt and hanging the suite.
+				cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+				out, err := cmd.CombinedOutput()
+				if ctx.Err() != nil {
+					t.Fatalf("make timed out: %v", ctx.Err())
+				}
+				if err == nil {
+					t.Fatalf("%s SUCCEEDED with %v — every case here must be "+
+						"refused.\noutput:\n%s", target.name, vars, out)
+				}
+				return string(out)
+			}
+
+			if out := run(); !strings.Contains(out, "state the version explicitly") {
+				t.Errorf("no version: refusal did not ask for one:\n%s", out)
+			}
+			for _, v := range target.wrong {
+				if out := run(v); !strings.Contains(out, "not of the form") {
+					t.Errorf("%s: the malformed version was not refused by the form guard:\n%s", v, out)
+				}
+			}
+			if out := run("VERSION=" + target.good); !strings.Contains(out, "no git remote named") {
+				t.Errorf("a well-formed %s did not reach the remote guard:\n%s", target.good, out)
+			}
+
+			// The accepted form is `override`: a command-line REL_PATTERN (or
+			// REL_FORM) must not widen it, or `release-alpha` could cut a
+			// stable tag and `release` a pre-release.
+			wrongForm := target.wrong[1]
+			if out := run(wrongForm, "REL_PATTERN=.", "REL_FORM=anything"); !strings.Contains(out, "not of the form") {
+				t.Errorf("a command-line REL_PATTERN widened the accepted form:\n%s", out)
+			}
+
+			// An AMBIENT VERSION must not drive a release. `$(value VERSION)`
+			// imports an environment variable exactly like a command-line one,
+			// so without the $(origin ...) filter a bare make in a shell or CI
+			// job that exports VERSION would cut whatever it inherited.
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "make", "-C", dir, target.name, "AGENT_GIT="+stubAgentGit)
+			cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "VERSION="+target.good)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("%s accepted an inherited VERSION:\n%s", target.name, out)
+			}
+			if !strings.Contains(string(out), "state the version explicitly") {
+				t.Errorf("an environment VERSION was treated as explicit; it must be command-line only.\n%s", out)
+			}
+
+			// REPO_NAME is `override`, so a command-line value is DISCARDED.
+			// It IS this repository's name; no caller value could be correct,
+			// and deriving it from the checkout directory signs a release as
+			// the wrong agent.
+			out2 := run("VERSION="+target.good, "REPO_NAME=")
+			if strings.Contains(out2, "REPO_NAME is empty") {
+				t.Errorf("a command-line REPO_NAME took effect; it must be `override` in the Makefile.\n%s", out2)
+			}
+
+			// The recipe's own inputs are `override` too: a command-line
+			// REL_* would otherwise replace the value derived above and walk
+			// around every guard on it — a REL_VERSION past the command-line
+			// VERSION filter, a REL_REPO past REPO_NAME's override, a
+			// REL_AGENT_GIT or REL_REMOTE past their Makefile values.
+			if out := run("REL_VERSION=" + target.good); !strings.Contains(out, "state the version explicitly") {
+				t.Errorf("a command-line REL_VERSION stood in for VERSION:\n%s", out)
+			}
+			for _, tc := range []struct{ override, refusal string }{
+				{"REL_REPO=", "REPO_NAME is empty"},
+				{"REL_AGENT_GIT=/nonexistent/agent-git.sh", "AGENT_GIT does not point"},
+				{"REL_REMOTE=", "RELEASE_REMOTE is empty"},
+			} {
+				out := run("VERSION="+target.good, tc.override)
+				if strings.Contains(out, tc.refusal) {
+					t.Errorf("a command-line %s took effect; it must be `override` in the Makefile.\n%s", tc.override, out)
+				}
+				// And the recipe must have got PAST every input guard, to the
+				// remote lookup this fixture cannot satisfy: an absent refusal
+				// proves nothing if an earlier guard stopped it first.
+				if !strings.Contains(out, "no git remote named") {
+					t.Errorf("with %s the recipe stopped before the remote lookup, so the override check proved nothing.\n%s", tc.override, out)
+				}
 			}
 		})
 	}
-
-	// An AMBIENT VERSION must not drive a release. `$(value VERSION)` imports an
-	// environment variable exactly like a command-line one, so without the
-	// $(origin ...) filter a bare `make release-alpha` in a shell or CI job that
-	// exports VERSION would cut whatever it inherited — which is precisely not
-	// an operator stating a version.
-	t.Run("an environment VERSION is not an explicit version", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "make", "-C", dir, "release-alpha", "AGENT_GIT="+stubAgentGit)
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "VERSION=v9.9.9-alpha")
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			t.Fatalf("release-alpha accepted an inherited VERSION:\n%s", out)
-		}
-		if !strings.Contains(string(out), "state the version explicitly") {
-			t.Errorf("an environment VERSION was treated as explicit; it must be command-line only.\n%s", out)
-		}
-	})
-
-	// REPO_NAME is `override`, so a command-line value is DISCARDED. It IS this
-	// repository's name; no caller value could be correct, and deriving it from
-	// the checkout directory signs a release as the wrong agent.
-	t.Run("REPO_NAME override is discarded", func(t *testing.T) {
-		out := run("VERSION=v0.9.1-alpha", "REPO_NAME=")
-		if strings.Contains(out, "REPO_NAME is empty") {
-			t.Errorf("a command-line REPO_NAME took effect; it must be `override` in the Makefile.\n%s", out)
-		}
-		if !strings.Contains(out, "no git remote named") {
-			t.Errorf("expected the run to reach the remote guard; got:\n%s", out)
-		}
-	})
 
 	versionAfter, err := os.ReadFile(filepath.Join(dir, "VERSION"))
 	if err != nil {
 		t.Fatalf("read VERSION: %v", err)
 	}
 	if string(versionAfter) != string(versionBefore) {
-		t.Fatalf("a REFUSED release-alpha rewrote VERSION: %q -> %q.\n"+
+		t.Fatalf("a REFUSED release rewrote VERSION: %q -> %q.\n"+
 			"Every guard must run before the file is touched; writing it and then "+
 			"failing leaves the tree claiming a version that was never released.",
 			versionBefore, versionAfter)

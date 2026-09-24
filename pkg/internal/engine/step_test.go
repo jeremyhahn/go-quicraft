@@ -2539,6 +2539,60 @@ func TestCommitMemoryMode_NoMessages(t *testing.T) {
 	}
 }
 
+// TestCommitMemoryMode_StoppingStepTierStillHandsOff: with a free apply slot
+// and the step tier stopping, the hand-off select chose at random between the
+// send and the stop, dropping a committed update about half the time although
+// the apply tier would still have applied it. The send is tried first; every
+// update of twenty reaches applyC.
+func TestCommitMemoryMode_StoppingStepTierStillHandsOff(t *testing.T) {
+	sender := newSequenceSender()
+	ws := NewWorkSignal(1)
+	commitC := make(chan *commitItem, 16)
+	applyC := make(chan *applyItem, 16)
+	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
+	stopC := make(chan struct{})
+
+	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+	sw.memoryMode = true
+	sw.applyC = applyC
+	sw.applyPool = applyPool
+
+	peer, lr := newTestPeer(t, 1, 1)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
+	sw.loadNode(node)
+	tickPeerToLeader(peer)
+	ws.Notify(1)
+	sw.processReady()
+	select {
+	case <-applyC:
+		node.commitPending.Store(false)
+	default:
+	}
+
+	close(stopC) // the step tier is stopping; the apply tier is still live
+	for i := range 20 {
+		node.DeliverProposal([]proto.Entry{{Cmd: []byte("stopping")}})
+		if buf := node.DrainProposals(nil); len(buf) > 0 {
+			_ = peer.Handle(proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, Entries: buf})
+		}
+		peer.FlushReadIndex()
+		update, err := peer.GetUpdate(true, node.lastApplied.Load())
+		if err != nil {
+			t.Fatalf("GetUpdate %d: %v", i, err)
+		}
+		update.Messages = nil
+		sw.commitMemoryMode(node, update)
+		select {
+		case <-applyC:
+			node.commitPending.Store(false)
+		default:
+			t.Fatalf("update %d was dropped although applyC had room: the stopping step tier won the select", i)
+		}
+	}
+}
+
 // TestCommitMemoryMode_CommitError_OrderedNotSent verifies that on a
 // Peer.Commit error, ordered messages are NOT sent. Free-order messages
 // that were already sent before Commit cannot be recalled, but ordered

@@ -1180,6 +1180,17 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	ai := w.applyPool.Get().(*applyItem)
 	ai.update = update
 	ai.node = node
+	// Try the hand-off before anything else. The backpressure guard left a
+	// free slot, so it succeeds unless the channel filled since; a single
+	// select with the stop case beside it chose AT RANDOM when both were
+	// ready, dropping a committed update the moment the step tier began to
+	// stop even though the apply tier would still have applied it.
+	select {
+	case w.applyC <- ai:
+		w.enqueuingNode = nil
+		return false
+	default:
+	}
 	select {
 	case w.applyC <- ai:
 		// Successfully queued for apply.

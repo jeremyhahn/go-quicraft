@@ -52,8 +52,9 @@ func orphanDecryptTemp(t *testing.T, dir, prefix string) string {
 // TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext is the regression
 // guard for the send-path plaintext leak.
 //
-// transportSender.decryptSnapshotForSend decrypts the ENTIRE snapshot into a
-// scratch file created as a SIBLING of the encrypted snapshot.dat. A leader
+// transportSender.decryptSnapshotForSend decrypted the ENTIRE snapshot into a
+// scratch file created as a SIBLING of the encrypted snapshot.dat (it now
+// uses the replica's own directory, which the same sweep covers). A leader
 // killed mid-send (SIGKILL/OOM/power loss) never runs the deferred removal, so
 // a COMPLETE PLAINTEXT COPY of the state machine is left next to the
 // ciphertext. Snapshot directories are retained indefinitely, so the copy

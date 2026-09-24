@@ -194,18 +194,6 @@ type snapshotPool struct {
 	// the global floor falls back to the calling shard only.
 	nodes func() []*Node
 
-	// tryImportLock takes the host's per-shard import lock without waiting,
-	// reporting whether it did; the returned func releases it. It is wired by
-	// the Host, which owns the lock ImportSnapshot holds for the DURATION of
-	// an import.
-	//
-	// The import staging directory holds the imported state machine in
-	// PLAINTEXT and is indistinguishable by name from one a crash orphaned, so
-	// the sweep that reclaims it may only run when no import is in flight. Nil
-	// means no host owns this pool (standalone engine tests): nothing can be
-	// importing, so the sweep runs.
-	tryImportLock func(shardID uint64) (func(), bool)
-
 	// metrics collects raft-level metrics. Nil when disabled.
 	metrics RaftMetrics
 }
@@ -1689,7 +1677,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 // directory. A record that cannot be read fails the publish closed.
 func (p *snapshotPool) publishStagedSave(stageDir, canonicalDir string, index uint64, req snapshotRequest, rebuilding bool) error {
 	if _, statErr := os.Stat(canonicalDir); statErr == nil {
-		if req.node.snapshotDirClaimed(index) || req.node.IsSnapshotDirPinned(canonicalDir) {
+		if req.node.IsSnapshotDirClaimed(index) || req.node.IsSnapshotDirPinned(canonicalDir) {
 			return ErrSnapshotIndexNotAdvanced
 		}
 		if p.logdb != nil {
@@ -1881,8 +1869,9 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	}
 
 	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
-	// is available, decrypt it to a throwaway SIBLING file and recover from
-	// that, leaving the canonical encrypted snapshot.dat untouched. Decrypting
+	// is available, decrypt it to a throwaway scratch file in the replica's
+	// own snapshot directory and recover from that, leaving the canonical
+	// encrypted snapshot.dat untouched. Decrypting
 	// in place is NOT crash/retry-safe: if RecoverFromSnapshot then fails or the
 	// process crashes, snapshot.dat would be plaintext while LogDB still records
 	// Epoch>0, so every later recovery/restart would re-attempt decryption on
@@ -1912,34 +1901,39 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}
 
-	// Sweep stale decrypt scratch files left by a crash during a prior
-	// recovery OR a prior snapshot SEND. Both write plaintext to a sibling
-	// scratch file and remove it via defer once done, but a process crash
-	// orphans these files. The whole shard tree is swept, not just the
-	// directory being recovered, because the send path decrypts inside
-	// whichever snapshot directory it streams. snapshotDir is swept too: a
-	// LogDB-recorded Filepath is not required to sit under the node's base.
-	SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
-	SweepStaleDecryptTmp(snapshotDir)
-
-	// Reclaim an import staging directory orphaned by a crash for the same
-	// reason and on the same trigger: it holds the imported state machine in
-	// PLAINTEXT and no scan on the host will ever look at it again.
+	// Sweep stale scratch files, then retry the reclaim of import staging
+	// directories — both left by a crash — before this recovery writes its own.
 	//
-	// "The shard is running, so no import can be in flight" is NOT a valid
-	// justification for sweeping unlocked. Host.ImportSnapshot checks that the
-	// shard is stopped in its PREFLIGHT, before it takes the import lock and
-	// long before it finishes writing; StartShard registers the node hundreds
-	// of lines after its own sweep. An import that passed preflight and is
-	// midway through a multi-gigabyte write is therefore perfectly compatible
-	// with a shard that is running by the time a leader's InstallSnapshot lands
-	// here — and RemoveAll on its live staging directory fails the operator's
-	// disaster-recovery restore for no reason.
+	// A recovery and a send both decrypt into the replica's own snapshot
+	// directory and a name survives only a crash or a failed unlink, so the
+	// whole shard tree, replica directory included, is swept, not just the
+	// directory being recovered. snapshotDir is swept too: a LogDB-recorded
+	// Filepath is not required to sit under the node's base, and the receive
+	// re-encrypt writes its scratch beside the artifact it received.
 	//
-	// Take the same try-lock StartShard takes: it is the only thing that
-	// distinguishes a live staging directory from an orphaned one, and an
-	// import that holds it owns its staging directory and removes it itself.
-	sweepImportStage(p.tryImportLock, node.SnapshotDir(), req.shardID, req.replicaID)
+	// The import-stage retry exists because StartShard sweeps first but only
+	// LOGS a failure — so without a retry one transient error left a
+	// plaintext copy of the imported state machine for as long as the shard
+	// ran.
+	//
+	// Every sweep is fenced by this node's write lease. While the lease is
+	// held the shard is loaded: no import can be in flight for it (StartShard
+	// holds the import lock until its node is published, and an import
+	// re-checks under that lock that the shard is not running), and no next
+	// incarnation can be decrypting in the same replica directory, since
+	// UnloadNode — and so that incarnation's StartShard — waits for the lease.
+	// A stopped incarnation's late recovery gets no lease and sweeps nothing:
+	// unfenced, it could unlink the new incarnation's live recovery scratch
+	// before StartShard opened it. The release is deferred so a recovered
+	// panic in a sweep cannot leave UnloadNode waiting on the lease forever.
+	if node.AcquireWriteLease() {
+		func() {
+			defer node.ReleaseWriteLease()
+			SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
+			SweepStaleDecryptTmp(snapshotDir)
+			SweepStaleImportStageDirs(node.SnapshotDir(), req.shardID, req.replicaID)
+		}()
+	}
 
 	// An encrypted artifact with no usable barrier fails CLOSED, matching
 	// Host.StartShard on the identical predicate. Falling through would hand
@@ -1964,8 +1958,8 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		}
 	}
 	if logdbSnap.Epoch > 0 {
-		plainPath, decryptErr := p.decryptSnapshotToSibling(
-			dataPath, req.shardID, req.replicaID, artifactIndex, logdbSnap.Epoch, barrier)
+		plainPath, decryptErr := p.decryptSnapshotToScratch(
+			node.ReplicaSnapshotDir(), dataPath, req.shardID, req.replicaID, artifactIndex, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
 			return &SnapshotError{
 				ShardID:   req.shardID,
@@ -2114,10 +2108,17 @@ func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapsh
 	return logdbSnap, dir, dirIndex, nil
 }
 
-// decryptSnapshotToSibling reads the encrypted snapshot data file and writes
-// its decrypted plaintext to a NEW sibling temp file in the same directory,
-// returning that temp file's path. It does NOT modify or replace the source
-// file: the canonical encrypted snapshot.dat is left intact.
+// decryptSnapshotToScratch reads the encrypted snapshot data file and writes
+// its decrypted plaintext to a NEW temp file in scratchDir, returning that
+// temp file's path. It does NOT modify or replace the source file: the
+// canonical encrypted snapshot.dat is left intact.
+//
+// scratchDir must be a directory the stale-scratch sweep covers: the
+// replica's own snapshot directory (ReplicaSnapshotDir), which StartShard
+// creates, or a save stage directory beneath it (the export's), which the
+// save removes and StartShard's stage sweep reclaims. Never the directory of
+// a path a record names, which may lie outside the replica's tree where
+// nothing reclaims a plaintext file a crash orphans.
 //
 // This is deliberately not an in-place transform. Decrypting in place (rename
 // plaintext over snapshot.dat) is not crash/retry-safe: a recovery failure or
@@ -2139,7 +2140,7 @@ func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapsh
 // positional context AAD (see NewSnapshotAAD). A mismatch fails authentication
 // and there is no weaker retry: an epoch-only fallback would readmit exactly
 // the frame-splicing this binding exists to prevent.
-func (p *snapshotPool) decryptSnapshotToSibling(path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (string, error) {
+func (p *snapshotPool) decryptSnapshotToScratch(scratchDir, path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (string, error) {
 	srcFile, err := os.Open(path)
 	if err != nil {
 		return "", &SnapshotEncryptError{Op: "read", Err: err}
@@ -2154,8 +2155,7 @@ func (p *snapshotPool) decryptSnapshotToSibling(path string, shardID, replicaID,
 		}
 	}()
 
-	dir := filepath.Dir(path)
-	tmpFile, err := os.CreateTemp(dir, RecoverDecryptTempPattern)
+	tmpFile, err := os.CreateTemp(scratchDir, RecoverDecryptTempPattern)
 	if err != nil {
 		return "", &SnapshotEncryptError{Op: "create_temp", Err: err}
 	}
@@ -2783,7 +2783,7 @@ const (
 	DecryptTempSuffix = ScratchTempSuffix
 
 	// RecoverDecryptTempPrefix marks a scratch file written by a snapshot
-	// RECOVERY decrypt (snapshotPool.decryptSnapshotToSibling and
+	// RECOVERY decrypt (snapshotPool.decryptSnapshotToScratch and
 	// Host.StartShard's local-snapshot recovery). Holds PLAINTEXT.
 	RecoverDecryptTempPrefix = ".decrypt-"
 
@@ -2901,11 +2901,10 @@ func IsSnapshotImportStage(name string) bool {
 //
 // It gets its OWN prefix rather than reusing ImportStageDirPrefix because the
 // two have different liveness proofs. An import staging directory is protected
-// by the shard's import lock, which is what lets sweepImportStage reclaim
-// orphans while the shard is running; a receive holds no such lock and can be
-// in flight concurrently with a snapshot recovery, so a sweeper matching this
-// prefix must run only where no receive is possible — Host.StartShard, before
-// the shard's node exists to route an InstallSnapshot to.
+// by the shard's import lock, which StartShard holds while it sweeps; a
+// receive holds no such lock, so a sweeper matching this prefix must run only
+// where no receive is possible — Host.StartShard, before the shard's node
+// exists to route an InstallSnapshot to.
 //
 // Unlike an import staging directory, this one holds CIPHERTEXT whenever the
 // shard has a barrier: the receive encrypts inline as it writes. An orphan is
@@ -3057,6 +3056,11 @@ func sweepStageDirs(baseDir string, shardID, replicaID uint64, match func(string
 //
 // Errors are logged and ignored: a failed cleanup must not abort startup.
 func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
+	// The replica's base directory first: a snapshot SEND decrypts into an
+	// anonymous scratch file created there (unlinked at once; a name survives
+	// only when that unlink failed). Sweeping one a live send still reads is
+	// harmless — the send holds it open, and only the name goes.
+	SweepStaleDecryptTmp(snapshotBaseDir(baseDir, shardID, replicaID))
 	dirs, err := listSnapshotDirs(baseDir, shardID, replicaID)
 	if err != nil {
 		slog.Debug("snapshot: stale decrypt tmp tree sweep: list failed",
@@ -3070,28 +3074,6 @@ func SweepStaleDecryptTmpTree(baseDir string, shardID, replicaID uint64) {
 	for _, d := range dirs {
 		SweepStaleDecryptTmp(d.path)
 	}
-}
-
-// sweepImportStage runs SweepStaleImportStageDirs only when the shard's import
-// lock can be taken without waiting, and releases it afterwards. A nil tryLock
-// means no host owns the caller (standalone engine tests), so nothing can be
-// importing and the sweep runs unconditionally.
-//
-// The wait must never happen: an import can run for as long as it takes to
-// write a multi-gigabyte artifact, and neither StartShard nor snapshot recovery
-// may block behind one. "An import holds the lock" is itself the answer —
-// whatever the sweep would have found belongs to that import.
-func sweepImportStage(tryLock func(shardID uint64) (func(), bool), baseDir string, shardID, replicaID uint64) {
-	if tryLock == nil {
-		SweepStaleImportStageDirs(baseDir, shardID, replicaID)
-		return
-	}
-	release, ok := tryLock(shardID)
-	if !ok {
-		return
-	}
-	defer release()
-	SweepStaleImportStageDirs(baseDir, shardID, replicaID)
 }
 
 // SweepStaleImportStageDirs removes orphaned import staging directories from a
@@ -3117,36 +3099,13 @@ func sweepImportStage(tryLock func(shardID uint64) (func(), bool), baseDir strin
 // otherwise ignored: a failed cleanup must not abort startup or recovery.
 //
 // The caller must ensure no import is in flight for the shard, since a live
-// staging directory is indistinguishable from an orphaned one by name — use
-// sweepImportStage, which takes the shard's import lock to establish exactly
-// that.
+// staging directory is indistinguishable from an orphaned one by name. Its two
+// callers establish that differently: Host.StartShard holds the shard's import
+// lock for its whole start, and a snapshot recovery holds the loaded node's
+// write lease, under which the shard is loaded and so cannot be importing.
 func SweepStaleImportStageDirs(baseDir string, shardID, replicaID uint64) {
-	base := snapshotBaseDir(baseDir, shardID, replicaID)
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			// The sweep could not even look. Whether a plaintext copy is
-			// sitting there is now unknown, which is the same operational state
-			// as a failed removal: report it the same way.
-			noteStaleDecryptSweepFailure(base, "read_dir", err)
-		}
-		return
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || !IsSnapshotImportStage(entry.Name()) {
-			continue
-		}
-		stalePath := filepath.Join(base, entry.Name())
-		if rmErr := os.RemoveAll(stalePath); rmErr != nil && !os.IsNotExist(rmErr) {
-			noteStaleDecryptSweepFailure(stalePath, "remove_all", rmErr)
-			continue
-		}
-		slog.Warn("snapshot: reclaimed an orphaned import staging directory; it held the imported state machine in PLAINTEXT",
-			"path", stalePath,
-			"shard_id", shardID,
-			"replica_id", replicaID,
-		)
-	}
+	sweepStageDirs(baseDir, shardID, replicaID, IsSnapshotImportStage,
+		"import (it held the imported state machine in PLAINTEXT)")
 }
 
 // SweepStaleDecryptTmp removes orphaned snapshot scratch files from the given
@@ -3235,6 +3194,13 @@ func noteStaleDecryptSweepFailure(path, op string, err error) {
 	)
 }
 
+// NoteScratchNotReclaimed records a decrypt scratch file outside this package
+// — the host's snapshot send — that could not be unlinked, on the same
+// counter and log as a failed sweep.
+func NoteScratchNotReclaimed(path string, err error) {
+	noteStaleDecryptSweepFailure(path, "remove", err)
+}
+
 // setCallback replaces the engine callback. Used by Engine.SetCallback
 // to propagate the callback to the snapshot pool.
 func (p *snapshotPool) setCallback(callback Callback) {
@@ -3305,6 +3271,15 @@ func snapshotSaveDir(baseDir string, shardID, replicaID, index uint64) string {
 // enumerate; see Node.SnapshotSaveDir for why writing elsewhere destroys keys.
 func SnapshotSaveDir(baseDir string, shardID, replicaID, index uint64) string {
 	return snapshotSaveDir(baseDir, shardID, replicaID, index)
+}
+
+// ReplicaSnapshotDir returns the replica's own snapshot directory under
+// baseDir: the parent of its canonical snapshot directories and the one place
+// a decrypted plaintext scratch file is ever created. It is never removed, and
+// SweepStaleDecryptTmpTree sweeps it at every start and recovery whatever
+// path a snapshot record names.
+func ReplicaSnapshotDir(baseDir string, shardID, replicaID uint64) string {
+	return snapshotBaseDir(baseDir, shardID, replicaID)
 }
 
 // snapshotBaseDir returns the per-shard/replica base directory.
@@ -3497,8 +3472,8 @@ func (p *snapshotPool) exportSnapshotBackup(saveDir, exportPath string, barrier 
 		}
 	}
 	dataPath := filepath.Join(saveDir, snapshotDataFile)
-	plainPath, decErr := p.decryptSnapshotToSibling(
-		dataPath, meta.ShardID, meta.ReplicaID, meta.Index, meta.Epoch, barrier)
+	plainPath, decErr := p.decryptSnapshotToScratch(
+		saveDir, dataPath, meta.ShardID, meta.ReplicaID, meta.Index, meta.Epoch, barrier)
 	if decErr != nil {
 		return &SnapshotExportError{
 			ExportPath: filepath.Clean(exportPath),

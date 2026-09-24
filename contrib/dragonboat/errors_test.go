@@ -196,6 +196,7 @@ func TestTranslateError_MapsQuicraftToDragonboat(t *testing.T) {
 		{"StaleConfigChange", quicraft.ErrStaleConfigChange, ErrStaleConfigChange},
 		{"SnapshotNotFound", quicraft.ErrSnapshotNotFound, ErrSnapshotNotFound},
 		{"SnapshotInProgress", quicraft.ErrSnapshotInProgress, ErrSnapshotInProgress},
+		{"ImportInProgress", quicraft.ErrImportInProgress, ErrSystemBusy},
 		{"SessionNotFound", quicraft.ErrSessionNotFound, ErrInvalidSession},
 		{"SessionExpired", quicraft.ErrSessionExpired, ErrRejected},
 		{"SessionAlreadyExists", quicraft.ErrSessionAlreadyExists, ErrRejected},
@@ -478,7 +479,7 @@ func TestTranslateError_PackageLevelMappings(t *testing.T) {
 		t.Fatal("errorMappings package-level variable must not be nil")
 	}
 
-	const expectedCount = 40
+	const expectedCount = 41
 	if len(errorMappings) != expectedCount {
 		t.Errorf("errorMappings has %d entries, want %d", len(errorMappings), expectedCount)
 	}

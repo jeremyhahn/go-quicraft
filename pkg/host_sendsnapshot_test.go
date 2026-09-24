@@ -23,11 +23,13 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +150,24 @@ type snapshotSendFixture struct {
 
 func newSnapshotSendFixture(t *testing.T, barrier Barrier) *snapshotSendFixture {
 	t.Helper()
+	eng, node := newLoadedEngine(t, 1, 1)
+
+	metrics := &recordingTransportMetrics{}
+	return &snapshotSendFixture{
+		sender: &transportSender{
+			transport: newTestTransport(t, metrics),
+			engine:    eng,
+			barrier:   barrier,
+			logger:    slog.Default(),
+		},
+		node:    node,
+		metrics: metrics,
+	}
+}
+
+// newLoadedEngine starts an engine holding one loaded node for shardID.
+func newLoadedEngine(t *testing.T, shardID, replicaID uint64) (*engine.Engine, *engine.Node) {
+	t.Helper()
 	hcfg := config.HostConfig{
 		WALDir:                t.TempDir(),
 		NodeHostDir:           t.TempDir(),
@@ -162,21 +182,64 @@ func newSnapshotSendFixture(t *testing.T, barrier Barrier) *snapshotSendFixture 
 	eng.Start()
 	t.Cleanup(eng.Stop)
 
-	node := newMinimalEngineNode(t, 1, 1)
-	eng.LoadNode(node)
-	t.Cleanup(func() { eng.UnloadNode(1) })
-
-	metrics := &recordingTransportMetrics{}
-	return &snapshotSendFixture{
-		sender: &transportSender{
-			transport: newTestTransport(t, metrics),
-			engine:    eng,
-			barrier:   barrier,
-			logger:    slog.Default(),
-		},
-		node:    node,
-		metrics: metrics,
+	node := newMinimalEngineNode(t, shardID, replicaID)
+	// StartShard creates the replica's snapshot directory, where the send
+	// creates its scratch.
+	if err := os.MkdirAll(node.ReplicaSnapshotDir(), 0o750); err != nil {
+		t.Fatalf("mkdir replica snapshot dir: %v", err)
 	}
+	eng.LoadNode(node)
+	t.Cleanup(func() { eng.UnloadNode(shardID) })
+	return eng, node
+}
+
+// newDecryptSender returns a transportSender for the decrypt-for-send path
+// alone: its engine holds a loaded node for (shardID, replicaID), from which
+// the send resolves its scratch directory, and it has no transport.
+func newDecryptSender(t *testing.T, b Barrier, shardID, replicaID uint64) *transportSender {
+	t.Helper()
+	eng, _ := newLoadedEngine(t, shardID, replicaID)
+	return &transportSender{engine: eng, barrier: b, logger: slog.Default()}
+}
+
+// sendSnapshotSync runs one transfer the way SendSnapshot does — the artifact
+// opened first, then handed to doSendSnapshot — but on the caller's goroutine.
+func sendSnapshotSync(s *transportSender, msg proto.Message) {
+	var src snapshotFile
+	var openErr error
+	if msg.Snapshot.Filepath != "" {
+		src, openErr = s.snapshotFsys().Open(msg.Snapshot.Filepath)
+	}
+	if src != nil {
+		defer func() { _ = src.Close() }()
+	}
+	s.doSendSnapshot(msg, src, openErr)
+}
+
+// decryptForSendToPath runs the send's handle-based decrypt on msg's artifact
+// and copies the plaintext into a named file under t.TempDir(), returning its
+// path and the plaintext size, so a test can inspect or re-stream it.
+func decryptForSendToPath(t *testing.T, s *transportSender, msg proto.Message) (string, uint64, error) {
+	t.Helper()
+	src, err := s.snapshotFsys().Open(msg.Snapshot.Filepath)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = src.Close() }()
+	dec, size, err := s.decryptSnapshotForSend(src, msg, s.barrier)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = dec.Close() }()
+	plain, err := io.ReadAll(dec)
+	if err != nil {
+		return "", 0, err
+	}
+	path := filepath.Join(t.TempDir(), "decrypted.dat")
+	if err := os.WriteFile(path, plain, 0o600); err != nil {
+		return "", 0, err
+	}
+	return path, size, nil
 }
 
 // expectSnapshotStatus drains the node inbox and asserts exactly one
@@ -225,15 +288,19 @@ func testInstallSnapshotMsg(t *testing.T, path string, epoch, transferSeq uint64
 	}
 }
 
-// assertNoTempFiles fails when a decrypt-for-send scratch file was left in dir.
-func assertNoTempFiles(t *testing.T, dir string) {
+// assertNoTempFiles fails when a decrypt-for-send scratch file was left in the
+// artifact's directory dir or in the node's replica snapshot directory, where
+// the send creates it.
+func (f *snapshotSendFixture) assertNoTempFiles(t *testing.T, dir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, sendDecryptTempPattern))
-	if err != nil {
-		t.Fatalf("glob temp files: %v", err)
-	}
-	if len(matches) > 0 {
-		t.Fatalf("decrypt-for-send temp files leaked: %v", matches)
+	for _, d := range []string{dir, f.node.ReplicaSnapshotDir()} {
+		matches, err := filepath.Glob(filepath.Join(d, sendDecryptTempPattern))
+		if err != nil {
+			t.Fatalf("glob temp files: %v", err)
+		}
+		if len(matches) > 0 {
+			t.Fatalf("decrypt-for-send temp files leaked: %v", matches)
+		}
 	}
 }
 
@@ -319,10 +386,10 @@ func TestDoSendSnapshot_PlaintextSendFailureRejects(t *testing.T) {
 	}
 
 	f := newSnapshotSendFixture(t, nil)
-	f.sender.doSendSnapshot(testInstallSnapshotMsg(t, path, 0, 77))
+	sendSnapshotSync(f.sender, testInstallSnapshotMsg(t, path, 0, 77))
 
 	f.expectSnapshotStatus(t, true, 77)
-	assertNoTempFiles(t, dir)
+	f.assertNoTempFiles(t, dir)
 
 	// The canonical snapshot file must survive a failed send so the leader
 	// can retry from it.
@@ -345,9 +412,9 @@ func TestDoSendSnapshot_EncryptedRefusedWithoutBarrier(t *testing.T) {
 
 	t.Run("no barrier configured", func(t *testing.T) {
 		f := newSnapshotSendFixture(t, nil)
-		f.sender.doSendSnapshot(testInstallSnapshotMsg(t, path, 3, 11))
+		sendSnapshotSync(f.sender, testInstallSnapshotMsg(t, path, 3, 11))
 		f.expectSnapshotStatus(t, true, 11)
-		assertNoTempFiles(t, dir)
+		f.assertNoTempFiles(t, dir)
 	})
 
 	t.Run("barrier sealed", func(t *testing.T) {
@@ -356,9 +423,9 @@ func TestDoSendSnapshot_EncryptedRefusedWithoutBarrier(t *testing.T) {
 			t.Fatalf("seal barrier: %v", err)
 		}
 		f := newSnapshotSendFixture(t, sealed)
-		f.sender.doSendSnapshot(testInstallSnapshotMsg(t, path, 3, 12))
+		sendSnapshotSync(f.sender, testInstallSnapshotMsg(t, path, 3, 12))
 		f.expectSnapshotStatus(t, true, 12)
-		assertNoTempFiles(t, dir)
+		f.assertNoTempFiles(t, dir)
 	})
 }
 
@@ -379,10 +446,10 @@ func TestDoSendSnapshot_DecryptFailureRejects(t *testing.T) {
 
 	b := createTestBarrier(t)
 	f := newSnapshotSendFixture(t, b)
-	f.sender.doSendSnapshot(testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 21))
+	sendSnapshotSync(f.sender, testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 21))
 
 	f.expectSnapshotStatus(t, true, 21)
-	assertNoTempFiles(t, dir)
+	f.assertNoTempFiles(t, dir)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("encrypted snapshot must survive a failed decrypt: %v", err)
 	}
@@ -408,10 +475,10 @@ func TestDoSendSnapshot_DecryptedTempFileRemoved(t *testing.T) {
 
 	f := newSnapshotSendFixture(t, b)
 	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 33)
-	f.sender.doSendSnapshot(msg)
+	sendSnapshotSync(f.sender, msg)
 
 	f.expectSnapshotStatus(t, true, 33)
-	assertNoTempFiles(t, dir)
+	f.assertNoTempFiles(t, dir)
 
 	after, err := os.ReadFile(path)
 	if err != nil {
@@ -457,21 +524,221 @@ func TestDoSendSnapshot_TempFileRemovalFailureIsNotFatal(t *testing.T) {
 	path := filepath.Join(dir, "snapshot.dat")
 
 	b := createTestBarrier(t)
-	writeEncryptedSnapshotFile(t, b, path, []byte("payload that decrypts cleanly"))
+	writeEncryptedSnapshotFileFor(t, b, path, []byte("payload that decrypts cleanly"), 1, 1, 100)
 
 	f := newSnapshotSendFixture(t, b)
 	f.sender.fsys = removeFailFS{}
-	f.sender.doSendSnapshot(testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 55))
+	before := engine.StaleDecryptSweepFailures()
+	// The artifact's own identity, so the decrypt succeeds and the scratch is
+	// handed to the send — whose cleanup retries the unlink.
+	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 55)
+	msg.ReplicaID = 1
+	sendSnapshotSync(f.sender, msg)
 
 	f.expectSnapshotStatus(t, true, 55)
 
-	// The scratch file is still there precisely because Remove failed; the
-	// point is that the transfer completed its notification regardless.
-	matches, err := filepath.Glob(filepath.Join(dir, sendDecryptTempPattern))
+	// The scratch file is still there precisely because Remove failed — at
+	// creation and again at close; the point is that the transfer completed
+	// its notification regardless, and that the unreclaimed plaintext is
+	// counted. It is created in the node's replica snapshot directory, which
+	// the stale-scratch sweep covers.
+	matches, err := filepath.Glob(filepath.Join(f.node.ReplicaSnapshotDir(), sendDecryptTempPattern))
 	if err != nil {
 		t.Fatalf("glob temp files: %v", err)
 	}
 	if len(matches) != 1 {
 		t.Fatalf("found %d scratch files, want the 1 whose removal was refused", len(matches))
+	}
+	// The artifact sits outside the node's tree, as a record may name it; the
+	// scratch must not have followed it there.
+	if beside, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), sendDecryptTempPattern)); len(beside) != 0 {
+		t.Fatalf("scratch created beside the artifact, outside the replica's swept tree: %v", beside)
+	}
+	if engine.StaleDecryptSweepFailures() == before {
+		t.Fatal("an unreclaimed plaintext scratch file was not counted")
+	}
+}
+
+// TestDecryptSnapshotForSend_UnloadedShardFailsClosed: the send resolves its
+// scratch directory from the loaded node, never from the artifact's path, so
+// a shard that is no longer loaded — or is loaded as a different replica — is
+// refused before anything is created.
+func TestDecryptSnapshotForSend_UnloadedShardFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.dat")
+
+	b := createTestBarrier(t)
+	writeEncryptedSnapshotFile(t, b, path, []byte("payload that decrypts cleanly"))
+	sender := newDecryptSender(t, b, testSnapShardID, testSnapReplicaID)
+
+	src, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	for _, tc := range []struct {
+		name               string
+		shardID, replicaID uint64
+	}{
+		{"shard not loaded", testSnapShardID + 1, testSnapReplicaID},
+		// A send of a stopped incarnation's artifact still running after
+		// the shard came back as a different replica.
+		{"shard loaded as another replica", testSnapShardID, testSnapReplicaID + 1},
+	} {
+		msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 58)
+		msg.ShardID, msg.ReplicaID = tc.shardID, tc.replicaID
+		dec, _, err := sender.decryptSnapshotForSend(src, msg, b)
+		if dec != nil {
+			_ = dec.Close()
+		}
+		if !errors.Is(err, ErrShardNotFound) {
+			t.Fatalf("%s: decrypt = %v, want ErrShardNotFound", tc.name, err)
+		}
+	}
+	for _, d := range []string{dir, filepath.Dir(dir)} {
+		if left, _ := filepath.Glob(filepath.Join(d, sendDecryptTempPattern)); len(left) != 0 {
+			t.Fatalf("a refused send created scratch files: %v", left)
+		}
+	}
+}
+
+// TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir: StartShard
+// creates the replica's snapshot directory and no scratch writer does, so a
+// late send whose tree was removed under it fails rather than resurrecting
+// the directory of a replica that is gone.
+func TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.dat")
+
+	b := createTestBarrier(t)
+	writeEncryptedSnapshotFile(t, b, path, []byte("payload that decrypts cleanly"))
+	eng, node := newLoadedEngine(t, testSnapShardID, testSnapReplicaID)
+	sender := &transportSender{engine: eng, barrier: b, logger: slog.Default()}
+	if err := os.RemoveAll(node.ReplicaSnapshotDir()); err != nil {
+		t.Fatalf("remove replica dir: %v", err)
+	}
+
+	src, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 59)
+	msg.ShardID, msg.ReplicaID, msg.Snapshot.Index = testSnapShardID, testSnapReplicaID, testSnapIndex
+	dec, _, err := sender.decryptSnapshotForSend(src, msg, b)
+	if dec != nil {
+		_ = dec.Close()
+	}
+	if err == nil {
+		t.Fatal("a send whose replica directory was removed succeeded")
+	}
+	if _, statErr := os.Stat(node.ReplicaSnapshotDir()); !os.IsNotExist(statErr) {
+		t.Fatalf("the send recreated the removed replica directory (stat err=%v)", statErr)
+	}
+}
+
+// removeFailOnceFS refuses the first Remove only.
+type removeFailOnceFS struct {
+	osSnapshotFS
+	failed *atomic.Bool
+}
+
+func (fs removeFailOnceFS) Remove(name string) error {
+	if fs.failed.CompareAndSwap(false, true) {
+		return errTestRemoveFailed
+	}
+	return fs.osSnapshotFS.Remove(name)
+}
+
+// TestDoSendSnapshot_FailedUnlinkIsRetriedAtClose: when the scratch file's
+// immediate unlink fails, the plaintext it is then filled with must not keep
+// its name for the life of the process — a leader rarely runs the recovery
+// that would sweep it. Closing the scratch retries the unlink.
+func TestDoSendSnapshot_FailedUnlinkIsRetriedAtClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.dat")
+
+	b := createTestBarrier(t)
+	writeEncryptedSnapshotFileFor(t, b, path, []byte("payload that decrypts cleanly"), 1, 1, 100)
+
+	f := newSnapshotSendFixture(t, b)
+	f.sender.fsys = removeFailOnceFS{failed: new(atomic.Bool)}
+	before := engine.StaleDecryptSweepFailures()
+	// The artifact's own identity, so the decrypt succeeds and the scratch is
+	// handed to the send — whose cleanup, not the decrypt's, closes it.
+	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 56)
+	msg.ReplicaID = 1
+	sendSnapshotSync(f.sender, msg)
+
+	f.expectSnapshotStatus(t, true, 56)
+	f.assertNoTempFiles(t, dir)
+	if got := engine.StaleDecryptSweepFailures(); got != before {
+		t.Fatalf("a reclaimed scratch file was counted as unreclaimed: %d -> %d", before, got)
+	}
+}
+
+// panicWriteFile panics on Write and records its Close.
+type panicWriteFile struct {
+	snapshotFile
+	closed *atomic.Bool
+}
+
+func (panicWriteFile) Write([]byte) (int, error) { panic("injected: scratch write") }
+
+func (f panicWriteFile) Close() error {
+	f.closed.Store(true)
+	return f.snapshotFile.Close()
+}
+
+// panicScratchFS hands out scratch files that panic when written.
+type panicScratchFS struct {
+	osSnapshotFS
+	closed *atomic.Bool
+}
+
+func (fs panicScratchFS) CreateTemp(dir, pattern string) (snapshotFile, error) {
+	f, err := fs.osSnapshotFS.CreateTemp(dir, pattern)
+	if err != nil {
+		return nil, err
+	}
+	return panicWriteFile{snapshotFile: f, closed: fs.closed}, nil
+}
+
+// TestDecryptSnapshotForSend_PanicClosesTheScratch: a panic inside the
+// decrypt — a custom barrier or filesystem — is recovered by SendSnapshot,
+// and the scratch descriptor must not leak with it. Automatic snapshot
+// retries would otherwise repeat the leak until descriptors run out.
+func TestDecryptSnapshotForSend_PanicClosesTheScratch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.dat")
+
+	b := createTestBarrier(t)
+	writeEncryptedSnapshotFile(t, b, path, []byte("payload that decrypts cleanly"))
+
+	sender := newDecryptSender(t, b, testSnapShardID, testSnapReplicaID)
+	closed := new(atomic.Bool)
+	sender.fsys = panicScratchFS{closed: closed}
+
+	src, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the injected scratch-write panic did not propagate")
+			}
+		}()
+		msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 57)
+		// The frames' positional context, so the decrypt reaches the write.
+		msg.ShardID, msg.ReplicaID, msg.Snapshot.Index = testSnapShardID, testSnapReplicaID, testSnapIndex
+		_, _, _ = sender.decryptSnapshotForSend(src, msg, b)
+	}()
+	if !closed.Load() {
+		t.Fatal("a panic inside the decrypt leaked the scratch descriptor")
 	}
 }

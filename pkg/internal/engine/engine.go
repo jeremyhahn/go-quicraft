@@ -266,23 +266,6 @@ func (e *Engine) SetShardBarriers(fn func(shardID uint64) SnapshotBarrier) {
 	e.snapshots.shardBarriers = fn
 }
 
-// SetImportLocker installs the host's per-shard import try-lock on the snapshot
-// pool. fn must take the lock without waiting and report whether it did,
-// returning a release func when it did.
-//
-// Snapshot recovery reclaims orphaned import staging directories, which hold an
-// imported state machine in PLAINTEXT and are indistinguishable by name from a
-// live one. The lock is the only thing that tells them apart, so without this
-// the recovery sweep can delete the staging directory of an import that is
-// still writing. When never called, the pool assumes no host owns it and sweeps
-// unconditionally.
-//
-// Must be called during Host construction, before Start() launches the snapshot
-// workers, so the lock is visible to every recovery.
-func (e *Engine) SetImportLocker(fn func(shardID uint64) (func(), bool)) {
-	e.snapshots.tryImportLock = fn
-}
-
 // GlobalSafePurgeFloor returns the minimum barrier epoch still required by
 // any retained encrypted snapshot (across all shards) or any live WAL
 // record. DEKs for epochs strictly below this floor can be safely purged.

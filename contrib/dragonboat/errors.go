@@ -258,6 +258,10 @@ var errorMappings = []errorMapping{
 	{quicraft.ErrStaleConfigChange, ErrStaleConfigChange},
 	{quicraft.ErrSnapshotNotFound, ErrSnapshotNotFound},
 	{quicraft.ErrSnapshotInProgress, ErrSnapshotInProgress},
+	// StartReplica refused because an ImportSnapshot of the shard is running.
+	// Dragonboat has no such error; ErrSystemBusy is its transient "retry",
+	// which IsTempError recognises, and the identical start then succeeds.
+	{quicraft.ErrImportInProgress, ErrSystemBusy},
 	// Session errors: map to dragonboat session/rejection sentinels.
 	{quicraft.ErrSessionNotFound, ErrInvalidSession},
 	{quicraft.ErrSessionExpired, ErrRejected},

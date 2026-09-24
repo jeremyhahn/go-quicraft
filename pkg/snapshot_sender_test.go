@@ -19,9 +19,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -592,10 +594,7 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 		t.Fatalf("stat encrypted file: %v", err)
 	}
 
-	ts := &transportSender{
-		barrier: b,
-		logger:  slog.Default(),
-	}
+	ts := newDecryptSender(t, b, testSnapShardID, testSnapReplicaID)
 
 	// The identity must match the one the frames were sealed under: the send
 	// path reproduces the positional context from (ShardID, ReplicaID, Index).
@@ -610,7 +609,7 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 		},
 	}
 
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
+	decPath, decSize, err := decryptForSendToPath(t, ts, msg)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}
@@ -626,6 +625,129 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, plaintext) {
 		t.Errorf("decrypted data mismatch: got %q, want %q", got, plaintext)
+	}
+}
+
+// TestSendSnapshot_SurvivesItsDirectoryBeingRemoved: a send used to read its
+// artifact by PATH — the decrypt, then every chunk — and a newer snapshot's GC,
+// or the next incarnation's, or an offline import's, could remove the
+// directory underneath it. The send now opens the artifact before the
+// hand-off and reads only through handles, decrypting into an anonymous
+// scratch file, so removing the directory after the open changes nothing.
+func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
+	newArtifact := func(t *testing.T) (string, string) {
+		t.Helper()
+		base := t.TempDir()
+		dir := filepath.Join(base, "snapshot-00000000000000000100")
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		return dir, filepath.Join(dir, "snapshot.dat")
+	}
+
+	t.Run("plaintext stream", func(t *testing.T) {
+		dir, path := newArtifact(t)
+		payload := bytes.Repeat([]byte("state machine "), 1000)
+		if err := os.WriteFile(path, payload, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		src, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = src.Close() }()
+		if err := os.RemoveAll(dir); err != nil { // the GC runs
+			t.Fatalf("remove: %v", err)
+		}
+
+		msg := proto.Message{ShardID: 1, To: 2, Snapshot: proto.Snapshot{
+			Index: 100, Filepath: path, FileSize: uint64(len(payload)),
+		}}
+		var got []byte
+		if err := streamSnapshotChunks(src, msg, func(c proto.SnapshotChunk) error {
+			got = append(got, c.Data...)
+			return nil
+		}); err != nil {
+			t.Fatalf("streaming after the directory was removed: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("streamed %d bytes, want the %d-byte artifact", len(got), len(payload))
+		}
+	})
+
+	t.Run("encrypted decrypt", func(t *testing.T) {
+		dir, path := newArtifact(t)
+		b := createTestBarrier(t)
+		plaintext := []byte("encrypted state machine that must still decrypt")
+		writeEncryptedSnapshotFile(t, b, path, plaintext)
+		src, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = src.Close() }()
+		if err := os.RemoveAll(dir); err != nil { // the GC runs
+			t.Fatalf("remove: %v", err)
+		}
+
+		ts := newDecryptSender(t, b, testSnapShardID, testSnapReplicaID)
+		msg := proto.Message{ShardID: testSnapShardID, ReplicaID: testSnapReplicaID, Snapshot: proto.Snapshot{
+			Index: testSnapIndex, Filepath: path, Epoch: b.CurrentEpoch(),
+		}}
+		dec, size, err := ts.decryptSnapshotForSend(src, msg, b)
+		if err != nil {
+			t.Fatalf("decrypting after the directory was removed: %v", err)
+		}
+		defer func() { _ = dec.Close() }()
+		got, err := io.ReadAll(dec)
+		if err != nil {
+			t.Fatalf("read decrypted: %v", err)
+		}
+		if size != uint64(len(plaintext)) || !bytes.Equal(got, plaintext) {
+			t.Fatalf("decrypted %d bytes %q, want %q", size, got, plaintext)
+		}
+		// The scratch file is anonymous: nothing named is left beside the base.
+		if left, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), "*")); len(left) != 0 {
+			t.Fatalf("the decrypt left named files behind: %v", left)
+		}
+	})
+}
+
+// TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly drives the real
+// SendSnapshot — its goroutine, its source handling, its panic recovery — with
+// a witness's snapshot: no data file, but the encrypted cluster's epoch on the
+// record. It used to reach the decrypt with no source, create a scratch file
+// in the process's working directory and panic on a nil read, leaking that
+// descriptor on every send the leader retried. It is metadata only, sent as
+// its single empty chunk at epoch 0; nothing is opened or created.
+func TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly(t *testing.T) {
+	b := createTestBarrier(t)
+	f := newSnapshotSendFixture(t, b)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	before, _ := filepath.Glob(filepath.Join(cwd, sendDecryptTempPattern))
+
+	var logs bytes.Buffer
+	f.sender.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	// A witness's snapshot: no data file, the cluster's epoch on the record.
+	msg := proto.Message{
+		Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 2, Hint: 91,
+		Snapshot: proto.Snapshot{Index: 100, Term: 5, Epoch: b.CurrentEpoch()},
+	}
+	f.sender.SendSnapshot(msg)
+	f.sender.snapshotWg.Wait()
+
+	// The fixture's transport cannot deliver, so the leader is told the
+	// transfer was rejected — by the transport, not by a recovered panic.
+	f.expectSnapshotStatus(t, true, 91)
+	if strings.Contains(logs.String(), "panic recovered") {
+		t.Fatalf("the witness send panicked:\n%s", logs.String())
+	}
+	after, _ := filepath.Glob(filepath.Join(cwd, sendDecryptTempPattern))
+	if len(after) != len(before) {
+		t.Fatalf("a witness send created decrypt scratch files in the working directory: %v", after)
 	}
 }
 
@@ -645,7 +767,7 @@ func TestDecryptSnapshotForSend_FileNotFound(t *testing.T) {
 		},
 	}
 
-	_, _, err := ts.decryptSnapshotForSend(msg, ts.barrier)
+	_, _, err := decryptForSendToPath(t, ts, msg)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -684,12 +806,9 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 	}
 
 	// Simulate what doSendSnapshot does: decrypt + split.
-	ts := &transportSender{
-		barrier: b,
-		logger:  slog.Default(),
-	}
+	ts := newDecryptSender(t, b, 1, 1)
 
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
+	decPath, decSize, err := decryptForSendToPath(t, ts, msg)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}
@@ -873,10 +992,7 @@ func TestDecryptSnapshotForSend_FileCloseOnError(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	ts := &transportSender{
-		barrier: b,
-		logger:  slog.Default(),
-	}
+	ts := newDecryptSender(t, b, 1, 1)
 
 	msg := proto.Message{
 		ShardID: 1,
@@ -887,7 +1003,7 @@ func TestDecryptSnapshotForSend_FileCloseOnError(t *testing.T) {
 	}
 
 	// This should fail during decryption but clean up all resources.
-	_, _, err = ts.decryptSnapshotForSend(msg, ts.barrier)
+	_, _, err = decryptForSendToPath(t, ts, msg)
 	if err == nil {
 		t.Fatal("expected decryption error, got nil")
 	}
@@ -924,10 +1040,7 @@ func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
 	}
 
 	// Create the transportSender with just the barrier for testing.
-	ts := &transportSender{
-		barrier: b,
-		logger:  slog.Default(),
-	}
+	ts := newDecryptSender(t, b, 1, 1)
 
 	msg := proto.Message{
 		Type:      proto.InstallSnapshot,
@@ -945,7 +1058,7 @@ func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
 	}
 
 	// Manually run the decryption step (which doSendSnapshot does internally).
-	decPath, decSize, err := ts.decryptSnapshotForSend(msg, ts.barrier)
+	decPath, decSize, err := decryptForSendToPath(t, ts, msg)
 	if err != nil {
 		t.Fatalf("decryptSnapshotForSend: %v", err)
 	}

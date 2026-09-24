@@ -18,7 +18,6 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -114,9 +113,9 @@ func TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported(t *testing.T) {
 // recoverSnapshot sweeps TWICE: the whole shard tree, and then the single
 // directory it is about to recover from. Only the tree sweep reclaims a
 // plaintext scratch file orphaned in a DIFFERENT retained directory — which is
-// where the snapshot SEND path leaves one when a leader is killed mid-stream,
-// because it decrypts inside whichever directory it is streaming, not the
-// newest. Losing the tree call leaves that plaintext copy on disk for the life
+// where the snapshot SEND path left one, before its scratch moved to the
+// replica's own directory, when a leader was killed mid-stream: it decrypted
+// inside whichever directory it was streaming, not the newest. Losing the tree call leaves that plaintext copy on disk for the life
 // of the snapshot directory while the recovery itself succeeds, so nothing else
 // in the system notices.
 //
@@ -201,55 +200,61 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	}
 }
 
-// TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock is the M1
-// regression guard. It covers a call site that previously had NO test at all —
-// deleting the sweep from recoverSnapshot left the package green.
-//
-// The staging directory holds the imported state machine in PLAINTEXT and is
-// indistinguishable by NAME from one a crash orphaned, so the only thing that
-// can tell a live one from an orphan is the shard's import lock. recoverSnapshot
-// used to sweep without taking it, justified by "no import can be in flight
-// here — Host.ImportSnapshot refuses a RUNNING shard". That is a TOCTOU: the
-// refusal is in importPreflight, which runs BEFORE the import lock is acquired
-// and is not held for the import's duration, and StartShard registers the node
-// hundreds of lines after its own sweep. So an import that passed preflight and
-// is midway through a multi-gigabyte write coexists with a running shard, and a
-// leader's InstallSnapshot then RemoveAll'd its staging directory — a
-// spuriously failed disaster-recovery restore.
-//
-// Both directions are asserted: the sweep must still reclaim an orphan when the
-// lock is free (which is what makes deleting the call fail), and must leave the
-// directory alone when an import holds it.
-func TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock(t *testing.T) {
-	tests := []struct {
-		name string
-		// importRunning models an ImportSnapshot holding the shard's lock.
-		importRunning bool
-		wantSurvives  bool
-	}{
-		{
-			name:          "no import in flight: the orphan is reclaimed",
-			importRunning: false,
-			wantSurvives:  false,
-		},
-		{
-			name:          "import in flight: its staging directory survives",
-			importRunning: true,
-			wantSurvives:  true,
-		},
+// TestSweepStaleDecryptTmpTree_ReclaimsASendScratchInTheBaseDir: a snapshot
+// send decrypts into a scratch file in the replica's base directory and
+// unlinks it at once; a name survives only when that unlink failed, and then
+// holds a plaintext state-machine image. The canonical snapshot-directory scan
+// never looks at regular files in the base directory, so the tree sweep must
+// reclaim it there — and leave everything else alone.
+func TestSweepStaleDecryptTmpTree_ReclaimsASendScratchInTheBaseDir(t *testing.T) {
+	const shardID, replicaID = uint64(3), uint64(1)
+	base := t.TempDir()
+	replicaDir := snapshotBaseDir(base, shardID, replicaID)
+	if err := os.MkdirAll(replicaDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	scratch := filepath.Join(replicaDir, SendDecryptTempPrefix+"123"+ScratchTempSuffix)
+	keep := filepath.Join(replicaDir, "unrelated")
+	for _, p := range []string{scratch, keep} {
+		if err := os.WriteFile(p, []byte("plaintext"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	SweepStaleDecryptTmpTree(base, shardID, replicaID)
+
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("send scratch survived the tree sweep: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("the sweep removed a file it does not own: %v", err)
+	}
+}
+
+// TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced pins the fence on the
+// recovery's sweeps: the retry of the import-stage reclaim and the scratch
+// sweep of the replica directory. StartShard sweeps first but
+// only logs a failure, so a recovery retries — under the loaded node's write
+// lease, which proves no import is in flight, rather than the shard's import
+// lock, which a stopped incarnation's late recovery held while the next
+// StartShard failed with ErrImportInProgress. A stopped node grants no lease,
+// so its recovery leaves the stage to the next StartShard.
+func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stopped      bool
+		wantReclaims bool
+	}{
+		{"a loaded node's recovery retries the reclaim", false, true},
+		{"a stopped node's recovery leaves it to the next StartShard", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			const shardID, replicaID uint64 = 11, 1
 			baseDir := t.TempDir()
 			stopC := make(chan struct{})
 			defer close(stopC)
 
-			// The staging directory, holding the imported state machine in
-			// plaintext exactly as ImportSnapshot leaves it mid-write.
-			stageDir := filepath.Join(snapshotBaseDir(baseDir, shardID, replicaID),
-				ImportStageDirPrefix+"live")
+			stageDir := filepath.Join(snapshotBaseDir(baseDir, shardID, replicaID), ImportStageDirPrefix+"orphan")
 			if err := os.MkdirAll(stageDir, 0o750); err != nil {
 				t.Fatalf("mkdir stage dir: %v", err)
 			}
@@ -257,9 +262,14 @@ func TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock(t *testing.T) {
 			if err := os.WriteFile(stagedArtifact, []byte("plaintext state machine"), 0o600); err != nil {
 				t.Fatalf("write staged artifact: %v", err)
 			}
+			// A scratch in the replica's own directory — a crash's orphan
+			// for a loaded node, but for a stopped one possibly the NEXT
+			// incarnation's live recovery scratch.
+			scratch := filepath.Join(snapshotBaseDir(baseDir, shardID, replicaID), RecoverDecryptTempPrefix+"live"+ScratchTempSuffix)
+			if err := os.WriteFile(scratch, []byte("plaintext state machine"), 0o600); err != nil {
+				t.Fatalf("write scratch: %v", err)
+			}
 
-			// The snapshot the leader's InstallSnapshot delivered, which is
-			// what triggers the recovery.
 			recoverDir := snapshotSaveDir(baseDir, shardID, replicaID, 100)
 			if err := os.MkdirAll(recoverDir, 0o750); err != nil {
 				t.Fatalf("mkdir recover dir: %v", err)
@@ -272,74 +282,37 @@ func TestRecoverSnapshot_ImportStageSweepRespectsTheImportLock(t *testing.T) {
 			if err := writeSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
 				t.Fatalf("write recover metadata: %v", err)
 			}
-
 			ldb := newSnapshotTestLogDB()
 			if err := ldb.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
-				Index:    100,
-				Term:     3,
-				Filepath: recoverDir,
-				FileSize: uint64(len(payload)),
+				Index: 100, Term: 3, Filepath: recoverDir, FileSize: uint64(len(payload)),
 			}); err != nil {
 				t.Fatalf("SaveSnapshot: %v", err)
 			}
 
 			p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-			// The host's real lock is a capacity-one channel; model it with the
-			// same try-semantics Host.tryAcquireImportLock provides.
-			lock := make(chan struct{}, 1)
-			if tt.importRunning {
-				lock <- struct{}{}
-			}
-			var released atomic.Bool
-			p.tryImportLock = func(id uint64) (func(), bool) {
-				if id != shardID {
-					t.Errorf("import lock taken for shard %d, want %d", id, shardID)
-				}
-				select {
-				case lock <- struct{}{}:
-					return func() {
-						<-lock
-						released.Store(true)
-					}, true
-				default:
-					return nil, false
-				}
-			}
-
 			cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-			ss := newSnapshotTestSnapshotter(0)
-			node := NewNode(nil, nil, nil, cfg, ss, baseDir, nil)
-
-			if err := p.recoverSnapshot(snapshotRequest{
-				shardID: shardID, replicaID: replicaID, node: node, save: false,
-			}); err != nil {
-				t.Fatalf("recoverSnapshot failed: %v", err)
+			node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(0), baseDir, nil)
+			if tc.stopped {
+				node.Stop()
 			}
-			if got := ss.LastApplied(); got != 100 {
-				t.Fatalf("recovered lastApplied = %d, want 100: the recovery did not run, "+
-					"so this test would not have reached the sweep either", got)
-			}
+			_ = p.recoverSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node})
 
 			_, statErr := os.Stat(stagedArtifact)
 			switch {
-			case tt.wantSurvives && statErr != nil:
-				t.Fatalf("recovery deleted the staging directory of a RUNNING import "+
-					"(%v): the operator's disaster-recovery restore fails for no reason",
-					statErr)
-			case !tt.wantSurvives && !os.IsNotExist(statErr):
-				t.Fatalf("the orphaned import staging directory survived recovery "+
-					"(err=%v): it holds a COMPLETE PLAINTEXT COPY of the state machine "+
-					"under a name no scan on the host enumerates, so nothing else ever "+
-					"reclaims it", statErr)
+			case tc.wantReclaims && !os.IsNotExist(statErr):
+				t.Fatalf("a loaded node's recovery left the orphaned PLAINTEXT import stage (%v): "+
+					"StartShard's sweep only logs a failure, so this is its one retry", statErr)
+			case !tc.wantReclaims && statErr != nil:
+				t.Fatalf("a stopped node's recovery touched an import stage (%v): only a "+
+					"loaded node's write lease proves no import is in flight", statErr)
 			}
-			if !tt.importRunning && !released.Load() {
-				t.Fatal("the import lock was taken and never released; the next " +
-					"ImportSnapshot for this shard would block forever")
-			}
-
-			// The canonical artifact must be untouched either way.
-			if _, err := os.Stat(filepath.Join(recoverDir, snapshotDataFile)); err != nil {
-				t.Fatalf("the sweep destroyed the canonical snapshot data file: %v", err)
+			_, statErr = os.Stat(scratch)
+			switch {
+			case tc.wantReclaims && !os.IsNotExist(statErr):
+				t.Fatalf("a loaded node's recovery left an orphaned plaintext scratch (%v)", statErr)
+			case !tc.wantReclaims && statErr != nil:
+				t.Fatalf("a stopped node's recovery swept the replica directory (%v): it "+
+					"could unlink the next incarnation's live recovery scratch", statErr)
 			}
 		})
 	}

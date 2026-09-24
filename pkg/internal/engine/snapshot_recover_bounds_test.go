@@ -85,7 +85,13 @@ func newRecoveryTestNode(t *testing.T, shardID, replicaID uint64,
 	if err != nil {
 		t.Fatalf("NewPeer: %v", err)
 	}
-	return NewNode(peer, nil, lr, cfg, ss, t.TempDir(), nil), peer
+	node := NewNode(peer, nil, lr, cfg, ss, t.TempDir(), nil)
+	// StartShard creates the replica's snapshot directory, where a recovery
+	// decrypts its scratch.
+	if err := os.MkdirAll(node.ReplicaSnapshotDir(), 0o750); err != nil {
+		t.Fatalf("mkdir replica snapshot dir: %v", err)
+	}
+	return node, peer
 }
 
 // installSnapshotIntoLog advances the peer's committed AND processed markers

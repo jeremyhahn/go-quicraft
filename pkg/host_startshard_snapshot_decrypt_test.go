@@ -22,12 +22,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/golang/snappy"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
@@ -297,6 +299,66 @@ func TestStartShard_LocalSnapshotRecovery_InMemorySM(t *testing.T) {
 			assertNoDecryptScratch(t, dir)
 		})
 	}
+}
+
+// createTempSpyFS records the directory of every CreateTemp.
+type createTempSpyFS struct {
+	osSnapshotFS
+	mu   *sync.Mutex
+	dirs *[]string
+}
+
+func (fs createTempSpyFS) CreateTemp(dir, pattern string) (snapshotFile, error) {
+	fs.mu.Lock()
+	*fs.dirs = append(*fs.dirs, dir)
+	fs.mu.Unlock()
+	return fs.osSnapshotFS.CreateTemp(dir, pattern)
+}
+
+// TestStartShard_LocalSnapshotRecovery_ScratchStaysInTheReplicaTree: a record
+// may name a snapshot directory outside the replica's tree (the fixture's
+// is a bare temp directory). The recovery's plaintext scratch must still be
+// created in the replica's own snapshot directory, which the stale-scratch
+// sweep covers: beside an external artifact, a copy a crash orphans is
+// reclaimed by nothing once the record moves on.
+func TestStartShard_LocalSnapshotRecovery_ScratchStaysInTheReplicaTree(t *testing.T) {
+	v := snapshotVariant{name: "encrypted_uncompressed", encrypted: true}
+	barrier := createTestBarrier(t)
+	db := newMockLogDB()
+	payload := []byte("in-memory state machine snapshot payload")
+	dir := seedLocalSnapshot(t, db, v, barrier, 1, 1, 40, 3, payload)
+
+	var mu sync.Mutex
+	var dirs []string
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithLogDB(db), WithBarrier(barrier), WithoutTransport(),
+		withSnapshotFS(createTempSpyFS{mu: &mu, dirs: &dirs}))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	memSM := &recordingMemSM{want: payload}
+	create := func(_, _ uint64) interface{} { return memSM }
+	if startErr := h.StartShard(quiescentMembers(), false, create, v.shardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard: %v", startErr)
+	}
+	if !memSM.recoverCalled.Load() {
+		t.Fatal("the shard did not recover from the snapshot, so no scratch was created")
+	}
+
+	want := engine.ReplicaSnapshotDir(shardSnapshotBaseDir(cfg.NodeHostDir, "", 1), 1, 1)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dirs) == 0 {
+		t.Fatal("the recovery created no scratch file through the snapshot filesystem")
+	}
+	for _, d := range dirs {
+		if d != want {
+			t.Fatalf("recovery scratch created in %s, want the replica's own directory %s", d, want)
+		}
+	}
+	assertNoDecryptScratch(t, dir)
 }
 
 // TestStartShard_LocalSnapshotRecovery_OnDiskBootstrap covers the on-disk

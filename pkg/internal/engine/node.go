@@ -596,6 +596,14 @@ func (n *Node) SnapshotDir() string {
 	return n.snapshotDir
 }
 
+// ReplicaSnapshotDir returns this replica's own snapshot directory,
+// <SnapshotDir()>/shard-<N>/replica-<N>: the parent of every canonical
+// snapshot directory, owned by this replica alone and swept for stale scratch
+// files at every start and recovery (SweepStaleDecryptTmpTree).
+func (n *Node) ReplicaSnapshotDir() string {
+	return ReplicaSnapshotDir(n.snapshotDir, n.shardID, n.replicaID)
+}
+
 // SnapshotSaveDir returns the on-disk directory for the snapshot at index:
 // <SnapshotDir()>/shard-<N>/replica-<N>/snapshot-<index>. This is the SAME
 // construction the snapshot pool uses for saving, garbage collection, and
@@ -740,9 +748,9 @@ func (n *Node) ReleaseSnapshotDir(index uint64) {
 	delete(n.claimedSnapshotDirs, index)
 }
 
-// snapshotDirClaimed reports whether a receive holds a claim on index. The
+// IsSnapshotDirClaimed reports whether a receive holds a claim on index. The
 // caller holds the snapshot-directory lock.
-func (n *Node) snapshotDirClaimed(index uint64) bool {
+func (n *Node) IsSnapshotDirClaimed(index uint64) bool {
 	_, ok := n.claimedSnapshotDirs[index]
 	return ok
 }

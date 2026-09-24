@@ -1849,7 +1849,7 @@ RELEASE_REMOTE ?= dev
 # INCLUDING -alpha prereleases -- bare 'go get @latest' ignores prereleases and
 # would downgrade to legacy v0.0.0.
 
-.PHONY: release-alpha deps-latest
+.PHONY: release release-alpha deps-latest
 
 # Every settable Make variable crosses into the recipe ONCE, via these
 # target-specific exports, and the body references only the shell parameters
@@ -1869,42 +1869,71 @@ RELEASE_REMOTE ?= dev
 # in a shell or CI job that happens to export VERSION would sail past the
 # explicit-version guard and cut whatever it inherited. An inherited value is
 # not an operator stating a version, which is the whole contract here.
-release-alpha: export REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
-release-alpha: export REL_REMOTE    := $(value RELEASE_REMOTE)
-release-alpha: export REL_REPO      := $(value REPO_NAME)
-release-alpha: export REL_AGENT_GIT := $(value AGENT_GIT)
+# The release recipe, shared by release-alpha (a pre-release, vX.Y.Z-alpha) and
+# release (a STABLE release, vX.Y.Z -- ruling R13). The two differ ONLY in the
+# version form they accept, carried in REL_PATTERN / REL_FORM; every other
+# guard -- main only, explicit version, clean tree, no existing tag, CHANGELOG
+# heading, agent authorship, verified signatures, one atomic push -- is the
+# same recipe text, so a safeguard added to one cannot be missing from the
+# other. release.yml publishes a tag with no alpha/beta/rc as a full release.
+define release-body
+@test -n "$$REL_VERSION" || { echo "ERROR: state the version explicitly: make $$REL_TARGET VERSION=$$REL_FORM (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)"; exit 1; }
+@printf '%s' "$$REL_VERSION" | grep -Eq "$$REL_PATTERN" || { echo "ERROR: VERSION is not of the form $$REL_FORM (no leading zeroes): $$REL_VERSION"; exit 1; }
+@test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). 'push $$REL_REMOTE HEAD' would publish this branch."; exit 1; }
+@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty -- set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
+@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh -- every git write in this recipe signs through it, and a bad path must fail before VERSION is written'; exit 1; }
+@test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the Gitea remote'; exit 1; }
+@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
+@! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
+@rc=0; git ls-remote --exit-code --tags "$$REL_REMOTE" "refs/tags/$$REL_VERSION" >/dev/null 2>&1 || rc=$$?; \
+case "$$rc" in \
+  0) echo "ERROR: tag $$REL_VERSION already exists on $$REL_REMOTE (a local check alone would miss this and fail the push AFTER committing VERSION)"; exit 1 ;; \
+  2) : ;; \
+  *) echo "ERROR: could not reach $$REL_REMOTE to check whether tag $$REL_VERSION exists. Refusing to continue: an unreachable remote is not an absent tag"; exit 1 ;; \
+esac
+@test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
+@ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
+@printf '%s\n' "$${REL_VERSION#v}" > VERSION
+"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
+"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
+"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
+"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)"
+@want="agent-$$REL_REPO"; got="$$(git log -1 --format='%an')"; \
+test "$$got" = "$$want" || { echo "ERROR: the release commit is authored by '$$got', not '$$want'. AGENT_GIT did not write as this repo's agent; nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; exit 1; }
+@test "$$(git cat-file -t "$$REL_VERSION")" = tag || { echo "ERROR: $$REL_VERSION is a lightweight tag; releases are annotated and signed. Nothing has been pushed."; exit 1; }
+@test -f "$(RELEASE_SIGNERS)" || { echo 'ERROR: $(RELEASE_SIGNERS) is missing. It is the trust anchor for release signature verification; without it a signature can only be observed, not TRUSTED. Nothing has been pushed.'; exit 1; }
+@rc=0; \
+git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-commit HEAD >/dev/null 2>&1 || { echo "ERROR: the release commit's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
+git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-tag "$$REL_VERSION" >/dev/null 2>&1 || { echo "ERROR: tag $$REL_VERSION's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
+exit $$rc
+"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION"
+@echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically)"
+endef
+
+release-alpha: export override REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release-alpha: export override REL_REMOTE    := $(value RELEASE_REMOTE)
+release-alpha: export override REL_REPO      := $(value REPO_NAME)
+release-alpha: export override REL_AGENT_GIT := $(value AGENT_GIT)
+release-alpha: export override REL_TARGET    := release-alpha
+release-alpha: export override REL_FORM      := vX.Y.Z-alpha
+release-alpha: export override REL_PATTERN   := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$
 release-alpha:
-	@test -n "$$REL_VERSION" || { echo 'ERROR: state the version explicitly: make release-alpha VERSION=vX.Y.Z-alpha (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)'; exit 1; }
-	@printf '%s' "$$REL_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$' || { echo "ERROR: VERSION is not of the form vX.Y.Z-alpha (no leading zeroes): $$REL_VERSION"; exit 1; }
-	@test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). 'push $$REL_REMOTE HEAD' would publish this branch."; exit 1; }
-	@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty -- set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
-	@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh -- every git write in this recipe signs through it, and a bad path must fail before VERSION is written'; exit 1; }
-	@test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the Gitea remote'; exit 1; }
-	@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
-	@! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
-	@rc=0; git ls-remote --exit-code --tags "$$REL_REMOTE" "refs/tags/$$REL_VERSION" >/dev/null 2>&1 || rc=$$?; \
-	case "$$rc" in \
-	  0) echo "ERROR: tag $$REL_VERSION already exists on $$REL_REMOTE (a local check alone would miss this and fail the push AFTER committing VERSION)"; exit 1 ;; \
-	  2) : ;; \
-	  *) echo "ERROR: could not reach $$REL_REMOTE to check whether tag $$REL_VERSION exists. Refusing to continue: an unreachable remote is not an absent tag"; exit 1 ;; \
-	esac
-	@test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
-	@ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
-	@printf '%s\n' "$${REL_VERSION#v}" > VERSION
-	"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
-	"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
-	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
-	"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)"
-	@want="agent-$$REL_REPO"; got="$$(git log -1 --format='%an')"; \
-	test "$$got" = "$$want" || { echo "ERROR: the release commit is authored by '$$got', not '$$want'. AGENT_GIT did not write as this repo's agent; nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; exit 1; }
-	@test "$$(git cat-file -t "$$REL_VERSION")" = tag || { echo "ERROR: $$REL_VERSION is a lightweight tag; releases are annotated and signed. Nothing has been pushed."; exit 1; }
-	@test -f "$(RELEASE_SIGNERS)" || { echo 'ERROR: $(RELEASE_SIGNERS) is missing. It is the trust anchor for release signature verification; without it a signature can only be observed, not TRUSTED. Nothing has been pushed.'; exit 1; }
-	@rc=0; \
-	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-commit HEAD >/dev/null 2>&1 || { echo "ERROR: the release commit's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
-	git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-tag "$$REL_VERSION" >/dev/null 2>&1 || { echo "ERROR: tag $$REL_VERSION's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
-	exit $$rc
-	"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION"
-	@echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically)"
+	$(release-body)
+
+# release cuts a STABLE version -- no -alpha. Taking one is the owner's
+# decision (release-versioning.md: drop -alpha "when the API is settled enough
+# that a consumer can pin it"); for go-quicraft the first one also unfreezes
+# the format version constants (CLAUDE.md), so the recipe states the form but
+# never chooses the moment.
+release: export override REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release: export override REL_REMOTE    := $(value RELEASE_REMOTE)
+release: export override REL_REPO      := $(value REPO_NAME)
+release: export override REL_AGENT_GIT := $(value AGENT_GIT)
+release: export override REL_TARGET    := release
+release: export override REL_FORM      := vX.Y.Z
+release: export override REL_PATTERN   := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
+release:
+	$(release-body)
 
 deps-latest:
 	@GOWORK=off sh -c ' \

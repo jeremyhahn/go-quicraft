@@ -443,15 +443,21 @@ func (w *applyWorker) dispatch(item *applyItem) {
 		"shard", shardID,
 		"channel_cap", cap(ch),
 	)
-	// Block until the shard drains, BUT remain responsive to shutdown and to
-	// membership requests: without the stopC guard a stalled/stopped shard
-	// goroutine whose channel is full would wedge the dispatcher forever,
-	// preventing the engine from tearing down; without the membershipC case
-	// it would also stall UnloadNode and LoadNode for EVERY shard on this
-	// worker, since both rendezvous with this goroutine. Committed entries
-	// are still never dropped in normal operation — the abandon branches
-	// below run only when the engine is stopping or this very shard was
-	// unloaded underneath us.
+	// Block until the shard drains, BUT remain responsive to membership
+	// requests and to the shard goroutine's EXIT: without the membershipC
+	// case this would stall UnloadNode and LoadNode for EVERY shard on this
+	// worker, since both rendezvous with this goroutine, and a shard goroutine
+	// that has exited — a panic past its recovery — reads nothing more, so a
+	// send to its full channel would wedge the dispatcher forever.
+	//
+	// The engine STOPPING is deliberately not a reason to give up. The shard
+	// goroutine keeps consuming until shutdownIfStopping closes its channel,
+	// so the send completes, and the committed, durable item is applied as
+	// the shutdown drain promises; abandoning it here failed proposals whose
+	// entries were committed. A goroutine stuck inside a user Apply would
+	// hold this wait — but it holds shutdownIfStopping's unbounded join
+	// anyway, so no shutdown that could finish is made to hang.
+	exited := w.shardExits[shardID]
 	for {
 		select {
 		case ch <- item:
@@ -467,12 +473,12 @@ func (w *applyWorker) dispatch(item *applyItem) {
 				w.discardItem(item)
 				return
 			}
-		case <-w.stopC:
-			slog.Warn("apply dispatcher shutting down; committed item not delivered",
+		case <-exited:
+			slog.Warn("apply dispatch skipped: the shard's apply goroutine has exited",
 				"worker", w.workerID, "shard", shardID)
 			// Mirror the unloaded-shard cleanup: release committed entries,
 			// clear commitPending, and return the item to the pool so we
-			// don't leak pooled state or wedge the node on shutdown.
+			// don't leak pooled state or wedge the node.
 			w.discardItem(item)
 			return
 		}

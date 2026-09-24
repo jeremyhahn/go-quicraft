@@ -1591,7 +1591,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 	}
 
 	// Decrypt to a sibling temp file; the source dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 3, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 3, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -1614,7 +1614,7 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 // decryptSnapshotFile renamed plaintext over snapshot.dat, so a recovery
 // failure (or crash) left plaintext on disk while LogDB still recorded
 // Epoch>0 — every later recovery would then re-decrypt plaintext and fail
-// permanently. decryptSnapshotToSibling decrypts to a throwaway sibling and
+// permanently. decryptSnapshotToScratch decrypts to a throwaway sibling and
 // leaves the canonical encrypted file untouched, so it must:
 //  1. leave snapshot.dat byte-for-byte unchanged (still ciphertext),
 //  2. return the plaintext in a distinct sibling file, and
@@ -1645,7 +1645,7 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	}
 
 	// First decryption: must produce a distinct sibling containing the plaintext.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 7, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 7, barrier)
 	if err != nil {
 		t.Fatalf("first decrypt failed: %v", err)
 	}
@@ -1673,13 +1673,13 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 		t.Fatalf("read source after decrypt failed: %v", err)
 	}
 	if !bytes.Equal(ciphertextBefore, ciphertextAfter) {
-		t.Fatal("source snapshot.dat was mutated by decryptSnapshotToSibling")
+		t.Fatal("source snapshot.dat was mutated by decryptSnapshotToScratch")
 	}
 
 	// Retry-safety: a second decrypt of the same (still encrypted) source must
 	// also succeed. Under the old in-place behavior the source would now be
 	// plaintext, so this second decrypt would fail.
-	plainPath2, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 7, barrier)
+	plainPath2, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 7, barrier)
 	if err != nil {
 		t.Fatalf("second (retry) decrypt failed: %v", err)
 	}
@@ -1744,7 +1744,7 @@ var _ SnapshotBarrier = (*rotateAfterNBarrier)(nil)
 // the DEK-purge floor protects every frame.
 //
 // This test builds a single file containing frames at epoch E and E+1, then
-// asserts decryptSnapshotToSibling recovers ALL frames correctly. Under the old
+// asserts decryptSnapshotToScratch recovers ALL frames correctly. Under the old
 // behavior (DecryptForEpoch with one recorded epoch), the frame whose true
 // epoch differs from the recorded epoch would fail AEAD and brick the snapshot.
 func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
@@ -1774,7 +1774,7 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 
 	// Decrypt using the MINIMUM recorded epoch (5). Per-frame embedded-epoch
 	// decryption must recover both frames despite frame 2 being at epoch 6.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 5, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 5, barrier)
 	if err != nil {
 		t.Fatalf("mixed-epoch decrypt failed (per-frame epoch not honored): %v", err)
 	}
@@ -1793,7 +1793,7 @@ func TestSnapshotPool_MixedEpochSnapshotDecryptsAllFrames(t *testing.T) {
 // TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation verifies the save
 // path records the MINIMUM frame epoch (not a post-hoc CurrentEpoch read) when
 // a rotation lands mid-save, and that the resulting mixed-epoch file round-trips
-// through decryptSnapshotToSibling using only that minimum epoch.
+// through decryptSnapshotToScratch using only that minimum epoch.
 func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Rotate after the first chunk: frame 1 at epoch 5, all later frames at 6.
@@ -1821,7 +1821,7 @@ func TestSnapshotPool_EncryptFile_RecordsMinEpochAcrossRotation(t *testing.T) {
 	}
 
 	// The mixed-epoch file must round-trip using only the recorded min epoch.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, minEpoch, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, minEpoch, barrier)
 	if err != nil {
 		t.Fatalf("decrypt of mixed-epoch file failed: %v", err)
 	}
@@ -1874,8 +1874,8 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 	copy(encryptedContent, fileData)
 
 	// Decrypt should fail on the corrupt second frame and return an empty
-	// path (decryptSnapshotToSibling never mutates the source).
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	// path (decryptSnapshotToScratch never mutates the source).
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected decrypt to fail on corrupt frame")
 	}
@@ -1920,7 +1920,7 @@ func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
 		t.Fatalf("write corrupt file failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for corrupt frame")
 	}
@@ -2948,7 +2948,7 @@ func TestSnapshotPool_DecryptFile_EmptyFileIsTruncation(t *testing.T) {
 	if err := os.WriteFile(dataPath, []byte{}, 0o644); err != nil {
 		t.Fatalf("write empty file failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if !errors.Is(err, ErrSnapshotCorrupt) {
 		t.Fatalf("decrypt of a frameless artifact = %v, want ErrSnapshotCorrupt", err)
 	}
@@ -2981,7 +2981,7 @@ func TestSnapshotPool_DecryptFile_EmptyPlaintextRoundTrips(t *testing.T) {
 	if err := os.WriteFile(dataPath, sealed.Bytes(), 0o644); err != nil {
 		t.Fatalf("write sealed file failed: %v", err)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, epoch, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, epoch, barrier)
 	if err != nil {
 		t.Fatalf("decrypt of an empty-plaintext artifact failed: %v", err)
 	}
@@ -3256,7 +3256,7 @@ func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
 	dataPath := filepath.Join(tmpDir, "single-byte.dat")
 	original := []byte{0x42}
 	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3285,7 +3285,7 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 		original[i] = byte(i % 199)
 	}
 	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 2, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 2, barrier)
 	if err != nil {
 		t.Fatalf("decrypt failed: %v", err)
 	}
@@ -3306,14 +3306,14 @@ func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
 }
 
 // TestSnapshotPool_DecryptFile_MissingFile verifies that
-// decryptSnapshotToSibling returns a SnapshotEncryptError and an empty path
+// decryptSnapshotToScratch returns a SnapshotEncryptError and an empty path
 // when the source file does not exist.
 func TestSnapshotPool_DecryptFile_MissingFile(t *testing.T) {
 	barrier := newTestBarrier(1)
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	plainPath, err := p.decryptSnapshotToSibling("/nonexistent/path/snapshot.dat", 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir("/nonexistent/path/snapshot.dat"), "/nonexistent/path/snapshot.dat", 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -3344,7 +3344,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameHeader(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame header")
 	}
@@ -3378,7 +3378,7 @@ func TestSnapshotPool_DecryptFile_TruncatedFrameData(t *testing.T) {
 		t.Fatalf("write test data failed: %v", err)
 	}
 
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, 1, 1, 1, 1, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
 	if err == nil {
 		t.Fatal("expected error for truncated frame data")
 	}
@@ -4923,7 +4923,7 @@ func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
 	sealSnapshotFile(t, dataPath, original, shardID, replicaID, index, barrier)
 
 	// Positive: the artifact's own identity opens it.
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, shardID, replicaID, index, 3, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, shardID, replicaID, index, 3, barrier)
 	if err != nil {
 		t.Fatalf("decrypt under the matching identity: %v", err)
 	}
@@ -4946,8 +4946,7 @@ func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
 		{"other_index", shardID, replicaID, index + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, decErr := p.decryptSnapshotToSibling(
-				dataPath, tc.shardID, tc.replicaID, tc.index, 3, barrier); decErr == nil {
+			if _, decErr := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, tc.shardID, tc.replicaID, tc.index, 3, barrier); decErr == nil {
 				t.Fatalf("snapshot sealed for (%d,%d,%d) decrypted as (%d,%d,%d)",
 					shardID, replicaID, index, tc.shardID, tc.replicaID, tc.index)
 			}
@@ -4983,8 +4982,7 @@ func TestSnapshotPool_FrameContext_RejectsSplicedArtifact(t *testing.T) {
 		if wrErr := os.WriteFile(swappedPath, swapped, 0o600); wrErr != nil {
 			t.Fatalf("write swapped artifact: %v", wrErr)
 		}
-		if _, decErr := p.decryptSnapshotToSibling(
-			swappedPath, shardID, replicaID, index, 3, barrier); decErr == nil {
+		if _, decErr := p.decryptSnapshotToScratch(filepath.Dir(swappedPath), swappedPath, shardID, replicaID, index, 3, barrier); decErr == nil {
 			t.Fatal("a reordered artifact decrypted: frames are not bound to their ordinal")
 		}
 	})
@@ -5143,7 +5141,7 @@ func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testin
 	if bytes.Contains(final, canary) {
 		t.Fatalf("the finished %s holds the state machine in the clear", snapshotDataFile)
 	}
-	plainPath, err := p.decryptSnapshotToSibling(dataPath, shardID, replicaID, index, epoch, barrier)
+	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, shardID, replicaID, index, epoch, barrier)
 	if err != nil {
 		t.Fatalf("decrypting the artifact back: %v", err)
 	}
@@ -5231,7 +5229,7 @@ func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *te
 // sealSnapshotFile writes plaintext to path through snapshotFrameWriter -- the
 // sealed artifact exactly as saveSnapshot produces it since #116 -- and
 // returns the epoch the artifact would record. The tests that read an
-// artifact back (decryptSnapshotToSibling, the frame-context binding, the
+// artifact back (decryptSnapshotToScratch, the frame-context binding, the
 // mixed-epoch minimum) build their input here, so they exercise the writer
 // that is actually on the save path.
 func sealSnapshotFile(t *testing.T, path string, plaintext []byte, shardID, replicaID, index uint64, barrier SnapshotBarrier) uint64 {

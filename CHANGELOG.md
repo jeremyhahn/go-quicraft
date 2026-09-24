@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Closes the residuals 0.14.0-alpha listed as known, and adds the stable
+release path (ruling R13).
+
+### Fixed
+- **A snapshot being sent to a follower could be deleted mid-send.** The
+  leader's send read the artifact by path — the decrypt, then every chunk —
+  from a goroutine started after raft chose it, and the GC a newer receive or
+  save, the next incarnation, or an offline import runs could remove the
+  directory underneath it. The send now opens the artifact before the
+  hand-off and reads only through handles, decrypting into an ANONYMOUS
+  scratch file (unlinked the moment it is created, in the loaded replica's
+  own snapshot directory whatever path the record names), so the plaintext
+  never has a name a crash could orphan or the GC could remove. The scratch
+  handle is released on every path, a panic inside decryption included. If
+  the immediate unlink fails it is retried when the scratch is closed; a
+  name that still survives is counted on `StaleDecryptSweepFailures` and
+  reclaimed by the stale-scratch sweep, which now covers the replica
+  directory at shard start and on every recovery. A send for a shard no
+  longer loaded, or loaded again as a different replica, is refused.
+- **A crash during snapshot recovery could strand plaintext outside every
+  sweep.** Recovery (at `StartShard` and in the engine) decrypted into a
+  named scratch file beside the artifact, and a snapshot record may name a
+  directory outside the replica's tree, where nothing reclaimed a copy a
+  crash orphaned once the record moved on. It now decrypts into the
+  replica's own snapshot directory, like the send. That directory is
+  created by `StartShard` and by no scratch writer, and a stopped
+  incarnation's late recovery no longer sweeps it: its sweeps are fenced by
+  the node's write lease, so they cannot unlink the next incarnation's live
+  recovery scratch.
+- **A witness in an encrypted cluster could never catch up by snapshot.** A
+  witness receives metadata only, but the send kept the snapshot's epoch and
+  tried to decrypt a file it did not have: every attempt panicked (recovered
+  and rejected), leaked a descriptor, and left a scratch file in the process
+  working directory. A snapshot with no file is now sent as metadata only.
+- **The engine shutdown dropped committed work in two places.** A dispatcher
+  blocked on a full per-shard apply channel abandoned the item as soon as the
+  engine began stopping, failing proposals whose entries were committed; it
+  now waits for the shard goroutine, which keeps consuming during the drain,
+  and discards only when that goroutine has exited. In memory mode the apply
+  hand-off chose at random between the send and the stop when both were
+  ready; the send is now tried first.
+- **`StartShard` could fail with `ErrImportInProgress` with no import
+  running,** when a stopped incarnation's late snapshot recovery held the
+  shard's import lock for its import-stage sweep. That retry of `StartShard`'s
+  reclaim (which only logs a failure) is now fenced by the loaded node's
+  write lease instead: while it is held the shard is loaded and cannot be
+  importing, and `UnloadNode` — hence the next `StartShard` — waits for it. A
+  stopped node's recovery skips it.
+- **The dragonboat adapter passed `ErrImportInProgress` through untranslated.**
+  It maps to `ErrSystemBusy`, dragonboat's transient retry.
+
+### Added
+- **`make release VERSION=vX.Y.Z` (ruling R13)** cuts a STABLE release. It
+  shares one recipe with `make release-alpha` — the same guards, signature
+  verification and atomic push — and differs only in the version form it
+  accepts. Every recipe input is `override`, in both targets, so no
+  command-line variable can widen the form or stand in for the explicit
+  `VERSION`, the repository name, the agent-git wrapper or the remote.
+  Taking a stable version remains the owner's decision.
+
 ## [0.14.0-alpha] - 2026-09-23
 
 Implements the production-readiness rulings of 2026-09-23 that change the

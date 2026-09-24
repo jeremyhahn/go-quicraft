@@ -564,12 +564,31 @@ func (s *transportSender) Send(msgs []proto.Message) {
 // on failure, a rejected SnapshotStatus tells the leader to transition
 // the remote out of snapshot state so replication can be retried.
 func (s *transportSender) SendSnapshot(msg proto.Message) {
+	// Open the artifact NOW, before the asynchronous hand-off, and read only
+	// through the handle from here on. Opening inside the goroutine left a
+	// window in which a newer snapshot's GC removed the directory raft had
+	// just chosen; an open file stays readable whatever happens to its name.
+	// The open is one syscall, cheap enough for the step worker's path.
+	var src snapshotFile
+	var openErr error
+	if msg.Snapshot.Filepath != "" {
+		src, openErr = s.snapshotFsys().Open(msg.Snapshot.Filepath)
+	}
 	s.snapshotWg.Add(1)
 	go func() {
 		defer s.snapshotWg.Done()
 		defer func() {
+			if src == nil {
+				return
+			}
+			if err := src.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				s.logger.Debug("snapshot send source close failed",
+					"shard", msg.ShardID, "path", msg.Snapshot.Filepath, "error", err)
+			}
+		}()
+		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("panic recovered in doSendSnapshot",
+				s.logger.Error("panic recovered in doSendSnapshot",
 					"shard", msg.ShardID,
 					"from", msg.From,
 					"to", msg.To,
@@ -582,7 +601,7 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 				s.safeNotifySnapshotRejected(msg.ShardID, msg.From, msg.To, msg.Hint)
 			}
 		}()
-		s.doSendSnapshot(msg)
+		s.doSendSnapshot(msg, src, openErr)
 	}()
 }
 
@@ -593,7 +612,7 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 func (s *transportSender) safeNotifySnapshotRejected(shardID, from, to, transferSeq uint64) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic in snapshot rejection notification",
+			s.logger.Error("panic in snapshot rejection notification",
 				"shard", shardID,
 				"from", from,
 				"to", to,
@@ -623,7 +642,7 @@ func (s *transportSender) Wait() {
 // need to decrypt it. Each node's barrier encrypts independently
 // for at-rest protection; the QUIC transport provides in-transit
 // encryption via mTLS.
-func (s *transportSender) doSendSnapshot(msg proto.Message) {
+func (s *transportSender) doSendSnapshot(msg proto.Message, src snapshotFile, openErr error) {
 	// resourceCleanup tracks resources that must be cleaned up on exit,
 	// whether by normal return, error, or panic. Resources are cleaned
 	// up in reverse order of registration.
@@ -635,10 +654,36 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 	}
 	defer cleanup()
 
-	// If the snapshot is encrypted, decrypt to a temp file so the
-	// receiver (which has a different barrier key) can read it. The barrier
-	// is routed by shardID so per-tenant snapshots decrypt under the correct
-	// barrier; without per-shard barriers this is the host-wide barrier.
+	// src was opened by SendSnapshot before this goroutine was handed the
+	// transfer, and every read below goes through it or through the
+	// anonymous decrypt scratch file — never through a path. A snapshot
+	// directory the GC removes meanwhile (a newer receive or save, the next
+	// incarnation, an offline import) takes only its names with it.
+	if openErr != nil {
+		s.logger.Warn("snapshot send refused: the artifact could not be opened",
+			"shard", msg.ShardID,
+			"to", msg.To,
+			"path", msg.Snapshot.Filepath,
+			"error", openErr,
+		)
+		s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
+		return
+	}
+	source := src
+
+	// A snapshot with NO data file — a witness's — is metadata only: there is
+	// nothing to decrypt and nothing to open, whatever epoch its record
+	// carries. It is shipped as its single empty chunk at epoch 0. Letting it
+	// reach the decrypt below read from a nil source, and a witness in an
+	// encrypted cluster then panicked on every send the leader retried.
+	if msg.Snapshot.Filepath == "" {
+		msg.Snapshot.Epoch = 0
+	}
+
+	// If the snapshot is encrypted, decrypt it so the receiver (which has a
+	// different barrier key) can read it. The barrier is routed by shardID so
+	// per-tenant snapshots decrypt under the correct barrier; without
+	// per-shard barriers this is the host-wide barrier.
 	sendBarrier := s.barrierFor(msg.ShardID)
 	if msg.Snapshot.Epoch > 0 {
 		// The snapshot is encrypted at rest and MUST be decrypted to plaintext
@@ -660,7 +705,7 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
 			return
 		}
-		decryptedPath, decryptedSize, err := s.decryptSnapshotForSend(msg, sendBarrier)
+		decrypted, decryptedSize, err := s.decryptSnapshotForSend(src, msg, sendBarrier)
 		if err != nil {
 			s.logger.Warn("snapshot decrypt-for-send failed",
 				"shard", msg.ShardID,
@@ -671,27 +716,23 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 			s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, true)
 			return
 		}
-		// Register temp file cleanup immediately after successful creation.
-		// This ensures cleanup even if a panic occurs later in this function.
-		tempPath := decryptedPath
+		// Registered immediately, so the anonymous scratch file is closed —
+		// and with that gone — even if a panic follows.
 		resourceCleanup = append(resourceCleanup, func() {
-			if err := s.snapshotFsys().Remove(tempPath); err != nil && !os.IsNotExist(err) {
-				s.logger.Debug("decrypted snapshot temp file removal failed",
-					"path", tempPath,
-					"error", err)
+			if err := decrypted.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				s.logger.Debug("decrypted snapshot scratch file close failed", "error", err)
 			}
 		})
-		// Update the message to reference the decrypted file.
-		msg.Snapshot.Filepath = decryptedPath
+		source = decrypted
 		msg.Snapshot.FileSize = decryptedSize
 		msg.Snapshot.Epoch = 0
 	}
 
-	// Stream snapshot chunks directly to the transport. The
-	// forEachSnapshotChunk callback reads one chunk at a time from disk,
-	// and SendSnapshotStreaming writes it to the wire immediately, so at
-	// most one chunk (snapshotChunkSize = 2MB) is held in memory at any
-	// point rather than the entire snapshot file.
+	// Stream snapshot chunks directly to the transport. The producer reads
+	// one chunk at a time from the open file, and SendSnapshotStreaming
+	// writes it to the wire immediately, so at most one chunk
+	// (snapshotChunkSize = 2MB) is held in memory at any point rather than
+	// the entire snapshot file.
 	snap := &msg.Snapshot
 	fileSize := snap.FileSize
 	var chunkCount uint64
@@ -711,7 +752,11 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 	}
 
 	producer := func(emit func(proto.SnapshotChunk) error) error {
-		return forEachSnapshotChunk(s.snapshotFsys(), msg, emit)
+		// A snapshot with no data file is the one metadata-only transfer.
+		if snap.Filepath == "" {
+			return emit(emptySnapshotChunk(msg, snap))
+		}
+		return streamSnapshotChunks(source, msg, emit)
 	}
 
 	if err := s.transport.SendSnapshotStreaming(meta, producer); err != nil {
@@ -727,18 +772,93 @@ func (s *transportSender) doSendSnapshot(msg proto.Message) {
 	s.notifySnapshotStatus(msg.ShardID, msg.From, msg.To, msg.Hint, false)
 }
 
-// decryptSnapshotForSend decrypts an encrypted snapshot file to a
-// temporary file for network transfer. The encrypted format is a
-// sequence of frames: [4-byte LE length][encrypted chunk]...
-// Returns the temp file path and the plaintext file size.
+// decryptSnapshotForSend decrypts an encrypted snapshot, read from the
+// already-open src, into an ANONYMOUS scratch file for network transfer, and
+// returns that file open and rewound, with the plaintext size. The encrypted
+// format is a sequence of frames: [4-byte LE length][encrypted chunk]...
 // The artifact was sealed by THIS node's snapshot pool under
 // (msg.ShardID, msg.ReplicaID, msg.Snapshot.Index) — msg.ReplicaID is the
 // sending replica, stamped by raft.send — so those identify the frames'
 // positional context.
-func (s *transportSender) decryptSnapshotForSend(msg proto.Message, barrier Barrier) (string, uint64, error) {
-	return decryptSnapshotToTemp(s.snapshotFsys(), msg.Snapshot.Filepath,
-		sendDecryptTempPattern, msg.ShardID, msg.ReplicaID, msg.Snapshot.Index,
-		msg.Snapshot.Epoch, barrier)
+//
+// The scratch file is unlinked the moment it is created, so the plaintext
+// never has a name: a crash cannot orphan it, the snapshot GC cannot delete
+// it from under the stream, and the caller's Close is the whole cleanup. It
+// is created in the loaded replica's own snapshot directory — never beside
+// the artifact, and never in a shared temporary directory. The caller owns
+// both files.
+func (s *transportSender) decryptSnapshotForSend(src snapshotFile, msg proto.Message, barrier Barrier) (snapshotFile, uint64, error) {
+	if src == nil {
+		return nil, 0, &SnapshotSendError{ShardID: msg.ShardID, ReplicaID: msg.To, Op: "read", Err: os.ErrNotExist}
+	}
+	barrier.RegisterInFlightEpoch(msg.Snapshot.Epoch)
+	defer barrier.DeregisterInFlightEpoch(msg.Snapshot.Epoch)
+
+	// In this replica's own snapshot directory, never beside the artifact:
+	// the GC may already have removed the artifact's directory, and a record
+	// may name one outside the replica's tree, in a directory quicraft does
+	// not own and does not sweep. The replica directory is never removed and
+	// is swept at every start and recovery whatever the record names. A
+	// shard no longer loaded — or loaded again as a different replica, while a
+	// send of the old one's artifact was still running — has no replica to
+	// send for. The file is unlinked before a byte is written, so even a crash
+	// between the create and the unlink leaves nothing but an empty name.
+	node := s.engine.GetNode(msg.ShardID)
+	if node == nil || node.ReplicaID() != msg.ReplicaID {
+		return nil, 0, &SnapshotSendError{ShardID: msg.ShardID, ReplicaID: msg.To, Op: "read", Err: ErrShardNotFound}
+	}
+	fsys := s.snapshotFsys()
+	tmp, err := fsys.CreateTemp(node.ReplicaSnapshotDir(), sendDecryptTempPattern)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Closed on every way out that does not hand it to the caller — a panic
+	// in the decrypt included — so no failed send leaks the descriptor.
+	handedOff := false
+	defer func() {
+		if handedOff {
+			return
+		}
+		if closeErr := tmp.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			s.logger.Debug("decrypt-for-send scratch file close failed", "error", closeErr)
+		}
+	}()
+	if rmErr := fsys.Remove(tmp.Name()); rmErr != nil && !os.IsNotExist(rmErr) {
+		// Still usable through the handle. The name — which the decrypt is
+		// about to fill with plaintext — is unlinked again when the scratch
+		// is closed, and failing that, reclaimed by the decrypt-scratch sweep
+		// of the replica directory (engine.SweepStaleDecryptTmpTree).
+		s.logger.Warn("decrypt-for-send scratch file could not be unlinked",
+			"path", tmp.Name(), "error", rmErr)
+		tmp = &unlinkOnCloseFile{snapshotFile: tmp, fsys: fsys}
+	}
+	size, err := decryptSnapshotFrames(barrier, msg.ShardID, msg.ReplicaID, msg.Snapshot.Index, src, tmp)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	handedOff = true
+	return tmp, size, nil
+}
+
+// unlinkOnCloseFile is a send scratch file whose immediate unlink failed. Its
+// Close retries the unlink, so the named plaintext does not outlive the send;
+// a retry that fails too is counted on engine.StaleDecryptSweepFailures, and
+// the name is left to the next decrypt-scratch sweep.
+type unlinkOnCloseFile struct {
+	snapshotFile
+	fsys snapshotFS
+}
+
+// Close closes the file, then removes its name.
+func (f *unlinkOnCloseFile) Close() error {
+	err := f.snapshotFile.Close()
+	if rmErr := f.fsys.Remove(f.Name()); rmErr != nil && !os.IsNotExist(rmErr) {
+		engine.NoteScratchNotReclaimed(f.Name(), rmErr)
+	}
+	return err
 }
 
 // sendDecryptTempPattern names the scratch file the send path decrypts into,
@@ -785,10 +905,13 @@ func shardSnapshotBaseDir(nodeHostDir, dataDir string, shardID uint64) string {
 }
 
 // decryptSnapshotToTemp decrypts the framed snapshot ciphertext at srcPath into
-// a NEW sibling temp file created from pattern, returning that file's path and
-// the plaintext byte count. srcPath is never modified: the canonical encrypted
-// snapshot.dat stays the only durable artifact, which is what keeps a failed
-// decrypt retryable. Decrypting in place would leave plaintext on disk while
+// a NEW temp file created from pattern in scratchDir, returning that file's
+// path and the plaintext byte count. scratchDir must be the replica's own
+// snapshot directory (engine.ReplicaSnapshotDir), which the stale-scratch
+// sweep covers — never the directory of a path a record names, which may lie
+// outside the replica's tree. srcPath is never modified: the canonical
+// encrypted snapshot.dat stays the only durable artifact, which is what keeps
+// a failed decrypt retryable. Decrypting in place would leave plaintext on disk while
 // LogDB still records Epoch>0, so every later read would re-attempt decryption
 // on plaintext and fail permanently.
 //
@@ -801,9 +924,9 @@ func shardSnapshotBaseDir(nodeHostDir, dataDir string, shardID uint64) string {
 // the belt-and-suspenders RegisterInFlightEpoch saveSnapshot takes around its
 // own encrypt: the recorded epoch is the minimum across the frames.
 //
-// Shared by the transport send path (decryptSnapshotForSend) and StartShard's
-// local-snapshot recovery so both consume identical plaintext.
-func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string,
+// StartShard's local-snapshot recovery uses it; the transport send decrypts
+// through the same decryptSnapshotFrames into an anonymous scratch instead.
+func decryptSnapshotToTemp(fsys snapshotFS, scratchDir, srcPath, pattern string,
 	shardID, replicaID, index, epoch uint64, barrier Barrier) (string, uint64, error) {
 	barrier.RegisterInFlightEpoch(epoch)
 	defer barrier.DeregisterInFlightEpoch(epoch)
@@ -826,7 +949,7 @@ func decryptSnapshotToTemp(fsys snapshotFS, srcPath, pattern string,
 		}
 	}()
 
-	tmpFile, err := fsys.CreateTemp(filepath.Dir(srcPath), pattern)
+	tmpFile, err := fsys.CreateTemp(scratchDir, pattern)
 	if err != nil {
 		return "", 0, err
 	}
@@ -1101,7 +1224,6 @@ func emptySnapshotChunk(msg proto.Message, snap *proto.Snapshot) proto.SnapshotC
 func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.SnapshotChunk) error) error {
 	snap := &msg.Snapshot
 	filePath := snap.Filepath
-	fileSize := snap.FileSize
 
 	// A snapshot with NO data file — a witness, or a state machine that saved
 	// nothing — is the only legitimate metadata-only transfer. A DECLARED size
@@ -1114,10 +1236,6 @@ func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.Sn
 		return emit(emptySnapshotChunk(msg, snap))
 	}
 
-	// Open the snapshot data file for streaming reads. Only one chunk's
-	// worth of data is held in memory at a time, avoiding OOM on large
-	// snapshots (up to DefaultMaxSnapshotSize = 4GB).
-	//
 	// The defer for cleanup is registered immediately after a successful
 	// open to ensure the file handle is always closed, even on panic.
 	// The fileClosed flag allows explicit early close while preventing
@@ -1143,6 +1261,37 @@ func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.Sn
 			}
 		}
 	}()
+
+	if err := streamSnapshotChunks(f, msg, emit); err != nil {
+		return err
+	}
+
+	// Close the file early to release the handle immediately after reading
+	// completes. The deferred cleanup will be a no-op due to fileClosed flag.
+	if err := f.Close(); err != nil {
+		return &SnapshotSendError{
+			ShardID:   msg.ShardID,
+			ReplicaID: msg.To,
+			Op:        "read",
+			Err:       err,
+		}
+	}
+	fileClosed = true
+	return nil
+}
+
+// streamSnapshotChunks streams an ALREADY-OPEN snapshot data file as chunks,
+// after verifying that its size is the one msg declares. Only one chunk's
+// worth of data is held in memory at a time, avoiding OOM on large snapshots
+// (up to DefaultMaxSnapshotSize = 4GB).
+//
+// Reading from a handle rather than a path is what lets the send survive the
+// snapshot GC: a directory removed while the send runs takes only its names
+// with it, and an open file stays readable. The caller owns f and closes it.
+func streamSnapshotChunks(f snapshotFile, msg proto.Message, emit func(proto.SnapshotChunk) error) error {
+	snap := &msg.Snapshot
+	filePath := snap.Filepath
+	fileSize := snap.FileSize
 
 	// Verify the actual file size matches the declared size.
 	info, err := f.Stat()
@@ -1209,19 +1358,6 @@ func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.Sn
 			return err
 		}
 	}
-
-	// Close the file early to release the handle immediately after reading
-	// completes. The deferred cleanup will be a no-op due to fileClosed flag.
-	if err := f.Close(); err != nil {
-		return &SnapshotSendError{
-			ShardID:   msg.ShardID,
-			ReplicaID: msg.To,
-			Op:        "read",
-			Err:       err,
-		}
-	}
-	fileClosed = true
-
 	return nil
 }
 
@@ -3532,13 +3668,6 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	cb := &hostEngineCallback{h: h}
 	eng.SetCallback(cb)
 
-	// Wire the per-shard import lock into the snapshot pool. Snapshot recovery
-	// reclaims orphaned import staging directories, which are indistinguishable
-	// by name from the one a RUNNING import is writing its plaintext state
-	// machine into; the lock is the only thing that tells them apart, and the
-	// Host owns it.
-	eng.SetImportLocker(h.tryAcquireImportLock)
-
 	// Start the engine worker pipeline.
 	eng.Start()
 
@@ -4244,6 +4373,15 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// and the case where no snapshot record exists at all.
 	engine.SweepStaleDecryptTmpTree(snapshotDir, cfg.ShardID, cfg.ReplicaID)
 
+	// The replica's own snapshot directory is where every plaintext scratch
+	// file is created (a send's and a recovery's), so it exists for as long
+	// as the replica is loaded. It is created here, once, and never by a
+	// scratch writer: a late writer from a stopped incarnation must fail on a
+	// removed tree, not recreate it.
+	if err := h.snapshotFsys().MkdirAll(engine.ReplicaSnapshotDir(snapshotDir, cfg.ShardID, cfg.ReplicaID), 0o750); err != nil {
+		return &HostInitError{Field: "snapshot_dir", Err: err}
+	}
+
 	// Reclaim an import staging directory orphaned by a crash. ImportSnapshot
 	// writes the artifact PLAINTEXT and re-encrypts it immediately afterwards;
 	// a process killed between the two leaves the complete plaintext state
@@ -4411,8 +4549,9 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			// snapshot.dat is stored ENCRYPTED whenever the record carries a
 			// non-zero epoch, so it must be decrypted before the state machine
 			// sees it — feeding it the raw frames either fails recovery or
-			// installs corrupt state. Decryption goes to a throwaway sibling
-			// file, removed on every path below, leaving the canonical
+			// installs corrupt state. Decryption goes to a throwaway scratch
+			// file in the replica's own snapshot directory, removed on every
+			// path below, leaving the canonical
 			// encrypted artifact untouched; this mirrors the runtime path
 			// (snapshotPool.recoverSnapshot) exactly.
 			//
@@ -4436,7 +4575,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 					}
 				}
 				plainPath, _, decErr := decryptSnapshotToTemp(
-					h.snapshotFsys(), dataPath, recoverDecryptTempPattern,
+					h.snapshotFsys(), engine.ReplicaSnapshotDir(snapshotDir, cfg.ShardID, cfg.ReplicaID),
+					dataPath, recoverDecryptTempPattern,
 					cfg.ShardID, cfg.ReplicaID, ss.Index, ss.Epoch, barrier,
 				)
 				if decErr != nil {
