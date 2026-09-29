@@ -57,7 +57,7 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 	defer cleanup()
 
 	target := t2.Addr().String()
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 	// Steady state under the peer's first incarnation: the epoch is known and
 	// the outbound is dialed (and therefore stamped) under it.
 	t1.evictStaleOutboundOnRecv(target, oldEpoch, inbound)
-	if _, err := t1.getConnection(target); err != nil {
+	if _, err := t1.getConnection(target, ""); err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
@@ -79,10 +79,10 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 		t.Fatalf("outbound survived a peer restart (%d connections)",
 			t1.ConnectionCount())
 	}
-	if _, err := t1.getConnection(target); err != nil {
+	if _, err := t1.getConnection(target, ""); err != nil {
 		t.Fatalf("re-dial failed: %v", err)
 	}
-	if _, err := t1.getStream(target, 1, false); err != nil {
+	if _, err := t1.getStream(target, 1, false, ""); err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
@@ -139,14 +139,14 @@ func TestReapPeerIncarnations_ForgetsDepartedPeersOnly(t *testing.T) {
 	defer cleanup()
 
 	connected := t2.Addr().String()
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
 
 	// A peer this node holds an outbound to.
 	t1.evictStaleOutboundOnRecv(connected, t2.bootEpoch, inbound)
-	if _, err := t1.getConnection(connected); err != nil {
+	if _, err := t1.getConnection(connected, ""); err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 

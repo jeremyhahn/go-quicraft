@@ -172,8 +172,10 @@ func TestProcessSnapshotHeaderRejectsChunkCountBeyondBudget(t *testing.T) {
 	tr.processSnapshotHeader(nil, bytes.NewReader(hdrBuf[:]), SnapshotHeaderSize)
 
 	rejects := rec.rejects()
-	if len(rejects) != 1 || rejects[0].reason != string(snapshotRejectMalformed) || rejects[0].shardID != 7 {
-		t.Fatalf("rejections = %+v, want one %q for shard 7", rejects, snapshotRejectMalformed)
+	// Counted under shard 0: the header was rejected before its sender was
+	// authorized, so the shard it names is unverified.
+	if len(rejects) != 1 || rejects[0].reason != string(snapshotRejectMalformed) || rejects[0].shardID != 0 {
+		t.Fatalf("rejections = %+v, want one %q, unattributed (shard 0)", rejects, snapshotRejectMalformed)
 	}
 }
 
@@ -718,7 +720,9 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 		"snapshot arriving over 0-RTT was not rejected under the replay policy",
 		func() bool {
 			for _, r := range rec.rejects() {
-				if r.reason == string(snapshotRejectPolicy) && r.shardID == 3 {
+				// Counted unattributed: the transfer is refused before its
+				// sender was authorized, so the shard it names is unverified.
+				if r.reason == string(snapshotRejectPolicy) && r.shardID == 0 {
 					return true
 				}
 			}

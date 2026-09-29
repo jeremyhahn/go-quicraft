@@ -145,6 +145,7 @@ func TestSplitSnapshotMessage_SmallFile(t *testing.T) {
 	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
 		t.Fatalf("failed to write snapshot file: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
 
 	msg := proto.Message{
 		Type:    proto.InstallSnapshot,
@@ -212,6 +213,7 @@ func TestSplitSnapshotMessage_MultiChunk(t *testing.T) {
 	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
 		t.Fatalf("failed to write snapshot file: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
 
 	msg := proto.Message{
 		Type:    proto.InstallSnapshot,
@@ -385,6 +387,7 @@ func TestSplitSnapshotMessage_ExactChunkBoundary(t *testing.T) {
 	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
 		t.Fatalf("failed to write snapshot file: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
 
 	msg := proto.Message{
 		Type:    proto.InstallSnapshot,
@@ -648,10 +651,10 @@ func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
 	t.Run("plaintext stream", func(t *testing.T) {
 		dir, path := newArtifact(t)
 		payload := bytes.Repeat([]byte("state machine "), 1000)
-		if err := os.WriteFile(path, payload, 0o600); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		src, err := os.Open(path)
+		writeRecordedSnapshot(t, dir, payload)
+		// The integrity record is read at open, so the removal below cannot
+		// take it from under the stream either.
+		src, err := openVerifiedSnapshotFile(osSnapshotFS{}, path)
 		if err != nil {
 			t.Fatalf("open: %v", err)
 		}
@@ -667,7 +670,7 @@ func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
 		if err := streamSnapshotChunks(src, msg, func(c proto.SnapshotChunk) error {
 			got = append(got, c.Data...)
 			return nil
-		}); err != nil {
+		}, src.Verify); err != nil {
 			t.Fatalf("streaming after the directory was removed: %v", err)
 		}
 		if !bytes.Equal(got, payload) {
@@ -783,6 +786,7 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 	plaintext := []byte("encrypted snapshot payload for chunk verification")
 	encPath := filepath.Join(tmpDir, "snapshot.dat")
 	writeEncryptedSnapshotFileFor(t, b, encPath, plaintext, 1, 1, 100)
+	stampTestSnapshotMeta(t, filepath.Dir(encPath), 1, 1)
 
 	info, err := os.Stat(encPath)
 	if err != nil {
@@ -814,7 +818,15 @@ func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
 	}
 	defer func() { _ = os.Remove(decPath) }()
 
-	// Update message to reference decrypted file.
+	// Update message to reference the decrypted file, laid out and recorded
+	// as a plaintext artifact would be: sends verify against the record
+	// beside the data.
+	plainPath := filepath.Join(filepath.Dir(decPath), "snapshot.dat")
+	if err := os.Rename(decPath, plainPath); err != nil {
+		t.Fatalf("rename decrypted artifact: %v", err)
+	}
+	decPath = plainPath
+	stampTestSnapshotMeta(t, filepath.Dir(decPath), 100, 5)
 	msg.Snapshot.Filepath = decPath
 	msg.Snapshot.FileSize = decSize
 	msg.Snapshot.Epoch = 0
@@ -927,6 +939,7 @@ func TestSplitSnapshotMessage_FileCloseOnError(t *testing.T) {
 	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
 		t.Fatalf("failed to write snapshot file: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
 
 	msg := proto.Message{
 		Type:    proto.InstallSnapshot,
@@ -1110,6 +1123,7 @@ func TestForEachSnapshotChunk_StreamsOneAtATime(t *testing.T) {
 	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
 		t.Fatalf("failed to write snapshot file: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
 
 	msg := proto.Message{
 		Type:    proto.InstallSnapshot,

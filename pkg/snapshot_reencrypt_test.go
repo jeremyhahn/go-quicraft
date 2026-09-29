@@ -175,14 +175,21 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 		t.Fatal("wire bytes are not the original plaintext")
 	}
 
-	// RECEIVE: node B writes the plaintext then re-encrypts under its OWN barrier.
+	// RECEIVE: node B seals the plaintext as it streams in, under its OWN
+	// barrier — what HandleSnapshot does with the received chunks.
 	recvPath := filepath.Join(dir, "b-snapshot.dat")
-	if err := os.WriteFile(recvPath, mustRead(t, wirePath), 0o600); err != nil {
-		t.Fatalf("write received plaintext: %v", err)
-	}
-	recvEpoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, recvPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nodeB)
+	rf, err := os.Create(recvPath)
 	if err != nil {
-		t.Fatalf("reencryptReceivedSnapshot: %v", err)
+		t.Fatalf("create received file: %v", err)
+	}
+	recvEpoch, recvPins, err := encryptSnapshotFrames(nodeB, testSnapShardID, testSnapReplicaID, testSnapIndex,
+		bytes.NewReader(mustRead(t, wirePath)), rf)
+	_ = rf.Close()
+	if err != nil {
+		t.Fatalf("encryptSnapshotFrames: %v", err)
+	}
+	for _, e := range recvPins {
+		nodeB.DeregisterInFlightEpoch(e)
 	}
 	if recvEpoch == 0 {
 		t.Fatal("receiver recorded epoch 0 — re-encryption did not run")
@@ -211,28 +218,6 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	var crossAttempt bytes.Buffer
 	if _, err := decryptSnapshotFrames(nodeA, testSnapShardID, testSnapReplicaID, testSnapIndex, bf2, &crossAttempt); err == nil && bytes.Equal(crossAttempt.Bytes(), plain) {
 		t.Fatal("node A decrypted node B's snapshot — per-node keys are NOT isolated")
-	}
-}
-
-// TestReceiveSnapshot_NilBarrierLeavesPlaintext proves the no-barrier path is a
-// no-op (snapshot stays plaintext, epoch 0) — the plaintext deployment is
-// unchanged.
-func TestReceiveSnapshot_NilBarrierLeavesPlaintext(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "snapshot.dat")
-	plain := snapshotPlaintext()
-	if err := os.WriteFile(path, plain, 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, nil)
-	if err != nil {
-		t.Fatalf("reencryptReceivedSnapshot(nil): %v", err)
-	}
-	if epoch != 0 {
-		t.Fatalf("nil-barrier epoch = %d, want 0", epoch)
-	}
-	if got := mustRead(t, path); !bytes.Equal(got, plain) {
-		t.Fatal("nil-barrier path modified the snapshot")
 	}
 }
 

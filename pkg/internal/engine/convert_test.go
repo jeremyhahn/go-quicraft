@@ -59,8 +59,11 @@ func TestProtoEntryToLogDB_ZeroValue(t *testing.T) {
 }
 
 func TestProtoStateToLogDB(t *testing.T) {
-	ps := proto.State{Term: 10, Vote: 3, Commit: 99}
+	ps := proto.State{Term: 10, Vote: 3, Commit: 99, VoteWindow: 2_000_000_000}
 	ls := protoStateToLogDB(&ps)
+	if ls.VoteWindow != ps.VoteWindow {
+		t.Errorf("VoteWindow = %d, want %d: a restarted replica would not know the window it owes", ls.VoteWindow, ps.VoteWindow)
+	}
 	if ls.Term != 10 {
 		t.Errorf("Term = %d, want 10", ls.Term)
 	}

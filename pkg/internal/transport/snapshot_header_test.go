@@ -210,7 +210,7 @@ func TestSnapshotHeaderLargerBuffer(t *testing.T) {
 
 // TestSnapshotHeaderSizeConstant verifies the documented constant value.
 func TestSnapshotHeaderSizeConstant(t *testing.T) {
-	expected := 6 * 8 // 6 uint64 fields at 8 bytes each
+	expected := 7 * 8 // 7 uint64 fields at 8 bytes each
 	if SnapshotHeaderSize != expected {
 		t.Fatalf("SnapshotHeaderSize: expected %d, got %d", expected, SnapshotHeaderSize)
 	}

@@ -943,7 +943,7 @@ func TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed(t *testing.T) 
 		t.Fatalf("could not locate the in-flight generation's start in the image (%d)", ackedEnd)
 	}
 	damageAt := ackedEnd - 8
-	damageFile(t, cfs, segPath, damageAt, 8)
+	invertFile(t, cfs, segPath, damageAt, 8)
 
 	_, err = Open(dir, WithFS(cfs), WithBlockSize(blockSize), WithMaxFileSize(maxFile))
 	if err == nil {
@@ -1013,16 +1013,25 @@ func pageSpan(writes []crashWrite, pageSize int) (lo, hi int, ok bool) {
 	return lo, hi, ok
 }
 
-// damageFile zeroes n bytes of a modelled file at off, durably, the way media
-// damage under acknowledged data presents to the next open.
-func damageFile(t *testing.T, cfs *crashFS, path string, off int64, n int) {
+// invertFile damages n bytes of path at off by complementing them, so the
+// range is changed whatever it held: a zero fill is no damage at all to bytes
+// that were already zero.
+func invertFile(t *testing.T, cfs *crashFS, path string, off int64, n int) {
 	t.Helper()
+	image := readWholeFile(t, cfs, path)
+	if off < 0 || off+int64(n) > int64(len(image)) {
+		t.Fatalf("invertFile(%s): range [%d, %d) outside the %d-byte file", path, off, off+int64(n), len(image))
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = ^image[off+int64(i)]
+	}
 	f, err := cfs.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		t.Fatalf("OpenFile(%s): %v", path, err)
 	}
 	defer f.Close()
-	if _, err := f.WriteAt(make([]byte, n), off); err != nil {
+	if _, err := f.WriteAt(b, off); err != nil {
 		t.Fatalf("WriteAt(%s, %d): %v", path, off, err)
 	}
 	if err := f.Sync(); err != nil {

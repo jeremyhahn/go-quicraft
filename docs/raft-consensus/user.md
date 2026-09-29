@@ -96,6 +96,20 @@ round. It is rejected at validation with `ErrLeaseReadRequiresCheckQuorum` if
 `CheckQuorum` is off or `ElectionRTT < 5` — a lease without quorum checking is a
 linearizability violation waiting for a partition.
 
+The lease is measured in real time on the leader's monotonic clock, so a leader
+that is paused or descheduled loses it and falls back to the heartbeat round.
+It assumes every replica uses the same `ElectionRTT`, `RTTMillisecond` and
+`LeaseRead` setting, and that no two nodes' clocks run at rates more than 1%
+apart.
+
+It costs availability after a restart. A restarted replica of a `LeaseRead`
+shard, witnesses included, neither votes nor campaigns for one election
+timeout (`ElectionRTT` ticks of real time) after it starts, because a leader
+may still be counting its pre-restart heartbeat acknowledgement toward a lease.
+It keeps accepting replication meanwhile. After a full-shard restart the first
+leader is therefore elected about one election timeout later than it would be
+without `LeaseRead`.
+
 ## Task: tune timing
 
 Everything is a multiple of `RTTMillisecond` (200 ms):

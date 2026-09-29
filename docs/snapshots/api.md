@@ -72,7 +72,10 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 | Errors | `*SnapshotArtifactError`, `ErrSnapshotEncryptedBarrierUnavailable`, `ErrSnapshotBarrierSealed` |
 | Permission | none |
 
-Requires a live `Host` that knows the shard's applied index.
+Requires a live `Host` that knows the shard's applied index. The artifact is a
+header, the plaintext data and a trailer carrying the data's length and
+xxhash64; the trailer is written last and only on success, so what a failed
+export wrote cannot be imported.
 
 ### Capability: import a snapshot
 
@@ -87,13 +90,16 @@ func WithImportMembership(members map[uint64]string) ImportOption
 |---|---|
 | Request | the shard, a reader, and optionally a data directory and a membership override |
 | Response | none |
-| Errors | `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `ErrSnapshotBarrierSealed` |
+| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `ErrSnapshotBarrierSealed` |
 | Permission | none in this library |
 
 **This rewrites the replica's membership and identity.** It is an offline,
 deliberate operation. The refusals above are the feature: `ImportSnapshotDirExists`
 stops it silently overwriting, `ImportSnapshotOutOfDate` stops it moving a
 replica backwards, `ImportDataDirMismatch` stops it targeting the wrong replica.
+The artifact's data is checked against its trailer as it is written, and a
+truncated, damaged or trailerless artifact — including one exported by an
+earlier build — is refused before anything is published or recorded.
 
 ### Capability: re-encrypt a snapshot under a different barrier
 

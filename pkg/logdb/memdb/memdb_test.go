@@ -1351,25 +1351,34 @@ func TestEntrySizeCalculation(t *testing.T) {
 	}
 }
 
-func TestRemoveNodeDataThenRecreateSameNode(t *testing.T) {
+func TestRemoveNodeDataThenRecreateSameNodeIsRefused(t *testing.T) {
 	db := New()
 
-	// Create, remove, and recreate the same node.
-	db.SaveState([]logdb.Update{
+	// Create and remove a node: its replica ID is retired, and every writer
+	// refuses it from then on, with nothing stored.
+	if err := db.SaveState([]logdb.Update{
 		{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 1}},
-	})
-	db.RemoveNodeData(1, 1)
-
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 2}},
-	})
-
-	state, _, err := db.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState after recreate: error %v", err)
+	}); err != nil {
+		t.Fatalf("SaveState: %v", err)
 	}
-	if state.Term != 2 {
-		t.Errorf("state.Term = %d, want 2", state.Term)
+	if err := db.RemoveNodeData(1, 1); err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+
+	writers := map[string]func() error{
+		"SaveState": func() error {
+			return db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 2}}})
+		},
+		"SaveSnapshot":  func() error { return db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 5, Term: 1}) },
+		"SaveBootstrap": func() error { return db.SaveBootstrap(1, 1, logdb.Bootstrap{Type: 1}) },
+	}
+	for name, write := range writers {
+		if err := write(); !errors.Is(err, logdb.ErrReplicaRetired) {
+			t.Fatalf("%s for a removed node = %v, want logdb.ErrReplicaRetired", name, err)
+		}
+	}
+	if _, _, err := db.ReadState(1, 1); !errors.Is(err, logdb.ErrNoState) {
+		t.Fatalf("ReadState after refused writes = %v, want ErrNoState", err)
 	}
 }
 
@@ -1486,5 +1495,43 @@ func TestMergeEntriesDoesNotMutateIncoming(t *testing.T) {
 	if result[1].Index != 2 || result[1].Term != 2 {
 		t.Errorf("result[1]: got Index=%d Term=%d, want Index=2 Term=2",
 			result[1].Index, result[1].Term)
+	}
+}
+
+// TestMemDB_NodeRemovedRetiresTheReplica verifies RemoveNodeData retires the
+// replica ID: NodeRemoved reports it from then on, and only for that pair.
+func TestMemDB_NodeRemovedRetiresTheReplica(t *testing.T) {
+	m := New()
+	if err := m.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 1}}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if removed, err := m.NodeRemoved(1, 1); err != nil || removed {
+		t.Fatalf("NodeRemoved before removal = (%v, %v), want (false, nil)", removed, err)
+	}
+	if err := m.RemoveNodeData(1, 1); err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+	if removed, err := m.NodeRemoved(1, 1); err != nil || !removed {
+		t.Fatalf("NodeRemoved after removal = (%v, %v), want (true, nil)", removed, err)
+	}
+	if removed, _ := m.NodeRemoved(1, 2); removed {
+		t.Fatal("NodeRemoved reported a replica that was never removed")
+	}
+}
+
+// TestRemoveEntriesToRefusesARetiredNode verifies RemoveEntriesTo refuses a
+// node RemoveNodeData retired, as every other writer does, rather than
+// reporting success for a node that no longer exists.
+func TestRemoveEntriesToRefusesARetiredNode(t *testing.T) {
+	db := New()
+	if err := db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1,
+		Entries: []logdb.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}}}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	if err := db.RemoveNodeData(1, 1); err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+	if err := db.RemoveEntriesTo(1, 1, 1); !errors.Is(err, logdb.ErrReplicaRetired) {
+		t.Fatalf("RemoveEntriesTo on a retired node = %v, want logdb.ErrReplicaRetired", err)
 	}
 }

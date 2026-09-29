@@ -1679,7 +1679,7 @@ func TestSendBatch_DirectCallWriteDeadlineError(t *testing.T) {
 
 	// Call sendBatch directly. The cached stream is dead, so either
 	// getStream will fail, or SetWriteDeadline/Write will fail.
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
 }
@@ -1734,7 +1734,7 @@ func TestSendBatch_DirectCallStreamWriteError(t *testing.T) {
 
 	// Call sendBatch directly multiple times to exercise different paths.
 	for i := 0; i < 5; i++ {
-		t1.sendBatch(t2Addr, []proto.Message{
+		t1.sendBatch(t2Addr, "", []proto.Message{
 			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: uint64(i + 2)},
 		})
 	}
@@ -1800,7 +1800,7 @@ func TestSendBatch_DirectCallSnappyPoolPaths(t *testing.T) {
 	// Pool is empty -> allocates new buffer. Compression succeeds
 	// -> snappyBufPtr is nil (came from allocation, not pool).
 	cmd := bytes.Repeat([]byte("A"), 5000)
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
 			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: cmd}}},
 	})
@@ -1811,7 +1811,7 @@ func TestSendBatch_DirectCallSnappyPoolPaths(t *testing.T) {
 	bigBuf := make([]byte, 128*1024)
 	t1.snappyEncPool.Put(&bigBuf)
 
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2,
 			Entries: []proto.Entry{{Index: 2, Term: 2, Cmd: cmd}}},
 	})
@@ -1941,7 +1941,7 @@ func TestSendBatch_DirectSnappyPoolCapTooSmall(t *testing.T) {
 
 	// Call sendBatch directly to avoid async queue GC timing issues.
 	cmd := bytes.Repeat([]byte("A"), 5000)
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
 			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: cmd}}},
 	})
@@ -2005,7 +2005,7 @@ func TestSendBatch_DirectSnappyPoolHitAndReturn(t *testing.T) {
 
 	// Call sendBatch directly to exercise pool hit with sufficient cap.
 	cmd := bytes.Repeat([]byte("A"), 5000)
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
 			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: cmd}}},
 	})
@@ -2048,7 +2048,7 @@ func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 
 	// Establish the connection and the exact pooled stream sendBatch will reuse
 	// for this shard.
-	stream, err := t1.getStream(t2Addr, shardID, false)
+	stream, err := t1.getStream(t2Addr, shardID, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -2073,7 +2073,7 @@ func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 	// error path can be responsible for the eviction that follows.
 	stream.CancelWrite(1)
 
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: shardID, From: 1, To: 2, Term: 2},
 	})
 
@@ -2112,7 +2112,7 @@ func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 
 	// Every stream pooled on that connection must have been evicted too, so the
 	// next send does not reuse the broken stream.
-	next, err := t1.getStream(t2Addr, shardID, false)
+	next, err := t1.getStream(t2Addr, shardID, false, "")
 	if err != nil {
 		// A dial failure here is acceptable; what must not happen is the
 		// cancelled stream being handed back.
@@ -2174,7 +2174,7 @@ func TestSendBatch_WithMetricsAndDebugLogging(t *testing.T) {
 	reg1.Register(1, 2, t2Addr)
 
 	// Direct sendBatch call with metrics configured.
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
 
@@ -2198,7 +2198,7 @@ func TestSendBatch_DirectWriteErrorViaConnectionClose(t *testing.T) {
 	t2Addr := t2.Addr().String()
 
 	// Get a stream to populate the cache and establish connection.
-	stream, err := t1.getStream(t2Addr, 1, false)
+	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -2234,7 +2234,7 @@ func TestSendBatch_DirectWriteErrorViaConnectionClose(t *testing.T) {
 	// conns (removed above). It will try to reconnect (which fails since
 	// t2 is stopped), so getStream returns error.
 	// This covers the getStream error path (line 833-835) at minimum.
-	t1.sendBatch(t2Addr, []proto.Message{
+	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
 

@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
@@ -707,6 +708,22 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 	p.r.onCampaign = fn
 }
 
+// SetTickInterval tells the peer how much real time one Tick represents,
+// which is what converts the tick-denominated election timeout into the
+// real-time read lease (see raft.hasValidLease). Must be called before
+// the first Tick, with the interval the engine's ticker actually runs at.
+// Until it is called the lease is never valid and every ReadIndex takes
+// the heartbeat quorum round, so omitting it costs latency, not safety.
+//
+// On a LeaseRead shard it also sizes the post-restart vote hold-down (see
+// raft.voteHeldDown): one election timeout of real time from construction.
+// Until it is called that window's length is unknown and the replica
+// neither grants a vote nor campaigns, so on a LeaseRead shard omitting it
+// costs availability, not safety.
+func (p *Peer) SetTickInterval(d time.Duration) {
+	p.r.setTickInterval(d)
+}
+
 // Tick advances the peer's logical clock by one tick. The engine calls
 // this at a regular interval (RTTMillisecond). The raft state machine
 // uses ticks to drive election timeouts (followers/candidates) and
@@ -728,6 +745,10 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 // for the life of the process — and a three-voter shard that lost its leader
 // could not elect a new one despite having a healthy quorum.
 func (p *Peer) Tick() {
+	// Ends a post-restart vote hold-down on time even on a replica that sees
+	// no vote traffic, so the owed window it lowers reaches the hard state
+	// (voteHeldDown). A no-op once the hold-down is over.
+	p.r.voteHeldDown()
 	p.r.tickFunc(p.r)
 	p.syncLeaderID()
 }
@@ -1199,12 +1220,8 @@ func (p *Peer) syncRaftRemotes() error {
 				p.r.transferTarget = noNode
 				p.r.transferElapsed = 0
 				// Restore the lease tracking handleLeaderTransfer cleared,
-				// mirroring tickLeader's transfer-timeout path. Without it
-				// every ReadIndex degrades to a full heartbeat round-trip
-				// for the rest of the term.
-				if p.r.leaseRead && p.r.remoteLastAck == nil {
-					p.r.remoteLastAck = make(map[uint64]int)
-				}
+				// as tickLeader's transfer-timeout path does.
+				p.r.resumeLeaseAfterTransfer()
 			}
 		}
 	}
@@ -1283,10 +1300,9 @@ func (p *Peer) syncRaftRemotes() error {
 //
 // Newly added members are deliberately NOT seeded: absence from the map
 // already means "never acked", and handleHeartbeatResp creates the key on
-// the first real ack. A seeded tick of 0 is indistinguishable from an ack
-// recorded at tick 0, and hasValidLease computes a negative expiry early in
-// each checkQuorum cycle, so the seed would let a member that is not even
-// running contribute to the read lease.
+// the first real ack. Any seeded value would claim the member received a
+// heartbeat round it never answered, and so would let a member that is not
+// even running contribute to the read lease.
 func (p *Peer) syncLeaseAcks() {
 	if p.r.remoteLastAck == nil {
 		return
@@ -1609,9 +1625,7 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 	// lost before SaveState, so prevState is claiming durability it does not
 	// have and this update must carry the hard state back through the WAL.
 	stateChanged := p.stateUnpersisted ||
-		hs.Term != p.prevState.Term ||
-		hs.Vote != p.prevState.Vote ||
-		hs.Commit != p.prevState.Commit
+		hs != p.prevState
 
 	update := proto.Update{
 		ShardID:     p.shardID,
@@ -2427,7 +2441,8 @@ type RemoteProgress struct {
 }
 
 // hasStateChanged returns true if the hard state has changed since the
-// last GetUpdate call. Checks term, vote, and commit index.
+// last GetUpdate call. Checks term, vote, commit index and the owed vote
+// window.
 //
 // It also reports true while a re-persist is owed (see stateUnpersisted).
 // HasUpdate is what wakes the step worker; if this returned false there, the
@@ -2438,7 +2453,8 @@ func (p *Peer) hasStateChanged() bool {
 	return p.stateUnpersisted ||
 		p.r.term != p.prevState.Term ||
 		p.r.vote != p.prevState.Vote ||
-		p.r.log.committed != p.prevState.Commit
+		p.r.log.committed != p.prevState.Commit ||
+		p.r.voteWindowOwed != p.prevState.VoteWindow
 }
 
 // RateLimited returns true if the per-shard in-memory log rate limit

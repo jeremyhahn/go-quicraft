@@ -48,8 +48,7 @@ type nodeKey struct {
 }
 
 // metaSegments records the segment ID holding the latest durable State,
-// Snapshot, Bootstrap, Compaction-marker, and RemoveNode-tombstone record for
-// a single node. These record types are not tracked by any entry index, so the
+// Snapshot, Bootstrap and Compaction-marker record for a single node. These record types are not tracked by any entry index, so the
 // shard pins their segments here to prevent segment garbage collection from
 // deleting the sole durable copy.
 //
@@ -61,12 +60,10 @@ type metaSegments struct {
 	snapshot     uint64
 	bootstrap    uint64
 	compact      uint64
-	remove       uint64
 	hasState     bool
 	hasSnapshot  bool
 	hasBootstrap bool
 	hasCompact   bool
-	hasRemove    bool
 }
 
 // WALBarrier is the encryption interface used by WAL segments. It mirrors
@@ -327,6 +324,10 @@ type DB struct {
 	opts    dbOptions
 	barrier WALBarrier
 	shards  [DefaultShardCount]*walShard
+	// retired is the retired-replica registry (retired.go): every node
+	// RemoveNodeData removed. Replay drops their records and every writer
+	// refuses them.
+	retired *retiredRegistry
 	diskMon *DiskMonitor
 	metrics LogDBMetrics
 	closed  atomic.Bool
@@ -505,29 +506,29 @@ type walShard struct {
 	segmentEpochs map[uint64]uint64
 
 	// metaSegments tracks, per node, the segment ID that holds the latest
-	// durable State, Snapshot, Bootstrap, Compaction-marker, and RemoveNode-
-	// tombstone record. Unlike entries, these record types are never tracked
-	// by any entry index, so without this pin a segment whose entries have all
-	// been compacted away could be garbage-collected even though it still
-	// holds the sole durable copy of a node's State/Snapshot/Bootstrap/Compact
-	// marker or RemoveNode tombstone. Compact and RemoveNodeData fold these
+	// durable State, Snapshot, Bootstrap and Compaction-marker record. Unlike
+	// entries, these record types are never tracked by any entry index, so
+	// without this pin a segment whose entries have all been compacted away
+	// could be garbage-collected even though it still holds the sole durable
+	// copy of a node's State/Snapshot/Bootstrap/Compact marker. Compact and
+	// the node-removal reclaim (reclaimSegmentsLocked) fold these
 	// IDs into their live-segment set before running GC. A zero ID means no
 	// such record has landed for that node. Last write wins. Protected by
 	// dataMu.
 	metaSegments map[nodeKey]metaSegments
 
-	// committedSegmentHWM is the highest segment ID whose batch has fully
-	// completed Phase 3 of SaveState (applyTo) or a non-batch commit
-	// (writeBootstrap). It closes a cross-goroutine window: SaveState runs
-	// on the commit worker and releases shard.mu between its durable WAL
-	// write (Phase 1, which may rotate to a new segment) and its in-memory
-	// index/pin update (Phase 3). A concurrent same-shard Compact — driven
-	// from the snapshot-pool goroutine or the public Host API — can acquire
-	// shard.mu in that window, compute liveSegments without the
-	// just-written-but-not-yet-indexed segment, and GC it. GarbageCollect
-	// refuses to delete any segment ID greater than this high-water mark, so
-	// a segment that is durably written but not yet reflected in the
-	// in-memory index/pins is never reclaimed. Advanced only at the commit
+	// committedSegmentHWM is the highest segment ID whose records are all
+	// reflected in the in-memory index and pins: advanced when a SaveState
+	// batch completes Phase 3 (applyTo), at a non-batch commit
+	// (writeBootstrap), and by recovery for every segment it replays — a
+	// final segment whose torn tail it repaired included. GarbageCollect
+	// refuses to delete any segment ID greater than this mark, so a segment
+	// that is durably written but not yet reflected in the index/pins is
+	// never reclaimed. SaveState holds every touched shard's mu for the whole
+	// batch, so a concurrent Compact cannot observe that state today; the mark
+	// is what keeps GC safe regardless — it was introduced when SaveState
+	// released shard.mu between its durable write and its index update, and a
+	// Compact in that window could delete the just-written segment. Advanced only at the commit
 	// points, monotonically, and always under shard.mu. Protected by dataMu
 	// as well, so it commits atomically with the index/pin updates it
 	// covers.
@@ -813,6 +814,15 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		}
 	}
 
+	// The retirements are read before any segment is replayed, and applied to
+	// what replay rebuilt before the DB is returned, so no caller ever sees a
+	// record of a retired replica.
+	retired, err := loadRetiredRegistry(o.fs, dir)
+	if err != nil {
+		return nil, &DBOpenError{Dir: dir, Err: err}
+	}
+	db.retired = retired
+
 	for i := 0; i < DefaultShardCount; i++ {
 		shardDir := filepath.Join(dir, shardDirName(i))
 		shard, err := openWALShard(i, shardDir, o, o.barrier, o.metrics)
@@ -828,8 +838,140 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		shard.diskMon = db.diskMon
 		db.shards[i] = shard
 	}
+	db.purgeRetired()
 
 	return db, nil
+}
+
+// purgeRetired drops, from what replay rebuilt, every record of a replica the
+// registry has retired, and reclaims the segments that leaves unreferenced.
+// Replay found such records only if a removal did not finish reclaiming them —
+// the process stopped between publishing the retirement and collecting its
+// segments, or that collection failed — so this is where it is finished. Any
+// segment still shared with a live node keeps its retired records until
+// garbage collection can take it, and every open drops them again until then.
+//
+// Every retired node is dropped first and each affected shard reclaimed once
+// afterwards: a reclaim scans the shard directory and fsyncs it, and doing it
+// per node would make an open after many interrupted removals cost one scan
+// and one fsync per retired replica.
+func (db *DB) purgeRetired() {
+	var affected [DefaultShardCount]bool
+	for _, key := range db.retired.keys() {
+		shard := db.getShard(key.ShardID)
+		shard.mu.Lock()
+		shard.dataMu.Lock()
+		if shard.dropNodeLocked(key) {
+			affected[key.ShardID%DefaultShardCount] = true
+		}
+		shard.dataMu.Unlock()
+		shard.mu.Unlock()
+	}
+	for i, hit := range affected {
+		if !hit {
+			continue
+		}
+		shard := db.shards[i]
+		shard.mu.Lock()
+		shard.reclaimSegmentsLocked("purging retired replicas")
+		shard.mu.Unlock()
+	}
+}
+
+// dropNodeLocked removes every in-memory record of key — its entry index and
+// entries, hard state, bootstrap, snapshot, compaction floor and the segment
+// pins that kept them durable — and reports whether there was any. Caller
+// holds s.mu and s.dataMu for writing.
+func (s *walShard) dropNodeLocked(key nodeKey) bool {
+	_, hasIndex := s.indexes[key]
+	_, hasState := s.states[key]
+	_, hasBootstrap := s.bootstraps[key]
+	_, hasSnapshot := s.snapshots[key]
+	_, hasFloor := s.compactedTo[key]
+	_, hasPins := s.metaSegments[key]
+	found := hasIndex || hasState || hasBootstrap || hasSnapshot || hasFloor || hasPins
+	delete(s.indexes, key)
+	delete(s.entries, key)
+	delete(s.states, key)
+	delete(s.bootstraps, key)
+	delete(s.snapshots, key)
+	delete(s.compactedTo, key)
+	delete(s.metaSegments, key)
+	return found
+}
+
+// validateBatchLocked refuses a SaveState batch, whole and before anything is
+// written, that names a retired replica (refuseRetiredBatch), carries a
+// snapshot outside the protocol bounds, or carries entries at or below its
+// node's compaction floor. Caller holds every touched shard's mu.
+//
+// Entries at or below the floor name indexes that are already deleted, and
+// storing them would truncate-and-append over the LIVE suffix above the floor
+// — destroying entries this replica still serves — while leaving EntryRange
+// reporting a first index that IterateEntries then refuses as ErrCompacted. It is always a caller bug: raft sends a lagging
+// follower an InstallSnapshot rather than entries beneath its own floor.
+//
+// Checked here, under every touched shard's mu and before Phase 1, so the
+// rejection costs no WAL write and no rollback. Reading compactedTo under
+// shard.mu alone is sufficient for the same reason RemoveEntriesTo relies
+// on: every mutator of it holds shard.mu as well.
+func (db *DB) validateBatchLocked(updates []logdb.Update) error {
+	if err := db.refuseRetiredBatch(updates); err != nil {
+		return err
+	}
+	for i := range updates {
+		u := &updates[i]
+		// A snapshot travels through SaveState as well as SaveSnapshot, and
+		// the protocol bound has to hold on both doors (see SaveSnapshot).
+		if u.Snapshot.Index > 0 {
+			if err := u.Snapshot.CheckBounds(); err != nil {
+				return err
+			}
+		}
+		if len(u.Entries) == 0 {
+			continue
+		}
+		shard := db.getShard(u.ShardID)
+		key := nodeKey{ShardID: u.ShardID, ReplicaID: u.ReplicaID}
+		floor, ok := shard.compactedTo[key]
+		if !ok {
+			continue
+		}
+		if first := u.Entries[0].Index; first <= floor {
+			return &logdb.EntriesBelowCompactionFloorError{
+				ShardID:     u.ShardID,
+				ReplicaID:   u.ReplicaID,
+				FirstIndex:  first,
+				CompactedTo: floor,
+			}
+		}
+	}
+	return nil
+}
+
+// refuseRetiredBatch applies refuseRetired to every Update of a batch, so a
+// batch naming a retired replica is refused whole, before anything is written.
+func (db *DB) refuseRetiredBatch(updates []logdb.Update) error {
+	if db.retired.size.Load() == 0 {
+		return nil
+	}
+	for i := range updates {
+		if err := db.refuseRetired(nodeKey{ShardID: updates[i].ShardID, ReplicaID: updates[i].ReplicaID}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refuseRetired returns logdb.ErrReplicaRetired when key was retired by
+// RemoveNodeData. Every writer checks it: a retired replica never comes back,
+// so no record may be written for it again. The common case — nothing ever
+// retired — takes no lock.
+func (db *DB) refuseRetired(key nodeKey) error {
+	if db.retired.contains(key) {
+		return logdb.ErrReplicaRetired
+	}
+	return nil
 }
 
 // openWALShard opens a single WAL shard directory. If the directory exists,
@@ -1079,6 +1221,14 @@ func (s *walShard) recover() error {
 				if sErr := syncDirFS(s.fs, s.dir); sErr != nil {
 					return &RecoveryError{SegmentID: segID, Err: sErr}
 				}
+				// The repaired segment's clean prefix is recovered and fully
+				// reflected in memory, like any clean segment's, and nothing is
+				// in flight during recovery: it is committed, and GC may
+				// consider it. Leaving the mark below it would keep a repaired
+				// final segment that holds only dead records — a retired
+				// replica's, say — out of reach of the reclaim that follows
+				// replay (purgeRetired).
+				s.advanceCommittedHWM(segID)
 				break
 			}
 			return err
@@ -1171,9 +1321,8 @@ func (s *walShard) reconcileCompactionFloors() error {
 		//
 		// Deliberately NOT an error otherwise: an absent prefix with no snapshot
 		// is INDISTINGUISHABLE from a node that legitimately starts at a high
-		// index — RemoveNodeData followed by a rewrite produces exactly that
-		// shape, and rejecting it would refuse to start healthy replicas
-		// (TestRemoveNodeDataThenRewrite). Making that case fail closed needs the
+		// index, and rejecting it would refuse to start healthy replicas.
+		// Making that case fail closed needs the
 		// floor to be durable independently of one WAL block, which is a format
 		// change, not a recovery heuristic.
 		derived := first.Index - 1
@@ -1595,9 +1744,13 @@ func (e *SegmentCorruptionError) Unwrap() error {
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
-	// RETIRED, NEVER REALLOCATED: 0x01, 0x03, 0x07, 0x08, 0x09, 0x0a.
+	// RETIRED, NEVER REALLOCATED: 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a.
 	//
-	// Each named an entry or snapshot layout whose fields have since moved. A
+	// 0x06 was the RemoveNode tombstone. A removal is now kept in the
+	// retired-replica registry beside the WAL (retired.go), not as a record.
+	//
+	// Each named an entry, snapshot or hard-state layout whose fields have
+	// since moved. A
 	// record still carrying one cannot be read by the current decoder, and the
 	// danger is not that it fails -- it is that it does not. The offsets shift
 	// rather than run off the end, so a stale record can satisfy every length
@@ -1612,10 +1765,11 @@ const (
 	// Reallocating one of these bytes would make a stale record indistinguishable
 	// from a current one, which is exactly how the 0x07 and 0x0a collisions
 	// happened. Take the next free value instead.
-	payloadTypeState      byte = 0x02
-	payloadTypeBootstrap  byte = 0x04
-	payloadTypeCompact    byte = 0x05
-	payloadTypeRemoveNode byte = 0x06
+	// payloadTypeState is the current hard-state format, which carries the
+	// vote window after Term, Vote and Commit (stateRecordSize).
+	payloadTypeState     byte = 0x0d
+	payloadTypeBootstrap byte = 0x04
+	payloadTypeCompact   byte = 0x05
 	// payloadTypeEntries is the current entry format (84-byte header --
 	// entryRecordHeaderSize -- including the five session fields
 	// Key, ClientID, SeriesID, RespondedTo and OwnerID).
@@ -1681,10 +1835,6 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 		}
 	case payloadTypeCompact:
 		if rerr := s.replayCompaction(data, segID); rerr != nil {
-			return 0, "", rerr
-		}
-	case payloadTypeRemoveNode:
-		if rerr := s.replayRemoveNode(data, segID); rerr != nil {
 			return 0, "", rerr
 		}
 	default:
@@ -1849,8 +1999,8 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 	return nil
 }
 
-// State encoding layout: [ShardID:8][ReplicaID:8][Term:8][Vote:8][Commit:8]
-const stateRecordSize = 8 + 8 + 8 + 8 + 8 // 40 bytes
+// State encoding layout: [ShardID:8][ReplicaID:8][Term:8][Vote:8][Commit:8][VoteWindow:8]
+const stateRecordSize = 8 + 8 + 8 + 8 + 8 + 8 // 48 bytes
 
 // replayState rebuilds per-node hard state. The record is fixed-width, so
 // any other length is corruption and returns ErrTruncatedStateRecord.
@@ -1865,9 +2015,10 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 	term := binary.LittleEndian.Uint64(data[16:])
 	vote := binary.LittleEndian.Uint64(data[24:])
 	commit := binary.LittleEndian.Uint64(data[32:])
+	voteWindow := binary.LittleEndian.Uint64(data[40:])
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
-	s.states[key] = logdb.State{Term: term, Vote: vote, Commit: commit}
+	s.states[key] = logdb.State{Term: term, Vote: vote, Commit: commit, VoteWindow: voteWindow}
 	// Pin the segment so post-recovery compaction does not delete the sole
 	// durable copy of this state. Segments replay in ascending ID order, so
 	// the last replayed wins — matching last-writer-wins at write time.
@@ -2417,39 +2568,6 @@ func (s *walShard) replayCompaction(data []byte, segID uint64) error {
 			}
 		}
 	}
-	return nil
-}
-
-// RemoveNode encoding layout: [ShardID:8][ReplicaID:8]
-const removeNodeRecordSize = 8 + 8 // 16 bytes
-
-// replayRemoveNode removes all in-memory state for a (shardID, replicaID)
-// pair during WAL recovery. This makes RemoveNodeData durable across restarts.
-// The record is fixed-width, so any other length is corruption and returns
-// ErrTruncatedRemoveNodeRecord, which recovery treats as fatal.
-func (s *walShard) replayRemoveNode(data []byte, segID uint64) error {
-	if len(data) != removeNodeRecordSize {
-		slog.Error("waldb: malformed remove-node record during replay",
-			"segment_id", segID, "length", len(data), "expected", removeNodeRecordSize)
-		return ErrTruncatedRemoveNodeRecord
-	}
-	shardID := binary.LittleEndian.Uint64(data[0:])
-	replicaID := binary.LittleEndian.Uint64(data[8:])
-
-	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
-	delete(s.indexes, key)
-	delete(s.entries, key)
-	delete(s.states, key)
-	delete(s.bootstraps, key)
-	delete(s.snapshots, key)
-	delete(s.compactedTo, key)
-	delete(s.metaSegments, key)
-	// Re-pin the tombstone's segment on recovery (last write wins) so a
-	// post-recovery GC cannot reclaim it while older segments still holding
-	// the removed node's records survive under other nodes' pins — replay
-	// without the tombstone would resurrect the removed replica (see
-	// setRemoveSegment).
-	s.setRemoveSegment(key, segID)
 	return nil
 }
 
@@ -3142,44 +3260,13 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		}
 	}()
 
-	// Refuse the whole batch, before anything is written, if any Update carries
-	// entries at or below its node's compaction floor. Those indexes are
-	// already deleted, and storing them would truncate-and-append over the LIVE
-	// suffix above the floor — destroying entries this replica still serves —
-	// while leaving EntryRange reporting a first index that IterateEntries then
-	// refuses as ErrCompacted. It is always a caller bug: raft sends a lagging
-	// follower an InstallSnapshot rather than entries beneath its own floor.
-	//
-	// Checked here, under every touched shard's mu and before Phase 1, so the
-	// rejection costs no WAL write and no rollback. Reading compactedTo under
-	// shard.mu alone is sufficient for the same reason RemoveEntriesTo relies
-	// on: every mutator of it holds shard.mu as well.
-	for i := range updates {
-		u := &updates[i]
-		// A snapshot travels through SaveState as well as SaveSnapshot, and
-		// the protocol bound has to hold on both doors (see SaveSnapshot).
-		if u.Snapshot.Index > 0 {
-			if err := u.Snapshot.CheckBounds(); err != nil {
-				return err
-			}
-		}
-		if len(u.Entries) == 0 {
-			continue
-		}
-		shard := db.getShard(u.ShardID)
-		key := nodeKey{ShardID: u.ShardID, ReplicaID: u.ReplicaID}
-		floor, ok := shard.compactedTo[key]
-		if !ok {
-			continue
-		}
-		if first := u.Entries[0].Index; first <= floor {
-			return &logdb.EntriesBelowCompactionFloorError{
-				ShardID:     u.ShardID,
-				ReplicaID:   u.ReplicaID,
-				FirstIndex:  first,
-				CompactedTo: floor,
-			}
-		}
+	// Refuse the whole batch, before anything is written, if one Update names
+	// a retired replica or breaks a floor or bound (validateBatchLocked).
+	// Checked under the touched shards' mu, which RemoveNodeData holds while
+	// it retires a node, so a retirement either precedes this check or follows
+	// the whole batch — and then drops it.
+	if err := db.validateBatchLocked(updates); err != nil {
+		return err
 	}
 
 	// Phase 1: Write all records to their shards WITHOUT fsyncing. All touched
@@ -3665,7 +3752,7 @@ func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *s
 	}
 
 	// Write hard state if non-zero.
-	if u.State.Term != 0 || u.State.Vote != 0 || u.State.Commit != 0 {
+	if u.State != (logdb.State{}) {
 		if err := s.writeState(key, u.ShardID, u.ReplicaID, u.State, pending, cp); err != nil {
 			return err
 		}
@@ -3877,7 +3964,7 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 // captureShardCheckpoint prepares a standalone (non-batch) record write for
 // rollback: it creates the active segment if the shard is still lazy, then
 // captures the segment position the write starts from. Paired with
-// DB.rollbackStandalone it gives SaveSnapshot/RemoveEntriesTo/RemoveNodeData
+// DB.rollbackStandalone it gives SaveSnapshot/RemoveEntriesTo/SaveBootstrap
 // the same "a failed write leaves nothing durable" guarantee SaveState has.
 // The caller must hold s.mu.
 func captureShardCheckpoint(s *walShard, cp *shardCheckpoint) error {
@@ -3950,6 +4037,7 @@ func (s *walShard) writeState(key nodeKey, shardID, replicaID uint64, state logd
 	binary.LittleEndian.PutUint64(buf[17:], state.Term)
 	binary.LittleEndian.PutUint64(buf[25:], state.Vote)
 	binary.LittleEndian.PutUint64(buf[33:], state.Commit)
+	binary.LittleEndian.PutUint64(buf[41:], state.VoteWindow)
 
 	landing, err := s.writeRecord(buf[:1+stateRecordSize])
 	if err != nil {
@@ -4338,6 +4426,11 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	// A retired replica gets no record ever again: a compaction marker would
+	// re-create its floor and pin a segment for a node that no longer exists.
+	if err := db.refuseRetired(key); err != nil {
+		return err
+	}
 
 	// The compaction floor is monotonic. Entries below an earlier, HIGHER
 	// floor are already deleted, so a lower floor can never be honoured: reads
@@ -4522,6 +4615,9 @@ func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) e
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	if err := db.refuseRetired(key); err != nil {
+		return err
+	}
 
 	// Reject stale snapshots, consistent with MemDB behavior.
 	if existing, ok := shard.snapshots[key]; ok && snapshot.Index <= existing.Index {
@@ -4569,10 +4665,20 @@ func (db *DB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
 	return copySnapshot(ss), nil
 }
 
-// RemoveNodeData durably removes all data for the given node. A remove-node
-// record is written to the WAL so the removal persists across restarts.
-// After clearing in-memory state, segment garbage collection is triggered
-// to reclaim disk space from segments that no longer contain live data.
+// RemoveNodeData durably removes all data for the given node and retires its
+// replica ID: the retirement is recorded in the retired-replica registry
+// (retired.go) before anything else changes, so from the moment it returns
+// every writer refuses the node and every replay drops its records. The
+// node's records are then dropped from memory, which releases every segment
+// pin they held, and segment garbage collection reclaims what no surviving
+// node still uses. Nothing is written to the WAL: the registry, not a
+// tombstone record, is what keeps the removal, so no segment has to be kept
+// for it.
+//
+// A crash at any point after the registry is published completes the removal
+// on the next open (purgeRetired). A failure before it changes nothing. A
+// failed directory fsync after it leaves the retirement's durability unknown,
+// the same uncertainty a failed WAL fsync leaves, and fail-stops the DB.
 func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	if err := db.writeGate(); err != nil {
 		return err
@@ -4581,99 +4687,64 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
+	// Held across the retirement and the drop, so a writer serialized on this
+	// shard either finished before the retirement (and is dropped below) or
+	// finds the node retired (refuseRetired).
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	// Capture the pre-write segment position: a tombstone left durable after an
-	// error return would erase the node on the next restart even though the
-	// caller was told the removal failed.
-	var cp shardCheckpoint
-	if err := captureShardCheckpoint(shard, &cp); err != nil {
+	drop := func() {
+		shard.dataMu.Lock()
+		shard.dropNodeLocked(key)
+		shard.dataMu.Unlock()
+	}
+	if published, err := db.retired.retire(db.opts.fs, db.dir, []nodeKey{key}, db.opts.noSync, drop); err != nil {
+		if published {
+			db.poison(err)
+		}
 		return err
 	}
+	shard.reclaimSegmentsLocked("RemoveNodeData", "shard_id", shardID, "replica_id", replicaID)
+	return nil
+}
 
-	// Write the remove-node record to the WAL for durability.
-	buf := shard.getMarshalBuf(1 + removeNodeRecordSize)
-	buf[0] = payloadTypeRemoveNode
-	binary.LittleEndian.PutUint64(buf[1:], shardID)
-	binary.LittleEndian.PutUint64(buf[9:], replicaID)
-	landing, err := shard.writeRecord(buf[:1+removeNodeRecordSize])
-	if err != nil {
-		return db.rollbackStandalone(shard, &cp, err)
-	}
-	// The tombstone landed in landing.segID (post-rotation). The record is
-	// durable here (non-batch writeRecord fdatasyncs inline).
-	tombstoneSegID := landing.segID
-
-	// Commit point: clear all in-memory state for this node and re-pin the
-	// tombstone in one atomic dataMu section, so a lock-free reader sees the
-	// node either wholly present or wholly gone. Dropping the removed node's
-	// meta tracking lets its now-obsolete State/Snapshot/Bootstrap segments be
-	// reclaimed below if no surviving node references them.
-	//
-	// The tombstone's own segment is pinned against garbage collection and the
-	// commit high-water mark advanced, mirroring the compaction-marker pin.
-	// Without the pin, GC could reclaim the tombstone's segment while OLDER
-	// segments holding this node's records survive (pinned by other nodes
-	// sharing the WAL shard) — replay would then resurrect the removed replica
-	// (see setRemoveSegment).
-	shard.dataMu.Lock()
-	delete(shard.indexes, key)
-	delete(shard.entries, key)
-	delete(shard.states, key)
-	delete(shard.bootstraps, key)
-	delete(shard.snapshots, key)
-	delete(shard.compactedTo, key)
-	delete(shard.metaSegments, key)
-	shard.setRemoveSegment(key, tombstoneSegID)
-	shard.advanceCommittedHWM(tombstoneSegID)
-	// The tombstone is durable, so its epoch joins the floor — before the
-	// recompute below, which would otherwise drop it.
-	shard.applyEpochLocked(landing)
-	shard.dataMu.Unlock()
-
-	// Trigger segment garbage collection to reclaim disk space. Collect
-	// the set of segments still referenced by remaining live nodes.
+// reclaimSegmentsLocked garbage-collects the shard's segments that no live
+// node references any more, makes the deletions durable and, only then,
+// recomputes the epoch floor from what survived on disk. It runs after a node
+// is dropped (RemoveNodeData, and purgeRetired at open). Every step is
+// best-effort for the caller: the removal is already durable in the registry,
+// and whatever this leaves behind the next open's purge and reclaim retry.
+// Caller holds s.mu.
+func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
+	// Collect the set of segments still referenced by remaining live nodes.
 	liveSegments := make(map[uint64]bool)
-	for _, idx := range shard.indexes {
+	for _, idx := range s.indexes {
 		for segID := range idx.AllSegmentIDs() {
 			liveSegments[segID] = true
 		}
 	}
-	// Keep surviving nodes' State/Snapshot/Bootstrap segments and RemoveNode
-	// tombstones pinned. These record types are not tracked by an entry
-	// index, so they must be folded in explicitly before GC.
-	shard.addMetaSegmentsToLive(liveSegments)
-	comp := newCompactor(shard.fs, shard.dir, shard.opts.blockSize)
-	// Best-effort GC: errors are non-fatal for the remove operation
-	// but are logged for observability.
-	_, gcErr := comp.GarbageCollect(liveSegments, shard.activeSegmentID, shard.committedSegmentHWM)
+	// Keep surviving nodes' State/Snapshot/Bootstrap/Compact segments pinned.
+	// These record types are not tracked by an entry index, so they must be
+	// folded in explicitly before GC.
+	s.addMetaSegmentsToLive(liveSegments)
+	comp := newCompactor(s.fs, s.dir, s.opts.blockSize)
+	_, gcErr := comp.GarbageCollect(liveSegments, s.activeSegmentID, s.committedSegmentHWM)
 	if gcErr != nil {
-		slog.Warn("waldb: garbage collection failed after RemoveNodeData",
-			"shard_dir", shard.dir,
-			"shard_id", shardID,
-			"replica_id", replicaID,
-			"error", gcErr,
-		)
+		slog.Warn("waldb: garbage collection failed after "+op,
+			append([]any{"shard_dir", s.dir, "error", gcErr}, logAttrs...)...)
 	}
 
-	// Fsync the parent directory to make segment deletions durable.
-	// Best-effort for the deletions: errors are logged but do not fail the
-	// remove operation, because the WAL remove-node record is already
-	// persisted. It MUST run BEFORE the epoch-floor recompute below — see the
-	// identical ordering rationale in Compact: raising the floor on an unlink
-	// that a crash can undo lets the engine purge a DEK the resurrected
-	// segment still needs, and the next restart fails with WALDecryptError.
+	// Fsync the shard directory to make segment deletions durable. It MUST
+	// run BEFORE the epoch-floor recompute below — see the identical ordering
+	// rationale in Compact: raising the floor on an unlink that a crash can
+	// undo lets the engine purge a DEK the resurrected segment still needs,
+	// and the next restart fails with WALDecryptError.
 	dirSynced := true
-	if err := syncDirFS(shard.fs, shard.dir); err != nil {
+	if err := syncDirFS(s.fs, s.dir); err != nil {
 		dirSynced = false
-		slog.Warn("waldb: directory sync failed after RemoveNodeData; "+
+		slog.Warn("waldb: directory sync failed after "+op+"; "+
 			"skipping epoch-floor recompute so an unproven deletion cannot purge a live DEK",
-			"shard_dir", shard.dir,
-			"shard_id", shardID,
-			"replica_id", replicaID,
-			"error", err,
-		)
+			append([]any{"shard_dir", s.dir, "error", err}, logAttrs...)...)
 	}
 
 	// Recompute minWriteEpoch from the segments that actually survived ON
@@ -4687,11 +4758,49 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	// segments still need — the engine would purge the DEK and the next
 	// restart would hit a fatal WALDecryptError. Skipping the recompute on GC
 	// failure is conservative: a too-low floor only defers DEK purging.
-	if gcErr == nil && dirSynced && shard.barrier != nil {
-		shard.recomputeMinWriteEpochFromDisk()
+	if gcErr == nil && dirSynced && s.barrier != nil {
+		s.recomputeMinWriteEpochFromDisk()
 	}
+}
 
-	return nil
+// NodeRemoved reports whether RemoveNodeData has removed the node, and so
+// retired its replica ID. The fact lives in the retired-replica registry
+// (retired.go), which survives every restart, compaction and migration.
+func (db *DB) NodeRemoved(shardID, replicaID uint64) (bool, error) {
+	if db.closed.Load() {
+		return false, logdb.ErrClosed
+	}
+	return db.retired.contains(nodeKey{ShardID: shardID, ReplicaID: replicaID}), nil
+}
+
+// retireNodes records every key in the registry in one rewrite, for the
+// re-encryption migration, which carries a whole registry into an empty
+// destination: there is no data to drop, and one publication instead of one
+// per key keeps the migration linear in the registry's size.
+func (db *DB) retireNodes(nodes []logdb.NodeInfo) error {
+	if err := db.writeGate(); err != nil {
+		return err
+	}
+	keys := make([]nodeKey, 0, len(nodes))
+	for _, ni := range nodes {
+		keys = append(keys, nodeKey{ShardID: ni.ShardID, ReplicaID: ni.ReplicaID})
+	}
+	published, err := db.retired.retire(db.opts.fs, db.dir, keys, db.opts.noSync, nil)
+	if err != nil && published {
+		db.poison(err)
+	}
+	return err
+}
+
+// removedNodes returns every node the registry has retired, for the
+// re-encryption migration, which must carry the retirements across.
+func (db *DB) removedNodes() []logdb.NodeInfo {
+	keys := db.retired.keys()
+	result := make([]logdb.NodeInfo, 0, len(keys))
+	for _, k := range keys {
+		result = append(result, logdb.NodeInfo{ShardID: k.ShardID, ReplicaID: k.ReplicaID})
+	}
+	return result
 }
 
 // ListNodeInfo returns all NodeInfo entries in the LogDB.
@@ -4784,10 +4893,12 @@ func (db *DB) saveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+	if err := db.refuseRetired(key); err != nil {
+		return err
+	}
 
 	// Standalone bootstrap write. This was the ONE standalone writer without a
-	// checkpoint — SaveSnapshot, RemoveEntriesTo and RemoveNodeData have all
-	// had one — so a failed write left its bytes in the segment and returned an
+	// checkpoint — SaveSnapshot and RemoveEntriesTo have both had one — so a failed write left its bytes in the segment and returned an
 	// error the caller reads as "nothing happened". Those bytes are a partial
 	// record, and the next successful write lands directly on top of them: what
 	// recovery then finds is a torn record with valid data above it, in the
@@ -5072,38 +5183,6 @@ func (s *walShard) setBootstrapSegment(key nodeKey, segID uint64) {
 	s.metaSegments[key] = m
 }
 
-// setRemoveSegment records segID as the segment holding the latest durable
-// RemoveNode tombstone for key. The tombstone must outlive every lower-ID
-// segment that still holds the removed node's records: WAL shards are shared
-// by many Raft groups, so older segments containing the removed node's
-// entries/state/snapshot can stay pinned by OTHER nodes long after the
-// removal. If GC reclaimed the tombstone's segment while such an older
-// segment survived, replay would resurrect the removed replica — a
-// membership-safety violation. The pin is therefore held until a later
-// RemoveNodeData for the same node (or its replay) rewrites it; it is never
-// dropped based on GC progress.
-//
-// Re-adding the same (shardID, replicaID) does NOT release the pin either,
-// even though later State/Bootstrap/Entries records supersede the tombstone.
-// GarbageCollect deletes segments in ascending ID order but skips any segment
-// pinned by ANOTHER node sharing this WAL shard, so a segment BELOW the
-// tombstone can outlive it. Replaying that older segment without the
-// intervening tombstone would resurrect the removed replica's entries above
-// the re-added log's range. The cost of holding the pin is one retained
-// segment per removed key — disk only, never correctness.
-//
-// Last write wins. Caller must hold s.mu and s.dataMu for writing, except on
-// the recover() path (see walShard).
-func (s *walShard) setRemoveSegment(key nodeKey, segID uint64) {
-	if s.metaSegments == nil {
-		s.metaSegments = make(map[nodeKey]metaSegments)
-	}
-	m := s.metaSegments[key]
-	m.remove = segID
-	m.hasRemove = true
-	s.metaSegments[key] = m
-}
-
 // setCompactSegment records segID as the segment holding the latest durable
 // compaction marker for key. A compaction marker is not tracked by any entry
 // index, so without this pin a (rotated, non-active) segment whose entries have
@@ -5122,8 +5201,8 @@ func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
 	s.metaSegments[key] = m
 }
 
-// clearMetaSegmentPins removes any State/Snapshot/Bootstrap/Compact/Remove
-// pin that points at segID, resetting both the field and its presence flag.
+// clearMetaSegmentPins removes any State/Snapshot/Bootstrap/Compact pin that
+// points at segID, resetting both the field and its presence flag.
 // Used when a segment is discarded (truncation-recovery cleanup) so no
 // phantom pin to a non-existent segment lingers in metaSegments. An entry
 // whose pins all become absent is removed from the map. Called only from
@@ -5147,11 +5226,7 @@ func (s *walShard) clearMetaSegmentPins(segID uint64) {
 			m.compact = 0
 			m.hasCompact = false
 		}
-		if m.hasRemove && m.remove == segID {
-			m.remove = 0
-			m.hasRemove = false
-		}
-		if !m.hasState && !m.hasSnapshot && !m.hasBootstrap && !m.hasCompact && !m.hasRemove {
+		if !m.hasState && !m.hasSnapshot && !m.hasBootstrap && !m.hasCompact {
 			delete(s.metaSegments, key)
 		} else {
 			s.metaSegments[key] = m
@@ -5170,12 +5245,11 @@ func (s *walShard) advanceCommittedHWM(segID uint64) {
 	}
 }
 
-// addMetaSegmentsToLive folds every tracked State/Snapshot/Bootstrap/Compact/
-// Remove segment ID for all live nodes into liveSegments. These record types
-// are never tracked by an entry index, so they must be pinned explicitly
-// before garbage collection or the sole durable copy of a node's
-// State/Snapshot/Bootstrap — or of a removed node's tombstone — could be
-// deleted. This only READS metaSegments, and every mutator of it holds s.mu,
+// addMetaSegmentsToLive folds every tracked State/Snapshot/Bootstrap/Compact
+// segment ID for all live nodes into liveSegments. These record types are
+// never tracked by an entry index, so they must be pinned explicitly before
+// garbage collection or the sole durable copy of a node's
+// State/Snapshot/Bootstrap/Compact record could be deleted. This only READS metaSegments, and every mutator of it holds s.mu,
 // so holding s.mu alone is sufficient exclusion (see walShard).
 func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 	for _, m := range s.metaSegments {
@@ -5190,9 +5264,6 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 		}
 		if m.hasCompact {
 			liveSegments[m.compact] = true
-		}
-		if m.hasRemove {
-			liveSegments[m.remove] = true
 		}
 	}
 }

@@ -111,7 +111,14 @@ same key does not.
   explicit offline operation — see
   [`../snapshots/architecture.md`](../snapshots/architecture.md).
 - **`RemoveData` and `StopReplica` are local and destructive.** They do not
-  reach consensus; they act on this node's copy.
+  reach consensus; they act on this node's copy. `RemoveData` also retires the
+  replica ID on this host (`LogDB.NodeRemoved`, from the WAL's `RETIRED`
+  registry — 16 bytes per retired replica, carried across a re-encryption
+  migration — and every LogDB writer refuses a retired node), and `StartShard`
+  refuses a retired ID: the replica's term, vote and owed vote window went with
+  its data, so starting it again could break election safety or a leader's
+  read lease. `RemoveData` takes the shard's import lock, which a start holds
+  throughout, so the two cannot interleave.
 
 ## Component boundaries
 

@@ -136,12 +136,14 @@ func (v snapshotVariant) writeSnapshotArtifact(t *testing.T, dir string, barrier
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
+		stampTestSnapshotMeta(t, dir, index, 1)
 		return 0
 	}
 	if barrier == nil {
 		t.Fatal("encrypted snapshot variant requires a barrier")
 	}
 	writeEncryptedSnapshotFileFor(t, barrier, path, data, shardID, replicaID, index)
+	stampTestSnapshotMeta(t, dir, index, 1)
 	return barrier.CurrentEpoch()
 }
 
@@ -236,8 +238,8 @@ func snapshotEnvelope(payload []byte) []byte {
 }
 
 // assertNoDecryptScratch fails if the snapshot directory holds anything other
-// than the canonical snapshot.dat: the decrypt scratch sibling must be removed
-// on every path.
+// than the canonical snapshot.dat and its snapshot.meta: the decrypt scratch
+// sibling must be removed on every path.
 func assertNoDecryptScratch(t *testing.T, dir string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -245,7 +247,7 @@ func assertNoDecryptScratch(t *testing.T, dir string) {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	for _, e := range entries {
-		if e.Name() != "snapshot.dat" {
+		if e.Name() != "snapshot.dat" && e.Name() != "snapshot.meta" {
 			t.Errorf("stray file %q left in snapshot directory", e.Name())
 		}
 	}
@@ -580,6 +582,10 @@ func TestStartShard_LocalSnapshotRecovery_CorruptCiphertextFailsStart(t *testing
 			if wErr := os.WriteFile(dataPath, raw, 0o600); wErr != nil {
 				t.Fatalf("WriteFile: %v", wErr)
 			}
+			// Re-stamp snapshot.meta over the altered bytes — a writer that
+			// can rewrite the artifact can rewrite its record too — so the
+			// non-cryptographic hash agrees and the AEAD is what must refuse it.
+			stampTestSnapshotMeta(t, dir, 40, 3)
 
 			h, err := NewHost(testHostConfig(t), WithLogDB(db), WithBarrier(barrier), WithoutTransport())
 			if err != nil {
@@ -649,13 +655,7 @@ func TestExportImportSnapshot_RoundTripRecoversPlaintext(t *testing.T) {
 			// The artifact body must be the writer chain's pre-encryption
 			// bytes: decrypted, still Snappy-framed when the shard compresses.
 			body := bytes.NewReader(exported.Bytes())
-			if _, hdrErr := readSnapshotArtifactHeader(body); hdrErr != nil {
-				t.Fatalf("readSnapshotArtifactHeader: %v", hdrErr)
-			}
-			data := make([]byte, body.Len())
-			if _, readErr := io.ReadFull(body, data); readErr != nil {
-				t.Fatalf("reading artifact data: %v", readErr)
-			}
+			_, data := readArtifactPayload(t, body)
 			if want := v.fileBytes(t, payload); !bytes.Equal(data, want) {
 				t.Fatalf("exported artifact data mismatch: got %d bytes, want the decrypted %d-byte artifact",
 					len(data), len(want))

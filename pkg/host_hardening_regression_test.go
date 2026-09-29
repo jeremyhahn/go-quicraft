@@ -418,6 +418,7 @@ func TestExportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	}
 	plaintext := []byte("export must pin the epoch it is decrypting under")
 	writeEncryptedSnapshotFileFor(t, pinning, filepath.Join(snapDir, "snapshot.dat"), plaintext, 1, 1, 900)
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 
 	const recordedEpoch = uint64(1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: recordedEpoch})
@@ -483,6 +484,7 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	}
 	writeEncryptedSnapshotFileFor(t, pinning, filepath.Join(snapDir, "snapshot.dat"),
 		[]byte("import must pin the epoch it seals under"), 1, 1, 1700)
+	stampTestSnapshotMeta(t, snapDir, 1, 1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1700, Filepath: snapDir, Epoch: 1})
 
 	var exported bytes.Buffer

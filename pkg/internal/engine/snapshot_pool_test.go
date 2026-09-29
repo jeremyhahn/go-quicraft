@@ -161,6 +161,8 @@ func (db *snapshotTestLogDB) GetSnapshot(shardID, _ uint64) (logdb.Snapshot, err
 
 func (db *snapshotTestLogDB) RemoveNodeData(_, _ uint64) error { return nil }
 
+func (db *snapshotTestLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
+
 func (db *snapshotTestLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -1100,7 +1102,7 @@ func TestSnapshotPool_GCSnapshotDirs_NothingToClean(t *testing.T) {
 
 func TestSnapshotPool_WriteSnapshotMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
-	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 0, config.NoCompression)
+	err := writeTestSnapshotMetadata(tmpDir, 42, 5, 10, 3, 0, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -1982,7 +1984,7 @@ func TestSnapshotPool_EpochInMetadata(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Write metadata with epoch.
-	err := writeSnapshotMetadata(tmpDir, 100, 5, 10, 1, 7, config.NoCompression)
+	err := writeTestSnapshotMetadata(tmpDir, 100, 5, 10, 1, 7, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -2134,7 +2136,7 @@ func TestSnapshotPool_PurgeOldEpochs_AfterCompaction(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2183,7 +2185,7 @@ func TestSnapshotPool_PurgeOldEpochs_AllPlaintext(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, idx, 1, 1, 1, 0, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, idx, 1, 1, 1, 0, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2258,7 +2260,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochFloor(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2292,7 +2294,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochHigherThanSnapshot(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2326,7 +2328,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALEpochZeroIgnored(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2360,7 +2362,7 @@ func TestSnapshotPool_PurgeOldEpochs_WALQueryError(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2395,7 +2397,7 @@ func TestSnapshotPool_PurgeOldEpochs_NonEpochAwareLogDB(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2462,7 +2464,7 @@ func TestSnapshotPool_PurgeOldEpochs_DurableNonEpochAwareLogDBBlocksPurge(t *tes
 				if err := os.MkdirAll(dir, 0o750); err != nil {
 					t.Fatalf("mkdir failed: %v", err)
 				}
-				if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch,
+				if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch,
 					config.NoCompression); err != nil {
 					t.Fatalf("write metadata failed: %v", err)
 				}
@@ -2504,7 +2506,7 @@ func TestSnapshotPool_PurgeOldEpochs_NilLogDB(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed: %v", err)
 		}
-		if err := writeSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
 			t.Fatalf("write metadata failed: %v", err)
 		}
 	}
@@ -2538,7 +2540,7 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardFloor(t *testing.T) {
 	if err := os.MkdirAll(dirA, 0o750); err != nil {
 		t.Fatalf("mkdir A: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 2, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(dirA, 100, 1, 1, 1, 2, config.NoCompression); err != nil {
 		t.Fatalf("write metadata A: %v", err)
 	}
 
@@ -2547,7 +2549,7 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardFloor(t *testing.T) {
 	if err := os.MkdirAll(dirB, 0o750); err != nil {
 		t.Fatalf("mkdir B: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 5, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(dirB, 200, 1, 2, 1, 5, config.NoCompression); err != nil {
 		t.Fatalf("write metadata B: %v", err)
 	}
 
@@ -2582,14 +2584,14 @@ func TestSnapshotPool_PurgeOldEpochs_CrossShardWALFloor(t *testing.T) {
 	if err := os.MkdirAll(dirA, 0o750); err != nil {
 		t.Fatalf("mkdir A: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirA, 100, 1, 1, 1, 4, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(dirA, 100, 1, 1, 1, 4, config.NoCompression); err != nil {
 		t.Fatalf("write metadata A: %v", err)
 	}
 	dirB := snapshotSaveDir(tmpDir, 2, 1, 200)
 	if err := os.MkdirAll(dirB, 0o750); err != nil {
 		t.Fatalf("mkdir B: %v", err)
 	}
-	if err := writeSnapshotMetadata(dirB, 200, 1, 2, 1, 6, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(dirB, 200, 1, 2, 1, 6, config.NoCompression); err != nil {
 		t.Fatalf("write metadata B: %v", err)
 	}
 
@@ -2998,7 +3000,7 @@ func TestSnapshotPool_DecryptFile_EmptyPlaintextRoundTrips(t *testing.T) {
 func TestSnapshotPool_WriteMetadataWithEpoch(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	err := writeSnapshotMetadata(tmpDir, 42, 5, 10, 3, 7, config.NoCompression)
+	err := writeTestSnapshotMetadata(tmpDir, 42, 5, 10, 3, 7, config.NoCompression)
 	if err != nil {
 		t.Fatalf("writeSnapshotMetadata failed: %v", err)
 	}
@@ -4100,7 +4102,7 @@ func TestSnapshotPool_GCSnapshotDirs_RemovesOrphanedDirs(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatalf("mkdir failed for index %d: %v", idx, err)
 		}
-		if err := writeSnapshotMetadata(dir, idx, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
+		if err := writeTestSnapshotMetadata(dir, idx, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
 			t.Fatalf("writeSnapshotMetadata failed for index %d: %v", idx, err)
 		}
 		// Write a data file to make it a complete snapshot directory.

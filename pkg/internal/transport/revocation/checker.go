@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -249,10 +250,14 @@ type ocspCacheEntry struct {
 // handshake path (IsRevoked) uses read locks and atomic cache lookups
 // to minimize contention with the background CRL reload goroutine.
 type Checker struct {
-	// mu protects revokedSet, crlHashes, and crlCurrent.
+	// mu protects revokedSet, adminRevoked, crlHashes, and crlCurrent.
 	mu         sync.RWMutex
 	revokedSet map[string]struct{} // scopedSerial(issuer, serial) -> revoked
-	crlHashes  map[string][32]byte // path -> SHA-256 content hash
+	// adminRevoked holds the serials AddRevokedSerial revoked. It is kept
+	// apart from revokedSet, which every CRL reload replaces wholesale:
+	// sharing it silently undid each runtime revocation at the next reload.
+	adminRevoked map[string]struct{}
+	crlHashes    map[string][32]byte // path -> SHA-256 content hash
 	// crlCurrent is true while revokedSet reflects a fully-successful
 	// load of every configured CRL file. It is false before the first
 	// successful load and after any failed reload (unreadable or
@@ -302,11 +307,12 @@ func NewChecker(cfg Config, issuers ...*x509.Certificate) *Checker {
 		}
 	}
 	return &Checker{
-		revokedSet: make(map[string]struct{}),
-		crlHashes:  make(map[string][32]byte),
-		ocspCache:  make(map[string]*ocspCacheEntry),
-		issuers:    kept,
-		cfg:        cfg,
+		revokedSet:   make(map[string]struct{}),
+		adminRevoked: make(map[string]struct{}),
+		crlHashes:    make(map[string][32]byte),
+		ocspCache:    make(map[string]*ocspCacheEntry),
+		issuers:      kept,
+		cfg:          cfg,
 		httpClient: &http.Client{
 			Timeout: time.Duration(cfg.OCSPTimeoutSeconds) * time.Second,
 		},
@@ -577,30 +583,30 @@ func parseCRLs(data []byte) ([]*x509.RevocationList, error) {
 // set. The serial should be a lowercase hex string. This is useful for
 // runtime revocation via admin API without modifying CRL files on disk.
 //
-// The entry is recorded under anyIssuerScope, so it revokes the serial no
-// matter which configured CA issued the certificate. The admin API names no
-// issuer, and over-revoking is the fail-closed direction.
+// The entry is issuer-agnostic, so it revokes the serial no matter which
+// configured CA issued the certificate: the admin API names no issuer, and
+// over-revoking is the fail-closed direction. It survives CRL reloads.
 func (c *Checker) AddRevokedSerial(serial string) {
 	c.mu.Lock()
-	c.revokedSet[scopedSerial(anyIssuerScope, serial)] = struct{}{}
+	c.adminRevoked[serial] = struct{}{}
 	c.mu.Unlock()
 }
 
 // RemoveRevokedSerial programmatically removes a serial number from the
 // revoked set. This is useful for undoing a programmatic revocation. It
-// removes only the issuer-agnostic entry AddRevokedSerial created: a
-// CRL-published revocation is owned by the CA and is restored by the next
-// reload regardless.
+// removes only the entry AddRevokedSerial created: a CRL-published revocation
+// is owned by the CA and is unaffected.
 func (c *Checker) RemoveRevokedSerial(serial string) {
 	c.mu.Lock()
-	delete(c.revokedSet, scopedSerial(anyIssuerScope, serial))
+	delete(c.adminRevoked, serial)
 	c.mu.Unlock()
 }
 
-// RevokedCount returns the number of serials currently in the revoked set.
+// RevokedCount returns the number of revocation records currently held: CRL
+// entries plus programmatic (AddRevokedSerial) revocations.
 func (c *Checker) RevokedCount() int {
 	c.mu.RLock()
-	n := len(c.revokedSet)
+	n := len(c.revokedSet) + len(c.adminRevoked)
 	c.mu.RUnlock()
 	return n
 }
@@ -668,6 +674,20 @@ func (c *Checker) isRevokedCRL(scope, serial string) (bool, error) {
 	return false, nil
 }
 
+// revokedLocked reports whether serial is revoked by a CRL entry under the
+// leaf's issuer scope or the issuer-agnostic scope, or by AddRevokedSerial.
+// The caller holds c.mu.
+func (c *Checker) revokedLocked(scope, serial string) bool {
+	if _, ok := c.revokedSet[scopedSerial(scope, serial)]; ok {
+		return true
+	}
+	if _, ok := c.revokedSet[scopedSerial(anyIssuerScope, serial)]; ok {
+		return true
+	}
+	_, ok := c.adminRevoked[serial]
+	return ok
+}
+
 // isRevokedOCSP consults OCSP, plus the programmatic revoked set.
 //
 // The programmatic set (AddRevokedSerial, the runtime admin revocation path) is
@@ -676,10 +696,7 @@ func (c *Checker) isRevokedCRL(scope, serial string) (bool, error) {
 // is NOT consulted: this mode does not derive its verdict from CRL files.
 func (c *Checker) isRevokedOCSP(cert *x509.Certificate, scope, serial string) (bool, error) {
 	c.mu.RLock()
-	_, revoked := c.revokedSet[scopedSerial(scope, serial)]
-	if !revoked {
-		_, revoked = c.revokedSet[scopedSerial(anyIssuerScope, serial)]
-	}
+	revoked := c.revokedLocked(scope, serial)
 	c.mu.RUnlock()
 	if revoked {
 		return true, nil
@@ -767,10 +784,7 @@ func (c *Checker) isRevokedCRLTail(crlErr error) (bool, error) {
 // scope used by AddRevokedSerial.
 func (c *Checker) checkCRLStatus(scope, serial string) (bool, error) {
 	c.mu.RLock()
-	_, revoked := c.revokedSet[scopedSerial(scope, serial)]
-	if !revoked {
-		_, revoked = c.revokedSet[scopedSerial(anyIssuerScope, serial)]
-	}
+	revoked := c.revokedLocked(scope, serial)
 	current := c.crlCurrent
 	c.mu.RUnlock()
 	if revoked {
@@ -976,6 +990,9 @@ func (c *Checker) queryOCSP(cert, issuerCert *x509.Certificate) (bool, time.Time
 	if err != nil {
 		return false, time.Time{}, err
 	}
+	if err := validateOCSPResponder(ocspResp, issuerCert, time.Now()); err != nil {
+		return false, time.Time{}, err
+	}
 
 	// Reject responses outside their validity window. Without this, a
 	// replayed stale "good" response (captured before a revocation) would
@@ -1043,6 +1060,29 @@ func validateOCSPFreshness(resp *ocsp.Response, now time.Time) error {
 			ThisUpdate: resp.ThisUpdate,
 			NextUpdate: resp.NextUpdate,
 		}
+	}
+	return nil
+}
+
+// validateOCSPResponder rejects a response signed by a delegated responder
+// that is not authorized to sign OCSP responses (RFC 6960 §4.2.2.2). A
+// response signed by the issuer itself is authorized whether or not it embeds
+// the issuer's certificate — a CA answering OCSP directly commonly includes
+// it, and ParseResponseForCert has verified the signature. Any other embedded
+// certificate is a delegate, accepted only if it carries id-kp-OCSPSigning and
+// is within its validity period: ParseResponseForCert checks nothing but the
+// issuer's signature on it, so a node's own CA-issued certificate would
+// otherwise let a revoked node vouch "good" for itself.
+func validateOCSPResponder(resp *ocsp.Response, issuer *x509.Certificate, now time.Time) error {
+	responder := resp.Certificate
+	if responder == nil || (issuer != nil && responder.Equal(issuer)) {
+		return nil
+	}
+	if !slices.Contains(responder.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning) {
+		return ErrOCSPResponderUnauthorized
+	}
+	if now.Add(revocationClockSkew).Before(responder.NotBefore) || now.After(responder.NotAfter.Add(revocationClockSkew)) {
+		return ErrOCSPResponderUnauthorized
 	}
 	return nil
 }

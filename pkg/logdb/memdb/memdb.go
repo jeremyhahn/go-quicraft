@@ -72,14 +72,40 @@ type nodeData struct {
 // It is safe for concurrent use from multiple goroutines.
 type MemDB struct {
 	closed atomic.Bool
-	mu     sync.RWMutex
-	nodes  map[nodeKey]*nodeData
+	// removalMu orders every write against RemoveNodeData and Close: a
+	// writer holds it for reading for its whole operation (beginWrite),
+	// RemoveNodeData and Close for writing. So a SaveState batch is applied
+	// entirely before a removal or a close or entirely after it — then
+	// refused whole — and never split by one, which would leave part of a
+	// batch the caller was told failed. One lock rather than per-node
+	// stripes: BenchmarkMemDBSaveStateParallel measured no contention gain
+	// from striping at 8 and 24 cores and a 14% single-core cost. Lock order:
+	// removalMu, then a node's mu, then mu.
+	removalMu sync.RWMutex
+	mu        sync.RWMutex
+	nodes     map[nodeKey]*nodeData
+	removed   map[nodeKey]struct{} // retired by RemoveNodeData; see NodeRemoved
+}
+
+// beginWrite takes removalMu for reading and then checks the database is still
+// open; on success the caller releases it with removalMu.RUnlock. The check
+// comes after the lock is held: Close marks the database closed before it
+// takes removalMu, so a writer that gets the lock after a Close sees the mark,
+// and one that got it before finishes before Close releases the data.
+func (m *MemDB) beginWrite() error {
+	m.removalMu.RLock()
+	if m.closed.Load() {
+		m.removalMu.RUnlock()
+		return logdb.ErrClosed
+	}
+	return nil
 }
 
 // New creates a ready-to-use in-memory LogDB instance.
 func New() *MemDB {
 	return &MemDB{
-		nodes: make(map[nodeKey]*nodeData),
+		nodes:   make(map[nodeKey]*nodeData),
+		removed: make(map[nodeKey]struct{}),
 	}
 }
 
@@ -110,6 +136,10 @@ func (m *MemDB) AtRestProtection() logdb.AtRestProtection {
 // method checks the closed flag before it reaches the nodes.
 func (m *MemDB) Close() error {
 	m.closed.Store(true)
+	// Wait out every write already in flight so none is split by the release
+	// below; any write that starts now sees the closed mark (beginWrite).
+	m.removalMu.Lock()
+	defer m.removalMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nodes = make(map[nodeKey]*nodeData)
@@ -122,6 +152,10 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	if m.closed.Load() {
 		return logdb.ErrClosed
 	}
+	if err := m.beginWrite(); err != nil {
+		return err
+	}
+	defer m.removalMu.RUnlock()
 	// Validate the WHOLE batch before applying any of it. SaveState is
 	// specified to be atomic, and a floor violation found half-way through
 	// would otherwise leave the updates before it stored and the ones after it
@@ -129,6 +163,9 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	// partly happened.
 	for i := range updates {
 		u := &updates[i]
+		if m.retired(u.ShardID, u.ReplicaID) {
+			return logdb.ErrReplicaRetired
+		}
 		// A snapshot travels through SaveState as well as SaveSnapshot, and
 		// the protocol bound has to hold on both doors (see SaveSnapshot).
 		if u.Snapshot.Index > 0 {
@@ -181,10 +218,12 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 // one thing a durability API must never do — the caller was told the write
 // happened. Neither ordering of the two calls explains that outcome.
 //
-// Re-checking makes the write win: the node is recreated and the result is
-// exactly what "remove, then save" produces. The alternative ordering, "save,
-// then remove", is also legal and is what happens when RemoveNodeData gets the
-// map lock second. Both are honest; only the lost write was not.
+// Re-checking settles the race one of two honest ways. RemoveNodeData retires
+// the node as it unlinks it, so a write that finds its node unlinked finds it
+// retired and is refused (logdb.ErrReplicaRetired): "remove, then save", where
+// the save is not allowed. The other ordering, "save, then remove", is what
+// happens when RemoveNodeData gets the map lock second. Both are honest; only
+// the lost write was not.
 //
 // The retry cannot spin indefinitely against anything but an unbroken stream of
 // RemoveNodeData calls for the same node, which is not a workload — each
@@ -196,11 +235,22 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 func (m *MemDB) withNode(shardID, replicaID uint64, fn func(nd *nodeData) error) error {
 	key := nodeKey{shardID: shardID, replicaID: replicaID}
 	for {
+		if m.retired(shardID, replicaID) {
+			return logdb.ErrReplicaRetired
+		}
 		nd := m.getOrCreateNode(shardID, replicaID)
 		nd.mu.Lock()
 		m.mu.RLock()
 		live := m.nodes[key] == nd
+		_, retired := m.removed[key]
 		m.mu.RUnlock()
+		if retired {
+			// RemoveNodeData retired the node while this write waited for its
+			// lock: the removal wins, and the write is refused rather than
+			// stored for a replica ID that is never used again.
+			nd.mu.Unlock()
+			return logdb.ErrReplicaRetired
+		}
 		if !live {
 			nd.mu.Unlock()
 			continue
@@ -486,6 +536,13 @@ func (m *MemDB) RemoveEntriesTo(shardID uint64, replicaID uint64, index uint64) 
 	if m.closed.Load() {
 		return logdb.ErrClosed
 	}
+	if err := m.beginWrite(); err != nil {
+		return err
+	}
+	defer m.removalMu.RUnlock()
+	if m.retired(shardID, replicaID) {
+		return logdb.ErrReplicaRetired
+	}
 
 	nd := m.getNode(shardID, replicaID)
 	if nd == nil {
@@ -543,6 +600,10 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 	if m.closed.Load() {
 		return logdb.ErrClosed
 	}
+	if err := m.beginWrite(); err != nil {
+		return err
+	}
+	defer m.removalMu.RUnlock()
 
 	// A snapshot at index 0 is not a snapshot: index 0 is the empty log, so it
 	// covers nothing and can never be newer than what is stored. Storing it
@@ -606,7 +667,8 @@ func (m *MemDB) GetSnapshot(shardID uint64, replicaID uint64) (logdb.Snapshot, e
 	return nd.snapshot, nil
 }
 
-// RemoveNodeData removes all data for the given node.
+// RemoveNodeData removes all data for the given node and retires its replica
+// ID (NodeRemoved).
 func (m *MemDB) RemoveNodeData(shardID uint64, replicaID uint64) error {
 	if m.closed.Load() {
 		return logdb.ErrClosed
@@ -614,11 +676,37 @@ func (m *MemDB) RemoveNodeData(shardID uint64, replicaID uint64) error {
 
 	key := nodeKey{shardID: shardID, replicaID: replicaID}
 
+	// Exclusive against every writer (removalMu), so no write is half-applied
+	// across the removal.
+	m.removalMu.Lock()
+	defer m.removalMu.Unlock()
+	if m.closed.Load() {
+		return logdb.ErrClosed
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	delete(m.nodes, key)
+	m.removed[key] = struct{}{}
 	return nil
+}
+
+// NodeRemoved reports whether RemoveNodeData has removed the node, and so
+// retired its replica ID.
+func (m *MemDB) NodeRemoved(shardID uint64, replicaID uint64) (bool, error) {
+	if m.closed.Load() {
+		return false, logdb.ErrClosed
+	}
+	return m.retired(shardID, replicaID), nil
+}
+
+// retired reports whether RemoveNodeData retired the node. Every writer
+// refuses a retired node (logdb.ErrReplicaRetired).
+func (m *MemDB) retired(shardID, replicaID uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, removed := m.removed[nodeKey{shardID: shardID, replicaID: replicaID}]
+	return removed
 }
 
 // ListNodeInfo returns all NodeInfo entries in the LogDB.
@@ -645,6 +733,10 @@ func (m *MemDB) SaveBootstrap(shardID uint64, replicaID uint64, bootstrap logdb.
 	if m.closed.Load() {
 		return logdb.ErrClosed
 	}
+	if err := m.beginWrite(); err != nil {
+		return err
+	}
+	defer m.removalMu.RUnlock()
 
 	// A record stored by this version always carries an explicit DataDir, so
 	// mark it recorded regardless of what the caller passed: DataDirRecorded

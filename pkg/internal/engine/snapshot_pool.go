@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -196,6 +197,20 @@ type snapshotPool struct {
 
 	// metrics collects raft-level metrics. Nil when disabled.
 	metrics RaftMetrics
+
+	// scratchFS creates and unlinks the anonymous scratch file a recovery
+	// decrypts into. Nil means the real filesystem; tests substitute one to
+	// observe that the scratch name is gone before any plaintext is written.
+	scratchFS ScratchFS
+}
+
+// scratchFsys returns the filesystem the recovery decrypt scratch is created
+// on: the configured one, or the real filesystem.
+func (p *snapshotPool) scratchFsys() ScratchFS {
+	if p.scratchFS != nil {
+		return p.scratchFS
+	}
+	return osScratchFS{}
 }
 
 // Snapshot file constants. These mirror snapshot.dataFileName and
@@ -1569,7 +1584,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 			"error", recErr,
 		)
 	} else if gcErr := gcSnapshotDirs(node.SnapshotDir(), req.shardID, req.replicaID, recorded,
-		node.PinnedSnapshotDirs()...); gcErr != nil {
+		node.GCSparedSnapshotDirs()...); gcErr != nil {
 		slog.Warn("snapshot GC failed",
 			"shard_id", req.shardID,
 			"replica_id", req.replicaID,
@@ -1869,15 +1884,14 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	}
 
 	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
-	// is available, decrypt it to a throwaway scratch file in the replica's
-	// own snapshot directory and recover from that, leaving the canonical
-	// encrypted snapshot.dat untouched. Decrypting
+	// is available, decrypt it to an anonymous (already unlinked) scratch file
+	// in the replica's own snapshot directory and recover from that handle,
+	// leaving the canonical encrypted snapshot.dat untouched. Decrypting
 	// in place is NOT crash/retry-safe: if RecoverFromSnapshot then fails or the
 	// process crashes, snapshot.dat would be plaintext while LogDB still records
 	// Epoch>0, so every later recovery/restart would re-attempt decryption on
 	// plaintext and fail — permanently losing an otherwise-valid snapshot.
 	dataPath := filepath.Join(snapshotDir, snapshotDataFile)
-	recoverPath := dataPath
 
 	// CONSUMER 1 of 3: verify the artifact against the integrity fields in its
 	// snapshot.meta BEFORE anything reads it. The check is over the file as
@@ -1892,6 +1906,19 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	//
 	// Fails CLOSED. Falling back to an older snapshot directory is NOT the
 	// remedy: that would roll the replica backwards silently.
+	//
+	// A recorded directory whose snapshot.dat is gone is reported as
+	// ErrSnapshotArtifactMissing FIRST, before its snapshot.meta is consulted:
+	// a directory lost whole has no record either, and the missing artifact is
+	// the actionable fact (see the open below).
+	if _, statErr := os.Stat(dataPath); os.IsNotExist(statErr) {
+		return &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      false,
+			Err:       ErrSnapshotArtifactMissing,
+		}
+	}
 	if verifyErr := verifyRecoveryArtifact(snapshotDir, dataPath, logdbSnap); verifyErr != nil {
 		return &SnapshotError{
 			ShardID:   req.shardID,
@@ -1957,8 +1984,14 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 			Err:       ErrSnapshotEncryptedBarrierUnavailable,
 		}
 	}
+	// The plaintext is read back through the open handle: an encrypted
+	// artifact is decrypted into an anonymous scratch file, unlinked before
+	// the first plaintext byte is written, so no crash point leaves a named
+	// plaintext copy of the state machine on disk; a plaintext artifact is
+	// read in place.
+	var f SnapshotFile
 	if logdbSnap.Epoch > 0 {
-		plainPath, decryptErr := p.decryptSnapshotToScratch(
+		scratch, decryptErr := p.decryptSnapshotToAnonymousScratch(
 			node.ReplicaSnapshotDir(), dataPath, req.shardID, req.replicaID, artifactIndex, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
 			return &SnapshotError{
@@ -1968,51 +2001,42 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 				Err:       decryptErr,
 			}
 		}
-		recoverPath = plainPath
-		defer func() {
-			if rmErr := os.Remove(plainPath); rmErr != nil && !os.IsNotExist(rmErr) {
-				slog.Debug("snapshot: failed to remove decrypted scratch file",
-					"shard_id", req.shardID,
-					"replica_id", req.replicaID,
-					"path", plainPath,
-					"error", rmErr,
-				)
+		f = scratch
+	} else {
+		// The engine.Snapshotter interface accepts io.Reader, and *os.File
+		// satisfies io.Reader.
+		plain, err := os.Open(dataPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// M13: a LogDB-recorded snapshot whose artifact is gone is a
+				// FAILURE, not a no-op. Returning nil here clears the recovering
+				// gate without seeding lastApplied, which later fails the shard
+				// with ErrApplyGap or serves stale reads. Fail with a typed error
+				// so the leader's ack-expiry -> re-send -> dedup -> re-recovery
+				// path engages, matching the encrypted branch (which already fails
+				// on a missing artifact via SnapshotEncryptError{Op:"read"}).
+				return &SnapshotError{
+					ShardID:   req.shardID,
+					ReplicaID: req.replicaID,
+					Save:      false,
+					Err:       ErrSnapshotArtifactMissing,
+				}
 			}
-		}()
-	}
-
-	// Open the (plaintext) snapshot data file. The engine.Snapshotter interface
-	// accepts io.Reader, and *os.File satisfies io.Reader.
-	f, err := os.Open(recoverPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// M13: a LogDB-recorded snapshot whose artifact is gone is a
-			// FAILURE, not a no-op. Returning nil here clears the recovering
-			// gate without seeding lastApplied, which later fails the shard
-			// with ErrApplyGap or serves stale reads. Fail with a typed error
-			// so the leader's ack-expiry -> re-send -> dedup -> re-recovery
-			// path engages, matching the encrypted branch (which already fails
-			// on a missing artifact via SnapshotEncryptError{Op:"read"}).
 			return &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      false,
-				Err:       ErrSnapshotArtifactMissing,
+				Err:       err,
 			}
 		}
-		return &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      false,
-			Err:       err,
-		}
+		f = plain
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Debug("snapshot: file close failed during recovery",
 				"shard_id", req.shardID,
 				"replica_id", req.replicaID,
-				"path", recoverPath,
+				"path", dataPath,
 				"error", closeErr,
 			)
 		}
@@ -2108,52 +2132,103 @@ func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapsh
 	return logdbSnap, dir, dirIndex, nil
 }
 
-// decryptSnapshotToScratch reads the encrypted snapshot data file and writes
-// its decrypted plaintext to a NEW temp file in scratchDir, returning that
-// temp file's path. It does NOT modify or replace the source file: the
-// canonical encrypted snapshot.dat is left intact.
+// decryptSnapshotToAnonymousScratch decrypts the encrypted snapshot data file
+// at path into an ANONYMOUS scratch file in scratchDir and returns that file
+// open and rewound, for the caller to read the plaintext back through. It is
+// the recovery form: the scratch is unlinked before a byte of plaintext is
+// written into it, so a crash or power loss at any point — mid-decrypt, or
+// mid-RecoverFromSnapshot — leaves nothing readable on disk, and the caller's
+// Close is the whole cleanup. The canonical encrypted snapshot.dat is never
+// modified.
 //
-// scratchDir must be a directory the stale-scratch sweep covers: the
-// replica's own snapshot directory (ReplicaSnapshotDir), which StartShard
-// creates, or a save stage directory beneath it (the export's), which the
-// save removes and StartShard's stage sweep reclaims. Never the directory of
-// a path a record names, which may lie outside the replica's tree where
-// nothing reclaims a plaintext file a crash orphans.
-//
-// This is deliberately not an in-place transform. Decrypting in place (rename
-// plaintext over snapshot.dat) is not crash/retry-safe: a recovery failure or
-// a crash after the rename would leave plaintext on disk while LogDB still
-// records Epoch>0, so any subsequent recovery/restart would re-attempt
-// decryption on plaintext and fail permanently, losing an otherwise-valid
-// snapshot. The caller is responsible for removing the returned temp file once
-// recovery is done. Only one frame is held in memory at a time, so this is
-// safe for large snapshots.
+// scratchDir must be the replica's own snapshot directory
+// (ReplicaSnapshotDir), which the stale-scratch sweep covers: a scratch whose
+// unlink failed fails the recovery before anything is decrypted into it, and
+// an empty name that survives the removal that follows is left to the sweep.
+// Never the directory of a path a record names, which may lie outside the
+// replica's tree.
 //
 // The epoch parameter is advisory: each frame is decrypted with the epoch
-// embedded in its own ciphertext header (via barrier.DecryptWithContext), not
-// with this value. It is retained only for log context. The caller uses the
-// recorded epoch solely to decide whether decryption is needed at all
-// (Epoch>0).
+// embedded in its own ciphertext header, not with this value. It is retained
+// only for log context. The caller uses the recorded epoch solely to decide
+// whether decryption is needed at all (Epoch>0).
 //
 // shardID/replicaID/index identify the artifact and MUST be the identity the
 // frames were sealed under; together with the frame ordinal they reproduce the
 // positional context AAD (see NewSnapshotAAD). A mismatch fails authentication
 // and there is no weaker retry: an epoch-only fallback would readmit exactly
 // the frame-splicing this binding exists to prevent.
-func (p *snapshotPool) decryptSnapshotToScratch(scratchDir, path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (string, error) {
+func (p *snapshotPool) decryptSnapshotToAnonymousScratch(scratchDir, path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (SnapshotFile, error) {
 	srcFile, err := os.Open(path)
 	if err != nil {
-		return "", &SnapshotEncryptError{Op: "read", Err: err}
+		return nil, &SnapshotEncryptError{Op: "read", Err: err}
 	}
+	defer closeDecryptSource(srcFile, path, epoch)
+
+	tmpFile, err := CreateAnonymousScratch(p.scratchFsys(), scratchDir, RecoverDecryptTempPattern)
+	if err != nil {
+		return nil, &SnapshotEncryptError{Op: "create_temp", Err: err}
+	}
+	handedOff := false
 	defer func() {
-		if closeErr := srcFile.Close(); closeErr != nil {
-			slog.Debug("snapshot: source file close failed during decryption",
-				"path", path,
+		if handedOff {
+			return
+		}
+		if closeErr := tmpFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			slog.Debug("snapshot: decrypt scratch close failed during cleanup",
 				"epoch", epoch,
 				"error", closeErr,
 			)
 		}
 	}()
+
+	// See decryptSnapshotToScratch for what each frame is authenticated
+	// against.
+	if _, err := OpenSnapshotFrames(barrier, shardID, replicaID, index, srcFile, tmpFile); err != nil {
+		return nil, err
+	}
+	// No fsync: the file has no name, so nothing after a crash could read it
+	// back. The recovery reads it through this handle.
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return nil, &SnapshotEncryptError{Op: "seek", Err: err}
+	}
+	handedOff = true // ownership of the handle passes to the caller
+	return tmpFile, nil
+}
+
+// decryptSnapshotToScratch reads the encrypted snapshot data file and writes
+// its decrypted plaintext to a NEW, NAMED temp file in scratchDir, returning
+// that temp file's path. It does NOT modify or replace the source file: the
+// canonical encrypted snapshot.dat is left intact.
+//
+// Only the export backup uses the named form, because the export copy reads
+// its source by path and the artifact it writes is plaintext by contract.
+// Recovery must not: a named plaintext scratch survives a crash as a complete,
+// readable copy of the state machine. Recovery decrypts through
+// decryptSnapshotToAnonymousScratch.
+//
+// scratchDir must be a directory the stale-scratch sweep covers: the save
+// stage directory the export decrypts in, which the save removes and
+// StartShard's stage sweep reclaims. Never the directory of a path a record
+// names, which may lie outside the replica's tree where nothing reclaims a
+// plaintext file a crash orphans.
+//
+// This is deliberately not an in-place transform. Decrypting in place (rename
+// plaintext over snapshot.dat) is not crash/retry-safe: a failure or a crash
+// after the rename would leave plaintext on disk while LogDB still records
+// Epoch>0, so any subsequent recovery/restart would re-attempt decryption on
+// plaintext and fail permanently, losing an otherwise-valid snapshot. The
+// caller is responsible for removing the returned temp file. Only one frame is
+// held in memory at a time, so this is safe for large snapshots.
+//
+// The epoch and identity parameters are those of
+// decryptSnapshotToAnonymousScratch.
+func (p *snapshotPool) decryptSnapshotToScratch(scratchDir, path string, shardID, replicaID, index, epoch uint64, barrier SnapshotBarrier) (string, error) {
+	srcFile, err := os.Open(path)
+	if err != nil {
+		return "", &SnapshotEncryptError{Op: "read", Err: err}
+	}
+	defer closeDecryptSource(srcFile, path, epoch)
 
 	tmpFile, err := os.CreateTemp(scratchDir, RecoverDecryptTempPattern)
 	if err != nil {
@@ -2163,19 +2238,17 @@ func (p *snapshotPool) decryptSnapshotToScratch(scratchDir, path string, shardID
 	committed := false
 	defer func() {
 		if !committed {
-			if closeErr := tmpFile.Close(); closeErr != nil {
+			if closeErr := tmpFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
 				slog.Debug("snapshot: temp file close failed during decryption cleanup",
 					"path", tmpPath,
 					"epoch", epoch,
 					"error", closeErr,
 				)
 			}
-			if removeErr := os.Remove(tmpPath); removeErr != nil {
-				slog.Debug("snapshot: temp file remove failed during decryption cleanup",
-					"path", tmpPath,
-					"epoch", epoch,
-					"error", removeErr,
-				)
+			// The file may already hold plaintext, so a name left behind is
+			// warned and counted rather than debug-logged.
+			if removeErr := os.Remove(tmpPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				NoteScratchNotReclaimed(tmpPath, removeErr)
 			}
 		}
 	}()
@@ -2200,6 +2273,19 @@ func (p *snapshotPool) decryptSnapshotToScratch(scratchDir, path string, shardID
 	}
 	committed = true // ownership of tmpPath passes to the caller
 	return tmpPath, nil
+}
+
+// closeDecryptSource closes a decrypt's source ciphertext file. The ciphertext
+// is the canonical artifact and stays in place, so a failed close costs a
+// descriptor and nothing at rest; it is logged at debug.
+func closeDecryptSource(srcFile *os.File, path string, epoch uint64) {
+	if closeErr := srcFile.Close(); closeErr != nil {
+		slog.Debug("snapshot: source file close failed during decryption",
+			"path", path,
+			"epoch", epoch,
+			"error", closeErr,
+		)
+	}
 }
 
 // snapshotFloorBlocker names one snapshot directory that could not be
@@ -2793,8 +2879,10 @@ const (
 	SendDecryptTempPrefix = ".send-decrypt-"
 
 	// RecvEncryptTempPrefix marks the scratch file an in-place re-encryption of
-	// a just-received or just-imported artifact writes its output to
-	// (quicraft.reencryptReceivedSnapshot). Holds CIPHERTEXT.
+	// a just-received or just-imported artifact wrote its output to. Both now
+	// seal the artifact as it streams in and write no such file; the prefix
+	// stays in the sweep so an orphan an earlier build left is still
+	// reclaimed. Holds CIPHERTEXT.
 	RecvEncryptTempPrefix = ".recv-encrypt-"
 
 	// ReencryptTempPrefix marks the scratch file a barrier-to-barrier snapshot
@@ -3194,9 +3282,9 @@ func noteStaleDecryptSweepFailure(path, op string, err error) {
 	)
 }
 
-// NoteScratchNotReclaimed records a decrypt scratch file outside this package
-// — the host's snapshot send — that could not be unlinked, on the same
-// counter and log as a failed sweep.
+// NoteScratchNotReclaimed records a decrypt scratch file that could not be
+// unlinked — by CreateAnonymousScratch, for this package's recovery and the
+// host's recovery and send — on the same counter and log as a failed sweep.
 func NoteScratchNotReclaimed(path string, err error) {
 	noteStaleDecryptSweepFailure(path, "remove", err)
 }
@@ -3322,18 +3410,17 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	// after the data file has been written, encrypted and fsynced, so the
 	// bytes hashed here are exactly the bytes every consumer will later read.
 	//
-	// A hash error is NOT fatal to the save: the artifact itself is already
-	// durable and correct, and refusing to record a snapshot because it could
-	// not be re-read would turn a transient read fault into a lost snapshot.
-	// The record is written without the fields, which makes the artifact
-	// recover without an integrity check rather than fail one.
-	var dataLen, dataHash uint64
-	if sum, size, hashErr := hashSnapshotData(filepath.Join(dir, snapshotDataFile)); hashErr == nil {
-		dataHash, dataLen = sum, size
-	} else {
-		slog.Warn("snapshot: could not hash the data file; recording metadata "+
-			"without an integrity check",
-			"dir", dir, "shard_id", shardID, "replica_id", replicaID, "error", hashErr)
+	// A hash error FAILS the save, before anything is written here. The
+	// encoder always emits the integrity fields, so there is no "record
+	// without them": a zero hash would be recorded as fact, the snapshot would
+	// be recorded in LogDB and the log below it compacted, and every later
+	// recovery would refuse the artifact — a single-replica shard would be left
+	// with nothing to recover from. dir is still an unpublished stage at this
+	// point, so failing here leaves no recorded artifact and compacts nothing;
+	// the next save retries.
+	dataHash, dataLen, err := stampSnapshotHash(filepath.Join(dir, snapshotDataFile))
+	if err != nil {
+		return err
 	}
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -3482,17 +3569,27 @@ func (p *snapshotPool) exportSnapshotBackup(saveDir, exportPath string, barrier 
 	}
 	defer func() {
 		if rmErr := os.Remove(plainPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			slog.Debug("snapshot export: decrypted scratch remove failed",
-				"path", plainPath,
-				"error", rmErr,
-			)
+			NoteScratchNotReclaimed(plainPath, rmErr)
 		}
 	}()
 	// The exported artifact is plaintext, so its meta must say Epoch 0. Every
 	// other field describes the same snapshot (Compression is preserved: decrypt
 	// removes the encryption layer but not the compression layer beneath it).
+	//
+	// The integrity fields are stamped over the DECRYPTED bytes, which are the
+	// bytes the export holds; the canonical record's fields describe the
+	// ciphertext and would fail every verification of the export. A stamp
+	// failure fails the export, exactly as it fails a save.
 	exportMeta := meta
 	exportMeta.Epoch = 0
+	sum, size, hashErr := stampSnapshotHash(plainPath)
+	if hashErr != nil {
+		return &SnapshotExportError{
+			ExportPath: filepath.Clean(exportPath),
+			Err:        hashErr,
+		}
+	}
+	exportMeta.DataHash, exportMeta.DataLen = sum, size
 	return writeSnapshotExport(plainPath, exportPath, MarshalSnapshotMeta(exportMeta))
 }
 
@@ -3501,42 +3598,68 @@ func (p *snapshotPool) exportSnapshotBackup(saveDir, exportPath string, barrier 
 // verbatim. The data file is copied (not moved) so the internal snapshot
 // directory remains intact for log compaction and follower catch-up.
 //
+// The source snapshot.meta is REQUIRED: the documented snapshot-directory
+// format is the pair, and an export without its record cannot be verified by
+// anything that later reads it. The save path wrote and fsynced it moments
+// ago, so a failure to read it back fails the export.
+//
 // Callers that may hold an ENCRYPTED artifact must use exportSnapshotBackup,
 // which decrypts first; this function copies bytes as-is and would otherwise
 // emit ciphertext into an unscanned directory.
 func exportSnapshotToPath(saveDir, exportPath string) error {
 	srcDataPath := filepath.Join(saveDir, snapshotDataFile)
-	var metaBytes []byte
-	if b, readErr := os.ReadFile(filepath.Join(saveDir, snapshotMetadataFile)); readErr == nil {
-		metaBytes = b
+	metaBytes, readErr := readBoundedSnapshotMeta(filepath.Join(saveDir, snapshotMetadataFile))
+	if readErr != nil {
+		return &SnapshotExportError{
+			ExportPath: filepath.Clean(exportPath),
+			Err:        readErr,
+		}
 	}
 	return writeSnapshotExport(srcDataPath, exportPath, metaBytes)
 }
 
-// writeSnapshotExport copies srcDataPath into exportPath/snapshot.dat and, when
-// metaBytes is non-nil, writes it as exportPath/snapshot.meta, then fsyncs the
-// export directory so both entries survive a crash. The export directory is
-// created with 0750 permissions if it does not exist. A metadata write failure
-// is non-fatal — the data file is the artifact — while every other step fails
-// the export. It is the single copy path shared by the plaintext export and the
-// decrypt-then-export backup so neither can drift from the other.
+// exportTempPattern is the os.CreateTemp pattern each exported file is staged
+// under before it is renamed onto its final name in the export directory.
+const exportTempPattern = ".snapshot-export-*.tmp"
+
+// writeSnapshotExport copies srcDataPath into exportPath/snapshot.dat and
+// writes metaBytes as exportPath/snapshot.meta. The export directory is
+// created with 0750 permissions if it does not exist. It is the single copy
+// path shared by the plaintext export and the decrypt-then-export backup so
+// neither can drift from the other.
+//
+// Both files are REQUIRED and every step fails the export: a snapshot
+// directory is the pair (docs/snapshots/architecture.md), and an export that
+// reported success with its record absent or not yet durable is a backup that
+// no verifier can vouch for. Each file is written the documented atomic way —
+// a temp file in the export directory, fsynced and closed, then renamed onto
+// its final name — and the directory is fsynced last, together with every
+// directory the MkdirAll created and the pre-existing ancestor's entry for the
+// first of them, so a new export directory survives a crash too. Both temps are
+// fully durable before either is renamed, so a failure while writing leaves any
+// previous export in place untouched. publishSnapshotExport renames them into
+// place without ever exposing a mixed pair, and restores a previous export on
+// any failure.
 func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error {
 	// Clean the export path to prevent directory traversal. The public
 	// SnapshotOption.Validate() already ensures it is an absolute path.
 	exportPath = filepath.Clean(exportPath)
+	fail := func(err error) error {
+		return &SnapshotExportError{ExportPath: exportPath, Err: err}
+	}
+	if len(metaBytes) == 0 {
+		return fail(ErrSnapshotMetaCorrupt)
+	}
+	// Recorded BEFORE the MkdirAll: the final fsync covers every directory
+	// it creates and no directory above them.
+	syncRoot := DeepestExistingAncestor(exportPath)
 	if err := os.MkdirAll(exportPath, 0o750); err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
-		}
+		return fail(err)
 	}
 
 	src, err := os.Open(srcDataPath)
 	if err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
-		}
+		return fail(err)
 	}
 	defer func() {
 		if closeErr := src.Close(); closeErr != nil {
@@ -3547,75 +3670,298 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 		}
 	}()
 
-	dstPath := filepath.Join(exportPath, snapshotDataFile)
-	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
-		}
-	}
-	// dstClosed marks the sync-then-close sequence below as already run so the
-	// cleanup defer does not double-close. dst is a WRITE handle, so its Close
-	// is where a deferred writeback error surfaces; the old Debug-only defer
-	// dropped it while io.Copy, Sync and SyncDir errors all failed the export,
-	// which meant a truncated backup could be reported as a successful one.
-	dstClosed := false
+	// Every staged temp not renamed onto its final name is removed on the way
+	// out, so a failed export leaves no half-written file behind. One that
+	// publication already renamed is simply gone.
+	var pending []string
 	defer func() {
-		if dstClosed {
-			return
-		}
-		if closeErr := dst.Close(); closeErr != nil {
-			slog.Debug("snapshot export: destination file close failed after write error",
-				"path", dstPath,
-				"error", closeErr,
-			)
+		for _, tmp := range pending {
+			if rmErr := os.Remove(tmp); rmErr != nil && !os.IsNotExist(rmErr) {
+				slog.Warn("snapshot export: failed to remove a staged temp file",
+					"path", tmp,
+					"error", rmErr,
+				)
+			}
 		}
 	}()
 
-	if _, err := io.Copy(dst, src); err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
-		}
+	dataTmp, err := writeExportTemp(exportPath, src)
+	if dataTmp != "" {
+		pending = append(pending, dataTmp)
+	}
+	if err != nil {
+		return fail(err)
+	}
+	metaTmp, err := writeExportTemp(exportPath, bytes.NewReader(metaBytes))
+	if metaTmp != "" {
+		pending = append(pending, metaTmp)
+	}
+	if err != nil {
+		return fail(err)
 	}
 
-	if err := dst.Sync(); err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
+	if err := publishSnapshotExport(exportPath, dataTmp, metaTmp, syncRoot); err != nil {
+		return fail(err)
+	}
+	pending = nil
+	return nil
+}
+
+// exportBackupPattern is the os.MkdirTemp pattern of the directory, inside the
+// export directory, that a previous export's pair is moved into while a new
+// pair is published over it.
+const exportBackupPattern = ".snapshot-export-prev-*"
+
+// exportRename and exportSyncDir are the rename and the directory fsync the
+// export's publication performs. They are variables solely so tests can fail
+// a chosen step and observe which directories are fsynced: a rename refused
+// between the two halves of a pair, or a directory entry lost to a power
+// failure, cannot be produced on demand against a real filesystem — and
+// unprivileged tricks that refuse a rename do not refuse it for root, which is
+// how the suite runs in a CI container.
+//
+// Production code must never assign to them.
+var (
+	exportRename  = os.Rename
+	exportSyncDir = SyncDir
+)
+
+// publishSnapshotExport renames the staged dataTmp and metaTmp onto
+// exportPath's snapshot.dat and snapshot.meta — data first, then the record
+// that vouches for it — and makes the result durable: the export directory
+// and every ancestor up to and including syncRoot, the deepest one that
+// existed before the export created any, are fsynced.
+//
+// Publication is failure-safe over a previous export. Its pair is first moved
+// aside into a new backup directory (exportBackupPattern) inside exportPath,
+// and both directories are fsynced BEFORE the new snapshot.dat is renamed into
+// place, so no crash can surface the new data beside the old record. On any
+// failure until the new pair is durable, the previous pair is renamed back and
+// a newly published file it had no counterpart for is removed, so a failed
+// export leaves the directory as it found it. The backup is removed only after
+// the new pair and the directory fsyncs succeed.
+//
+// A crash leaves one of these states, each either a complete pair or one every
+// verifier (VerifySnapshotArtifact, and ImportSnapshot through it) refuses:
+//
+//   - before the move aside, or once the new pair is published: the complete
+//     old or the complete new pair (the backup directory may remain beside
+//     the new pair, until the next successful export sweeps it —
+//     sweepExportOrphans);
+//   - part or all of the old pair moved aside, or the new snapshot.dat
+//     published without its record: no snapshot.meta, refused as
+//     *SnapshotMetaInvalidError — or no pair at all;
+//   - mid-restore after a failure: halves of the old and the new pair, whose
+//     recorded DataLen/DataHash disagree with the data beside it, refused as
+//     a hash mismatch. (Halves of two exports of identical data agree, and the
+//     record is then true of the data.)
+//
+// In every state before the new pair is complete, the complete previous pair
+// survives across exportPath and the backup directory, from which an operator
+// can restore it.
+func publishSnapshotExport(exportPath, dataTmp, metaTmp, syncRoot string) (err error) {
+	backup, err := stashPreviousExport(exportPath)
+	if err != nil {
+		return err
+	}
+	var published []string
+	defer func() {
+		if err != nil {
+			backup.restore(exportPath, published)
+			return
+		}
+		backup.discard()
+		sweepExportOrphans(exportPath)
+	}()
+
+	if err = exportRename(dataTmp, filepath.Join(exportPath, snapshotDataFile)); err != nil {
+		return err
+	}
+	published = append(published, snapshotDataFile)
+	if err = exportRename(metaTmp, filepath.Join(exportPath, snapshotMetadataFile)); err != nil {
+		return err
+	}
+	published = append(published, snapshotMetadataFile)
+
+	// Fsync the export directory so both renames survive a crash, then every
+	// directory the export created, so the export directory itself does.
+	return SyncDirChainWith(exportSyncDir, exportPath, syncRoot)
+}
+
+// sweepExportOrphans removes every backup directory (exportBackupPattern) and
+// staged temp file (exportTempPattern) left in exportPath by an export that
+// crashed part-way. It runs once a new pair is published and durable, which
+// supersedes whatever such an export was writing or preserving: a crash
+// orphan holds an obsolete snapshot — PLAINTEXT, when it came from a
+// decrypted export — that nothing else ever removes, since discard and the
+// temp cleanup only know their own export's names. Exports into one
+// directory are not run concurrently, so every such entry is an orphan.
+//
+// The removals are made durable with an fsync of exportPath, so a power loss
+// after the export returns cannot bring a removed plaintext leftover back. A
+// removal or fsync that fails is warned and left: the export itself has
+// succeeded, and the next successful export sweeps again.
+func sweepExportOrphans(exportPath string) {
+	removed := false
+	for _, pattern := range []string{exportBackupPattern, exportTempPattern} {
+		matches, err := filepath.Glob(filepath.Join(exportPath, pattern))
+		if err != nil {
+			continue // only ErrBadPattern, and both patterns are constants
+		}
+		for _, orphan := range matches {
+			if rmErr := os.RemoveAll(orphan); rmErr != nil {
+				slog.Warn("snapshot export: failed to remove a crashed export's leftover",
+					"path", orphan,
+					"error", rmErr,
+				)
+				continue
+			}
+			removed = true
 		}
 	}
+	if !removed {
+		return
+	}
+	if err := exportSyncDir(exportPath); err != nil {
+		slog.Warn("snapshot export: removing a crashed export's leftovers is not durable",
+			"path", exportPath,
+			"error", err,
+		)
+	}
+}
 
-	dstClosed = true
-	if err := dst.Close(); err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
+// exportBackup is a previous export's pair, moved aside while a new one is
+// published. Its zero value is an empty backup: there was nothing to move.
+type exportBackup struct {
+	dir   string
+	moved []string
+}
+
+// stashPreviousExport moves the regular snapshot.meta and snapshot.dat found
+// in exportPath — the record first, so the data is never left beside a
+// record that is not its own — into a new backup directory, and fsyncs both
+// directories so the move is durable before anything replaces them. A
+// non-regular entry under either name is not a previous export: it is left
+// in place, and the rename onto it fails the publication. A failure restores
+// whatever was already moved.
+func stashPreviousExport(exportPath string) (*exportBackup, error) {
+	var present []string
+	for _, name := range []string{snapshotMetadataFile, snapshotDataFile} {
+		info, err := os.Lstat(filepath.Join(exportPath, name))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if info.Mode().IsRegular() {
+			present = append(present, name)
 		}
 	}
+	b := &exportBackup{}
+	if len(present) == 0 {
+		return b, nil
+	}
+	dir, err := os.MkdirTemp(exportPath, exportBackupPattern)
+	if err != nil {
+		return nil, err
+	}
+	b.dir = dir
+	for _, name := range present {
+		if err := exportRename(filepath.Join(exportPath, name), filepath.Join(dir, name)); err != nil {
+			b.restore(exportPath, nil)
+			return nil, err
+		}
+		b.moved = append(b.moved, name)
+	}
+	for _, d := range []string{dir, exportPath} {
+		if err := exportSyncDir(d); err != nil {
+			b.restore(exportPath, nil)
+			return nil, err
+		}
+	}
+	return b, nil
+}
 
-	// Write the metadata beside it for completeness.
-	if metaBytes != nil {
-		dstMetaPath := filepath.Join(exportPath, snapshotMetadataFile)
-		if writeErr := os.WriteFile(dstMetaPath, metaBytes, 0o600); writeErr != nil { // #nosec G703 -- exportPath is filepath.Clean'd and validated as absolute
-			slog.Warn("snapshot export: metadata copy failed",
-				"path", dstMetaPath,
-				"error", writeErr,
+// restore undoes a failed publication: every moved file is renamed back over
+// whatever now holds its name, and every file in published with no moved
+// counterpart is removed. A restore that cannot finish is warned, and leaves
+// the rest of the previous pair in the backup directory rather than delete it.
+func (b *exportBackup) restore(exportPath string, published []string) {
+	var firstErr error
+	for _, name := range []string{snapshotDataFile, snapshotMetadataFile} {
+		dst := filepath.Join(exportPath, name)
+		var err error
+		switch {
+		case slices.Contains(b.moved, name):
+			err = exportRename(filepath.Join(b.dir, name), dst)
+		case slices.Contains(published, name):
+			if err = os.Remove(dst); os.IsNotExist(err) {
+				err = nil
+			}
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if b.dir == "" && len(published) == 0 {
+		return
+	}
+	if err := exportSyncDir(exportPath); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if firstErr != nil {
+		slog.Warn("snapshot export: the previous export could not be restored after a failed publish",
+			"path", exportPath,
+			"backup", b.dir,
+			"error", firstErr,
+		)
+		return
+	}
+	if b.dir != "" {
+		if err := os.Remove(b.dir); err != nil {
+			slog.Warn("snapshot export: failed to remove the emptied backup directory",
+				"path", b.dir,
+				"error", err,
 			)
 		}
 	}
+}
 
-	// Fsync the export directory so the exported files' directory entries
-	// survive a crash.
-	if err := SyncDir(exportPath); err != nil {
-		return &SnapshotExportError{
-			ExportPath: exportPath,
-			Err:        err,
-		}
+// discard removes the backup once the new pair is durable. A backup that
+// cannot be removed is warned: it holds the previous export's plaintext.
+func (b *exportBackup) discard() {
+	if b.dir == "" {
+		return
 	}
+	if err := os.RemoveAll(b.dir); err != nil {
+		slog.Warn("snapshot export: failed to remove the previous export's backup",
+			"path", b.dir,
+			"error", err,
+		)
+	}
+}
 
-	return nil
+// writeExportTemp copies r into a new temp file in dir, fsyncs and closes it,
+// and returns its path. The path is returned whenever the file was created,
+// even on error, so the caller can remove it. dst is a WRITE handle, so its
+// Close is where a deferred writeback error surfaces, and it is reported like
+// the copy and the fsync: a truncated file must never be renamed into place as
+// a successful export.
+func writeExportTemp(dir string, r io.Reader) (string, error) {
+	dst, err := os.CreateTemp(dir, exportTempPattern)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr := io.Copy(dst, r)
+	if writeErr == nil {
+		writeErr = dst.Sync()
+	}
+	closeErr := dst.Close()
+	if writeErr != nil {
+		return dst.Name(), writeErr
+	}
+	return dst.Name(), closeErr
 }
 
 // GCSnapshotDirs reclaims a shard's superseded snapshot directories, keeping
@@ -3645,8 +3991,8 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 // unusable higher-indexed directory (a partial receive left by a crash) can
 // push the recorded one into the removal window, and deleting it leaves the
 // LogDB record pointing at nothing. spare lists further cleaned directories
-// that must not be removed — those a recovery is reading
-// (Node.PinnedSnapshotDirs).
+// that must not be removed — those a recovery is reading or a receive has
+// published and not yet settled (Node.GCSparedSnapshotDirs).
 func GCSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string, spare ...string) error {
 	return gcSnapshotDirs(baseDir, shardID, replicaID, recorded, spare...)
 }
@@ -3682,6 +4028,8 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string, 
 		// Likewise a directory a recovery is reading (Node.PinSnapshotDir):
 		// it chose the recorded snapshot of its moment, and a newer record
 		// landing since does not make that artifact safe to delete under it.
+		// And one a receive has published but raft has not yet adopted
+		// (Node.ClaimSnapshotDir): it is unrecorded only until the verdict.
 		if slices.Contains(spare, filepath.Clean(d.path)) {
 			continue
 		}

@@ -47,9 +47,10 @@ func protoEntryToLogDB(e *proto.Entry) logdb.Entry {
 // protoStateToLogDB converts a proto.State to a logdb.State.
 func protoStateToLogDB(s *proto.State) logdb.State {
 	return logdb.State{
-		Term:   s.Term,
-		Vote:   s.Vote,
-		Commit: s.Commit,
+		Term:       s.Term,
+		Vote:       s.Vote,
+		Commit:     s.Commit,
+		VoteWindow: s.VoteWindow,
 	}
 }
 

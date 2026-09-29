@@ -280,7 +280,7 @@ func TestAuthorizationCloseReasonIsNotDisclosedToPeer(t *testing.T) {
 
 		// t1 dials t2 and is the side that will publish the revocation, so the
 		// peer-visible close is read from t2's INBOUND connection.
-		outbound, err := t1.getConnection(t2.Addr().String())
+		outbound, err := t1.getConnection(t2.Addr().String(), "")
 		if err != nil {
 			t.Fatalf("getConnection: %v", err)
 		}
@@ -314,7 +314,7 @@ func TestAuthorizationCloseReasonIsNotDisclosedToPeer(t *testing.T) {
 		awaitInboundConn(t, receiver)
 
 		// The peer-visible side is the SENDER's outbound connection.
-		outbound, err := sender.getConnection(receiver.Addr().String())
+		outbound, err := sender.getConnection(receiver.Addr().String(), "")
 		if err != nil {
 			t.Fatalf("getConnection: %v", err)
 		}

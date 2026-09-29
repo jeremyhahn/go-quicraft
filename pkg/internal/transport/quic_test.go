@@ -16,7 +16,10 @@ package transport
 
 import (
 	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -89,6 +92,9 @@ func (h *testHandler) HandleMessage(batch proto.MessageBatch, _ PeerAuth) error 
 	}
 	return nil
 }
+
+// AuthorizeSnapshot admits every transfer: this fake exercises the paths after admission.
+func (*testHandler) AuthorizeSnapshot(uint64, uint64, uint64, uint64, PeerAuth) error { return nil }
 
 func (h *testHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ PeerAuth) error {
 	if h.snapshotErr != nil {
@@ -1797,7 +1803,7 @@ func TestSendBatch_MarshalError(t *testing.T) {
 
 	// Sending to an unreachable target exercises the error paths.
 	// The marshal will succeed but getStream will fail.
-	tr.sendBatch("127.0.0.1:1", []proto.Message{
+	tr.sendBatch("127.0.0.1:1", "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
 	// Should not panic.
@@ -1812,7 +1818,7 @@ func TestSendBatch_EmptyMessages(t *testing.T) {
 	target := t2.Addr().String()
 
 	// sendBatch with empty messages should handle gracefully.
-	t1.sendBatch(target, []proto.Message{})
+	t1.sendBatch(target, "", []proto.Message{})
 	// Should not panic.
 }
 
@@ -1837,7 +1843,7 @@ func TestSendBatch_GetStreamError(t *testing.T) {
 	defer tr.Stop()
 
 	// Target that cannot be connected to.
-	tr.sendBatch("127.0.0.1:1", []proto.Message{
+	tr.sendBatch("127.0.0.1:1", "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
 	// Should not panic, message is silently dropped.
@@ -4895,7 +4901,7 @@ func TestSendSnapshot_OpenStreamSyncErrorViaShutdownCancel(t *testing.T) {
 	reg1.Register(1, 2, t2Addr)
 
 	// Establish a connection first so getConnection succeeds.
-	_, dialErr := t1.getConnection(t2Addr)
+	_, dialErr := t1.getConnection(t2Addr, "")
 	if dialErr != nil {
 		t.Fatalf("getConnection failed: %v", dialErr)
 	}
@@ -4969,7 +4975,7 @@ func TestSendSnapshotStreaming_OpenStreamSyncErrorViaShutdown(t *testing.T) {
 	reg1.Register(1, 2, t2Addr)
 
 	// Establish connection first.
-	_, dialErr := t1.getConnection(t2Addr)
+	_, dialErr := t1.getConnection(t2Addr, "")
 	if dialErr != nil {
 		t.Fatalf("getConnection failed: %v", dialErr)
 	}
@@ -5602,5 +5608,315 @@ func TestSend_UnresolvedTargetCountsDrop(t *testing.T) {
 	}
 	if got[0].shardID != 5 || got[0].to != 3 || got[0].reason != dropReasonUnresolvedTarget {
 		t.Fatalf("drop = %+v, want shard 5 to 3 reason %q", got[0], dropReasonUnresolvedTarget)
+	}
+}
+
+// peerLeafIdentity returns the node identity tr presents to peers.
+func peerLeafIdentity(t *testing.T, tr *QUICTransport) string {
+	t.Helper()
+	block, _ := pem.Decode(tr.cfg.MTLSConfig.Cert)
+	if block == nil {
+		t.Fatal("no certificate PEM block")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+	return NodeIdentityFromCertificate(leaf)
+}
+
+// replicaIdentities is a mutable Config.ReplicaIdentity for tests.
+type replicaIdentities struct {
+	mu  sync.Mutex
+	ids map[[2]uint64]string
+}
+
+func (r *replicaIdentities) set(shardID, replicaID uint64, id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ids == nil {
+		r.ids = make(map[[2]uint64]string)
+	}
+	r.ids[[2]uint64{shardID, replicaID}] = id
+}
+
+func (r *replicaIdentities) get(shardID, replicaID uint64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ids[[2]uint64{shardID, replicaID}]
+}
+
+// strangerIdentity is an identity no test transport presents.
+const strangerIdentity = "spki:0000000000000000000000000000000000000000000000000000000000000000"
+
+// TestGetConnection_DialsOnlyTheWantedIdentity: a connection is taken for a
+// specific destination identity. A dial is kept only when the peer presents
+// exactly that identity — the TLS handshake proves no more than a cluster
+// certificate whose SAN covers the host — and a refusal is remembered, so an
+// immediate retry costs no second handshake.
+func TestGetConnection_DialsOnlyTheWantedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		want   func(real string) string
+		wantOK bool
+	}{
+		{"the peer's own identity", func(real string) string { return real }, true},
+		{"another identity", func(string) string { return strangerIdentity }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := &replicaIdentities{}
+			var failedDials atomic.Int64
+			t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), newTestHandler(), func(c *Config) {
+				c.ReplicaIdentity = ids.get
+				c.EventListener = &config.EventListener{
+					OnConnectionFailed: func(config.ConnectionInfo) { failedDials.Add(1) },
+				}
+			})
+			defer cleanup()
+			want := tc.want(peerLeafIdentity(t, t2))
+
+			conn, err := t1.getConnection(t2.Addr().String(), want)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("dial to the wanted identity failed: %v", err)
+				}
+				return
+			}
+			var refused *DialIdentityError
+			if !errors.As(err, &refused) {
+				t.Fatalf("getConnection error = %v (connection returned: %t), want a DialIdentityError", err, conn != nil)
+			}
+			if t1.ConnectionCount() != 0 {
+				t.Fatal("a refused connection was pooled for reuse")
+			}
+			if _, again := t1.getConnection(t2.Addr().String(), want); !errors.As(again, &refused) {
+				t.Fatalf("immediate re-dial = %v, want the remembered refusal", again)
+			}
+			if n := failedDials.Load(); n != 1 {
+				t.Fatalf("%d refused dials for two attempts inside the cooldown, want 1", n)
+			}
+		})
+	}
+}
+
+// TestSend_AMovedRouteNeitherReceivesNorChurnsAnotherReplicasTraffic: a member
+// of another shard has moved its own route onto a victim replica's address and
+// holds the connection there. The victim's messages are dropped rather than
+// written to it — and rather than re-dialed, which would let the member churn
+// the connection — while the member's own traffic flows.
+func TestSend_AMovedRouteNeitherReceivesNorChurnsAnotherReplicasTraffic(t *testing.T) {
+	ids := &replicaIdentities{}
+	rec := &dropRecorder{}
+	handler2 := newTestHandler()
+	var established atomic.Int64
+	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), handler2, func(c *Config) {
+		c.ReplicaIdentity = ids.get
+		c.EventListener = &config.EventListener{
+			OnConnectionEstablished: func(config.ConnectionInfo) { established.Add(1) },
+		}
+	})
+	defer cleanup()
+	t1.metrics = rec
+	member := peerLeafIdentity(t, t2)
+	addr := t2.Addr().String()
+
+	ids.set(1, 2, strangerIdentity) // the victim, bound to another node's key
+	ids.set(7, 9, member)           // the member that moved its route here
+	t1.reg.Register(7, 9, addr)
+	if _, err := t1.getConnection(addr, member); err != nil {
+		t.Fatalf("member dial: %v", err)
+	}
+
+	// The heartbeat stream is shared by every shard and pre-opened on the
+	// member's connection, so the victim's heartbeat would find a pooled
+	// stream to it without the identity check on pooled streams.
+	pollUntil(t, 5*time.Second, 10*time.Millisecond, "the member's heartbeat stream was not pre-opened",
+		func() bool { _, ok := t1.cachedStream(addr, 7, true, member); return ok })
+	for range 3 {
+		t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+		t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1}})
+	}
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 7, From: 1, To: 9, Term: 1}})
+	waitForBatchCount(t, handler2, 1, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // let any stray victim frame land
+
+	for _, b := range handler2.getBatches() {
+		for _, m := range b.Requests {
+			if m.ShardID == 1 {
+				t.Fatal("the victim replica's message was written to the member holding its address")
+			}
+		}
+	}
+	if _, ok := rec.firstDropWithReason(dropReasonIdentityMismatch); !ok {
+		t.Fatal("the victim's messages were not counted as identity_mismatch drops")
+	}
+	// t1's listener counts only t1's own dials: one, the member's.
+	if n := established.Load(); n != 1 || t1.ConnectionCount() != 1 {
+		t.Fatalf("the member's connection was churned: %d dials established, %d pooled, want 1 and 1",
+			n, t1.ConnectionCount())
+	}
+}
+
+// TestSend_EachMessageIsPinnedToItsDestination: connections are keyed by
+// address and shared by every replica the registry routes there, and address
+// learning lets a member of ANY shard point its own route at another replica's
+// address. A dial-time check of the peer against every identity routed there
+// then accepted that member for the other replica's traffic. Each message is
+// held to its own destination: the member receives its own shard's traffic
+// and none of the victim's.
+func TestSend_EachMessageIsPinnedToItsDestination(t *testing.T) {
+	ids := &replicaIdentities{}
+	rec := &dropRecorder{}
+	handler2 := newTestHandler()
+	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), handler2, func(c *Config) {
+		c.ReplicaIdentity = ids.get
+	})
+	defer cleanup()
+	t1.metrics = rec
+	peer := peerLeafIdentity(t, t2)
+
+	// Shard 1's replica 2 (the victim) is bound to another node's identity;
+	// shard 7's replica 9 (the member that moved its route) is the peer that
+	// answers at the address. Both routes point at t2.
+	ids.set(1, 2, strangerIdentity)
+	ids.set(7, 9, peer)
+	t1.reg.Register(7, 9, t2.Addr().String())
+
+	t1.Send([]proto.Message{
+		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+		{Type: proto.Replicate, ShardID: 7, From: 1, To: 9, Term: 1},
+	})
+
+	waitForBatchCount(t, handler2, 1, 5*time.Second)
+	for _, b := range handler2.getBatches() {
+		for _, m := range b.Requests {
+			if m.ShardID == 1 {
+				t.Fatal("the victim replica's message was written to a peer bound to another replica")
+			}
+		}
+	}
+	if d, ok := rec.firstDropWithReason(dropReasonIdentityMismatch); !ok || d.shardID != 1 || d.to != 2 {
+		t.Fatalf("identity-mismatch drop = %+v (recorded: %t), want shard 1 to 2", d, ok)
+	}
+}
+
+// TestSend_ClosesAConnectionWhosePeerIsNoLongerBound: the pin was checked only
+// at dial time, so a connection cached before membership rebound a replica to
+// a new keypair at the same address kept carrying that replica's traffic to
+// the old key's holder. A send whose destination the peer no longer is drops
+// the message and, when the peer is bound to no replica at the address any
+// more, closes the connection so the next send dials whoever is bound now.
+func TestSend_ClosesAConnectionWhosePeerIsNoLongerBound(t *testing.T) {
+	ids := &replicaIdentities{}
+	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), newTestHandler(), func(c *Config) {
+		c.ReplicaIdentity = ids.get
+	})
+	defer cleanup()
+	ids.set(1, 2, peerLeafIdentity(t, t2))
+	if _, err := t1.getConnection(t2.Addr().String(), peerLeafIdentity(t, t2)); err != nil {
+		t.Fatalf("initial dial: %v", err)
+	}
+
+	ids.set(1, 2, strangerIdentity) // rebound to a new keypair at the same address
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
+
+	pollUntil(t, 5*time.Second, 10*time.Millisecond,
+		"the connection to a peer no longer bound at the address was not closed",
+		func() bool { return t1.ConnectionCount() == 0 })
+}
+
+// TestSnapshotSends_ArePinnedToTheDestination: a snapshot is the whole state
+// machine. Both send paths take their connection for the destination
+// replica's bound identity, so a snapshot for a replica whose address another
+// peer answers — or that nothing binds — is refused, not streamed.
+func TestSnapshotSends_ArePinnedToTheDestination(t *testing.T) {
+	for _, bind := range []string{strangerIdentity, ""} {
+		t.Run(fmt.Sprintf("bound=%q", bind), func(t *testing.T) {
+			ids := &replicaIdentities{}
+			handler2 := newTestHandler()
+			t1, _, cleanup := transportPairWith(t, 1, newTestHandler(), handler2, func(c *Config) {
+				c.ReplicaIdentity = ids.get
+			})
+			defer cleanup()
+			if bind != "" {
+				ids.set(1, 2, bind)
+			}
+
+			var refused *DialIdentityError
+			meta := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 100, Term: 1, ChunkCount: 1, From: 1}
+			err := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
+				return emit(proto.SnapshotChunk{ShardID: 1, ReplicaID: 2, From: 1, Index: 100, Term: 1, ChunkCount: 1})
+			})
+			if !errors.As(err, &refused) {
+				t.Fatalf("SendSnapshotStreaming = %v, want a DialIdentityError", err)
+			}
+			err = t1.SendSnapshot([]proto.SnapshotChunk{{ShardID: 1, ReplicaID: 2, From: 1, Index: 100, Term: 1, ChunkCount: 1}})
+			if !errors.As(err, &refused) {
+				t.Fatalf("SendSnapshot = %v, want a DialIdentityError", err)
+			}
+			if n := handler2.snapshotCount.Load(); n != 0 {
+				t.Fatalf("%d snapshots reached a peer that is not their destination", n)
+			}
+		})
+	}
+}
+
+// TestSend_AMessageForAnUnboundReplicaIsDropped: with pinning on, a message for
+// a replica nothing binds has no peer it may be written to — alone in its
+// batch or mixed with deliverable ones — and is dropped as identity_mismatch
+// while the rest of the batch is delivered.
+func TestSend_AMessageForAnUnboundReplicaIsDropped(t *testing.T) {
+	ids := &replicaIdentities{}
+	rec := &dropRecorder{}
+	handler2 := newTestHandler()
+	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), handler2, func(c *Config) {
+		c.ReplicaIdentity = ids.get
+	})
+	defer cleanup()
+	t1.metrics = rec
+	ids.set(1, 2, peerLeafIdentity(t, t2))
+	t1.reg.Register(3, 5, t2.Addr().String()) // routed there, bound to nothing
+
+	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 3, From: 1, To: 5, Term: 1}})
+	t1.Send([]proto.Message{
+		{Type: proto.Replicate, ShardID: 3, From: 1, To: 5, Term: 1},
+		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+	})
+	waitForBatchCount(t, handler2, 1, 5*time.Second)
+	time.Sleep(100 * time.Millisecond)
+
+	for _, b := range handler2.getBatches() {
+		for _, m := range b.Requests {
+			if m.ShardID == 3 {
+				t.Fatal("a message for a replica nothing binds was written")
+			}
+		}
+	}
+	var unbound int
+	for _, d := range rec.drops() {
+		if d.reason == dropReasonIdentityMismatch && d.shardID == 3 && d.to == 5 {
+			unbound++
+		}
+	}
+	if unbound != 2 {
+		t.Fatalf("%d identity_mismatch drops for the unbound replica, want 2 (alone and mixed)", unbound)
+	}
+}
+
+// TestGetConnection_EmptyIdentityFailsClosedWhenPinned: with pinning on, a
+// caller that names no destination identity gets no connection, rather than
+// an unpinned one any peer could answer.
+func TestGetConnection_EmptyIdentityFailsClosedWhenPinned(t *testing.T) {
+	ids := &replicaIdentities{}
+	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), newTestHandler(), func(c *Config) {
+		c.ReplicaIdentity = ids.get
+	})
+	defer cleanup()
+	var refused *DialIdentityError
+	if _, err := t1.getConnection(t2.Addr().String(), ""); !errors.As(err, &refused) {
+		t.Fatalf("getConnection with no identity = %v, want a DialIdentityError", err)
+	}
+	if t1.ConnectionCount() != 0 {
+		t.Fatal("an unpinned connection was dialed")
 	}
 }

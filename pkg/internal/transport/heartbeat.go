@@ -63,7 +63,7 @@ func (t *QUICTransport) initHeartbeatPrefix() {
 //
 // The wire format is fully compatible with the standard receive path:
 // the receiver sees a normal FlagNone frame containing a MessageBatch.
-func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) {
+func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Message) {
 	msgCount := len(msgs)
 
 	// Payload: prefix + requestsCount(4) + N * HeartbeatMessageSize
@@ -118,7 +118,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 		shardID = msgs[0].ShardID
 	}
 
-	stream, err := t.getStream(target, shardID, true)
+	stream, err := t.getStream(target, shardID, true, want)
 	if err != nil {
 		// Debug level: repeats every heartbeat tick while a peer is
 		// unreachable; the next tick retries. Gated so the variadic slog form
@@ -130,7 +130,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target string, msgs []proto.Message) 
 				"error", err,
 			)
 		}
-		t.incBatchDropped(msgs, dropReasonStreamUnavailable)
+		t.incBatchDropped(msgs, streamDropReason(err))
 		t.putBuf(bufPtr)
 		return
 	}

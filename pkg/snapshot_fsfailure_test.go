@@ -16,10 +16,14 @@ package quicraft
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // Sentinels for the individual filesystem failures injected below. Each is a
@@ -106,15 +110,15 @@ var (
 )
 
 // ---------------------------------------------------------------------------
-// decryptSnapshotToTemp
+// decryptSnapshotToAnonymousScratch
 // ---------------------------------------------------------------------------
 
-// TestDecryptSnapshotToTemp_FilesystemFailures verifies that every filesystem
-// failure on the decrypt-for-send path fails CLOSED: the caller is told which
-// operation failed, no scratch file survives, and the canonical encrypted
-// snapshot is never modified — that untouched ciphertext is what makes the
-// transfer retryable once the fault clears.
-func TestDecryptSnapshotToTemp_FilesystemFailures(t *testing.T) {
+// TestDecryptSnapshotToAnonymousScratch_FilesystemFailures verifies that every
+// filesystem failure on StartShard's recovery decrypt fails CLOSED: the caller
+// is told which operation failed, no scratch name survives, and the canonical
+// encrypted snapshot is never modified — that untouched ciphertext is what
+// makes the recovery retryable once the fault clears.
+func TestDecryptSnapshotToAnonymousScratch_FilesystemFailures(t *testing.T) {
 	tests := []struct {
 		name    string
 		fsys    faultySnapshotFS
@@ -124,21 +128,6 @@ func TestDecryptSnapshotToTemp_FilesystemFailures(t *testing.T) {
 			name:    "temp file cannot be created",
 			fsys:    faultySnapshotFS{failCreateTemp: true},
 			wantErr: errTestCreateTempFailed,
-		},
-		{
-			name:    "temp file cannot be flushed",
-			fsys:    faultySnapshotFS{failSync: true},
-			wantErr: errTestSyncFailed,
-		},
-		{
-			name:    "temp file cannot be closed",
-			fsys:    faultySnapshotFS{failCloseTemp: true},
-			wantErr: errTestCloseFailed,
-		},
-		{
-			name:    "source cannot be closed",
-			fsys:    faultySnapshotFS{failCloseSource: true},
-			wantErr: errTestCloseFailed,
 		},
 		{
 			name:    "source cannot be opened",
@@ -159,15 +148,15 @@ func TestDecryptSnapshotToTemp_FilesystemFailures(t *testing.T) {
 				t.Fatalf("read snapshot: %v", err)
 			}
 
-			tmpPath, size, err := decryptSnapshotToTemp(tt.fsys, filepath.Dir(path), path, sendDecryptTempPattern, testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
+			f, err := decryptSnapshotToAnonymousScratch(tt.fsys, dir, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("decryptSnapshotToTemp error = %v, want %v", err, tt.wantErr)
+				t.Fatalf("decryptSnapshotToAnonymousScratch error = %v, want %v", err, tt.wantErr)
 			}
-			if tmpPath != "" || size != 0 {
-				t.Fatalf("decryptSnapshotToTemp returned (%q, %d) with an error", tmpPath, size)
+			if f != nil {
+				t.Fatal("decryptSnapshotToAnonymousScratch returned a file with an error")
 			}
 
-			matches, globErr := filepath.Glob(filepath.Join(dir, sendDecryptTempPattern))
+			matches, globErr := filepath.Glob(filepath.Join(dir, recoverDecryptTempPattern))
 			if globErr != nil {
 				t.Fatalf("glob: %v", globErr)
 			}
@@ -186,99 +175,102 @@ func TestDecryptSnapshotToTemp_FilesystemFailures(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotToTemp_ScratchRemovalFailureStillReportsError verifies
-// that when the cleanup of a scratch file ALSO fails, the original decrypt
-// error is still what the caller sees. Masking it with the cleanup failure
-// would misreport why the transfer was refused.
-func TestDecryptSnapshotToTemp_ScratchRemovalFailureStillReportsError(t *testing.T) {
+// TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed verifies that
+// a scratch whose immediate unlink is refused fails StartShard's recovery
+// decrypt before a byte of plaintext is written: no file is handed back, the
+// name that survives the best-effort removal is EMPTY and counted as
+// unreclaimed, and the canonical encrypted snapshot is untouched, so the
+// recovery can be retried.
+func TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")
 	b := createTestBarrier(t)
-	writeEncryptedSnapshotFile(t, b, path, []byte("snapshot payload"))
-
-	fsys := faultySnapshotFS{failSync: true, failRemove: true}
-	tmpPath, size, err := decryptSnapshotToTemp(fsys, filepath.Dir(path), path, sendDecryptTempPattern, testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
-	if !errors.Is(err, errTestSyncFailed) {
-		t.Fatalf("decryptSnapshotToTemp error = %v, want the sync failure", err)
+	plaintext := []byte("snapshot payload that must never have a name")
+	writeEncryptedSnapshotFile(t, b, path, plaintext)
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
 	}
-	if tmpPath != "" || size != 0 {
-		t.Fatalf("decryptSnapshotToTemp returned (%q, %d) with an error", tmpPath, size)
+
+	before := engine.StaleDecryptSweepFailures()
+	f, err := decryptSnapshotToAnonymousScratch(faultySnapshotFS{failRemove: true}, dir, path,
+		testSnapShardID, testSnapReplicaID, testSnapIndex, b.CurrentEpoch(), b)
+	if f != nil {
+		_ = f.Close()
+		t.Fatal("decryptSnapshotToAnonymousScratch decrypted into a scratch whose unlink was refused")
+	}
+	if !errors.Is(err, engine.ErrScratchNotUnlinked) || !errors.Is(err, errTestRemoveFailed) {
+		t.Fatalf("decryptSnapshotToAnonymousScratch = %v, want ErrScratchNotUnlinked wrapping the refused unlink", err)
+	}
+	left, globErr := filepath.Glob(filepath.Join(dir, recoverDecryptTempPattern))
+	if globErr != nil {
+		t.Fatalf("glob: %v", globErr)
+	}
+	if len(left) != 1 {
+		t.Fatalf("found %d scratch names, want the 1 whose removal was refused", len(left))
+	}
+	if data, readErr := os.ReadFile(left[0]); readErr != nil || len(data) != 0 {
+		t.Fatalf("the surviving scratch name must be empty, got %d bytes (err=%v)", len(data), readErr)
+	}
+	if engine.StaleDecryptSweepFailures() == before {
+		t.Fatal("a scratch name that survived the best-effort removal was not counted")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-read snapshot: %v", err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Fatal("the failed decrypt modified the canonical encrypted snapshot")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// reencryptReceivedSnapshot
+// writeImportedSnapshotData
 // ---------------------------------------------------------------------------
 
-// TestReencryptReceivedSnapshot_FilesystemFailures verifies that the receive
-// path's in-place re-encryption is crash-safe under filesystem faults: on any
-// failure the caller gets the error, no epoch is reported, and the received
-// plaintext file is left exactly as it was, so the recovery path still finds a
-// consistent artifact.
-func TestReencryptReceivedSnapshot_FilesystemFailures(t *testing.T) {
+// importWriteFaultFS is the real filesystem whose snapshot data file fails
+// Sync or Close, the durability steps after an import's payload is written.
+type importWriteFaultFS struct {
+	osSnapshotFS
+	failSync  bool
+	failClose bool
+}
+
+func (f importWriteFaultFS) OpenFile(name string, flag int, perm fs.FileMode) (snapshotFile, error) {
+	inner, err := f.osSnapshotFS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &faultySnapshotFile{snapshotFile: inner, failSync: f.failSync, failClose: f.failClose}, nil
+}
+
+var _ snapshotFS = importWriteFaultFS{}
+
+// TestWriteImportedSnapshotData_FilesystemFailures verifies that the import's
+// data write reports every durability failure — the caller discards the
+// staging directory on it — and hands back no epoch and no pins.
+func TestWriteImportedSnapshotData_FilesystemFailures(t *testing.T) {
 	tests := []struct {
 		name    string
-		fsys    faultySnapshotFS
+		fsys    importWriteFaultFS
 		wantErr error
 	}{
-		{
-			name:    "source cannot be opened",
-			fsys:    faultySnapshotFS{failOpen: true},
-			wantErr: errTestOpenFailed,
-		},
-		{
-			name:    "temp file cannot be created",
-			fsys:    faultySnapshotFS{failCreateTemp: true},
-			wantErr: errTestCreateTempFailed,
-		},
-		{
-			name:    "temp file cannot be flushed",
-			fsys:    faultySnapshotFS{failSync: true},
-			wantErr: errTestSyncFailed,
-		},
-		{
-			name:    "temp file cannot be closed",
-			fsys:    faultySnapshotFS{failCloseTemp: true},
-			wantErr: errTestCloseFailed,
-		},
-		{
-			name:    "source cannot be closed",
-			fsys:    faultySnapshotFS{failCloseSource: true},
-			wantErr: errTestCloseFailed,
-		},
+		{"data file cannot be flushed", importWriteFaultFS{failSync: true}, errTestSyncFailed},
+		{"data file cannot be closed", importWriteFaultFS{failClose: true}, errTestCloseFailed},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "snapshot.dat")
-			plaintext := []byte("received plaintext snapshot")
-			if err := os.WriteFile(path, plaintext, 0o600); err != nil {
-				t.Fatalf("write snapshot: %v", err)
-			}
+			h := &Host{}
+			path := filepath.Join(t.TempDir(), "snapshot.dat")
 			b := createTestBarrier(t)
-
-			epoch, _, err := reencryptReceivedSnapshot(tt.fsys, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
+			epoch, pins, err := h.writeImportedSnapshotData(context.Background(), tt.fsys,
+				testSnapShardID, testSnapReplicaID, testSnapIndex, path, nil,
+				trailedPayload(t, []byte("imported plaintext")), b)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("reencryptReceivedSnapshot error = %v, want %v", err, tt.wantErr)
+				t.Fatalf("writeImportedSnapshotData error = %v, want %v", err, tt.wantErr)
 			}
-			if epoch != 0 {
-				t.Fatalf("epoch = %d, want 0 on failure", epoch)
-			}
-
-			got, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("read back: %v", err)
-			}
-			if !bytes.Equal(got, plaintext) {
-				t.Fatalf("failed re-encryption replaced snapshot.dat: %q", got)
-			}
-			matches, globErr := filepath.Glob(filepath.Join(dir, ".recv-encrypt-*.tmp"))
-			if globErr != nil {
-				t.Fatalf("glob: %v", globErr)
-			}
-			if len(matches) > 0 {
-				t.Fatalf("failed re-encryption leaked scratch files: %v", matches)
+			if epoch != 0 || pins != nil {
+				t.Fatalf("writeImportedSnapshotData returned (epoch %d, pins %v) with an error", epoch, pins)
 			}
 		})
 	}

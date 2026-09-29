@@ -128,8 +128,16 @@ type LogDB interface {
 	// GetSnapshot returns the most recent snapshot metadata for the given node.
 	GetSnapshot(shardID uint64, replicaID uint64) (Snapshot, error)
 
-	// RemoveNodeData removes all data for the given node.
+	// RemoveNodeData removes all data for the given node and RETIRES the
+	// (shardID, replicaID) pair: NodeRemoved reports it from then on, across
+	// restarts. Raft never lets a removed replica ID return — its term and
+	// vote are gone, so it could vote twice in one term — and the host refuses
+	// to start or import a retired replica.
 	RemoveNodeData(shardID uint64, replicaID uint64) error
+
+	// NodeRemoved reports whether RemoveNodeData has ever removed the given
+	// node, and so retired its replica ID.
+	NodeRemoved(shardID uint64, replicaID uint64) (bool, error)
 
 	// ListNodeInfo returns all NodeInfo entries in the LogDB.
 	ListNodeInfo() ([]NodeInfo, error)

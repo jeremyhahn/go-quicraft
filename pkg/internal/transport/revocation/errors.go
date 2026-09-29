@@ -80,6 +80,16 @@ var (
 	// enforcement fails closed and the verdict is never cached as good.
 	ErrOCSPStatusUnknown = errors.New("revocation: OCSP responder reported status unknown")
 
+	// ErrOCSPResponderUnauthorized is returned when an OCSP response is signed
+	// by a delegated responder certificate that is not authorized for OCSP
+	// signing (RFC 6960 §4.2.2.2): it lacks the id-kp-OCSPSigning extended key
+	// usage, or it is outside its validity period. The parser checks only that
+	// the issuer signed the delegate, which any certificate the CA issued —
+	// a node's own included — satisfies, so without this check a revoked node
+	// could answer its own OCSP query "good". It routes through the
+	// status-unavailable path, so enforcement fails closed.
+	ErrOCSPResponderUnauthorized = errors.New("revocation: OCSP response signed by a responder not authorized for OCSP signing")
+
 	// ErrNoCRLInFile is returned when a configured CRL file contains no
 	// parseable "X509 CRL" PEM block. Committing an empty revoked set from
 	// such a file would silently un-revoke every listed certificate.

@@ -17,7 +17,8 @@ upgrade actually involves today.
 **Sources:** `pkg/proto/constants.go`, `pkg/proto/membership.go`,
 `pkg/proto/entry.go`, `pkg/internal/transport/frame.go`,
 `pkg/logdb/waldb/db.go`, `pkg/logdb/waldb/format.go`,
-`pkg/internal/engine/snapshot_meta.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`,
+`pkg/internal/engine/snapshot_meta.go`, `pkg/snapshot_artifact_trailer.go`,
+`pkg/seal/barrier.go`, `CHANGELOG.md`,
 `VERSION`
 
 The current release is **0.12.0-alpha**, published 2026-09-16; `0.13.0-alpha` is in
@@ -379,17 +380,18 @@ type byte, is what detects it.
 | Byte | Constant | Status on replay |
 |---|---|---|
 | `0x01` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named an entry format with no session fields, so replay would disable at-most-once delivery |
-| `0x02` | `payloadTypeState` | Current |
+| `0x02` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named the 40-byte hard-state record without `VoteWindow`, so a replica recovering from it would come up owing no vote window to a leader's read lease |
 | `0x03` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a snapshot format with no `MaxWitnesses`/policy flags |
 | `0x04` | `payloadTypeBootstrap` | Current |
 | `0x05` | `payloadTypeCompact` | Current |
-| `0x06` | `payloadTypeRemoveNode` | Current |
+| `0x06` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named the remove-node tombstone, whose segment had to be pinned forever; a removal is now kept in the `RETIRED` registry file beside the segments (16 bytes per retired replica) |
 | `0x07` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a 76-byte entry header, so `OwnerID` would be read from the record's own `CmdLen` plus four command bytes and the command length then taken from inside the command |
 | `0x08` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. Its membership section started at `ConfigChangeID`, so current parsing would eat its low byte as a version byte |
 | `0x09` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. Its `FilePathLen` sat where the current layout reads `Compression` |
 | `0x0a` | *(retired, unallocated)* | **Fatal** — `ErrUnknownPayloadType`. It named a three-field session policy tail, so `MaxSessionsPerOwner` would be read from the `RemovedIdentities` count and the deny-list located eight bytes late |
 | `0x0b` | `payloadTypeEntries` | **Current entry format** — 84-byte record header, five session fields (`Key`, `ClientID`, `SeriesID`, `RespondedTo`, `OwnerID`) |
 | `0x0c` | `payloadTypeSnapshot` | **Current snapshot format** — artifact `Compression` in the fixed region, four-field session policy tail |
+| `0x0d` | `payloadTypeState` | **Current hard-state format** — `Term`, `Vote`, `Commit`, `VoteWindow` (48-byte record) |
 
 Every fatal error names the same remedy: **restore from a snapshot, or re-sync
 this node from its peers.** Old byte values stay reserved forever so a legacy
@@ -434,11 +436,42 @@ pre-magic ("v0") layouts are still read positionally at their original offsets:
 40 bytes (receive/import paths, no `Epoch`), 48 bytes (save path, with `Epoch`)
 and 56 bytes (save path, with `Epoch` and `Compression`). Nothing rewrites an
 existing record; a legacy directory keeps its record until the snapshot rolls
-off.
+off. No current writer produces a v0 record, and none carries `DataLen` or
+`DataHash`, so recovery refuses one (`ErrSnapshotCorrupt`) exactly as it refuses
+a missing record; only the DEK purge-floor scan still reads them.
 
 The reverse does not hold: **an older binary reads a current record as corrupt.**
 That is fail-safe where it lands (it suppresses DEK purging) but it means a
 downgrade must be treated as a wipe-and-restore.
+
+### 7. Exported snapshot artifact — header version, payload trailer
+
+The portable artifact `Host.ExportSnapshot` writes and `Host.ImportSnapshot`
+reads is three parts: a header (`QRSNAP01` magic, a uint32 version — **2**,
+unchanged — then `Index`, `Term`, `OnDiskIndex`, `Compression` and a
+length-prefixed `Membership`), the plaintext payload, and a 24-byte **trailer**:
+
+```
+magic "QRSNTRLR"[8] | payloadLen:u64 LE | hash:u64 LE (xxhash64 of header || payload)
+```
+
+The trailer binds the header and the payload as the exporter WROTE them: the
+hash runs over the raw header bytes followed by the payload, so a damaged
+`Index`, `Term` or `Membership` that still parses is refused like a damaged
+payload byte. It is written last, and it is written last,
+only once the export has passed every check. The header carries no payload
+length, so the trailer is found by position — the last 24 bytes of the stream —
+and its magic is what makes that position self-checking. `ImportSnapshot`
+checks the header it parsed and the payload against it while streaming it into the staging directory,
+and refuses a mismatch, a truncation or a missing trailer before anything is
+published, recorded in LogDB or seen by raft.
+
+The trailer was added in place: the header version did not move, per the rule
+above. **An artifact exported by an earlier build has no trailer and is
+refused** with `*SnapshotArtifactError` ("missing or malformed trailer"). It is
+not migrated and there is no flag to accept it: export the snapshot again with
+this build. A length or hash mismatch is the same error type and also matches
+`ErrSnapshotCorrupt`.
 
 ### Sealed root key
 
@@ -791,7 +824,7 @@ the version numbers:
 | `waldb` membership section minimum | 66 bytes | **74** |
 | WAL snapshot payload type | `0x0a` | **`0x0c`** — `0x0a` retired and left unallocated |
 | `proto.Snapshot` | `Type`, `Imported`, `Witness` | those three **removed** (written or reserved, never read); `Compression` **added** |
-| `snapshot.meta` body | 7 fields | **9** — `DataLen` and `DataHash`, version bumped, old records still read |
+| `snapshot.meta` body | 7 fields | **9** — `DataLen` and `DataHash`, version bumped; old records still parse, but recovery refuses one without the fields |
 | Sealed root key `state_mac` | v1 | **v2** — covers `LoadGeneration`; **migrates itself** |
 
 Two of those need separate treatment. The `snapshot.meta` record is

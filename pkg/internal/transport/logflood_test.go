@@ -34,20 +34,20 @@ func TestLogSampled_BoundsPeerDrivenDiagnostics(t *testing.T) {
 	// A burst of 10,000 "frames" must produce exactly one line.
 	emitted := 0
 	for i := 0; i < 10000; i++ {
-		if logSampled(&stamp, time.Hour) {
+		if LogSampled(&stamp, time.Hour) {
 			emitted++
 		}
 	}
 	if emitted != 1 {
-		t.Fatalf("logSampled emitted %d lines for a 10,000-frame burst, want 1: "+
+		t.Fatalf("LogSampled emitted %d lines for a 10,000-frame burst, want 1: "+
 			"one peer can drive this path at frame rate", emitted)
 	}
 
 	// Once the interval elapses, a line is emitted again — the limiter samples,
 	// it does not silence.
 	stamp.Store(time.Now().Add(-2 * time.Hour).UnixNano())
-	if !logSampled(&stamp, time.Hour) {
-		t.Fatal("logSampled never re-armed: the diagnostic is silenced, not sampled")
+	if !LogSampled(&stamp, time.Hour) {
+		t.Fatal("LogSampled never re-armed: the diagnostic is silenced, not sampled")
 	}
 }
 
@@ -61,7 +61,7 @@ func TestRecvWarnings_AreCountedNotJustSampled(t *testing.T) {
 	var stamp atomic.Int64
 	for i := 0; i < 100; i++ {
 		tr.recvBudgetDrops.Add(1)
-		_ = logSampled(&stamp, time.Hour)
+		_ = LogSampled(&stamp, time.Hour)
 	}
 	if got := tr.recvBudgetDrops.Load() - before; got != 100 {
 		t.Fatalf("counter recorded %d of 100 drops: sampling must bound the "+

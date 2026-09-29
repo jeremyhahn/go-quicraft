@@ -105,7 +105,7 @@ There is exactly one TLS-config constructor, `buildMTLSTLS`:
 |---|---|
 | `MinVersion` | TLS 1.3, both directions |
 | `ClientAuth` | `RequireAndVerifyClientCert` against `ClientCAs` |
-| Server verification | `RootCAs` plus per-dial `ServerName`, so hostname verification against the SANs is active |
+| Server verification | `RootCAs` plus per-dial `ServerName`, so hostname verification against the SANs is active; then every message and snapshot is written only to a peer presenting the node identity membership binds to its destination replica (`Config.ReplicaIdentity`) |
 | ALPN | `NextProtos: ["quicraft"]` |
 | Curve | build-dependent: `[X25519, P-256, P-384]` standard, `[P-256, P-384]` with `-tags fips` |
 
@@ -194,9 +194,14 @@ A peer must not be able to make this process allocate by asserting a size.
 ### What the transport does not protect
 
 - **Snapshots cross as plaintext over the mTLS session.** The leader decrypts
-  its at-rest snapshot to a sibling temp file, streams it, and the receiver
-  re-encrypts under its **own** barrier. Nodes cannot decrypt each other's
-  at-rest data; confidentiality in transit is TLS's, not the barrier's.
+  its at-rest snapshot to an anonymous scratch file in its replica directory,
+  streams it, and the receiver re-encrypts under its **own** barrier. Nodes
+  cannot decrypt each other's at-rest data; confidentiality in transit is
+  TLS's, not the barrier's. That confidentiality does not rest on SAN
+  exclusivity: every outbound connection is pinned to the node identity
+  membership binds to the replica dialed, so a wildcard or shared-SAN
+  certificate held by anyone on the path to a peer's address cannot receive
+  its traffic.
 - **One SHA-1 identifier on the OCSP path is outside approved-only.** See the
   exemption record below. It is the OCSP CertID hash, which RFC 6960 mandates
   and which protects nothing; a deployment configured `Mode: "crl"` never

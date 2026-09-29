@@ -313,6 +313,47 @@ func TestSaveAndReadState(t *testing.T) {
 	}
 }
 
+// TestStateVoteWindowSurvivesReopen verifies the owed vote window is
+// persisted with the rest of the hard state and recovered on replay, and that
+// a state carrying only a vote window is still written. A replica that
+// restarts must recover the window it may still owe a leader's read lease, or
+// it grants a vote the leader is relying on it to withhold.
+func TestStateVoteWindowSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *DB {
+		db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		return db
+	}
+	want := map[uint64]logdb.State{
+		1: {Term: 5, Vote: 2, Commit: 100, VoteWindow: 2_000_000_000},
+		2: {VoteWindow: 1},
+	}
+	db := open()
+	for shard, st := range want {
+		if err := db.SaveState([]logdb.Update{{ShardID: shard, ReplicaID: 1, State: st}}); err != nil {
+			t.Fatalf("SaveState(%d): %v", shard, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db = open()
+	defer db.Close()
+	for shard, st := range want {
+		got, _, err := db.ReadState(shard, 1)
+		if err != nil {
+			t.Fatalf("ReadState(%d): %v", shard, err)
+		}
+		if got != st {
+			t.Fatalf("ReadState(%d) after reopen = %+v, want %+v", shard, got, st)
+		}
+	}
+}
+
 // TestReadStateNonExistent verifies ReadState returns ErrNoState for
 // an unknown node.
 func TestReadStateNonExistent(t *testing.T) {
@@ -918,11 +959,12 @@ func TestRemoveNodeDataDurableAfterReopen(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeDataThenRewrite verifies that after removing a node, new
-// data can be written for the same (shardID, replicaID) and survives
-// recovery. This exercises the WAL replay ordering: remove record clears
-// old data, then new entries are replayed.
-func TestRemoveNodeDataThenRewrite(t *testing.T) {
+// TestRemoveNodeDataThenRewriteIsRefused verifies that removing a node
+// retires its replica ID: every writer refuses the node afterwards, with
+// nothing written, and after a reopen the node is still removed and still
+// retired. A replica whose term and vote were removed must never be written
+// again under the same ID.
+func TestRemoveNodeDataThenRewriteIsRefused(t *testing.T) {
 	dir := t.TempDir()
 
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -930,63 +972,55 @@ func TestRemoveNodeDataThenRewrite(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// Write initial data.
 	if err := db.SaveEntries(1, 1, makeEntries(1, 5, 1)); err != nil {
 		t.Fatalf("SaveEntries: %v", err)
 	}
 	if err := db.SaveNodeState(1, 1, logdb.State{Term: 1, Vote: 1, Commit: 5}); err != nil {
 		t.Fatalf("SaveNodeState: %v", err)
 	}
-
-	// Remove the node.
 	if err := db.RemoveNodeData(1, 1); err != nil {
 		t.Fatalf("RemoveNodeData: %v", err)
 	}
 
-	// Write new data for the same node.
-	if err := db.SaveEntries(1, 1, makeEntries(100, 3, 5)); err != nil {
-		t.Fatalf("SaveEntries (new): %v", err)
+	writers := map[string]func() error{
+		"SaveEntries":     func() error { return db.SaveEntries(1, 1, makeEntries(100, 3, 5)) },
+		"SaveNodeState":   func() error { return db.SaveNodeState(1, 1, logdb.State{Term: 5, Vote: 2, Commit: 102}) },
+		"SaveSnapshot":    func() error { return db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 10, Term: 2}) },
+		"SaveBootstrap":   func() error { return db.SaveBootstrap(1, 1, logdb.Bootstrap{Type: 1}) },
+		"RemoveEntriesTo": func() error { return db.RemoveEntriesTo(1, 1, 3) },
+		"SaveState batch": func() error {
+			return db.SaveState([]logdb.Update{
+				{ShardID: 2, ReplicaID: 1, State: logdb.State{Term: 1}},
+				{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 9}},
+			})
+		},
 	}
-	if err := db.SaveNodeState(1, 1, logdb.State{Term: 5, Vote: 2, Commit: 102}); err != nil {
-		t.Fatalf("SaveNodeState (new): %v", err)
+	for name, write := range writers {
+		if err := write(); !errors.Is(err, logdb.ErrReplicaRetired) {
+			t.Fatalf("%s for a removed node = %v, want logdb.ErrReplicaRetired", name, err)
+		}
 	}
-
+	// The refused batch wrote nothing, for the retired node or the other one.
+	if _, err := db.GetState(2, 1); !errors.Is(err, logdb.ErrNoState) {
+		t.Fatalf("GetState(2,1) after a refused batch = %v, want ErrNoState", err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen and verify only the new data exists.
 	db2, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
 	defer db2.Close()
-
-	// Old entries (1-5) should be gone.
-	got, err := db2.GetEntries(1, 1, 1, 6, 0)
-	if err != nil {
-		t.Fatalf("GetEntries(1,6) after reopen: %v", err)
+	if got, err := db2.GetEntries(1, 1, 1, 6, 0); err != nil || got != nil {
+		t.Fatalf("GetEntries after reopen = (%d entries, %v), want none", len(got), err)
 	}
-	if got != nil {
-		t.Fatalf("GetEntries(1,6) after reopen: old entries still present: %d", len(got))
+	if _, err := db2.GetState(1, 1); !errors.Is(err, logdb.ErrNoState) {
+		t.Fatalf("GetState after reopen = %v, want ErrNoState", err)
 	}
-
-	// New entries (100-102) should be present.
-	got, err = db2.GetEntries(1, 1, 100, 103, 0)
-	if err != nil {
-		t.Fatalf("GetEntries(100,103) after reopen: %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("GetEntries(100,103) after reopen: got %d, want 3", len(got))
-	}
-
-	// New state should be present.
-	state, err := db2.GetState(1, 1)
-	if err != nil {
-		t.Fatalf("GetState after reopen: %v", err)
-	}
-	if state.Term != 5 || state.Vote != 2 || state.Commit != 102 {
-		t.Fatalf("GetState after reopen: got %+v, want Term=5 Vote=2 Commit=102", state)
+	if err := db2.SaveEntries(1, 1, makeEntries(1, 1, 1)); !errors.Is(err, logdb.ErrReplicaRetired) {
+		t.Fatalf("SaveEntries after reopen = %v, want logdb.ErrReplicaRetired", err)
 	}
 }
 

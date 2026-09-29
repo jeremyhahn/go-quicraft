@@ -16,8 +16,8 @@ package transport
 
 import "encoding/binary"
 
-// SnapshotHeaderSize is the wire size of SnapshotHeader: 6 uint64 fields.
-const SnapshotHeaderSize = 6 * 8 // 48 bytes
+// SnapshotHeaderSize is the wire size of SnapshotHeader: 7 uint64 fields.
+const SnapshotHeaderSize = 7 * 8 // 56 bytes
 
 // SnapshotHeader is the wire-format header written at the start of a
 // dedicated snapshot stream. It identifies the snapshot being transferred
@@ -39,6 +39,11 @@ type SnapshotHeader struct {
 	// receiver uses this to save the correct epoch to LogDB so that
 	// snapshot recovery can decrypt the data.
 	Epoch uint64
+	// From is the sending replica. The receiver authorizes it against the
+	// connection's verified identity BEFORE it takes a receive slot or any
+	// memory (MessageHandler.AuthorizeSnapshot), and every chunk must carry
+	// the same From and ReplicaID as the header.
+	From uint64
 }
 
 // MarshalTo writes the snapshot header into buf and returns the number
@@ -54,6 +59,7 @@ func (h *SnapshotHeader) MarshalTo(buf []byte) (int, error) {
 	binary.BigEndian.PutUint64(buf[24:32], h.Term)
 	binary.BigEndian.PutUint64(buf[32:40], h.ChunkCount)
 	binary.BigEndian.PutUint64(buf[40:48], h.Epoch)
+	binary.BigEndian.PutUint64(buf[48:56], h.From)
 	return SnapshotHeaderSize, nil
 }
 
@@ -70,5 +76,6 @@ func (h *SnapshotHeader) UnmarshalFrom(buf []byte) (int, error) {
 	h.Term = binary.BigEndian.Uint64(buf[24:32])
 	h.ChunkCount = binary.BigEndian.Uint64(buf[32:40])
 	h.Epoch = binary.BigEndian.Uint64(buf[40:48])
+	h.From = binary.BigEndian.Uint64(buf[48:56])
 	return SnapshotHeaderSize, nil
 }

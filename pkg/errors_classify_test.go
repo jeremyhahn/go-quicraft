@@ -101,6 +101,7 @@ func sentinelTable() []sentinelClassification {
 		{"ErrEntropyDegenerate", ErrEntropyDegenerate, false},
 		{"ErrSnapshotDestinationRecorded", ErrSnapshotDestinationRecorded, false},
 		{"ErrShardNotStopped", ErrShardNotStopped, false},
+		{"ErrReplicaRetired", ErrReplicaRetired, false},
 		{"ErrStaleConfigChange", ErrStaleConfigChange, false},
 		{"ErrReplicaNotFound", ErrReplicaNotFound, false},
 		{"ErrInvalidRange", ErrInvalidRange, false},

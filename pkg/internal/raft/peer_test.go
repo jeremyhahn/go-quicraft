@@ -98,6 +98,7 @@ func newTestPeer(t *testing.T, cfg config.Config, state proto.State, ms proto.Me
 	if err != nil {
 		t.Fatalf("failed to create peer: %v", err)
 	}
+	setTestLeaseClock(p.r)
 	return p
 }
 
@@ -5371,6 +5372,7 @@ func TestPeer_SyncRaftRemotes_TracksWitnessLeaseAcks(t *testing.T) {
 		},
 	}
 	p := newTestPeer(t, cfg, proto.State{}, ms)
+	passVoteHoldDown(p.r)
 
 	// Tick past election timeout to trigger election.
 	for range 30 {
@@ -5400,31 +5402,36 @@ func TestPeer_SyncRaftRemotes_TracksWitnessLeaseAcks(t *testing.T) {
 
 	// A witness ack counts toward the lease exactly like a voter ack:
 	// witnesses vote in elections, so they belong to the same quorum.
+	round := sendLeaseRound(p.r)
 	for _, from := range []uint64{2, 3} {
 		mustHandle(t, p, proto.Message{
-			Type: proto.HeartbeatResp,
-			From: from,
-			Term: p.r.term,
+			Type:     proto.HeartbeatResp,
+			From:     from,
+			Term:     p.r.term,
+			LogIndex: round,
+			LogTerm:  testLeaseWindow,
 		})
 		if _, ok := p.r.remoteLastAck[from]; !ok {
 			t.Fatalf("expected replica %d in remoteLastAck after its heartbeat ack", from)
 		}
 	}
 
-	// A witness added during leadership must NOT be seeded with an ack
-	// tick: an entry at tick 0 is indistinguishable from a real ack and
-	// would let a member that never responded contribute to the lease.
+	// A witness added during leadership must NOT be seeded with an ack:
+	// any seeded time is indistinguishable from a real ack and would let
+	// a member that never responded contribute to the lease.
 	p.membership.witnesses[4] = "addr4"
 	p.syncRaftRemotes()
 	if _, ok := p.r.remoteLastAck[4]; ok {
-		t.Fatal("newly added witness 4 was seeded with an ack tick")
+		t.Fatal("newly added witness 4 was seeded with an ack")
 	}
 
 	// It enters the map on its first real ack.
 	mustHandle(t, p, proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 4,
-		Term: p.r.term,
+		Type:     proto.HeartbeatResp,
+		From:     4,
+		Term:     p.r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	})
 	if _, ok := p.r.remoteLastAck[4]; !ok {
 		t.Fatal("expected witness 4 in remoteLastAck after its first ack")
@@ -5462,6 +5469,7 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 		},
 	}
 	p := newTestPeer(t, cfg, proto.State{}, ms)
+	passVoteHoldDown(p.r)
 
 	// Become leader.
 	for range 30 {
@@ -5482,16 +5490,18 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 		t.Fatal("expected peer to become leader")
 	}
 
-	// Tick a few times so electionTick advances beyond 0 to verify ack
-	// values are preserved, not just re-initialized.
+	// Tick a few times so the leader broadcasts a heartbeat round and
+	// electionTick advances beyond 0.
 	p.Tick()
 	p.Tick()
 
 	// Simulate a heartbeat response from the witness, which sets the ack.
 	p.Handle(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 3,
-		Term: p.r.term,
+		Type:     proto.HeartbeatResp,
+		From:     3,
+		Term:     p.r.term,
+		LogIndex: p.r.leaseRound,
+		LogTerm:  testLeaseWindow,
 	})
 
 	// Verify the ack was recorded.
@@ -5499,8 +5509,8 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 		t.Fatal("expected witness 3 ack in remoteLastAck after heartbeat response")
 	}
 	ackTick := p.r.remoteLastAck[3]
-	if ackTick == 0 {
-		t.Fatal("expected non-zero ack tick after ticking and heartbeat response")
+	if ackTick.IsZero() {
+		t.Fatal("expected the ack to be dated by its round's send time")
 	}
 
 	// Trigger syncRaftRemotes (e.g., from a config change).
@@ -5512,8 +5522,8 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	}
 
 	// The ack value should be preserved, not reset to 0.
-	if p.r.remoteLastAck[3] != ackTick {
-		t.Fatalf("expected witness 3 ack tick %d to be preserved, got %d",
+	if !p.r.remoteLastAck[3].Equal(ackTick) {
+		t.Fatalf("expected witness 3 ack time %v to be preserved, got %v",
 			ackTick, p.r.remoteLastAck[3])
 	}
 }

@@ -22,12 +22,14 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/quic-go/quic-go"
 )
 
@@ -94,17 +96,30 @@ const (
 	inboundIdleRetention = 10 * connectionCleanupInterval
 )
 
-// getConnection returns an existing QUIC connection to the target address or
-// dials a new one. Concurrent dials to the same target are coalesced via
-// singleflight to avoid redundant connections.
-func (t *QUICTransport) getConnection(target string) (*quic.Conn, error) {
+// getConnection returns the pooled connection to target, dialing one when
+// there is none. Concurrent dials are coalesced via singleflight.
+//
+// want is the node identity the peer must present — the identity membership
+// binds to the replica the caller is sending to (see wantFor) — or "" when
+// identity pinning is disabled. A pooled connection is handed out only when its
+// peer presented want, and a dial is kept only when the peer presents exactly
+// want, so every write is pinned to its destination at the point it takes the
+// connection, whatever re-dial or retry the send path goes through. When the
+// pooled peer presented another identity, replaceUnboundPeer decides between
+// refusing the send and replacing the connection.
+func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 	if t.stopped.Load() {
 		return nil, ErrStreamClosed
+	}
+	if want == "" && t.cfg.ReplicaIdentity != nil {
+		// Pinning is on and the caller named no destination: fail closed.
+		return nil, &DialError{Target: target, Err: &DialIdentityError{}}
 	}
 
 	// Fast path: check existing connection.
 	t.connMu.RLock()
 	conn, ok := t.conns[target]
+	presented := t.connPeer[conn]
 	t.connMu.RUnlock()
 	if ok {
 		// Verify the connection is still alive by checking its context.
@@ -118,7 +133,29 @@ func (t *QUICTransport) getConnection(target string) (*quic.Conn, error) {
 			t.removeConnection(target)
 			t.evictStreamsForTarget(target)
 		default:
-			return conn, nil
+			if t.serves(presented, want) {
+				return conn, nil
+			}
+		}
+	}
+
+	dialKey := target
+	if want != "" {
+		dialKey = target + "\x00" + want
+	}
+	// A destination just refused is not tried again until the cooldown
+	// passes: see dialRefusalCooldown.
+	if v, found := t.dialRefusals.Load(dialKey); found {
+		refusal := v.(dialRefusal)
+		if time.Since(refusal.at) < dialRefusalCooldown {
+			return nil, refusal.err
+		}
+		t.dialRefusals.CompareAndDelete(dialKey, v)
+	}
+	if ok && want != "" && presented != want && conn.Context().Err() == nil {
+		if err := t.replaceUnboundPeer(target, conn, presented); err != nil {
+			t.dialRefusals.Store(dialKey, dialRefusal{at: time.Now(), err: err})
+			return nil, err
 		}
 	}
 
@@ -126,10 +163,13 @@ func (t *QUICTransport) getConnection(target string) (*quic.Conn, error) {
 	slog.Debug("initiating connection dial",
 		"target", target,
 	)
-	result, err, _ := t.dialGroup.Do(target, func() (any, error) {
-		return t.dialConnection(target)
+	result, err, _ := t.dialGroup.Do(dialKey, func() (any, error) {
+		return t.dialConnection(target, want)
 	})
 	if err != nil {
+		if _, refused := errors.AsType[*DialIdentityError](err); refused {
+			t.dialRefusals.Store(dialKey, dialRefusal{at: time.Now(), err: err})
+		}
 		slog.Debug("connection dial failed",
 			"target", target,
 			"error", err,
@@ -139,8 +179,52 @@ func (t *QUICTransport) getConnection(target string) (*quic.Conn, error) {
 	return result.(*quic.Conn), nil
 }
 
-// dialConnection establishes a new QUIC connection to the target address.
-func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
+// replaceUnboundPeer handles a live pooled connection to target whose peer
+// presented, not the identity a send wanted. While presented is still bound to
+// a replica routed to target, the connection stays and the send is refused:
+// one peer holds an address at a time, and two bound identities meet at one
+// address only when a member has moved its own route onto another replica's —
+// which must be able neither to receive that replica's traffic nor to churn
+// the connection. Once presented is bound to nothing there (its replica
+// removed, or rebound to a new keypair at the same address), the connection
+// is closed — only if it is still the pooled one — and nil tells the caller to
+// dial whoever is bound now.
+func (t *QUICTransport) replaceUnboundPeer(target string, conn *quic.Conn, presented string) error {
+	if slices.Contains(t.boundIdentitiesAt(target), presented) {
+		return &DialError{Target: target, Err: &DialIdentityError{Presented: presented}}
+	}
+	t.connMu.Lock()
+	removed := t.conns[target] == conn
+	if removed {
+		delete(t.connPeer, conn)
+		delete(t.conns, target)
+		delete(t.connEpoch, target)
+	}
+	t.connMu.Unlock()
+	if removed {
+		_ = conn.CloseWithError(QUICErrDialIdentity, closeReasonRedacted)
+		t.evictStreamsForTarget(target)
+	}
+	return nil
+}
+
+// dialRefusalCooldown is how long a target whose peer failed the identity pin
+// is not dialed again. Refusing a peer costs a full QUIC and TLS handshake,
+// and every send that misses the connection cache would otherwise pay one: a
+// handshake and log storm against that peer at the sender's message rate.
+const dialRefusalCooldown = time.Second
+
+// dialRefusal records a dial refused by the identity pin, for
+// dialRefusalCooldown.
+type dialRefusal struct {
+	at  time.Time
+	err error
+}
+
+// dialConnection establishes a new QUIC connection to the target address. When
+// want is not "", the peer must present exactly that node identity or the
+// connection is closed and refused before it is pooled (see getConnection).
+func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
 		return nil, err
@@ -172,6 +256,15 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 	clientTLS.ServerName = host
 
 	conn, err := t.quicTr.Dial(ctx, udpAddr, clientTLS, t.quicCfg)
+	if err == nil && want != "" {
+		// The handshake proves only a cluster certificate whose SAN covers
+		// the host, which a wildcard or shared-SAN certificate held by anyone
+		// on the path to this address also satisfies.
+		if presented := peerNodeIdentity(conn); presented != want {
+			_ = conn.CloseWithError(QUICErrDialIdentity, closeReasonRedacted)
+			err = &DialError{Target: target, Err: &DialIdentityError{Presented: presented}}
+		}
+	}
 	if err != nil {
 		slog.Info("peer connection failed", "target", target, "error", err)
 		if t.eventListener != nil && t.eventListener.OnConnectionFailed != nil {
@@ -201,14 +294,22 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 		select {
 		case <-existing.Context().Done():
 			// Cached connection is dead; replace it with the fresh dial.
+			delete(t.connPeer, existing)
 		default:
+			existingPeer := t.connPeer[existing]
 			t.connMu.Unlock()
 			_ = conn.CloseWithError(QUICErrDuplicateDial, "duplicate dial: reusing cached connection")
 			slog.Debug("dial race lost, reusing cached connection", "target", target)
+			if want != "" && existingPeer != want {
+				// The winner reached another peer; the caller's destination
+				// is not reachable over it (see replaceUnboundPeer).
+				return nil, &DialError{Target: target, Err: &DialIdentityError{Presented: existingPeer}}
+			}
 			return existing, nil
 		}
 	}
 	t.conns[target] = conn
+	t.connPeer[conn] = peerNodeIdentity(conn)
 	t.connEpoch[target] = dialEpoch
 	t.connMu.Unlock()
 
@@ -233,6 +334,65 @@ func (t *QUICTransport) dialConnection(target string) (*quic.Conn, error) {
 	}
 
 	return conn, nil
+}
+
+// boundIdentitiesAt returns the node identities membership binds to the
+// replicas the registry routes to target.
+func (t *QUICTransport) boundIdentitiesAt(target string) []string {
+	var ids []string
+	for _, at := range t.reg.ReplicasAt(target) {
+		if id := t.cfg.ReplicaIdentity(at.ShardID, at.ReplicaID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// wantFor returns the node identity a send to (shardID, replicaID) must reach
+// (Config.ReplicaIdentity), or "" with ok true when pinning is disabled. ok is
+// false when pinning is enabled and nothing binds the replica: the send has no
+// destination it may reach.
+func (t *QUICTransport) wantFor(shardID, replicaID uint64) (string, bool) {
+	if t.cfg.ReplicaIdentity == nil {
+		return "", true
+	}
+	id := t.cfg.ReplicaIdentity(shardID, replicaID)
+	return id, id != ""
+}
+
+// serves reports whether a connection whose peer presented peer may carry a
+// send that must reach want. want == "" means "any peer" only when pinning is
+// disabled: with it enabled an empty want fails closed, so a caller that
+// forgets to name its destination gets no connection rather than an unpinned
+// one.
+func (t *QUICTransport) serves(peer, want string) bool {
+	if want == "" {
+		return t.cfg.ReplicaIdentity == nil
+	}
+	return peer == want
+}
+
+// connServes reports whether conn may carry a send that must reach want (see
+// serves).
+func (t *QUICTransport) connServes(conn *quic.Conn, want string) bool {
+	t.connMu.RLock()
+	defer t.connMu.RUnlock()
+	return t.serves(t.connPeer[conn], want)
+}
+
+// dropIdentityMismatch counts, and logs at a sampled rate, a message the send
+// path refused to write because the peer at target is not its destination.
+func (t *QUICTransport) dropIdentityMismatch(target string, msg *proto.Message) {
+	if t.metrics != nil {
+		t.metrics.IncMessagesDropped(msg.ShardID, msg.To, dropReasonIdentityMismatch)
+	}
+	if LogSampled(&t.lastIdentityMismatchLog, peerRejectionLogInterval) {
+		slog.Warn("transport: message dropped: the peer at its replica's address presents another node identity",
+			"target", target,
+			"shard", msg.ShardID,
+			"to", msg.To,
+		)
+	}
 }
 
 // preOpenHeartbeatStream proactively opens a QUIC stream and stores it in the
@@ -329,6 +489,7 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 // has been both disconnected AND silent for peerIncarnationRetention.
 func (t *QUICTransport) removeConnection(target string) {
 	t.connMu.Lock()
+	delete(t.connPeer, t.conns[target])
 	delete(t.conns, target)
 	delete(t.connEpoch, target)
 	t.connMu.Unlock()
@@ -564,6 +725,7 @@ func (t *QUICTransport) reapPeerIncarnations(now time.Time) {
 func (t *QUICTransport) removeAndCloseConnection(target string, reason string) bool {
 	t.connMu.Lock()
 	conn, ok := t.conns[target]
+	delete(t.connPeer, conn)
 	delete(t.conns, target)
 	delete(t.connEpoch, target)
 	t.connMu.Unlock()
@@ -695,7 +857,10 @@ func (t *QUICTransport) forgetPeerIncarnation(target string) {
 // When the cached entry is unusable this evicts exactly as much state as the
 // failure warrants — see the three cases below — and reports false, leaving
 // the caller to open a fresh stream.
-func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat bool) (*quic.Stream, bool) {
+//
+// A stream is handed out only when its connection's peer is want (connServes):
+// otherwise the slow path's getConnection decides what the send may reach.
+func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat bool, want string) (*quic.Stream, bool) {
 	idx := t.streamIndexFor(shardID, isHeartbeat)
 	shard := &t.streamShards[idx&(streamShardCount-1)]
 	key := streamKey{target: target, idx: idx}
@@ -708,8 +873,11 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 		return nil, false
 	}
 
+	// The pooled connection and its peer's identity are read together: the
+	// identity check costs no second acquisition of connMu on the fast path.
 	t.connMu.RLock()
 	conn, connOK := t.conns[target]
+	connServesWant := t.serves(t.connPeer[conn], want)
 	t.connMu.RUnlock()
 
 	switch {
@@ -718,6 +886,9 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 		// connection to be the one currently cached for the target.
 		switch {
 		case connOK && conn == owner && owner.Context().Err() == nil:
+			if !connServesWant {
+				return nil, false
+			}
 			// Live and current. Re-verify the stream is still the cached
 			// entry after the conn read: a concurrent evict may have
 			// removed or replaced it, in which case the local variable
@@ -753,6 +924,9 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 			t.removeConnection(target)
 			t.evictStreamsForTarget(target)
 		default:
+			if !connServesWant {
+				return nil, false
+			}
 			shard.mu.RLock()
 			_, stillCached := shard.streams[key]
 			shard.mu.RUnlock()
@@ -766,12 +940,29 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 	return nil, false
 }
 
+// ownerIsLivePooled reports whether a pooled stream's owning connection is
+// alive and is the connection pooled for its target.
+func ownerIsLivePooled(owner, pooled *quic.Conn, pooledOK bool) bool {
+	return owner != nil && pooledOK && pooled == owner && owner.Context().Err() == nil
+}
+
+// closeStreamQuietly closes a stream getStream is discarding; a close error is
+// diagnostic only.
+func closeStreamQuietly(stream *quic.Stream, msg, target string, shardID uint64) {
+	if err := stream.Close(); err != nil {
+		slog.Debug(msg, "target", target, "shard_id", shardID, "error", err)
+	}
+}
+
 // getStream returns a pooled QUIC stream for the given target. Heartbeats
 // use stream index 0, data messages use (shardID % (poolSize-1)) + 1.
 // The stream pool is sharded across streamShardCount buckets to reduce
 // lock contention.
-func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat bool) (*quic.Stream, error) {
-	if stream, ok := t.cachedStream(target, shardID, isHeartbeat); ok {
+//
+// want is the node identity the stream's peer must present (see
+// getConnection); every stream returned is on a connection that serves it.
+func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat bool, want string) (*quic.Stream, error) {
+	if stream, ok := t.cachedStream(target, shardID, isHeartbeat, want); ok {
 		return stream, nil
 	}
 
@@ -780,7 +971,7 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 	key := streamKey{target: target, idx: idx}
 
 	// Slow path: open a new stream.
-	conn, err := t.getConnection(target)
+	conn, err := t.getConnection(target, want)
 	if err != nil {
 		return nil, err
 	}
@@ -806,25 +997,29 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		cachedConn, connOK := t.conns[target]
 		t.connMu.RUnlock()
 
+		existingLive := ownerIsLivePooled(existingOwner, cachedConn, connOK)
+		if existingLive && !t.connServes(existingOwner, want) {
+			// The entry is on the live pooled connection, but its peer is not
+			// this send's destination: the connection we opened on was
+			// replaced meanwhile by one to another peer. Refuse rather than
+			// tear the pooled connection down — it is healthy, and other
+			// senders use it (see replaceUnboundPeer).
+			shard.mu.Unlock()
+			closeStreamQuietly(s, "transport: stream close failed during getStream refusal", target, shardID)
+			return nil, &DialError{Target: target, Err: &DialIdentityError{}}
+		}
 		existingUsable := false
 		if existingOwner != nil {
-			existingUsable = connOK && cachedConn == existingOwner &&
-				existingOwner.Context().Err() == nil
+			existingUsable = existingLive
 		} else if connOK {
 			// Owner unknown (only test-injected raw streams reach this): fall
 			// back to the cached conn's liveness, preserving prior behavior.
-			existingUsable = cachedConn.Context().Err() == nil
+			existingUsable = cachedConn.Context().Err() == nil && t.connServes(cachedConn, want)
 		}
 		if existingUsable {
 			// Prefer the already-cached stream; close the duplicate we opened.
 			shard.mu.Unlock()
-			if closeErr := s.Close(); closeErr != nil {
-				slog.Debug("transport: stream close failed during getStream dedup",
-					"target", target,
-					"shard_id", shardID,
-					"error", closeErr,
-				)
-			}
+			closeStreamQuietly(s, "transport: stream close failed during getStream dedup", target, shardID)
 			return existing, nil
 		}
 
@@ -834,13 +1029,7 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		if connOK && cachedConn == conn && conn.Context().Err() == nil {
 			shard.put(key, s, conn)
 			shard.mu.Unlock()
-			if closeErr := existing.Close(); closeErr != nil {
-				slog.Debug("transport: stale stream close failed during getStream replace",
-					"target", target,
-					"shard_id", shardID,
-					"error", closeErr,
-				)
-			}
+			closeStreamQuietly(existing, "transport: stale stream close failed during getStream replace", target, shardID)
 			return s, nil
 		}
 
@@ -850,23 +1039,11 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		// dial and stream. If the retry also fails, return the error.
 		shard.drop(key)
 		shard.mu.Unlock()
-		if closeErr := existing.Close(); closeErr != nil {
-			slog.Debug("transport: stale stream close failed during getStream dedup",
-				"target", target,
-				"shard_id", shardID,
-				"error", closeErr,
-			)
-		}
-		if closeErr := s.Close(); closeErr != nil {
-			slog.Debug("transport: new stream close failed during getStream dedup",
-				"target", target,
-				"shard_id", shardID,
-				"error", closeErr,
-			)
-		}
+		closeStreamQuietly(existing, "transport: stale stream close failed during getStream dedup", target, shardID)
+		closeStreamQuietly(s, "transport: new stream close failed during getStream dedup", target, shardID)
 		t.removeConnection(target)
 		t.evictStreamsForTarget(target)
-		retryConn, retryErr := t.getConnection(target)
+		retryConn, retryErr := t.getConnection(target, want)
 		if retryErr != nil {
 			return nil, retryErr
 		}
@@ -884,13 +1061,12 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		// churn scenario this path handles.
 		shard.mu.Lock()
 		if existingRetry, ok := shard.streams[key]; ok {
+			retryOwner := shard.owners[key]
 			shard.mu.Unlock()
-			if closeErr := retryStream.Close(); closeErr != nil {
-				slog.Debug("transport: duplicate retry stream close failed",
-					"target", target,
-					"shard_id", shardID,
-					"error", closeErr,
-				)
+			closeStreamQuietly(retryStream, "transport: duplicate retry stream close failed", target, shardID)
+			if !t.connServes(retryOwner, want) {
+				// Cached meanwhile on a connection to another peer.
+				return nil, &DialError{Target: target, Err: &DialIdentityError{}}
 			}
 			return existingRetry, nil
 		}
@@ -1226,6 +1402,7 @@ func (t *QUICTransport) cleanStaleConnections() {
 	for addr, conn := range t.conns {
 		select {
 		case <-conn.Context().Done():
+			delete(t.connPeer, conn)
 			delete(t.conns, addr)
 			delete(t.connEpoch, addr)
 			deadTargets = append(deadTargets, addr)
@@ -1767,7 +1944,10 @@ type peerMsgBudget struct {
 	// conns counts live connections using this entry. The entry is removed
 	// when it reaches zero, so the map stays bounded across connection churn
 	// without being torn down while another connection is still reserving
-	// against it.
+	// against it. A negative value marks an entry its last connection has
+	// retired: it is being removed and is never counted again, so a
+	// connection that arrives meanwhile takes a fresh entry instead of one
+	// about to disappear under it.
 	conns atomic.Int64
 }
 
@@ -1792,8 +1972,26 @@ func (t *QUICTransport) acquirePeerMsgBudgetRef(conn *quic.Conn) {
 	if conn == nil || t.maxConnMsgRecv <= 0 {
 		return
 	}
-	v, _ := t.connMsgBudget.LoadOrStore(msgBudgetKey(conn), new(peerMsgBudget))
-	v.(*peerMsgBudget).conns.Add(1)
+	t.acquirePeerMsgBudgetKey(msgBudgetKey(conn))
+}
+
+// acquirePeerMsgBudgetKey counts one more live connection on key's entry,
+// never on a retired one.
+func (t *QUICTransport) acquirePeerMsgBudgetKey(key string) {
+	for {
+		v, _ := t.connMsgBudget.LoadOrStore(key, new(peerMsgBudget))
+		pb := v.(*peerMsgBudget)
+		for {
+			n := pb.conns.Load()
+			if n < 0 {
+				break // retired: help remove it, then take a fresh entry
+			}
+			if pb.conns.CompareAndSwap(n, n+1) {
+				return
+			}
+		}
+		t.connMsgBudget.CompareAndDelete(key, pb)
+	}
 }
 
 // releasePeerMsgBudgetRef drops one connection's reference and removes the
@@ -1802,13 +2000,22 @@ func (t *QUICTransport) releasePeerMsgBudgetRef(conn *quic.Conn) {
 	if conn == nil || t.maxConnMsgRecv <= 0 {
 		return
 	}
-	key := msgBudgetKey(conn)
+	t.releasePeerMsgBudgetKey(msgBudgetKey(conn))
+}
+
+// releasePeerMsgBudgetKey drops one connection from key's entry. The last one
+// retires it (0 -> -1) before removing it, and only if no connection counted
+// itself in between: a decrement to zero followed by a plain Delete removed
+// an entry a newly arrived connection had just taken, leaving that live
+// connection's reservations on an entry no longer in the map.
+func (t *QUICTransport) releasePeerMsgBudgetKey(key string) {
 	v, ok := t.connMsgBudget.Load(key)
 	if !ok {
 		return
 	}
-	if v.(*peerMsgBudget).conns.Add(-1) <= 0 {
-		t.connMsgBudget.Delete(key)
+	pb := v.(*peerMsgBudget)
+	if pb.conns.Add(-1) == 0 && pb.conns.CompareAndSwap(0, -1) {
+		t.connMsgBudget.CompareAndDelete(key, pb)
 	}
 }
 

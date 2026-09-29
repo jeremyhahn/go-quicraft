@@ -169,6 +169,15 @@ var (
 	// would be decided by a quorum of one.
 	ErrJoiningNodeCannotCampaign = errors.New("raft: joining node cannot campaign with incomplete membership")
 
+	// ErrLeaseVoteHoldDown is returned when a TimeoutNow reaches a replica
+	// that a leader may still be counting toward a read lease: one inside its
+	// post-restart vote hold-down, or one whose vote promise from a recent
+	// heartbeat ack is still outstanding and was not made to the leader asking
+	// for the transfer. A campaign opened now (a self-vote) could elect a
+	// second leader inside that lease. The transfer can be retried once the
+	// window has passed.
+	ErrLeaseVoteHoldDown = errors.New("raft: vote withheld while a read lease may still count this replica")
+
 	// ErrStaleConfigCannotCampaign is returned when a TimeoutNow reaches a
 	// replica whose committed configuration tail could not be folded into its
 	// membership. Membership is config-in-log: a restart recovers a BASE

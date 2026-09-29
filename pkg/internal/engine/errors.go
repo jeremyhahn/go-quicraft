@@ -124,6 +124,14 @@ var (
 	ErrSnapshotMembershipAhead = errors.New(
 		"engine: snapshot membership is ahead of the snapshot index")
 
+	// ErrScratchNotUnlinked is returned when a snapshot decrypt scratch file
+	// could not be unlinked the moment it was created. It is the sentinel form
+	// of *ScratchUnlinkError. The recovery or send that asked for the scratch
+	// fails rather than decrypt plaintext into a file that still has a name,
+	// and is retried later.
+	ErrScratchNotUnlinked = errors.New(
+		"engine: snapshot decrypt scratch could not be unlinked")
+
 	// ErrApplyGap is returned when a committed batch does not start at
 	// lastApplied+1. The missing range can never be re-offered (Raft's
 	// processed marker already advanced past it), so the shard is failed
@@ -420,6 +428,65 @@ func (e *SnapshotSizeMismatchError) Error() string {
 func (e *SnapshotSizeMismatchError) Is(target error) bool {
 	return target == ErrSnapshotSizeMismatch
 }
+
+// ScratchUnlinkError reports a decrypt scratch file whose immediate unlink
+// failed. Nothing was written into it; Err is the refused unlink.
+type ScratchUnlinkError struct {
+	Path string
+	Err  error
+}
+
+// Error returns a human-readable description of the refused unlink.
+func (e *ScratchUnlinkError) Error() string {
+	return fmt.Sprintf("engine: snapshot decrypt scratch %s could not be unlinked: %s",
+		e.Path, e.Err.Error())
+}
+
+// Unwrap returns the underlying unlink error.
+func (e *ScratchUnlinkError) Unwrap() error {
+	return e.Err
+}
+
+// Is reports whether target matches the sentinel ErrScratchNotUnlinked.
+func (e *ScratchUnlinkError) Is(target error) bool {
+	return target == ErrScratchNotUnlinked
+}
+
+// SnapshotMetaInvalidError reports a recorded snapshot whose snapshot.meta
+// cannot vouch for the data file beside it: the record is missing,
+// unreadable, malformed, or lacks the DataLen/DataHash integrity fields.
+//
+// Every writer of a snapshot directory stamps those fields through
+// MarshalSnapshotMeta before the directory is published, so a recorded
+// artifact without them was not produced by this format. Treating it as
+// "nothing to check" would let a partial restore that dropped or damaged
+// snapshot.meta, paired with a same-length alteration of snapshot.dat, be
+// recovered as divergent state. It therefore matches ErrSnapshotCorrupt, the
+// sentinel every recovery consumer already fails closed on, and
+// ErrSnapshotMetaCorrupt; Err carries the underlying cause, when there is one.
+type SnapshotMetaInvalidError struct {
+	Dir string
+	Err error
+}
+
+// Error returns a human-readable description of the unusable record.
+func (e *SnapshotMetaInvalidError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf(
+			"engine: snapshot metadata in %s carries no integrity fields", e.Dir)
+	}
+	return fmt.Sprintf(
+		"engine: snapshot metadata in %s cannot verify the artifact: %v", e.Dir, e.Err)
+}
+
+// Is reports whether target matches ErrSnapshotCorrupt or
+// ErrSnapshotMetaCorrupt.
+func (e *SnapshotMetaInvalidError) Is(target error) bool {
+	return target == ErrSnapshotCorrupt || target == ErrSnapshotMetaCorrupt
+}
+
+// Unwrap returns the underlying read or parse error, if any.
+func (e *SnapshotMetaInvalidError) Unwrap() error { return e.Err }
 
 // SMPanicError is returned when a user state machine panics during Apply
 // or a related operation. The shard is marked as failed and becomes

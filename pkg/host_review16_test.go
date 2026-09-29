@@ -548,7 +548,7 @@ func TestWriteImportedSnapshotData_HonoursContext(t *testing.T) {
 	defer cancel()
 	r := &cancelAfterFirstRead{cancel: cancel, chunk: bytes.Repeat([]byte("x"), 4096)}
 
-	err := h.writeImportedSnapshotData(ctx, osSnapshotFS{}, 1, dataPath, r)
+	_, _, err := h.writeImportedSnapshotData(ctx, osSnapshotFS{}, 1, 1, 1, dataPath, nil, r, nil)
 	if !errors.Is(err, ErrCanceled) {
 		t.Fatalf("writeImportedSnapshotData on a cancelled context = %v, want "+
 			"ErrCanceled; the copy ran to completion instead", err)

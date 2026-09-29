@@ -111,7 +111,7 @@ err = removedHost.RemoveData(shardID, replicaID)
 **Steps 3's two calls do not reach consensus.** They act on the local copy and
 `RemoveData` deletes it. `*ShardNotStoppedError` catches running the second
 before the first; nothing catches running either before step 2, which leaves a
-node that still believes it is a member.
+node that still believes it is a member. It also **retires the replica ID on this host**: `StartShard` refuses it from then on with `*ReplicaRetiredError` (`ErrReplicaRetired`) (`ImportSnapshot` finds no data left to import into and returns `ErrShardNotFound`), because the deleted data held the replica's term, vote and owed lease vote window, and Raft never lets a removed replica return under the same ID. Rejoin under a new replica ID.
 
 ## Task: change the witness policy
 

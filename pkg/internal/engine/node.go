@@ -779,12 +779,21 @@ func (n *Node) UnpinSnapshotDir(dir string) {
 	n.pinnedSnapshotDirs[dir]--
 }
 
-// PinnedSnapshotDirs returns the directories recoveries are reading, for the
-// snapshot GC to spare. The caller holds the snapshot-directory lock.
-func (n *Node) PinnedSnapshotDirs() []string {
-	dirs := make([]string, 0, len(n.pinnedSnapshotDirs))
+// GCSparedSnapshotDirs returns the directories the snapshot GC must spare
+// besides the recorded one: those recoveries are reading (PinSnapshotDir) and
+// those receives have published and not yet settled (ClaimSnapshotDir). A
+// claimed directory is unrecorded until raft's verdict, and GC selects by
+// index alone, so unrecorded directories at higher indexes — receives a stop
+// abandoned, or a crash left — could push it into the removal window; raft
+// adopting it then records a snapshot whose directory is gone. The caller
+// holds the snapshot-directory lock.
+func (n *Node) GCSparedSnapshotDirs() []string {
+	dirs := make([]string, 0, len(n.pinnedSnapshotDirs)+len(n.claimedSnapshotDirs))
 	for dir := range n.pinnedSnapshotDirs {
 		dirs = append(dirs, dir)
+	}
+	for index := range n.claimedSnapshotDirs {
+		dirs = append(dirs, filepath.Clean(n.SnapshotSaveDir(index)))
 	}
 	return dirs
 }

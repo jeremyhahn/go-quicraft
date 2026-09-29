@@ -34,7 +34,7 @@ func TestGetConnectionCreatesNewConnection(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -54,12 +54,12 @@ func TestGetConnectionReusesExisting(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	conn1, err := t1.getConnection(target)
+	conn1, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("first getConnection failed: %v", err)
 	}
 
-	conn2, err := t1.getConnection(target)
+	conn2, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("second getConnection failed: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestGetConnectionSingleflightCoalescing(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			conns[idx], errs[idx] = t1.getConnection(target)
+			conns[idx], errs[idx] = t1.getConnection(target, "")
 		}(i)
 	}
 	wg.Wait()
@@ -128,7 +128,7 @@ func TestGetConnectionWhenStopped(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.getConnection("127.0.0.1:12345")
+	_, err = tr.getConnection("127.0.0.1:12345", "")
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("expected ErrStreamClosed, got %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRemoveConnection(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestCleanStaleConnections(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestGetStreamOpensNewStream(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	stream, err := t1.getStream(target, 1, false)
+	stream, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -208,12 +208,12 @@ func TestGetStreamReusesExisting(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	s1, err := t1.getStream(target, 1, false)
+	s1, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("first getStream failed: %v", err)
 	}
 
-	s2, err := t1.getStream(target, 1, false)
+	s2, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("second getStream failed: %v", err)
 	}
@@ -229,12 +229,12 @@ func TestGetStreamHeartbeatUsesIndexZero(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	hbStream, err := t1.getStream(target, 1, true)
+	hbStream, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
 
-	dataStream, err := t1.getStream(target, 1, false)
+	dataStream, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream(data) failed: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestDialConnectionServerNameExtraction(t *testing.T) {
 		defer cleanup()
 
 		target := t2.Addr().String()
-		conn, err := t1.getConnection(target)
+		conn, err := t1.getConnection(target, "")
 		if err != nil {
 			t.Fatalf("getConnection(%s) failed: %v", target, err)
 		}
@@ -371,7 +371,7 @@ func TestDialConnectionServerNameExtraction(t *testing.T) {
 		// so we test the empty host fallback indirectly: verify getConnection
 		// works with an address that resolves to the peer.
 		target := t2.Addr().String()
-		conn, err := t1.getConnection(target)
+		conn, err := t1.getConnection(target, "")
 		if err != nil {
 			t.Fatalf("getConnection failed: %v", err)
 		}
@@ -474,13 +474,13 @@ func TestCleanStaleConnectionsEvictsStreams(t *testing.T) {
 
 	// Create several streams on the connection.
 	for shardID := uint64(1); shardID <= 5; shardID++ {
-		_, err := t1.getStream(target, shardID, false)
+		_, err := t1.getStream(target, shardID, false, "")
 		if err != nil {
 			t.Fatalf("getStream(%d) failed: %v", shardID, err)
 		}
 	}
 	// Also a heartbeat stream.
-	_, err := t1.getStream(target, 1, true)
+	_, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
@@ -493,7 +493,7 @@ func TestCleanStaleConnectionsEvictsStreams(t *testing.T) {
 	}
 
 	// Kill the connection from the remote side.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -569,11 +569,11 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 
 	// Create streams to both t2 and t3. dialConnection also pre-opens a
 	// heartbeat stream (index 0) asynchronously for each new connection.
-	_, err = t1.getStream(target2, 1, false)
+	_, err = t1.getStream(target2, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream(t2) failed: %v", err)
 	}
-	_, err = t1.getStream(target3, 1, false)
+	_, err = t1.getStream(target3, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream(t3) failed: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 	t3StreamsBefore := countStreamsForTarget(t1, target3)
 
 	// Kill only t2's connection.
-	conn2, err := t1.getConnection(target2)
+	conn2, err := t1.getConnection(target2, "")
 	if err != nil {
 		t.Fatalf("getConnection(t2) failed: %v", err)
 	}
@@ -620,7 +620,7 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 
 	// Create a data stream on the connection. dialConnection also
 	// pre-opens a heartbeat stream asynchronously.
-	_, err := t1.getStream(target, 1, false)
+	_, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 	}
 
 	// Kill the connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -644,7 +644,7 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 	// getConnection should detect the dead connection, evict streams,
 	// and redial. The redial will also fire preOpenHeartbeatStream
 	// asynchronously.
-	newConn, err := t1.getConnection(target)
+	newConn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("redial getConnection failed: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Trigger a connection dial by calling getConnection.
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 
 	// Verify getStream returns the pre-opened heartbeat stream without
 	// needing to open a new one (cache hit path).
-	stream, err := t1.getStream(target, 1, true)
+	stream, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
@@ -751,14 +751,14 @@ func TestPreOpenHeartbeatStreamNoRaceWithGetStream(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Dial the connection (which triggers preOpenHeartbeatStream async).
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Immediately open a heartbeat stream from the main goroutine,
 	// racing with the pre-open goroutine.
-	stream, err := t1.getStream(target, 1, true)
+	stream, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
@@ -771,7 +771,7 @@ func TestPreOpenHeartbeatStreamNoRaceWithGetStream(t *testing.T) {
 
 	// The stream pool should have exactly one heartbeat stream for
 	// this target, not two. Verify by fetching again.
-	stream2, err := t1.getStream(target, 1, true)
+	stream2, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("second getStream(heartbeat) failed: %v", err)
 	}
@@ -810,7 +810,7 @@ func TestPreOpenHeartbeatStreamDeadConnection(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Get a connection to obtain a real quic.Conn object.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -858,7 +858,7 @@ func TestStreamCount(t *testing.T) {
 
 	// Create streams across different shard indices.
 	for shardID := uint64(1); shardID <= 8; shardID++ {
-		_, err := t1.getStream(target, shardID, false)
+		_, err := t1.getStream(target, shardID, false, "")
 		if err != nil {
 			t.Fatalf("getStream(%d) failed: %v", shardID, err)
 		}
@@ -881,7 +881,7 @@ func TestPreOpenHeartbeatStreamTrackedByWaitGroup(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Trigger a dial to start the preOpenHeartbeatStream goroutine.
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -913,7 +913,7 @@ func TestPreOpenHeartbeatStreamExitsEarlyWhenStopped(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Get a connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -955,7 +955,7 @@ func TestPreOpenHeartbeatStreamWaitGroupDoneOnAllPaths(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Get a connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -1018,7 +1018,7 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a live connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -1027,7 +1027,7 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 	}
 
 	// Create a data stream on this connection.
-	_, err = t1.getStream(target, 1, false)
+	_, err = t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -1084,13 +1084,13 @@ func TestEvictStaleOutboundDeadConnection(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection and create some streams.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	for shardID := uint64(1); shardID <= 3; shardID++ {
-		_, err = t1.getStream(target, shardID, false)
+		_, err = t1.getStream(target, shardID, false, "")
 		if err != nil {
 			t.Fatalf("getStream(%d) failed: %v", shardID, err)
 		}
@@ -1128,13 +1128,13 @@ func TestEvictStaleOutboundOnRecvDelegatesToEvictStaleOutbound(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Create a stream.
-	_, err = t1.getStream(target, 1, false)
+	_, err = t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -1168,13 +1168,13 @@ func TestEvictStaleOutboundOnRecv_AliveOutboundNotEvicted(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a live outbound connection from t1 to t2.
-	outbound, err := t1.getConnection(target)
+	outbound, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Get a different connection (t2 dialing t1) to use as inbound.
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -1204,13 +1204,13 @@ func TestEvictStaleOutboundOnRecv_DeadOutboundEvicted(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish outbound from t1 to t2.
-	outbound, err := t1.getConnection(target)
+	outbound, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Create some streams to verify they are evicted too.
-	_, err = t1.getStream(target, 1, false)
+	_, err = t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -1220,7 +1220,7 @@ func TestEvictStaleOutboundOnRecv_DeadOutboundEvicted(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Use a different connection as inbound (t2 dialing t1).
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -1247,7 +1247,7 @@ func TestEvictStaleOutboundOnRecv_NoOutboundNoAdoption(t *testing.T) {
 	defer cleanup()
 
 	// t1 has no outbound to t2. Use t2's connection to t1 as inbound.
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -1291,13 +1291,13 @@ func TestEvictStaleOutboundOnRecv_SameConnectionNoop(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish outbound.
-	outbound, err := t1.getConnection(target)
+	outbound, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Create a stream to verify nothing is evicted.
-	_, err = t1.getStream(target, 1, false)
+	_, err = t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -1353,7 +1353,7 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Open a data stream so it gets cached in the shard map.
-	s1, err := t1.getStream(target, 1, false)
+	s1, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("initial getStream failed: %v", err)
 	}
@@ -1365,7 +1365,7 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 	waitForStableStreamCount(t, t1, 200*time.Millisecond)
 
 	// Kill the connection. This makes the context Done channel close.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -1378,7 +1378,7 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 
 	// Now getStream should detect the stale stream and fall through to
 	// the slow path, dialing a new connection and opening a fresh stream.
-	s2, err := t1.getStream(target, 1, false)
+	s2, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream after eviction failed: %v", err)
 	}
@@ -1402,7 +1402,7 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish initial connection and stream.
-	_, err := t1.getStream(target, 1, false)
+	_, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("initial getStream failed: %v", err)
 	}
@@ -1444,7 +1444,7 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 				return
 			default:
 			}
-			s, err := t1.getStream(target, 1, false)
+			s, err := t1.getStream(target, 1, false, "")
 			if err != nil {
 				// Connection errors are expected under eviction.
 				continue
@@ -1478,7 +1478,7 @@ func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -1526,7 +1526,7 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection so getStream's slow path can reach OpenStreamSync.
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -1539,7 +1539,7 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := t1.getStream(target, 1, false)
+		_, err := t1.getStream(target, 1, false, "")
 		done <- err
 	}()
 
@@ -1582,7 +1582,7 @@ func TestGetStreamReturnsErrorOnShutdown(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.getStream("127.0.0.1:12345", 0, false)
+	_, err = tr.getStream("127.0.0.1:12345", 0, false, "")
 	if err == nil {
 		t.Fatal("expected error from getStream after stop, got nil")
 	}
@@ -1615,7 +1615,7 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := tr.dialConnection(target)
+		_, err := tr.dialConnection(target, "")
 		done <- err
 	}()
 
@@ -1659,7 +1659,7 @@ func TestDialConnectionReturnsErrorOnShutdown(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.dialConnection("127.0.0.1:12345")
+	_, err = tr.dialConnection("127.0.0.1:12345", "")
 	if err == nil {
 		t.Fatal("expected error from dialConnection after stop, got nil")
 	}
@@ -1756,7 +1756,7 @@ func TestGetStream_StoppedTransportReturnsError(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.getStream("127.0.0.1:1234", 0, false)
+	_, err = tr.getStream("127.0.0.1:1234", 0, false, "")
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("expected ErrStreamClosed, got %v", err)
 	}
@@ -2082,7 +2082,7 @@ func TestGetConnection_StoppedTransportReturnsError(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.getConnection("127.0.0.1:9999")
+	_, err = tr.getConnection("127.0.0.1:9999", "")
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("expected ErrStreamClosed, got %v", err)
 	}
@@ -2111,7 +2111,7 @@ func TestDialConnection_InvalidTarget(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	_, err = tr.dialConnection("not-valid")
+	_, err = tr.dialConnection("not-valid", "")
 	if err == nil {
 		t.Fatal("expected error for invalid target")
 	}
@@ -2128,7 +2128,7 @@ func TestDialConnection_EmptyHost(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Verify connection works with normal target.
-	conn, err := t1.dialConnection(target)
+	conn, err := t1.dialConnection(target, "")
 	if err != nil {
 		t.Fatalf("dialConnection failed: %v", err)
 	}
@@ -2258,7 +2258,7 @@ func TestDialConnection_WithEventListener(t *testing.T) {
 	}
 	defer t2.Stop()
 
-	_, dialErr := tr.dialConnection(t2.Addr().String())
+	_, dialErr := tr.dialConnection(t2.Addr().String(), "")
 	if dialErr != nil {
 		t.Fatalf("dialConnection failed: %v", dialErr)
 	}
@@ -2506,7 +2506,7 @@ func TestGetStream_StaleConnectionFastPathEviction(t *testing.T) {
 
 	// Now getStream should detect the dead connection in the fast path,
 	// evict it, and fall through to the slow path.
-	stream, err := t1.getStream(t2Addr, 1, false)
+	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		// This may fail if the connection isn't fully dead yet, which
 		// is acceptable. The important thing is that the eviction path
@@ -2557,7 +2557,7 @@ func TestEvictStreamsForTarget_WithMultipleStreams(t *testing.T) {
 	t1.evictStreamsForTarget(t2Addr)
 
 	// After eviction, getting a stream should open a new one.
-	stream, err := t1.getStream(t2Addr, 1, false)
+	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Logf("getStream after eviction: %v", err)
 	} else if stream == nil {
@@ -2643,7 +2643,7 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// 2. Enter slow path, dial fresh connection
 	// 3. Find existing stale stream in shard
 	// 4. Detect it's stale (!connOK), discard + retry
-	stream, err := t1.getStream(t2Addr, 1, false)
+	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Logf("getStream stale dedup: %v (may be timing-dependent)", err)
 	} else if stream == nil {
@@ -2721,7 +2721,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	t1.connMu.Lock()
 	delete(t1.conns, t2Addr)
 	t1.connMu.Unlock()
-	conn2, dialErr := t1.dialConnection(t2Addr)
+	conn2, dialErr := t1.dialConnection(t2Addr, "")
 	if dialErr != nil {
 		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
 		return
@@ -2821,7 +2821,7 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	// Open a second connection and simulate a recv on that new *quic.Conn —
 	// i.e. "the peer dialled us from a fresh connection" — but with the SAME
 	// boot epoch (7): a benign re-dial, NOT a restart.
-	conn2, dialErr := t1.dialConnection(t2Addr)
+	conn2, dialErr := t1.dialConnection(t2Addr, "")
 	if dialErr != nil {
 		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
 	}
@@ -2887,11 +2887,11 @@ func TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored(t *testing.T) {
 
 	// Two live, fully-handshaked connections to t2. Both present t2's
 	// certificate, which covers loopback/:: but NOT the spoofed host below.
-	cachedConn, dialErr := t1.dialConnection(t2.Addr().String())
+	cachedConn, dialErr := t1.dialConnection(t2.Addr().String(), "")
 	if dialErr != nil {
 		t.Fatalf("dialConnection(cached) failed: %v", dialErr)
 	}
-	inboundConn, dialErr := t1.dialConnection(t2.Addr().String())
+	inboundConn, dialErr := t1.dialConnection(t2.Addr().String(), "")
 	if dialErr != nil {
 		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
 	}
@@ -3032,7 +3032,7 @@ func TestGetStream_StaleStreamInShardDedupRetry(t *testing.T) {
 	// 4. Find injected stale stream in shard dedup check
 	// 5. Detect stale (!connOK since we removed the original conn)
 	// 6. Retry with fresh connection
-	stream, err := t1.getStream(t2Addr, shardID, false)
+	stream, err := t1.getStream(t2Addr, shardID, false, "")
 	if err != nil {
 		t.Fatalf("getStream stale dedup retry failed: %v", err)
 	}
@@ -3153,7 +3153,7 @@ func TestDialConnection_OnConnectionFailedEvent(t *testing.T) {
 	defer tr.Stop()
 
 	// Dial a non-existent address to trigger failure.
-	_, err = tr.dialConnection("127.0.0.1:1")
+	_, err = tr.dialConnection("127.0.0.1:1", "")
 	if err == nil {
 		t.Fatal("expected dial to fail")
 	}
@@ -3189,7 +3189,7 @@ func TestDialConnection_EmptyHostRejected(t *testing.T) {
 	// ":12345" has an empty host. Rather than silently verifying the peer
 	// certificate against a hardcoded "localhost" ServerName (masking a
 	// misconfiguration), dialConnection must reject it with ErrEmptyDialHost.
-	_, err = tr.dialConnection(":12345")
+	_, err = tr.dialConnection(":12345", "")
 	if !errors.Is(err, ErrEmptyDialHost) {
 		t.Fatalf("expected ErrEmptyDialHost for empty-host target, got %v", err)
 	}
@@ -3292,7 +3292,7 @@ func TestGetStream_FastPathDetectsDeadConnectionAndReconnects(t *testing.T) {
 	defer t2b.Stop()
 
 	// getStream should detect the dead connection, evict, and reconnect.
-	stream, getErr := t1.getStream(t2Addr, 1, false)
+	stream, getErr := t1.getStream(t2Addr, 1, false, "")
 	if getErr != nil {
 		t.Fatalf("getStream failed after reconnect: %v", getErr)
 	}
@@ -3433,7 +3433,7 @@ func TestGetStream_ConcurrentDedupReturnsCachedStream(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = t1.getStream(t2Addr, 1, false)
+				_, _ = t1.getStream(t2Addr, 1, false, "")
 			}()
 		}
 		wg.Wait()
@@ -3505,7 +3505,7 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 		key := streamKey{target: t2Addr, idx: idx}
 
 		// Get a fresh stream to inject.
-		s, getErr := t1.getStream(t2Addr, shardID, false)
+		s, getErr := t1.getStream(t2Addr, shardID, false, "")
 		if getErr != nil {
 			continue
 		}
@@ -3536,7 +3536,7 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 				}
 				shard.mu.Unlock()
 
-				_, _ = t1.getStream(t2Addr, shardID, false)
+				_, _ = t1.getStream(t2Addr, shardID, false, "")
 				time.Sleep(time.Microsecond)
 			}
 		}()
@@ -3570,7 +3570,7 @@ func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Get a stream to populate the cache.
-	stream1, err := t1.getStream(t2Addr, 1, false)
+	stream1, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
@@ -3584,7 +3584,7 @@ func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
 
 	// Now getStream should detect the stream was evicted and fall
 	// through to the slow path, opening a new stream.
-	stream2, err := t1.getStream(t2Addr, 1, false)
+	stream2, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream after eviction failed: %v", err)
 	}
@@ -3609,7 +3609,7 @@ func TestGetStream_FastPathDeadConnection(t *testing.T) {
 	t2Addr := t2.Addr().String()
 
 	// Establish a stream via getStream.
-	stream1, err := t1.getStream(t2Addr, 1, false)
+	stream1, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Fatalf("initial getStream failed: %v", err)
 	}
@@ -3628,7 +3628,7 @@ func TestGetStream_FastPathDeadConnection(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// getStream should detect the dead connection, evict, and reconnect.
-	stream2, err := t1.getStream(t2Addr, 1, false)
+	stream2, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
 		t.Fatalf("getStream after dead connection failed: %v", err)
 	}
@@ -3679,7 +3679,7 @@ func TestGetStream_OpenStreamSyncError(t *testing.T) {
 	reg.Register(1, 2, t2Addr)
 
 	// Establish a connection.
-	_, dialErr := t1.getConnection(t2Addr)
+	_, dialErr := t1.getConnection(t2Addr, "")
 	if dialErr != nil {
 		t.Fatalf("getConnection failed: %v", dialErr)
 	}
@@ -3688,7 +3688,7 @@ func TestGetStream_OpenStreamSyncError(t *testing.T) {
 	t1.shutdownCancel()
 
 	// getStream should fail at OpenStreamSync.
-	_, err = t1.getStream(t2Addr, 999, false)
+	_, err = t1.getStream(t2Addr, 999, false, "")
 	if err == nil {
 		t.Fatal("expected error from getStream after shutdown cancel")
 	}
@@ -3727,7 +3727,7 @@ func TestDialConnection_ShutdownContextCanceled(t *testing.T) {
 	tr.shutdownCancel()
 
 	// dialConnection should fail because the context is canceled.
-	_, err = tr.dialConnection("127.0.0.1:39999")
+	_, err = tr.dialConnection("127.0.0.1:39999", "")
 	if err == nil {
 		t.Fatal("expected error from dialConnection with canceled context")
 	}
@@ -3759,14 +3759,14 @@ func TestDialConnection_ReusesCachedWinner(t *testing.T) {
 
 	t2Addr := t2.Addr().String()
 
-	winner, err := t1.getConnection(t2Addr)
+	winner, err := t1.getConnection(t2Addr, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// A direct dial simulates the loser of the race: the cache already
 	// holds a live connection when its insert runs.
-	got, err := t1.dialConnection(t2Addr)
+	got, err := t1.dialConnection(t2Addr, "")
 	if err != nil {
 		t.Fatalf("dialConnection failed: %v", err)
 	}

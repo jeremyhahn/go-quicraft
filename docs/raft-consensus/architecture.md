@@ -127,7 +127,17 @@ satisfy a ReadIndex quorum.
 `LeaseRead` (PhD §6.4) resolves inline while the lease holds, with no heartbeat
 at all. It **requires `CheckQuorum` and `ElectionRTT >= 5`** and is rejected
 with `ErrLeaseReadRequiresCheckQuorum` otherwise — a lease without quorum
-checking is a linearizability violation waiting for a partition.
+checking is a linearizability violation waiting for a partition. The lease is
+measured in monotonic real time from when the acknowledged heartbeat round was
+sent, so a paused leader loses it, and it assumes clock rates within 1% of each
+other. Every heartbeat acknowledgement states the vote window its sender
+promises, and the leader counts only acknowledgements whose window covers the
+lease, so a replica configured to promise less backs no lease rather than an
+unsound one. The promise is recorded in the replica's Raft hard state before
+any acknowledgement makes it, and a restarted replica withholds its vote, and
+does not campaign, for the recorded window — whatever configuration it
+restarted into — so a full-shard restart elects about one election timeout
+later.
 
 ## Request keys are random draws, and applied entries are placed by index too
 

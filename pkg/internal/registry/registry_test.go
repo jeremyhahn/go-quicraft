@@ -15,8 +15,10 @@
 package registry
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -467,5 +469,24 @@ func TestCompareAndRemoveKeepsAMappingThatMoved(t *testing.T) {
 	}
 	if c := r.Count(); c != 1 {
 		t.Fatalf("Count = %d, want 1", c)
+	}
+}
+
+// TestReplicasAt returns every replica routed to an address, and none for an
+// address nothing is routed to.
+func TestReplicasAt(t *testing.T) {
+	r := NewRegistry()
+	r.Register(1, 1, "10.0.0.1:5000")
+	r.Register(2, 3, "10.0.0.1:5000") // a co-located replica of another shard
+	r.Register(1, 2, "10.0.0.2:5000")
+
+	got := r.ReplicasAt("10.0.0.1:5000")
+	slices.SortFunc(got, func(a, b NodeInfo) int { return cmp.Compare(a.ShardID, b.ShardID) })
+	want := []NodeInfo{{ShardID: 1, ReplicaID: 1}, {ShardID: 2, ReplicaID: 3}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ReplicasAt = %v, want %v", got, want)
+	}
+	if got := r.ReplicasAt("10.0.0.9:5000"); len(got) != 0 {
+		t.Fatalf("ReplicasAt of an unused address = %v, want none", got)
 	}
 }

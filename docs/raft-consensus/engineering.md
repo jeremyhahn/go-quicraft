@@ -1815,33 +1815,173 @@ valid lease exists.
 1. `Config.LeaseRead = true` (opt-in) and this replica is the leader with a
    non-nil `remoteLastAck`.
 2. A quorum of ALL voting members (remotes + witnesses + self) acked a
-   heartbeat within `leaseTimeout` ticks. Witnesses vote, so the lease quorum
-   must span the same set as the election quorum; otherwise a lease could be
-   held by a coalition that a new leader's election coalition does not
-   intersect.
+   heartbeat round that the leader SENT less than `leaseDuration` ago by its
+   monotonic clock. Witnesses vote, so the lease quorum must span the same set
+   as the election quorum; otherwise a lease could be held by a coalition that
+   a new leader's election coalition does not intersect.
 
-`leaseTimeout` is `ElectionRTT - 2` ticks. The safety argument (PhD 6.4):
-followers will not grant votes to another candidate until their own election
-timeout expires, and the 2-tick margin covers goroutine scheduling jitter
-between the leader's lease check and the followers' election timers. The lease
-is measured in TICKS, not wall-clock time, so it does not depend on clock
-synchronization between nodes; it does depend on ticks being delivered at
-roughly the configured rate on the leader.
+`leaseTimeout` is `ElectionRTT - 2` ticks and `leaseDuration` is that many
+tick intervals (`RTTMillisecond`) of real time, less 1% for clock-rate drift.
+The safety argument (PhD 6.4): a follower that acks a heartbeat sent at `T`
+received it no earlier than `T`, reset its election timer then, and will not
+grant a vote to another candidate until its election timeout has elapsed. Its
+Go ticker can hand it one coalesced tick immediately and another just after the
+reset, so that window is at least `ElectionRTT - 2` tick intervals, which is
+what the 2-tick margin covers. A quorum of acks for rounds sent at or after `T`
+therefore rules out another leader before `T + leaseDuration` — provided each
+of those followers' election timeouts covers the lease, which the follower
+states in its ack (below). A follower that restarts inside that window has lost
+its election timer; the vote hold-down below carries the promise across the
+restart.
+
+The lease is measured in REAL MONOTONIC TIME from the round's send time, not in
+ticks. It was once measured in ticks, and that was unsound: a leader
+descheduled or paused for longer than the election timeout resumes with its
+ticker's missed ticks coalesced into one, so its acks still look fresh by any
+tick count while the followers have already elected a new leader and committed
+past it. Anchoring at send time means a pause can only shorten the lease; on
+resuming, the elapsed time already exceeds it and the read takes the heartbeat
+quorum round. Anchoring at ack receipt would be wrong for the same reason: a
+stall between an ack's arrival and its processing would be credited to the
+lease.
+
+**Each ack states the promise it makes, and the follower keeps it in real
+time.** The window a follower keeps its vote is its OWN configuration — its
+`ElectionRTT`, its host's `RTTMillisecond`, whether it runs `LeaseRead` — not
+the leader's. So `HeartbeatResp.LogTerm`, which a heartbeat response otherwise
+leaves unused, carries the follower's `voteWindow`: its `ElectionRTT` tick
+intervals in nanoseconds when it runs `LeaseRead` and knows its tick, and 0
+otherwise. On sending the ack the follower takes the promise on
+(`promiseVotes`): until that window has passed on its monotonic clock it grants
+no vote or pre-vote and starts no campaign (`votePromised`). The promise is
+enforced in real time and nothing else, because the election timer and the
+known-leader tests both end early: the ticker is not re-phased by a heartbeat,
+so a minimum-length timer fires about one tick short of the window; and any
+higher-term message — a delayed rejection from an old pre-vote, say — moves the
+follower to a new term with no known leader, after which `dropHighTermVote` and
+the leader-active test no longer refuse anything. Only a leadership transfer by
+the leader the promise was made to releases it — its `TimeoutNow` at the
+promise's term, and its candidate's transfer-hinted vote at the next term.
+That is sound because the leader gives up lease reads for the rest of the term
+the moment it sends a `TimeoutNow` (`timeoutNowSent`), not merely while the
+transfer is active: the message can be delayed without bound and arrive after
+the transfer has timed out and fresh heartbeats have renewed the followers'
+promises, which it then releases. A transfer abandoned before its target caught
+up sent no `TimeoutNow` and restores the lease (`resumeLeaseAfterTransfer`);
+one that did send one leaves reads on the heartbeat quorum round until the next
+term. A campaign that the promise declines retries on the next tick, so a timer
+that fires just short of the window costs at most one tick, not another
+election timeout. Observers promise nothing: no lease quorum counts their
+acks. The leader records an ack for the lease only
+when that window is at least its lease span, `leaseTimeout` tick intervals
+before the drift bound is taken off (`ackBacksLease`). A follower configured to
+promise less backs no lease, and while too few followers back one, reads take
+the heartbeat quorum round: replicas need not be configured alike for lease
+reads to be safe, only for them to be fast. An ack from a build that sends no
+window carries 0 and backs nothing.
+
+The lease assumes the clock RATES of any two nodes differ by less than the 1%
+drift bound (`leaseDriftDivisor`); the kernel bounds `CLOCK_MONOTONIC` slew to
+500 ppm. Clock offset between nodes is irrelevant. The host passes the engine's
+tick interval to each peer (`Peer.SetTickInterval`); a peer that was never
+given one never grants a lease, promises no window, and on a `LeaseRead` shard
+never votes (see the vote hold-down below). `Host.StartShard` refuses an
+`ElectionRTT` whose product with `RTTMillisecond` does not fit a
+`time.Duration` (`Config.ValidateElectionTimeout`).
+
+Rounds travel in the heartbeat's `LogIndex` field, which a heartbeat otherwise
+leaves unused, and the follower echoes it in `HeartbeatResp.LogIndex` — no wire
+layout change. The leader remembers the send time of the last
+`leaseRoundWindow` (32) rounds and opens a new round at most once per
+1/16 of the lease, so every round sent within the lease is still in the window
+even under sustained ReadIndex load, when every step cycle broadcasts. A
+broadcast inside the current granule reuses its round and keeps the round's
+first send time, which can only date an ack early. An ack naming round 0, a
+round never issued, or one that has left the window renews nothing.
 
 CheckQuorum should be enabled (it is a `*bool` whose nil zero value means
 enabled, so this holds unless explicitly disabled with `config.BoolPtr(false)`)
 so the leader periodically re-verifies quorum and `resetLeaseAcks` forces the
 lease to be re-earned.
 
-The lease is invalidated at every point the clock or the role changes:
+The lease is invalidated at every point the clock regime or the role changes:
 `becomeFollower`, `exitQuiesce`, quiesce entry, `handleLeaderTransfer`, and the
-`resetLeaseAcks` call at the end of each CheckQuorum cycle. That last one is
-not optional: after `electionTick` wraps to 0, `leaseExpiry = 0 - leaseTimeout`
-underflows negative and every stale positive tick would appear valid.
+`resetLeaseAcks` call at the end of each CheckQuorum cycle, which makes the
+lease be re-earned at the cadence remote activity is re-proven. Heartbeats sent
+during a leader transfer carry round 0, so no ack of one ever counts.
 `syncLeaseAcks` drops entries for replicas that left the voting set and
-deliberately does NOT seed new ones, because a seeded tick of 0 is
-indistinguishable from an ack recorded at tick 0 and would let a member that is
-not even running contribute to the lease.
+deliberately does NOT seed new ones, because any seeded time would claim a
+heartbeat round the member never answered and would let a member that is not
+even running contribute to the lease.
+
+### Vote hold-down after restart
+
+The safety argument above rests on each acking follower's election timer, and a
+restart discards it: the replica comes back with no known leader, so neither
+`dropHighTermVote` nor the leader-active test in `handleVoteRequest` fires, and
+it would grant the first up-to-date candidate at once. In a three-voter shard,
+leader L holds a lease on its own ack and F1's; F1 restarts; F2, which has lost
+L, campaigns at a higher term; F1 grants; F1 and F2 elect F2 while L still
+counts F1's pre-restart ack and serves reads that miss F2's writes.
+
+`voteHeldDown` closes it. A restarted replica withholds every vote and
+pre-vote, transfer-hinted ones included, from the moment it is constructed, for
+the longer of two windows: the one its previous incarnation recorded as owed,
+and the one it now promises. The refusal takes the ordinary rejection
+path (a rejected `RequestVoteResp`, or a `RequestPreVoteResp` at the
+responder's own term), and a refused higher-term `RequestVote` still advances
+the replica's term in `step()`. Replication and heartbeats are accepted
+throughout, so the leader's CheckQuorum sees the replica as active; acks sent in
+the new incarnation are covered by the ordinary election-timer denial.
+
+- **The promise is persisted.** The window a replica promises is recorded in its
+  Raft hard state (`State.VoteWindow`, next to `Term` and `Vote`) as soon as it
+  is known (`sizeVoteHoldDown`), and hard state is persisted before any ordered
+  message — `HeartbeatResp` among them — leaves the replica, so no ack makes a
+  promise the WAL does not hold. On restart the hold-down honours the recorded
+  window whatever the replica restarted into: `LeaseRead` switched off, or a
+  shorter `ElectionRTT` or `RTTMillisecond`, cannot shorten a promise already
+  made. Once the hold-down has run, every earlier promise has been outlived and
+  the record is lowered to the current promise — on the next vote request or
+  tick (`Peer.Tick`), and persisted with the next update — so a replica moved
+  off `LeaseRead` stops paying for it after one restart.
+- **Window length.** Every pre-restart ack promised at most the recorded window,
+  was sent before construction, and answered a round sent no later, so the
+  hold-down ends at least that window, on the replica's clock, after any such
+  round was sent; the leader counted the ack only if that window covers its
+  lease span, and the lease is that span less 1% on the leader's clock, so the
+  window needs no drift allowance of its own.
+- **Real time, not ticks.** The window is measured on the injectable monotonic
+  clock (`raft.now`), because ticks coalesce across a pause, which is the bug
+  class the lease itself was moved to real time to fix. Quiesce changes how
+  often ticks arrive and therefore neither extends nor ends the window.
+- **Anchored at construction.** A peer answers `RequestVote` from the moment it
+  exists, before its first tick; a first-tick anchor would need a "not yet
+  started" state that is held anyway, and would only start the window later.
+- **Self-votes too.** A candidate counts its own grant, and a quorum holding
+  F1's self-vote can miss the rest of the lease quorum just as one holding a
+  vote F1 granted can. `startElection` and `handleTimeoutNow` both refuse
+  inside the window (the latter with `ErrLeaseVoteHoldDown`), leader transfer
+  included: the `Hint == From` exemption is chosen by the sender, and the
+  replica cannot tell whether the transferring leader is the one whose lease its
+  old ack backs. A transfer that needs the replica during the window times out
+  and can be retried. A restarted replica's own election timer is randomized
+  over `[ElectionRTT, 2*ElectionRTT)` ticks, so the self-campaign gate rarely
+  delays anything.
+- **Witnesses** vote and their acks count toward the lease, so the hold-down
+  applies to them. Observers do not vote and are unaffected. A single-voter
+  shard holds no lease (its reads are served without one), but its own
+  campaign still waits out the window, which again is about its election
+  timeout.
+- **No tick interval.** Until `Peer.SetTickInterval` sizes the window it stays
+  held: this peer's leader side grants no lease without the interval, but a
+  leader on another host may, and it is that lease the old ack backs.
+- **A replica that has never run `LeaseRead`** records no window, returns before
+  reading the clock, and votes at once after a restart, exactly as before.
+
+The cost is availability: after a restart a `LeaseRead` replica cannot help
+elect a leader for about one election timeout, so a full-shard restart elects
+its first leader about one election timeout later.
 
 ### Flow
 
@@ -1861,8 +2001,8 @@ Host.ReadIndex(ctx, shardID)   (or Host.SyncRead)
   +-- either way the caller still waits for lastApplied >= readIndex
 ```
 
-The leader tracks per-remote heartbeat ack ticks in
-`remoteLastAck map[uint64]int`.
+The leader tracks, per voting member, the send time of the newest heartbeat
+round it acked in `remoteLastAck map[uint64]time.Time`.
 
 ### Failure Mode
 

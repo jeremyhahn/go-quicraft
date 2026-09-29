@@ -265,13 +265,13 @@ waldb.Open(dir)
       |      |         |    Decrypt if barrier configured
       |      |         |    replayRecord(data, segID)
       |      |         |      dispatch on payload type byte:
-      |      |         |        0x02: state     -> restore hard state
       |      |         |        0x04: bootstrap -> restore bootstrap info
       |      |         |        0x05: compact   -> replay compaction markers
-      |      |         |        0x06: remove    -> replay node removal
       |      |         |        0x0b: entries   -> rebuild entry map + index
       |      |         |        0x0c: snapshot  -> restore snapshot metadata
-      |      |         |        0x01/0x03/0x07/0x08/0x09/0x0a: legacy -> FATAL
+      |      |         |        0x0d: state     -> restore hard state
+      |      |         |        0x01/0x02/0x03/0x06/0x07/0x08/0x09/0x0a: legacy -> FATAL
+      |      |         |    then purgeRetired: drop every replica the RETIRED registry names
       |      |         |        anything else: ErrUnknownPayloadType (FATAL)
       |      |
       |      |  4. Track nextSegmentID = max(segID) + 1
@@ -775,11 +775,14 @@ StopShard(shardID)
 
 ### Commit Fence on StopShard
 
-`UnloadNode` waits for the commit worker to take the unload, and the worker
-takes membership changes only between batches. When the wait returns, no batch
-that could hold the stopped incarnation's update is still inside `SaveState`,
-and an update of that incarnation still queued in `commitC` is dropped when it
-is admitted to a batch, before `SaveState` and together with its ordered
+`UnloadNode` waits for the commit worker to take the unload. The worker takes
+membership changes between batches, and also while its forward to the apply
+tier is blocked, so a stop never waits out another shard's busy state machine;
+it never takes one while a `SaveState` is running. When the wait returns, no
+`SaveState` of the stopped incarnation is running, every item of it still ahead
+in the current batch is skipped by the per-item unloaded checks before it is
+committed or persisted, and an update of that incarnation still queued in
+`commitC` is dropped when it is admitted to a batch, before `SaveState` and together with its ordered
 messages — exactly as a crash before the fsync would lose it. A `StartShard`
 that follows therefore reads a LogDB the old incarnation can no longer write:
 without the fence, an old vote could land over the new incarnation's
@@ -1307,7 +1310,7 @@ Sources: `pkg/internal/queue/entryqueue.go`, `pkg/internal/engine/node.go`, `pkg
 
 #### LeaseRead (O20) -- Raft PhD Section 6.4
 
-When `Config.LeaseRead = true`, the leader tracks per-remote heartbeat ack timestamps in `remoteLastAck map[uint64]int`. When the lease is valid, ReadIndex requests are served immediately without a heartbeat round-trip. When the lease has expired, the standard ReadIndex path (heartbeat quorum confirmation) is used as a fallback.
+When `Config.LeaseRead = true`, the leader tracks, per voting member, the send time of the newest heartbeat round it acked in `remoteLastAck map[uint64]time.Time`, and the lease holds while a quorum's rounds were sent less than `ElectionRTT - 2` ticks of real time (less 1% for clock drift) ago on the leader's monotonic clock. A paused leader therefore loses the lease rather than keeping it across the pause (see `docs/raft-consensus/engineering.md` §15). When the lease is valid, ReadIndex requests are served immediately without a heartbeat round-trip. When the lease has expired, the standard ReadIndex path (heartbeat quorum confirmation) is used as a fallback.
 
 Sources: `pkg/internal/raft/raft.go`, `pkg/config/config.go`
 

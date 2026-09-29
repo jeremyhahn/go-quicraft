@@ -1114,12 +1114,12 @@ When a replica is removed from a shard, the following cleanup sequence runs:
 1. `RequestRemoveNode(ctx, shardID, replicaID, configChangeIndex)` proposes a `RemoveNode` config change through Raft
 2. Once committed and applied, the membership no longer includes the removed replica
 3. On the removed node, call `LogDB.RemoveNodeData(shardID, replicaID)` to clean up persistent state:
-   - Writes a durable `payloadTypeRemoveNode` record to the WAL (survives crash-recovery)
+   - Durably retires the replica ID in the WAL's retired-replica registry (a 16-byte entry in the `RETIRED` file), before anything else changes
    - Clears all in-memory state: index, entries, hard state, bootstrap, snapshots, compaction markers
    - Triggers segment garbage collection: collects the set of segments still referenced by remaining live nodes and deletes orphaned segment files
    - Fsyncs the parent directory to make segment deletions durable
 
-The durable WAL record ensures that if the process crashes after `RemoveNodeData` but before all segment files are deleted, WAL replay on restart will re-apply the removal and re-trigger garbage collection. Data for other nodes sharing the same WAL shard is unaffected.
+The registry entry ensures that if the process crashes after `RemoveNodeData` but before all segment files are deleted, the next open drops every record of the removed replica wherever it is found, and garbage collection reclaims its segments. The replica ID is retired for good: `StartShard` refuses it, and every LogDB writer refuses it with `logdb.ErrReplicaRetired`. Data for other nodes sharing the same WAL shard is unaffected.
 
 ## Tuning Guide
 
@@ -1203,7 +1203,7 @@ Set `ZeroCopyEntryCmd: true` to avoid copying `Entry.Cmd` during unmarshal. The 
 
 ### LeaseRead
 
-Enable `LeaseRead: true` on a shard config to use lease-based reads (PhD 6.4 optimization). Lease reads skip the heartbeat round-trip required by normal linearizable reads, reducing read latency to zero (serving from local committed state). Requires CheckQuorum, which is on by default — `CheckQuorum` is a `*bool` whose nil zero value means enabled, so leave it unset rather than writing `CheckQuorum: true` (that does not compile; the compiling form is `config.BoolPtr(true)`). `Config.Validate` returns `*LeaseReadRequiresCheckQuorumError` when LeaseRead is set with CheckQuorum explicitly disabled, and LeaseRead also requires `ElectionRTT >= 5`. Not compatible with witness replicas.
+Enable `LeaseRead: true` on a shard config to use lease-based reads (PhD 6.4 optimization). Lease reads skip the heartbeat round-trip required by normal linearizable reads, reducing read latency to zero (serving from local committed state). Requires CheckQuorum, which is on by default — `CheckQuorum` is a `*bool` whose nil zero value means enabled, so leave it unset rather than writing `CheckQuorum: true` (that does not compile; the compiling form is `config.BoolPtr(true)`). `Config.Validate` returns `*LeaseReadRequiresCheckQuorumError` when LeaseRead is set with CheckQuorum explicitly disabled, and LeaseRead also requires `ElectionRTT >= 5`. Witness replicas are supported: witnesses vote, so their heartbeat acknowledgements count toward the lease quorum exactly as a full replica's do. The lease is measured in real time on the leader's monotonic clock from when the acknowledged heartbeat was sent, so a paused leader loses it and reads fall back to the heartbeat round; it assumes every replica uses the same `ElectionRTT`, `RTTMillisecond` and `LeaseRead` setting and that node clock rates differ by less than 1%. After a restart, a replica of a LeaseRead shard (witnesses included) neither votes nor campaigns for one election timeout of real time, because a leader may still count its pre-restart acknowledgement toward a lease; it keeps accepting replication meanwhile. The cost is availability: a restarted replica cannot help elect a leader for about one election timeout, so a full-shard restart elects its first leader about one election timeout later.
 
 ## Build and CI
 

@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,33 @@ func SyncDir(dir string) error {
 		return syncErr
 	}
 	return closeErr
+}
+
+// DeepestExistingAncestor returns the deepest ancestor of path that already
+// exists (path itself when it exists). Recorded BEFORE an os.MkdirAll(path),
+// it is the stopAt the following SyncDirChain must use: the fsync has to cover
+// every directory the MkdirAll creates, and the pre-existing ancestor's entry
+// for the first of them, and no directory above that.
+func DeepestExistingAncestor(path string) string {
+	return DeepestExistingAncestorWith(os.Stat, path)
+}
+
+// DeepestExistingAncestorWith performs DeepestExistingAncestor's walk with
+// the supplied stat instead of os.Stat, so a caller that routes its file I/O
+// through its own filesystem abstraction probes through that same
+// abstraction; the walk itself must not be duplicated.
+func DeepestExistingAncestorWith(stat func(string) (fs.FileInfo, error), path string) string {
+	dir := path
+	for {
+		if _, err := stat(dir); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
 }
 
 // SyncDirChain fsyncs leaf and each ancestor directory up to and

@@ -60,7 +60,7 @@ func TestRevocation_EvictsAnAlreadyEstablishedConnection(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection: %v", err)
 	}

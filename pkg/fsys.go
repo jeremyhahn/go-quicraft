@@ -17,7 +17,6 @@ package quicraft
 import (
 	"io/fs"
 	"os"
-	"path/filepath"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
@@ -25,15 +24,11 @@ import (
 // snapshotFile is the open-handle surface the snapshot persistence paths use.
 // Seek exists for the frame-epoch prescan in ReencryptSnapshotFile, Stat for
 // the send path's declared-size check, and Name to recover a CreateTemp path.
-type snapshotFile interface {
-	Read(p []byte) (int, error)
-	Write(p []byte) (int, error)
-	Seek(offset int64, whence int) (int64, error)
-	Stat() (fs.FileInfo, error)
-	Name() string
-	Sync() error
-	Close() error
-}
+//
+// It is the engine's surface, aliased rather than restated, so snapshotFS
+// satisfies engine.ScratchFS and the host's recovery and send create their
+// anonymous decrypt scratch through the one engine.CreateAnonymousScratch.
+type snapshotFile = engine.SnapshotFile
 
 // snapshotFS abstracts exactly the filesystem operations the snapshot
 // persistence paths perform: receive/persist, save, export, import,
@@ -170,19 +165,10 @@ func syncDirChain(fsys snapshotFS, leaf, stopAt string) error {
 // deepestExistingAncestor returns the deepest ancestor of path that already
 // exists on fsys (path itself when it exists). Recorded BEFORE a MkdirAll, it
 // is the stopAt the following syncDirChain must use: the fsync has to cover
-// every directory the MkdirAll creates and no directory above them.
+// every directory the MkdirAll creates and no directory above them. It applies
+// engine.DeepestExistingAncestor's walk to the injected filesystem.
 func deepestExistingAncestor(fsys snapshotFS, path string) string {
-	dir := path
-	for {
-		if _, err := fsys.Stat(dir); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return dir
-		}
-		dir = parent
-	}
+	return engine.DeepestExistingAncestorWith(fsys.Stat, path)
 }
 
 // mkdirAllSynced creates dir and any missing parents, then fsyncs the whole

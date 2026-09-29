@@ -15,9 +15,14 @@
 package revocation
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -369,5 +374,99 @@ func TestOCSPCacheScopedToIssuingCA(t *testing.T) {
 	if !revokedB {
 		t.Fatalf("cached verdict for interA's serial %#x satisfied the lookup for interB's revoked certificate",
 			collidingSerial)
+	}
+}
+
+// TestOCSPDelegatedResponderMustBeAuthorized: ParseResponseForCert accepts a
+// response signed by ANY certificate the issuer signed, embedded as the
+// responder. A revoked node holds exactly such a certificate — its own — so on
+// the path to the responder it could answer its own OCSP query "good" and pass
+// revocation. A delegated responder must carry id-kp-OCSPSigning and be within
+// its validity period (RFC 6960 §4.2.2.2); a responder that does still works.
+func TestOCSPDelegatedResponderMustBeAuthorized(t *testing.T) {
+	ca := newTestCA(t)
+	issue := func(serial int64, eku []x509.ExtKeyUsage, notAfter time.Time) (*x509.Certificate, *ecdsa.PrivateKey) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("generate key: %v", err)
+		}
+		der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: "delegate"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     notAfter,
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  eku,
+		}, ca.cert, &key.PublicKey, ca.key)
+		if err != nil {
+			t.Fatalf("issue: %v", err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return cert, key
+	}
+	// serve answers every query "good", signed by the given delegate.
+	serve := func(responder *x509.Certificate, key *ecdsa.PrivateKey) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body := make([]byte, r.ContentLength)
+			_, _ = r.Body.Read(body)
+			req, err := ocsp.ParseRequest(body)
+			if err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			resp, err := ocsp.CreateResponse(ca.cert, responder, ocsp.Response{
+				Status:       ocsp.Good,
+				SerialNumber: req.SerialNumber,
+				ThisUpdate:   time.Now().Add(-time.Minute),
+				NextUpdate:   time.Now().Add(time.Hour),
+				Certificate:  responder,
+			}, key)
+			if err != nil {
+				http.Error(w, "create response", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/ocsp-response")
+			_, _ = w.Write(resp)
+		}))
+	}
+	node, nodeKey := issue(501, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, time.Now().Add(time.Hour))
+	delegate, delegateKey := issue(502, []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}, time.Now().Add(time.Hour))
+	expired, expiredKey := issue(503, []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}, time.Now().Add(-10*time.Minute))
+
+	for _, tc := range []struct {
+		name      string
+		responder *x509.Certificate
+		key       *ecdsa.PrivateKey
+		wantOK    bool
+	}{
+		{"a node vouching for itself", node, nodeKey, false},
+		{"an expired OCSP-signing delegate", expired, expiredKey, false},
+		{"an authorized OCSP-signing delegate", delegate, delegateKey, true},
+		// The CA answering OCSP itself commonly embeds its own certificate;
+		// that is the issuer signing, not a delegate, and must stay accepted.
+		{"the issuer itself, embedding its certificate", ca.cert, ca.key, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := serve(tc.responder, tc.key)
+			defer server.Close()
+			checker := NewChecker(Config{Mode: ModeOCSP, OCSPResponderURL: server.URL, OCSPTimeoutSeconds: 5}, ca.cert)
+
+			revoked, err := checker.IsRevoked(node)
+			if tc.wantOK {
+				if err != nil || revoked {
+					t.Fatalf("IsRevoked = (%v, %v), want a good verdict from an authorized delegate", revoked, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("IsRevoked = (%v, nil): a response from an unauthorized responder was accepted", revoked)
+			}
+			if !errors.Is(err, ErrOCSPUnavailable) {
+				t.Fatalf("IsRevoked error = %v, want it treated as status unavailable (fail closed)", err)
+			}
+		})
 	}
 }

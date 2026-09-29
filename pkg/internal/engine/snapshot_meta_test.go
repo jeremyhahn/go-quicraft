@@ -265,7 +265,7 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			name: "current_record",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
-				if err := writeSnapshotMetadata(dir, 1, 1, 1, 1, 9, config.NoCompression); err != nil {
+				if err := writeTestSnapshotMetadata(dir, 1, 1, 1, 1, 9, config.NoCompression); err != nil {
 					t.Fatalf("writeSnapshotMetadata: %v", err)
 				}
 			},
@@ -275,7 +275,7 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			name: "current_record_plaintext_artifact",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
-				if err := writeSnapshotMetadata(dir, 1, 1, 1, 1, 0, config.NoCompression); err != nil {
+				if err := writeTestSnapshotMetadata(dir, 1, 1, 1, 1, 0, config.NoCompression); err != nil {
 					t.Fatalf("writeSnapshotMetadata: %v", err)
 				}
 			},

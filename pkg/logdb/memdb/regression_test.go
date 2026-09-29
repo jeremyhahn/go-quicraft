@@ -542,83 +542,109 @@ func TestSaveSnapshotRejectsIndexZero(t *testing.T) {
 	}
 }
 
-// TestSaveStateIsNotLostToAConcurrentRemoveNodeData pins the node-unlink race.
+// TestRemoveNodeDataWaitsForAnInFlightBatch pins that a removal never splits a
+// SaveState batch. A batch for replicas A and B used to be applied one update
+// at a time with nothing ordering it against RemoveNodeData, so removing B
+// between the two stored A and then refused B: SaveState returned an error
+// for a batch it had half applied, and a caller told the batch failed would
+// retry or abandon writes that were in fact kept. RemoveNodeData now waits for
+// every in-flight write (removalMu), so the batch is applied whole and the
+// removal follows it.
 //
-// getOrCreateNode resolves the *nodeData under the map lock and releases it
-// before the node lock is taken. RemoveNodeData can unlink the node inside that
-// window, and the write then landed in a value no reader could ever reach —
-// while SaveState still returned nil. A durability API reporting success for a
-// write nobody can read is the one outcome no ordering of the two calls
-// explains: "remove then save" leaves the entry present, "save then remove"
-// leaves the node gone, and neither leaves a node that exists but is empty
-// after an acknowledged write.
-//
-// The window is HELD OPEN rather than raced for: the test takes the node's own
-// lock first, so a SaveState in flight resolves that exact node and then blocks
-// acquiring it. The unlink happens while it is blocked — precisely the
-// interleaving — and the fixture asserts the writer really was parked there, so
-// a change that closed the window some other way cannot make this vacuous.
-func TestSaveStateIsNotLostToAConcurrentRemoveNodeData(t *testing.T) {
+// The window is HELD OPEN rather than raced for: the test holds B's node lock,
+// so the batch applies A and parks on B. The fixture asserts both the batch
+// and the removal really are blocked there, so a change that closed the
+// window some other way cannot make this vacuous.
+func TestRemoveNodeDataWaitsForAnInFlightBatch(t *testing.T) {
 	db := New()
+	b := db.getOrCreateNode(2, 1)
+	b.mu.Lock()
 
-	// The node SaveState will resolve. Holding its lock parks the writer in
-	// the window between resolving the pointer and using it.
-	stale := db.getOrCreateNode(1, 1)
-	stale.mu.Lock()
-
-	done := make(chan error, 1)
+	saved := make(chan error, 1)
 	go func() {
-		done <- db.SaveState([]logdb.Update{{
-			ShardID:   1,
-			ReplicaID: 1,
-			State:     logdb.State{Term: 3, Vote: 2, Commit: 1},
-			Entries:   []logdb.Entry{{Index: 1, Term: 3, Cmd: []byte("x")}},
-		}})
+		saved <- db.SaveState([]logdb.Update{
+			{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 3, Vote: 1}},
+			{ShardID: 2, ReplicaID: 1, State: logdb.State{Term: 3, Vote: 1}},
+		})
 	}()
-
-	// Give the writer time to resolve the node and block on its lock, then
-	// prove it is parked there. Without this the test would assert nothing.
+	removed := make(chan error, 1)
+	time.Sleep(50 * time.Millisecond)
+	go func() { removed <- db.RemoveNodeData(2, 1) }()
 	time.Sleep(50 * time.Millisecond)
 	select {
-	case err := <-done:
-		stale.mu.Unlock()
-		t.Fatalf("SaveState completed (%v) while the node lock was held: it never "+
-			"entered the window this test exists to reproduce", err)
+	case err := <-saved:
+		b.mu.Unlock()
+		t.Fatalf("SaveState completed (%v) while B's lock was held: the batch never reached B", err)
+	case err := <-removed:
+		b.mu.Unlock()
+		t.Fatalf("RemoveNodeData completed (%v) while a batch naming its node was in flight", err)
 	default:
 	}
+	b.mu.Unlock()
 
-	// Unlink the node out from under the parked writer.
-	if err := db.RemoveNodeData(1, 1); err != nil {
-		stale.mu.Unlock()
-		t.Fatalf("RemoveNodeData: %v", err)
-	}
-	stale.mu.Unlock()
-
-	err := <-done
-	if err != nil {
+	if err := <-saved; err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
+	if err := <-removed; err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+	if st, _, err := db.ReadState(1, 1); err != nil || st.Term != 3 {
+		t.Fatalf("A after the batch = (%+v, %v), want term 3", st, err)
+	}
+	if _, _, err := db.ReadState(2, 1); !errors.Is(err, logdb.ErrNoState) {
+		t.Fatalf("B after its removal = %v, want ErrNoState", err)
+	}
+	if retired, _ := db.NodeRemoved(2, 1); !retired {
+		t.Fatal("B not retired by RemoveNodeData")
+	}
+}
 
-	first, span, err := db.EntryRange(1, 1)
-	if err != nil {
-		t.Fatalf("EntryRange: %v", err)
+// TestCloseWaitsForAnInFlightBatch pins that Close never splits a SaveState
+// batch either. Close released the node map while holding only the map lock,
+// so a batch in flight across it stored part of itself in the discarded map
+// and the rest in the new one, and returned nil. Close now waits for every
+// in-flight write, and a write that starts after it is refused.
+func TestCloseWaitsForAnInFlightBatch(t *testing.T) {
+	db := New()
+	b := db.getOrCreateNode(2, 1)
+	b.mu.Lock()
+
+	saved := make(chan error, 1)
+	go func() {
+		saved <- db.SaveState([]logdb.Update{
+			{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 3, Vote: 1}},
+			{ShardID: 2, ReplicaID: 1, State: logdb.State{Term: 3, Vote: 1}},
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	closed := make(chan error, 1)
+	go func() { closed <- db.Close() }()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-saved:
+		b.mu.Unlock()
+		t.Fatalf("SaveState completed (%v) while B's lock was held: the batch never reached B", err)
+	case err := <-closed:
+		b.mu.Unlock()
+		t.Fatalf("Close completed (%v) while a batch was in flight", err)
+	default:
 	}
-	if first != 1 || span != 1 {
-		t.Fatalf("SaveState returned nil but the entry it acknowledged is not "+
-			"readable: EntryRange = (%d, %d), want (1, 1). The write landed in a "+
-			"nodeData that RemoveNodeData had already unlinked, so the caller was "+
-			"told a Raft entry was persisted that no reader can reach", first, span)
+	b.mu.Unlock()
+
+	if err := <-saved; err != nil {
+		t.Fatalf("SaveState: %v", err)
 	}
-	st, _, err := db.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState after the acknowledged write: %v", err)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
 	}
-	if st.Term != 3 || st.Vote != 2 {
-		t.Fatalf("hard state after the acknowledged write = %+v, want term 3 vote 2: "+
-			"a lost vote permits a second vote in the same term", st)
+	if err := db.SaveState([]logdb.Update{{ShardID: 3, ReplicaID: 1, State: logdb.State{Term: 1}}}); !errors.Is(err, logdb.ErrClosed) {
+		t.Fatalf("SaveState after Close = %v, want ErrClosed", err)
 	}
-	if stale == db.getNode(1, 1) {
-		t.Fatal("the store is still using the unlinked nodeData")
+	db.mu.RLock()
+	n := len(db.nodes)
+	db.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("Close left %d nodes in the map: a write in flight across it repopulated the released data", n)
 	}
 }
 

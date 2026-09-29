@@ -784,12 +784,12 @@ func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
 	waitConnDown(t, t1, t2Addr, 10*time.Second)
 
 	// Call sendHeartbeatBatch directly. Should hit error paths.
-	t1.sendHeartbeatBatch(t2Addr, []proto.Message{
+	t1.sendHeartbeatBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
 
 	// Call again to exercise the path after connection eviction.
-	t1.sendHeartbeatBatch(t2Addr, []proto.Message{
+	t1.sendHeartbeatBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 3},
 	})
 }
@@ -824,7 +824,7 @@ func TestSendHeartbeatBatch_GetStreamError(t *testing.T) {
 
 	// sendHeartbeatBatch should hit the getStream error path
 	// at heartbeat.go:109-112 and return without crash.
-	tr.sendHeartbeatBatch("127.0.0.1:50001", []proto.Message{
+	tr.sendHeartbeatBatch("127.0.0.1:50001", "", []proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
 

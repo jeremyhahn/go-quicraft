@@ -133,11 +133,11 @@ func TestConnectionCleanupWithMultipleConns(t *testing.T) {
 	reg.Register(1, 2, target2)
 	reg.Register(1, 3, target3)
 
-	_, err = t1.getConnection(target2)
+	_, err = t1.getConnection(target2, "")
 	if err != nil {
 		t.Fatalf("getConnection(t2) failed: %v", err)
 	}
-	_, err = t1.getConnection(target3)
+	_, err = t1.getConnection(target3, "")
 	if err != nil {
 		t.Fatalf("getConnection(t3) failed: %v", err)
 	}
@@ -200,12 +200,12 @@ func TestGetStreamPoolSizeOneDataPath(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Both heartbeat and data should use index 0 when pool size is 1.
-	hbStream, err := t1.getStream(target, 1, true)
+	hbStream, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("heartbeat getStream failed: %v", err)
 	}
 
-	dataStream, err := t1.getStream(target, 1, false)
+	dataStream, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("data getStream failed: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestDialConnectionResolveFailure(t *testing.T) {
 	defer tr.Stop()
 
 	// Invalid address should fail at resolution.
-	_, err = tr.dialConnection("not-a-valid-address::::")
+	_, err = tr.dialConnection("not-a-valid-address::::", "")
 	if err == nil {
 		t.Fatal("expected error for invalid address")
 	}
@@ -571,7 +571,7 @@ func TestSendBatchStreamGetError(t *testing.T) {
 
 	// sendBatch to an unreachable target. This triggers the getStream
 	// error path (which calls getConnection which fails).
-	tr.sendBatch("127.0.0.1:1", []proto.Message{
+	tr.sendBatch("127.0.0.1:1", "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
 	// Should not panic or block.
@@ -629,7 +629,7 @@ func TestHandleConnectionStopDuringAccept(t *testing.T) {
 
 	// Establish a connection.
 	target := t2.Addr().String()
-	_, err := t1.getConnection(target)
+	_, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -648,7 +648,7 @@ func TestGetConnectionDeadConnectionRedial(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Get initial connection.
-	conn1, err := t1.getConnection(target)
+	conn1, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("first getConnection failed: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestGetConnectionDeadConnectionRedial(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Next getConnection should redial.
-	conn2, err := t1.getConnection(target)
+	conn2, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("second getConnection after close failed: %v", err)
 	}
@@ -832,13 +832,13 @@ func TestGetStreamConcurrentDoubleCheck(t *testing.T) {
 	target := t2.Addr().String()
 
 	// First, create a stream so the double-check path is exercised.
-	s1, err := t1.getStream(target, 5, false)
+	s1, err := t1.getStream(target, 5, false, "")
 	if err != nil {
 		t.Fatalf("first getStream failed: %v", err)
 	}
 
 	// Getting the same stream should return the cached one.
-	s2, err := t1.getStream(target, 5, false)
+	s2, err := t1.getStream(target, 5, false, "")
 	if err != nil {
 		t.Fatalf("second getStream failed: %v", err)
 	}
@@ -857,7 +857,7 @@ func TestSendBatchWithHeartbeatDetection(t *testing.T) {
 	t1.sendBatch(func() string {
 		addr, _ := t1.reg.Resolve(1, 2)
 		return addr
-	}(), []proto.Message{
+	}(), "", []proto.Message{
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 3},
 	})
 
@@ -1717,14 +1717,14 @@ func TestStopPooledStreamsClosedOnShutdown(t *testing.T) {
 
 	// Create multiple streams.
 	for shardID := uint64(1); shardID <= 5; shardID++ {
-		_, err := t1.getStream(target, shardID, false)
+		_, err := t1.getStream(target, shardID, false, "")
 		if err != nil {
 			t.Fatalf("getStream(%d) failed: %v", shardID, err)
 		}
 	}
 
 	// Also create a heartbeat stream.
-	_, err := t1.getStream(target, 1, true)
+	_, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
@@ -1996,7 +1996,7 @@ func TestSendBatch_DisableCompression(t *testing.T) {
 		t1.sendBatch(func() string {
 			addr, _ := t1.reg.Resolve(1, 2)
 			return addr
-		}(), []proto.Message{
+		}(), "", []proto.Message{
 			{
 				Type:    proto.Replicate,
 				ShardID: 1,
@@ -2060,7 +2060,7 @@ func TestSendBatch_DisableCompression(t *testing.T) {
 
 		reg1.Register(1, 2, t2.Addr().String())
 
-		t1.sendBatch(t2.Addr().String(), []proto.Message{
+		t1.sendBatch(t2.Addr().String(), "", []proto.Message{
 			{
 				Type:    proto.Replicate,
 				ShardID: 1,

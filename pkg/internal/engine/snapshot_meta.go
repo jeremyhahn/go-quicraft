@@ -96,6 +96,9 @@ const maxSnapshotMetaFileLen = snapshotMetaHeaderSize + maxSnapshotMetaBodyLen
 //
 // Nothing rewrites an existing record: a v0 record stays v0 until its snapshot
 // directory rolls off, and every new record is written at the current version.
+// No current writer produces a v0 record. They are still PARSED so the DEK
+// purge-floor scan can read an epoch from one, but none carries the integrity
+// fields, so recovery refuses the artifact beside one (VerifySnapshotArtifact).
 const (
 	// snapshotMetaMagic identifies a self-describing snapshot.meta record. It
 	// is 8 bytes so that a v0 record can never be mistaken for one: a v0
@@ -198,8 +201,10 @@ type SnapshotMeta struct {
 	DataHash uint64
 
 	// DataHashRecorded reports whether the record carried DataLen/DataHash.
-	// Artifacts written before this field existed leave it false and are
-	// recovered without an integrity check rather than refused.
+	// Every current writer stamps them, so a record that leaves it false —
+	// a pre-magic one included — cannot vouch for its artifact, and recovery
+	// refuses it (see VerifySnapshotArtifact). The purge-floor scan, which
+	// reads only Epoch, still accepts such a record.
 	DataHashRecorded bool
 }
 

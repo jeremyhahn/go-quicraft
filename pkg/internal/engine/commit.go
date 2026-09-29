@@ -273,8 +273,8 @@ func (w *commitWorker) drainCommitC() {
 //
 // Dropping is what keeps an unloaded incarnation from writing LogDB after
 // UnloadNode returns. The unload fence (requestUnload) proves only that no
-// batch in progress when it was sent is still running; an item still queued in
-// commitC is admitted later, and by then a new incarnation of the same shard
+// SaveState of the stopped incarnation is running or will run in the current
+// batch; an item still queued in commitC is admitted later, and by then a new incarnation of the same shard
 // may have loaded. Its update was never made durable, so dropping it is
 // exactly a crash before the fsync: its ordered messages — the ones that
 // promise durability, such as a vote grant — are dropped with it and never
@@ -356,6 +356,39 @@ func (w *commitWorker) forwardGiveUpC() <-chan struct{} {
 		return w.applyStopC
 	}
 	return w.stopC
+}
+
+// forwardToApply hands ai to the apply worker. It returns false, having
+// delivered nothing, when it gave up because the apply tier is stopping.
+//
+// The common case is a non-blocking send. While the send blocks — the apply
+// dispatcher backpressured on some shard's full per-shard channel — the
+// worker keeps applying unload/reload requests. An unload waits on this
+// worker (requestUnload is a fence), and StopShard of one shard must not wait
+// out another shard's busy state machine: the dispatcher answers its own
+// membership requests while backpressured, and this send is where the
+// commit tier would otherwise stall them. Applying membership mid-batch is
+// safe. The batch's SaveState, and any piggyback SaveState of the item being
+// forwarded, have already completed, and every later item in the batch
+// re-checks the unloaded set and its node's unloaded mark before it is
+// committed or persisted.
+func (w *commitWorker) forwardToApply(ai *applyItem) bool {
+	select {
+	case w.applyC <- ai:
+		return true
+	default:
+	}
+	giveUp := w.forwardGiveUpC()
+	for {
+		select {
+		case w.applyC <- ai:
+			return true
+		case m := <-w.membershipC:
+			w.applyMembership(m)
+		case <-giveUp:
+			return false
+		}
+	}
 }
 
 // retryWait waits for the SaveState retry backoff delay for the given
@@ -563,31 +596,18 @@ func (w *commitWorker) processBatch() {
 		ai := w.applyPool.Get().(*applyItem)
 		ai.update = u
 		ai.node = node
-		// Send to the apply worker with a stopC guard to prevent
-		// deadlock when the apply worker has panicked and is in its
-		// 100ms restart delay window. The non-blocking attempt first
-		// ensures committed entries are always delivered when the
-		// channel has capacity (which is the common case during
-		// ordered shutdown, since the apply worker is still running).
-		// Only if the channel is full AND stopC is closed do we give
-		// up — this can only happen during a simultaneous shutdown
-		// and apply worker panic, which is an edge case where the
-		// engine is already tearing down.
-		select {
-		case w.applyC <- ai:
-		default:
-			select {
-			case w.applyC <- ai:
-			case <-w.forwardGiveUpC():
-				slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
-					"shard", ai.update.ShardID)
-				ai.update.ReleaseCommittedEntries()
-				releaseApplyItem(w.applyPool, ai)
-				node.commitPending.Store(false)
-				w.abandonBatchTail(i + 1)
-				w.clearBatch()
-				return
-			}
+		// Only if the channel is full AND the apply tier is stopping do we
+		// give up — an edge case where the engine is already tearing down
+		// (see forwardToApply).
+		if !w.forwardToApply(ai) {
+			slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
+				"shard", ai.update.ShardID)
+			ai.update.ReleaseCommittedEntries()
+			releaseApplyItem(w.applyPool, ai)
+			node.commitPending.Store(false)
+			w.abandonBatchTail(i + 1)
+			w.clearBatch()
+			return
 		}
 	}
 	w.clearBatch()
@@ -975,10 +995,15 @@ func (w *commitWorker) drainUnloadReload() {
 // the membership channel and returns a channel closed once the worker has
 // applied it. Safe for concurrent use by the Host goroutine.
 //
-// The returned channel is what makes an unload a fence rather than a hint: the
-// worker applies membership only between batches, so once it closes, no batch
-// that could still hold the stopped incarnation's update is mid-SaveState, and
-// every later batch drops that update at admission (see admit). Without the
+// The returned channel is what makes an unload a fence rather than a hint.
+// The worker applies membership between batches, and while a forward to the
+// apply tier is blocked (forwardToApply) — never while a SaveState is running.
+// Once it closes: no SaveState of the stopped incarnation is running; every
+// item of it still ahead in the current batch is skipped, because processBatch
+// re-checks the unloaded set and the node's unloaded mark before it commits or
+// persists an item; and every later batch drops its update at admission (see
+// admit). Any new LogDB write added to the batch loop must sit behind those
+// re-checks, or the fence no longer holds. Without the
 // fence, an old incarnation's HardState, entries or adopted snapshot could be
 // written AFTER a new incarnation of the same shard had loaded LogDB.
 //
@@ -1076,11 +1101,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		stateUpdate := []logdb.Update{{
 			ShardID:   piggyback.ShardID,
 			ReplicaID: piggyback.ReplicaID,
-			State: logdb.State{
-				Term:   piggyback.State.Term,
-				Vote:   piggyback.State.Vote,
-				Commit: piggyback.State.Commit,
-			},
+			State:     protoStateToLogDB(&piggyback.State),
 		}}
 		// Retry with the same backoff schedule as the batch path — a transient
 		// fsync hiccup should not give up on the first attempt.
@@ -1171,26 +1192,17 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	}
 
 	// Forward to apply worker (commitPending cleared by apply worker).
-	// Non-blocking attempt first to ensure delivery when the channel
-	// has capacity (common case). Falls back to stopC-guarded blocking
-	// send to prevent deadlock during apply worker panic recovery.
 	ai := w.applyPool.Get().(*applyItem)
 	ai.update = piggyback
 	ai.node = node
-	select {
-	case w.applyC <- ai:
-	default:
-		select {
-		case w.applyC <- ai:
-		case <-w.forwardGiveUpC():
-			slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
-				"shard", piggyback.ShardID)
-			ai.update.ReleaseCommittedEntries()
-			releaseApplyItem(w.applyPool, ai)
-			// Signal the caller to stop: it must NOT keep iterating the
-			// shared batch (clearBatch will run in the caller).
-			return false
-		}
+	if !w.forwardToApply(ai) {
+		slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
+			"shard", piggyback.ShardID)
+		ai.update.ReleaseCommittedEntries()
+		releaseApplyItem(w.applyPool, ai)
+		// Signal the caller to stop: it must NOT keep iterating the
+		// shared batch (clearBatch will run in the caller).
+		return false
 	}
 	return true
 }

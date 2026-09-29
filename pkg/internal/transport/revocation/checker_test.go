@@ -502,6 +502,37 @@ func TestAddRevokedSerial(t *testing.T) {
 	}
 }
 
+// TestAddRevokedSerial_SurvivesCRLReload: a CRL reload replaces the CRL-derived
+// set wholesale, and programmatic revocations used to live in that same set,
+// so every runtime revocation was silently undone at the next reload — every
+// 60s whenever CRL files are configured.
+func TestAddRevokedSerial_SurvivesCRLReload(t *testing.T) {
+	ca := newTestCA(t)
+	crlPath := writeCRLFile(t, t.TempDir(), "ca.crl", ca.createCRL(t)) // lists nothing
+	checker := NewChecker(Config{Mode: ModeCRL, CRLPaths: []string{crlPath}}, ca.cert)
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+
+	leaf := ca.issueLeaf(t, 4242)
+	checker.AddRevokedSerial(leaf.SerialNumber.Text(16))
+
+	// A changed CRL file forces a real reload, not a hash-skip.
+	if err := os.WriteFile(crlPath, ca.createCRL(t, 7), 0o600); err != nil {
+		t.Fatalf("rewrite CRL: %v", err)
+	}
+	if err := checker.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+	revoked, err := checker.IsRevoked(leaf)
+	if err != nil {
+		t.Fatalf("IsRevoked error: %v", err)
+	}
+	if !revoked {
+		t.Fatal("a CRL reload undid a programmatic revocation")
+	}
+}
+
 // TestRemoveRevokedSerial verifies that programmatically removed serials
 // are no longer detected as revoked.
 func TestRemoveRevokedSerial(t *testing.T) {

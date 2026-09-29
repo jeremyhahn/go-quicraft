@@ -553,7 +553,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		// latency only for non-quicraft clients — all risk, no benefit.
 		if inboundConn != nil && inboundConn.ConnectionState().Used0RTT {
 			cnt := t.zeroRTTRefusals.Add(1)
-			if logSampled(&t.lastZeroRTTLog, protocolViolationLogInterval) {
+			if LogSampled(&t.lastZeroRTTLog, protocolViolationLogInterval) {
 				slog.Warn("message frame refused: arrived over 0-RTT early "+
 					"data, which is replayable",
 					"remote", remoteAddrOf(inboundConn),
@@ -589,8 +589,10 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 // log flood.
 const protocolViolationLogInterval = 10 * time.Second
 
-// logSampled reports whether a peer-driven diagnostic may be emitted now,
-// advancing the stamp when it may.
+// LogSampled reports whether a peer-driven diagnostic may be emitted now,
+// advancing the stamp when it may. It is exported for the host's message
+// handler, whose per-message authorization warnings a peer can drive at the
+// same rate.
 //
 // Every warning on the inbound receive path is triggerable at frame rate by a
 // single authenticated peer. slog's default handler writes synchronously to
@@ -599,7 +601,7 @@ const protocolViolationLogInterval = 10 * time.Second
 // behind it — a denial of service whose cost to the attacker is a few dozen
 // bytes per line produced. Pair every call with an unconditional counter so
 // the sampled line can report the true total.
-func logSampled(stamp *atomic.Int64, interval time.Duration) bool {
+func LogSampled(stamp *atomic.Int64, interval time.Duration) bool {
 	now := time.Now().UnixNano()
 	last := stamp.Load()
 	if now-last < int64(interval) {
@@ -763,7 +765,7 @@ func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inbou
 		return true
 	default:
 		n := t.snapshotStreamDrops.Add(1)
-		if logSampled(&t.lastSnapshotRejectLog, protocolViolationLogInterval) {
+		if LogSampled(&t.lastSnapshotRejectLog, protocolViolationLogInterval) {
 			slog.Warn("snapshot stream dropped: per-connection snapshot limit reached",
 				"remote", inboundConn.RemoteAddr().String(),
 				"limit", t.cfg.MaxConcurrentSnapshotRecv,
@@ -800,7 +802,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// the aggregate budget for one peer's burst.
 	if !t.reserveMsgRecvBudget(decodeCharge(int64(length))) {
 		n := t.recvBudgetDrops.Add(1)
-		if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 			slog.Warn("message frame dropped: receive memory budget exhausted",
 				"remote", remoteAddrOf(inboundConn),
 				"length", length,
@@ -815,7 +817,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// aggregate, so a single connection cannot starve all the others.
 	if !t.reserveConnMsgRecvBudget(inboundConn, int64(length)) {
 		n := t.recvBudgetDrops.Add(1)
-		if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 			slog.Warn("message frame dropped: per-connection receive memory budget exhausted",
 				"remote", remoteAddrOf(inboundConn),
 				"length", length,
@@ -870,7 +872,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 			if !t.reserveMsgRecvBudget(decodeCharge(delta)) {
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
-				if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 					slog.Warn("compressed message frame dropped: receive memory budget exhausted",
 						"remote", remoteAddrOf(inboundConn),
 						"compressed_length", length,
@@ -884,7 +886,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 			if !t.reserveConnMsgRecvBudget(inboundConn, delta) {
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
-				if logSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 					slog.Warn("compressed message frame dropped: per-connection receive memory budget exhausted",
 						"remote", remoteAddrOf(inboundConn),
 						"compressed_length", length,
@@ -952,7 +954,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	for i := range batch.Requests {
 		if batch.Requests[i].ShardID == 0 {
 			n := t.zeroShardDrops.Add(1)
-			if logSampled(&t.lastZeroShardLog, protocolViolationLogInterval) {
+			if LogSampled(&t.lastZeroShardLog, protocolViolationLogInterval) {
 				slog.Warn("dropping message with ShardID=0",
 					"from", batch.Requests[i].From,
 					"type", proto.MessageTypeName(batch.Requests[i].Type),
@@ -997,7 +999,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	// most once per (connection, claimed-address) rather than on every batch.
 	if batch.SourceAddress != "" && !t.inboundAuthorizedForCached(inboundConn, batch.SourceAddress) {
 		n := t.spoofedSourceClears.Add(1)
-		if logSampled(&t.lastSpoofedSourceLog, protocolViolationLogInterval) {
+		if LogSampled(&t.lastSpoofedSourceLog, protocolViolationLogInterval) {
 			slog.Warn("clearing spoofed source address: not covered by peer certificate",
 				"claimed_source", batch.SourceAddress,
 				"remote", remoteAddrOf(inboundConn),

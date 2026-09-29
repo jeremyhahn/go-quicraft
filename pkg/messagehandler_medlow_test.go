@@ -17,10 +17,13 @@ package quicraft
 import (
 	"bytes"
 	"errors"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,6 +101,80 @@ func TestHandleMessage_DropsMisroutedTo(t *testing.T) {
 		if m.To != 0 && m.To != localReplicaID {
 			t.Errorf("message with To=%d was delivered; only To==0 or To==%d may pass", m.To, localReplicaID)
 		}
+	}
+}
+
+// dropCountRecorder counts unauthorized-message drops.
+type dropCountRecorder struct {
+	NoOpMetricsCollector
+	drops atomic.Int64
+}
+
+func (r *dropCountRecorder) IncUnauthorizedMessageDropped(uint64, uint64, string) {
+	r.drops.Add(1)
+}
+
+// TestHandleMessage_DropWarningsAreRateLimited: every drop in the
+// authorization path used to write its own Warn line. A batch carries up to
+// proto.MaxMessagesPerBatch messages, so one frame from a peer the shard does
+// not admit wrote thousands of synchronous lines. The warning is sampled; the
+// counter still records every drop.
+func TestHandleMessage_DropWarningsAreRateLimited(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
+	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
+		localReplicaID: "127.0.0.1:6001",
+		peerReplicaID:  "127.0.0.1:6002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(shardID)
+	rec := &dropCountRecorder{}
+	h.metrics = rec
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
+
+	const n = 5000
+	batch := proto.MessageBatch{Requests: make([]proto.Message, n)}
+	for i := range batch.Requests {
+		batch.Requests[i] = proto.Message{ShardID: shardID, From: peerReplicaID, To: 99, Type: proto.Heartbeat} // misrouted
+	}
+	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+
+	if lines := strings.Count(logs.String(), "rejected misrouted message"); lines != 1 {
+		t.Fatalf("%d warning lines for %d dropped messages, want 1", lines, n)
+	}
+	if got := rec.drops.Load(); got != n {
+		t.Fatalf("counted %d drops, want every one of %d", got, n)
+	}
+}
+
+// TestReplicaIdentity_IsTheIdentityASenderIsHeldTo: the transport writes a
+// message, or a snapshot, only to a connection whose peer presents the
+// identity replicaIdentity returns for its destination. It must be the
+// identity membership binds to the replica — what an inbound sender from it is
+// held to — and "" for a shard not loaded here, so nothing is sent there.
+func TestReplicaIdentity_IsTheIdentityASenderIsHeldTo(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
+	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
+		localReplicaID: "127.0.0.1:6001",
+		peerReplicaID:  "127.0.0.1:6002",
+	})
+	eng.LoadNode(node)
+	defer eng.UnloadNode(shardID)
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	if got := handler.replicaIdentity(shardID, peerReplicaID); got != fixtureIdentity {
+		t.Fatalf("replicaIdentity(%d, %d) = %q, want the bound identity %q", shardID, peerReplicaID, got, fixtureIdentity)
+	}
+	if got := handler.replicaIdentity(shardID+1, peerReplicaID); got != "" {
+		t.Fatalf("replicaIdentity of a shard not loaded = %q, want none", got)
 	}
 }
 

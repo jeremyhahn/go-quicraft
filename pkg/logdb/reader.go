@@ -637,7 +637,7 @@ func (lr *LogReader) PersistBootstrap(entries []proto.Entry, state proto.State) 
 		if err := lr.logdb.SaveState([]Update{{
 			ShardID:   lr.shardID,
 			ReplicaID: lr.replicaID,
-			State:     State{Term: state.Term, Vote: state.Vote, Commit: state.Commit},
+			State:     State{Term: state.Term, Vote: state.Vote, Commit: state.Commit, VoteWindow: state.VoteWindow},
 			Entries:   dbEntries,
 		}}); err != nil {
 			return err

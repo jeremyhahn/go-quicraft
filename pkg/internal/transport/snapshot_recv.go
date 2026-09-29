@@ -15,6 +15,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -534,12 +535,26 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	default:
 	}
 
+	// Authorize the sender from the header BEFORE taking a slot or any
+	// memory. Authorization used to run only once the whole transfer had been
+	// buffered, so any cluster-certificate holder — a member of no shard —
+	// could hold a peer's slots and half the snapshot memory budget for the
+	// length of a transfer and starve every snapshot the node needed.
+	if err := sr.handler.AuthorizeSnapshot(hdr.ShardID, hdr.ReplicaID, hdr.From, hdr.Index, peer); err != nil {
+		if errors.Is(err, ErrSnapshotNotAccepting) {
+			sr.rejectStream(snapshotRejectNotAccepting, "shard is not accepting snapshots", hdr, 0, err, slog.LevelDebug)
+			return
+		}
+		sr.rejectSnapshotStream(snapshotRejectUnauthorized, "sender not authorized for this snapshot", hdr, err)
+		return
+	}
+
 	// Per-peer fairness first: the host-global semaphore alone lets one peer
 	// hold every slot, silently starving snapshot delivery to every other
 	// recovering follower. peerKey is the peer's authenticated identity, not
 	// its transport address — see snapshotFairnessKey.
 	if !sr.acquirePeerSlot(peerKey) {
-		sr.rejectSnapshotStream(snapshotRejectConcurrency, "per-peer snapshot concurrency limit reached", hdr, nil)
+		sr.rejectAuthorizedStream(snapshotRejectConcurrency, "per-peer snapshot concurrency limit reached", hdr)
 		return
 	}
 	defer sr.releasePeerSlot(peerKey)
@@ -550,7 +565,7 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 		defer func() { <-sr.sem }()
 	default:
 		// At concurrency limit, drop the snapshot.
-		sr.rejectSnapshotStream(snapshotRejectConcurrency, "global snapshot concurrency limit reached", hdr, nil)
+		sr.rejectAuthorizedStream(snapshotRejectConcurrency, "global snapshot concurrency limit reached", hdr)
 		return
 	}
 
@@ -878,9 +893,27 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotR
 // known yet. It fires the same OnSnapshotRejected listener and structured
 // warning as rejectSnapshot so every discarded transfer is observable through
 // one signal, rather than some paths returning silently and leaving the sender
-// to time out its ack wait. hdr may be nil when the header never parsed, in
-// which case the counter is attributed to shard 0.
+// to time out its ack wait. hdr may be nil when the header never parsed.
+//
+// The counter is attributed to shard 0: every caller rejects before the
+// sender was authorized, when the shard the header names is whatever the peer
+// wrote, and using it as a metric label would let any certificate holder mint
+// unbounded series by cycling shard IDs. The log line and the listener still
+// carry the shard the header named. A rejection after authorization goes
+// through rejectAuthorizedStream.
 func (sr *snapshotReceiver) rejectSnapshotStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, err error) {
+	sr.rejectStream(reason, detail, hdr, 0, err, slog.LevelWarn)
+}
+
+// rejectAuthorizedStream is rejectSnapshotStream for a transfer whose sender
+// AuthorizeSnapshot has admitted: its shard is verified, and is counted.
+func (sr *snapshotReceiver) rejectAuthorizedStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader) {
+	sr.rejectStream(reason, detail, hdr, hdr.ShardID, nil, slog.LevelWarn)
+}
+
+// rejectStream records a stream-level rejection, counting it under
+// countedShard and logging it at level.
+func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, countedShard uint64, err error, level slog.Level) {
 	var info config.SnapshotInfo
 	if hdr != nil {
 		info = config.SnapshotInfo{
@@ -889,7 +922,7 @@ func (sr *snapshotReceiver) rejectSnapshotStream(reason snapshotRejectReason, de
 			Index:     hdr.Index,
 		}
 	}
-	slog.Warn("snapshot stream rejected, discarding transfer",
+	slog.Log(context.Background(), level, "snapshot stream rejected, discarding transfer",
 		"reason", reason,
 		"detail", detail,
 		"shard", info.ShardID,
@@ -898,7 +931,7 @@ func (sr *snapshotReceiver) rejectSnapshotStream(reason snapshotRejectReason, de
 		"error", err,
 	)
 	if sr.metrics != nil {
-		sr.metrics.IncSnapshotsRejected(info.ShardID, string(reason))
+		sr.metrics.IncSnapshotsRejected(countedShard, string(reason))
 	}
 	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
 		sr.listener.OnSnapshotRejected(info)
@@ -1014,6 +1047,25 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *Snaps
 				ChunkID:     chunk.ChunkID,
 				HeaderValue: hdr.Epoch,
 				ChunkValue:  chunk.Epoch,
+			}
+		}
+		// The header's sender and target are what AuthorizeSnapshot admitted;
+		// a chunk naming others would be persisted on an authorization it
+		// never received.
+		if chunk.From != hdr.From {
+			return &ChunkHeaderMismatchError{
+				Field:       "from",
+				ChunkID:     chunk.ChunkID,
+				HeaderValue: hdr.From,
+				ChunkValue:  chunk.From,
+			}
+		}
+		if chunk.ReplicaID != hdr.ReplicaID {
+			return &ChunkHeaderMismatchError{
+				Field:       "replica_id",
+				ChunkID:     chunk.ChunkID,
+				HeaderValue: hdr.ReplicaID,
+				ChunkValue:  chunk.ReplicaID,
 			}
 		}
 	}

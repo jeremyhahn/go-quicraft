@@ -20,7 +20,6 @@ import (
 	"io"
 	"io/fs"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -251,8 +250,8 @@ func TestWriteImportedSnapshotData_ReportsCloseFailure(t *testing.T) {
 	h := &Host{}
 	dataPath := filepath.Join(t.TempDir(), "snapshot.dat")
 
-	err := h.writeImportedSnapshotData(context.Background(), closeFailingImportFS{}, 1, dataPath,
-		strings.NewReader("an imported state machine image"))
+	_, _, err := h.writeImportedSnapshotData(context.Background(), closeFailingImportFS{}, 1, 1, 1, dataPath, nil,
+		trailedPayload(t, []byte("an imported state machine image")), nil)
 	if !errors.Is(err, errTestCloseFailed) {
 		t.Fatalf("writeImportedSnapshotData = %v, want the file's Close error. The "+
 			"import goes on to record this artifact as the shard's snapshot and to "+

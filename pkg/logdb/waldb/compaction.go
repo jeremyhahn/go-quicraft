@@ -54,14 +54,16 @@ func newCompactor(fs FS, dir string, blockSize int) *compactor {
 //     mark); and
 //   - it is not present in liveSegments.
 //
-// The maxCommittedID guard closes a cross-goroutine window. SaveState writes
-// a record durably in its Phase 1 (possibly rotating to a new segment) but
-// updates the in-memory index and meta pins only in its Phase 3, releasing
-// shard.mu in between. A concurrent same-shard Compact running in that window
-// would not see the just-written segment in liveSegments and could delete it.
-// Because maxCommittedID is advanced only at the Phase-3 commit point (and at
-// the writeBootstrap commit), any durably-written-but-not-yet-indexed segment
-// has an ID greater than maxCommittedID and is therefore preserved.
+// The maxCommittedID guard keeps GC away from any segment whose records are
+// not yet reflected in the in-memory index and meta pins. SaveState writes a
+// record durably in its Phase 1 (possibly rotating to a new segment) but
+// updates the index and pins only in its Phase 3. It now holds shard.mu across
+// both, so a concurrent same-shard Compact cannot run in between; the guard is
+// what keeps GC correct regardless of that locking, and it was the fix when
+// SaveState released shard.mu between the phases. maxCommittedID advances only
+// at the Phase-3 commit point, the writeBootstrap commit and recovery, so a
+// durably-written-but-not-yet-indexed segment has an ID above it and is
+// preserved.
 func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID, maxCommittedID uint64) (int, error) {
 	dirEntries, err := c.fs.ReadDir(c.dir)
 	if err != nil {

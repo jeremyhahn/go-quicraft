@@ -87,4 +87,16 @@ type MessageHandler interface {
 	// the committed membership every other authorization decision reads, so
 	// this is the single most consequential binding in the transport.
 	HandleSnapshot(chunks []proto.SnapshotChunk, peer PeerAuth) error
+
+	// AuthorizeSnapshot decides, from the stream header alone, whether a
+	// snapshot transfer may proceed: the sending replica from, to replica
+	// replicaID of shardID, over a connection whose verified identity is
+	// peer. The transport calls it BEFORE taking a receive slot or any
+	// memory, so a peer the shard does not admit — any holder of a cluster
+	// certificate — cannot hold those for the length of a transfer and starve
+	// the snapshots the shard needs. A non-nil error refuses the transfer.
+	// It does not replace HandleSnapshot's own checks: every chunk is bound to
+	// the header it authorized, and HandleSnapshot re-checks before it
+	// persists anything.
+	AuthorizeSnapshot(shardID, replicaID, from, index uint64, peer PeerAuth) error
 }

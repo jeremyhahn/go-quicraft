@@ -100,17 +100,19 @@ type TransportMetrics interface {
 	// IncSnapshotsRejected counts an inbound snapshot transfer discarded
 	// before it reached the state machine. reason comes from a closed set
 	// defined by the transport: "shutdown", "concurrency_limit",
-	// "memory_budget", "liveness", "malformed", "io_error", "policy".
+	// "memory_budget", "liveness", "malformed", "io_error", "policy",
+	// "unauthorized", "not_accepting".
 	// Implementations must treat it as a metric label and must not derive
-	// new label values from it. shardID is 0 when the transfer was rejected
-	// before its header parsed.
+	// new label values from it. shardID is 0 for a transfer rejected before
+	// its sender was authorized: until then the shard the header names is
+	// whatever the peer wrote, and is not used as a label.
 	IncSnapshotsRejected(shardID uint64, reason string)
 
 	// IncMessagesDropped counts a Raft message the transport discarded
 	// instead of delivering. reason comes from a closed set defined by the
 	// transport: "unresolved_target", "queue_full", "stream_unavailable",
 	// "write_failed", "marshal_failed", "protocol_violation", "unsendable",
-	// "peer_rejected". Implementations must treat it as a metric label and
+	// "peer_rejected", "identity_mismatch". Implementations must treat it as a metric label and
 	// must not derive new label values from it. shardID and to are both 0
 	// for "protocol_violation", where the frame is discarded before its
 	// messages are parsed.
@@ -150,6 +152,8 @@ type SecurityMetrics interface {
 
 	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped
 	// because the sender failed authorization or TLS identity binding.
+	// shardID is 0 when the snapshot named a shard this host has not loaded:
+	// that ID is unverified and is not used as a label.
 	IncUnauthorizedSnapshotDropped(shardID, from uint64)
 }
 

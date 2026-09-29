@@ -51,11 +51,11 @@ func TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted(t *testing.T) {
 	// t1 dials t2 without ever having received a batch from it, which is the
 	// ordinary case: the dial path has no way to learn the peer's epoch. The
 	// resulting outbound is therefore of unproven provenance.
-	outbound, err := t1.getConnection(target)
+	outbound, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
-	if _, err := t1.getStream(target, 1, false); err != nil {
+	if _, err := t1.getStream(target, 1, false, ""); err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
 	if t1.ConnectionCount() != 1 {
@@ -66,7 +66,7 @@ func TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted(t *testing.T) {
 	// that is NOT the cached outbound (each peer dials independently). The
 	// cached outbound is alive, so the dead-connection branch does not apply:
 	// only incarnation attribution can decide whether it is usable.
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches(t *t
 	defer cleanup()
 
 	target := t2.Addr().String()
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
@@ -113,10 +113,10 @@ func TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches(t *t
 
 	// The dial now happens with t2's incarnation known, so the outbound is
 	// attributable to it.
-	if _, err := t1.getConnection(target); err != nil {
+	if _, err := t1.getConnection(target, ""); err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
-	if _, err := t1.getStream(target, 1, false); err != nil {
+	if _, err := t1.getStream(target, 1, false, ""); err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
@@ -146,20 +146,20 @@ func TestEvictStaleOutboundOnRecv_RestartAfterTeardownEvicts(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	inbound, err := t2.getConnection(t1.Addr().String())
+	inbound, err := t2.getConnection(t1.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("t2.getConnection failed: %v", err)
 	}
 
 	t1.evictStaleOutboundOnRecv(target, t2.bootEpoch, inbound)
-	if _, err := t1.getConnection(target); err != nil {
+	if _, err := t1.getConnection(target, ""); err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
 	// Tear the outbound down and re-dial, as a write failure would.
 	t1.removeAndCloseConnection(target, "test teardown")
 	t1.evictStreamsForTarget(target)
-	if _, err := t1.getConnection(target); err != nil {
+	if _, err := t1.getConnection(target, ""); err != nil {
 		t.Fatalf("re-dial failed: %v", err)
 	}
 

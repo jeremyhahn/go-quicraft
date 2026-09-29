@@ -247,14 +247,16 @@ func TestCompact_PartialGCFailureKeepsEpochFloor(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeData_TombstonePinnedAgainstGC is the H2 regression test. The
-// RemoveNode tombstone's segment must be pinned against garbage collection:
-// WAL shards are shared by many Raft groups, so OLDER segments holding the
-// removed node's records can stay alive (pinned by other nodes) after the
-// tombstone's own segment becomes otherwise dead. If GC deletes the tombstone
-// while those older segments survive, replay resurrects the removed replica —
-// a membership-safety violation.
-func TestRemoveNodeData_TombstonePinnedAgainstGC(t *testing.T) {
+// TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive is the H2
+// regression test, restated for the retired-replica registry. WAL shards are
+// shared by many Raft groups, so a segment holding the removed node's records
+// can stay alive — pinned by another node — long after the removal. Replay of
+// that segment must not resurrect the removed replica. The removal used to be
+// a tombstone record whose segment was pinned forever to stay ahead of such
+// segments; now it is the registry, which replay applies after rebuilding, so
+// nothing is pinned for it and the removed node's own segments are ordinary
+// garbage.
+func TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
 		db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -279,25 +281,29 @@ func TestRemoveNodeData_TombstonePinnedAgainstGC(t *testing.T) {
 	}
 	rotateShard(t, db, nodeA)
 
-	// Segment 1: the RemoveNode tombstone for node A.
-	if err := db.RemoveNodeData(nodeA, 1); err != nil {
-		t.Fatalf("RemoveNodeData: %v", err)
+	// Segment 1: node A alone.
+	if err := db.SaveEntries(nodeA, 1, makeEntries(6, 5, 1)); err != nil {
+		t.Fatalf("SaveEntries A seg1: %v", err)
 	}
 	rotateShard(t, db, nodeA)
 
-	// Segment 2: more node B records, advancing the commit high-water mark
-	// past the tombstone's segment so GC would consider it.
+	if err := db.RemoveNodeData(nodeA, 1); err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+	// Segment 2: more node B records, advancing the commit high-water mark.
 	if err := db.SaveEntries(nodeB, 1, makeEntries(4, 3, 1)); err != nil {
 		t.Fatalf("SaveEntries B seg2: %v", err)
 	}
-
-	// GC: segment 0 is alive via node B, segment 2 is alive and active.
-	// Segment 1 holds only the tombstone — it must survive via the pin.
 	if err := db.Compact(nodeB, 0); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	if _, err := defaultFS().Stat(segmentPath(db, nodeA, 1)); err != nil {
-		t.Fatalf("tombstone segment deleted by GC: %v", err)
+	// Segment 0 survives (node B). Segment 1 held only node A and nothing
+	// pins it for the removal any more: it is reclaimed.
+	if _, err := defaultFS().Stat(segmentPath(db, nodeA, 0)); err != nil {
+		t.Fatalf("segment 0, still used by node B, was deleted: %v", err)
+	}
+	if _, err := defaultFS().Stat(segmentPath(db, nodeA, 1)); err == nil {
+		t.Fatal("segment 1, holding only the removed node, was kept")
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -322,21 +328,20 @@ func TestRemoveNodeData_TombstonePinnedAgainstGC(t *testing.T) {
 		}
 	}
 	if sawA {
-		t.Fatal("removed node A resurrected after reopen (tombstone lost to GC)")
+		t.Fatal("removed node A resurrected after reopen from a surviving older segment")
 	}
 	if !sawB {
 		t.Fatal("surviving node B missing after reopen")
 	}
-
-	// The tombstone pin must be restored by recovery so a post-recovery GC
-	// cannot reclaim it either.
 	shard := db2.getShard(nodeA)
 	shard.mu.Lock()
-	m, ok := shard.metaSegments[keyA]
-	pinned := ok && m.hasRemove
+	_, pinned := shard.metaSegments[keyA]
 	shard.mu.Unlock()
-	if !pinned {
-		t.Fatal("tombstone segment not re-pinned after recovery")
+	if pinned {
+		t.Fatal("recovery left segment pins for a removed node")
+	}
+	if removed, err := db2.NodeRemoved(nodeA, 1); err != nil || !removed {
+		t.Fatalf("NodeRemoved after reopen = (%v, %v), want (true, nil)", removed, err)
 	}
 }
 

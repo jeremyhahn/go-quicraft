@@ -65,9 +65,11 @@ func TestStartShard_ReclaimsCrashOrphanedImportStaging(t *testing.T) {
 	replicaBase := filepath.Dir(live.record.Filepath)
 	plaintext := []byte("PLAINTEXT-STATE-MACHINE-FROM-A-KILLED-IMPORT")
 
-	// The exact tree a SIGKILL between writeImportedSnapshotData and
-	// reencryptReceivedSnapshot leaves behind: a staging directory named from
-	// the same pattern the import creates, holding the artifact in the clear.
+	// The tree a SIGKILL mid-import left behind when the import wrote its
+	// plaintext before encrypting it: a staging directory named from the same
+	// pattern the import creates, holding the artifact in the clear. The
+	// import now seals as it writes, but the sweep must still reclaim such a
+	// directory — and a plaintext deployment's import legitimately holds one.
 	orphan := filepath.Join(replicaBase,
 		strings.Replace(engine.ImportStageDirPattern, "*", "3517658391", 1))
 	if err := os.MkdirAll(orphan, 0o750); err != nil {

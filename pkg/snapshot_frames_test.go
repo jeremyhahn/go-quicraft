@@ -159,41 +159,6 @@ func TestEncryptSnapshotFrames_PropagatesSourceFailure(t *testing.T) {
 	}
 }
 
-// TestReencryptReceivedSnapshot_FailsClosedWhenSealed verifies the fail-closed
-// rule on the receive path: with a CONFIGURED but sealed barrier the received
-// plaintext must not be committed to disk, because doing so would durably
-// downgrade a shard that is required to be encrypted at rest.
-func TestReencryptReceivedSnapshot_FailsClosedWhenSealed(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "snapshot.dat")
-	plaintext := []byte("received plaintext snapshot")
-	if err := os.WriteFile(path, plaintext, 0o600); err != nil {
-		t.Fatalf("write snapshot: %v", err)
-	}
-
-	sealed := &mockBarrier{}
-	if err := sealed.Seal(); err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-
-	epoch, _, err := reencryptReceivedSnapshot(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, sealed)
-	if !errors.Is(err, ErrSnapshotBarrierSealed) {
-		t.Fatalf("reencryptReceivedSnapshot error = %v, want ErrSnapshotBarrierSealed", err)
-	}
-	if epoch != 0 {
-		t.Fatalf("epoch = %d, want 0 when the barrier is sealed", epoch)
-	}
-
-	// The file must be untouched: no partial re-encryption, no truncation.
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if !bytes.Equal(got, plaintext) {
-		t.Fatalf("snapshot.dat was modified by a refused re-encryption: %q", got)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // classifySnapshotCompression
 // ---------------------------------------------------------------------------

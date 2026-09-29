@@ -16,6 +16,7 @@ package quicraft
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -220,8 +221,7 @@ func (r *pinErrReader) Read(p []byte) (int, error) {
 }
 
 // renameFailFS is the real filesystem with Rename refused, the one
-// reencryptReceivedSnapshot / reencryptSnapshotFile failure the shared
-// faultySnapshotFS does not inject.
+// reencryptSnapshotFile failure the shared faultySnapshotFS does not inject.
 type renameFailFS struct {
 	osSnapshotFS
 }
@@ -428,44 +428,51 @@ func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// reencryptReceivedSnapshot / reencryptImportPinned
+// writeImportedSnapshotData (the import's streamed encryption)
 // ---------------------------------------------------------------------------
 
-func writePlainSnapshot(t *testing.T, dir string) string {
-	t.Helper()
-	path := filepath.Join(dir, "snapshot.dat")
+// plainImportPayload is a plaintext snapshot payload spanning several frames.
+func plainImportPayload() []byte {
 	data := make([]byte, snapshotEncryptChunkSize*2+64)
 	for i := range data {
 		data[i] = byte(i*17 + 1)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	return data
+}
+
+// writePlainSnapshot writes plainImportPayload to dir/snapshot.dat.
+func writePlainSnapshot(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "snapshot.dat")
+	if err := os.WriteFile(path, plainImportPayload(), 0o600); err != nil {
 		t.Fatalf("write plaintext snapshot: %v", err)
 	}
 	return path
 }
 
-// TestPinBalance_ReencryptReceivedSnapshot_PostEncryptFailuresRelease drives
+// TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease drives
 // each failure that can land AFTER encryptSnapshotFrames has already taken its
-// pins but BEFORE reencryptReceivedSnapshot commits — Sync, the temp Close, the
-// source Close, and Rename. The caller never receives the set on those paths,
-// so the helper itself must release it or the epochs are pinned forever.
-func TestPinBalance_ReencryptReceivedSnapshot_PostEncryptFailuresRelease(t *testing.T) {
+// pins but BEFORE the import's data file is durable — Sync and Close. The
+// caller never receives the set on those paths, so the writer itself must
+// release it or the epochs are pinned forever.
+func TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease(t *testing.T) {
 	cases := []struct {
 		name string
 		fsys snapshotFS
 		want error
 	}{
-		{"sync_failure", faultySnapshotFS{failSync: true}, errTestSyncFailed},
-		{"temp_close_failure", faultySnapshotFS{failCloseTemp: true}, errTestCloseFailed},
-		{"source_close_failure", faultySnapshotFS{failCloseSource: true}, errTestCloseFailed},
-		{"rename_failure", renameFailFS{}, errTestRenameRefused},
+		{"sync_failure", importWriteFaultFS{failSync: true}, errTestSyncFailed},
+		{"close_failure", importWriteFaultFS{failClose: true}, errTestCloseFailed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newCountingBarrier(newRotatingMockBarrier(4, true))
-			path := writePlainSnapshot(t, t.TempDir())
+			path := filepath.Join(t.TempDir(), "snapshot.dat")
+			h := &Host{}
 
-			_, pins, err := reencryptReceivedSnapshot(tc.fsys, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
+			_, pins, err := h.writeImportedSnapshotData(context.Background(), tc.fsys,
+				testSnapShardID, testSnapReplicaID, testSnapIndex, path, nil,
+				trailedPayload(t, plainImportPayload()), b)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("error = %v, want %v", err, tc.want)
 			}
@@ -476,24 +483,26 @@ func TestPinBalance_ReencryptReceivedSnapshot_PostEncryptFailuresRelease(t *test
 			if b.registrations() == 0 {
 				t.Fatalf("fixture: nothing was pinned, so the release is untested: %s", b.counts())
 			}
-			b.assertBalanced(t, "reencryptReceivedSnapshot "+tc.name)
+			b.assertBalanced(t, "writeImportedSnapshotData "+tc.name)
 		})
 	}
 }
 
-// TestPinBalance_ReencryptImportPinned covers the import handoff: on SUCCESS
-// the pins must still be held when the function returns (ImportSnapshot's
-// SaveSnapshot has not run yet) and must drop to zero once the returned cleanup
-// runs; on ERROR the returned cleanup must be inert and the accounting already
-// flat — releasing there would double-free what the helper already released.
-func TestPinBalance_ReencryptImportPinned(t *testing.T) {
+// TestPinBalance_WriteImportedSnapshotData covers the import handoff: on SUCCESS
+// the pins must still be held when the data write returns (ImportSnapshot's
+// SaveSnapshot has not run yet) and must drop to zero once they are released;
+// on ERROR nothing may be left held.
+func TestPinBalance_WriteImportedSnapshotData(t *testing.T) {
 	t.Run("success_holds_then_releases", func(t *testing.T) {
 		b := newCountingBarrier(newRotatingMockBarrier(11, true))
-		path := writePlainSnapshot(t, t.TempDir())
+		path := filepath.Join(t.TempDir(), "snapshot.dat")
+		h := &Host{}
 
-		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
+		epoch, pins, err := h.writeImportedSnapshotData(context.Background(), osSnapshotFS{},
+			testSnapShardID, testSnapReplicaID, testSnapIndex, path, nil,
+			trailedPayload(t, plainImportPayload()), b)
 		if err != nil {
-			t.Fatalf("reencryptImportPinned: %v", err)
+			t.Fatalf("writeImportedSnapshotData: %v", err)
 		}
 		if epoch == 0 {
 			t.Fatal("epoch = 0 for an encrypted import")
@@ -503,39 +512,34 @@ func TestPinBalance_ReencryptImportPinned(t *testing.T) {
 				b.registrations(), b.counts())
 		}
 		if b.held(epoch) != 1 {
-			t.Fatalf("recorded epoch %d held %d times before cleanup, want 1 — the import's "+
+			t.Fatalf("recorded epoch %d held %d times before release, want 1 — the import's "+
 				"SaveSnapshot has not recorded it yet: %s", epoch, b.held(epoch), b.counts())
 		}
-		cleanup()
-		b.assertBalanced(t, "reencryptImportPinned success")
-	})
-
-	t.Run("error_cleanup_is_inert", func(t *testing.T) {
-		b := newCountingBarrier(newRotatingMockBarrier(11, true))
-		path := writePlainSnapshot(t, t.TempDir())
-
-		_, cleanup, err := reencryptImportPinned(renameFailFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, b)
-		if !errors.Is(err, errTestRenameRefused) {
-			t.Fatalf("error = %v, want %v", err, errTestRenameRefused)
+		for _, e := range pins {
+			b.DeregisterInFlightEpoch(e)
 		}
-		b.assertBalanced(t, "reencryptImportPinned error (before cleanup)")
-		// ImportSnapshot defers cleanup unconditionally, so it also runs on the
-		// error path; it must not release anything a second time.
-		cleanup()
-		b.assertBalanced(t, "reencryptImportPinned error (after deferred cleanup)")
+		b.assertBalanced(t, "writeImportedSnapshotData success")
 	})
 
-	t.Run("nil_barrier_is_a_noop", func(t *testing.T) {
-		path := writePlainSnapshot(t, t.TempDir())
-		epoch, cleanup, err := reencryptImportPinned(osSnapshotFS{}, path, testSnapShardID, testSnapReplicaID, testSnapIndex, nil)
+	t.Run("nil_barrier_writes_plaintext", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "snapshot.dat")
+		h := &Host{}
+		payload := plainImportPayload()
+		epoch, pins, err := h.writeImportedSnapshotData(context.Background(), osSnapshotFS{},
+			testSnapShardID, testSnapReplicaID, testSnapIndex, path, nil, trailedPayload(t, payload), nil)
 		if err != nil {
 			t.Fatalf("nil barrier: %v", err)
 		}
-		if epoch != 0 {
-			t.Fatalf("epoch = %d, want 0 for a plaintext deployment", epoch)
+		if epoch != 0 || pins != nil {
+			t.Fatalf("(epoch %d, pins %v), want (0, nil) for a plaintext deployment", epoch, pins)
 		}
-		// Must not dereference the nil barrier.
-		cleanup()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatal("a plaintext deployment's import did not store the payload as it is")
+		}
 	})
 }
 

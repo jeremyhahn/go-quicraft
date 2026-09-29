@@ -423,7 +423,7 @@ func TestCoalescedBatchSplitsAcrossFrames(t *testing.T) {
 		}
 	}
 	wantEntries := receivedEntries(p.handler) + msgCount*5
-	p.sender.sendBatch(p.target, msgs)
+	p.sender.sendBatch(p.target, "", msgs)
 
 	pollUntil(t, 30*time.Second, 50*time.Millisecond,
 		"messages from an oversized coalesced batch were not delivered", func() bool {
@@ -449,7 +449,7 @@ func TestUnsendableMessageDoesNotPoisonBatch(t *testing.T) {
 	p.handler.waitBatch(t, 10*time.Second)
 
 	before := receivedEntries(p.handler)
-	p.sender.sendBatch(p.target, []proto.Message{
+	p.sender.sendBatch(p.target, "", []proto.Message{
 		{
 			// Unsendable: larger than a whole frame.
 			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,

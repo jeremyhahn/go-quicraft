@@ -135,9 +135,9 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // sealed-means-fail-closed policy saveSnapshot, HandleSnapshot, and
 // ImportSnapshot enforce.
 //
-// It is the migration counterpart of the receive-side
-// reencryptReceivedSnapshot: that path encrypts just-received plaintext, this
-// path re-keys an already-sealed snapshot from one barrier to another.
+// It is the migration counterpart of the receive and import encryption: those
+// paths seal plaintext as it streams in, this path re-keys an already-sealed
+// snapshot from one barrier to another.
 // shardID, replicaID and index identify the SNAPSHOT both paths hold: the
 // migration re-keys one logical snapshot, so the source frames are read under
 // that identity and the destination frames are sealed under the same one. They

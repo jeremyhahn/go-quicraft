@@ -1085,10 +1085,25 @@ func TestNoopSender_SendSnapshot_DoesNotPanic(t *testing.T) {
 	})
 }
 
+// stampTestSnapshotMeta writes the snapshot.meta record beside a hand-built
+// snapshot.dat, through the writer the receive and import paths use. Every
+// recovery verifies the artifact against this record and refuses one without
+// it, so a fixture that records a snapshot must stamp it.
+func stampTestSnapshotMeta(t *testing.T, dir string, index, term uint64) {
+	t.Helper()
+	if err := writeReceivedSnapshotMetadata(osSnapshotFS{}, dir, index, term, 0, 0, 0,
+		config.NoCompression); err != nil {
+		t.Fatalf("stamp snapshot.meta: %v", err)
+	}
+}
+
 // TestWriteReceivedSnapshotMetadata verifies the binary metadata format
 // written by writeReceivedSnapshotMetadata.
 func TestWriteReceivedSnapshotMetadata(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.dat"), []byte("received artifact"), 0o600); err != nil {
+		t.Fatalf("write snapshot.dat: %v", err)
+	}
 
 	err := writeReceivedSnapshotMetadata(osSnapshotFS{}, dir, 42, 7, 10, 3, 9, config.Snappy)
 	if err != nil {

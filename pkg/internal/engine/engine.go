@@ -84,6 +84,10 @@ type Engine struct {
 	// Nil when global rate limiting is disabled.
 	globalRL *server.RateLimiter
 
+	// tickInterval is the real duration of one Raft tick: the period of
+	// every step worker's ticker.
+	tickInterval time.Duration
+
 	// metrics collects raft-level metrics (proposal, commit, apply,
 	// election, snapshot). Nil when metrics are disabled.
 	metrics RaftMetrics
@@ -219,6 +223,7 @@ func NewEngine(cfg config.HostConfig, ldb logdb.LogDB, sender MessageSender, bar
 		workSignal:    workSignal,
 		applyPool:     applyPool,
 		globalRL:      globalRL,
+		tickInterval:  tickInterval,
 		stepStopC:     stepStopC,
 		commitStopC:   commitStopC,
 		applyStopC:    applyStopC,
@@ -988,6 +993,13 @@ func (e *Engine) SnapshotPool() *snapshotPool {
 // Returns nil when global rate limiting is disabled.
 func (e *Engine) GlobalRateLimiter() *server.RateLimiter {
 	return e.globalRL
+}
+
+// TickInterval returns the real duration of one Raft tick, the period at
+// which the step workers tick every loaded peer. A peer needs it to measure
+// its read lease in real time (raft.Peer.SetTickInterval).
+func (e *Engine) TickInterval() time.Duration {
+	return e.tickInterval
 }
 
 // SnapshotRequestOption holds per-request snapshot options that are passed

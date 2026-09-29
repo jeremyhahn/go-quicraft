@@ -67,6 +67,9 @@ type State struct {
 	Vote uint64
 	// Commit is the highest log index known to be committed.
 	Commit uint64
+	// VoteWindow is the vote window, in nanoseconds, this replica may still
+	// owe a leader's read lease. See proto.State.VoteWindow.
+	VoteWindow uint64
 }
 
 // Membership represents a Raft cluster membership configuration.

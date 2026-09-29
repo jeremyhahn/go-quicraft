@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -205,10 +206,10 @@ func newDecryptSender(t *testing.T, b Barrier, shardID, replicaID uint64) *trans
 // sendSnapshotSync runs one transfer the way SendSnapshot does — the artifact
 // opened first, then handed to doSendSnapshot — but on the caller's goroutine.
 func sendSnapshotSync(s *transportSender, msg proto.Message) {
-	var src snapshotFile
+	var src *verifiedSnapshotFile
 	var openErr error
 	if msg.Snapshot.Filepath != "" {
-		src, openErr = s.snapshotFsys().Open(msg.Snapshot.Filepath)
+		src, openErr = openVerifiedSnapshotFile(s.snapshotFsys(), msg.Snapshot.Filepath)
 	}
 	if src != nil {
 		defer func() { _ = src.Close() }()
@@ -509,53 +510,111 @@ func TestSendSnapshot_AsyncRejectsAndDrains(t *testing.T) {
 // errTestRemoveFailed models a scratch file that cannot be reclaimed.
 var errTestRemoveFailed = errors.New("test fs: remove refused")
 
-// removeFailFS is the real filesystem with a Remove that always fails, so the
-// decrypt-for-send cleanup path can be observed failing.
-type removeFailFS struct{ osSnapshotFS }
+// unlinkRefusingSpyFS is namedWriteSpyFS whose Remove of a decrypt scratch
+// name is refused: every time, or only the first (the scratch's immediate
+// unlink). Removes of any other name pass through.
+type unlinkRefusingSpyFS struct {
+	namedWriteSpyFS
+	always  bool
+	refused *atomic.Bool
+}
 
-func (removeFailFS) Remove(string) error { return errTestRemoveFailed }
-
-// TestDoSendSnapshot_TempFileRemovalFailureIsNotFatal verifies that a scratch
-// file that cannot be reclaimed does not derail the transfer: the leader still
-// receives its SnapshotStatus. A cleanup error must be logged, never
-// propagated as a send failure or a panic.
-func TestDoSendSnapshot_TempFileRemovalFailureIsNotFatal(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "snapshot.dat")
-
-	b := createTestBarrier(t)
-	writeEncryptedSnapshotFileFor(t, b, path, []byte("payload that decrypts cleanly"), 1, 1, 100)
-
-	f := newSnapshotSendFixture(t, b)
-	f.sender.fsys = removeFailFS{}
-	before := engine.StaleDecryptSweepFailures()
-	// The artifact's own identity, so the decrypt succeeds and the scratch is
-	// handed to the send — whose cleanup retries the unlink.
-	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 55)
-	msg.ReplicaID = 1
-	sendSnapshotSync(f.sender, msg)
-
-	f.expectSnapshotStatus(t, true, 55)
-
-	// The scratch file is still there precisely because Remove failed — at
-	// creation and again at close; the point is that the transfer completed
-	// its notification regardless, and that the unreclaimed plaintext is
-	// counted. It is created in the node's replica snapshot directory, which
-	// the stale-scratch sweep covers.
-	matches, err := filepath.Glob(filepath.Join(f.node.ReplicaSnapshotDir(), sendDecryptTempPattern))
-	if err != nil {
-		t.Fatalf("glob temp files: %v", err)
+func (s unlinkRefusingSpyFS) Remove(name string) error {
+	if engine.IsSnapshotScratchTemp(filepath.Base(name)) &&
+		(s.always || s.refused.CompareAndSwap(false, true)) {
+		return errTestRemoveFailed
 	}
-	if len(matches) != 1 {
-		t.Fatalf("found %d scratch files, want the 1 whose removal was refused", len(matches))
-	}
-	// The artifact sits outside the node's tree, as a record may name it; the
-	// scratch must not have followed it there.
-	if beside, _ := filepath.Glob(filepath.Join(filepath.Dir(dir), sendDecryptTempPattern)); len(beside) != 0 {
-		t.Fatalf("scratch created beside the artifact, outside the replica's swept tree: %v", beside)
-	}
-	if engine.StaleDecryptSweepFailures() == before {
-		t.Fatal("an unreclaimed plaintext scratch file was not counted")
+	return s.namedWriteSpyFS.Remove(name)
+}
+
+// TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend: when the decrypt
+// scratch cannot be unlinked, the send fails before a byte of plaintext is
+// written into it — the leader gets a rejected SnapshotStatus and retries
+// later — so no named file ever holds the plaintext, not even for the life of
+// the send. The best-effort removal that follows reclaims the name; a name
+// that survives it too is empty, left in the replica's swept directory, and
+// counted.
+func TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		always bool
+	}{
+		{"name reclaimed", false},
+		{"name survives", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "snapshot.dat")
+			plaintext := bytes.Repeat([]byte("send-plaintext-must-never-have-a-name|"), 4096)
+
+			b := createTestBarrier(t)
+			writeEncryptedSnapshotFileFor(t, b, path, plaintext, 1, 1, 100)
+
+			f := newSnapshotSendFixture(t, b)
+			spy := unlinkRefusingSpyFS{namedWriteSpyFS: newNamedWriteSpyFS(), always: tc.always, refused: new(atomic.Bool)}
+			f.sender.fsys = spy
+			spy.armed.Store(true)
+			before := engine.StaleDecryptSweepFailures()
+			// The artifact's own identity, so only the refused unlink can stop
+			// the decrypt.
+			msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 55)
+			msg.ReplicaID = 1
+
+			src, err := os.Open(path)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			dec, _, err := f.sender.decryptSnapshotForSend(src, msg, b)
+			_ = src.Close()
+			if dec != nil {
+				_ = dec.Close()
+				t.Fatal("the send decrypted into a scratch whose unlink was refused")
+			}
+			if !errors.Is(err, engine.ErrScratchNotUnlinked) || !errors.Is(err, errTestRemoveFailed) {
+				t.Fatalf("decryptSnapshotForSend = %v, want ErrScratchNotUnlinked wrapping the refused unlink", err)
+			}
+
+			spy.refused.Store(false)
+			sendSnapshotSync(f.sender, msg)
+			f.expectSnapshotStatus(t, true, 55)
+			spy.armed.Store(false)
+
+			if named := spy.namedPaths(); len(named) != 0 {
+				t.Fatalf("the send wrote into files that still had a name: %v", named)
+			}
+			for _, root := range []string{dir, f.node.ReplicaSnapshotDir()} {
+				if exposed := filesHolding(root, plaintext[:4096]); len(exposed) != 0 {
+					t.Fatalf("named files hold the send's plaintext: %v", exposed)
+				}
+			}
+			// The artifact sits outside the node's tree, as a record may name
+			// it; the scratch must not have followed it there.
+			if beside, _ := filepath.Glob(filepath.Join(dir, sendDecryptTempPattern)); len(beside) != 0 {
+				t.Fatalf("scratch created beside the artifact, outside the replica's swept tree: %v", beside)
+			}
+			left, _ := filepath.Glob(filepath.Join(f.node.ReplicaSnapshotDir(), sendDecryptTempPattern))
+			if !tc.always {
+				if len(left) != 0 {
+					t.Fatalf("the refused scratch kept its name: %v", left)
+				}
+				if got := engine.StaleDecryptSweepFailures(); got != before {
+					t.Fatalf("a reclaimed scratch name was counted as unreclaimed: %d -> %d", before, got)
+				}
+				return
+			}
+			// One per attempt: the direct decrypt and the send.
+			if len(left) != 2 {
+				t.Fatalf("found %d scratch names, want the 2 whose removal was refused", len(left))
+			}
+			for _, name := range left {
+				if info, statErr := os.Stat(name); statErr != nil || info.Size() != 0 {
+					t.Fatalf("surviving scratch name %s must be empty (info=%v, err=%v)", name, info, statErr)
+				}
+			}
+			if engine.StaleDecryptSweepFailures() == before {
+				t.Fatal("a scratch name that survived the best-effort removal was not counted")
+			}
+		})
 	}
 }
 
@@ -636,46 +695,6 @@ func TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir(t *testing.T) 
 	}
 	if _, statErr := os.Stat(node.ReplicaSnapshotDir()); !os.IsNotExist(statErr) {
 		t.Fatalf("the send recreated the removed replica directory (stat err=%v)", statErr)
-	}
-}
-
-// removeFailOnceFS refuses the first Remove only.
-type removeFailOnceFS struct {
-	osSnapshotFS
-	failed *atomic.Bool
-}
-
-func (fs removeFailOnceFS) Remove(name string) error {
-	if fs.failed.CompareAndSwap(false, true) {
-		return errTestRemoveFailed
-	}
-	return fs.osSnapshotFS.Remove(name)
-}
-
-// TestDoSendSnapshot_FailedUnlinkIsRetriedAtClose: when the scratch file's
-// immediate unlink fails, the plaintext it is then filled with must not keep
-// its name for the life of the process — a leader rarely runs the recovery
-// that would sweep it. Closing the scratch retries the unlink.
-func TestDoSendSnapshot_FailedUnlinkIsRetriedAtClose(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "snapshot.dat")
-
-	b := createTestBarrier(t)
-	writeEncryptedSnapshotFileFor(t, b, path, []byte("payload that decrypts cleanly"), 1, 1, 100)
-
-	f := newSnapshotSendFixture(t, b)
-	f.sender.fsys = removeFailOnceFS{failed: new(atomic.Bool)}
-	before := engine.StaleDecryptSweepFailures()
-	// The artifact's own identity, so the decrypt succeeds and the scratch is
-	// handed to the send — whose cleanup, not the decrypt's, closes it.
-	msg := testInstallSnapshotMsg(t, path, b.CurrentEpoch(), 56)
-	msg.ReplicaID = 1
-	sendSnapshotSync(f.sender, msg)
-
-	f.expectSnapshotStatus(t, true, 56)
-	f.assertNoTempFiles(t, dir)
-	if got := engine.StaleDecryptSweepFailures(); got != before {
-		t.Fatalf("a reclaimed scratch file was counted as unreclaimed: %d -> %d", before, got)
 	}
 }
 

@@ -600,7 +600,7 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error
 func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error
 ```
 
-Removes all persistent data for a replica (logs, snapshots, metadata). The shard must be stopped first. `SyncRemoveData` is the synchronous variant (included for API consistency).
+Removes all persistent data for a replica (logs, snapshots, metadata) and retires its replica ID on this host: `StartShard` refuses it from then on with `*ReplicaRetiredError` (`ImportSnapshot` finds no data left to import into and returns `ErrShardNotFound`), since its term, vote and owed lease vote window are gone. Rejoin under a new replica ID. The shard must be stopped first. `SyncRemoveData` is the synchronous variant (included for API consistency).
 
 **Errors:** `ErrClosed`, `ErrShardNotFound`, `*ShardNotStoppedError` (shard still running).
 
@@ -1062,6 +1062,7 @@ All sentinel errors declared here use the `"quicraft:"` prefix. Check with `erro
 | `ErrShardNotReady`      | Shard initializing, cannot serve requests         |
 | `ErrShardAlreadyExists` | `StartShard` for an already-running shard         |
 | `ErrShardNotStopped`    | `RemoveData` for a shard still loaded             |
+| `ErrReplicaRetired`     | `StartShard` of a replica ID `RemoveData` retired |
 | `ErrShardFailed`        | State machine panicked; the shard failure latch tripped |
 | `ErrReplicaNotFound`    | Replica ID does not match the replica on this host |
 

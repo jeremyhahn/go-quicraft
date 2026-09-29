@@ -508,14 +508,13 @@ Each logical WAL record begins with a 1-byte payload type that identifies its co
 
 ```go
 const (
-    payloadTypeState      byte = 0x02
-    payloadTypeBootstrap  byte = 0x04
-    payloadTypeCompact    byte = 0x05
-    payloadTypeRemoveNode byte = 0x06
-    // 0x07 and 0x0a are RETIRED and never reallocated; a record carrying
-    // either fails replay with ErrUnknownPayloadType
-    payloadTypeEntries    byte = 0x0b // current entry format (84-byte header, five session fields)
-    payloadTypeSnapshot   byte = 0x0c // current snapshot format (four-field session policy tail)
+    payloadTypeBootstrap byte = 0x04
+    payloadTypeCompact   byte = 0x05
+    // 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09 and 0x0a are RETIRED and never
+    // reallocated; a record carrying one fails replay with ErrUnknownPayloadType
+    payloadTypeEntries  byte = 0x0b // current entry format (84-byte header, five session fields)
+    payloadTypeSnapshot byte = 0x0c // current snapshot format (four-field session policy tail)
+    payloadTypeState    byte = 0x0d // current hard-state format (Term, Vote, Commit, VoteWindow)
 )
 ```
 
@@ -530,17 +529,18 @@ The repair retires `0x07` and `0x0a` and moves the current formats to `0x0b` and
 | Value  | Constant                | Status  | Replay behaviour                                                    |
 |--------|-------------------------|---------|---------------------------------------------------------------------|
 | `0x01` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named an entry format with no session fields, so replaying it would zero them and silently break at-most-once delivery |
-| `0x02` | `payloadTypeState`      | current | hard state (Term/Vote/Commit)                                       |
+| `0x02` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named the 40-byte hard-state record without `VoteWindow`, so a replica recovering from it would come up owing no vote window to a leader's read lease |
 | `0x03` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named a snapshot format with no `MaxWitnesses`/`PolicyFlags` in the membership section |
 | `0x04` | `payloadTypeBootstrap`  | current | bootstrap record                                                    |
 | `0x05` | `payloadTypeCompact`    | current | compaction floor marker                                             |
-| `0x06` | `payloadTypeRemoveNode` | current | remove-node tombstone                                               |
+| `0x06` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named the remove-node tombstone; a removal is now kept in the retired-replica registry beside the WAL (see [Retired-Replica Registry](#retired-replica-registry)) |
 | `0x07` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named an entry header eight bytes shorter, so `OwnerID` would be read from the record's own `CmdLen` and the first four command bytes, and `CmdLen` then taken from inside the command |
 | `0x08` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — its membership section started with `ConfigChangeID`, so the current parser would consume that field's low byte as a version byte and shift every subsequent read |
 | `0x09` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — its `FilePathLen` sat where the current layout reads `Compression`, so the record would be sliced at the wrong offset |
 | `0x0a` | *(unallocated)* | retired | fatal, `ErrUnknownPayloadType` — it named a three-field session policy tail, so `MaxSessionsPerOwner` would be read from the `RemovedIdentities` count and the deny-list then located eight bytes late |
 | `0x0b` | `payloadTypeEntries`    | current | entry batch, 84-byte per-entry header                               |
 | `0x0c` | `payloadTypeSnapshot`   | current | snapshot metadata, four-field session policy tail                   |
+| `0x0d` | `payloadTypeState`      | current | hard state (Term/Vote/Commit/VoteWindow), 48-byte record            |
 
 Any type byte outside this set is `ErrUnknownPayloadType`, which is also fatal. That case matters most for a KEYED WAL opened with `barrier == nil`: every ciphertext record's leading epoch byte decodes as type `0x00`, and skipping those records would boot the node as an empty replica with no memory of prior votes.
 
@@ -794,7 +794,7 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 }
 ```
 
-The `batchMode` guard is the whole point: inside a `SaveState` batch the fsync belongs to Phase 2, so `writeRecord` buffers only. The standalone writers (`RemoveEntriesTo`, `SaveSnapshot`, `SaveBootstrap`, `RemoveNodeData`) run with `batchMode` false and sync inline.
+The `batchMode` guard is the whole point: inside a `SaveState` batch the fsync belongs to Phase 2, so `writeRecord` buffers only. The standalone writers (`RemoveEntriesTo`, `SaveSnapshot`, `SaveBootstrap`) run with `batchMode` false and sync inline. `RemoveNodeData` writes no WAL record at all (see [Retired-Replica Registry](#retired-replica-registry)).
 
 The landing is returned rather than applied, because the record is not durable yet. Each caller folds it into the shard's epoch floor at its own commit point, so a batch that rolls back contributes nothing. There is one deliberate exception: when the record was fully written and only the inline `fdatasync` failed, the epoch is applied inside `writeRecord`. Those bytes may well be on the medium, and an epoch floor above a record recovery still has to decrypt breaks the node outright (`WALDecryptError` at startup) rather than merely retaining a key longer than necessary.
 
@@ -1333,9 +1333,9 @@ The epoch-floor recompute is ordered after the directory fsync for a reason of i
 
 #### Pinning Meta-Record Segments
 
-The live-segment set is **not** computed from entry indexes alone. State, snapshot, bootstrap, compaction-marker and remove-node records are never tracked by any entry index, so a segment whose entries have all been compacted away can still hold the sole durable copy of one of them. Computing liveness only from `idx.AllSegmentIDs()` would let GC delete such a segment, losing that record: a lost compaction marker, for instance, resets `compactedTo` to 0 on the next recovery.
+The live-segment set is **not** computed from entry indexes alone. State, snapshot, bootstrap and compaction-marker records are never tracked by any entry index, so a segment whose entries have all been compacted away can still hold the sole durable copy of one of them. Computing liveness only from `idx.AllSegmentIDs()` would let GC delete such a segment, losing that record: a lost compaction marker, for instance, resets `compactedTo` to 0 on the next recovery.
 
-To prevent this, each `walShard` tracks, per node, the segment ID that holds the latest durable record of each of the five kinds:
+To prevent this, each `walShard` tracks, per node, the segment ID that holds the latest durable record of each of the four kinds:
 
 ```go
 type metaSegments struct {
@@ -1343,12 +1343,10 @@ type metaSegments struct {
     snapshot     uint64
     bootstrap    uint64
     compact      uint64
-    remove       uint64
     hasState     bool   // segment IDs are 0-based, so presence needs a flag
     hasSnapshot  bool
     hasBootstrap bool
     hasCompact   bool
-    hasRemove    bool
 }
 
 // walShard field, protected by dataMu
@@ -1360,7 +1358,7 @@ Each record type carries an explicit presence flag rather than treating a zero I
 These segment IDs are recorded in two places, both following last-writer-wins semantics:
 
 - **On write-land**: each writer calls its `setXxxSegment` setter with the segment the record actually landed in, taken from the `recordLanding` that `writeRecord` returns, so a mid-write rotation is accounted for. For batched state and snapshot writes the pin is applied at the Phase 3 commit point via `pendingMemUpdates.applyTo`.
-- **During recovery replay**: `replayState`, `replaySnapshot`, `replayBootstrap`, `replayCompaction` and `replayRemoveNode` call the same setters with the replayed segment ID. Because segments replay in ascending ID order, the last replayed record wins, matching last-writer-wins at write time.
+- **During recovery replay**: `replayState`, `replaySnapshot`, `replayBootstrap` and `replayCompaction` call the same setters with the replayed segment ID. Because segments replay in ascending ID order, the last replayed record wins, matching last-writer-wins at write time.
 
 Before running `GarbageCollect`, both `Compact` and `RemoveNodeData` fold these meta-segments into the live set via `addMetaSegmentsToLive`:
 
@@ -1371,12 +1369,27 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
         if m.hasSnapshot  { liveSegments[m.snapshot] = true }
         if m.hasBootstrap { liveSegments[m.bootstrap] = true }
         if m.hasCompact   { liveSegments[m.compact] = true }
-        if m.hasRemove    { liveSegments[m.remove] = true }
     }
 }
 ```
 
-This guarantees that the segment holding a live node's latest meta record of any kind is never garbage-collected. When a node is removed (`RemoveNodeData`) or replayed past (`replayRemoveNode`), its `metaSegments` entry is dropped, so its now-obsolete meta-segments become eligible for reclamation if no surviving node references them.
+This guarantees that the segment holding a live node's latest meta record of any kind is never garbage-collected. When a node is removed (`RemoveNodeData`), or dropped at open because the registry retired it (`purgeRetired`), its `metaSegments` entry goes with it, so its now-obsolete segments become eligible for reclamation if no surviving node references them.
+
+#### Retired-Replica Registry
+
+`RemoveNodeData` retires the replica ID for good: Raft never lets a removed replica return, because its term, vote and owed lease vote window went with its data. The retirement is kept in one small file in the WAL root, `RETIRED`, not as a WAL record:
+
+```
+magic "QRRETIRE"[8] | count:u64 | count × (shardID:u64 | replicaID:u64) | crc32c:u32
+```
+
+That is 16 bytes per retired replica, entries sorted. It used to be a remove-node tombstone record (`0x06`), and a tombstone had to outlive every older segment still holding the removed replica's records — segments other Raft groups on the same WAL shard can keep alive indefinitely — so its segment was pinned for good: one whole segment (64 MiB by default) per removed replica. The registry needs no segment at all.
+
+- **Removal.** `RemoveNodeData` publishes the new registry first — written to `RETIRED.tmp`, fsynced, renamed over `RETIRED`, WAL root fsynced — while holding the shard's `mu`, then drops the node from memory, and only then makes the retirement visible to `NodeRemoved`, so a caller never sees it reported while readers still return the node's records. Garbage collection follows (`reclaimSegmentsLocked`). A failure before the rename changes nothing. A failed root fsync after it leaves the retirement's durability unknown, so the DB is poisoned, exactly as for a failed WAL fsync.
+- **Replay.** `Open` reads the registry before any segment and, once replay has rebuilt every shard, drops every retired replica's records (`purgeRetired`). Replay finds such records only when a removal did not finish reclaiming them — the process stopped after publishing the retirement, or its garbage collection failed — so `purgeRetired` runs the same reclaim for that shard and finishes the job. Records in a segment still shared with a live node are dropped on every open until that segment can be reclaimed; nothing pins them.
+- **Writes.** `SaveState` (the whole batch, checked under the batch's shard locks), `SaveSnapshot`, `SaveBootstrap` and `RemoveEntriesTo` refuse a retired replica with `logdb.ErrReplicaRetired`; `NodeRemoved` reports retirement to the host, which refuses to start a retired replica.
+- **Integrity.** A registry that is present but does not parse (length, magic or checksum) fails `Open` with `ErrRetiredRegistryMalformed`: opening without it would hand retired replica IDs back.
+- **Migration.** `Reencrypt` writes the source's retirements into the destination, in one registry write, before copying any node.
 
 #### Deletion Durability
 
@@ -1449,7 +1462,6 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (int, string, error) {
     case payloadTypeSnapshot:   return 0, "", s.replaySnapshot(rec[1:], segID)
     case payloadTypeBootstrap:  return 0, "", s.replayBootstrap(rec[1:], segID)
     case payloadTypeCompact:    return 0, "", s.replayCompaction(rec[1:], segID)
-    case payloadTypeRemoveNode: return 0, "", s.replayRemoveNode(rec[1:], segID)
 
     default:                     return 0, "", ErrUnknownPayloadType
     }
@@ -1460,7 +1472,8 @@ Replay builds the same in-memory state that normal writes would:
 
 - Entries are added to both the index and the entries map. A batch whose first replayed index is already present is a leader overwrite: `idx.Append` truncates the superseded index suffix, and replay additionally prunes the orphaned higher indices from the entry map, mirroring the write path.
 - States, snapshots and bootstraps replace any previously replayed value, last writer wins.
-- Compaction markers remove entries from the index and entries map; remove-node tombstones drop the node's state entirely.
+- Compaction markers remove entries from the index and entries map.
+- Once every shard has replayed, `purgeRetired` drops everything replay rebuilt for a replica the retired-replica registry names, wherever its records were found.
 - Every replayed record also re-establishes its GC pin and its contribution to the epoch floor.
 
 **No replay failure is ever skipped.** A record that already passed its chunk CRC but fails to decode is corruption the CRC did not explain, and skipping it while later records and segments still replay would leave a silent hole. The consequences differ by type and all of them are fatal: a dropped entry batch is a Log Matching violation served to followers as a shortened, nil-error range; a dropped `State` record lets an older one win last-writer-wins, regressing term and vote and permitting a double vote in one term; a dropped `Snapshot` record boots the node with empty membership.
@@ -1599,7 +1612,7 @@ That state **fails open**, which is what makes it dangerous. The index is self-c
 
 `reconcileCompactionFloors` re-derives the floor as `firstIndex - 1` from the **rebuilt index**, never from the snapshot index. Anchoring at the snapshot would be wrong because the snapshot pool deliberately retains `CompactionOverhead` entries below it for cheap follower catch-up, so a snapshot-anchored floor would mark live, deliberately kept entries unreadable and force a full `InstallSnapshot` on every lagging follower after any restart.
 
-The snapshot is the **validity check** on that derivation, not its source. The repair is applied, with a `WARN`, only when a recorded snapshot actually covers the missing prefix, which is the lost-marker case since compaction always follows a snapshot. Otherwise the prefix is unexplained and the derivation is skipped: an absent prefix with no snapshot is indistinguishable from a node that legitimately starts at a high index, which is exactly what `RemoveNodeData` followed by a rewrite produces, and rejecting it would refuse to start healthy replicas. Making that case fail closed needs the floor durable independently of one WAL block, which is a format change rather than a recovery heuristic.
+The snapshot is the **validity check** on that derivation, not its source. The repair is applied, with a `WARN`, only when a recorded snapshot actually covers the missing prefix, which is the lost-marker case since compaction always follows a snapshot. Otherwise the prefix is unexplained and the derivation is skipped: an absent prefix with no snapshot is indistinguishable from a node that legitimately starts at a high index, and rejecting it would refuse to start healthy replicas. Making that case fail closed needs the floor durable independently of one WAL block, which is a format change rather than a recovery heuristic.
 
 ### Post-Recovery Segment Creation
 

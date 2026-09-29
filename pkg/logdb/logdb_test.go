@@ -59,6 +59,8 @@ func (t *testLogDB) GetSnapshot(_ uint64, _ uint64) (Snapshot, error) {
 
 func (t *testLogDB) RemoveNodeData(_ uint64, _ uint64) error { return nil }
 
+func (t *testLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
+
 func (t *testLogDB) ListNodeInfo() ([]NodeInfo, error) { return nil, nil }
 
 func (t *testLogDB) SaveBootstrap(_ uint64, _ uint64, _ Bootstrap) error { return nil }

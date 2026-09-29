@@ -214,14 +214,9 @@ func TestEpochFloorTracksCommittedWrites(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "RemoveNodeData",
-			op: func(t *testing.T, db *DB) {
-				if err := db.RemoveNodeData(shardID, replicaID); err != nil {
-					t.Fatalf("RemoveNodeData: %v", err)
-				}
-			},
-		},
+		// RemoveNodeData is absent: it writes no WAL record. The removal is
+		// kept in the retired-replica registry beside the WAL, which is not
+		// encrypted under any epoch and needs no DEK.
 	}
 
 	for _, tc := range cases {

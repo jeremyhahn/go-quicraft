@@ -42,6 +42,13 @@ var (
 	// does not match the expected node address from the registry.
 	ErrPeerIdentityMismatch = errors.New("transport: peer identity mismatch")
 
+	// ErrSnapshotNotAccepting marks a MessageHandler.AuthorizeSnapshot
+	// refusal that is an ordinary shard state — the shard failed, or is
+	// stopping — rather than an authorization failure. A leader retransmits
+	// to such a replica as a matter of course, so the transport reports it
+	// quietly and apart from unauthorized transfers.
+	ErrSnapshotNotAccepting = errors.New("transport: shard is not accepting snapshots")
+
 	// ErrDecompressedSizeLimitExceeded is returned when the declared
 	// decompressed size exceeds MaxDecompressedSize, preventing
 	// decompression bomb attacks.
@@ -144,6 +151,11 @@ const (
 	// QUICErrPeerRemoved is sent to the INBOUND half of a peer whose removal
 	// from membership this node has committed. See closeInboundFromPeer.
 	QUICErrPeerRemoved quic.ApplicationErrorCode = 0x8
+
+	// QUICErrDialIdentity closes an OUTBOUND connection whose peer presents a
+	// node identity membership does not bind to any replica routed to the
+	// dialed address or is not a send's destination. See getConnection.
+	QUICErrDialIdentity quic.ApplicationErrorCode = 0x9
 )
 
 // closeReasonRedacted is the CONNECTION_CLOSE reason phrase used for every
@@ -364,6 +376,19 @@ var ErrEmptyDialHost = errors.New("transport: dial target has empty host")
 type DialError struct {
 	Target string
 	Err    error
+}
+
+// DialIdentityError reports a connection refused because the peer's verified
+// node identity is not one membership binds to a replica routed to the dialed
+// address, or not the replica a snapshot send was for (Config.ReplicaIdentity).
+// Presented is empty when the peer offered no verified leaf.
+type DialIdentityError struct {
+	Presented string
+}
+
+// Error returns a human-readable description of the refusal.
+func (e *DialIdentityError) Error() string {
+	return fmt.Sprintf("transport: dialed peer presents node identity %q, which membership binds to no replica at this address", e.Presented)
 }
 
 // Error returns a human-readable description of the dial failure.

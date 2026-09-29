@@ -533,14 +533,55 @@ type Config struct {
 	// expires sessions faster than a slow client can round-trip.
 	SessionExpiryEntries uint64
 
-	// LeaseRead enables lease-based linearizable reads. When the leader has
-	// received heartbeat acks from a quorum within the lease period (derived
-	// from ElectionRTT), ReadIndex requests are served immediately without a
-	// heartbeat round-trip. The lease timeout is ElectionRTT - 2 ticks to
-	// provide a safety margin: followers will not grant votes to another
-	// candidate until their election timeout expires, and the leader's lease
-	// expires before that. Requires monotonic clocks (guaranteed by Go's
-	// time.Now on supported platforms). Per Raft PhD thesis Section 6.4.
+	// LeaseRead enables lease-based linearizable reads. While a quorum of
+	// voting members has acknowledged a heartbeat round the leader SENT less
+	// than the lease duration ago, ReadIndex requests are served immediately
+	// without a heartbeat round-trip. The lease duration is ElectionRTT - 2
+	// ticks of real time (RTTMillisecond each), less 1% for clock-rate
+	// drift: a follower grants no vote to another candidate until its
+	// election timeout has elapsed since the heartbeat it acked, and the
+	// lease ends before that. Per Raft PhD thesis Section 6.4.
+	//
+	// The lease is measured on the leader's monotonic clock from the time
+	// the acknowledged round was sent, so a leader that is paused or
+	// descheduled loses it: on resuming, the elapsed time already exceeds
+	// the lease and reads take the heartbeat quorum round until fresh acks
+	// arrive. It is NOT measured in ticks, which a paused process drops.
+	//
+	// That promise is each follower's own, so it is carried explicitly: every
+	// heartbeat acknowledgement states the vote window its sender promises
+	// (its ElectionRTT ticks of real time, when it runs LeaseRead), the
+	// sender keeps that promise on its monotonic clock — granting no vote or
+	// pre-vote and starting no campaign until the window has passed, whatever
+	// happens to its term or known leader meanwhile — and the leader counts an
+	// acknowledgement toward the lease only when that window covers the lease.
+	// Replicas therefore need not be configured alike for lease reads to be
+	// SAFE: a follower that promises less — a shorter ElectionRTT or
+	// RTTMillisecond, or no LeaseRead — simply backs no lease, and while too
+	// few followers back one, reads take the ReadIndex heartbeat round.
+	// Configure the shard's replicas alike for lease reads to be FAST.
+	//
+	// A restart erases the election timer that promise lives in, so the
+	// promised window is recorded in the replica's persisted Raft hard state
+	// before any acknowledgement makes it, and a restarted replica withholds
+	// its vote and pre-vote, and does not campaign, for the longer of that
+	// recorded window and the one it now promises, measured on its monotonic
+	// clock from when it starts: a leader may still be counting its
+	// pre-restart acknowledgement toward a lease. This holds whatever the
+	// replica restarts into, LeaseRead off included; once the window has
+	// passed the record is lowered to the current promise. It keeps accepting
+	// replication and heartbeats from a leader meanwhile. The cost is
+	// availability: a restarted replica cannot help elect a leader for about
+	// one election timeout, so after a full-shard restart the first leader is
+	// elected about one election timeout later than it would be without
+	// LeaseRead. Witnesses vote and their acknowledgements count toward the
+	// lease, so the hold-down applies to them as well. A replica that has
+	// never run LeaseRead records nothing and votes immediately after a
+	// restart, as before.
+	//
+	// Safety assumes that the clock rates of any two nodes differ by less
+	// than 1%. Clock OFFSET between nodes does not matter; a clock that runs
+	// fast on a follower or slow on the leader beyond that bound does.
 	// Default: false (use heartbeat-based ReadIndex).
 	LeaseRead bool
 
@@ -700,6 +741,24 @@ func (c *Config) validateIdentity() error {
 	}
 	if c.Witness.MaxWitnesses < 0 {
 		return newValidationError("Witness.MaxWitnesses", "must be >= 0 (0 means no explicit cap)")
+	}
+	return nil
+}
+
+// ValidateElectionTimeout checks that this shard's election timeout,
+// ElectionRTT ticks of rttMillisecond each, is representable as a
+// time.Duration on the host that runs it. Validate cannot check it, because
+// the tick length is host configuration: ElectionRTT and RTTMillisecond are
+// each bounded on their own, but their product is not, and a product that
+// overflows wraps negative. The raft layer measures the post-restart vote
+// hold-down as that product, so an unrepresentable timeout would leave the
+// replica unable to measure the end of the hold-down. Host.StartShard calls
+// this with its RTTMillisecond.
+func (c *Config) ValidateElectionTimeout(rttMillisecond uint64) error {
+	const nanosPerMilli = 1_000_000
+	if rttMillisecond > 0 && c.ElectionRTT > uint64(math.MaxInt64)/nanosPerMilli/rttMillisecond {
+		return newValidationError("ElectionRTT",
+			"ElectionRTT * RTTMillisecond overflows time.Duration on this host")
 	}
 	return nil
 }

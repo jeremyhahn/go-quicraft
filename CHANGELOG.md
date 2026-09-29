@@ -7,6 +7,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`go-enclave` v0.5.0-alpha → v0.6.1-alpha**, per the rule that every
+  dependency tracks its current release; the nightly dependency-freshness job
+  had been failing on it. The releases in between are additive (a process-wide
+  locked-memory allocator and its budget) and change no API this module uses.
+
+### Fixed
+- **An exported snapshot artifact could be imported truncated or damaged
+  (format change of the export artifact).** The artifact carried no length or
+  hash, so `ImportSnapshot` adopted whatever arrived whenever a caller ignored
+  the exporter's error — including an encrypted export that had written all of
+  its plaintext before its recorded-hash check failed it. `ExportSnapshot` now
+  ends the artifact with a trailer binding the payload's length and the
+  xxhash64 of the header and payload together — so a flipped `Index`, `Term`
+  or `Membership` byte is caught like a flipped payload byte — written last
+  and only once every check has passed, and `ImportSnapshot` checks the
+  artifact against it as it streams, refusing a mismatch, a truncation or a
+  missing trailer (`*SnapshotArtifactError`, matching
+  `ErrSnapshotCorrupt` on a mismatch) before anything is published, recorded
+  or seen by raft. No version constant changed. **Artifacts exported by
+  earlier builds have no trailer and are refused; export them again.**
+- **A transient read error while hashing a new snapshot made the shard
+  unrecoverable.** The save recorded a zero integrity hash, recorded the
+  snapshot in LogDB and compacted the log it covered; recovery then refused
+  the snapshot forever. A hash failure now fails the save before anything is
+  published, recorded or compacted, and the next save retries. Received and
+  imported snapshots fail the same way, and encrypted exports now carry a
+  verifiable hash.
+- **A missing or damaged `snapshot.meta` switched off the integrity check.**
+  Recovery treated it as a legacy record with nothing to verify. A recorded
+  snapshot whose metadata is missing, unreadable, malformed or has no
+  integrity fields now fails closed (`ErrSnapshotCorrupt`); pre-v1 layouts are
+  wiped rather than migrated.
+- **A corrupted plaintext snapshot could be sent to a follower or exported as
+  authoritative.** Recovery verified the recorded hash but the transport send
+  and `ExportSnapshot` did not, and the receiver made the hash of whatever
+  arrived its record, so a bit flip on disk diverged the replicas at the
+  original index. Both now verify while they read — no second pass over the
+  file — and fail before the last bytes leave: a send withholds its final
+  chunk, so the follower installs nothing. On an `ExportSnapshot` error the
+  caller must discard what its writer received.
+- **Encrypted snapshot recovery and import left complete plaintext on disk
+  across a crash.** Recovery decrypted into a named, fsynced scratch file, and
+  an import wrote the whole plaintext artifact before encrypting it. Recovery
+  now decrypts into an unnamed file, and an encrypted import streams straight
+  through encryption, so no plaintext copy ever has a name.
+- **A decrypt scratch whose unlink failed was filled with plaintext anyway.**
+  Recovery (engine and `StartShard`) and the transport send decrypt into a
+  scratch file unlinked the moment it is created. When that unlink failed,
+  the scratch kept its name and was filled with the whole plaintext state
+  machine, the unlink being retried only when it was closed (0.14.1-alpha);
+  a SIGKILL or power loss before then left it readable on disk. A failed
+  unlink now fails the recovery or send before anything is decrypted
+  (`ErrScratchNotUnlinked`), and it is retried later. The empty name is
+  removed at once, and one that cannot be is counted on
+  `StaleDecryptSweepFailures` and reclaimed by the stale-scratch sweep.
+- **`SnapshotOption.ExportPath` could report success without durable
+  metadata.** A failed `snapshot.meta` write was ignored and the file was
+  never fsynced. Both files are now written, fsynced and renamed into place,
+  the directory is fsynced, and any metadata failure fails the export. The
+  directories the export creates are fsynced too, so a new export directory
+  survives a power loss. A failure while publishing over an existing export
+  no longer leaves the new `snapshot.dat` beside the old `snapshot.meta`: the
+  previous pair is moved aside first and restored on any failure, and a crash
+  leaves a complete pair or one every verifier refuses.
+- **A restarted follower could let a stale `LeaseRead` through.** A follower
+  that restarts forgets its election timer and could vote at once, electing a
+  new leader while the old one still counted that follower's earlier
+  acknowledgement toward its lease. With `LeaseRead` on, a replica now
+  withholds its vote, its pre-vote and its own campaign for one election
+  timeout (on the monotonic clock) after it starts — longer than any lease an
+  earlier acknowledgement can back. Only `LeaseRead` shards pay it: a
+  restarted replica cannot help elect for about one election timeout, so a
+  full-shard restart elects about one timeout later. Witnesses are held down
+  too; the witness doc that called `LeaseRead` incompatible with them is
+  corrected.
+- **A follower configured to promise less than the leader's lease could let a
+  stale `LeaseRead` through (format change of the WAL hard-state record).**
+  The lease's safety rests on every acknowledging follower withholding its
+  vote for as long as the lease, and that window is the FOLLOWER's own
+  configuration: a follower with a shorter `ElectionRTT` or `RTTMillisecond`,
+  or without `LeaseRead` — running that way, or restarted
+  into it after acknowledging — could help elect a new leader while the old
+  one still counted its acknowledgement — and even an identically configured
+  follower could, since its election timer can fire about one tick short of
+  its timeout and any delayed higher-term message made it forget its leader
+  and grant the next vote at once. Each heartbeat acknowledgement now states
+  the vote window its sender promises, the sender keeps that promise on its
+  monotonic clock (no vote, pre-vote or campaign until it has passed, whatever
+  happens to its term or known leader; only a leadership transfer by the
+  leader it promised releases it, and a leader that has sent a `TimeoutNow`
+  takes no lease for the rest of that term, since the message can arrive
+  late and release promises made after the transfer was abandoned), and the
+  leader counts only acknowledgements whose window covers its lease, so a differently configured
+  follower backs no lease and reads take the ReadIndex round. The promised window is
+  recorded in the replica's Raft hard state before any acknowledgement makes
+  it, and a restarted replica withholds its vote for that recorded window
+  whatever it restarted into, then lowers the record to what it now promises.
+  `Host.StartShard` also refuses an `ElectionRTT` whose product with the
+  host's `RTTMillisecond` overflows `time.Duration` (it disabled the
+  hold-down's timer for good). The hard-state record gained the field in
+  place and moved to payload type `0x0d`; `0x02` is retired. No version
+  constant changed. **WAL directories written by earlier builds are refused
+  with `ErrUnknownPayloadType`; wipe them and re-sync from peers.**
+- **`RemoveData` let a removed replica ID come back (behavior change).**
+  `RemoveData` erased a replica's Raft hard state — term, vote and owed lease
+  vote window — and nothing stopped the same replica ID being started again.
+  Run on a replica that was still a member, that let it vote twice in one term
+  or inside a lease its earlier acknowledgement backed. `RemoveData` now
+  retires the replica ID on this host (`LogDB.NodeRemoved`), and
+  `StartShard` refuses it with `*ReplicaRetiredError` (`ErrReplicaRetired`);
+  `RemoveData` takes the shard's import lock, which a start holds throughout,
+  so a concurrent start cannot pass the check and then run a freshly retired
+  replica. **A replica that rejoins after `RemoveData` must use
+  a new replica ID.** `logdb.LogDB` gains `NodeRemoved`.
+- **Every removed replica pinned a whole WAL segment forever (format change
+  of the WAL).** A removal was kept as a remove-node tombstone record, and the
+  tombstone had to outlive every older segment still holding the removed
+  replica's records — segments other Raft groups can keep alive indefinitely
+  — so its segment was never reclaimed: 64 MiB by default per removed
+  replica. Removals are now kept in a small `RETIRED` registry file in the WAL
+  root (16 bytes per retired replica, checksummed, published by
+  fsync-and-rename); replay drops a retired replica's records wherever they
+  are, so its segments are ordinary garbage, and an open that finds a
+  removal was interrupted before its segments were collected collects them —
+  once per affected WAL shard, and including a final segment whose torn tail
+  recovery just repaired.
+  Every LogDB writer — `RemoveEntriesTo` included — refuses a retired replica
+  (`logdb.ErrReplicaRetired`); memdb orders every write against
+  `RemoveNodeData` and `Close`, so neither ever splits a `SaveState` batch; a
+  retirement is reported by `NodeRemoved` only once the node's records are
+  gone; a registry that does not parse fails `Open`
+  (`waldb.ErrRetiredRegistryMalformed`); and `waldb.Reencrypt` carries the
+  registry across in one write. Payload type `0x06` is retired. **WAL
+  directories written by earlier builds are refused with
+  `ErrUnknownPayloadType`; wipe them and re-sync from peers.**
+- **A crashed snapshot export's leftovers were never removed.** An export that
+  crashed after moving the previous pair aside, or with its temps staged,
+  left a backup directory or temp file — an obsolete, possibly decrypted,
+  snapshot — in the export directory for good. The next successful export
+  into that directory now removes every such leftover and fsyncs the
+  directory, so a removed leftover cannot reappear after a power loss.
+- **A paused leader could serve a stale `LeaseRead`.** The read lease was
+  measured in ticks, and a leader's ticker drops the ticks it misses while the
+  process is descheduled or paused. A leader paused past the followers'
+  election timeout resumed with one tick and acks that still looked fresh,
+  while the followers had elected a new leader and committed past it, so a
+  `SyncRead` could return stale state. The lease is now measured on the
+  leader's monotonic clock from when the acknowledged heartbeat round was
+  SENT — `ElectionRTT - 2` ticks of real time less 1% for clock-rate drift —
+  so a pause can only shorten it, and a resumed leader takes the heartbeat
+  quorum round instead. Heartbeats carry the round in `LogIndex`, which they
+  did not use, and followers echo it; the wire layout is unchanged, but both
+  ends must run this version for leases to be granted (an older follower's
+  acks carry no round and do not count). The `Config.LeaseRead` doc now states
+  the real assumptions: identical `ElectionRTT` and `RTTMillisecond` on every
+  replica, and clock rates within 1% of each other.
+- **An outbound connection was not tied to the replica it was dialed for.**
+  A dial verified only the cluster CA and that a SAN covered the host, so
+  anyone with network position on a peer's address and any CA-issued
+  certificate covering that host — a wildcard, or one shared across hosts —
+  received that replica's replication traffic and snapshots (snapshots cross
+  as plaintext inside TLS). Every outbound connection now requires the peer
+  to present a node identity membership binds to a replica routed to the
+  dialed address, and every message and snapshot is written only over a
+  connection whose peer presents its destination replica's bound identity —
+  the identity an inbound sender is already held to. The destination identity
+  travels with the send to the point it takes a connection, and dials verify
+  it exactly, so no re-dial or retry can reach an unchecked peer. Connections
+  are shared by address and address learning lets a member of any shard move
+  its own route onto another replica's address: the other replica's traffic
+  is then dropped, never written to that member nor re-dialed on its behalf.
+  A connection whose peer is no longer bound at the address is replaced, and
+  a refused destination is not retried for a second.
+- **A snapshot's sender was authorized only after the whole transfer.** The
+  transport took a receive slot and memory budget for every snapshot stream
+  and buffered it before the host checked the sender, so any holder of a
+  cluster certificate — a member of no shard — could hold a peer's slots and
+  half the snapshot memory for up to an hour and starve every snapshot the
+  node needed. The snapshot stream header now carries the sender (`From`;
+  56 bytes, changed in place — both ends upgrade together), and the transport
+  asks the host to authorize it from the header, through the new
+  `MessageHandler.AuthorizeSnapshot`, before taking any resource. The host
+  applies `HandleSnapshot`'s own gates there, and every chunk must carry the
+  header's sender and target. Rejections before authorization are counted
+  under shard 0 with the new `unauthorized` reason.
+- **A revoked node could vouch for itself over OCSP.** The OCSP parser
+  accepts a response signed by any certificate the issuer signed, embedded as
+  the responder, so a revoked node — which still holds its own CA-issued
+  certificate — could answer its own OCSP query "good" from a position on the
+  path to the responder, defeating revocation in `ocsp` mode and in `any` /
+  `both` while the CRL did not list it yet. A delegated responder must now
+  carry the OCSP-signing extended key usage and be within its validity
+  period; otherwise the response is status-unavailable (fail closed). A CA
+  that answers OCSP itself — embedding its own certificate or not — is the
+  issuer, not a delegate, and is accepted as before.
+- **A CRL reload silently undid runtime revocations.** `AddRevokedSerial`
+  entries lived in the set every CRL reload replaces; they are now held
+  apart and survive reloads.
+- **One peer's receive budget could split under connection churn.** The
+  last connection's release could remove the budget entry another
+  connection from the same peer had just taken, splitting that peer's
+  accounting. Entries are retired atomically before removal.
+- **Unauthorized traffic could flood the log and mint metric series.** Each
+  refused message wrote its own Warn line — up to 10,000 per frame — and a
+  snapshot for an unloaded shard was counted under whatever shard ID the
+  sender wrote. Drop warnings are rate-limited (the counters still record
+  every drop), and unverified shard IDs are counted under shard 0.
+- **`StopShard` could wait on an unrelated shard's state machine.** The
+  unload waits for the commit worker's fence, and the commit worker answered
+  it only between batches — not while its forward to the apply tier was
+  blocked behind another shard's full apply channel. `StopShard` of one shard
+  then waited out another shard's busy `Apply`, and hung for good if that
+  `Apply` was the one calling it. The blocked forward now answers unload and
+  reload requests, as the apply dispatcher already does.
+- **Snapshot GC could delete a received snapshot raft had not yet adopted.**
+  A receive publishes its directory and claims it until raft's verdict; the
+  save's publish respected the claim but GC did not, so unrecorded
+  directories at higher indexes could push it out of retention, and raft
+  adopting it then recorded a snapshot whose directory was gone. GC now
+  spares claimed directories as it does recovery pins.
+- **Snapshots offered to a failed or stopping shard were reported as
+  unauthorized.** They went through the authorization-failure path — a Warn
+  "rejected unauthorized snapshot", `IncUnauthorizedSnapshotDropped` and an
+  `UnauthorizedMessageError` — so routine leader retransmits during a
+  restart, or to a failed replica, tripped security alerting. They now
+  return a `SnapshotReceiveError` wrapping `ErrShardFailed` or
+  `ErrShardNotReady`, logged at Debug — after every authorization gate, so
+  an unauthorized snapshot that lands while the shard is failed or stopping
+  is still refused and counted as unauthorized. A snapshot for a shard that
+  is not loaded at all still counts as unauthorized: with no node there is
+  no committed membership to authenticate the sender against.
+
 ## [0.14.1-alpha] - 2026-09-23
 
 Closes the residuals 0.14.0-alpha listed as known, and adds the stable

@@ -693,16 +693,6 @@ func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 			want:    ErrTruncatedCompactionRecord,
 		},
 		{
-			name:    "remove-node too short",
-			payload: append([]byte{payloadTypeRemoveNode}, make([]byte, removeNodeRecordSize-1)...),
-			want:    ErrTruncatedRemoveNodeRecord,
-		},
-		{
-			name:    "remove-node trailing bytes",
-			payload: append([]byte{payloadTypeRemoveNode}, make([]byte, removeNodeRecordSize+1)...),
-			want:    ErrTruncatedRemoveNodeRecord,
-		},
-		{
 			name:    "bootstrap too short",
 			payload: append([]byte{payloadTypeBootstrap}, make([]byte, bootstrapRecordBaseSize-1)...),
 			want:    ErrTruncatedBootstrapRecord,

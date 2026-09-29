@@ -61,6 +61,10 @@ func seedRecoverableSnapshot(t *testing.T, ldb *snapshotTestLogDB,
 	if err := os.WriteFile(filepath.Join(dir, snapshotDataFile), buf[:], 0o600); err != nil {
 		t.Fatalf("write snapshot artifact: %v", err)
 	}
+	if err := writeTestSnapshotMetadata(dir, index, term, shardID, replicaID, 0,
+		config.NoCompression); err != nil {
+		t.Fatalf("write snapshot metadata: %v", err)
+	}
 	if err := ldb.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
 		Index:    index,
 		Term:     term,

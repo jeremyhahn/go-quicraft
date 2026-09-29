@@ -167,6 +167,37 @@ it fell back to pin-before / encrypt / pin-after, which left that window narrow
 rather than closed, and a custom barrier that missed the optional method was
 exposed to it.
 
+## The portable export artifact
+
+`ExportSnapshot` writes, and `ImportSnapshot` reads, an artifact that stands on
+its own between two hosts with unrelated barrier keys:
+
+```
+header   magic "QRSNAP01" | version:u32 (2) | Index | Term | OnDiskIndex |
+         Compression:u16 | membLen:u32 | Membership[membLen]
+payload  the snapshot data, PLAINTEXT (decrypted, never decompressed)
+trailer  magic "QRSNTRLR" | payloadLen:u64 | payloadHash:u64 (xxhash64)
+```
+
+The trailer is what makes the artifact verifiable by itself. The header is
+written before the length and hash are known — the export streams — so they
+follow the payload instead. They are computed over the bytes as they are
+WRITTEN, and the trailer is written only after the export's own check of the
+source against its `snapshot.meta` has passed. An export that fails anywhere
+never writes one. That matters most for an encrypted export: its frames
+authenticate one at a time, so all of its plaintext has reached the writer
+before the recorded-hash check can fail it, and the missing trailer is what
+keeps that output from being a complete artifact.
+
+`ImportSnapshot` withholds the last 24 bytes of the stream as it copies the
+payload into its staging directory, hashes what it copies, and checks both
+against the trailer when the stream ends — inside the copy, so a mismatch
+fails the write of the staged data file and the stage is discarded before
+anything is synced, published, recorded in LogDB or seen by raft. A truncated
+artifact ends in payload bytes where the trailer magic should be; an artifact
+from a build that predates the trailer does too, and both are refused as
+`*SnapshotArtifactError`.
+
 ## Data flow
 
 ```

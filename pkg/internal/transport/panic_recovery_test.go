@@ -534,6 +534,11 @@ func (h *panicOnHandleHandler) HandleMessage(_ proto.MessageBatch, _ PeerAuth) e
 	panic("intentional panic in HandleMessage")
 }
 
+// AuthorizeSnapshot admits every transfer: this fake exercises the paths after admission.
+func (*panicOnHandleHandler) AuthorizeSnapshot(uint64, uint64, uint64, uint64, PeerAuth) error {
+	return nil
+}
+
 func (h *panicOnHandleHandler) HandleSnapshot(_ []proto.SnapshotChunk, _ PeerAuth) error {
 	panic("intentional panic in HandleSnapshot")
 }

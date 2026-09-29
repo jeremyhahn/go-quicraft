@@ -63,7 +63,7 @@ Source files:
 | `revocation/`         | CRL/OCSP checker with hot reload and negative caching       |
 | `config.go`           | Internal `Config`, defaults, validation, metric label sets  |
 | `handler.go`          | `MessageHandler` and `PeerAuth`                             |
-| `snapshot_header.go`  | `SnapshotHeader` wire format (48 bytes, big-endian)         |
+| `snapshot_header.go`  | `SnapshotHeader` wire format (56 bytes, big-endian)         |
 | `snapshot_recv.go`    | Snapshot receiver: concurrency, memory, rate and liveness bounds |
 | `shutdown_tracker.go` | Lock-free in-flight counter that can reject new work atomically |
 | `errors.go`           | Typed transport errors and QUIC application error codes     |
@@ -101,16 +101,17 @@ shared result. The dial deadline is `dialTimeout` (5 s) and derives from
 `shutdownCtx`, so `Stop` unblocks it.
 
 ```
-getConnection(target)
+getConnection(target, want)
     |-- RLock: check conns[target]
     |   |-- alive? return
     |   |-- dead? removeConnection + evictStreamsForTarget
-    |-- dialGroup.Do(target, dialConnection)
+    |-- dialGroup.Do(target+want, dialConnection)
     |   |-- net.ResolveUDPAddr
     |   |-- net.SplitHostPort(target) -> host   (empty host => ErrEmptyDialHost)
     |   |-- dialEpoch = knownPeerEpoch(target)  // captured BEFORE the dial
     |   |-- clientTLS.ServerName = host
     |   |-- quicTr.Dial(ctx, addr, clientTLS, quicCfg)
+    |   |-- peer identity == want, or close    // exact pin (see Identity pinning)
     |   |-- Lock: re-check cache, then conns[target] = conn
     |   |             connEpoch[target] = dialEpoch
     |   |-- go preOpenHeartbeatStream(target, conn)
@@ -124,6 +125,42 @@ An *empty* host is refused with `ErrEmptyDialHost` rather than defaulted:
 verifying a peer certificate against an implicit `"localhost"` would mask a
 misconfigured address and silently fail SAN matching against real
 hostname or IP certificates.
+
+**Identity pinning.** The handshake proves only a cluster certificate whose SAN
+covers the host, which a wildcard or shared-SAN certificate held by anyone on
+the path to that address also satisfies. So every connection is taken for a
+specific destination identity — `Config.ReplicaIdentity(shard, replica)`,
+answered by the host with the identity membership binds to that replica, exactly
+the identity an inbound sender from it is held to — and the pin travels with the
+send down to the point it takes a connection:
+
+- `sendToTarget` splits a batch by destination identity (nearly always one
+  group: every replica a node hosts presents that node's identity) and drops,
+  as `identity_mismatch`, messages for a replica nothing binds.
+- `getStream` hands out a pooled stream only when its connection's peer
+  presented that identity (`connServes`); `getConnection` hands out the pooled
+  connection only on the same condition; and `dialConnection` keeps a dial only
+  when the peer presents **exactly** that identity, closing it otherwise
+  (`QUICErrDialIdentity`, `DialIdentityError`). Every re-dial and retry on the
+  write path goes through these, so no write can reach an unchecked peer.
+- One connection is pooled per address. When the pooled peer presented another
+  identity that is **still bound** at the address — two bound identities meet
+  at one address only when a member has moved its own route onto another
+  replica's — the send is refused and dropped, not re-dialed, so that member can
+  neither receive the replica's traffic nor churn the connection
+  (`replaceUnboundPeer`). When the pooled peer is bound to **nothing** there any
+  more (its replica removed, or rebound to a new keypair at the same address),
+  the connection is closed — compare-and-remove — and the send dials whoever is
+  bound now.
+- A refusal is remembered per (address, identity) for `dialRefusalCooldown`, so
+  it costs no handshake, and no registry scan, per send.
+
+The peer identity of each pooled connection is recorded at dial (`connPeer`,
+under `connMu` with `conns`), so the pin costs no TLS-state copy or hash per
+send: about 22 ns and no allocations for a one-message batch, and about 28 ns
+per additional message (`BenchmarkPinnedSendOverhead`). With pinning on, an
+empty destination identity fails closed: a caller that names none gets no
+connection rather than an unpinned one.
 
 **Dial race.** `singleflight` coalesces only overlapping dials. A dial that
 starts just after another completed reaches the insert with the cache already
@@ -463,7 +500,7 @@ streams:
 3. Get (or dial) the connection.
 4. `conn.OpenStreamSync` on a context derived from `shutdownCtx` with a 60 s
    timeout covering the stream handshake.
-5. Write the 48-byte `SnapshotHeader` as the first frame, **with `FlagSnapshot`
+5. Write the 56-byte `SnapshotHeader` as the first frame, **with `FlagSnapshot`
    set**. This flag is what routes the stream to the snapshot handler.
 6. Write each `SnapshotChunk` as a subsequent frame with `FlagNone`. Only the
    header frame carries `FlagSnapshot`.
@@ -741,7 +778,7 @@ result, and `GetRangeCopy` copies under the lock into a private buffer. See
 When `FlagSnapshot` is set on the first frame, the stream is routed to
 `handleSnapshotStream` -> `processSnapshotHeader` -> `snapshotReceiver`.
 
-The `SnapshotHeader` (48 bytes) identifies the snapshot:
+The `SnapshotHeader` (56 bytes) identifies the snapshot and its sender:
 
 ```go
 type SnapshotHeader struct {
@@ -751,13 +788,26 @@ type SnapshotHeader struct {
     Term       uint64
     ChunkCount uint64
     Epoch      uint64
+    From       uint64
 }
 ```
 
-All six fields are big-endian. `Epoch` is the barrier encryption epoch the
+All seven fields are big-endian. `Epoch` is the barrier encryption epoch the
 snapshot was saved under (0 means plaintext); the receiver persists it to LogDB
 so recovery can decrypt, and registers it with the barrier's `EpochTracker`
 while the transfer is in flight so the key is not purged underneath it.
+
+`From` is the sending replica. The receiver authorizes the transfer from the
+header alone — `MessageHandler.AuthorizeSnapshot(shard, replica, from, index,
+peer)`, which the host answers with the same gates `HandleSnapshot` applies —
+**before** it takes a receive slot or any memory. Authorization used to run only
+after the whole transfer was buffered, so any holder of a cluster certificate,
+a member of no shard, could hold a peer's slots and half the snapshot memory
+budget for the length of a transfer. Every chunk must then carry the header's
+`From` and `ReplicaID` (as well as its shard, index and epoch), so what is
+persisted is what was authorized; `HandleSnapshot` re-checks before it persists
+anything. A rejection before authorization is counted under shard 0, since the
+shard the header names is unverified until then.
 
 Source: `pkg/internal/transport/snapshot_header.go`
 

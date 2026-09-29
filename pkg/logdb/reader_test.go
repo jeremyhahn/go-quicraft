@@ -222,6 +222,8 @@ func (m *memLogDB) RemoveNodeData(shardID, replicaID uint64) error {
 	return nil
 }
 
+func (m *memLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
+
 func (m *memLogDB) ListNodeInfo() ([]NodeInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

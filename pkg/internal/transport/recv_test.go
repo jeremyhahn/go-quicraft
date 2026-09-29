@@ -605,7 +605,7 @@ func TestHandleConnectionUsesConnContext(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection.
-	conn, err := t1.getConnection(target)
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -2987,7 +2987,7 @@ func TestHandleMessageFrame_SpoofedSourceAddressCleared(t *testing.T) {
 	// An authenticated inbound connection: t1's view of t2 carries t2's
 	// verified leaf certificate, which covers 127.0.0.1/localhost but NOT
 	// 10.99.99.99.
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3015,7 +3015,7 @@ func TestHandleMessageFrame_AuthorizedSourceAddressPreserved(t *testing.T) {
 	t1, t2, handler1, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3047,7 +3047,7 @@ func TestInboundAuthorizedForCached_VerifiesOncePerConn(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3126,7 +3126,7 @@ func TestInboundAuthorizedForCached_CachesMultipleAddresses(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3171,7 +3171,7 @@ func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3205,7 +3205,7 @@ func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -3495,7 +3495,7 @@ func TestPerConnectionMsgRecvBudgetBoundsOnePeer(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}

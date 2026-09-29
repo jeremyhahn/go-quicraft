@@ -130,6 +130,29 @@ const maxInflightMsgs = 256
 // ReadIndex requests are rejected with ErrReadIndexOverloaded.
 const maxPendingReadIndex = 4096
 
+// leaseDriftDivisor bounds the relative clock-rate drift the read lease
+// tolerates: the lease is shortened by 1/leaseDriftDivisor (1%) of its
+// tick-derived length. The lease compares the leader's monotonic clock
+// against the followers' election timers, which run on their own clocks,
+// so a leader clock running slow or a follower clock running fast would
+// otherwise let the lease outlive a follower's vote-denial window. The
+// kernel bounds CLOCK_MONOTONIC slew to 500 ppm (0.05%), so 1% covers the
+// combined drift of both ends with a wide margin; it does NOT cover a
+// clock that stops, which is why the lease is anchored at send time.
+const leaseDriftDivisor = 100
+
+// leaseRoundWindow is how many recent heartbeat rounds the leader remembers
+// the send time of (a power of two, so a round's slot is round &
+// leaseRoundMask). A new round opens at most once per leaseRoundSlices-th
+// of the lease (see nextLeaseRound), so every round sent within the last
+// leaseDuration is always still in the window; an ack for an older round
+// could not extend the lease anyway and is simply not counted.
+const (
+	leaseRoundWindow = 32
+	leaseRoundMask   = leaseRoundWindow - 1
+	leaseRoundSlices = leaseRoundWindow / 2
+)
+
 // maxReadStates caps the number of resolved ReadIndex results that have
 // not yet been consumed by GetUpdate or DrainReadStatesOnly. If ReadIndex
 // requests resolve faster than the step worker drains them (e.g., under
@@ -380,14 +403,64 @@ type raft struct {
 
 	// Lease-based read fields (PhD Section 6.4). When leaseRead is
 	// enabled, the leader can serve ReadIndex requests without a
-	// heartbeat round-trip if it has received acks from a quorum of
-	// data-bearing remotes within leaseTimeout ticks. The per-remote
-	// tick at which the last heartbeat ack was received is tracked in
-	// remoteLastAck. leaseEnabled is only true when the config flag
-	// is set AND the node is leader.
-	leaseRead     bool           // config: enable lease reads
-	leaseTimeout  int            // lease duration in ticks (electionTimeout - 2)
-	remoteLastAck map[uint64]int // replicaID -> electionTick at last ack
+	// heartbeat round-trip while a quorum of voting members has acked a
+	// heartbeat round SENT less than leaseDuration ago, measured on the
+	// monotonic clock (see hasValidLease). Every heartbeat broadcast
+	// carries a round number in LogIndex that the follower echoes back;
+	// leaseRoundSent remembers when recent rounds were sent, and
+	// remoteLastAck holds, per voting member, the send time of the newest
+	// round it acked. The lease is measured in real time rather than in
+	// ticks because a descheduled leader's ticker coalesces the ticks it
+	// missed, so a tick count cannot see a pause; elapsed time can, and a
+	// pause can only shorten a lease anchored at send time.
+	leaseRead      bool                 // config: enable lease reads
+	leaseTimeout   int                  // lease length in ticks (electionTimeout - 2)
+	leaseDuration  time.Duration        // leaseTimeout ticks in real time less the drift bound; 0 = no lease
+	leaseSpan      time.Duration        // leaseTimeout ticks in real time: the vote window an ack must promise
+	now            func() time.Time     // monotonic clock; time.Now outside tests
+	leaseRound     uint64               // newest heartbeat round issued; 0 = none
+	leaseRoundSent []time.Time          // ring of recent round send times, indexed by round & leaseRoundMask
+	remoteLastAck  map[uint64]time.Time // replicaID -> send time of the newest round it acked
+
+	// Vote hold-down (see voteHeldDown). A restarted replica has forgotten
+	// its election timer, so without this it could grant a vote the moment
+	// it comes back while a leader still counts its pre-restart ack toward
+	// a live read lease. It therefore neither grants a vote nor campaigns
+	// until voteHoldDuration has elapsed on its monotonic clock since
+	// voteHoldStart, the instant it was constructed: the longer of the
+	// window a previous incarnation may still owe (voteWindowOwed, as
+	// recovered) and the window this one promises (voteWindow).
+	voteHoldArmed    bool          // a hold-down applies: LeaseRead, or a window is owed
+	voteHoldStart    time.Time     // construction time: the window's anchor
+	voteHoldDuration time.Duration // the hold-down's length; 0 = not yet known
+	voteHoldOver     bool          // latched once the window has elapsed
+	electionSpan     time.Duration // electionTimeout ticks in real time; 0 = tick interval unknown
+
+	// The live vote promise (see votePromised). Every heartbeat ack this
+	// replica sends promises its leader a vote window from the moment it
+	// acks; until promiseUntil it grants no vote or pre-vote and starts no
+	// campaign, whatever happens to its term, its known leader or its
+	// election timer meanwhile. promisedTo and promisedTerm name the leader
+	// the newest promise was made to, which alone may release it by
+	// transferring leadership.
+	promiseUntil time.Time
+	promisedTo   uint64
+	promisedTerm uint64
+
+	// timeoutNowSent records that this leader has sent a TimeoutNow in its
+	// current term. From then on it takes no read lease for the rest of the
+	// term (resumeLeaseAfterTransfer): the message can be delayed without
+	// bound, and on arrival it — and its candidate's transfer-hinted votes —
+	// release the vote promises made to this leader in this term, including
+	// ones made after a transfer that timed out. Cleared by becomeLeader.
+	timeoutNowSent bool
+
+	// voteWindowOwed is the persisted VoteWindow of the hard state: the
+	// longest vote window this replica may have promised in a heartbeat ack
+	// and not yet outlived, in nanoseconds. It is raised to the current
+	// promise before any ack carries it, and lowered to it once the
+	// hold-down has outlived every earlier promise. See voteWindow.
+	voteWindowOwed uint64
 
 	// pendingConfigChange tracks whether a config change entry has been
 	// appended but not yet committed. Per PhD thesis 4.1, only one
@@ -526,6 +599,7 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 		isWitness:             cfg.IsWitness,
 		leaseRead:             cfg.LeaseRead,
 		leaseTimeout:          int(cfg.ElectionRTT) - 2,
+		now:                   time.Now,
 		electionTimeout:       int(cfg.ElectionRTT),
 		heartbeatTimeout:      int(cfg.HeartbeatRTT),
 		maxReplicationPayload: cfg.MaxApplyEntrySize,
@@ -536,6 +610,9 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 		votes:                 make(map[uint64]bool),
 		quiesce:               newQuiesceState(cfg.Quiesce, int(cfg.ElectionRTT)),
 		rng:                   mathrand.New(mathrand.NewSource(seed)),
+	}
+	if r.leaseRead {
+		r.leaseRoundSent = make([]time.Time, leaseRoundWindow)
 	}
 
 	// Initialize remotes from membership.
@@ -581,6 +658,7 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 		r.term = state.Term
 		r.vote = state.Vote
 	}
+	r.armVoteHoldDown(state.VoteWindow)
 	// Start as follower.
 	r.becomeFollower(r.term, noLeader)
 
@@ -966,9 +1044,11 @@ func (r *raft) becomeLeader() error {
 	}
 
 	// Reset lease tracking. The lease must be earned through the first
-	// heartbeat round after becoming leader.
+	// heartbeat round after becoming leader. A new term has sent no
+	// TimeoutNow yet, so it may take a lease again.
+	r.timeoutNowSent = false
 	if r.leaseRead {
-		r.remoteLastAck = make(map[uint64]int)
+		r.remoteLastAck = make(map[uint64]time.Time)
 	} else {
 		r.remoteLastAck = nil
 	}
@@ -1468,14 +1548,13 @@ func tickLeader(r *raft) {
 		if r.quiesce.tickLiveness() {
 			r.broadcastHeartbeat()
 		}
-		// CheckQuorum must keep running while quiesced. Freezing
-		// electionTick here would freeze the read lease as well: acks
-		// recorded before or during quiesce never age, hasValidLease
-		// computes a negative expiry and accepts all of them, and a
-		// partitioned leader keeps answering ReadIndex from a stale
-		// committed index for the whole partition. The quiesce liveness
-		// interval is the quiesced equivalent of the election timeout,
-		// so it paces both the step-down check and the lease reset.
+		// CheckQuorum must keep running while quiesced: a partitioned
+		// leader that never re-checks its quorum never steps down. The
+		// read lease ages by elapsed time on its own (hasValidLease), so
+		// it lapses between liveness probes regardless; the quiesce
+		// liveness interval is the quiesced equivalent of the election
+		// timeout, so it paces both the step-down check and the lease
+		// reset.
 		if r.checkQuorum {
 			r.electionTick++
 			if r.electionTick >= r.quiesce.livenessInterval {
@@ -1530,12 +1609,11 @@ func tickLeader(r *raft) {
 				return
 			}
 			r.resetRemoteActivity()
-			// Reset lease ack timestamps so the lease must be re-earned
-			// through fresh heartbeat acknowledgments. Without this,
-			// stale ack ticks from the previous cycle would satisfy
-			// hasValidLease() after the electionTick wraps to 0, because
-			// leaseExpiry = 0 - leaseTimeout underflows negative and all
-			// positive stale ticks appear valid.
+			// Reset lease acks so the lease must be re-earned through
+			// fresh heartbeat acknowledgments each checkQuorum cycle,
+			// the same cadence at which remote activity is re-proven.
+			// hasValidLease ages acks by elapsed time on its own; this
+			// only ever shortens the lease further.
 			r.resetLeaseAcks()
 		}
 	}
@@ -1554,12 +1632,7 @@ func tickLeader(r *raft) {
 			r.transferTarget = noNode
 			r.transferElapsed = 0
 
-			// Restore lease tracking invalidated by handleLeaderTransfer.
-			// Without this, the leader silently degrades to heartbeat-based
-			// ReadIndex for the rest of its term.
-			if r.leaseRead && r.remoteLastAck == nil {
-				r.remoteLastAck = make(map[uint64]int)
-			}
+			r.resumeLeaseAfterTransfer()
 		}
 	}
 
@@ -1751,6 +1824,26 @@ func (r *raft) startElection() {
 			"term", r.term,
 			"last_leader", r.leaderID)
 		r.leaderID = noLeader
+		return
+	}
+	// A replica inside its post-restart vote hold-down must not vote for
+	// itself either: a self-vote counts toward the election quorum exactly
+	// as a grant to another candidate does, and a leader may still count
+	// this replica's pre-restart ack toward a read lease (voteHeldDown).
+	// Same stale-leaderID reasoning as the joining branch above.
+	if r.voteHeldDown() || r.votePromised() {
+		slog.Debug("election skipped: a leader may be counting this replica's ack toward a read lease",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term,
+			"last_leader", r.leaderID)
+		r.leaderID = noLeader
+		// The window ends at a point in real time, not on a tick boundary, so
+		// the timer that fired just short of it retries on the next tick
+		// rather than waiting out a whole new election timeout. Only a
+		// replica whose timer has already expired gets here, so this costs
+		// one clock read per tick until the window ends.
+		r.electionTick = max(r.randomizedElectionTimeout-1, 0)
 		return
 	}
 	// Refuse to start an election at all when this node's own last log term
@@ -2003,6 +2096,23 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		noCompetingLeader := r.leaderID == noLeader || msg.Hint == msg.From
 		canVote = logOK && (r.vote == msg.From ||
 			(r.vote == noNode && noCompetingLeader))
+	}
+
+	// A replica that restarted recently on a LeaseRead shard withholds every
+	// vote and pre-vote, the transfer-hinted ones included, until its
+	// election timeout has passed in real time: a leader may still be
+	// counting its pre-restart ack toward a read lease (voteHeldDown). The
+	// refusal takes the ordinary rejection path below. Checked only when the
+	// vote would otherwise be granted, so a refusal reads no clock.
+	if canVote && (r.voteHeldDown() || (r.votePromised() && !r.transferReleasesPromise(msg))) {
+		canVote = false
+		slog.Debug("vote withheld: a leader may be counting this replica's ack toward a read lease",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"candidate", msg.From,
+			"term", r.term,
+			"msg_term", msg.Term,
+			"pre_vote", isPreVote)
 	}
 
 	// PreVote response term depends on the outcome:
@@ -3112,27 +3222,33 @@ func (r *raft) broadcastHeartbeat() {
 
 // broadcastHeartbeatCtx sends heartbeat messages with a context key to
 // all remotes, observers, and witnesses. The context key is used to
-// correlate heartbeat responses with specific ReadIndex requests.
+// correlate heartbeat responses with specific ReadIndex requests; the
+// lease round (see nextLeaseRound) correlates them with the time the
+// round was sent.
 func (r *raft) broadcastHeartbeatCtx(ctx uint64) {
+	round := r.nextLeaseRound()
 	for id := range r.remotes {
-		r.sendHeartbeatTo(id, ctx)
+		r.sendHeartbeatTo(id, ctx, round)
 	}
 	for id := range r.observers {
-		r.sendHeartbeatTo(id, ctx)
+		r.sendHeartbeatTo(id, ctx, round)
 	}
 	for id := range r.witnesses {
-		r.sendHeartbeatTo(id, ctx)
+		r.sendHeartbeatTo(id, ctx, round)
 	}
 }
 
 // sendHeartbeatTo sends a heartbeat message with context to the given peer.
-func (r *raft) sendHeartbeatTo(to uint64, ctx uint64) {
+// LogIndex carries the lease round, which a Heartbeat otherwise leaves
+// unused and handleHeartbeat echoes back unchanged.
+func (r *raft) sendHeartbeatTo(to uint64, ctx uint64, round uint64) {
 	commit := min(r.log.committed, r.getMatchForPeer(to))
 	r.send(proto.Message{
-		Type:   proto.Heartbeat,
-		To:     to,
-		Commit: commit,
-		Hint:   ctx,
+		Type:     proto.Heartbeat,
+		To:       to,
+		Commit:   commit,
+		Hint:     ctx,
+		LogIndex: round,
 	})
 }
 
@@ -3205,11 +3321,19 @@ func (r *raft) handleHeartbeat(msg proto.Message) error {
 		}
 	}
 
-	// Echo back the context so the leader can correlate ReadIndex responses.
+	// Echo back the context so the leader can correlate ReadIndex responses,
+	// and the lease round so it can date the ack by when the heartbeat was
+	// sent (hasValidLease), together with the vote window this replica
+	// promises from now (voteWindow), which decides whether the leader may
+	// count the ack toward a lease at all. The promise is taken on here,
+	// before the ack leaves (promiseVotes).
+	r.promiseVotes(msg.From)
 	r.send(proto.Message{
-		Type: proto.HeartbeatResp,
-		To:   msg.From,
-		Hint: msg.Hint,
+		Type:     proto.HeartbeatResp,
+		To:       msg.From,
+		Hint:     msg.Hint,
+		LogIndex: msg.LogIndex,
+		LogTerm:  r.voteWindow(),
 	})
 	return nil
 }
@@ -3227,11 +3351,25 @@ func (r *raft) handleHeartbeatResp(msg proto.Message) error {
 	// lease and ReadIndex quorums use the unified quorum (remotes + witnesses
 	// + self). All voting members must be tracked so their heartbeat
 	// acks count toward the leadership confirmation quorum.
-	if r.remoteLastAck != nil {
-		if _, isRemote := r.remotes[msg.From]; isRemote {
-			r.remoteLastAck[msg.From] = r.electionTick
-		} else if _, isWitness := r.witnesses[msg.From]; isWitness {
-			r.remoteLastAck[msg.From] = r.electionTick
+	//
+	// The ack is dated by when the round it answers was SENT, never by when
+	// it arrived or was processed: time spent between the two — a slow
+	// network, or this leader descheduled with the ack queued — would
+	// otherwise be credited to the lease. Only a newer round moves the date
+	// forward, so a reordered older ack cannot pull it back either way.
+	//
+	// It counts only when the member promises, in the ack, a vote window at
+	// least as long as this leader's lease (ackBacksLease): the lease is sound
+	// only while every ack it rests on is backed by a member that will not
+	// help elect anyone else before it ends, and that promise is made by the
+	// member's own configuration, not this one's.
+	if r.remoteLastAck != nil && r.ackBacksLease(msg) {
+		_, isRemote := r.remotes[msg.From]
+		_, isWitness := r.witnesses[msg.From]
+		if sent, ok := r.leaseRoundSentAt(msg.LogIndex); ok && (isRemote || isWitness) {
+			if prev, seen := r.remoteLastAck[msg.From]; !seen || sent.After(prev) {
+				r.remoteLastAck[msg.From] = sent
+			}
 		}
 	}
 
@@ -3421,11 +3559,19 @@ func snapshotVotingBitCount(m proto.Membership, self uint64) int {
 // discard higher-term RequestVotes — simply by retransmitting one long-obsolete
 // snapshot. Suppressing an election is not a lesser power than winning one.
 //
-// The term dimension is already covered upstream and deliberately not repeated:
-// step() drops a lower-term InstallSnapshot (answering with a corrective
-// ReplicateResp) and, for a higher term, calls becomeFollower(msg.Term, msg.From)
-// — InstallSnapshot is one of the leader-originated types it trusts to name a
-// leader — so msg.From IS r.leaderID by the time the handler runs. stepCandidate
+// The term dimension of a WIRE InstallSnapshot is covered upstream and
+// deliberately not repeated: step() drops a lower-term one (answering with a
+// corrective ReplicateResp) and, for a higher term, calls
+// becomeFollower(msg.Term, msg.From) — InstallSnapshot is one of the
+// leader-originated types it trusts to name a leader — so msg.From IS
+// r.leaderID by the time the handler runs. The installs the host injects after
+// receiving a snapshot are different: the snapshot itself never passed step()
+// (the host's handler received it and authorized the sender against committed
+// membership), and the injected message carries no message term (Term 0), so
+// step()'s term gate does not run for it. Within raft the sender check below is
+// its only gate: the install is adopted only from the replica this one already
+// follows, or when it follows no one yet — the same power a member already has
+// through a higher-term message. stepCandidate
 // reaches the same state through stepDownToFollower. A replica with no leader
 // for this term yet (leaderID == noLeader) accepts, which is what keeps first
 // contact after an election working.
@@ -3765,28 +3911,342 @@ func (r *raft) hasCommittedEntryAtCurrentTerm() bool {
 }
 
 // hasValidLease returns true if the leader holds a valid read lease.
+//
 // A lease is valid when a quorum of all voting members (remotes + witnesses
-// + self) have acknowledged heartbeats within leaseTimeout ticks. Since
-// witnesses vote in elections, the lease quorum must overlap with every
-// possible election-winning coalition to prevent stale reads after
-// leadership change. The safety argument (PhD 6.4): followers will not
-// grant votes to another candidate until their election timeout expires,
-// and leaseTimeout = electionTimeout - 2 provides a 2-tick safety margin
-// that accounts for goroutine scheduling jitter between the leader's
-// lease check and followers' election timeout, preventing split-brain reads.
+// + self) has acknowledged a heartbeat round that this leader SENT less than
+// leaseDuration ago by its monotonic clock. Since witnesses vote in
+// elections, the lease quorum must overlap with every possible
+// election-winning coalition to prevent stale reads after leadership change.
+//
+// The safety argument (PhD 6.4): a follower that acks a heartbeat sent at T
+// received it no earlier than T, reset its election timer then, and grants
+// no vote to another candidate (handleVoteRequest, dropHighTermVote) until
+// electionTimeout of its own ticks have elapsed. Its ticker can deliver one
+// coalesced tick early, and one more can land just after the reset, so that
+// window is at least electionTimeout - 2 tick intervals of real time —
+// leaseTimeout. leaseDuration is that span less the clock-rate drift bound
+// (leaseDriftDivisor), so a quorum of acks for rounds sent at or after T
+// means no other leader can exist before T + leaseDuration. A follower that
+// restarts in between loses that election timer; voteHeldDown carries the
+// promise across the restart.
+//
+// Anchoring at SEND time is what makes a pause harmless. Measured from ack
+// receipt, or in ticks, the lease would survive a leader that was
+// descheduled for longer than the election timeout: its ticker drops the
+// ticks it missed, so on resuming it sees one tick and still-fresh acks,
+// while the followers have meanwhile elected a new leader and committed
+// past it. Elapsed monotonic time since the round was sent covers the
+// pause, so the lease is already expired and the read takes the heartbeat
+// quorum round instead. A pause can only shorten the lease, never extend
+// it.
+//
+// It assumes every replica runs the same ElectionRTT and tick interval
+// (RTTMillisecond) and that clock rates differ by less than the drift
+// bound. It does not survive a clock that stops or jumps backward, which
+// Go's monotonic clock does not do.
 func (r *raft) hasValidLease() bool {
-	if !r.leaseRead || r.state != leader || r.remoteLastAck == nil {
+	if !r.leaseRead || r.state != leader || r.remoteLastAck == nil || r.leaseDuration <= 0 {
 		return false
 	}
 	q := quorum(r.remotes, r.witnesses)
 	count := 1 // count self
-	leaseExpiry := r.electionTick - r.leaseTimeout
-	for _, tick := range r.remoteLastAck {
-		if tick >= leaseExpiry {
+	now := r.now()
+	for _, sent := range r.remoteLastAck {
+		if elapsed := now.Sub(sent); elapsed >= 0 && elapsed < r.leaseDuration {
 			count++
 		}
 	}
 	return count >= q
+}
+
+// setTickInterval derives leaseDuration from the real duration of one tick:
+// leaseTimeout ticks, shortened by the drift bound (rounded up, so the
+// lease errs short). A non-positive result disables the lease.
+//
+// It also sizes the vote hold-down (sizeVoteHoldDown) from electionTimeout
+// ticks of real time, deliberately NOT shortened by the drift bound (see
+// voteHeldDown). An interval that gives no positive span leaves a LeaseRead
+// replica's hold-down unsized, which holds votes down indefinitely rather
+// than releasing them.
+func (r *raft) setTickInterval(tick time.Duration) {
+	if span, ok := ticksToDuration(r.electionTimeout, tick); ok {
+		r.electionSpan = span
+		r.sizeVoteHoldDown()
+	}
+	d, ok := ticksToDuration(r.leaseTimeout, tick)
+	if !ok {
+		r.leaseDuration = 0
+		r.leaseSpan = 0
+		return
+	}
+	r.leaseSpan = d
+	r.leaseDuration = d - (d+leaseDriftDivisor-1)/leaseDriftDivisor
+}
+
+// ticksToDuration returns n ticks of the given interval as a duration, and
+// false when that is not a positive duration: a non-positive count or
+// interval, or a product too large for time.Duration. The overflow case is
+// refused rather than wrapped, since a wrapped product is negative and would
+// silently leave the vote hold-down with no length.
+func ticksToDuration(n int, tick time.Duration) (time.Duration, bool) {
+	if n <= 0 || tick <= 0 || int64(n) > math.MaxInt64/int64(tick) {
+		return 0, false
+	}
+	return time.Duration(n) * tick, true
+}
+
+// armVoteHoldDown sets up the post-restart vote hold-down at construction.
+// owed is the vote window the previous incarnation recorded in the hard
+// state as possibly still owed.
+//
+// The hold-down is anchored here, not at the first tick: this replica
+// answers RequestVote from the moment it is constructed, before any tick,
+// and every ack a previous incarnation sent was sent before this peer
+// existed. It applies when this replica runs LeaseRead (it will promise a
+// window, and a restart must not break the promise) OR when a window is
+// owed, whatever the current configuration: an operator may have restarted
+// the replica into one that promises less, or nothing, and the leader still
+// counting the old ack relies on the old promise.
+//
+// An owed window's length is known now; the current promise is known only
+// once SetTickInterval supplies the tick, which then re-sizes the hold-down.
+func (r *raft) armVoteHoldDown(owed uint64) {
+	r.voteWindowOwed = owed
+	if !r.leaseRead && owed == 0 {
+		return
+	}
+	r.voteHoldArmed = true
+	r.voteHoldStart = r.now()
+	if !r.leaseRead {
+		r.voteHoldDuration = time.Duration(min(owed, uint64(math.MaxInt64)))
+	}
+}
+
+// sizeVoteHoldDown sets the hold-down's length to the longer of the window
+// owed from before the restart and the window this incarnation promises, and
+// raises the owed window to that promise. The raise reaches the hard state,
+// and hard state is persisted before any ordered message — a HeartbeatResp
+// among them — leaves this replica (the engine's SaveState-then-send order),
+// so the promise is durable before the first ack that makes it.
+func (r *raft) sizeVoteHoldDown() {
+	promise := r.voteWindow()
+	if promise > r.voteWindowOwed {
+		r.voteWindowOwed = promise
+	}
+	if r.voteHoldArmed && !r.voteHoldOver {
+		r.voteHoldDuration = time.Duration(min(r.voteWindowOwed, uint64(math.MaxInt64)))
+	}
+}
+
+// promiseVotes takes on the vote promise a heartbeat ack is about to make to
+// leader: for voteWindow from now on this replica's monotonic clock it grants
+// no vote and starts no campaign (votePromised). A replica that promises no
+// window — no LeaseRead, or no known tick — reads no clock.
+func (r *raft) promiseVotes(leader uint64) {
+	w := r.voteWindow()
+	if w == 0 {
+		return
+	}
+	if until := r.now().Add(time.Duration(w)); until.After(r.promiseUntil) {
+		r.promiseUntil = until
+	}
+	r.promisedTo = leader
+	r.promisedTerm = r.term
+}
+
+// votePromised reports whether a vote promise made in a heartbeat ack is
+// still outstanding (promiseVotes).
+//
+// This is what keeps the promise while the replica runs. It is enforced in
+// real time and in nothing else, because everything else a follower could
+// lean on can end early. The election timer counts ticks, and the ticker is
+// not re-phased by the heartbeat that resets the count, so the next tick can
+// land at once and a minimum-length timer fires about one tick short of the
+// window the ack promised. The known-leader tests (dropHighTermVote, the
+// leader-active test in handleVoteRequest) end the moment any higher-term
+// message — a delayed pre-vote rejection from an old campaign, say — moves
+// the replica to a new term with no leader, after which the next candidate's
+// vote is granted at once. Either would let this replica help elect a new
+// leader inside a lease its ack still backs.
+//
+// A replica that has promised nothing returns before reading the clock.
+func (r *raft) votePromised() bool {
+	return !r.promiseUntil.IsZero() && r.now().Before(r.promiseUntil)
+}
+
+// transferReleasesPromise reports whether a vote request comes from the
+// candidate of a leadership transfer started by the leader this replica's
+// newest promise was made to: a transfer-hinted request (Hint == From) for
+// the term after the promise's. One term has one leader, so that transfer was
+// started by the promisee, and a leader clears its own lease before it starts
+// a transfer (handleLeaderTransfer), so no lease rests on the promise any more.
+// A transfer hint at any other term proves nothing about the promisee and
+// releases nothing.
+func (r *raft) transferReleasesPromise(msg proto.Message) bool {
+	return msg.Hint == msg.From && r.promisedTerm != 0 && msg.Term == r.promisedTerm+1
+}
+
+// voteWindow is the vote window this replica promises in a heartbeat ack:
+// how long, from the moment it acks, it will grant no vote to another
+// candidate and start no election. The leader counts the ack toward a read
+// lease only if this is at least the lease's span (ackBacksLease), so a
+// member whose configuration makes a weaker promise than the leader assumes —
+// a shorter ElectionRTT, a shorter RTTMillisecond, no CheckQuorum, or no
+// LeaseRead — backs no lease rather than an unsound one.
+//
+// The promise is electionTimeout ticks of real time (electionSpan), and it is
+// kept in real time on both paths an ack can outlive: while this replica
+// runs, votePromised refuses every vote, pre-vote and campaign until the
+// window has passed since the ack; if it restarts, the vote hold-down
+// (voteHeldDown) does the same from construction, which is after the ack,
+// for at least the window recorded as owed — and the promise is recorded as
+// owed before any ack makes it (sizeVoteHoldDown). The record, not the
+// configuration, is what the restarted replica honours, so restarting into a
+// configuration that promises less, or nothing, does not break a promise
+// already made.
+//
+// It is 0 — no promise — without LeaseRead, so a shard that does not use
+// lease reads never records a window, reads no clock per heartbeat and never
+// holds its votes down; on an observer, whose ack no lease quorum counts and
+// who has no vote to withhold; and until the tick interval is known.
+func (r *raft) voteWindow() uint64 {
+	if !r.leaseRead || r.isObserver || r.electionSpan <= 0 {
+		return 0
+	}
+	return uint64(r.electionSpan)
+}
+
+// ackBacksLease reports whether a heartbeat ack promises a vote window
+// (voteWindow, carried in LogTerm) at least as long as this leader's lease
+// span. The span is compared before the drift bound is taken off, which
+// keeps the margin the uniform-configuration argument relies on: the lease
+// ends 1% before the span on this clock, and the member's window, measured
+// on its clock, lasts at least the span.
+//
+// An ack from a build that sent no window carries 0 and backs no lease, so
+// reads take the heartbeat quorum round.
+func (r *raft) ackBacksLease(msg proto.Message) bool {
+	return r.leaseSpan > 0 && msg.LogTerm <= math.MaxInt64 &&
+		time.Duration(msg.LogTerm) >= r.leaseSpan
+}
+
+// voteHeldDown reports whether this replica must still withhold its vote,
+// from other candidates and from itself, because it restarted recently and a
+// leader may still be counting an ack it sent before the restart. A replica
+// that neither runs LeaseRead nor owes a window from before its restart
+// returns false before reading the clock, so its vote handling is unchanged.
+//
+// The hazard it closes: the lease safety argument (hasValidLease) rests on a
+// follower that acked a heartbeat sent at T granting no vote until its
+// election timeout has elapsed. That promise lives in the follower's election
+// timer, which a restart discards: the replica comes back with no known
+// leader, so dropHighTermVote does not fire and handleVoteRequest grants the
+// first up-to-date candidate. In a three-node shard, leader L holds a lease
+// on its own ack plus F1's; F1 restarts and votes for F2, F2 wins with F1 and
+// itself, and L — whose lease still counts F1's pre-restart ack — serves a
+// read that misses F2's writes until that ack's round ages out.
+//
+// The window is anchored at construction (voteHoldStart) on this replica's
+// monotonic clock, and lasts the longer of the window recorded as owed in the
+// hard state and the one this incarnation promises (sizeVoteHoldDown). Every
+// ack this replica sent before the restart promised a window no longer than
+// the one recorded, was sent before construction, and answered a round sent
+// no later than that, so the hold-down ends at least that window after any
+// such round was sent. A leader counts an ack only when the window it
+// promises covers the lease span (ackBacksLease): leaseTimeout =
+// electionTimeout - 2 of the leader's tick intervals, of which the lease is
+// the span less 1% (leaseDriftDivisor), on the leader's clock. With clock
+// rates within that 1% of each other the window outlasts every lease a
+// pre-restart ack can back by about two ticks, which is why the window
+// itself needs no drift allowance of its own. Measuring in ticks instead
+// would reintroduce the pause bug the lease was moved to real time to fix:
+// a descheduled process's ticker coalesces the ticks it missed, so a tick
+// count would declare the window over before the time had passed.
+//
+// Anchoring at the first tick instead would be later, not safer: votes
+// arrive from the moment the peer is constructed, and a tick-anchored window
+// would have to treat "no tick yet" as held anyway.
+//
+// A self-vote is a vote. A candidate counts its own grant, and a quorum that
+// contains this replica's self-vote can omit every other member of the lease
+// quorum just as a quorum containing a vote it granted can (F1 campaigning
+// with F2's grant is the scenario above with the roles swapped), so
+// startElection and handleTimeoutNow consult this too. That includes the
+// leadership-transfer path: the Hint == From exemption is chosen by the
+// sender, and a restarted replica cannot tell whether the leader asking for
+// the transfer is the one whose lease its old ack backs. A transfer that
+// needs this replica during the window times out and is retried by the
+// caller. It costs no normal-case latency: a restarted replica's own
+// election timer is randomized over [electionTimeout, 2*electionTimeout)
+// ticks, which is already about the window.
+//
+// Only vote-granting is held down. The replica still accepts Replicate and
+// Heartbeat from a leader and acks them, so the leader's CheckQuorum counts it
+// active; an ack sent in this incarnation is covered by the ordinary
+// election-timer denial (dropHighTermVote and the leader-active test in
+// handleVoteRequest), which the window does not replace. A refused
+// higher-term RequestVote still advances this replica's term in step(), as
+// any refused vote does. Quiesce neither extends nor ends the window: it
+// changes how often ticks arrive, and the window is not counted in ticks.
+//
+// Until SetTickInterval supplies the tick interval the window's length is
+// unknown, so votes stay held. The leader side of the same peer grants no
+// lease without the interval, but a leader on another host may, and it is
+// that leader's lease this replica's old ack backs.
+//
+// Once the window has elapsed the result is latched, so the clock is read
+// only while the window might still be open.
+func (r *raft) voteHeldDown() bool {
+	if !r.voteHoldArmed || r.voteHoldOver {
+		return false
+	}
+	if r.voteHoldDuration > 0 && r.now().Sub(r.voteHoldStart) >= r.voteHoldDuration {
+		r.voteHoldOver = true
+		// Every promise an earlier incarnation made has now been outlived, so
+		// only this incarnation's own is still owed. Lowering the record is
+		// what lets a later restart into a configuration that promises less
+		// stop paying for a promise nobody holds any more.
+		r.voteWindowOwed = r.voteWindow()
+		return false
+	}
+	return true
+}
+
+// nextLeaseRound returns the heartbeat round a broadcast about to be sent
+// carries in LogIndex, or 0 when lease tracking is off (including during a
+// leader transfer, so no ack of a heartbeat sent then can ever count).
+//
+// A new round opens only when the current one is older than
+// leaseDuration/leaseRoundSlices; until then broadcasts reuse it. Reuse is
+// safe because the round keeps the send time of its FIRST broadcast, which
+// is earlier than any later one, so an ack of a reused round anchors the
+// lease early, never late. It is also what bounds the rounds in flight:
+// under sustained ReadIndex load every step cycle broadcasts, and a round
+// per broadcast would evict a round from the window before its acks came
+// back, leaving the lease unrenewable for as long as the load lasted.
+func (r *raft) nextLeaseRound() uint64 {
+	if r.remoteLastAck == nil || r.leaseDuration <= 0 {
+		return 0
+	}
+	now := r.now()
+	if r.leaseRound != 0 &&
+		now.Sub(r.leaseRoundSent[r.leaseRound&leaseRoundMask]) < r.leaseDuration/leaseRoundSlices {
+		return r.leaseRound
+	}
+	r.leaseRound++
+	r.leaseRoundSent[r.leaseRound&leaseRoundMask] = now
+	return r.leaseRound
+}
+
+// leaseRoundSentAt returns when heartbeat round was first sent. It reports
+// false for round 0 (no round: lease tracking was off, or the follower
+// predates rounds), for a round this leader never issued, and for one old
+// enough to have left the window, none of which may renew the lease.
+func (r *raft) leaseRoundSentAt(round uint64) (time.Time, bool) {
+	if round == 0 || round > r.leaseRound || r.leaseRound-round >= leaseRoundWindow {
+		return time.Time{}, false
+	}
+	return r.leaseRoundSent[round&leaseRoundMask], true
 }
 
 // handleLeaderReadIndex handles a read index request on the leader.
@@ -3816,13 +4276,17 @@ func (r *raft) handleLeaderReadIndex(msg proto.Message) error {
 
 	// Single-node cluster or valid lease: respond immediately without
 	// a heartbeat round-trip.
-	if numVotingMembers(r.remotes, r.witnesses) == 1 || r.hasValidLease() {
+	// The lease is evaluated once: it reads the clock, and the log line
+	// below would otherwise read it again on every fast-path read.
+	singleVoter := numVotingMembers(r.remotes, r.witnesses) == 1
+	leaseValid := !singleVoter && r.hasValidLease()
+	if singleVoter || leaseValid {
 		slog.Debug("read index fast path",
 			"shard", r.shardID,
 			"replica", r.replicaID,
 			"key", msg.Hint,
 			"commit_index", r.log.committed,
-			"lease_valid", r.hasValidLease(),
+			"lease_valid", leaseValid,
 		)
 		if msg.From != 0 && msg.From != r.replicaID {
 			// Forwarded from a follower; respond to originator.
@@ -4123,15 +4587,33 @@ func (r *raft) sendTimeoutNow(to uint64) {
 		"target", to,
 		"term", r.term,
 	)
+	// The lease is forfeit for the rest of this term; see timeoutNowSent.
+	// handleLeaderTransfer already cleared it, and this keeps it cleared
+	// even if the transfer is later abandoned.
+	r.timeoutNowSent = true
+	r.remoteLastAck = nil
 	r.send(proto.Message{
 		Type: proto.TimeoutNow,
 		To:   to,
 	})
 }
 
+// resumeLeaseAfterTransfer restores the lease tracking handleLeaderTransfer
+// cleared, once a transfer is abandoned — unless a TimeoutNow was sent in
+// this term. Such a message may still arrive, however late, and the vote
+// promises it and its candidate's transfer-hinted votes release
+// (votePromised) include any made after the abandonment; a lease resting on
+// them would let the transfer's candidate be elected inside it. Reads then
+// take the heartbeat quorum round until the next term.
+func (r *raft) resumeLeaseAfterTransfer() {
+	if r.leaseRead && r.remoteLastAck == nil && !r.timeoutNowSent {
+		r.remoteLastAck = make(map[uint64]time.Time)
+	}
+}
+
 // handleTimeoutNow processes a TimeoutNow message by immediately
 // starting an election.
-func (r *raft) handleTimeoutNow(_ proto.Message) error {
+func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	// A removed replica must not campaign even when told to: a TimeoutNow
 	// in flight when the removal committed would otherwise hand leadership
 	// to a replica the configuration no longer contains. The same applies to
@@ -4173,6 +4655,25 @@ func (r *raft) handleTimeoutNow(_ proto.Message) error {
 			"replica", r.replicaID,
 			"term", r.term)
 		return ErrJoiningNodeCannotCampaign
+	}
+	// Nor may a replica inside its post-restart vote hold-down, however it
+	// was asked: the transfer's campaign would open with this replica's
+	// self-vote while a leader may still count its pre-restart ack toward a
+	// read lease (voteHeldDown). The leader's transfer times out and can be
+	// retried once the window has passed.
+	//
+	// A live promise is released only by the leader it was made to asking for
+	// the transfer at the promise's own term: that leader cleared its lease
+	// before sending TimeoutNow (handleLeaderTransfer). From anyone else, or at
+	// another term, the promise stands and the transfer is refused the same way.
+	promiseStands := r.votePromised() && (msg.From != r.promisedTo || msg.Term != r.promisedTerm)
+	if r.voteHeldDown() || promiseStands {
+		slog.Warn("ignoring TimeoutNow: a leader may be counting this replica's ack toward a read lease",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"term", r.term)
+		return ErrLeaseVoteHoldDown
 	}
 	// A leader must never call becomeCandidate (invariant assertion).
 	// This can happen if a same-term TimeoutNow arrives at the leader
@@ -4513,9 +5014,9 @@ func (r *raft) exitQuiesce() {
 }
 
 // resetLeaseAcks clears all remoteLastAck timestamps so the lease must
-// be re-earned through fresh heartbeat acknowledgments. Called after the
-// electionTick wraps to 0 during checkQuorum to prevent stale ack values
-// from the previous cycle from satisfying hasValidLease().
+// be re-earned through fresh heartbeat acknowledgments. Called when the
+// electionTick wraps to 0 during checkQuorum and on quiesce exit, so no
+// ack from a previous cycle or clock regime contributes to hasValidLease().
 func (r *raft) resetLeaseAcks() {
 	if r.remoteLastAck == nil {
 		return
@@ -4608,8 +5109,9 @@ func (r *raft) rebuildReplicaToBit() error {
 // hardState returns the current hard state for persistence.
 func (r *raft) hardState() proto.State {
 	return proto.State{
-		Term:   r.term,
-		Vote:   r.vote,
-		Commit: r.log.committed,
+		Term:       r.term,
+		Vote:       r.vote,
+		Commit:     r.log.committed,
+		VoteWindow: r.voteWindowOwed,
 	}
 }

@@ -30,7 +30,7 @@ func liveConn(t *testing.T) (*QUICTransport, *quic.Conn) {
 	t.Helper()
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	t.Cleanup(cleanup)
-	conn, err := t1.getConnection(t2.Addr().String())
+	conn, err := t1.getConnection(t2.Addr().String(), "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}

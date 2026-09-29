@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -514,8 +515,8 @@ func TestSetProcessedIndex_ClampedSoCommitDoesNotPanic(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // A member added during leadership must not contribute to hasValidLease
-// before its first real heartbeat ack. Seeding a zero ack tick is
-// indistinguishable from an ack recorded at tick 0.
+// before its first real heartbeat ack. Any seeded ack time would claim a
+// heartbeat round the member never answered.
 func TestSyncLeaseAcks_NewMemberCannotGrantLease(t *testing.T) {
 	ms := threeNodeMembership()
 	cfg := testConfigWithID(1, 1)
@@ -526,7 +527,7 @@ func TestSyncLeaseAcks_NewMemberCannotGrantLease(t *testing.T) {
 	// from replica 3.
 	p.r.state = leader
 	p.r.leaderID = 1
-	p.r.remoteLastAck = map[uint64]int{2: 1}
+	p.r.remoteLastAck = map[uint64]time.Time{2: p.r.now()}
 	p.r.electionTick = 1
 
 	// AddNode(4) commits during leadership.
@@ -540,7 +541,7 @@ func TestSyncLeaseAcks_NewMemberCannotGrantLease(t *testing.T) {
 	p.syncRaftRemotes()
 
 	if _, ok := p.r.remoteLastAck[4]; ok {
-		t.Fatal("newly added replica 4 was seeded with an ack tick")
+		t.Fatal("newly added replica 4 was seeded with an ack")
 	}
 	// Voters are now {1,2,3,4}: quorum 3, real acks are self + replica 2.
 	if p.r.hasValidLease() {

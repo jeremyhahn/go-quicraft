@@ -21,6 +21,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,7 +88,7 @@ func TestSendHeartbeatBatch_MarshalFailureDropsBatch(t *testing.T) {
 			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: bytes.Repeat([]byte("x"), 512)}},
 		},
 	}
-	tr.sendHeartbeatBatch("127.0.0.1:1", msgs)
+	tr.sendHeartbeatBatch("127.0.0.1:1", "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != len(msgs) {
@@ -113,7 +115,7 @@ func TestSendHeartbeatBatch_StreamUnavailableDropsBatch(t *testing.T) {
 	msgs := []proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}}
 	// A syntactically valid but unresolvable target: the dial fails, so no
 	// stream can be opened.
-	tr.sendHeartbeatBatch("no-such-host.invalid:1234", msgs)
+	tr.sendHeartbeatBatch("no-such-host.invalid:1234", "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != 1 {
@@ -139,11 +141,11 @@ func TestSendHeartbeatBatch_WriteFailureEvictsConnection(t *testing.T) {
 
 	target := t2.Addr().String()
 	// Cache a heartbeat stream (index 0) plus a data stream on this connection.
-	hbStream, err := t1.getStream(target, 1, true)
+	hbStream, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
-	if _, err := t1.getStream(target, 1, false); err != nil {
+	if _, err := t1.getStream(target, 1, false, ""); err != nil {
 		t.Fatalf("getStream(data) failed: %v", err)
 	}
 	if got := t1.StreamCount(); got < 2 {
@@ -159,7 +161,7 @@ func TestSendHeartbeatBatch_WriteFailureEvictsConnection(t *testing.T) {
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
 		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
 	}
-	t1.sendHeartbeatBatch(target, msgs)
+	t1.sendHeartbeatBatch(target, "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != len(msgs) {
@@ -196,7 +198,7 @@ func TestSendBatch_StreamUnavailableDropsBatch(t *testing.T) {
 		{Type: proto.Replicate, ShardID: 4, From: 1, To: 2, Term: 3},
 		{Type: proto.Replicate, ShardID: 4, From: 1, To: 5, Term: 3},
 	}
-	tr.sendBatch("no-such-host.invalid:1234", msgs)
+	tr.sendBatch("no-such-host.invalid:1234", "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != len(msgs) {
@@ -242,7 +244,7 @@ func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 		Entries: []proto.Entry{{Index: 1, Term: 4, Cmd: cmd}},
 	}}
 
-	tr.sendBatch("127.0.0.1:1", msgs)
+	tr.sendBatch("127.0.0.1:1", "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != 1 {
@@ -373,7 +375,7 @@ func TestDialConnection_RefusesInsertAfterStop(t *testing.T) {
 	// itself succeeds and the post-dial guard is the branch under test.
 	t1.stopped.Store(true)
 
-	conn, err := t1.dialConnection(target)
+	conn, err := t1.dialConnection(target, "")
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("dialConnection after stop = (%v, %v), want ErrStreamClosed", conn, err)
 	}
@@ -462,11 +464,11 @@ func TestSendBatch_WriteFailureEvictsConnection(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	dataStream, err := t1.getStream(target, 4, false)
+	dataStream, err := t1.getStream(target, 4, false, "")
 	if err != nil {
 		t.Fatalf("getStream failed: %v", err)
 	}
-	if _, err := t1.getStream(target, 4, true); err != nil {
+	if _, err := t1.getStream(target, 4, true, ""); err != nil {
 		t.Fatalf("getStream(heartbeat) failed: %v", err)
 	}
 	if got := t1.StreamCount(); got < 2 {
@@ -481,7 +483,7 @@ func TestSendBatch_WriteFailureEvictsConnection(t *testing.T) {
 		{Type: proto.Replicate, ShardID: 4, From: 1, To: 2, Term: 3},
 		{Type: proto.Replicate, ShardID: 4, From: 1, To: 2, Term: 3},
 	}
-	t1.sendBatch(target, msgs)
+	t1.sendBatch(target, "", msgs)
 
 	drops := rec.drops()
 	if len(drops) != len(msgs) {
@@ -713,11 +715,11 @@ func TestAcceptLoop_GlobalConnectionLimitRejects(t *testing.T) {
 	// batch proves the handler goroutine is running and holds the semaphore,
 	// so the second connection's rejection is not a race.
 	first, _ := newDropTransport(t, sharedMTLS)
-	firstConn, err := first.getConnection(target)
+	firstConn, err := first.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("first getConnection failed: %v", err)
 	}
-	first.sendBatch(target, []proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
+	first.sendBatch(target, "", []proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
 	receiverHandler.waitBatch(t, 10*time.Second)
 	select {
 	case <-firstConn.Context().Done():
@@ -727,7 +729,7 @@ func TestAcceptLoop_GlobalConnectionLimitRejects(t *testing.T) {
 
 	// Second sender: over the limit, so the receiver must close it.
 	second, _ := newDropTransport(t, sharedMTLS)
-	secondConn, err := second.getConnection(target)
+	secondConn, err := second.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("second getConnection failed: %v", err)
 	}
@@ -775,5 +777,44 @@ func TestConfigValidate_RejectsNegativeDialTimeout(t *testing.T) {
 	}
 	if _, err := NewQUICTransport(cfg, newTestHandler(), registry.NewRegistry()); !errors.Is(err, ErrInvalidDialTimeout) {
 		t.Fatalf("NewQUICTransport with negative DialTimeout = %v, want ErrInvalidDialTimeout", err)
+	}
+}
+
+// TestPeerMsgBudget_EntryStaysLiveWhileReferenced: a release that decremented
+// a peer's budget entry to zero and then deleted it could remove the entry a
+// connection from the same peer had counted itself on in between. That live
+// connection's reservations then went to an entry no longer in the map, and
+// the next reservation for the peer created a fresh one, splitting the peer's
+// accounting. While a connection holds a reference, the map must hold a live
+// entry for its peer; once none does, no entry may remain.
+func TestPeerMsgBudget_EntryStaysLiveWhileReferenced(t *testing.T) {
+	var tr QUICTransport
+	const key = "spki:peer"
+	const workers, rounds = 8, 5000
+
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				tr.acquirePeerMsgBudgetKey(key)
+				v, ok := tr.connMsgBudget.Load(key)
+				if !ok || v.(*peerMsgBudget).conns.Load() < 1 {
+					failures.Add(1)
+				}
+				tr.releasePeerMsgBudgetKey(key)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := failures.Load(); n != 0 {
+		t.Fatalf("%d times a referenced peer had no live budget entry: its reservations "+
+			"would land on an entry removed from the map", n)
+	}
+	if _, ok := tr.connMsgBudget.Load(key); ok {
+		t.Fatal("a budget entry remained after every connection released it")
 	}
 }

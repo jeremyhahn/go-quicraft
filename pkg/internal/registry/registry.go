@@ -180,6 +180,20 @@ func (r *Registry) AddressInUse(address string) bool {
 	return inUse
 }
 
+// ReplicasAt returns every (shardID, replicaID) registered at address. Like
+// AddressInUse it is a scan, not a snapshot, and is meant for rare paths —
+// the transport asks it once per outbound dial — never the per-message one.
+func (r *Registry) ReplicasAt(address string) []NodeInfo {
+	var at []NodeInfo
+	r.addresses.Range(func(key, val any) bool {
+		if val.(string) == address {
+			at = append(at, key.(NodeInfo))
+		}
+		return true
+	})
+	return at
+}
+
 // Count returns the number of registered nodes.
 func (r *Registry) Count() int {
 	return int(r.count.Load())

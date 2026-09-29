@@ -15,6 +15,8 @@
 package transport
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -164,6 +166,9 @@ func (s *benchSink) HandleMessage(batch proto.MessageBatch, _ PeerAuth) error {
 	return nil
 }
 
+// AuthorizeSnapshot admits every transfer: this fake exercises the paths after admission.
+func (*benchSink) AuthorizeSnapshot(uint64, uint64, uint64, uint64, PeerAuth) error { return nil }
+
 func (s *benchSink) HandleSnapshot([]proto.SnapshotChunk, PeerAuth) error {
 	return nil
 }
@@ -243,7 +248,7 @@ func benchmarkThroughput(b *testing.B, incomingConns int, wantWindow uint64, str
 					Entries: entries,
 				}}
 				for range framesPerStream {
-					sender.sendBatch(target, msgs)
+					sender.sendBatch(target, "", msgs)
 				}
 			}(uint64(s) + 1) // shard 0 is reserved and rejected on receive
 		}
@@ -276,4 +281,70 @@ func benchmarkThroughput(b *testing.B, incomingConns int, wantWindow uint64, str
 		transfer(framesPerStream)
 	}
 	b.StopTimer()
+}
+
+// BenchmarkPinnedSendOverhead measures what identity pinning adds to sending a
+// batch: sendToTarget's destination-identity lookup per message, and the
+// identity check on the pooled stream the frame takes (getStream fast path),
+// against the same stream fetch with pinning disabled. The resolver models the
+// host's (a sync.Map node lookup and a map read).
+func BenchmarkPinnedSendOverhead(b *testing.B) {
+	for _, n := range []int{1, 64} {
+		for _, pinned := range []bool{false, true} {
+			b.Run(fmt.Sprintf("batch=%d/pinned=%t", n, pinned), func(b *testing.B) {
+				var nodes sync.Map
+				bound := map[uint64]string{}
+				ident := func(shardID, replicaID uint64) string {
+					if _, ok := nodes.Load(shardID); !ok {
+						return ""
+					}
+					return bound[replicaID]
+				}
+				sender, receiver, cleanup := transportPairWith(b, benchDeploymentID, newBenchSink(), newBenchSink(),
+					func(c *Config) {
+						if pinned { // the baseline transport has pinning off
+							c.ReplicaIdentity = ident
+						}
+					})
+				defer cleanup()
+				target := receiver.Addr().String()
+
+				block, _ := pem.Decode(receiver.cfg.MTLSConfig.Cert)
+				leaf, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					b.Fatalf("parse leaf: %v", err)
+				}
+				bound[2] = NodeIdentityFromCertificate(leaf)
+				batch := make([]proto.Message, n)
+				for i := range batch {
+					shardID := uint64(i%16) + 1
+					nodes.Store(shardID, struct{}{})
+					batch[i] = proto.Message{Type: proto.Replicate, ShardID: shardID, From: 1, To: 2, Term: 1}
+				}
+				want := ""
+				if pinned {
+					want = bound[2]
+				}
+				if _, err := sender.getStream(target, 1, false, want); err != nil {
+					b.Fatalf("warm stream: %v", err)
+				}
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					if pinned {
+						w := ident(batch[0].ShardID, batch[0].To)
+						for i := 1; i < len(batch); i++ {
+							if ident(batch[i].ShardID, batch[i].To) != w {
+								b.Fatal("mixed destinations")
+							}
+						}
+					}
+					if _, err := sender.getStream(target, 1, false, want); err != nil {
+						b.Fatalf("getStream: %v", err)
+					}
+				}
+			})
+		}
+	}
 }

@@ -119,9 +119,30 @@ belongs. **Only the second is a security limitation.**
 
 **Integrity is verified against the file as stored.** `DataHash` is xxhash64 of
 `snapshot.dat` *before* decryption and *before* decompression, checked with
-`DataLen` at recovery. A record written before those fields existed
-(`DataHashRecorded == false`) recovers **unverified** — a pre-`0.5.0` artifact,
-not an error, but a truncated file from that era still recovers as if complete.
+`DataLen` at recovery. Every writer — save, receive, import and the export —
+stamps both fields through `MarshalSnapshotMeta`, and a failure to hash the
+artifact **fails the write before the directory is published**: nothing is
+recorded in LogDB and nothing is compacted, and the next save retries. A
+recorded snapshot whose `snapshot.meta` is missing, unreadable, malformed or
+without the fields (`DataHashRecorded == false`, a pre-magic record included)
+fails **closed** with `ErrSnapshotCorrupt` (`*SnapshotMetaInvalidError`); there
+is no unverified path. A recorded directory whose `snapshot.dat` is gone is still
+reported as a missing artifact first.
+
+**The export artifact verifies itself.** `ExportSnapshot` ends the artifact
+with a trailer — `QRSNTRLR` magic, the payload's length, and the xxhash64 of
+the raw header followed by the payload, as written — and writes it last, only
+once every check has passed; an export that fails never writes one. The header
+is inside the hash because its fields decide where the snapshot is recorded: a
+flipped `Index` or `Term` that still parses would otherwise import a sound
+payload at the wrong log position. `ImportSnapshot` checks the header bytes it
+parsed and the payload against the trailer
+inside the copy that writes the staged `snapshot.dat`
+(`artifactPayloadReader`), so a truncated, damaged, re-headed or trailerless artifact is
+refused before the stage is published, recorded in LogDB or seen by raft. Both
+sides share one encoder and decoder, `pkg/snapshot_artifact_trailer.go`. The
+trailer was added in place, with the header version unchanged; an artifact from
+an earlier build has none and is refused.
 
 **Receive is bounded before it is committed.** `maxAdmissibleChunkCount` rejects
 an inflated declared count before any memory is allocated; the receiver refuses
@@ -144,7 +165,7 @@ workers, so a large save or recover cannot stall step, commit or apply.
 | `*SnapshotFailedError` | the save failed | Yes |
 | `*SnapshotTooLargeError` | the state machine's output exceeds `MaxSnapshotSize` (4 GB), measured after compression and before sealing | Yes |
 | `*SnapshotSendError` / `*SnapshotReceiveError` | the transfer failed | Yes |
-| `*SnapshotArtifactError` | the artifact is malformed or fails verification | Yes |
+| `*SnapshotArtifactError` | the artifact is malformed or fails verification: a bad header, a missing or malformed trailer, or a payload that does not match its trailer (which also matches `ErrSnapshotCorrupt`) | Yes |
 | `*SnapshotOptionError` (`ErrInvalidSnapshotOption`) | `SnapshotOption.Validate` rejected the request | Yes |
 | `*SnapshotCommittedNotDurableError` | see below | **partially — read this one** |
 | `*ImportSnapshotDirExistsError` | the import destination directory already exists | Yes |
@@ -209,9 +230,30 @@ data file. When both compression and encryption are on the order is
 ```
 
 `snapshot.meta` is **self-describing and append-only** in its evolution: new
-fields are added, and a reader that finds an older record recovers what it can
-rather than refusing. `DataHashRecorded` is how the reader tells "this record
-predates verification" from "this record failed verification".
+fields are added, and the parser reads an older record for what it carries — the
+DEK purge-floor scan still learns an epoch from one. Recovery does not: a record
+without `DataLen`/`DataHash` (`DataHashRecorded == false`) cannot vouch for its
+artifact and is refused.
+
+A `SnapshotOption.ExportPath` export writes the same pair. Each file is staged
+as a temp in the export directory, fsynced and closed, then renamed onto its
+name — `snapshot.dat` first, `snapshot.meta` last. The export directory is then
+fsynced, together with every directory the export created for it and the
+pre-existing ancestor's entry for the first of them, so a new export directory
+survives a power loss too. A failure anywhere, including reading the source
+record or writing the exported one, fails the export and with it the save.
+
+Publication over a previous export is failure-safe. The previous pair is first
+moved into a backup directory (`.snapshot-export-prev-*`) inside the export
+directory, and that move is fsynced before the new `snapshot.dat` is renamed
+into place, so a crash can never surface the new data beside the old record.
+Any failure before the new pair is durable renames the previous pair back (a
+fresh export removes the half it published), and the backup is removed only
+once the new pair is durable. A crash leaves either a complete pair, or a
+directory every verifier refuses — no `snapshot.meta`, or halves of two
+exports whose recorded hash disagrees with the data — and until the new pair
+is complete the previous one survives whole across the export and backup
+directories, for an operator to restore.
 
 Snapshot metadata is also persisted through `logdb.SaveSnapshot`, which is what
 establishes the log compaction floor. A `Membership` section inside a snapshot
@@ -227,8 +269,10 @@ Target: `make test-snapshot`, plus the integration and fault-injection suites.
 |---|---|
 | `snapshot_durability_test.go` | the temp → fsync → rename → fsync-dir sequence |
 | `snapshot_crashfs_test.go`, `snapshot_fsfailure_test.go` | crash and I/O failure at each step of that sequence |
-| `snapshot_integrity_test.go` | `DataLen` / `DataHash` verification, and the unverified pre-`0.5.0` path |
+| `snapshot_integrity_test.go` | `DataLen` / `DataHash` verification, and the fail-closed refusal of missing or unusable metadata |
+| `snapshot_stamp_export_test.go` | a hash failure fails the save before publish, record or compaction; export metadata is required and verifiable |
 | `snapshot_frames_test.go` | the length-prefixed frame layout |
+| `snapshot_artifact_trailer_test.go` | the export artifact's trailer: round trip, refusal of truncated, damaged (payload or header), trailerless and failed-export artifacts with nothing adopted |
 | `snapshot_decrypt_sweep_test.go` | decryption across every epoch combination |
 | `snapshot_pin_balance_test.go` | **that every in-flight pin is released on every path**, including error paths |
 | `snapshot_reencrypt_test.go`, `snapshot_reencrypt_commit_test.go` | migration, including the committed-not-durable case |
@@ -261,7 +305,6 @@ worth alerting on: snapshot save duration, transfers in flight against
 | ERROR | snapshot save or recovery failed | the shard cannot compact, and a follower may be unrecoverable by log replay |
 | ERROR | re-encryption committed but not durable | `*SnapshotCommittedNotDurableError` — **record the epoch** |
 | ERROR | integrity verification failed | `DataHash` mismatch: the artifact is corrupt or truncated |
-| WARN | recovering an artifact with `DataHashRecorded == false` | a pre-`0.5.0` snapshot, recovering unverified |
 | WARN | barrier sealed during a snapshot operation | the operation failed closed |
 | INFO | snapshot created / received / recovered, with index and epoch | |
 

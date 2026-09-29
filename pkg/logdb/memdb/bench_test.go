@@ -15,6 +15,7 @@
 package memdb
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -58,4 +59,34 @@ func BenchmarkMemDBIterateEntries(b *testing.B) {
 			b.Fatalf("IterateEntries: %v", err)
 		}
 	}
+}
+
+// BenchmarkMemDBSaveStateParallel measures concurrent SaveState batches on
+// distinct nodes — the shape of many Raft groups committing at once — so any
+// lock every writer shares shows up as contention.
+func BenchmarkMemDBSaveStateParallel(b *testing.B) {
+	db := New()
+	var next atomic.Uint64
+	cmd := make([]byte, 64)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		shard := next.Add(1)
+		var index uint64
+		for pb.Next() {
+			index++
+			if err := db.SaveState([]logdb.Update{{
+				ShardID:   shard,
+				ReplicaID: 1,
+				State:     logdb.State{Term: 1, Commit: index},
+				Entries:   []logdb.Entry{{Index: index, Term: 1, Cmd: cmd}},
+			}}); err != nil {
+				b.Fatalf("SaveState: %v", err)
+			}
+			if index%1024 == 0 {
+				if err := db.RemoveEntriesTo(shard, 1, index-1); err != nil {
+					b.Fatalf("RemoveEntriesTo: %v", err)
+				}
+			}
+		}
+	})
 }

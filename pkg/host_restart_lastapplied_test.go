@@ -49,6 +49,7 @@ func startShardRecoveringFromSnapshot(t *testing.T, h *Host, index uint64) {
 		[]byte{0, 0, 0, 0}, 0o600); err != nil {
 		t.Fatalf("writing the snapshot artifact: %v", err)
 	}
+	stampTestSnapshotMeta(t, snapDir, index, 1)
 	if err := h.logdb.SaveSnapshot(1, 1, logdb.Snapshot{
 		Index: index,
 		Term:  1,

@@ -21,9 +21,10 @@ import (
 
 func TestStateMarshalUnmarshalRoundTrip(t *testing.T) {
 	s := State{
-		Term:   10,
-		Vote:   3,
-		Commit: 50,
+		Term:       10,
+		Vote:       3,
+		Commit:     50,
+		VoteWindow: 2_000_000_000,
 	}
 	buf := make([]byte, s.Size())
 	n, err := s.MarshalTo(buf)
@@ -42,9 +43,8 @@ func TestStateMarshalUnmarshalRoundTrip(t *testing.T) {
 	if consumed != stateSize {
 		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, stateSize)
 	}
-	if s2.Term != s.Term || s2.Vote != s.Vote || s2.Commit != s.Commit {
-		t.Fatalf("Round-trip mismatch: got {%d, %d, %d}, want {%d, %d, %d}",
-			s2.Term, s2.Vote, s2.Commit, s.Term, s.Vote, s.Commit)
+	if s2 != s {
+		t.Fatalf("Round-trip mismatch: got %+v, want %+v", s2, s)
 	}
 }
 
@@ -54,30 +54,31 @@ func TestStateMarshalUnmarshalZero(t *testing.T) {
 	s.MarshalTo(buf)
 	var s2 State
 	s2.UnmarshalFrom(buf)
-	if s2.Term != 0 || s2.Vote != 0 || s2.Commit != 0 {
+	if s2 != (State{}) {
 		t.Fatal("Zero state round-trip failed")
 	}
 }
 
 func TestStateMarshalUnmarshalMaxValues(t *testing.T) {
 	s := State{
-		Term:   ^uint64(0),
-		Vote:   ^uint64(0),
-		Commit: ^uint64(0),
+		Term:       ^uint64(0),
+		Vote:       ^uint64(0),
+		Commit:     ^uint64(0),
+		VoteWindow: ^uint64(0),
 	}
 	buf := make([]byte, s.Size())
 	s.MarshalTo(buf)
 	var s2 State
 	s2.UnmarshalFrom(buf)
-	if s2.Term != s.Term || s2.Vote != s.Vote || s2.Commit != s.Commit {
+	if s2 != s {
 		t.Fatal("Max value state round-trip failed")
 	}
 }
 
 func TestStateSize(t *testing.T) {
 	s := State{}
-	if s.Size() != 24 {
-		t.Fatalf("Size: got %d, want 24", s.Size())
+	if s.Size() != 32 {
+		t.Fatalf("Size: got %d, want 32", s.Size())
 	}
 }
 
@@ -91,7 +92,8 @@ func TestStateIsEmpty(t *testing.T) {
 		{"term set", State{Term: 1}, false},
 		{"vote set", State{Vote: 1}, false},
 		{"commit set", State{Commit: 1}, false},
-		{"all set", State{Term: 1, Vote: 2, Commit: 3}, false},
+		{"vote window set", State{VoteWindow: 1}, false},
+		{"all set", State{Term: 1, Vote: 2, Commit: 3, VoteWindow: 4}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -121,9 +123,9 @@ func TestStateBufferTooSmallUnmarshal(t *testing.T) {
 }
 
 func TestStateReset(t *testing.T) {
-	s := State{Term: 10, Vote: 3, Commit: 50}
+	s := State{Term: 10, Vote: 3, Commit: 50, VoteWindow: 7}
 	s.Reset()
-	if s.Term != 0 || s.Vote != 0 || s.Commit != 0 {
+	if s != (State{}) {
 		t.Fatal("Reset did not clear all fields")
 	}
 	if !s.IsEmpty() {

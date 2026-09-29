@@ -38,6 +38,11 @@ var (
 	// instance that has already been closed.
 	ErrClosed = errors.New("logdb: database closed")
 
+	// ErrReplicaRetired is returned when a write names a node that
+	// RemoveNodeData removed. Removal retires the replica ID for good (see
+	// LogDB.RemoveNodeData), so no record is ever written for it again.
+	ErrReplicaRetired = errors.New("logdb: replica ID retired by RemoveNodeData")
+
 	// ErrCompacted is returned when a requested log entry has already
 	// been removed by compaction.
 	ErrCompacted = errors.New("logdb: entry compacted")

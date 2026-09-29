@@ -81,6 +81,13 @@ To stream one to a writer instead:
 err := host.ExportSnapshot(ctx, shardID, w)
 ```
 
+The artifact is a header, the plaintext snapshot data, and a trailer binding
+that data's length and the hash of the header and data together. The trailer is written last, and only when the
+export succeeds, so the output of a failed export can never be imported — but
+on any error, discard what `w` received anyway. An artifact exported by an
+earlier build has no trailer and will be refused by `ImportSnapshot`; export it
+again.
+
 ## Task: import a snapshot
 
 **Read this before running it.** `ImportSnapshot` rewrites the replica's
@@ -101,6 +108,7 @@ The refusals are the safety net, not obstacles:
 | `*ImportSnapshotOutOfDateError` | the snapshot is older than what this replica holds — it will not move you backwards |
 | `*ImportDataDirMismatchError` | `WithImportDataDir` names a directory that is not this replica's |
 | `*ImportMembershipInvalidError` | the membership override is unusable |
+| `*SnapshotArtifactError` | the artifact is malformed, truncated, damaged, or has no trailer (exported by an earlier build) — nothing was adopted; a damaged payload also matches `ErrSnapshotCorrupt` |
 
 If you find yourself wanting to work around one of these, stop and work out
 which replica you are actually operating on.
@@ -182,9 +190,11 @@ Either your state is genuinely that large, in which case raise the limit and
 think about `DiskStateMachine`, or `SaveSnapshot` is writing more than it needs.
 
 **A `DataHash` mismatch at recovery** — the artifact is corrupt or truncated.
-Note that verification is skipped for artifacts written before `0.5.0`
-(`DataHashRecorded == false`); those recover unverified, so a truncated file
-from that era recovers as if complete.
+A recorded snapshot whose `snapshot.meta` is missing, unreadable, malformed or
+lacks `DataLen`/`DataHash` (including a pre-magic record) is refused the same
+way, as `ErrSnapshotCorrupt`: every writer stamps those fields before the
+directory is published, so nothing can vouch for such an artifact. There is no
+unverified path; pre-v1 data directories are wiped and re-synced from peers.
 
 **Recovery decrypted successfully but the state is wrong** — check that
 `shardID`, `replicaID` and `index` match what the frames were sealed under. A

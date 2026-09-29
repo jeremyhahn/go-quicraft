@@ -498,14 +498,19 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 			end = len(data)
 		}
 		block := data[blockStart:end]
-		// A zero-headed block is the segment's pre-allocated tail.
-		if len(block) < recordHeaderSize+1 || block[0] == 0 {
+		// A wholly zero block is the segment's pre-allocated tail. The test
+		// is the whole block, as segment.ReadAll's is, not its first byte: a
+		// record opens with its CRC32, whose low byte is zero about one time in
+		// 256, and reading that as the tail stopped the scan early and tore an
+		// earlier block — below records a later fdatasync had acknowledged,
+		// which recovery rightly refuses rather than truncating.
+		if len(block) < recordHeaderSize+1 || isAllZero(block) {
 			break
 		}
 		if completed > 0 {
 			best = int64(blockStart)
 		}
-		for pos := 0; pos+recordHeaderSize < len(block) && block[pos] != 0; {
+		for pos := 0; pos+recordHeaderSize < len(block) && !isAllZero(block[pos:]); {
 			_, recType, _, _, n, err := decodeRecord(block[pos:])
 			if err != nil {
 				t.Fatalf("segment already corrupt at offset %d before tearing: %v",

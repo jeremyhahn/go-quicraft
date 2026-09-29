@@ -138,7 +138,7 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	if err := os.WriteFile(staleOrphan, []byte("plaintext state machine"), 0o600); err != nil {
 		t.Fatalf("write stale orphan: %v", err)
 	}
-	if err := writeSnapshotMetadata(staleDir, 50, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(staleDir, 50, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
 		t.Fatalf("write stale metadata: %v", err)
 	}
 
@@ -157,7 +157,7 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(recoverDir, snapshotDataFile), payload[:], 0o600); err != nil {
 		t.Fatalf("write snapshot data: %v", err)
 	}
-	if err := writeSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
 		t.Fatalf("write recover metadata: %v", err)
 	}
 
@@ -279,7 +279,7 @@ func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(recoverDir, snapshotDataFile), payload[:], 0o600); err != nil {
 				t.Fatalf("write snapshot data: %v", err)
 			}
-			if err := writeSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
+			if err := writeTestSnapshotMetadata(recoverDir, 100, 3, shardID, replicaID, 0, config.NoCompression); err != nil {
 				t.Fatalf("write recover metadata: %v", err)
 			}
 			ldb := newSnapshotTestLogDB()

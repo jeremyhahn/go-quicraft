@@ -221,6 +221,7 @@ func TestForEachSnapshotChunk_GenuinelyEmptyFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(path), 1, 1)
 
 	msg := proto.Message{
 		Type:     proto.InstallSnapshot,
@@ -337,7 +338,7 @@ func TestSnapshotArtifactHeader_RejectsLegacyVersion(t *testing.T) {
 	legacy := append([]byte(nil), hdr...)
 	legacy[8] = byte(snapshotArtifactVersion - 1)
 
-	_, err = readSnapshotArtifactHeader(bytes.NewReader(legacy))
+	_, _, err = readSnapshotArtifactHeader(bytes.NewReader(legacy))
 	var artErr *SnapshotArtifactError
 	if !errors.As(err, &artErr) {
 		t.Fatalf("error = %T (%v), want *SnapshotArtifactError", err, err)
@@ -356,7 +357,7 @@ func TestSnapshotArtifactHeader_RejectsUnknownCompression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshalSnapshotArtifactHeader: %v", err)
 	}
-	_, err = readSnapshotArtifactHeader(bytes.NewReader(hdr))
+	_, _, err = readSnapshotArtifactHeader(bytes.NewReader(hdr))
 	var artErr *SnapshotArtifactError
 	if !errors.As(err, &artErr) {
 		t.Fatalf("error = %T (%v), want *SnapshotArtifactError", err, err)

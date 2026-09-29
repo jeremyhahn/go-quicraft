@@ -261,7 +261,7 @@ func writeShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, index,
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir failed: %v", err)
 	}
-	if err := writeSnapshotMetadata(dir, index, 1, shardID, replicaID, epoch, config.NoCompression); err != nil {
+	if err := writeTestSnapshotMetadata(dir, index, 1, shardID, replicaID, epoch, config.NoCompression); err != nil {
 		t.Fatalf("write metadata failed: %v", err)
 	}
 }

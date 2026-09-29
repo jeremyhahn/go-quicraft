@@ -119,7 +119,7 @@ func (h *Host) HasNodeInfo(shardID, replicaID uint64) bool
 
 **These do not reach consensus.** They act on this node's own copy, and
 `RemoveData` deletes it. `*ShardNotStoppedError` is returned if the shard is
-still running. Remove from the cluster first, then remove the data.
+still running. Remove from the cluster first, then remove the data. It also **retires the replica ID on this host**: `StartShard` refuses it from then on with `*ReplicaRetiredError` (`ErrReplicaRetired`) (`ImportSnapshot` finds no data left to import into and returns `ErrShardNotFound`), because the deleted data held the replica's term, vote and owed lease vote window, and Raft never lets a removed replica return under the same ID. Rejoin under a new replica ID.
 
 ### Capability: transfer leadership
 

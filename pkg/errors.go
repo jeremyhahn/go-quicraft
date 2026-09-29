@@ -316,7 +316,9 @@ var (
 	ErrSnapshotSizeMismatch = errors.New("quicraft: snapshot file size mismatch")
 
 	// ErrSnapshotCorrupt is returned when an encrypted snapshot frame has a
-	// corrupt/oversized length prefix during decryption (send/export path).
+	// corrupt/oversized length prefix during decryption (send/export path),
+	// or when a snapshot's data does not match the length and hash recorded
+	// in its snapshot.meta as the send or export path reads it.
 	ErrSnapshotCorrupt = errors.New("quicraft: snapshot frame corrupt")
 
 	// ErrSnapshotDestinationRecorded is returned when a received snapshot's
@@ -340,6 +342,10 @@ var (
 	// ErrShardNotStopped is returned when RemoveData is called for a
 	// shard that is still loaded on this host.
 	ErrShardNotStopped = errors.New("quicraft: shard not stopped")
+
+	// ErrReplicaRetired is returned when StartShard targets a replica whose
+	// data RemoveData removed on this host. See ReplicaRetiredError.
+	ErrReplicaRetired = errors.New("quicraft: replica ID retired")
 
 	// ErrStaleConfigChange is returned when a config change request
 	// carries a ConfigChangeID that does not match the shard's current
@@ -788,6 +794,32 @@ func (e *ShardNotStoppedError) Error() string {
 // Is reports whether target matches the sentinel ErrShardNotStopped error.
 func (e *ShardNotStoppedError) Is(target error) bool {
 	return target == ErrShardNotStopped
+}
+
+// ReplicaRetiredError is returned when StartShard targets a replica whose
+// data Host.RemoveData removed on this host (ImportSnapshot, which imports into
+// a replica that has data on this host, finds none and returns
+// ErrShardNotFound, or this error should a record for it remain). RemoveData retires
+// the replica ID: Raft never lets a removed replica return under the same ID,
+// because its term and vote are gone with its data and it could vote twice in
+// one term — and a vote it had promised a leader's read lease is gone with
+// them. Rejoin the shard under a new replica ID.
+type ReplicaRetiredError struct {
+	ShardID   uint64
+	ReplicaID uint64
+}
+
+// Error returns a human-readable description.
+func (e *ReplicaRetiredError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: shard %d replica %d was retired by RemoveData; rejoin under a new replica ID",
+		e.ShardID, e.ReplicaID,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrReplicaRetired error.
+func (e *ReplicaRetiredError) Is(target error) bool {
+	return target == ErrReplicaRetired
 }
 
 // ReplicaNotFoundError is returned when an operation targets a replica ID

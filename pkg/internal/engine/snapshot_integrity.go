@@ -46,29 +46,44 @@ func hashSnapshotData(path string) (sum uint64, size uint64, err error) {
 		// does not override a successful hash.
 		_ = f.Close()
 	}()
+	return HashSnapshotReader(f)
+}
 
+// HashSnapshotReader returns the xxhash64 and byte count of everything r
+// yields: the DataHash/DataLen pair a snapshot.meta record stamps over its
+// snapshot.dat. It is the single implementation of that value, exported for
+// the receive and import paths in package quicraft, which read the artifact
+// through their own filesystem abstraction and must stamp exactly what this
+// package verifies. A read error MUST fail the write it was stamping for: a
+// record written without a real hash is refused by every verifier.
+func HashSnapshotReader(r io.Reader) (sum uint64, size uint64, err error) {
 	h := xxhash.New()
-	n, err := io.Copy(h, f)
+	n, err := io.Copy(h, r)
 	if err != nil {
 		return 0, 0, err
 	}
 	return h.Sum64(), uint64(n), nil
 }
 
-// verifySnapshotData checks the data file at path against the integrity fields
-// recorded in its snapshot.meta.
+// checkSnapshotData checks a data file's hash and length, supplied by the
+// caller, against the integrity fields recorded in its snapshot.meta. Taking
+// the hash from the caller lets a path that hashed the bytes while it read
+// them — the send and export paths, which must not read the artifact twice —
+// be held to exactly the comparison recovery makes. hash is called only when
+// the record carries integrity fields.
 //
-// A record written before those fields existed leaves DataHashRecorded false
-// and is accepted without a check, so an upgrade does not refuse artifacts
-// that predate it. Everything else fails CLOSED with ErrSnapshotCorrupt: a
-// corrupt snapshot must never be recovered into the state machine, and falling
-// back to an older directory is not an option either — that would silently
-// roll the replica backwards.
-func verifySnapshotData(path string, meta SnapshotMeta) error {
+// A record without those fields fails CLOSED, like every other disagreement:
+// every writer stamps them before a directory is published, so their absence
+// means the record is not one this format produced (see
+// SnapshotMetaInvalidError). A mismatch is ErrSnapshotCorrupt: a corrupt
+// snapshot must never be recovered into the state machine, and falling back to
+// an older directory is not an option either — that would silently roll the
+// replica backwards.
+func checkSnapshotData(dir string, meta SnapshotMeta, hash func() (sum uint64, size uint64, err error)) error {
 	if !meta.DataHashRecorded {
-		return nil
+		return &SnapshotMetaInvalidError{Dir: dir}
 	}
-	sum, size, err := hashSnapshotData(path)
+	sum, size, err := hash()
 	if err != nil {
 		return err
 	}
@@ -81,18 +96,22 @@ func verifySnapshotData(path string, meta SnapshotMeta) error {
 // readSnapshotMetaFile reads and parses the snapshot.meta record in dir.
 //
 // It uses the same bounded read readSnapshotEpoch uses, so a corrupt or
-// substituted multi-gigabyte file is refused rather than slurped. A missing or
-// unparseable record returns an error; callers that verify integrity treat
-// that as "no check recorded" rather than as corruption, because an artifact
-// written before the integrity fields existed has a valid record without them
-// and a half-written directory is already handled by the recorded-snapshot
-// lookup.
+// substituted multi-gigabyte file is refused rather than slurped. A missing,
+// unreadable or unparseable record is reported as *SnapshotMetaInvalidError,
+// which matches ErrSnapshotCorrupt: every consumer that verifies integrity
+// fails closed on it. The record is written into the staging directory before
+// any snapshot is published, so a published directory without a usable one
+// has lost it after the fact.
 func readSnapshotMetaFile(dir string) (SnapshotMeta, error) {
 	data, err := readBoundedSnapshotMeta(filepath.Join(dir, snapshotMetadataFile))
 	if err != nil {
-		return SnapshotMeta{}, err
+		return SnapshotMeta{}, &SnapshotMetaInvalidError{Dir: dir, Err: err}
 	}
-	return ParseSnapshotMeta(data)
+	meta, err := ParseSnapshotMeta(data)
+	if err != nil {
+		return SnapshotMeta{}, &SnapshotMetaInvalidError{Dir: dir, Err: err}
+	}
+	return meta, nil
 }
 
 // VerifySnapshotArtifact checks the snapshot data file at dataPath against the
@@ -105,23 +124,86 @@ func readSnapshotMetaFile(dir string) (SnapshotMeta, error) {
 // removed Checksum field was in — an integrity control that reads as present
 // and verifies nothing.
 //
-// A directory with no readable snapshot.meta, or a record written before the
-// integrity fields existed, returns nil: there is nothing recorded to check
-// against, and refusing such artifacts would make an upgrade unable to recover
-// snapshots taken by the binary it replaced.
+// It fails CLOSED when there is nothing to check against: a snapshot.meta that
+// is missing, unreadable, malformed, or lacks the integrity fields — a pre-magic
+// (v0) record among them, since no current writer produces one — is refused
+// with *SnapshotMetaInvalidError, which matches ErrSnapshotCorrupt. Every
+// writer (save, receive, import) stamps the fields through MarshalSnapshotMeta
+// before the directory is published, and pre-v1 layouts are wiped rather than
+// migrated, so no legitimately written artifact lacks them. Accepting one that
+// does would let a partial restore that omitted or damaged snapshot.meta,
+// paired with a same-length alteration of snapshot.dat, recover as divergent
+// state.
 func VerifySnapshotArtifact(dir, dataPath string) error {
 	meta, err := readSnapshotMetaFile(dir)
-	if err != nil {
-		// The ABSENCE of a record is not a verification failure. An artifact
-		// written before the integrity fields existed carries a valid record
-		// without them, and an unreadable one is already handled by the
-		// recorded-snapshot lookup that selected this directory. Returning the
-		// read error here would make an upgrade unable to recover the
-		// snapshots it inherited, which is a worse failure than not checking.
-		//nolint:nilerr // absence of a record is deliberately not a failure; see above
-		return nil
+	return checkSnapshotArtifact(dir, meta, err, func() (uint64, uint64, error) {
+		return hashSnapshotData(dataPath)
+	})
+}
+
+// checkSnapshotArtifact is the policy VerifySnapshotArtifact applies to the
+// outcome of reading an artifact's snapshot.meta (meta, metaErr), with the
+// data hash supplied by the caller. It is split out so the streaming verifier
+// (SnapshotDataVerifier) is governed by the SAME policy rather than a copy of
+// it: whatever this function decides about a missing or pre-integrity record
+// is what the send and export paths decide too — and it fails closed, as
+// VerifySnapshotArtifact documents.
+func checkSnapshotArtifact(dir string, meta SnapshotMeta, metaErr error, hash func() (sum uint64, size uint64, err error)) error {
+	if metaErr != nil {
+		return metaErr
 	}
-	return verifySnapshotData(dataPath, meta)
+	return checkSnapshotData(dir, meta, hash)
+}
+
+// SnapshotDataVerifier checks a snapshot data file against the integrity
+// fields recorded in its snapshot.meta WHILE another reader consumes the file.
+//
+// Recovery verifies an artifact before it reads it, at the cost of a second
+// pass over the file. The egress paths — the transport send and
+// Host.ExportSnapshot — cannot afford that on a multi-gigabyte artifact, and
+// used to not check at all: a same-size bit flip in a retained plaintext
+// snapshot was streamed to a lagging follower, which hashed the corrupt bytes
+// on arrival, stamped THAT hash as authoritative and discarded the log the
+// snapshot covers. Egress instead tees every byte it reads into a verifier and
+// calls Verify before the LAST byte leaves the node, so a mismatch fails the
+// transfer while it is still incomplete — and an incomplete transfer is one
+// the receiver discards.
+//
+// The record is read when the verifier is created, not when Verify runs: the
+// snapshot GC may remove the directory while a long send streams from an
+// already-open handle, and the record that describes that handle's bytes is
+// the one that was there when it was opened. What a missing or pre-integrity
+// record means is checkSnapshotArtifact's decision, the one recovery applies.
+type SnapshotDataVerifier struct {
+	dir     string
+	meta    SnapshotMeta
+	metaErr error
+	digest  *xxhash.Digest
+	n       uint64
+}
+
+// NewSnapshotDataVerifier reads the snapshot.meta record in dir and returns a
+// verifier for the data file beside it.
+func NewSnapshotDataVerifier(dir string) *SnapshotDataVerifier {
+	meta, err := readSnapshotMetaFile(dir)
+	return &SnapshotDataVerifier{dir: dir, meta: meta, metaErr: err, digest: xxhash.New()}
+}
+
+// Write adds p to the running hash. It never fails, so it is safe as the sink
+// of an io.TeeReader.
+func (v *SnapshotDataVerifier) Write(p []byte) (int, error) {
+	n, _ := v.digest.Write(p) // xxhash.Digest.Write never returns an error
+	v.n += uint64(n)
+	return n, nil
+}
+
+// Verify compares every byte written so far against the recorded length and
+// hash. It returns ErrSnapshotCorrupt on a mismatch, and nil when the policy
+// finds nothing recorded to check against.
+func (v *SnapshotDataVerifier) Verify() error {
+	return checkSnapshotArtifact(v.dir, v.meta, v.metaErr, func() (uint64, uint64, error) {
+		return v.digest.Sum64(), v.n, nil
+	})
 }
 
 // VerifySnapshotFileSize checks the snapshot data file at dataPath against the
@@ -138,10 +220,9 @@ func VerifySnapshotArtifact(dir, dataPath string) error {
 // of its state, silently diverged from every peer at the same log position.
 //
 // This is a cheap check that the artifact is the one that was recorded, and it
-// is complementary to VerifySnapshotArtifact: the meta-based hash only exists
-// for artifacts written by a binary that stamps it, whereas FileSize is on
-// every record ever written and is the only at-rest check an inherited
-// artifact has.
+// is complementary to VerifySnapshotArtifact: the meta-based hash lives beside
+// the artifact, whereas FileSize lives in LogDB, so the size check still holds
+// when the file and its snapshot.meta are replaced together.
 //
 // A recorded size of zero claims nothing and is not checked: a record written
 // before FileSize was populated carries zero, and refusing those would make an
@@ -168,20 +249,21 @@ func VerifySnapshotFileSize(dataPath string, recorded uint64) error {
 // artifact it is about to read: the snapshot.meta integrity fields, and the
 // FileSize the LogDB record claims.
 //
-// The two are complementary and neither subsumes the other. The meta hash only
-// exists for artifacts a stamping binary wrote, so an inherited one has no hash
-// to check at all; FileSize is on every record ever written. Conversely the
-// hash catches a flipped byte, which no size can.
+// The two are complementary and neither subsumes the other. The meta hash
+// catches a flipped byte, which no size can; FileSize lives in LogDB, away from
+// the directory, so it still holds when the file and its record are swapped
+// together. A missing or unusable snapshot.meta fails the recovery (see
+// VerifySnapshotArtifact) rather than skipping the hash.
 //
 // The size is checked only when the record NAMES a directory. The recovery's
 // discovery fallback picks the newest directory on disk, which may be a
 // different index, and rec.FileSize describes the file in the RECORDED
-// directory — not that one.
+// directory — not that one. The meta check applies to that fallback all the
+// same: a published "snapshot-<index>" directory is only ever produced by a
+// rename of a stage whose snapshot.meta is already written and fsynced.
 func verifyRecoveryArtifact(snapshotDir, dataPath string, rec logdb.Snapshot) error {
-	if meta, metaErr := readSnapshotMetaFile(snapshotDir); metaErr == nil {
-		if err := verifySnapshotData(dataPath, meta); err != nil {
-			return err
-		}
+	if err := VerifySnapshotArtifact(snapshotDir, dataPath); err != nil {
+		return err
 	}
 	if rec.Filepath == "" {
 		return nil
@@ -189,9 +271,13 @@ func verifyRecoveryArtifact(snapshotDir, dataPath string, rec logdb.Snapshot) er
 	return VerifySnapshotFileSize(dataPath, rec.FileSize)
 }
 
-// HashSnapshotFile is hashSnapshotData exported for the receive and import
-// paths, which write snapshot artifacts from package quicraft and must stamp
-// the same value this package verifies.
-func HashSnapshotFile(path string) (sum uint64, size uint64, err error) {
-	return hashSnapshotData(path)
-}
+// stampSnapshotHash is the hash writeSnapshotMetadata and the decrypted
+// export stamp the integrity fields with. The verifiers call hashSnapshotData
+// directly, so a test can fail the stamp without also failing the check that
+// later reads it.
+//
+// It is a variable ONLY so the fail-before-publish branch can be exercised: a
+// read of a file this process just wrote and fsynced cannot be made to fail
+// honestly — chmod does not bind a root test runner, and removing the file
+// fails the save earlier. Production code must never assign to it.
+var stampSnapshotHash = hashSnapshotData

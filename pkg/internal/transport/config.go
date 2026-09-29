@@ -75,6 +75,16 @@ const (
 	// snapshotRejectPolicy covers transfers refused by a security policy
 	// rather than by a defect, currently only arrival over 0-RTT.
 	snapshotRejectPolicy snapshotRejectReason = "policy"
+
+	// snapshotRejectUnauthorized covers transfers the handler refused from
+	// the stream header (MessageHandler.AuthorizeSnapshot), before any receive
+	// slot or memory was taken.
+	snapshotRejectUnauthorized snapshotRejectReason = "unauthorized"
+
+	// snapshotRejectNotAccepting covers transfers AuthorizeSnapshot refused
+	// because the shard is failed or stopping (ErrSnapshotNotAccepting): an
+	// ordinary state, not an authorization failure.
+	snapshotRejectNotAccepting snapshotRejectReason = "not_accepting"
 )
 
 // Message-drop reasons recorded as the reason label of IncMessagesDropped.
@@ -115,6 +125,11 @@ const (
 	// by a stream reset carrying QUICStreamErrFrameRejected. The connection is
 	// healthy; only the frame was unacceptable.
 	dropReasonPeerRejected = "peer_rejected"
+
+	// dropReasonIdentityMismatch is a message whose destination replica is
+	// bound to a node identity other than the one the peer connected at its
+	// routed address presents (Config.ReplicaIdentity).
+	dropReasonIdentityMismatch = "identity_mismatch"
 )
 
 // Default configuration values for QUICTransport.
@@ -398,6 +413,17 @@ type Config struct {
 	// is skipped on resumed sessions, so resumption would bypass revocation.
 	// CRL files are periodically reloaded from disk for hot-reload support.
 	RevocationConfig *revocation.Config
+
+	// ReplicaIdentity returns the node identity membership binds to replica
+	// replicaID of shard shardID, or "" when none is bound. It pins outbound
+	// traffic to the replica it is for: a message, or a snapshot, is written
+	// only to a connection whose peer presents its destination's identity,
+	// and a dial is refused unless the peer presents the identity of some
+	// replica routed to the dialed address. The TLS handshake alone proves
+	// only a certificate from the cluster CA whose SAN covers the host, which
+	// a wildcard or shared-SAN certificate held by anyone on the path to that
+	// address also satisfies. Nil disables pinning; the host always sets it.
+	ReplicaIdentity func(shardID, replicaID uint64) string
 
 	// EventListener holds optional event callbacks for connection and
 	// snapshot lifecycle events. May be nil.

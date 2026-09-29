@@ -155,6 +155,14 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 		}
 	}()
 
+	// Retirements first: the retired-replica registry is what keeps a
+	// removed replica ID from ever being started again
+	// (logdb.LogDB.NodeRemoved), and a migration that dropped it would hand
+	// the ID back. Carried in one registry write however many there are.
+	if err := dst.retireNodes(src.removedNodes()); err != nil {
+		return 0, &ReencryptError{Op: "retire-nodes", Err: err}
+	}
+
 	nodes, err := src.ListNodeInfo()
 	if err != nil {
 		return 0, &ReencryptError{Op: "list-nodes", Err: err}

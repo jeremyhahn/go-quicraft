@@ -168,6 +168,50 @@ func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
 	})
 }
 
+// TestRetiredStatePayloadTypeRejected pins that a hard-state record in the
+// 40-byte layout released builds wrote under 0x02 — Term, Vote and Commit,
+// without the VoteWindow a leader's read lease may be relying on — is refused
+// as an unknown record rather than reported as a truncated one. A current
+// replica recovering from it would come up owing no vote window, which is the
+// safety property the field exists to carry across a restart, so it must not
+// be read at all: the remedy is to wipe the directory and re-sync.
+func TestRetiredStatePayloadTypeRejected(t *testing.T) {
+	const legacyStateRecordSize = stateRecordSize - 8 // 40 bytes
+	payload := make([]byte, 1+legacyStateRecordSize)
+	// The LITERAL retired byte -- see the note in retiredEntryRecord.
+	payload[0] = 0x02
+	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
+	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
+	binary.LittleEndian.PutUint64(payload[17:], 5)  // term
+	binary.LittleEndian.PutUint64(payload[25:], 2)  // vote
+	binary.LittleEndian.PutUint64(payload[33:], 10) // commit
+
+	t.Run("replayRecord returns ErrUnknownPayloadType", func(t *testing.T) {
+		s := newReplayShard()
+		_, _, err := s.replayRecord(payload, 0)
+		if !errors.Is(err, ErrUnknownPayloadType) {
+			t.Fatalf("replayRecord(0x02) err = %v, want ErrUnknownPayloadType", err)
+		}
+		if errors.Is(err, ErrTruncatedStateRecord) {
+			t.Fatal("a legacy state record was reported as TRUNCATED; the record " +
+				"is intact and the remedy is to wipe and re-sync")
+		}
+		if len(s.states) != 0 {
+			t.Fatalf("a refused legacy record stored %d states", len(s.states))
+		}
+	})
+
+	t.Run("Open fails on a segment with a retired state record", func(t *testing.T) {
+		dir := t.TempDir()
+		writeRawShardRecord(t, dir, 1, payload)
+
+		if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
+			WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
+			t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+		}
+	})
+}
+
 // TestA04xDirectoryIsRefusedByRecordNotByVersion pins WHERE detection lives.
 //
 // walFormatVersion is deliberately held at 1 for the whole pre-release period,
@@ -236,18 +280,19 @@ func TestPayloadTypesAreDistinct(t *testing.T) {
 	// the one place they are written down -- and writing them as literals is
 	// what lets this test catch a live constant being pointed back at one.
 	types := map[string]byte{
-		"payloadTypeState":      payloadTypeState,
-		"payloadTypeBootstrap":  payloadTypeBootstrap,
-		"payloadTypeCompact":    payloadTypeCompact,
-		"payloadTypeRemoveNode": payloadTypeRemoveNode,
-		"payloadTypeEntries":    payloadTypeEntries,
-		"payloadTypeSnapshot":   payloadTypeSnapshot,
-		"retired 0x01":          0x01,
-		"retired 0x03":          0x03,
-		"retired 0x07":          0x07,
-		"retired 0x08":          0x08,
-		"retired 0x09":          0x09,
-		"retired 0x0a":          0x0a,
+		"payloadTypeState":     payloadTypeState,
+		"payloadTypeBootstrap": payloadTypeBootstrap,
+		"payloadTypeCompact":   payloadTypeCompact,
+		"payloadTypeEntries":   payloadTypeEntries,
+		"payloadTypeSnapshot":  payloadTypeSnapshot,
+		"retired 0x01":         0x01,
+		"retired 0x02":         0x02,
+		"retired 0x03":         0x03,
+		"retired 0x06":         0x06,
+		"retired 0x07":         0x07,
+		"retired 0x08":         0x08,
+		"retired 0x09":         0x09,
+		"retired 0x0a":         0x0a,
 	}
 	seen := make(map[byte]string, len(types))
 	for name, b := range types {
@@ -408,10 +453,14 @@ func TestPayloadTypesAreThePublishedBytes(t *testing.T) {
 		got  byte
 		want byte
 	}{
-		{"payloadTypeState", payloadTypeState, 0x02},
+		// 0x02 was the 40-byte state record; the record gained VoteWindow and
+		// moved to 0x0d, retired below. WALs written before are refused with
+		// ErrUnknownPayloadType and re-synced from peers (pre-v1 rule).
+		{"payloadTypeState", payloadTypeState, 0x0d},
 		{"payloadTypeBootstrap", payloadTypeBootstrap, 0x04},
 		{"payloadTypeCompact", payloadTypeCompact, 0x05},
-		{"payloadTypeRemoveNode", payloadTypeRemoveNode, 0x06},
+		// 0x06 was the RemoveNode tombstone, retired above: a removal is kept
+		// in the retired-replica registry beside the WAL (retired.go).
 		{"payloadTypeEntries", payloadTypeEntries, 0x0b},
 		{"payloadTypeSnapshot", payloadTypeSnapshot, 0x0c},
 	}

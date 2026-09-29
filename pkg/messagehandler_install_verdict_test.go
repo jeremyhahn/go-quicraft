@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -162,6 +164,12 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 		if err == nil {
 			t.Fatal("HandleSnapshot accepted a snapshot for a failed shard")
 		}
+		// An ordinary shard state, not an authorization failure: a leader
+		// retransmits to a failed replica as a matter of course.
+		var unauthorized *UnauthorizedMessageError
+		if errors.As(err, &unauthorized) || !errors.Is(err, ErrShardFailed) {
+			t.Fatalf("HandleSnapshot = %v, want ErrShardFailed and not an authorization failure", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("HandleSnapshot still blocked 2s after a snapshot arrived for a failed shard")
 	}
@@ -195,12 +203,129 @@ func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
 	node.Stop()
 
 	err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders)
+	// Refused as an ordinary shard state, not an authorization failure: a
+	// leader retransmits to a restarting replica as a matter of course.
 	var unauthorized *UnauthorizedMessageError
-	if !errors.As(err, &unauthorized) {
-		t.Fatalf("HandleSnapshot = %v, want the stopping shard refused", err)
+	if errors.As(err, &unauthorized) || !errors.Is(err, ErrShardNotReady) {
+		t.Fatalf("HandleSnapshot = %v, want ErrShardNotReady and not an authorization failure", err)
 	}
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Fatalf("the retained artifact was reclaimed by a receive on a stopping shard: %v", statErr)
+	}
+}
+
+// TestHandleSnapshot_AuthorizationIsCheckedBeforeShardState: the failed and
+// stopping refusals are reported as ordinary shard states, so they must not
+// run ahead of the authorization gates — an unauthorized snapshot that lands
+// while the shard is failed or stopping is still refused, and counted, as
+// unauthorized.
+func TestHandleSnapshot_AuthorizationIsCheckedBeforeShardState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state func(*engine.Node)
+	}{
+		{"failed", func(n *engine.Node) { n.Fail(errors.New("latched for the test")) }},
+		{"stopping", func(n *engine.Node) { n.Stop() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, h, _ := newMedlowHandlerFixture(t)
+			const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+			authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+			handler := &hostMessageHandler{engine: eng, host: h}
+			tc.state(eng.GetNode(shardID))
+
+			// Addressed to a replica this host does not own.
+			err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID+7, fromReplicaID, 900), authorizeAllSenders)
+			var unauthorized *UnauthorizedMessageError
+			if !errors.As(err, &unauthorized) {
+				t.Fatalf("HandleSnapshot = %v, want the misaddressed snapshot refused as unauthorized "+
+					"whatever the shard's state", err)
+			}
+		})
+	}
+}
+
+// snapshotDropRecorder records the shard label of each unauthorized-snapshot
+// drop.
+type snapshotDropRecorder struct {
+	NoOpMetricsCollector
+	mu     sync.Mutex
+	shards []uint64
+}
+
+func (r *snapshotDropRecorder) IncUnauthorizedSnapshotDropped(shardID, _ uint64) {
+	r.mu.Lock()
+	r.shards = append(r.shards, shardID)
+	r.mu.Unlock()
+}
+
+// TestHandleSnapshot_UnloadedShardIsNotAMetricLabel: a snapshot naming a shard
+// this host has not loaded carries a shard ID nothing has verified. Counting
+// the drop under it let any cluster-certificate holder mint an unbounded
+// number of metric series by cycling shard IDs; it is counted under shard 0.
+// A loaded shard's drop keeps its own label.
+func TestHandleSnapshot_UnloadedShardIsNotAMetricLabel(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	rec := &snapshotDropRecorder{}
+	h.metrics = rec
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	for _, unloaded := range []uint64{1_000_001, 1_000_002} {
+		_ = handler.HandleSnapshot(verdictTestChunks(unloaded, localReplicaID, fromReplicaID, 900), authorizeAllSenders)
+	}
+	// A loaded shard, misaddressed: still an authorization failure, labelled.
+	_ = handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID+7, fromReplicaID, 900), authorizeAllSenders)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	want := []uint64{0, 0, shardID}
+	if !slices.Equal(rec.shards, want) {
+		t.Fatalf("unauthorized-snapshot drops counted under shards %v, want %v", rec.shards, want)
+	}
+}
+
+// TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone: the transport asks the host
+// to authorize a snapshot's sender from the stream header, before it takes a
+// receive slot or any memory. The host applies HandleSnapshot's own gates
+// there, so a sender the shard admits proceeds and one it does not — a
+// certificate holder with the wrong identity, a misaddressed transfer, a shard
+// not loaded — is refused before the transfer costs the receiver anything.
+func TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone(t *testing.T) {
+	eng, h, _ := newMedlowHandlerFixture(t)
+	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
+	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
+	handler := &hostMessageHandler{engine: eng, host: h}
+
+	if err := handler.AuthorizeSnapshot(shardID, localReplicaID, fromReplicaID, 900, authorizeAllSenders); err != nil {
+		t.Fatalf("AuthorizeSnapshot refused the committed sender: %v", err)
+	}
+
+	// A shard that is merely failed is an ordinary state: marked so the
+	// transport reports it quietly, apart from unauthorized transfers.
+	eng.GetNode(shardID).Fail(errors.New("latched for the test"))
+	if err := handler.AuthorizeSnapshot(shardID, localReplicaID, fromReplicaID, 900, authorizeAllSenders); !errors.Is(err, transport.ErrSnapshotNotAccepting) {
+		t.Fatalf("AuthorizeSnapshot on a failed shard = %v, want ErrSnapshotNotAccepting", err)
+	}
+
+	stranger := transport.PeerAuth{
+		Identity:          "spki:5555555555555555555555555555555555555555555555555555555555555555",
+		AuthorizesAddress: func(string) bool { return true },
+	}
+	for _, tc := range []struct {
+		name                   string
+		shard, replica, sender uint64
+		peer                   transport.PeerAuth
+	}{
+		{"a certificate holder the shard does not admit", shardID, localReplicaID, fromReplicaID, stranger},
+		{"a transfer addressed to another replica", shardID, localReplicaID + 7, fromReplicaID, authorizeAllSenders},
+		{"a shard not loaded", shardID + 1, localReplicaID, fromReplicaID, authorizeAllSenders},
+	} {
+		var unauthorized *UnauthorizedMessageError
+		if err := handler.AuthorizeSnapshot(tc.shard, tc.replica, tc.sender, 900, tc.peer); !errors.As(err, &unauthorized) {
+			t.Fatalf("%s: AuthorizeSnapshot = %v, want an authorization refusal", tc.name, err)
+		}
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -83,7 +84,53 @@ func newTestRaftLeaseRead(replicaID uint64) *raft {
 	if err != nil {
 		panic("newTestRaftLeaseRead failed: " + err.Error())
 	}
+	setTestLeaseClock(r)
 	return r
+}
+
+// testLeaseTick is the tick interval lease tests run at. With the test
+// ElectionRTT of 10 it gives a lease of 8 ticks less 1% drift: 7.92s.
+const testLeaseTick = time.Second
+
+// testLeaseWindow is the vote window (voteWindow) a follower configured like
+// the lease tests' leader promises in its heartbeat acks: ElectionRTT ticks
+// of testLeaseTick. A hand-built ack must carry it, or the leader does not
+// count the ack toward its lease (ackBacksLease).
+const testLeaseWindow = uint64(10 * testLeaseTick)
+
+// setTestLeaseClock gives r a real-time lease (testLeaseTick per tick) and
+// freezes its clock, so a test moves time only through advanceLeaseClock
+// and no lease expires because the test machine was slow. The vote
+// hold-down is re-anchored on the frozen clock, as if r had been
+// constructed at t0; passVoteHoldDown ends it. The anchor is set on every
+// shard, LeaseRead or not, so a hold-down that ignored the flag would show.
+func setTestLeaseClock(r *raft) {
+	r.setTickInterval(testLeaseTick)
+	t0 := time.Unix(1_700_000_000, 0)
+	r.now = func() time.Time { return t0 }
+	r.voteHoldStart = t0
+}
+
+// passVoteHoldDown advances r's frozen clock to the end of its post-restart
+// vote hold-down, for tests of a LeaseRead replica that must vote or
+// campaign and are not about the hold-down itself.
+func passVoteHoldDown(r *raft) {
+	advanceLeaseClock(r, r.voteHoldDuration)
+}
+
+// advanceLeaseClock moves r's frozen clock forward by d without ticking,
+// which is exactly what a descheduled leader sees on resuming.
+func advanceLeaseClock(r *raft, d time.Duration) {
+	t := r.now().Add(d)
+	r.now = func() time.Time { return t }
+}
+
+// sendLeaseRound broadcasts a heartbeat round, discards the heartbeats and
+// returns the round they carried, for tests that ack it by hand.
+func sendLeaseRound(r *raft) uint64 {
+	r.broadcastHeartbeatCtx(0)
+	r.drainMessages()
+	return r.leaseRound
 }
 
 // persistLog simulates the engine's commit worker persisting every
@@ -127,12 +174,15 @@ func commitNoOp(r *raft) {
 // grantLease sends heartbeat responses from followers 2 and 3 to establish
 // a valid lease on the leader. The leader must be node 1 in a 3-node cluster.
 func grantLease(r *raft) {
+	round := sendLeaseRound(r)
 	for _, from := range []uint64{2, 3} {
 		if err := r.step(proto.Message{
-			Type: proto.HeartbeatResp,
-			From: from,
-			Term: r.term,
-			Hint: 0,
+			Type:     proto.HeartbeatResp,
+			From:     from,
+			Term:     r.term,
+			Hint:     0,
+			LogIndex: round,
+			LogTerm:  testLeaseWindow,
 		}); err != nil {
 			panic("grantLease: " + err.Error())
 		}
@@ -8121,8 +8171,8 @@ func TestStepCandidate_VoteRespIgnoredInPreCandidateState(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLeaseRead_ImmediateResponseWithValidLease(t *testing.T) {
-	// When the leader holds a valid lease (quorum of heartbeat acks within
-	// leaseTimeout ticks), ReadIndex should respond immediately without
+	// When the leader holds a valid lease (quorum of acks for heartbeat
+	// rounds sent within leaseDuration), ReadIndex should respond immediately without
 	// sending any heartbeat broadcast.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
@@ -8171,9 +8221,9 @@ func TestLeaseRead_FallbackToHeartbeatWhenLeaseExpired(t *testing.T) {
 	electLeader(r)
 	commitNoOp(r)
 
-	// Do NOT grant lease. Advance electionTick beyond leaseTimeout to ensure
-	// any stale acks are expired.
-	r.electionTick = r.leaseTimeout + 1
+	// Do NOT grant lease. Advance the clock a full lease so that nothing
+	// recorded before this point could still count.
+	advanceLeaseClock(r, r.leaseDuration)
 
 	// Submit a ReadIndex request.
 	if err := r.step(proto.Message{
@@ -8227,7 +8277,8 @@ func TestLeaseRead_InvalidatedOnLeadershipLoss(t *testing.T) {
 
 func TestLeaseRead_RenewalOnHeartbeatAck(t *testing.T) {
 	// Verify that heartbeat ack responses update remoteLastAck, which
-	// keeps the lease valid.
+	// keeps the lease valid, and that the ack is dated by when its round
+	// was SENT rather than when it arrived.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -8237,13 +8288,21 @@ func TestLeaseRead_RenewalOnHeartbeatAck(t *testing.T) {
 		t.Fatal("expected no lease before any heartbeat acks")
 	}
 
+	round := sendLeaseRound(r)
+	sentAt := r.now()
+
+	// The ack arrives a while after the round was sent.
+	advanceLeaseClock(r, testLeaseTick)
+
 	// Send ack from follower 2 only. In a 3-node cluster:
 	// Unified quorum = (2+1)/2+1 = 2. Self(1) + follower(2) = 2 = quorum.
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     2,
+		Term:     r.term,
+		Hint:     0,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from 2: %v", err)
 	}
@@ -8253,19 +8312,65 @@ func TestLeaseRead_RenewalOnHeartbeatAck(t *testing.T) {
 		t.Fatal("expected valid lease after ack from follower 2 (self + 1 remote = quorum)")
 	}
 
-	// Verify remoteLastAck was updated.
-	tick, ok := r.remoteLastAck[2]
+	// Verify remoteLastAck was updated with the round's send time.
+	ackAt, ok := r.remoteLastAck[2]
 	if !ok {
 		t.Fatal("expected remoteLastAck[2] to exist")
 	}
-	if tick != r.electionTick {
-		t.Fatalf("expected remoteLastAck[2] = %d, got %d", r.electionTick, tick)
+	if !ackAt.Equal(sentAt) {
+		t.Fatalf("expected remoteLastAck[2] = round send time %v, got %v", sentAt, ackAt)
+	}
+}
+
+func TestLeaseRead_AckWithoutRoundDoesNotRenew(t *testing.T) {
+	// A HeartbeatResp that names no round (LogIndex 0), a round this leader
+	// never issued, or one that has left the window carries no send time,
+	// so it must not count toward the lease: there is nothing to date it by
+	// except its arrival, which is exactly the anchor a pause extends.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+	round := sendLeaseRound(r)
+
+	for _, idx := range []uint64{0, round + 1, round + leaseRoundWindow} {
+		if err := r.step(proto.Message{
+			Type:     proto.HeartbeatResp,
+			From:     2,
+			Term:     r.term,
+			LogIndex: idx,
+		}); err != nil {
+			t.Fatalf("HeartbeatResp LogIndex=%d: %v", idx, err)
+		}
+		r.drainMessages()
+		if _, ok := r.remoteLastAck[2]; ok {
+			t.Fatalf("ack naming round %d (issued: %d) was recorded", idx, round)
+		}
+	}
+
+	// Push round out of the window, then ack it.
+	for range leaseRoundWindow {
+		advanceLeaseClock(r, r.leaseDuration)
+		sendLeaseRound(r)
+	}
+	if err := r.step(proto.Message{
+		Type:     proto.HeartbeatResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
+	}); err != nil {
+		t.Fatalf("HeartbeatResp for evicted round: %v", err)
+	}
+	r.drainMessages()
+	if _, ok := r.remoteLastAck[2]; ok {
+		t.Fatal("ack for a round evicted from the window was recorded")
 	}
 }
 
 func TestLeaseRead_SafetyMarginElectionTimeoutMinusTwo(t *testing.T) {
 	// The lease timeout should be electionTimeout - 2 to provide a 2-tick
-	// safety margin against goroutine scheduling jitter (PhD 6.4).
+	// safety margin against ticker coalescing (PhD 6.4), and the real-time
+	// lease is that many ticks less the 1% clock-drift bound.
 	r := newTestRaftLeaseRead(1)
 
 	expectedLeaseTimeout := r.electionTimeout - 2
@@ -8273,11 +8378,29 @@ func TestLeaseRead_SafetyMarginElectionTimeoutMinusTwo(t *testing.T) {
 		t.Fatalf("expected leaseTimeout = %d (electionTimeout - 2), got %d",
 			expectedLeaseTimeout, r.leaseTimeout)
 	}
+	ticks := time.Duration(expectedLeaseTimeout) * testLeaseTick
+	if want := ticks - ticks/leaseDriftDivisor; r.leaseDuration != want {
+		t.Fatalf("expected leaseDuration = %v (%v less 1%%), got %v",
+			want, ticks, r.leaseDuration)
+	}
+}
+
+func TestLeaseRead_NoTickIntervalMeansNoLease(t *testing.T) {
+	// A raft that was never told its tick interval has no real-time
+	// measure of the election timeout, so it must never grant a lease.
+	r := newTestRaftLeaseRead(1)
+	r.setTickInterval(0)
+	electLeader(r)
+	commitNoOp(r)
+	grantLease(r)
+	if r.hasValidLease() {
+		t.Fatal("lease granted with no tick interval to measure it by")
+	}
 }
 
 func TestLeaseRead_LeaseExpiresAfterTimeout(t *testing.T) {
-	// Verify that the lease expires when electionTick advances beyond
-	// leaseTimeout ticks past the last ack.
+	// Verify that the lease expires once leaseDuration of real time has
+	// elapsed since the acked round was sent.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -8287,23 +8410,196 @@ func TestLeaseRead_LeaseExpiresAfterTimeout(t *testing.T) {
 		t.Fatal("expected valid lease right after grant")
 	}
 
-	// Advance electionTick. Acks were at tick 0, leaseTimeout = 8.
-	// At tick 7: leaseExpiry = 7 - 8 = -1. Ack at 0 >= -1, valid.
-	r.electionTick = r.leaseTimeout - 1
+	advanceLeaseClock(r, r.leaseDuration-time.Nanosecond)
 	if !r.hasValidLease() {
-		t.Fatal("expected valid lease at leaseTimeout - 1")
+		t.Fatal("expected valid lease 1ns before leaseDuration elapses")
 	}
 
-	// At tick 8: leaseExpiry = 8 - 8 = 0. Ack at 0 >= 0, still valid.
-	r.electionTick = r.leaseTimeout
-	if !r.hasValidLease() {
-		t.Fatal("expected valid lease at exactly leaseTimeout (boundary)")
-	}
-
-	// At tick 9: leaseExpiry = 9 - 8 = 1. Ack at 0 < 1, expired.
-	r.electionTick = r.leaseTimeout + 1
+	advanceLeaseClock(r, time.Nanosecond)
 	if r.hasValidLease() {
-		t.Fatal("expected lease to be expired at leaseTimeout + 1")
+		t.Fatal("expected lease to be expired once leaseDuration has elapsed")
+	}
+}
+
+func TestLeaseRead_PausedLeaderRefusesLease(t *testing.T) {
+	// Regression: a leader descheduled for longer than the followers'
+	// election timeout must not serve a lease read on resuming. Its ticker
+	// coalesced the missed ticks, so it resumes with at most one tick and
+	// acks that are fresh by any tick count; meanwhile the followers may
+	// have elected a new leader and committed past it. The lease is dated
+	// by real time since the acked round was sent, so the pause expires it
+	// and the read goes through the heartbeat quorum round.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+	grantLease(r)
+	if !r.hasValidLease() {
+		t.Fatal("expected valid lease before the pause")
+	}
+	tickBefore := r.electionTick
+
+	// The pause: well past the followers' election timeout in real time,
+	// but the resumed leader sees a single coalesced tick.
+	advanceLeaseClock(r, time.Duration(r.electionTimeout)*testLeaseTick*2)
+	r.tickFunc(r)
+	r.drainMessages()
+	if r.state != leader {
+		t.Fatalf("expected the resumed node to still believe it leads, state=%v", r.state)
+	}
+	if r.electionTick != tickBefore+1 {
+		t.Fatalf("expected one logical tick across the pause, electionTick %d -> %d",
+			tickBefore, r.electionTick)
+	}
+
+	if r.hasValidLease() {
+		t.Fatal("paused leader still holds a lease after the followers' election timeout elapsed")
+	}
+
+	if err := r.step(proto.Message{
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
+		Hint: 5,
+	}); err != nil {
+		t.Fatalf("ReadIndex after pause: %v", err)
+	}
+	if len(r.readStates) != 0 {
+		t.Fatalf("read served from the lease after a pause: %+v", r.readStates)
+	}
+	if len(r.pendingReadIndex) != 1 {
+		t.Fatalf("expected the read queued for the quorum round, got %d pending",
+			len(r.pendingReadIndex))
+	}
+	r.flushReadIndex()
+	hbs := collectMessages(r, proto.Heartbeat)
+	if len(hbs) == 0 {
+		t.Fatal("expected a heartbeat quorum round for the read")
+	}
+}
+
+func TestLeaseRead_AckProcessedLateDatesFromSend(t *testing.T) {
+	// A pause between an ack's arrival and its processing must not extend
+	// the lease. The round is sent, the leader stalls with the acks queued,
+	// and they are processed after the lease would have expired: the lease
+	// must still be expired, because the acks are dated by the round's send
+	// time and prove nothing about the followers after it.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+	round := sendLeaseRound(r)
+
+	advanceLeaseClock(r, r.leaseDuration)
+	for _, from := range []uint64{2, 3} {
+		if err := r.step(proto.Message{
+			Type:     proto.HeartbeatResp,
+			From:     from,
+			Term:     r.term,
+			LogIndex: round,
+			LogTerm:  testLeaseWindow,
+		}); err != nil {
+			t.Fatalf("HeartbeatResp from %d: %v", from, err)
+		}
+	}
+	r.drainMessages()
+	if r.hasValidLease() {
+		t.Fatal("acks processed after a stall extended the lease past its round's send time")
+	}
+}
+
+func TestLeaseRead_FreshLeaseWithinDurationIsHonoured(t *testing.T) {
+	// The fast path must survive the fix: a quorum ack for a round sent
+	// within leaseDuration still answers ReadIndex immediately, with no
+	// heartbeat round.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+	grantLease(r)
+	advanceLeaseClock(r, r.leaseDuration/2)
+
+	if err := r.step(proto.Message{
+		Type: proto.ReadIndex, Origin: proto.OriginLocal,
+		Hint: 6,
+	}); err != nil {
+		t.Fatalf("ReadIndex within lease: %v", err)
+	}
+	if len(r.readStates) != 1 || r.readStates[0].Key != 6 {
+		t.Fatalf("expected the read served from the lease, readStates=%+v", r.readStates)
+	}
+	if len(r.pendingReadIndex) != 0 {
+		t.Fatalf("expected no quorum round, got %d pending", len(r.pendingReadIndex))
+	}
+}
+
+func TestLeaseRead_RoundReusedWithinGranularity(t *testing.T) {
+	// Broadcasts inside one granule share a round and keep its FIRST send
+	// time; a broadcast after the granule opens a new round. Reuse is what
+	// keeps the window from being flooded by per-step ReadIndex broadcasts.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+
+	first := sendLeaseRound(r)
+	firstAt := r.now()
+	advanceLeaseClock(r, r.leaseDuration/leaseRoundSlices-time.Nanosecond)
+	if got := sendLeaseRound(r); got != first {
+		t.Fatalf("expected round %d reused inside the granule, got %d", first, got)
+	}
+	if at, _ := r.leaseRoundSentAt(first); !at.Equal(firstAt) {
+		t.Fatalf("reused round lost its first send time: %v, want %v", at, firstAt)
+	}
+	advanceLeaseClock(r, time.Nanosecond)
+	if got := sendLeaseRound(r); got != first+1 {
+		t.Fatalf("expected a new round after the granule, got %d (previous %d)", got, first)
+	}
+}
+
+func TestLeaseRead_OlderAckDoesNotMoveAnchorBack(t *testing.T) {
+	// A reordered ack for an older round must not replace the date of a
+	// newer one already recorded.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+
+	older := sendLeaseRound(r)
+	advanceLeaseClock(r, r.leaseDuration/2)
+	newer := sendLeaseRound(r)
+	newerAt := r.now()
+	for _, idx := range []uint64{newer, older} {
+		if err := r.step(proto.Message{
+			Type:     proto.HeartbeatResp,
+			From:     2,
+			Term:     r.term,
+			LogIndex: idx,
+			LogTerm:  testLeaseWindow,
+		}); err != nil {
+			t.Fatalf("HeartbeatResp round %d: %v", idx, err)
+		}
+	}
+	r.drainMessages()
+	if at := r.remoteLastAck[2]; !at.Equal(newerAt) {
+		t.Fatalf("older ack moved the anchor back: %v, want %v", at, newerAt)
+	}
+}
+
+func TestLeaseRead_HeartbeatEchoesRound(t *testing.T) {
+	// The follower echoes the round (LogIndex) with the context (Hint),
+	// which is what lets the leader date the ack.
+	r := newTestRaft(2)
+	r.becomeFollower(1, noLeader)
+	if err := r.step(proto.Message{
+		Type:     proto.Heartbeat,
+		From:     1,
+		Term:     1,
+		Hint:     9,
+		LogIndex: 17,
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	resps := collectMessages(r, proto.HeartbeatResp)
+	if len(resps) != 1 {
+		t.Fatalf("expected 1 HeartbeatResp, got %d", len(resps))
+	}
+	if resps[0].Hint != 9 || resps[0].LogIndex != 17 {
+		t.Fatalf("expected Hint=9 LogIndex=17 echoed, got Hint=%d LogIndex=%d",
+			resps[0].Hint, resps[0].LogIndex)
 	}
 }
 
@@ -8344,10 +8640,11 @@ func TestLeaseRead_SingleNodeBypassesLeaseCheck(t *testing.T) {
 }
 
 func TestLeaseRead_RestoredAfterFailedLeaderTransfer(t *testing.T) {
-	// After a leader transfer times out, the leader must restore
-	// remoteLastAck so lease reads can resume. Without the fix, the
-	// leader silently degrades to heartbeat-based ReadIndex for the
-	// rest of its term.
+	// After a leader transfer times out WITHOUT having sent TimeoutNow —
+	// its target never caught up — the leader must restore remoteLastAck so
+	// lease reads can resume: nothing that could release a vote promise is
+	// in flight. (Once TimeoutNow has been sent, the lease is forfeit for
+	// the term; see TestLeaseRead_ForfeitForTheTermOnceTimeoutNowIsSent.)
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -8358,14 +8655,19 @@ func TestLeaseRead_RestoredAfterFailedLeaderTransfer(t *testing.T) {
 		t.Fatal("expected valid lease before transfer")
 	}
 
-	// Initiate a leader transfer -- this nils remoteLastAck.
+	// Initiate a leader transfer to 3, which commitNoOp left behind, so no
+	// TimeoutNow is sent -- this nils remoteLastAck.
 	if err := r.step(proto.Message{
 		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
-		Hint: 2,
+		Hint: 3,
 	}); err != nil {
 		t.Fatalf("LeaderTransfer: %v", err)
 	}
-	r.drainMessages()
+	for _, m := range r.drainMessages() {
+		if m.Type == proto.TimeoutNow {
+			t.Fatal("fixture: TimeoutNow sent to a target that is not caught up")
+		}
+	}
 
 	if r.remoteLastAck != nil {
 		t.Fatal("expected remoteLastAck nil during active transfer")
@@ -8776,49 +9078,48 @@ func TestLeaseRead_LeaseExpiresOnlyForStaleAcks(t *testing.T) {
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
+	step := r.leaseDuration / 2
 
-	// Ack from follower 2 at tick 0.
+	// Follower 2 acks a round sent at t=0.
+	first := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: first,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from 2: %v", err)
 	}
 	r.drainMessages()
 
-	// Advance tick and ack from follower 3 at the new tick.
-	r.electionTick = 5
+	// Follower 3 acks a round sent at t=step.
+	advanceLeaseClock(r, step)
+	second := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 3,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     3,
+		Term:     r.term,
+		LogIndex: second,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from 3: %v", err)
 	}
 	r.drainMessages()
 
-	// Now follower 2 acked at tick 0, follower 3 at tick 5.
-	// leaseTimeout = 8 (10 - 2). leaseExpiry = 5 - 8 = -3.
-	// Both ticks (0 and 5) >= -4, so lease is valid.
 	if !r.hasValidLease() {
-		t.Fatal("expected valid lease with both acks within timeout")
+		t.Fatal("expected valid lease with both acks within the lease")
 	}
 
-	// Advance tick so follower 2's ack expires but follower 3's remains.
-	// leaseTimeout=8, so at tick 10: leaseExpiry = 10 - 8 = 2.
-	// Follower 2 acked at 0 < 1 (expired), follower 3 at 5 >= 1 (valid).
-	// Self + follower 3 = 2 = quorum of 3. Still valid.
-	r.electionTick = 10
+	// At t=2*step+1ns follower 2's round is a full lease old, follower 3's
+	// is not. Self + follower 3 = 2 = quorum of 3. Still valid.
+	advanceLeaseClock(r, step+time.Nanosecond)
 	if !r.hasValidLease() {
 		t.Fatal("expected valid lease with self + one fresh remote = quorum")
 	}
 
-	// Advance further so both expire.
-	// At tick 15: leaseExpiry = 15 - 9 = 6. Follower 3 at 5 < 6 (expired).
-	r.electionTick = 15
+	// Once follower 3's round is a full lease old too, both are stale.
+	advanceLeaseClock(r, step)
 	if r.hasValidLease() {
 		t.Fatal("expected expired lease when all remote acks are stale")
 	}
@@ -8827,28 +9128,12 @@ func TestLeaseRead_LeaseExpiresOnlyForStaleAcks(t *testing.T) {
 func TestLeaseRead_ElectionTickWrapResetsLeaseAcks(t *testing.T) {
 	// Verify that when electionTick wraps to 0 during checkQuorum, the
 	// remoteLastAck map is cleared so the lease must be re-earned through
-	// fresh heartbeat acks. Without this, stale ack values from the
-	// previous cycle would satisfy hasValidLease() because
-	// leaseExpiry = 0 - leaseTimeout underflows negative.
+	// fresh heartbeat acks each CheckQuorum window.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
 
-	// Ack from both followers at tick 5.
-	r.electionTick = 5
-	for _, id := range []uint64{2, 3} {
-		if err := r.step(proto.Message{
-			Type: proto.HeartbeatResp,
-			From: id,
-			Term: r.term,
-			Hint: 0,
-		}); err != nil {
-			t.Fatalf("HeartbeatResp from %d: %v", id, err)
-		}
-	}
-	r.drainMessages()
-
-	// Lease should be valid now.
+	grantLease(r)
 	if !r.hasValidLease() {
 		t.Fatal("expected valid lease after acks")
 	}
@@ -8865,18 +9150,7 @@ func TestLeaseRead_ElectionTickWrapResetsLeaseAcks(t *testing.T) {
 	}
 
 	// Re-earn the lease through fresh acks.
-	for _, id := range []uint64{2, 3} {
-		if err := r.step(proto.Message{
-			Type: proto.HeartbeatResp,
-			From: id,
-			Term: r.term,
-			Hint: 0,
-		}); err != nil {
-			t.Fatalf("HeartbeatResp from %d: %v", id, err)
-		}
-	}
-	r.drainMessages()
-
+	grantLease(r)
 	if !r.hasValidLease() {
 		t.Fatal("expected valid lease after re-earned acks")
 	}
@@ -10117,7 +10391,7 @@ func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
 	// by setting remoteLastAck to nil. In production, tickLeader clears
 	// the transfer target but the lease map must be re-initialized to
 	// resume lease-based reads.
-	r.remoteLastAck = make(map[uint64]int)
+	r.remoteLastAck = make(map[uint64]time.Time)
 
 	// Re-establish the lease since transfer invalidated it.
 	grantLease(r)
@@ -10326,6 +10600,7 @@ func TestRaft_Witness_HeartbeatAckCountsForLeaseQuorum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	electLeader(r)
 	r.drainMessages()
 
@@ -10347,11 +10622,13 @@ func TestRaft_Witness_HeartbeatAckCountsForLeaseQuorum(t *testing.T) {
 	}
 
 	// Send heartbeat ack from witness only.
+	round := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 3,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     3,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
@@ -10382,15 +10659,18 @@ func TestRaft_Witness_LeaseQuorumUsesElectionQuorum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	electLeader(r)
 	r.drainMessages()
 
 	// Witness ack should be tracked in remoteLastAck.
+	round := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 4,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     4,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
@@ -10405,10 +10685,11 @@ func TestRaft_Witness_LeaseQuorumUsesElectionQuorum(t *testing.T) {
 
 	// One data-bearing ack (self + witness + remote 2 = 3 = quorum).
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
-		Hint: 0,
+		Type:     proto.HeartbeatResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from remote 2: %v", err)
 	}
@@ -13416,14 +13697,18 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	electLeader(r)
 	r.drainMessages()
 
 	// Only remote 2 acks. self(1) + remote2(1) = 2 < quorum(3).
+	round := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
+		Type:     proto.HeartbeatResp,
+		From:     2,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp: %v", err)
 	}
@@ -13435,9 +13720,11 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 
 	// Add witness 4 ack. self(1) + remote2(1) + witness4(1) = 3 = quorum.
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 4,
-		Term: r.term,
+		Type:     proto.HeartbeatResp,
+		From:     4,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
@@ -13493,6 +13780,7 @@ func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	electLeader(r)
 	r.drainMessages()
 
@@ -13506,10 +13794,13 @@ func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 	}
 
 	// remoteLastAck should track witness after heartbeat ack.
+	round := sendLeaseRound(r)
 	if err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 3,
-		Term: r.term,
+		Type:     proto.HeartbeatResp,
+		From:     3,
+		Term:     r.term,
+		LogIndex: round,
+		LogTerm:  testLeaseWindow,
 	}); err != nil {
 		t.Fatalf("HeartbeatResp from witness: %v", err)
 	}
@@ -13641,8 +13932,8 @@ func TestS3_QuiesceBlockedDuringLeaderTransfer_InvalidTarget(t *testing.T) {
 
 func TestS4_LeaseInvalidatedOnQuiesceEntry(t *testing.T) {
 	// When a leader enters quiesce, the lease must be invalidated to
-	// prevent stale reads. During quiesce, electionTick is frozen, so
-	// hasValidLease would compute a stale leaseExpiry.
+	// prevent stale reads: heartbeats drop to the liveness-probe cadence,
+	// so the lease must be re-earned once normal ticking resumes.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgLeaseRead(1, 1)
 	cfg.PreVote = config.BoolPtr(false)
@@ -13653,6 +13944,7 @@ func TestS4_LeaseInvalidatedOnQuiesceEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	electLeader(r)
 	r.drainMessages()
 
@@ -13753,3 +14045,34 @@ func benchmarkTryCommit(b *testing.B, witnesses int) {
 
 func BenchmarkTryCommit(b *testing.B)            { benchmarkTryCommit(b, 0) }
 func BenchmarkTryCommit_2Witnesses(b *testing.B) { benchmarkTryCommit(b, 2) }
+
+// BenchmarkLeaseHeartbeatCycle measures one lease-renewal cycle on a
+// 3-voter LeaseRead leader: a heartbeat broadcast, a quorum of acks for its
+// round, and the lease check a ReadIndex makes. It runs on the real clock,
+// which is what the hot path pays for.
+func BenchmarkLeaseHeartbeatCycle(b *testing.B) {
+	r := newTestRaftLeaseRead(1)
+	r.now = time.Now
+	electLeader(r)
+	commitNoOp(r)
+	b.ReportAllocs()
+	for b.Loop() {
+		r.broadcastHeartbeat()
+		r.drainMessages()
+		for _, from := range []uint64{2, 3} {
+			if err := r.step(proto.Message{
+				Type:     proto.HeartbeatResp,
+				From:     from,
+				Term:     r.term,
+				LogIndex: r.leaseRound,
+				LogTerm:  testLeaseWindow,
+			}); err != nil {
+				b.Fatalf("HeartbeatResp: %v", err)
+			}
+		}
+		r.drainMessages()
+		if !r.hasValidLease() {
+			b.Fatal("expected a valid lease")
+		}
+	}
+}

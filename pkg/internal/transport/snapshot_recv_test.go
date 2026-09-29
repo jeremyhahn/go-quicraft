@@ -17,7 +17,9 @@ package transport
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -192,8 +194,9 @@ func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
 		if len(got) != 1 {
 			t.Fatalf("IncSnapshotsRejected calls = %d, want 1 (%+v)", len(got), got)
 		}
-		if got[0].shardID != 4 || got[0].reason != string(snapshotRejectShutdown) {
-			t.Fatalf("rejection = %+v, want shard 4 reason %q", got[0], snapshotRejectShutdown)
+		// Refused before the sender was authorized: counted unattributed.
+		if got[0].shardID != 0 || got[0].reason != string(snapshotRejectShutdown) {
+			t.Fatalf("rejection = %+v, want shard 0 reason %q", got[0], snapshotRejectShutdown)
 		}
 		if n := handler.snapshotCount.Load(); n != 0 {
 			t.Fatalf("HandleSnapshot called %d times during shutdown, want 0", n)
@@ -1365,7 +1368,7 @@ func TestReceiveChunks_MemoryBudgetRestoredOnSuccess(t *testing.T) {
 		}
 	}
 
-	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 4}
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 4, From: 1}
 	sr.receiveChunks(&testChunkReader{data: buildChunkFrames(t, chunks)}, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if got := handler.snapshotCount.Load(); got != 1 {
@@ -1500,6 +1503,7 @@ func TestReceiveChunks_WithEventListener(t *testing.T) {
 		Index:      50,
 		Term:       3,
 		ChunkCount: 1,
+		From:       1,
 	}
 	stopC := make(chan struct{})
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
@@ -1555,6 +1559,7 @@ func TestReceiveChunks_WithMetrics(t *testing.T) {
 		Index:      50,
 		Term:       3,
 		ChunkCount: 1,
+		From:       1,
 	}
 	stopC := make(chan struct{})
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
@@ -1650,6 +1655,7 @@ func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 		Index:      50,
 		Term:       3,
 		ChunkCount: 1,
+		From:       1,
 	}
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
@@ -1791,6 +1797,7 @@ func TestReceiveChunks_CompleteTransferCommitted(t *testing.T) {
 		Index:      50,
 		Term:       3,
 		ChunkCount: 3,
+		From:       1,
 	}
 	stopC := make(chan struct{})
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
@@ -1824,6 +1831,11 @@ func TestReceiveChunks_ZeroChunkCountCommitsNothing(t *testing.T) {
 type errorSnapshotHandler struct {
 	testHandler
 	calls atomic.Int64
+}
+
+// AuthorizeSnapshot admits every transfer: this fake exercises the paths after admission.
+func (*errorSnapshotHandler) AuthorizeSnapshot(uint64, uint64, uint64, uint64, PeerAuth) error {
+	return nil
 }
 
 func (h *errorSnapshotHandler) HandleSnapshot(chunks []proto.SnapshotChunk, _ PeerAuth) error {
@@ -1938,8 +1950,10 @@ func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("IncSnapshotsRejected calls = %d, want 1 (%+v)", len(got), got)
 	}
-	if got[0].shardID != 7 || got[0].reason != string(snapshotRejectShutdown) {
-		t.Fatalf("rejection = %+v, want shard 7 reason %q", got[0], snapshotRejectShutdown)
+	// Refused before the sender was authorized: counted unattributed (the
+	// listener above still carries the shard the header named).
+	if got[0].shardID != 0 || got[0].reason != string(snapshotRejectShutdown) {
+		t.Fatalf("rejection = %+v, want shard 0 reason %q", got[0], snapshotRejectShutdown)
 	}
 
 	if n := handler.snapshotCount.Load(); n != 0 {
@@ -1960,6 +1974,115 @@ func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 	sr.peerMu.Unlock()
 	if slots != 0 {
 		t.Fatalf("peer slots retained after a rejected admission: %d, want 0", slots)
+	}
+}
+
+// refusingAuthHandler refuses every snapshot at AuthorizeSnapshot and records
+// what it was asked.
+type refusingAuthHandler struct {
+	*testHandler
+	asked []uint64 // shard, replica, from, index of the last call
+	err   error    // the refusal; nil means "sender not admitted"
+}
+
+func (h *refusingAuthHandler) AuthorizeSnapshot(shardID, replicaID, from, index uint64, _ PeerAuth) error {
+	h.asked = []uint64{shardID, replicaID, from, index}
+	if h.err != nil {
+		return h.err
+	}
+	return errors.New("sender not admitted")
+}
+
+// TestReceiveSnapshot_UnauthorizedSenderTakesNoResources: authorization used
+// to run only once the whole transfer had been buffered, so any holder of a
+// cluster certificate could hold a peer's receive slots and half the snapshot
+// memory budget for the length of a transfer. The sender is now authorized
+// from the header first: a refused one takes no slot and no memory, and the
+// stream is never read — a nil stream proves it, as receiveChunks would
+// dereference it.
+func TestReceiveSnapshot_UnauthorizedSenderTakesNoResources(t *testing.T) {
+	handler := &refusingAuthHandler{testHandler: newTestHandler()}
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+	rec := &dropRecorder{}
+	sr.metrics = rec
+	memBefore := sr.AvailableMemory()
+
+	hdr := &SnapshotHeader{ShardID: 7, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1, From: 9}
+	sr.receiveSnapshot(nil, hdr, "spki:intruder", PeerAuth{Identity: "spki:intruder"}, make(chan struct{}))
+
+	if want := []uint64{7, 2, 9, 50}; !slices.Equal(handler.asked, want) {
+		t.Fatalf("AuthorizeSnapshot asked %v, want shard/replica/from/index %v", handler.asked, want)
+	}
+	got := rec.rejects()
+	if len(got) != 1 || got[0].reason != string(snapshotRejectUnauthorized) || got[0].shardID != 0 {
+		t.Fatalf("rejections = %+v, want one %q counted unattributed (shard 0)", got, snapshotRejectUnauthorized)
+	}
+	if n := handler.snapshotCount.Load(); n != 0 {
+		t.Fatalf("HandleSnapshot called %d times for a refused sender", n)
+	}
+	if len(sr.sem) != 0 {
+		t.Fatalf("%d global receive slots held after the refusal", len(sr.sem))
+	}
+	sr.peerMu.Lock()
+	use := len(sr.peerUse)
+	sr.peerMu.Unlock()
+	if use != 0 {
+		t.Fatalf("the refused peer holds per-peer receive state (%d entries)", use)
+	}
+	if after := sr.AvailableMemory(); after != memBefore {
+		t.Fatalf("snapshot memory %d after the refusal, want %d", after, memBefore)
+	}
+}
+
+// TestReceiveSnapshot_ShardNotAcceptingIsNotUnauthorized: a refusal the
+// handler marks ErrSnapshotNotAccepting — a failed or stopping shard, which a
+// leader retransmits to as a matter of course — is counted apart from
+// unauthorized transfers, so routine restarts do not read as an attack.
+func TestReceiveSnapshot_ShardNotAcceptingIsNotUnauthorized(t *testing.T) {
+	handler := &refusingAuthHandler{
+		testHandler: newTestHandler(),
+		err:         fmt.Errorf("%w: shard stopping", ErrSnapshotNotAccepting),
+	}
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+	rec := &dropRecorder{}
+	sr.metrics = rec
+
+	hdr := &SnapshotHeader{ShardID: 7, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1, From: 1}
+	sr.receiveSnapshot(nil, hdr, "spki:leader", PeerAuth{Identity: "spki:leader"}, make(chan struct{}))
+
+	got := rec.rejects()
+	if len(got) != 1 || got[0].reason != string(snapshotRejectNotAccepting) {
+		t.Fatalf("rejections = %+v, want one %q", got, snapshotRejectNotAccepting)
+	}
+}
+
+// TestValidateChunk_BindsSenderAndTargetToTheHeader: AuthorizeSnapshot admits
+// the header's From and ReplicaID, so a chunk naming another sender or target
+// would be persisted on an authorization it never received.
+func TestValidateChunk_BindsSenderAndTargetToTheHeader(t *testing.T) {
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, newTestHandler())
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1, From: 1}
+	chunk := func(from, replica uint64) *proto.SnapshotChunk {
+		return &proto.SnapshotChunk{
+			BinVer: proto.WireVersion, ShardID: 1, ReplicaID: replica, From: from,
+			Index: 50, Term: 3, ChunkCount: 1, DeploymentID: 42,
+		}
+	}
+	if err := sr.validateChunk(chunk(1, 2), hdr); err != nil {
+		t.Fatalf("a chunk matching its header was refused: %v", err)
+	}
+	for _, tc := range []struct {
+		name          string
+		from, replica uint64
+		field         string
+	}{
+		{"another sender", 3, 2, "from"},
+		{"another target", 1, 5, "replica_id"},
+	} {
+		var mismatch *ChunkHeaderMismatchError
+		if err := sr.validateChunk(chunk(tc.from, tc.replica), hdr); !errors.As(err, &mismatch) || mismatch.Field != tc.field {
+			t.Fatalf("%s: validateChunk = %v, want a %q ChunkHeaderMismatchError", tc.name, err, tc.field)
+		}
 	}
 }
 
@@ -1998,6 +2121,7 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 		Index:      50,
 		Term:       3,
 		ChunkCount: 1,
+		From:       1,
 	}
 	stopC := make(chan struct{})
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)

@@ -131,6 +131,8 @@ func (t *testLogDB) GetSnapshot(_ uint64, _ uint64) (logdb.Snapshot, error) {
 
 func (t *testLogDB) RemoveNodeData(_ uint64, _ uint64) error { return nil }
 
+func (t *testLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
+
 func (t *testLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) { return nil, nil }
 
 func (t *testLogDB) SaveBootstrap(_ uint64, _ uint64, _ logdb.Bootstrap) error { return nil }
@@ -5996,6 +5998,9 @@ func TestRecoverSnapshot_RecoverError(t *testing.T) {
 	if err := os.WriteFile(dataPath, []byte("snapshot-data"), 0o644); err != nil {
 		t.Fatalf("failed to create snapshot data file: %v", err)
 	}
+	if err := writeTestSnapshotMetadata(snapDir, 100, 5, 1, 1, 0, config.NoCompression); err != nil {
+		t.Fatalf("failed to write snapshot metadata: %v", err)
+	}
 
 	pool := newSnapshotPool(1, ldb, nil, nil, ws, stopC, nil)
 
@@ -6054,6 +6059,9 @@ func TestRecoverSnapshot_SuccessUpdatesNodeState(t *testing.T) {
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
 	if err := os.WriteFile(dataPath, []byte("valid-snapshot"), 0o644); err != nil {
 		t.Fatalf("failed to create snapshot data file: %v", err)
+	}
+	if err := writeTestSnapshotMetadata(snapDir, 200, 10, 1, 1, 0, config.NoCompression); err != nil {
+		t.Fatalf("failed to write snapshot metadata: %v", err)
 	}
 
 	pool := newSnapshotPool(1, ldb, nil, nil, ws, stopC, nil)

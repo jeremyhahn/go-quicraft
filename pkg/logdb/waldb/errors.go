@@ -203,11 +203,6 @@ var (
 	// floor return empty instead of ErrCompacted.
 	ErrTruncatedCompactionRecord = errors.New("waldb: compaction record malformed")
 
-	// ErrTruncatedRemoveNodeRecord is returned when WAL replay finds a
-	// remove-node tombstone whose length does not match the fixed on-disk
-	// layout. Fatal: a skipped tombstone resurrects a removed replica.
-	ErrTruncatedRemoveNodeRecord = errors.New("waldb: remove-node record malformed")
-
 	// ErrUnknownPayloadType is returned when WAL replay finds a record whose
 	// payload type byte is not written by this package. Payload types are
 	// CRC-protected, so an unknown type is corruption or a configuration

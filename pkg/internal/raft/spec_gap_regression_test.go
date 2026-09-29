@@ -68,7 +68,7 @@ func TestHeartbeatCommitIsCappedAtPeerMatch(t *testing.T) {
 		t.Fatalf("fixture: expected match 0 for peer 2, got %d", leader.remotes[2].match)
 	}
 
-	leader.sendHeartbeatTo(2, 0)
+	leader.sendHeartbeatTo(2, 0, 0)
 	hb := firstMsgOfType(leader.drainMessages(), proto.Heartbeat)
 	if hb == nil {
 		t.Fatal("no Heartbeat produced")
@@ -83,7 +83,7 @@ func TestHeartbeatCommitIsCappedAtPeerMatch(t *testing.T) {
 
 	// Once the peer's match catches up, the commit index may be advertised.
 	leader.remotes[2].match = committed
-	leader.sendHeartbeatTo(2, 0)
+	leader.sendHeartbeatTo(2, 0, 0)
 	hb = firstMsgOfType(leader.drainMessages(), proto.Heartbeat)
 	if hb == nil {
 		t.Fatal("no Heartbeat produced after match advanced")
@@ -119,7 +119,7 @@ func TestHeartbeatCommitCap_FollowerDoesNotApplyItsOwnDivergentTail(t *testing.T
 		t.Fatalf("fixture: follower committed = %d, want 0", follower.log.committed)
 	}
 
-	leader.sendHeartbeatTo(2, 0)
+	leader.sendHeartbeatTo(2, 0, 0)
 	hb := firstMsgOfType(leader.drainMessages(), proto.Heartbeat)
 	if hb == nil {
 		t.Fatal("no Heartbeat produced")
@@ -191,13 +191,13 @@ func TestReadIndexRecordsCommittedNotLastIndex(t *testing.T) {
 // TestLeaseAcksResetEachCheckQuorumWindow protects resetLeaseAcks() in
 // tickLeader.
 //
-// hasValidLease compares each recorded ack tick against
-// electionTick - leaseTimeout. electionTick WRAPS to 0 at the end of every
-// CheckQuorum window, so the expiry goes negative and every stale ack tick
-// from the previous window looks valid again. The lease would then survive
-// roughly two election timeouts with no fresh acknowledgement at all —
-// exactly long enough for another replica to win an election and for this one
-// to keep serving lease reads as a deposed leader.
+// The lease must be re-earned every CheckQuorum window, the cadence at which
+// remote activity is re-proven. hasValidLease also ages acks by elapsed real
+// time, so the clock is frozen here: with no time passing, the reset at the
+// window boundary is the only thing that can drop the lease, and this test
+// isolates it. (When the lease was measured in ticks the reset was the only
+// guard: electionTick WRAPS to 0 at the end of the window, and without it
+// every stale ack tick from the previous window looked valid again.)
 func TestLeaseAcksResetEachCheckQuorumWindow(t *testing.T) {
 	cfg := raftTestCfgCheckQuorum(1, 1, true)
 	cfg.LeaseRead = true
@@ -206,13 +206,14 @@ func TestLeaseAcksResetEachCheckQuorumWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
+	setTestLeaseClock(r)
 	r.becomeCandidate()
 	r.becomeLeader()
 	r.drainMessages()
 
 	// A full quorum acks the heartbeat early in this CheckQuorum window.
-	r.remoteLastAck[2] = r.electionTick
-	r.remoteLastAck[3] = r.electionTick
+	r.remoteLastAck[2] = r.now()
+	r.remoteLastAck[3] = r.now()
 	r.recordActivity()
 	for _, rm := range r.remotes {
 		rm.setActive()
@@ -236,10 +237,8 @@ func TestLeaseAcksResetEachCheckQuorumWindow(t *testing.T) {
 
 	if r.hasValidLease() {
 		t.Fatalf("the read lease survived a whole CheckQuorum window with no "+
-			"fresh ack (recorded acks: %v, electionTick=%d, leaseTimeout=%d): "+
-			"electionTick wrapped to 0, the lease expiry underflowed negative "+
-			"and every stale tick looks valid, so a deposed leader keeps "+
-			"serving lease reads", r.remoteLastAck, r.electionTick, r.leaseTimeout)
+			"fresh ack (recorded acks: %v, electionTick=%d): resetLeaseAcks "+
+			"did not run at the window boundary", r.remoteLastAck, r.electionTick)
 	}
 }
 

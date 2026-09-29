@@ -54,7 +54,7 @@ func newRecoverFixture(t *testing.T, payload []byte, recordedSize uint64) *recov
 	if err := os.WriteFile(dataPath, payload, 0o600); err != nil {
 		t.Fatalf("write snapshot data: %v", err)
 	}
-	if err := writeSnapshotMetadata(dir, index, term, shardID, replicaID, 0,
+	if err := writeTestSnapshotMetadata(dir, index, term, shardID, replicaID, 0,
 		config.NoCompression); err != nil {
 		t.Fatalf("write metadata: %v", err)
 	}
@@ -104,19 +104,18 @@ func TestRecoverSnapshot_RefusesATruncatedArtifact(t *testing.T) {
 	const full = 4096
 	f := newRecoverFixture(t, snapshotPayload(100, full), full)
 
-	// Remove snapshot.meta, modelling the artifact this check exists for: one
-	// inherited from a binary that did not stamp the integrity fields.
-	// VerifySnapshotArtifact returns nil when there is no record to check
-	// against — deliberately, so an upgrade can still recover what it inherited
-	// — which leaves FileSize as the ONLY at-rest check the artifact has.
-	if err := os.Remove(filepath.Join(filepath.Dir(f.dataPath), snapshotMetadataFile)); err != nil {
-		t.Fatalf("remove metadata: %v", err)
-	}
-
-	// Truncate the artifact AFTER it was recorded. The record still claims the
-	// full size; the file no longer has it.
+	// Truncate the artifact AFTER it was recorded, and re-stamp snapshot.meta
+	// over the truncated bytes: the file and its record replaced TOGETHER — a
+	// partial restore that brought both from the wrong place — so the meta
+	// hash agrees with the file and FileSize, which lives in LogDB, is the
+	// only check that can see the difference. The record still claims the full
+	// size; the file no longer has it.
 	if err := os.Truncate(f.dataPath, full/2); err != nil {
 		t.Fatalf("truncate: %v", err)
+	}
+	if err := writeSnapshotMetadata(filepath.Dir(f.dataPath), 100, 3, 21, 1, 0,
+		config.NoCompression); err != nil {
+		t.Fatalf("re-stamp metadata: %v", err)
 	}
 
 	err := f.pool.recoverSnapshot(f.req)

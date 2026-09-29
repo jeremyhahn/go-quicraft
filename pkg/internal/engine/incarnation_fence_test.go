@@ -51,6 +51,129 @@ func newFenceTestNode(shardID uint64) *Node {
 	return NewNode(nil, nil, nil, cfg, nil, "", nil)
 }
 
+// TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured: the
+// commit worker's forward to the apply tier blocks while the apply dispatcher
+// is backpressured on ANOTHER shard's busy state machine. UnloadNode waits on
+// the commit worker's unload fence, so a forward that did not answer
+// membership made StopShard of one shard wait out an unrelated shard's
+// Apply — and hang outright if that Apply was the one calling StopShard.
+func TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured(t *testing.T) {
+	applyC := make(chan *applyItem, 1)
+	applyC <- &applyItem{} // the dispatcher is not draining: full
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cw := newCommitWorker(0, nil, nil, make(chan *commitItem, 1), applyC,
+		&sync.Pool{New: func() interface{} { return &applyItem{} }}, NewWorkSignal(1), nil, stopC, nil)
+
+	delivered := make(chan bool, 1)
+	blocked := &applyItem{update: proto.Update{ShardID: 2}}
+	go func() { delivered <- cw.forwardToApply(blocked) }()
+
+	fence := cw.requestUnload(1)
+	select {
+	case <-fence:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the unload fence was not answered while the forward was blocked: " +
+			"StopShard would wait on another shard's apply")
+	}
+	if !cw.unloaded.has(1) {
+		t.Fatal("the fence closed without the unload being applied")
+	}
+
+	select {
+	case ok := <-delivered:
+		t.Fatalf("the forward returned (%v) while the apply tier was still full", ok)
+	default:
+	}
+	<-applyC // the dispatcher drains
+	if ok := <-delivered; !ok {
+		t.Fatal("the forward gave up instead of delivering once the apply tier drained")
+	}
+	if got := <-applyC; got != blocked {
+		t.Fatal("the delivered item is not the one that was blocked")
+	}
+}
+
+// TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard pins what makes
+// answering the fence during a blocked forward safe: an unload applied while
+// processBatch is blocked forwarding one shard's item must still keep every
+// later item of the unloaded shard in the same batch from being committed or
+// forwarded — the per-item re-checks, not the between-batches timing, are
+// what the fence rests on.
+func TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard(t *testing.T) {
+	ldb := newTestLogDB()
+	applyC := make(chan *applyItem, 1)
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cw := newCommitWorker(0, ldb, nil, make(chan *commitItem, 1), applyC,
+		&sync.Pool{New: func() any { return &applyItem{} }}, NewWorkSignal(64), nil, stopC, nil)
+	cw.noRetryDelay = true
+
+	follower := func(shardID uint64) (*Node, proto.Update) {
+		peer, lr := newPiggybackFollower(t, ldb, shardID, 1)
+		if err := peer.Handle(proto.Message{
+			Type: proto.Replicate, ShardID: shardID, From: 2, To: 1, Term: 1, Commit: 1,
+			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("x")}},
+		}); err != nil {
+			t.Fatalf("Handle(Replicate): %v", err)
+		}
+		u, err := peer.GetUpdate(true, 0)
+		if err != nil {
+			t.Fatalf("GetUpdate: %v", err)
+		}
+		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
+		cfg.SetDefaults()
+		node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
+		node.commitPending.Store(true)
+		return node, u
+	}
+	busy, busyUpdate := follower(1)
+	stopping, stoppingUpdate := follower(2)
+	cw.batch = append(cw.batch[:0], busyUpdate, stoppingUpdate)
+	cw.batchNodes = []*Node{busy, stopping}
+
+	applyC <- &applyItem{} // the apply tier is backpressured
+	done := make(chan struct{})
+	go func() {
+		cw.processBatch()
+		close(done)
+	}()
+
+	// UnloadNode's order: mark, stop, then the fence. The fence can only be
+	// answered while processBatch is blocked forwarding the busy shard's item.
+	stopping.unloaded.Store(true)
+	stopping.Stop()
+	select {
+	case <-cw.requestUnload(2):
+	case <-time.After(5 * time.Second):
+		t.Fatal("the unload fence was not answered while the batch's forward was blocked")
+	}
+
+	<-applyC // the dispatcher drains
+	var forwarded []uint64
+	for {
+		select {
+		case ai := <-applyC:
+			forwarded = append(forwarded, ai.update.ShardID)
+			continue
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("processBatch did not finish once the apply tier drained")
+		}
+		break
+	}
+	for len(applyC) > 0 {
+		forwarded = append(forwarded, (<-applyC).update.ShardID)
+	}
+	if len(forwarded) != 1 || forwarded[0] != 1 {
+		t.Fatalf("forwarded shards %v, want only the busy shard [1]: the unloaded shard's "+
+			"item later in the batch was committed after its fence closed", forwarded)
+	}
+	if stopping.commitPending.Load() {
+		t.Fatal("the skipped item left commitPending set")
+	}
+}
+
 // TestCommitWorker_UnloadFenceWaitsForInFlightSaveState pins the unload fence.
 // UnloadNode used to hand the commit worker an asynchronous unload and return,
 // so a batch holding the stopped incarnation's update could reach SaveState
@@ -770,7 +893,7 @@ func TestGCSnapshotDirs_SparesADirectoryARecoveryIsReading(t *testing.T) {
 	}
 	node.LockSnapshotDir()
 	node.PinSnapshotDir(dirs[0]) // the recovery's choice, the oldest
-	spare := node.PinnedSnapshotDirs()
+	spare := node.GCSparedSnapshotDirs()
 	node.UnlockSnapshotDir()
 
 	if err := GCSnapshotDirs(base, 4, 1, dirs[4], spare...); err != nil {
@@ -785,8 +908,48 @@ func TestGCSnapshotDirs_SparesADirectoryARecoveryIsReading(t *testing.T) {
 
 	node.LockSnapshotDir()
 	node.UnpinSnapshotDir(dirs[0])
-	if got := node.PinnedSnapshotDirs(); len(got) != 0 {
+	if got := node.GCSparedSnapshotDirs(); len(got) != 0 {
 		t.Fatalf("pins left after the unpin: %v", got)
+	}
+	node.UnlockSnapshotDir()
+}
+
+// TestGCSnapshotDirs_SparesADirectoryAReceiveHasClaimed: a receive publishes
+// its canonical directory and claims it until raft's verdict, during which it
+// is unrecorded. Unrecorded directories at higher indexes — receives a stop
+// abandoned, or a crash left — pushed it into GC's removal window, and raft
+// adopting it then recorded a snapshot whose directory was gone.
+func TestGCSnapshotDirs_SparesADirectoryAReceiveHasClaimed(t *testing.T) {
+	const shardID, replicaID = uint64(4), uint64(1)
+	base := t.TempDir()
+	node := NewNode(nil, nil, nil, config.Config{ShardID: shardID, ReplicaID: replicaID}, nil, base, nil)
+	var dirs []string
+	for i := uint64(1); i <= 5; i++ { // two more than the GC retains
+		dir := node.SnapshotSaveDir(i * 100)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		dirs = append(dirs, dir)
+	}
+	node.LockSnapshotDir()
+	node.ClaimSnapshotDir(100) // published, awaiting raft's verdict
+	spare := node.GCSparedSnapshotDirs()
+	node.UnlockSnapshotDir()
+
+	if err := GCSnapshotDirs(base, shardID, replicaID, "", spare...); err != nil {
+		t.Fatalf("GCSnapshotDirs: %v", err)
+	}
+	if _, err := os.Stat(dirs[0]); err != nil {
+		t.Fatalf("GC deleted the directory a receive had published and claimed: %v", err)
+	}
+	if _, err := os.Stat(dirs[1]); !os.IsNotExist(err) {
+		t.Fatalf("GC spared an unclaimed directory beyond retention (stat err %v)", err)
+	}
+
+	node.LockSnapshotDir()
+	node.ReleaseSnapshotDir(100)
+	if got := node.GCSparedSnapshotDirs(); len(got) != 0 {
+		t.Fatalf("claims left after the release: %v", got)
 	}
 	node.UnlockSnapshotDir()
 }

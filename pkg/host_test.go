@@ -250,6 +250,8 @@ func (m *mockLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, erro
 
 func (m *mockLogDB) RemoveNodeData(shardID, replicaID uint64) error { return nil }
 
+func (m *mockLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
+
 func (m *mockLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -5570,6 +5572,7 @@ func TestExportSnapshot_Success(t *testing.T) {
 	if writeErr := os.WriteFile(dataPath, snapshotData, 0o644); writeErr != nil {
 		t.Fatalf("WriteFile failed: %v", writeErr)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(dataPath), 1, 1)
 
 	// Save snapshot metadata pointing to the real file.
 	db.SaveSnapshot(1, 1, logdb.Snapshot{
@@ -5583,12 +5586,10 @@ func TestExportSnapshot_Success(t *testing.T) {
 		t.Fatalf("ExportSnapshot failed: %v", err)
 	}
 
-	// The export is now a self-describing artifact: header then plaintext
-	// data. Parse the header and verify the metadata and trailing data.
-	hdr, hdrErr := readSnapshotArtifactHeader(&buf)
-	if hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
+	// The export is now a self-describing artifact: header, plaintext data,
+	// then the trailer, which stripArtifactTrailer checks and removes. Parse
+	// the header and verify the metadata and the data.
+	hdr := stripArtifactTrailer(t, &buf)
 	if hdr.Index != 500 {
 		t.Errorf("artifact Index = %d, want 500", hdr.Index)
 	}
@@ -5602,7 +5603,8 @@ func TestExportSnapshot_Success(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // buildSnapshotArtifact constructs a valid exported-snapshot artifact (header
-// + plaintext data) for use as ImportSnapshot input in tests.
+// + plaintext data + trailer) for use as ImportSnapshot input in tests. The
+// trailer is produced by the same writer ExportSnapshot uses.
 func buildSnapshotArtifact(t *testing.T, index, term, onDiskIndex uint64, memb proto.Membership, data []byte) []byte {
 	t.Helper()
 	hdr, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{
@@ -5614,7 +5616,14 @@ func buildSnapshotArtifact(t *testing.T, index, term, onDiskIndex uint64, memb p
 	if err != nil {
 		t.Fatalf("marshalSnapshotArtifactHeader failed: %v", err)
 	}
-	return append(hdr, data...)
+	var buf bytes.Buffer
+	buf.Write(hdr)
+	pw := newArtifactPayloadWriter(&buf, hdr)
+	if _, err := pw.Write(data); err != nil {
+		t.Fatalf("write artifact payload: %v", err)
+	}
+	buf.Write(pw.trailer())
+	return buf.Bytes()
 }
 
 func TestImportSnapshot_ClosedHost(t *testing.T) {
@@ -5817,6 +5826,7 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	if writeErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), originalData, 0o644); writeErr != nil {
 		t.Fatalf("WriteFile failed: %v", writeErr)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1000, Filepath: snapDir})
 
@@ -5890,6 +5900,7 @@ func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	if writeErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), originalData, 0o644); writeErr != nil {
 		t.Fatalf("WriteFile failed: %v", writeErr)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 
 	// A non-trivial source snapshot: high Index/Term, multi-category
 	// membership, and a non-zero OnDiskIndex.
@@ -5988,6 +5999,7 @@ func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
 	if writeErr := os.WriteFile(filepath.Join(srcDir, "snapshot.dat"), []byte{0, 0, 0, 0}, 0o644); writeErr != nil {
 		t.Fatalf("WriteFile failed: %v", writeErr)
 	}
+	stampTestSnapshotMeta(t, srcDir, 5, 4)
 	srcMemb := logdb.Membership{
 		ConfigChangeID: 3,
 		Addresses:      map[uint64]string{1: "127.0.0.1:5000"},
@@ -6083,6 +6095,7 @@ func TestExportSnapshot_LargeData(t *testing.T) {
 	if writeErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), largeData, 0o644); writeErr != nil {
 		t.Fatalf("WriteFile failed: %v", writeErr)
 	}
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 777, Filepath: snapDir})
 
@@ -6093,9 +6106,7 @@ func TestExportSnapshot_LargeData(t *testing.T) {
 
 	// The artifact prepends a header; after parsing it, the remaining bytes
 	// must equal the original data length.
-	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
+	stripArtifactTrailer(t, &buf)
 	if buf.Len() != len(largeData) {
 		t.Errorf("exported data len = %d, want %d", buf.Len(), len(largeData))
 	}
@@ -12654,22 +12665,14 @@ func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 	// SyncPropose returning does not pin the applied mirror (see
 	// waitForApplied). The barrier's own index is not in the result either:
 	// the apply path hands the user SM nothing for an empty entry, so its
-	// result is the zero sm.Result. The commit marker is the bound instead —
-	// published by the step worker when it extracted the batch, before the
-	// apply worker ran it, so it names the barrier's index or higher now.
-	engNode := h.engine.GetNode(1)
-	if engNode == nil {
-		t.Fatal("engine node for shard 1 missing")
-	}
-	waitForApplied(t, h, 1, engNode.CommittedIndex())
-
-	// The barrier committed: the applied index moved even though the user
-	// state machine never saw the entry.
-	appliedAfter := appliedIndex()
-	if appliedAfter <= appliedBefore {
-		t.Fatalf("empty proposal did not commit: applied %d -> %d",
-			appliedBefore, appliedAfter)
-	}
+	// result is the zero sm.Result. Nor is the engine's commit marker a bound:
+	// it is published on the step worker's NEXT cycle, so it can still name
+	// the index before the barrier when SyncPropose returns (observed:
+	// committed 2 with the barrier at 3, failing about 1 run in 160). The
+	// barrier is the only entry proposed here, so the applied mirror moving
+	// past its prior value is the barrier committing even though the user
+	// state machine never saw it.
+	waitForApplied(t, h, 1, appliedBefore+1)
 
 	// A subsequent non-empty proposal still works normally.
 	if _, err := h.SyncPropose(ctx, 1, []byte("after-barrier")); err != nil {
@@ -16335,6 +16338,7 @@ func TestStartShard_SnapshotRecovery(t *testing.T) {
 	if err := os.WriteFile(dataPath, []byte{0, 0, 0, 0}, 0644); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
+	stampTestSnapshotMeta(t, snapDir, 5, 1)
 
 	// Save the snapshot record into the LogDB.
 	ss := logdb.Snapshot{
@@ -20605,6 +20609,7 @@ func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 	plaintext := []byte("the quick brown fox jumps over the lazy dog (encrypted at rest)")
 	dataPath := filepath.Join(snapDir, "snapshot.dat")
 	writeEncryptedSnapshotFileFor(t, barrier, dataPath, plaintext, 1, 1, 700)
+	stampTestSnapshotMeta(t, filepath.Dir(dataPath), 1, 1)
 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 700, Filepath: snapDir, Epoch: 1})
 
@@ -20613,9 +20618,7 @@ func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 		t.Fatalf("ExportSnapshot failed: %v", exportErr)
 	}
 	// Strip the artifact header; the data portion must be decrypted plaintext.
-	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
+	stripArtifactTrailer(t, &buf)
 	if !bytes.Equal(buf.Bytes(), plaintext) {
 		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
 	}
@@ -20727,6 +20730,7 @@ func exportShardSnapshotSetup(t *testing.T, db *mockLogDB, b Barrier, plaintext 
 		t.Fatalf("MkdirAll failed: %v", mkErr)
 	}
 	writeEncryptedSnapshotFileFor(t, b, filepath.Join(snapDir, "snapshot.dat"), plaintext, 1, 1, 900)
+	stampTestSnapshotMeta(t, snapDir, 900, 1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: 1})
 }
 
@@ -20765,9 +20769,7 @@ func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
 	if exportErr := h.ExportSnapshot(context.Background(), 1, &buf); exportErr != nil {
 		t.Fatalf("ExportSnapshot failed: %v", exportErr)
 	}
-	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
+	stripArtifactTrailer(t, &buf)
 	if !bytes.Equal(buf.Bytes(), plaintext) {
 		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
 	}
@@ -20810,9 +20812,7 @@ func TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier(t *testing.T) {
 	if exportErr := h.ExportSnapshot(context.Background(), 1, &buf); exportErr != nil {
 		t.Fatalf("ExportSnapshot failed: %v", exportErr)
 	}
-	if _, hdrErr := readSnapshotArtifactHeader(&buf); hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
+	stripArtifactTrailer(t, &buf)
 	if !bytes.Equal(buf.Bytes(), plaintext) {
 		t.Errorf("exported data = %q, want decrypted plaintext %q", buf.Bytes(), plaintext)
 	}
@@ -20924,6 +20924,7 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 	}
 	originalData := []byte("encrypted round-trip snapshot payload 0987654321")
 	writeEncryptedSnapshotFileFor(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData, 1, 1, 1500)
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1500, Filepath: snapDir, Epoch: 1})
 
 	// Export must yield an artifact whose data portion is plaintext. Decode
@@ -20933,13 +20934,7 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 		t.Fatalf("ExportSnapshot failed: %v", exportErr)
 	}
 	peek := bytes.NewReader(exported.Bytes())
-	if _, hdrErr := readSnapshotArtifactHeader(peek); hdrErr != nil {
-		t.Fatalf("readSnapshotArtifactHeader failed: %v", hdrErr)
-	}
-	remaining := make([]byte, peek.Len())
-	if _, readErr := io.ReadFull(peek, remaining); readErr != nil {
-		t.Fatalf("reading artifact data failed: %v", readErr)
-	}
+	_, remaining := readArtifactPayload(t, peek)
 	if !bytes.Equal(remaining, originalData) {
 		t.Fatalf("exported data = %q, want plaintext %q", remaining, originalData)
 	}
@@ -20960,8 +20955,8 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 	}
 
 	// The host has a configured, unsealed barrier, so ImportSnapshot must
-	// re-encrypt the plaintext artifact under it before it lands on disk
-	// (reencryptReceivedSnapshot) — the same policy saveSnapshot enforces for
+	// encrypt the plaintext artifact under it as it lands on disk
+	// (writeImportedSnapshotData) — the same policy saveSnapshot enforces for
 	// a locally-taken snapshot. Epoch=0 would tell recovery to skip
 	// decryption, which is only correct for a plaintext deployment.
 	db.mu.Lock()
@@ -20993,7 +20988,7 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 // refuses to write an imported artifact when the host's barrier is
 // configured but SEALED, rather than durably persisting it as plaintext.
 // This is the ImportSnapshot counterpart of the already-fixed saveSnapshot
-// and HandleSnapshot (reencryptReceivedSnapshot) fail-closed behavior: a
+// and HandleSnapshot fail-closed behavior: a
 // sealed barrier means encryption is temporarily unavailable, not that the
 // shard is a plaintext deployment.
 func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
@@ -21018,6 +21013,7 @@ func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 	}
 	originalData := []byte("must never land on disk while the barrier is sealed")
 	writeEncryptedSnapshotFileFor(t, barrier, filepath.Join(snapDir, "snapshot.dat"), originalData, 1, 1, 1600)
+	stampTestSnapshotMeta(t, filepath.Dir(filepath.Join(snapDir, "snapshot.dat")), 1, 1)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 1600, Filepath: snapDir, Epoch: 1})
 
 	var exported bytes.Buffer
@@ -21418,6 +21414,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 	if wErr := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), envelope, 0o644); wErr != nil {
 		t.Fatalf("WriteFile failed: %v", wErr)
 	}
+	stampTestSnapshotMeta(t, snapDir, 80, 3)
 	db.SaveSnapshot(1, 1, logdb.Snapshot{
 		Index:       80,
 		Term:        3,

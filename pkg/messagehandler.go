@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -52,6 +53,11 @@ type engineDeliverer interface {
 type hostMessageHandler struct {
 	engine engineDeliverer
 	host   *Host
+
+	// dropLogStamp and dropsSinceLog rate-limit the per-message
+	// authorization warnings (see warnDrop).
+	dropLogStamp  atomic.Int64
+	dropsSinceLog atomic.Int64
 
 	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
 	// same (shard, replica, index). The snapshot directory is deterministic
@@ -219,7 +225,7 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// and is then dropped below: there is nothing to bind the sender to.
 	node := h.engine.GetNode(msg.ShardID)
 	if node != nil && node.IsRemoved(msg.From) {
-		slog.Warn("rejected message from removed replica",
+		h.warnDrop("rejected message from removed replica",
 			"shard", msg.ShardID,
 			"from", msg.From,
 			"type", proto.MessageTypeName(msg.Type),
@@ -228,7 +234,7 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 		return false
 	}
 	if node != nil && node.IsRemovedIdentity(peer.Identity) {
-		slog.Warn("rejected message from removed replica identity",
+		h.warnDrop("rejected message from removed replica identity",
 			"shard", msg.ShardID,
 			"claimed_from", msg.From,
 			"identity", peer.Identity,
@@ -246,7 +252,7 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// earlier. (An uncommitted removal is not consulted — see
 	// raft.Peer.PendingRemoval.)
 	if node != nil && node.PendingRemoval(msg.From, peer.Identity) {
-		slog.Warn("rejected message from a replica a pending config change removes",
+		h.warnDrop("rejected message from a replica a pending config change removes",
 			"shard", msg.ShardID,
 			"claimed_from", msg.From,
 			"identity", peer.Identity,
@@ -264,7 +270,7 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// as if it were addressed here. To == 0 is allowed: broadcast/local control
 	// messages leave it unset.
 	if node != nil && msg.To != 0 && msg.To != node.ReplicaID() {
-		slog.Warn("rejected misrouted message",
+		h.warnDrop("rejected misrouted message",
 			"shard", msg.ShardID,
 			"from", msg.From,
 			"to", msg.To,
@@ -358,7 +364,7 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	// to tell a rolling membership change from an attack.
 	committed, reason := h.senderBinding(node, msg.ShardID, msg.From, peer)
 	if reason != "" {
-		slog.Warn("rejected message: "+unauthorizedDropDescriptions[reason],
+		h.warnDrop("rejected message: "+unauthorizedDropDescriptions[reason],
 			"shard", msg.ShardID,
 			"from", msg.From,
 			"committed", committed,
@@ -504,6 +510,40 @@ func (h *hostMessageHandler) senderBinding(node *engine.Node, shardID, from uint
 	return "", dropUnknownMember
 }
 
+// replicaIdentity implements transport.Config.ReplicaIdentity: the node
+// identity this host's view of the shard binds to replicaID — the one
+// senderBinding would accept FROM it — so outbound traffic is held to the same
+// identity an inbound sender is. "" when the shard is not loaded here or
+// nothing binds the replica, which the transport treats as no peer at all.
+func (h *hostMessageHandler) replicaIdentity(shardID, replicaID uint64) string {
+	if h.host == nil || h.engine == nil {
+		return ""
+	}
+	node := h.engine.GetNode(shardID)
+	if node == nil {
+		return ""
+	}
+	return h.boundIdentity(node, shardID, replicaID)
+}
+
+// boundIdentity returns the node identity senderBinding binds replicaID of
+// shardID to, from the same sources in the same order: the committed
+// membership when it names the replica (whose missing identity binds
+// nothing), else a pending config change in the shard's own log, else the
+// operator anchor. "" when none binds it.
+func (h *hostMessageHandler) boundIdentity(node *engine.Node, shardID, replicaID uint64) string {
+	if binding, ok := node.MemberBinding(replicaID); ok && binding.Address != "" {
+		return binding.Identity
+	}
+	if identity, ok := node.PendingMemberIdentity(replicaID); ok {
+		return identity
+	}
+	if anchor, ok := h.host.anchorIdentity(shardID, replicaID); ok {
+		return anchor
+	}
+	return ""
+}
+
 // registeredAddress returns the address the routing registry currently holds
 // for (shardID, replicaID), or "" when there is none or no registry is wired.
 //
@@ -561,6 +601,25 @@ var unauthorizedDropDescriptions = map[string]string{
 	dropUnknownMember:    "no configuration this replica holds names the sender (not committed, not pending in its own log, not in Config.MemberIdentities); if this persists for a leader, this replica missed the config change that added it — restart it with a Config.MemberIdentities that names the leader",
 	dropIdentityMismatch: "the connection's authenticated node identity is not the one committed membership assigns this replica",
 	dropMissingIdentity:  "committed membership records no node identity for this replica; a member is authorized by its identity and by nothing else",
+}
+
+// dropLogInterval bounds how often a per-message authorization drop is
+// logged. The drop counters record every one.
+const dropLogInterval = 10 * time.Second
+
+// warnDrop logs a per-message authorization drop, rate-limited. A batch
+// carries up to proto.MaxMessagesPerBatch messages, so one frame from a peer
+// the shard does not admit would otherwise write that many lines — each a
+// synchronous write that serialises every other log call in the process (see
+// transport.LogSampled). The sampled line reports how many drops it stands
+// for; countUnauthorizedDrop still counts each one.
+func (h *hostMessageHandler) warnDrop(msg string, args ...any) {
+	n := h.dropsSinceLog.Add(1)
+	if !transport.LogSampled(&h.dropLogStamp, dropLogInterval) {
+		return
+	}
+	h.dropsSinceLog.Add(-n)
+	slog.Warn(msg, append(args, "drops_since_last_log", n)...)
 }
 
 // countUnauthorizedDrop records a message this handler refused, when metrics
@@ -678,10 +737,10 @@ func routingOverwriteAuthorized(node *engine.Node, replicaID uint64, peer transp
 // worst an authenticated peer achieves by claiming another replicaID's From here
 // is to re-point that member's ROUTING at itself — a black-hole, corrected by the
 // next committed config change or by the victim's own later traffic, and never a
-// path to having a forged response tallied. Note the recovered-at-new-address
-// case this overwrite serves is now only half-served: the peer becomes reachable
-// again, but its own quorum-bearing responses stay uncounted until a config
-// change commits the new address.
+// path to having a forged response tallied. A member that recovers at a new
+// address is served in full: its responses are counted as soon as it is
+// reachable, because a sender is bound by the node identity its certificate
+// carries, not by the address membership records.
 //
 // Callers reach here only for a sender that is a member of a loaded shard
 // (IsMember) or for a shard this replica is still joining, and the transport has
@@ -745,6 +804,168 @@ func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, regis
 	h.host.registry.Register(shardID, replicaID, address)
 }
 
+// admitSnapshotSender applies every check a snapshot's sender must pass before
+// anything of the transfer is kept, and returns the shard's loaded node. It
+// runs twice for every transfer: from the stream header, through
+// AuthorizeSnapshot, before the transport takes any receive slot or memory;
+// and from the chunks — which the transport has bound to that header — in
+// HandleSnapshot, before anything is persisted.
+func (h *hostMessageHandler) admitSnapshotSender(shardID, replicaID, fromReplicaID, snapshotIndex uint64, peer transport.PeerAuth) (*engine.Node, error) {
+	// Per-shard authorization, fail closed. The header and chunk fields
+	// (including From) travel in-band and are NOT bound to the sender's mTLS
+	// identity by the transport framing, so three independent checks are
+	// required:
+	//
+	//  1. The target shard must be loaded locally. Without a loaded node
+	//     there is no membership to authorize against; persisting the
+	//     snapshot anyway would let any authenticated peer poison the
+	//     LogDB state consumed by a later StartShard.
+	//  2. The snapshot must be addressed to THIS replica.
+	//  3. The claimed From must be bound to the verified TLS certificate of
+	//     the connection the snapshot arrived on, through the node identity
+	//     the shard's COMMITTED MEMBERSHIP assigns it — the identical predicate
+	//     the message path applies, senderBinding.
+	//
+	// Gate 3 is the whole reason this is not a routing-registry lookup. A
+	// snapshot REPLACES this replica's membership (raft.Peer.Handle adopts
+	// Snapshot.Membership, and deliverSnapshotControl injects it OriginLocal so
+	// the wire-origin refusal does not apply), which makes the snapshot channel
+	// the one inbound path that can rewrite the authorization source itself.
+	// Resolving the sender from the mutable registry made that a two-step
+	// escalation: a peer sent an exempt message claiming the leader's From,
+	// address learning re-pointed registry[shard, leader] at the peer, and the
+	// snapshot that followed authorized against the entry the peer had just
+	// written — replacing the state machine AND every committed address the
+	// message-path gate reads. Committed membership is not writable that way.
+
+	// The shard the drop is counted against. It stays 0 — unattributed —
+	// until a loaded shard is found: before that the ID is whatever the
+	// sender wrote, and counting it as a label would let any certificate
+	// holder mint unbounded metric series by cycling shard IDs.
+	var countedShard uint64
+	reject := func(reason string) (*engine.Node, error) {
+		return nil, h.refuseUnauthorizedSnapshot(countedShard, shardID, fromReplicaID, snapshotIndex, reason)
+	}
+	if h.engine == nil {
+		return reject("no engine")
+	}
+	node := h.engine.GetNode(shardID)
+	if node == nil {
+		// Counted as an authorization failure even though a leader can hit it
+		// in the gap between StopShard and StartShard: with no node loaded
+		// there is no committed membership to authenticate the sender
+		// against, so an unauthenticated probe and a legitimate retransmit
+		// are indistinguishable here, and the gate fails closed.
+		return reject("shard not loaded")
+	}
+	countedShard = shardID
+	// Destination check, mirroring the msg.To check in HandleMessage. The
+	// target ReplicaID travels in-band and is otherwise trusted verbatim,
+	// yet everything downstream keys off it: a foreign value splits the
+	// snapshotRecvKey so the inflight serialization guard is bypassed while
+	// snapshotDir still uses the LOCAL replica ID (two concurrent receives
+	// O_TRUNC and interleave into the same snapshot.dat), defeats the
+	// LogDB dedup lookup, writes a durable LogDB record under a replica ID
+	// this host does not own, and reaches raft through DeliverMessage,
+	// which performs no destination check of its own.
+	if replicaID != node.ReplicaID() {
+		return reject("snapshot addressed to a different replica")
+	}
+	// Deny-list, not an allow-list: see raft.Peer.IsRemoved. A replica that has
+	// not yet applied the config change adding the sender must still be able to
+	// receive the snapshot that brings it up to date.
+	//
+	// Asked of both facts, exactly as authorizeInbound asks it: the CLAIMED
+	// sender ID, and the AUTHENTICATED identity that a removed replica cannot
+	// change by renaming itself. It matters more here than anywhere else — a
+	// snapshot REPLACES this replica's state machine and its committed
+	// membership, so a removed replica admitted through the claimed-ID gap would
+	// be rewriting the very configuration that records its removal.
+	if node.IsRemoved(fromReplicaID) {
+		return reject("sender removed from the shard")
+	}
+	if node.IsRemovedIdentity(peer.Identity) {
+		return reject("the connection's authenticated node identity is one the shard removed")
+	}
+	if node.PendingRemoval(fromReplicaID, peer.Identity) {
+		return reject("a committed config change this replica has not yet applied removes the sender")
+	}
+	if h.host.registry == nil {
+		return reject("no registry to record the sender address")
+	}
+	if _, reason := h.senderBinding(node, shardID, fromReplicaID, peer); reason != "" {
+		return reject(reason)
+	}
+	// The two refusals below are ordinary shard states, not authorization
+	// failures: a leader retransmits to a failed or restarting replica as a
+	// matter of course, so they are reported as such rather than through
+	// reject's security log, metric and error. They come AFTER every
+	// authorization gate above, so an unauthorized sender is still counted as
+	// one whatever state the shard is in, and BEFORE anything is staged.
+	notAccepting := func(cause error) (*engine.Node, error) {
+		slog.Debug("snapshot refused: shard is not accepting installs",
+			"shard", shardID,
+			"from", fromReplicaID,
+			"index", snapshotIndex,
+			"error", cause,
+		)
+		return nil, &SnapshotReceiveError{ShardID: shardID, ReplicaID: replicaID, Op: "admit", Err: cause}
+	}
+	// A failed shard steps nothing more, so its install would never get a
+	// verdict; refuse before staging anything rather than hold a transport
+	// receive slot and its memory budget for nothing.
+	if node.IsFailed() {
+		return notAccepting(ErrShardFailed)
+	}
+	// A stopped incarnation likewise adopts nothing more — and it may still
+	// have an adopted-but-unrecorded install of its own in the commit
+	// pipeline, whose retained directory this receive's publish step would
+	// reclaim as an orphan moments before the record naming it lands. The
+	// receive waits for the incarnation that follows: UnloadNode does not
+	// return until the stopped one can no longer write LogDB.
+	if node.IsStopped() {
+		return notAccepting(ErrShardNotReady)
+	}
+	return node, nil
+}
+
+// refuseUnauthorizedSnapshot logs and counts a snapshot refused for failing
+// authorization, and returns the error the transfer is refused with.
+// countedShard is the metric label: 0 until the shard is known to be loaded.
+func (h *hostMessageHandler) refuseUnauthorizedSnapshot(countedShard, shardID, fromReplicaID, snapshotIndex uint64, reason string) error {
+	slog.Warn("rejected unauthorized snapshot",
+		"shard", shardID,
+		"from", fromReplicaID,
+		"index", snapshotIndex,
+		"reason", reason,
+	)
+	if h.host.metrics != nil {
+		h.host.metrics.IncUnauthorizedSnapshotDropped(countedShard, fromReplicaID)
+	}
+	return &UnauthorizedMessageError{
+		ShardID: shardID,
+		From:    fromReplicaID,
+		MsgType: proto.InstallSnapshot,
+	}
+}
+
+// AuthorizeSnapshot implements transport.MessageHandler: a snapshot's sender
+// is admitted from the stream header, before the transport takes any receive
+// slot or memory for the transfer.
+func (h *hostMessageHandler) AuthorizeSnapshot(shardID, replicaID, from, index uint64, peer transport.PeerAuth) error {
+	if h.host == nil {
+		return nil // as HandleSnapshot: a handler not wired to a host persists nothing
+	}
+	_, err := h.admitSnapshotSender(shardID, replicaID, from, index, peer)
+	var notAccepting *SnapshotReceiveError
+	if errors.As(err, &notAccepting) {
+		// A failed or stopping shard: an ordinary state, which the transport
+		// reports quietly and apart from unauthorized transfers.
+		return fmt.Errorf("%w: %w", transport.ErrSnapshotNotAccepting, err)
+	}
+	return err
+}
+
 // HandleSnapshot processes received snapshot chunks from the transport
 // layer. It reassembles the snapshot data, writes it to disk, saves
 // metadata to LogDB, delivers an InstallSnapshot to the local raft
@@ -788,106 +1009,12 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	snapshotIndex := first.Index
 	snapshotTerm := first.Term
 
-	// Per-shard authorization, fail closed. All chunk fields (including
-	// From) travel in-band and are NOT bound to the sender's mTLS identity
-	// by the transport framing, so three independent checks are required
-	// before anything is buffered or persisted:
-	//
-	//  1. The target shard must be loaded locally. Without a loaded node
-	//     there is no membership to authorize against; persisting the
-	//     snapshot anyway would let any authenticated peer poison the
-	//     LogDB state consumed by a later StartShard.
-	//  2. The snapshot must be addressed to THIS replica.
-	//  3. The claimed From must be bound to the verified TLS certificate of
-	//     the connection the snapshot arrived on, through the address the
-	//     shard's COMMITTED MEMBERSHIP assigns it — the identical predicate
-	//     the message path applies, committedSenderAddress.
-	//
-	// Gate 3 is the whole reason this is not a routing-registry lookup. A
-	// snapshot REPLACES this replica's membership (raft.Peer.Handle adopts
-	// Snapshot.Membership, and deliverSnapshotControl injects it OriginLocal so
-	// the wire-origin refusal does not apply), which makes the snapshot channel
-	// the one inbound path that can rewrite the authorization source itself.
-	// Resolving the sender from the mutable registry made that a two-step
-	// escalation: a peer sent an exempt message claiming the leader's From,
-	// address learning re-pointed registry[shard, leader] at the peer, and the
-	// snapshot that followed authorized against the entry the peer had just
-	// written — replacing the state machine AND every committed address the
-	// message-path gate reads. Committed membership is not writable that way.
-	reject := func(reason string) error {
-		slog.Warn("rejected unauthorized snapshot",
-			"shard", shardID,
-			"from", fromReplicaID,
-			"index", snapshotIndex,
-			"reason", reason,
-		)
-		if h.host.metrics != nil {
-			h.host.metrics.IncUnauthorizedSnapshotDropped(shardID, fromReplicaID)
-		}
-		return &UnauthorizedMessageError{
-			ShardID: shardID,
-			From:    fromReplicaID,
-			MsgType: proto.InstallSnapshot,
-		}
-	}
-	if h.engine == nil {
-		return reject("no engine")
-	}
-	node := h.engine.GetNode(shardID)
-	if node == nil {
-		return reject("shard not loaded")
-	}
-	// A failed shard steps nothing more, so its install would never get a
-	// verdict; refuse before staging anything rather than hold a transport
-	// receive slot and its memory budget for nothing.
-	if node.IsFailed() {
-		return reject("shard failed")
-	}
-	// A stopped incarnation likewise adopts nothing more — and it may still
-	// have an adopted-but-unrecorded install of its own in the commit
-	// pipeline, whose retained directory this receive's publish step would
-	// reclaim as an orphan moments before the record naming it lands. The
-	// receive waits for the incarnation that follows: UnloadNode does not
-	// return until the stopped one can no longer write LogDB.
-	if node.IsStopped() {
-		return reject("shard stopping")
-	}
-	// Destination check, mirroring the msg.To check in HandleMessage. The
-	// target ReplicaID travels in-band and is otherwise trusted verbatim,
-	// yet everything downstream keys off it: a foreign value splits the
-	// snapshotRecvKey so the inflight serialization guard is bypassed while
-	// snapshotDir still uses the LOCAL replica ID (two concurrent receives
-	// O_TRUNC and interleave into the same snapshot.dat), defeats the
-	// LogDB dedup lookup, writes a durable LogDB record under a replica ID
-	// this host does not own, and reaches raft through DeliverMessage,
-	// which performs no destination check of its own.
-	if replicaID != node.ReplicaID() {
-		return reject("snapshot addressed to a different replica")
-	}
-	// Deny-list, not an allow-list: see raft.Peer.IsRemoved. A replica that has
-	// not yet applied the config change adding the sender must still be able to
-	// receive the snapshot that brings it up to date.
-	//
-	// Asked of both facts, exactly as authorizeInbound asks it: the CLAIMED
-	// sender ID, and the AUTHENTICATED identity that a removed replica cannot
-	// change by renaming itself. It matters more here than anywhere else — a
-	// snapshot REPLACES this replica's state machine and its committed
-	// membership, so a removed replica admitted through the claimed-ID gap would
-	// be rewriting the very configuration that records its removal.
-	if node.IsRemoved(fromReplicaID) {
-		return reject("sender removed from the shard")
-	}
-	if node.IsRemovedIdentity(peer.Identity) {
-		return reject("the connection's authenticated node identity is one the shard removed")
-	}
-	if node.PendingRemoval(fromReplicaID, peer.Identity) {
-		return reject("a committed config change this replica has not yet applied removes the sender")
-	}
-	if h.host.registry == nil {
-		return reject("no registry to record the sender address")
-	}
-	if _, reason := h.senderBinding(node, shardID, fromReplicaID, peer); reason != "" {
-		return reject(reason)
+	// Per-shard authorization, fail closed — the gates AuthorizeSnapshot
+	// applied from the stream header before the transport took any receive
+	// resource, re-checked from the chunks before anything is persisted.
+	node, err := h.admitSnapshotSender(shardID, replicaID, fromReplicaID, snapshotIndex, peer)
+	if err != nil {
+		return err
 	}
 	// The snapshot REPLACES this replica's committed membership, and for a
 	// joiner it is the only one it will ever hold. A binding in it for THIS
@@ -901,7 +1028,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// re-add the replica with the right identity.
 	if own := h.host.NodeIdentity(); own != "" {
 		if committed := first.Membership.Identities[replicaID]; committed != "" && committed != own {
-			return reject(fmt.Sprintf("the snapshot's membership binds this replica to identity %s "+
+			return h.refuseUnauthorizedSnapshot(shardID, shardID, fromReplicaID, snapshotIndex, fmt.Sprintf("the snapshot's membership binds this replica to identity %s "+
 				"but this host presents %s; every peer would refuse it — remove and re-add the "+
 				"replica with the identity it presents", committed, own))
 		}
@@ -1042,8 +1169,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	//     tenant alone would be downgraded, invisibly.
 	//
 	// A shard with NO barrier configured at all is unaffected: it resolves to
-	// (nil, nil) and stays plaintext as configured. reencryptReceivedSnapshot
-	// re-checks the seal below and covers one that lands mid-receive.
+	// (nil, nil) and stays plaintext as configured. The streamed encryption
+	// below re-checks the seal and covers one that lands mid-receive.
 	recvBarrier, barrierErr := h.host.snapshotBarrierForShard(shardID)
 	if barrierErr != nil {
 		return &SnapshotReceiveError{
@@ -1494,8 +1621,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			// the file the send path will read.
 			FileSize:   onDiskSize,
 			Membership: first.Membership,
-			// Deliver the RECEIVER's at-rest epoch (from reencryptReceivedSnapshot
-			// above, persisted to LogDB), NOT the wire epoch (first.Epoch is 0 —
+			// Deliver the RECEIVER's at-rest epoch (from the encryption above,
+			// persisted to LogDB), NOT the wire epoch (first.Epoch is 0 —
 			// the sender streamed plaintext). Peer.Commit applies this snapshot to
 			// the LogReader; using first.Epoch would make the in-memory raft layer
 			// advertise the encrypted on-disk snapshot as plaintext until restart,
@@ -1739,7 +1866,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		// snapshot is recorded and the transfer succeeded. Failing to reclaim disk
 		// costs space, and the next successful receive or local save runs the GC
 		// again.
-		h.host.gcShardSnapshots(node.SnapshotDir(), shardID, replicaID, node.PinnedSnapshotDirs()...)
+		h.host.gcShardSnapshots(node.SnapshotDir(), shardID, replicaID, node.GCSparedSnapshotDirs()...)
 		// Inside the lease with the record: a join window is keyed by shard ID,
 		// and once this incarnation stops, the window may already belong to
 		// the next one.
@@ -2025,28 +2152,37 @@ func (r *snapshotChunkReader) Read(p []byte) (int, error) {
 // recovery and the DEK purge floor read them back as fact.
 func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, shardID, replicaID, epoch uint64,
 	compression config.CompressionType) error {
-	metaPath := filepath.Join(dir, "snapshot.meta")
-	f, err := fsys.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-
 	// Stamp the integrity fields over the data file AS STORED. Both callers of
 	// this function — the streamed receive path and Host.ImportSnapshot — have
 	// already written and fsynced snapshot.dat by the time they get here, so
 	// the bytes hashed are the bytes every later consumer reads.
 	//
-	// A hash failure is not fatal: the artifact is already durable, and
-	// refusing to record it would turn a transient read fault into a lost
-	// snapshot. The record is then written without the fields, which recovers
-	// without a check rather than failing one.
-	var dataLen, dataHash uint64
-	if sum, size, hashErr := engine.HashSnapshotFile(filepath.Join(dir, "snapshot.dat")); hashErr == nil {
-		dataHash, dataLen = sum, size
-	} else {
-		slog.Warn("snapshot: could not hash the received data file; recording "+
-			"metadata without an integrity check",
-			"dir", dir, "shard_id", shardID, "replica_id", replicaID, "error", hashErr)
+	// A hash failure FAILS the write, before the record is created. The
+	// encoder always emits the integrity fields, so there is no record
+	// "without" them: a zero hash would be stamped as fact, and every later
+	// recovery would refuse the artifact after it had been recorded in LogDB
+	// and the log below it compacted. Both callers write into an unpublished
+	// staging directory and discard it on error, so the failure leaves no
+	// recorded artifact; the leader re-sends, or the operator re-imports.
+	//
+	// The artifact is read through fsys, like every other step here, so the
+	// hash is taken over the file this path actually wrote.
+	dataFile, err := fsys.Open(filepath.Join(dir, "snapshot.dat"))
+	if err != nil {
+		return err
+	}
+	dataHash, dataLen, hashErr := engine.HashSnapshotReader(dataFile)
+	// A read-only handle's Close error cannot indicate lost data, so it does
+	// not override the hash's own outcome.
+	_ = dataFile.Close()
+	if hashErr != nil {
+		return hashErr
+	}
+
+	metaPath := filepath.Join(dir, "snapshot.meta")
+	f, err := fsys.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
 	}
 
 	buf := engine.MarshalSnapshotMeta(engine.SnapshotMeta{

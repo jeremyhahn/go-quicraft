@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -175,6 +176,12 @@ type QUICTransport struct {
 
 	connMu sync.RWMutex
 	conns  map[string]*quic.Conn
+	// connPeer holds, for each pooled outbound connection, the node identity
+	// its peer presented, so the identity pin (getConnection, connServes) does
+	// not re-derive it — a TLS state copy and a hash — on every send. Maintained
+	// under connMu with conns: set where a connection is pooled, deleted
+	// wherever one is removed.
+	connPeer map[*quic.Conn]string
 
 	// connEpoch records, for each cached outbound in conns, the peer boot
 	// epoch this node believed the target to be running when that outbound
@@ -415,6 +422,13 @@ type QUICTransport struct {
 	// peer-rejection warning, per transport instance (see
 	// lastProtocolViolationLog for why it is not package-global).
 	lastPeerRejectionLog atomic.Int64
+
+	// lastIdentityMismatchLog rate-limits dropIdentityMismatch's warning.
+	lastIdentityMismatchLog atomic.Int64
+
+	// dialRefusals holds, per target, the last dial refused by the identity
+	// pin (dialRefusal), so it is not re-dialed within dialRefusalCooldown.
+	dialRefusals sync.Map
 }
 
 // srcAddrAuthSlots is the number of distinct claimed SourceAddresses cached
@@ -571,6 +585,7 @@ func NewQUICTransport(
 		tlsPair:         pair,
 		quicCfg:         qcfg,
 		conns:           make(map[string]*quic.Conn),
+		connPeer:        make(map[*quic.Conn]string),
 		connEpoch:       make(map[string]uint64),
 		bootEpoch:       newBootEpoch(),
 		peerEpoch:       make(map[string]*peerIncarnation),
@@ -810,6 +825,7 @@ func (t *QUICTransport) stop() {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
 			slog.Debug("QUIC connection close failed", "addr", addr, "error", err)
 		}
+		delete(t.connPeer, conn)
 		delete(t.conns, addr)
 		delete(t.connEpoch, addr)
 	}
@@ -1321,12 +1337,81 @@ func (t *QUICTransport) sendQueueWorkerOnce(target string, sq *sendQueue) (panic
 // sendToTarget dispatches a batch of messages to a single target, routing
 // heartbeat-only batches through the fast path. Extracted from Send() to
 // share logic between the single-target and parallel multi-target paths.
+//
+// Every message is pinned to its destination: it is written only over a
+// connection whose peer presents the identity membership binds to the replica
+// it is for (Config.ReplicaIdentity). Connections are keyed by address and
+// shared by every replica routed there, and address learning lets a member of
+// any shard move its own route onto another replica's address, so the batch
+// is split by destination identity — nearly always a single group, since every
+// replica a node hosts presents that node's identity — and each group carries
+// its identity down to the connection it takes (getStream, getConnection),
+// through any re-dial or retry on the way.
 func (t *QUICTransport) sendToTarget(target string, batch []proto.Message) {
-	if t.hbPrefix != nil && isHeartbeatBatch(batch) {
-		t.sendHeartbeatBatch(target, batch)
-	} else {
-		t.sendBatch(target, batch)
+	if t.cfg.ReplicaIdentity == nil || len(batch) == 0 {
+		t.sendGroup(target, "", batch)
+		return
 	}
+	want := t.cfg.ReplicaIdentity(batch[0].ShardID, batch[0].To)
+	for i := 1; i < len(batch); i++ {
+		if t.cfg.ReplicaIdentity(batch[i].ShardID, batch[i].To) != want {
+			t.sendMixedGroups(target, batch)
+			return
+		}
+	}
+	if want == "" {
+		t.dropUnbound(target, batch)
+		return
+	}
+	t.sendGroup(target, want, batch)
+}
+
+// sendMixedGroups sends a batch whose messages are for replicas bound to
+// different identities, one group per identity, in the order each identity
+// first appears; order within a group is preserved.
+func (t *QUICTransport) sendMixedGroups(target string, batch []proto.Message) {
+	var order []string
+	groups := make(map[string][]proto.Message)
+	for i := range batch {
+		want := t.cfg.ReplicaIdentity(batch[i].ShardID, batch[i].To)
+		if _, seen := groups[want]; !seen {
+			order = append(order, want)
+		}
+		groups[want] = append(groups[want], batch[i])
+	}
+	for _, want := range order {
+		if want == "" {
+			t.dropUnbound(target, groups[want])
+			continue
+		}
+		t.sendGroup(target, want, groups[want])
+	}
+}
+
+// dropUnbound drops messages for replicas no identity is bound to: with
+// pinning enabled there is no peer they may be written to.
+func (t *QUICTransport) dropUnbound(target string, msgs []proto.Message) {
+	for i := range msgs {
+		t.dropIdentityMismatch(target, &msgs[i])
+	}
+}
+
+// sendGroup sends messages that must all reach the peer presenting want.
+func (t *QUICTransport) sendGroup(target, want string, batch []proto.Message) {
+	if t.hbPrefix != nil && isHeartbeatBatch(batch) {
+		t.sendHeartbeatBatch(target, want, batch)
+	} else {
+		t.sendBatch(target, want, batch)
+	}
+}
+
+// streamDropReason is the drop label for a batch whose stream could not be
+// had: identity_mismatch when the peer at target is not its destination.
+func streamDropReason(err error) string {
+	if _, mismatch := errors.AsType[*DialIdentityError](err); mismatch {
+		return dropReasonIdentityMismatch
+	}
+	return dropReasonStreamUnavailable
 }
 
 // incBatchDropped records one IncMessagesDropped sample per message in a
@@ -1355,7 +1440,10 @@ func (t *QUICTransport) incBatchDropped(msgs []proto.Message, reason string) {
 //     an I/O failure; the batch is then retried unchanged and the loop is
 //     unbounded. Dropping it also stops one unsendable message from taking the
 //     rest of its batch (heartbeats included) down with it.
-func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) {
+//
+// want is the identity every message's destination is bound to (see
+// sendToTarget); each frame is written only over a connection serving it.
+func (t *QUICTransport) sendBatch(target, want string, msgs []proto.Message) {
 	headerSize := batchHeaderSize(t.localAddr())
 	for len(msgs) > 0 {
 		n, payload, err := sendableGroup(headerSize, msgs)
@@ -1364,7 +1452,7 @@ func (t *QUICTransport) sendBatch(target string, msgs []proto.Message) {
 			msgs = msgs[1:]
 			continue
 		}
-		t.sendFrame(target, msgs[:n], payload)
+		t.sendFrame(target, want, msgs[:n], payload)
 		msgs = msgs[n:]
 	}
 }
@@ -1433,7 +1521,7 @@ func (t *QUICTransport) PeerFrameRejections() uint64 {
 // sendBatch already measured the group at, which it has verified fits a frame;
 // a stale value can only under-size the buffer, which MarshalTo reports as
 // ErrBufferTooSmall on the drop path below. Errors are logged and dropped.
-func (t *QUICTransport) sendFrame(target string, msgs []proto.Message, payloadSize int) { //nolint:gocognit // metrics instrumentation adds branches
+func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, payloadSize int) { //nolint:gocognit // metrics instrumentation adds branches
 	debugOn := debugEnabled()
 	var sendStart time.Time
 	if t.metrics != nil || debugOn {
@@ -1563,7 +1651,7 @@ func (t *QUICTransport) sendFrame(target string, msgs []proto.Message, payloadSi
 
 	frameSize := totalSize
 
-	stream, err := t.getStream(target, shardID, isHeartbeat)
+	stream, err := t.getStream(target, shardID, isHeartbeat, want)
 	if err != nil {
 		// Debug level: repeats for every batch while a peer is unreachable;
 		// Raft retransmits once the peer returns.
@@ -1574,7 +1662,7 @@ func (t *QUICTransport) sendFrame(target string, msgs []proto.Message, payloadSi
 				"error", err,
 			)
 		}
-		t.incBatchDropped(msgs, dropReasonStreamUnavailable)
+		t.incBatchDropped(msgs, streamDropReason(err))
 		t.putBuf(bufPtr)
 		return
 	}
@@ -1662,6 +1750,7 @@ func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk) error 
 		Term:       first.Term,
 		ChunkCount: first.ChunkCount,
 		Epoch:      first.Epoch,
+		From:       first.From,
 	}
 	var hdrBuf [SnapshotHeaderSize]byte
 	if _, err := hdr.MarshalTo(hdrBuf[:]); err != nil {
@@ -1712,7 +1801,13 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		return err
 	}
 
-	conn, err := t.getConnection(target)
+	// A snapshot is the whole state machine: it goes only over a connection
+	// to the replica it is for (see sendToTarget).
+	want, bound := t.wantFor(first.ShardID, first.ReplicaID)
+	if !bound {
+		return &DialError{Target: target, Err: &DialIdentityError{}}
+	}
+	conn, err := t.getConnection(target, want)
 	if err != nil {
 		return err
 	}
@@ -1917,7 +2012,13 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 		return err
 	}
 
-	conn, err := t.getConnection(target)
+	// A snapshot is the whole state machine: it goes only over a connection
+	// to the replica it is for (see sendToTarget).
+	want, bound := t.wantFor(meta.ShardID, meta.ReplicaID)
+	if !bound {
+		return &DialError{Target: target, Err: &DialIdentityError{}}
+	}
+	conn, err := t.getConnection(target, want)
 	if err != nil {
 		return err
 	}
