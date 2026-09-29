@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0-alpha] - 2026-09-29
+
+Closes the R11 whole-project review: lease reads rest only on vote promises
+that are kept in real time and survive restarts, snapshot artifacts verify
+their integrity end to end, and `RemoveData` retires a replica ID for good.
+**WAL format changes in place (hard-state record `0x02` → `0x0d`, remove-node
+record `0x06` retired): wipe existing WAL directories and re-sync from
+peers.** `logdb.LogDB` gains `NodeRemoved`; a replica that rejoins after
+`RemoveData` needs a new replica ID.
+
 ### Changed
 - **`go-enclave` v0.5.0-alpha → v0.6.1-alpha**, per the rule that every
   dependency tracks its current release; the nightly dependency-freshness job
