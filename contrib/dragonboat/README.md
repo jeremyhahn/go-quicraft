@@ -44,6 +44,6 @@ its config changes and leader-bound reads through leader-resolving helpers,
 because a shim that retries against a stale leader hides the very forwarding it
 is meant to exercise.
 
-See the per-machine [QuicRaft vs Dragonboat](../../test/performance/profiles/ci-node-2/dragonboat.md)
+See the per-machine [QuicRaft vs Dragonboat](../../test/performance/profiles/ci-node-2/dragonboat.md) <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
 document for performance comparisons; other machines are under
 `test/performance/profiles/`.

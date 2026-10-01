@@ -3,7 +3,7 @@
 #
 # One command drives the whole thing:
 #
-#   make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+#   make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
 #
 # which is this script's "all": stage the working tree onto the target, capture
 # the target's specifications, run the benchmark suite there, fetch the results
@@ -39,7 +39,7 @@ set -euo pipefail
 HOST="${PERF_HOST:?PERF_HOST is required (ssh destination of the bench machine, e.g. user@host)}"
 
 # The machine profile these results belong to. Operator-supplied, always.
-PROFILE="${PERF_PROFILE:?PERF_PROFILE is required (machine profile name, e.g. omega or r640)}"
+PROFILE="${PERF_PROFILE:?PERF_PROFILE is required (machine profile name, e.g. bench-01)}"
 
 # Staging directory on the bench host. Relative paths resolve against the remote
 # login's home directory (both ssh and rsync do this); override with an absolute

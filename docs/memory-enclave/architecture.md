@@ -205,9 +205,10 @@ arithmetic can multiply out of hand, is a priced refusal — `MaxShareSetBytes`
 refuses an over-budget Shamir split before taking a single page. A consumer that
 *does* buffer key material before authenticating a peer should admit those
 allocations through an `Allocator` at its own layer — and the Shamir primitive
-lets it cover share material too: `SplitProtectedWith`, `CombineProtectedWith`
-and `NewProtectedShareWith` charge every region they lock to the `Allocator` the
-caller passes (issue #204). This repository accepts an allocator there; it never
+lets it cover share material too: `SplitProtectedWith`, `CombineProtectedWith`,
+`NewProtectedShareWith` (issue #204), `UnmarshalShareSetWith` and
+`Share.ProtectWith` (issue #211) charge every region they lock to the
+`Allocator` the caller passes. This repository accepts an allocator there; it never
 constructs or installs one.
 
 This repository also never calls `WipeAll`: it is a shutdown sweep for whoever

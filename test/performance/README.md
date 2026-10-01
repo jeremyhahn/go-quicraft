@@ -12,8 +12,8 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
-| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-09-14; all four systems |
-| [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17; etcd not yet measured |
+| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-09-14; all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+| [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17; etcd not yet measured | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18; hardware offline pending repair |
 
 Each profile's hardware is recorded in its own `env.json`, captured on that
@@ -24,22 +24,22 @@ generally also different builds of the engine.
 ## Running against a machine
 
 ```bash
-make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
 ```
 
 One command: stage the working tree onto the target, capture the target's
 specifications into `env.json`, run the suite there in Docker, fetch the results
-*and* the capture back into `profiles/omega/`, and regenerate that profile's
+*and* the capture back into `profiles/<profile>/`, and regenerate that profile's
 documents locally. The remote run is detached, so a dropped ssh session costs
 you the log tail rather than the run.
 
 ```bash
 # Knobs
-make perf-remote PERF_HOST=user@host PERF_PROFILE=omega \
+make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile> \
      BENCHTIME=30s PERF_TIMEOUT=7200s PERF_SYSTEMS=quicraft,dragonboat
 
 # Reattach to a run already in flight
-make perf-remote-status PERF_HOST=user@host PERF_PROFILE=omega
+make perf-remote-status PERF_HOST=user@host PERF_PROFILE=<profile>
 test/performance/run-remote.sh wait     # stream until it exits
 
 # Individual phases
@@ -98,7 +98,7 @@ Two consequences worth stating plainly:
   generated document is gone on the next run.
 - A system with no results gets **no document**, not a document of `N/A` rows.
   A file full of `N/A` is indistinguishable at a glance from a real result of
-  zero. `omega` currently has no `etcd.md` for exactly this reason, and both
+  zero. `omega` currently has no `etcd.md` for exactly this reason, and both <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
   documents it does have say so on their face.
 
 Generation refuses to run at all if any system it was asked to cover has no
@@ -106,7 +106,7 @@ results, so a partial comparison is never published as a whole one. Narrow it
 explicitly when a gap is intended:
 
 ```bash
-make perf-generate PERF_PROFILE=omega PERF_SYSTEMS=quicraft,dragonboat,openraft
+make perf-generate PERF_PROFILE=<profile> PERF_SYSTEMS=quicraft,dragonboat,openraft
 ```
 
 ## Where the analysis lives
@@ -119,7 +119,7 @@ make perf-generate PERF_PROFILE=omega PERF_SYSTEMS=quicraft,dragonboat,openraft
   **scenario definitions** (§ *Scenario Definitions*). Read the fairness audit
   before drawing a conclusion from any row — the election rows in particular are
   not like-for-like across columns.
-- `profiles/omega/analysis.md` — not written yet. Create it when there is
+- `profiles/omega/analysis.md` — not written yet. Create it when there is <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
   something to say about the omega dataset; nothing generates it, and nothing
   will overwrite it once it exists.
 
@@ -131,8 +131,8 @@ test/performance/
   capture-env.sh         <- runs ON the target; emits env.json
   run-remote.sh          <- the one remote pipeline (make perf-remote drives it)
   profiles/
-    omega/
-      env.json           <- captured on omega
+    <profile>/
+      env.json           <- captured on that machine
       results/*.json     <- one per system
       logs/*.log         <- one container console per system, verbatim
       charts/*.svg       <- GENERATED
@@ -200,7 +200,7 @@ environment of whatever invoked it:
 ```
 GOPRIVATE=github.com/jeremyhahn/*
 GIT_CONFIG_COUNT=1
-GIT_CONFIG_KEY_0=url.http://x:<read-only token>@git.example.internal/jeremyhahn/.insteadOf
+GIT_CONFIG_KEY_0=url.http://x:<read-only token>@forge.example:3001/jeremyhahn/.insteadOf
 GIT_CONFIG_VALUE_0=https://github.com/jeremyhahn/
 ```
 

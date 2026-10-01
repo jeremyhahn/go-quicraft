@@ -55,9 +55,10 @@ outside the feature folders.
 | [Testing Overview](testing/overview.md) | unit, integration and E2E structure, coverage targets, Makefile targets |
 | [Test Infrastructure](testing/infrastructure.md) | fuzzing, linearizability verification, I/O error injection |
 | [Benchmark Regression Testing](testing/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
+| [Public Releasability](release/public-releasability.md) | what may be published from this tree, the development-tooling exclusion list, and the `test/releasability` gate that enforces both |
 
-Per-feature test strategy lives in each feature's `engineering.md`; these three
-describe the harnesses that serve all of them.
+Per-feature test strategy lives in each feature's `engineering.md`; the three
+testing documents describe the harnesses that serve all of them.
 
 ## References
 

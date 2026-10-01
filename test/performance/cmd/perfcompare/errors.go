@@ -61,7 +61,7 @@ type NoProfileError struct{}
 
 // Error implements the error interface.
 func (e *NoProfileError) Error() string {
-	return "no profile specified: pass --profile=<dir> (e.g. --profile=profiles/omega). " +
+	return "no profile specified: pass --profile=<dir> (e.g. --profile=profiles/<name>). " +
 		"Every result belongs to one machine profile; there is no default"
 }
 

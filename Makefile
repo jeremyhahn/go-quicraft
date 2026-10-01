@@ -650,8 +650,8 @@ PERF_CMD := $(PERF_DIR)/cmd/perfcompare
 # DRAGONBOAT_SRC override.
 #
 # Everything these targets store lives under a MACHINE PROFILE,
-# test/performance/profiles/<name>/. Two are tracked long-term: omega, a
-# single-socket desktop-grade box, and r640, a dual-socket server-grade box. A
+# test/performance/profiles/<name>/, named after the machine that measured it
+# (test/performance/README.md lists the profiles on record). A
 # throughput number is a property of the machine as much as of the code, so
 # there is no profile-less place to put one.
 #
@@ -667,9 +667,9 @@ PERF_PROFILE ?=
 # Systems to run, and the systems the generated documents must cover.
 # Generation refuses to run if anything named here has no results, so a profile
 # that is genuinely missing an engine is narrowed explicitly:
-#   make perf-generate PERF_PROFILE=omega PERF_SYSTEMS=quicraft,dragonboat,openraft
+#   make perf-generate PERF_PROFILE=<profile> PERF_SYSTEMS=quicraft,dragonboat,openraft
 PERF_SYSTEMS ?= all
-# ssh destination for the remote targets, e.g. PERF_HOST=jhahn@198.51.100.90.
+# ssh destination for the remote targets, e.g. PERF_HOST=user@bench-host.example.
 PERF_HOST ?=
 
 PROFILE_DIR = profiles/$(PERF_PROFILE)
@@ -695,7 +695,7 @@ PERFCOMPARE = cd $(PERF_DIR) && $(MODULE_AUTH_ENV) ./perfcompare
 # Internal: refuse to touch a nameless profile. Writing results into a directory
 # whose machine nobody recorded is how a number ends up uninterpretable.
 REQUIRE_PROFILE = @if [ -z "$(PERF_PROFILE)" ]; then \
-	echo "PERF_PROFILE is required (e.g. PERF_PROFILE=omega). Profiles: $$(ls $(PERF_DIR)/profiles 2>/dev/null | tr '\n' ' ')"; \
+	echo "PERF_PROFILE is required (e.g. PERF_PROFILE=<profile>). Profiles: $$(ls $(PERF_DIR)/profiles 2>/dev/null | tr '\n' ' ')"; \
 	exit 1; fi
 
 .PHONY: perf-build
@@ -733,9 +733,9 @@ perf-compare-all: perf-build
 # ----------------------------------------------------------------------------
 # Profile pipeline: run into a profile, then generate that profile's documents.
 #
-#   make perf-all PERF_PROFILE=omega
-#   make perf-run PERF_PROFILE=omega PERF_SYSTEMS=etcd     # one engine
-#   make perf-generate PERF_PROFILE=omega
+#   make perf-all PERF_PROFILE=<profile>
+#   make perf-run PERF_PROFILE=<profile> PERF_SYSTEMS=etcd     # one engine
+#   make perf-generate PERF_PROFILE=<profile>
 # ----------------------------------------------------------------------------
 .PHONY: perf-run
 perf-run: perf-build
@@ -771,7 +771,7 @@ perf-env:
 # tree, capture the target's specs, run the suite, fetch results AND env.json
 # back into profiles/<name>/, regenerate that profile's documents.
 #
-#   make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+#   make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
 #
 # The remote run is detached, so a dropped ssh costs the tail and not the run;
 # reattach with 'test/performance/run-remote.sh wait'. Knobs: BENCHTIME,
@@ -1199,7 +1199,7 @@ ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci
 	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + fuzz mutation + all modules + FIPS)"
 
 # ============================================================================
-# Heavyweight test offload to omega (198.51.100.90)
+# Heavyweight test offload to a remote build host
 #
 # Every test target here runs under `-race` (see GOTEST), and ci-integration
 # stands up multi-node QUIC clusters. On a developer workstation that is also
@@ -1208,15 +1208,19 @@ ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci
 # environmental, they look like raft defects, and chasing them has cost real
 # days (see the CI runner-contention and load-generator incidents).
 #
-# omega is the department's designated spare-capacity host for exactly this
-# (software/CLAUDE.md: "Use it for agent fleets, performance and load testing
-# ... rather than loading a busy machine"). It is also where the omega-docker
-# Gitea runner lives, so CI already executes there; this target just gives the
-# same machine to the local inner loop.
+# Point REMOTE_HOST at a machine with spare capacity — ideally the one CI
+# already executes on, so a local failure and a CI failure mean the same thing.
+# There is no default host: the target refuses to run without one rather than
+# reaching for somebody else's machine.
 #
-#   make remote-ci-full        # the full gate, off-box
-#   make remote-test           # any target: remote-<target> runs <target> there
-#   make remote-integration-test
+#   make remote-ci-full REMOTE_HOST=build-host.example        # the full gate, off-box
+#   make remote-test REMOTE_HOST=build-host.example           # remote-<target> runs <target> there
+#   make remote-integration-test REMOTE_HOST=build-host.example REMOTE_USER=ci
+#
+# REMOTE_USER is optional (ssh's own default, or ~/.ssh/config, applies when it
+# is empty); REMOTE_WORKDIR is where the tree lands on the host. It is not
+# called REMOTE_DIR because test/performance/run-remote.sh already reads that
+# name from the environment for the benchmark staging directory.
 #
 # The pattern rule means no target needs enrolling by hand. `remote-sync` is an
 # explicit rule, so it wins over the pattern and does not recurse.
@@ -1228,65 +1232,85 @@ ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci
 # perform a git operation against this repository's history.
 # ============================================================================
 
-OMEGA_USER    ?= jhahn
-OMEGA_HOST    ?= 198.51.100.90
-OMEGA_DIR     ?= ~/ci/go-quicraft
-# omega keeps its toolchain in ~/sdk and its go-installed tools in ~/go/bin;
+REMOTE_HOST    ?=
+REMOTE_USER    ?=
+REMOTE_WORKDIR ?= ~/ci/go-quicraft
+# The ssh destination: user@host when REMOTE_USER is set, the bare host otherwise.
+REMOTE_DEST     = $(if $(REMOTE_USER),$(REMOTE_USER)@)$(REMOTE_HOST)
+# The host keeps its toolchain in ~/sdk and its go-installed tools in ~/go/bin;
 # a non-interactive ssh does not source the profile that would add them.
-OMEGA_PATH    := export PATH=$$HOME/sdk/go1.26.5/bin:$$HOME/go/bin:$$PATH
-OMEGA_SSH     := ssh -o BatchMode=yes -o ConnectTimeout=10 $(OMEGA_USER)@$(OMEGA_HOST)
-RSYNC_EXCLUDE := --exclude .git --exclude .build-cache --exclude $(COVER_DIR) \
-                 --exclude $(BUILD_DIR) --exclude '*.test' --exclude '*.prof' \
-                 --exclude '*.out' --exclude test/performance/openraft/target
+REMOTE_ENV_PATH := export PATH=$$HOME/sdk/go1.26.5/bin:$$HOME/go/bin:$$PATH
+REMOTE_SSH      = ssh -o BatchMode=yes -o ConnectTimeout=10 $(REMOTE_DEST)
+RSYNC_EXCLUDE  := --exclude .git --exclude .build-cache --exclude $(COVER_DIR) \
+                  --exclude $(BUILD_DIR) --exclude '*.test' --exclude '*.prof' \
+                  --exclude '*.out' --exclude test/performance/openraft/target
+
+# Internal: refuse to run a remote target with no host named.
+REQUIRE_REMOTE_HOST = @if [ -z "$(REMOTE_HOST)" ]; then \
+	echo "REMOTE_HOST is required: the remote targets have no default host."; \
+	echo "usage: make remote-<target> REMOTE_HOST=<host> [REMOTE_USER=<user>] [REMOTE_WORKDIR=<dir>]"; \
+	echo "       make remote-tools REMOTE_HOST=<host> [FORGE_SSH_HOST=<forge> FORGE_SSH_PORT=<port>]"; \
+	exit 1; fi
 
 .PHONY: remote-sync
 remote-sync:
-	@$(OMEGA_SSH) 'mkdir -p $(OMEGA_DIR)'
-	@rsync -az --delete $(RSYNC_EXCLUDE) ./ $(OMEGA_USER)@$(OMEGA_HOST):$(OMEGA_DIR)/
-	@echo "synced working tree to $(OMEGA_USER)@$(OMEGA_HOST):$(OMEGA_DIR)"
+	$(REQUIRE_REMOTE_HOST)
+	@$(REMOTE_SSH) 'mkdir -p $(REMOTE_WORKDIR)'
+	@rsync -az --delete $(RSYNC_EXCLUDE) ./ $(REMOTE_DEST):$(REMOTE_WORKDIR)/
+	@echo "synced working tree to $(REMOTE_DEST):$(REMOTE_WORKDIR)"
 
-# remote-<target>: sync, then run <target> on omega. Output is streamed back,
-# so a failure reads exactly as it would locally.
+# remote-<target>: sync, then run <target> on REMOTE_HOST. Output is streamed
+# back, so a failure reads exactly as it would locally.
 .PHONY: remote-%
 remote-%: remote-sync
-	@echo "==> running 'make $*' on $(OMEGA_HOST)"
-	@$(OMEGA_SSH) '$(OMEGA_PATH); cd $(OMEGA_DIR) && make $*'
+	@echo "==> running 'make $*' on $(REMOTE_HOST)"
+	@$(REMOTE_SSH) '$(REMOTE_ENV_PATH); cd $(REMOTE_WORKDIR) && make $*'
 
-# One-time (or after a toolchain bump) provisioning of the scanners omega does
-# not ship with. Kept separate from remote-sync so the common path stays fast.
+# One-time (or after a toolchain bump) provisioning of the scanners the remote
+# host does not ship with. Kept separate from remote-sync so the common path
+# stays fast.
 #
-# Every tool is installed UNCONDITIONALLY, not "if absent". omega had a v1
-# golangci-lint AND a years-old gosec on PATH, so `command -v` guards skipped
-# both installs: `make lint` died on `unknown flag: --timeout` (v2 moved it) and
-# `make gosec` died printing its usage, because the old binary has no
-# -exclude-dir and a rule set predating G115/G306.
+# Every tool is installed UNCONDITIONALLY, not "if absent". The first remote
+# host had a v1 golangci-lint AND a years-old gosec on PATH, so `command -v`
+# guards skipped both installs: `make lint` died on `unknown flag: --timeout`
+# (v2 moved it) and `make gosec` died printing its usage, because the old
+# binary has no -exclude-dir and a rule set predating G115/G306.
 #
 # An analyser of the wrong version is worse than none. It gates on a different
 # rule set from CI while looking like it passed — the precise failure mode this
 # repository's review keeps turning up. golangci-lint is pinned to the version
 # quality.yml installs; gosec and govulncheck follow quality.yml's @latest.
+#
+# FORGE_SSH_HOST names a private forge that a global insteadOf on the remote
+# host rewrites module fetches to; its host key is seeded alongside
+# github.com's. There is no default: leave it empty when modules resolve from
+# the public proxy and github.com alone.
+FORGE_SSH_HOST ?=
+FORGE_SSH_PORT ?= 22
+
 .PHONY: remote-tools
 remote-tools:
-	@$(OMEGA_SSH) '$(OMEGA_PATH); \
+	$(REQUIRE_REMOTE_HOST)
+	@$(REMOTE_SSH) '$(REMOTE_ENV_PATH); \
 		go install golang.org/x/vuln/cmd/govulncheck@latest; \
 		go install github.com/securego/gosec/v2/cmd/gosec@latest; \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
 		command -v trivy >/dev/null || curl -sfL \
 			https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
 			| sh -s -- -b $$HOME/go/bin >/dev/null; \
-		echo "omega tools ready ($(GOLANGCI_VERSION))"'
+		echo "remote tools ready ($(GOLANGCI_VERSION))"'
 	@# ci-modules builds test/performance/dragonboat, which requires
-	@# github.com/jeremyhahn/dragonboat. A global insteadOf rewrites that to the
-	@# Gitea host over ssh, so the module download fails with "Host key
+	@# github.com/jeremyhahn/dragonboat. A global insteadOf may rewrite that to
+	@# a forge over ssh, so the module download fails with "Host key
 	@# verification failed" until the host key is known -- an error that reads
 	@# like a missing repository rather than a missing known_hosts entry.
-	@$(OMEGA_SSH) 'mkdir -p $$HOME/.ssh && chmod 700 $$HOME/.ssh; \
-		for hk in "-p 2222 198.51.100.50" "github.com"; do \
+	@$(REMOTE_SSH) 'mkdir -p $$HOME/.ssh && chmod 700 $$HOME/.ssh; \
+		for hk in $(if $(FORGE_SSH_HOST),"-p $(FORGE_SSH_PORT) $(FORGE_SSH_HOST)") "github.com"; do \
 			ssh-keyscan $$hk 2>/dev/null >> $$HOME/.ssh/known_hosts; \
 		done; \
 		sort -u $$HOME/.ssh/known_hosts -o $$HOME/.ssh/known_hosts; \
 		chmod 600 $$HOME/.ssh/known_hosts; echo "  known_hosts seeded"'
-	@$(OMEGA_SSH) '$(OMEGA_PATH); for t in go golangci-lint gosec govulncheck trivy; do \
+	@$(REMOTE_SSH) '$(REMOTE_ENV_PATH); for t in go golangci-lint gosec govulncheck trivy; do \
 		printf "  %-14s %s\n" "$$t" "$$(command -v $$t || echo MISSING)"; done'
 
 # ============================================================================
@@ -1456,7 +1480,7 @@ vuln:
 # A missing binary FAILS rather than skipping. This target used to print
 # "trivy not installed, skipping fs scan" and return success, so `make security`
 # announced "All security scans passed" with one of its four scanners absent —
-# and that is exactly what happened on the omega test host, silently, until the
+# and that is exactly what happened on the remote test host, silently, until the
 # tool inventory was printed. `vuln` and `nancy` were both hardened against this
 # same shape earlier ("a security gate that cannot fail is not a gate"); trivy
 # was left behind.
@@ -1678,7 +1702,7 @@ help:
 	@echo "  perf-env                     Capture a machine's specs into the profile"
 	@echo "  perf-remote                  Stage, capture, run, fetch and generate, on PERF_HOST"
 	@echo "  perf-remote-status           Tail a remote run already in flight"
-	@echo "    Flags: PERF_PROFILE=omega PERF_HOST=user@host PERF_SYSTEMS=all"
+	@echo "    Flags: PERF_PROFILE=<profile> PERF_HOST=user@host PERF_SYSTEMS=all"
 	@echo "           BENCHTIME=30s PERF_TIMEOUT=7200s PERF_EXTRA=--no-build"
 	@echo ""
 	@echo "Coverage (minimum $(COVER_MIN)%):"

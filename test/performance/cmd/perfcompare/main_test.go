@@ -439,14 +439,14 @@ func TestDockerRunErrorNamesTheReason(t *testing.T) {
 	bare := &DockerRunError{
 		System:  "dragonboat",
 		Err:     &exitStatusStub{},
-		LogPath: "profiles/omega/logs/dragonboat.log",
+		LogPath: "profiles/bench-01/logs/dragonboat.log",
 	}
 	if !strings.Contains(bare.Error(), "no failure lines found") {
 		t.Fatalf("a container with no diagnostics must say so, got %q", bare.Error())
 	}
 	// A container that said nothing the summary understands is exactly when
 	// the operator needs the whole console, so the failure names where it is.
-	if !strings.Contains(bare.Error(), "profiles/omega/logs/dragonboat.log") {
+	if !strings.Contains(bare.Error(), "profiles/bench-01/logs/dragonboat.log") {
 		t.Fatalf("the failure does not name the container log, got %q", bare.Error())
 	}
 }
@@ -543,7 +543,7 @@ func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 	runner := map[string]string{
 		"GOPRIVATE":          "github.com/jeremyhahn/*",
 		"GIT_CONFIG_COUNT":   "1",
-		"GIT_CONFIG_KEY_0":   "url.http://x:" + token + "@git.example.internal/jeremyhahn/.insteadOf",
+		"GIT_CONFIG_KEY_0":   "url.http://x:" + token + "@198.51.100.50:3001/jeremyhahn/.insteadOf",
 		"GIT_CONFIG_VALUE_0": "https://github.com/jeremyhahn/",
 	}
 	getenv := func(m map[string]string) func(string) string {
@@ -553,7 +553,7 @@ func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 	got := moduleAuth(getenv(runner))
 	want := "GOPRIVATE='github.com/jeremyhahn/*'\n" +
 		"GIT_CONFIG_COUNT='1'\n" +
-		"GIT_CONFIG_KEY_0='url.http://x:" + token + "@git.example.internal/jeremyhahn/.insteadOf'\n" +
+		"GIT_CONFIG_KEY_0='url.http://x:" + token + "@198.51.100.50:3001/jeremyhahn/.insteadOf'\n" +
 		"GIT_CONFIG_VALUE_0='https://github.com/jeremyhahn/'\n"
 	if got != want {
 		t.Fatalf("runner environment:\n got %q\nwant %q", got, want)
@@ -591,7 +591,7 @@ func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {
 	t.Setenv(moduleAuthEnv, "")
 	t.Setenv("GOPRIVATE", "github.com/jeremyhahn/*")
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@git.example.internal/jeremyhahn/.insteadOf")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@198.51.100.50:3001/jeremyhahn/.insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/jeremyhahn/")
 
 	if err := buildImage("quicraft-bench-quicraft", "quicraft/Dockerfile", "/repo"); err != nil {

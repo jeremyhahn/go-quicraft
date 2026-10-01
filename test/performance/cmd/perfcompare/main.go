@@ -110,7 +110,7 @@ func runBenchmarks(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	benchtime := fs.String("benchtime", "30s", "Duration for each benchmark (go test -benchtime)")
 	timeout := fs.String("timeout", "3600s", "Timeout for the entire benchmark run")
-	profileDir := fs.String("profile", "", "Profile directory to store results in (e.g. profiles/omega)")
+	profileDir := fs.String("profile", "", "Profile directory to store results in (e.g. profiles/<name>)")
 	noBuild := fs.Bool("no-build", false, "Skip Docker image rebuild")
 	fs.Parse(args)
 
@@ -210,7 +210,7 @@ func runBenchmarks(args []string) error {
 // its face which systems this profile has never measured.
 func runGenerate(args []string) error {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
-	profileDir := fs.String("profile", "", "Profile directory to generate (e.g. profiles/omega)")
+	profileDir := fs.String("profile", "", "Profile directory to generate (e.g. profiles/<name>)")
 	systemsFlag := fs.String("systems", "all", "Comma-separated systems the generated documents must cover")
 	fs.Parse(args)
 

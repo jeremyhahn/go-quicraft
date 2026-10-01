@@ -1,7 +1,7 @@
 # quicraft benchmark run
 # generated:     2026-08-04T19:32:33Z
 # mode:          baseline
-# run-host:      omega  (PERF_HOST=jhahn@198.51.100.90)
+# run-host:      omega  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
 # cpu-count:     20
 # governor:      powersave
@@ -13,7 +13,7 @@
 # bench-filter:  .
 # rounds:        10 (interleaved)
 # iterations:    200000x (fixed)
-# command:       BASELINE_REF='HEAD' PERF_HOST='jhahn@198.51.100.90' BENCH_PKGS='./pkg/internal/raft/ ./pkg/internal/engine/' BENCH_FILTER='.' BENCH_ROUNDS='10' BENCH_ITERS='200000x' make bench-baseline
+# command:       BASELINE_REF='HEAD' PERF_HOST='user@bench-host.example' BENCH_PKGS='./pkg/internal/raft/ ./pkg/internal/engine/' BENCH_FILTER='.' BENCH_ROUNDS='10' BENCH_ITERS='200000x' make bench-baseline
 #
 # Raw samples follow in Go benchmark format. Diff a future run against
 # this file with:

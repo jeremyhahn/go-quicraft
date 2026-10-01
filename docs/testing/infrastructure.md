@@ -431,15 +431,17 @@ module is removed on purpose, lower the floor in the same commit.
 ## Running heavyweight suites off-box
 
 `make remote-<target>` rsyncs the working tree to a remote build host
-(set by `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR`) and runs `make <target>` there,
+(set by `REMOTE_HOST`, which is required and has no default, plus the optional
+`REMOTE_USER` and `REMOTE_WORKDIR`) and runs `make <target>` there,
 streaming output back. It is a pattern rule, so no target needs enrolling:
 
 ```
+export REMOTE_HOST=build-host.example
 make remote-ci-full            # the whole gate, off-box
 make remote-integration-test
 make remote-test               # or any other target
 make remote-tools              # one-time: install the scanners the host lacks
-make remote-test OMEGA_DIR='~/ci/qr-myfeature'   # avoid colliding with other work
+make remote-test REMOTE_WORKDIR='~/ci/qr-myfeature'   # avoid colliding with other work
 ```
 
 This exists because every target runs under `-race` and the integration suites
@@ -458,7 +460,9 @@ against this repository's history.
 
 `make remote-tools` installs govulncheck, gosec, golangci-lint (pinned to
 `GOLANGCI_VERSION`, matching what ci.yml's `lint`/`security` jobs install) and
-trivy (matching nightly.yml's `trivy` job), and seeds `known_hosts`. Every tool is installed unconditionally rather than "if absent",
+trivy (matching nightly.yml's `trivy` job), and seeds `known_hosts` for
+github.com and, when `FORGE_SSH_HOST` (and `FORGE_SSH_PORT`) name one, a private
+forge that the host's module-fetch rewrite points at. Every tool is installed unconditionally rather than "if absent",
 because the remote host had a v1 golangci-lint and a years-old gosec on PATH and
 `command -v` guards skipped both installs. An analyser of the wrong version
 gates on a different rule set from CI while looking like it passed.
@@ -480,7 +484,7 @@ method. `make bench-baseline` records provenance-stamped baselines.
 Cross-system comparison against dragonboat, etcd/raft and OpenRaft lives in
 `test/performance/` behind the `perfcompare` orchestrator, stored per machine
 profile (`make perf-compare-all` for an ad-hoc report;
-`make perf-remote PERF_HOST=user@host PERF_PROFILE=omega` for a stored,
+`make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>` for a stored,
 documented run).
 
 Full rationale and interpretation guidance:

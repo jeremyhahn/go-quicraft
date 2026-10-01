@@ -485,7 +485,7 @@ func (c *BenchCluster) Leader() *dragonboat.NodeHost {
 // benchmark times reads of it, on the warmup retry budget, re-resolving the
 // leader before every attempt. The cluster was warm a moment ago, but a
 // 3-node shard on a 112-core host lost its leader between the warmup and
-// the first benchmark (ci-node-2, #184 part 3), and dragonboat does not
+// the first benchmark (the dual-socket profile, #184 part 3), and dragonboat does not
 // forward: a proposal addressed to the deposed leader sits for its whole
 // 10s and reports "timeout", which took the run down with it. The retry
 // treats that the way #181 treats every other transient, and LeaderIdx is

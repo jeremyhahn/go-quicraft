@@ -198,13 +198,13 @@ with a different unit of storage: the **machine profile**.
 
 ```bash
 # Everything, against any machine, in one command.
-make perf-remote PERF_HOST=user@host PERF_PROFILE=omega
+make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
 
 # On this machine.
-make perf-all      PERF_PROFILE=omega                   # run, store, generate
-make perf-run      PERF_PROFILE=omega PERF_SYSTEMS=etcd # one engine
-make perf-generate PERF_PROFILE=omega                   # documents from stored JSON
-make perf-env      PERF_PROFILE=omega                   # capture this machine's specs
+make perf-all      PERF_PROFILE=<profile>                   # run, store, generate
+make perf-run      PERF_PROFILE=<profile> PERF_SYSTEMS=etcd # one engine
+make perf-generate PERF_PROFILE=<profile>                   # documents from stored JSON
+make perf-env      PERF_PROFILE=<profile>                   # capture this machine's specs
 
 # Ad-hoc: terminal report only, stores nothing, needs no profile.
 make perf-compare-all
@@ -213,7 +213,7 @@ make perf-compare SYSTEMS="quicraft etcd"
 
 `PERF_PROFILE` is required by everything that reads or writes stored results and
 has no default, because a throughput number without its machine cannot be
-interpreted. Two profiles are tracked long-term: `omega` (single-socket,
+interpreted. Two profiles are tracked long-term: `omega` (single-socket, <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 desktop-grade) and `r640` (dual-socket, server-grade).
 
 `make perf-remote` stages the working tree onto the target, runs
@@ -387,9 +387,9 @@ a revision has more than one baseline, giving:
 
 The host name is part of the filename on purpose: absolute ns/op is a property
 of the machine, so the host is what makes the file interpretable. The existing
-files follow it -- `omega-64bc288-hotpath.txt` and `omega-64bc288-codec.txt` are
+files follow it -- `omega-64bc288-hotpath.txt` and `omega-64bc288-codec.txt` are <!-- lab-string-ok: benchmark provenance: baseline file names record which machine measured the numbers -->
 the µs-scale and ns-scale halves of one revision measured on a host named
-`omega`. Baselines recorded on your own machine will carry your machine's name,
+`omega`. Baselines recorded on your own machine will carry your machine's name, <!-- lab-string-ok: benchmark provenance: the stored baselines carry this host name -->
 which is correct and expected.
 
 Each file carries the provenance needed to make it meaningful -- a baseline
@@ -400,7 +400,7 @@ which is worse than having no baseline at all:
 # quicraft benchmark run
 # generated:     2026-08-04T19:32:33Z
 # mode:          baseline
-# run-host:      omega  (PERF_HOST=user@bench-host.example)
+# run-host:      bench-host  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
 # cpu-count:     20
 # governor:      powersave
@@ -420,7 +420,7 @@ comment lines are ignored by benchstat, so a stored baseline can be diffed
 directly:
 
 ```sh
-benchstat test/performance/baselines/omega-<sha>-hotpath.txt \
+benchstat test/performance/baselines/<run-host>-<sha>-hotpath.txt \
           build/bench-compare/<run>/current.txt
 ```
 
@@ -451,7 +451,7 @@ What makes a good one, in rough order of impact:
   series; switching hosts invalidates the comparison entirely (see above).
 
 As a worked example, this project has used a dedicated node referred to in the
-stored baselines as `omega` -- an Intel Core i9-9900X @ 3.50 GHz, 20 threads,
+stored baselines as `omega` -- an Intel Core i9-9900X @ 3.50 GHz, 20 threads, <!-- lab-string-ok: benchmark provenance: the stored baselines carry this host name -->
 62 GB, idle at ~0.00 load. You point the harness at your own machine with
 `PERF_HOST=user@host`; there is no default and no built-in host. It is an
 example of a `PERF_HOST`, not a requirement: the harness has no knowledge of it, and every stored baseline it

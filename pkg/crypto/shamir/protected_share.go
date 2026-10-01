@@ -258,9 +258,10 @@ func lockedBytes(n int) int {
 // after they return — still has to bound itself.
 // go-enclave's Allocator is the mechanism for that, and it belongs to whoever
 // owns the process's locked-memory policy, not to this primitive. This package
-// only accepts one: SplitProtectedWith, CombineProtectedWith and
-// NewProtectedShareWith charge every locked allocation they make to the
-// allocator they are handed, so the caller's budget covers share material too.
+// only accepts one: SplitProtectedWith, CombineProtectedWith,
+// NewProtectedShareWith, UnmarshalShareSetWith and Share.ProtectWith charge
+// every locked allocation they make to the allocator they are handed, so the
+// caller's budget covers share material too.
 //
 // A caller that genuinely needs more does its own accounting and works share by
 // share with SplitBytes and NewProtectedShare — the policy is then explicitly
@@ -1167,7 +1168,33 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 // 255-share bound arrives long after the allocations it would have limited.
 // Use UnmarshalShareSet for anything arriving from outside the process: it
 // bounds the set before it allocates any of it.
+//
+// Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator], and
+// it cannot be, because json.Unmarshaler's signature has no room for one. A
+// caller that bounds its locked memory with an allocator decodes through
+// UnmarshalShareSetWith instead — a single share is a one-element set, so the
+// document is the share object wrapped in [ ] — or, when it already holds the
+// value bytes outside JSON, builds the share with NewProtectedShareWith. Both
+// run the same validation this method does.
 func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
+	decoded, err := decodeProtectedShare(nil, data)
+	if err != nil {
+		return err
+	}
+	// Decoding into a share that already holds a value — json.Unmarshal reuses
+	// the elements of a non-empty []*ProtectedShare — must not strand the old
+	// locked buffer.
+	s.Destroy()
+	*s = *decoded
+	return nil
+}
+
+// decodeProtectedShare is the one implementation behind UnmarshalJSON and the
+// per-element decode of UnmarshalShareSet and UnmarshalShareSetWith: it decodes
+// ONE share object into a new ProtectedShare whose value is locked through
+// newProtectedShare, admitted against a when a is non-nil and unbudgeted when it
+// is nil (see lockValue).
+func decodeProtectedShare(a *enclave.Allocator, data []byte) (*ProtectedShare, error) {
 	var aux struct {
 		Index     int               `json:"index"`
 		Threshold int               `json:"threshold"`
@@ -1176,7 +1203,7 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 		Metadata  map[string]string `json:"metadata,omitempty"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
-		return err
+		return nil, err
 	}
 	// The value is decoded as a RAW token, not into a string field:
 	// json.RawMessage is a []byte copy of the quoted literal that can be
@@ -1184,26 +1211,21 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 	// type exists to avoid.
 	defer wipe(aux.Value)
 	if len(aux.Value) < 2 || aux.Value[0] != '"' || aux.Value[len(aux.Value)-1] != '"' {
-		return &ValidationError{Field: "value", Reason: "must be a JSON string"}
+		return nil, &ValidationError{Field: "value", Reason: "must be a JSON string"}
 	}
-	// NewProtectedShare wipes the value bytes as it copies them in; the quotes
+	// newProtectedShare wipes the value bytes as it copies them in; the quotes
 	// and any remaining bytes are covered by the deferred wipe. An escape
 	// sequence in the literal is not decoded — the base64 check rejects it,
 	// which is correct: a share value that needs escaping is not a share value
 	// this package ever produced.
-	decoded, err := NewProtectedShare(aux.Index, aux.Threshold, aux.Total, aux.Value[1:len(aux.Value)-1])
+	decoded, err := newProtectedShare(a, aux.Index, aux.Threshold, aux.Total, aux.Value[1:len(aux.Value)-1])
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if aux.Metadata != nil {
 		decoded.Metadata = aux.Metadata
 	}
-	// Decoding into a share that already holds a value — json.Unmarshal reuses
-	// the elements of a non-empty []*ProtectedShare — must not strand the old
-	// locked buffer.
-	s.Destroy()
-	*s = *decoded
-	return nil
+	return decoded, nil
 }
 
 // shareSetLockedBytes prices the locked memory UnmarshalShareSet will hold for
@@ -1310,7 +1332,47 @@ func elementLockedBytes(elem json.RawMessage) int {
 // every share already built is destroyed, so a rejected set leaks no locked
 // memory. As with UnmarshalJSON, the caller's own data buffer still holds the
 // share material afterwards and is the caller's to wipe.
+//
+// A share whose value the locked-memory allocator refuses fails the set with a
+// *ProtectedMemoryError naming the element, not a *ValidationError: the document
+// was well formed and the host is out of locked memory, which is the distinction
+// ProtectedMemoryError exists to draw.
+//
+// Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator]. A
+// caller that bounds its locked memory with one uses UnmarshalShareSetWith.
 func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error) {
+	return unmarshalShareSet(nil, data)
+}
+
+// UnmarshalShareSetWith is UnmarshalShareSet with every share's locked value
+// admitted against a, so a consumer's locked-memory budget covers the recovery
+// ceremony's ingestion path — the unauthenticated one, where a budget matters
+// most.
+//
+// Its contract is UnmarshalShareSet's, with one addition. When admitting a
+// share would exceed a's budget it returns a *ProtectedMemoryError matching
+// [enclave.ErrBudgetExhausted] under errors.Is. That can happen partway through
+// the set — the budget is shared with every other holder of a, so unlike
+// MaxShareSetBytes it cannot be priced up front — and every share this call had
+// already built is destroyed before it returns, so a refused set gives its whole
+// reservation back to a. Shares returned by EARLIER calls are the caller's and
+// are untouched. The share-count and MaxShareSetBytes bounds still apply, and
+// still run before anything is admitted.
+//
+// A nil a is refused with [enclave.ErrNilAllocator] before data is read, rather
+// than falling back to the unbudgeted path. Libraries obtain a from
+// [enclave.ProcessAllocator].
+func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
+	if a == nil {
+		return nil, enclave.ErrNilAllocator
+	}
+	return unmarshalShareSet(a, data)
+}
+
+// unmarshalShareSet is the one implementation behind UnmarshalShareSet and
+// UnmarshalShareSetWith; a nil a selects the unbudgeted constructor (see
+// lockValue).
+func unmarshalShareSet(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
 	// Into raw elements, not shares: this decode allocates ordinary heap that
 	// the collector reclaims, and it is what makes the bounds checkable before
 	// anything is locked.
@@ -1350,12 +1412,21 @@ func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error) {
 
 	shares := make([]*ProtectedShare, 0, len(raw))
 	for i, elem := range raw {
-		share := &ProtectedShare{}
-		if err := share.UnmarshalJSON(elem); err != nil {
+		share, err := decodeProtectedShare(a, elem)
+		if err != nil {
 			// Unwind: a set that is rejected half way through must not strand
-			// the locked memory its accepted prefix already took.
+			// the locked memory its accepted prefix already took — nor, under an
+			// allocator, the reservation it holds against a.
 			for _, built := range shares {
 				built.Destroy()
+			}
+			// A refused lock is reported as what it is. Folding it into a
+			// *ValidationError would tell the operator the document was wrong
+			// when the host is out of locked memory, and would hide
+			// ErrBudgetExhausted and ErrLockedMemoryUnavailable from errors.Is.
+			var pme *ProtectedMemoryError
+			if errors.As(err, &pme) {
+				return nil, &ProtectedMemoryError{Op: fmt.Sprintf("share %d: %s", i, pme.Op), Err: pme.Err}
 			}
 			return nil, &ValidationError{Field: "shares", Reason: fmt.Sprintf("share %d: %v", i, err)}
 		}
@@ -1373,14 +1444,45 @@ func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error) {
 // it, whichever copies were made of it along the way. A caller that can choose
 // where the share material is born should call SplitProtected instead and
 // never create the string.
+//
+// The value's locked memory is UNBUDGETED: it is charged to no
+// [enclave.Allocator]. A caller that bounds its locked memory with one uses
+// ProtectWith.
 func (s *Share) Protect() (*ProtectedShare, error) {
+	return s.protect(nil)
+}
+
+// ProtectWith is Protect with the value's locked memory admitted against a, so a
+// consumer's locked-memory budget covers the migrated share.
+//
+// Its contract is Protect's, with one addition. When admitting the value would
+// exceed a's budget it returns a *ProtectedMemoryError matching
+// [enclave.ErrBudgetExhausted] under errors.Is, and nothing stays allocated.
+// The Share is never modified — its value is a string, and the one copy this
+// makes of it is wiped on every path — so a refused call can be retried against
+// a larger budget. Shares built earlier, from a or anywhere else, are
+// untouched.
+//
+// A nil a is refused with [enclave.ErrNilAllocator] before s is read, rather
+// than falling back to the unbudgeted path. Libraries obtain a from
+// [enclave.ProcessAllocator].
+func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error) {
+	if a == nil {
+		return nil, enclave.ErrNilAllocator
+	}
+	return s.protect(a)
+}
+
+// protect is the one implementation behind Protect and ProtectWith; a nil a
+// selects the unbudgeted constructor (see lockValue).
+func (s *Share) protect(a *enclave.Allocator) (*ProtectedShare, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
-	// The conversion copies; NewProtectedShare wipes that copy into the
+	// The conversion copies; newProtectedShare wipes that copy into the
 	// enclave. The string itself is the one copy nothing can take away.
 	value := []byte(s.Value)
-	protected, err := NewProtectedShare(s.Index, s.Threshold, s.Total, value)
+	protected, err := newProtectedShare(a, s.Index, s.Threshold, s.Total, value)
 	if err != nil {
 		wipe(value)
 		return nil, err

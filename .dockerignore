@@ -35,8 +35,13 @@ test/performance/openraft/target/
 go.work
 go.work.sum
 
-# Agent / AI context files
-.claude/
+# Agent / AI context files. The private development workflow never enters an
+# image build context: the same list .gitattributes keeps out of every archive,
+# enforced by test/releasability (docs/release/public-releasability.md).
+**/CLAUDE.md
+**/AGENTS.md
+**/.claude
+**/.serena
 .cursor/
 .codex/
 

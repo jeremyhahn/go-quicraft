@@ -541,10 +541,11 @@ repeatedly cost days.
 
 Run them on a **remote build host** instead — ideally the same machine CI
 executes on, so a local failure and a CI failure mean the same thing. Configure
-it with `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR`, which the Makefile defaults
-to a site-local machine:
+it with `REMOTE_HOST`, which is required and has no default, plus the optional
+`REMOTE_USER` and `REMOTE_WORKDIR`:
 
 ```
+export REMOTE_HOST=build-host.example
 make remote-ci-full            # the whole gate, off-box
 make remote-test               # any target: remote-<target> runs <target> there
 make remote-integration-test
@@ -558,10 +559,10 @@ remotely and turn a broken build green. `.git` is excluded deliberately:
 nothing on the remote can perform a git operation against this repository's
 history.
 
-Override `OMEGA_DIR` to keep concurrent work from colliding:
+Override `REMOTE_WORKDIR` to keep concurrent work from colliding:
 
 ```
-make remote-test OMEGA_DIR='~/ci/qr-myfeature'
+make remote-test REMOTE_WORKDIR='~/ci/qr-myfeature'
 ```
 
 Targeted single-package runs are fine locally while developing. Final

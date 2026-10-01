@@ -191,9 +191,12 @@ legal arguments can multiply into an illegal footprint, is price and refuse the
 whole operation up front — `MaxShareSetBytes` against `splitLockedBytes`. A
 consumer that buffers key material before authenticating a peer should admit
 those allocations through an `Allocator` at its own layer, and can pass that
-same allocator to `shamir.SplitProtectedWith`, `CombineProtectedWith` and
-`NewProtectedShareWith` so its budget covers share material as well (issue
-#204). A nil allocator is refused there, never treated as unbudgeted.
+same allocator to `shamir.SplitProtectedWith`, `CombineProtectedWith`,
+`NewProtectedShareWith` (issue #204), `UnmarshalShareSetWith` and
+`Share.ProtectWith` (issue #211) so its budget covers share material as well.
+A nil allocator is refused there, never treated as unbudgeted.
+`ProtectedShare.UnmarshalJSON` is the one share constructor that cannot take an
+allocator; a budgeted consumer decodes through `UnmarshalShareSetWith` instead.
 
 ## 5. Persistence
 

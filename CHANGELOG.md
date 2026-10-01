@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing in this release is breaking, despite the `!` in the squash title of
+PR #210 (auto-merge kept the title the PR was opened with). Every API change
+is additive. #209 changes behaviour only where a contract already permitted
+it: a `ConcurrentStateMachine` or `DiskStateMachine` now does see `Lookup`
+run concurrently with `Update`, as both interfaces have always documented. An
+implementation that leaned on the old, undocumented serialization must
+synchronise itself, as its interface requires.
+
 ### Added
 - **`seal.Barrier.Reset`** returns a sealed barrier to the uninitialized state
   so `Initialize` can run again (#208). It lets an embedder roll back a first
@@ -33,6 +41,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NewProtectedShare` keep their signatures and their unbudgeted behaviour
   (go-enclave's default constructors do not consult the process allocator) and
   delegate to the same implementation.
+- **The remaining Shamir protected-memory paths can be charged to a go-enclave
+  budget too (#211).** `shamir.UnmarshalShareSetWith(a, data)`, the budgeted
+  form of the recovery-ceremony ingestion path, and `(*Share).ProtectWith(a)`
+  admit every share value they lock against `a`, under #204's contract: a nil
+  allocator is refused with `enclave.ErrNilAllocator` before the input is
+  read, exhaustion is a `*ProtectedMemoryError` matching
+  `enclave.ErrBudgetExhausted`, and a set refused partway through destroys the
+  shares that call had built while leaving shares from earlier calls
+  untouched. `UnmarshalShareSetWith` still enforces the 255-share and
+  `MaxShareSetBytes` bounds before admitting anything. `ProtectedShare.UnmarshalJSON`
+  cannot take an allocator, so it stays unbudgeted and says so; the budgeted
+  route for one share is a one-element `UnmarshalShareSetWith`, or
+  `NewProtectedShareWith` for a caller already holding the value bytes.
+  `UnmarshalShareSet` and `Protect` keep their signatures and delegate to the
+  same implementation. One behaviour moves with the shared code:
+  `UnmarshalShareSet` now reports a refused lock on a share as a
+  `*ProtectedMemoryError` naming the element, where it used to fold it into a
+  `*ValidationError` that hid the allocator's error from `errors.Is`.
+- **Public-releasability gate (#213, #206).** `test/releasability` scans every
+  published file — the git index minus what `.gitattributes` marks
+  `export-ignore` — for four classes of private-lab value (fleet address, fleet
+  hostname, owner path, owner account) and runs as
+  `TestTheTrackedTreeIsPubliclyReleasable` under `make test`. A line is
+  accepted by an inline `lab-string-ok: <reason>` waiver or a reasoned,
+  class-scoped allow-list entry; both are validated. The package is test-only
+  and adds no importable API. A new `.gitattributes` export-ignores `CLAUDE.md`,
+  `AGENTS.md`, `.claude/` and `.serena/` at any depth, `.dockerignore` mirrors
+  the four entries, and tests pin the published manifest, a real `git archive`,
+  and both lists. Policy: `docs/release/public-releasability.md`. The Go module
+  zip and a push of this history do not honour `export-ignore`; that limit is
+  documented there.
+
+### Changed
+- **`go-enclave` v0.6.1-alpha → v0.6.2-alpha**, per the rule that every
+  dependency tracks its current release. The release only fixes bugs and
+  changes no API this module uses. Most relevant here: a failed
+  `Allocator.New`/`NewSized` no longer refunds budget for pages it could not
+  release. That is the allocator the `...With` Shamir functions charge.
+- **The remote-offload targets have no default host (#213).** `make remote-*`
+  and `make remote-tools` now require `REMOTE_HOST` and stop with a usage
+  message without it; `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR` are renamed
+  `REMOTE_USER` (optional), `REMOTE_HOST` and `REMOTE_WORKDIR`. `remote-tools`
+  seeds a private forge's host key only when `FORGE_SSH_HOST` (and
+  `FORGE_SSH_PORT`, default 22) name one. Target names are unchanged. Lab
+  addresses, hostnames and the owner's account were removed from shipped
+  examples, test fixtures and the stored benchmark baselines' headers.
 
 ### Fixed
 - **One slow read stalled the whole shard on concurrent and on-disk state

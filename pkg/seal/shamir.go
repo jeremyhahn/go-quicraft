@@ -198,6 +198,13 @@ func (r *ShamirInitResult) Destroy() {
 // result) has them destroyed before the new set replaces them. The copy this
 // method makes of the "shares" bytes is share material and is wiped on the way
 // out; the caller's own data buffer is not this method's to wipe.
+//
+// Budget: the shares' locked memory is UNBUDGETED — json.Unmarshaler fixes
+// this method's signature, so it cannot be handed an enclave.Allocator. A
+// caller that bounds its locked memory with one decodes the "shares" member
+// itself (as json.RawMessage) through shamir.UnmarshalShareSetWith, which
+// applies the same bounds and ownership rules and charges every share to the
+// allocator.
 func (r *ShamirInitResult) UnmarshalJSON(data []byte) error {
 	var aux struct {
 		Shares      json.RawMessage `json:"shares"`

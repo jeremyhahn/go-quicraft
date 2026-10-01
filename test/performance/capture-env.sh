@@ -21,7 +21,7 @@
 set -uo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
-  echo "usage: $0 <profile-name>   (e.g. $0 omega)" >&2
+  echo "usage: $0 <profile-name>   (e.g. $0 bench-01)" >&2
   exit 1
 fi
 PROFILE="$1"

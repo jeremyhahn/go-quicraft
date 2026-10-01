@@ -158,7 +158,7 @@ func TestLoadEnvAbsentIsTyped(t *testing.T) {
 // being printed beside another machine's numbers, which is the single failure
 // the capture exists to prevent.
 func TestProfileRejectsForeignCapture(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "omega")
+	dir := filepath.Join(t.TempDir(), "bench-01")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -178,8 +178,8 @@ func TestProfileRejectsForeignCapture(t *testing.T) {
 	} else {
 		t.Fatalf("error = %T (%v); want *EnvProfileMismatchError", err, err)
 	}
-	if mismatch.Captured != "r640" || mismatch.Directory != "omega" {
-		t.Fatalf("mismatch = %+v; want captured r640 in directory omega", mismatch)
+	if mismatch.Captured != "r640" || mismatch.Directory != "bench-01" {
+		t.Fatalf("mismatch = %+v; want captured r640 in directory bench-01", mismatch)
 	}
 }
 

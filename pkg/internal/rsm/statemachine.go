@@ -620,7 +620,8 @@ func (s *StateMachine) advanceLastApplied(idx uint64) {
 // expiry-disabled fast path). It does NOT evaluate session expiry and does NOT
 // advance lastApplied — Apply owns both so their evaluation stays a pure
 // function of the committed log rather than of segment boundaries. The caller
-// holds the read guard; results must be pre-allocated with
+// holds what lockApply acquires (readGuard in its tier's mode, then applyMu);
+// results must be pre-allocated with
 // len(results) == len(entries).
 //
 //nolint:gocyclo // the classification loop is not a per-entry function: it reads and mutates six pieces of BATCH-scoped state (admittedThisBatch, batchSeen, mirrors, sessionLifecycleAt and the three reused smEntries/smResults/indexMap buffers), and four of those are keyed by the entry's POSITION in the batch, which the second loop then resolves against. Extracting the body would have to thread all of it through the helper or hoist it into a struct — relocating the state rather than reducing it
@@ -971,12 +972,12 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 
 // Lookup forwards the query to the user state machine.
 //
-// The read guard serializes this against Apply, which holds the same guard
-// for writing, so a basic sm.StateMachine never sees Update and Lookup
+// On a basic sm.StateMachine the read guard serializes this against Apply,
+// which holds the same guard for writing there, so Update and Lookup never
 // overlap — the contract its doc comment publishes. Concurrent and on-disk
 // state machines are documented as handling their own synchronization, and
-// they pay the same exclusion here; the guard is on the adapter, not the
-// tier. Note the earlier claim that the CALLER serialized this was never
+// their Apply holds the guard for reading, so this runs alongside Update; on
+// those tiers the guard keeps out only Close (see lockApply). Note the earlier claim that the CALLER serialized this was never
 // true: Host.SyncRead, FollowerRead, QueryLocalNode and StaleRead all reach
 // this on their own goroutine while the apply worker runs.
 //

@@ -6,7 +6,7 @@ require (
 	github.com/anishathalye/porcupine v1.3.1
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/golang/snappy v1.0.0
-	github.com/jeremyhahn/go-enclave v0.6.1-alpha
+	github.com/jeremyhahn/go-enclave v0.6.2-alpha
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/quic-go/quic-go v0.63.0

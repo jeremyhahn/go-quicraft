@@ -689,8 +689,8 @@ make coverage-<pkg>                    # Per-package coverage
 
 # Performance comparison (QuicRaft vs etcd vs Dragonboat vs OpenRaft)
 make perf-compare-all                          # Run all systems, print a report
-make perf-all PERF_PROFILE=omega               # Run + store + generate, for one machine profile
-make perf-remote PERF_HOST=user@host PERF_PROFILE=omega  # Same, on another machine
+make perf-all PERF_PROFILE=<profile>           # Run + store + generate, for one machine profile
+make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>  # Same, on another machine
 ```
 
 ## Documentation

@@ -105,7 +105,18 @@ service choose how much locked memory to take, exhausting a process-wide
 resource every other caller depends on. `UnmarshalShareSet` bounds the element
 count (255) and the page-rounded locked cost of the share values
 (`MaxShareSetBytes`) *before* allocating, and
-destroys the accepted prefix if a later element is rejected.
+destroys the accepted prefix if a later element is rejected. A share whose
+locked memory is refused fails the set with a `*ProtectedMemoryError` naming the
+element, not a `*ValidationError`: the document was well formed, the host is out
+of locked memory. A consumer that bounds its locked memory with an allocator
+uses `UnmarshalShareSetWith` (§Capability: charge share memory to a
+locked-memory budget).
+
+`ProtectedShare.UnmarshalJSON` decodes one share and is **unbudgeted**: it
+implements `json.Unmarshaler`, whose signature has no room for an allocator.
+Under a budget, decode one share as a one-element set with
+`UnmarshalShareSetWith` (wrap the object in `[ ]`), or build it with
+`NewProtectedShareWith` when the value bytes are already in hand.
 
 `NewProtectedShare` builds one share at a time, and where it wipes the source
 buffer follows the error type exactly:
@@ -130,25 +141,30 @@ and decodes share by share with it.
 func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
 func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
 func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
+func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error)
+func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error)
 ```
 
 | | |
 |---|---|
 | Request | as the allocator-less form, plus `a` — a go-enclave `*Allocator`, normally `enclave.ProcessAllocator()` |
 | Response | as the allocator-less form; every locked region the call makes is charged to `a` until it is `Destroy`ed |
-| Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (nothing allocated, `value` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
+| Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (decided before the input is read: nothing allocated, `value`/`data`/the `Share` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
 | Permission | none — in-process call, no authorization boundary |
 | Caller obligation | as the allocator-less form |
 
-The allocator-less `SplitProtected`, `CombineProtected` and `NewProtectedShare`
-lock memory through go-enclave's **unbudgeted** constructors, which no
-`Allocator` sees: a consumer that bounds its locked memory with a process
-allocator would have every share escape that bound. The `...With` forms charge
-**every** region they lock — for a split that is the coefficient pool, the
-coefficient vector, the payload scratch and each share's value; for a combine,
-the decode buffer and the returned secret — to the allocator they are handed
-(issue #204). The allocator-less forms are unchanged and delegate to the same
-implementation.
+The allocator-less `SplitProtected`, `CombineProtected`, `NewProtectedShare`,
+`UnmarshalShareSet`, `Share.Protect` and `ProtectedShare.UnmarshalJSON` lock
+memory through go-enclave's **unbudgeted** constructors, which no `Allocator`
+sees: a consumer that bounds its locked memory with a process allocator would
+have every share escape that bound. The `...With` forms charge **every** region
+they lock — for a split that is the coefficient pool, the coefficient vector,
+the payload scratch and each share's value; for a combine, the decode buffer and
+the returned secret; for a set decode or a `Protect`, each share's value — to
+the allocator they are handed (issues #204, #211). The allocator-less forms are
+unchanged and delegate to the same implementation. `UnmarshalJSON` alone has no
+`...With` form, because `json.Unmarshaler` fixes its signature; see §Capability:
+decode a share set for the budgeted route.
 
 go-enclave's own unbudgeted constructors do **not** consult
 `enclave.ProcessAllocator()`, so neither does this package implicitly: the
@@ -159,15 +175,19 @@ A budget refusal is recoverable and local to the call:
 
 - It is decided before the refused region's locked memory is requested.
 - Everything the call had already allocated is destroyed before it returns, so
-  a split refused partway through its share loop gives its whole reservation
-  back to `a`. Shares returned by earlier calls — and the input shares to a
-  combine — are untouched.
+  a split refused partway through its share loop, or a set decode refused
+  partway through its elements, gives its whole reservation back to `a`. Shares
+  returned by earlier calls — and the input shares to a combine — are untouched.
 - `NewProtectedShareWith` keeps `NewProtectedShare`'s ownership contract: a
   `*ProtectedMemoryError`, budget refusal included, means `value` has already
-  been wiped.
+  been wiped. `ProtectWith` never modifies the `Share` (its value is a string,
+  and the one copy it makes is wiped on every path), so a refused call can be
+  retried against a larger budget.
 
-`MaxShareSetBytes` still bounds a single split up front; an allocator bounds
-everything the process holds, across calls, which no per-call figure can.
+`MaxShareSetBytes` still bounds a single split, and a single set decode, up
+front — `UnmarshalShareSetWith` runs the 255-share and `MaxShareSetBytes` checks
+before it admits anything — while an allocator bounds everything the process
+holds, across calls, which no per-call figure can.
 
 ### Capability: reconstruct a secret from M shares (bytes form)
 
@@ -230,6 +250,8 @@ type Share struct {
 }
 
 func (s *Share) Bytes() ([]byte, error)        // raw decoded value
+func (s *Share) Protect() (*ProtectedShare, error)                         // unbudgeted
+func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error) // charged to a
 func (s *Share) Validate() error               // nil-receiver safe
 func (s *Share) String() string                // value REDACTED
 func (s *Share) LogValue() slog.Value          // value REDACTED

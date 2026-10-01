@@ -59,13 +59,14 @@ before opening a pull request.
 
 Run the heavy parts off-box. `make remote-<target>` rsyncs your working tree,
 uncommitted edits included, to a remote build host and runs the target there,
-streaming output back. Point it at your own machine with `OMEGA_USER`,
-`OMEGA_HOST` and `OMEGA_DIR`:
+streaming output back. Point it at your own machine with `REMOTE_HOST`
+(required; there is no default), and optionally `REMOTE_USER` and
+`REMOTE_WORKDIR`:
 
 ```sh
-make remote-ci-full
-make remote-integration-test
-make remote-tools     # one-time: install the scanners the host lacks
+make remote-ci-full REMOTE_HOST=build-host.example
+make remote-integration-test REMOTE_HOST=build-host.example
+make remote-tools REMOTE_HOST=build-host.example   # one-time: install the scanners the host lacks
 ```
 
 This is not politeness about shared hardware. Every target runs under `-race`

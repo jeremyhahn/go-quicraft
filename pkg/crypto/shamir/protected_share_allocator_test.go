@@ -17,7 +17,9 @@ package shamir
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -249,5 +251,248 @@ func TestWithVariants_RefuseNilAllocator(t *testing.T) {
 	if out != nil || !errors.Is(err, enclave.ErrNilAllocator) {
 		out.Destroy()
 		t.Fatalf("CombineProtectedWith(nil) err = %v, want ErrNilAllocator", err)
+	}
+}
+
+// marshalShareSet is the document UnmarshalShareSet(With) reads: exactly what
+// json.Marshal writes for a share set.
+func marshalShareSet(t *testing.T, shares []*ProtectedShare) []byte {
+	t.Helper()
+	doc, err := json.Marshal(shares)
+	if err != nil {
+		t.Fatalf("json.Marshal share set: %v", err)
+	}
+	return doc
+}
+
+func TestUnmarshalShareSetWith_ChargesAndDestroyRefunds(t *testing.T) {
+	secret := []byte("issue-211 secret")
+	shares, err := SplitProtected(secret, 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer destroyAll(shares)
+	doc := marshalShareSet(t, shares)
+
+	a := newBudget(t, 3)
+	decoded, err := UnmarshalShareSetWith(a, doc)
+	if err != nil {
+		t.Fatalf("UnmarshalShareSetWith within budget: %v", err)
+	}
+	if got, want := a.InUse(), 3*pageBytes(); got != want {
+		destroyAll(decoded)
+		t.Fatalf("InUse after decoding 3 shares = %d, want %d (one page each)", got, want)
+	}
+	got, err := CombineProtected(decoded[:2])
+	if err != nil {
+		destroyAll(decoded)
+		t.Fatalf("decoded shares do not combine: %v", err)
+	}
+	ok := bytes.Equal(encBytes(got), secret)
+	got.Destroy()
+	if !ok {
+		destroyAll(decoded)
+		t.Fatal("decoded shares reconstruct the wrong secret")
+	}
+
+	destroyAll(decoded)
+	if got := a.InUse(); got != 0 {
+		t.Fatalf("InUse after Destroy = %d, want 0", got)
+	}
+}
+
+// TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact is the
+// verification issue #211 names for the recovery-ceremony ingestion path. An
+// earlier decode holds one page; the second set fits two of its three shares in
+// what is left and is refused on the third — partway through the set, the
+// refusal that has to be unwound — and must give back what it took while the
+// earlier share stays intact. The earlier decode is also the budgeted route for
+// ONE share that UnmarshalJSON documents: a one-element set.
+func TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) {
+	shares, err := SplitProtected([]byte("0123456789abcdef0123456789abcdef"), 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer destroyAll(shares)
+
+	a := newBudget(t, 3)
+	earlier, err := UnmarshalShareSetWith(a, marshalShareSet(t, shares[:1]))
+	if err != nil {
+		t.Fatalf("one-element set within budget: %v", err)
+	}
+	defer destroyAll(earlier)
+	held := a.InUse()
+	if held != pageBytes() {
+		t.Fatalf("InUse after one-element set = %d, want one page (%d)", held, pageBytes())
+	}
+	snapshot := append([]byte(nil), earlier[0].Value()...)
+
+	second, err := UnmarshalShareSetWith(a, marshalShareSet(t, shares))
+	if second != nil {
+		destroyAll(second)
+		t.Fatal("set beyond the budget was admitted")
+	}
+	assertBudgetExhausted(t, err)
+	var vErr *ValidationError
+	if errors.As(err, &vErr) {
+		t.Fatal("a budget refusal must NOT be reported as a *ValidationError")
+	}
+	if got := a.InUse(); got != held {
+		t.Fatalf("InUse after refused set = %d, want it back at %d (the refused call leaked)", got, held)
+	}
+
+	if err := earlier[0].Validate(); err != nil {
+		t.Fatalf("earlier share invalid after refusal: %v", err)
+	}
+	if !bytes.Equal(earlier[0].Value(), snapshot) {
+		t.Fatal("earlier share's value changed after a refused set")
+	}
+	if earlier[0].Index != shares[0].Index {
+		t.Fatalf("earlier share index = %d, want %d", earlier[0].Index, shares[0].Index)
+	}
+}
+
+// TestUnmarshalShareSetWith_SetBoundsRunBeforeTheAllocator pins that the
+// allocator is an addition to the set's own bounds, not a replacement: an
+// oversized set is refused as a *ValidationError before anything is admitted,
+// however large the budget.
+func TestUnmarshalShareSetWith_SetBoundsRunBeforeTheAllocator(t *testing.T) {
+	a, err := enclave.NewAllocator(int64(4 * MaxShareSetBytes))
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	doc := []byte("[" + strings.Repeat(`{},`, maxShares) + `{}]`)
+	shares, err := UnmarshalShareSetWith(a, doc)
+	if shares != nil {
+		destroyAll(shares)
+		t.Fatal("a set of more than maxShares elements was admitted")
+	}
+	var vErr *ValidationError
+	if !errors.As(err, &vErr) {
+		t.Fatalf("err = %T (%v), want *ValidationError", err, err)
+	}
+	if got := a.InUse(); got != 0 {
+		t.Fatalf("InUse after a bounds refusal = %d, want 0", got)
+	}
+}
+
+// TestUnmarshalShareSet_LockRefusalIsProtectedMemoryError pins the error type
+// the shared implementation reports on the unbudgeted path when the kernel
+// refuses a share's lock: the same *ProtectedMemoryError the budgeted path
+// reports, not a *ValidationError that would tell the operator the document was
+// wrong.
+func TestUnmarshalShareSet_LockRefusalIsProtectedMemoryError(t *testing.T) {
+	shares, err := SplitProtected([]byte("lock refusal"), 2, 3)
+	if err != nil {
+		t.Fatalf("SplitProtected: %v", err)
+	}
+	defer destroyAll(shares)
+	doc := marshalShareSet(t, shares)
+
+	restore := testOnlyProtectedMemory(refuseProtectedMemory)
+	defer restore()
+
+	decoded, err := UnmarshalShareSet(doc)
+	if decoded != nil {
+		destroyAll(decoded)
+		t.Fatal("a refused lock yielded a share set")
+	}
+	var pme *ProtectedMemoryError
+	if !errors.As(err, &pme) {
+		t.Fatalf("err = %T (%v), want *ProtectedMemoryError", err, err)
+	}
+	if !errors.Is(err, errLockRefused) {
+		t.Fatal("the allocator's own error must remain reachable through Unwrap")
+	}
+	var vErr *ValidationError
+	if errors.As(err, &vErr) {
+		t.Fatal("a locked-memory refusal must NOT be reported as a *ValidationError")
+	}
+}
+
+func TestShareProtectWith_OnePageBudget(t *testing.T) {
+	plain, err := Split([]byte("issue-211 protect"), 2, 3)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	plain[0].Metadata = map[string]string{"custodian": "a"}
+
+	a := newBudget(t, 1)
+	first, err := plain[0].ProtectWith(a)
+	if err != nil {
+		t.Fatalf("first ProtectWith within budget: %v", err)
+	}
+	defer first.Destroy()
+	if got := a.InUse(); got != pageBytes() {
+		t.Fatalf("InUse after first share = %d, want one page (%d)", got, pageBytes())
+	}
+	if !bytes.Equal(first.Value(), []byte(plain[0].Value)) {
+		t.Fatal("protected value differs from the plain share's")
+	}
+	if first.Metadata["custodian"] != "a" {
+		t.Fatal("ProtectWith dropped the share's metadata")
+	}
+	want0 := append([]byte(nil), first.Value()...)
+
+	before := plain[1].Value
+	second, err := plain[1].ProtectWith(a)
+	if second != nil {
+		second.Destroy()
+		t.Fatal("second share beyond a one-page budget was admitted")
+	}
+	assertBudgetExhausted(t, err)
+	if got := a.InUse(); got != pageBytes() {
+		t.Fatalf("InUse after refusal = %d, want it unchanged at %d", got, pageBytes())
+	}
+	if plain[1].Value != before {
+		t.Fatal("a refused ProtectWith changed the plain share")
+	}
+	if err := first.Validate(); err != nil {
+		t.Fatalf("earlier share invalid after refusal: %v", err)
+	}
+	if !bytes.Equal(first.Value(), want0) {
+		t.Fatal("earlier share's value changed after refusal")
+	}
+
+	// The plain share is intact, so the refused call can be retried against a
+	// budget that admits it.
+	retry, err := plain[1].ProtectWith(newBudget(t, 1))
+	if err != nil {
+		t.Fatalf("retry against a fresh budget: %v", err)
+	}
+	retry.Destroy()
+
+	first.Destroy()
+	if got := a.InUse(); got != 0 {
+		t.Fatalf("InUse after Destroy = %d, want 0", got)
+	}
+}
+
+// TestUnmarshalAndProtectWith_RefuseNilAllocator pins the nil-allocator refusal
+// for the variants issue #211 adds, and that it is decided before the input is
+// read: a document that does not parse and a nil Share both report
+// ErrNilAllocator rather than their own errors.
+func TestUnmarshalAndProtectWith_RefuseNilAllocator(t *testing.T) {
+	shares, err := UnmarshalShareSetWith(nil, []byte("not json"))
+	if shares != nil || !errors.Is(err, enclave.ErrNilAllocator) {
+		destroyAll(shares)
+		t.Fatalf("UnmarshalShareSetWith(nil) err = %v, want ErrNilAllocator", err)
+	}
+
+	var nilShare *Share
+	p, err := nilShare.ProtectWith(nil)
+	if p != nil || !errors.Is(err, enclave.ErrNilAllocator) {
+		p.Destroy()
+		t.Fatalf("(*Share)(nil).ProtectWith(nil) err = %v, want ErrNilAllocator", err)
+	}
+
+	plain, err := Split([]byte("nil allocator"), 2, 3)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+	p, err = plain[0].ProtectWith(nil)
+	if p != nil || !errors.Is(err, enclave.ErrNilAllocator) {
+		p.Destroy()
+		t.Fatalf("ProtectWith(nil) err = %v, want ErrNilAllocator", err)
 	}
 }

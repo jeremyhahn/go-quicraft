@@ -27,6 +27,13 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
 func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error)
 func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error)
 
+// The same, with every locked region charged to a go-enclave Allocator
+// (#204, #211); a nil allocator is refused with enclave.ErrNilAllocator
+func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
+func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
+func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error)
+
 // Split / combine — wipeable bytes form
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
 func CombineBytes(values [][]byte, threshold int) ([]byte, error)
@@ -44,6 +51,7 @@ type Share struct {
 
 func (s *Share) Bytes() ([]byte, error)
 func (s *Share) Protect() (*ProtectedShare, error)
+func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error)
 func (s *Share) Validate() error
 func (s *Share) String() string
 func (s *Share) LogValue() slog.Value
@@ -102,7 +110,7 @@ wiped by `Destroy`:
 | `Split` | `SplitProtected` |
 | `Combine`, `CombineUnverified` | `CombineProtected` (returns the secret in a `*enclave.MemoryEnclave`) |
 | `&Share{…, Value: v}` | `NewProtectedShare(index, threshold, total, value)` — wipes the source **on success only**; the caller wipes it on every error return |
-| an existing `*Share` | `(*Share).Protect()` |
+| an existing `*Share` | `(*Share).Protect()`, or `(*Share).ProtectWith(a)` under a locked-memory budget |
 
 Both protected paths are **native**, not wrappers: `SplitProtected` reads the
 polynomial coefficients into locked memory and encodes each share value
@@ -327,8 +335,8 @@ accept.
 | `len(secret) > 0` | `Split`, `SplitProtected` | `SplitError` |
 | `len(secret) <= MaxSecretBytes` | `Split`, `SplitProtected` | `SplitError` |
 | page-rounded whole-set footprint `<= MaxShareSetBytes` | `SplitProtected` | `SplitError` |
-| page-rounded sum of share-value lengths `<= MaxShareSetBytes` | `UnmarshalShareSet` | `ValidationError` |
-| `len(shares) <= 255` | `UnmarshalShareSet` | `ValidationError` |
+| page-rounded sum of share-value lengths `<= MaxShareSetBytes` | `UnmarshalShareSet`, `UnmarshalShareSetWith` | `ValidationError` |
+| `len(shares) <= 255` | `UnmarshalShareSet`, `UnmarshalShareSetWith` | `ValidationError` |
 | `len(shares) <= 255` (`maxShares`) | `Combine`, `CombineBytes` | `CombineError` |
 | payload `<= MaxSecretBytes` | `parseRawShare` | `CombineError` |
 | `x != 0` | `parseRawShare` | `CombineError` |
@@ -411,9 +419,13 @@ key that does fit. Against the 8 MiB `RLIMIT_MEMLOCK` a Linux host commonly
 defaults to, one maximal set is a quarter of the ceiling; that bounds ONE call
 and is deliberately not a concurrency budget. The concurrency budget is a
 go-enclave `Allocator`, owned by whoever owns the process: the `...With`
-variants of `SplitProtected`, `CombineProtected` and `NewProtectedShare` charge
-every region they lock to the one they are handed (issue #204), and a refusal
-partway through a split destroys everything that call had allocated.
+variants of `SplitProtected`, `CombineProtected`, `NewProtectedShare` (issue
+#204), `UnmarshalShareSet` and `Share.Protect` (issue #211) charge every region
+they lock to the one they are handed, and a refusal partway through a split or
+a set decode destroys everything that call had allocated. The one locking entry
+point without a `...With` form is `ProtectedShare.UnmarshalJSON`, because
+`json.Unmarshaler` fixes its signature; it is documented as unbudgeted, and the
+budgeted route for one share is a one-element `UnmarshalShareSetWith`.
 
 And **shares arriving from outside the process are decoded with
 `UnmarshalShareSet`, not `json.Unmarshal` into a `[]*ProtectedShare`.** Shares
@@ -470,9 +482,10 @@ and `Share.Total` are unauthenticated caller-supplied metadata.
 | `*SplitError` | `Reason` | `Split`, `SplitBytes`, `SplitProtected` — parameter and size violations, RNG failure, and (protected only) a whole-set footprint above `MaxShareSetBytes` |
 | `*CombineError` | `Reason` | `Combine`, `CombineUnverified`, `CombineBytes`, `CombineProtected` — set-level and per-share structural violations |
 | `*ValidationError` | `Field`, `Reason` | `Share.Validate`, `ProtectedShare.Validate`, `VerifyShare`, `NewProtectedShare`, `UnmarshalShareSet` — per-field violations, positionally named |
+| `*ProtectedMemoryError` | `Op`, `Err` | every protected path and its `...With` form — a locked allocation the kernel (`enclave.ErrLockedMemoryUnavailable`) or the caller's allocator (`enclave.ErrBudgetExhausted`) refused; `UnmarshalShareSet` names the element in `Op` |
 | `*IntegrityError` | — | **never**. Deprecated; retained for API/SDK compatibility only. |
 
-- All four are concrete pointer types; match with `errors.As`.
+- All five are concrete pointer types; match with `errors.As`.
 - Error strings name the offending share by its position in the input slice
   (`"share 3 has zero x-coordinate"`), not by custodian identity — this package
   has no notion of one.
