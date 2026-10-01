@@ -201,29 +201,159 @@ func TestBarrier_ResetThenInitializeNewRootKey(t *testing.T) {
 	}
 }
 
-// TestBarrier_ResetAfterSetSealedRootKey covers the other route into the sealed
-// state: a barrier that adopted a persisted blob, including an HKDFV1 one,
-// must reset to a fresh barrier that stamps the current derivation layout.
+// assertResetRefusedIntact asserts that Reset refuses with ErrResetNotFirstBoot
+// and leaves the sealed barrier exactly where it was: same epoch, same blob,
+// still unsealable with strategy.
+func assertResetRefusedIntact(t *testing.T, b *Barrier, strategy SealingStrategy) {
+	t.Helper()
+	epoch := b.CurrentEpoch()
+	gen := b.LoadGeneration()
+	if err := b.Reset(); !errors.Is(err, ErrResetNotFirstBoot) {
+		t.Fatalf("Reset: got %v, want ErrResetNotFirstBoot", err)
+	}
+	if !b.IsInitialized() || !b.IsSealed() || b.SealedRootKeyData() == nil {
+		t.Fatal("refused Reset changed the barrier's state")
+	}
+	if b.CurrentEpoch() != epoch || b.LoadGeneration() != gen {
+		t.Fatalf("refused Reset moved epoch/generation: epoch %d->%d gen %d->%d",
+			epoch, b.CurrentEpoch(), gen, b.LoadGeneration())
+	}
+	if err := b.Unseal(context.Background(), strategy, Credentials{}); err != nil {
+		t.Fatalf("Unseal after refused Reset: %v", err)
+	}
+	ct, err := b.Encrypt(nil, []byte("still works"))
+	if err != nil {
+		t.Fatalf("Encrypt after refused Reset: %v", err)
+	}
+	if _, err := b.Decrypt(nil, ct); err != nil {
+		t.Fatalf("Decrypt after refused Reset: %v", err)
+	}
+}
+
+// TestBarrier_ResetAfterSetSealedRootKey: a barrier whose root key was loaded
+// from a persisted blob is not a first boot, so Reset must refuse — otherwise
+// it would discard the in-process rollback floor SetSealedRootKey enforces.
 func TestBarrier_ResetAfterSetSealedRootKey(t *testing.T) {
 	src, _ := testInitializedBarrier(t)
 	blob := src.SealedRootKeyData()
-	blob.HKDFVersion = 0 // a pre-version blob, adopted as HKDFV1
 
 	b := MustNewBarrier(testBarrierConfig(1))
 	if err := b.SetSealedRootKey(blob); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
-	if b.hkdfVersion != HKDFV1 {
-		t.Fatalf("precondition: hkdfVersion = %d, want HKDFV1", b.hkdfVersion)
+	assertResetRefusedIntact(t, b, testStrategy(t))
+}
+
+// TestBarrier_ResetAfterLoadOverOwnInitialize: SetSealedRootKey applied on top
+// of this process's own Initialize also ends the first boot.
+func TestBarrier_ResetAfterLoadOverOwnInitialize(t *testing.T) {
+	b, s := testSealedBarrier(t)
+	if err := b.SetSealedRootKey(b.SealedRootKeyData()); err != nil {
+		t.Fatalf("SetSealedRootKey: %v", err)
+	}
+	assertResetRefusedIntact(t, b, s)
+}
+
+// TestBarrier_ResetAfterRotate: once an epoch above the first exists, Reset
+// must refuse.
+func TestBarrier_ResetAfterRotate(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	if _, err := b.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	assertResetRefusedIntact(t, b, s)
+}
+
+// TestBarrier_ResetAfterUnsealForcedRotation: Unseal's forced rotation (taken
+// when the invocation count is not authoritative) advances the epoch, and that
+// too ends the first boot. invocationsAuthoritative is cleared directly so the
+// rotation is the ONLY thing that can have cleared firstBoot.
+func TestBarrier_ResetAfterUnsealForcedRotation(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	b.invocationsAuthoritative = false
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if got := b.CurrentEpoch(); got != 2 {
+		t.Fatalf("precondition: Unseal should have rotated to epoch 2, got %d", got)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	assertResetRefusedIntact(t, b, s)
+}
+
+// TestBarrier_ResetFirstBootSurvivesInProcessUnseal: an in-process Seal/Unseal
+// cycle that does not advance the epoch keeps the first boot resettable.
+func TestBarrier_ResetFirstBootSurvivesInProcessUnseal(t *testing.T) {
+	b, s := testSealedBarrier(t)
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if got := b.CurrentEpoch(); got != 1 {
+		t.Fatalf("precondition: epoch = %d, want 1", got)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
 	}
 	if err := b.Reset(); err != nil {
 		t.Fatalf("Reset: %v", err)
 	}
+	if b.firstBoot {
+		t.Fatal("Reset re-armed firstBoot")
+	}
+}
+
+// TestBarrier_RefusedResetKeepsRollbackFloor is the #216 scenario: a barrier
+// that has reached epoch 3 refuses Reset, and the older authentic epoch-1 blob
+// is still rejected by SetSealedRootKey's rollback floor afterwards.
+func TestBarrier_RefusedResetKeepsRollbackFloor(t *testing.T) {
+	b, s := testInitializedBarrier(t)
+	oldBlob := b.SealedRootKeyData()
+	for i := 0; i < 2; i++ {
+		if _, err := b.Rotate(); err != nil {
+			t.Fatalf("Rotate: %v", err)
+		}
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if err := b.Reset(); !errors.Is(err, ErrResetNotFirstBoot) {
+		t.Fatalf("Reset: got %v, want ErrResetNotFirstBoot", err)
+	}
+	if err := b.SetSealedRootKey(oldBlob); !errors.Is(err, ErrSealedEpochRollback) {
+		t.Fatalf("SetSealedRootKey(epoch-1 blob) after refused Reset: got %v, want ErrSealedEpochRollback", err)
+	}
+	if got := b.CurrentEpoch(); got != 3 {
+		t.Fatalf("CurrentEpoch = %d, want 3", got)
+	}
+	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+}
+
+// TestBarrier_ResetThenInitializeIsFirstBootAgain: the flag is re-armed only by
+// a new Initialize, so Initialize -> Seal -> Reset -> Initialize -> Seal -> Reset
+// succeeds.
+func TestBarrier_ResetThenInitializeIsFirstBootAgain(t *testing.T) {
+	b, _ := testSealedBarrier(t)
+	if err := b.Reset(); err != nil {
+		t.Fatalf("first Reset: %v", err)
+	}
 	if err := b.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
 		t.Fatalf("Initialize after Reset: %v", err)
 	}
-	if got := b.SealedRootKeyData().HKDFVersion; got != currentHKDFVersion {
-		t.Fatalf("re-initialized blob HKDFVersion = %d, want %d", got, currentHKDFVersion)
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if err := b.Reset(); err != nil {
+		t.Fatalf("second Reset: %v", err)
 	}
 }
 

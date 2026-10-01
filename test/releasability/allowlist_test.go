@@ -49,16 +49,11 @@ const benchmarkProvenance = "Benchmark provenance: profile names record which ma
 	"the numbers. A throughput figure is a property of its machine, so the " +
 	"machine's name is the measurement's meaning, not a leak."
 
-// companyTemplate is the reason shared by the forge-side SDLC configuration.
-const companyTemplate = "Company CI template copy; values owned by the template in the private " +
-	"company repo; the template is the place to neutralise them. This file " +
-	"configures the private forge's review and update automation and is not " +
-	"edited here."
-
 // allowList is the accepted set for THIS repository. Every entry is a
 // deliberate decision, and the list is meant to shrink. Lab values were removed
-// everywhere they were removable; what remains is benchmark provenance or
-// configuration another repository owns.
+// everywhere they were removable, and the private forge's own configuration is
+// export-ignored rather than allowed (manifest_test.go: privateWorkflowFiles);
+// what remains is benchmark provenance.
 var allowList = []allowRule{
 	{
 		path:    "test/performance/profiles/**",
@@ -82,21 +77,6 @@ var allowList = []allowRule{
 		classes: []class{classLabHost},
 		reason: "Historical release notes recording where measurements ran. Released " +
 			"entries are not rewritten; new entries name roles, not machines.",
-	},
-	{
-		path:    ".github/workflows/opencode-review.yml",
-		classes: []class{classLabAddress, classLabHost},
-		reason:  companyTemplate,
-	},
-	{
-		path:    ".github/workflows/claude-review.yml",
-		classes: []class{classLabHost},
-		reason:  companyTemplate,
-	},
-	{
-		path:    ".github/dependabot.yml",
-		classes: []class{classLabAddress},
-		reason:  companyTemplate,
 	},
 }
 

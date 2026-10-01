@@ -23,7 +23,12 @@ synchronise itself, as its interface requires.
   already hold. Every key enclave is destroyed, and the epoch, DEK maps, load
   generation, backoff counters and invocation accounting are cleared. It is
   refused while the barrier is unsealed (`ErrBarrierUnsealed`), uninitialized
-  (`ErrBarrierNotInit`), superseded (`ErrBarrierSuperseded`) or holds an epoch
+  (`ErrBarrierNotInit`), superseded (`ErrBarrierSuperseded`), not an
+  uncompleted first boot (the new `ErrResetNotFirstBoot`: its root key was
+  loaded with `SetSealedRootKey`, or its epoch advanced past 1 through `Rotate`
+  or `Unseal`'s forced rotation — resetting such a barrier would drop
+  `SetSealedRootKey`'s in-process rollback floor and let an older blob
+  re-derive an already-used DEK with fresh counters, #216) or holds an epoch
   pinned in flight (the new `ErrEpochsInFlight`). Persisted state is not
   touched; the caller owns any blob it saved. `Reset` is on `*Barrier` only:
   the host-facing `Barrier` and WAL `WALBarrier` interfaces are unchanged.
@@ -61,15 +66,18 @@ synchronise itself, as its interface requires.
   `*ValidationError` that hid the allocator's error from `errors.Is`.
 - **Public-releasability gate (#213, #206).** `test/releasability` scans every
   published file — the git index minus what `.gitattributes` marks
-  `export-ignore` — for four classes of private-lab value (fleet address, fleet
-  hostname, owner path, owner account) and runs as
+  `export-ignore` — for five classes of private-lab value (fleet address, fleet
+  hostname, owner path, owner account, and internal identity: the internal
+  mail domain and `agent-<name>@` principals, #215) and runs as
   `TestTheTrackedTreeIsPubliclyReleasable` under `make test`. A line is
   accepted by an inline `lab-string-ok: <reason>` waiver or a reasoned,
   class-scoped allow-list entry; both are validated. The package is test-only
   and adds no importable API. A new `.gitattributes` export-ignores `CLAUDE.md`,
-  `AGENTS.md`, `.claude/` and `.serena/` at any depth, `.dockerignore` mirrors
-  the four entries, and tests pin the published manifest, a real `git archive`,
-  and both lists. Policy: `docs/release/public-releasability.md`. The Go module
+  `AGENTS.md`, `.claude/` and `.serena/` at any depth, plus the private forge
+  and release workflow — the review and auto-merge workflows and the release
+  trust anchor `.release-allowed-signers` (#215) — and `.dockerignore` mirrors
+  every entry; tests pin the published manifest, a real `git archive`, and both
+  lists. Policy: `docs/release/public-releasability.md`. The Go module
   zip and a push of this history do not honour `export-ignore`; that limit is
   documented there.
 

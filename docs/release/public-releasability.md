@@ -5,13 +5,14 @@
 
 This repository ships publicly: as a Go module and as release archives built
 from a tagged commit. Everything tracked here is published except the private
-development workflow, which `.gitattributes` excludes (below). This page is the
+development workflow and the private forge and release workflow, which
+`.gitattributes` excludes (below). This page is the
 rule that keeps that true, and the gate that enforces it.
 
 ## The rule
 
-No published file names the private development fleet or its owner. Concretely,
-four classes:
+No published file names the private development fleet, its owner or its
+internal identities. Concretely, five classes:
 
 | Class | What it covers | Use instead |
 |---|---|---|
@@ -19,9 +20,10 @@ four classes:
 | `lab-host` | A fleet hostname (`vstation-NN`, `dellemc-NN`, the GPU review box, the spare-capacity build and bench host) | The role, not the machine: `build-host.example`, `user@bench-host.example`, `forge.example`, `bench-01` |
 | `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, `/home/agent` |
 | `owner-account` | The owner's account name on its own | A role: `user`, `operator`, or the module path |
+| `internal-identity` | An address in the internal mail domain, or an agent principal of the form `agent-<name>@...` on any domain | A neutral example identity: `release@example.invalid`, `ops@forge.example` |
 
-The fleet's own subnet, hostnames and path prefixes are written down in exactly
-one place: the `patterns` list in `test/releasability/scanner_test.go`. Read it
+The fleet's own subnet, hostnames, path prefixes and internal mail domain are
+written down in exactly one place: the `patterns` list in `test/releasability/scanner_test.go`. Read it
 there rather than repeating it here.
 
 Site configuration — which machine the remote targets offload to, which forge a
@@ -46,41 +48,74 @@ fixtures (`bench-01`, `198.51.100.x`, `forge.example`). Only the gate's own
 tests plant fleet values, because they are what the rules exist to find, and
 each such line carries an inline waiver.
 
-## Development tooling stays private
+## Private workflow stays private
 
-`CLAUDE.md` and `AGENTS.md` (at any depth), `.claude/` and `.serena/` are the
-agent development workflow. They name the private forge and internal
-identities, so they stay in the private repository and are never published.
+Two groups of tracked files are never published:
+
+- **Development tooling.** `CLAUDE.md` and `AGENTS.md` (at any depth),
+  `.claude/` and `.serena/` are the agent development workflow
+  (`isDevelopmentTooling`).
+- **The private forge and release workflow** (`privateWorkflowFiles`, exact
+  paths):
+
+  | Path | What it is |
+  |---|---|
+  | `.github/workflows/opencode-review.yml` | The private forge's automated peer review |
+  | `.github/workflows/claude-review.yml` | A disabled second reviewer for the same forge |
+  | `.github/workflows/automerge.yml` | Arms the private forge's auto-merge when a PR opens |
+  | `.release-allowed-signers` | The release recipe's trust anchor: the internal agent principal and its public key |
+
+  None of them does anything for a public reader. `ci.yml`, `release.yml`,
+  `nightly.yml` and `fuzz.yml` neither call nor read them, and
+  `make release-alpha` reads the signers file from the checkout it runs in,
+  which `export-ignore` does not touch. `.github/dependabot.yml` stays
+  published: it is a github.com service file, inert on the private forge and
+  intended for the public mirror.
+
+All of these name the private forge, its hosts or internal identities, so they
+stay in the private repository.
 
 The exclusion list is `.gitattributes`: each entry is `export-ignore`, which
 every archive git builds applies — `git archive`, and the source tarball a
-forge serves for a tag. `.dockerignore` carries the same four entries, so no
-image build context includes them. `test/releasability` enforces both:
+forge serves for a tag. `.dockerignore` carries the same entries, so no image
+build context includes them. `test/releasability` enforces both:
 
 - `TestThePublishedTreeCarriesNoDevelopmentTooling` — the published manifest
-  (`publishedFiles`: the index minus export-ignored paths) holds no agent file,
+  (`publishedFiles`: the index minus export-ignored paths) holds none of them,
   and nothing else is export-ignored.
 - `TestGitArchiveHonoursTheExclusionList` — a repository carrying this tree's
-  `.gitattributes`, archived as a forge would, contains none of them.
+  `.gitattributes`, archived as a forge would, contains none of them and keeps
+  the public workflows beside them.
 - `TestTheExclusionListsNameTheDevelopmentTooling` — `.gitattributes` and
-  `.dockerignore` both carry all four entries.
+  `.dockerignore` both carry every entry.
 
-A new agent tool's files go in `isDevelopmentTooling`
-(`test/releasability/manifest_test.go`), `.gitattributes` and `.dockerignore`
-together.
+A new agent tool's files go in `isDevelopmentTooling`, a new private-forge file
+in `privateWorkflowFiles` (both `test/releasability/manifest_test.go`), and
+either one in `.gitattributes` and `.dockerignore` together.
+
+Two build gates read private-forge files: `test/buildgates` checks that
+`claude-review.yml` can neither publish a status nor run, and drives
+`make release-alpha` against `.release-allowed-signers`. Both go through
+`requirePrivateWorkflowFile`, which skips when the file is absent *and*
+`.gitattributes` export-ignores it exactly — a published export, where there is
+no private machinery to check — and fails when it is absent for any other
+reason. `TestPrivateWorkflowFilesAreExportIgnored` pins that both files are
+export-ignored, so an export skips those gates rather than failing them; in the
+private repository both files are present and the gates run.
 
 **Not covered: the module zip and a history push.** The Go module zip
 (`proxy.golang.org`, `go mod download`) is built from the repository at the
 tag and does not honour `export-ignore`; neither does pushing this
 repository's history to a public remote, where every commit carries the agent
-files. For the exclusion to hold there, the public repository must be produced
+files, the private forge workflows and the internal signer principal. For the
+exclusion to hold there, the public repository must be produced
 as an export — `git archive` of the release commit, committed fresh — and not
 as a push of this history.
 
 ## The gate
 
 `test/releasability` scans every published file and reports each line carrying
-a value in one of the four classes. It runs as
+a value in one of the five classes. It runs as
 `TestTheTrackedTreeIsPubliclyReleasable`, and `make test` (`go test ./...`)
 includes the package, so there is no target to remember. Every file in the
 package is a `_test.go` file: the gate adds nothing to the module's importable
@@ -124,9 +159,10 @@ The list is meant to shrink. Today it holds:
 | `test/performance/baselines/**` | `lab-host` | Benchmark provenance: the file name and run-host/build-host header |
 | `test/performance/perfprofile/generate_test.go` | `lab-host` | Drives the generator with a real stored profile |
 | `CHANGELOG.md` | `lab-host` | Historical release notes recording where measurements ran |
-| `.github/workflows/opencode-review.yml` | `lab-address`, `lab-host` | Company CI template copy; neutralised in the template, not here |
-| `.github/workflows/claude-review.yml` | `lab-host` | Same |
-| `.github/dependabot.yml` | `lab-address` | Same |
+
+The private forge's review workflows used to be allow-listed here as company
+template copies; since #215 they are export-ignored instead, so they are not
+published at all and need no allowance.
 
 ### Adding a fleet value to the rule set
 
@@ -147,6 +183,18 @@ headers carried the same address and account; the `perfcompare` tests and
 example (now `198.51.100.50` and `forge.example`); and copy-pasteable examples
 in the Makefile, README and testing docs named a fleet machine as the profile
 (now `PERF_PROFILE=<profile>`).
+
+## What #215 changed
+
+The `internal-identity` class was added. Its only hits in the tree were the
+release trust anchor, now export-ignored with the rest of the private forge
+workflow, and the forged-helper fixtures in
+`test/buildgates/release_inputs_test.go`, which now write
+`agent-$repo@example.invalid`: the release recipe checks the author name and
+finds the signer by key, so no assertion read the address. The review-workflow
+allow-list entries went with the files; `.github/dependabot.yml` stays
+published, and its comment no longer gives the private forge's address, so its
+entry went too.
 
 The same scheme is the company model: go-quicbaas carries the original
 (`pkg/labstrings`), and this repository's gate mirrors its classes, patterns,

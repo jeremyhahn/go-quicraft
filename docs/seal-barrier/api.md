@@ -79,7 +79,7 @@ func (b *Barrier) Reset() error
 |---|---|
 | Request | none; the barrier must be Sealed |
 | Response | barrier is Uninitialized and accepts `Initialize` again |
-| Errors | `ErrBarrierNotInit`, `ErrBarrierUnsealed`, `ErrBarrierSuperseded`, `ErrEpochsInFlight` |
+| Errors | `ErrBarrierNotInit`, `ErrBarrierUnsealed`, `ErrBarrierSuperseded`, `ErrResetNotFirstBoot`, `ErrEpochsInFlight` |
 | Permission | none — in-process call on the concrete barrier |
 
 For an embedder whose bootstrap fails after `Initialize` returned, and which
@@ -89,6 +89,14 @@ and the epoch, DEK maps, load generation and invocation accounting are cleared.
 **`Reset` does not touch persisted state** — delete or replace any blob you
 already saved. The next `Initialize` draws a new root key and salt, so data
 sealed under the discarded key fails with `ErrDecryptionFailed`.
+
+`Reset` rolls back **only a first boot**: a root key this process created with
+`Initialize`, with no `SetSealedRootKey` applied since and no rotation
+(`Rotate`, or the forced rotation inside `Unseal`) past epoch 1. Anything else
+returns `ErrResetNotFirstBoot` and leaves the barrier untouched, because
+discarding a later epoch would drop `SetSealedRootKey`'s rollback floor and let
+an older blob re-derive an already-used DEK with fresh nonce and invocation
+counters.
 
 `Reset` is a method of `*Barrier` only. The host-facing `Barrier` interface and
 the WAL's `WALBarrier` carry no lifecycle methods, and gain none.

@@ -5,8 +5,8 @@ version: 2
 #
 # Dependabot is a github.com service. This repository has no `github` remote —
 # it has never been mirrored, and `git ls-remote github` answers "does not
-# appear to be a git repository". All development happens on the Gitea plane at
-# 198.51.100.50, where nothing reads this file. Zero pull requests have ever
+# appear to be a git repository". All development happens on the private Gitea
+# plane, where nothing reads this file. Zero pull requests have ever
 # come from it.
 #
 # The cost was not merely that it did nothing. Two comments in

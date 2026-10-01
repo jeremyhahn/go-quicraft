@@ -14,9 +14,9 @@
 
 // Package releasability is the release gate that keeps this repository
 // publicly releasable: it reports every published file that names a host, an
-// address or a filesystem path belonging to the private development fleet,
-// and it pins the exclusion list that keeps the private development workflow
-// out of every published form of the tree.
+// address, a filesystem path or an identity belonging to the private
+// development fleet, and it pins the exclusion list that keeps the private
+// development workflow out of every published form of the tree.
 //
 // WHY THIS IS A GATE AND NOT A CONVENTION. go-quicraft ships publicly as a Go
 // module and as release archives. Anything committed here is published unless
@@ -37,6 +37,10 @@
 //     mount. Meaningless off that one machine, and it leaks the account name.
 //   - classOwnerAccount: the owner's account name on its own. It identifies a
 //     person, and it is how the paths above get rebuilt by hand.
+//   - classInternalIdentity: a principal in the internal mail domain, or an
+//     agent principal (`agent-<name>@...`). It publishes who and what holds
+//     signing and write access on the private forge, and no public reader can
+//     do anything with it.
 //
 // TWO WAYS TO ACCEPT A LINE, both explicit:
 //
@@ -83,6 +87,11 @@ const (
 
 	// classOwnerAccount is the owner's account name outside a path.
 	classOwnerAccount class = "owner-account"
+
+	// classInternalIdentity is an identity of the private development
+	// workflow: an address in the internal mail domain, or an agent
+	// principal.
+	classInternalIdentity class = "internal-identity"
 )
 
 // waiverPrefix marks a line whose lab value is the point of the line. The text
@@ -110,7 +119,8 @@ type pattern struct {
 }
 
 // patterns is the rule set, and the one place in this repository the fleet's
-// own subnet, hostnames and path prefixes are written down.
+// own subnet, hostnames, path prefixes and internal mail domain are written
+// down.
 //
 // Note what is NOT here: 192.168.0.0/16 at large. Tests across this tree use
 // RFC 1918 literals as opaque addresses that are never dialed; banning the whole
@@ -158,6 +168,20 @@ var patterns = []pattern{
 		expr:     regexp.MustCompile(`/mnt/vstation`), // lab-string-ok: the mount prefix this rule exists to find
 		needle:   "/mnt/vstation",                     // lab-string-ok: the mount prefix this rule exists to find
 		guidance: "the lab's NFS mount does not exist anywhere else; use a repository-relative path",
+	},
+	{
+		// Before the domain rule on purpose: an agent principal is reported
+		// once, whole, and the internal domain inside it is not reported again.
+		class:    classInternalIdentity,
+		expr:     regexp.MustCompile(`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`),
+		needle:   "agent-",
+		guidance: "an agent principal identifies the private workflow, not the project: use a neutral example identity such as release@example.invalid",
+	},
+	{
+		class:    classInternalIdentity,
+		expr:     regexp.MustCompile(`(?i)\bautomatethethings\.internal\b`), // lab-string-ok: the mail domain this rule exists to find
+		needle:   "example.internal",                              // lab-string-ok: the mail domain this rule exists to find
+		guidance: "the internal mail domain resolves nowhere public: use a name under .example or .invalid",
 	},
 	{
 		// Last on purpose: a match inside a span an earlier rule already

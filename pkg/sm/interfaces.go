@@ -178,6 +178,14 @@ type DiskStateMachine interface {
 
 // Hasher computes a deterministic hash of state machine state for
 // cross-replica consistency verification. Detected via type assertion.
+//
+// The hash must be order-independent, and it must cover WHOLE batches. On a
+// StateMachine, QuicRaft never calls GetHash concurrently with Update. On a
+// ConcurrentStateMachine or DiskStateMachine it may, exactly as Lookup may,
+// so GetHash must synchronize with Update and hash the state either before or
+// after a batch, never part-way through one. A hash of a half-applied batch
+// reports a divergence between replicas that does not exist. kv.ConcurrentStore
+// does this by holding every bucket lock across both Update and GetHash.
 type Hasher interface {
 	GetHash() (uint64, error)
 }

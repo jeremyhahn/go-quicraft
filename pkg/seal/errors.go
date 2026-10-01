@@ -129,6 +129,14 @@ var (
 	// the DEK derives from.
 	ErrEpochsInFlight = errors.New("quicraft/seal: cannot reset barrier while epochs are pinned in flight")
 
+	// ErrResetNotFirstBoot is returned by Reset when the barrier is not an
+	// uncompleted first boot: its root key was loaded with SetSealedRootKey
+	// rather than created by this process's Initialize, or its epoch has
+	// advanced past the first (Rotate, or Unseal's forced rotation). Resetting
+	// such a barrier would discard SetSealedRootKey's in-process rollback floor
+	// and let an older blob re-derive an already-used DEK with fresh counters.
+	ErrResetNotFirstBoot = errors.New("quicraft/seal: reset only rolls back an uncompleted first-boot initialization")
+
 	// ErrInvalidSealedEpoch is returned when SetSealedRootKey receives a
 	// sealed key with Epoch == 0, or with 0 among its KnownEpochs. Epochs start
 	// at 1 (Initialize) and only ever increment, so nothing was sealed under

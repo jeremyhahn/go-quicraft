@@ -239,7 +239,7 @@ Uninitialized ──Initialize()──▶ Unsealed ──Seal()──▶ Sealed
 | `SetSealedRootKey` | any | blob validated and adopted; Sealed if it was Uninitialized |
 | `Unseal` | Sealed | root key unwrapped, `StateMAC` verified **before deriving any DEK**, blob claimed (`LoadGeneration+1`), DEKs re-derived for every known epoch, invocation budget re-established |
 | `Seal` | Unsealed | every key reference dropped; delegated encryptor cleared; `binding` reset to `ContextBindingUnresolved` |
-| `Reset` | Sealed, not superseded, no epoch pinned in flight | Uninitialized: any remaining key enclave destroyed; in-memory sealed blob, salt, epoch, `KnownEpochs`, DEK/AEAD maps, load generation and backoff counters cleared; invocation counter reset and nonce tracker cleared. **Does not call `StatePersister`** — any persisted blob is the caller's to remove. `Initialize` may then run again and produces an unrelated root key and salt. |
+| `Reset` | Sealed, not superseded, **an uncompleted first boot** (root key from this process's `Initialize`, no `SetSealedRootKey` since, epoch never advanced past 1), no epoch pinned in flight | Uninitialized: any remaining key enclave destroyed; in-memory sealed blob, salt, epoch, `KnownEpochs`, DEK/AEAD maps, load generation and backoff counters cleared; invocation counter reset and nonce tracker cleared. **Does not call `StatePersister`** — any persisted blob is the caller's to remove. `Initialize` may then run again and produces an unrelated root key and salt. |
 
 **`Reset` is the rollback for a failed first boot.** An embedder whose
 initialization cannot complete after `Initialize` returned (go-qrdb's Shamir
@@ -248,6 +248,19 @@ building a new one, because the WAL and host already hold it. Nothing encrypted
 under the discarded key decrypts under the next one: epoch 1 is reused, but its
 DEK derives from a different root key and salt, so the AEAD fails closed with
 `ErrDecryptionFailed`.
+
+**`Reset` refuses anything but a first boot** (`ErrResetNotFirstBoot`, #216).
+`SetSealedRootKey`'s in-process rollback floor is the epoch the barrier holds,
+and `Reset` discards it. On a barrier that had loaded a blob or reached epoch
+N > 1, a `Reset` would let an older authentic blob load, and `Unseal`'s forced
+rotation would re-derive an epoch whose DEK was already used — with the
+invocation counter and nonce tracker freshly reset, i.e. nonce and DEK reuse.
+A first boot never derived any epoch but 1, so the only blob naming its key
+also names epoch 1, and the forced rotation on loading it derives epoch 2,
+which never existed. The `firstBoot` field is set by `Initialize` and cleared
+by `SetSealedRootKey`, by any committed rotation (`Rotate` or `Unseal`'s
+forced one) and by `Reset` itself; an in-process `Seal`/`Unseal` cycle that
+stays at epoch 1 keeps it.
 
 **`Unseal` writes.** It persists the load-generation claim before the barrier
 will encrypt, and it usually rotates. Neither happens in delegated or
@@ -447,6 +460,7 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrPurgeCurrentEpoch` | tried to purge the active epoch |
 | (no error) | an epoch with in-flight references is **skipped** by `PurgeEpochsBefore`, not refused — the caller deregisters and purges again later |
 | `ErrEpochsInFlight` | `Reset` while any epoch holds an in-flight reference |
+| `ErrResetNotFirstBoot` | `Reset` on a barrier that loaded a blob via `SetSealedRootKey` or whose epoch advanced past 1 |
 | `ErrNoStatePersister` | `Rotate`, or a purging `PurgeEpochsBefore`, with no persister |
 | `ErrUnsupportedHKDFVersion` | blob names a DEK-derivation layout this build lacks |
 | `ErrInvocationLimitExceeded` | SP 800-38D budget reached for the epoch |

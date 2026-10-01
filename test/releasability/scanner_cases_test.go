@@ -35,6 +35,10 @@ const (
 	plantedHome      = "/home/jhahn"    // lab-string-ok: planted fixture for the owner-path rule
 	plantedMount     = "/mnt/vstation"  // lab-string-ok: planted fixture for the owner-path rule
 	plantedAccount   = "jhahn"          // lab-string-ok: planted fixture for the owner-account rule
+
+	plantedDomain    = "example.internal"                   // lab-string-ok: planted fixture for the internal-identity rule
+	plantedPrincipal = "agent-go-quicraft@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
+	plantedSibling   = "agent-go-qrdb@forge.example"                  // lab-string-ok: an agent principal outside the internal domain is still one
 )
 
 // writeTree writes files into a temporary directory and returns the root plus
@@ -114,6 +118,27 @@ func TestScanReportsEveryClassWithItsLineAndMatch(t *testing.T) {
 			wantLine:  1,
 		},
 		{
+			name:      "agent principal in an allowed-signers file",
+			content:   "# trust anchor\n" + plantedPrincipal + " ssh-ed25519 AAAAC3Nz\n",
+			wantClass: classInternalIdentity,
+			wantMatch: plantedPrincipal,
+			wantLine:  2,
+		},
+		{
+			name:      "agent principal on any domain in a script",
+			content:   "GIT_AUTHOR_EMAIL=" + strings.ToUpper(plantedSibling) + " make release\n",
+			wantClass: classInternalIdentity,
+			wantMatch: strings.ToUpper(plantedSibling),
+			wantLine:  1,
+		},
+		{
+			name:      "internal mail domain in a doc",
+			content:   "Mail ops@" + plantedDomain + " for access.\n",
+			wantClass: classInternalIdentity,
+			wantMatch: plantedDomain,
+			wantLine:  1,
+		},
+		{
 			name:      "owner account in a baseline header",
 			content:   "# command: PERF_HOST='" + plantedAccount + "@bench' make bench-baseline\n",
 			wantClass: classOwnerAccount,
@@ -168,6 +193,9 @@ func TestScanAcceptsWhatItShould(t *testing.T) {
 		{"a waiver whose reason ends at a comment closer", "x := 1 /* lab-string-ok: provenance */ // " + plantedGPUHost + "\n"},
 		{"a fleet name inside a longer word", "un" + plantedGPUHost + "ness, " + plantedBenchHost + "Dir and OMEGA_HOST are not hosts\n"},
 		{"a fleet prefix without its two digits", "vstation-0 and dellemc-1 name no machine\n"},
+		{"agent words that are not principals", "agent-" + "git.sh go-quicraft commit; User-Agent: x; agent-01 runs it\n"},
+		{"a templated principal with no name", "user.email=\"agent-$repo@example.invalid\"\n"},
+		{"a neutral example identity", "release@example.invalid and ops@example.internal\n"},
 	}
 
 	for _, tc := range cases {
@@ -322,6 +350,24 @@ func TestScanReportsAValueOnceByItsMostSpecificRule(t *testing.T) {
 	}
 }
 
+// TestScanReportsAnAgentPrincipalOnce pins the rule order: the internal domain
+// inside an agent principal is part of that one identity, not a second leak.
+func TestScanReportsAnAgentPrincipalOnce(t *testing.T) {
+	root, files := writeTree(t, map[string]string{"signers": plantedPrincipal + " ssh-ed25519 AAAA " + plantedPrincipal + "\n"})
+	findings, err := scan(root, files, nil)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("want the principal once per occurrence and the domain never, got %v", findings)
+	}
+	for _, f := range findings {
+		if f.class != classInternalIdentity || f.match != plantedPrincipal {
+			t.Errorf("finding = %v, want the whole principal", f)
+		}
+	}
+}
+
 func TestScanQuotesALongLineBounded(t *testing.T) {
 	long := "const x=\"" + strings.Repeat("padding;", 200) + plantedGPUHost + "\";"
 	root, files := writeTree(t, map[string]string{"dist/bundle.js": long + "\n"})
@@ -399,14 +445,16 @@ func TestErrorsNameTheirSubjectAndUnwrap(t *testing.T) {
 // every file, and the gate would pass while seeing nothing.
 func TestPatternsEveryNeedleIsImpliedByItsExpr(t *testing.T) {
 	samples := map[string][]string{
-		`\b192\.168\.101\.\d{1,3}\b`:   {plantedAddress + ":3001", "at " + plantedAddress},
-		`(?i)\bvstation-\d{2}\b`:       {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
-		`(?i)\bdellemc-\d{2}\b`:        {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
-		`(?i)\bgodlike(\.internal)?\b`: {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"},
-		`(?i)\bomega\b`:                {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
-		`/home/jhahn\b`:                {plantedHome + "/sources"},                                                            // lab-string-ok: the rule's own source text, as the map key
-		`/mnt/vstation`:                {plantedMount + "-01/go-qrdb"},                                                        // lab-string-ok: the rule's own source text, as the map key
-		`(?i)\bjhahn\b`:                {plantedAccount + "@example.com", "signed off by " + strings.ToUpper(plantedAccount)}, // lab-string-ok: the rule's own source text, as the map key
+		`\b192\.168\.101\.\d{1,3}\b`:                       {plantedAddress + ":3001", "at " + plantedAddress},
+		`(?i)\bvstation-\d{2}\b`:                           {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
+		`(?i)\bdellemc-\d{2}\b`:                            {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
+		`(?i)\bgodlike(\.internal)?\b`:                     {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"},
+		`(?i)\bomega\b`:                                    {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
+		`/home/jhahn\b`:                                    {plantedHome + "/sources"},     // lab-string-ok: the rule's own source text, as the map key
+		`/mnt/vstation`:                                    {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
+		`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`: {plantedPrincipal, "user.email=" + strings.ToUpper(plantedSibling)},
+		`(?i)\bautomatethethings\.internal\b`:              {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
+		`(?i)\bjhahn\b`:                                    {plantedAccount + "@example.com", "signed off by " + strings.ToUpper(plantedAccount)}, // lab-string-ok: the rule's own source text, as the map key
 	}
 
 	for _, p := range patterns {

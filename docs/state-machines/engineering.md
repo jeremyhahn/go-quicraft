@@ -259,6 +259,8 @@ type Hasher interface {
 
 Returns a deterministic hash of the state machine's state, surfaced by `Host.StateMachineHash(shardID) (hash, appliedIndex uint64, ok bool, err error)`. The hash must be order-independent, or it reports divergence that does not exist; both reference stores sort their keys and length-prefix each field before hashing (`pkg/sm/kv/memory.go:239`). Compare replicas at the same `appliedIndex`, which is why the method returns it.
 
+On `ConcurrentStateMachine` and `DiskStateMachine`, `GetHash` can run concurrently with `Update`, just as `Lookup` can, so it must hash whole batches: synchronize with `Update` and never observe one part-way through. A hash of a half-applied batch reports a divergence that does not exist. `kv.ConcurrentStore` holds every bucket lock across `GetHash`, and `Update` holds the affected buckets' locks across the batch. A basic `StateMachine` needs nothing, because the adapter never runs the two together.
+
 ### NALookup
 
 ```go

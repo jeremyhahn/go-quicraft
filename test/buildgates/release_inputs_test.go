@@ -211,6 +211,7 @@ func TestNoImmediateAssignmentReadsVERSION(t *testing.T) {
 // happy path is unreachable here by construction: this test cannot cut a
 // release however wrong the recipe becomes.
 func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
+	requirePrivateWorkflowFile(t, ".release-allowed-signers")
 	dir := t.TempDir()
 	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", ".release-allowed-signers"} {
 		raw, err := os.ReadFile(filepath.Join(repoRoot, name))
@@ -382,6 +383,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 // resolves it and stops at a later, read-only guard; if the default is anything
 // else the run stops at "no git remote named <that>", naming the wrong value.
 func TestReleaseRemoteDefaultsToDev(t *testing.T) {
+	requirePrivateWorkflowFile(t, ".release-allowed-signers")
 	dir := t.TempDir()
 	remote := filepath.Join(t.TempDir(), "remote.git")
 
@@ -461,6 +463,7 @@ func TestReleaseRemoteDefaultsToDev(t *testing.T) {
 // WOULD succeed if the checks were absent; that is what makes the assertion
 // mean something rather than being satisfied by some earlier guard.
 func TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease(t *testing.T) {
+	requirePrivateWorkflowFile(t, ".release-allowed-signers")
 	dir := t.TempDir()
 	remote := filepath.Join(t.TempDir(), "remote.git")
 
@@ -484,7 +487,9 @@ func TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease(t *testing.T) {
 	// MESSAGES. This is the precise bypass that makes grepping `cat-file`
 	// output insufficient: the object text contains "gpgsig" and
 	// "SSH SIGNATURE" while nothing is actually signed. Only real verification
-	// against the agent's published key rejects it.
+	// against the agent's published key rejects it. The e-mail is a neutral
+	// example: the recipe checks the author NAME and finds the signer by KEY in
+	// .release-allowed-signers, so nothing it verifies reads the address.
 	shim := filepath.Join(dir, "fake-agent-git.sh")
 	writeFile(t, shim, "#!/usr/bin/env bash\n"+
 		"repo=\"$1\"; shift\n"+
@@ -495,11 +500,11 @@ func TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease(t *testing.T) {
 		"done\n"+
 		"case \"$1\" in\n"+
 		"  commit) exec git -c commit.gpgsign=false -c user.name=\"agent-$repo\" "+
-		"-c user.email=\"agent-$repo@example.internal\" commit -m \"$msg\" ;;\n"+
+		"-c user.email=\"agent-$repo@example.invalid\" commit -m \"$msg\" ;;\n"+
 		"  tag)    exec git -c tag.gpgsign=false -c user.name=\"agent-$repo\" "+
-		"-c user.email=\"agent-$repo@example.internal\" tag -a \"$3\" -m \"$msg\" ;;\n"+
+		"-c user.email=\"agent-$repo@example.invalid\" tag -a \"$3\" -m \"$msg\" ;;\n"+
 		"  *)      exec git -c commit.gpgsign=false -c tag.gpgsign=false -c user.name=\"agent-$repo\" "+
-		"-c user.email=\"agent-$repo@example.internal\" \"$@\" ;;\n"+
+		"-c user.email=\"agent-$repo@example.invalid\" \"$@\" ;;\n"+
 		"esac\n", 0o755)
 
 	git := func(args ...string) {
@@ -623,6 +628,7 @@ func bumpPatch(v string) string {
 // company root it also controls. The recipe must still refuse, because its
 // anchor is the in-repo .release-allowed-signers and nothing else.
 func TestReleaseAlphaRefusesAKeyItWasNotPinnedTo(t *testing.T) {
+	requirePrivateWorkflowFile(t, ".release-allowed-signers")
 	if _, err := exec.LookPath("ssh-keygen"); err != nil {
 		t.Skipf("ssh-keygen not available: %v", err)
 	}
@@ -658,11 +664,12 @@ func TestReleaseAlphaRefusesAKeyItWasNotPinnedTo(t *testing.T) {
 	}
 
 	// A helper that signs as the right author with the WRONG key, planted where
-	// the old, unsafe implementation would have looked for its trust anchor.
+	// the old, unsafe implementation would have looked for its trust anchor. As
+	// above, the e-mail is a neutral example the recipe never compares.
 	shim := filepath.Join(fakeRoot, "software", "scripts", "agent-git.sh")
 	writeFile(t, shim, "#!/usr/bin/env bash\nrepo=\"$1\"; shift\n"+
 		"exec git -c gpg.format=ssh -c user.signingkey="+key+" -c commit.gpgsign=true -c tag.gpgsign=true "+
-		"-c user.name=\"agent-$repo\" -c user.email=\"agent-$repo@example.internal\" \"$@\"\n", 0o755)
+		"-c user.name=\"agent-$repo\" -c user.email=\"agent-$repo@example.invalid\" \"$@\"\n", 0o755)
 
 	git := func(args ...string) {
 		t.Helper()

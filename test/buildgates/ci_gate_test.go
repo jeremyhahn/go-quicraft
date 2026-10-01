@@ -249,6 +249,7 @@ func workflowTriggers(t *testing.T, path string, raw []byte) map[string]bool {
 //
 // So: no PR trigger (publishes nothing) AND `if: false` (runs never).
 func TestClaudeReviewIsBothUnpublishedAndUnrunnable(t *testing.T) {
+	requirePrivateWorkflowFile(t, ".github/workflows/claude-review.yml")
 	path := filepath.Join(repoRoot, ".github", "workflows", "claude-review.yml")
 	raw, err := os.ReadFile(path)
 	if err != nil {

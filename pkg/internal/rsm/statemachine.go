@@ -1114,10 +1114,14 @@ func nopRelease() {}
 // GetHash returns the state machine hash if the underlying SM supports it.
 // Returns (0, false, nil) if not supported.
 //
-// It takes the read guard for the same reason Lookup does. Without it this
-// hashed the user SM concurrently with Apply — so a replica-divergence check
-// could observe a half-applied batch and report a mismatch that does not
-// exist — and concurrently with Close, reading a closed SM.
+// It takes the read guard for the same reasons Lookup does, with the same
+// tier split. On a basic sm.StateMachine the guard excludes Apply, so the hash
+// never observes a half-applied batch. On the concurrent and on-disk tiers it
+// excludes only Close, so GetHash runs alongside Update, and the sm.Hasher
+// contract makes the implementation responsible for hashing whole batches.
+// Holding applyMu here instead would let a long hash stall the shard's
+// applies, which is the stall #209 removed. On every tier the guard keeps a
+// closed SM from being read.
 func (s *StateMachine) GetHash() (uint64, bool, error) {
 	s.readGuard.RLock()
 	defer s.readGuard.RUnlock()

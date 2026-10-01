@@ -17,8 +17,12 @@ package releasability
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -56,6 +60,31 @@ func isDevelopmentTooling(name string) bool {
 	return false
 }
 
+// privateWorkflowFiles are exact root-relative paths that only the private
+// forge and the private release recipe read: forge-side review and auto-merge
+// automation, and the trust anchor pinning the internal agent principal. They
+// name internal identities and hosts and do nothing for a public reader, so
+// they stay in the private repository. The list is exact on purpose: the
+// public CI workflows beside them are published.
+var privateWorkflowFiles = []string{
+	".github/workflows/opencode-review.yml",
+	".github/workflows/claude-review.yml",
+	".github/workflows/automerge.yml",
+	".release-allowed-signers",
+}
+
+// isPrivateWorkflowFile reports whether a slash-separated, root-relative path
+// is one of privateWorkflowFiles.
+func isPrivateWorkflowFile(name string) bool {
+	return slices.Contains(privateWorkflowFiles, name)
+}
+
+// isUnpublished reports whether a path belongs in the exclusion list: the
+// private development workflow or the private forge and release workflow.
+func isUnpublished(name string) bool {
+	return isDevelopmentTooling(name) || isPrivateWorkflowFile(name)
+}
+
 // gitCommand builds a git invocation against root. safe.directory is set for
 // root alone so the gate reads the index the same way when the checkout is
 // owned by another uid -- a bind-mounted tree inside the devcontainer, where git
@@ -91,6 +120,9 @@ func trackedFiles(ctx context.Context, root string) ([]string, error) {
 // minus every path .gitattributes marks export-ignore. It is the manifest the
 // gate scans.
 func publishedFiles(ctx context.Context, root string) ([]string, error) {
+	if err := statIndex(ctx, root); err != nil {
+		return nil, err
+	}
 	tracked, err := trackedFiles(ctx, root)
 	if err != nil {
 		return nil, err
@@ -106,6 +138,23 @@ func publishedFiles(ctx context.Context, root string) ([]string, error) {
 		}
 	}
 	return published, nil
+}
+
+// statIndex stats the git index from this process, so that go test's result
+// cache keys on it. The manifest is read by git in a subprocess, which the
+// cache cannot see: without this, staging a new file — whose contents the
+// previous run never opened — leaves a plain `go test` reporting a cached pass
+// over a tree that now leaks. A missing index (a repository with nothing
+// staged yet) is not an error; ls-files then reports an empty index anyway.
+func statIndex(ctx context.Context, root string) error {
+	out, err := gitCommand(ctx, root, "rev-parse", "--path-format=absolute", "--git-path", "index").Output()
+	if err != nil {
+		return &listError{root: root, err: err}
+	}
+	if _, err := os.Stat(strings.TrimSpace(string(out))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return &listError{root: root, err: err}
+	}
+	return nil
 }
 
 // exportIgnored asks git which of files carry the export-ignore attribute, so

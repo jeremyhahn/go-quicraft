@@ -178,7 +178,9 @@ const (
 //
 // Lifecycle: Initialize moves Uninitialized to Unsealed; Seal and Unseal move
 // between Unsealed and Sealed; SetSealedRootKey moves Uninitialized to Sealed;
-// Reset moves Sealed back to Uninitialized.
+// Reset moves Sealed back to Uninitialized, and only while the root key in hand
+// is still the uncompleted first boot of this process's own Initialize (see
+// firstBoot).
 type Barrier struct {
 	mu       sync.RWMutex
 	unsealed atomic.Bool // fast-path check, avoids RWMutex contention on hot path
@@ -281,6 +283,23 @@ type Barrier struct {
 	// encrypted" and "fresh process, counter not yet seeded", and reading the
 	// second as the first is what re-granted the NIST budget on every restart.
 	invocationsAuthoritative bool
+
+	// firstBoot records that the root key in hand was created by THIS
+	// process's Initialize and has never left its first epoch: no blob has been
+	// applied through SetSealedRootKey and no rotation (Rotate, or Unseal's
+	// forced rotation) has committed. Initialize sets it; SetSealedRootKey,
+	// rotateLocked and Reset clear it, and nothing else ever sets it.
+	//
+	// It is the whole basis on which Reset may discard the barrier's epoch.
+	// Reset zeroes b.epoch and b.state, and those are the in-process rollback
+	// floor SetSealedRootKey enforces; once any epoch above the first has been
+	// derived, or a blob from an earlier lifetime has been loaded, zeroing them
+	// would let an older authentic blob load and Unseal's forced rotation
+	// re-derive an epoch whose DEK was already used, with fresh counters —
+	// nonce and DEK reuse. A first boot that never advanced past epoch 1 has no
+	// such epoch: the only blob that can name its key also names epoch 1, and
+	// the forced rotation on loading it derives epoch 2, which never existed.
+	firstBoot bool
 
 	// loadGeneration is the LoadGeneration this barrier CLAIMED — stamped by
 	// Initialize (1) or written by the claim step in Unseal (loaded + 1). It is
@@ -623,6 +642,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 		b.sealed = sealed
 		b.state = barrierUnsealed
 		b.unsealed.Store(true)
+		b.firstBoot = true
 		b.logDelegatedMode("initialize", binding)
 		slog.Info("barrier initialized (hardware mode)", "epoch", initialEpoch, "context_binding", binding.String())
 		return nil
@@ -667,6 +687,9 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 	// This process created the epoch, so its counter starts at a known zero and
 	// stays authoritative until a blob describing some other lifetime is loaded.
 	b.invocationsAuthoritative = true
+	// ...and it is a first boot Reset may still roll back, until the epoch
+	// advances or another blob is loaded over it.
+	b.firstBoot = true
 
 	slog.Info("barrier initialized", "epoch", initialEpoch, "algorithm", b.config.Algorithm.String())
 	return nil
@@ -1354,11 +1377,26 @@ func (b *Barrier) Seal() error {
 // root-key shares were never distributed — without replacing the barrier
 // instance, which the WAL and the host already hold.
 //
-// Reset succeeds only from the sealed state. It returns ErrBarrierNotInit on a
-// barrier that is already uninitialized, ErrBarrierUnsealed on an unsealed one
-// (Seal it first), ErrBarrierSuperseded once another loader has claimed this
-// barrier's sealed state, and ErrEpochsInFlight while any epoch is pinned by
-// RegisterInFlightEpoch or an EncryptWithEpochPinned* call.
+// Reset succeeds only from the sealed state, and only for a FIRST BOOT: a root
+// key this process created with Initialize, onto which no blob has since been
+// loaded with SetSealedRootKey and whose epoch has never advanced past the
+// first (no Rotate, and no forced rotation inside Unseal). It returns
+// ErrBarrierNotInit on a barrier that is already uninitialized,
+// ErrBarrierUnsealed on an unsealed one (Seal it first), ErrBarrierSuperseded
+// once another loader has claimed this barrier's sealed state,
+// ErrResetNotFirstBoot when the barrier is not an uncompleted first boot, and
+// ErrEpochsInFlight while any epoch is pinned by RegisterInFlightEpoch or an
+// EncryptWithEpochPinned* call.
+//
+// The first-boot restriction protects SetSealedRootKey's in-process rollback
+// floor. That floor is the epoch the barrier holds, and Reset discards it; on a
+// barrier that had reached epoch N, a Reset would let an older authentic blob
+// load and Unseal's forced rotation re-derive an epoch below N whose DEK was
+// already used — with its invocation counter and nonce tracker freshly reset,
+// which is exactly the nonce and DEK reuse those trackers exist to prevent. A
+// first boot never derived any epoch but the first, so it has no such epoch to
+// re-derive. The flag is cleared by Reset itself, so a successful Reset re-arms
+// nothing until the next Initialize.
 //
 // The superseded refusal keeps that condition terminal for the instance, as
 // ErrBarrierSuperseded documents: a Reset followed by Initialize must not
@@ -1391,6 +1429,8 @@ func (b *Barrier) Reset() error {
 		return ErrBarrierUnsealed
 	case b.superseded.Load():
 		return ErrBarrierSuperseded
+	case !b.firstBoot:
+		return ErrResetNotFirstBoot
 	}
 
 	// Lock order matches PurgeEpochsBefore (b.mu then inFlightMu). Held for the
@@ -1425,6 +1465,7 @@ func (b *Barrier) Reset() error {
 	b.hkdfVersion = currentHKDFVersion
 	b.loadGeneration = 0
 	b.invocationsAuthoritative = false
+	b.firstBoot = false
 	b.failedAttempts = 0
 	b.lastFailedAt = time.Time{}
 	b.hwEncryptor = nil
@@ -2293,6 +2334,8 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// under the held write lock. After this point the NEW key is active and the
 	// rotation has succeeded; the trackers below are reset against the new epoch.
 	b.epoch = newEpoch
+	// An epoch above the first now exists; Reset may no longer drop the floor.
+	b.firstBoot = false
 	b.currentDEK = dekPK
 	b.cipher = aead
 	b.deks[newEpoch] = dekPK
@@ -3230,6 +3273,9 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	b.sealed = sealed
 	b.salt = sealed.Salt
 	b.epoch = sealed.Epoch
+	// The root key is now one some earlier lifetime used; Reset may no longer
+	// roll it back (see firstBoot).
+	b.firstBoot = false
 
 	// The blob describes an epoch some EARLIER process encrypted under, for an
 	// unknown number of invocations. Whatever the in-memory counter holds, it is

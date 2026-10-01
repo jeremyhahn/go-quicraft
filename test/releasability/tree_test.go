@@ -26,17 +26,29 @@ import (
 	"testing"
 )
 
-// developmentToolingPatterns are the .gitattributes and .dockerignore entries
-// that keep the private development workflow out of every published form of
-// the tree. They mirror developmentToolingNames and developmentToolingDirs.
+// gitattributesEntries and dockerignoreEntries are the .gitattributes and
+// .dockerignore entries that keep the private development workflow and the
+// private forge and release workflow out of every published form of the tree.
+// They mirror developmentToolingNames, developmentToolingDirs and
+// privateWorkflowFiles.
 var (
 	gitattributesEntries = []string{
 		"CLAUDE.md export-ignore",
 		"AGENTS.md export-ignore",
 		"**/.claude/** export-ignore",
 		"**/.serena/** export-ignore",
+		".github/workflows/opencode-review.yml export-ignore",
+		".github/workflows/claude-review.yml export-ignore",
+		".github/workflows/automerge.yml export-ignore",
+		"/.release-allowed-signers export-ignore",
 	}
-	dockerignoreEntries = []string{"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena"}
+	dockerignoreEntries = []string{
+		"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena",
+		".github/workflows/opencode-review.yml",
+		".github/workflows/claude-review.yml",
+		".github/workflows/automerge.yml",
+		".release-allowed-signers",
+	}
 )
 
 // repoRoot walks up from the test's working directory to the module root, which
@@ -85,6 +97,7 @@ func TestThePlantedViolationIsCaught(t *testing.T) {
 		"docs/guide.md":      "Deploy it on " + plantedGPUHost + ", then check " + plantedHome + "/sources.\n",
 		"README.md":          "Questions go to " + plantedAccount + ".\n",
 		"pkg/seal/doc.go":    "// observed on " + plantedAgent + "\n",
+		"scripts/release.sh": "GIT_AUTHOR_EMAIL=" + plantedPrincipal + " make release\n",
 		"test/performance/x": "PERF_PROFILE=" + plantedBenchHost + "\n",
 	}
 	root, files := writeTree(t, planted)
@@ -136,6 +149,8 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 		"test/performance/run-remote.sh",
 		"test/performance/cmd/perfcompare/main_test.go",
 		"contrib/dragonboat/README.md",
+		"test/buildgates/release_inputs_test.go",
+		".github/dependabot.yml",
 	} {
 		if accepted := acceptedClasses(allowList, name); len(accepted) != 0 {
 			t.Errorf("%s is allow-listed for %v; it must be clean or waived line by line", name, accepted)
@@ -172,9 +187,31 @@ func TestIsDevelopmentTooling(t *testing.T) {
 	}
 }
 
+func TestIsPrivateWorkflowFile(t *testing.T) {
+	cases := map[string]bool{
+		".github/workflows/opencode-review.yml":  true,
+		".github/workflows/claude-review.yml":    true,
+		".github/workflows/automerge.yml":        true,
+		".release-allowed-signers":               true,
+		".github/workflows/ci.yml":               false,
+		".github/workflows/release.yml":          false,
+		".github/workflows/nightly.yml":          false,
+		".github/workflows/fuzz.yml":             false,
+		".github/dependabot.yml":                 false,
+		"sub/.release-allowed-signers":           false,
+		"sub/.github/workflows/automerge.yml":    false,
+		".github/workflows/automerge.yml.sample": false,
+	}
+	for name, want := range cases {
+		if got := isPrivateWorkflowFile(name); got != want {
+			t.Errorf("isPrivateWorkflowFile(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 // TestThePublishedTreeCarriesNoDevelopmentTooling is the exclusion gate on this
-// repository: the agent files stay tracked for development, and none of them is
-// in what gets published.
+// repository: the agent files and the private forge and release workflow stay
+// tracked for development, and none of them is in what gets published.
 func TestThePublishedTreeCarriesNoDevelopmentTooling(t *testing.T) {
 	root := repoRoot(t)
 	tracked, err := trackedFiles(t.Context(), root)
@@ -186,13 +223,13 @@ func TestThePublishedTreeCarriesNoDevelopmentTooling(t *testing.T) {
 		t.Fatalf("publishedFiles: %v", err)
 	}
 	for _, name := range published {
-		if isDevelopmentTooling(name) {
+		if isUnpublished(name) {
 			t.Errorf("%s is published; add its path to .gitattributes as export-ignore", name)
 		}
 	}
 	for _, name := range tracked {
-		if !isDevelopmentTooling(name) && !slices.Contains(published, name) {
-			t.Errorf("%s is export-ignored but is not development tooling; the exclusion is too wide", name)
+		if !isUnpublished(name) && !slices.Contains(published, name) {
+			t.Errorf("%s is export-ignored but is not private workflow; the exclusion is too wide", name)
 		}
 	}
 	if !slices.Contains(published, "go.mod") {
@@ -231,16 +268,23 @@ func TestGitArchiveHonoursTheExclusionList(t *testing.T) {
 		t.Fatalf("reading .gitattributes: %v", err)
 	}
 	root, _ := writeTree(t, map[string]string{
-		".gitattributes":                string(attrs),
-		"go.mod":                        "module example.com/m\n",
-		"pkg/a/a.go":                    "package a\n",
-		"CLAUDE.md":                     "private\n",
-		"AGENTS.md":                     "private\n",
-		"pkg/a/CLAUDE.md":               "private\n",
-		".claude/agents/go-quicraft.md": "private\n",
-		".serena/memories/notes.md":     "private\n",
-		"test/x/.serena/project.yml":    "private\n",
-		"docs/claude-review.md":         "public\n",
+		".gitattributes":                        string(attrs),
+		"go.mod":                                "module example.com/m\n",
+		"pkg/a/a.go":                            "package a\n",
+		"CLAUDE.md":                             "private\n",
+		"AGENTS.md":                             "private\n",
+		"pkg/a/CLAUDE.md":                       "private\n",
+		".claude/agents/go-quicraft.md":         "private\n",
+		".serena/memories/notes.md":             "private\n",
+		"test/x/.serena/project.yml":            "private\n",
+		"docs/claude-review.md":                 "public\n",
+		".github/workflows/ci.yml":              "public\n",
+		".github/dependabot.yml":                "public\n",
+		".github/workflows/opencode-review.yml": "private\n",
+		".github/workflows/claude-review.yml":   "private\n",
+		".github/workflows/automerge.yml":       "private\n",
+		".release-allowed-signers":              "private\n",
+		"sub/.release-allowed-signers":          "public\n",
 	})
 	runGit(t, root, "init", "-q")
 	runGit(t, root, "add", "-A")
@@ -248,7 +292,10 @@ func TestGitArchiveHonoursTheExclusionList(t *testing.T) {
 		"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "fixture")
 
 	archived := archiveEntries(t, root)
-	want := []string{".gitattributes", "docs/claude-review.md", "go.mod", "pkg/a/a.go"}
+	want := []string{
+		".gitattributes", ".github/dependabot.yml", ".github/workflows/ci.yml",
+		"docs/claude-review.md", "go.mod", "pkg/a/a.go", "sub/.release-allowed-signers",
+	}
 	if !slices.Equal(archived, want) {
 		t.Errorf("git archive contains %v, want %v", archived, want)
 	}
