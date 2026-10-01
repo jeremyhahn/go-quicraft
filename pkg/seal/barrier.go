@@ -174,7 +174,11 @@ const (
 //  1. Atomic check of b.unsealed (no contention).
 //  2. RLock for the actual cipher operation (prevents TOCTOU with Seal).
 //
-// Seal, Unseal, Initialize, and Rotate acquire the exclusive write lock.
+// Seal, Unseal, Initialize, Reset, and Rotate acquire the exclusive write lock.
+//
+// Lifecycle: Initialize moves Uninitialized to Unsealed; Seal and Unseal move
+// between Unsealed and Sealed; SetSealedRootKey moves Uninitialized to Sealed;
+// Reset moves Sealed back to Uninitialized.
 type Barrier struct {
 	mu       sync.RWMutex
 	unsealed atomic.Bool // fast-path check, avoids RWMutex contention on hot path
@@ -472,7 +476,9 @@ func (b *Barrier) Config() BarrierConfig { return b.config }
 // software strategy ignores both parameters.
 //
 // Initialize must be called exactly once (first boot). Subsequent calls
-// return ErrBarrierAlreadyInit.
+// return ErrBarrierAlreadyInit, unless Reset has returned the sealed barrier
+// to the uninitialized state to roll back an initialization the caller could
+// not complete.
 func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, creds Credentials) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1340,6 +1346,110 @@ func (b *Barrier) seal() error {
 // Production code should prefer Host.Seal() which quiesces the pipeline first.
 func (b *Barrier) Seal() error {
 	return b.seal()
+}
+
+// Reset returns a sealed barrier to the uninitialized state, so that
+// Initialize may be called on it again. It exists to roll back a first-boot
+// initialization that the embedder could not complete — for example one whose
+// root-key shares were never distributed — without replacing the barrier
+// instance, which the WAL and the host already hold.
+//
+// Reset succeeds only from the sealed state. It returns ErrBarrierNotInit on a
+// barrier that is already uninitialized, ErrBarrierUnsealed on an unsealed one
+// (Seal it first), ErrBarrierSuperseded once another loader has claimed this
+// barrier's sealed state, and ErrEpochsInFlight while any epoch is pinned by
+// RegisterInFlightEpoch or an EncryptWithEpochPinned* call.
+//
+// The superseded refusal keeps that condition terminal for the instance, as
+// ErrBarrierSuperseded documents: a Reset followed by Initialize must not
+// become a way to shed it in-process.
+//
+// Everything the barrier knew about its root key is discarded: the sealed blob
+// held in memory, the salt, the epoch and the known-epoch set, every DEK and
+// AEAD, the claimed load generation and the brute-force backoff counters. Any
+// key enclave still held is Destroyed (wiped, not merely dropped) exactly as
+// seal() does. The AEAD invocation counter is Reset and the nonce tracker
+// Cleared, since their counts describe a key that no longer exists here; as in
+// Rotate, a failure of either is logged and is fail-safe — a stale count only
+// forces an earlier rotation under the next key, and a stale nonce set only
+// yields conservative rejections.
+//
+// Reset does NOT touch anything persisted. A blob already written through
+// BarrierConfig.StatePersister, or saved by the caller from SealedRootKeyData,
+// still exists and still names the discarded key; removing or replacing it is
+// the caller's responsibility. Data encrypted under the discarded root key is
+// unrecoverable once its sealed blob is gone, and is never decryptable under a
+// root key produced by a later Initialize.
+func (b *Barrier) Reset() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	switch {
+	case b.state == barrierUninitialized:
+		return ErrBarrierNotInit
+	case b.state == barrierUnsealed:
+		return ErrBarrierUnsealed
+	case b.superseded.Load():
+		return ErrBarrierSuperseded
+	}
+
+	// Lock order matches PurgeEpochsBefore (b.mu then inFlightMu). Held for the
+	// rest of the reset so a pin cannot be registered against an epoch that is
+	// in the middle of being discarded.
+	b.inFlightMu.Lock()
+	defer b.inFlightMu.Unlock()
+	for _, n := range b.inFlightEpochs {
+		if n > 0 {
+			return ErrEpochsInFlight
+		}
+	}
+
+	// seal() has already destroyed these in every reachable sealed state; doing
+	// it again is idempotent and nil-safe, and keeps Reset correct on its own
+	// rather than by reliance on the path that led here.
+	b.rootKey.Destroy()
+	b.currentDEK.Destroy()
+	for _, dek := range b.deks {
+		dek.Destroy()
+	}
+
+	b.rootKey = nil
+	b.currentDEK = nil
+	b.cipher = nil
+	b.deks = make(map[uint64]*enclave.SealedEnclave)
+	b.ciphers = make(map[uint64]cipher.AEAD)
+	b.knownEpochs = make(map[uint64]struct{})
+	b.salt = nil
+	b.epoch = 0
+	b.sealed = nil
+	b.hkdfVersion = currentHKDFVersion
+	b.loadGeneration = 0
+	b.invocationsAuthoritative = false
+	b.failedAttempts = 0
+	b.lastFailedAt = time.Time{}
+	b.hwEncryptor = nil
+	b.binding = ContextBindingUnresolved
+	b.plaintextMode = false
+	b.strategyID = ""
+	b.strategyHardwareBacked = false
+	b.state = barrierUninitialized
+	b.unsealed.Store(false)
+
+	if b.invocations != nil {
+		if err := b.invocations.Reset(); err != nil {
+			slog.Warn("barrier reset but invocation counter reset failed; the next key will re-rotate earlier (fail-safe)",
+				"tracker", "invocation", "op", "reset", "error", err)
+		}
+	}
+	if b.nonceTracker != nil {
+		if err := b.nonceTracker.Clear(); err != nil {
+			slog.Warn("barrier reset but nonce tracker clear failed; stale nonces may be conservatively rejected (fail-safe)",
+				"tracker", "nonce", "op", "clear", "error", err)
+		}
+	}
+
+	slog.Info("barrier reset to uninitialized")
+	return nil
 }
 
 // Encrypt encrypts plaintext using the configured AEAD algorithm with the

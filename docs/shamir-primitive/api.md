@@ -124,6 +124,51 @@ That split is the reason the two error types exist; see §Error vocabulary.
 A ceremony that legitimately needs more than the budget does its own accounting
 and decodes share by share with it.
 
+### Capability: charge share memory to a locked-memory budget
+
+```go
+func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
+func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
+```
+
+| | |
+|---|---|
+| Request | as the allocator-less form, plus `a` — a go-enclave `*Allocator`, normally `enclave.ProcessAllocator()` |
+| Response | as the allocator-less form; every locked region the call makes is charged to `a` until it is `Destroy`ed |
+| Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (nothing allocated, `value` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
+| Permission | none — in-process call, no authorization boundary |
+| Caller obligation | as the allocator-less form |
+
+The allocator-less `SplitProtected`, `CombineProtected` and `NewProtectedShare`
+lock memory through go-enclave's **unbudgeted** constructors, which no
+`Allocator` sees: a consumer that bounds its locked memory with a process
+allocator would have every share escape that bound. The `...With` forms charge
+**every** region they lock — for a split that is the coefficient pool, the
+coefficient vector, the payload scratch and each share's value; for a combine,
+the decode buffer and the returned secret — to the allocator they are handed
+(issue #204). The allocator-less forms are unchanged and delegate to the same
+implementation.
+
+go-enclave's own unbudgeted constructors do **not** consult
+`enclave.ProcessAllocator()`, so neither does this package implicitly: the
+budget is opted into by passing it, and a nil allocator is refused rather than
+treated as "unbudgeted", exactly as `SealedEnclave.OpenWith` refuses one.
+
+A budget refusal is recoverable and local to the call:
+
+- It is decided before the refused region's locked memory is requested.
+- Everything the call had already allocated is destroyed before it returns, so
+  a split refused partway through its share loop gives its whole reservation
+  back to `a`. Shares returned by earlier calls — and the input shares to a
+  combine — are untouched.
+- `NewProtectedShareWith` keeps `NewProtectedShare`'s ownership contract: a
+  `*ProtectedMemoryError`, budget refusal included, means `value` has already
+  been wiped.
+
+`MaxShareSetBytes` still bounds a single split up front; an allocator bounds
+everything the process holds, across calls, which no per-call figure can.
+
 ### Capability: reconstruct a secret from M shares (bytes form)
 
 ```go
@@ -221,7 +266,10 @@ value has **already been wiped**: go-enclave's constructor wipes its source
 before it reports a refusal. Do not retry with the same buffer on that error; it
 is zeroes. It is also the one an operator can act on — it says the host or
 container is out of locked memory, not that the input was wrong. It unwraps to
-the allocator's own error, so `errors.Is` reaches go-enclave's sentinels.
+the allocator's own error, so `errors.Is` reaches go-enclave's sentinels —
+`enclave.ErrLockedMemoryUnavailable` for a kernel refusal, and
+`enclave.ErrBudgetExhausted` when a `...With` call's allocator refused the
+admission. The value has been wiped in both cases.
 
 ### Constants
 

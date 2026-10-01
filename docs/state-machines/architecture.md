@@ -69,6 +69,8 @@ not importable, and its behavior *is* your contract:
 - **The read guard.** For tier 0 it holds a `readGuard` for writing across
   `Apply` and for reading across every read entry point, which is what makes
   "`Update` and `Lookup` never run concurrently" true rather than aspirational.
+  Tiers 1 and 2 promise the opposite, so their `Apply` holds the guard for
+  reading: it still keeps `Close` out, and `Lookup` runs alongside `Update`.
 - **The `(value, supported, error)` wrapper shape** behind every optional
   interface, where the bool reports whether your state machine implemented it at
   all. That three-value form is internal; it is not the contract you implement.

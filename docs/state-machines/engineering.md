@@ -223,7 +223,7 @@ The engine pre-allocates one `[]sm.Result` per shard and reuses it across batche
 
 `Host.SyncRead`, `Host.FollowerRead`, `Host.QueryLocalNode` and `Host.StaleRead` all reach the adapter's `Lookup` on the calling goroutine rather than on the apply worker. The serialization comes from the guard, not from those callers.
 
-The guard belongs to the adapter, not to a tier. `ConcurrentStateMachine` and `DiskStateMachine` publish the opposite contract — `Lookup` may be called concurrently with `Update`, and the implementation synchronizes itself — and because there is one guard for all three, they currently get the exclusion too. Do not read that as permission to drop their locking. Those tiers are held to what their doc comments promise, and the adapter is free to stop excluding them.
+**`ConcurrentStateMachine` and `DiskStateMachine` do see them overlap.** Both publish the opposite contract — `Lookup` may be called concurrently with `Update`, and the implementation synchronizes itself — and the adapter honours it: on those tiers `Apply` takes the `readGuard` for reading, which keeps `Close` out and nothing else. A long read on those tiers, such as a range scan or an export, no longer holds up the shard's applies (#209). Your state machine's own locking is what keeps a `Lookup` from observing a half-applied batch.
 
 `kv.MemoryStore` keeps its `RWMutex`, but not for this reason any more. See [MemoryStore](engineering.md#memorystore).
 
@@ -233,15 +233,15 @@ A local read parks behind an in-flight `Apply`. On a follower catching up, that 
 
 Go's `RWMutex` also blocks new readers once a writer is queued, so a single apply behind a slow read stalls every subsequent read on the shard until it drains.
 
-`ConcurrentStateMachine` is where an implementation that needs finer-grained read concurrency belongs; offering that choice is why the tier exists. It does not remove the wait today, though. The guard is on the adapter, so the concurrent tier queues behind an apply exactly as the basic tier does. Declaring the tier is what leaves your state machine ready for the adapter to stop excluding it.
+`ConcurrentStateMachine` is where an implementation that needs finer-grained read concurrency belongs; offering that choice is why the tier exists. On that tier, and on `DiskStateMachine`, neither wait applies: a read does not queue behind an apply, and an apply does not queue behind a read.
 
 What differs per tier:
 
 | Tier | `Update` vs `Lookup` | `Update` vs `SaveSnapshot` |
 |------|----------------------|----------------------------|
 | `StateMachine` | serialized by the adapter's guard, as the interface promises | serialized: the whole save runs under the engine's apply gate |
-| `ConcurrentStateMachine` | documented concurrent; serialized by the adapter today | contracted concurrent after `PrepareSnapshot` returns |
-| `DiskStateMachine` | documented concurrent; serialized by the adapter today | contracted concurrent after `PrepareSnapshot` returns |
+| `ConcurrentStateMachine` | concurrent; the adapter's guard excludes only `Close` | concurrent after `PrepareSnapshot` returns |
+| `DiskStateMachine` | concurrent; the adapter's guard excludes only `Close` | concurrent after `PrepareSnapshot` returns |
 
 `StaleRead` and `QueryLocalNode` bypass the ReadIndex protocol entirely and return whatever the local replica has applied so far. `SyncRead` and `FollowerRead` add a consistency check before calling the same `Lookup`.
 
@@ -597,9 +597,11 @@ type smWrapper interface {
 
 Two checks run before a single entry is classified.
 
-**Read guard, held for writing.** `Apply` takes the state machine's `readGuard` in **write** mode and returns `ErrClosed` if `Close` already ran.
+**Read guard, mode by tier, then `applyMu`.** `Apply` takes the state machine's `readGuard` and returns `ErrClosed` if `Close` already ran. On a basic `sm.StateMachine` it takes the guard in **write** mode; on `ConcurrentStateMachine` and `DiskStateMachine` in **read** mode.
 
-The write mode is the enforcement of `sm.StateMachine`'s published contract: QuicRaft serializes all method calls, and `Update` and `Lookup` are never called concurrently. Every read entry point takes the same guard for reading, so an apply excludes them all. See [Lookup concurrency](engineering.md#lookup-concurrency) for the tier-by-tier consequences and the latency it adds.
+The write mode is the enforcement of `sm.StateMachine`'s published contract: QuicRaft serializes all method calls, and `Update` and `Lookup` are never called concurrently. Every read entry point takes the same guard for reading, so an apply excludes them all. The other two tiers publish that `Lookup` may run concurrently with `Update`, so their apply takes the read mode and excludes only `Close`. See [Lookup concurrency](engineering.md#lookup-concurrency) for the tier-by-tier consequences and the latency the write mode adds.
+
+`Apply` then takes `applyMu`, a plain mutex that serializes everything owning the apply stream's state: `Apply`, the capture phase of `SaveSnapshotGated`, and `RecoverFromSnapshot`. That state is the session table (not safe for concurrent use), the session policy and the expiry checkpoint walk. Reads never take it. The lock order is `readGuard`, then `applyMu`, then `streamGuard`.
 
 The guard also carries the closed check. The engine's synchronous `UnloadNode` guarantees no `Apply` is in flight when `Close` runs, so that part is defence in depth, but holding the guard forces `Close` to wait out an in-flight `Apply` rather than closing the state machine underneath it.
 
@@ -801,7 +803,7 @@ Both matter for the same two reasons. The counter is the index source for the ne
 
 ### Read paths
 
-`Lookup`, `NALookup`, `NALookupBuf` and `GetHash` all take the `readGuard` in read mode and return `ErrClosed` if `Close` already ran. In-memory backends do not self-track closure and would otherwise return stale data after `Close`. Because `Apply` holds the same guard for writing, none of the four can run while an apply is in flight.
+`Lookup`, `NALookup`, `NALookupBuf` and `GetHash` all take the `readGuard` in read mode and return `ErrClosed` if `Close` already ran. In-memory backends do not self-track closure and would otherwise return stale data after `Close`. On a basic state machine `Apply` holds the same guard for writing, so none of the four can run while an apply is in flight; on the concurrent and on-disk tiers they run alongside it.
 
 #### Lookup
 
@@ -874,7 +876,7 @@ The engine sets the node's saving flag and waits for the apply drain before call
 
 A regular state machine has no point-in-time prepare and is not safe against a concurrent `Update`, so its whole in-memory save is the consistent capture. For the other two the capture is cheap and the stream is not, which is the reason the split exists: a large on-disk snapshot is not meant to pause the shard's applies for the duration of its transfer.
 
-The column says apply *gate* rather than applies for a reason. `SaveSnapshotGated` holds the `readGuard` in read mode for the whole call, streaming included, and `Apply` takes that guard for writing. So on the concurrent and on-disk wrappers the gate is released after `PrepareSnapshot` as the table says, and an apply arriving during the stream still blocks on the guard until the stream ends. Reads queue behind that apply.
+The adapter's own guards follow the same split. `SaveSnapshotGated` holds `readGuard` (read mode) and `applyMu` for the capture only, releasing both in lockstep with the engine's apply gate, so an apply arriving during the stream proceeds. `streamGuard` is held across capture and stream and excludes only `Close`, so the state machine is never closed under a save in progress.
 
 #### Recover
 
@@ -882,7 +884,7 @@ The column says apply *gate* rather than applies for a reason. `SaveSnapshotGate
 func (s *StateMachine) RecoverFromSnapshot(ctx, r, stopper) error
 ```
 
-1. Closed guard, then stopper check.
+1. `readGuard` (read mode) and `applyMu`, held for the whole recovery, so neither `Close` nor `Apply` can overlap it. Then the closed guard and the stopper check.
 2. `refreshSessionPolicy()`. `UnmarshalFrom` bounds-checks the table against the manager's limits, and the table was written by a replica applying the *shard's* policy. Checking it against this node's configuration instead would reject a snapshot the rest of the shard considers well-formed, and that rejection is fatal to recovery. For a replica bootstrapped by an `InstallSnapshot` this is also the first point at which any policy is known.
 3. Decode the session table into a **staged** manager.
 4. `smWrapper.RecoverFromSnapshot`.

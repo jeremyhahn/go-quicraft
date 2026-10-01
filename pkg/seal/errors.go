@@ -122,6 +122,13 @@ var (
 	// to purge the current active epoch.
 	ErrPurgeCurrentEpoch = errors.New("quicraft/seal: cannot purge current epoch")
 
+	// ErrEpochsInFlight is returned by Reset when any epoch still holds an
+	// in-flight reference (RegisterInFlightEpoch, or an EncryptWithEpochPinned*
+	// call not yet matched by DeregisterInFlightEpoch). A pin means a caller is
+	// still relying on that epoch's DEK, and Reset would discard the root key
+	// the DEK derives from.
+	ErrEpochsInFlight = errors.New("quicraft/seal: cannot reset barrier while epochs are pinned in flight")
+
 	// ErrInvalidSealedEpoch is returned when SetSealedRootKey receives a
 	// sealed key with Epoch == 0, or with 0 among its KnownEpochs. Epochs start
 	// at 1 (Initialize) and only ever increment, so nothing was sealed under

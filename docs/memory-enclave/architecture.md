@@ -204,7 +204,11 @@ memory on behalf of an unauthenticated peer. What it uses instead, where the
 arithmetic can multiply out of hand, is a priced refusal — `MaxShareSetBytes`
 refuses an over-budget Shamir split before taking a single page. A consumer that
 *does* buffer key material before authenticating a peer should admit those
-allocations through an `Allocator` at its own layer.
+allocations through an `Allocator` at its own layer — and the Shamir primitive
+lets it cover share material too: `SplitProtectedWith`, `CombineProtectedWith`
+and `NewProtectedShareWith` charge every region they lock to the `Allocator` the
+caller passes (issue #204). This repository accepts an allocator there; it never
+constructs or installs one.
 
 This repository also never calls `WipeAll`: it is a shutdown sweep for whoever
 owns the process, and a library that called it would destroy enclaves its embedder

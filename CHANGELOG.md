@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`seal.Barrier.Reset`** returns a sealed barrier to the uninitialized state
+  so `Initialize` can run again (#208). It lets an embedder roll back a first
+  boot it could not finish, such as go-qrdb's Shamir initialization whose share
+  distribution failed, without replacing the barrier instance the WAL and host
+  already hold. Every key enclave is destroyed, and the epoch, DEK maps, load
+  generation, backoff counters and invocation accounting are cleared. It is
+  refused while the barrier is unsealed (`ErrBarrierUnsealed`), uninitialized
+  (`ErrBarrierNotInit`), superseded (`ErrBarrierSuperseded`) or holds an epoch
+  pinned in flight (the new `ErrEpochsInFlight`). Persisted state is not
+  touched; the caller owns any blob it saved. `Reset` is on `*Barrier` only:
+  the host-facing `Barrier` and WAL `WALBarrier` interfaces are unchanged.
+- **Shamir shares can be charged to a go-enclave locked-memory budget
+  (#204).** `shamir.SplitProtectedWith`, `CombineProtectedWith` and
+  `NewProtectedShareWith` take an `*enclave.Allocator` — normally
+  `enclave.ProcessAllocator()` — and admit every region they lock against it:
+  the split's coefficient pool, coefficient vector, payload scratch and each
+  share value, and the combine's decode buffer and returned secret. Exhausting
+  the budget is a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted`,
+  never a panic; a split refused partway through destroys everything that call
+  had allocated, and shares from earlier calls are untouched. A nil allocator
+  is refused with `enclave.ErrNilAllocator` rather than falling back to
+  unbudgeted memory. `SplitProtected`, `CombineProtected` and
+  `NewProtectedShare` keep their signatures and their unbudgeted behaviour
+  (go-enclave's default constructors do not consult the process allocator) and
+  delegate to the same implementation.
+
+### Fixed
+- **One slow read stalled the whole shard on concurrent and on-disk state
+  machines (#209).** `rsm.StateMachine.Apply` took its read guard for writing
+  on every tier, so a `Lookup` held open inside a `ConcurrentStateMachine` or
+  `DiskStateMachine`, such as a range scan or an export, blocked the shard's
+  applies. Go's `RWMutex` then parked every later reader behind the waiting
+  apply. Both tiers document `Lookup` as safe to call concurrently with
+  `Update`, and `Apply` now honours that: on those tiers it holds the guard
+  for reading, which still keeps `Close` out. A basic `sm.StateMachine` keeps
+  its exclusion. The session-table exclusion that used to come from the write
+  lock (`Apply` against snapshot capture and recovery) now comes from a
+  dedicated `applyMu`. With four goroutines running 20µs reads, `Apply` on
+  those tiers drops from about 55µs to about 100ns.
+
 ## [0.15.0-alpha] - 2026-09-29
 
 Closes the R11 whole-project review: lease reads rest only on vote promises

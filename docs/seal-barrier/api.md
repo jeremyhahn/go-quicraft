@@ -69,6 +69,30 @@ func (b *Barrier) SealedRootKeyData() *SealedRootKey
 **`Initialize` does not call `StatePersister`.** Persist
 `SealedRootKeyData()` yourself, once, at bootstrap.
 
+### Capability: roll back a failed first boot
+
+```go
+func (b *Barrier) Reset() error
+```
+
+| | |
+|---|---|
+| Request | none; the barrier must be Sealed |
+| Response | barrier is Uninitialized and accepts `Initialize` again |
+| Errors | `ErrBarrierNotInit`, `ErrBarrierUnsealed`, `ErrBarrierSuperseded`, `ErrEpochsInFlight` |
+| Permission | none — in-process call on the concrete barrier |
+
+For an embedder whose bootstrap fails after `Initialize` returned, and which
+cannot swap the barrier instance because the WAL and host already hold it:
+`Seal`, then `Reset`, then `Initialize` again. Every key enclave is destroyed
+and the epoch, DEK maps, load generation and invocation accounting are cleared.
+**`Reset` does not touch persisted state** — delete or replace any blob you
+already saved. The next `Initialize` draws a new root key and salt, so data
+sealed under the discarded key fails with `ErrDecryptionFailed`.
+
+`Reset` is a method of `*Barrier` only. The host-facing `Barrier` interface and
+the WAL's `WALBarrier` carry no lifecycle methods, and gain none.
+
 ### Capability: restart — adopt and unseal persisted state
 
 ```go

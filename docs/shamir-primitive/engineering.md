@@ -409,7 +409,11 @@ second page and the footprint jumps to 2,879,488, which is refused — as is
 sharing a 4 KiB *payload* 255 ways (3,141,632). Envelope large payloads under a
 key that does fit. Against the 8 MiB `RLIMIT_MEMLOCK` a Linux host commonly
 defaults to, one maximal set is a quarter of the ceiling; that bounds ONE call
-and is deliberately not a concurrency budget.
+and is deliberately not a concurrency budget. The concurrency budget is a
+go-enclave `Allocator`, owned by whoever owns the process: the `...With`
+variants of `SplitProtected`, `CombineProtected` and `NewProtectedShare` charge
+every region they lock to the one they are handed (issue #204), and a refusal
+partway through a split destroys everything that call had allocated.
 
 And **shares arriving from outside the process are decoded with
 `UnmarshalShareSet`, not `json.Unmarshal` into a `[]*ProtectedShare`.** Shares

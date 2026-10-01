@@ -190,7 +190,10 @@ unauthenticated peer, so there is no path to bound. What it does instead, where
 legal arguments can multiply into an illegal footprint, is price and refuse the
 whole operation up front — `MaxShareSetBytes` against `splitLockedBytes`. A
 consumer that buffers key material before authenticating a peer should admit
-those allocations through an `Allocator` at its own layer.
+those allocations through an `Allocator` at its own layer, and can pass that
+same allocator to `shamir.SplitProtectedWith`, `CombineProtectedWith` and
+`NewProtectedShareWith` so its budget covers share material as well (issue
+#204). A nil allocator is refused there, never treated as unbudgeted.
 
 ## 5. Persistence
 

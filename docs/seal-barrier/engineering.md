@@ -228,8 +228,9 @@ then registering in two steps reopens exactly that window.
 
 ```
 Uninitialized ──Initialize()──▶ Unsealed ──Seal()──▶ Sealed
-                                    ▲                   │
-                                    └───── Unseal() ────┘
+      ▲                             ▲                   │ │
+      │                             └───── Unseal() ────┘ │
+      └──────────────────── Reset() ──────────────────────┘
 ```
 
 | Method | Precondition | Postcondition |
@@ -238,6 +239,15 @@ Uninitialized ──Initialize()──▶ Unsealed ──Seal()──▶ Sealed
 | `SetSealedRootKey` | any | blob validated and adopted; Sealed if it was Uninitialized |
 | `Unseal` | Sealed | root key unwrapped, `StateMAC` verified **before deriving any DEK**, blob claimed (`LoadGeneration+1`), DEKs re-derived for every known epoch, invocation budget re-established |
 | `Seal` | Unsealed | every key reference dropped; delegated encryptor cleared; `binding` reset to `ContextBindingUnresolved` |
+| `Reset` | Sealed, not superseded, no epoch pinned in flight | Uninitialized: any remaining key enclave destroyed; in-memory sealed blob, salt, epoch, `KnownEpochs`, DEK/AEAD maps, load generation and backoff counters cleared; invocation counter reset and nonce tracker cleared. **Does not call `StatePersister`** — any persisted blob is the caller's to remove. `Initialize` may then run again and produces an unrelated root key and salt. |
+
+**`Reset` is the rollback for a failed first boot.** An embedder whose
+initialization cannot complete after `Initialize` returned (go-qrdb's Shamir
+share distribution, #208) seals and resets the same instance rather than
+building a new one, because the WAL and host already hold it. Nothing encrypted
+under the discarded key decrypts under the next one: epoch 1 is reused, but its
+DEK derives from a different root key and salt, so the AEAD fails closed with
+`ErrDecryptionFailed`.
 
 **`Unseal` writes.** It persists the load-generation claim before the barrier
 will encrypt, and it usually rotates. Neither happens in delegated or
@@ -331,7 +341,7 @@ zero-filled ciphertext header decodes to.
 |---|---|---|
 | `Encrypt` / `Decrypt` | `RLock` after an `atomic.Bool` pre-filter | hot path |
 | `Rotate` | exclusive `Lock` (~1–2 ms) | rare |
-| `Seal` / `Unseal` | exclusive `Lock` | lifecycle |
+| `Seal` / `Unseal` / `Reset` | exclusive `Lock`; `Reset` then takes `inFlightMu`, in the `PurgeEpochsBefore` order | lifecycle |
 
 The `atomic.Bool` avoids `RLock` contention when sealed; the crypto operation
 always holds `RLock` so `Seal` cannot zero the cipher mid-operation, and the
@@ -436,6 +446,7 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrUnsealBackoff` | brute-force backoff active |
 | `ErrPurgeCurrentEpoch` | tried to purge the active epoch |
 | (no error) | an epoch with in-flight references is **skipped** by `PurgeEpochsBefore`, not refused — the caller deregisters and purges again later |
+| `ErrEpochsInFlight` | `Reset` while any epoch holds an in-flight reference |
 | `ErrNoStatePersister` | `Rotate`, or a purging `PurgeEpochsBefore`, with no persister |
 | `ErrUnsupportedHKDFVersion` | blob names a DEK-derivation layout this build lacks |
 | `ErrInvocationLimitExceeded` | SP 800-38D budget reached for the epoch |

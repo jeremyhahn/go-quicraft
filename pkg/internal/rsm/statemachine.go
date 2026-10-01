@@ -187,36 +187,63 @@ type StateMachine struct {
 	smResultBuf []sm.Result
 	indexMapBuf []int
 
-	// readGuard serializes read access (Lookup/NALookup/NALookupBuf/GetHash)
-	// against BOTH Apply and Close. Readers hold RLock for the duration of the
-	// call into the underlying state machine — and no longer, so no caller-held
-	// resource can pin it — which is what keeps the SM from being closed
-	// mid-lookup. Apply and Close take the write lock.
+	// readGuard excludes Close from everything that calls into the underlying
+	// state machine, and — for the basic tier only — excludes reads
+	// (Lookup/NALookup/NALookupBuf/GetHash) from Apply. Readers hold RLock for
+	// the duration of the call into the underlying state machine — and no
+	// longer, so no caller-held resource can pin it — which is what keeps the
+	// SM from being closed mid-lookup. Close takes the write lock.
 	// A pooled NALookupBuf buffer outlives the guard: its contents are a COPY
 	// (see the sm.NALookupInto contract), so it stays valid after Close.
 	//
-	// Apply holds the WRITE lock because that is the contract sm.StateMachine
-	// publishes: "QuicRaft serializes all method calls -- Update and Lookup are
-	// never called concurrently." That promise is the whole point of the tier
-	// system. ConcurrentStateMachine and DiskStateMachine document the opposite
-	// ("May be called concurrently with Update ... responsible for its own
-	// internal synchronization"), so if the basic tier were also concurrent the
-	// three interfaces would differ only in snapshot mechanics.
+	// How Apply holds it depends on the tier, because the tiers publish
+	// opposite contracts (lockApply):
 	//
-	// The engine already enforces this premise elsewhere on this tier: the
-	// snapshot pool sets the saving gate and drains applies before a regular
-	// SM's whole-state save, precisely because that save cannot race Apply
-	// (see internal/engine/snapshot_pool.go and rsm/adapter.go). Reads were the
-	// one path where the promise was unenforced — Apply and Lookup both took
-	// RLock, which excludes neither from the other.
+	//   - sm.StateMachine (SMTypeRegular): Apply takes the WRITE lock. That
+	//     tier promises "QuicRaft serializes all method calls -- Update and
+	//     Lookup are never called concurrently", and the promise is the whole
+	//     point of the tier. The engine enforces the same premise for
+	//     snapshots: the snapshot pool sets the saving gate and drains applies
+	//     before a regular SM's whole-state save (see
+	//     internal/engine/snapshot_pool.go and rsm/adapter.go).
 	//
-	// Cost: a local read parks behind an in-flight Apply, which during
-	// follower catch-up can carry up to maxEntriesToApplySize of entries, and
-	// sync.RWMutex has no context-aware acquire, so a deadline is not observed
-	// while blocked here. An implementation that needs finer-grained
-	// concurrency should implement sm.ConcurrentStateMachine, which is exactly
-	// the choice the tiers exist to offer.
+	//   - sm.ConcurrentStateMachine and sm.DiskStateMachine: Apply takes the
+	//     READ lock. Both document Lookup as "May be called concurrently with
+	//     Update ... responsible for its own internal synchronization", so
+	//     excluding reads here would serialise a state machine that was built
+	//     not to be. It did, until #209: one long read (a range scan, an
+	//     export) blocked the shard's Apply, and sync.RWMutex then parked
+	//     every new reader behind that waiting writer, so a single slow read
+	//     stalled reads and writes for the whole shard. The read lock still
+	//     excludes Close.
+	//
+	// Cost on the basic tier: a local read parks behind an in-flight Apply,
+	// which during follower catch-up can carry up to maxEntriesToApplySize of
+	// entries, and sync.RWMutex has no context-aware acquire, so a deadline is
+	// not observed while blocked here. An implementation that needs
+	// finer-grained concurrency should implement sm.ConcurrentStateMachine,
+	// which is exactly the choice the tiers exist to offer.
 	readGuard sync.RWMutex
+
+	// applyMu serializes everything that owns the apply stream's state: Apply,
+	// the capture phase of SaveSnapshotGated, and RecoverFromSnapshot. That
+	// state is the session manager (not safe for concurrent use), the session
+	// policy and the expiry checkpoint walk.
+	//
+	// readGuard used to carry this exclusion as a side effect of Apply holding
+	// its write lock. Once Apply became a READER on the concurrent and on-disk
+	// tiers, two readGuard readers no longer exclude each other, so the role
+	// moves here — the same split streamGuard made for Close. The engine's
+	// apply gate quiesces applies around both snapshot paths as well; this is
+	// what keeps a misordered caller from racing the session table instead of
+	// relying on that gate alone.
+	//
+	// Readers never take it, so it costs the read path nothing, and on the
+	// apply path it is uncontended except against a snapshot capture or
+	// recovery, which exclude Apply by design.
+	//
+	// LOCK ORDER: readGuard, then applyMu, then streamGuard.
+	applyMu sync.Mutex
 
 	// streamGuard blocks Close for as long as a snapshot is STREAMING, without
 	// blocking Apply.
@@ -238,7 +265,8 @@ type StateMachine struct {
 	// from capture until the last byte; Close takes it for writing after
 	// readGuard, and therefore still waits out an in-flight save.
 	//
-	// LOCK ORDER: readGuard before streamGuard, everywhere, without exception.
+	// LOCK ORDER: readGuard, then applyMu, then streamGuard, everywhere,
+	// without exception.
 	streamGuard sync.RWMutex
 	// closed is set under readGuard.Lock by Close so that any reader which was
 	// blocked acquiring RLock observes the closed state and returns ErrClosed
@@ -407,6 +435,29 @@ func (s *StateMachine) IsOnDisk() bool {
 	return s.smType == SMTypeOnDisk
 }
 
+// lockApply acquires the guards Apply runs under: readGuard exclusively for a
+// basic-tier state machine and shared for the concurrent and on-disk tiers,
+// then applyMu. smType is fixed at construction, so lockApply and unlockApply
+// always agree on the mode.
+func (s *StateMachine) lockApply() {
+	if s.smType == SMTypeRegular {
+		s.readGuard.Lock()
+	} else {
+		s.readGuard.RLock()
+	}
+	s.applyMu.Lock()
+}
+
+// unlockApply releases what lockApply acquired, in reverse order.
+func (s *StateMachine) unlockApply() {
+	s.applyMu.Unlock()
+	if s.smType == SMTypeRegular {
+		s.readGuard.Unlock()
+	} else {
+		s.readGuard.RUnlock()
+	}
+}
+
 // Apply processes committed entries through the session lifecycle:
 //   - Session register entries (SeriesID == SessionSeriesIDForRegister)
 //     register the client with the session manager.
@@ -441,18 +492,18 @@ func (s *StateMachine) IsOnDisk() bool {
 // expire different sessions at different indexes with nothing in the protocol
 // able to notice.
 func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
-	// Apply takes the WRITE lock so it excludes Lookup/NALookup/NALookupBuf/
-	// GetHash, which is the serialization sm.StateMachine's doc comment
-	// promises its implementers. See the readGuard field comment for why this
-	// is a write lock and not a read lock.
+	// lockApply takes readGuard in the mode the tier's contract demands —
+	// exclusive on the basic tier, so Apply excludes Lookup/NALookup/
+	// NALookupBuf/GetHash as sm.StateMachine promises; shared otherwise — and
+	// then applyMu. See the readGuard and applyMu field comments.
 	//
-	// It also subsumes the original defence-in-depth role: the engine's
-	// synchronous UnloadNode guarantees no Apply is in flight when Close runs,
-	// but a misordered caller must get a typed error instead of running user
-	// code on a closed SM, and holding the guard forces Close to wait out an
-	// in-flight Apply rather than closing the SM under it.
-	s.readGuard.Lock()
-	defer s.readGuard.Unlock()
+	// Either mode also subsumes the original defence-in-depth role: the
+	// engine's synchronous UnloadNode guarantees no Apply is in flight when
+	// Close runs, but a misordered caller must get a typed error instead of
+	// running user code on a closed SM, and holding the guard forces Close to
+	// wait out an in-flight Apply rather than closing the SM under it.
+	s.lockApply()
+	defer s.unlockApply()
 	if s.closed {
 		return ErrClosed
 	}
@@ -1097,28 +1148,37 @@ func (s *StateMachine) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-
 func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	// Two guards, because this call spans two phases with different needs.
 	//
-	// readGuard covers the CAPTURE only. It excludes Apply, which is what makes
-	// the session MarshalTo below safe (the session manager is not safe for
-	// concurrent use) and what a regular SM's whole-state save requires. It is
-	// released the instant the capture completes, so applies resume while the
-	// snapshot streams — the reason SaveSnapshotGated exists.
+	// readGuard and applyMu cover the CAPTURE only. applyMu excludes Apply on
+	// every tier, which is what makes the session MarshalTo below safe (the
+	// session manager is not safe for concurrent use); readGuard's read lock
+	// additionally excludes a basic-tier Apply, which is what a regular SM's
+	// whole-state save requires. Both are released the instant the capture
+	// completes, so applies resume while the snapshot streams — the reason
+	// SaveSnapshotGated exists.
 	//
 	// streamGuard covers CAPTURE AND STREAM. It excludes only Close, so an
 	// in-flight save still finishes (or aborts via stopper) before the SM is
 	// closed under it, without holding applies for the transfer.
 	//
-	// Lock order is readGuard then streamGuard, as documented on the fields.
+	// Lock order is readGuard, applyMu, streamGuard, as documented on the
+	// fields.
 	s.readGuard.RLock()
+	s.applyMu.Lock()
 	s.streamGuard.RLock()
 	defer s.streamGuard.RUnlock()
 
-	// releaseRead drops the capture guard exactly once, whether the capture
-	// completed or the save failed before it. sync.Once rather than a bool
-	// because afterCapture is invoked from the wrapper, off this goroutine's
-	// straight-line path.
+	// releaseCapture drops the capture guards exactly once, whether the
+	// capture completed or the save failed before it. sync.Once rather than a
+	// bool because afterCapture is invoked from the wrapper, off this
+	// goroutine's straight-line path.
 	var once sync.Once
-	releaseRead := func() { once.Do(s.readGuard.RUnlock) }
-	defer releaseRead()
+	releaseCapture := func() {
+		once.Do(func() {
+			s.applyMu.Unlock()
+			s.readGuard.RUnlock()
+		})
+	}
+	defer releaseCapture()
 
 	if s.closed {
 		return ErrClosed
@@ -1133,7 +1193,7 @@ func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopp
 
 	// Save session state first. The session manager is not safe for concurrent
 	// use, so this MarshalTo must run with applies quiesced -- by the caller's
-	// gate and by readGuard, which is still held here.
+	// gate and by applyMu, which is still held here.
 	if err := s.sessions.MarshalTo(w); err != nil {
 		return err
 	}
@@ -1142,7 +1202,7 @@ func (s *StateMachine) SaveSnapshotGated(ctx context.Context, w io.Writer, stopp
 	// engine's apply gate: whatever resumes applies must also stop excluding
 	// them, or the gate release buys nothing.
 	gated := func() {
-		releaseRead()
+		releaseCapture()
 		if afterCapture != nil {
 			afterCapture()
 		}
@@ -1156,8 +1216,12 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// Defence in depth: never install snapshot state into a closed SM (see
 	// Apply). The read guard is held for the whole recovery, so Close blocks
 	// until it finishes; the stopper aborts it promptly once the node stops.
+	// applyMu excludes Apply on every tier for the same span, because the
+	// recovery replaces the session table and policy Apply works against.
 	s.readGuard.RLock()
 	defer s.readGuard.RUnlock()
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	if s.closed {
 		return ErrClosed
 	}

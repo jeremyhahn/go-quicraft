@@ -493,7 +493,9 @@ See `pkg/sm/interfaces.go`.
 
 All state in memory, serialized access (Update and Lookup never run
 concurrently — the RSM adapter holds its `readGuard` for writing across
-`Apply` and for reading across every read entry point). Simplest to implement:
+`Apply` and for reading across every read entry point). The concurrent and
+on-disk tiers below are not serialized: their `Apply` holds the guard for
+reading, so `Lookup` runs alongside `Update`. Simplest to implement:
 
 ```go
 type StateMachine interface {

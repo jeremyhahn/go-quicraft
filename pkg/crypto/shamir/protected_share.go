@@ -60,7 +60,44 @@ var newProtectedMemory = enclave.NewMemoryEnclave
 // kernel that denies the lock, and the *ProtectedMemoryError each maps it to —
 // as the only ones the errLockRefused injection could not reach, and the only
 // ones untested (#95). A seam half the call sites bypass is not a seam.
+//
+// Both seams stand in for the UNBUDGETED constructors only. A call that was
+// handed an [enclave.Allocator] — the ...With variants — allocates through it
+// instead (see lockValue and lockSized), and needs no seam: its refusal is
+// produced for real by an allocator sized to refuse, which, unlike exhausting
+// RLIMIT_MEMLOCK, touches nothing outside the test that built it.
 var newSizedProtectedMemory = enclave.NewMemoryEnclaveSized
+
+// lockValue moves value into locked, frozen memory, admitted against a when the
+// caller supplied one and unbudgeted when a is nil.
+//
+// It is the single place this package chooses between the two, so threading an
+// allocator through a path is one parameter rather than a nil branch at every
+// allocation site — the same shape as go-enclave's own allocSized. nil is not
+// a refusal down here: it is how the original, allocator-less entry points ask
+// for the unbudgeted behaviour they have always had. The refusal of a nil
+// allocator belongs at the ...With entry points, where it is a statement about
+// the call.
+//
+// Both constructors take ownership of value and wipe it on every path,
+// including a budget refusal, so callers keep one ownership contract whichever
+// is chosen.
+func lockValue(a *enclave.Allocator, value []byte) (*enclave.MemoryEnclave, error) {
+	if a == nil {
+		return newProtectedMemory(value)
+	}
+	return a.New(value)
+}
+
+// lockSized allocates n bytes of locked, zeroed, writable memory, admitted
+// against a when the caller supplied one and unbudgeted when a is nil. See
+// lockValue.
+func lockSized(a *enclave.Allocator, n int) (*enclave.MemoryEnclave, error) {
+	if a == nil {
+		return newSizedProtectedMemory(n)
+	}
+	return a.NewSized(n)
+}
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
 // function restoring the previous one. It PANICS outside a test binary.
@@ -220,7 +257,10 @@ func lockedBytes(n int) int {
 // This bounds ONE call: a process running several at once — or holding sets
 // after they return — still has to bound itself.
 // go-enclave's Allocator is the mechanism for that, and it belongs to whoever
-// owns the process's locked-memory policy, not to this primitive.
+// owns the process's locked-memory policy, not to this primitive. This package
+// only accepts one: SplitProtectedWith, CombineProtectedWith and
+// NewProtectedShareWith charge every locked allocation they make to the
+// allocator they are handed, so the caller's budget covers share material too.
 //
 // A caller that genuinely needs more does its own accounting and works share by
 // share with SplitBytes and NewProtectedShare — the policy is then explicitly
@@ -364,7 +404,39 @@ type ProtectedShare struct {
 // unauthenticated share submission would otherwise get to size.
 //
 // The returned share must be Destroyed.
+//
+// The value's locked memory is UNBUDGETED: it is charged to no
+// [enclave.Allocator]. A caller that bounds its locked memory with one uses
+// NewProtectedShareWith.
 func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error) {
+	return newProtectedShare(nil, index, threshold, total, value)
+}
+
+// NewProtectedShareWith is NewProtectedShare with the value's locked memory
+// admitted against a, so a consumer's locked-memory budget covers it.
+//
+// Its contract is NewProtectedShare's, with one addition. When admitting the
+// value would exceed a's budget it returns a *ProtectedMemoryError matching
+// [enclave.ErrBudgetExhausted] under errors.Is — decided before any locked
+// memory is requested, and, as for every *ProtectedMemoryError, with value
+// ALREADY WIPED. The refusal fails this call alone; shares built earlier, from
+// a or anywhere else, are untouched.
+//
+// A nil a is refused with [enclave.ErrNilAllocator] before value is touched,
+// rather than falling back to the unbudgeted constructor: a caller that asked
+// for a budget and supplied none has a bug, and silently locking outside the
+// budget would hide it. Libraries obtain a from [enclave.ProcessAllocator].
+func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
+	if a == nil {
+		return nil, enclave.ErrNilAllocator
+	}
+	return newProtectedShare(a, index, threshold, total, value)
+}
+
+// newProtectedShare is the one implementation behind NewProtectedShare and
+// NewProtectedShareWith; a nil a selects the unbudgeted constructor (see
+// lockValue).
+func newProtectedShare(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
 	if err := validateShareHeader(index, threshold, total); err != nil {
 		return nil, err
 	}
@@ -402,11 +474,12 @@ func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedSha
 			"is %d bytes, exceeding the %d-byte maximum for a %d-byte payload",
 			len(value), maxProtectedValueBytes, MaxSecretBytes)}
 	}
-	// NewMemoryEnclave moves the bytes into locked memory, wipes the source and
-	// freezes the result. It reports a refusal instead of terminating: locking
-	// pages is a syscall the kernel can decline, and this constructor runs on
+	// NewMemoryEnclave (or Allocator.New, when a budget was supplied) moves the
+	// bytes into locked memory, wipes the source and freezes the result. It
+	// reports a refusal instead of terminating: locking pages is a syscall the
+	// kernel can decline, a budget can be exhausted, and this constructor runs on
 	// operator-supplied JSON at a recovery ceremony.
-	held, err := newProtectedMemory(value)
+	held, err := lockValue(a, value)
 	if err != nil {
 		// NOT a ValidationError: value is wiped by now. See the contract above.
 		return nil, &ProtectedMemoryError{Op: "locking share value", Err: err}
@@ -455,7 +528,41 @@ func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedSha
 // there was no failure left to report. It is now an ErrLockedMemoryUnavailable
 // on the one allocation that hit the ceiling — recoverable, and still not what
 // this API should hand back for arguments it could have priced.
+//
+// Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator]. A
+// caller that bounds its locked memory with one uses SplitProtectedWith.
 func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error) {
+	return splitProtected(nil, secret, threshold, total)
+}
+
+// SplitProtectedWith is SplitProtected with EVERY locked allocation it makes —
+// the coefficient pool, the coefficient vector, the share payload and each
+// returned share's value — admitted against a, so a consumer's locked-memory
+// budget covers the share set and the scratch that produced it.
+//
+// Its contract is SplitProtected's, with one addition. When an allocation would
+// exceed a's budget it returns a *ProtectedMemoryError matching
+// [enclave.ErrBudgetExhausted] under errors.Is, and that can happen partway
+// through the set: the budget is shared with every other holder of a, so it
+// cannot be priced up front the way MaxShareSetBytes is. Every region this call
+// had already allocated — scratch and the shares built so far — is destroyed
+// before it returns, so a refused split gives its whole reservation back to a.
+// Shares returned by EARLIER calls are the caller's and are untouched.
+//
+// A nil a is refused with [enclave.ErrNilAllocator] before anything is
+// allocated, rather than falling back to the unbudgeted path. Libraries obtain
+// a from [enclave.ProcessAllocator].
+func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
+	if a == nil {
+		return nil, enclave.ErrNilAllocator
+	}
+	return splitProtected(a, secret, threshold, total)
+}
+
+// splitProtected is the one implementation behind SplitProtected and
+// SplitProtectedWith; a nil a selects the unbudgeted constructors (see
+// lockSized).
+func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
 	if err := validateSplitParams(secret, threshold, total); err != nil {
 		return nil, err
 	}
@@ -478,7 +585,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// bulk read of crypto/rand — as in SplitBytes, but read directly into
 	// locked memory. The coefficients are as sensitive as the secret: with
 	// them and one share, the secret follows.
-	randCoeffs, err := newSizedProtectedMemory(len(secret) * (threshold - 1))
+	randCoeffs, err := lockSized(a, len(secret)*(threshold-1))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient memory", Err: err}
 	}
@@ -494,7 +601,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// and no secret digest is embedded in shares — see SplitBytes for why
 	// both of those are deliberate and must not be "fixed".
 
-	coeffs, err := newSizedProtectedMemory(threshold) // [secret byte, c1..c_{t-1}]
+	coeffs, err := lockSized(a, threshold) // [secret byte, c1..c_{t-1}]
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
 	}
@@ -507,7 +614,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 	// of it (version, x, and one y byte per secret byte) before it is read, so
 	// no share ever sees another's bytes, and Destroy wipes the last share's
 	// payload on the way out.
-	raw, err := newSizedProtectedMemory(rawShareOverhead + len(secret))
+	raw, err := lockSized(a, rawShareOverhead+len(secret))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking share payload", Err: err}
 	}
@@ -559,7 +666,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 		// removed the copy, one whole locked region from the peak footprint (see
 		// splitLockedBytes), and the window in which two copies of a share value
 		// were live at once.
-		value, err := newSizedProtectedMemory(encodedLen)
+		value, err := lockSized(a, encodedLen)
 		if err != nil {
 			return nil, failed("locking share value", err)
 		}
@@ -633,7 +740,38 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 // Only the x-coordinates and the Lagrange basis derived from them live on the
 // ordinary heap: a share's x-coordinate is its published index, not secret (see
 // interpolateSecretInto).
+//
+// Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator]. A
+// caller that bounds its locked memory with one uses CombineProtectedWith.
 func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) {
+	return combineProtected(nil, shares)
+}
+
+// CombineProtectedWith is CombineProtected with both of its locked allocations
+// — the decode buffer and the returned secret — admitted against a, so a
+// consumer's locked-memory budget covers reconstruction too. The returned
+// enclave holds its reservation on a until it is Destroyed.
+//
+// Its contract is CombineProtected's, with one addition. When an allocation
+// would exceed a's budget it returns a *ProtectedMemoryError matching
+// [enclave.ErrBudgetExhausted] under errors.Is, having destroyed whatever this
+// call had already allocated. The input shares are left intact either way, as
+// they are on every CombineProtected error path.
+//
+// A nil a is refused with [enclave.ErrNilAllocator] before anything is
+// allocated, rather than falling back to the unbudgeted path. Libraries obtain
+// a from [enclave.ProcessAllocator].
+func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error) {
+	if a == nil {
+		return nil, enclave.ErrNilAllocator
+	}
+	return combineProtected(a, shares)
+}
+
+// combineProtected is the one implementation behind CombineProtected and
+// CombineProtectedWith; a nil a selects the unbudgeted constructors (see
+// lockSized).
+func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error) {
 	if len(shares) == 0 {
 		return nil, &CombineError{Reason: "no shares provided"}
 	}
@@ -698,7 +836,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 			return nil, &CombineError{Reason: "share was destroyed during reconstruction"}
 		}
 	}
-	buf, err := newSizedProtectedMemory(base64.StdEncoding.DecodedLen(widest))
+	buf, err := lockSized(a, base64.StdEncoding.DecodedLen(widest))
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking decode buffer", Err: err}
 	}
@@ -760,7 +898,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error) 
 	// accumulated and written into in place. It is not a scratch — which is what
 	// it used to be, when a frozen result had to be copied out of it — so it is
 	// destroyed on every error path below and on none of the success path.
-	secret, err := newSizedProtectedMemory(secretLen)
+	secret, err := lockSized(a, secretLen)
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking secret buffer", Err: err}
 	}
