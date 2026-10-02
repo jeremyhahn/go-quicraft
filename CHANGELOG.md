@@ -7,13 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing in this release is breaking, despite the `!` in the squash title of
-PR #210 (auto-merge kept the title the PR was opened with). Every API change
-is additive. #209 changes behaviour only where a contract already permitted
-it: a `ConcurrentStateMachine` or `DiskStateMachine` now does see `Lookup`
-run concurrently with `Update`, as both interfaces have always documented. An
-implementation that leaned on the old, undocumented serialization must
-synchronise itself, as its interface requires.
+## [0.16.0-alpha] - 2026-10-01
+
+Removes the shard-wide stall that one slow read caused on concurrent and
+on-disk state machines (#209). A promoted observer now becomes a voter in
+place, with no restart (#218). Shamir share memory can be charged to a
+go-enclave budget (#204, #211). `Barrier.Reset` rolls back an uncompleted
+first boot (#208, #216). A public-releasability gate now runs under
+`make test` (#213, #215).
+
+**No format version changed, and no API was removed or renamed.** The PR #210
+squash title carries a stray `!` (auto-merge kept the title the PR was opened
+with). Behaviour changes a consumer should check:
+
+- **Concurrent and on-disk state machines.** A `ConcurrentStateMachine` or
+  `DiskStateMachine` now sees `Lookup` and `GetHash` run concurrently with
+  `Update`, as both interfaces have always documented. Synchronise them, and
+  make `GetHash` hash whole batches.
+- **`UnmarshalShareSet` lock refusals.** When the kernel refuses a lock,
+  `UnmarshalShareSet` now returns `*ProtectedMemoryError`, as documented,
+  instead of a `*ValidationError`.
+- **Observer role.** A replica's observer role follows the committed
+  membership. A replica the membership lists as an observer behaves as one
+  instead of latching a role mismatch.
+- **Makefile offload variables.** The remote-offload variables are renamed
+  `OMEGA_*` → `REMOTE_*`, and `REMOTE_HOST` is required.
 
 ### Added
 - **A promoted observer becomes a voter in place (#218).** A replica's
