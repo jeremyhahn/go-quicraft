@@ -1,25 +1,25 @@
 # Log Storage — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-08-19
+> `pkg/logdb/memdb` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
+go-quicraft is a library. The Go API is the API.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the surface below. This is the transport. |
-| Unix socket / REST / gRPC / MCP | n/a — this repository serves no socket, exposes no HTTP handler, defines no gRPC service and registers no MCP tools |
-| QUIC | n/a for storage. The QUIC listener carries Raft messages; entries reach the log through the engine's commit worker, never from a socket directly. |
+| **Embedded (Go call)** | the surface below |
+| Unix socket / REST / gRPC / MCP | n/a: this repository serves no socket, HTTP handler, gRPC service or MCP tool |
+| QUIC | n/a for storage. The QUIC listener carries Raft messages; entries reach the log through the engine's commit worker, never from a socket. |
 
-Not missing-capability rows. This feature is part of the go-quicraft capability
+These are not missing-capability rows. The feature is part of the go-quicraft
 row covering Raft consensus, log replication and QUIC transport, which the
-portfolio register marks as consumed by implementing interfaces rather than by
-calling a client.
+portfolio register marks as consumed by implementing interfaces, not by calling
+a client.
 
-## Go API — the interface
+## The interface
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/logdb`
 
@@ -28,96 +28,124 @@ type LogDB interface {
     Name() string
     SaveState(updates []Update) error
     IterateEntries(entries []Entry, size uint64, shardID, replicaID, low, high, maxSize uint64) ([]Entry, uint64, error)
-    // ... plus snapshot, bootstrap, node-info, compaction and lifecycle methods
+    ReadState(shardID, replicaID uint64) (State, Membership, error)
+    EntryRange(shardID, replicaID uint64) (firstIndex, length uint64, err error)
+    RemoveEntriesTo(shardID, replicaID, index uint64) error
+    Compact(shardID, replicaID uint64) error
+    SaveSnapshot(shardID, replicaID uint64, snapshot Snapshot) error
+    GetSnapshot(shardID, replicaID uint64) (Snapshot, error)
+    RemoveNodeData(shardID, replicaID uint64) error
+    NodeRemoved(shardID, replicaID uint64) (bool, error)
+    ListNodeInfo() ([]NodeInfo, error)
+    SaveBootstrap(shardID, replicaID uint64, bootstrap Bootstrap) error
+    GetBootstrap(shardID, replicaID uint64) (Bootstrap, bool, error)
+    Close() error
 }
 ```
 
-The **authoritative signature list is the interface declaration itself**
-(`pkg/logdb/logdb.go`), whose doc comments carry the per-method contract in
-full; the semantics that matter to an implementer are restated in
-[`engineering.md`](engineering.md). Two contracts are load-bearing enough to
-repeat here, because getting either wrong is silent corruption rather than a
-failed test:
+The doc comments on the declaration (`pkg/logdb/logdb.go`) carry the
+per-method contract; [engineering.md](engineering.md) restates what an
+implementer must get right. Four contracts are repeated here because getting
+them wrong corrupts data silently instead of failing a test.
 
 **No aliasing, in either direction.**
 
-- `SaveState` **must not retain or alias the caller's `Entry.Cmd` backing
-  arrays.** Callers reuse those buffers after it returns, so the store holds its
-  own copies.
-- `IterateEntries` **must not return an `Entry` whose `Cmd` aliases the store's
-  own memory.** The returned payloads are the caller's to keep *and to modify* —
-  and what a caller would otherwise be writing through into is the live log this
-  replica serves to its followers and replays to itself on restart.
+- `SaveState` must not retain or alias the caller's `Entry.Cmd` backing arrays.
+  Callers reuse those buffers after it returns.
+- `IterateEntries` must not return an `Entry` whose `Cmd` aliases the store's
+  memory. The returned payloads are the caller's to keep and to modify, and what
+  a caller would otherwise write through into is the live log this replica
+  serves to followers and replays on restart. `CopyEntryCmd(e Entry) Entry`
+  returns an entry that owns its `Cmd`.
 
 **Size accounting in `IterateEntries`.** Each entry is charged
-`EntryOverheadBytes + len(Cmd)` against `maxSize`; `maxSize` of 0 means
-unlimited; **at least one entry is returned when any is available**, even if it
-alone exceeds `maxSize`; otherwise iteration stops *before* the entry that would
-cross the limit.
+`EntryOverheadBytes + len(Cmd)` against `maxSize`, and `maxSize` 0 means
+unlimited. Iteration stops before the entry that would cross the limit, except
+that one entry is always returned when the result slice is still empty, even if
+it alone exceeds `maxSize`.
 
-### Errors the interface defines
+**Retirement.** `RemoveNodeData` removes a node's data and retires its
+`(shardID, replicaID)` for good. `NodeRemoved` reports that from then on, across
+restarts, and every writer refuses the node with `ErrReplicaRetired`. A removed
+replica must rejoin under a new replica ID: its term and vote went with its
+data, so reusing the ID could let it vote twice in one term.
+
+**Snapshot bounds.** `SaveSnapshot`, and a snapshot carried in an `Update`, are
+refused when the index or term is at or above the protocol bound
+(`Snapshot.CheckBounds`). `SaveSnapshot` refuses a snapshot at index 0, or at or
+below the stored one, with `ErrSnapshotOutOfDate`; `SaveState` skips a stale
+snapshot silently.
+
+### Errors
 
 | Error | Meaning |
 |---|---|
 | `ErrNoState` | no saved hard state for this node |
+| `ErrNoSnapshot` | no saved snapshot |
+| `ErrNoBootstrap` | no saved bootstrap record |
+| `ErrClosed` | the store is closed |
 | `ErrCompacted` | `low` is at or below the node's compaction floor |
 | `ErrUnavailable` | unknown node, or a range holding no entries |
-| `ErrLogGapDetected` | the stored range does not begin exactly at `low`, or an interior index is missing. **A log hole must never be served as a silently shortened result.** |
-| `ErrEntriesBelowCompactionFloor` | an `Update` whose first entry sits at or below the floor. The **whole batch** is rejected without storing any of it: those indexes are already deleted, so honouring the write would replace the live suffix above the floor with entries nothing can serve. |
+| `ErrSnapshotOutOfDate` | `SaveSnapshot` with a snapshot no newer than the stored one, or at index 0 |
+| `ErrLogGapDetected` | the stored range does not begin exactly at `low`, an interior index is missing, or the stored count disagrees with the first..last span. A log hole is never served as a short result. |
+| `ErrEntriesBelowCompactionFloor` (`*EntriesBelowCompactionFloorError`) | an `Update` whose first entry is at or below the floor. The whole batch is refused and nothing is stored: those indexes are already deleted, so writing them would replace the live suffix above the floor with entries nothing can serve. |
+| `ErrReplicaRetired` | a write names a node `RemoveNodeData` removed |
 
-Full error semantics, including `waldb`'s own set, are in
-[`engineering.md`](engineering.md).
+[engineering.md](engineering.md#recovery-error-reference) covers `waldb`'s
+errors and which paths fail closed.
 
-### Capability interfaces — probed, not required
+### Optional interfaces
 
 The engine type-asserts for these. A `LogDB` that implements none still works;
-each one it implements enables a capability rather than changing a contract.
+each one enables a capability without changing a contract.
 
-| Interface | Enables |
-|---|---|
-| `AtRestProtectedLogDB` | reporting `AtRestProtection()` — `AtRestUnprotected` or the protected states — so a caller checks the store's answer instead of inferring encryption from the presence of a barrier |
-| `EpochAwareLogDB` | `MinLiveEpoch() (uint64, error)`, the safe-purge floor for barrier DEKs. `0` with a nil error means no encrypted records, or no barrier. |
-| `PerBarrierEpochAwareLogDB` | `MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)`, the same restricted to one barrier's records |
-| `BarrierShardEnumerator` | enumerating which shards are behind which barrier |
+| Interface | Method | Enables |
+|---|---|---|
+| `AtRestProtectedLogDB` | `AtRestProtection() AtRestProtection` | the store's own statement of at-rest protection: `AtRestUnprotected` (the zero value, and what a missing implementation means), `AtRestNonDurable` or `AtRestBarrierEncrypted`. A host that requires encryption checks this instead of inferring it from the presence of a barrier. |
+| `EpochAwareLogDB` | `MinLiveEpoch() (uint64, error)` | the safe-purge floor for barrier DEKs. `0` with a nil error means no encrypted records, or no barrier. |
+| `PerBarrierEpochAwareLogDB` | `MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)` | the same floor, restricted to one barrier's records |
+| `BarrierShardEnumerator` | `ShardsForBarrier(barrier any) (shards []uint64, known bool)` | the complete shard set behind a barrier, when that set is fixed |
 
-The three-value form is a fail-safe contract callers **must** honour before
+`waldb.DB` implements the first three; `memdb.MemDB` implements
+`AtRestProtectedLogDB` (reporting `AtRestNonDurable`). Nothing in this
+repository implements `BarrierShardEnumerator`; it exists for a multiplexing
+per-tenant `LogDB`.
+
+The three-value form is a fail-safe contract. Callers must honour it before
 purging any DEK:
 
 | Result | Means | May purge below the floor? |
 |---|---|---|
-| `known == false` | this store cannot **attribute** the barrier — it holds no records under it, or cannot prove which records belong to it | **No** |
-| any error | the value could not be determined | **No** |
-| `known == true, epoch == 0` | the store owns the barrier and has zero live encrypted records | yes, as far as this store is concerned; other floors still apply |
-| `known == true, epoch > 0` | the oldest live record under this barrier sits at `epoch` | not below `epoch` |
+| `known == false` | the store cannot attribute the barrier: it holds no records under it, or cannot prove which records belong to it | No |
+| any error | the value could not be determined | No |
+| `known == true, epoch == 0` | the store owns the barrier and has no live encrypted records | yes, as far as this store goes; other floors still apply |
+| `known == true, epoch > 0` | the oldest live record under this barrier is at `epoch` | not below `epoch` |
 
-The two-value and three-value distinction is the whole point of the second
-interface: in a two-value signature, "unknown barrier" is indistinguishable from
-"zero live records", and treating the first as the second **over-purges**.
+With two return values, "unknown barrier" and "zero live records" look the
+same, and reading the first as the second over-purges. The `barrier` argument
+is an opaque, comparable handle (the value the caller installed), compared by
+identity.
 
-The `barrier` argument is an opaque, comparable handle — the same concrete value
-the caller installed — compared by identity.
+### Types
 
-### Storage-layer types
+`Entry`, `State`, `Membership`, `Snapshot`, `Bootstrap`, `Update`, `NodeInfo`.
+They are deliberately separate from `pkg/proto`'s types so serialization and
+persistence change independently. Every field must be persisted; see
+[engineering.md](engineering.md#storage-layer-types) for what breaks when one
+is dropped.
 
-`Entry`, `State`, `Membership`, `Snapshot`, `Bootstrap`, `Update`, `NodeInfo`,
-`LogRange`.
-
-These are **separate types from `pkg/proto`'s**, deliberately, so serialization
-and persistence stay independently changeable. `CopyEntryCmd(e Entry) Entry`
-returns an entry owning its own `Cmd`.
-
-`LogReader` (`NewLogReader(shardID, replicaID, logdb)`) is the read-side adapter
-the Raft peer uses.
+`LogReader` (`NewLogReader(shardID, replicaID, logdb)`) is the read-side
+adapter the Raft peer uses.
 
 ```go
 const EntryOverheadBytes = 84
 ```
 
-## Go API — the durable implementation
+## The durable implementation
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb`
 
-### Capability: open a store
+### Open a store
 
 ```go
 func Open(dir string, opts ...Option) (*DB, error)
@@ -125,102 +153,158 @@ func Open(dir string, opts ...Option) (*DB, error)
 
 | Option | Effect | Default |
 |---|---|---|
-| `WithBlockSize(n)` | record block size | 32 KiB. **Immutable for the life of the directory** — `Open` refuses a changed value rather than destroying the log. |
-| `WithMaxFileSize(n)` | segment rotation threshold | 64 MiB. Safe to raise on a populated directory: recovery never reads it, so it only changes where future rotations land. |
-| `WithNoSync(true)` | skip every fsync **and** every directory sync | off. **Tests and container benchmarks only.** Every record in such a segment carries durability generation 0, so recovery is always free to truncate it. |
-| `WithBarrier(b WALBarrier)` | at-rest encryption | none. The barrier must be initialized **and unsealed** before `Open`; a sealed one fails with `ErrBarrierContextUnresolved` rather than latching a downgraded binding. |
-| `WithMetrics(m LogDBMetrics)` | latency and throughput collection | nil, and nil skips collection entirely |
+| `WithBlockSize(n)` | block size: a power of two, at least 16 bytes | 32 KiB. Immutable for the life of the directory; `Open` refuses a changed value (`ErrWALGeometryMismatch`). |
+| `WithMaxFileSize(n)` | segment rotation threshold, at most 4 GiB − 1 (`ErrInvalidMaxFileSize` above) | 64 MiB. Safe to change on a populated directory: recovery never reads it, so it only moves future rotations. |
+| `WithNoSync(true)` | skip every fsync and every directory sync | off. Tests and container benchmarks only. Nothing in such a segment is ever acknowledged, so recovery is always free to truncate it. |
+| `WithBarrier(b WALBarrier)` | at-rest encryption | none. The barrier must be initialized and unsealed before `Open`; a sealed one fails with `ErrBarrierContextUnresolved`. |
+| `WithMetrics(m LogDBMetrics)` | write, fsync and compaction latency, bytes written | nil, which skips collection |
 | `WithFS(fs FS)` | filesystem abstraction | `DefaultFS()`. The fault-injection seam. |
-| `WithDiskMonitorOpts(maxBytes, ...)` | disk-usage monitoring | none |
+| `WithDiskMonitorOpts(maxBytes, ...DiskMonitorOption)` | disk-usage ceiling | none |
 
-`DiskMonitor` options: `WithWarningPercent` (default `DefaultWarningPercent` =
-0.85), `WithFullPercent`, `WithCheckEvery(n)`, `WithOnWarning`, `WithOnFull`,
-`WithOnRecovery`, `WithDiskUsageFunc`.
+`DiskMonitorOption`s: `WithWarningPercent` (default `DefaultWarningPercent` =
+0.85), `WithFullPercent` (default `DefaultFullPercent` = 0.95), `WithCheckEvery`
+(default `DefaultCheckEvery` = 100 writes), `WithOnWarning`, `WithOnFull`,
+`WithOnRecovery`, `WithDiskUsageFunc`. Thresholds are fractions of `maxBytes`.
+Past the full threshold `SaveState` returns `ErrDiskFull`.
 
-`Options.MaxBatchSize` **is vestigial and bounds nothing.** It is defaulted by
-`SetDefaults` and rejected by `Validate` when non-positive, but no `Option`
-carries it into `Open`, so no value a caller sets can reach a write. It is
-documented rather than silently dropped because the name promises a cap that
-already exists elsewhere under different owners: segment geometry bounds a
-record, `maxCmdLen` (8 MB) bounds an entry's `Cmd`, and
-`config.MaxApplyEntrySize` bounds the batch Raft hands to `SaveState`. Giving it
-an effect would add a rejection on the durable write path, which is a durability
-decision rather than a doc fix, so it is left inert until that decision is made.
+`Options` is a declarative mirror of these (`WALDir`, `BlockSize`,
+`MaxFileSize`, `NoSync`) with `DefaultOptions`, `SetDefaults` and `Validate`;
+`Open` does not take it. Its `MaxBatchSize` field is deprecated and has no
+effect. A record is bounded by segment geometry, an entry's `Cmd` by 8 MiB, and
+the batch Raft hands to `SaveState` by `config.MaxApplyEntrySize`.
 
-### Capability: repair a corrupt segment
+Besides the `LogDB` methods, `*DB` has `CompactedTo`, `MinLiveEpoch`,
+`MinLiveEpochForBarrier`, `AtRestProtection`, and the single-node conveniences
+`SaveEntries`, `GetEntries`, `SaveNodeState` and `GetState`.
+
+### Repair a corrupt segment
 
 ```go
 func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, error)
+
+type RepairTarget struct {
+    ShardIndex int    // WAL shard, in [0, DefaultShardCount)
+    SegmentID  uint64
+    TruncateAt int64  // must equal the clean-prefix end the scan computes
+}
+type RepairResult struct {
+    RecordsKept     int
+    BytesDiscarded  int64
+    SegmentsDeleted []uint64
+}
 ```
 
-Explicit target and offset, never automatic. Refuses a segment that is not
-corrupt (`ErrRepairNoCorruption`), an offset that is not the clean-prefix end
-(`ErrRepairOffsetMismatch`, `*RepairOffsetMismatchError`), and a shard index
-that does not exist (`ErrRepairShardOutOfRange`). **A repair discards data**,
-which is why recovery never performs one on its own.
+Run it with the database closed, with the same `WithBlockSize` the directory
+was written with. Every field of `RepairTarget` comes from the
+`*SegmentCorruptionError` `Open` returned (`ShardIndex`, `SegmentID`,
+`CleanEnd`). It refuses a segment that is not corrupt (`ErrRepairNoCorruption`),
+an offset that is not the clean-prefix end (`ErrRepairOffsetMismatch`,
+`*RepairOffsetMismatchError`), and a shard index out of range
+(`ErrRepairShardOutOfRange`). A repair discards data, which is why recovery
+never runs one on its own.
 
-### Capability: re-encrypt a WAL
+### Re-encrypt a WAL
 
 ```go
 func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier,
-    snapFn SnapshotReencryptFunc) (count int, err error)
+    snapFn SnapshotReencryptFunc, opts ...Option) (count int, err error)
+
+type SnapshotReencryptFunc func(shardID, replicaID uint64, snap logdb.Snapshot) (dstEpoch uint64, err error)
 ```
 
-Writes to a **new** directory. This is the supported path for a
-sealing-strategy change; doing it across a restart in place is not.
+Copies every node into an empty `dstDir` and returns how many nodes it copied.
+Either barrier may be nil for a plaintext side. `opts` apply to both sides, so
+pass the options the node normally opens its WAL with. This is the supported
+path for a sealing-strategy change; changing it in place across a restart is
+not.
 
 ### The filesystem seam
 
 ```go
-type FS interface{ /* Open, Create, Remove, Rename, ReadDir, ... */ }
-type File interface{ /* Write, Read, Sync, Close, ... */ }
+type FS interface {
+    OpenFile(name string, flag int, perm fs.FileMode) (File, error)
+    Open(name string) (File, error)
+    MkdirAll(path string, perm fs.FileMode) error
+    ReadDir(name string) ([]fs.DirEntry, error)
+    Stat(name string) (fs.FileInfo, error)
+    Remove(name string) error
+    Rename(oldpath, newpath string) error
+}
 func DefaultFS() FS
-
-type FileMetadataSyncer interface{ /* optional */ }
-type FilePreAllocator  interface{ /* optional */ }
 ```
 
-`FS` **requires `Rename(oldpath, newpath string) error`** — an embedder
-supplying its own implementation must provide it. `FileMetadataSyncer` and
-`FilePreAllocator` are optional capabilities probed by type assertion.
+`File` is `Read`, `ReadAt`, `Write`, `WriteAt`, `Seek`, `Stat`, `Truncate`,
+`Sync` and `Close`. `FileMetadataSyncer` (`SyncMetadata`) and
+`FilePreAllocator` (`PreAllocate`) are optional and found by type assertion.
+`Rename` is required: an embedder's own `FS` must provide it.
 
 ### The barrier seam
 
 ```go
-type WALBarrier interface{ /* the narrow subset waldb needs */ }
+type WALBarrier interface {
+    Encrypt(dst, plaintext []byte) ([]byte, error)
+    Decrypt(dst, ciphertext []byte) ([]byte, error)
+    EncryptWithEpoch(dst, plaintext []byte) ([]byte, uint64, error)
+    DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
+    CurrentEpoch() uint64
+}
 ```
 
-Declared here rather than imported from `pkg/seal`, so the two are
-independently testable. It requires `ContextBindingResolved() bool` — a barrier
-implementation must provide it, and `seal.ContextBinding`'s zero value is
-`Unresolved`, **not** a binding.
+Declared here instead of imported from `pkg/seal`, so the two are tested
+independently. At `Open`, a configured barrier must also provide
+`EncryptWithContext`, `DecryptWithContext`, `IsHardwareMode`,
+`SupportsContextAAD` and `ContextBindingResolved`; `*seal.Barrier` does. A
+barrier missing only `ContextBindingResolved` fails with
+`ErrBarrierContextBindingUnreportable`, one missing the rest with
+`ErrBarrierContextUnsupported`. Note that `seal.ContextBinding`'s zero value is
+`ContextBindingUnresolved`, not a binding.
 
 ### Errors
 
-`ErrCorruptedRecord`, `ErrMidSegmentCorruption`, `ErrNonFinalSegmentCorruption`,
-`ErrRecordSequenceRegression`, `ErrDBPoisoned`, `ErrDiskFull`,
+Sentinels: `ErrCorruptedRecord`, `ErrMidSegmentCorruption`,
+`ErrNonFinalSegmentCorruption`, `ErrAcknowledgedDataLost`,
+`ErrRecordSequenceRegression`, `ErrUnknownPayloadType`,
+`ErrUnsupportedMembershipVersion`, `ErrUnsupportedSnapshotCompression`,
 `ErrWALFormatMissing`, `ErrWALFormatMalformed`,
 `ErrWALFormatUnsupportedVersion`, `ErrWALGeometryMismatch`,
-`ErrSnapshotReencryptRequired`, `ErrUnsupportedMembershipVersion`,
-`ErrUnsupportedSnapshotCompression`, and the repair sentinels above — plus the
-typed errors `*BatchWriteError`, `*SegmentCorruptionError`, `*RecoveryError`,
-`*WALEncryptError`, `*WALDecryptError`, `*WALWriteError`, `*DBOpenError`,
-`*DirSyncError`, `*DiskUsageError`, `*CompactionDeleteError`,
-`*CompactionReadDirError`, `*SegmentCreateError`, `*SegmentReadError`,
-`*SegmentDiscardError`, `*ReencryptError`, `*WALFormatVersionError`,
-`*WALGeometryMismatchError`, `WriteBootstrapBatchModeError`.
+`ErrRetiredRegistryMalformed`, `ErrBarrierContextUnsupported`,
+`ErrBarrierContextBindingUnreportable`, `ErrBarrierContextUnresolved`,
+`ErrBarrierContextBindingChanged`, `ErrLandingSegmentOverflow`,
+`ErrDBPoisoned`, `ErrDiskFull`, `ErrRecordTooLarge`, `ErrCmdTooLarge`,
+`ErrSnapshotReencryptRequired`, the option errors (`ErrEmptyWALDir`,
+`ErrInvalidBlockSize`, `ErrInvalidMaxFileSize`, `ErrInvalidMaxBatchSize`) and the
+repair sentinels above.
 
-Conditions and fail-closed behavior: [`engineering.md`](engineering.md).
+Typed errors: `*SegmentCorruptionError`, `*RecoveryError`, `*DBOpenError`,
+`*SegmentReadError`, `*SegmentCreateError`, `*SegmentDiscardError`,
+`*WALEncryptError`, `*WALDecryptError`, `*WALWriteError`, `*BatchWriteError`,
+`*DirSyncError`, `*DiskUsageError`, `*CompactionDeleteError`,
+`*CompactionReadDirError`, `*ReencryptError`, `*WALFormatVersionError`,
+`*WALGeometryMismatchError`, `*RepairOffsetMismatchError`,
+`*WriteBootstrapBatchModeError`.
+
+When each is raised, and which fail closed:
+[engineering.md](engineering.md#recovery-error-reference).
 
 ### Constants
 
 ```go
-const DefaultShardCount    = 16
-const DefaultWarningPercent = 0.85
-const RecordFull byte = 1   // plus First / Middle / Last
+const DefaultShardCount = 16
+const (
+    DefaultWarningPercent = 0.85
+    DefaultFullPercent    = 0.95
+    DefaultCheckEvery     = 100
+)
+const (
+    RecordFull     byte = 1
+    RecordFirst    byte = 2
+    RecordMiddle   byte = 3
+    RecordLast     byte = 4
+    RecordSyncMark byte = 5
+)
 ```
 
-## Go API — the in-memory implementation
+## The in-memory implementation
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb`
 
@@ -228,28 +312,22 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb`
 func New() *MemDB
 ```
 
-Satisfies `logdb.LogDB` with **no durability**. Sharded by
-`(shardID, replicaID)` with per-node RWMutexes and an atomic closed-check, so it
-serializes the way production does rather than hiding races.
-
-At the `Host` level, `WithMemoryLogDB()` selects it; a nil `LogDB` disables
-persistence entirely and lets the engine inline `Peer.Commit`.
+Satisfies `logdb.LogDB` and `logdb.AtRestProtectedLogDB` with no durability.
+The `Host` selects it with `WithMemoryLogDB()`.
 
 ## Versioning and deprecation
 
-- `walFormatVersion` = 1, persisted, **exact match**, checked first at `Open`.
-  Pinned for the pre-release period: layout changes are made in place and
-  development data directories are wiped rather than migrated.
-- The WAL's own `membershipSectionVersion` is a **third** discriminator on the
-  `Membership` layout, distinct from `proto.WireVersion` and
-  `proto.membershipFormatVersion`, and gated the same way.
-- **0.5.x cannot read a 0.4.x data directory**: the per-entry WAL record header
-  grew from 76 to 84 bytes, `proto.Entry`'s from 60 to 68, and the seal MAC
-  moved from v1 to v2. The break is detected at the **record** level by the
-  payload-type ladder — which names the legacy format it found — rather than by
-  the version number.
-- `Options.MaxBatchSize` is inert, documented, and not deprecated; see above.
-- Nothing else here is deprecated.
+- `walFormatVersion` = 1, recorded in the `WALFORMAT` marker, compared for exact
+  equality before any segment is read.
+- The membership section inside a snapshot record has its own version byte,
+  `membershipSectionVersion` = 1, also exact-match. It is separate from
+  `proto.WireVersion` and from `proto.Membership`'s persisted format version.
+- Every format version stays pinned at 1 until the first production release.
+  Layout changes are made in place; a record layout change retires its old
+  payload-type byte and takes the next free one, so a stale record fails replay
+  with `ErrUnknownPayloadType`. The remedy is always the same: wipe the data
+  directory and re-sync from peers.
+- `Options.MaxBatchSize` is deprecated and has no effect.
 
-The repository-wide policy and per-release upgrade procedure are in
+The policy and the per-release upgrade notes are in
 [`../compatibility.md`](../compatibility.md).

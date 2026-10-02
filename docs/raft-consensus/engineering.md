@@ -1,8 +1,8 @@
-# Raft Consensus — Engineering Contract
+# Raft consensus: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-09-15
+> `pkg/internal/invariant` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are **internal** and not importable from outside the module.
@@ -40,7 +40,7 @@ Source files:
 Code is cited by file and symbol rather than by line number, because line
 numbers rot faster than the doc is revised and a stale one is worse than none.
 
-## Safety Properties
+## Safety properties
 
 The five Raft safety properties and where each is enforced:
 
@@ -84,7 +84,7 @@ written together by `syncLeaderID()` under a seqlock (`leaderSeq`) so
 two words separately can observe one that never did, which would report that a
 replica led in a term it never led.
 
-### Function Pointer Dispatch
+### Function pointer dispatch
 
 Role-specific behavior is dispatched through two function pointers set during
 role transitions:
@@ -98,20 +98,20 @@ The concrete functions are `stepFollower`/`stepCandidate`/`stepLeader` and
 `tickFollower`/`tickCandidate`/`tickLeader`. A pre-candidate uses
 `stepCandidate` and `tickCandidate`; the two are distinguished by `r.state`.
 
-### Double-Buffered Message Output
+### Double-buffered message output
 
 Outbound messages accumulate in `r.msgs`. `drainMessages()` swaps `msgs` and
 `msgsBuf` to return the current batch and prepare a fresh buffer, avoiding an
 allocation on every drain cycle. `drainFreeOrderMessages()` and
 `withholdOrderedMessages()` are the two partial drains; see Section 18.
 
-## 2. Role Transitions
+## 2. Role transitions
 
 Four roles are defined (`raft.go`, `roleState`):
 
     follower(0)   candidate(1)   preCandidate(2)   leader(3)
 
-### State Transition Diagram
+### State transition diagram
 
 ```
                  +--timeout--+
@@ -148,10 +148,10 @@ Four roles are defined (`raft.go`, `roleState`):
 
 `stepDownToFollower` is the candidate-side wrapper. It clamps the term to
 `max(msg.Term, r.term)` because a locally injected message carries no term:
-passing `msg.Term == 0` straight through set a candidate's term to 0 and
-cleared its vote, after which it granted votes again in terms it had already
-voted in. That is reachable in production whenever a follower catching up by
-snapshot has its election timer fire mid-transfer.
+passing `msg.Term == 0` straight through would set a candidate's term to 0 and
+clear its vote, after which it would grant votes again in terms it had already
+voted in. That is reachable whenever a follower catching up by snapshot has its
+election timer fire mid-transfer.
 
 ### becomeCandidate
 
@@ -186,19 +186,19 @@ snapshot has its election timer fire mid-transfer.
    entries from prior terms (Paper 5.4.2).
 6. Calls `tryCommit()` (handles single-node shards) and `broadcastAppend()`.
 
-### Derived Campaign Gates
+### Derived campaign gates
 
 Four latches and one derived role, all taken from the replicated
 configuration, suppress campaigning. None of them is ever proposed; each is
 re-evaluated everywhere the configuration is (re)established (construction,
 snapshot restore, commit-time config change).
 
-- **`selfRemoved`** — this replica is in none of the configuration's voter,
+- **`selfRemoved`**: this replica is in none of the configuration's voter,
   observer or witness sets. The surviving configuration computes its quorum
   without it, so a removed replica counting its own vote against its own stale
   voting set can win a term the real configuration also elects in (PhD 4.2.2).
   An empty configuration counts as "not a member".
-- **`isObserver`** — the replica's EFFECTIVE non-voting role, derived
+- **`isObserver`**: the replica's EFFECTIVE non-voting role, derived
   (`checkSelfRole` / `setObserver`) from the replicated membership whenever the
   membership names the replica; `Config.IsObserver` is only the initial hint for
   a replica the membership does not yet mention. `quorum()` sizes the voting
@@ -215,7 +215,7 @@ snapshot restore, commit-time config change).
   is an observer steps down. The observer test runs after the configuration
   fold, so a replica restarted from a base that predates its promotion folds
   the committed promotion before deciding.
-- **`roleMismatch`** — the locally configured WITNESS role contradicts the
+- **`roleMismatch`**: the locally configured WITNESS role contradicts the
   replicated membership (`checkSelfRole`). The two roles run different data
   paths: the leader strips entry payloads for a replica the configuration calls
   a witness, so a replica started with `IsWitness=false` applies stripped
@@ -226,14 +226,14 @@ snapshot restore, commit-time config change).
   deliberately still allowed, because a replica that stopped voting would
   remove itself from a quorum the rest of the cluster still counts it in. A
   leader that learns of the mismatch steps down immediately.
-- **`joining`** — a replica started with `join=true` holds a known-incomplete
+- **`joining`**: a replica started with `join=true` holds a known-incomplete
   membership and would win with a quorum of one. It gates CAMPAIGNING ONLY: the
-  election clock keeps ticking, because freezing `electionTick` left `leaderID`
-  permanently "active", which made `handleVoteRequest` deny every PreVote and
-  `dropHighTermVote` discard every higher-term RequestVote. A joining node that
-  caught up by pure log replay then silently withheld its vote forever and
-  could hold a healthy quorum leaderless.
-- **`staleConfigThrough`** — see "Restart and the Stale Configuration Tail"
+  election clock keeps ticking, because freezing `electionTick` would leave
+  `leaderID` permanently "active", so `handleVoteRequest` would deny every
+  PreVote and `dropHighTermVote` would discard every higher-term RequestVote. A
+  joining node that caught up by pure log replay would then withhold its vote
+  forever and could hold a healthy quorum leaderless.
+- **`staleConfigThrough`**: see "Restart and the stale configuration tail"
   below.
 
 Every refusing branch in `startElection` sets `leaderID = noLeader` before
@@ -243,7 +243,7 @@ leaving `leaderID` set keeps the shared leader-lease test
 each tick cycle, and this replica would deny PreVotes and drop higher-term
 RequestVotes while not campaigning itself.
 
-### Restart and the Stale Configuration Tail
+### Restart and the stale configuration tail
 
 Membership is config-in-log (Section 9) and is reconstructed asynchronously
 after a restart. A restarting replica recovers only a BASE configuration: the
@@ -268,7 +268,8 @@ whichever of these happens first:
 `Peer.configFoldedThrough` is the separate marker the on-demand fold resumes
 from. It is NOT the processed marker: `SetProcessedIndex` advances `processed`
 unconditionally and then discards the report of whether the accompanying fold
-reached the end, so resuming from `processed` declared an unread window empty.
+reached the end, so resuming from `processed` would declare an unread window
+empty.
 
 Both campaign entry points call the resolver, because `handleTimeoutNow`
 bypasses `startElection` entirely. Returning false suppresses the campaign for
@@ -280,19 +281,19 @@ UNCOMMITTED log content is a liveness violation the specification calls out:
 if a leader crashes after replicating an uncommitted config change to a
 majority, no follower in that majority could ever start an election. Tying
 campaigning to apply progress has the same shape and cannot self-clear on a
-replica whose apply pipeline is not running at all. An earlier `replayFloor`
-approach was removed for exactly this reason.
+replica whose apply pipeline is not running at all. A replay-floor gate was
+rejected for exactly this reason.
 
 ## 3. Elections
 
-### PreVote Protocol (PhD 9.6)
+### PreVote protocol (PhD 9.6)
 
 When `preVote` is enabled a node first enters the `preCandidate` state.
 PreVote requests use `term + 1` as the prospective term without incrementing
 the node's term (`campaign`). This prevents a partitioned node that kept
 incrementing its term from forcing the cluster to advance when it rejoins.
 
-### Election Flow
+### Election flow
 
 ```
 startElection()
@@ -333,7 +334,7 @@ rejections and deposes it. One replica with a transient storage fault would
 otherwise escalate into cluster-wide leader churn while emitting no election
 traffic of its own.
 
-### Vote Granting (`handleVoteRequest`)
+### Vote granting (`handleVoteRequest`)
 
 Four gates run before the grant decision.
 
@@ -392,6 +393,10 @@ Four gates run before the grant decision.
    Leadership-transfer votes (`Hint == From`) are exempt from the known-leader
    clause, because the outgoing leader asked for the election.
 
+   A vote that passes these tests is still withheld while `voteHeldDown()` or
+   `votePromised()` holds: the replica owes a leader its vote window under
+   `LeaseRead` (Section 15). The refusal takes the ordinary rejection path.
+
 A granted PreVote response echoes `msg.Term` (the prospective term) so the
 pre-candidate counts it at the term it is campaigning for. A REJECTED PreVote
 response carries the responder's own `r.term`. Echoing the prospective term on
@@ -403,7 +408,7 @@ which is the disruption PreVote exists to prevent.
 When granting a real vote the election tick is reset to zero, extending the
 current leader's implicit lease window.
 
-### CheckQuorum Vote Dropping
+### CheckQuorum vote dropping
 
 `dropHighTermVote` drops a higher-term `RequestVote` while this node heard from
 a live leader within the last election timeout (Paper §6 last paragraph, PhD
@@ -420,7 +425,7 @@ election timeout, so the lease clause is already false.
 This removes the amplification, not the disruption: a plain RequestVote still
 forces a term advance whenever no leader lease is live.
 
-### Term Ceiling
+### Term ceiling
 
 `maxAdoptableTerm` (= `proto.MaxTerm` = `math.MaxUint64 - 1024`) is an
 exclusive upper bound on a term this replica will adopt from the wire
@@ -435,14 +440,14 @@ removes a voter. Terms advance by one per election, so no cluster reaches this
 range by running.
 
 The same bound, and its index twin `proto.MaxLogIndex`, govern **snapshot
-admission and persisted state** (#197). `InstallSnapshot` is delivered
-process-locally once the artifact is on disk, so it never meets `step()`'s wire
-gate, and a snapshot at `Index = MaxUint64` used to restore cleanly and then
-wrap `markerIndex`, `firstIndex` and every remote's `next` to 0 — durably,
-because LogDB had already recorded it. `proto.Snapshot.CheckBounds` is applied
+admission and persisted state**. `InstallSnapshot` is delivered process-locally
+once the artifact is on disk, so it never meets `step()`'s wire gate; unchecked,
+a snapshot at `Index = MaxUint64` would restore cleanly and then wrap
+`markerIndex`, `firstIndex` and every remote's `next` to 0, durably, because
+LogDB had already recorded it. `proto.Snapshot.CheckBounds` is applied
 at every door: the transport's chunk validation, both LogDB `SaveSnapshot`
 implementations, `handleSnapshot` (`proto.ErrLogIndexOutOfRange` /
-`proto.ErrTermOutOfRange`, logged at ERROR — a peer-chosen value fails the
+`proto.ErrTermOutOfRange`, logged at ERROR: a peer-chosen value fails the
 message, never an invariant), both LogDBs' `SaveState` batch path, and a leader
 refuses proposals once its log has reached `proto.MaxLogIndex`. `newRaft`
 refuses to open persisted state only at the CEILING (`persistedCeiling`, a few
@@ -450,7 +455,7 @@ below `math.MaxUint64`, where `+1` wraps): state admitted just below the bounds
 can be moved by local transitions, and an open check at the admission bound
 would refuse state the replica produced itself.
 
-### Randomized Election Timeout
+### Randomized election timeout
 
 The election timeout is randomized in `[electionTimeout, 2*electionTimeout)`
 using a `math/rand` PRNG seeded from `crypto/rand`
@@ -460,7 +465,7 @@ using a `math/rand` PRNG seeded from `crypto/rand`
 r.randomizedElectionTimeout = r.electionTimeout + r.rng.Intn(r.electionTimeout)
 ```
 
-### Quorum Calculation
+### Quorum calculation
 
 `tallyVotes` counts grants and rejections over the CURRENT configuration's
 voting set. The election is decided early when `granted >= quorum` or
@@ -497,7 +502,7 @@ Both full replicas and witnesses vote in elections. This is the same unified
 `quorum` used for commit advancement (Section 6), for ReadIndex confirmation
 (Section 8), for `hasQuorumActive`, and for the read lease (Section 15).
 
-## 4. Log Replication
+## 4. Log replication
 
 ### sendAppend
 
@@ -533,11 +538,12 @@ Follower processing of AppendEntries:
    `ReplicateResp{LogIndex: committed}` and return. This keeps `tryAppend` from
    ever seeing a conflict at or below the committed index.
 3. Call `log.tryAppend(msg.LogIndex, msg.LogTerm, msg.Entries)`.
-4. On success: advance commit to `min(msg.Commit, lastNewIdx)` and respond with
-   `ReplicateResp` carrying the last index covered by the append.
+4. On success: advance commit to `min(msg.Commit, lastIdx)`, where `lastIdx` is
+   the last index covered by the append, and respond with `ReplicateResp`
+   carrying `lastIdx`.
 5. On failure: respond with `Reject: true` and a backtracking hint (below).
 
-### Rejection Hints and Term-Based Backtracking (Paper 5.3)
+### Rejection hints and term-based backtracking (Paper 5.3)
 
 The follower builds one of two hint shapes:
 
@@ -608,7 +614,7 @@ drain advances the committed index partway through processing multiple
 `Replicate` messages. A compacted index is skipped for the same reason; only
 `ErrUnavailable` (past the end of the log) is reported as the append point.
 
-### Replication Chunking
+### Replication chunking
 
 `sendAppend` bounds each `Replicate` message two ways.
 
@@ -645,7 +651,7 @@ The follower acknowledges each batch with `ReplicateResp`, the leader advances
 `rm.next` and sends again, so catch-up streams in bounded increments with no
 explicit chunking state.
 
-### Witness Replication Behavior
+### Witness replication behavior
 
 Witnesses are voting members that do not store full log entries. During
 `broadcastAppend` the leader sends `Replicate` to remotes and observers, and
@@ -680,7 +686,7 @@ index. Observers are non-voting, so their lag affects neither commit safety nor
 election safety. Operators tune `CompactionOverhead` to retain enough history
 for observer replication.
 
-### Entry Compression
+### Entry compression
 
 When `Config.EntryCompressionType == config.Snappy`, `handleLeaderPropose`
 compresses `EntryNormal` payloads with `CompressEntry` before append. Config
@@ -689,7 +695,7 @@ compression configuration. The compressed flag rides in the entry type
 (`proto.EntryCompressFlag`), which is why every type test in this package masks
 with `proto.EntryTypeMask`.
 
-## 5. Remote State Machine
+## 5. Remote state machine
 
 Each peer tracked by the leader has a `remote` struct (`remote.go`) with three
 states:
@@ -723,7 +729,7 @@ arrives at all; a real status report overwrites that value rather than adding
 to it. The transfer outcome report (`SnapshotStatus`) does NOT un-pause the
 peer either; it re-arms the countdown. The peer exits to probe via the
 follower's `ReplicateResp` ack (`respondedTo` with `match >= snapshotIndex`) or
-countdown expiry. See Section 7, "Snapshot Status and the Post-Transfer Wait".
+countdown expiry. See Section 7, "Snapshot status and the post-transfer wait".
 
 `becomeProbe` from snapshot state sets `next = max(match+1, snapshotIndex+1)`,
 since the peer holds the snapshot data through `snapshotIndex`.
@@ -767,7 +773,7 @@ Index-based backtracking, used when the follower supplied no term hint:
 Both forms return false for a stale rejection, which the caller reads as "do
 not retry".
 
-## 6. Commit Calculation
+## 6. Commit calculation
 
 ### tryCommit
 
@@ -807,9 +813,13 @@ async-storage-writes design.
 
 A follower advances its commit index through the same term check.
 `handleHeartbeat` calls `log.tryCommit(min(msg.Commit, lastIndex), r.term)`
-rather than a bare `commitTo`; see Section 7's heartbeat notes for why.
+rather than a bare `commitTo`. A heartbeat carries no log-matching proof, and an
+entry from an older term is exactly the tail a new leader may still truncate;
+an entry at `r.term` was appended through `handleAppend`, which log-matched the
+prefix beneath it. The cost is at most one heartbeat interval for a follower
+whose tail is behind the current term.
 
-### Unified Quorum (Election == Commit)
+### Unified quorum (election == commit)
 
 ```go
 // Single quorum over the full voting set (remotes + witnesses + self),
@@ -851,7 +861,7 @@ replica can pass the witnesses' up-to-date vote check, and recovery requires
 operator intervention (snapshot import at an earlier index). This is inherent
 to the witness design and matches the dragonboat reference.
 
-### Witness Policy Is Replicated State
+### Witness policy is replicated state
 
 `WitnessConfig.RequireFullReplicaMajority` (default true) bounds membership
 *shape*: it rejects any witness-add or full-replica-removal that would leave
@@ -893,7 +903,7 @@ apply path:
 
 ## 7. Snapshots
 
-### Message Admission: wire vs in-process injection
+### Message admission: wire vs in-process injection
 
 `raft.step` runs four admission gates before any role dispatch, in a fixed
 order. Each gate's placement is a safety property.
@@ -946,15 +956,15 @@ both chosen by the sender, with no term, no log match and no committed entry
 behind them; adopting one lets any authenticated shard member redefine the
 voting set of every replica it can reach.
 
-### Snapshot Membership Persistence
+### Snapshot membership persistence
 
 Snapshots persist full membership information, including the config-change ID,
 the witness policy, and all members (voting, observer, witness).
 `LogDB.ReadState(shardID, replicaID)` returns that membership alongside the
 hard state, so recovery restores the cluster topology without requiring
 external configuration. It is the BASE configuration a restart starts from; the
-committed tail above it is folded separately (Section 2, "Restart and the Stale
-Configuration Tail").
+committed tail above it is folded separately (Section 2, "Restart and the
+stale configuration tail").
 
 ### handleSnapshot
 
@@ -967,9 +977,9 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13).
    proposals are bounded by the propose-time validators, bootstrap and import
    by the Host's `MaxVotingMembers` checks, and a snapshot's membership by
    nothing between the wire and `rebuildRemotesFromMembership` (proto decodes
-   up to `MaxMembershipEntries`). Accepting one installed the whole map and
-   returned success, and the damage surfaced later as `rebuildReplicaToBit`
-   failing the next time this replica won an election. It is a REJECTION rather
+   up to `MaxMembershipEntries`). Accepting one would install the whole map
+   and return success, and the damage would surface later as
+   `rebuildReplicaToBit` failing the next time this replica won an election. It is a REJECTION rather
    than a clamp because dropping members to make the configuration fit computes
    quorum over a set no committed entry put there, which is a split-brain, not
    a degradation.
@@ -980,7 +990,7 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13).
    an `InstallSnapshot` carries no proof either and may REPLACE the entire log
    and rebuild the voting set from a membership the sender chose. The gate has
    to come first rather than only guarding the accepting branches, because the
-   two unconditional writes in step 3 run even on the reject path: before it,
+   two unconditional writes in step 3 run even on the reject path: without it,
    any authenticated shard member could hold a healthy follower's election
    timer at zero indefinitely, and install itself as that follower's
    `leaderID`, simply by retransmitting one long-obsolete snapshot. Suppressing
@@ -1025,14 +1035,14 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13).
 `handleSnapshot` is idempotent for an already-applied snapshot: step 4 rejects
 it and answers with the committed index.
 
-### Snapshot Sending
+### Snapshot sending
 
 When `sendAppend` cannot resolve `prevLogTerm` or entries (the log is
 compacted), it calls `sendSnapshot`:
 
 1. Get the latest snapshot from `log.snapshot()` (inmem first, then the
    LogReader's persisted snapshot). If there is none, log a warning and call
-   `rm.becomeProbe()`. Returning without touching the remote used to leave
+   `rm.becomeProbe()`. Returning without touching the remote would leave
    `next` wherever the caller had put it, including past the end of the
    leader's log, where `term()` fails on every retry and nothing is ever sent
    to that peer again. `becomeProbe` re-seats `next` at `match + 1`, which the
@@ -1044,11 +1054,11 @@ compacted), it calls `sendSnapshot`:
    Index, Term and Membership. The empty `Filepath` IS the statement that the
    transfer carries no payload.
 
-The engine layer handles snapshot chunking for large snapshots, reassembling
+The engine and transport handle chunked streaming, and the receiver reassembles
 chunks on disk before calling `LogDB.SaveSnapshot`. See
-`docs/engine/pipeline.md`.
+[`../snapshots/engineering.md`](../snapshots/engineering.md) and "Snapshot pool" below.
 
-### Snapshot Status and the Post-Transfer Wait
+### Snapshot status and the post-transfer wait
 
 The transport reports the transfer outcome to the leader's raft layer as a
 `SnapshotStatus` message. `Hint` echoes the transfer sequence the leader
@@ -1096,7 +1106,7 @@ the observer role and `roleMismatch` (a snapshot can carry a configuration this
 replica is no longer in, or one that promotes or demotes it), and calls
 `purgeDepartedVotes`.
 
-### Snapshot Recovery vs Apply Race
+### Snapshot recovery vs apply race
 
 The engine's per-node `recovering` atomic flag gates **state machine access
 only**. When a snapshot is being restored:
@@ -1121,13 +1131,12 @@ snapshot and the log.
 
 **The gate deliberately does NOT suspend protocol participation.** Nothing in
 `Handle(RequestVote)` or `Handle(Heartbeat)` touches the state machine; only
-`GetUpdate`'s committed-entry extraction does. An earlier implementation
-skipped the node entirely, including its inbox drain, so a recovering replica
-answered no votes and no heartbeats while its tick kept campaigning into a
-void. Because `RecoverFromSnapshot` runs arbitrary state-machine code with no
-time bound, two concurrent recoveries could dissolve quorum with every node up:
-a 5-replica test with 2 recovering and the leader killed elected no leader for
-20 seconds. A replica that cannot apply must still vote.
+`GetUpdate`'s committed-entry extraction does. Skipping the node entirely,
+inbox drain included, was rejected: a recovering replica would answer no votes
+and no heartbeats while its tick kept campaigning, and because
+`RecoverFromSnapshot` runs arbitrary state-machine code with no time bound, two
+concurrent recoveries could dissolve quorum with every node up. A replica that
+cannot apply must still vote.
 
 Recovery is visible in `ShardInfo.Health` as `recovering` (and `snapshotting`
 during a save) rather than `healthy`, and through `Host.DiagShardGates`.
@@ -1137,7 +1146,7 @@ during a save) rather than `healthy`, and through `Host.DiagShardGates`.
 Linearizable reads without log writes (PhD 6.4, Figure 6.4). The leader
 confirms it still holds authority via a heartbeat quorum round.
 
-### Batch Coalescing
+### Batch coalescing
 
 Multiple concurrent ReadIndex requests are coalesced into a single heartbeat
 round. Each node has a dedicated MPSC `readIndexQ`, separate from the proposal
@@ -1191,7 +1200,7 @@ Apply Worker / OnApplied callback
   |     complete RequestState with readIndex value
 ```
 
-### Key Design Points
+### Key design points
 
 **PhD 6.4 guard** (`hasCommittedEntryAtCurrentTerm`): the leader must have
 committed at least one entry from its own term (the no-op) before serving
@@ -1201,14 +1210,14 @@ Rejected with `ErrReadIndexNotReady`.
 **Leader transfer guard** (PhD 6.4.1): `ErrTransferInProgress` while a transfer
 is active. The old leader must not serve reads because the transfer target may
 begin committing writes at any moment. The sentinel is exported as
-`quicraft.ErrTransferInProgress` and is `Temporary` (#175), so a caller matches
-it with `errors.Is` rather than by message text.
+`quicraft.ErrTransferInProgress` and is `Temporary`, so a caller matches it
+with `errors.Is` rather than by message text.
 
-**A campaigning replica refuses, it does not drop** (#153): `stepCandidate`
-answers a `ReadIndex` with the same not-leader error it gives a `Propose`. It
-used to fall through to the default case and drop the message, so a read that
-arrived during the election window hung to its deadline and reported a timeout
-for what is a `Temporary` not-leader condition.
+**A campaigning replica refuses, it does not drop**: `stepCandidate` answers a
+`ReadIndex` with the same not-leader error it gives a `Propose`. Dropping it
+would leave a read that arrived during the election window hanging to its
+deadline and reporting a timeout for what is a `Temporary` not-leader
+condition.
 
 **Role-mismatch guard**: `ErrWitnessRoleMismatch` on both the leader and
 follower paths. A replica the configuration lists as a witness has been
@@ -1249,9 +1258,8 @@ batch N does not block batch N+1 that already has quorum.
 requests to `r.leaderID`. When the leader's quorum confirms, it emits
 `ReadIndexResp` back to the originating follower, identified by `pending.from`.
 `handleReadIndexResp` refuses a response from anyone but `r.leaderID`
-(`ErrReadIndexRespNotFromLeader`): the correlation key is a random 64-bit
-draw (`nextRequestKey`, #186) rather than the guessable counter it once was,
-but the check stands on its own: a response from another sender would serve a
+(`ErrReadIndexRespNotFromLeader`). The correlation key is a random 64-bit
+draw (`nextRequestKey`), but the check stands on its own: a response from another sender would serve a
 read at an index of the sender's choosing with no quorum ever run, whatever
 the key. It deliberately does NOT check `msg.LogIndex` against the
 local committed index, because the leader answers with ITS committed index,
@@ -1264,7 +1272,8 @@ with a `uint64` bitfield instead of a map. Replica IDs are mapped to bit
 positions 0..63 via `raft.replicaToBit`, built in `becomeLeader` and rebuilt by
 `rebuildReplicaToBit` on every membership change during leadership. This gives
 zero-allocation ack tracking on the hot path and is the reason for the hard
-64-voting-member cap (Section 9).
+64-voting-member cap
+([`../membership-changes/engineering.md`](../membership-changes/engineering.md#the-64-voting-member-cap)).
 
 ```go
 type readIndexStatus struct {
@@ -1301,7 +1310,7 @@ with `ErrInvalidOperation` before any raft work happens. Witnesses lack the
 full log needed to provide linearizable reads. Their acks still count toward
 another replica's confirmation quorum.
 
-### End-to-End Host Pipeline
+### End-to-end host pipeline
 
 The raft-level flow produces `readStates` on the raft struct. These flow
 through the engine and Host layers to complete the caller's request:
@@ -1310,7 +1319,7 @@ through the engine and Host layers to complete the caller's request:
 Host.ReadIndex(shardID)
   |
   +-- reject if this replica is a witness (ErrInvalidOperation)
-  +-- refuse at once with ErrShardFailed if the failure latch has tripped (#185)
+  +-- refuse at once with ErrShardFailed if the failure latch has tripped
   +-- generate readKey (nextRequestKey: a random 64-bit draw, never zero)
   +-- create pendingRead{rs: RequestState} in ns.pendingReads map
   +-- enqueue readKey on the node's readIndexQ (ErrSystemBusy if full)
@@ -1371,7 +1380,7 @@ synchronous linearizable read:
 
 `Host.SyncReadBuf` is the zero-copy byte-slice variant.
 
-### ReadOnly Bypass Optimization
+### ReadOnly bypass
 
 ReadIndex-only updates carry no entries, state changes, or snapshots.
 `Peer.GetUpdate` detects this and sets `update.ReadOnly`:
@@ -1399,28 +1408,28 @@ be answered by a `RequestVoteResp` with no WAL write behind it.
 With batch coalescing, ReadIndex latency on a healthy cluster is dominated by
 one heartbeat round-trip: leader to followers to leader.
 
-## 9. Membership Changes
+## 9. Membership changes
 
 Membership has its own feature folder:
 [`../membership-changes/`](../membership-changes/architecture.md). The protocol
-detail that used to live in this section is now
+detail is in
 [`../membership-changes/engineering.md`](../membership-changes/engineering.md),
 which is where a change to `ConfigChange` handling, witness policy or the
 identity binding belongs.
 
-## 10. Quiesce Mode
+## 10. Quiesce mode
 
 Quiesce reduces resource consumption for idle shards by suppressing normal
 heartbeats and extending election timeouts. Idle means no proposals, config
 changes, or reads for an extended period.
 
-### Configuration Constants (`quiesce.go`)
+### Configuration constants (`quiesce.go`)
 
     quiesceThresholdMultiplier         = 10   (threshold = 10 * electionTimeout ticks)
     quiesceLivenessMultiplier          = 10   (livenessInterval = 10 * electionTimeout)
     quiesceElectionTimeoutMultiplier   = 3    (follower timeout = 3 * livenessInterval)
 
-### Entry and Exit
+### Entry and exit
 
 ```
 Normal Operation
@@ -1477,9 +1486,8 @@ message came from its own `leaderID`. Quiesce is a local configuration choice,
 not replicated state, so a peer cannot impose it: entering it switches
 `tickFollower` to a 30x election timeout, which on a node that never opted in
 turns a leader failure into a multi-second leaderless window. A follower does
-NOT self-quiesce; `tickFollower` used to call `tryEnter()` on election timeout
-and RETURN when it fired, suppressing exactly the election a leaderless
-follower must run.
+NOT self-quiesce: entering quiesce on its own election timeout would suppress
+exactly the election a leaderless follower must run.
 
 **Activity detection**: `raft.recordActivity()` resets the inactivity counter
 and exits quiesce if active. Exiting also invalidates the read lease and zeroes
@@ -1500,7 +1508,7 @@ places:
 `exitQuiesce` is also called explicitly by `handleLeaderTransfer` and
 `handleTimeoutNow`, so a transfer never runs on the quiesced clock.
 
-## 11. Leader Transfer
+## 11. Leader transfer
 
 ### Flow
 
@@ -1552,32 +1560,32 @@ after the fold,
 term (`ErrUnreadableLogCannotCampaign`). `Peer.Handle` additionally refuses a
 delivered `TimeoutNow` on a joining node before it reaches `step`.
 
-### Catch-Up Replication
+### Catch-up replication
 
 If the target is not caught up the leader clears `probeSent` and sends an
 append immediately. Each successful `handleAppendResp` re-checks whether the
 target has reached `lastIndex` and sends `TimeoutNow` when it has.
 
-## 12. Rate Limiting
+## 12. Rate limiting
 
 Per-shard in-memory log growth is controlled by an `InMemRateLimiter`
 configured at shard startup (`Config.MaxInMemLogSize`; nil when zero). A
 separate cross-shard `RateLimiter` is shared by every shard on the host.
 
-### Leader Side
+### Leader side
 
 - `rl.Tick()` and `rateLimited()` run every non-quiesced leader tick.
 - `handleLeaderRateLimit` records follower in-memory sizes reported via
   `RateLimit` messages (`msg.Hint` carries the size).
 - `rateLimited()` reports whether the threshold is exceeded.
 
-### Follower Side
+### Follower side
 
 - `tickRateLimit()` runs every non-quiesced follower tick and sends the local
   in-memory log size to the leader every `electionTimeout` ticks via a
   `RateLimit` message.
 
-### InMemory Tracking
+### InMemory tracking
 
 The `inMemory` struct tracks both limiters:
 
@@ -1594,7 +1602,7 @@ Admission is asymmetric by design: `Host.proposeEntry` refuses with
 performs no rate-limit check at all, so reads are not blocked during write
 backpressure. The only backpressure a read sees is a full `readIndexQ`.
 
-## 13. Peer API and Concurrency Model
+## 13. Peer API and concurrency model
 
 The `Peer` struct (`peer.go`) bridges the engine and the raft state machine. It
 is owned by exactly one worker goroutine at a time:
@@ -1626,7 +1634,7 @@ The fields safe for concurrent reads without the mutex are `leaderID` and
 `syncLeaderID()`, plus `joining` (`atomic.Bool`) and `membershipSnap`
 (`atomic.Pointer[membershipSnapshot]`).
 
-### Core Methods
+### Core methods
 
 **Tick()**: advances the logical clock via `r.tickFunc(r)`, then syncs
 `leaderID`/`term`.
@@ -1691,7 +1699,7 @@ election until the next timeout.
    `term(prevLogIndex)` for slow followers after inmem truncation.
 2. `log.appliedTo(lastProcessed)`, advancing the processed marker. Everything
    from here on is infallible.
-3. `processConfigChanges(update.CommittedEntries)` — the point where membership
+3. `processConfigChanges(update.CommittedEntries)`: the point where membership
    takes effect. A fatal decode error is returned here, past `appliedTo`, which
    is correct: retrying would decode the same bytes.
 4. For each committed `EntryConfigChange`: clear `pendingConfigChange` and run
@@ -1708,7 +1716,7 @@ tick, step, propose, and GetUpdate. This enables lock-free `LeaderID()`,
 `IsLeader()` and `LeaderAndTerm()` queries for routing decisions without
 blocking the raft state machine.
 
-## 14. Raft Log Architecture
+## 14. Raft log architecture
 
 The log is a two-tier structure: `raftLog` (`log.go`) composes `inMemory` and
 `LogReader`.
@@ -1727,7 +1735,7 @@ The log is a two-tier structure: `raftLog` (`log.go`) composes `inMemory` and
   +-----------------------------+
 ```
 
-### Entry Lifecycle
+### Entry lifecycle
 
 1. **Append**: `raft.log.append()` -> `inmem.merge()`. Entries are assigned
    term and index, then placed in the in-memory buffer. `append` asserts
@@ -1752,7 +1760,7 @@ The log is a two-tier structure: `raftLog` (`log.go`) composes `inMemory` and
    the front, advances the processed index, and decreases the rate limiter
    counters.
 
-### Recovery Clamps
+### Recovery clamps
 
 `newRaftLog` seeds `committed` from the persisted hard state, raised to the
 snapshot index (a snapshot's index is committed by construction, so it is a
@@ -1778,9 +1786,10 @@ comes up with `processed > committed` and `handleSnapshot`'s matching branch
 would trip `appliedTo`'s monotonicity assertion. Found by
 `FuzzRaftLogRecovery`.
 
-`confChangeIndex` is seeded conservatively at `lastIndex()`; see Section 9.
+`confChangeIndex` is seeded conservatively at `lastIndex()`; see
+[`../membership-changes/engineering.md`](../membership-changes/engineering.md#one-at-a-time-configuration-phd-41-paper-section-6).
 
-### InMemory Buffer (`inmemory.go`)
+### InMemory buffer (`inmemory.go`)
 
 Pre-allocated to 512 entries (`entrySliceSize`). `merge()` handles three cases:
 
@@ -1796,7 +1805,7 @@ Resize management: the `shrunk` flag tracks front-truncation.
 `minEntrySliceFreeSize` (64 entries), avoiding repeated growth when small
 truncations are followed by new appends.
 
-### Term Resolution
+### Term resolution
 
 `raftLog.term(index)` checks inmem first (O(1) index arithmetic), then falls
 back to `LogReader.Term()`, translating `logdb.ErrCompacted`/`ErrUnavailable`
@@ -1814,7 +1823,7 @@ rejects it.
 non-decreasing term sequence in O(log N) for the term-based backtracking in
 Section 4.
 
-### LogDB Fallback on Recovery
+### LogDB fallback on recovery
 
 After a restart the inmem buffer is empty. `firstIndex()` and `lastIndex()`
 fall back to `LogReader.IndexRange()` to determine log bounds from persistent
@@ -1826,7 +1835,7 @@ the first append.
 Lease-based linearizable reads (PhD 6.4) skip the heartbeat quorum round when a
 valid lease exists.
 
-### Lease Validity
+### Lease validity
 
 `hasValidLease()` requires all of:
 
@@ -1846,15 +1855,14 @@ grant a vote to another candidate until its election timeout has elapsed. Its
 Go ticker can hand it one coalesced tick immediately and another just after the
 reset, so that window is at least `ElectionRTT - 2` tick intervals, which is
 what the 2-tick margin covers. A quorum of acks for rounds sent at or after `T`
-therefore rules out another leader before `T + leaseDuration` — provided each
+therefore rules out another leader before `T + leaseDuration`, provided each
 of those followers' election timeouts covers the lease, which the follower
 states in its ack (below). A follower that restarts inside that window has lost
 its election timer; the vote hold-down below carries the promise across the
 restart.
 
 The lease is measured in REAL MONOTONIC TIME from the round's send time, not in
-ticks. It was once measured in ticks, and that was unsound: a leader
-descheduled or paused for longer than the election timeout resumes with its
+ticks. Ticks would be unsound: a leader descheduled or paused for longer than the election timeout resumes with its
 ticker's missed ticks coalesced into one, so its acks still look fresh by any
 tick count while the followers have already elected a new leader and committed
 past it. Anchoring at send time means a pause can only shorten the lease; on
@@ -1864,8 +1872,8 @@ stall between an ack's arrival and its processing would be credited to the
 lease.
 
 **Each ack states the promise it makes, and the follower keeps it in real
-time.** The window a follower keeps its vote is its OWN configuration — its
-`ElectionRTT`, its host's `RTTMillisecond`, whether it runs `LeaseRead` — not
+time.** The window a follower keeps its vote is its OWN configuration (its
+`ElectionRTT`, its host's `RTTMillisecond`, whether it runs `LeaseRead`), not
 the leader's. So `HeartbeatResp.LogTerm`, which a heartbeat response otherwise
 leaves unused, carries the follower's `voteWindow`: its `ElectionRTT` tick
 intervals in nanoseconds when it runs `LeaseRead` and knows its tick, and 0
@@ -1875,10 +1883,10 @@ no vote or pre-vote and starts no campaign (`votePromised`). The promise is
 enforced in real time and nothing else, because the election timer and the
 known-leader tests both end early: the ticker is not re-phased by a heartbeat,
 so a minimum-length timer fires about one tick short of the window; and any
-higher-term message — a delayed rejection from an old pre-vote, say — moves the
+higher-term message (a delayed rejection from an old pre-vote, say) moves the
 follower to a new term with no known leader, after which `dropHighTermVote` and
 the leader-active test no longer refuse anything. Only a leadership transfer by
-the leader the promise was made to releases it — its `TimeoutNow` at the
+the leader the promise was made to releases it: its `TimeoutNow` at the
 promise's term, and its candidate's transfer-hinted vote at the next term.
 That is sound because the leader gives up lease reads for the rest of the term
 the moment it sends a `TimeoutNow` (`timeoutNowSent`), not merely while the
@@ -1908,7 +1916,7 @@ never votes (see the vote hold-down below). `Host.StartShard` refuses an
 `time.Duration` (`Config.ValidateElectionTimeout`).
 
 Rounds travel in the heartbeat's `LogIndex` field, which a heartbeat otherwise
-leaves unused, and the follower echoes it in `HeartbeatResp.LogIndex` — no wire
+leaves unused, and the follower echoes it in `HeartbeatResp.LogIndex`, so no wire
 layout change. The leader remembers the send time of the last
 `leaseRoundWindow` (32) rounds and opens a new round at most once per
 1/16 of the lease, so every round sent within the lease is still in the window
@@ -1955,13 +1963,13 @@ the new incarnation are covered by the ordinary election-timer denial.
 - **The promise is persisted.** The window a replica promises is recorded in its
   Raft hard state (`State.VoteWindow`, next to `Term` and `Vote`) as soon as it
   is known (`sizeVoteHoldDown`), and hard state is persisted before any ordered
-  message — `HeartbeatResp` among them — leaves the replica, so no ack makes a
+  message (`HeartbeatResp` among them) leaves the replica, so no ack makes a
   promise the WAL does not hold. On restart the hold-down honours the recorded
   window whatever the replica restarted into: `LeaseRead` switched off, or a
   shorter `ElectionRTT` or `RTTMillisecond`, cannot shorten a promise already
   made. Once the hold-down has run, every earlier promise has been outlived and
-  the record is lowered to the current promise — on the next vote request or
-  tick (`Peer.Tick`), and persisted with the next update — so a replica moved
+  the record is lowered to the current promise (on the next vote request or
+  tick, `Peer.Tick`, and persisted with the next update), so a replica moved
   off `LeaseRead` stops paying for it after one restart.
 - **Window length.** Every pre-restart ack promised at most the recorded window,
   was sent before construction, and answered a round sent no later, so the
@@ -1970,8 +1978,8 @@ the new incarnation are covered by the ordinary election-timer denial.
   lease span, and the lease is that span less 1% on the leader's clock, so the
   window needs no drift allowance of its own.
 - **Real time, not ticks.** The window is measured on the injectable monotonic
-  clock (`raft.now`), because ticks coalesce across a pause, which is the bug
-  class the lease itself was moved to real time to fix. Quiesce changes how
+  clock (`raft.now`), because ticks coalesce across a pause, the same reason
+  the lease is measured in real time. Quiesce changes how
   often ticks arrive and therefore neither extends nor ends the window.
 - **Anchored at construction.** A peer answers `RequestVote` from the moment it
   exists, before its first tick; a first-tick anchor would need a "not yet
@@ -1995,7 +2003,7 @@ the new incarnation are covered by the ordinary election-timer denial.
   held: this peer's leader side grants no lease without the interval, but a
   leader on another host may, and it is that lease the old ack backs.
 - **A replica that has never run `LeaseRead`** records no window, returns before
-  reading the clock, and votes at once after a restart, exactly as before.
+  reading the clock, and votes at once after a restart.
 
 The cost is availability: after a restart a `LeaseRead` replica cannot help
 elect a leader for about one election timeout, so a full-shard restart elects
@@ -2022,79 +2030,44 @@ Host.ReadIndex(ctx, shardID)   (or Host.SyncRead)
 The leader tracks, per voting member, the send time of the newest heartbeat
 round it acked in `remoteLastAck map[uint64]time.Time`.
 
-### Failure Mode
+### Failure mode
 
 If the lease expires, `hasValidLease()` returns false and the request takes the
 standard ReadIndex path. Callers see no difference beyond latency.
 
-## 16. Client Sessions
+## 16. Client sessions
 
-Sessions implement at-most-once delivery (PhD Figure 6.1) for exactly-once
-state machine semantics. The full design is in
-`docs/sessions/deduplication.md`; this section covers only the raft-visible
-parts.
+Sessions implement at-most-once delivery (PhD Figure 6.1). The full design is
+in [`../client-sessions/engineering.md`](../client-sessions/engineering.md);
+this section covers only the raft-visible parts.
 
-### Session Registration Through Raft
+- **Registration goes through the log.** Sessions are registered and
+  unregistered by committed entries, not locally. The reserved series IDs
+  `proto.SessionSeriesIDForRegister` (`math.MaxUint64 - 1`) and
+  `proto.SessionSeriesIDForUnregister` (`math.MaxUint64`) mark them, and
+  `Entry.IsNewSessionRequest()`, `IsEndOfSessionRequest()` and
+  `IsSessionManaged()` classify an entry.
+- **Deduplication happens at apply, not at propose.** The `rsm` apply layer
+  keeps a `session.Manager` per shard. For each session-managed entry it calls
+  `CheckDuplicate`; a hit returns the cached result without calling the user
+  state machine. A new series whose result could not be cached
+  (`Manager.CanRecord` reports `ErrResponseLimitExceeded`) is answered
+  `SESSION_EXPIRED` before the state machine sees it, because applying it
+  without a cached result would break at-most-once on a later retry.
+- **Expiry is index-based.** `ExpireSessions(currentIndex, inactivityThreshold,
+  maxExpire)` removes sessions inactive for longer than the threshold, measured
+  in applied entries, so every replica expires the same sessions at the same
+  index. Candidates are sorted by client ID before the per-call cap, so every
+  replica picks the same subset.
+- **The session policy is replicated.** The expiry threshold, the total session
+  cap, the per-session response-cache depth (`MaxSessionsPerClient`, default
+  128) and the per-owner cap are carried on `proto.Membership` as a
+  `proto.SessionPolicy`, seeded at bootstrap from `config.Config`. No config
+  change alters it after bootstrap, and that is load-bearing: the state machine
+  reads the published value on the apply goroutine, which trails commit, so a
+  value that changed mid-log would be observed at a replica-local point.
 
-Sessions are registered and unregistered via Raft consensus, not locally. Entry
-types are distinguished by reserved series IDs (`proto/constants.go`):
-
-- `SessionSeriesIDForRegister = math.MaxUint64 - 1`
-- `SessionSeriesIDForUnregister = math.MaxUint64`
-
-Entry helpers query the type: `IsNewSessionRequest()`,
-`IsEndOfSessionRequest()`, `IsSessionManaged()`.
-
-### Deterministic Index-Based Expiry
-
-Sessions expire on applied index, not wall-clock time. The `rsm` apply layer
-maintains a `session.Manager` tracking registered sessions and their last-active
-index; `ExpireSessions(currentIndex, inactivityThreshold, maxExpire)` removes
-those inactive for longer than the threshold. All replicas therefore make
-identical expiry decisions regardless of clock skew.
-
-Candidates are sorted by client ID BEFORE the per-call cap is applied, so every
-replica selects the same subset when more sessions are eligible than one call
-may expire.
-
-### Response Caching
-
-The `session.Manager` tracks up to `maxResponses` (default 128) completed
-operations per session, keyed by series ID within a client's session. On
-proposal the engine checks the response cache before applying to the state
-machine and returns the cached response without re-execution on a hit.
-
-The cache enforces a hard limit: `RecordResult` returns
-`ErrResponseLimitExceeded` when full, forcing the client to unregister before
-registering a new session.
-
-The three session limits (`maxTotal`, `maxResponses`, `maxPerOwner`) are
-REPLICATED state carried on `proto.Membership` as a `SessionPolicy`, seeded at
-bootstrap from `config.Config`. Unlike the witness policy there is no config
-change that alters it, and that immutability is load-bearing: the state machine
-reads the published value on the APPLY goroutine, which trails commit, so a
-value that changed mid-log would be observed at a replica-local point in the
-log.
-
-### Session Proposal Flow
-
-```
-Propose(clientID, seriesID, cmd)
-  |
-  +-- check session cache: (clientID, seriesID) -> cached response?
-  |     |
-  |     +-- yes: return cached response immediately
-  |     +-- no: append entry, proceed to apply
-  |
-Apply entry
-  |
-  +-- SM.Update(cmd)
-  +-- RecordResult(clientID, seriesID, result)
-  |
-  +-- returns ErrResponseLimitExceeded at maxResponses
-```
-
-## 17. Error Handling
+## 17. Error handling
 
 Errors in `pkg/internal/raft/errors.go` are pre-allocated sentinel values, so
 the hot path returns them with no allocation. Selected errors:
@@ -2140,7 +2113,7 @@ Errors surfaced to Host callers rather than produced by this package include
 `ErrInvalidOperation` (`pkg/errors.go`, returned by `Host.ReadIndex` on a
 witness) and `ErrResponseLimitExceeded` (`pkg/internal/session/errors.go`).
 
-## 18. Message Ordering and Partial Drains
+## 18. Message ordering and partial drains
 
 Some outbound messages may be released before the state they depend on is
 durable, and some may not (Paper Figure 2: state is "updated on stable storage
@@ -2224,20 +2197,20 @@ Host.Propose()  Host.ReadIndex()  transport
 
 **Partitioning**: Shards hash to workers via `shardID % NumWorkers`. Shards in different partitions never contend; shards sharing a partition share one goroutine per tier.
 
-**Message ordering is a safety boundary, not a tuning knob.** Free-order messages go out from the step worker before the WAL persist, which is what overlaps network and disk I/O. Ordered messages — a vote grant, a heartbeat or replicate acknowledgement — go out from the commit worker only after `SaveState` returns, because each of them promises a state change is durable. Sending a `VoteResp` before the vote is on disk lets a crash-and-restart node vote twice in one term. Raft PhD §10.2.1.
+**Message ordering is a safety boundary, not a tuning knob.** Free-order messages go out from the step worker before the WAL persist, which is what overlaps network and disk I/O. Ordered messages (a vote grant, a heartbeat or replicate acknowledgement) go out from the commit worker only after `SaveState` returns, because each of them promises a state change is durable. Sending a `VoteResp` before the vote is on disk lets a crash-and-restart node vote twice in one term. Raft PhD §10.2.1.
 
 **Batching**: The commit worker blocks on the first item, then non-blocking-drains whatever accumulated while the previous persist was in flight, and persists the lot in one `SaveState`.
 
-**Single-owner**: The `commitPending` flag ensures only one worker tier touches a shard's Peer at any time. `Peer.Tick()` is the deliberate exception; see the Step Worker section.
+**Single-owner**: The `commitPending` flag ensures only one worker tier touches a shard's Peer at any time. `Peer.Tick()` is the deliberate exception; see the Step worker section.
 
 
-### Engine Lifecycle
+### Engine lifecycle
 
 **Initialization**: `NumWorkers` (workers per tier: step/commit/apply, 0 means `runtime.NumCPU()`), `MaxApplyWorkers` (apply semaphore), `CommitCBufferSize` (commit channel, default 64) and a derived apply channel buffer of `max(CommitCBufferSize*4, 256)`, `RTTMillisecond` (tick interval). The snapshot pool gets `max(NumWorkers/2, 2)` workers. Tick interval derived from RTTMillisecond maps Raft election/heartbeat timeouts to real network latency.
 
 **Memory mode**: when the LogDB is nil, step workers set `memoryMode` and inline `Peer.Commit`, forwarding straight to `applyC`. The commit worker goroutine is bypassed and the pipeline is two hops instead of three.
 
-**Startup**: The listener dispatcher starts FIRST — until its goroutine is running, every notification would be invoked inline on the producing worker, which is exactly the reentrancy hazard it exists to remove. Then workers launch in reverse pipeline order (snapshot, apply, commit, step), so downstream consumers are ready before upstream producers emit. Each tier is tracked by a `sync.WaitGroup` for sequential shutdown.
+**Startup**: The listener dispatcher starts FIRST: until its goroutine is running, every notification would be invoked inline on the producing worker, which is exactly the reentrancy hazard it exists to remove. Then workers launch in reverse pipeline order (snapshot, apply, commit, step), so downstream consumers are ready before upstream producers emit. Each tier is tracked by a `sync.WaitGroup` for sequential shutdown.
 
 **Restart on panic**: all three worker tiers run inside a restart loop. A panicking worker would otherwise stall every shard mapped to it permanently. The step-worker recovery clears `commitPending` for the single node that was mid-enqueue; the commit-worker recovery clears it for every node that worker owns. Both re-enter after a short delay so a deterministic panic does not become a tight loop.
 
@@ -2249,14 +2222,14 @@ Host.Propose()  Host.ReadIndex()  transport
 5. `close(snapshotStopC)` → wait
 6. Stop the listener dispatcher → wait
 
-The dispatcher is stopped LAST, once every tier that can produce a notification has exited, and it drains what they queued before returning. A leadership loss or shard failure observed during teardown therefore still reaches the listener. A listener that blocks here blocks `Stop` — the same way it would previously have blocked its producing worker, except the dispatcher goroutine holds no engine lock.
+The dispatcher is stopped LAST, once every tier that can produce a notification has exited, and it drains what they queued before returning. A leadership loss or shard failure observed during teardown therefore still reaches the listener. A listener that blocks here blocks `Stop`, but the dispatcher goroutine holds no engine lock, so it cannot deadlock a worker.
 
 Commit workers forward to apply unconditionally (no stopC escape) after persist: entries MUST be applied. Ordered shutdown guarantees apply workers still running.
 
 **Node management**: `LoadNode` adds to `allNodes` and to the step worker at partition `shardID % NumWorkers`. `UnloadNode` reverses via `unloadC`. `DeliverMessage` (transport boundary) looks up the node under a read lock and calls `node.Deliver(msg)`, which stamps the message `OriginRemote`.
 
 
-### Step Worker
+### Step worker
 
 **Source**: `step.go`
 
@@ -2264,28 +2237,28 @@ Drains proposals from the MPSC `EntryQueue` and ReadIndex requests from the dedi
 
 **Main loop**: Woken by WorkSignal (message arrival, apply completion) or ticker. Drains inbox into reusable buffer, calls `peer.Handle()` for each message, checks `peer.HasUpdate()`, retrieves `Update`, and sends to commit worker via `commitC` (blocking with `stopC` escape).
 
-**ReadIndex batching (OPT-8)**: ReadIndex requests accumulated in dedicated MPSC queue, drained as a batch with single key used as batchKey for coalescing. Multiple callers alias complete when batchKey resolves via `OnReadIndexBatched` callback.
+**ReadIndex batching**: ReadIndex requests accumulated in dedicated MPSC queue, drained as a batch with single key used as batchKey for coalescing. Multiple callers alias complete when batchKey resolves via `OnReadIndexBatched` callback.
 
-**ReadOnly bypass**: When `Update.ReadOnly` flag set (no entries/state/snapshot), skips commit/apply pipeline entirely. Reduces ReadIndex latency from ~300us (3 goroutine hops) to ~5us (inline callback).
+**ReadOnly bypass**: When `Update.ReadOnly` flag set (no entries/state/snapshot), skips commit/apply pipeline entirely, so a confirmed read completes inline instead of crossing three goroutine hops.
 
-**Campaign detection**: Scans outbound `RequestVote`/`RequestPreVote` messages and calls `callback.OnCampaignLaunched(shardID, replicaID, term)` — cold path (elections seconds apart).
+**Campaign detection**: Scans outbound `RequestVote`/`RequestPreVote` messages and calls `callback.OnCampaignLaunched(shardID, replicaID, term)`, a cold path (elections are seconds apart).
 
 **Message pipelining**: Separates `InstallSnapshot` messages (routed to `sender.SendSnapshot()` for chunked streaming) from regular protocol messages (batched through `sender.Send()`). Only free-order messages leave here, before the entries are persisted; that is what overlaps network and disk I/O. Ordered messages are carried on the `commitItem` and released by the commit worker after `SaveState`.
 
 **Ownership guard**: Checks `node.commitPending.Load()` before calling `Handle()` or `processReady()`. When true, the node is skipped for `Handle`/ready processing to prevent concurrent Peer access with the commit and apply workers.
 
-`Tick()` is the exception: it runs **unconditionally**, regardless of `commitPending` state. This is required for leader liveness — the leader must always advance its heartbeat timer and send heartbeats, even while WAL fsync and state machine apply are in progress. Without it, a commit+apply cycle (200-500us under load) starves heartbeat delivery, followers time out and campaign, and the leader then fails `checkQuorum` and steps down.
+`Tick()` is the exception: it runs **unconditionally**, regardless of `commitPending` state. This is required for leader liveness: the leader must always advance its heartbeat timer and send heartbeats, even while WAL fsync and state machine apply are in progress. Without it, a long commit+apply cycle starves heartbeat delivery, followers time out and campaign, and the leader then fails `checkQuorum` and steps down.
 
-What prevents `Tick()` racing `Commit()` is the per-node `raftMu` mutex, which serializes the two. Contention is minimal: `Tick()` is ~100ns (counter increment, conditional heartbeat broadcast) and `Commit()` ~200ns (marker updates, inmem truncation), and both run at most once per RTT interval. `raftMu` is **not reentrant** — event callbacks such as `OnLeaderUpdated` are invoked outside it, because a callback running under `raftMu` would block the commit worker for every shard that worker owns.
+What prevents `Tick()` racing `Commit()` is the per-node `raftMu` mutex, which serializes the two. Contention is minimal: both are short (counter and marker updates) and run at most once per RTT interval. `raftMu` is **not reentrant**: event callbacks such as `OnLeaderUpdated` are invoked outside it, because a callback running under `raftMu` would block the commit worker for every shard that worker owns.
 
-When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set — `Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp` — and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `VoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
+When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set (`Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp`) and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `VoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
 
 **Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
 
-**Batched proposal queue**: `internal/queue.EntryQueue` is MPSC with a *brief* `sync.Mutex`, not lock-free. Multiple producers take the lock only for a slice append (typically <50ns); the single consumer takes it once per drain cycle to `Swap` the write buffer with a caller-provided read buffer, regardless of item count. That amortization — one acquisition per drain rather than per item — is what reduces step worker contention versus a shared proposals map. `maxLen` provides bounded backpressure: `Add`/`AddOne` return false at capacity and add nothing. A refused proposal surfaces as `ErrDropped` (with `IncProposalDropped` and the `OnProposalDropped` event); a refused ReadIndex surfaces as `ErrSystemBusy`. `ErrSystemBusy` is reserved for the global `MaxTotalInMemLogSize` rate limiter, so reporting it for a full per-shard proposal queue would send an operator to the wrong metric.
+**Batched proposal queue**: `internal/queue.EntryQueue` is MPSC with a *brief* `sync.Mutex`, not lock-free. Multiple producers take the lock only for a slice append; the single consumer takes it once per drain cycle to `Swap` the write buffer with a caller-provided read buffer, regardless of item count. That amortization (one acquisition per drain rather than per item) is what reduces step worker contention versus a shared proposals map. `maxLen` provides bounded backpressure: `Add`/`AddOne` return false at capacity and add nothing. A refused proposal surfaces as `ErrDropped` (with `IncProposalDropped` and the `OnProposalDropped` event); a refused ReadIndex surfaces as `ErrSystemBusy`. `ErrSystemBusy` is reserved for the global `MaxTotalInMemLogSize` rate limiter, so reporting it for a full per-shard proposal queue would send an operator to the wrong metric.
 
 
-### Commit Worker
+### Commit worker
 
 **Source**: `commit.go`
 
@@ -2295,7 +2268,7 @@ Receives `Update` from step worker, persists entries to LogDB (sharded WAL with 
 
 **ReadOnly bypass**: When `Update.ReadOnly` flag set, skips persistence entirely and bounces back to step worker. Reduces latency since no entries need durability.
 
-**Piggyback commit (O29)**: On a multi-node proposal, entries are persisted in cycle 1 and the commit index advances during the `commitPending` window via `processCommitPendingInbox`. Rather than making those entries wait for a second full pipeline traversal, `Peer.GetPiggybackUpdate(lastApplied)` extracts the newly committable entries and applies them in the same cycle. It is deliberately narrower than `GetUpdate`: it writes no `EntriesToSave` (the entries it applies are clamped to the durable marker), leaves `readStates` and pending snapshots alone, releases only the messages the durability rules permit, and does not advance `prevState` — the engine does that through `NotePiggybackPersisted` once the hard state is on disk, so a failed persist re-emits it.
+**Piggyback commit**: On a multi-node proposal, entries are persisted in cycle 1 and the commit index advances during the `commitPending` window via `processCommitPendingInbox`. Rather than making those entries wait for a second full pipeline traversal, `Peer.GetPiggybackUpdate(lastApplied)` extracts the newly committable entries and applies them in the same cycle. It is deliberately narrower than `GetUpdate`: it writes no `EntriesToSave` (the entries it applies are clamped to the durable marker), leaves `readStates` and pending snapshots alone, releases only the messages the durability rules permit, and does not advance `prevState`: the engine does that through `NotePiggybackPersisted` once the hard state is on disk, so a failed persist re-emits it.
 
 **CommitNotify**: When `HostConfig.NotifyCommit` is enabled, the commit worker fires `Callback.OnCommitted(shardID, entries)` after `SaveState` succeeds and before the apply forward, per update so the callback is scoped to one shard. This lets a caller learn an entry is WAL-durable before it is applied.
 
@@ -2306,7 +2279,7 @@ Receives `Update` from step worker, persists entries to LogDB (sharded WAL with 
 **Forward to apply (unconditional)**: After successful persist, sends `applyItem` to apply worker via blocking send WITHOUT `stopC` escape. Persisted entries MUST be applied (dropping them leaves committed-but-unapplied state). Ordered shutdown (apply workers stop after commit) guarantees consumer is running.
 
 
-### Apply Worker
+### Apply worker
 
 **Source**: `apply.go`
 
@@ -2318,7 +2291,7 @@ Per-shard goroutines gated by semaphore (MaxApplyWorkers limit). Fan-out dispatc
 
 **Semaphore per-call (not per-goroutine)**: Acquired at apply time, released after. Idle shard goroutines do not hold slots, preventing deadlock when shards > MaxApplyWorkers.
 
-**Fail-fast on apply error**: Any `SM.Apply()` or decompression error is terminal. The shared `failApply` helper fails the batch's pending proposals via `OnProposalFailed`, sets `node.failed = true` immediately (on the FIRST error — no retry counting), and reports an `ApplyError` via `handleError`. `lastApplied` is deliberately NOT advanced: skipping the batch while advancing the watermark would silently diverge this state machine from its peers, violating Raft's state-machine safety property. The step worker then skips the shard (`IsFailed()` check) until operator intervention (reload or snapshot recovery). This mirrors the SM-panic recovery path, which already took the shard offline on the first panic.
+**Fail-fast on apply error**: Any `SM.Apply()` or decompression error is terminal. The shared `failApply` helper fails the batch's pending proposals via `OnProposalFailed`, sets `node.failed = true` immediately (on the FIRST error: no retry counting), and reports an `ApplyError` via `handleError`. `lastApplied` is deliberately NOT advanced: skipping the batch while advancing the watermark would silently diverge this state machine from its peers, violating Raft's state-machine safety property. The step worker then skips the shard (`IsFailed()` check) until operator intervention (reload or snapshot recovery). This mirrors the SM-panic recovery path, which already took the shard offline on the first panic.
 
 **Post-apply flow**:
 1. Callback delivers results to Host layer for completing pending proposals
@@ -2329,10 +2302,10 @@ Per-shard goroutines gated by semaphore (MaxApplyWorkers limit). Fan-out dispatc
 
 **UnloadNode cleanup**: When `engine.UnloadNode(shardID)` called, dispatcher receives via `unloadC` channel, closes per-shard goroutine channel, allowing exit and resource cleanup. Prevents goroutine leak on node unload.
 
-**Skip-apply optimization (O29)**: An update whose first cycle carries no `CommittedEntries` bypasses the apply pipeline entirely rather than paying a dispatcher hop and a semaphore acquisition to apply nothing.
+**Skip-apply**: An update whose first cycle carries no `CommittedEntries` bypasses the apply pipeline entirely rather than paying a dispatcher hop and a semaphore acquisition to apply nothing.
 
 
-### Node Struct and Concurrency
+### Node struct and concurrency
 
 Each shard has a `Node` containing Raft state, state machine instance, message inbox, and ownership atomics.
 
@@ -2353,44 +2326,44 @@ Atomic flag blocks step worker from concurrent Peer access during commit/apply p
 | `inboxQ` | `proto.Message` | 4096 | transport delivery goroutines, via `Deliver` |
 | `readIndexQ` | `uint64` (read key) | 4096 | `Host.ReadIndex` callers, via `DeliverReadIndex` |
 
-`inboxQ` replaced a 256-capacity buffered channel that silently dropped messages under burst load; the queue drains in batches via `Swap` and reuses its slices, so steady state is allocation-free. Backpressure is still by refusal at `maxLen` — dropping a Raft message is safe because the sender retransmits, and a refused proposal surfaces as `ErrDropped` rather than a silent loss. Proposals were split out of `inboxQ` (optimization O19) to remove the channel serialization bottleneck under concurrent proposal load; `inboxQ` now carries only non-proposal transport messages.
+The queues drain in batches via `Swap` and reuse their slices, so steady state is allocation-free. Backpressure is by refusal at `maxLen`: dropping a Raft message is safe because the sender retransmits, and a refused proposal surfaces as `ErrDropped` rather than a silent loss. Proposals have their own queue so concurrent proposers do not serialize behind transport traffic; `inboxQ` carries only transport messages.
 
-**Message origin**: `Deliver` stamps `proto.OriginRemote`, `DeliverLocal` stamps `OriginLocal`. `OriginRemote` is the zero value, so a message decoded from the wire or recycled through the pool is untrusted by construction. Local-origin messages carry no term and are exempt from the term gate in `raft.step`, so the exemption must not be reachable from the network — which is why the marshaller never reads or writes the field.
+**Message origin**: `Deliver` stamps `proto.OriginRemote`, `DeliverLocal` stamps `OriginLocal`. `OriginRemote` is the zero value, so a message decoded from the wire or recycled through the pool is untrusted by construction. Local-origin messages carry no term and are exempt from the term gate in `raft.step`, so the exemption must not be reachable from the network: which is why the marshaller never reads or writes the field.
 
-**Failed shard gate**: On any SM.Apply or decompression error (and on SM panic), the apply worker sets `failed = true` immediately — there is no retry counting and no retry budget to configure. The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the node entirely, removing it from the pipeline until operator intervention (reload or snapshot recovery).
+**Failed shard gate**: On any SM.Apply or decompression error (and on SM panic), the apply worker sets `failed = true` immediately: there is no retry counting and no retry budget to configure. The step worker checks `IsFailed()` in both `tick()` and `processReady()` and skips the node entirely, removing it from the pipeline until operator intervention (reload or snapshot recovery).
 
 **Snapshot adoption gate**: A received `InstallSnapshot` moves the raft log's committed AND processed markers to the snapshot index the instant the step worker steps it, but the state machine adopts that index only when the snapshot pool finishes `RecoverFromSnapshot` and seeds `lastApplied`. Between the two, raft offers committed entries from `snapshotIndex+1` over a `lastApplied` that is still behind — a batch the apply worker refuses as `ErrApplyGap`, taking a replica that had just finished joining permanently out of apply. The `recovering` flag does not cover that window: the pool raises it from its own goroutine and cannot do so until it has observed the install. So both extraction sites — `processReady`'s `GetUpdate` and the commit worker's piggyback — additionally check `snapshotAdoptionPending()` (raft `processed` > `lastApplied`) on the Peer's owning goroutine. Withholding cannot wedge the log: extraction is the only thing that advances `processed`, so the entries are re-offered once the marker is seeded.
 
 **stopC channel**: Closed by `Stop()` to signal cancellation for snapshot operations (used in SaveSnapshot/RecoverFromSnapshot context).
 
 
-### Work Signaling
+### Work signaling
 
 `WorkSignal` routes shard notifications to correct worker partition without contention.
 
-**Notify fast path**: Atomic pre-filter `notified[workerID]` avoids ~10-15ns channel send when worker already notified (most calls hit this). Only sends to channel when transitioning from non-notified → notified state.
+**Notify fast path**: Atomic pre-filter `notified[workerID]` skips the channel send when the worker is already notified (most calls). Only sends to channel when transitioning from non-notified → notified state.
 
 **ReadyMap (double-buffered)**: One `sync.Mutex` over one live map, plus a two-map rotation (`maps [2]`). `Set()` holds the lock for a single map insert; `Swap()` clears the alternate map outside the lock, then holds it only to exchange pointers, and returns the map that was live. Two-map rotation keeps the swap path at zero steady-state allocations. The returned map is owned by the caller only until the next `Swap()`, which recycles it.
 
-**HasWork() utility**: Returns atomic load of WorkSignal state, ~1ns check for poll-based optimization.
+**HasWork() utility**: Returns an atomic load of the WorkSignal state, for poll-based checks.
 
 
-### Listener Dispatcher
+### Listener dispatcher
 
 **Source**: `dispatch.go`
 
 User-visible cold-path notifications run on one dedicated goroutine rather than on the worker that produced them. This is a correctness fix, not a throughput optimization.
 
-Every callback the step worker fired ran synchronously on the step-worker goroutine *while that goroutine held `stepWorker.nodesMu.RLock`* — `tick()` and `processReady()` each hold it for their whole body. `Host.StopShard` re-enters the same goroutine's `nodesMu.Lock()` via `Engine.UnloadNode` → `stepWorker.unloadNode`, and Go's `RWMutex` is not reentrant. So an operator handler that reacted to an event by stopping the shard did not stall, it deadlocked — permanently, and not only for that shard. Every shard mapped to the same worker (`shardID % NumWorkers`) stopped ticking: no heartbeats, no elections, no inbox drain, and a later `Host.Close` never returned from `Engine.Stop`'s `stepWg.Wait()`. "React to a failed shard by stopping it" is the obvious handler to write, which is what made it reachable.
+The step worker holds `stepWorker.nodesMu.RLock` for the whole of `tick()` and `processReady()`, and `Host.StopShard` takes the same goroutine's `nodesMu.Lock()` via `Engine.UnloadNode` → `stepWorker.unloadNode`. Go's `RWMutex` is not reentrant, so a handler invoked inline that stopped the shard would deadlock permanently: every shard on that worker (`shardID % NumWorkers`) would stop ticking, and `Host.Close` would never return from `Engine.Stop`'s `stepWg.Wait()`. See [`architecture.md`](architecture.md#the-listener-dispatcher-prevents-a-deadlock).
 
 Moving the notification off the worker goroutine removes the class rather than the instance. The dispatcher goroutine holds no engine lock, so a listener may call any Host API, including the synchronous `StopShard`.
 
-**Ordering**: notifications are consumed by exactly one goroutine from a FIFO channel, so delivery follows the order the engine produced them — a total order, and therefore a per-shard order. There is deliberately no ordering guarantee against the callbacks that stay synchronous; those were already unordered with respect to each other, since they run on three different worker tiers.
+**Ordering**: notifications are consumed by exactly one goroutine from a FIFO channel, so delivery follows the order the engine produced them: a total order, and therefore a per-shard order. There is deliberately no ordering guarantee against the callbacks that stay synchronous; those were already unordered with respect to each other, since they run on three different worker tiers.
 
-**Queue-full policy** (`listenerQueueSize` = 1024): `dispatch` never blocks the producing worker — a worker parked on a full queue still holds `nodesMu.RLock`, which would reintroduce the deadlock. It also never drops silently: `dispatch` reports acceptance and each caller picks a policy. `OnLeaderUpdated` leaves its bookkeeping uncommitted and re-publishes next tick; `OnCampaignLaunched` and `OnShardFailed` drop, counted and logged at ERROR. The queue only fills when a listener violates the documented non-blocking contract.
+**Queue-full policy** (`listenerQueueSize` = 1024): `dispatch` never blocks the producing worker: a worker parked on a full queue still holds `nodesMu.RLock`, which would reintroduce the deadlock. It also never drops silently: `dispatch` reports acceptance and each caller picks a policy. `OnLeaderUpdated` leaves its bookkeeping uncommitted and re-publishes next tick; `OnCampaignLaunched` and `OnShardFailed` drop, counted and logged at ERROR. The queue only fills when a listener violates the documented non-blocking contract.
 
 
-### Snapshot Pool
+### Snapshot pool
 
 Asynchronous snapshot operations. Bounded pool (NumWorkers/2, minimum 2) with per-shard dedup via sync.Map.
 
@@ -2423,15 +2396,15 @@ The record is **self-describing**: a 16-byte header followed by a body of little
   80     8  DataHash (xxhash64)
 ```
 
-`DataLen` and `DataHash` cover `snapshot.dat` **as written** — after compression and after encryption. They are the only at-rest integrity check a snapshot has when no barrier is configured: with a barrier, per-frame AEAD covers it, but a plaintext deployment had nothing, and a single flipped byte inside a serialized value leaves the file length unchanged, so no structural check trips. The replica then recovers the corrupt value into its state machine and serves it, diverging from its peers at the same log index with every Raft invariant intact. Hashing the final bytes rather than the pre-encryption ones is what lets all three consumers — recovery, the streamed receive path and `ImportSnapshot` — verify one value without holding a key. Records written before the field existed leave `DataHashRecorded` false and are recovered without the check rather than refused.
+`DataLen` and `DataHash` cover `snapshot.dat` **as written**, after compression and after encryption. They are the only at-rest integrity check a snapshot has when no barrier is configured: with a barrier, per-frame AEAD covers it, but without one a single flipped byte inside a serialized value leaves the file length unchanged, so no structural check trips. The replica then recovers the corrupt value into its state machine and serves it, diverging from its peers at the same log index with every Raft invariant intact. Hashing the final bytes rather than the pre-encryption ones is what lets all three consumers (recovery, the streamed receive path and `ImportSnapshot`) verify one value without holding a key. A record that carries no `DataLen`/`DataHash` (every pre-magic record) leaves `DataHashRecorded` false and cannot vouch for its artifact, so recovery refuses it with `*SnapshotMetaInvalidError`, which matches `ErrSnapshotCorrupt`. The purge-floor scan, which reads only `Epoch`, still accepts it.
 
-**Evolution rule**: body fields are append-only — an existing field never moves and never changes meaning. A new field is appended and the version is incremented. Because the body length is recorded, a reader can always tell a field that is ABSENT (written by an older version) from one that is CORRUPT (a truncated or foreign record). Changing the meaning of an existing field is not permitted under this rule; that requires a new magic.
+**Evolution rule**: body fields are append-only: an existing field never moves and never changes meaning. A new field is appended and the version is incremented. Because the body length is recorded, a reader can always tell a field that is ABSENT (written by an older version) from one that is CORRUPT (a truncated or foreign record). Changing the meaning of an existing field is not permitted under this rule; that requires a new magic.
 
-**Compatibility**: three pre-magic ("v0") layouts are still accepted verbatim, positionally, at their original offsets — **40** bytes (`Index|Term|ShardID|ReplicaID|CreatedAt`), **48** bytes (`...|Epoch`) and **56** bytes (`...|Epoch|Compression`). The 40-byte layout was written by the snapshot receive and import paths and carries no `Epoch` even though the artifact beside it may be encrypted, so such a directory can hold ciphertext at an epoch nothing on disk names. It is therefore reported as UNEVALUABLE, never as epoch 0 — a zero `Epoch` with `EpochRecorded` false means UNKNOWN, not plaintext, and the two are opposite in consequence for DEK purging. Nothing rewrites an existing record: a v0 record stays v0 until its snapshot directory rolls off.
+**Pre-magic records**: three positional layouts without a header are still parsed, at exactly **40** bytes (`Index|Term|ShardID|ReplicaID|CreatedAt`), **48** bytes (`...|Epoch`) and **56** bytes (`...|Epoch|Compression`), so the DEK purge-floor scan can read an epoch from one. No current writer produces them. A 40-byte record carries no `Epoch` although the artifact beside it may be encrypted, so it is reported as UNEVALUABLE, never as epoch 0: a zero `Epoch` with `EpochRecorded` false means UNKNOWN, not plaintext, and the two are opposite in consequence for DEK purging. Nothing rewrites an existing record.
 
 The declared body length is bounded at 64 KiB before use. It is a `uint32` read from a file and is used to slice the body, so on a 32-bit GOARCH an unbounded declared length could become a negative int and panic inside the purge-floor scan, whose entire input is bytes on disk.
 
-**Recover flow**: Gets latest snapshot metadata from LogDB, locates the directory, verifies the artifact against `DataLen`/`DataHash` from `snapshot.meta` before anything reads it, then opens the data file, calls the state machine's `RecoverFromSnapshot()`, and updates `lastApplied` and `lastSnapshotIndex`. Sets the `recovering` atomic flag gating all SM operations during recovery (safety property S1).
+**Recover flow**: Gets latest snapshot metadata from LogDB, locates the directory, verifies the artifact against `DataLen`/`DataHash` from `snapshot.meta` before anything reads it, then opens the data file, calls the state machine's `RecoverFromSnapshot()`, and updates `lastApplied` and `lastSnapshotIndex`. Sets the `recovering` atomic flag gating all SM operations during recovery.
 
 When the LogDB record says `Epoch > 0`:
 
@@ -2447,14 +2420,14 @@ When the LogDB record says `Epoch > 0`:
 **Leader snapshot streaming**: Step worker routes `InstallSnapshot` messages to `transport.SendSnapshot()`, chunked streaming transfer to follower. Receiver handles chunked reassembly on disk, saves to LogDB, triggers recovery. Prevents unbounded memory usage during snapshot transfer.
 
 
-### Concurrency and Safety
+### Concurrency and safety
 
 **Single-owner Peer semantics**: Raft Peer is NOT thread-safe. `commitPending` atomic flag enforces exclusive ownership through pipeline topology:
 - Normal: Step worker owns Peer (Tick, Handle, HasUpdate, GetUpdate)
 - commitPending=true: Commit worker holds Peer via Peer.Commit(), then apply worker (SM.Apply only, Peer untouched)
 - commitPending=false: Ownership returned to step worker
 
-Step worker checks `commitPending.Load()` before touching Peer in `processReady()` and skips the node when set. No re-enqueue, to avoid spin loops; naturally re-checked on the next tick or WorkSignal notification. `tick()` is deliberately **not** gated this way — see the Step Worker ownership guard above.
+Step worker checks `commitPending.Load()` before touching Peer in `processReady()` and skips the node when set. No re-enqueue, to avoid spin loops; naturally re-checked on the next tick or WorkSignal notification. `tick()` is deliberately **not** gated this way: see the Step worker ownership guard above.
 
 **Happens-before proof (commitIndex safety)**: the `commitPending` flag blocks the step worker from producing a new Update until the apply worker finishes, so entries MUST be persisted AND applied before the step worker produces a new Update referencing them. It also prevents duplicate CommittedEntries: when `commitPending` is cleared, `lastApplied` has advanced past the committed entries, so the next `GetUpdate(lastApplied)` does not reproduce them.
 
@@ -2473,7 +2446,7 @@ The `Tick()`/`Commit()` race is prevented by the per-node `raftMu` mutex, not by
 6. Stop the listener dispatcher, wait for it to drain
 
 
-### End-to-End Data Flow
+### End-to-end data flow
 
 From client proposal to state machine apply:
 
@@ -2531,12 +2504,12 @@ Step worker re-processes shard (inner loop)
 **Error paths**:
 - SaveState exhausts retries OR shutdown cancels mid-backoff: `failBatchSaveState` marks node failed, clears commitPending, reports SaveStateError to handleError, fails pending proposals (OnProposalFailed)
 - Peer.Commit fails (log gap): `failCommit` marks node failed, clears commitPending, reports CommitError to handleError, fails pending proposals and drains pending reads (OnProposalFailed, OnShardFailed)
-- DecompressEntries fails: fail-fast — `failApply` marks node failed, reports ApplyError, fails pending proposals; lastApplied NOT advanced; step worker skips shard until operator intervention
-- SM.Apply fails: fail-fast — same `failApply` path as decompression (shard offline on first error, no retry counting)
+- DecompressEntries fails: fail-fast. `failApply` marks node failed, reports ApplyError, fails pending proposals; lastApplied NOT advanced; step worker skips shard until operator intervention
+- SM.Apply fails: fail-fast, the same `failApply` path as decompression (shard offline on first error, no retry counting)
 - SM.Apply panics: recovered, node failed, SMPanicError to handleError, step worker skips node
 
 
-### Error Types
+### Error types
 
 | Type                      | Trigger                                 | Effect                    |
 |---------------------------|-----------------------------------------|---------------------------|
@@ -2552,7 +2525,7 @@ Step worker re-processes shard (inner loop)
 
 Sentinels: `ErrShardFailed` (shard taken offline; `SMPanicError` matches it via `errors.Is`. `ApplyError`, `SaveStateError` and `CommitError` also set `node.failed` but are distinct typed errors), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
 
-Two different things reach a caller as the public `ErrShardFailed`. The proposal or read that was in flight when the latch tripped is completed with the error that tripped it: `SMPanicError` matches `ErrShardFailed`, while a *returned* `SM.Apply` error produces an `ApplyError`, which carries no `Is` method and reaches the caller wrapping the state machine's own error — the more specific answer. Every request that arrives AFTER the latch tripped, whatever tripped it, is refused with the bare `ErrShardFailed` sentinel at the gate: `Propose`, `ReadIndex` (so `SyncRead`/`SyncReadBuf`) and `FollowerRead` all check `Node.IsFailed` first (#185). All failures latch identically; only the error the in-flight request sees differs.
+Two different things reach a caller as the public `ErrShardFailed`. The proposal or read that was in flight when the latch tripped is completed with the error that tripped it: `SMPanicError` matches `ErrShardFailed`, while a *returned* `SM.Apply` error produces an `ApplyError`, which carries no `Is` method and reaches the caller wrapping the state machine's own error: the more specific answer. Every request that arrives AFTER the latch tripped, whatever tripped it, is refused with the bare `ErrShardFailed` sentinel at the gate: `Propose`, `ReadIndex` (so `SyncRead`/`SyncReadBuf`) and `FollowerRead` all check `Node.IsFailed` first. All failures latch identically; only the error the in-flight request sees differs.
 
 ### Interfaces
 
@@ -2560,7 +2533,7 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 
 **Callback**: all methods must be non-blocking and concurrent-safe. Two delivery classes:
 
-*Synchronous, on the producing worker* — these resolve pending client requests and have happens-before requirements against `Peer.Handle`, so they cannot be queued behind user code:
+*Synchronous, on the producing worker*: these resolve pending client requests and have happens-before requirements against `Peer.Handle`, so they cannot be queued behind user code:
 
 | Method | Producer |
 |--------|----------|
@@ -2571,14 +2544,23 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 | `OnReadIndexFailed(shardID, keys, err)` | step worker |
 | `OnProposalFailed(shardID, entries, err)` | step worker |
 | `OnSnapshotCompleted(shardID, index, err)` | snapshot pool worker |
+| `OnLogCompacted(shardID, replicaID, compaction)` | snapshot pool worker, after a save that compacted the log |
 | `OnSnapshotRejected(shardID, replicaID)` | snapshot pool worker |
-| `OnCampaignSkipped(shardID, replicaID, term)` | step worker — **NOT EMITTED** (see below) |
+| `OnShardFailed(shardID, err)` | the worker that latched the failure |
+| `OnCampaignSkipped(shardID, replicaID, term)` | step worker; **not emitted** (see below) |
+
+The producer column is the goroutine that calls the engine callback. The
+host's snapshot and log-compaction callbacks do not run user code there: they
+queue the matching `EventListener` events (`OnSnapshotCreated`,
+`OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnShardFailed`, `OnLogCompacted`,
+`OnLogDBCompacted`) on the listener dispatcher, so a listener may call
+`StopShard` from them. `OnSnapshotRejected` is the exception and runs inline.
 
 `OnCampaignSkipped` is declared on the interface and its doc comment names the step worker as the producer, but nothing in `pkg/internal/engine` calls it: every campaign-refusal branch in `startElection` and `handleTimeoutNow` logs and returns without notifying the engine, so `selfRemoved`, `roleMismatch`, `joining`, an unresolved stale config tail and an unreadable own-log term all produce no event. The Host-side plumbing down to `EventListener.OnCampaignSkipped` is wired and works if the hook is ever called, so implement against it if you like, but do not build monitoring that depends on receiving these events today.
 
-*Via the listener dispatcher* — `OnLeaderUpdated(shardID, leaderID, term)` and `OnCampaignLaunched(shardID, replicaID, term)`. Their queue-full policies differ: a refused `OnLeaderUpdated` leaves the step worker's published-leader bookkeeping uncommitted, so the change is re-published on the next tick and never lost. `OnCampaignLaunched` is a cold path (elections are seconds apart), so a full queue drops it — counted and logged at ERROR — rather than reporting the election at the wrong time later. The election metric is incremented inline either way, so the counter stays exact.
+*Via the listener dispatcher*: `OnLeaderUpdated(shardID, leaderID, term)`, `OnCampaignLaunched(shardID, replicaID, term)`, and the node-level `EventListener.OnShardFailed` (`Node.handleError`). Their queue-full policies differ: a refused `OnLeaderUpdated` leaves the step worker's published-leader bookkeeping uncommitted, so the change is re-published on the next tick and never lost. `OnCampaignLaunched` is a cold path (elections are seconds apart), so a full queue drops it (counted and logged at ERROR) rather than reporting the election at the wrong time later. The election metric is incremented inline either way, so the counter stays exact.
 
-**Applier**: `Apply(entries, results)` — State machine integration. Decouples engine from concrete rsm.StateMachine for testability.
+**Applier**: `Apply(entries, results)`, the state machine integration. Decouples engine from concrete rsm.StateMachine for testability.
 
 **Snapshotter**: `SaveSnapshot(ctx, writer, stopper)`, `RecoverFromSnapshot(ctx, reader, stopper)`, `LastApplied()`. rsm.StateMachine satisfies both.
 
@@ -2586,12 +2568,10 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 
 ---
 
----
-
 ## Configuration
 
 Per shard, on `config.Config`. Every value that affects consensus timing is a
-multiple of `HostConfig.RTTMillisecond` (200 ms) rather than an absolute
+multiple of `HostConfig.RTTMillisecond` (default 200 ms) rather than an absolute
 duration, so one number retunes a cluster for its network.
 
 | Field | Default | Effect |
@@ -2601,7 +2581,7 @@ duration, so one number retunes a cluster for its network.
 | `CheckQuorum` | `*bool`, nil = **enabled** | the leader steps down when quorum becomes unavailable |
 | `PreVote` | `*bool`, nil = **enabled** | the pre-vote extension, which stops a partitioned node disrupting a healthy term |
 | `OrderedConfigChange` | `*bool`, nil = **enabled** | serialize membership changes |
-| `LeaseRead` | `false` | lease-based linearizable reads (PhD §6.4). **Requires `CheckQuorum` and `ElectionRTT >= 5`** — `ErrLeaseReadRequiresCheckQuorum` otherwise. |
+| `LeaseRead` | `false` | lease-based linearizable reads (PhD §6.4). Requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) and `ElectionRTT >= 5` (`*config.ValidationError`). |
 | `MaxEntrySize` | 8 MB | per-proposal cap and the decompression ceiling on apply. May not exceed `proto.MaxEntrySize`. |
 | `MaxProposalPayloadSize` | 8 MB | user-facing cap; the effective limit at `Propose` is `min(MaxProposalPayloadSize, MaxEntrySize)` |
 | `MaxApplyEntrySize` | `MaxReplicationPayloadBytes` = 16,711,672 | batch size per `SM.Update` call |
@@ -2629,7 +2609,7 @@ Per host, on `config.HostConfig`:
 path is fail-fast, and a shard is marked failed on the **first** `SM.Apply`
 error with no retry counting.
 
-## Test Strategy
+## Test strategy
 
 Targets: `make test-raft`, `make test-engine`, `make test-queue`,
 `make test-invariant`, `make test-server`, `make bench-raft`, `make bench-engine`,
@@ -2640,20 +2620,20 @@ Targets: `make test-raft`, `make test-engine`, `make test-queue`,
 |---|---|
 | **Unit** (`pkg/internal/raft`) | role transitions, elections, replication, commit calculation, ReadIndex, quiescence, leader transfer, the remote state machine |
 | **Unit** (`pkg/internal/engine`) | the three worker tiers, the ready map, panic recovery, ordered shutdown, the listener dispatcher |
-| **Unit** (`pkg/*_test.go`) | the host-level regression suites — `host_hardening_regression_test.go`, `host_medlow_regression_test.go`, `host_review12_test.go`, `host_review16_test.go`, `messagehandler_*_test.go` |
+| **Unit** (`pkg/*_test.go`) | the host-level regression suites, among them `host_hardening_regression_test.go`, `host_medlow_regression_test.go`, `host_review12_test.go`, `host_review16_test.go` and the `messagehandler_*_test.go` files |
 | **Fuzz** (`make fuzz-raft`) | message handling against arbitrary inputs |
 | **Integration** (`test/integration`) | real multi-node clusters, elections under real transport |
-| **Linearizability** (`make integration-test-linearizability`) | that observed histories are actually linearizable — the only check that can falsify the whole feature |
+| **Linearizability** (`make integration-test-linearizability`) | that observed histories are actually linearizable: the only check that can falsify the whole feature |
 | **Fault injection** (`test/netfault`, `make ci-netfault`) | partitions, delays and drops; where split-brain and spurious-election bugs surface |
 
 **What a change here must not break**, and where the test lives:
 
-1. **Election Safety** — at most one leader per term.
-2. **Leader Append-Only** — a leader never overwrites or deletes its own entries.
-3. **Log Matching** — same index and term implies identical prefixes.
-4. **Leader Completeness** — an entry committed in a term is present in every
+1. **Election Safety**: at most one leader per term.
+2. **Leader Append-Only**: a leader never overwrites or deletes its own entries.
+3. **Log Matching**: same index and term implies identical prefixes.
+4. **Leader Completeness**: an entry committed in a term is present in every
    later leader's log.
-5. **State Machine Safety** — no two replicas apply different entries at the
+5. **State Machine Safety**: no two replicas apply different entries at the
    same index.
 
 These are the five Raft safety properties. A test that fails on any of them is
@@ -2661,20 +2641,16 @@ never "flaky".
 
 **Fault-injection seams**: `WithoutTransport()` for a single-node engine,
 `memdb` for a store with no durability, and the netfault harness at the socket.
-There is deliberately no injectable clock — timing is expressed in RTT multiples
-and driven by the tick, so a test controls timing by controlling ticks.
+Election and heartbeat timing are tick counts, so a test controls them by
+controlling ticks. The lease and the vote hold-down read `raft.now`, a
+monotonic clock a test can replace.
 
 **A test must never use `time.Sleep` to wait for consensus.** Use the request
 completion channels, the listener notifications, or the diagnostic accessors.
 
-**Coverage note.** `pkg/internal/engine` sits at 89.1%, below the repository's
-own `COVER_MIN = 91`, and the module-total gate does not catch it. `README.md`
-names the engine pipeline, the WAL and the QUIC transport as the gaps that
-matter; treat it as tracked work rather than a settled state.
-
 ## Observability
 
-**Metrics** — the `RaftMetrics` collector, exposed through the host's
+**Metrics.** The `RaftMetrics` collector, exposed through the host's
 `MetricsCollector`. Names and the Prometheus implementation are in
 [`../observability/engineering.md`](../observability/engineering.md).
 
@@ -2689,43 +2665,56 @@ The signals that matter, and what each one actually tells you:
 | in-memory log size against `MaxTotalInMemLogSize` | a follower falling behind |
 | shards in quiesce | expected on an idle cluster |
 
-**Diagnostics** — `Host` exposes four accessors that exist for incident
+**Diagnostics.** `Host` exposes four accessors that exist for incident
 response rather than for monitoring, and they are worth knowing about before you
 need them: `DiagRaftState`, `DiagPipelineState`, `DiagShardGates` and
 `DiagRemotes`. They report term, commit and processed indexes, queue depths, the
 recovering/saving gates and per-remote replication state.
 
-**Logging** — `log/slog`. Worth alerting on:
+**Logging** (`log/slog`). Leadership changes are logged at DEBUG and are
+better counted through the leader-change metric. Worth alerting on:
 
 | Level | Event | Why |
 |---|---|---|
-| ERROR | a shard marked failed after an apply error | that shard has stopped; there is no retry |
-| ERROR | a worker panic and restart | the shard's state after a panic mid-apply is the state machine's business, not recoverable here |
-| ERROR | `LoopPanicError` | as above, surfaced to the embedder |
-| WARN | leadership lost, campaign launched | normal in isolation, a signal in volume |
-| WARN | proposal rejected — `ErrBusy`, `ErrDiskFull`, not-leader | back-pressure or a misrouted client |
+| ERROR | `state machine panic recovered`; `step worker` / `commit worker` / `apply worker panic recovered, restarting` | a shard has been taken offline, or a worker tier is restarting |
+| ERROR | `committed entry gap before apply` | the apply pipeline found a hole; the shard is failed |
+| ERROR | `refusing leadership: ...` | the log reached the index bound, or the voting set exceeds the ackBits word |
+| ERROR | `replica witness role contradicts the replicated membership` | the replica refuses to campaign or serve reads until fixed |
+| ERROR | `campaign notification dropped` / `shard failure notification dropped: listener queue full` | a listener is blocking the dispatcher |
+| WARN | `commit Peer.Commit failed, shard marked failed` | that shard has stopped; there is no retry |
+| WARN | `replica is not in the current configuration and will not campaign` | a removed replica still running |
+| INFO | `leader lost quorum, stepping down to follower` | CheckQuorum fired; a partition or overloaded followers |
+
+`*LoopPanicError` is the typed error the host reports after recovering a
+panic in a background loop (key rotation, pending sweep) or while completing a
+membership-changing batch.
 
 **No proposal payload is ever logged.** It is application data.
 
-**User-visible notifications** go through `config.EventListener` on a dedicated
-dispatcher goroutine: `OnLeaderUpdated`, `OnCampaignLaunched`, shard failure,
-and the `LeaderInfo` / `ShardFailedInfo` / `SnapshotInfo` / `ConnectionInfo` /
-`DiskInfo` / `EventShardInfo` payloads. The dispatcher holds no engine lock, so a
-listener may call any `Host` API — including the synchronous `StopShard`.
+**User-visible notifications** go through `config.EventListener`.
+`OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched` and the engine's
+`OnShardFailed` are delivered on the listener dispatcher, which holds no engine
+lock, so a listener may call any `Host` API, including the synchronous
+`StopShard`. Payloads are `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`,
+`ConnectionInfo`, `DiskInfo` and `EventShardInfo`.
 
 **There is deliberately no ordering guarantee** between dispatched
-notifications and the callbacks that stay synchronous (`OnApplied`,
+notifications and the engine callbacks that stay synchronous (`OnApplied`,
 `OnCommitted`, `OnReadyToRead`, `OnProposalFailed`, `OnReadIndexBatched`,
 `OnReadIndexFailed`): those resolve pending client requests and have
 happens-before requirements against `Peer.Handle`, so they cannot queue behind
 user code.
 
-## Related Documents
+## Related documents
 
-- `docs/engine/pipeline.md` — step/commit/apply workers, snapshot pool.
-- `docs/protocol/wire-format.md` — `proto.Entry`, `proto.Message`,
-  `proto.Membership` encodings.
-- `docs/storage/wal.md` — LogDB and the WAL record layout.
-- `docs/sessions/deduplication.md` — client sessions in full.
-- `docs/discovery/bootstrap.md` — shard bootstrap and joining.
-- `docs/api/reference.md` — the public `Host` API.
+- [`../snapshots/engineering.md`](../snapshots/engineering.md): snapshot save,
+  transfer and recovery.
+- [`../wire-protocol/engineering.md`](../wire-protocol/engineering.md):
+  `proto.Entry`, `proto.Message` and `proto.Membership` encodings.
+- [`../log-storage/engineering.md`](../log-storage/engineering.md): LogDB and
+  the WAL record layout.
+- [`../client-sessions/engineering.md`](../client-sessions/engineering.md):
+  client sessions in full.
+- [`../multi-group-host/engineering.md`](../multi-group-host/engineering.md):
+  shard start, join and recovery; the public `Host` API is in
+  [`../multi-group-host/api.md`](../multi-group-host/api.md).

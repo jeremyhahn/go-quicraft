@@ -2,23 +2,23 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
 > `pkg/internal/transport/revocation`, `pkg/internal/registry`,
-> `pkg/internal/netaddr` · Last verified: 2026-08-19
+> `pkg/internal/netaddr` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-These packages are **internal**: they are not importable from outside the
+These packages are internal: they are not importable from outside the
 module. The transport is configured through `config.TransportConfig` and
 `config.MTLSConfig` and driven by the `Host`; there is no `Transport` interface
-to swap and no exported transport type. This document is therefore the
-implementation contract for work *inside* this repository — an embedder's
-surface is [`api.md`](api.md).
+to swap and no exported transport type. This document is the implementation
+contract for work inside this repository. An embedder's surface is
+[`api.md`](api.md).
 
 Design rationale, rejected alternatives and the scope fence are in
 [`architecture.md`](architecture.md).
 
 ## Overview
 
-QuicRaft uses QUIC exclusively for peer-to-peer communication. **There is no
-TCP fallback and no insecure mode**: `Config.Validate` refuses to build a
+QuicRaft uses QUIC exclusively for peer-to-peer communication. There is no
+TCP fallback and no insecure mode: `TransportConfig.Validate` refuses a
 transport without mTLS material, and every connection is mutually
 authenticated. The properties that made QUIC the right substrate:
 
@@ -43,8 +43,8 @@ The transport is implemented in `pkg/internal/transport/` as a concrete
 `QUICTransport` type. There is no `Transport` interface: the engine holds
 `*QUICTransport` directly, because there is one implementation and the send path
 is hot. The underlying QUIC library is
-[quic-go](https://github.com/quic-go/quic-go) **v0.63.0** (see `go.mod`).
-**v0.60.0 is a hard floor**, not merely the current pin: below it, packet
+[quic-go](https://github.com/quic-go/quic-go) v0.63.0 (see `go.mod`).
+v0.60.0 is a hard floor, not merely the current requirement: below it, packet
 protection is built with the general `cipher.NewGCM` and a process panics under
 `GODEBUG=fips140=only`. See
 [FIPS 140-3 exemption record](architecture.md#fips-140-3-exemption-record).
@@ -69,9 +69,9 @@ Source files:
 | `errors.go`           | Typed transport errors and QUIC application error codes     |
 | `netfault_on.go` / `netfault_off.go` | Build-tagged (`quicraft_netfault`) partition injector; compiled away in normal builds |
 
-## Connection Management
+## Connection management
 
-### Connection Pool
+### Connection pool
 
 `QUICTransport` maintains a connection pool keyed by target address:
 
@@ -97,8 +97,8 @@ its pooled streams evicted before the dial.
 
 **Dial (slow path)**: `singleflight.Group` ensures only one goroutine dials
 a given target. Other callers block on the same flight and receive the
-shared result. The dial deadline is `dialTimeout` (5 s) and derives from
-`shutdownCtx`, so `Stop` unblocks it.
+shared result. The dial deadline is `Config.DialTimeout` (default
+`dialTimeout`, 5 s) and derives from `shutdownCtx`, so `Stop` unblocks it.
 
 ```
 getConnection(target, want)
@@ -129,10 +129,10 @@ hostname or IP certificates.
 **Identity pinning.** The handshake proves only a cluster certificate whose SAN
 covers the host, which a wildcard or shared-SAN certificate held by anyone on
 the path to that address also satisfies. So every connection is taken for a
-specific destination identity — `Config.ReplicaIdentity(shard, replica)`,
-answered by the host with the identity membership binds to that replica, exactly
-the identity an inbound sender from it is held to — and the pin travels with the
-send down to the point it takes a connection:
+specific destination identity, `Config.ReplicaIdentity(shard, replica)`. The
+host answers it with the identity membership binds to that replica, which is
+the same identity an inbound sender from that replica is held to. The pin
+travels with the send down to the point it takes a connection:
 
 - `sendToTarget` splits a batch by destination identity (nearly always one
   group: every replica a node hosts presents that node's identity) and drops,
@@ -144,13 +144,13 @@ send down to the point it takes a connection:
   (`QUICErrDialIdentity`, `DialIdentityError`). Every re-dial and retry on the
   write path goes through these, so no write can reach an unchecked peer.
 - One connection is pooled per address. When the pooled peer presented another
-  identity that is **still bound** at the address — two bound identities meet
+  identity that is **still bound** at the address (two bound identities meet
   at one address only when a member has moved its own route onto another
-  replica's — the send is refused and dropped, not re-dialed, so that member can
+  replica's), the send is refused and dropped, not re-dialed, so that member can
   neither receive the replica's traffic nor churn the connection
   (`replaceUnboundPeer`). When the pooled peer is bound to **nothing** there any
   more (its replica removed, or rebound to a new keypair at the same address),
-  the connection is closed — compare-and-remove — and the send dials whoever is
+  the connection is closed (compare-and-remove) and the send dials whoever is
   bound now.
 - A refusal is remembered per (address, identity) for `dialRefusalCooldown`, so
   it costs no handshake, and no registry scan, per send.
@@ -173,7 +173,7 @@ pre-opened streams diverging from the pool's bookkeeping.
 `connectionCleanupInterval` (30 s) and performs four sweeps:
 
 - `cleanStaleConnections` drops pooled outbounds whose `Context()` is done,
-  evicts their streams, and fires `OnConnectionFailed` — all outside `connMu`,
+  evicts their streams, and fires `OnConnectionFailed`, all outside `connMu`,
   because that lock is on every shard's send path and the listener callback is
   user code of unbounded duration.
 - `reapPeerIncarnations` forgets a peer's incarnation record once the address has
@@ -219,44 +219,43 @@ the code stays distinct per verdict because that is the protocol contract.
 Stream-level codes: `QUICStreamErrReceiverGone` (`0x1`) means this receiver has
 abandoned the stream, `QUICStreamErrShutdown` (`0x2`) cancels a snapshot write
 during shutdown, and `QUICStreamErrFrameRejected` (`0x3`) means the frame was
-unacceptable but the connection is fine — see
+unacceptable but the connection is fine; see
 [Failed write handling](#stream-pool-and-heartbeat-streams).
 
 ### Rolling restart detection
 
 Every `MessageBatch` carries the sender's
-`SourceEpoch` — a per-process boot epoch — and every outbound records, in
+`SourceEpoch`, a per-process boot epoch, and every outbound records, in
 `connEpoch`, the epoch its target was believed to be running when it was
 dialed. On receive, `evictStaleOutboundOnRecv` evicts the cached outbound when
 that stamp does not match the epoch of the batch that just arrived: the
 outbound belongs to an incarnation the peer has left behind, so it is
 black-holed and would otherwise linger until `MaxIdleTimeout` (~30s), stalling
-`HeartbeatResp`/`ReplicateResp` and triggering avoidable elections. Keying on
-the epoch rather than the inbound `*quic.Conn` pointer is what makes this
-converge: each peer dials independently and re-dials benignly, and those
-re-dials carry the SAME epoch, whereas the earlier pointer-identity heuristic
-evicted on every one of them and produced a self-sustaining cascade.
+`HeartbeatResp`/`ReplicateResp` and triggering avoidable elections. The key is
+the epoch, not the inbound `*quic.Conn` pointer: each peer dials independently
+and re-dials benignly, and those re-dials carry the same epoch. Keying on the
+connection pointer evicts on every benign re-dial and produces a
+self-sustaining cascade.
 
 Boot epochs are `UnixNano ^ crypto/rand`, so two of them cannot be ordered by
-comparison. Each peer's record therefore keeps a small ring of **superseded**
-epochs, making its incarnation history one-way. Without it the record was
-last-writer-wins: a restart leaves the old inbound draining, so a frame written
-by the DEAD incarnation can arrive after the fresh outbound has been dialed,
-drag the record backwards, and evict the healthy connection — which the next
-genuine batch evicts again. A batch bearing an already-superseded epoch is
-ignored for both recording and eviction.
+comparison. Each peer's record therefore keeps a small ring of superseded
+epochs (`supersededEpochRing`, 4), making its incarnation history one-way. A
+last-writer-wins record would go backwards: a restart leaves the old inbound
+draining, so a frame written by the dead incarnation can arrive after the fresh
+outbound has been dialed and evict the healthy connection. A batch bearing an
+already-superseded epoch is ignored for both recording and eviction.
 
 Acting on `SourceEpoch` requires authorization: it and `SourceAddress` are
 in-band and unauthenticated by mTLS, so a record is created or advanced only
 when the claimed target's host appears in the inbound connection's verified
-peer certificate. The dead-outbound branch is exempt — a spoofed batch cannot
+peer certificate. The dead-outbound branch is exempt: a spoofed batch cannot
 make our own outbound's context `Done`.
 
-### Stream Pool and Heartbeat Streams
+### Stream pool and heartbeat streams
 
 Streams are pooled to reduce per-message overhead. The pool holds
 `StreamPoolSize` (default 16) indices per target. `MaxStreamPoolSize` (default
-256) is only the validation ceiling `StreamPoolSize` is checked against — **the
+256) is only the validation ceiling `StreamPoolSize` is checked against. **The
 pool does not auto-scale**, and nothing in the transport grows it at runtime.
 
 Stream index assignment (`streamIndexFor`):
@@ -281,7 +280,7 @@ shard bucket keeps an `owners` map alongside `streams`, recording the
 delayed pre-open can store a stream opened on a now-closed connection while a
 fresh one is already cached for the same target. Comparing against the cached
 connection alone would hand out that dead stream, the write would fail, and the
-failure path would then tear down the *healthy* connection.
+failure path would then tear down the healthy connection.
 
 `cachedStream` therefore resolves three cases:
 
@@ -297,16 +296,16 @@ whole connection and all its streams (`removeAndCloseConnection` +
 stream reset carrying `QUICStreamErrFrameRejected`: the peer's decoder refused
 the frame, which proves the connection is alive, so only the batch is dropped
 and only that stream is replaced (`evictStream`). Treating it as a dead
-connection is what turns one unacceptable batch into a dial storm.
+connection would turn one unacceptable batch into a dial storm.
 
-### QUIC Configuration
+### QUIC configuration
 
 Source: `pkg/internal/transport/quic.go`, `NewQUICTransport`
 
 ```go
 qcfg := &quic.Config{
     MaxIdleTimeout:             30 * time.Second,
-    HandshakeIdleTimeout:       5 * time.Second,
+    HandshakeIdleTimeout:       cfg.DialTimeout,            // 5 s by default
     MaxIncomingStreams:         int64(maxIncomingStreams), // derived, see below
     MaxIncomingUniStreams:      -1,                        // disabled
     KeepAlivePeriod:            10 * time.Second,
@@ -324,15 +323,19 @@ Two of these are derived rather than constant.
 floored at `StreamPoolSize + snapshotStreamHeadroom` (4). Snapshot streams are
 charged to a separate semaphore for the duration of their transfer, so the
 advertised budget has to cover both; the floor stops an operator who raises
-`StreamPoolSize` from starving a peer's snapshot stream on flow control. (An
-earlier hardcoded 4096 advertised far more streams than the receiver could
-service.) See [Stream Isolation](#stream-isolation-data-vs-snapshot).
+`StreamPoolSize` from starving a peer's snapshot stream on flow control. A
+fixed large value would advertise far more streams than the receiver can
+service. See [Stream isolation](#stream-isolation-data-vs-snapshot).
+
+`HandshakeIdleTimeout` follows the dial budget: quic-go abandons a handshake
+that idles that long and caps the whole handshake at twice it, so a dial
+deadline wider than this could never be reached.
 
 `MaxConnectionReceiveWindow` is `MaxMessageReceiveMemory / MaxIncomingConnections`,
 floored at the 8 MB per-stream window and capped at 32 MB. quic-go buffers bytes
 before the application reads them, so a window fixed independently of the
 application budget multiplies by `MaxIncomingConnections` into memory that
-budget does not cover — 32 MB × 256 connections is 8 GB against a 256 MB budget.
+budget does not cover: 32 MB × 256 connections is 8 GB against a 256 MB budget.
 The floor means the QUIC-level footprint is not strictly inside the budget for
 small budgets; it is bounded and documented rather than silently unbounded.
 
@@ -350,7 +353,7 @@ RTT but caps a 10 Gbps path beyond about 6.7 ms RTT. Cross-region deployments on
 runs with the OS default instead of refusing to boot. Setting either to 0 skips
 the call.
 
-## Send Path
+## Send path
 
 Source: `pkg/internal/transport/quic.go`
 
@@ -448,13 +451,13 @@ the dependency cannot go the other way.
 
 The clamp is load bearing. An oversized message is dropped by the send path,
 raft does not advance the follower's next index, so it rebuilds the identical
-oversized message on every replicate cycle and the follower never catches up —
+oversized message on every replicate cycle and the follower never catches up:
 no backoff, no batch-size reduction, and no snapshot fallback, because the
 entries are still present. `proto.MaxEntriesPerMessage` is the other half of the
 same contract: a byte-bounded batch of tiny entries can still exceed the
 decoder's entry-count limit with the same outcome.
 
-### Per-Target Send Queues and Idle Pruning
+### Per-target send queues and idle pruning
 
 `Send` is non-blocking because each target address has a dedicated buffered
 `sendQueue` (data channel capacity 2048, plus a high-priority heartbeat channel)
@@ -481,11 +484,11 @@ channel with no drainer. To close this without silently losing the message, each
 
 The retry is bounded to a single attempt: a freshly created queue cannot have
 been pruned yet (its idle timer has not run), so a second orphaning is
-impossible. Best-effort delivery is preserved — full queues still drop (Raft
-retransmits) — but a message can no longer be silently lost into an orphaned
+impossible. Best-effort delivery is preserved (full queues still drop and Raft
+retransmits), but a message cannot be silently lost into an orphaned
 channel.
 
-### Snapshot Send
+### Snapshot send
 
 Source: `pkg/internal/transport/quic.go`, `SendSnapshot` and
 `SendSnapshotStreaming`
@@ -493,7 +496,7 @@ Source: `pkg/internal/transport/quic.go`, `SendSnapshot` and
 Snapshots use a dedicated bidirectional stream, never the pooled message
 streams:
 
-1. `snapshotTracker.TryAdd()` — refused with `ErrStreamClosed` once `Stop` has
+1. `snapshotTracker.TryAdd()`, refused with `ErrStreamClosed` once `Stop` has
    begun, which is what lets shutdown wait for in-flight transfers without a
    `WaitGroup.Add`/`Wait` race.
 2. Resolve the target address from the registry.
@@ -522,7 +525,7 @@ per-chunk deadline. The returned release func is idempotent and disarms under a
 mutex, and both send paths call it **explicitly after the last chunk, before any
 success bookkeeping**. Without that ordering, a `close(stopC)` landing between
 the final write and the deferred release would let the watcher reset a stream
-that already carried the whole snapshot — discarding the peer's buffered data
+that already carried the whole snapshot, discarding the peer's buffered data
 while the sender reported `OnSnapshotSent` and incremented `IncSnapshotsSent`.
 
 **Streaming variant.** `SendSnapshotStreaming(meta, produce)` takes a
@@ -555,7 +558,7 @@ protocol-level retransmission: a dropped status leaves the leader's remote
 paused in snapshot state with no ack countdown armed. Full state-machine detail
 lives in [Raft Protocol](../raft-consensus/engineering.md).
 
-## Receive Path
+## Receive path
 
 Source: `pkg/internal/transport/recv.go`
 
@@ -593,8 +596,8 @@ handleStream(...)
     |   |-- handleMessageFrame(conn, stream, length, flags)
     v
 handleMessageFrame(...)
-    |-- reserveMsgRecvBudget(length)         // aggregate MaxMessageReceiveMemory
-    |-- reserveConnMsgRecvBudget(conn, length)  // per-peer sub-budget
+    |-- reserveMsgRecvBudget(decodeCharge(length))  // aggregate, length x MaxDecodeMemoryFactor
+    |-- reserveConnMsgRecvBudget(conn, length)  // per-peer sub-budget, wire bytes
     |-- buf = getRecvBuf(length)             // sync.Pool
     |-- io.ReadFull(stream, payload)
     |-- if FlagCompressed: bound declared size, charge the delta, Snappy decode
@@ -609,7 +612,7 @@ handleMessageFrame(...)
     |-- handler.HandleMessage(batch, PeerAuth{Identity, AuthorizesAddress})
     v
 hostMessageHandler.HandleMessage()
-    |-- bind msg.From to the peer's committed identity (or address)
+    |-- bind msg.From to PeerAuth.Identity (committed, pending or anchor config)
     |-- engine.DeliverMessage(msg.ShardID, msg); engine.NotifyWork(msg.ShardID)
 ```
 
@@ -621,7 +624,7 @@ connection is closed with `QUICErrConnLimitReached`, at the per-IP limit with
 
 **Idle streams are kept open on purpose.** `StreamReadIdleTimeout` (30 s) bounds
 how long a read waits *at a clean frame boundary* before re-checking the
-connection's liveness — it is not a stream lifetime. A sender caches and reuses
+connection's liveness. It is not a stream lifetime. A sender caches and reuses
 one stream across bursts, so abandoning an idle stream on a live connection puts
 the leader back to writing into a stream nobody drains: proposals stop
 committing and never self-heal. Only a dead connection or a half-delivered frame
@@ -648,9 +651,9 @@ cluster-wide connection churn for every other peer sharing the budget.
 
 **Peer-driven logs are sampled.** Every warning reachable from the receive path
 is triggerable at frame rate by one authenticated peer, and slog's default
-handler writes synchronously to stderr under a single mutex — an unsampled line
-there puts a write syscall on the raft receive path and serializes every other
-log call in the process behind it. Each is gated by `logSampled` at
+handler writes synchronously to stderr under a single mutex, so an unsampled
+line there puts a write syscall on the raft receive path and serializes every
+other log call in the process behind it. Each is gated by `LogSampled` at
 `protocolViolationLogInterval` (10 s) and paired with an unconditional counter
 (`recvBudgetDrops`, `zeroShardDrops`, `spoofedSourceClears`,
 `snapshotStreamDrops`, `zeroRTTRefusals`, `peerFrameRejections`) so the sampled
@@ -666,7 +669,7 @@ spin the CPU or flood logs. A normal (non-panicking) iteration re-enters
 immediately, so accept latency is unaffected. This mirrors the backoff applied
 to `sendQueueWorker` and `connectionCleanup`.
 
-### Stream Isolation (Data vs Snapshot)
+### Stream isolation (data vs snapshot)
 
 `handleConnection` maintains **two** per-connection semaphores so slow snapshot
 transfers can never starve acceptance of replication and heartbeat streams:
@@ -692,38 +695,41 @@ so flow-control backpressure kicks in exactly when the combined data + snapshot
 processing capacity is reached. A floor of
 `StreamPoolSize + snapshotStreamHeadroom` (4) is also enforced so an operator who
 raises `StreamPoolSize` cannot starve a peer's snapshot stream on QUIC flow
-control. (The previous hardcoded limit of 4096 advertised far more streams than
-the receiver could actually service.)
+control.
 
-### Receive Memory Budgets
+### Receive memory budgets
 
-A frame's buffer is allocated from its *declared* length before the body is
+A frame's buffer is allocated from its declared length before the body is
 read, so without an aggregate cap an authenticated peer can open many streams
 that each declare `MaxFrameSize` and withhold the body, pinning 16 MB per stream
 until the read deadline. Two budgets bound that:
 
 - **`msgRecvBudget`** is the host-wide `MaxMessageReceiveMemory` (default
-  256 MB). A frame reserves its length before allocating and releases on
-  dispatch.
+  256 MB). A frame reserves `decodeCharge(length)`, its declared length times
+  `proto.MaxDecodeMemoryFactor` (8), before allocating, and releases on
+  dispatch. The factor is the measured ceiling on heap per wire byte, so the
+  budget bounds the heap decoded frames can occupy, not just the bytes read.
+  The multiplication saturates rather than wraps.
 - **`connMsgBudget`** is a per-peer sub-budget capped at `maxConnMsgRecv`
   (`MaxMessageReceiveMemory / 4`, floored at one maximum frame plus its
-  decompression delta so a legal frame always fits).
+  decompression delta so a legal frame always fits). It is charged in wire
+  bytes.
 
-The sub-budget is keyed on the peer's **authenticated node identity**, not on
-`*quic.Conn`. Keying it on the connection did not achieve what its name said:
-`MaxConnectionsPerIP` is 16, so one peer opened four connections, saturated four
-separate sub-budgets, drove the global budget to zero, and every other peer's
-frames were silently dropped. Reproduced with 16 streams and 128 bytes of
-traffic, since the frame header alone reserves the declared length. Entries are
-refcounted by live connection and removed when the last one closes.
+The sub-budget is keyed on the peer's authenticated node identity, not on
+`*quic.Conn`. A per-connection key bounds nothing: `MaxConnectionsPerIP` is 16,
+so one peer can open four connections, saturate four separate sub-budgets,
+drive the global budget to zero, and have every other peer's frames dropped.
+Entries are refcounted by live connection, removed when the last one closes,
+and retired atomically so a concurrent acquire cannot split a peer's
+accounting.
 
 Compression is charged honestly. Snappy reaches ratios above 1000:1, so a
 compressed frame reserves the compressed length up front and then reserves the
-**positive delta to the declared decompressed length** before decoding, with
+positive delta to the declared decompressed length before decoding, with
 balanced deferred releases on every exit path. Charging only the compressed
-length would defeat the aggregate budget entirely.
+length would defeat the aggregate budget.
 
-### Entry.Cmd Buffer Safety
+### Entry.Cmd buffer safety
 
 `Entry.UnmarshalFrom` is zero-copy: `Cmd` aliases the source buffer. The receive
 buffer is pooled and recycled while the step worker still reads those fields
@@ -756,24 +762,22 @@ if totalCmdBytes > 0 {
 }
 ```
 
-`Cmd` is now the only such alias on a decoded `Message`. `Snapshot.Filepath` and
-every membership map own their storage already (their decoders copy), and
-`Snapshot.Checksum` — the other former alias — was removed from the wire format
-in an earlier pre-release layout change.
+`Cmd` is the only such alias on a decoded `Message`. `Snapshot.Filepath` and
+every membership map own their storage already (their decoders copy).
 
 Source: `pkg/internal/transport/recv.go`, `handleMessageFrame()`
 
 The same reasoning governs the read side that feeds `sendAppend`.
 `LogReader.protoEntryBuf` (`pkg/logdb/reader.go`) is retained by `GetRange`'s
-caller past the lock, and sharing it across the four goroutines that could reach
-the reader was a live data race. It is now confined to the single goroutine that
-owns `GetRange` — the step worker on a running shard, and `StartShard` before
-that worker exists, which never overlap. Every other reader takes a separate
-path: `termLocked` has its own `termLogdbBuf`/`termProtoBuf` and never retains a
-result, and `GetRangeCopy` copies under the lock into a private buffer. See
+caller past the lock, so it is confined to the single goroutine that owns
+`GetRange`: the step worker on a running shard, and `StartShard` before that
+worker exists, which never overlap. Sharing it across goroutines is a data
+race. Every other reader takes a separate path: `termLocked` has its own
+`termLogdbBuf`/`termProtoBuf` and never retains a result, and `GetRangeCopy`
+copies under the lock into a private buffer. See
 [Engine Pipeline](../raft-consensus/engineering.md) and [WAL Storage](../log-storage/engineering.md).
 
-### Snapshot Receive
+### Snapshot receive
 
 When `FlagSnapshot` is set on the first frame, the stream is routed to
 `handleSnapshotStream` -> `processSnapshotHeader` -> `snapshotReceiver`.
@@ -798,16 +802,18 @@ so recovery can decrypt, and registers it with the barrier's `EpochTracker`
 while the transfer is in flight so the key is not purged underneath it.
 
 `From` is the sending replica. The receiver authorizes the transfer from the
-header alone — `MessageHandler.AuthorizeSnapshot(shard, replica, from, index,
-peer)`, which the host answers with the same gates `HandleSnapshot` applies —
-**before** it takes a receive slot or any memory. Authorization used to run only
-after the whole transfer was buffered, so any holder of a cluster certificate,
-a member of no shard, could hold a peer's slots and half the snapshot memory
-budget for the length of a transfer. Every chunk must then carry the header's
-`From` and `ReplicaID` (as well as its shard, index and epoch), so what is
-persisted is what was authorized; `HandleSnapshot` re-checks before it persists
-anything. A rejection before authorization is counted under shard 0, since the
-shard the header names is unverified until then.
+header alone, through `MessageHandler.AuthorizeSnapshot(shard, replica, from,
+index, peer)`, which the host answers with the same gates `HandleSnapshot`
+applies, before it takes a receive slot or any memory. Authorizing only after
+the transfer would let any holder of a cluster certificate, a member of no
+shard, hold a peer's slots and half the snapshot memory budget for the length
+of a transfer. Every chunk must then carry the header's `From` and `ReplicaID`
+(as well as its shard, index and epoch), so what is persisted is what was
+authorized; `HandleSnapshot` re-checks before it persists anything. A rejection
+before authorization is counted under shard 0, since the shard the header names
+is unverified until then. A snapshot offered to a shard that is failed or
+stopping is refused as `not_accepting`, an ordinary state rather than an
+authorization failure.
 
 Source: `pkg/internal/transport/snapshot_header.go`
 
@@ -818,8 +824,8 @@ The `snapshotReceiver` enforces host-wide limits:
 - **MaxSnapshotReceiveMemory** (default 1 GB): total in-flight chunk memory.
   A chunk is charged its frame length *plus* its retained
   `proto.SnapshotChunk` struct, because `receiveChunks` accumulates every
-  accepted chunk for the whole transfer — charging the frame length alone
-  under-counted residency by roughly 2.6x for minimum-size chunks and let
+  accepted chunk for the whole transfer. Charging the frame length alone
+  under-counts residency by roughly 2.6x for minimum-size chunks and lets
   concurrent transfers hold multiples of the configured budget.
 - **MaxSnapshotReceiveRate** (default 256 MB/s): the receive loop paces chunk
   reads by sleeping proportional to each chunk's size (`rateLimitChunkSleep`).
@@ -854,7 +860,8 @@ close that:
 Every rejection routes through `rejectSnapshotStream`, which fires
 `OnSnapshotRejected` and increments `IncSnapshotsRejected` with a reason from a
 closed label set (`shutdown`, `concurrency_limit`, `memory_budget`, `liveness`,
-`malformed`, `io_error`, `policy`). The set is closed deliberately: the label
+`malformed`, `io_error`, `policy`, `unauthorized`, `not_accepting`). The set is
+closed deliberately: the label
 feeds Prometheus, and a per-transfer string would create unbounded child series.
 A silent return would leave the sender waiting out its ack timeout with no local
 record of why the transfer never landed.
@@ -885,7 +892,7 @@ silently discarded. This enables operational visibility into snapshot failures.
 instead of `time.After`, preventing timer leaks when the receive loop aborts
 early (e.g., on error or connection close).
 
-## Frame Format
+## Frame format
 
 Source: `pkg/internal/transport/frame.go`
 
@@ -916,18 +923,24 @@ being read as a valid frame; rejecting everything above keeps a peer built from
 another commit from being misparsed rather than refused. There is no accepted
 range, because there is no version other than 1 to accept.
 
+`transport.WireVersion`, like every format version in this repository, is
+pinned at 1 until the first production release. A frame layout change before
+then is made in place and every peer is rebuilt, so the byte does not move for
+it, and two builds from different commits can disagree on layout while both
+stamp `0x01`. See [Compatibility](../compatibility.md).
+
 **Decompression limit:** Payloads are decompressed only if the decompressed
 size is within `MaxDecompressedSize`, which is PINNED to `MaxFrameSize` (16 MB)
 and rejected by `Validate` at any other value. It prevents decompression bombs
 without being a per-node tunable: the send path admits frames against the
 `MaxFrameSize` constant, so a receiver configured lower would refuse frames
-every peer considers valid — and because a frame rejection deliberately keeps
+every peer considers valid, and because a frame rejection deliberately keeps
 the connection (see [Failed write handling](#stream-pool-and-heartbeat-streams)),
 that replica would silently stop
 replicating. Nothing is bought by lowering it either, since a peer wanting this
 node to buffer 16 MB can simply send an uncompressed 16 MB frame.
 
-### Frame Flags
+### Frame flags
 
 ```go
 // frame.go
@@ -950,87 +963,27 @@ receiver decompresses before unmarshaling.
 `FlagSnapshot` marks **only the first frame** of a snapshot stream, the one
 carrying the `SnapshotHeader`. It is what routes the stream to
 `handleSnapshotStream`. Every subsequent chunk frame on that stream is written
-with `FlagNone` — both `SendSnapshot` and `SendSnapshotStreaming` call
+with `FlagNone`: both `SendSnapshot` and `SendSnapshotStreaming` call
 `WriteFrame(stream, chunkBuf, FlagNone)`.
 
-### MessageBatch Wire Format
+### Payload layouts
 
-Source: `pkg/proto/messagebatch.go`
+The frame payload is a `proto.MessageBatch` (or, on a snapshot stream, a
+`SnapshotHeader` followed by `proto.SnapshotChunk` frames). Their byte layouts,
+bounds and version gates are specified once, in
+[`../wire-protocol/engineering.md`](../wire-protocol/engineering.md). The facts
+this layer depends on:
 
-```
-+----------+---------------+---------------+-----------+--------+-----------+-----+
-| BinVer:8 | DeploymentID:8| SourceEpoch:8 | AddrLen:4 | Addr:N | ReqCnt:4  | ... |
-+----------+---------------+---------------+-----------+--------+-----------+-----+
-                                                                     |
-                                                          ReqCnt x Message
-```
+- `MessageBatch.BinVer` must equal `proto.WireVersion` exactly, and
+  `DeploymentID` must equal this host's; a mismatch drops the whole batch.
+- `SourceAddress` and `SourceEpoch` are in-band and unauthenticated by mTLS;
+  see [Per-node SANs](#per-node-sans-are-a-hard-deployment-precondition).
+- A decoded `Entry.Cmd` aliases the receive buffer until the transport detaches
+  it ([Entry.Cmd buffer safety](#entrycmd-buffer-safety)).
+- `proto` integers are little-endian; the transport's own frame header and
+  `SnapshotHeader` are big-endian.
 
-Fixed portion: 24 bytes (BinVer + DeploymentID + SourceEpoch).
-
-- `BinVer` validated against `proto.WireVersion` (**1**, pinned there for the
-  whole pre-release period) for **exact** equality -- `BinVer != WireVersion`
-  returns `ErrUnsupportedVersion`. There is no version negotiation and no
-  legacy decode path, so batches from both older and newer binaries are
-  rejected. Note that a matching `BinVer` is not a guarantee that two binaries
-  agree on the bytes: pre-release layout changes happen in place at version 1.
-  See [Compatibility](../compatibility.md).
-- `DeploymentID` validated against transport config (cross-cluster rejection)
-- `SourceEpoch` is the sender's per-process boot epoch. It changes only when
-  the sending node restarts, which lets the receiver distinguish a genuine
-  peer restart from a benign re-dial and evict the stale cached outbound
-  connection promptly instead of waiting for `MaxIdleTimeout`
-- `ReqCnt` validated against `proto.MaxMessagesPerBatch` (10000), then
-  cross-checked against the bytes remaining in the frame
-- Cumulative size tracked against `MaxBatchSize` (64 MB)
-
-### Message Wire Format
-
-Source: `pkg/proto/message.go`
-
-11 fixed uint64 fields (88 bytes), followed by entries and optional snapshot:
-
-```
-+------+------+----+--------+-----------+------+---------+----------+
-| Type | From | To | ShardID| ReplicaID | Term | LogTerm | LogIndex |
-|  :8  |  :8  | :8 |   :8   |    :8     |  :8  |   :8    |    :8    |
-+------+------+----+--------+-----------+------+---------+----------+
-| Commit | Reject | Hint | EntryCnt:4 | entries... |
-|   :8   |   :8   |  :8  |            |            |
-+--------+--------+------+------------+------------+
-| HasSnapshot:8 | snapshot... (if HasSnapshot) |
-+---------------+------------------------------+
-```
-
-`Reject` is stored as uint64 on wire (0 or 1) for fixed-width encoding.
-
-### Entry Wire Format
-
-Source: `pkg/proto/entry.go`
-
-**68-byte** fixed header (`entryHeaderSize` = 8 uint64 fields + a uint32 length
-prefix) followed by the variable-length command:
-
-```
-+------+-------+------+-----+----------+----------+-------------+---------+---------+-----+
-| Term | Index | Type | Key | ClientID | SeriesID | RespondedTo | OwnerID | CmdLen  | Cmd |
-|  :8  |  :8   |  :8  | :8  |    :8    |    :8    |     :8      |   :8    | :4(u32) | :N  |
-+------+-------+------+-----+----------+----------+-------------+---------+---------+-----+
-```
-
-- `CmdLen` is validated against `MaxEntrySize` (8 MB) before buffer access.
-- `Cmd` is zero-copy aliased into the source buffer after `UnmarshalFrom`; the
-  transport detaches it (see [Entry.Cmd Buffer Safety](#entrycmd-buffer-safety)).
-- `Type` lower 4 bits are the entry type, bit 4 is the compression flag. Bits 5
-  and above are reserved and **rejected** at both `MarshalTo` and
-  `UnmarshalFrom` rather than masked away — masking would let a sender attach 59
-  bits of its own and have this build silently agree to a type it read as
-  something else.
-- `OwnerID` is the principal the embedder declared for the session a
-  registration entry creates, and is the key the per-owner session cap is
-  counted against. Zero means unset. Only session-registration entries carry a
-  meaningful value. See [Session Deduplication](../client-sessions/engineering.md).
-
-## TLS Configuration
+## TLS configuration
 
 Source: `pkg/internal/transport/tls.go`, `pkg/config/transportconfig.go`
 
@@ -1078,9 +1031,9 @@ The `Certificate` field is what makes a TPM- or HSM-resident transport key
 usable: its `PrivateKey` may be any `crypto.Signer`, so the key never has to
 exist as PEM bytes. `buildMTLSTLS` parses the leaf from DER when the pre-built
 certificate does not populate `Leaf`, and rejects one whose leaf cannot be parsed
-at all — the startup SAN-exclusivity precondition below cannot be evaluated
+at all, because the startup SAN-exclusivity precondition below cannot be evaluated
 without it. This is the transport's own key, separate from the barrier root key;
-see [Key Custody](../seal-barrier/architecture.md#delegated-hardware-mode--total-by-design) for the
+see [Key Custody](../seal-barrier/architecture.md#delegated-hardware-mode-is-total-by-design) for the
 at-rest side.
 
 **TLS properties** (`buildMTLSTLS`):
@@ -1091,7 +1044,7 @@ at-rest side.
   node's own certificate. `ServerName` is set per dial from the target host.
 - **ALPN**: `"quicraft"`.
 - **Minimum version**: TLS 1.3 (`MinVersion: tls.VersionTLS13`).
-- **Curve preference**: `handshakeCurves()`, which is build-dependent —
+- **Curve preference**: `handshakeCurves()`, which is build-dependent:
   `[X25519, P-256, P-384]` in a standard build (`tls_curves_nofips.go`),
   `[P-256, P-384]` with `-tags fips` (`tls_curves_fips.go`). Pinning any list
   is what suppresses ML-KEM hybrid negotiation, worth roughly 5% for
@@ -1100,9 +1053,9 @@ at-rest side.
   X25519 is not FIPS 140-3 approved, so a FIPS build must not be able to name
   it; the NIST curves are in BOTH lists so the two builds still share a group
   and a cluster can be converted one node at a time. Do not trim either list to
-  one entry — `TestHandshakeCurves_InteroperateAcrossBuilds` fails, and a
-  single-entry list is how every intra-cluster handshake came to fail under
-  `GODEBUG=fips140=on`. No cipher suites are configured explicitly — TLS 1.3
+  one entry: `TestHandshakeCurves_InteroperateAcrossBuilds` fails, and an
+  X25519-only list fails every intra-cluster handshake under
+  `GODEBUG=fips140=on`. No cipher suites are configured explicitly; TLS 1.3
   suite selection is left to `crypto/tls`. FIPS-mode *cipher* selection is a
   sealing-layer concern; see [Encryption](../seal-barrier/architecture.md).
 - **Session resumption**: the client keeps a
@@ -1113,7 +1066,7 @@ at-rest side.
 **CA bundle parsing.** `parseCACertificates` parses *every* CERTIFICATE block in
 the bundle and keeps those able to issue. TLS verification consumes the whole
 bundle via `AppendCertsFromPEM`, so revocation must be able to select the same
-issuer the peer's leaf was actually signed by — in a root plus
+issuer the peer's leaf was actually signed by, and in a root plus
 issuing-intermediate PKI that is never the first block. A bundle with no usable
 issuer is a fatal startup error (`CACertificateParseError`): OCSP requests would
 otherwise name the wrong CA, which is a permanent silent no-op under soft-fail
@@ -1140,12 +1093,12 @@ revocation is still enforced on session resumption.
   network error) the failure is cached for `ocspUnavailableTTL` (10 s). During
   that short window, reconnect handshakes short-circuit instead of re-querying a
   dead responder and adding the full OCSP timeout to every handshake. The
-  negative cache only suppresses re-queries — it never upgrades an unavailable
+  negative cache only suppresses re-queries; it never upgrades an unavailable
   result to "good" or "revoked". Its TTL is far shorter than the positive-result
   cache (`OCSPCacheSeconds`, default 300 s) so the responder is retried promptly
   once it recovers.
-- **Fail closed by default:** an unknown revocation status — OCSP responder
-  unreachable, CRL stale or unreadable, no revocation source configured —
+- **Fail closed by default:** an unknown revocation status (OCSP responder
+  unreachable, CRL stale or unreadable, no revocation source configured)
   **rejects** the connection. The knob is `RevocationConfig.AllowSoftFail`, and
   its zero value (`false`) is the fail-closed posture, so a `RevocationConfig`
   you never touch enforces revocation. Set `AllowSoftFail: true` only when the
@@ -1165,7 +1118,7 @@ revocation is still enforced on session resumption.
   `"ocsp"`/`"both"`, and rejects the default `"any"` mode with neither source
   configured while `AllowSoftFail` is false. That last combination admits every
   revoked certificate for the process lifetime with no error, no log and no
-  metric — the exact failure revocation exists to prevent. At runtime the
+  metric, the exact failure revocation exists to prevent. At runtime the
   checker repeats the check for whichever mode it was given: under enforcement,
   a mode with no usable source returns an error rather than "not revoked", so a
   checker built without `Validate` cannot become a silent no-op.
@@ -1185,27 +1138,30 @@ verification.
 
 Each node **must** have its own leaf certificate whose SANs name **only that
 node's advertised Raft host**. This is not a hardening recommendation; it is a
-correctness precondition for three separate authorization controls, and
+correctness precondition for the two address-based controls below, and
 `StartShard` **fails closed** when it is violated.
 
 `MessageBatch.SourceAddress` and `MessageBatch.SourceEpoch` travel **in band**.
 mTLS authenticates the *connection*, not those fields, so the transport binds
 them to the sender's verified certificate via `inboundAuthorizedFor`
-(`certs[0].VerifyHostname(host) == nil`). Three controls reduce to that answer:
+(`certs[0].VerifyHostname(host) == nil`). Two controls reduce to that answer:
 
 1. clearing a spoofed `SourceAddress` before it reaches the handler
    (`recv.go`, which otherwise poisons the `(shardID, replicaID) -> address`
    registry),
 2. deciding who may mutate `peerEpoch` and **evict a live outbound**
-   (`observePeerEpoch` / `evictStaleOutboundOnRecv`),
-3. binding a snapshot sender to a shard member (`messagehandler.go`).
+   (`observePeerEpoch` / `evictStaleOutboundOnRecv`).
+
+The host's address learning (`learnFromSource` in `pkg/messagehandler.go`)
+consumes the first: it records a sender's address only when the certificate
+covers it.
 
 `VerifyHostname` tests SAN **presence**, not SAN **exclusivity**. Issue the
 cluster one wildcard certificate (`*.raft.svc.cluster.local`), or one
-certificate carrying every node's SAN, and all three answer "authorized" for
+certificate carrying every node's SAN, and both answer "authorized" for
 **every** peer address. A single compromised replica can then claim any peer's
 address with a fresh `SourceEpoch` per batch and drive every node to evict its
-healthy outbound to a **third-party** victim — an attacker-controlled,
+healthy outbound to a **third-party** victim: an attacker-controlled,
 cluster-wide replication stall, i.e. exactly the cascade the epoch mechanism
 exists to prevent.
 
@@ -1215,7 +1171,7 @@ returns `transport.ErrSharedPeerCertificate` (a `*SharedPeerCertificateError`
 naming the offending hosts) when this node's own leaf also covers another
 member's host. It fails closed rather than warning because the weakness is
 invisible from a running cluster, the operator has no signal to act on, and the
-only remediation — re-issued certificates — has to happen before the cluster
+only remediation, re-issued certificates, has to happen before the cluster
 carries data.
 
 `StartShard`'s check is a **misconfiguration detector**, not an attack control:
@@ -1224,9 +1180,9 @@ handed the local API, so a malicious joiner never runs it. The enforcing
 counterpart is on the receive path.
 
 **Inbound peers with a promiscuous certificate are refused at accept.**
-`refuseInboundPromiscuousCert` runs on every accepted connection — including
-resumed TLS sessions, since `Accept` yields every inbound connection regardless
-— and closes it with `QUICErrPromiscuousCert` (`0x5`) when the peer's verified
+`refuseInboundPromiscuousCert` runs on every accepted connection, including
+resumed TLS sessions, since `Accept` yields every inbound connection regardless,
+and closes it with `QUICErrPromiscuousCert` (`0x5`) when the peer's verified
 leaf **also covers this node's own host**. A certificate that covers this member
 covers every member, so its holder can satisfy the address binding for any
 replica of any shard. This node cannot enumerate the other members here (the
@@ -1234,33 +1190,35 @@ transport has no shard membership) and does not need to: it is itself a member,
 so "covers me" is a sound proxy for "covers everyone", checkable against nothing
 but its own configured address.
 
-It runs **once per connection**, deliberately. The per-message alternative —
-probing each member address through the `PeerAuth` callback — thrashes the
+It runs **once per connection**, deliberately. The per-message alternative,
+probing each member address through the `PeerAuth` callback, thrashes the
 4-slot per-connection decision cache and trips its 16-distinct-miss fail-closed
 cap (`inboundAuthorizedForCached`), which would permanently kill every
 connection on any shard with five or more members. A certificate is fixed for
 the life of a connection, so once is also sufficient.
 
-**Known limitation — co-located replicas.** A certificate is matched on its
+**Known limitation: co-located replicas.** A certificate is matched on its
 HOST only; the port is not part of the decision. Replicas separated only by port
-(`127.0.0.1:5000`, `127.0.0.1:5001`) are therefore indistinguishable to all
-three controls, and no certificate policy can separate them. Both the startup
-check and the receive-side refusal skip peers sharing this node's own host — the
-same host under any spelling, or any loopback address (`isCoLocatedCertHost`) —
+(`127.0.0.1:5000`, `127.0.0.1:5001`) are therefore indistinguishable to both
+controls, and no certificate policy can separate them. Both the startup
+check and the receive-side refusal skip peers sharing this node's own host (the
+same host under any spelling, or any loopback address: `isCoLocatedCertHost`),
 since flagging them would fail every single-machine deployment while offering
 nothing actionable. **Deployments that need these controls must give each
-replica its own host.**
+replica its own host.** Sender authorization is unaffected: it is by node
+identity, so two hosts on one machine with separate keypairs stay distinct.
 
-**What supersedes all of this for `msg.From`.** The address-based binding above
-still governs `SourceAddress` learning and epoch-driven eviction, but the replica
-ID Raft counts toward quorum is no longer authorized by address at all wherever
-committed membership records a **node identity** for it. The identity is
+**What governs `msg.From`.** The address-based binding above governs only
+`SourceAddress` learning and epoch-driven eviction. The replica ID Raft counts
+toward quorum is never authorized by address: every member carries a committed
+node identity, and every inbound message is bound to it. The identity is
 `sha256(leaf.RawSubjectPublicKeyInfo)` (`NodeIdentityFromCertificate`, rendered
-`spki:<hex>`) — derived from the peer's public key rather than matched against
-its SANs, so a wildcard certificate proves nothing about it, and unchanged by
-certificate renewal on the same keypair. It reaches membership only through
-consensus and is supplied by an operator, never captured from a connection. See
-[Compatibility](../compatibility.md#node-identities-and-requirememberidentity).
+`spki:<hex>`). It is derived from the peer's public key rather than matched
+against its SANs, so a wildcard certificate proves nothing about it, and it is
+unchanged by certificate renewal on the same keypair. It reaches membership only
+through consensus or the operator anchor (`Config.MemberIdentities`), never
+captured from a connection. See
+[Compatibility](../compatibility.md#node-identities-are-mandatory).
 
 The internal transport builds separate server and client `tls.Config`
 instances from the provided PEM material. The `ServerName` field on the client
@@ -1273,12 +1231,12 @@ An authorized restart hint is bounded as well as authenticated. Each peer
 address may drive at most `evictionBudget` (4) epoch-driven evictions per
 `evictionWindow` (30 s); past that the hint is ignored and recovery degrades to
 the QUIC `MaxIdleTimeout` path. A genuine restart costs exactly one eviction,
-so the budget is invisible in normal operation — but without it an
+so the budget is invisible in normal operation, but without it an
 authenticated peer could stamp a fresh `SourceEpoch` on every batch and, past
 the 4-slot `supersededEpochRing` hysteresis, force a full QUIC handshake plus
 stream-pool teardown **per batch**.
 
-## Node Registry
+## Node registry
 
 Source: `pkg/internal/registry/registry.go`
 
@@ -1312,13 +1270,14 @@ change.
 | `CompareAndRemove`    | `CompareAndDelete`: roll back a speculative pre-register |
 | `CompareAndRegister`  | `CompareAndSwap`: restore a prior mapping on rollback   |
 | `AddressInUse`        | Whether *any* shard still resolves a replica to an address |
+| `ReplicasAt`          | Every `(shardID, replicaID)` currently routed to an address |
 | `Count`               | Number of registered nodes                              |
 
 The compare-and-swap variants are not conveniences. A sender the committed
 configuration does not name may **establish** a mapping but must never
 **replace** one, and doing that as a separate Resolve-then-Register is not
 atomic: two concurrent receives for the same `(shard, replica)` both see no
-entry, both register, and the loser's address silently replaces the winner's —
+entry, both register, and the loser's address silently replaces the winner's:
 exactly the hijack the check exists to deny. `RegisterIfAbsent` closes that
 window, leaving `Register` and `CompareAndRegister` as the only paths that can
 replace an established mapping.
@@ -1331,7 +1290,7 @@ other shard still resolves a replica to the same address.
 The registry is populated by `Host.StartShard()` when members are registered,
 and cleaned by `Host.StopShard()` when a shard is unloaded.
 
-### Address Resolution Flow
+### Address resolution flow
 
 ```
 Step Worker produces Message{ShardID: 100, To: 3}
@@ -1348,7 +1307,7 @@ A `Resolve` miss is not an error condition: it recurs for every message aimed at
 a removed or not-yet-registered replica during membership churn, so the message
 is dropped at Debug level and counted as `unresolved_target`.
 
-## Transport Configuration Summary
+## Transport configuration summary
 
 `TransportConfig` fields (with defaults):
 
@@ -1363,11 +1322,11 @@ is dropped at Debug level and counted as `unresolved_target`.
 | `MaxSnapshotReceiveRate`        | int64         | 256 MB/s       | Inbound snapshot bandwidth; non-zero values below 64 KB/s are rejected |
 | `MaxConcurrentSnapshotReceives` | int           | 4              | Parallel inbound snapshot transfers  |
 | `MaxSnapshotReceiveMemory`      | int64         | 1 GB           | Total in-flight snapshot chunk budget |
-| `MaxMessageReceiveMemory`       | int64         | 256 MB         | Aggregate in-flight message-frame buffer budget; also derives the QUIC per-connection receive window |
+| `MaxMessageReceiveMemory`       | int64         | 256 MB         | Aggregate in-flight message-frame heap budget (each frame charged at 8x its wire length); also derives the QUIC per-connection receive window |
 | `MaxDecompressedSize`           | uint32        | 16 MB (pinned) | Decompression size limit; must equal `MaxFrameSize` |
 | `MaxConnectionsPerIP`           | int           | 16             | Concurrent inbound connections per source IP |
 | `MaxIncomingConnections`        | int           | 256            | Total inbound connection limit       |
-| `SendBatchMaxSize`              | int           | 64 KB          | Initial send-buffer pool capacity    |
+| `SendBatchMaxSize`              | int           | 64 KB          | Initial capacity of pooled send buffers; it does not cap a batch |
 | `UDPRecvBufSize`                | int           | 7 MB           | `SO_RCVBUF`; 0 uses the OS default   |
 | `UDPSendBufSize`                | int           | 7 MB           | `SO_SNDBUF`; 0 uses the OS default   |
 | `Enable0RTT`                    | bool          | false          | 0-RTT reconnection; replayable, and the receive path refuses 0-RTT frames anyway |
@@ -1381,7 +1340,7 @@ socket address when stamping `MessageBatch.SourceAddress`, which is what lets a
 node behind NAT or in a container advertise a reachable external address rather
 than `0.0.0.0` or `[::]`.
 
-## Transport Metrics
+## Transport metrics
 
 The transport emits metrics through `quicraft.TransportMetrics`
 (`pkg/metrics.go`) when one is configured; when nil, collection is skipped
@@ -1400,13 +1359,13 @@ type TransportMetrics interface {
 ```
 
 The two `reason` arguments come from closed sets defined by the transport and
-must be treated as metric labels, never as free-form strings — deriving new
+must be treated as metric labels, never as free-form strings: deriving new
 label values from them creates unbounded Prometheus child series.
 
 | Counter | Reasons |
 |---------|---------|
-| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy` |
-| `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected` |
+| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy`, `unauthorized`, `not_accepting` |
+| `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected`, `identity_mismatch` |
 
 `shardID` is 0 for `IncSnapshotsRejected` when the transfer failed before its
 header parsed, and both `shardID` and `to` are 0 for `protocol_violation`, where
@@ -1418,64 +1377,71 @@ counters for the sampled diagnostics (`PeerFrameRejections()` is exported;
 `snapshotStreamDrops` and `zeroRTTRefusals` are reported inside the sampled log
 lines), plus `ConnectionCount()`, `StreamCount()` and `SendQueueCount()`.
 
-## Test Strategy
+## Test strategy
 
-Targets: `make test-transport`, `make bench-transport`, `make fuzz-transport`,
-`make ci-netfault`.
+Targets: `make test-transport`, `make bench-transport`, `make ci-fuzz-seeds`,
+`make ci-fuzz-mutation`, `make ci-netfault`.
 
 | Layer | What it covers |
 |---|---|
 | **Unit** (`pkg/internal/transport/*_test.go`) | frame encode/decode, the stream pool, connection admission and per-IP limits, the mTLS config builder, node-identity derivation, the revocation checker's CRL reload and OCSP cache |
-| **Fuzz** (`make fuzz-transport`) | frame-header and length-prefix decoding against arbitrary bytes. The transport is the one place in the repository where the input is genuinely adversarial. |
-| **Integration** (`test/integration`) | real QUIC connections between real hosts, with real certificates |
-| **Fault injection** (`test/netfault`, `make ci-netfault`) | partitions, delays and drops. This is the suite that exercises the paths a unit test cannot reach: a peer that goes away mid-snapshot, a stream that stalls past `StreamReadIdleTimeout`, a connection admitted and then abandoned. |
+| **Fuzz** (build tag `quicraft_fuzz`) | `FuzzFrameHeaderRoundTrip`, `FuzzFrameHeaderUnmarshalCrash`, `FuzzFrameWithPayload`, `FuzzMessageFrameDecode`, `FuzzHeartbeatDetection`: frame-header and payload decoding against arbitrary bytes. The transport is the one place in the repository where the input is genuinely adversarial. `make ci-fuzz-seeds` replays the seed corpora; `make ci-fuzz-mutation` runs a bounded mutation pass per target. |
+| **Integration** (`test/integration`) | real QUIC connections between real hosts, with real certificates (one leaf per host from a per-cluster CA, `test/testpki`) |
+| **Fault injection** (`test/netfault`, `make ci-netfault`) | directed partitions between live replicas, run over the `test/integration/e2e` suites with the `quicraft_netfault` build tag. It exercises what a process kill cannot: a live leader deposed by a quorum it can no longer reach. |
 
-**Seams for fault injection**: the `netfault` harness sits at the socket, not
-inside the transport — there is no injectable dialer, deliberately, because a
-fake dialer cannot reproduce QUIC's own loss recovery and flow control, which is
-what most transport bugs are actually about.
+**Seams for fault injection**: `test/netfault` is consulted from the transport's
+send path, and only in a build tagged `quicraft_netfault` (`netfault_on.go`); in
+a normal build the check is a false constant and folds away. Drops are applied
+on the sending side, so both nodes stay alive and keep their term and role.
+There is deliberately no injectable dialer: a fake dialer cannot reproduce
+QUIC's own loss recovery and flow control, which is what most transport bugs
+are about.
 
 **Fixtures**: certificates are generated per test run rather than checked in. A
 checked-in key is a real key.
 
-**Coverage note.** `pkg/internal/transport` sits at 88.8%, below the repository's
-own `COVER_MIN = 91` floor, and the module-total gate does not catch it. The WAL,
-the QUIC transport and the engine pipeline are named in `README.md` as the gaps
-that matter, precisely because their failure modes are the hardest to recover
-from. Treat that as tracked work rather than a settled state.
+**Coverage** (measured 2026-10-02): `pkg/internal/transport` 91.4%,
+`revocation` 99.0%, `registry` and `netaddr` 100%. The repository floor is
+`COVER_MIN = 91`, applied to the module total.
 
 ## Observability
 
-**Metrics** — the `TransportMetrics` collector on the `Host`, plus the
-transport's own counters described in [Transport
-Metrics](#transport-metrics): `ConnectionCount()`, `StreamCount()` and
-`SendQueueCount()`. Metric names and the Prometheus collector are in
+**Metrics.** An embedder sees the transport through the `MetricsCollector`
+passed with `WithMetrics`: its `TransportMetrics` methods, plus
+`SecurityMetrics.IncUnauthorizedMessageDropped` and
+`IncUnauthorizedSnapshotDropped`, which the host's message handler records.
+`ConnectionCount()`, `StreamCount()` and `SendQueueCount()` are methods on the
+internal `QUICTransport` and are not reachable from outside the module. Metric
+names and the Prometheus collector are in
 [`../observability/engineering.md`](../observability/engineering.md).
 
-The four worth alerting on:
+The signals worth alerting on:
 
 | Signal | Why |
 |---|---|
-| connection count against `MaxIncomingConnections` | at the ceiling, new peers are refused |
-| send-queue depth | a peer that cannot keep up shows here before it shows as a Raft timeout |
-| snapshot receive concurrency against `MaxConcurrentSnapshotReceives` | transfers are queueing |
-| revocation-check failures | under fail-closed defaults these become connection refusals |
+| `IncMessagesDropped` with `queue_full` | a peer that cannot keep up shows here before it shows as a Raft timeout |
+| `IncMessagesDropped` with `identity_mismatch` | a destination replica's bound identity is not what the peer at its address presents |
+| `IncSnapshotsRejected` with `concurrency_limit` or `memory_budget` | snapshot transfers are being shed |
+| `IncUnauthorizedMessageDropped` with `identity_mismatch` | a forged `From`, or a stale identity after a key rotation; never routine |
+| `OnConnectionFailed` events | dial failures, including TLS handshake refusals and revoked peers |
 
-**Logging** — `log/slog`. The events worth alerting on:
+**Logging** (`log/slog`). The events worth alerting on:
 
-| Level | Event | Why |
+| Level | Message | Why |
 |---|---|---|
-| ERROR | mTLS handshake refused | a certificate problem, a wrong CA, or a peer whose leaf covers the local node (`refuseInboundPromiscuousCert`) |
-| ERROR | revocation source unavailable under enforcement | `ErrNoRevocationSources` — connections are being refused, and that is the intended behavior |
-| WARN | a message dropped for an unauthorized sender | the peer's authenticated identity is not the one committed for the replica it claims, or the configuration holds none for it |
-| WARN | frame rejected for a foreign wire version | two binaries from different builds |
-| WARN | inbound connection refused at a limit | `MaxIncomingConnections` or `MaxConnectionsPerIP` |
+| WARN | `refusing inbound connection: peer certificate is not exclusive` | the peer's leaf also covers this node's host (`refuseInboundPromiscuousCert`) |
+| WARN | `closing connection: peer certificate is no longer admissible` | a live connection failed the periodic revocation re-check |
+| WARN | `inbound frame header rejected` | bad magic, oversized frame, or a foreign wire version: two binaries from different commits (sampled) |
+| WARN | `per-IP connection limit reached` | `MaxConnectionsPerIP`; the global `MaxIncomingConnections` refusal closes with `QUICErrConnLimitReached` and is not logged above Debug |
+| WARN | unauthorized-message drops (host message handler, sampled) | the peer's authenticated identity is not one any configuration this replica holds binds to the claimed sender |
+| INFO | `peer connection failed` | an outbound dial failed: unreachable UDP path, TLS refusal (wrong CA, SAN, revoked) or a peer presenting the wrong identity (`DialIdentityError`) |
+| ERROR | `transport: dropping message that cannot be framed; ...` | a producer emitted a message no peer can accept (`unsendable`) |
 
 **No certificate private key, no session secret, and no message payload appears
 in any log line.** A refused peer is identified by its SPKI identity and its
 address, both of which are already public.
 
-## Cross-References
+## Cross-references
 
 - [Architecture Overview](../multi-group-host/architecture.md) -- system overview, data flow, configuration
 - [Wire Format](../wire-protocol/engineering.md) -- MessageBatch, Message, Entry and Membership encodings

@@ -1,10 +1,10 @@
 # Snapshots — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption — `pkg/snapshot_*.go`,
-> `pkg/internal/engine/snapshot_pool.go`, `pkg/internal/engine/snapshot_meta.go`,
+> import/export and re-encryption: `pkg/snapshot_*.go`, the snapshot paths of
+> `pkg/host.go` and `pkg/messagehandler.go`, `pkg/internal/engine/snapshot_*.go`,
 > the snapshot paths of `pkg/internal/transport` and `pkg/logdb` ·
-> Last verified: 2026-09-15
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -12,12 +12,12 @@
 A Raft log that is never truncated grows without bound, and a follower that
 falls far enough behind can never catch up by replaying it. Snapshots solve
 both: a point-in-time image of the state machine lets the log below it be
-compacted, and lets a lagging replica be brought up to date in one transfer
-instead of a million entries.
+compacted, and brings a lagging replica up to date in one transfer instead of a
+million entries.
 
-Both uses put the same requirement on the mechanism: the image has to be
-**consistent with a specific log index**, and it has to survive a crash halfway
-through being written or received.
+Both uses need the same two things from the image: it must be consistent with a
+specific log index, and it must survive a crash halfway through being written
+or received.
 
 ## The shape chosen
 
@@ -26,79 +26,90 @@ state machine wrote and a metadata record describing it:
 
 ```
 <NodeHostDir>/snapshots/shard-<N>/replica-<N>/snapshot-<index>/
-    snapshot.dat     the state machine's own bytes (optionally compressed,
+    snapshot.dat     the state machine's bytes (optionally compressed,
                      optionally encrypted as length-prefixed frames)
-    snapshot.meta    index, term, DataLen, DataHash, membership, epoch, ...
+    snapshot.meta    index, term, epoch, compression, DataLen, DataHash, ...
 ```
 
-- **The state machine owns the contents.** `SaveSnapshot` gets an `io.Writer`
-  and this library does not look inside.
-- **Membership travels with the snapshot**, because a replica recovering from
-  one has to learn the configuration as of that index — it cannot read it from a
-  log it does not have.
-- **Every write is atomic**: temp file, fsync the file, rename, **fsync the
-  directory**. The last step matters because without it a crash can roll the
-  directory entry back to the deleted temp name even though the bytes were
-  fsynced.
-- **Snapshot work runs on its own pool** — `max(NumWorkers/2, 2)` workers —
-  rather than on the step, commit or apply workers, so a multi-gigabyte save
-  cannot stall consensus.
+A shard with `Config.DataDir` set roots its tree at `<DataDir>/shard-<N>/`
+instead.
 
-Snapshots are triggered automatically every `SnapshotEntries` applied entries
-(default 100000), or explicitly by `RequestSnapshot`.
+- **The state machine owns the contents.** `SaveSnapshot` gets an `io.Writer`,
+  and this library never looks inside.
+- **Membership travels with the snapshot.** A replica recovering from one must
+  learn the configuration as of that index, and it cannot read it from a log it
+  does not have.
+- **Every write is atomic**: temp file, fsync the file, rename, fsync the
+  directory. Without the last step a crash can roll the directory entry back to
+  the temp name even though the bytes were synced.
+- **Integrity is checked against the file as stored.** `DataLen` and `DataHash`
+  (xxhash64 of `snapshot.dat` before decryption and decompression) are recorded
+  in `snapshot.meta` and checked on recovery, on send and on export.
+- **Snapshot work runs on its own pool** of `max(NumWorkers/2, 2)` workers, not
+  on the step, commit or apply workers, so a multi-gigabyte save cannot stall
+  consensus.
+
+Snapshots are taken automatically every `SnapshotEntries` applied entries
+(default 100000), or on request with `RequestSnapshot`.
 
 **`SnapshotEntries` zero does not disable it.** Zero means "unset" and selects
-the default; `config.SnapshotsDisabled` is the value that turns it off. Never
-snapshotting also means never reclaiming snapshot directories, never purging an
-old epoch's DEK, and never invoking the at-rest barrier.
+the default; `config.SnapshotsDisabled` turns it off. Never snapshotting also
+means never compacting the log, never reclaiming snapshot directories, never
+purging an old epoch's DEK, and never invoking the at-rest barrier.
 
 ## Rejected designs
 
 ### Rejected: copy-on-write of the library's own state
 
-The library does not know what the state machine's state *is*. Tiers 1 and 2
-solve this in the state machine instead: `PrepareSnapshot` captures a
-point-in-time context and `SaveSnapshot` writes it without blocking `Update`.
-Tier 0 pays for the simpler interface by serializing.
+The library does not know what the state machine's state is. Tiers 1 and 2
+solve this in the state machine: `PrepareSnapshot` captures a point-in-time
+context, and `SaveSnapshot` writes it without blocking `Update`. Tier 0 pays for
+its simpler interface by serializing.
 
 ### Rejected: encrypting snapshots for transport
 
-Snapshots cross the wire as **plaintext over the mTLS session**, and the
-receiver re-encrypts under its **own** barrier. The alternative — shipping the
-leader's ciphertext — would require every replica to share key material, which
-is precisely the property the per-node barrier design refuses. Nodes cannot
-decrypt each other's at-rest data, and that stays true through a snapshot
-transfer.
+Snapshots cross the wire as plaintext inside the mTLS session, and the receiver
+re-encrypts under its own barrier. Shipping the leader's ciphertext instead
+would require every replica to share key material, which is the property the
+per-node barrier design refuses. Nodes cannot decrypt each other's at-rest data,
+and that stays true through a snapshot transfer.
 
 ### Rejected: write plaintext, then encrypt in place
 
-The save used to write the state machine's bytes to the canonical
-`snapshot.dat` in the clear, fsync them, and encrypt the file in place
-afterwards. Between the fsync and the rename a complete plaintext state machine
-was durable under the name every consumer, backup and operator reads — the one
-path in this feature that had that window, while the receive path always sealed
-inline from memory (#116). The writer now seals each 64 KB frame as the state
-machine hands it over; the plaintext exists only in the writer's buffer.
+Writing the state machine's bytes to `snapshot.dat` in the clear and encrypting
+the file afterwards leaves a complete plaintext state machine durable under the
+name every consumer, backup and operator reads. The save seals each 64 KiB frame
+as the state machine hands it over, so plaintext exists only in the writer's
+buffer.
 
-### Rejected: in-place decryption for recovery
+### Rejected: decrypting to a named file, or in place
 
-Renaming plaintext over `snapshot.dat` is neither crash- nor retry-safe: a
-recovery failure or a crash after the rename leaves plaintext on disk while
-LogDB still records `Epoch > 0`, so **every subsequent restart re-attempts
-decryption on plaintext and fails permanently**, losing an otherwise-valid
-snapshot. Decryption therefore writes a **sibling temp file** and leaves the
-canonical artifact intact.
+Recovery and the transport send need plaintext to read from. Renaming plaintext
+over `snapshot.dat` is neither crash- nor retry-safe: a failure after the rename
+leaves plaintext on disk while LogDB still records `Epoch > 0`, so every later
+restart tries to decrypt plaintext, fails, and the snapshot is lost. A named
+plaintext scratch file is no better: a crash before it is removed leaves a
+complete, readable copy of the state machine on disk.
+
+Recovery and send therefore decrypt into an **anonymous scratch file**, created
+in the replica's snapshot directory and unlinked before a byte is written. The
+plaintext never has a name, and closing the handle is the whole cleanup. If the
+unlink fails, the operation fails before anything is decrypted
+(`ErrScratchNotUnlinked`) and is retried later; an empty name left behind is
+removed by the stale-scratch sweep. The canonical encrypted `snapshot.dat` is
+never modified. The one named decrypt is the `ExportPath` copy, which writes a
+plaintext artifact by contract and decrypts inside the save's staging directory.
 
 ### Rejected: an epoch-only fallback when frame authentication fails
 
 Snapshot frames bind their position into the AAD. A reader that fails to
-authenticate must **never** retry without the context — that retry would readmit
-exactly the frame-splicing the binding exists to prevent.
+authenticate never retries without that context, because the retry would let
+in exactly the frame splicing the binding exists to stop.
 
-## At-rest encryption of snapshots
+## At-rest encryption
 
-When a barrier is configured, `snapshot.dat` is a sequence of length-prefixed
-frames, 64 KB of plaintext each:
+With a barrier configured, `snapshot.dat` is a sequence of length-prefixed
+frames of 64 KiB of plaintext each:
 
 ```
 [ChunkLen:4 LE | EncryptedChunk₁][ChunkLen:4 LE | EncryptedChunk₂]...
@@ -106,15 +117,15 @@ frames, 64 KB of plaintext each:
 EncryptedChunk = [Epoch:8 BE | AlgID:1 | Nonce:N | Ciphertext | Tag:16]
 ```
 
-Each frame is self-describing for decryption: it carries its own epoch and
-nonce, so a file written across a key rotation still reads.
+Each frame carries its own epoch and nonce, so a file written across a key
+rotation still reads.
 
 ### Positional binding
 
-Epoch-only AAD would let an attacker reorder chunks, substitute chunks from
-another snapshot at the same epoch, or truncate the stream without failing
-per-chunk authentication. Every frame therefore binds a positional context built
-by `engine.NewSnapshotAAD` — `SnapshotFrameAADLen` is **40 bytes**:
+Epoch-only AAD would let an attacker reorder frames, substitute frames from
+another snapshot at the same epoch, or truncate the stream. Every frame
+therefore binds a positional context built by `engine.NewSnapshotAAD`;
+`SnapshotFrameAADLen` is 40 bytes:
 
 ```
  off  size  field
@@ -128,44 +139,40 @@ by `engine.NewSnapshotAAD` — `SnapshotFrameAADLen` is **40 bytes**:
 AAD = [Epoch:8 little-endian] || context      = 48 bytes
 ```
 
-Every field is fixed-width and big-endian with no delimiters, so no two distinct
-identities produce the same bytes. This makes a wrong `ChunkSeq` (reordering), a
-wrong `SnapshotIndex` (cross-snapshot substitution) and a wrong
-`ShardID`/`ReplicaID` (cross-replica substitution) all fail authentication.
+The context fields are fixed-width and big-endian with no delimiters, so no two
+positions produce the same bytes. A wrong `ChunkSeq` (reordering), `SnapshotIndex`
+(cross-snapshot substitution) or `ShardID`/`ReplicaID` (cross-replica
+substitution) fails authentication.
 
 `NewSnapshotAAD` asks the barrier `SupportsContextAAD()` first. A barrier that
-cannot bind must not be handed a context: the write **fails closed** rather than
-silently dropping the binding.
+cannot bind is not handed a context; the write fails closed instead of dropping
+the binding.
 
-### Truncation is detected in both places it can happen, by different means
+### Truncation is caught where it can happen, by different means
 
-- **In transit**: the stream header declares a `ChunkCount` and the receiver
-  refuses a transfer where `len(chunks) != hdr.ChunkCount`, where the count is
-  zero, or where the stream was marked truncated. A separate
-  `maxAdmissibleChunkCount` bound rejects an inflated declared count *before*
-  any memory is committed.
-- **At rest**: the `Final` flag. Exactly one frame of every sealed artifact is
-  sealed as the last: the frame writer holds a full chunk back until more
-  plaintext proves it is not, and `Close` always emits a terminal frame, an
-  empty one if need be. `engine.OpenSnapshotFrames`, the only reader, reads one
-  frame ahead and authenticates the frame after which the file ends as the
-  last. A truncated artifact therefore fails on the frame it now ends with,
-  which was sealed non-terminal; frames spliced after a terminal frame from a
-  longer artifact of the same identity fail on that terminal frame; and an
-  artifact truncated to nothing is refused as `ErrSnapshotCorrupt`, since a
-  sealed artifact always has at least one frame. A barrier that cannot bind
-  caller context gets no positional binding and so only the zero-frame rule.
+- **In transit.** The stream header declares `ChunkCount`, and the receiver
+  refuses a transfer whose chunk count differs, is zero, or was marked
+  truncated. `maxAdmissibleChunkCount` rejects an inflated count before any
+  memory is committed.
+- **At rest.** The `Final` flag. Exactly one frame of every sealed artifact is
+  sealed as the last: the writer holds a full chunk back until more plaintext
+  proves it is not the last, and `Close` always emits a terminal frame, an empty
+  one if need be. `engine.OpenSnapshotFrames`, the only reader, reads one frame
+  ahead and authenticates the frame the file ends on as the last. A truncated
+  artifact fails on the frame it now ends with, frames appended after a terminal
+  frame fail on that terminal frame, and an artifact truncated to nothing is
+  `ErrSnapshotCorrupt`, since a sealed artifact always has at least one frame. A
+  barrier that cannot bind context gets no positional binding and so only the
+  zero-frame rule.
 
-### The epoch-pinning window
+### Epoch pinning
 
-`EncryptWithEpochPinnedContext` seals a frame **and** registers its epoch
-in-flight under one lock. Without that atomicity, a concurrent `Rotate` plus
-`PurgeEpochsBefore` between the seal and the pin can drop the DEK of a frame
-already written into the artifact. The method is therefore part of the
-`Barrier` interface, not an optional capability: until 0.14.0 a barrier without
-it fell back to pin-before / encrypt / pin-after, which left that window narrow
-rather than closed, and a custom barrier that missed the optional method was
-exposed to it.
+`EncryptWithEpochPinnedContext` seals a frame and registers its epoch as in use
+under one lock. Without that, a concurrent `Rotate` plus `PurgeEpochsBefore`
+between the seal and the pin could drop the DEK of a frame already written into
+the artifact. It is a required method of the `Barrier` interface, not an
+optional capability, so no barrier can fall back to a pin-before/pin-after
+sequence that only narrows the window.
 
 ## The portable export artifact
 
@@ -176,27 +183,29 @@ its own between two hosts with unrelated barrier keys:
 header   magic "QRSNAP01" | version:u32 (2) | Index | Term | OnDiskIndex |
          Compression:u16 | membLen:u32 | Membership[membLen]
 payload  the snapshot data, PLAINTEXT (decrypted, never decompressed)
-trailer  magic "QRSNTRLR" | payloadLen:u64 | payloadHash:u64 (xxhash64)
+trailer  magic "QRSNTRLR" | payloadLen:u64 | hash:u64 (xxhash64 of header || payload)
 ```
 
-The trailer is what makes the artifact verifiable by itself. The header is
-written before the length and hash are known — the export streams — so they
-follow the payload instead. They are computed over the bytes as they are
-WRITTEN, and the trailer is written only after the export's own check of the
-source against its `snapshot.meta` has passed. An export that fails anywhere
-never writes one. That matters most for an encrypted export: its frames
-authenticate one at a time, so all of its plaintext has reached the writer
-before the recorded-hash check can fail it, and the missing trailer is what
-keeps that output from being a complete artifact.
+The trailer makes the artifact verifiable on its own. The export streams, so
+the length and hash are not known when the header is written; they follow the
+payload instead. They are computed over the bytes as written, and the hash
+covers the header because a flipped `Index` or `Term` that still parses would
+otherwise import a sound payload at the wrong log position.
 
-`ImportSnapshot` withholds the last 24 bytes of the stream as it copies the
+The trailer is written last, only after the export's own check of the source
+against its `snapshot.meta` has passed. An export that fails never writes one.
+That matters most for an encrypted export: its frames authenticate one at a
+time, so all its plaintext has reached the writer before the recorded-hash
+check can fail it, and the missing trailer is what keeps that output from being
+importable.
+
+`ImportSnapshot` holds back the last 24 bytes of the stream while it copies the
 payload into its staging directory, hashes what it copies, and checks both
-against the trailer when the stream ends — inside the copy, so a mismatch
-fails the write of the staged data file and the stage is discarded before
-anything is synced, published, recorded in LogDB or seen by raft. A truncated
-artifact ends in payload bytes where the trailer magic should be; an artifact
-from a build that predates the trailer does too, and both are refused as
-`*SnapshotArtifactError`.
+against the trailer when the stream ends. The check runs inside the copy, so a
+mismatch fails the staged write and the stage is discarded before anything is
+synced, published, recorded in LogDB or seen by raft. A truncated artifact, or
+one without a trailer, ends in payload bytes where the trailer magic should be,
+and is refused as `*SnapshotArtifactError`.
 
 ## Data flow
 
@@ -204,117 +213,114 @@ from a build that predates the trailer does too, and both are refused as
  SAVE
    apply worker: appliedIndex crosses SnapshotEntries
         ▼ snapshot pool worker
-   PrepareSnapshot (tiers 1,2) ─▶ SM.SaveSnapshot(w)      [into .save-* stage]
-        w = [snappy ─▶] snapshotFrameWriter ─▶ snapshot.dat
-            64 KB of plaintext per frame, sealed under the pinned epoch
-            AS IT IS WRITTEN: no plaintext is ever durable on disk (#116)
-        ▼ fsync ─▶ MaxSnapshotSize on the PLAINTEXT the writer consumed
-   snapshot.meta (Epoch = lowest frame epoch) ─▶ [export]
+   PrepareSnapshot (tiers 1, 2) ─▶ SM.SaveSnapshot(w)          [into a .save-* stage]
+        w = [snappy ─▶] snapshot frame writer ─▶ snapshot.dat
+            64 KiB of plaintext per frame, sealed as it is written
+        ▼ fsync ─▶ MaxSnapshotSize checked on the bytes the writer consumed
+   hash the file ─▶ snapshot.meta (DataLen, DataHash, Epoch = lowest frame epoch)
+        ─▶ [ExportPath copy]
         ▼ under the node's write lease: rename stage ─▶ snapshot-<index>
    LogDB.SaveSnapshot ─▶ epoch pins released ─▶ log compaction below index
 
  TRANSFER
-   leader: decryptSnapshotToSibling ─▶ plaintext temp
-        ─▶ 2 MB chunks over QUIC (mTLS) ─▶ follower
+   leader: open snapshot.dat, checking DataLen/DataHash as it reads
+        [encrypted: decrypt into an anonymous scratch]
+        ─▶ 2 MiB chunks over QUIC (mTLS); the final chunk is withheld until
+           the check passes ─▶ follower
    follower: reassemble ─▶ re-encrypt under the RECEIVER'S barrier
-        ─▶ staged snapshot.dat + snapshot.meta, fsync ─▶ publish the dir
+        ─▶ staged snapshot.dat + snapshot.meta, fsync ─▶ publish the directory
         ─▶ InstallSnapshot to raft ─▶ await raft's verdict
-             adopted:  LogDB.SaveSnapshot ─▶ log floor ─▶ RequestSnapshotRecovery
-             refused / declined / superseded: discard the unrecorded dir
-        ─▶ SnapshotReceived back to the leader's inbox
+             adopted:  LogDB.SaveSnapshot ─▶ log floor ─▶ state-machine recovery
+             refused / declined / superseded: discard the unrecorded directory
+        ─▶ SnapshotReceived back to the leader
 
  RECOVER
-   verify DataLen + DataHash (xxhash64 of the file AS STORED)
-        ─▶ decryptSnapshotToSibling ─▶ Snappy decompress if configured
+   snapshot.meta must exist and carry DataLen + DataHash; verify them
+        ─▶ [encrypted: decrypt into an anonymous scratch] ─▶ Snappy decompress if recorded
         ─▶ SM.RecoverFromSnapshot(r)     [always plaintext]
-        ─▶ update lastApplied, lastSnapshotIndex ─▶ remove the temp file
+        ─▶ update lastApplied ─▶ close the scratch
 ```
 
 **The receive is two-phase.** Everything durable about a received snapshot
-beyond its own directory — the LogDB record, the log floor raised to it,
-reclaiming older directories, the state-machine recovery — waits for raft to
-ADOPT the install, which the step worker reports back per install. Raft can
-refuse one that passed every host check (its sender deposed while the stream
-was in flight, a position or membership out of bounds) or decline one it is
-already past; either way the unrecorded directory is discarded and nothing
-else changed. Until 0.14.0 those steps ran on delivery, so a refused snapshot
-stayed recorded with the floor raised under it and a recovery queued that the
-log could never catch up to, and the shard failed. Once raft has adopted the
-install the artifact is never rolled back: a record that cannot then be
-written fails the shard instead, and a restart replays the log.
+beyond its own directory (the LogDB record, the raised log floor, reclaiming
+older directories, state-machine recovery) waits for raft to adopt the install,
+which the step worker reports back per install. Raft can refuse one that passed
+every host check (its sender was deposed while the stream was in flight, or a
+position or membership is out of bounds) or decline one it is already past.
+Either way the unrecorded directory is discarded and nothing else changes. Once
+raft has adopted the install, the artifact is never rolled back: a record that
+cannot then be written fails the shard instead, and a restart replays the log.
 
-The verdict is bound to one shard incarnation. The install is injected into,
-and recovery queued on, exactly the node the verdict is awaited on — never
-whichever node holds the shard ID by then. A node that stops or fails, or a
-step-worker panic that interrupts the install's own step (which also fails
-the node), answers **abandoned**, and that does not prove raft never stepped it, so the directory
-is kept rather than discarded: if the stopped incarnation's commit pipeline
-records it, the next start recovers from it; if not, it is an orphan the next
-receive or GC reclaims. The next receive cannot race that record: a receive
-for a stopping shard is refused before staging anything, its publish and its
-post-adoption writes run under the node's write lease, and `UnloadNode` does
-not return until the stopped incarnation can no longer write LogDB (see the
-commit fence in the multi-group-host engineering doc). Installs a panic
-dropped before they were stepped answer **superseded** and are discarded; an
-install whose step the panic interrupted fails the shard, because raft's state
-after a partial restore is unknown.
+The verdict is bound to one shard incarnation. The install is injected into, and
+recovery queued on, exactly the node the verdict is awaited on, never whichever
+node holds the shard ID by then.
 
-`DataHash` is computed over the file **as stored** — before decryption and
-before decompression — so it verifies the artifact rather than its
-interpretation.
+- A node that stops or fails, or a step-worker panic that interrupts the
+  install's own step (which also fails the node), answers **abandoned**. That
+  does not prove raft never stepped it, so the directory is kept: if the stopped
+  incarnation's commit pipeline records it, the next start recovers from it;
+  otherwise it is an orphan the next receive or GC reclaims.
+- The next receive cannot race that record. A receive for a stopping shard is
+  refused before it stages anything, its publish and post-adoption writes run
+  under the node's write lease, and `UnloadNode` does not return until the
+  stopped incarnation can no longer write LogDB (see the commit fence in
+  [the multi-group host engineering doc](../multi-group-host/engineering.md)).
+- Installs a panic dropped before they were stepped answer **superseded** and
+  are discarded. An install whose step the panic interrupted fails the shard,
+  because raft's state after a partial restore is unknown.
 
-Verification is skipped for a `snapshot.meta` written before those fields
-existed (`DataHashRecorded` is false). Such a record is not an error — it is a
-pre-`0.5.0` artifact and recovers unverified — but a truncated file from that
-era still recovers as if complete. Snapshots taken by this build are verified.
+**Every recorded snapshot is verified.** A save, receive, import or export that
+cannot hash its artifact fails before anything is published, recorded or
+compacted. A recorded snapshot whose `snapshot.meta` is missing, unreadable,
+malformed or lacks `DataLen`/`DataHash` fails closed with `ErrSnapshotCorrupt`:
+nothing can vouch for its artifact, and there is no unverified path.
 
 ## Trust boundaries
 
 - **A received snapshot is untrusted input.** The sender is mTLS-authenticated
-  and a committed member; its payload is not. Chunk count, declared sizes and
-  memory are all bounded before anything is committed —
+  and a committed member; its payload is not trusted. Chunk count, declared
+  sizes and memory are bounded before anything is committed:
   `MaxConcurrentSnapshotReceives`, `MaxSnapshotReceiveMemory`,
   `MaxSnapshotReceiveRate`, `maxAdmissibleChunkCount`.
-- **The state machine always sees plaintext** during `RecoverFromSnapshot`,
-  whether or not encryption is on.
-- **Snapshot transport is plaintext under TLS.** Confidentiality in transit is
-  the transport's; confidentiality at rest is the barrier's, and each node's is
-  its own.
+- **The state machine always sees plaintext** in `RecoverFromSnapshot`, whether
+  or not encryption is on.
+- **Transport is plaintext under TLS.** Confidentiality in transit belongs to the
+  transport; confidentiality at rest belongs to each node's own barrier.
+- **Plaintext on disk has no name.** Decryption for recovery and send goes into
+  an unlinked scratch file, so a crash cannot leave a readable copy.
 - **A snapshot carries membership**, so importing one changes who this replica
   believes the cluster is. `ImportSnapshot` is therefore a deliberate,
-  offline-only operation — see the scope fence.
+  offline-only operation.
+- **No at-rest tail-truncation detection without positional binding.** The
+  `Final` flag needs a barrier that binds context; a plaintext `snapshot.dat` is
+  protected by `DataLen`/`DataHash` only.
 
 ## Component boundaries
 
-- **`pkg/internal/engine/snapshot_pool.go`** — the pool, `saveSnapshot`,
-  `decryptSnapshotToSibling`, recovery.
-- **`pkg/internal/engine/snapshot_frame_writer.go`** — `snapshotFrameWriter`,
-  the `io.Writer` the state machine saves into: frames, epoch pins, the lowest
-  frame epoch, and the plaintext count the size limit is measured on.
-- **`pkg/internal/engine/snapshot_meta.go`** — `SnapshotAAD`,
-  `NewSnapshotAAD`, `SnapshotFrameAADLen`, the metadata record.
-- **`pkg/snapshot_*.go`** — the public `SnapshotOption`, `ImportOption`,
-  `ReencryptSnapshotFile`, and the snapshot error vocabulary.
-- **`pkg/internal/transport`** — chunked send and bounded receive.
-- **`pkg/logdb`** — snapshot metadata persistence, and the compaction floor a
-  snapshot establishes.
-- **`pkg/sm`** — `SaveSnapshot`, `PrepareSnapshot`, `RecoverFromSnapshot`.
-
-This feature is part of the go-quicraft capability row covering Raft consensus
-and log replication in `docs/00 §R`.
+| Location | Holds |
+|---|---|
+| `pkg/internal/engine/snapshot_pool.go` | the pool, the save, recovery, decrypt-to-scratch, the DEK purge floor, snapshot GC |
+| `pkg/internal/engine/snapshot_frame_writer.go` | the frame writer the state machine saves into: frames, epoch pins, the lowest frame epoch, the plaintext count the size limit uses |
+| `pkg/internal/engine/snapshot_frame_reader.go` | `OpenSnapshotFrames`, the only frame reader |
+| `pkg/internal/engine/snapshot_meta.go` | `SnapshotMeta`, `SnapshotAAD`, `NewSnapshotAAD`, `SnapshotFrameAADLen` |
+| `pkg/internal/engine/snapshot_integrity.go` | `DataLen`/`DataHash` hashing and verification |
+| `pkg/internal/engine/snapshot_scratch.go` | `CreateAnonymousScratch` |
+| `pkg/snapshot_option.go`, `pkg/snapshot_reencrypt.go`, `pkg/snapshot_artifact_trailer.go` | `SnapshotOption`, `ReencryptSnapshotFile`, the export trailer |
+| `pkg/host.go`, `pkg/messagehandler.go` | request, export, import, send and receive |
+| `pkg/internal/transport` | chunked send and bounded receive |
+| `pkg/logdb` | snapshot metadata persistence, and the compaction floor a snapshot sets |
+| `pkg/sm` | `SaveSnapshot`, `PrepareSnapshot`, `RecoverFromSnapshot` |
 
 ## What this feature deliberately does not do
 
 - **No snapshot contents.** The state machine writes them; this library never
   parses them.
 - **No incremental or differential snapshots.** Each one is a full image.
-- **No automatic scheduling beyond an applied-entry count.** No time-based
-  cadence, because a wall clock would make replicas snapshot at different log
-  positions.
+- **No scheduling beyond an applied-entry count.** No time-based cadence: a wall
+  clock would make replicas snapshot at different log positions.
 - **No encryption in transit at this layer.** TLS covers it.
 - **No cross-node key sharing.** The receiver re-encrypts under its own barrier.
-- **No at-rest tail-truncation detection.** Stated as a limit, not a footnote.
 - **No automatic import.** `ImportSnapshot` is an explicit, offline operation
-  that rewrites a replica's identity and membership.
+  that rewrites a replica's membership.
 - **No backup or retention policy.** Which exported snapshots to keep, and
   where, belongs to the layer that owns the data directory.

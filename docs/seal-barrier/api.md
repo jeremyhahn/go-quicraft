@@ -1,35 +1,31 @@
-# Seal & Barrier — API
+# Seal and barrier: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-09-15
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
+go-quicraft is a library, and the Go API is the only API.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the whole surface below. This is the transport. |
-| Unix socket | n/a — this repository serves no socket |
-| REST | n/a — this repository exposes no HTTP handler |
-| gRPC | n/a — this repository defines no gRPC service |
-| QUIC | n/a. The repository's QUIC listener carries Raft messages only; the barrier is at-rest, the transport is in-transit, and snapshots cross it as **plaintext** under mTLS. See [`../quic-transport/api.md`](../quic-transport/api.md). |
-| MCP | n/a — this repository registers no MCP tools |
+| Embedded (Go call) | the whole surface below |
+| Unix socket | n/a: this repository serves no socket |
+| REST | n/a: no HTTP handler |
+| gRPC | n/a: no gRPC service |
+| QUIC | n/a. The QUIC listener carries Raft messages only; the barrier is at-rest, the transport is in-transit, and snapshots cross it as plaintext under mTLS. See [`../quic-transport/api.md`](../quic-transport/api.md). |
+| MCP | n/a: no MCP tools |
 
-These are not missing-capability rows. In the portfolio capability register the
-go-quicraft rows for `Barrier` / `SealingStrategy` / `EpochBarrier` /
-`StrategyID` and for the `none` + `passphrase` strategies are consumed by
-**implementing the interfaces and re-exporting the types**, not by calling a
-client — the register records the re-export path through go-qrdb's `types_seal.go`
-and `types_seal_strategy.go` rather than a transport tier. A barrier endpoint in
-this repository would be the defect, not the fix.
+These rows are not gaps. The barrier and strategy types are consumed by
+implementing the interfaces and re-exporting the types one layer up, not by
+calling a client. A barrier endpoint in this repository would be a defect.
 
 ## Go API
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/seal`
 
-### Capability: construct a barrier
+### Construct a barrier
 
 ```go
 func DefaultBarrierConfig(deploymentID uint64) BarrierConfig
@@ -41,18 +37,17 @@ func (c *BarrierConfig) GetNonceTracking() bool
 
 | | |
 |---|---|
-| Request | a `BarrierConfig` — see [`engineering.md`](engineering.md) §4 for every field |
+| Request | a `BarrierConfig`; see [`engineering.md`](engineering.md) §4 for every field |
 | Response | `*Barrier` in the Uninitialized state |
 | Errors | `ErrUnsupportedAlgorithm`, `ErrAlgorithmNotFIPSApproved`, `ErrFIPSUnavailable`, and the other `Validate` failures |
-| Permission | none — in-process call |
+| Permission | none; in-process call |
 
 `MustNewBarrier` panics instead of returning an error and is for
 compile-time-constant configs only. `NewEpochBarrier` / `MustNewEpochBarrier`
-are functions that call the same constructors — not `var` aliases, which every
-importer could reassign (#95, #117) — and `EpochBarrier` is a type alias of
-`Barrier`.
+are functions that call the same constructors (not `var` aliases, which every
+importer could reassign), and `EpochBarrier` is a type alias of `Barrier`.
 
-### Capability: first boot — create the root key
+### First boot: create the root key
 
 ```go
 func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, creds Credentials) error
@@ -64,12 +59,12 @@ func (b *Barrier) SealedRootKeyData() *SealedRootKey
 | Request | a strategy and its credentials |
 | Response | barrier is Unsealed at epoch 1 |
 | Errors | `ErrBarrierAlreadyInit`, `ErrBarrierUnsealed`, `ErrContextAADUnsupported`, strategy errors (`*Error`) |
-| Permission | none in this library; the credential **is** the authorization |
+| Permission | none in this library; the credential is the authorization |
 
 **`Initialize` does not call `StatePersister`.** Persist
 `SealedRootKeyData()` yourself, once, at bootstrap.
 
-### Capability: roll back a failed first boot
+### Roll back a failed first boot
 
 ```go
 func (b *Barrier) Reset() error
@@ -80,17 +75,17 @@ func (b *Barrier) Reset() error
 | Request | none; the barrier must be Sealed |
 | Response | barrier is Uninitialized and accepts `Initialize` again |
 | Errors | `ErrBarrierNotInit`, `ErrBarrierUnsealed`, `ErrBarrierSuperseded`, `ErrResetNotFirstBoot`, `ErrEpochsInFlight` |
-| Permission | none — in-process call on the concrete barrier |
+| Permission | none; in-process call on the concrete barrier |
 
 For an embedder whose bootstrap fails after `Initialize` returned, and which
 cannot swap the barrier instance because the WAL and host already hold it:
 `Seal`, then `Reset`, then `Initialize` again. Every key enclave is destroyed
 and the epoch, DEK maps, load generation and invocation accounting are cleared.
-**`Reset` does not touch persisted state** — delete or replace any blob you
+**`Reset` does not touch persisted state**: delete or replace any blob you
 already saved. The next `Initialize` draws a new root key and salt, so data
 sealed under the discarded key fails with `ErrDecryptionFailed`.
 
-`Reset` rolls back **only a first boot**: a root key this process created with
+`Reset` rolls back only a first boot: a root key this process created with
 `Initialize`, with no `SetSealedRootKey` applied since and no rotation
 (`Rotate`, or the forced rotation inside `Unseal`) past epoch 1. Anything else
 returns `ErrResetNotFirstBoot` and leaves the barrier untouched, because
@@ -101,7 +96,7 @@ counters.
 `Reset` is a method of `*Barrier` only. The host-facing `Barrier` interface and
 the WAL's `WALBarrier` carry no lifecycle methods, and gain none.
 
-### Capability: restart — adopt and unseal persisted state
+### Restart: adopt and unseal persisted state
 
 ```go
 func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error
@@ -119,7 +114,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 **`Unseal` writes**: it claims the blob (`LoadGeneration+1`) before the barrier
 will encrypt, and usually rotates. Both need a `StatePersister`.
 
-### Capability: encrypt at rest
+### Encrypt at rest
 
 ```go
 func (b *Barrier) Encrypt(dst, plaintext []byte) ([]byte, error)
@@ -137,14 +132,14 @@ func (b *Barrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byt
 | Errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrInvocationLimitExceeded`, `ErrNonceReuse`, `ErrPlaintextTooLarge`, `ErrHardwareMode` (non-empty context on an encryptor without AAD capability), `*CipherError` |
 | Permission | none |
 
-The `Pinned` forms seal the frame **and** register its epoch in-flight under one
+The `Pinned` forms seal the frame and register its epoch in-flight under one
 lock, closing the window in which a concurrent `Rotate` + `PurgeEpochsBefore`
 could drop the DEK of a frame already written into an artifact.
 
 A nil or empty `contextAAD` produces byte-identical, epoch-only AAD, so
 `EncryptWithContext(dst, pt, nil)` and `Encrypt(dst, pt)` are interoperable.
 
-### Capability: decrypt at rest
+### Decrypt at rest
 
 ```go
 func (b *Barrier) Decrypt(dst, ciphertext []byte) ([]byte, error)
@@ -155,20 +150,20 @@ func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, c
 
 | | |
 |---|---|
-| Request | ciphertext, and the **exact** context bytes used at encrypt time |
+| Request | ciphertext, and the exact context bytes used at encrypt time |
 | Response | plaintext |
-| Errors | `ErrBarrierSealed`, `ErrCiphertextTooShort`, and `ErrDecryptionFailed` for **everything else** |
+| Errors | `ErrBarrierSealed`, `ErrCiphertextTooShort`, and `ErrDecryptionFailed` for everything else |
 | Permission | none |
 
-**`ErrDecryptionFailed` is deliberately generic** — unknown epoch,
-authentication failure, corruption and wrong context all return it, so error
-type cannot be used as an oracle.
+`ErrDecryptionFailed` is deliberately generic: unknown epoch, authentication
+failure, corruption and wrong context all return it, so the error type cannot be
+used as an oracle.
 
-The context is **not stored** in the ciphertext; the caller reproduces it.
-**Never retry without the context on failure** — that retry is the vulnerability
-the binding exists to prevent.
+The context is not stored in the ciphertext; the caller reproduces it. **Never
+retry without the context on failure**: that retry is the vulnerability the
+binding exists to prevent.
 
-### Capability: rotate and purge epochs
+### Rotate and purge epochs
 
 ```go
 func (b *Barrier) Rotate() (uint64, error)
@@ -182,30 +177,31 @@ func (b *Barrier) DeregisterInFlightEpoch(epoch uint64)
 | | |
 |---|---|
 | `Rotate` response | the new epoch |
-| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, `*StatePersistError{Op:"rotate"}`, `*KeyDerivationError` — checked in that order |
+| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, `*StatePersistError{Op:"rotate"}`, `*KeyDerivationError`, checked in that order |
 | `PurgeEpochsBefore` response | the number of epochs dropped |
 | `PurgeEpochsBefore` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrPurgeCurrentEpoch`, `ErrNoStatePersister` (only when something would be purged), `*StatePersistError{Op:"purge"}` |
 | Permission | none |
 
-Both persist **before** committing. `PurgeEpochsBefore` never drops the current
+Both persist before committing. `PurgeEpochsBefore` never drops the current
 epoch or an epoch with a non-zero in-flight refcount, and returns `(0, nil)`
 when there is nothing to purge.
 
 `RegisterInFlightEpoch` / `DeregisterInFlightEpoch` are a refcount the snapshot
 receive path holds across a transfer.
 
-### Capability: seal
+### Seal
 
 ```go
 func (b *Barrier) Seal() error
 ```
 
 Drops every key reference, clears any delegated encryptor, and resets the
-context binding to `ContextBindingUnresolved`. Prefer `Host.Seal()` /
-`Host.Close()`, which quiesce the pipeline first so the engine does not take an
-`ErrBarrierSealed` storm.
+context binding to `ContextBindingUnresolved`. For the host-wide barrier, prefer
+`Host.Close()`, which drains the pipeline before sealing so the engine does not
+take an `ErrBarrierSealed` storm. Per-shard barriers are sealed by the caller
+after `Close` returns.
 
-### Capability: introspect state and capability
+### Introspect state and capability
 
 ```go
 func (b *Barrier) IsInitialized() bool
@@ -222,12 +218,12 @@ func (b *Barrier) InvocationCounter() InvocationCounter
 func (b *Barrier) NonceTracker() NonceTrackerProvider
 ```
 
-`SupportsContextAAD()` is safe to **ask** at any time and unsafe to
-**remember** — see [`engineering.md`](engineering.md) §2. `IsHardwareMode()` is
+`SupportsContextAAD()` is safe to ask at any time and unsafe to remember; see
+[`engineering.md`](engineering.md) §2. `IsHardwareMode()` is
 true for both `ContextBindingUnsupported` and `ContextBindingPlaintext`;
 `IsPlaintextMode()` separates them.
 
-### Capability: root-key access (rare)
+### Root-key access (rare)
 
 ```go
 func (b *Barrier) RootKey() ([]byte, error)
@@ -236,14 +232,13 @@ func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error
 func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error
 ```
 
-`RootKeyProtected` is the form to prefer: it returns a wiped-on-`Destroy`
-enclave, and it returns it FROZEN (#95) — a key to read and destroy, not a
-buffer to edit, so a write through a slice retained past the borrow faults
-instead of silently rewriting the caller's copy. (Only the caller's copy is ever
-at stake: `Open` decrypts into a fresh enclave each call, so the barrier's own
-root key is not reachable this way.) **Do not zero the borrowed bytes yourself
-before `Destroy`** — that is a write to a read-only region and faults; `Destroy`
-is the release. `RootKey` returns an ordinary slice the caller must zero itself.
+`RootKeyProtected` is the form to prefer. It returns a frozen enclave that
+`Destroy` wipes: a key to read and destroy, not a buffer to edit, so a write
+through a slice retained past the borrow faults instead of silently rewriting
+the caller's copy. Only the caller's copy is at stake, because each call
+decrypts into a fresh enclave. **Do not zero the borrowed bytes yourself before
+`Destroy`**: that is a write to a read-only region and faults; `Destroy` is the
+release. `RootKey` returns an ordinary slice the caller must zero itself.
 Both return `ErrNoRootKeyAvailable` in no-encryption mode.
 
 ### Interfaces you implement
@@ -263,20 +258,27 @@ type SealingStrategy interface {
 Implementer obligations:
 
 - Every method takes a `context.Context` where it may block on an external
-  device, and `Credentials` **by value**.
-- `Credentials.Secret` is a `[]byte`, not a `string`, so callers can wipe it.
-  Each strategy interprets it differently: the software strategy as an Argon2id
-  or PBKDF2 passphrase, TPM2 possibly as an authorization value, cloud KMS
-  typically ignoring it in favour of ambient credentials.
-- `UnsealRootKey` returns a slice **the caller owns and must zero**.
+  device, and `Credentials` by value.
+- `Credentials.Secret` is a `*enclave.SealedEnclave` (built by
+  `NewCredentials`, which wipes the caller's slice). The caller owns it; a
+  strategy opens it, uses the plaintext and destroys the opened copy, and never
+  destroys the credential itself. Each strategy interprets it differently: the
+  software strategy as an Argon2id or PBKDF2 passphrase, TPM2 possibly as an
+  authorization value, cloud KMS typically ignoring it in favour of ambient
+  credentials.
+- `UnsealRootKey` returns a slice the caller owns and must zero.
+- A strategy may also implement `ProtectedSealingStrategy` to take and return
+  the root key in locked memory; see
+  [`../shamir-primitive/api.md`](../shamir-primitive/api.md#go-api-the-protected-sealing-pair).
 - `Close` must be idempotent.
 - **`BarrierEncryptor` returning `(nil, nil)` is correct and intended.** It
   means "I seal only the root key; the barrier derives epoch DEKs and does all
   bulk encryption itself." Every non-hardware strategy returns it, including
-  this repository's own `SoftwareStrategy`. A non-nil return delegates the
-  entire data path — see [`architecture.md`](architecture.md).
+  this repository's `SoftwareStrategy` and `NoneStrategy`. A non-nil return
+  delegates the entire data path; see [`architecture.md`](architecture.md).
 - `Available()` is a startup diagnostic, not an auto-selection mechanism. There
-  is no preference order anywhere in `pkg/seal`.
+  is no default strategy and no preference order anywhere in `pkg/seal`;
+  selection is always explicit at barrier or tenant setup.
 
 ```go
 type SymmetricEncrypter interface {
@@ -284,7 +286,7 @@ type SymmetricEncrypter interface {
     Decrypt(ciphertext []byte) ([]byte, error)
 }
 
-type AADSymmetricEncrypter interface {   // OPTIONAL — a promise, not a convenience
+type AADSymmetricEncrypter interface {   // OPTIONAL: a promise, not a convenience
     SymmetricEncrypter
     EncryptWithAAD(plaintext, aad []byte) ([]byte, error)
     DecryptWithAAD(ciphertext, aad []byte) ([]byte, error)
@@ -295,7 +297,7 @@ type AADSymmetricEncrypter interface {   // OPTIONAL — a promise, not a conven
 end to end** such that `DecryptWithAAD` fails when a different `aad` is
 supplied. An encryptor that cannot bind AAD must implement **only**
 `SymmetricEncrypter`; the barrier then refuses a non-empty context with
-`ErrHardwareMode` — loud, at the write — and `RequireContextAAD` refuses the
+`ErrHardwareMode` (loudly, at the write) and `RequireContextAAD` refuses the
 deployment at setup. The declaration is verified behaviourally at `Initialize`
 and `Unseal`.
 
@@ -329,16 +331,16 @@ func (s *SoftwareStrategy) DeferredPassphrase() bool
 
 - `NewSoftwareStrategy` auto-selects the KDF from `FIPSEnabled()`.
 - `NewSoftwareStrategyWithParams` names Argon2id explicitly and is refused with
-  `ErrKDFNotFIPSApproved` in FIPS mode; in a `-tags fips` **build** it exists
-  and compiles but cannot succeed, answering `ErrKDFUnsupportedVersion`.
+  `ErrKDFNotFIPSApproved` in FIPS mode; in a `-tags fips` build it exists and
+  compiles but cannot succeed, answering `ErrKDFUnsupportedVersion`.
 - `NewDeferredSoftwareStrategy` takes no passphrase at construction and reads it
-  from `Credentials.Secret` at seal/unseal time — for flows where the strategy
-  is built before an operator has supplied anything. It derives with the
-  **defaults**.
+  from `Credentials.Secret` at seal/unseal time, for flows where the strategy is
+  built before an operator has supplied anything. It derives with the defaults.
 - `NewDeferredSoftwareStrategyWithParams` is that constructor with an explicit
-  work factor. Deferred binding and tunability used to be disjoint — the two
-  tunable constructors are both *bound*, and the only deferred one took no
-  parameters — so a caller could have one or the other and never both.
+  work factor, and the only way to get both deferred binding and a tuned work
+  factor.
+- Sealed format (`SealedRootKey.Ciphertext`):
+  `[KDFSalt:32 ‖ Nonce:12 ‖ EncryptedRootKey ‖ Tag:16]`.
 
 **Preserving a work factor across a strategy replacement.** `KDFParams()` reads
 the factor off the strategy in hand; `NewDeferredSoftwareStrategyWithParams`
@@ -349,19 +351,17 @@ no branch on the algorithm:
 replacement, err := seal.NewDeferredSoftwareStrategyWithParams(old.KDFVersion(), old.KDFParams())
 ```
 
-This is not optional hardening. **A sealed blob records the KDF *version* byte
-and never the params**, so a blob sealed at a non-default factor can only be
-unsealed by a strategy carrying the same factor — the live strategy object is
-the only place that number exists. A replacement built at the defaults silently
-resets a hardened deployment toward the *weaker* setting, on the credential that
-wraps the root key. Taking `(version, params)` together, rather than mirroring
-the bound constructors' split signatures, is what stops a caller that is merely
-copying settings from picking the wrong algorithm and failing on the FIPS leg
-only.
-- Seal format: `[KDFSalt:32 ‖ Nonce:12 ‖ EncryptedRootKey ‖ Tag:16]`.
+This is not optional hardening. **A sealed blob records the KDF version byte and
+never the params**, so a blob sealed at a non-default factor can only be unsealed
+by a strategy carrying the same factor; the live strategy object is the only
+place that number exists. A replacement built at the defaults silently moves a
+hardened deployment toward the weaker setting, on the credential that wraps the
+root key. Taking `(version, params)` together, rather than mirroring the bound
+constructors' split signatures, stops a caller that is merely copying settings
+from picking the wrong algorithm and failing on the FIPS leg only.
 
 **`tpm2`, `pkcs11`, `awskms`, `gcpkms`, `azurekv` and `vault` are go-xkms's;
-`shamir` is go-qrdb's.** This repository defines the `StrategyID` *type* and
+`shamir` is go-qrdb's.** This repository defines the `StrategyID` type and
 exactly two values.
 
 ### Algorithms and helpers
@@ -385,10 +385,10 @@ func BoolPtr(v bool) *bool
 | `AlgAES128GCM` | 0x01 | 16 | 12 | never |
 | `AlgAES192GCM` | 0x02 | 24 | 12 | never |
 | `AlgAES256GCM` | 0x03 | 32 | 12 | yes, with hardware AES or under FIPS |
-| `AlgChaCha20Poly1305` | 0x04 | 32 | 12 | yes, without hardware AES (absent in a FIPS build) |
+| `AlgChaCha20Poly1305` | 0x04 | 32 | 12 | yes, without hardware AES and outside FIPS mode (absent in a FIPS build) |
 | `AlgXChaCha20Poly1305` | 0x05 | 32 | 24 | never (absent in a FIPS build) |
 
-## `pkg/crypto` — compatibility shim
+## `pkg/crypto`: compatibility shim
 
 ```go
 type Barrier         = seal.Barrier
@@ -401,25 +401,27 @@ func MustNewBarrier(config BarrierConfig) *Barrier        // calls seal.MustNewB
 func NewCredentials(secret []byte) (Credentials, error)   // calls seal.NewCredentials, consuming secret
 ```
 
-Type aliases and forwarding functions only — functions, not `var`s holding
-function values, for the reason at `NewEpochBarrier` (#95, #117). No cipher
-code lives there. New code should import `pkg/seal`.
+Type aliases and forwarding functions only (functions, not `var`s holding
+function values, for the reason given at `NewEpochBarrier`). No cipher code
+lives there. New code should import `pkg/seal`.
 
 ## Versioning and deprecation
 
-- **Ciphertext frame**: no version discriminator, and none is needed — the epoch
-  and `algID` are in the header, and the module-nonce and hand-written-nonce
-  constructions produce byte-identical output. `legacy_format_test.go` proves
-  that against checked-in pre-migration bytes.
+- **Ciphertext frame**: no version discriminator, and none is needed: the epoch
+  and `algID` are in the header. Module-generated and caller-supplied nonces
+  produce the same frame layout, which `legacy_format_test.go` checks against
+  checked-in bytes.
 - **`SealedRootKey.Version`**: the sealed-blob format version.
 - **`HKDFVersion`**: current is `HKDFV2`. `0` means pre-versioning and derives
   as v1; anything above the current version is refused with
   `ErrUnsupportedHKDFVersion`.
-- **`StateMAC` covered-field encoding**: version byte `2`. A v1 blob is accepted
-  once, at WARN, only when `LoadGeneration == 0`, and is restamped at v2.
+- **`StateMAC` covered-field encoding**: version byte `2`. A tag over the
+  version-1 field set is accepted once, at WARN, only when
+  `LoadGeneration == 0`, and is restamped at version 2.
 - **`KDFVersion`**: `KDFArgon2id` (1) and `KDFPbkdf2SHA256` (2). Both identifiers
   stay defined in every build because they appear in data already on disk.
-- Nothing here is deprecated. `EpochBarrier`, `NewEpochBarrier` and
+- **Deprecated**: `ProtectedCredentials` and `NewProtectedCredentials`, aliases
+  for `Credentials` and `NewCredentials`. `EpochBarrier`, `NewEpochBarrier` and
   `MustNewEpochBarrier` are supported aliases, not legacy names.
 - A signature change to `SealingStrategy`, `SymmetricEncrypter` or
   `AADSymmetricEncrypter` breaks go-xkms and go-qrdb implementations. Sequence

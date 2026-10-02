@@ -1,30 +1,24 @@
 # State Machines — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library, and this feature is the clearest case of what that
-means: **you consume it by implementing an interface, not by calling a client.**
+You consume this feature by implementing an interface, not by calling a client.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the interfaces below. This is the transport, and it points *inward* — the library calls you. |
-| Unix socket / REST / gRPC / QUIC / MCP | n/a — this repository serves none of them |
+| Embedded (Go call) | the interfaces below; the library calls you |
+| Unix socket, REST, gRPC, QUIC, MCP | not applicable: this repository serves none of them |
 
-Not missing-capability rows. The portfolio capability register records
-go-quicraft's Raft row as "consumed by interface implementation, not client
-calls", and this feature is that row's clearest instance.
+## The interface you implement
 
-## Go API — the interface you implement
+Import: `github.com/jeremyhahn/go-quicraft/pkg/sm`. Implement exactly one of the
+three.
 
-Import: `github.com/jeremyhahn/go-quicraft/pkg/sm`
-
-Implement **exactly one** of the three.
-
-### Tier 0 — `StateMachine`
+### Tier 0: `StateMachine`
 
 ```go
 type StateMachine interface {
@@ -36,11 +30,9 @@ type StateMachine interface {
 }
 ```
 
-All state in memory, serialized access — `Update` and `Lookup` never run
-concurrently, because the adapter holds a read guard for writing across `Apply`
-and for reading across every read entry point.
+All state in memory. `Update` and `Lookup` never run concurrently.
 
-### Tier 1 — `ConcurrentStateMachine`
+### Tier 1: `ConcurrentStateMachine`
 
 ```go
 type ConcurrentStateMachine interface {
@@ -53,11 +45,11 @@ type ConcurrentStateMachine interface {
 }
 ```
 
-`Lookup` runs concurrently with `Update`. `PrepareSnapshot` captures a
-point-in-time context that `SaveSnapshot` then writes **without blocking**
-`Update`.
+`Lookup` and `GetHash` (if implemented) run concurrently with `Update`; you
+synchronize them. `PrepareSnapshot` runs with applies paused and captures a
+point-in-time value that `SaveSnapshot` then streams while applies continue.
 
-### Tier 2 — `DiskStateMachine`
+### Tier 2: `DiskStateMachine`
 
 ```go
 type DiskStateMachine interface {
@@ -72,59 +64,63 @@ type DiskStateMachine interface {
 }
 ```
 
-`Open` is called at startup and returns the **last applied index** from the
-machine's own storage. Raft replays from there, so the machine **must replay
-already-applied entries idempotently**.
+`Open` returns the last index your store durably applied, or 0 on a fresh start.
+Raft replays from there, so replay of already-applied entries must be
+idempotent. Concurrency is as for tier 1. Client sessions are refused on this
+tier with `ErrSessionsUnsupportedOnDisk`.
 
-### The values that cross the boundary
+### Values that cross the boundary
 
 ```go
 type Entry struct {
-    Index uint64   // Raft log index
-    Cmd   []byte   // proposal payload
+    Index uint64 // Raft log index
+    Cmd   []byte // proposal payload
 }
-func (e *Entry) CopyCmd() []byte
+func (e *Entry) CopyCmd() []byte // nil for an empty Cmd
 
 type Result struct {
-    Value uint64   // application-defined result code
-    Data  []byte   // optional data, returned through RequestState.Result()
+    Value uint64 // application-defined result code
+    Data  []byte // optional; returned through RequestState.Result()
 }
+
+const ResultSessionExpired uint64 = math.MaxUint64 - 2 // reserved, set by the adapter
+const ResultInvalidCommand uint64 = math.MaxUint64 - 3 // reserved, for undecodable payloads
 ```
 
-`Entry` is a **deliberately simplified view** of `proto.Entry`: no `Term`, no
-`Key`, no `ClientID`. `Term` is excluded because a state machine must be
-term-agnostic — reading it is a route to non-determinism.
+`Entry` carries no term, type or session fields. A state machine must be
+term-agnostic.
 
-`Cmd` is an owned copy by default. **When `Config.ZeroCopyEntryCmd` is true it
-aliases an internal buffer reused after `Update` returns**, and you must copy it
-to retain it. `CopyCmd()` is the one-call form.
+`Cmd` is an owned copy by default. When `Config.ZeroCopyEntryCmd` is true it
+aliases an engine buffer reused after `Update` returns, and you must copy what
+you keep; `CopyCmd` is the one-call form.
 
-Reserved `Result.Value` constants are used internally by the RSM layer to signal
-session outcomes — `ResultSessionExpired` and its neighbours. Do not return
-them from application code.
+Do not return `ResultSessionExpired`. Write `ResultInvalidCommand` for a
+committed payload you cannot decode, instead of returning an error.
 
-### Registering your state machine
+### Registering a state machine
 
 ```go
 type CreateFunc func(shardID, replicaID uint64) interface{}
 
+type CreateStateMachineFunc           func(shardID uint64, replicaID uint64) StateMachine
+type CreateConcurrentStateMachineFunc func(shardID uint64, replicaID uint64) ConcurrentStateMachine
+type CreateDiskStateMachineFunc       func(shardID uint64, replicaID uint64) DiskStateMachine
+
 func NewCreateFunc(fn CreateStateMachineFunc) CreateFunc
 func NewConcurrentCreateFunc(fn CreateConcurrentStateMachineFunc) CreateFunc
 func NewDiskCreateFunc(fn CreateDiskStateMachineFunc) CreateFunc
-
-type CreateStateMachineFunc           func(shardID, replicaID uint64) StateMachine
-type CreateConcurrentStateMachineFunc func(shardID, replicaID uint64) ConcurrentStateMachine
-type CreateDiskStateMachineFunc       func(shardID, replicaID uint64) DiskStateMachine
 ```
 
-Use the typed wrapper for your tier. It makes the choice explicit at the call
-site rather than inferred from a method set you may have got wrong.
+Use the typed wrapper for your tier:
 
 ```go
-err := host.StartShard(members, join, sm.NewCreateFunc(newMySM), cfg)
+err := host.StartShard(members, false, sm.NewCreateFunc(newMySM), cfg)
 ```
 
-### Optional capability interfaces
+A raw `CreateFunc` whose value implements none of the three interfaces makes
+`StartShard` return `quicraft.ErrInvalidSMType`.
+
+### Optional interfaces
 
 ```go
 type Hasher       interface{ GetHash() (uint64, error) }
@@ -133,32 +129,33 @@ type NALookupInto interface {
     NALookup
     BytesLookupInto(key, dst []byte) ([]byte, error)
 }
-type EntryKeyFunc     func(cmd []byte) (key string, value []byte)
-type EntryAppliedFunc func(cmd []byte, result Result) bool
 ```
 
 | Interface | Enables |
 |---|---|
-| `Hasher` | `Host.StateMachineHash(shardID)` — cross-replica divergence detection |
-| `NALookup` | the zero-alloc read path |
-| `NALookupInto` | reads into a caller-supplied buffer |
+| `Hasher` | `Host.StateMachineHash(shardID)`, cross-replica divergence detection. The hash must be order-independent and, on tiers 1 and 2, must cover whole batches. |
+| `NALookup` | a `[]byte` read path without `interface{}` boxing |
+| `NALookupInto` | reads into a pooled buffer for `Host.SyncReadBuf` and `Host.StaleReadBuf`. The value must be copied into `dst`. |
 
-**Two return values, not three.** Detection is by type assertion, so a wrong
-signature produces **no compile error** and the capability is silently never
-invoked. Assert it:
+Detection is by type assertion, so a wrong signature compiles and the capability
+is never called. Assert it:
 
 ```go
 var _ sm.Hasher = (*MyStateMachine)(nil)
 ```
 
-The internal adapter wraps each of these behind a `(value, supported, error)`
-shape where the bool reports whether you implemented the interface at all. That
-three-value form is **internal** (`pkg/internal/rsm`), not importable, and not
-the contract you implement.
-
-### Capability: wrap a disk state machine in a write-through cache
+### Write-through cache for a disk state machine
 
 ```go
+type EntryKeyFunc     func(cmd []byte) (key string, value []byte)
+type EntryAppliedFunc func(cmd []byte, result Result) bool
+
+type CacheConfig struct {
+    MaxEntries   int              // required, > 0
+    ExtractKV    EntryKeyFunc     // required
+    EntryApplied EntryAppliedFunc // required if any operation is conditional
+}
+
 func NewCachedDiskStateMachine(inner DiskStateMachine, cfg CacheConfig) (*CachedDiskStateMachine, error)
 func (c *CachedDiskStateMachine) CacheStats() (hits, misses uint64)
 ```
@@ -166,52 +163,50 @@ func (c *CachedDiskStateMachine) CacheStats() (hits, misses uint64)
 | | |
 |---|---|
 | Request | an inner `DiskStateMachine` and a `CacheConfig` |
-| Response | a `DiskStateMachine` that also satisfies `NALookup` and delegates `Hasher` |
-| Errors | `*InvalidCacheConfigError`, `*CacheMaxEntriesError` (`MaxEntries` not positive) |
+| Response | a `DiskStateMachine` that also implements `NALookup` and `Hasher` |
+| Errors | `*CacheMaxEntriesError` (`MaxEntries` not positive), `*InvalidCacheConfigError` (`ExtractKV` nil) |
 
-Two behaviors worth knowing before using it:
-
-- **Invalidation happens before the inner write**, not after. If the cache were
-  only invalidated afterwards, a concurrent read between the two could repopulate
-  it from the pre-write state.
-- **Cache hits return an owned copy.** Handing out the live cache buffer would
-  let a caller mutate cached state.
-- **A state machine with conditional operations — compare-and-set,
-  put-if-absent, delete-if-match — MUST set `CacheConfig.EntryApplied`.** The
-  cache is populated from the value `ExtractKV` pulls out of the *command*, and
-  a conditional write may not have applied; nothing here can infer the outcome,
-  because the encoding is the state machine's own.
+- Affected keys are invalidated before the inner write, so a racing read
+  misses instead of returning a stale value.
+- Cache hits return an owned copy.
+- A state machine with conditional operations (compare-and-set, put-if-absent,
+  delete-if-match) must set `EntryApplied`. The cache is filled from the value
+  in the command, and a conditional write may not have applied.
+- `GetHash` delegates to the inner store. If the inner store does not implement
+  `Hasher`, it returns `*InvalidCacheConfigError`, so `StateMachineHash` reports
+  `ok == true` with that error.
 
 ### Errors
 
 ```go
-type UnsupportedLookupResultError struct{ ... }
-type InvalidCacheConfigError       struct{ ... }
-type CacheMaxEntriesError          struct{ ... }
+type UnsupportedLookupResultError struct{ Got string } // BytesLookup got a non-[]byte Lookup result
+type InvalidCacheConfigError       struct{ Reason string }
+type CacheMaxEntriesError          struct{ Value int }
 ```
 
-An error returned from `Update` **fails the shard**. There is no retry and no
-setting to add one.
+An error returned from `Update` fails the shard. There is no retry.
 
-## Go API — the reference KV backends
+## The reference KV backends
 
-Import: `github.com/jeremyhahn/go-quicraft/pkg/sm/kv`
-
-**Reference implementations and test fixtures, not a product surface.** A real
-key-value store is go-qrdb's.
+Import: `github.com/jeremyhahn/go-quicraft/pkg/sm/kv`. These are reference
+implementations and test fixtures, not a product surface.
 
 ```go
-func NewMemoryCreateFunc() sm.CreateFunc       // MemoryStore, tier 0
-func NewConcurrentCreateFunc() sm.CreateFunc   // ConcurrentStore, tier 1
-
+func NewMemoryCreateFunc() sm.CreateFunc     // MemoryStore, tier 0
+func NewConcurrentCreateFunc() sm.CreateFunc // ConcurrentStore, tier 1
 func NewMemoryStore() *MemoryStore
 func NewConcurrentStore() *ConcurrentStore
-```
 
-Command codec:
-
-```go
-const OpPut byte = 1   // plus OpDelete, OpGet, OpPutIfAbsent
+const (
+    OpPut         byte = 1
+    OpGet         byte = 2 // no-op in Update
+    OpDelete      byte = 3
+    OpPutIfAbsent byte = 4
+    ResultStored    uint64 = 1
+    ResultNotStored uint64 = 0
+    MaxKeyLength   = 65535
+    MaxValueLength = 64 * 1024 * 1024 // snapshot-recovery bound
+)
 
 func EncodePut(key, value []byte) ([]byte, error)
 func EncodePutIfAbsent(key, value []byte) ([]byte, error)
@@ -219,24 +214,21 @@ func EncodeDelete(key []byte) ([]byte, error)
 func EncodeGet(key []byte) ([]byte, error)
 func DecodeCommand(data []byte) (Command, error)
 
-type Command   struct{ ... }
-type ListQuery struct{ ... }
+type Command   struct{ Op byte; Key, Value []byte }
+type ListQuery struct{ Prefix string }
 ```
 
 Errors: `*KeyNotFoundError`, `*KeyTooLongError`, `*InvalidCommandError`,
-`*HashWriteError`.
+`*HashWriteError`. Both stores implement `sm.Hasher`, `sm.NALookup` and
+`sm.NALookupInto`.
 
-Both stores implement `sm.Hasher`, which is what makes them usable as the
-fixture for divergence tests.
-
-## Versioning and deprecation
+## Versioning
 
 - Nothing here is deprecated.
-- **A signature change to any of the three interfaces breaks every consumer in
-  the portfolio**, because consumers implement them. Sequence such changes
-  bottom-up and coordinate through the Software Department.
-- Snapshot payloads written by your `SaveSnapshot` are **your** format; this
-  library versions the envelope, not the contents. See
+- A signature change to any of the three interfaces breaks every implementation,
+  so it is a breaking release.
+- The bytes your `SaveSnapshot` writes are your format. The library versions the
+  envelope around them, not the contents; see
   [`../snapshots/api.md`](../snapshots/api.md).
-- `pkg/sm/kv`'s command encoding and snapshot format are stable for the fixture
-  role they serve and carry no compatibility promise to application code.
+- The `pkg/sm/kv` command encoding and snapshot format carry no compatibility
+  promise beyond their fixture role.

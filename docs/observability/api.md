@@ -1,26 +1,28 @@
-# Observability — API
+# Observability: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-08-19
+> notifications · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
+go-quicraft is a library, so the Go API is the API.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the interfaces below, all pointing *inward* — the library calls your collector and your listener |
-| Unix socket / REST / gRPC / QUIC / MCP | n/a. **This library serves no scrape endpoint.** It hands the embedder a `prometheus.Registry`; exposing it over HTTP is the embedder's. |
+| Embedded (Go call) | the interfaces below. They point inward: the library calls your collector and your listener. |
+| Unix socket / REST / gRPC / QUIC / MCP | Not applicable. The library serves no scrape endpoint; it hands the embedder a `prometheus.Registry` to expose. |
 
-Not missing-capability rows. A metrics endpoint inside an embedded library would
-be the library opening a socket in someone else's process.
+These are not missing-capability rows. A metrics endpoint inside an embedded
+library would mean the library opening a socket in someone else's process.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-quicraft/pkg` and `.../pkg/config`
+Import `github.com/jeremyhahn/go-quicraft/pkg` (package `quicraft`) and
+`github.com/jeremyhahn/go-quicraft/pkg/config`. The full interface listing is in
+[`engineering.md`](engineering.md#1-exported-surface).
 
-### Capability: install a metrics collector
+### Install a metrics collector
 
 ```go
 func WithMetrics(c MetricsCollector) HostOption
@@ -28,88 +30,37 @@ func WithMetrics(c MetricsCollector) HostOption
 
 | | |
 |---|---|
-| Request | any `MetricsCollector`; **nil is supported** and means no collection, with no hot-path cost |
-| Response | a `HostOption` |
+| Request | any `MetricsCollector`. Nil, including a typed nil, means no collection and no hot-path cost. |
+| Response | a `HostOption` for `NewHost` |
 | Errors | none |
-| Permission | none — in-process call |
+| Permission | none (in-process call) |
 
-```go
-type MetricsCollector interface {
-    RaftMetrics
-    LogDBMetrics
-    TransportMetrics
-    SecurityMetrics
-    RegisterShard(shardID uint64)
-    UnregisterShard(shardID uint64)
-}
-```
+Implementer obligations:
 
-**Implementer obligations:**
+- Pre-bind per-shard metrics in `RegisterShard` and use cached references in
+  the hot-path methods.
+- Do not panic. The library recovers and counts a collector panic, but that is
+  a backstop.
+- Do not block. A stalled metrics backend stalls the worker that called it.
+- Treat `reason` as a label from a closed set and never derive new values from
+  it.
 
-- **Pre-bind per-shard metrics in `RegisterShard`** and use cached references in
-  the hot-path methods. A label lookup inside the commit loop is measurable.
-- **Never panic.** Your collector runs on the hot path. The library forwards
-  through a guard, but that is a backstop, not a licence.
-- **Treat `reason` as a label from a closed set** and do not derive new values
-  from it — see below.
-- **Do not block.** Observation is best-effort by construction; a metrics
-  backend that stalls must not stall a proposal.
-
-### The four sub-interfaces
-
-Each component internally receives only its own, so a component cannot record
-another's metric.
-
-```go
-type RaftMetrics interface {
-    ObserveProposalLatency(shardID uint64, d time.Duration)
-    ObserveCommitLatency(shardID uint64, d time.Duration)
-    ObserveApplyLatency(shardID uint64, d time.Duration)
-    ObserveReadIndexLatency(shardID uint64, d time.Duration)
-    // ... election, snapshot, batch-size and drop counters
-}
-
-type LogDBMetrics interface {
-    ObserveWriteLatency(d time.Duration)
-    ObserveFsyncLatency(d time.Duration)
-    ObserveCompactionLatency(d time.Duration)
-    IncWriteBytes(n int64)
-}
-
-type TransportMetrics interface {
-    ObserveSendLatency(d time.Duration)
-    IncMessagesSent(shardID, to uint64, msgType uint64)
-    IncMessagesReceived(shardID, from uint64, msgType uint64)
-    IncSnapshotsSent(shardID uint64, bytes int64, d time.Duration)
-    IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
-    IncSnapshotsRejected(shardID uint64, reason string)
-    IncMessagesDropped(shardID, to uint64, reason string)
-}
-
-type SecurityMetrics interface {
-    IncUnauthorizedMessageDropped(shardID, from uint64, reason string)
-    IncUnauthorizedSnapshotDropped(shardID, from uint64)
-}
-```
-
-`waldb.LogDBMetrics` is a **separate interface with the same four methods**,
-declared in `pkg/logdb/waldb` so that package need not import `pkg`. Install it
-with `waldb.WithMetrics`.
+Embedding `NoOpMetricsCollector` lets an implementation override only the
+methods it cares about.
 
 ### The closed `reason` vocabularies
 
-| Method | Values | Zero-value caveat |
+| Method | Values | Zero-value note |
 |---|---|---|
-| `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected` | `shardID` and `to` are **both 0** for `protocol_violation` |
-| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy` | `shardID` is **0** when rejected before the header parsed |
-| `IncUnauthorizedMessageDropped` | `removed_replica`, `removed_identity`, `misrouted`, `unknown_member`, `identity_mismatch`, `missing_identity` | — |
+| `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected`, `identity_mismatch` | `shardID` and `to` are 0 for `protocol_violation` |
+| `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy`, `unauthorized`, `not_accepting` | `shardID` is 0 when rejected before the sender was authorized |
+| `IncUnauthorizedMessageDropped` | `removed_replica`, `removed_identity`, `misrouted`, `unknown_member`, `identity_mismatch`, `missing_identity` | none |
 
-The security split is **operational, not cosmetic**: one aggregate counter
-cannot tell a rolling membership change from an attack.
-`identity_mismatch` means the sender does not hold the claimed replica's private
-key and is never routine; `unknown_member` is the benign config-change window.
+`identity_mismatch` and `removed_identity` are never routine. `unknown_member`
+is the benign config-change window. The meaning of each security reason is in
+[`architecture.md`](architecture.md#security-counters-are-split-on-purpose).
 
-### Capability: use the reference collector
+### Use the reference collector
 
 ```go
 func NewPrometheusMetricsCollector() *PrometheusMetricsCollector
@@ -118,44 +69,45 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 type PrometheusMetricsCollector struct {
     Registry                *prometheus.Registry
     EnablePerMessageMetrics bool
-    // ...
+    // unexported fields
 }
 ```
 
-`Registry` is **dedicated**, not the default one. Serve it yourself:
+`Registry` is dedicated, not the Prometheus default. Serve it yourself:
 
 ```go
 http.Handle("/metrics", promhttp.HandlerFor(c.Registry, promhttp.HandlerOpts{}))
 ```
 
 `NewPrometheusMetricsCollector()` uses the zero `config.MetricsConfig`, so
-**per-shard metrics are off**.
+per-shard metrics are off. The label mode cannot change after construction.
 
-`EnablePerMessageMetrics` is set on the collector after construction and turns
-`IncMessagesSent`/`IncMessagesReceived` from simple atomic counters into a
-per-shard/target/message-type breakdown. **Expensive; for debugging.**
+Setting `EnablePerMessageMetrics` after construction populates the
+`_detailed_` transport counters with a per-shard, per-peer, per-message-type
+breakdown. It is expensive and meant for debugging.
 
-The full metric name list is in
+Metric names and labels are listed in
 [`engineering.md`](engineering.md#8-metric-reference).
 
-### Capability: sample expensive observations
+### Sample latency observations
 
 ```go
 func NewSampledMetricsCollector(inner MetricsCollector, sampleRate uint64) *SampledMetricsCollector
 ```
 
-`SampleRate` is the **inverse** rate — 100 means one in 100. Default 100.
+Records one in `sampleRate` commit-latency and apply-latency observations.
+`sampleRate` is the inverse rate; 0 becomes 100. Counters are never sampled.
 
-### Capability: no-op
+### No-op
 
 ```go
 type NoOpMetricsCollector struct{}
 ```
 
-Satisfies the whole interface and does nothing. Passing `nil` to `WithMetrics`
-achieves the same with less indirection.
+Satisfies the whole interface and does nothing. Passing nil to `WithMetrics`
+does the same with less indirection.
 
-### Capability: configure logging
+### Configure logging
 
 ```go
 func config.NewLogger(cfg LogConfig) *slog.Logger
@@ -163,70 +115,81 @@ func config.SetDefaultLogger(cfg LogConfig)
 func WithLogger(l *slog.Logger) HostOption
 
 type LogConfig struct {
-    Format LogFormat   // LogFormatText | LogFormatJSON
-    Level  LogLevel    // LogLevelDebug | LogLevelInfo | LogLevelWarn | LogLevelError
+    Format LogFormat // LogFormatText (default) | LogFormatJSON
+    Level  LogLevel  // LogLevelDebug | LogLevelInfo (default) | LogLevelWarn | LogLevelError
 }
 
 type LogValidationError struct{ Field, Message, Value string }
 ```
 
-Neither opens a file nor chooses a destination.
+`NewLogger` writes to stderr. For any other destination, build your own
+`slog.Logger` and pass it with `WithLogger`. Lower layers log through
+`slog.Default()`, so install the same handler there to capture everything.
 
-### Capability: receive notifications
+### Receive notifications
 
-```go
-type config.EventListener struct { /* the callbacks */ }
-```
+Set `HostConfig.EventListener` to a `*config.EventListener`. Every field is an
+optional callback; nil fields are skipped.
 
-Payloads: `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`, `ConnectionInfo`,
-`DiskInfo`, `EventShardInfo`.
+| Group | Callbacks | Payload |
+|---|---|---|
+| Raft | `OnLeaderUpdated` | `LeaderInfo` |
+| | `OnLeaderLost`, `OnCampaignLaunched`, `OnCampaignSkipped`, `OnProposalDropped`, `OnReadIndexDropped` | `EventShardInfo` |
+| | `OnSnapshotRejected` | `SnapshotInfo` |
+| System | `OnNodeHostShuttingDown` | none |
+| | `OnNodeReady`, `OnNodeUnloaded`, `OnNodeDeleted`, `OnMembershipChanged`, `OnLogCompacted`, `OnLogDBCompacted` | `EventShardInfo` |
+| | `OnConnectionEstablished`, `OnConnectionFailed` | `ConnectionInfo` |
+| | `OnSnapshotSendStarted`, `OnSnapshotSent`, `OnSnapshotSendAborted`, `OnSnapshotReceived`, `OnSnapshotRecovered`, `OnSnapshotCreated`, `OnSnapshotCompacted` | `SnapshotInfo` |
+| Failure | `OnShardFailed` | `ShardFailedInfo` |
+| | `OnLogDBDiskWarning`, `OnLogDBDiskFull` | `DiskInfo` |
 
-**Two classes, and the distinction matters:**
+`OnCampaignSkipped` is never invoked. Detect a leaderless shard with
+`Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
+
+Delivery comes in two classes:
 
 | Class | Callbacks | Runs on | You may |
 |---|---|---|---|
-| **cold path** | `OnLeaderUpdated`, `OnCampaignLaunched`, shard failure | a dedicated dispatcher goroutine holding **no engine lock** | call **any** `Host` API, including the synchronous `StopShard` |
-| **hot path** | `OnApplied`, `OnCommitted`, `OnReadyToRead`, `OnProposalFailed`, `OnReadIndexBatched`, `OnReadIndexFailed` | the worker | **not** call back into the engine — these resolve pending client requests and have happens-before requirements against `Peer.Handle` |
+| dispatched | `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted` | one dispatcher goroutine holding no engine lock, FIFO | call any `Host` API, including `StopShard` |
+| inline | every other callback | the goroutine that produced the event | return quickly; do not call a synchronous `Host` API that stops or unloads a shard |
 
-Cold-path notifications are FIFO on a single consumer, giving a total order and
-therefore a per-shard order. **There is deliberately no ordering guarantee
-between the two classes.**
+There is no ordering guarantee between the two classes.
 
-### Capability: inspect host state
+### Inspect host state
 
 ```go
 func (h *Host) HealthCheck() *HealthStatus
 func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
 func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
+func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
 func (h *Host) ShardCount() int
 func (h *Host) ID() string
 func (h *Host) NodeIdentity() string
 func (h *Host) RaftAddress() string
 
-type ShardHealth uint8
-const ShardHealthy ShardHealth = iota   // ...
+type ShardHealth uint8 // ShardHealthy, ShardNoLeader, ShardLagging, ShardUnloaded,
+                       // ShardError, ShardRecovering, ShardSnapshotting
 ```
 
-`HealthCheck` returns a value; **serving it is the embedder's**.
-`*InvalidShardHealthError` / `ErrInvalidShardHealth` guard an unrecognized
-`ShardHealth`.
+`HealthCheck` returns a value; serving it is the embedder's job.
+`ShardHealth` unmarshals from JSON and rejects an unrecognized value with
+`*InvalidShardHealthError`, which matches `ErrInvalidShardHealth`.
 
 ## Configuration
 
 | Field | Owner | Default |
 |---|---|---|
-| `PerShardMetrics` | `config.MetricsConfig` | **false** |
+| `PerShardMetrics` | `config.MetricsConfig` | `false` |
 | `Format`, `Level` | `config.LogConfig` | text, info |
-| `EnablePerMessageMetrics` | `PrometheusMetricsCollector` | **false** |
+| `EnablePerMessageMetrics` | `PrometheusMetricsCollector` | `false` |
 | `SampleRate` | `SampledMetricsCollector` | 100 |
 
 ## Versioning and deprecation
 
-- **Adding a method to `MetricsCollector` or any sub-interface breaks every
-  embedder implementation.** These are consumed by implementation; sequence such
-  changes bottom-up.
-- **The `reason` vocabularies are part of the contract.** Adding a value changes
-  what an embedder's dashboards see; removing one silently drops a series.
-- Metric **names** are the reference implementation's, not the interface's. An
+- Adding a method to `MetricsCollector` or any sub-interface breaks every
+  embedder implementation, because embedders implement these interfaces.
+- The `reason` vocabularies are part of the contract. Adding a value changes
+  what dashboards see; removing one silently drops a series.
+- Metric names belong to the reference implementation, not the interface. An
   embedder with its own collector chooses its own names.
-- Nothing here is deprecated.
+- `EventListener.OnCampaignSkipped` is reserved and never fires.

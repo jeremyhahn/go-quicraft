@@ -1,20 +1,17 @@
-# Membership Changes — Engineering Contract
+# Membership changes: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
 > `config.WitnessConfig`, and the membership half of `pkg/internal/raft` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the role model and the scope fence are in
 [`architecture.md`](architecture.md). The Go call surface is in
-[`api.md`](api.md). This section is the protocol detail, moved verbatim from the
-Raft protocol document's membership chapter.
+[`api.md`](api.md). The Raft protocol around it is in
+[`../raft-consensus/engineering.md`](../raft-consensus/engineering.md).
 
-## Protocol detail
-
-
-## Config-in-Log Bootstrap
+## Config-in-log bootstrap
 
 A shard's initial configuration is a single committed entry at index 1
 (`proto.EntryInitialMembership`, built by `BuildInitialMembershipEntry`), not
@@ -47,23 +44,23 @@ config-carrying entry that does not decode is FATAL on both paths
 (`ErrCorruptConfigEntry`), because skipping one reconstructs a membership that
 differs from the rest of the shard. A partial fold is not a degraded
 membership, it is a different one. A zero-length `EntryConfigChange` payload is
-the silent no-op it has always been on both paths: every replica reads the same
-nothing and skips identically.
+a silent no-op on both paths: every replica reads the same nothing and skips
+identically.
 
-## One-at-a-Time Configuration (PhD 4.1, Paper Section 6)
+## One-at-a-time configuration (PhD 4.1, Paper Section 6)
 
-Only one config change may be in flight at a time. Attempting to propose a
-second while one is uncommitted returns `ErrPendingConfigChange`. This prevents
-two overlapping config change entries, which could produce two disjoint
-majorities.
+Only one config change may be in flight at a time. Proposing a second while one
+is uncommitted returns `ErrPendingConfigChange`, which the Host reports as
+`quicraft.ErrRejected` (retryable: nothing entered the log). This prevents two
+overlapping config change entries, which could produce two disjoint majorities.
 
 The authoritative test is `raftLog.confChangeIndex > raftLog.processed`
 (`hasConfigChangeToApply`), and `r.pendingConfigChange` is a cached view of it
-that `handleLeaderPropose` re-derives UNCONDITIONALLY on every proposal. The
-guarded form (`if r.pendingConfigChange`) could only ever relax the flag, never
+that `handleLeaderPropose` re-derives UNCONDITIONALLY on every proposal. A
+guarded form (`if r.pendingConfigChange`) could only relax the flag, never
 restore it: `Peer.Commit` clears it for every committed `EntryConfigChange` it
-applies without asking whether a LATER one is still unapplied, so a catch-up
-batch containing an earlier change cleared it while one was genuinely
+applies without asking whether a later one is still unapplied, so a catch-up
+batch containing an earlier change would clear it while one was still
 outstanding.
 
 The frontier is `processed`, NOT `committed`. Membership takes effect at commit
@@ -83,11 +80,10 @@ via `tryAppend`, the leadership no-op). `newRaftLog` seeds it CONSERVATIVELY
 with the recovered last index, because nothing in this process classified the
 recovered entries; that blocks new config-change proposals on a just-restarted
 leader until it has applied the tail it started with, and releases
-automatically. It is also strictly safer than the O(N) log scan it replaced,
-which could fail to READ, and a failed read had to be treated as "a change
-might be pending".
+automatically. An O(N) log scan was rejected because it can fail to read, and a
+failed read has to be treated as "a change might be pending".
 
-## Config Change Takes Effect on Commit
+## A config change takes effect on commit
 
 Membership changes take effect when the config change entry COMMITS, not when
 it is appended (the etcd/dragonboat model, diverging from PhD 4.1's append-time
@@ -106,14 +102,14 @@ CheckQuorum.
 validates, serializes to an `EntryConfigChange`, and steps a `Propose`; the
 membership mutation happens later, on commit, on every replica alike.
 
-## Log Truncation Needs No Membership Rollback
+## Log truncation needs no membership rollback
 
 Because membership only mutates on COMMITTED entries and committed entries are
 never truncated, conflict-driven log truncation cannot remove an applied config
 change. No rollback or log-rescan machinery exists; an appended-but-uncommitted
 config change that gets truncated was never applied in the first place.
 
-## Dispatch Tables
+## Dispatch tables
 
 Config change handling uses map-based dispatch (`membership.go`), with a
 mutating handler table and a read-only validator table:
@@ -137,7 +133,7 @@ The handlers update `addresses`, `observers`, `witnesses`, `removed`,
 `identities`, `removedIdentities`, the two witness-policy fields, and
 `configChangeID`.
 
-## Replay Guard
+## Replay guard
 
 `membership.apply(cc, logIndex)` skips any change at or below
 `m.configChangeID`, which is the log index of the most recently applied config
@@ -151,7 +147,7 @@ state.
 The initial membership's `ConfigChangeID` is left at 0, so a caller observes 0
 until the first real membership change.
 
-## Node Types
+## Node types
 
 **Voters (Remotes)**: full replicas that replicate the entire log and
 participate in elections and the commit quorum.
@@ -201,16 +197,17 @@ map (see Convergent Apply below) is likewise brought back to observer by
 that fold before it can campaign, and every voter independently refuses to grant
 a vote to a candidate it lists as an observer.
 
-**Demotion** (a voter listed as an observer) cannot be asked of a live voter —
-`validateAddNonVoting` refuses an existing member — but a snapshot, or a
+**Demotion** (a voter listed as an observer) cannot be asked of a live voter
+(`validateAddNonVoting` refuses an existing member), but a snapshot, or a
 committed `AddNonVoting` converging a members-map seed, can deliver it. The
 replica then steps down if it was leading or campaigning.
 
 **Witnesses**: vote in elections and count toward the unified commit quorum,
-but store only entry metadata (Index/Term, no command payload). See Section 6
-for the durability trade-off.
+but store only entry metadata (Index/Term, no command payload). The durability
+trade-off is in
+[`../raft-consensus/engineering.md`](../raft-consensus/engineering.md#6-commit-calculation).
 
-## Per-Shard Authorization Is a Deny-List
+## Per-shard authorization is a deny-list
 
 Per-shard authorization is a removed-node TOMBSTONE deny-list (the
 etcd/Consul model), never a member allow-list. `Peer.IsRemoved` and
@@ -232,7 +229,7 @@ refuse duplicates, and leaving a departed replica's identity there would refuse
 the legitimate operation of recycling a decommissioned machine into a new
 replica ID. Nothing is ever evicted from `removedIdentities`.
 
-## Safety Validations
+## Safety validations
 
 Validate-time (`configChangeValidators`), evaluated on the leader before the
 entry is proposed:
@@ -280,7 +277,7 @@ transition:
   (`AddNode` over a witness, `AddWitness`/`AddNonVoting` over each other's
   role).
 
-## The 64-Voting-Member Cap
+## The 64-voting-member cap
 
 `MaxVotingMembers = 64` exists because ReadIndex ack tracking uses a `uint64`
 `ackBits` bitfield, mapping replica IDs to bit positions 0..63. A 65th voting
@@ -289,12 +286,13 @@ check. It is enforced at every point a voting set can GROW, and each of those
 points fails in a way the operator can act on:
 
 - `Host.StartShard` and `ImportSnapshot` (admission). Bootstrap does not run
-  the config-change validators, so a 65-member map used to be committed as the
-  index-1 entry and then killed every future election on that shard,
-  durably, across restarts.
+  the config-change validators, so without this a 65-member map would be
+  committed as the index-1 entry and break every future election on that
+  shard, durably, across restarts.
 - `validateAddNode` / `validateAddWitness` / `validateConfigChangePolicy`
   (propose time).
-- `handleSnapshot` (the snapshot membership gate, Section 7).
+- `handleSnapshot` (the snapshot membership size gate; see
+  [`../raft-consensus/engineering.md`](../raft-consensus/engineering.md#handlesnapshot)).
 - `newRaft`, which refuses to build a replica whose RECOVERED configuration
   does not fit, returning `ErrTooManyVotingMembers` so `StartShard` reports the
   error and the host stays up. This is the durable form of the fault and the
@@ -305,11 +303,11 @@ points fails in a way the operator can act on:
   keep running. Leaving the raft mirror on the last configuration that fit is
   what makes this fail closed.
 - `becomeLeader`, which declines the promotion before writing any field.
-- `rebuildReplicaToBit`, the backstop, which RETURNS `ErrTooManyVotingMembers`.
-  It used to be an `invariant.Assert`, which panicked the raft STEP WORKER, a
-  goroutine shared by every shard that worker owns, over a fault concerning
-  exactly one shard, and did so again on every restart. Truncating the map to
-  fit is not an option: bit positions above 63 would alias onto live ones.
+- `rebuildReplicaToBit`, the backstop, which RETURNS `ErrTooManyVotingMembers`
+  rather than asserting: a panic there would kill the raft step worker, a
+  goroutine shared by every shard that worker owns, over a fault in one shard,
+  and again on every restart. Truncating the map to fit is not an option: bit
+  positions above 63 would alias onto live ones.
 
 **Apply deliberately does NOT re-check the cap.** `handleAddNode` and
 `handleAddWitness` skip it by design. `membership.apply` runs on followers
@@ -317,7 +315,7 @@ replicating a committed entry and during recovery replay; rejecting an
 already-committed config change at apply time would make that replica diverge
 from the agreed membership.
 
-## Convergent Apply
+## Convergent apply
 
 The same reasoning that removes the cap check from apply shapes the
 duplicate-add checks. `handleAddNode`, `handleAddNonVoting` and
@@ -336,8 +334,8 @@ seeded as a full voter**, including the local replica (`join=false` requires
 self to be listed). The committed `AddWitness` / `AddNonVoting` entries that
 gave those replicas their real roles are still in the log, since config changes
 are compacted only behind a snapshot, and are re-applied on restart. Refusing
-them left the wrong roles in place permanently: nothing else repairs the seed,
-and `configChangeID` never advanced past the skipped entry. `checkSelfRole` is
+them would leave the wrong roles in place permanently: nothing else repairs the
+seed, and `configChangeID` would never advance past the skipped entry. `checkSelfRole` is
 not a substitute: it repairs nothing in the membership and acts only on the
 local replica, whose observer role it then derives from the repaired
 membership and whose witness disagreement it latches.
@@ -364,8 +362,8 @@ on every replica, or that the seed can only LOOSEN:
   so continuing means running on a configuration that differs from the rest of
   the shard, silently, and durably once the next snapshot persists it.
   `Peer.Commit` propagates it and the engine's `failCommit` turns it into a
-  shard fault. Recovery already treats the identical bytes as fatal; runtime
-  failing open while recovery failed closed was the inconsistency. Whatever was
+  shard fault. Recovery treats the identical bytes as fatal, and the two paths
+  must agree. Whatever was
   folded before the corrupt entry is published first, so the shard's last
   coherent configuration is what its readers see.
 - A **deterministic apply refusal** is logged at WARN and skipped. Every
@@ -376,7 +374,7 @@ on every replica, or that the seed can only LOOSEN:
   skip on the leader's own freshly proposed entry would hang the caller's
   `RequestState`.
 
-## Leader Self-Removal (Paper Section 6)
+## Leader self-removal (Paper Section 6)
 
 When a committed config change removes the leader from membership,
 `Peer.checkLeaderSelfRemoval` transitions it to follower. It runs during
@@ -385,9 +383,6 @@ When a committed config change removes the leader from membership,
 membership. `syncRaftRemotes` sets `selfRemoved` in the same pass, so the
 stepped-down leader also stops campaigning.
 
-
----
-
 ## Configuration
 
 Per shard, on `config.Config`:
@@ -395,9 +390,9 @@ Per shard, on `config.Config`:
 | Field | Default | Meaning |
 |---|---|---|
 | `OrderedConfigChange` | `*bool`, nil = **enabled** | serialize membership changes; no concurrent config changes |
-| `IsObserver` | `false` | this replica starts as an observer: replicates but does not vote. Initial hint only — the committed membership decides from the moment it names the replica |
+| `IsObserver` | `false` | this replica starts as an observer: replicates but does not vote. Initial hint only: the committed membership decides from the moment it names the replica |
 | `IsWitness` | `false` | this replica votes but stores no log data |
-| `Witness` | `WitnessConfig{}` | `MaxWitnesses` and `RequireFullReplicaMajority` — **bootstrap seed only** |
+| `Witness` | `WitnessConfig{}` | `MaxWitnesses` and `RequireFullReplicaMajority`; bootstrap seed only |
 
 `IsObserver` and `IsWitness` are **mutually exclusive**. `IsWitness` is binding;
 `IsObserver` is not (see "A replica's observer role follows the committed
@@ -412,10 +407,10 @@ default" rather than "off". Use `config.BoolPtr(false)` to disable deliberately.
 `proto.UpdateWitnessPolicy`. A per-node policy value would let replicas disagree
 about which config changes are legal.
 
-`Config.MemberIdentities` is the founding map's identities (join=false) or the
-join anchor (join=true), and `Config.RequireMemberIdentities` — set by the Host
-from whether it has a transport — makes every admission require one; there is
-no transport-side switch any more.
+`Config.MemberIdentities` is the founding map's identities (`join=false`) or
+the join anchor (`join=true`). `Config.RequireMemberIdentities`, which the Host
+sets from whether it has a transport, makes every admission require one. It is
+validate-only: a committed entry is never refused on the apply path.
 
 ## Persistence
 
@@ -428,7 +423,7 @@ Membership is persisted in three places, and all three must agree:
    configuration as of that index without the log.
 3. **In the WAL's own membership section**, which carries a third version
    discriminator (`membershipSectionVersion`) distinct from
-   `proto.WireVersion` — see
+   `proto.WireVersion`; see
    [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md).
 
 `proto.Membership` carries the address map, the observer and witness sets, the
@@ -436,14 +431,25 @@ removed set, the replicated session policy, the identity maps, and the witness
 policy. Maps are encoded with keys sorted ascending so identical configurations
 produce identical bytes.
 
-## Test Strategy
+Replica retirement is host-local, not replicated. `RemoveData` →
+`LogDB.RemoveNodeData` adds `(shardID, replicaID)` to the WAL's retired-replica
+registry, a `RETIRED` file in the WAL root (`magic "QRRETIRE" | count |
+count × (shardID, replicaID) | crc32c`, 16 bytes per entry, rewritten whole and
+renamed into place). Replay drops every record of a retired replica,
+`LogDB.NodeRemoved` reports it, every LogDB write naming it returns
+`logdb.ErrReplicaRetired`, and re-encryption carries the registry across. A
+malformed registry fails `Open` (`ErrRetiredRegistryMalformed`) rather than
+handing retired IDs back.
 
-Covered by `make test-raft` and the host-level suites; the membership-specific
-files are:
+## Test strategy
+
+Unit coverage runs under `make test` (`pkg`) and `make test-raft`
+(`pkg/internal/raft/membership_test.go` and the raft suites). The host-level
+membership files in `pkg/` are:
 
 | File | Pins |
 |---|---|
-| `host_membership_identity_test.go` | the identity binding and its fallback |
+| `host_membership_identity_test.go` | the identity binding |
 | `host_membership_limits_test.go` | the 64-voting-member cap and the witness limits |
 | `host_membership_reconstruct_test.go` | reconstructing membership from the log |
 | `host_membership_sync_test.go` | the sync variants |
@@ -455,37 +461,53 @@ files are:
 | `messagehandler_identity_test.go`, `messagehandler_removed_identity_test.go` | sender authorization, including a removed member's identity |
 | `membership_test.go` | the `Membership` type |
 
-**What a test here must always assert**: that a config change takes effect **on
-commit**, not on append. Applying on append is how a config change that is later
+Integration: `test/integration/host` (`make integration-test-host`) covers add
+and remove under load and with snapshots, and in-place observer promotion;
+`test/integration/e2e` (`make integration-test-e2e`) covers add, remove and
+replica replacement on a multi-node cluster. `test/membership` is the shared
+helper that applies a change through whichever replica leads at each attempt
+and treats a retried change that already committed as success.
+
+**What a test here must always assert**: that a config change takes effect on
+commit, not on append. Applying on append is how a config change that is later
 truncated leaves a replica believing in a configuration no quorum agreed to.
 
-**Fault-injection seams**: `test/netfault` for a config change that commits
-during a partition; propose a stale `configChangeIndex` to exercise the replay
-guard.
+**Fault-injection seams**: propose a stale `configChangeIndex` to exercise the
+replay guard; the convergent-apply path is exercised by restarting a replica
+whose membership was seeded from the `StartShard` members map.
 
 ## Observability
 
-**Metrics** — membership changes are rare, so there is no dedicated collector.
-What to watch is the shard's voting-member count against the 64 cap, and the
-number of observers waiting to be promoted.
+**Metrics.** `SecurityMetrics.IncUnauthorizedMessageDropped(shardID, from,
+reason)` counts every inbound message refused by the sender gate. The reason
+set is closed: `removed_replica` (usually a removed node that has not noticed),
+`removed_identity` (a removed keypair claiming another replica ID; alert on
+it), `misrouted`, `unknown_member` (the benign window before a config change
+reaches this replica), `identity_mismatch` (a forged sender or a stale identity
+after a key change; never routine) and `missing_identity`. There is no
+dedicated membership collector; watch the voting-member count against the 64
+cap.
 
-**Diagnostics** — `Host.DiagRemotes(shardID)` reports per-remote replication
-state, which is how you tell a newly added replica that is catching up from one
-that is not receiving anything.
+**Diagnostics.** `Host.DiagRemotes(shardID)` reports per-remote replication
+state, which tells a newly added replica that is catching up from one that is
+not receiving anything.
 
-**Logging** — `log/slog`. Worth alerting on:
+**Logging** (`log/slog`):
 
 | Level | Event | Why |
 |---|---|---|
-| ERROR | a message dropped for a removed or unauthorized member | either a stale node that has not noticed it was removed, or something impersonating one |
-| ERROR | `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable; the shard cannot start |
-| WARN | `*StaleConfigChangeError` | a config change raced another; retry with the current `configChangeIndex` |
-| WARN | witness policy change committed | rare enough that each one should be accounted for |
-| INFO | replica added, removed, promoted; leadership transferred | |
+| WARN | a message dropped by the sender gate (rate-limited, with `drops_since_last_log`) | a stale removed node, or something impersonating a member |
+| ERROR | `config change unmarshal failed`, `initial membership entry unmarshal failed`, `refusing initial-membership entry outside the bootstrap index` | committed membership is unreadable; the shard faults |
+| ERROR | `shard membership exceeds the ReadIndex ackBits word` | the 64-member cap was reached on a path that fails the shard |
+| WARN | `config change apply skipped` | a deterministic apply refusal, identical on every replica |
+| INFO | `replica promoted in place` / observer role derived from the membership | the replica's own role changed |
 
-**No certificate material and no node identity secret appears in any log line.**
-A node identity is an SPKI hash, which is public by construction.
+No certificate material appears in any log line. A node identity is an SPKI
+hash, public by construction.
 
-**Notifications** — `config.EventListener` carries `LeaderInfo` and
-`EventShardInfo`; membership changes surface through the leadership and shard
-callbacks rather than through a dedicated one.
+**Notifications.** `config.EventListener.OnMembershipChanged` fires on the
+apply goroutine when a batch applied on this host contained a config change or
+the bootstrap membership entry, after that batch's proposals completed; it must
+not block. `OnNodeDeleted` fires after `RemoveData`,
+and the leadership callbacks report the leader changes that removals and
+transfers cause.

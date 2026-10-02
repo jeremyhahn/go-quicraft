@@ -1,27 +1,17 @@
-# Memory Enclave — CLI
+# Memory enclave: CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-09-03
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-**No CLI surface: this feature is reachable only as a Go package.**
+No CLI: go-quicraft is a library and ships no binaries (there is no `cmd/`
+directory), so this feature is reachable only through the Go API in
+[`api.md`](api.md).
 
-go-quicraft ships no binaries at all. The repository has no `cmd/` directory,
-and `make build` runs `go build ./...` and produces no executable. That is
-correct for the project — it is a consensus **library**, consumed by importing
-it and implementing its interfaces, not by invoking a client.
+Memory protection is a property of whatever holds a key, not an operator verb,
+so no consuming project exposes it as a command either. The operator-visible
+seal and key-custody verbs belong to the projects that consume this library and
+are documented there.
 
-There is also no CLI surface *above* this feature. Memory protection is an
-internal property of whatever holds a key, not an operator verb: exposing "open
-this key into a buffer" as a command would defeat the point of it. This feature
-therefore contributes **no** `CommandDefinition` to any integration parity suite,
-and that absence is not a gap.
-
-The operator-visible consequences appear under the surfaces of the projects that
-consume this library — the barrier and seal verbs of the database layer above,
-and the key-custody verbs of the key-management layer above that. Those verbs are
-documented in their own repositories.
-
-The one operational lever that is not a verb: locked buffers consume
-`RLIMIT_MEMLOCK`. A container running a consumer must be given a limit large
-enough for its protected keys, or locked allocations start failing. That is a
-deployment setting, not a flag.
+The one operational lever is not a flag: locked memory consumes
+`RLIMIT_MEMLOCK`. A process or container running a consumer needs a limit large
+enough for its protected keys, or locked allocations fail.

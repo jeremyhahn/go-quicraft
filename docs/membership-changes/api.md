@@ -1,25 +1,32 @@
-# Membership Changes — API
+# Membership changes: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
+go-quicraft is a library. The Go API is the API.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the `Host` methods below. This is the transport. |
-| **QUIC** | a committed `proto.ConfigChange` replicates like any other entry, and `proto.Membership` travels inside snapshots. There is no membership RPC. |
-| Unix socket / REST / gRPC / MCP | n/a — this repository serves none of them |
+| Embedded (Go call) | the `Host` methods below |
+| QUIC | a committed `proto.ConfigChange` replicates like any other entry, and `proto.Membership` travels inside snapshots. There is no membership RPC. |
+| Unix socket / REST / gRPC / MCP | n/a: this repository serves none of them |
 
-Not missing-capability rows. This feature is part of the go-quicraft Raft row,
-which the portfolio register marks as consumed by implementing interfaces rather
-than by calling a client.
+These are not missing-capability rows. The feature is part of the go-quicraft
+Raft row, which the portfolio register marks as consumed by implementing
+interfaces rather than by calling a client.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-quicraft/pkg`
+Import: `github.com/jeremyhahn/go-quicraft/pkg` (package `quicraft`).
+
+Every change below is proposed to the shard's current leader and takes a
+`configChangeIndex`: pass `Membership.ConfigChangeID` read immediately before
+the call. A non-zero value that does not match the shard's current
+configuration is refused with `*StaleConfigChangeError`; 0 skips the check.
+`Sync*` forms block until the change commits and need a context with a
+deadline.
 
 ### Capability: add a voting member
 
@@ -32,35 +39,42 @@ func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, repl
 
 | | |
 |---|---|
-| Request | the shard, the new replica id, its **advertised** address, optionally its committed node identity, and the `configChangeIndex` this change expects to follow |
-| Response | a `*RequestState`, or nothing from the `Sync` form |
-| Errors | `*StaleConfigChangeError` (the guard fired — re-read and retry), `*InvalidMemberError`, `*EmptyMembersError`, `*SelfNotInMembersError`, `ErrTooManyWitnesses`, `NotLeaderError`, `ErrBusy` |
+| Request | the shard, the new replica ID, its advertised address, its node identity, and the `configChangeIndex` |
+| Response | a `*RequestState`, or only an error from the `Sync` form |
+| Errors | see [Errors](#errors); before validation also `*NotLeaderError`, `ErrSystemBusy` (global rate limiter), `ErrShardNotReady`, `ErrDraining`, `ErrClosed` |
 | Permission | none in this library; the caller must be talking to the leader |
 
-`identity` is the SPKI pin the transport derives from the peer's mTLS leaf:
-`"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`, the value the node
-reports from `Host.NodeIdentity()`. **It is required** on a host with a
-transport: the identity-less forms return `ErrMemberIdentityRequired`, and a
-member is authorized by its committed identity and by nothing else.
+`identity` is the SPKI pin the transport derives from the peer's mTLS leaf,
+`"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`, which the node reports
+from `Host.NodeIdentity()`. It is required on a host with a transport: the
+identity-less forms, or an empty `identity`, return `ErrMemberIdentityRequired`
+unless the configuration already holds an identity for the replica (a role
+change such as promotion). The identity-less forms exist for transportless
+hosts.
+
+`AddNode` on an existing observer promotes it to a voter in place.
 
 ### Capability: add an observer or a witness
 
 ```go
 func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error)
 func (h *Host) RequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) (*RequestState, error)
+func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
+func (h *Host) SyncRequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) error
+
 func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error)
 func (h *Host) RequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) (*RequestState, error)
-func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
 func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
+func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64, addr, identity string, configChangeIndex uint64) error
 ```
 
 | Role | Votes | Stores log | Serves reads | Proposes |
 |---|---|---|---|---|
 | observer | no | yes | yes | yes |
-| witness | **yes** | **no** | **no** — `ErrInvalidOperation` | **no** — `ErrInvalidOperation` |
+| witness | yes | no | no (`ErrInvalidOperation`) | no (`ErrInvalidOperation`) |
 
-The voting set (`remotes + witnesses + self`) is capped at **64**;
-`ErrTooManyWitnesses` and the member validations enforce it.
+The identity rules are the same as for `AddNode`. The voting set
+(`voters + witnesses + self`) is capped at 64 (`ErrTooManyVotingMembers`).
 
 ### Capability: remove a replica
 
@@ -69,8 +83,9 @@ func (h *Host) RequestRemoveNode(ctx context.Context, shardID, replicaID uint64,
 func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error
 ```
 
-Removal is a consensus operation. Afterwards, the removed replica's messages are
-refused for that shard.
+Removal is a consensus operation. Once it commits, the removed replica's
+messages, and any connection presenting its committed identity, are refused for
+that shard.
 
 ### Capability: change the witness policy
 
@@ -79,13 +94,16 @@ func (h *Host) RequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, p
 func (h *Host) SyncRequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) error
 
 type config.WitnessConfig struct {
-    MaxWitnesses               int
-    RequireFullReplicaMajority *bool
+    MaxWitnesses               int   // 0 = no cap; negative is refused with *HostInitError
+    RequireFullReplicaMajority *bool // nil = true
 }
 ```
 
-Proposes a `ConfigChange` of type `proto.UpdateWitnessPolicy`. **The policy is
-replicated state**; `Config.Witness` is only the bootstrap seed.
+Proposes a `ConfigChange` of type `proto.UpdateWitnessPolicy`. The policy is
+replicated state; `Config.Witness` is only the bootstrap seed. The new policy
+must already hold for the current membership, or the change is refused with
+`ErrTooManyWitnesses` or `ErrBreaksFullReplicaMajority`: reshape first, then
+tighten.
 
 ### Capability: read the current membership
 
@@ -93,20 +111,24 @@ replicated state**; `Config.Witness` is only the bootstrap seed.
 func (h *Host) GetShardMembership(shardID uint64) (*Membership, error)
 func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Membership, error)
 func NewMembership() *Membership
+func (m *Membership) ConfigChangeIndex() uint64 // alias for ConfigChangeID
 
 type Membership struct {
-    ConfigChangeID uint64                // the log index that produced this
-    Nodes          map[uint64]string     // voting members
-    Observers      map[uint64]string
-    Witnesses      map[uint64]string
-    Removed        map[uint64]struct{}
-    // ... plus the replicated session policy and identity maps
+    ConfigChangeID    uint64              // log index of the change that produced this
+    Nodes             map[uint64]string   // voting members
+    Observers         map[uint64]string
+    Witnesses         map[uint64]string
+    Removed           map[uint64]struct{}
+    Identities        map[uint64]string   // committed node identity per replica
+    RemovedIdentities map[uint64]string   // banned identities, never evicted
+    // plus the replicated witness policy (MaxWitnesses,
+    // RequireFullReplicaMajority) and session policy fields
 }
 ```
 
-**`ConfigChangeID` is what you pass as the next `configChangeIndex`.** The
-`Sync` form confirms through consensus; the plain form reads local state, which
-may be behind.
+`ConfigChangeID` is what you pass as the next `configChangeIndex`. The `Sync`
+form confirms through consensus; the plain form reads local state, which may be
+behind.
 
 ### Capability: local, destructive replica operations
 
@@ -117,9 +139,21 @@ func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) er
 func (h *Host) HasNodeInfo(shardID, replicaID uint64) bool
 ```
 
-**These do not reach consensus.** They act on this node's own copy, and
-`RemoveData` deletes it. `*ShardNotStoppedError` is returned if the shard is
-still running. Remove from the cluster first, then remove the data. It also **retires the replica ID on this host**: `StartShard` refuses it from then on with `*ReplicaRetiredError` (`ErrReplicaRetired`) (`ImportSnapshot` finds no data left to import into and returns `ErrShardNotFound`), because the deleted data held the replica's term, vote and owed lease vote window, and Raft never lets a removed replica return under the same ID. Rejoin under a new replica ID.
+These do not reach consensus. They act on this node's own copy, and
+`RemoveData` deletes it. Remove the replica from the cluster first, then stop
+it, then remove its data.
+
+- `RemoveData` on a running replica returns `*ShardNotStoppedError`; while a
+  start or import holds the shard it returns `ErrShardNotReady` or
+  `ErrImportInProgress`.
+- `RemoveData` retires the replica ID on this host. From then on `StartShard`
+  refuses it with `*ReplicaRetiredError` (matches `ErrReplicaRetired`), and
+  `ImportSnapshot` finds no data to import into (`ErrShardNotFound`). The
+  deleted data held the replica's term, vote and owed lease vote window, and
+  Raft never lets a removed replica return under the same ID. Rejoin under a
+  new replica ID.
+- `StopReplica` returns `*ReplicaNotFoundError` when this host runs a different
+  replica of the shard.
 
 ### Capability: transfer leadership
 
@@ -131,51 +165,70 @@ Not a membership change, but the operation you run before removing a leader.
 
 ### Errors
 
+All are exported from `quicraft` and match with `errors.Is` / `errors.As`.
+
 | Error | Meaning |
 |---|---|
-| `*StaleConfigChangeError` | the `configChangeIndex` did not match; another change landed first. Re-read `Membership.ConfigChangeID` and retry. |
-| `*InvalidMemberError` | the member specification is not usable |
-| `*EmptyMembersError` | an empty member map |
-| `*SelfNotInMembersError` | this replica is not in the map it was given |
-| `*NonVotingRoleInMembersError` / `ErrNonVotingRoleInMembers` | an observer or witness appears in the voting map |
-| `ErrTooManyWitnesses` | the 64-voting-member cap |
-| `ErrRemovedMemberIdentity` | the add binds a node identity this shard has removed, under any replica ID; see `Membership.RemovedIdentities` |
-| `*ReplicaNotFoundError` | no such replica in this shard |
-| `*ShardNotStoppedError` | a local data operation on a running shard |
-| `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable or absent — the shard cannot start |
-| `*UnauthorizedMessageError` | a message from a sender not authorized for the shard |
+| `*StaleConfigChangeError` (`ErrStaleConfigChange`) | the `configChangeIndex` did not match; another change landed first. Re-read `Membership.ConfigChangeID` and retry. |
+| `ErrRejected` | another config change is still uncommitted. Retry once it commits. |
+| `ErrMemberIdentityRequired` | an add without a node identity on a host with a transport |
+| `ErrRemovedMemberIdentity` | the add binds an identity this shard has removed, under any replica ID; see `Membership.RemovedIdentities` |
+| `ErrNodeAlreadyExists` | the target already holds the requested role, or is a witness (a witness cannot be promoted) |
+| `ErrNodeRemoved` | the replica ID was removed from this shard; IDs are never reused |
+| `ErrNodeNotFound` | a removal targets a replica that is not a member |
+| `ErrRemoveLastFullReplica`, `ErrRemoveLastVoter` | the removal would leave the shard unable to elect |
+| `ErrTooManyVotingMembers` | the 64-voting-member cap |
+| `ErrTooManyWitnesses` | the replicated `MaxWitnesses` cap |
+| `ErrBreaksFullReplicaMajority` | the change violates `RequireFullReplicaMajority` |
+| `ErrZeroReplicaID`, `ErrEmptyAddress` | malformed request |
+| `ErrReplicaRetired` / `*ReplicaRetiredError` | `StartShard` for a replica ID `RemoveData` retired on this host |
+| `*ReplicaNotFoundError` | no such replica of this shard on this host |
+| `*ShardNotStoppedError` | a local data operation on a running replica |
+| `*EmptyMembersError`, `*SelfNotInMembersError`, `*InvalidMemberError` | `StartShard` was given an unusable founding member map |
+| `*NonVotingRoleInMembersError` (`ErrNonVotingRoleInMembers`) | `StartShard` for a replica configured as observer or witness that is also listed in the founding member map |
+| `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable or absent; the shard cannot start |
+| `*UnauthorizedMessageError` | an inbound snapshot transfer from a sender not authorized for the shard. Ordinary Raft messages from such a sender are dropped and counted, not returned. |
+
+`ErrDuplicateMemberAddress` and `ErrDuplicateMemberIdentity` (an address or
+identity already held by another active member) are returned by the same
+validation but are not re-exported, so a caller cannot match them with
+`errors.Is`.
 
 ### Wire types
 
 ```go
-proto.ConfigChange                 // Type: AddNode | AddObserver | AddWitness |
-                                   //       RemoveNode | UpdateWitnessPolicy
+proto.ConfigChange                 // Type: AddNode | RemoveNode | AddNonVoting |
+                                   //       AddWitness | UpdateWitnessPolicy
 proto.Membership                   // replicated configuration
 const proto.EntryInitialMembership uint64 = 4
-const proto.MaxNodeIdentityLength  = 256
+const proto.MaxNodeIdentityLength = 256
 func proto.ConfigChangeTypeName(t uint64) string
 ```
 
 ## Configuration
 
-| Field | Owner | Default | Note |
-|---|---|---|---|
-| `OrderedConfigChange` | `config.Config` | `*bool`, nil = **enabled** | serialize membership changes |
-| `IsObserver` / `IsWitness` | `config.Config` | false | **mutually exclusive**. `IsObserver` is an initial hint: the committed membership decides once it names the replica |
-| `Witness` | `config.Config` | `WitnessConfig{}` | bootstrap seed only |
-| `MemberIdentities` | `config.Config` | `nil` | required on a host with a transport: every founder's members (join=false), at least one anchor replica (join=true); entries beyond the members map are the operator anchor the receive gate consults for a sender no configuration names |
+Per shard, on `config.Config`.
+
+| Field | Default | Note |
+|---|---|---|
+| `OrderedConfigChange` | `*bool`, nil = enabled | serialize membership changes |
+| `IsObserver` / `IsWitness` | false | mutually exclusive. `IsObserver` is an initial hint: the committed membership decides once it names the replica. `IsWitness` is binding. |
+| `Witness` | `WitnessConfig{}` | bootstrap seed only |
+| `MemberIdentities` | nil | required on a host with a transport: every founder's members (`join=false`), at least one anchor replica (`join=true`). Entries beyond the members map are the operator anchor the receive gate consults for a sender no configuration names. |
+
+`Config.RequireMemberIdentities` is set by the Host from whether it has a
+transport; whatever the caller puts there is overwritten.
 
 ## Versioning and deprecation
 
-- `proto.Membership` carries a **persisted-scoped** version byte
+- `proto.Membership` carries a persisted-scoped version byte
   (`membershipFormatVersion` = 1), a separate namespace from
   `proto.WireVersion`, gated on exact equality. It is stamped into the WAL,
   snapshot records, exported artifacts, and the `EntryInitialMembership` entry
-  at log index 1 — bytes that outlive the process that wrote them. See
+  at log index 1. See
   [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md).
-- The WAL has a **third** discriminator on the same layout,
+- The WAL has a third discriminator on the same layout,
   `membershipSectionVersion`.
-- `RequireMemberIdentity` was removed in 0.13.0-alpha (#197): identities are
-  required at admission and there is no address fallback — see
+- Identities are required at admission and there is no address fallback; see
   [`../compatibility.md`](../compatibility.md).
 - Nothing here is deprecated.

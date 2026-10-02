@@ -1,12 +1,12 @@
 # Wire Protocol — API
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API** — and for this feature that
-statement is unusually literal: the "transport" *is* the byte layout below.
+go-quicraft is a library, so the Go API is the API. For this feature that is
+unusually literal: the "transport" is the byte layout below.
 
 | Transport | This feature |
 |---|---|
@@ -17,16 +17,14 @@ statement is unusually literal: the "transport" *is* the byte layout below.
 | gRPC | n/a — this repository defines no gRPC service, and deliberately does not: see [`architecture.md`](architecture.md) |
 | MCP | n/a — this repository registers no MCP tools |
 
-Not missing-capability rows. This feature is part of the go-quicraft capability
-row covering Raft consensus, log replication and QUIC transport, which the
-portfolio register marks as consumed by implementing interfaces rather than by
-calling a client.
+These are not missing capabilities: the codec is consumed in-process by the
+transport and the WAL, not called by a client.
 
 ## Go API
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/proto`
 
-### The codec contract — every serializable type implements it
+### The codec contract every serializable type implements
 
 ```go
 func (t *T) MarshalTo(buf []byte) (int, error)   // buf must be >= Size()
@@ -39,20 +37,20 @@ func (t *T) Reset()                              // pool-friendly
 |---|---|---|
 | `Entry` | 68 | the unit of replication: `Term`, `Index`, `Type`, `Key`, `ClientID`, `SeriesID`, `RespondedTo`, `OwnerID`, `CmdLen`, `Cmd` |
 | `Message` | 88 | one Raft message, plus `Entries` and an inline `Snapshot` |
-| `MessageBatch` | 24 | `BinVer`, `DeploymentID`, `SourceEpoch`, `SourceAddress`, `Messages` |
-| `State` | — | persisted term/vote/commit |
-| `Snapshot` | — | snapshot metadata, embedded `Membership`, `Filepath`, `Files` |
+| `MessageBatch` | 24 | `BinVer`, `DeploymentID`, `SourceEpoch`, `SourceAddress`, `Requests` |
+| `State` | 32 (whole) | persisted `Term`, `Vote`, `Commit`, `VoteWindow` |
+| `Snapshot` | 32 | position (`ShardID`, `ReplicaID`, `Index`, `Term`), embedded `Membership`, `Filepath`, `FileSize`, `OnDiskIndex`, `Epoch`, `Compression` |
 | `SnapshotFile` | — | one file within a snapshot, with application `Metadata` |
-| `SnapshotChunk` | — | one streamed chunk, with `BinVer` and embedded `Membership` |
-| `Membership` | — | addresses, observers, witnesses, removed set, session policy, identity maps |
-| `ConfigChange` | — | a membership change proposal |
-| `ReadyToRead` | — | a resolved ReadIndex |
-| `UpdateCommit` | — | commit bookkeeping |
+| `SnapshotChunk` | 72 | one streamed chunk, with `BinVer` and embedded `Membership` |
+| `Membership` | 57 | version byte, addresses, observers, witnesses, removed set, session policy, identity maps |
+| `ConfigChange` | 52 | a membership change proposal, with the added member's `NodeIdentity` |
+| `ReadyToRead` | 16 (whole) | a resolved ReadIndex |
+| `UpdateCommit` | 48 (whole) | commit bookkeeping |
 | `Update` | — | **in-process only**; not a wire type |
 
 Full field-offset tables, validation rules and per-type semantics are in
-[`engineering.md`](engineering.md). Do not reproduce offsets from memory —
-`Entry`'s header was 60 bytes in 0.4.x and is 68 now.
+[`engineering.md`](engineering.md). Read offsets from there, not from memory:
+a layout change before the first production release is made in place.
 
 ### Capability: encode a value
 
@@ -66,8 +64,8 @@ n, err := entry.MarshalTo(buf)
 |---|---|
 | Request | a destination buffer of at least `Size()` bytes |
 | Response | bytes written |
-| Errors | `ErrBufferTooSmall`, plus every bound the type enforces on the write side — `ErrEntrySizeLimitExceeded`, `ErrInvalidEntryType`, `ErrTooManyMessages`, `ErrAddressTooLong`, … |
-| Permission | none — in-process call |
+| Errors | `ErrBufferTooSmall`, plus every bound the type enforces on the write side: `ErrEntrySizeLimitExceeded`, `ErrInvalidEntryType`, `ErrTooManyMessages`, `ErrAddressTooLong`, … |
+| Permission | none; in-process call |
 
 **Write-side validation is not defensive programming here.** An entry is
 committed to the Raft log before any peer parses it, so an encoder that could
@@ -97,7 +95,7 @@ func PutEntrySlice(s *[]Entry)
 ```
 
 Reuse for the hot decode path. Anything aliasing a pooled buffer must be copied
-first — see the buffer-ownership rules in
+first; see the buffer-ownership rules in
 [`engineering.md`](engineering.md#buffer-ownership-rules).
 
 ### Capability: name a constant
@@ -136,11 +134,11 @@ const MaxLogIndex             uint64 = math.MaxUint64 - 1024
 ```
 
 `MaxTerm` and `MaxLogIndex` are protocol bounds rather than decode limits: the
-codec accepts any `uint64`, and the values are refused where they are ADMITTED
-— `raft.step` for a wire term, `Snapshot.CheckBounds` on every snapshot
+codec accepts any `uint64`, and the values are refused where they are admitted:
+`raft.step` for a wire term, `Snapshot.CheckBounds` on every snapshot
 admission path (chunk validation, LogDB `SaveSnapshot` and `SaveState`,
 `handleSnapshot`), and a leader's proposals once its log reaches
-`MaxLogIndex` — with `ErrTermOutOfRange` / `ErrLogIndexOutOfRange`. Persisted
+`MaxLogIndex`, with `ErrTermOutOfRange` / `ErrLogIndexOutOfRange`. Persisted
 state is refused at open only at the ceiling itself, a few below `MaxUint64`;
 the headroom between the two is what local `term+1` / `index+1` transitions
 spend without ever wrapping.
@@ -151,10 +149,11 @@ decoder**. A producer that exceeds one emits a payload every peer rejects, and a
 rejection is indistinguishable from a broken connection at the sender.
 **Producers MUST bound themselves by these values.**
 
-`MaxDecodeMemoryFactor` is not a runtime check. It is the measured heap-per-wire-byte
-ceiling an operator needs in order to size
-`TransportConfig.MaxMessageReceiveMemory`: a frame admitted under a 256 MB
-budget can occupy up to 2 GB of heap.
+`MaxDecodeMemoryFactor` is not checked by the codec. It is the measured
+heap-per-wire-byte ceiling of a decode, and the transport charges every inbound
+frame at that multiple against `TransportConfig.MaxMessageReceiveMemory`, so
+the budget bounds decoded heap: 256 MB admits at most 32 MB of frames in
+flight.
 
 ### Entry types and masks
 
@@ -184,11 +183,11 @@ const SessionSeriesIDForUnregister uint64 = math.MaxUint64
 ```
 
 (`quicraft.SeriesIDForRegister`, in `pkg`, is a separate constant on the
-public API — not this package's.)
+public API, not this package's.)
 
 See [`../client-sessions/engineering.md`](../client-sessions/engineering.md).
 
-### Message origin — process-local, never on the wire
+### Message origin: process-local, never on the wire
 
 ```go
 type MessageOrigin uint8
@@ -197,8 +196,8 @@ const OriginRemote MessageOrigin = iota
 
 `Message.Origin` is a twelfth field that `MarshalTo` never writes,
 `UnmarshalFrom` sets to `OriginRemote`, and `Reset` zeroes. `OriginRemote` is
-the zero value, so a message decoded from the network — or recycled through the
-pool — is never mistaken for a locally generated one. Putting it on the wire
+the zero value, so a message decoded from the network, or recycled through the
+pool, is never mistaken for a locally generated one. Putting it on the wire
 would let a sender assert its own provenance.
 
 ### Error vocabulary
@@ -222,9 +221,7 @@ in [`engineering.md`](engineering.md#error-types).
   reachable from `MessageBatch` or `SnapshotChunk` changes layout, including the
   embedded persisted ones.** It is a supremum, not a transport-only counter.
 - `Update` is in-process only and carries no version.
-- Nothing in this package is deprecated. Types removed from earlier layouts are
-  listed in [`engineering.md`](engineering.md) so a reader of old code knows
-  what became of them.
+- Nothing in this package is deprecated.
 
 The repository-wide policy and per-release upgrade procedure are in
 [`../compatibility.md`](../compatibility.md).

@@ -1,57 +1,58 @@
 # State Machines — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-This is the part of go-quicraft you actually write code against. You implement
-one interface, hand the library a factory, and it handles consensus,
-replication, snapshotting and recovery.
+This is the part of go-quicraft you write code against. You implement one
+interface, hand the library a factory, and it handles consensus, replication,
+snapshotting and recovery.
 
 ## Before you start
 
-- Go 1.27.0 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
-- A clear answer to one question: **is your `Update` deterministic?** Every
-  replica applies the same entries in the same order and must reach the same
-  state. No clock, no random source, no network call, no map iteration order.
-  Nothing in this library checks it for you, and divergence has no symptom until
-  it is already replicated.
+- Go 1.27 or later, with `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Make sure your `Update` is deterministic. Every replica applies the same
+  entries in the same order and must reach the same state: no clock, no random
+  source, no network call, no dependence on map iteration order. Nothing checks
+  this for you, and divergence has no symptom until it is already replicated.
 
-## Task: choose a tier
+## Choose a tier
 
 | If your state… | Implement | You get |
 |---|---|---|
-| fits in memory and reads are not hot | `StateMachine` | the simplest correct thing. `Update` and `Lookup` never overlap. |
-| fits in memory and reads must run during writes | `ConcurrentStateMachine` | concurrent `Lookup`, and snapshots that do not block `Update` |
-| lives in a disk store that already has durability | `DiskStateMachine` | the library stops duplicating your fsync, and hands replay back to you |
+| fits in memory and reads are not hot | `StateMachine` | the simplest correct option; `Update` and `Lookup` never overlap |
+| fits in memory and reads must run during writes | `ConcurrentStateMachine` | concurrent `Lookup`, and snapshots that do not pause `Update`; you do the locking |
+| lives in a disk store with its own durability | `DiskStateMachine` | no duplicated fsync, and replay handed back to you; no client sessions |
 
-Start at tier 0. Moving up later is a contained change; discovering you needed
-tier 0's serialization guarantee after building on tier 1 is not.
+Start with `StateMachine`. Moving up a tier later is a contained change.
 
-## Task: write a tier-0 state machine
+## Write a basic state machine
 
 ```go
 type Counter struct{ n uint64 }
 
 func (c *Counter) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
-    for i, e := range entries {
-        delta := binary.LittleEndian.Uint64(e.Cmd)
-        c.n += delta
-        results[i] = sm.Result{Value: c.n}
-    }
-    return nil
+	for i, e := range entries {
+		if len(e.Cmd) != 8 {
+			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
+			continue
+		}
+		c.n += binary.LittleEndian.Uint64(e.Cmd)
+		results[i] = sm.Result{Value: c.n}
+	}
+	return nil
 }
 
 func (c *Counter) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
-    return c.n, nil
+	return c.n, nil
 }
 
 func (c *Counter) SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error {
-    return binary.Write(w, binary.LittleEndian, c.n)
+	return binary.Write(w, binary.LittleEndian, c.n)
 }
 
 func (c *Counter) RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error {
-    return binary.Read(r, binary.LittleEndian, &c.n)
+	return binary.Read(r, binary.LittleEndian, &c.n)
 }
 
 func (c *Counter) Close(ctx context.Context) error { return nil }
@@ -60,156 +61,175 @@ func (c *Counter) Close(ctx context.Context) error { return nil }
 Register it:
 
 ```go
-err := host.StartShard(members, join,
-    sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-        return &Counter{}
-    }),
-    cfg)
+err := host.StartShard(members, false,
+	sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return &Counter{}
+	}),
+	cfg)
 ```
 
-Use the typed wrapper for your tier — `NewCreateFunc`,
-`NewConcurrentCreateFunc`, `NewDiskCreateFunc`. It makes the choice explicit
-instead of inferred from a method set you may have got wrong.
+Use the typed wrapper for your tier (`NewCreateFunc`, `NewConcurrentCreateFunc`,
+`NewDiskCreateFunc`) so the compiler checks that your type implements it.
 
-## Task: fill in `results`
+## Fill in `results`
 
-`results` is pre-sized to match `entries`. Write `results[i]` for `entries[i]`;
-what you put there comes back to the proposer through
-`RequestState.Result()`.
+`results` has the same length as `entries`, and the slice is reused between
+calls, so write every `results[i]`. What you write comes back to the proposer
+through `RequestState.Result()`.
+
+- `Data` is optional.
+- A payload you cannot decode gets `sm.ResultInvalidCommand`, with your state
+  left unchanged. Do not return an error for it: the entry is committed, so an
+  error would fail the shard on every replica.
+- Never return `sm.ResultSessionExpired`; it is reserved.
+
+## Keep `Update` all-or-nothing
+
+Either every entry in the call is applied and every result written, or your
+state is back where it started and you return an error. The simplest way to get
+there is to decode and validate the whole batch first, then apply in a pass that
+cannot fail.
+
+`Update` can be called several times for one committed batch, and the indexes it
+sees can have gaps (configuration changes and session bookkeeping entries never
+reach you). Do not use `Index` to count entries.
+
+## Handle `Cmd` correctly
 
 ```go
-results[i] = sm.Result{Value: applicationCode, Data: payload}
+value := e.Cmd       // safe by default: Cmd is an owned copy
+value = e.CopyCmd()  // required when Config.ZeroCopyEntryCmd is true
 ```
 
-`Data` is optional. Do not return the reserved `Result.Value` constants the RSM
-layer uses for session signalling (`ResultSessionExpired` and its neighbours).
+Under `ZeroCopyEntryCmd`, anything you keep past `Update`, in a map, a queue or
+another goroutine, must be copied. If you are not sure which mode you run under,
+copy.
 
-## Task: handle `Cmd` correctly
+## Implement a disk state machine
 
-```go
-// Safe by default — Cmd is an owned copy.
-value := e.Cmd
-
-// When Config.ZeroCopyEntryCmd is true, Cmd aliases a reused internal buffer.
-value := e.CopyCmd()
-```
-
-If you retain anything past `Update()` — putting it in a map, queueing it,
-handing it to a goroutine — **copy it**. If you are not certain which mode you
-run under, copy: the cost is one allocation, and the alternative is reading
-another shard's bytes later.
-
-## Task: implement a disk state machine
-
-Two obligations beyond the tier-0 ones:
+Two obligations beyond the basic tier:
 
 ```go
 func (d *DiskSM) Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error) {
-    // Return the last index YOUR store durably applied. Raft replays from here.
-    return d.store.LastAppliedIndex()
+	// Return the last index YOUR store durably applied. Raft replays from here.
+	return d.store.LastAppliedIndex()
 }
 ```
 
-**Replay must be idempotent.** After a crash the library will hand you entries
-your store has already applied, because its notion of "durable" and yours are
-independent. Applying them twice must be a no-op — typically by persisting the
-applied index in the same atomic write as the data.
+Replay must be idempotent. After a crash you can be handed entries your store
+already applied. The usual fix is to persist the applied index in the same
+atomic write as the data.
 
-`Sync()` is where you make your own writes durable. It is called by the library
-at the points where durability matters.
+`Sync()` makes your pending writes durable. It is called before every snapshot
+capture.
 
-## Task: turn on divergence detection
+Client sessions are not available on this tier (`ErrSessionsUnsupportedOnDisk`).
+Make your commands idempotent and propose them with `Propose` or `SyncPropose`.
+
+## Implement a concurrent state machine
+
+`Lookup` and `GetHash` run while `Update` runs, so protect your state with your
+own locks. Two rules:
+
+- A reader must never see a half-applied batch. Hold your write lock (or locks)
+  for the whole `Update` call.
+- `PrepareSnapshot` must return a value that later `Update` calls cannot change:
+  a deep copy, a copy-on-write view, or a database snapshot handle.
+  `SaveSnapshot` runs while applies continue and must not touch live state.
+
+## Turn on divergence detection
 
 ```go
 func (c *Counter) GetHash() (uint64, error) { return c.n, nil }
 
-var _ sm.Hasher = (*Counter)(nil)   // compile-time assertion — do this
+var _ sm.Hasher = (*Counter)(nil) // compile-time check
 ```
 
-Then compare across replicas at the same applied index:
+Then compare replicas at the same applied index:
 
 ```go
 hash, appliedIndex, ok, err := host.StateMachineHash(shardID)
 ```
 
-The compile-time assertion is not decoration. **Detection is by type assertion,
-so a wrong signature produces no compile error and the capability is silently
-never invoked** — you get `ok == false` and no explanation. The same applies to
-`NALookup` and `NALookupInto`: two return values, exact signatures.
+The hash must not depend on iteration order: sort keys before hashing. On a
+concurrent or disk state machine it must also cover whole batches, so take the
+same lock `Update` holds.
 
-## Task: make reads allocation-free
+Keep the compile-time assertion. A wrong signature compiles, and the capability
+is silently never called; you just get `ok == false`. The same applies to
+`BytesLookup` and `BytesLookupInto`.
+
+## Make reads allocation-free
 
 ```go
-func (s *Store) BytesLookup(key []byte) ([]byte, error)              // NALookup
-func (s *Store) BytesLookupInto(key, dst []byte) ([]byte, error)     // NALookupInto
+func (s *Store) BytesLookup(key []byte) ([]byte, error)          // sm.NALookup
+func (s *Store) BytesLookupInto(key, dst []byte) ([]byte, error) // sm.NALookupInto
 ```
 
-The host then serves `SyncReadBuf` and `StaleReadBuf`, which return a buffer and
-a `release` function instead of allocating. Call `release` when done.
+With `BytesLookupInto`, `Host.SyncReadBuf` and `Host.StaleReadBuf` read into a
+pooled buffer and return it with a `release` function. Copy the value into
+`dst` (growing it with `append`), never return your own internal slice, and call
+`release` when you are done with the result.
 
-## Task: cache a disk state machine
+## Cache a disk state machine
 
 ```go
 cached, err := sm.NewCachedDiskStateMachine(inner, sm.CacheConfig{
-    MaxEntries:   100000,
-    ExtractKV:    func(cmd []byte) (string, []byte) { /* key + value from the COMMAND */ },
-    EntryApplied: func(cmd []byte, r sm.Result) bool { /* did it actually apply? */ },
+	MaxEntries:   100000,
+	ExtractKV:    extractKV,    // key and value from the COMMAND bytes
+	EntryApplied: entryApplied, // did this entry actually change the store?
 })
 ```
 
-**If your state machine has conditional operations — compare-and-set,
-put-if-absent, delete-if-match — you MUST set `EntryApplied`.** The cache is
-populated from the value `ExtractKV` pulls out of the *command*, and a
-conditional write may not have applied. Nothing in the library can infer the
-outcome, because the encoding is yours. Omitting it caches values that were
-never written.
+If any operation is conditional (compare-and-set, put-if-absent,
+delete-if-match), you must set `EntryApplied`. The cache is filled from the
+value in the command, and a conditional write may not have taken effect. Without
+it the cache serves values that were never written.
 
-## Task: start from a worked example
+## Start from a worked example
 
-`pkg/sm/kv` has both a tier-0 (`MemoryStore`) and a tier-1 (`ConcurrentStore`)
-implementation, with a command codec, a snapshot format, and `sm.Hasher`. Read
-them; do not ship them. They are reference implementations and test fixtures —
-a real key-value store is the database layer's job, not something to grow here.
+`pkg/sm/kv` has a basic (`MemoryStore`) and a concurrent (`ConcurrentStore`)
+implementation with a command codec, a snapshot format and `sm.Hasher`. Read
+them; do not ship them. They are reference implementations, not a database.
 
 ## Troubleshooting
 
-**Replicas disagree** — a non-deterministic `Update`. Look for, in order: a
-clock, `rand`, map iteration order, a network or filesystem read, a pointer
-address, and goroutine scheduling. Once you find it you also have to repair the
-divergence, because the wrong state has been snapshotted and shipped.
+**Replicas disagree.** `Update` is non-deterministic. Look for a clock, `rand`,
+map iteration order, a network or file read, a pointer address, or goroutine
+scheduling. Fixing the code is not enough: the wrong state has already been
+snapshotted and shipped, so it has to be repaired too.
 
-**A capability I implemented never runs** — the signature is wrong, so the type
-assertion fails silently. `GetHash() (uint64, error)`,
-`BytesLookup(key []byte) ([]byte, error)`. Add
-`var _ sm.Hasher = (*T)(nil)` and let the compiler tell you.
+**A capability I implemented never runs.** The signature is wrong and the type
+assertion fails silently. Add `var _ sm.Hasher = (*T)(nil)` and let the compiler
+tell you.
 
-**The shard stopped after one bad entry** — that is the design. The apply path
-is fail-fast: the shard is marked failed on the **first** `Update` error, with
-no retry and no setting to add one. Fix the entry handling; a retry loop over
-code that already failed either loops forever or applies twice.
+**The shard stopped after one bad entry.** That is the design: the first
+`Update` error or panic fails the shard, with no retry. Handle undecodable
+payloads with `sm.ResultInvalidCommand` instead of an error.
 
-**Reading garbage that changes between runs** — you kept an `Entry.Cmd` past
-`Update()` under `ZeroCopyEntryCmd`. Copy it.
+**Reading garbage that changes between runs.** You kept an `Entry.Cmd` past
+`Update` under `ZeroCopyEntryCmd`. Copy it.
 
-**Snapshots never happen** — `Config.SnapshotEntries` is 100000 by default and
-**zero does not disable it**; zero means "unset" and selects the default. If you
-meant to disable, assign `config.SnapshotsDisabled`. Never snapshotting also
-means never reclaiming snapshot directories, never purging an old epoch's DEK,
-and never invoking the at-rest barrier.
+**Snapshots never happen.** `Config.SnapshotEntries` defaults to 100000, and
+zero selects that default rather than disabling. To disable automatic snapshots,
+assign `config.SnapshotsDisabled`. Without snapshots, old snapshot directories
+are never reclaimed and the log is never compacted.
 
-**`Update` is called with a huge batch** — bounded by
-`Config.MaxApplyEntrySize`, default `MaxReplicationPayloadBytes` (~15.94 MB).
-Lower it if your per-entry work is expensive enough that a full batch blows a
-latency budget.
+**`Update` gets a huge batch.** One apply batch is capped at 64 MiB of entries,
+and each `Cmd` at `Config.MaxEntrySize` (8 MiB). Keep per-entry work cheap or
+expect latency proportional to batch size.
 
-**`RecoverFromSnapshot` gets encrypted bytes** — it does not. Your state machine
-always sees plaintext, whether or not at-rest encryption is on; the barrier
-decrypts to a sibling temp file first.
+**`RecoverFromSnapshot` gets encrypted bytes.** It does not. Your state machine
+always reads plaintext, with or without at-rest encryption.
 
-**A panic in `Update` took out more than the shard** — engine workers restart on
-panic so one shard cannot stall every shard mapped to that worker, but the state
-your code left behind mid-apply is yours. Return errors; do not panic.
+**A panic in `Update`.** The panic is recovered and logged with its stack, and
+the shard is marked failed; proposals in that batch fail with
+`ErrShardFailed`. Other shards keep running. Return errors instead of
+panicking.
 
-**Lookups block during writes on tier 0** — correct, and guaranteed. If you need
-concurrent reads, implement `ConcurrentStateMachine`; the adapter will not fake
-it.
+**Lookups block during writes.** On the basic tier that is guaranteed. If you
+need concurrent reads, implement `ConcurrentStateMachine`.
+
+**Hash mismatches between replicas at the same index on a concurrent state
+machine.** `GetHash` is reading part-way through a batch. Hold the same lock
+`Update` holds for the whole hash.

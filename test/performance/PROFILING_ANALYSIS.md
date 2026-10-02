@@ -1,8 +1,13 @@
-# QuicRaft Performance Profiling Analysis
+# QuicRaft profiling analysis
+
+> **Status: REFERENCE** · Scope: one CPU and memory profile of the QuicRaft
+> benchmark harness, taken at commit 3d92cd2 · Last verified: 2026-10-02
 
 ## Provenance
 
-Read this first. The profile below carries no recorded hardware.
+Read this first. The profile below carries no recorded hardware, and it
+predates many changes to the code it profiles. Function names in the tables
+are as they appeared in that profile.
 
 | Field | Value |
 |---|---|
@@ -12,27 +17,25 @@ Read this first. The profile below carries no recorded hardware.
 | Profiling duration | 233.06 s |
 | Total CPU samples | 467.21 s (200.47% utilization, multi-core) |
 
-Commit 3d92cd2 is the same commit that recorded the R640 benchmark set in
-[README.md](README.md), which makes the R640 the likely source, but nothing in
-the profile confirms it and the file has not been touched since. Absolute
-`ns/op` is a property of the machine, so every timing number here is
-uninterpretable without that attribution: treat them as ratios and shapes, not
-as values you can compare against a run on known hardware.
+Commit 3d92cd2 also produced the R640 baseline in
+[profiles/r640/analysis.md](profiles/r640/analysis.md), which makes the R640
+the likely source, but nothing in the profile confirms it. Absolute `ns/op` is
+a property of the machine, so treat every timing number here as a ratio or a
+shape, not a value to compare against a run on known hardware.
 
-The percentages, `B/op` and `allocs/op` figures are far more portable than the
-timings. Allocation counts are deterministic for a given build, so those are the
-parts of this document worth trusting. The next profile run should be captured
-with the same provenance header the `bench-compare` harness emits (machine, CPU
-model, governor, load, Go version, commit) so this caveat is not needed again.
-See [docs/performance/benchmarking.md](../../docs/performance/benchmarking.md).
+The percentages, `B/op` and `allocs/op` figures are more portable than the
+timings: allocation counts are deterministic for a given build. Capture the
+next profile with the provenance header the `bench-compare` harness emits
+(machine, CPU model, governor, load, Go version, commit); see
+[docs/testing/benchmarking.md](../../docs/testing/benchmarking.md).
 
 ## Summary
 
 QUIC transport I/O and Go runtime scheduling are the dominant CPU consumers, accounting for ~57% of CPU time. Context and timer allocations on the read path are the primary memory hotspots. LeaseRead is roughly 30x the throughput of standard ReadIndex in this profile, because it removes the heartbeat round-trip.
 
-## CPU Profile
+## CPU profile
 
-### Top Consumers (Flat %)
+### Top consumers (flat %)
 
 | Component | CPU % | Description |
 |-----------|-------|-------------|
@@ -51,7 +54,7 @@ QUIC transport I/O and Go runtime scheduling are the dominant CPU consumers, acc
 | **Total runtime/scheduler** | **~43%** | |
 | **Total QUIC transport** | **~12%** | |
 
-### Cumulative CPU (QuicRaft Paths)
+### Cumulative CPU (QuicRaft paths)
 
 | Function | Cumulative % | Role |
 |----------|-------|------|
@@ -66,7 +69,7 @@ QUIC transport I/O and Go runtime scheduling are the dominant CPU consumers, acc
 | `raft.(*Peer).Handle` | 2.51% | Raft message processing |
 | `raft.(*Peer).GetUpdate` | 0.61% | Update extraction from Raft core |
 
-### LeaseRead CPU Path
+### LeaseRead CPU path
 
 LeaseRead benchmarks account for 5.96% of total cumulative CPU while executing ~2M+ operations each.
 
@@ -77,14 +80,14 @@ LeaseRead benchmarks account for 5.96% of total cumulative CPU while executing ~
 | `Host.SyncRead` | 2.77% | Top-level read API |
 | `engine.drainAndHandleReadIndex` | 1.88% | Step worker ReadIndex drain |
 | `context.WithDeadlineCause` | 1.65% | Per-request context allocation |
-| `Host.ReadIndex` | 1.32% | Lease validity check + SM lookup |
+| `Host.ReadIndex` | 1.32% | ReadIndex submission and waiting |
 | `engine.WorkSignal.Notify` | 0.61% | Non-blocking wake signal |
 
-`Peer.Handle` does not appear in the LeaseRead hot path. The lease check (`checkQuorumActive`) short-circuits before enqueuing a ReadIndex message. CPU time is dominated by context allocation and scheduler overhead, not Raft consensus.
+CPU time on this path is dominated by context allocation and scheduler overhead, not Raft consensus. In the current code the lease check is `raft.hasValidLease`, evaluated in the leader's ReadIndex handler: with a valid lease the leader records the read at its commit index immediately instead of starting a heartbeat round and waiting for quorum acknowledgements.
 
-## Memory Profile
+## Memory profile
 
-### Top Allocators
+### Top allocators
 
 | Component | Allocated | Total % | Description |
 |-----------|-----------|---------|-------------|
@@ -101,11 +104,11 @@ LeaseRead benchmarks account for 5.96% of total cumulative CPU while executing ~
 | `raft.(*raft).addReadState` | 293 MB | 2.12% | ReadState per ReadIndex round |
 | `logdb.newTermRingBuffer` | 222 MB | 1.61% | Ring buffer per election cycle |
 
-LeaseRead allocates 554 B/op vs 3,635 B/op for standard 3N ReadIndex (85% reduction). It bypasses `raft.(*raft).addReadState` entirely since no heartbeat round-trip occurs.
+LeaseRead allocates 554 B/op vs 3,635 B/op for standard 3N ReadIndex (85% reduction), because no heartbeat round is sent or tracked.
 
-## Benchmark Results
+## Benchmark results
 
-### Single-Node
+### Single-node
 
 | Benchmark | ns/op | MB/s | B/op | allocs/op |
 |-----------|-------|------|------|-----------|
@@ -118,7 +121,7 @@ LeaseRead allocates 554 B/op vs 3,635 B/op for standard 3N ReadIndex (85% reduct
 | StaleRead_WAL | 307.1 | -- | 48 | 2 |
 | StaleRead_Memory | 289.7 | -- | 48 | 2 |
 
-### Multi-Node (3N/5N, real QUIC + mTLS)
+### Multi-node (3N/5N, real QUIC + mTLS)
 
 | Benchmark | ns/op | B/op | allocs/op | ops/sec |
 |-----------|-------|------|-----------|---------|
@@ -136,12 +139,12 @@ LeaseRead allocates 554 B/op vs 3,635 B/op for standard 3N ReadIndex (85% reduct
 | 5N ReadIndex | 199,646 | 1x | 159 | -- |
 | 5N LeaseRead | 6,700 | 29.8x | 10 | 94% |
 
-LeaseRead eliminates the heartbeat round-trip required by ReadIndex. The leader's lease validity check is a local clock comparison instead of a network round-trip.
+LeaseRead removes the heartbeat round-trip ReadIndex needs; the lease check is a local clock comparison.
 
 - ReadIndex (3N): ~6,086 reads/sec
 - LeaseRead (3N): ~181,260 reads/sec (30x throughput)
 
-## Optimizations Implemented
+## Optimizations implemented
 
 | Optimization | Target | Status |
 |-------------|--------|--------|
@@ -151,30 +154,30 @@ LeaseRead eliminates the heartbeat round-trip required by ReadIndex. The leader'
 
 Timer pooling eliminates heap allocation for the `Result()` deadline timer. SM Lookup zero-copy introduces `NALookupInto` where callers provide a destination buffer, and `SyncReadBuf`/`StaleReadBuf` APIs that use a `sync.Pool` of reusable byte buffers. Callers receive a `release()` function to return the buffer to the pool after use.
 
-## Remaining Optimization Opportunities
+## Remaining optimization opportunities
 
 | Priority | Target | Current Impact | Approach |
 |----------|--------|---------------|----------|
-| MEDIUM | Context allocation | 8.63% of allocations (1,191 MB) | Benchmark callers create `context.WithTimeout` — internal paths already pass raw deadlines |
-| LOW | QUIC GSO tuning | 11.91% CPU | Tune `MaxDatagramSize` and GSO batch size |
+| MEDIUM | Context allocation | 8.63% of allocations (1,191 MB) | Benchmark callers create `context.WithTimeout`; internal paths already pass raw deadlines |
+| LOW | QUIC send path | 11.91% CPU | Investigate packet sizing and GSO batching in quic-go |
 | LOW | ReadState pool | 2.12% of allocations (293 MB) | `sync.Pool` for `ReadState` structs (standard ReadIndex only) |
 
 The remaining context allocation is from callers creating `context.WithTimeout` before calling `SyncRead`/`SyncPropose`. Internal paths already extract the deadline as `time.Time` with zero allocation. This is a caller-side cost that cannot be eliminated in the library.
 
-## Reproducing This Profile
+## Reproducing this profile
 
 ```bash
 cd test/performance/quicraft
-mkdir -p ../profiles
+out=$(mktemp -d)
 
 GOWORK=off go test -tags=benchmark -run=^$ \
   -bench='BenchmarkPropose_SEQ_WAL|BenchmarkPropose_SEQ_Memory|BenchmarkSyncRead_WAL|BenchmarkSyncRead_Memory|BenchmarkStaleRead_WAL|BenchmarkStaleRead_Memory|BenchmarkCommitLatency_WAL|BenchmarkCommitLatency_Memory|BenchmarkSyncRead_3N_WAL_LeaseRead|BenchmarkSyncRead_5N_WAL_LeaseRead|BenchmarkSyncRead_3N_WAL|BenchmarkSyncRead_5N_WAL' \
   -benchtime=10s \
-  -cpuprofile=../profiles/cpu.prof \
-  -memprofile=../profiles/mem.prof \
+  -cpuprofile=$out/cpu.prof \
+  -memprofile=$out/mem.prof \
   -benchmem -count=1 -timeout=3600s .
 
-go tool pprof -top ../profiles/cpu.prof
-go tool pprof -top -cum ../profiles/cpu.prof
-go tool pprof -top ../profiles/mem.prof
+go tool pprof -top $out/cpu.prof
+go tool pprof -top -cum $out/cpu.prof
+go tool pprof -top $out/mem.prof
 ```

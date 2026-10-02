@@ -2,46 +2,48 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — the `Host`, its options,
 > `RequestState`, `Membership`, `ShardInfo`, the error and metrics vocabulary,
-> and `pkg/config` · Last verified: 2026-09-15
+> and `pkg/config` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-The `Host` is the single exported entry point of this library: one per process,
-managing shard lifecycle, proposal routing, reads, sessions and membership. This
-document is also the repository's system overview, because the `Host` is where
-every other feature is composed.
+The `Host` is the library's single entry point: one per process, managing shard
+lifecycle, proposal routing, reads, sessions and membership. This document is
+also the repository's system overview, because every other feature is composed
+in the `Host`.
 
-Per-feature design lives in the other folders — [`../raft-consensus/`](../raft-consensus/architecture.md),
-[`../quic-transport/`](../quic-transport/architecture.md),
-[`../log-storage/`](../log-storage/architecture.md),
-[`../snapshots/`](../snapshots/architecture.md),
-[`../seal-barrier/`](../seal-barrier/architecture.md),
-[`../state-machines/`](../state-machines/architecture.md),
-[`../client-sessions/`](../client-sessions/architecture.md),
-[`../membership-changes/`](../membership-changes/architecture.md),
-[`../wire-protocol/`](../wire-protocol/architecture.md),
-[`../write-batching/`](../write-batching/architecture.md),
-[`../shamir-primitive/`](../shamir-primitive/architecture.md),
-[`../memory-enclave/`](../memory-enclave/architecture.md),
-[`../observability/`](../observability/architecture.md).
+Per-feature design lives in the other folders:
+[raft-consensus](../raft-consensus/architecture.md),
+[quic-transport](../quic-transport/architecture.md),
+[log-storage](../log-storage/architecture.md),
+[snapshots](../snapshots/architecture.md),
+[seal-barrier](../seal-barrier/architecture.md),
+[state-machines](../state-machines/architecture.md),
+[client-sessions](../client-sessions/architecture.md),
+[membership-changes](../membership-changes/architecture.md),
+[wire-protocol](../wire-protocol/architecture.md),
+[write-batching](../write-batching/architecture.md),
+[shamir-primitive](../shamir-primitive/architecture.md),
+[memory-enclave](../memory-enclave/architecture.md),
+[observability](../observability/architecture.md).
 
+## System overview
 
-## System Overview
+QuicRaft (`github.com/jeremyhahn/go-quicraft`) is a multi-group Raft consensus
+library in Go. One `Host` manages thousands of independent Raft shards, each
+with its own state machine, log and membership. It provides:
 
-QuicRaft (github.com/jeremyhahn/go-quicraft) is a multi-group Raft consensus
-library in Go. A single `Host` manages thousands of independent Raft shards,
-each with its own state machine, log, and membership. It provides:
+- multi-group Raft with per-shard configuration
+- QUIC-only transport with mutual TLS, and no TCP fallback
+- a fixed-layout binary wire format (no protobuf)
+- a sharded WAL: 16 directory shards selected by `shardID % 16`, each with its
+  own segment files, index and mutex
+- AEAD encryption at rest (AES-256-GCM or ChaCha20-Poly1305), chosen by
+  hardware detection
+- session-based at-most-once proposal delivery
+- three state machine tiers: in-memory, concurrent, on-disk
 
-- Multi-group Raft with per-shard configuration
-- QUIC-only transport (no TCP fallback) with mutual TLS
-- Custom fixed-layout binary wire format (no protobuf)
-- Sharded WAL: 16 directory shards keyed by `shardID` hash, each with its own
-  segment files, index and mutex
-- Algorithm-agile AEAD encryption (AES-256-GCM or ChaCha20-Poly1305) with hardware auto-detection
-- Session-based at-most-once proposal delivery
-- Three state machine tiers: in-memory, concurrent, on-disk
-
-What it does not do: peer discovery, quorum validation, and cluster bootstrap
-orchestration are the caller's problem. See [Cluster Formation](#cluster-formation-lives-in-go-qrdb).
+It does not discover peers, validate a quorum of founders, or orchestrate
+bootstrap. The caller hands `StartShard` the member set. See
+[Cluster formation](#cluster-formation-and-the-discovery-boundary).
 
 ```
 +---------------------------------------------------------------------+
@@ -68,54 +70,47 @@ orchestration are the caller's problem. See [Cluster Formation](#cluster-formati
 +---------------------------------------------------------------------+
 ```
 
-## Package Structure
+## Package structure
 
-**Public API**
+Public API:
 
-- `pkg/` — Host, RequestState, Session, Membership, ShardInfo, errors, metrics
-- `pkg/config/` — HostConfig, Config, TransportConfig, MTLSConfig, EventListener
-- `pkg/sm/` — StateMachine, ConcurrentStateMachine, DiskStateMachine interfaces
-- `pkg/sm/kv/` — Reference KV implementations: MemoryStore, ConcurrentStore
-- `pkg/proto/` — Custom binary wire format: Entry, Message, MessageBatch, Snapshot
-- `pkg/logdb/` — LogDB interface, LogReader, storage layer types
-- `pkg/logdb/waldb/` — WAL-based LogDB (16 directory shards, segment files)
-- `pkg/logdb/memdb/` — In-memory LogDB for testing
-- `pkg/seal/` — Barrier (epoch DEK, HKDF, AEAD, rotation), algorithm selection
-  and hardware detection, `SealingStrategy` (with its `ProtectedSealingStrategy`
-  sibling) and `ProtectedShareSplitter`/`ProtectedShareAccumulator`
-- `pkg/crypto/` — Type aliases re-exporting `pkg/seal` for backward
-  compatibility. No implementation lives here.
-- `pkg/crypto/shamir/` — Pure GF(256) split/combine primitive. Share custody,
-  M-of-N quorum and recovery ceremonies are owned by go-qrdb, not by this
-  library.
-- `pkg/batch/` — Proposal batching aggregator
-- `pkg/writemode/` — Write durability modes
+| Package | Holds |
+|---|---|
+| `pkg/` (package `quicraft`) | `Host`, `RequestState`, `Session`, `Membership`, `ShardInfo`, errors, metrics |
+| `pkg/config/` | `HostConfig`, `Config`, `TransportConfig`, `MTLSConfig`, `EventListener` |
+| `pkg/sm/` | the `StateMachine`, `ConcurrentStateMachine` and `DiskStateMachine` interfaces |
+| `pkg/sm/kv/` | reference stores: `MemoryStore`, `ConcurrentStore` |
+| `pkg/proto/` | wire types: `Entry`, `Message`, `MessageBatch`, `Snapshot` |
+| `pkg/logdb/` | the `LogDB` interface, `LogReader`, storage types |
+| `pkg/logdb/waldb/` | the WAL-backed `LogDB` |
+| `pkg/logdb/memdb/` | an in-memory `LogDB` for tests |
+| `pkg/seal/` | the barrier (epoch DEK, HKDF, AEAD, rotation), algorithm selection, `SealingStrategy` and its protected-memory siblings |
+| `pkg/crypto/` | type aliases re-exporting `pkg/seal`; no implementation |
+| `pkg/crypto/shamir/` | the GF(256) split/combine primitive. Share custody, M-of-N quorum and recovery ceremonies belong to go-qrdb |
+| `pkg/batch/` | proposal batching aggregator |
+| `pkg/writemode/` | write durability modes |
 
-**Internal Implementation**
+Internal (not importable):
 
-- `pkg/internal/engine/` — Step/commit/apply/snapshot workers, listener
-  dispatcher, `Node` struct, `ReadyMap`
-- `pkg/internal/raft/` — Raft protocol, `Peer`, log, in-memory log, membership,
-  remotes, quiescence
-- `pkg/internal/transport/` — QUIC transport, connection/stream pool, frame I/O,
-  snapshot receive
-- `pkg/internal/rsm/` — Replicated state machine adapter, session routing
-- `pkg/internal/session/` — Client session manager (at-most-once delivery)
-- `pkg/internal/registry/` — (shardID, replicaID) → address mapping
-- `pkg/internal/netaddr/` — Address canonicalization so two spellings of one
-  endpoint compare equal
-- `pkg/internal/queue/` — `EntryQueue` (double-buffered MPSC), `SwapBuffer`
-- `pkg/internal/server/` — Global in-memory-log rate limiter
-- `pkg/internal/invariant/` — Debug assertions
-- `pkg/internal/transport/revocation/` — Certificate revocation (CRL, OCSP)
+| Package | Holds |
+|---|---|
+| `pkg/internal/engine/` | step, commit, apply and snapshot workers, the listener dispatcher, `Node`, `ReadyMap` |
+| `pkg/internal/raft/` | the Raft protocol, `Peer`, log, in-memory log, membership, remotes, quiescence |
+| `pkg/internal/transport/` | QUIC transport, connection and stream pool, frame I/O, snapshot receive |
+| `pkg/internal/transport/revocation/` | certificate revocation (CRL, OCSP) |
+| `pkg/internal/rsm/` | the replicated state machine adapter and session routing |
+| `pkg/internal/session/` | client session manager |
+| `pkg/internal/registry/` | `(shardID, replicaID)` to address mapping |
+| `pkg/internal/netaddr/` | address canonicalization, so two spellings of one endpoint compare equal |
+| `pkg/internal/queue/` | `EntryQueue` (double-buffered MPSC) and `SwapBuffer` |
+| `pkg/internal/server/` | the global in-memory-log rate limiter |
+| `pkg/internal/invariant/` | debug assertions |
 
-**Compatibility Layers**
+`contrib/dragonboat/` is a Dragonboat API compatibility layer.
 
-- `contrib/dragonboat/` — Dragonboat API compatibility layer
+## Data flow
 
-## Data Flow
-
-### Proposal Path
+### Proposal path
 
 ```
 Client
@@ -127,69 +122,63 @@ Host.Propose()
   | Find nodeState (h.nodes sync.Map)
   | Reject witnesses (ErrInvalidOperation) and full disks (ErrDiskFull)
   | len(cmd) <= min(MaxProposalPayloadSize, MaxEntrySize)?
-  | No leader known at all? → NotLeaderError (fail fast)
+  | No leader known at all? -> NotLeaderError (fail fast)
   v
 Host.proposeEntry()
-  | Global rate limiter, then per-shard rate limiter
-  | proposalKey = nextRequestKey()   — a random 64-bit draw, never zero
+  | Global rate limiter (ErrSystemBusy); failure latch (ErrShardFailed);
+  |   per-shard rate limiter (*BusyError)
+  | proposalKey = nextRequestKey()   -- random 64-bit draw, never zero
   | entry.Key = proposalKey
   | rs = newRequestState(ns.requestPool, proposalKey, deadline)
   | ns.pendingProposals.Store(proposalKey, &pendingProposal{rs, deadline,
   |     floor: engNode.CommittedIndex()})
-  | engNode.DeliverProposal([]proto.Entry{entry}) — MPSC proposalQ, non-blocking
+  | engNode.DeliverProposal(...) -- MPSC proposalQ; full -> ErrDropped
   | engine.NotifyWork(shardID)
   v
-Engine Step Worker (shardID % NumWorkers)
+Engine step worker (shardID % NumWorkers)
   | Drain proposalQ, inboxQ and readIndexQ into reusable buffers
   | peer.Handle(...) under node.raftMu
-  | peer.GetUpdate() → proto.Update
-  | Send FREE-ORDER messages now, before persist (Replicate, Heartbeat, ...)
-  |   Ordered messages (VoteResp, HeartbeatResp) are held for the commit worker
+  | peer.GetUpdate() -> proto.Update
+  | Send free-order messages now, before persist (Replicate, Heartbeat, ...)
+  |   Ordered messages (VoteResp, HeartbeatResp) wait for the commit worker
   | commitPending.Store(true)
-  | commitC ← {update, node}
+  | commitC <- {update, node}
   v
-Engine Commit Worker
-  | logdb.SaveState(batch) — persist entries + term/vote (5 attempts)
-  | Send ORDERED messages now that the state they promise is durable
-  | peer.Commit() — logReader.Append, advance markers, truncate inmem
-  | applyC ← {update, node}
+Engine commit worker
+  | logdb.SaveState(batch) -- entries + term/vote (5 attempts)
+  | Send ordered messages, now that the state they promise is durable
+  | peer.Commit() -- logReader.Append, advance markers, truncate inmem
+  | applyC <- {update, node}
   v
-Engine Apply Worker → per-shard goroutine (bounded by semaphore)
-  | rsm.Apply(entries) → session routing, then user SM
+Engine apply worker -> per-shard goroutine (bounded by a semaphore)
+  | rsm.Apply(entries) -> session routing, then the user SM
   | callback.OnApplied(shardID, entries, results)
   | commitPending.Store(false); workSignal.Notify()
   v
 Host.OnApplied() callback
-  | For each entry: match entry.Key → pendingProposals[key]
+  | For each entry: match entry.Key -> pendingProposals[key]
   | rs.complete(Result{Value, Data})
   v
-Client ← rs.Result() unblocks
+Client <- rs.Result() unblocks
 ```
 
 The request key is a random 64-bit draw, not a counter. `entry.Key` travels
-through the raft log to every replica and is how an applied entry is matched
-back to the caller waiting on it, so it must not repeat across hosts — replica B
-must not complete its own pending request with replica A's unrelated entry —
-and it must not repeat across **incarnations** of one host either. It used to
-be `(replicaID, per-Host sequence)`, unique across hosts by construction; a
-restarted replica is a new `Host` under the same replica ID with the sequence
-back at zero, and a snapshot-less restart replays the whole log through
-`OnApplied`, so a replayed old entry completed the fresh proposal registered
-under its key with the old entry's result — the caller was told its write had
-landed while its entry was still in flight (#186). A random draw from
-`math/rand/v2` needs no persistence and is what dragonboat does; uniqueness is
-probabilistic at 2^-64 per pair over the requests currently pending. Behind it,
-`pendingProposal.floor` records the committed index as last published to the
-host at registration (`Node.CommittedIndex`, an atomic the step worker stores
-once per cycle), and `OnApplied` and `OnCommitted` refuse an entry at or below
-it: whatever its key, an entry that was committed and published before the
-proposal registered cannot be that proposal. The marker can lag the peer's own
-commit by the cycle that is in progress, so the floor is a bound rather than
-the instant's value — it makes the replay case certain, which is the case that
-happened, and leaves the rest to the draw. See `nextRequestKey` and
-`pendingProposal.owns`.
+through the log to every replica and is how an applied entry is matched back to
+the caller waiting on it, so it must not repeat across hosts, nor across
+incarnations of one host: a restarted replica replays its log through
+`OnApplied`, and a replayed old entry must never complete a fresh proposal. A
+random draw from `math/rand/v2` needs no persistence; uniqueness is
+probabilistic at 2^-64 per pair of pending requests.
 
-### Read Path (Linearizable)
+The committed-index floor makes the replay case certain. `pendingProposal.floor`
+is the committed index last published to the host when the proposal registered
+(`Node.CommittedIndex`, an atomic the step worker stores once per cycle, seeded
+from the recovered log before `StartShard` returns). `OnApplied` and
+`OnCommitted` refuse an entry at or below it (`pendingProposal.owns`): an entry
+committed before the proposal registered cannot be that proposal, whatever its
+key.
+
+### Read path (linearizable)
 
 ```
 Client
@@ -197,567 +186,382 @@ Client
   | h.SyncRead(ctx, shardID, query)
   v
 Host.ReadIndex()
-  | Witnesses rejected here (ErrInvalidOperation) — they store no log data
-  | Refused at once with ErrShardFailed if the shard's failure latch tripped
-  | readKey = nextRequestKey()   [the same random draw proposals use]
+  | Witnesses rejected (ErrInvalidOperation): they store no log data
+  | Refused at once with ErrShardFailed if the failure latch has tripped
+  | readKey = nextRequestKey()
   | ns.pendingReads[readKey] = &pendingRead{rs}   (under ns.pendingReadsMu)
-  | engNode.DeliverReadIndex(readKey) — MPSC readIndexQ
+  | engNode.DeliverReadIndex(readKey) -- MPSC readIndexQ; full -> ErrSystemBusy
   | engine.NotifyWork(shardID)
   v
-Engine Step Worker
+Engine step worker
   | Drain readIndexQ as a batch; the first key becomes the batchKey
   | callback.OnReadIndexBatched(shardID, batchKey, aliasKeys)  [BEFORE Handle]
   | peer.Handle(ReadIndex{Hint: batchKey})
-  |   LeaseRead enabled and lease still valid → resolves inline, no heartbeat
-  |   Otherwise the leader broadcasts a heartbeat carrying its own monotonic
-  |   readIndexCtx (ctx 0 is reserved for plain heartbeats, so an ordinary
-  |   heartbeat response can never satisfy a ReadIndex quorum)
-  | On quorum of HeartbeatResp: ReadyToRead{Key: batchKey, Index: commitIndex}
+  |   LeaseRead on and lease valid -> resolves inline, no heartbeat
+  |   Otherwise the leader broadcasts a heartbeat carrying its own
+  |   readIndexCtx. Context 0 is reserved for plain heartbeats, so an
+  |   ordinary heartbeat response never satisfies a ReadIndex quorum.
+  | On a quorum of HeartbeatResp: ReadyToRead{Key: batchKey, Index: commitIndex}
   v
 callback.OnReadyToRead(shardID, []ReadyToRead)
   | Resolve batchKey and every alias registered against it
-  | If lastApplied >= readIndex: rs.complete immediately
-  | If the failure latch trips while the read is pending: OnShardFailed
-  |   drains it with ErrShardFailed (#185) — a halted shard never applies
-  |   again, so a read waiting on it would otherwise wait for its deadline
-  | Else: wait for OnApplied
+  | lastApplied >= readIndex -> rs.complete now
+  | Failure latch trips while pending -> OnShardFailed drains it with
+  |   ErrShardFailed (a halted shard never applies again)
+  | Otherwise wait for OnApplied
   v
 Host.SyncRead() continues
-  | rs.Result() ← read index confirmed and applied
-  | ns.rsm.Lookup(ctx, query) — reads the SM directly, no log traversal
+  | rs.Result() <- read index confirmed and applied
+  | ns.rsm.Lookup(ctx, query) -- reads the SM directly
   v
-Client ← query result
+Client <- query result
 ```
 
-Concurrent readers on one shard share a single heartbeat round. The step worker
-drains the whole `readIndexQ` in one cycle, submits the first key to raft, and
-registers the rest as aliases through `OnReadIndexBatched`. Alias registration
-happens before `Peer.Handle` on purpose: on a single-node shard `Handle` resolves
-the ReadIndex synchronously, so registering afterwards would let `OnReadyToRead`
-complete and delete the batch key before the aliases were attached, stranding
-every aliased caller until its context deadline.
+Concurrent readers on one shard share a heartbeat round. The step worker drains
+the whole `readIndexQ` in one cycle, submits the first key to Raft, and
+registers the rest as aliases through `OnReadIndexBatched`. Aliases are
+registered before `Peer.Handle` on purpose: on a single-node shard `Handle`
+resolves the ReadIndex synchronously, so registering afterwards would let
+`OnReadyToRead` complete and delete the batch key first, stranding every aliased
+caller until its deadline.
 
-Witnesses cannot serve a ReadIndex, but their heartbeat acknowledgements still
-count toward the quorum that confirms one. See
-[Witnesses and Membership](#witnesses-and-membership).
+Witnesses cannot serve a ReadIndex, but their heartbeat acknowledgements count
+toward the quorum that confirms one. See
+[Witnesses and membership](#witnesses-and-membership).
 
-## Key Design Decisions
+## Key design decisions
 
-### Custom Binary Wire Format
+### Fixed-layout binary wire format
 
-All wire types (`Entry`, `Message`, `MessageBatch`, `Snapshot`) use fixed-layout
-binary encoding (no protobuf, no code generation). Design properties:
+`Entry`, `Message`, `MessageBatch` and `Snapshot` use hand-written fixed-layout
+encoding with no protobuf and no code generation:
 
-- **Fixed field positions**: struct layout determines byte offsets, no type tags
-- **Little-endian uint64**: all large integers are 8 bytes, no varints
-- **Zero-copy Cmd**: `Entry.Cmd` aliases source buffer after unmarshal
-- **Hand-written serialization**: MarshalTo/UnmarshalFrom methods, ~300 lines per type
-- **Deterministic maps**: key-value pairs encoded in sorted order
-- **Bounded sizes**: MaxEntrySize (8 MB), MaxBatchSize (64 MB), 10000 messages per batch
+- struct layout fixes byte offsets; there are no type tags
+- integers are 8-byte little-endian, with no varints
+- `Entry.Cmd` aliases the source buffer after unmarshal (zero copy)
+- maps are encoded in sorted key order, so encoding is deterministic
+- sizes are bounded: `proto.MaxEntrySize` (8 MB), `proto.MaxBatchSize`
+  (64 MB), `proto.MaxMessagesPerBatch` (10000)
 
-Fixed header sizes:
-
-| Type         | Fixed header | Content                                |
-|--------------|--------------|----------------------------------------|
-| Entry        | 68           | Cmd (variable, length-prefixed)        |
-| Message      | 88           | Entries + inline Snapshot              |
-| MessageBatch | 24           | SourceAddress + Messages               |
+| Type | Fixed header (bytes) | Variable content |
+|---|---|---|
+| `Entry` | 68 | `Cmd`, length-prefixed |
+| `Message` | 88 | entries and an inline snapshot |
+| `MessageBatch` | 24 | source address and messages |
 
 `Entry` is eight uint64 fields plus a uint32 `CmdLen`. `Message` is eleven
-uint64 fields; a heartbeat (no entries, no snapshot) encodes to 100 bytes and is
-the minimum message on the wire. The MessageBatch header is `BinVer:8`,
-`DeploymentID:8` and `SourceEpoch:8`, with `BinVer` first so a receiver can
-reject a foreign wire version before parsing anything else.
+uint64 fields; a heartbeat (no entries, no snapshot) encodes to 100 bytes. The
+`MessageBatch` header is `BinVer`, `DeploymentID`, `SourceEpoch`, with `BinVer`
+first so a receiver can reject a foreign wire version before parsing anything
+else. Field tables are in [wire-protocol](../wire-protocol/engineering.md).
 
-See [Wire Format](../wire-protocol/engineering.md) for the full field tables.
+### QUIC-only transport
 
-### QUIC-Only Transport
-
-No TCP fallback, and no `Transport` interface to swap one in. The Host holds a
-concrete `*transport.QUICTransport` and wraps it in an internal
+There is no TCP fallback and no `Transport` interface to swap one in. The Host
+holds a concrete `*transport.QUICTransport` and wraps it in an internal
 `transportSender` that satisfies the engine's `MessageSender`. Whenever the
-transport is enabled, mTLS configuration is required — validation fails with
-`MTLSConfigRequiredError` otherwise.
+transport is enabled, mTLS configuration is required; validation fails with
+`*config.MTLSConfigRequiredError` otherwise.
 
-QUIC 1.0 (RFC 9000) buys:
+What QUIC (RFC 9000) provides here:
 
-- Built-in TLS 1.3, with optional 0-RTT reconnection (off by default; 0-RTT data
-  is replayable)
-- Multiplexed streams, so one stalled shard does not head-of-line-block others
-- Stream 0 reserved for heartbeats, pre-opened per connection and reused across
-  ticks. Heartbeats also ride a separate priority channel (`hbCh`) that is
-  drained ahead of data, so a large replication batch cannot delay a heartbeat
-  past the election timeout.
+- TLS 1.3 built in, with optional 0-RTT reconnection (off by default, because
+  0-RTT data is replayable)
+- multiplexed streams, so one stalled shard does not block others
+- stream 0 reserved for heartbeats, pre-opened per connection. Heartbeats also
+  use a priority channel drained ahead of data, so a large replication batch
+  cannot delay one past the election timeout
 - `StreamPoolSize` (default 16) data streams per connection, growable to
-  `MaxStreamPoolSize` (256), to reduce mutex contention
-- Pooled byte buffers on send and receive paths
-- `singleflight.Group` to coalesce concurrent dials to the same peer
+  `MaxStreamPoolSize` (256)
+- pooled buffers on the send and receive paths, and `singleflight` to coalesce
+  concurrent dials to the same peer
 
-Snapshot transfers carry a dedicated frame flag that routes them to a separate
-handler, keeping multi-gigabyte streams out of the stream pool.
+Snapshot transfers carry a frame flag that routes them to a separate handler,
+keeping multi-gigabyte streams out of the stream pool.
 
 ### Sharded WAL
 
-The `waldb` package splits writes across `DefaultShardCount` = 16 directory
-shards, selected by `shardID % 16`. The on-disk layout is `shard-0` through
-`shard-15`, each holding its own segment files. Design:
+`waldb` splits writes across `DefaultShardCount` = 16 directory shards
+(`shard-0` to `shard-15`), selected by `shardID % 16`:
 
-- Each shard has its own active segment, entry index and mutex
-- Segments are append-only, block-aligned, CRC32-checked
-- Sharding exists to reduce fsync contention: one slow shard's fsync does not
-  serialize behind another's
-- Recovery reconstructs all in-memory state by replaying the segments
-- An fsync failure poisons the whole DB (`ErrDBPoisoned`) rather than
+- each shard has its own active segment, entry index and mutex, so one shard's
+  fsync does not serialize behind another's
+- segments are append-only, block-aligned and CRC32-checked
+- recovery rebuilds all in-memory state by replaying segments
+- an fsync failure poisons the whole DB (`ErrDBPoisoned`) rather than
   continuing, because a failed `fdatasync` may leave the kernel marking dirty
   pages clean without writing them
 
-### Engine Worker Pipeline
+### Engine worker pipeline
 
-Shards are partitioned across `N = NumWorkers` workers by `shardID % NumWorkers`.
-Three worker tiers plus a snapshot pool and a listener dispatcher:
+Shards are partitioned across `N = NumWorkers` workers by `shardID % NumWorkers`:
 
 ```
-Step Workers (N)   — tick, drain proposalQ/inboxQ/readIndexQ, produce Updates
+Step workers (N)    tick; drain proposalQ/inboxQ/readIndexQ; produce Updates
        |
-   Commit Channels (CommitCBufferSize, default 64, per worker)
+   commit channels  (CommitCBufferSize, default 64, per worker)
        |
-Commit Workers (N) — persist entries to LogDB, Peer.Commit()
+Commit workers (N)  persist entries to LogDB, Peer.Commit()
        |
-   Apply Channels (max(CommitCBufferSize*4, 256), per worker)
+   apply channels   (max(CommitCBufferSize*4, 256), per worker)
        |
-Apply Workers (N)  — dispatcher fans out to per-shard goroutines (chan cap 64),
-                     each gated by the MaxApplyWorkers semaphore
+Apply workers (N)   fan out to per-shard goroutines (channel cap 64),
+                    gated by the MaxApplyWorkers semaphore
        |
-Snapshot Pool      — max(NumWorkers/2, 2) workers, async save/recover
+Snapshot pool       max(NumWorkers/2, 2) workers, async save and recover
 ```
 
-When the LogDB is nil (memory mode), step workers inline `Peer.Commit` and
-forward straight to `applyC`, cutting the pipeline from three hops to two.
+A `Host` always has a LogDB: the default WAL, a `WithLogDB` store, or the
+in-memory store from `WithMemoryLogDB`. The engine alone also supports running
+with no LogDB, in which the step worker runs `Peer.Commit` itself and forwards
+straight to `applyC`; no `Host` configuration reaches that mode.
 
-Every tier restarts on panic. A panicking step, commit or apply worker would
-otherwise stall every shard mapped to it permanently, so the recovery clears
-`commitPending` for the affected nodes and re-enters the loop after a short
-delay.
+Every tier restarts on panic. A panicking worker would otherwise stall every
+shard mapped to it for good, so recovery clears `commitPending` for the affected
+nodes and re-enters the loop after a short delay.
 
-Ordered shutdown, six steps: stop all nodes (unblocks in-flight snapshot I/O) →
-step → commit → apply → snapshot → listener dispatcher, draining at each stage.
-The dispatcher goes last so a leadership loss or shard failure observed during
-teardown still reaches the listener.
+Shutdown runs in six ordered steps: stop all nodes (unblocking in-flight
+snapshot I/O), then step, commit, apply, snapshot, and finally the listener
+dispatcher, draining at each stage. The dispatcher goes last so a leadership
+loss or shard failure observed during teardown still reaches the listener.
 
 ### Listener dispatcher
 
-User-visible cold-path notifications (`OnLeaderUpdated`, `OnCampaignLaunched`,
-shard failure) run on one dedicated goroutine rather than on the worker that
-produced them.
+Engine notifications for user code (leader changes, campaign launches, shard
+failure, log compaction, snapshot creation) run on one dedicated goroutine
+rather than on the worker that produced them.
 
-This is not a throughput optimization. The step worker fires callbacks while
-holding `stepWorker.nodesMu.RLock`, and `Host.StopShard` re-enters the same
+The reason is deadlock, not throughput. The step worker fires callbacks while
+holding `stepWorker.nodesMu.RLock`, and `Host.StopShard` takes the same
 goroutine's `nodesMu.Lock()` through `Engine.UnloadNode`. Go's `RWMutex` is not
-reentrant, so a handler that reacted to an event by stopping the shard
-deadlocked — and not only that shard: every shard sharing the worker stopped
-ticking, so heartbeats, elections and inbox drain all stopped with it, and a
-later `Host.Close` never returned. Reacting to a failed shard by stopping it is
-the obvious handler to write, which is what made it reachable.
+reentrant, so a handler that stopped the shard from inside the callback would
+deadlock that shard and every other shard on the same worker. Stopping a failed
+shard is the obvious handler to write.
 
-The dispatcher goroutine holds no engine lock, so a listener may call any Host
-API, including the synchronous `StopShard`. Notifications are FIFO on a single
-consumer, giving a total order and therefore a per-shard order. There is
-deliberately no ordering guarantee between dispatched notifications and the
-callbacks that stay synchronous (`OnApplied`, `OnCommitted`, `OnReadyToRead`,
-`OnProposalFailed`, `OnReadIndexBatched`, `OnReadIndexFailed`) — those resolve
+The dispatcher holds no engine lock, so a listener may call any Host method,
+including the synchronous `StopShard`. Notifications are FIFO on a single
+consumer, which gives a total order and therefore a per-shard order. There is
+no ordering guarantee between dispatched notifications and the callbacks that
+stay synchronous (`OnApplied`, `OnCommitted`, `OnReadyToRead`,
+`OnProposalFailed`, `OnReadIndexBatched`, `OnReadIndexFailed`). Those resolve
 pending client requests and have happens-before requirements against
 `Peer.Handle`, so they cannot queue behind user code.
 
-### Lock-Free Synchronization
+### Synchronization
 
-- Request keys: random draws from `math/rand/v2`'s process-wide generator
-  (`nextRequestKey`), lock-free for callers; there is no per-Host counter to
-  contend on
-- `Node.commitPending` and `Node.lastApplied`: padded to 128 bytes (the
-  prefetch-adjacent line pair on x86 and ARM) to prevent false sharing between
+Lock-free:
+
+- request keys: draws from `math/rand/v2`'s process-wide generator
+  (`nextRequestKey`), with no per-Host counter to contend on
+- `Node.commitPending` and `Node.lastApplied`, each padded to 128 bytes (the
+  adjacent-line prefetch pair on x86 and ARM) to prevent false sharing between
   the step worker, which reads them, and the apply worker, which writes them
-- `nodeState` fields: leaderID, term, lastApplied, isLeader all atomic
-- `Host.nodes`: sync.Map (lock-free reads for shard lookup), with
-  `Host.activeNodes atomic.Int64` for the count
-- `Host.registry`: `registry.Registry` over a sync.Map, lock-free on the
+- `nodeState` leader ID, term, last applied and leader flag, all atomics
+- `Host.nodes`, a `sync.Map`, with `Host.activeNodes` (`atomic.Int64`) for the
+  count
+- `Host.registry`, a `registry.Registry` over a `sync.Map`, lock-free on the
   `Resolve` hot path
-- `Barrier.unsealed`: atomic.Bool fast-path before RWMutex acquisition
+- the barrier's unsealed flag, an `atomic.Bool` checked before the `RWMutex`
 
-Not on this list, deliberately: the `EntryQueue` behind `proposalQ`, `inboxQ`
-and `readIndexQ` is **mutex-guarded**. Producers hold a `sync.Mutex` for a
-slice append and the consumer takes it once per drain cycle; the design goal
-is amortizing acquisitions over a batch, not eliminating them. Nor is the
-per-node `raftMu`, which serializes `Peer.Tick()` against `Peer.Commit()` and
-also covers the step worker's `Peer.Step` and inbox-handling paths. It is not
-reentrant, which is why event callbacks are invoked outside it.
+Not lock-free, deliberately:
+
+- the `EntryQueue` behind `proposalQ`, `inboxQ` and `readIndexQ`. Producers hold
+  a `sync.Mutex` for one slice append and the consumer takes it once per drain;
+  the goal is amortizing acquisitions, not eliminating them.
+- the per-node `raftMu`, which serializes `Peer.Tick()`, `Peer.Commit()`,
+  `Peer.Step` and inbox handling. It is not reentrant, which is why event
+  callbacks run outside it.
 
 ## Configuration
 
-### HostConfig (per-host)
+The full field tables, with defaults, are in
+[api.md](api.md#configuration). Design-level rules:
 
-- `WALDir` (required) — Write-ahead log directory
-- `NodeHostDir` (required) — Metadata, snapshots, host ID
-- `ListenAddress` (required) — Local bind address (e.g., `:4001`)
-- `RaftAddress` — External address seen by peers (default: ListenAddress)
-- `RTTMillisecond` (200ms) — Estimated round-trip time for timeout calculations
-- `DeploymentID` (required) — Cluster identity token (must match all nodes)
-- `NumWorkers` (0 = runtime.NumCPU()) — Worker goroutines per tier (step, commit, apply)
-- `MaxApplyWorkers` (0 = runtime.NumCPU()) — Apply semaphore capacity
-- `CommitCBufferSize` (64) — Commit channel buffer per worker
-- `ShutdownTimeout` (30s) — Graceful shutdown timeout
-- `MaxTotalInMemLogSize` (0 = disabled) — Global rate limiter threshold
-- `NotifyCommit` (false) — Fire `OnCommitted` after WAL persist, before apply
-- `MaxWALDiskSize` (0 = unbounded) — Reject proposals once the WAL disk fills
-- `NoSyncWAL` (false) — Skip WAL fsync. Test and container-benchmark use only.
-- `KeyRotationInterval` (0 = no scheduled rotation; 24h is a reasonable
-  production value) — Time-based barrier DEK rotation. Invocation-threshold
-  rotation (the NIST SP 800-38D AEAD budget) runs regardless whenever a barrier
-  is configured.
-- `MaxRetainedEpochs` (0 = retain all) — Old epochs beyond
-  `currentEpoch - MaxRetainedEpochs` are purged from memory
+- `RaftAddress` and `ListenAddress` are both required. Peers dial
+  `RaftAddress`; the listener binds `ListenAddress`. They differ under NAT,
+  port mapping and containers.
+- There is no apply-retry setting. The apply path is fail-fast: the first
+  `SM.Update` error marks the shard failed. See
+  [engineering.md](engineering.md#error-handling-and-shard-failure).
+- `SnapshotEntries`, `SessionExpiryEntries` and `MaxSessionsPerOwner` treat zero
+  as "use the default". Each has a named sentinel for "off". Never snapshotting
+  also means never reclaiming snapshot directories, never purging an old
+  epoch's DEK and never invoking the at-rest barrier.
+- `CheckQuorum`, `PreVote` and `OrderedConfigChange` are `*bool`; nil means
+  enabled.
+- `Config.Witness` and the four session limits are bootstrap seeds. The live
+  values are replicated state in `proto.Membership`.
+- `MaxSessionsPerClient` bounds cached responses per session, not sessions. The
+  name is kept because renaming a public field breaks callers.
 
-There is no apply-retry setting. The apply path is fail-fast: a shard is marked
-failed on the first `SM.Apply` error, with no retry counting. See
-[Engine Pipeline](../raft-consensus/engineering.md).
+## State machine tiers
 
-See `pkg/config/hostconfig.go`.
+Three tiers, detected by type assertion at `StartShard`. Full contracts are in
+[state-machines](../state-machines/engineering.md).
 
-### Config (per-shard)
+| Tier | Interface | Concurrency |
+|---|---|---|
+| 0 | `sm.StateMachine` | serialized: `Update` and `Lookup` never overlap. The RSM adapter holds its `readGuard` for writing across `Apply` |
+| 1 | `sm.ConcurrentStateMachine` | `Lookup` runs alongside `Update`; `Apply` holds the guard for reading. Two-phase snapshot (`PrepareSnapshot`, then `SaveSnapshot`) |
+| 2 | `sm.DiskStateMachine` | as tier 1, plus `Open` returns the last applied index and replay after a crash must be idempotent |
 
-- `ElectionRTT` (10) — Election timeout as multiples of RTTMillisecond
-- `HeartbeatRTT` (1) — Heartbeat interval as multiples of RTTMillisecond
-- `CheckQuorum` (`*bool`, nil = enabled) — Leader steps down if quorum becomes unavailable
-- `PreVote` (`*bool`, nil = enabled) — Use pre-vote extension to prevent disruptive elections
-- `OrderedConfigChange` (`*bool`, nil = enabled) — Serialize membership changes (no concurrent config changes)
-- `LeaseRead` (false) — Lease-based linearizable reads (PhD §6.4). Requires
-  `CheckQuorum` and `ElectionRTT >= 5`.
-- `SnapshotEntries` (100000) — Applied entries between automatic snapshots.
-  **Zero does not disable it.** Zero means "unset" and selects the default;
-  assign `config.SnapshotsDisabled` for manual-only snapshotting. Never
-  snapshotting also means never reclaiming snapshot directories, never purging
-  an old epoch's DEK, and never invoking the at-rest barrier.
-- `CompactionOverhead` (5000) — Entries retained after compaction
-- `MaxEntrySize` (8 MB) — Maximum single proposal size, and the decompression
-  ceiling on the apply path. May not exceed `proto.MaxEntrySize`.
-- `MaxProposalPayloadSize` (8 MB) — User-facing proposal cap. The effective
-  limit at `Propose()` is `min(MaxProposalPayloadSize, MaxEntrySize)`.
-- `MaxApplyEntrySize` (`MaxReplicationPayloadBytes` = 16,711,672 bytes, ~15.94 MB) — Maximum batch size per SM.Update call
-- `MaxSnapshotSize` (4 GB) — Maximum snapshot file size
-- `MaxSessionsPerClient` (128) — Cached responses retained per session. The name
-  is wrong and is kept only because renaming a public field would break
-  compatibility; read it as `MaxResponsesPerSession`. It bounds nothing about
-  how many sessions exist.
-- `MaxTotalSessions` (16384) — Per-shard total session limit
-- `MaxSessionsPerOwner` (128) — Concurrent sessions one declared owner may hold.
-  Sessions registered without an owner are exempt.
-- `SessionExpiryEntries` (100000) — Session inactivity threshold measured in
-  applied log entries, so it is deterministic across replicas. Zero selects the
-  default; assign `config.SessionExpiryDisabled` to turn it off.
-- `Witness` (`WitnessConfig`) — `MaxWitnesses` and `RequireFullReplicaMajority`.
-  This is only the bootstrap seed; the live policy is replicated state.
-- `IsObserver` / `IsWitness` — Mutually exclusive replica roles
-- `Quiesce` (false) — Enable quiescence for idle shards
-- `ZeroCopyEntryCmd` (false) — Let `Entry.Cmd` alias the internal buffer. When
-  true the state machine must copy `Cmd` to retain it past `Update()`.
+Factories: `sm.NewCreateFunc`, `sm.NewConcurrentCreateFunc`,
+`sm.NewDiskCreateFunc`, each wrapping a typed constructor into an
+`sm.CreateFunc`.
 
-See `pkg/config/config.go`.
+Optional interfaces (`sm.Hasher`, `sm.NALookup`, `sm.NALookupInto`) are also
+detected by type assertion, so a method with the wrong signature produces no
+compile error and is never called. Match the signatures in
+[api.md](api.md#optional-interfaces) exactly. Internally the RSM adapter wraps
+each in a `(value, supported, error)` form; that wrapper is in
+`pkg/internal/rsm` and is not the contract you implement.
 
-### TransportConfig
+## Witnesses and membership
 
-- `StreamPoolSize` (16) — Streams per QUIC connection
-- `MaxStreamPoolSize` (256) — Upper bound for dynamic pool growth
-- `MaxSnapshotReceiveRate` (256 MB/s) — Inbound snapshot bandwidth limit
-- `MaxConcurrentSnapshotReceives` (4) — Concurrent inbound snapshot transfers
-- `MaxSnapshotReceiveMemory` (1 GB) — Total snapshot receive buffer pool
-- `MaxMessageReceiveMemory` (256 MB) — Bounds memory committed to inbound
-  message frames, so a peer cannot declare a huge frame length and withhold the body
-- `SendBatchMaxSize` (64 KB) — Maximum batch size for sending to one peer
-- `MaxIncomingConnections` (256) — Total inbound connections allowed
-- `MaxConnectionsPerIP` (16) — Inbound connections from a single source IP
-- `MaxStreamsPerConnection` (256) — QUIC stream limit per connection
-- `StreamReadIdleTimeout` (30s) — Idle timeout on a receive stream
-- `UDPRecvBufSize` / `UDPSendBufSize` (7 MB each) — Socket buffers; 0 uses the
-  OS default
-- `Enable0RTT` (false) — QUIC 0-RTT (replayable, use with caution)
-- `DisableCompression` (false) — Disable QUIC header compression (for benchmarking)
-
-See `pkg/config/transportconfig.go`.
-
-## State Machine Interface
-
-QuicRaft supports three state machine tiers (detected at startup via type assertion):
-
-See `pkg/sm/interfaces.go`.
-
-### StateMachine (tier 0)
-
-All state in memory, serialized access (Update and Lookup never run
-concurrently — the RSM adapter holds its `readGuard` for writing across
-`Apply` and for reading across every read entry point). The concurrent and
-on-disk tiers below are not serialized: their `Apply` holds the guard for
-reading, so `Lookup` runs alongside `Update`. Simplest to implement:
-
-```go
-type StateMachine interface {
-    Update(ctx context.Context, entries []Entry, results []Result) error
-    Lookup(ctx context.Context, query interface{}) (interface{}, error)
-    SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
-    RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
-    Close(ctx context.Context) error
-}
-```
-
-### ConcurrentStateMachine (tier 1)
-
-Concurrent Lookup while Update runs. Two-phase snapshotting: `PrepareSnapshot()`
-captures a point-in-time view, then `SaveSnapshot()` writes without blocking Update.
-
-```go
-type ConcurrentStateMachine interface {
-    Update(ctx context.Context, entries []Entry, results []Result) error
-    Lookup(ctx context.Context, query interface{}) (interface{}, error)
-    PrepareSnapshot() (interface{}, error)
-    SaveSnapshot(ctx context.Context, snapshotCtx interface{}, w io.Writer, stopper <-chan struct{}) error
-    RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
-    Close(ctx context.Context) error
-}
-```
-
-### DiskStateMachine (tier 2)
-
-Backed by persistent storage (e.g., PebbleDB). Must idempotently replay
-already-applied entries after crash recovery. `Open()` is called at startup
-with the last applied index from the Raft log.
-
-```go
-type DiskStateMachine interface {
-    Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error)
-    Update(ctx context.Context, entries []Entry, results []Result) error
-    Lookup(ctx context.Context, query interface{}) (interface{}, error)
-    Sync() error
-    PrepareSnapshot() (interface{}, error)
-    SaveSnapshot(ctx context.Context, snapshotCtx interface{}, w io.Writer, stopper <-chan struct{}) error
-    RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
-    Close(ctx context.Context) error
-}
-```
-
-### Factory Registration
-
-Use `sm.CreateFunc` with type-safe wrappers:
-
-```go
-type CreateFunc func(shardID, replicaID uint64) interface{}
-
-sm.NewCreateFunc(fn)            // StateMachine
-sm.NewConcurrentCreateFunc(fn)  // ConcurrentStateMachine
-sm.NewDiskCreateFunc(fn)        // DiskStateMachine
-```
-
-### Optional Interfaces
-
-Detected via type assertion on the SM. **These are the signatures your state
-machine must implement** — two return values, not three:
-
-```go
-// Cross-replica consistency checks.
-type Hasher interface {
-    GetHash() (uint64, error)
-}
-
-// Zero-alloc reads.
-type NALookup interface {
-    BytesLookup(key []byte) ([]byte, error)
-}
-
-// Zero-alloc reads into a caller-supplied buffer.
-type NALookupInto interface {
-    NALookup
-    BytesLookupInto(key, dst []byte) ([]byte, error)
-}
-```
-
-Because detection is by type assertion, an implementation with the wrong
-signature does not satisfy the interface, produces **no compile error**, and
-is simply never invoked — hash verification or the zero-alloc path silently
-does not run. Match these signatures exactly.
-
-Internally, the RSM adapter wraps each of these behind a
-`(value, supported, error)` shape, where the `bool` reports whether the user
-SM implemented the optional interface at all:
-
-- SM implements the interface: `(result, true, error)`
-- SM does not implement it: `(zero, false, nil)`
-- SM errors are always propagated to the caller
-
-That three-value form is an **internal** wrapper (`pkg/internal/rsm`). It is
-not importable and is not the contract you implement. See
-[State Machine Interfaces](../state-machines/engineering.md) and
-[RSM Adapter](../state-machines/engineering.md).
-
-## Cluster Formation (lives in go-qrdb)
-
-go-quicraft is a Raft-primitives library and does **not** discover peers or
-orchestrate cluster formation. It exposes the primitive a cluster manager
-builds on:
-
-```go
-// Caller supplies the member map (by discovery, static config, etc.).
-err := host.StartShard(members, join, createFn, cfg)
-```
-
-Peer discovery (static / multicast / DNS SRV / token) and bootstrap
-orchestration (discover → quorum → `StartShard`), plus opt-in dynamic
-membership, live in **go-qrdb** (`pkg/discovery`, `pkg/cluster`) — the layer
-that owns the cluster. See go-qrdb's `docs/discovery.md`.
-
-## Witnesses and Membership
-
-Initial membership is not out-of-band seed state. `StartShard` commits an
-`EntryInitialMembership` (`proto.Entry.Type = 4`, `Cmd` = a marshaled
-`proto.Membership`) at log index 1, so the member set a replica believes in is
-the member set the log proves. Before this, a joining node could be authorized
-against a locally seeded map that no quorum had agreed to.
+`StartShard` commits the initial membership as an `EntryInitialMembership`
+(`proto.Entry.Type = 4`, `Cmd` = a marshaled `proto.Membership`) at log index 1,
+so the member set a replica believes in is the one its log proves. Membership is
+a fold over the committed log.
 
 Three replica roles:
 
-- **Voter** — the default. Votes, stores log data, serves reads.
-- **Observer** (`Config.IsObserver`) — replicates the log but does not vote.
-  `Config.IsObserver` is only the initial hint. The committed membership decides,
-  so an observer whose `AddNode` promotion commits becomes a voter in place, with no
+- **Voter**: the default. Votes, stores log data, serves reads.
+- **Observer** (`Config.IsObserver`): replicates the log but does not vote.
+  `IsObserver` is only the initial hint. The committed membership decides, so an
+  observer whose `AddNode` promotion commits becomes a voter in place, with no
   restart.
-- **Witness** (`Config.IsWitness`) — votes but stores no log data. Cannot
-  propose and cannot serve a ReadIndex; both return `ErrInvalidOperation`.
+- **Witness** (`Config.IsWitness`): votes but stores no log data. It cannot
+  propose or serve a ReadIndex (`ErrInvalidOperation`), and it is never
+  promoted.
 
-Witnesses use a **unified quorum**: the same voting set (`remotes + witnesses +
-self`) decides elections, commit, ReadIndex confirmation, and lease reads. A
-witness's heartbeat acknowledgement counts toward the quorum that confirms a
-linearizable read even though the witness could not serve that read itself. The
-reason is overlap: the leadership-confirmation quorum has to intersect every
-coalition that could win an election, and witnesses vote in elections. The
-voting set is capped at `raft.MaxVotingMembers` = 64, because acknowledgements
-are tracked in a 64-bit word.
+Witnesses use a unified quorum: the same voting set (remotes, witnesses and
+self) decides elections, commit, ReadIndex confirmation and lease reads. The
+confirmation quorum has to intersect every coalition that could win an
+election, and witnesses vote. The voting set is capped at
+`raft.MaxVotingMembers` = 64 because acknowledgements are tracked in a 64-bit
+word.
 
-Witness policy (`MaxWitnesses`, `RequireFullReplicaMajority`) is **replicated
-state**, carried in `proto.Membership` through the log, snapshots and the WAL.
-`Config.WitnessConfig` is only the bootstrap seed; after that the policy changes
-through `Host.RequestUpdateWitnessPolicy` (a `ConfigChange` of type
-`proto.UpdateWitnessPolicy`). A per-node policy value would let replicas
-disagree about which config changes are legal.
+Witness policy (`MaxWitnesses`, `RequireFullReplicaMajority`) is replicated
+state, carried in `proto.Membership` through the log, snapshots and the WAL.
+`Config.Witness` only seeds it; afterwards it changes through
+`Host.RequestUpdateWitnessPolicy`, a `ConfigChange` of type
+`proto.UpdateWitnessPolicy`. A per-node value would let replicas disagree about
+which config changes are legal.
 
-## At-Rest Encryption
+## At-rest encryption
 
-The `Barrier` in `pkg/seal/barrier.go` provides AEAD encryption for WAL data at rest.
+The barrier in `pkg/seal/barrier.go` encrypts WAL records and snapshots.
 
-**Algorithm selection** (automatic based on hardware):
-- x86-64 with AES-NI or ARM64 with crypto extensions → AES-256-GCM
-- Otherwise → ChaCha20-Poly1305, or AES-256-GCM in a build with `-tags fips`,
-  which does not compile the ChaCha20 family in at all
+Algorithm selection:
+
+- x86-64 with AES-NI, or ARM64 with crypto extensions: AES-256-GCM
+- otherwise ChaCha20-Poly1305, except in a `-tags fips` build, which does not
+  compile ChaCha20 in at all and uses AES-256-GCM
   ([FIPS builds](../seal-barrier/engineering.md#fips-runtime-mode-vs-build-tag))
-- Configurable via `BarrierConfig.Algorithm`
+- override with `BarrierConfig.Algorithm`
 
-**Design**:
-- Root key (32 bytes) generated directly into locked memory by `crypto/rand`, then
-  held in a go-enclave `SealedEnclave` so it is encrypted at rest in process memory
-- Data Encryption Keys (DEKs) derived via HKDF-SHA256 with a 32-byte salt and
-  per-epoch info strings. The v2 info layout binds the algorithm identifier and
-  DEK length into the derivation; v1 remains readable.
-- Ciphertext format: `[epoch:8][algID:1][nonce:N][ciphertext+tag]`. The
-  algorithm ID is inside the header, so a ciphertext names the AEAD it was
-  written with instead of relying on the reader's configuration matching.
-- Key rotation: `Rotate()` increments the epoch and derives a new DEK
-- Old DEKs are retained for reading prior-epoch data, bounded by
-  `MaxRetainedEpochs`, and purged once nothing on disk references them
-- Brute-force protection: exponential backoff (1s doubling to a 60s cap) after 5
-  consecutive failed Unseal attempts
+Design:
 
-**Lifecycle**: Initialize → Unseal → Encrypt/Decrypt → Seal
+- the 32-byte root key is generated by `crypto/rand` directly into locked
+  memory and held in a go-enclave `SealedEnclave`, encrypted at rest in process
+  memory
+- per-epoch DEKs are derived with HKDF-SHA256 from a 32-byte salt. The v2 info
+  layout binds the algorithm identifier and DEK length; v1 remains readable
+- ciphertext is `[epoch:8][algID:1][nonce:N][ciphertext+tag]`, so a ciphertext
+  names the AEAD that wrote it
+- `Rotate()` increments the epoch and derives a new DEK. Old DEKs stay for
+  reading prior-epoch data, bounded by `MaxRetainedEpochs`, and are purged once
+  nothing on disk references them
+- after 5 consecutive failed unseal attempts, backoff starts at 1s and doubles
+  to a 60s cap
 
-Root-key custody (where the sealed root key lives: TPM, HSM, KMS, passphrase)
-is pluggable and documented in [Key Custody](../seal-barrier/user.md). This
-library names only `StrategyPassphrase` and `StrategyNone`; hardware and cloud
-strategy IDs are owned by go-xkms, and Shamir share custody by go-qrdb.
+Lifecycle: Initialize, Unseal, Encrypt/Decrypt, Seal.
 
----
+Root-key custody (TPM, HSM, KMS, passphrase) is pluggable; see
+[key custody](../seal-barrier/user.md). This library implements only
+`StrategyPassphrase` and `StrategyNone`. Hardware and cloud strategies are
+owned by go-xkms, and Shamir share custody by go-qrdb.
 
 ## Rejected alternatives
 
-The per-feature rationale lives in each feature folder; these are the decisions
-that belong to the `Host` itself.
+Per-feature rationale lives in each feature folder. These decisions belong to
+the `Host`.
 
-### Rejected: one `Host` per Raft group
+### One `Host` per Raft group
 
-The obvious API, and it would make every shard pay for its own transport,
-its own WAL, its own worker set and its own snapshot pool. A host runs
-thousands of shards, so the resources are shared and the `Host` is the thing
-that owns them: one process, one listener, one 16-shard WAL, `NumWorkers`
-goroutines per tier.
+Every shard would pay for its own transport, WAL, worker set and snapshot pool.
+A host runs thousands of shards, so those resources are shared and the `Host`
+owns them: one process, one listener, one 16-shard WAL, `NumWorkers` goroutines
+per tier.
 
-### Rejected: a `Cluster` type that forms itself
+### A `Cluster` type that forms itself
 
-`StartShard` takes an explicit member map because **a consensus engine cannot
-safely guess its own membership** — see the scope fence below. A `Host` that
-discovered peers would be making a decision only something with a view of all
-the nodes can make.
+`StartShard` takes an explicit member map because a consensus engine cannot
+safely guess its own membership (see
+[below](#why-the-boundary-sits-here)). Only something that can see all the
+nodes can make that decision.
 
-### Rejected: exposing the engine, the peer, or the transport
+### Exposing the engine, the peer or the transport
 
-`Host` is the only exported entry point, and `pkg/internal/*` is not
-importable. The narrow surface is what lets the execution model change without
-breaking consumers, and it is what `docs/00 §R` records: `StartShard`,
-`GetLeaderID`, replica add/remove — nothing more.
+`Host` is the only entry point and `pkg/internal/*` is not importable. The
+narrow surface lets the execution model change without breaking consumers.
 
-### Rejected: a `Transport` interface
+### A `Transport` interface
 
 An interface implies a swappable implementation, and the one thing an embedder
 would actually swap in is a transport without mTLS. See
-[`../quic-transport/architecture.md`](../quic-transport/architecture.md).
+[quic-transport](../quic-transport/architecture.md).
 
-### Rejected: returning `error` from every accessor
+### Returning only `error` from every accessor
 
 `GetLeaderID` returns `(uint64, bool, error)` and `StateMachineHash` returns
-`(uint64, uint64, bool, error)`: the `bool` distinguishes "no answer yet" from
-"failed to ask". Collapsing the two would make an ordinary startup race
-indistinguishable from a fault.
+`(uint64, uint64, bool, error)`. The `bool` separates "no answer yet" from
+"failed to ask"; collapsing them would make an ordinary startup race look like
+a fault.
 
----
+### Type-based sender exemptions
+
+Admitting leader-originated pushes and vote requests from an unknown replica
+ID, so a lagging replica could catch up, would let any holder of a cluster
+certificate move a shard's term, install itself as leader on followers,
+re-point routing and get forwarded proposals appended. The receive gate instead
+admits only senders a replica can vouch for from facts it holds; see
+[Every sender is bound](#every-sender-is-bound-to-a-replica-it-can-prove-it-is).
 
 ## Trust boundaries
 
-The `Host` is where four different trust boundaries meet, and each is owned by
-the feature behind it:
+Four trust boundaries meet at the `Host`. Each is owned by the feature behind
+it:
 
 | Boundary | Owner |
 |---|---|
-| the network — peer authentication, revocation, memory budgets | [`../quic-transport/`](../quic-transport/architecture.md) |
-| the disk — at-rest encryption, key custody | [`../seal-barrier/`](../seal-barrier/architecture.md), [`../log-storage/`](../log-storage/architecture.md) |
-| embedder code on the apply path | [`../state-machines/`](../state-machines/architecture.md) |
-| membership and sender authorization | [`../membership-changes/`](../membership-changes/architecture.md) |
+| the network: peer authentication, revocation, memory budgets | [quic-transport](../quic-transport/architecture.md) |
+| the disk: at-rest encryption, key custody | [seal-barrier](../seal-barrier/architecture.md), [log-storage](../log-storage/architecture.md) |
+| embedder code on the apply path | [state-machines](../state-machines/architecture.md) |
+| membership and sender authorization | [membership-changes](../membership-changes/architecture.md) |
 
 What the `Host` itself owns:
 
-- **Rate limiting**, global (`MaxTotalInMemLogSize`) and per shard, applied
-  before a proposal is accepted. Without it a single client can grow the
-  in-memory log until the process dies.
-- **Disk-full refusal** (`ErrDiskFull`), so proposals are rejected before the
-  WAL fills the volume and an `fdatasync` poisons the store.
-- **Proposal size bounds**, `min(MaxProposalPayloadSize, MaxEntrySize)`.
+- **Rate limiting**, global (`MaxTotalInMemLogSize`) and per shard
+  (`MaxInMemLogSize`), applied before a proposal is accepted. Without it one
+  client can grow the in-memory log until the process dies.
+- **Disk-full refusal** (`ErrDiskFull`), so proposals stop before the WAL fills
+  the volume and a failed `fdatasync` poisons the store.
+- **Proposal size bounds**: `min(MaxProposalPayloadSize, MaxEntrySize)`.
 - **Draining and sealed states**, so a shutting-down host refuses new work
-  rather than half-accepting it.
-- **Proposal-key namespacing by replica ID**, so two hosts in one shard cannot
-  mint the same key.
+  instead of half-accepting it.
+- **Request-key uniqueness**: random 64-bit keys plus the committed-index floor,
+  so no replica or incarnation completes a pending request with another
+  request's entry.
 
-The `Host` performs **no authentication and no authorization of callers**. It is
-in-process; whoever holds the `*Host` has full access. Client identity, tenancy
-and RBAC belong to the layers above.
-
----
+The `Host` performs no authentication or authorization of its callers. It is
+in-process, and whoever holds the `*Host` has full access. Client identity,
+tenancy and RBAC belong to the layers above.
 
 ## Cluster formation and the discovery boundary
 
-
-**go-quicraft does not discover peers and does not orchestrate cluster
-formation.** It is a Raft-primitives library. The primitive it exposes is:
+go-quicraft does not discover peers and does not orchestrate cluster formation.
+The primitive it exposes is:
 
 ```go
 func (h *Host) StartShard(
@@ -768,31 +572,28 @@ func (h *Host) StartShard(
 ) error
 ```
 
-The caller hands it an explicit `map[uint64]string` of replica ID to Raft
-address. Where that map came from — a config file, environment variables,
-multicast, DNS SRV, a token exchange — is not this library's concern and there
-is no code here that answers it.
-
-Discovery, quorum validation and bootstrap orchestration live one layer up in
-**go-qrdb**, the layer that owns the cluster. If you are asking "how do I start
-a cluster?", the short answer is at the bottom of this page: use
-[go-qrdb](#forming-a-cluster-automatically-go-qrdb).
+The caller supplies an explicit map of replica ID to Raft address. Where the map
+comes from (a config file, multicast, DNS SRV, a token exchange) is outside this
+library. Discovery, quorum validation and bootstrap orchestration live in
+go-qrdb; see [Forming a cluster automatically](#forming-a-cluster-automatically-go-qrdb).
 
 ### Why the boundary sits here
 
-A consensus engine cannot safely guess its own membership. The initial
-configuration is committed as a log entry, and every founding replica writes
-that entry **independently** — so the map has to be an input, decided by
+The initial configuration is committed as a log entry that every founding
+replica writes independently. The map therefore has to be an input, decided by
 something that can see all the nodes, not something the engine infers.
 
 ### The primitive
 
-`StartShard` takes its `ShardID` and `ReplicaID` from `cfg`; both must be
-non-zero. A single-node shard:
+`StartShard` takes `ShardID` and `ReplicaID` from `cfg`; both must be non-zero.
+On a host with a transport, `cfg.MemberIdentities` must name every member's node
+identity (the value each node reports from `Host.NodeIdentity`). A three-node
+shard, as run on node 1:
 
 ```go
 hostCfg := config.HostConfig{
-    NodeHostDir:   "/var/data/quicraft",
+    WALDir:        "/var/lib/quicraft/wal",
+    NodeHostDir:   "/var/lib/quicraft/nodehost",
     RaftAddress:   "node1.example.com:63100",
     ListenAddress: "0.0.0.0:63100",
     DeploymentID:  1,
@@ -814,8 +615,9 @@ members := map[uint64]string{
 }
 
 shardCfg := config.Config{
-    ShardID:   1,
-    ReplicaID: 1, // 2 on node2, 3 on node3
+    ShardID:          1,
+    ReplicaID:        1, // 2 on node2, 3 on node3
+    MemberIdentities: identities, // replica ID -> NodeIdentity(), same on every founder
 }
 
 if err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg); err != nil {
@@ -823,184 +625,164 @@ if err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg); e
 }
 ```
 
-Every founder calls this with the **same** `members` map and the same shard
-configuration, changing only `ReplicaID`.
+Every founder calls this with the same `members` map, the same
+`MemberIdentities` and the same shard configuration, changing only `ReplicaID`.
 
 #### `join` and the two ways in
 
-`join = false` bootstraps: this replica is a founding member and writes the
+`join = false` bootstraps: this replica is a founder and writes the
 initial-membership entry itself.
 
-`join = true` grows an existing shard. The joining replica passes an **empty**
-`members` map — it has no committed configuration yet and learns one by
-replicating the log. An operator on an existing member adds it first with
-`Host.RequestAddNode` / `SyncRequestAddNode` (or the identity-carrying variants,
-`RequestAddNodeWithIdentity` / `SyncRequestAddNodeWithIdentity`), and the
+`join = true` grows an existing shard. The joiner holds no configuration and
+learns one by replicating the log. Its `MemberIdentities` is the operator
+anchor: it must name at least one other replica it may accept the bootstrap
+snapshot from. On an existing member, an operator first adds the joiner with
+`RequestAddNodeWithIdentity` (or `SyncRequestAddNodeWithIdentity`), and the
 config change commits before the joiner catches up.
 
 A replica configured as a witness (`cfg.IsWitness`) or observer
-(`cfg.IsObserver`) must **not** appear in `members` — that map seeds the voting
-membership, and passing one is rejected with `*NonVotingRoleInMembersError`.
-Bootstrap the voters first, then start the witness or observer with
-`join = true` and add it with `RequestAddWitness` / `RequestAddObserver`.
+(`cfg.IsObserver`) must not appear in `members` on a first start: that map seeds
+the voting membership, and naming one is refused with
+`*NonVotingRoleInMembersError`. Bootstrap the voters, then start the witness or
+observer with `join = true` and add it with `RequestAddWitnessWithIdentity` or
+`RequestAddObserverWithIdentity`.
 
 Other primitives a cluster manager builds on: `Host.StopShard`,
-`Host.GetLeaderID`, `Host.GetLeaderIDAndTerm`, `Host.GetShardMembership`, and
-the membership change requests in `pkg/membership.go`.
+`Host.GetLeaderID`, `Host.GetLeaderIDAndTerm`, `Host.GetShardMembership` and the
+membership requests in `pkg/membership.go`.
 
 ### What StartShard commits, and what it refuses
 
 #### Initial membership is a committed log entry
 
-The initial configuration is written to the log as a single
-`EntryInitialMembership` at **index 1**, term 1, whose `Cmd` is a marshaled
-`proto.Membership`. Every replica reconstructs its membership by replaying the
-committed log, so membership is a pure fold over the log.
+The initial configuration is one `EntryInitialMembership` at index 1, term 1,
+whose `Cmd` is a marshaled `proto.Membership`. Every replica reconstructs its
+membership by replaying the committed log, so a joiner learns the full
+configuration from the log even if no snapshot ever reaches it. One entry
+carrying the whole `Membership` is used, rather than one `ConfigChange` per
+member, so the first real proposal lands at index 2.
 
-It used to be injected out of band, which meant a replica's membership was not a
-function of its durable log: a joining replica could learn the configuration only
-from a snapshot, and if no snapshot ever arrived it never learned the full
-configuration at all. That gap was a permanent authorization bypass for joiners.
-One entry carrying the whole `Membership` is used rather than one `ConfigChange`
-per member, so the first real proposal lands at index 2 and the index arithmetic
-the recovery clamps depend on is perturbed as little as possible.
+**Every founder must be given identical bootstrap input.** `proto.Membership`
+marshals its maps with sorted keys, so the entry is byte-identical across
+founders given identical input. The input is the whole `Membership`: addresses,
+`MemberIdentities`, the witness policy (`Config.Witness`) and the session policy
+(`SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`,
+`MaxSessionsPerOwner`), all seeded from each founder's local config. Founders
+that disagree produce different entries at the same `(index=1, term=1)`, and
+AppendEntries matches on `(index, term)` alone, so the divergence is never
+reconciled.
 
-**This is why every founder must be given identical bootstrap input.**
-`proto.Membership` marshals its maps with sorted keys, so the entry is
-byte-identical across founders given identical input — but the input is the
-whole `Membership`, not just the addresses. The witness policy
-(`Config.Witness`) and the session policy (`SessionExpiryEntries`,
-`MaxTotalSessions`, `MaxSessionsPerClient`, `MaxSessionsPerOwner`) are seeded
-into it from each founder's local config. Founders that disagree on any of them
-produce byte-different entries at the same `(index=1, term=1)`. AppendEntries
-matches on `(index, term)` alone, so that divergence is never reconciled.
-
-See [Wire Format](../wire-protocol/engineering.md) for the `Membership` encoding and
-[Session Deduplication](../client-sessions/engineering.md) for the session policy.
+See [wire-protocol](../wire-protocol/engineering.md) for the `Membership`
+encoding and [client-sessions](../client-sessions/engineering.md) for the
+session policy.
 
 #### Per-node certificate exclusivity is checked, and fails closed
 
 `StartShard` calls
 `QUICTransport.VerifyPeerAddressExclusivity(RaftAddress, memberAddresses)` and
-returns `transport.ErrSharedPeerCertificate` when this node's own leaf
-certificate also covers another member's host.
+refuses to start when this node's own leaf certificate also covers another
+member's host (`transport.ErrSharedPeerCertificate`, from an internal package).
 
-A wildcard certificate (`*.raft.svc.cluster.local`), or one certificate carrying
-every node's SAN, makes every in-band authorization decision in the transport
+A wildcard certificate (`*.raft.svc.cluster.local`), or one carrying every
+node's SAN, would make every in-band authorization decision in the transport
 answer "authorized" for every peer address. The check fails closed rather than
 warning because the weakness is invisible from a running cluster and the only
-remediation — re-issued certificates — has to happen before the cluster carries
-data. Replicas that share this node's host (the same host under any spelling, or
-any loopback address) are exempt, because no certificate policy can separate
-them; deployments that need these controls must give each replica its own host.
+fix, re-issued certificates, has to happen before the cluster carries data.
+Replicas that share this node's host (any spelling, or any loopback address) are
+exempt, because no certificate policy can separate them.
 
-This is a **misconfiguration detector**, not an attack control: a malicious
+This detects misconfiguration; it does not stop an attacker, since a malicious
 joiner never runs it. The enforcing counterpart is on the receive path
 (`refuseInboundPromiscuousCert`). See
-[QUIC Transport](../quic-transport/engineering.md#per-node-sans-are-a-hard-deployment-precondition).
+[quic-transport](../quic-transport/engineering.md#per-node-sans-are-a-hard-deployment-precondition).
 
 ### Every sender is bound to a replica it can prove it is
 
-Per-shard authorization first refuses the replicas (and node identities) whose
-removal the shard has committed — the tombstone deny-list etcd and Consul use —
-and then binds **every** inbound message's `From` to the authenticated peer.
-There are exactly three facts a replica holds that can vouch for a sender, and
-each binds the connection's identity, never an address (`senderBinding`,
-`#197 B`):
+Per-shard authorization first refuses the replicas, and the node identities,
+whose removal the shard has committed: a tombstone deny-list, as etcd and Consul
+keep. It then binds every inbound message's `From` to the authenticated peer.
+Three facts can vouch for a sender, and each binds the connection's identity,
+never an address (`senderBinding`):
 
-1. The **committed** configuration names the sender with a node identity, and
+1. **The committed configuration** names the sender with a node identity, and
    the connection presents it.
-2. The **pending** configuration does: a config-carrying entry in this
-   replica's own log, appended but not yet applied, admits the sender with an
-   identity — and a committed `RemoveNode` there, above the applied
-   configuration, is a pending tombstone refused before anything else is
-   consulted, by the removed ID and by the keypair it held
-   (`Peer.PendingRemoval`), because adds and removals are folded in log
-   order and the gate sees them in the same order. An uncommitted removal
-   revokes nobody: admission on an entry that may be truncated costs
-   nothing, revocation on one can wedge the shard. This is the lagging follower that holds the `AddNode` for the new
-   leader before committing it; it must admit that leader's `Replicate` and
-   `Heartbeat` or it can never catch up. The entry reached this log through a
-   sender bound by the same rule, so the pending configuration is as
-   trustworthy as the committed one.
-3. The **operator anchor** does: the replicas the operator started this shard
-   with (`Config.MemberIdentities`) and their identities. A joiner holds no
-   configuration, so nothing else can say who may bring it one — the leader's
-   `Replicate` it must ack, and the bootstrap snapshot itself. An established
-   replica that was down while a member was added and elected holds no entry
-   for that leader either, and a restart with a map naming it is how its
-   operator vouches for it without a wipe. On such a restart the map is held
-   to what was recovered (`checkRecoveredIdentities`): it may not name a
-   different identity for a committed member, nor bind a committed member's
-   identity to a second replica ID — the anchor admits senders the committed
-   configuration does not know, so that entry would let one keypair send as
-   two replicas — and the host itself must present the identity the shard
-   committed for its replica, or the start is refused rather than every peer
-   refusing the replica with nothing local saying why. That check sees the
-   configuration recovery handed `StartShard`; bindings committed after it
-   are covered at the moment they matter — the receive gate asks the
-   committed configuration (`Peer.IdentityHolder`) before the pending
-   configuration or the anchor may admit a sender, so a keypair the
-   committed configuration binds to one replica is never admitted as
-   another, and a committed binding for this replica that the host does not
-   present is reported at ERROR when it is applied. An anchor entry whose
-   identity the shard has since removed is inert (the removal deny-list runs
-   first) and tolerated at WARN, because every founder's map names it after
-   a routine `RemoveNode`.
+2. **The pending configuration** does: a config-carrying entry appended to this
+   replica's own log but not yet applied admits the sender with an identity.
+   This is the lagging follower that holds the `AddNode` for a new leader before
+   committing it; it must admit that leader's `Replicate` and `Heartbeat` or it
+   can never catch up. The entry reached this log through a sender bound by the
+   same rule. A committed `RemoveNode` above the applied configuration is a
+   pending tombstone, refused before anything else is consulted, by replica ID
+   and by keypair (`Peer.PendingRemoval`). An uncommitted removal revokes
+   nobody: admitting on an entry that may be truncated costs nothing, while
+   revoking on one can wedge the shard.
+3. **The operator anchor** (`Config.MemberIdentities`): the replicas the
+   operator started this shard with, and their identities. A joiner holds no
+   configuration, so nothing else can say who may bring it one. An established
+   replica that was down while a member was added and elected holds no entry for
+   that leader either; restarting it with a map naming the leader is how its
+   operator vouches for it without a wipe.
 
-There used to be type-based exemptions — leader-originated pushes and vote
-requests from an unknown replica ID were admitted so a lagging replica could be
-brought up to date — and they let any holder of a cluster certificate move a
-shard's term, install itself as leader on followers, re-point routing, and have
-forwarded proposals appended. The pending configuration replaces them with a
-fact the replica holds itself. The cost is a replica that never received the
-config change adding the new leader: it refuses that leader until a replica its
-configuration does name leads, or it is restarted with a
-`Config.MemberIdentities` that names the leader; the shard itself has quorum
-without it.
+On a restart the anchor is held to what was recovered
+(`checkRecoveredIdentities`): it may not name a different identity for a
+committed member, nor bind a committed member's identity to a second replica ID
+(that would let one keypair send as two replicas), and the host must present the
+identity the shard committed for its own replica, or the start is refused. For
+bindings committed after recovery, the receive gate asks the committed
+configuration (`Peer.IdentityHolder`) before the pending configuration or the
+anchor, so a keypair bound to one replica is never admitted as another. A
+committed binding for this replica that the host does not present is logged at
+ERROR when applied. An anchor entry whose identity the shard has removed is inert
+(the deny-list runs first) and tolerated with a WARN, since every founder's map
+still names it after a routine `RemoveNode`.
 
-The separation that keeps routing live is between **routing** and
-**authorization**:
+The cost: a replica that never received the config change adding a new leader
+refuses that leader until a replica its configuration names leads, or until it
+is restarted with a `Config.MemberIdentities` naming the leader. The shard keeps
+quorum without it.
+
+Routing and authorization are kept separate:
 
 - Routing state is learnable, from bound messages only. `learnFromSource`
-  records a bound sender's address for the return path, and may REPLACE an
+  records a bound sender's address for the return path, and may replace an
   established entry only on the strength of the committed identity. A joiner
   records the anchored leader's address so it can ack.
-- Authorization is not learnable at all. Drops are counted by reason
+- Authorization is never learned. Drops are counted by reason
   (`removed_replica`, `removed_identity`, `misrouted`, `unknown_member`,
   `identity_mismatch`, `missing_identity`), because one aggregate counter
   cannot tell a rolling membership change from an attack.
 
-See [Compatibility](../compatibility.md) for node identities and why they are
-required at admission.
+See [Compatibility](../compatibility.md#node-identities-are-mandatory) for why
+identities are required at admission.
 
 ### Forming a cluster automatically (go-qrdb)
 
-Everything above the member map lives in **go-qrdb**:
+Everything above the member map lives in go-qrdb:
 
-- **`go-qrdb/pkg/discovery`** implements the discovery methods behind a common
-  `Method` interface: `static.go`, `multicast.go`, `dns.go` (SRV) and
-  `token.go`, plus a `Manager` that chains several methods as a fallback list.
-- **`go-qrdb/pkg/cluster`** orchestrates formation. `Bootstrapper.Bootstrap`
-  runs discover → validate addresses → check quorum → add self → build the
-  member map → `StartShard`. `BootstrapShard(ctx, node, opts, shardID, createFn,
-  shardCfg)` is the single reusable entry point that builds the discovery method
-  from options and runs that sequence. `MinPeers` defaults to 3 and quorum is
-  checked before any shard is started.
-- **Dynamic membership** is opt-in and also in `pkg/cluster`: members register
-  under the `__sys:cluster/members/` prefix with a lease (10 s TTL, refreshed
-  every 3 s) and a watcher drives Raft add/remove with bounded retries.
+- `pkg/discovery` implements the discovery methods behind a common `Method`
+  interface (static, multicast, DNS SRV, token), plus a `Manager` that chains
+  several methods as a fallback list.
+- `pkg/cluster` orchestrates formation. `Bootstrapper.Bootstrap` runs
+  discover, validate addresses, check quorum, add self, build the member map,
+  then `StartShard`. `BootstrapShard(ctx, node, opts, shardID, createFn,
+  shardCfg)` is the reusable entry point that builds the discovery method from
+  options and runs that sequence. `MinPeers` defaults to 3, and quorum is
+  checked before any shard starts.
+- Dynamic membership is opt-in, also in `pkg/cluster`: members register under
+  the `__sys:cluster/members/` prefix with a lease (10 s TTL, refreshed every
+  3 s), and a watcher drives Raft add and remove with bounded retries.
 
 To form a multi-node cluster automatically, call go-qrdb's
-`cluster.BootstrapShard`, or run the `qrdbd` daemon, which wraps it. go-qrdb's
-`docs/discovery.md` is the reference.
+`cluster.BootstrapShard` or run its `qrdbd` daemon. The reference is go-qrdb's
+clustering feature documentation (`docs/clustering/` in that repository).
 
-### Cross-References
+## Cross-references
 
-- [API Reference](../multi-group-host/api.md) -- `Host.StartShard`, membership requests
-- [Architecture Overview](../multi-group-host/architecture.md) -- how a Host, shards and the transport fit together
-- [Raft Protocol](../raft-consensus/engineering.md) -- membership changes, config-in-log, witnesses
-- [QUIC Transport](../quic-transport/engineering.md) -- certificate exclusivity, sender authorization
-- [Deployment](../multi-group-host/user.md) -- certificate issuance and per-node SANs
-- [Lifecycle](../multi-group-host/engineering.md) -- host and shard startup and shutdown
-- [Compatibility](../compatibility.md) -- node identities, wire-format pinning
+- [API reference](api.md): `Host.StartShard`, membership requests, every type
+- [Lifecycle](engineering.md): host and shard startup, recovery, shutdown
+- [Usage](user.md): deployment, certificates, monitoring
+- [Raft protocol](../raft-consensus/engineering.md): membership changes,
+  config-in-log, witnesses
+- [QUIC transport](../quic-transport/engineering.md): certificate exclusivity,
+  sender authorization
+- [Compatibility](../compatibility.md): node identities, format pinning

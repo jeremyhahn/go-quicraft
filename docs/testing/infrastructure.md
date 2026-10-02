@@ -1,517 +1,387 @@
-# Testing Infrastructure
+# Testing infrastructure
 
 > **Status: NORMATIVE** · Scope: go-quicraft's test suites, build tags, injectors
-> and gates — `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-09-15
+> and gates: `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-This document describes the frameworks: what each suite is built out of, which
-build tag gates it, and why the gates are shaped the way they are. For the
-day-to-day commands and unit-test patterns, see [Testing Overview](overview.md).
+What each suite is built from, which build tag gates it, and why the gates are
+shaped as they are. Day-to-day commands, test patterns and the target reference
+are in [Testing overview](overview.md).
 
 ## Two rules that outrank coverage
 
 **A regression test must be seen to fail before the fix.** Write the test,
-revert the fix hunk, watch it fail, then put the fix back. This project has
-shipped regression tests that passed against unfixed code, three of them in one
-change, each accompanied by a claim that they covered the bug. The author's
-claim is not evidence. The observed failure is.
+revert the fix hunk, watch it fail, then restore the fix. A regression test that
+passes against unfixed code proves nothing, and an author's claim that it covers
+the bug is not evidence; the observed failure is. If you cannot make a test
+fail, say so in the pull request.
 
-**Count passes, never the absence of failures.** A bisect here once read
-"setup failed" as "0 failures" and walked the wrong direction for hours. A run
-that produced no FAIL lines because it never compiled looks identical, in a
-grep, to a clean run. Assert on the number of tests that ran.
+**Count passes, never the absence of failures.** A run that produced no FAIL
+lines because it never compiled looks identical, in a grep, to a clean run.
+Assert on the number of tests that ran.
 
-Both rules are why several gates below are written to fail closed on missing
-data rather than to pass quietly.
+Both rules are why several gates below fail closed on missing data instead of
+passing quietly.
 
 ## Suites and their build tags
 
 | Suite | Tag | Where | Runner |
-|-------|-----|-------|--------|
-| Unit | none | `pkg/...` | `make test`, `make test-<pkg>` |
+|---|---|---|---|
+| Unit | none | `pkg/...`, plus the untagged tests under `test/` | `make test`, `make test-<pkg>` |
 | Integration | `integration` | `test/integration/{raft,host,e2e,linearizability}` | `make integration-test`, `make ci-integration` |
-| Network partition | `integration quicraft_netfault` | `test/integration/e2e` | `make ci-netfault` |
+| Network partition | `integration quicraft_netfault` | `test/integration/e2e`, `test/integration/host` | `make ci-netfault` (e2e only) |
 | I/O fault injection | `quicraft_errfs` | `test/errfs` | `make errfs-waldb`, `make ci-errfs` |
-| Fuzz | `quicraft_fuzz` | 6 packages under `pkg/` | `make fuzz-<pkg>`, `make ci-fuzz-seeds`, `make ci-fuzz-mutation` |
+| Fuzz | `quicraft_fuzz` | six packages under `pkg/` | `make fuzz-<pkg>`, `make ci-fuzz-seeds`, `make ci-fuzz-mutation` |
+| FIPS | `fips` | `./...` | `make build-fips`, `make verify-fips`, `make verify-fips-exempt` |
 
-A build tag is a way to hide tests from CI without anyone noticing: the Go
-toolchain does not warn that a constraint excluded a file, it just compiles a
-smaller program. `make ci` runs only the untagged suite. `make ci-full` runs
-every tag, and that is the target to reproduce a red CI run with.
-
-### Unit tests
-
-`GOTEST := go test -race -count=1 -v`, so the race detector is always on and
-results are never cached. 22 per-package targets exist (`test-proto`,
-`test-raft`, `test-crypto`, and so on); the full list is in
-[Testing Overview](overview.md#unit-test-targets).
-
-There is no `-short` mode in any Makefile target. Two guards on
-`testing.Short()` exist in `pkg/logdb/waldb/crash_test.go` and never fire,
-because nothing passes the flag.
+The Go toolchain does not warn when a build constraint excludes a file; it just
+compiles a smaller program. `make ci` runs only the untagged suite. `make
+ci-full` runs every tag and is the target to reproduce a red CI run with.
 
 ### Integration tests
 
 Four packages under `test/integration/`, all behind `//go:build integration`:
 
 | Package | Tests | Covers |
-|---------|-------|--------|
-| `raft/` | 31 | Elections, replication, failover, snapshots, multi-shard, 3N and 5N |
-| `host/` | 45 (+1 under `quicraft_netfault`) | Public Host API, LeaseRead, membership change, rolling restart, snapshot under load, reads against a halted shard |
-| `e2e/` | 60 (+5 under `quicraft_netfault`) | Cluster formation, partitions, quorum loss, barrier encryption, node replacement |
-| `linearizability/` | 26 | Porcupine verification, the chaos soaks, the read-your-writes soak and the incarnation-key reproduction (#186) |
+|---|---|---|
+| `raft/` | 31 | elections, replication, failover, snapshots, read paths, multi-shard, stress, 3N and 5N |
+| `host/` | 47 (+1 under `quicraft_netfault`) | public Host API, LeaseRead, membership change, observer promotion, rolling restart, snapshot under load |
+| `e2e/` | 60 (+5 under `quicraft_netfault`) | cluster formation, partitions, quorum loss, barrier encryption, node replacement |
+| `linearizability/` | 26 | Porcupine verification, chaos soaks, read-your-writes, proposal-key incarnations |
 
-`make integration-test` builds the devcontainer and runs all four inside it.
-`make ci-integration` runs the same suite on the host, byte-identical to the
-`integration` job in `.github/workflows/ci.yml`.
+Counts include each suite's budget pin test.
 
-Both pass `-p 1`. That is deliberate and load-bearing. Each package stands up
-multi-node QUIC clusters under `-race`, and running four of them concurrently
-starves CPU enough that the 30-second snapshot catch-up waits expire. Every
-package is stable standalone; the failure is contention, not a defect. Do not
-remove `-p 1` to shorten the job.
+`make integration-test` runs all four inside the devcontainer;
+`make ci-integration` runs the same suite on the host, with the same command as
+the `integration` job in `.github/workflows/ci.yml`.
+
+Both pass `-p 1`, and that is load-bearing. Each package stands up multi-node
+QUIC clusters under `-race`; four at once starve the CPU enough that the
+30-second snapshot catch-up waits expire. Every package is stable standalone.
+Do not remove `-p 1` to shorten the job.
 
 Because `-p 1` makes every package share one deadline, the timeouts are large:
-900s in the devcontainer, 1800s in CI, where a shared runner is slower. A 300s
-cap once failed the suite with a timeout panic and zero test failures, which
-reads as a product bug rather than as a budget.
+900s in the devcontainer and 1800s in CI, where a shared runner is slower. A
+smaller cap fails the suite with a timeout panic and zero test failures, which
+reads as a product bug instead of a budget.
 
 ### E2E over Docker Compose
 
-`make integration-test-e2e` brings up `.devcontainer/docker-compose.integration.yml`:
-a single `test-runner` container executing a binary compiled from
-`./test/integration/e2e/...`.
+`make integration-test-e2e` brings up
+`.devcontainer/docker-compose.integration.yml`: one `test-runner` container
+running a binary compiled from `./test/integration/e2e/...`. The e2e package
+builds its own clusters (`newTestCluster`: real `quicraft.Host` instances over
+real QUIC with mTLS on loopback), so the container adds the pinned toolchain
+and the entrypoint's tuned UDP buffers, not topology. There is no node server
+binary; the only `package main` in the tree is the benchmark orchestrator.
 
-It used to declare three `node1`/`node2`/`node3` containers as well. Those were
-removed, for three reasons worth recording so they are not reintroduced. Nothing
-read the `INTEGRATION_NODE*_ADDR` variables they were configured with. They
-declared a `node` build stage that does not exist in `Dockerfile.integration`, so
-they could never build. And there is no node server binary for them to run — the
-only `package main` in the tree is the benchmark orchestrator. The e2e package
-builds its own clusters instead: `newTestCluster` stands up real `quicraft.Host`
-instances over real QUIC with mandatory mTLS on loopback ports, which is genuine
-multi-replica coverage that simply does not need cross-container topology.
-
-What the container still contributes over `make integration-test` is the pinned
-toolchain and the entrypoint's tuned QUIC UDP buffers.
-
-The build step in `.devcontainer/Dockerfile.integration` is also worth
-understanding, because it was the subject of a real defect. It used to read:
-
-```
-go test -c ... 2>/dev/null || echo "no integration tests found yet" && touch /integration-tests
-```
-
-`||` and `&&` are equal-precedence and left-associative, so that parses as
-`((go test || echo) && touch) && chmod`. A compile failure was hidden by
-`2>/dev/null`, `echo` succeeded, and a zero-byte executable was installed;
-`execve` on an empty file returns `ENOEXEC`, the shell falls back to running it
-as a script, and an empty script exits 0. The compose run then reported success
-having executed nothing. It now compiles with `set -eux`, no stderr suppression
-and no fallback, then asserts the binary is non-empty and actually lists tests —
-because `go test -c` on a package with no test files writes no output and still
-exits 0.
+The build step in `.devcontainer/Dockerfile.integration` compiles under
+`set -eux` with no stderr suppression and no fallback, then asserts the binary
+is non-empty and lists at least one test. Both checks matter: `go test -c` on a
+package with no test files writes nothing and still exits 0, and a zero-byte
+executable run through a shell exits 0 having tested nothing.
+`test/buildgates/dockerfile_integration_test.go` pins that shape.
 
 ### Network partition injection
 
-`test/netfault` drops messages between **live** replicas, behind the
-`quicraft_netfault` build tag. Run via `make ci-netfault`.
+`test/netfault` drops messages between live replicas, behind the
+`quicraft_netfault` build tag.
 
-Why it exists: every test in the suite calling itself a partition test called
-`stopNode`, which is a process kill. A killed node holds no leadership belief,
-answers nothing, and comes back with cold in-memory state, so the most
-dangerous configuration in Raft, a live leader deposed by a quorum it can no
-longer reach, could not be constructed anywhere. The cost was measured: with
-the suite as it stood, weakening the election quorum from a strict majority to
-`n/2` passed 18 of the 19 linearizability tests. Against the partition
-primitive the same mutant is caught in about 1.1 seconds.
+A process kill (`stopNode`) cannot build the most dangerous configuration in
+Raft: a live leader deposed by a quorum it can no longer reach. A killed node
+holds no leadership belief and comes back with cold state. With only
+`stopNode`, weakening the election quorum from a strict majority to `n/2`
+passed 18 of the 19 linearizability tests then in the suite; the partition
+primitive catches the same mutant in about a second.
 
 | Primitive | Effect |
-|-----------|--------|
-| `Isolate(replica)` / `Rejoin(replica)` | Cuts one replica off in both directions without stopping it. It keeps its term, role and ticker |
-| `Partition(groupA, groupB)` | Blocks both directions across a cut; each side stays internally connected |
-| `BlockLink(from, to)` / `HealLink(from, to)` | A single directed edge, for asymmetric partitions |
-| `Heal()` | Removes every fault. Tests register it with `t.Cleanup` because the state is process-global |
-| `BlockedCount()` | Number of installed faults, used by the self-guard below |
+|---|---|
+| `Isolate(replica)` / `Rejoin(replica)` | cuts one replica off in both directions without stopping it; it keeps its term, role and ticker |
+| `Partition(groupA, groupB)` | blocks both directions across a cut; each side stays internally connected |
+| `BlockLink(from, to)` / `HealLink(from, to)` | one directed edge, for asymmetric partitions |
+| `Heal()` | removes every fault; register it with `t.Cleanup`, because the state is process-global |
+| `BlockedCount()` | number of installed faults |
 
-Drops are applied on the sending side, which expresses any directed cut since
-the edge A→B is controlled entirely at A, and they are silent: the sender's
-connections stay up and no error surfaces, as on a real network.
+Drops apply on the sending side, which can express any directed cut, and they
+are silent: connections stay up and no error surfaces, as on a real network.
 
-Production cost is zero, and that is verified rather than asserted.
-`pkg/internal/transport/netfault_off.go` defines `netFaultEnabled` as a false
-`const`, so the compiler folds away every
-`if netFaultEnabled && netFaultDrop(...)` site in the send path, and
-`go list -deps ./pkg/internal/transport` does not contain `test/netfault`. Only
-`netfault_on.go`, itself behind the tag, imports it.
+Production cost is zero. `pkg/internal/transport/netfault_off.go` defines
+`netFaultEnabled` as a false constant, so the compiler removes every
+`if netFaultEnabled && netFaultDrop(...)` site, and only `netfault_on.go`,
+itself behind the tag, imports `test/netfault`.
 
-Every test asserts `netfault.BlockedCount()` is non-zero before proceeding, so
-building without the tag fails the suite loudly instead of silently exercising
-a healthy cluster, which is precisely the defect the package was written to
-correct.
+Every netfault test asserts `netfault.BlockedCount()` is non-zero before it
+proceeds, so building without the tag fails loudly instead of exercising a
+healthy cluster.
 
-Four tests use it today: `TestNetPartition_TwoOfFourCannotElect`,
-`TestNetPartition_DeposedLeaderStaysAliveAndCannotCommit`,
-`TestNetPartition_AsymmetricLeaderCannotBeHeard` and
-`TestElectionSafety_SpentTermCannotBeWonTwice`. The older partition tests
-(`partition_test.go`, `asymmetric_partition_test.go`, `quorum_loss_test.go`,
-13 tests) still build under the plain `integration` tag and still simulate
-topology with `stopNode`. They are worth keeping, but they do not cover the
-deposed-live-leader case.
+Six tests use it:
 
-The injector has its own tests in `test/netfault/netfault_test.go` (7 of them,
-untagged, so they run under `make test`): that `Drop` returns false with
-nothing injected, that `BlockLink` is directional, that `Isolate` cuts both
-ways, that `Partition` cuts across and not within, that `Heal` clears
-everything, that the mutators are safe under concurrent reads, and that the
-shard ID is not consulted.
+| Test | Package |
+|---|---|
+| `TestNetPartition_TwoOfFourCannotElect` | e2e |
+| `TestNetPartition_DeposedLeaderStaysAliveAndCannotCommit` | e2e |
+| `TestNetPartition_AsymmetricLeaderCannotBeHeard` | e2e |
+| `TestElectionSafety_SpentTermCannotBeWonTwice` | e2e |
+| `TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent` | e2e |
+| `TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent` | host |
+
+`make ci-netfault` and CI's `netfault` job run the e2e package only, so the
+host test runs only when invoked by hand with both tags.
+
+The older partition tests (`partition_test.go`, `asymmetric_partition_test.go`,
+`quorum_loss_test.go`) still use `stopNode`. They are worth keeping but do not
+cover the deposed-live-leader case.
+
+The injector's own seven tests in `test/netfault/netfault_test.go` are
+untagged and run under `make test`: `Drop` is false with nothing injected,
+`BlockLink` is directional, `Isolate` cuts both ways, `Partition` cuts across
+and not within, `Heal` clears everything, mutators are safe under concurrent
+reads, and the shard ID is not consulted.
 
 ### I/O fault injection
 
 `test/errfs` wraps the filesystem the WAL and LogDB write through and fails
-individual operations on demand: the Nth call, only a named operation, a
-bounded number of times, or a short write that disturbs the delegate before
-returning an error.
+operations on demand: the Nth call, only a named operation, a bounded number of
+times, or a short write that disturbs the delegate before returning an error.
 
-Two tiers, and the split matters:
+Two tiers:
 
-- 23 tests behind `quicraft_errfs` drive the WAL and LogDB through injected
-  failures (`waldb_test.go`, 21, and `durability_test.go`, 2). They cover torn
-  tails and repair, failed fsync losing only unacknowledged data, mid-entry
-  write failure, read failure during replay, `OpenFile` and `MkdirAll` failure,
-  `Stat` failure during replay, compaction remove and readdir failure, double
-  faults across write and rollback, and idempotent recovery.
+- 23 tests behind `quicraft_errfs` (`waldb_test.go`, 21; `durability_test.go`,
+  2) drive the WAL and LogDB through injected failures: torn tails and repair,
+  a failed fsync losing only unacknowledged data, mid-entry write failure, read
+  and `Stat` failure during replay, `OpenFile` and `MkdirAll` failure,
+  compaction remove and readdir failure, double faults across write and
+  rollback, and idempotent recovery.
 - 13 untagged tests in `errfs_unit_test.go` and `harness_test.go` test the
-  injector itself: that `InjectAt` fires on exactly the Nth operation, that
-  `OnlyOps` restricts and rejects unknown operations, that `Times` bounds the
-  budget, that a short write really disturbs the delegate, and that every
-  non-injecting operation delegates. These run in the ordinary unit suite,
-  which is the point. An injector that quietly stopped injecting would make
-  the 23 tagged tests pass for the wrong reason.
+  injector: the `injectAt` argument to `New` fires on exactly the Nth operation, `OnlyOps` restricts
+  and rejects unknown operations, `Times` bounds the budget, a short write
+  disturbs the delegate, and every non-injecting operation delegates. They run
+  in `make test`, because an injector that silently stopped injecting would
+  make the 23 tagged tests pass for the wrong reason.
 
-`make errfs-waldb` runs the tagged suite with `-v`, which is what you want when
-one fails: the failure is a sequence of I/O outcomes and the test name is the
-only way to tell which injection point produced it. `make ci-errfs` is the same
-suite without `-v`, byte-identical to the `errfs` job in ci.yml and the `errfs`
-gate in release.yml. Both keep `-race`, because a torn recovery path shows up
-as a race rather than as a wrong answer.
+`make errfs-waldb` runs the tagged suite with `-v`, which you want when one
+fails: the test name is the only way to tell which injection point produced the
+failure. `make ci-errfs` is the same without `-v`, matching the `errfs` job in
+ci.yml and the `errfs` gate in release.yml. Both keep `-race`, because a torn
+recovery path shows up as a race rather than a wrong answer.
 
 ### Fuzzing
 
-37 targets behind `quicraft_fuzz`, across six packages:
+37 targets behind `quicraft_fuzz`:
 
 | Package | Targets | Surface |
-|---------|---------|---------|
-| `pkg/proto` | 13 | Entry, Message, MessageBatch, State, Membership, ConfigChange, Snapshot round-trip and crash |
+|---|---|---|
+| `pkg/proto` | 13 | Entry, Message, MessageBatch, State, Membership, ConfigChange, Snapshot: round-trip and crash |
 | `pkg/logdb/waldb` | 9 | WAL record codec and recovery |
-| `pkg/internal/transport` | 5 | Frame header decode and the message-frame receive path |
-| `pkg/internal/session` | 4 | Session encoding boundaries |
-| `pkg/seal` | 4 | AES-GCM encrypt/decrypt across epochs |
-| `pkg/internal/raft` | 2 | Adversarial step sequences, log recovery |
+| `pkg/internal/transport` | 5 | frame header decode and the message-frame receive path |
+| `pkg/internal/session` | 4 | session encoding boundaries |
+| `pkg/seal` | 4 | AEAD encrypt/decrypt across epochs |
+| `pkg/internal/raft` | 2 | adversarial step sequences, log recovery |
 
-Every one of the 37 has `f.Add` seeds. The committed corpus is 39 files under
-`pkg/proto/testdata/fuzz/<Target>/`; no other package has promoted a
-reproducer yet.
+Every target has `f.Add` seeds. The committed corpus is 39 files under
+`pkg/proto/testdata/fuzz/<Target>/`; nightly fuzzing uploads crashers as
+artifacts, and committing one makes it a permanent regression test.
 
-Three different things are called fuzzing here, and they are not
-interchangeable:
+Three different things are called fuzzing here:
 
-- `make fuzz-<pkg>` and `make fuzz-all` mutate for `FUZZ_TIME` (60s default).
-  Local use. `fuzz-raft` names its two targets explicitly because
-  `go test -fuzz` runs exactly one target per invocation and the pattern
-  `-fuzz=Fuzz` would match both.
-- `make ci-fuzz-seeds` runs `-run=Fuzz` **without** `-fuzz`, over `./...`. That
-  executes each target once per seed and once per corpus file, then exits: a
-  deterministic regression suite over every input a previous run found
-  interesting. It is the PR gate. `./...` rather than the six known packages,
-  so a new target in a seventh package cannot go unrun.
-- `make ci-fuzz-mutation` gives each target a 10s mutation budget. It is a
-  release gate, not a campaign. The real search is `.github/workflows/fuzz.yml`
-  on a nightly cron, where the budget is an execution COUNT per target
-  (`-fuzztime=<N>x`), calibrated per package from measured throughput. It is a
-  count and not a duration because Go only installs a fuzzing deadline context
-  for a duration budget, and the shutdown path can record that deadline as a
-  test failure; see the header of that workflow (#49).
+- `make fuzz-<pkg>` and `make fuzz-all` mutate for `FUZZ_TIME` (default 60s),
+  for local use. `fuzz-raft` names its two targets because `go test -fuzz` runs
+  exactly one target per invocation.
+- `make ci-fuzz-seeds` runs `-run=Fuzz` without `-fuzz` over `./...`: each
+  target once per seed and once per corpus file, deterministically. It is the
+  PR gate. It walks `./...` so a new target in a seventh package cannot go
+  unrun.
+- `make ci-fuzz-mutation` is the release gate: a smoke check, not a search. Each
+  target gets a fixed execution count (`-fuzztime=<N>x`), the nightly
+  campaign's per-target budget divided by `FUZZ_MUT_DIVISOR` (6). A package
+  without a calibrated budget fails the gate instead of running unbounded.
 
-The mutation gate retries, and the retry is not a weakening. Go's fuzzing
-coordinator can lose its shutdown RPC and report a bare "context deadline
-exceeded" after the full `-fuzztime` has elapsed, which reads exactly like a
-crash and is not one (reproduced on an idle host running one target at a time).
-The gate separates the two on the signal Go itself gives: a real crash always
-writes a reproducer and prints "Failing input written to". That string present
-means fail immediately and never retry; absent, with only the deadline message,
-means retry; anything else fails. The retry is gated on the *absence* of the
-reproducer a real crash produces, so a real crash cannot be retried away.
-
-The nightly workflow no longer needs that classification. With an
-execution-count budget Go creates no deadline context at all and ends the run
-through an explicit `stop(nil)`, so the artefact has no way to occur there
-(#49). The release gate still spends a duration, so it still classifies.
+The unbounded search is `.github/workflows/fuzz.yml` on a nightly schedule,
+deliberately off the PR path: a crash it finds depends on the RNG schedule, and
+failing unrelated pull requests at random is how a gate stops being trusted.
+Both the nightly and the release gate budget by execution count, not duration.
+With a duration budget Go installs a deadline context, and its coordinator can
+report a bare "context deadline exceeded" at shutdown that reads like a crash
+and is not one; with a count there is no deadline to race.
 
 ### Linearizability
 
 `test/integration/linearizability`, Porcupine-based, 26 tests. Clients issue
-alternating put/get operations against a KV state machine while faults are
-applied, and the recorded history is checked for a valid sequential ordering.
+put/get operations against a KV state machine while faults are applied, and the
+recorded history is checked for a valid sequential order.
 
 | Test | Nodes | Clients | Duration | Fault |
-|------|-------|---------|----------|-------|
+|---|---|---|---|---|
 | `3Node_Normal` | 3 | 8 | 5s | none |
 | `5Node_Normal` | 5 | 8 | 5s | none |
-| `3Node_SingleKeyContention` | 3 | 8 | 5s | none, 1 key |
+| `3Node_SingleKeyContention` | 3 | 8 | 5s | none, one key |
 | `3Node_LeaseRead` | 3 | 8 | 5s | none, LeaseRead path |
 | `3Node_SessionProposal` | 3 | 4 | 5s | none, at-most-once sessions |
 | `3Node_LeaderFailover` | 3 | 4 | 5s | leader stopped |
-| `5Node_MinorityDown` | 5 | 8 | 8s | 2 followers stopped |
-| `3Node_SnapshotDuringLoad` | 3 | 8 | 10s | snapshot triggered under load |
+| `5Node_MinorityDown` | 5 | 8 | 8s | two followers stopped |
+| `3Node_SnapshotDuringLoad` | 3 | 8 | 10s | snapshot under load |
 | `4Node_ElectionSafety` | 4 | 4 | 12s | leadership churn |
-| `3Node_FollowerRestart` | 3 | 4 | 12s | follower stopped, restarted on its own WAL |
-| `3Node_LeaderRestart` | 3 | 4 | 12s | leader stopped, restarted, rejoins as follower |
+| `3Node_FollowerRestart` | 3 | 4 | 12s | follower restarted on its own WAL |
+| `3Node_LeaderRestart` | 3 | 4 | 12s | leader restarted, rejoins as follower |
 | `5Node_MultipleLeaderFailovers` | 5 | 4 | 15s | two leaders stopped in sequence |
 | `5Node_MembershipAddRemove` | 5 | 4 | 15s | add then remove a node |
 | `5Node_RollingRestart` | 5 | 4 | 20s | each node restarted, never two down |
 | `5Node_HighThroughput` | 5 | 16 | 30s | none |
 
-Plus `TestRestartedReplicaResumesReplication` (`catchup_probe_test.go`), which
-targets a restarted replica being starved by a full inflight window, and three
-soaks in `soak_chaos_test.go`: `ChaosUnderSustainedLoad`,
-`RollingRestartUnderLoad`, `LeaderCloseDoesNotStallWrites`.
+The rest of the package: `TestRestartedReplicaResumesReplication`
+(`catchup_probe_test.go`, a restarted replica starved by a full inflight
+window); three soaks in `soak_chaos_test.go` (`ChaosUnderSustainedLoad`,
+`RollingRestartUnderLoad`, `LeaderCloseDoesNotStallWrites`);
+`TestSoak_RollingRestart_ReadYourWrites`;
+`TestRestart_ProposalKeysDoNotCollideAcrossIncarnations`, which pins that
+proposal keys stay unique across restarts; and the history-pruning and
+partition-diagnosis tests behind the checker.
 
-The important part is not the fault list, it is the operation floor. A history
-that is empty, or that contains only writes, or only reads, is trivially
-linearizable, and the suite once passed with half the entries dropped.
-`checkLinearizability` therefore fails unless the run recorded at least
-`floorFor(numClients, active)` writes *and* that many reads, where the floor is
-30% of a measured baseline of 5.4 completed writes per client-second. Chaos
-tests pass a reduced `active` window because elections and catch-up legitimately
-stall clients. At 30% the tightest test keeps a 3.3x margin, while a mutation
-that collapses throughput lands one to three orders of magnitude below the
-floor. `checkLinearizability` also fails on any client-observed protocol
-violation, independently of the Porcupine verdict.
+What makes the suite meaningful is the operation floor. An empty history, or
+one with only writes or only reads, is trivially linearizable.
+`checkLinearizability` fails unless the run recorded at least
+`floorFor(numClients, active)` writes and as many reads: 30% of a measured
+baseline of 5.4 completed writes per client-second. Chaos tests pass a reduced
+`active` window, because elections and catch-up legitimately stall clients. At
+30% the tightest test keeps a 3.3x margin, while a mutation that collapses
+throughput lands one to three orders of magnitude below the floor. The checker
+also fails on any client-observed protocol violation, independent of the
+Porcupine verdict.
 
-The election-safety invariant is *not* covered here despite the test name.
-`TestLinearizability_4Node_ElectionSafety` exercises churn;
-`TestElectionSafety_SpentTermCannotBeWonTwice`, under `quicraft_netfault`, is
-what spends a term's votes on a candidate structurally unable to win with them
-and asserts nothing else can win that term.
+`TestLinearizability_4Node_ElectionSafety` exercises churn but does not prove
+election safety. `TestElectionSafety_SpentTermCannotBeWonTwice`, under
+`quicraft_netfault`, spends a term's votes on a candidate that cannot win and
+asserts nothing else wins that term.
 
-## Shared test infrastructure
+## Shared test packages
 
-### In-memory LogDB
+Every directory under `test/`:
 
-`pkg/logdb/memdb` implements the full `logdb.LogDB` interface over Go maps, so
-unit tests and Host benchmarks skip WAL overhead:
+| Directory | What it is |
+|---|---|
+| `integration/` | the four integration suites above |
+| `errfs/` | the I/O fault-injecting filesystem and its suites |
+| `netfault/` | the live-replica partition injector |
+| `netport/` | reserves loopback UDP ports for hosts that do not exist yet, without the bind-close-rebind race of `127.0.0.1:0` |
+| `testpki/` | one CA per cluster and one keypair per host, so every host has a distinct node identity |
+| `electionbudget/` | the election wait budgets (`Round`, `LeaderElection`, `Failover`) every suite derives from its own `ElectionRTT` and `RTTMillisecond` |
+| `proposer/` | submits proposals and linearizable reads to whichever replica leads at the moment of the call |
+| `membership/` | applies membership changes through the current leader and treats the retry of an already committed change as success |
+| `lockedmem/` | reads the kernel's view of this process's mappings (Linux), so tests can assert a page is locked or read-only |
+| `buildgates/` | untagged tests for the parts of the build that are not Go: analyser version pins, CI gate wiring, the integration Dockerfile, FIPS and fuzz budgets, release inputs |
+| `releasability/` | the public-releasability gate; see [public-releasability.md](../release/public-releasability.md) |
+| `performance/` | the cross-system benchmark framework (separate modules) |
 
-```go
-h, err := quicraft.NewHost(cfg, quicraft.WithMemoryLogDB(), quicraft.WithoutTransport(), quicraft.WithoutEncryption())
-```
+Each suite keeps a small pin test (`TestBudgetsDescribeTheClusterTheyBudgetFor`)
+asserting that its own config builders set the `ElectionRTT` the budgets were
+derived from.
 
-`mockLogDB` in `pkg/host_test.go` is lighter still, with injectable errors for
-Host-level error paths.
+`pkg/internal/engine` has its own, unrelated `newTestCluster` for in-process
+engine tests.
 
-### Mock state machines
-
-`kvStateMachine` is the standard test state machine, defined once per
-integration package (`test/integration/e2e/helpers_test.go` and
-`test/integration/host/helpers_test.go`). It implements `sm.StateMachine` over
-a `[op:1][keyLen:2][key][value]` wire format. `kvCreateFunc()` returns a
-`sm.CreateFunc` alongside an `smTracker` that hands tests the live instance:
-
-```go
-createFn, tracker := kvCreateFunc()
-// ... start the shard with createFn ...
-val, ok := tracker.Get(shardID, replicaID).Get("my-key")
-```
-
-### Transport pair
-
-`transportPair(t, deploymentID)` in `pkg/internal/transport/quic_test.go`
-creates two `QUICTransport` instances on loopback with mutual registration.
-`transportPairWith` takes options; `transportPairWithRevocation` adds a
-revocation checker. The `testHandler` records batches and snapshot chunks and
-exposes notification channels, so assertions synchronize instead of sleeping.
-
-### Cluster helpers
-
-`newTestCluster(t, n)` builds N Hosts on loopback with real QUIC and
-auto-generated TLS, each on an ephemeral port from `freePort()`. It offers
-`startShard`, `stopNode`, `findLeader`, `findFollower`, `waitForClusterLeader`,
-`observeLeaders` and `liveNodes`. `pkg/internal/engine` has its own unrelated
-`newTestCluster` for in-process engine tests.
-
-### Polling, not sleeping
-
-Integration tests poll rather than sleep: `waitForClusterLeader`,
-`waitForSingleLeader`, `waitForLeader`, `waitForApplied`, `waitForReplication`,
-`waitForMembershipSize`, `waitForMembershipConverged`, `waitForNodeData`,
-`waitForSnapshotArtifact`, and the generic `waitForCondition` /
-`waitForConditionDiag`.
-
-## Gates that are shaped by a past failure
+## Gates shaped by past failures
 
 ### The coverage gate fails closed
 
-`COVER_MIN` is 91, and it is one floor applied by every `coverage-*` target and
-by `make coverage` (which measures `./...`). There is no per-package threshold
-table; a package target and the total target are judged against the same
-number.
+`COVER_MIN` is 91. Every `coverage-*` target and `make coverage` (`./...`) fail
+below it, and `make coverage-packages` applies it to every package under `pkg/`
+from the same profile. CI's `test` job runs the same total and per-package
+checks at `COVERAGE_THRESHOLD = 90`, one point lower so a single package's
+flaky test (which contributes no coverage when it fails) does not fail the gate
+twice.
 
-The three guards in `check-coverage` are not defensive padding. The previous
-version went straight to the comparison:
+`check-coverage` fails on a missing or empty profile and on any value that is
+not a number before it compares. Without those guards an empty percentage made
+`bc` print nothing, the shell test degenerated to `[ -eq 1 ]`, and the gate
+passed exactly when it had no data. It reads the total with
+`awk '/^total:/'`, because `grep total` also matches functions whose names
+contain "total". CI duplicates the guards so the two gates cannot drift apart.
 
-```make
-COVERAGE=$$(go tool cover -func=$(1) | grep total | ...)
-if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]
-```
-
-On an empty or missing profile `COVERAGE` is the empty string, `bc` fails with
-a syntax error and prints nothing, the test degenerates to `[ -eq 1 ]`, the
-shell reports "unary operator expected", and the `if` takes the else branch.
-The gate passed precisely when it had no coverage data to judge. Now a missing
-or empty profile, and any value that is not a number, is an explicit failure.
-`awk '/^total:/'` replaced `grep total` for the same reason: the old filter also
-matched any function whose name contains "total", and two matches produced two
-values, which lands back in the unparseable case.
-
-The same guards are duplicated in the `test` job of ci.yml, deliberately, so
-the CI gate cannot regress independently of the Makefile one.
-
-`-coverpkg=./...` is deliberately not passed. This was measured rather than
-assumed: `go test -coverprofile` already emits a 0% entry for a package with no
-test file, so an untested package is already in the denominator (adding a
-270-statement untested package moved the module total from 91.3% to 89.7%).
-What `-coverpkg` adds is credit for statements covered by some *other*
-package's tests, which raised the same tree from 91.3% to 92.0%. Against an
-unchanged `COVER_MIN` that is a 0.7-point loosening, so adopting it is a
-threshold decision, not a wiring fix.
+`-coverpkg=./...` is not passed. An untested package is already in the
+denominator at 0%; `-coverpkg` only adds credit for statements covered by
+another package's tests, which moved the same tree from 91.3% to 92.0%. Against
+an unchanged floor that loosens the gate, so adopting it is a threshold
+decision, not a wiring fix.
 
 ### The mutation-marker guard
 
-`make no-mutants` runs as the second step of `make ci`. It greps `pkg/`,
-`test/` and `contrib/` for `if false {`, `MUTANT` and `MUTATION`, excluding
-`_test.go` files, and fails if it finds any.
+`make no-mutants` runs early in `make ci`. It greps `pkg/`, `test/` and
+`contrib/` for `if false {`, `MUTANT` and `MUTATION` outside `_test.go` files
+and fails on any hit.
 
-Mutation testing is how correctness is verified here: a fix is not trusted
-until the defect it closes has been re-introduced and the test seen to fail.
-That workflow edits production code, and a restore that never happens is
-invisible, because a disabled guard makes tests pass rather than fail. It has
-already happened once. An `if false {` around the rollback fsync in waldb
-reached a commit, and a failed `SaveState` whose bytes had reached the medium
-through ordinary writeback could then be resurrected by a crash and replayed as
-committed entries the caller had been told were rejected. Every suite stayed
-green, because the site had no test, which is exactly why it was being mutated.
+Mutation testing is how a fix is verified here, and it edits production code. A
+mutation that is never restored is invisible, because a disabled guard makes
+tests pass. An `if false {` around the WAL's rollback fsync once reached a
+commit with every suite green, because the site had no test, which is why it was
+being mutated. Test files are excluded: `if false` is legitimate there, and a
+mutation in a test cannot weaken production behaviour.
 
-Test files are excluded because `if false` is legitimate there for pinning a
-compile-time branch, and a mutation left in a test file cannot silently weaken
-production behavior.
+### The nested-module gate
 
-### The nested-module gate, and the matrix that never ran
-
-`make ci-modules` finds every `go.mod` in the tree and runs `go build` and
-`go vet` in each, collecting failures rather than stopping at the first, so one
-broken sibling cannot hide a second.
+`make ci-modules` runs `go build` and `go vet` in every directory holding a
+`go.mod`, collecting failures instead of stopping at the first, so one broken
+module cannot hide a second.
 
 `GOWORK=off` is exported at the bottom of the Makefile and set in the workflow
-env, and it is load-bearing here specifically. Inside a workspace these modules
-resolve the root through the workspace instead of through their own
-`require`/`replace` directives, and the `go` directive mismatch this gate exists
-to catch does not reproduce. `contrib/dragonboat` sat broken for exactly that
-reason, with nothing compiling it.
+env. Inside a workspace, nested modules resolve the root through the workspace
+instead of their own `require`/`replace` directives, and the `go` directive
+mismatch this gate exists to catch does not reproduce.
 
-The CI job was previously a `discover-modules` job feeding
-`matrix: ${{ fromJSON(needs.discover-modules.outputs.modules) }}`. The runner
-does not expand a matrix sourced from another job's output. It scheduled one job
-literally named `Module ${{ matrix.module }}` whose `working-directory`
-interpolated to the empty string, so it rebuilt the repository root and was
-green while building none of the nested modules. The replacement is a shell
-loop, which expands identically everywhere, plus a `MODULE_FLOOR=6` check so
-that a discovery returning nothing fails instead of reading as clean. If a
-module is removed on purpose, lower the floor in the same commit.
+The CI `modules` job discovers modules with a shell loop and fails if it finds
+fewer than `MODULE_FLOOR=6`, so a discovery that returns nothing cannot read as
+clean. Lower the floor in the same commit that removes a module on purpose.
 
 ## Running heavyweight suites off-box
 
-`make remote-<target>` rsyncs the working tree to a remote build host
-(set by `REMOTE_HOST`, which is required and has no default, plus the optional
-`REMOTE_USER` and `REMOTE_WORKDIR`) and runs `make <target>` there,
-streaming output back. It is a pattern rule, so no target needs enrolling:
+`make remote-<target>` rsyncs the working tree to `REMOTE_HOST` (required, no
+default; optional `REMOTE_USER` and `REMOTE_WORKDIR`, default
+`~/ci/go-quicraft`) and runs `make <target>` there, streaming output back. It is
+a pattern rule, so no target needs enrolling.
 
-```
-export REMOTE_HOST=build-host.example
-make remote-ci-full            # the whole gate, off-box
-make remote-integration-test
-make remote-test               # or any other target
-make remote-tools              # one-time: install the scanners the host lacks
-make remote-test REMOTE_WORKDIR='~/ci/qr-myfeature'   # avoid colliding with other work
-```
-
-This exists because every target runs under `-race` and the integration suites
-stand up multi-node QUIC clusters. On a workstation also running editors,
-browsers and agents, that contention expires the 30-second catch-up waits, and
-the resulting failures read as raft defects rather than as the scheduling
-artifacts they are. Chasing them has cost days. Point the remote host at the
-machine CI already executes on, so the local inner loop and CI agree about what
-a failure means.
+Every target runs under `-race`, and the integration suites stand up multi-node
+QUIC clusters. On a busy workstation that contention expires the 30-second
+catch-up waits, and the failures read as Raft defects. Point `REMOTE_HOST` at
+the machine CI runs on, so a local failure and a CI failure mean the same thing.
 
 The sync uses `--delete`, so a file removed locally cannot linger remotely and
-turn a broken build green. `.git` is excluded deliberately: this ships the
-working tree including uncommitted edits, which is the point during
-development, and it means nothing on the remote can perform a git operation
-against this repository's history.
+turn a broken build green. `.git` is excluded: the target ships the working
+tree including uncommitted edits, and nothing on the remote can run a git
+operation against this repository's history.
 
 `make remote-tools` installs govulncheck, gosec, golangci-lint (pinned to
-`GOLANGCI_VERSION`, matching what ci.yml's `lint`/`security` jobs install) and
-trivy (matching nightly.yml's `trivy` job), and seeds `known_hosts` for
-github.com and, when `FORGE_SSH_HOST` (and `FORGE_SSH_PORT`) name one, a private
-forge that the host's module-fetch rewrite points at. Every tool is installed unconditionally rather than "if absent",
-because the remote host had a v1 golangci-lint and a years-old gosec on PATH and
-`command -v` guards skipped both installs. An analyser of the wrong version
-gates on a different rule set from CI while looking like it passed.
+`GOLANGCI_VERSION`) and trivy on the remote host, and seeds `known_hosts` for
+github.com and, when `FORGE_SSH_HOST` (with `FORGE_SSH_PORT`) names one, a
+private module forge. Every tool is installed unconditionally: an analyser of
+the wrong version gates on a different rule set from CI while looking like it
+passed.
 
 ## Benchmarking
 
 `make bench-<pkg>` covers proto, raft, waldb, engine, registry, seal,
-transport, quicraft, server, writemode, batch and crypto. These are single
-unreplicated runs whose spread on a loaded machine reaches 5x. They cannot
-detect a regression on their own.
+transport, quicraft, server, writemode, batch and crypto. They are single
+unreplicated runs and cannot detect a regression. `make bench-compare` is the
+gate: it interleaves baseline and current binaries across many rounds at a fixed
+iteration count and compares the distributions with benchstat. See
+[Benchmark regression testing](benchmarking.md).
 
-`make bench-compare` is the gate. It builds baseline and current test binaries
-with an identical toolchain, interleaves them across many rounds at a fixed
-iteration count, and compares the distributions with benchstat. Binaries run on
-the invoking machine by default; `PERF_HOST=user@host` ships them over ssh to a
-quiet machine, which tightens the confidence intervals without changing the
-method. `make bench-baseline` records provenance-stamped baselines.
+## Numbers (2026-10-02)
 
-Cross-system comparison against dragonboat, etcd/raft and OpenRaft lives in
-`test/performance/` behind the `perfcompare` orchestrator, stored per machine
-profile (`make perf-compare-all` for an ad-hoc report;
-`make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>` for a stored,
-documented run).
+- 6,799 top-level test functions across the 24 packages under `pkg/`; 7,874
+  across the module tree
+- 170 integration test functions: 164 under `integration`, 6 more under
+  `quicraft_netfault`
+- 37 fuzz targets in six packages, all seeded; 39 committed corpus files
+- 36 errfs tests: 23 injecting, 13 testing the injector
+- 26 linearizability tests; 7 netfault injector tests
+- Coverage floor 91% locally, 90% in CI, total and per package
 
-Full rationale and interpretation guidance:
-[Benchmark Regression Testing](../testing/benchmarking.md) and
-[Performance Architecture](../multi-group-host/engineering.md).
+Counts drift. Regenerate with `git grep -cE '^func Test'`.
 
-## Numbers, as of 0.11.0-alpha
+## Cross-references
 
-- ~6,500 top-level test functions across the 24 packages under `pkg/`
-  (7,553 across the module)
-- 168 integration test functions (162 under `integration`, 6 more under
-  `quicraft_netfault`)
-- 37 fuzz targets in six packages, all seeded, 39 committed corpus files
-- 36 errfs tests: 23 injecting into the WAL and LogDB, 13 testing the injector
-- 26 linearizability tests, 7 netfault injector tests
-- Coverage floor: 91%, one threshold, enforced by the Makefile and again in CI
-
-Counts drift. Regenerate them with `git grep -cE '^func Test'` rather than
-trusting this list.
-
-## Cross-References
-
-- [Testing Overview](overview.md) -- commands, unit-test patterns, target reference
-- [Contributing](../../CONTRIBUTING.md) -- what a change is expected to bring with it
-- [Benchmark Regression Testing](../testing/benchmarking.md) -- bench-compare method
-- [Performance Architecture](../multi-group-host/engineering.md) -- cross-system framework
-- [Raft Specification](../raft-consensus/engineering.md) -- the invariants the suites are checking
-- [Session Management](../client-sessions/engineering.md) -- at-most-once delivery
-- [WAL Persistence](../log-storage/engineering.md) -- WAL internals the errfs suite drives
-- [Transport](../quic-transport/engineering.md) -- where the netfault hook sits
+- [Testing overview](overview.md): commands, patterns, target reference
+- [Benchmark regression testing](benchmarking.md): the `bench-compare` method
+- [Contributing](../../CONTRIBUTING.md): what a change is expected to bring
+- [Raft consensus engineering](../raft-consensus/engineering.md): the invariants the suites check
+- [Log storage engineering](../log-storage/engineering.md): the WAL internals errfs drives
+- [QUIC transport engineering](../quic-transport/engineering.md): where the netfault hook sits

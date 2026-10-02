@@ -1,49 +1,69 @@
 # contrib/dragonboat
 
-> **Status: REFERENCE** · Scope: the Dragonboat-compatible shim over QuicRaft —
-> this directory's `nodehost.go`, `errors.go`, `membership.go`,
-> `requeststate.go` · Last verified: 2026-09-15
+> **Status: REFERENCE** · Scope: the Dragonboat-compatible shim over QuicRaft in
+> this directory · Last verified: 2026-10-02
 
-This is a [Dragonboat](https://github.com/lni/dragonboat)-compatible shim for
-[QuicRaft](../../README.md): a `NodeHost` that presents Dragonboat's method
-names over a `quicraft.Host`, so code written against Dragonboat's API can run
-on QuicRaft's engine and QUIC transport with the call sites unchanged. No
-[pebble](https://github.com/cockroachdb/pebble) dependency.
+A [Dragonboat](https://github.com/lni/dragonboat) v4 compatible layer for
+[QuicRaft](../../README.md). Its `NodeHost` exposes Dragonboat's method names
+and types over a `quicraft.Host`, so code written against Dragonboat can run on
+QuicRaft's engine and QUIC transport with few call-site changes. It does not
+depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
 
 ## What it is, and is not
 
-- **A nested Go module** (`github.com/jeremyhahn/go-quicraft/contrib/dragonboat`)
-  that `replace`s the root with `../..`. It is **not published for consumption**:
-  no tag carries it and no consumer imports it — go-qrdb and the other
-  consumers use `pkg` directly. It exists to keep the Dragonboat surface honest
-  and to drive the performance comparison (`test/performance/dragonboat`).
-- **The surface**: `StartReplica`/`StartOnDiskReplica`/`StopReplica`/`Close`;
-  `SyncPropose`/`Propose`; `SyncRead`/`ReadIndex`/`StaleRead`/`NAReadLocalNode`;
-  sessions (`GetNoOPSession`, `SyncGetSession`, `SyncCloseSession`); membership
-  (`SyncGetShardMembership`, `GetLeaderID`, `SyncRequestAddReplica`,
-  `SyncRequestAddNonVoting`, `SyncRequestAddWitness`,
-  `SyncRequestDeleteReplica`, `RequestAddReplica`, `RequestDeleteReplica`);
-  `SyncRequestSnapshot`; `SyncRemoveData`.
-- **Errors** are translated to Dragonboat's sentinels by `translateError`, and
-  QuicRaft's `*MaybeAppliedError` wrapper survives the translation (#156), so a
-  post-delivery leadership change and a pre-flight refusal do not both arrive
-  as a bare `ErrShardNotReady`. `dragonboat.IsTempError` is the retry
-  predicate the performance harness uses, and it classifies exactly the
-  transient set.
-- **Ten `Get`-prefixed names** on `quicraft.Host` exist for this shim's sake and
-  are a recorded exception to the portfolio naming rule; see
-  `docs/multi-group-host/api.md`.
+- A nested Go module, `github.com/jeremyhahn/go-quicraft/contrib/dragonboat`,
+  whose `go.mod` replaces the root module with `../..`. No tag carries it,
+  so it always builds against the QuicRaft tree it sits in. Applications
+  written for QuicRaft use `pkg` directly.
+- Packages: `config` (`NodeHostConfig`, `Config`), `statemachine` (the regular,
+  concurrent and on-disk state machine interfaces and their adapters),
+  `client` (`Session`), and `raftio` (event listener and LogDB interfaces and
+  event types).
+- The `NodeHost` surface:
+  - lifecycle: `StartReplica`, `StartConcurrentReplica`, `StartOnDiskReplica`,
+    `StopReplica`, `StopShard`, `Close`;
+  - proposals and reads: `SyncPropose`, `Propose`, `ProposeSession`,
+    `SyncRead`, `ReadIndex`, `ReadLocalNode`, `NAReadLocalNode`, `StaleRead`;
+  - sessions: `GetNoOPSession`, `SyncGetSession`, `SyncCloseSession`;
+  - membership: `SyncGetShardMembership`, `GetShardMembership`, `GetLeaderID`,
+    and `RequestAddReplica`, `RequestAddNonVoting`, `RequestAddWitness`, each
+    with a `Sync…` form and a `…WithIdentity` form, plus
+    `RequestDeleteReplica` / `SyncRequestDeleteReplica` and
+    `RequestLeaderTransfer`;
+  - snapshots and storage: `RequestSnapshot`, `SyncRequestSnapshot`,
+    `ExportSnapshot`, `ImportSnapshot`, `RequestCompaction`, `RemoveData`,
+    `SyncRemoveData`, `QueryRaftLog`, `GetLogReader`;
+  - introspection: `ID`, `RaftAddress`, `GetNodeHostInfo`, `GetShardInfo`,
+    `HasNodeInfo`, `GetNodeHostRegistry`, `GetNodeUser`.
+- QuicRaft authorizes members by node identity. On a host with a transport, add
+  members with the `…WithIdentity` methods; the identity is the value the new
+  member's host reports from `quicraft.Host.NodeIdentity()`.
+- Errors are translated to Dragonboat's sentinels. A QuicRaft
+  `*MaybeAppliedError` survives the translation, so `quicraft.MaybeApplied`
+  still distinguishes "refused before anything happened" from "accepted, then
+  leadership was lost, so it may still commit". Errors with no Dragonboat
+  equivalent are wrapped in `AdapterError`. `IsTempError` reports the
+  retryable set: `ErrSystemBusy`, `ErrShardNotReady`, `ErrTimeout`,
+  `ErrShardClosed`, `ErrShardNotInitialized`, `ErrClosed`, `ErrAborted` and
+  `ErrNotLeader`.
+- The `Get`-prefixed methods on `quicraft.Host` that this shim calls are a
+  documented naming exception; see
+  [docs/multi-group-host/api.md](../../docs/multi-group-host/api.md).
+
+The performance comparison in `test/performance/dragonboat` does not use this
+shim. It benchmarks a Dragonboat fork directly; see
+[test/performance/dragonboat](../../test/performance/dragonboat/README.md).
 
 ## Testing
 
-CI runs this module's unit and integration suites in the
-`contrib/dragonboat [unit + integration]` job, and `make ci-modules` builds
-every nested module so a root change that breaks the shim cannot land quietly
-(`go` directive drift is the case that motivated it). The adapter suite routes
-its config changes and leader-bound reads through leader-resolving helpers,
-because a shim that retries against a stale leader hides the very forwarding it
-is meant to exercise.
+```sh
+cd contrib/dragonboat
+make test               # unit tests, race detector on
+make ci-integration     # multi-node integration suite (-tags=integration)
+```
 
-See the per-machine [QuicRaft vs Dragonboat](../../test/performance/profiles/ci-node-2/dragonboat.md) <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
-document for performance comparisons; other machines are under
-`test/performance/profiles/`.
+CI runs both suites in a dedicated job, and the root `make ci-modules` builds
+every nested module so a root change that breaks the shim fails there. The
+integration helpers resolve the current leader before config changes and
+leader-bound reads, so a retry against a stale leader cannot hide the
+forwarding the suite is meant to exercise.

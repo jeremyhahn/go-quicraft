@@ -1,25 +1,24 @@
-# QuicRaft Documentation
+# QuicRaft documentation
 
 > **Status: REFERENCE** · Scope: the index of this repository's documentation ·
-> Last verified: 2026-09-15
+> Last verified: 2026-10-02
 
 Technical documentation for the QuicRaft multi-group Raft consensus library.
 
-Documentation follows the **feature-folder convention**: every implemented
-feature has a folder holding five documents — `architecture.md` (design,
-boundaries, rejected alternatives), `engineering.md` (the implementation
-contract), `cli.md`, `api.md`, and `user.md`. The five files together are the
-feature's documentation and its requirements.
+Every implemented feature has a folder holding five documents:
+`architecture.md` (design, boundaries, rejected alternatives), `engineering.md`
+(the implementation contract), `cli.md`, `api.md` and `user.md`. Together they
+are the feature's documentation and its requirements.
 
-**go-quicraft ships no binaries**, so every `cli.md` records that explicitly and
-points at the consuming surface rather than being absent — an absent file cannot
+go-quicraft ships no binaries, so every `cli.md` says so in one line and points
+at the consuming surface. The file still exists, because an absent file cannot
 be told apart from an unwritten one.
 
 ## Start here
 
-| If you are… | Read |
+| If you are | Read |
 |---|---|
-| new to the library | [multi-group-host/architecture.md](multi-group-host/architecture.md) — also the system overview |
+| new to the library | [multi-group-host/architecture.md](multi-group-host/architecture.md), which is also the system overview |
 | writing a state machine | [state-machines/user.md](state-machines/user.md) |
 | deploying it | [multi-group-host/user.md](multi-group-host/user.md) |
 | looking for a function signature | [multi-group-host/api.md](multi-group-host/api.md) |
@@ -51,11 +50,11 @@ outside the feature folders.
 
 | Document | Description |
 |---|---|
-| [Compatibility and Upgrades](compatibility.md) | the pinned-at-1 format policy, every version discriminator that exists, the per-release upgrade path, and the interface requirements for embedders. It spans `pkg/proto`, the WAL, `snapshot.meta` and the sealed root key, so splitting it across feature folders would destroy the upgrade narrative. |
-| [Testing Overview](testing/overview.md) | unit, integration and E2E structure, coverage targets, Makefile targets |
-| [Test Infrastructure](testing/infrastructure.md) | fuzzing, linearizability verification, I/O error injection |
-| [Benchmark Regression Testing](testing/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
-| [Public Releasability](release/public-releasability.md) | what may be published from this tree, the development-tooling exclusion list, and the `test/releasability` gate that enforces both |
+| [Compatibility and upgrades](compatibility.md) | the pinned format-version policy, every version discriminator, upgrade notes for each release, and the interface requirements for embedders. It spans `pkg/proto`, the WAL, snapshots and the sealed root key, so it sits outside the feature folders. |
+| [Testing overview](testing/overview.md) | how the suites are organised and run, coverage gates, the Makefile target reference |
+| [Testing infrastructure](testing/infrastructure.md) | build tags, fault injectors, fuzzing, linearizability verification, test helper packages, and the gates |
+| [Benchmark regression testing](testing/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |
+| [Public releasability](release/public-releasability.md) | what may be published from this tree, the development-tooling exclusion list, and the `test/releasability` gate that enforces both |
 
 Per-feature test strategy lives in each feature's `engineering.md`; the three
 testing documents describe the harnesses that serve all of them.
@@ -67,12 +66,5 @@ testing documents describe the harnesses that serve all of them.
 
 ## Migration state
 
-**Complete.** Every implemented feature has a folder with all five files, and
-the pre-convention layout (`docs/architecture/`, `docs/raft/`, `docs/engine/`,
-`docs/transport/`, `docs/protocol/`, `docs/storage/`, `docs/statemachine/`,
-`docs/sessions/`, `docs/security/`, `docs/api/`, `docs/operations/`,
-`docs/discovery/`, `docs/performance/`) has been moved into it — not rewritten.
-`docs/testing/` and `docs/references/` remain as cross-feature material.
-
-A new feature gets a folder from day one. The portfolio view is derived rather
-than maintained: count `docs/*/architecture.md`.
+Complete: every implemented feature has its five-file folder, and a new feature
+gets one from day one.

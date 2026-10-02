@@ -1,49 +1,34 @@
 # Client Sessions — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
-> `pkg/internal/session` · Last verified: 2026-08-19
+> `pkg/internal/session` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-**No CLI surface: this feature is reachable only as a Go package.**
+**No CLI surface.** go-quicraft is a library and ships no binaries (there is no
+`cmd/` directory). A session belongs to an application's connection to a shard,
+so there is nothing for an operator to open, and the feature contributes no
+`CommandDefinition` to any parity suite.
 
-go-quicraft ships no binaries. The repository has no `cmd/` directory, and
-`make build` runs `go build ./...` and produces no executable.
+There is deliberately no "list sessions" or "expire sessions" command either.
+Sessions are replicated state: expiring one out of band would change replicated
+state without going through the log, which is the divergence entry-counted
+expiry exists to prevent.
 
-This feature contributes **no** `CommandDefinition` to any integration parity
-suite, and there is no verb above it either. A session belongs to a *connection*
-between an application and a shard; an operator has nobody to open one on behalf
-of, and a session opened from a shell would be closed the moment the shell
-exited.
+## Settings
 
-## What an operator can actually act on
-
-Three settings, all of them replicated shard state rather than commands. They
-are set as bootstrap seed on `config.Config` and changed thereafter through the
-membership path, because a per-node value would let replicas disagree about
-which registrations are legal:
+Bootstrap seeds on `config.Config`, written into the shard's replicated policy
+when it is founded and fixed after that:
 
 | Setting | Default | Watch for |
 |---|---|---|
 | `MaxTotalSessions` | 16384 | registrations refused on a busy shard |
-| `MaxSessionsPerOwner` | 128 | one tenant exhausting its own quota |
-| `MaxSessionsPerClient` | 128 | **cached responses per session**, not a session count. The name is wrong and kept for compatibility. |
-| `SessionExpiryEntries` | 100000 | measured in **applied entries**, not seconds. An idle shard never expires anything. |
-
-The composing layer above owns whatever operator surface exposes these; those
-verbs are documented in that repository.
+| `MaxSessionsPerOwner` | 128 | one owner exhausting its quota |
+| `MaxSessionsPerClient` | 128 | cached responses per session, not a session count |
+| `SessionExpiryEntries` | 100000 | counted in applied entries, not seconds; an idle shard expires nothing |
 
 ## Build-time targets
 
 | Target | Runs |
 |---|---|
-| `make test-session` | `go test ./pkg/internal/session/...` |
-| `make fuzz-session` | session-bearing entry decode |
-
-## The counter-intuitive one
-
-There is no "list sessions" or "expire sessions" command anywhere in the stack,
-and adding one at this layer would be a defect. Sessions are replicated state
-machine content: enumerating them is a read of the state machine, and expiring
-one out of band would mutate replicated state without going through the log,
-which is exactly the divergence the entry-counted expiry design exists to
-prevent.
+| `make test-session` | the `pkg/internal/session` unit tests |
+| `make fuzz-session` | fuzzing of the session manager: snapshot round trip and decode, sentinel series handling, duplicate detection |

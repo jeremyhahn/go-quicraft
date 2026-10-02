@@ -1,54 +1,56 @@
 # Write Batching — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
-
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | the surface below. This is the transport. |
-| QUIC | a flushed batch is one ordinary Raft entry; there is nothing batch-specific on the wire |
-| Unix socket / REST / gRPC / MCP | n/a — this repository serves none of them |
+| Embedded (Go call) | the surface below |
+| QUIC | a flushed batch is one ordinary Raft entry; nothing on the wire is batch-specific |
+| Unix socket, REST, gRPC, MCP | not applicable: this repository serves none of them |
 
-Not missing-capability rows. This feature is an optional in-process component
-above the `Host`, part of the go-quicraft Raft row.
-
-## Go API — `pkg/batch`
+## `pkg/batch`
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/batch`
 
-### Capability: construct an aggregator
+### Construct an aggregator
 
 ```go
 func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error)
 
-func WithConfig(cfg Config) Option
-func WithLogger(logger *slog.Logger) Option
-func WithRegistry(reg prometheus.Registerer) Option
+type Option func(*Aggregator)
+func WithConfig(cfg Config) Option                 // zero fields keep their defaults
+func WithLogger(logger *slog.Logger) Option        // nil keeps slog.Default()
+func WithRegistry(reg prometheus.Registerer) Option // nil keeps prometheus.DefaultRegisterer
+
+type Proposer interface {
+    SyncPropose(ctx context.Context, shardID uint64, cmd []byte) error
+}
+type SyncProposer interface {
+    SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.Result, error)
+}
+type HostProposer struct{ Host SyncProposer }
 ```
 
 | | |
 |---|---|
 | Request | a `Proposer` and options |
-| Response | a running `*Aggregator` with its own background flush loop |
+| Response | a running `*Aggregator` with its own flush goroutine |
 | Errors | `*NilProposerError` when `proposer` is nil |
-| Permission | none — in-process call |
 
-**`*Host` does not satisfy `Proposer`.** Use the adapter:
+`*Host` does not satisfy `Proposer`; wrap it:
 
 ```go
-agg, err := batch.NewAggregator(&batch.HostProposer{Host: host})
+agg, err := batch.NewAggregator(batch.HostProposer{Host: host})
 ```
 
-`Proposer.SyncPropose` returns `error` alone while `Host.SyncPropose` returns
-`(sm.Result, error)`. `HostProposer` exists because the documented construction
-`batch.NewAggregator(host, ...)` did not compile.
+`HostProposer` discards the state machine's `sm.Result`; a batch has no
+per-command result.
 
-### Capability: submit a command
+### Submit a command
 
 ```go
 func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) error
@@ -58,131 +60,143 @@ func (a *Aggregator) SubmitNoCopy(ctx context.Context, shardID uint64, data []by
 | | |
 |---|---|
 | Request | shard and command bytes |
-| Response | nil once the batch containing it commits |
-| Errors | `ErrClosed`, `*QueueFullError`, `*FlushError`, `*EncodeError`, context deadline |
-| Permission | none |
+| Response | nil once the batch carrying the command has been proposed and applied |
+| Errors | `*ClosedError` (matches `ErrClosed`), `*QueueFullError` (matches `ErrQueueFull`), `*FlushError` (matches `ErrFlush`) |
 | Concurrency | safe from multiple goroutines |
 
-**`Submit` blocks until the batch commits, but can return before that** — its
-own context expiring is the common case. **Delivery is at-least-once.**
+`*FlushError{ShardID, Err, Indeterminate}` wraps the cause (`errors.Is` and
+`errors.As` reach it):
 
-**`SubmitNoCopy` transfers ownership of `data`.** The aggregator reads the slice
-at an unspecified later time — after your call has returned, on the flush
-goroutine. Mutating or reusing that buffer commits a **wrong command on every
-replica**. Use it only for a buffer allocated per call and then dropped; when in
-doubt use `Submit`.
+| Cause | `Indeterminate` | Command committed? |
+|---|---|---|
+| your `ctx` ended while waiting | true | no if its batch had not been encoded yet (the command is dropped), otherwise unknown |
+| the propose timed out or was cancelled | true | unknown |
+| the proposer returned another error (for example `*NotLeaderError`, `*EntryTooLargeError`) | false | no |
+| the command cannot be encoded (`*EncodeError`, length above `math.MaxInt32`) | false | no |
 
-### Capability: inspect and close
+Retrying an indeterminate failure can apply the whole batch twice: delivery is
+at-least-once. In the rare case that `Close` races your call and your
+context ends at the same moment, the bare context error is returned.
+
+`Submit` copies `data`. `SubmitNoCopy` does not and takes ownership of the
+slice permanently, whatever it returns: the aggregator may read it later on the
+flush goroutine. Use it only for a buffer allocated per call and never touched
+again.
+
+### Inspect and close
 
 ```go
-func (a *Aggregator) BatchLen() int
-func (a *Aggregator) Close() error
+func (a *Aggregator) BatchLen() int // proposals in the current unflushed batch
+func (a *Aggregator) Close() error  // always nil
 ```
 
-`Close` stops accepting proposals, flushes what is pending, and makes every
-subsequent `Submit` return `ErrClosed`. It is one-way.
+`Close` stops accepting proposals, drains the queue, flushes what is pending
+and waits for the flush goroutine. Later `Submit` calls return `*ClosedError`.
+Calling it again is a no-op.
 
-### Capability: encode and decode a batch payload
+### Encode and decode a payload
 
 ```go
 func EncodeBatch(cmds [][]byte) ([]byte, error)
 func DecodeBatch(data []byte) ([][]byte, error)
 ```
 
-Format: each command prefixed with its length as a **4-byte big-endian
-uint32**.
+Each command is prefixed with its length as a 4-byte big-endian `uint32`.
 
-`EncodeBatch` on an empty slice produces zero-length output. `DecodeBatch` on
-empty or nil input returns a nil slice with **no error**; on a truncated length
-prefix or a command length past the buffer it returns `*DecodeError`.
+- `EncodeBatch` of an empty slice returns zero-length output. A command longer
+  than `math.MaxInt32` returns `*EncodeError`.
+- `DecodeBatch` of empty or nil input returns `nil, nil`. A truncated length
+  prefix, a length above `math.MaxInt32`, or a command running past the buffer
+  returns `*DecodeError`.
+- The decoded commands alias `data`. Copy them if you keep them past `Update`
+  under `ZeroCopyEntryCmd`.
 
-**Your state machine calls `DecodeBatch`.** That is the other half of the
-contract: an aggregator on the write side is useless unless `Update` knows the
-entry it receives is a batch.
+Your state machine calls `DecodeBatch`; an aggregator is useless unless
+`Update` knows the entry is a batch.
 
 ### Configuration
 
 ```go
 type Config struct {
-    MaxBatchSize   int            // DefaultMaxBatchSize   = 1000
-    MaxBatchBytes  uint64         // DefaultMaxBatchBytes  = proto.MaxEntrySize (8 MB)
-    FlushInterval  time.Duration  // DefaultFlushInterval  = 50ms
-    QueueSize      int            // DefaultQueueSize      = 10000
-    ProposeTimeout time.Duration  // DefaultProposeTimeout = 30s
+    MaxBatchSize   int           // DefaultMaxBatchSize   = 1000
+    MaxBatchBytes  uint64        // DefaultMaxBatchBytes  = uint64(proto.MaxEntrySize) (8 MiB)
+    FlushInterval  time.Duration // DefaultFlushInterval  = 50 * time.Millisecond
+    QueueSize      int           // DefaultQueueSize      = 10000
+    ProposeTimeout time.Duration // DefaultProposeTimeout = 30 * time.Second
 }
 func DefaultConfig() Config
 ```
 
-`MaxBatchBytes` applies to the **whole** accumulated batch, not per shard, and
-is enforced by flushing first rather than by exceeding. `ProposeTimeout` is a
-**ceiling**: a batch goes out under `min(latest live caller deadline,
-ProposeTimeout)`.
+`MaxBatchBytes` applies to the whole accumulated batch, enforced by flushing
+before a proposal would exceed it. `ProposeTimeout` is a ceiling: each batch is
+proposed under `min(latest live caller deadline, now + ProposeTimeout)`.
 
 ### Errors
 
 ```go
-var ErrClosed = errors.New("quicraft/batch: aggregator closed")
+var (
+    ErrClosed      // "quicraft/batch: aggregator closed"
+    ErrQueueFull   // "quicraft/batch: queue full"
+    ErrNilProposer // "quicraft/batch: proposer is nil"
+    ErrFlush       // "quicraft/batch: flush failed"
+    ErrDecode      // "quicraft/batch: decode failed"
+    ErrEncode      // "quicraft/batch: encode failed"
+)
 
-type ClosedError      struct{}   // Is(ErrClosed) == true
+type ClosedError      struct{}
+type QueueFullError   struct{ QueueSize int }
 type NilProposerError struct{}
-type QueueFullError   struct{ ... }
-type FlushError       struct{ ... }
-type EncodeError      struct{ ... }
-type DecodeError      struct{ ... }
+type FlushError       struct{ ShardID uint64; Err error; Indeterminate bool } // Unwrap
+type DecodeError      struct{ Reason string }
+type EncodeError      struct{ Reason string }
 ```
 
-Sentinels are pre-allocated for zero-alloc hot-path returns and implement `Is`,
-so `errors.Is` works against both forms.
+Each typed error implements `Is` against its sentinel, so `errors.Is(err,
+batch.ErrQueueFull)` matches a `*QueueFullError`.
 
-## Go API — `pkg/writemode`
+## `pkg/writemode`
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/writemode`
 
 ```go
 type Mode uint8
-const Sync       Mode = iota   // wait for quorum commit — strongest
-const WALDurable               // wait for local WAL persistence — lower latency
-const Batched                  // collect and propose as a single Raft entry
+const (
+    Sync       Mode = iota // acknowledged after quorum commit
+    WALDurable             // acknowledged after local WAL persistence
+    Batched                // acknowledged after quorum commit of the batch
+)
 
 func FromString(s string) (Mode, error)
-func (m Mode) String() string
-func (m Mode) IsSynchronous() bool
-func (m Mode) IsAsync() bool
-func (m Mode) RequiresQuorum() bool
+func (m Mode) String() string // "sync", "wal_durable", "batched", or "unknown(N)"
+func (m Mode) IsSynchronous() bool  // Sync, Batched
+func (m Mode) IsAsync() bool        // WALDurable
+func (m Mode) RequiresQuorum() bool // Sync, Batched
 func (m Mode) Validate() error
 
-type InvalidModeError struct{ ... }
+type InvalidModeError struct{ Value string }
 ```
 
-**`Mode` is an open `uint8`.** A value outside the three constants is
-representable — a field decoded from configuration or a wire format is the
-ordinary way one arrives — and it describes **no durability guarantee**:
-`String` reports `"unknown(N)"`, and `IsSynchronous`, `IsAsync` and
-`RequiresQuorum` all report **false**.
+`FromString` accepts `""` and `"sync"` (Sync), `"wal_durable"`, `"wal"` and
+`"async"` (WALDurable), and `"batched"` and `"batch"` (Batched). Any other
+string returns `Sync` with `*InvalidModeError`; it is case-sensitive.
 
-An embedder dispatching on `RequiresQuorum` therefore takes the "quorum not
-required" branch for a `Mode` that means nothing at all. The predicates cannot
-report an error, so:
+`Mode` is an open `uint8`. A value outside the three constants describes no
+durability guarantee, and all three predicates report false for it. A caller
+accepting a `Mode` from outside its own code must call `Validate` at that
+boundary:
 
 ```go
-if err := m.Validate(); err != nil {   // do this at the boundary
+if err := m.Validate(); err != nil {
     return err
 }
 ```
 
-**A caller accepting a `Mode` from outside its own code MUST call `Validate` at
-that boundary.** `TestMode_UnknownValueGuaranteesNothing` pins the predicate
-behavior so it cannot change silently.
+`writemode` implements nothing; the modes are realized by which `Host` method
+the caller uses, or by the aggregator.
 
-`writemode` implements nothing. The modes are realized by which `Host` method
-the caller chooses, or by using the aggregator.
+## Versioning
 
-## Versioning and deprecation
-
-- The batch payload format (4-byte big-endian length prefixes) is **application
-  level**, not part of `pkg/proto`. It is the contract between your aggregator
-  and your state machine; this library does not stamp a version into it, and a
-  layout change is yours to coordinate.
-- `HostProposer` is a correction, not a deprecation — `batch.NewAggregator(host)`
-  never compiled.
+- The batch payload format is application-level, not part of `pkg/proto`. It is
+  a contract between your aggregator and your state machine, carries no version,
+  and a layout change is yours to coordinate.
 - Nothing here is deprecated.

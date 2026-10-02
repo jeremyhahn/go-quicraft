@@ -1,222 +1,197 @@
 # Write Batching — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-08-19
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-Import paths:
-`github.com/jeremyhahn/go-quicraft/pkg/batch`
-`github.com/jeremyhahn/go-quicraft/pkg/writemode`
+Rationale and the scope fence are in [`architecture.md`](architecture.md); the
+full signatures are in [`api.md`](api.md).
 
-Design rationale and the scope fence are in
-[`architecture.md`](architecture.md).
+| Source | Holds |
+|---|---|
+| `pkg/batch/aggregator.go` | `Aggregator`, `Config`, options, flush loop, metrics |
+| `pkg/batch/hostproposer.go` | `SyncProposer`, `HostProposer` |
+| `pkg/batch/decode.go` | `EncodeBatch`, `DecodeBatch` |
+| `pkg/batch/errors.go` | sentinels and typed errors |
+| `pkg/writemode/mode.go`, `errors.go` | `Mode`, `FromString`, predicates, `InvalidModeError` |
 
-## 1. Exported surface
+## 1. Invariants
 
-### `pkg/batch`
+**Delivery is at-least-once.** A batch is proposed with no client session. The
+aggregator never re-proposes a batch, but a propose that times out or is
+cancelled may still commit, and a caller retry then applies it twice.
 
-```go
-func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error)
-func (a *Aggregator) Submit(ctx context.Context, shardID uint64, data []byte) error
-func (a *Aggregator) SubmitNoCopy(ctx context.Context, shardID uint64, data []byte) error
-func (a *Aggregator) BatchLen() int
-func (a *Aggregator) Close() error
+**One result per batch.** `HostProposer` discards the `sm.Result`, so a command
+the state machine rejected is reported to its submitter as successful.
 
-type Option func(*Aggregator)
-func WithConfig(cfg Config) Option
-func WithLogger(logger *slog.Logger) Option
-func WithRegistry(reg prometheus.Registerer) Option
+**Flush triggers**, whichever comes first:
 
-type Config struct {
-    MaxBatchSize   int
-    MaxBatchBytes  uint64
-    FlushInterval  time.Duration
-    QueueSize      int
-    ProposeTimeout time.Duration
-}
-func DefaultConfig() Config
+| Trigger | `flush_reason` |
+|---|---|
+| `len(currentBatch) >= MaxBatchSize` after an add | `size` |
+| the next proposal would push the encoded size past `MaxBatchBytes` | `bytes` |
+| `FlushInterval` elapsed with proposals pending | `time` |
+| `Close` | `close` |
 
-type Proposer interface {
-    SyncPropose(ctx context.Context, shardID uint64, cmd []byte) error
-}
-type SyncProposer interface{ /* what *Host actually provides */ }
-type HostProposer struct{ Host SyncProposer }
+The encoded size of a proposal is `len(data) + 4`. The byte check runs before
+the append and only when the batch is non-empty, so a proposal that is too large
+on its own is flushed alone and fails alone.
 
-func EncodeBatch(cmds [][]byte) ([]byte, error)
-func DecodeBatch(data []byte) ([][]byte, error)
+**`MaxBatchSize` and `MaxBatchBytes` count the whole batch, across shards.** A
+flush groups the batch by shard and proposes each shard's group concurrently
+(inline when there is one shard), so a slow shard cannot stall the others. One
+flush completes before the loop takes the next proposal.
 
-const DefaultMaxBatchSize          = 1000
-const DefaultFlushInterval         = 50 * time.Millisecond
-const DefaultQueueSize             = 10000
-const DefaultProposeTimeout        = 30 * time.Second
-var   DefaultMaxBatchBytes  uint64 = uint64(proto.MaxEntrySize)   // 8 MB
+**Callers that gave up are not proposed.** Before encoding, each shard's group
+drops proposals whose context has ended (they receive a definite
+`*FlushError`, though their `Submit` has normally already returned). If none
+remain, nothing is proposed. If every remaining context ends before the propose
+context is built, the batch is dropped with a definite `*FlushError` wrapping
+`context.Canceled`.
 
-var ErrClosed = errors.New("quicraft/batch: aggregator closed")
+**Propose context.** Derived from the aggregator's lifetime context, never from
+a caller's, with deadline `min(latest deadline among live callers,
+now + ProposeTimeout)`; a live caller with no deadline leaves only
+`ProposeTimeout`. This keeps one caller from cutting the batch short for the
+others, and keeps a caller with a very long deadline from parking the flush
+goroutine past `ProposeTimeout`. The lifetime context is cancelled only after
+the flush loop has exited, so `Close`'s final flush is not cancelled.
 
-type ClosedError    struct{}
-type NilProposerError struct{}
-type QueueFullError struct{ ... }
-type FlushError     struct{ ... }
-type EncodeError    struct{ ... }
-type DecodeError    struct{ ... }
-```
+**`Submit` copies `data`; `SubmitNoCopy` takes it.** The aggregator reads the
+slice later on the flush goroutine. Under `SubmitNoCopy` the caller must never
+touch the slice again, on any return path: a context error means the proposal
+was enqueued and may still be encoded.
 
-### `pkg/writemode`
+**`Submit` never blocks on a full queue.** It enqueues without waiting and
+returns `*QueueFullError` if the queue is at `QueueSize`.
 
-```go
-type Mode uint8
-const Sync       Mode = iota   // wait for quorum commit
-const WALDurable               // wait for local WAL persistence
-const Batched                  // collect and propose as one entry
+**`Submit` waits for the result, its context, or `Close`.**
 
-func FromString(s string) (Mode, error)
-func (m Mode) String() string
-func (m Mode) IsSynchronous() bool
-func (m Mode) IsAsync() bool
-func (m Mode) RequiresQuorum() bool
-func (m Mode) Validate() error
+- A delivered result always wins a tie with the context: the result channel is
+  drained before reporting the context.
+- On its own context ending, `Submit` returns `*FlushError{Err: ctx.Err(),
+  Indeterminate: true}`. A bare context error would read as "did not happen".
+- If `Close` races the call, `Submit` still returns the real result if the
+  close path flushes the proposal, the context error if the context ends first,
+  or `*ClosedError` once the flush goroutine has exited without delivering one.
 
-type InvalidModeError struct{ ... }
-```
+**`Close` is one-way and idempotent**: it marks the aggregator closed, drains
+the queue into the batch (through the same byte check), flushes, waits for the
+flush goroutine and returns nil.
 
-## 2. Invariants
+**Payload format**: `[len:4 BE][cmd]...`. Encode and decode both refuse a
+length above `math.MaxInt32` (on 32-bit platforms it would wrap negative and
+panic the slice), so the encoder never writes what the decoder cannot read. An
+undecodable committed entry would be undecodable on every replica forever.
 
-**Delivery is AT-LEAST-ONCE.** The aggregator proposes a raw encoded batch and
-may propose it more than once. `Submit` blocks until the batch commits, but can
-return before that — its own context expiring is the common case.
+**`writemode.Mode` is an open `uint8`.** The valid set is defined once
+(`modeSpecs`), and `String`, `Validate` and the three predicates all read it.
+An unknown value reports `"unknown(N)"` and false from every predicate;
+`Validate` is the boundary check.
 
-**Flush triggers, whichever fires first**: `MaxBatchSize` proposals,
-`MaxBatchBytes` encoded bytes, `FlushInterval` elapsed, or `Close`.
+## 2. Error semantics
 
-**`MaxBatchBytes` is enforced by flushing first, never by exceeding.** A
-proposal that would push the batch past the cap triggers a flush, so the batch
-handed to the proposer never exceeds it and the oversized proposal ends up alone
-in its own batch instead of poisoning the unrelated commands batched with it.
-
-**The cap applies to the whole accumulated batch, not per shard.** A per-shard
-subset is never larger than the whole, so the bound holds for every shard's
-proposal; a multi-shard workload flushes slightly sooner than per-shard
-arithmetic would require.
-
-**The propose deadline is `min(latest live caller deadline, ProposeTimeout)`.**
-The aggregator never proposes for longer than `ProposeTimeout`, and never cuts a
-caller short of its own deadline.
-
-**`Submit` is safe for concurrent use** from multiple goroutines. The aggregator
-owns a background flush loop.
-
-**`SubmitNoCopy` transfers ownership of `data`.** The aggregator reads the slice
-at an unspecified later time — after `Submit`'s caller has returned, on the
-flush goroutine. Mutating or reusing the buffer commits a **wrong command on
-every replica**. Use it only for a buffer allocated per call and then dropped.
-
-**`Close` is a one-way transition**: it stops accepting proposals, flushes what
-is pending, and every subsequent `Submit` returns `ErrClosed`.
-
-**Batch payload format**: each command prefixed with its length as a **4-byte
-big-endian uint32**. `EncodeBatch(nil)` and `EncodeBatch([][]byte{})` produce
-zero-length output; `DecodeBatch(nil)` and `DecodeBatch([]byte{})` return a nil
-slice with no error.
-
-**`writemode.Mode` is an open `uint8`.** A value outside the three constants is
-representable and describes **no guarantee**: `String` reports `"unknown(N)"`
-and `IsSynchronous`, `IsAsync` and `RequiresQuorum` all report **false**. The
-predicates cannot report an error, so `Validate` is the boundary check and a
-caller accepting a `Mode` from outside its own code **must** run it there.
-
-## 3. Error semantics
-
-| Error | Returned when | Fail-closed? |
+| Error | Returned when | Fail-closed |
 |---|---|---|
-| `ErrClosed` / `*ClosedError` | `Submit` after `Close` | yes |
-| `*NilProposerError` | `NewAggregator(nil, ...)` | yes — construction fails |
-| `*QueueFullError` | the proposal channel is at `QueueSize` | yes — back-pressure, not a silent drop |
-| `*FlushError` | the underlying `SyncPropose` failed | yes, for that batch |
-| `*EncodeError` | a command cannot be encoded | yes |
-| `*DecodeError` | malformed batch data — truncated length prefix, or a command length past the buffer | yes |
-| `*InvalidModeError` | `writemode.Validate` on an unrecognized value, or `FromString` on an unknown name | yes |
+| `*ClosedError` / `ErrClosed` | `Submit` after `Close`, or `Close` won the race | yes |
+| `*NilProposerError` / `ErrNilProposer` | `NewAggregator(nil, ...)` | yes; construction fails |
+| `*QueueFullError` / `ErrQueueFull` | the queue is at `QueueSize` | yes; back-pressure, nothing enqueued |
+| `*FlushError` / `ErrFlush` | the batch failed: proposer error, encode error, abandoned caller, or the caller's own context | yes for that batch; `Indeterminate` marks an unknown outcome |
+| `*EncodeError` / `ErrEncode` | `EncodeBatch` on a command above `math.MaxInt32`; reaches `Submit` inside a `*FlushError` | yes |
+| `*DecodeError` / `ErrDecode` | `DecodeBatch` on malformed input | yes |
+| `*InvalidModeError` | `FromString` on an unknown name, `Validate` on an unknown value | yes |
 
-Sentinel errors are **pre-allocated for zero-alloc hot-path returns** and
-implement `Is`, so `errors.Is(err, batch.ErrClosed)` works against both the
-sentinel and the typed form.
+`FlushError.Indeterminate` is true when the proposer's error is
+`context.DeadlineExceeded` or `context.Canceled`, when the propose context has
+ended, or when the caller's own context ended while waiting. Otherwise the
+failure is definite.
 
-**The path that is deliberately not fail-closed**: `writemode`'s predicates on
-an unknown `Mode`. They report false rather than erroring, which is why
-`Validate` exists and why a test pins the behavior.
+Sentinels are package-level values; each typed error implements `Is` against
+its sentinel, and `FlushError` implements `Unwrap`.
 
-## 4. Configuration
+The one path that is not fail-closed by itself: `writemode`'s predicates on an
+unknown `Mode` report false instead of failing, which is why `Validate` exists.
 
-`DefaultConfig()` returns production-ready values:
+## 3. Configuration
 
 | Field | Default | Meaning |
 |---|---|---|
 | `MaxBatchSize` | `DefaultMaxBatchSize` = 1000 | proposals before a flush |
-| `MaxBatchBytes` | `DefaultMaxBatchBytes` = `proto.MaxEntrySize` (8 MB) | encoded bytes before a flush; the batch never exceeds it |
-| `FlushInterval` | `DefaultFlushInterval` = 50 ms | maximum time between flushes — **this is the latency you are trading for throughput** |
-| `QueueSize` | `DefaultQueueSize` = 10000 | proposal channel capacity; past it, `*QueueFullError` |
-| `ProposeTimeout` | `DefaultProposeTimeout` = 30 s | ceiling on one batch's `SyncPropose` |
+| `MaxBatchBytes` | `DefaultMaxBatchBytes` = `proto.MaxEntrySize` (8 MiB) | encoded bytes per batch; the batch never exceeds it |
+| `FlushInterval` | `DefaultFlushInterval` = 50 ms | maximum time between flushes, and the latency added to a write |
+| `QueueSize` | `DefaultQueueSize` = 10000 | queue capacity |
+| `ProposeTimeout` | `DefaultProposeTimeout` = 30 s | ceiling on one batch's propose |
 
-Applied with `WithConfig(cfg)`. `WithLogger` and `WithRegistry` install a
-`*slog.Logger` and a `prometheus.Registerer`.
+`DefaultMaxBatchBytes` is `proto.MaxEntrySize` because the batch is one entry
+and the protocol rejects a larger `Cmd`; `Config.MaxEntrySize` and
+`MaxProposalPayloadSize` on the shard can only lower that. Without a byte cap,
+1000 commands of a few KiB build a batch the host rejects whole, and the next
+batch forms the same way.
 
-`writemode` reads no configuration; `FromString` parses a mode name from
-whatever the embedder's own configuration format is.
+`WithConfig` copies only positive fields, so a zero or negative field keeps its
+default. `WithLogger(nil)` keeps `slog.Default()`; `WithRegistry(nil)` keeps
+`prometheus.DefaultRegisterer`.
 
-## 5. Persistence
+`writemode` reads no configuration. `FromString` parses a name from the
+embedder's own configuration: `""`/`sync`, `wal_durable`/`wal`/`async`,
+`batched`/`batch`.
 
-**None.** A batch that has not flushed lives only in memory, and an aggregator
-that is killed loses it. `Close` flushes; a `SIGKILL` does not.
+## 4. Persistence
 
-What reaches disk is one ordinary Raft entry per batch, through the normal
-proposal path — see [`../log-storage/engineering.md`](../log-storage/engineering.md).
+None. An unflushed batch lives only in memory; `Close` flushes it, a crash
+loses it. What reaches disk is one ordinary Raft entry per shard per flush,
+through the normal proposal path
+([`../log-storage/engineering.md`](../log-storage/engineering.md)).
 
-## 6. Test Strategy
+## 5. Test strategy
 
 Targets: `make test-batch`, `make bench-batch`, `make test-writemode`,
 `make bench-writemode`.
 
 | Covers | Where |
 |---|---|
-| the three flush triggers, independently and in combination | `pkg/batch/*_test.go` |
-| the oversized-proposal isolation path | as above |
-| `min(caller deadline, ProposeTimeout)` | as above |
-| concurrent `Submit` under `-race` | as above |
-| `Close` semantics and post-`Close` `Submit` | as above |
-| `EncodeBatch`/`DecodeBatch` round trips and malformed input | as above |
-| **`TestMode_UnknownValueGuaranteesNothing`** | `pkg/writemode` |
+| each flush trigger, alone and combined | `pkg/batch` |
+| oversized-proposal isolation | `pkg/batch` |
+| propose deadline: ceiling, latest live caller, no caller | `pkg/batch` |
+| abandoned callers dropped before encoding; indeterminate reporting | `pkg/batch` |
+| concurrent `Submit` under `-race`; per-shard concurrent flush | `pkg/batch` |
+| `Close` semantics and the `Close`/`Submit` race | `pkg/batch` |
+| `EncodeBatch`/`DecodeBatch` round trips, malformed and oversized input | `pkg/batch` |
+| `HostProposer` adapting the `Host` signature and driving an aggregator | `pkg/batch` |
+| `TestMode_UnknownValueGuaranteesNothing` | `pkg/writemode` |
 
-**The test that must never be deleted**: `TestMode_UnknownValueGuaranteesNothing`.
-It pins that an unrecognized `Mode` reports false from every predicate, which is
-the behavior an embedder's dispatch depends on being stable.
+`TestMode_UnknownValueGuaranteesNothing` must not be deleted: it pins that an
+unknown `Mode` reports false from every predicate, which embedder dispatch
+depends on.
 
-**Fault-injection seam**: `Proposer` is an interface, so a test proposer that
-fails, blocks, or counts invocations is one struct.
+Fault-injection seam: `Proposer` is an interface, so a test proposer that fails,
+blocks or counts calls is one struct.
 
-**Coverage note.** `pkg/batch` sits at 90.5%, just below the repository's own
-`COVER_MIN = 91`, and the module-total gate does not catch it. Tracked work
-rather than a settled state.
+## 6. Observability
 
-## 7. Observability
+Prometheus collectors, registered with the `WithRegistry` registry or
+`prometheus.DefaultRegisterer`. If an identical collector is already registered
+(several aggregators in one process), the existing one is reused so updates are
+still scraped.
 
-**Metrics** — Prometheus, when a registry is supplied:
+| Metric | Type | Labels |
+|---|---|---|
+| `quicraft_batch_batches_total` | counter | `shard`, `status` (`attempted`, `success`, `failed`) |
+| `quicraft_batch_batch_size` | histogram | none |
+| `quicraft_batch_flush_duration_seconds` | histogram | none |
+| `quicraft_batch_queue_depth` | gauge | none |
+| `quicraft_batch_flush_reason_total` | counter | `reason` (`size`, `bytes`, `time`, `close`) |
 
-```go
-batch.NewAggregator(proposer, batch.WithRegistry(reg))
-```
+Only `batches_total` carries a shard label; the histograms are aggregate so a
+host with thousands of shards does not multiply them into hundreds of thousands
+of series.
 
-This is the only package in the repository that registers Prometheus collectors
-directly rather than going through the host's `MetricsCollector`, because it is
-an optional component that sits **above** the `Host` rather than inside it.
+What to watch: `flush_reason_total{reason="time"}` dominating means batches
+time out rather than fill, so `MaxBatchSize` is too high for the load and every
+write pays the full interval; `queue_depth` near `QueueSize` precedes
+`*QueueFullError`. `BatchLen()` gives the current unflushed count.
 
-The two to watch: **flush rate** against `FlushInterval` — a flush rate at the
-interval means batches are timing out rather than filling, so `MaxBatchSize` is
-too high for the load — and **queue depth** against `QueueSize`, which becomes
-`*QueueFullError` at the ceiling.
-
-`BatchLen()` reports the current unflushed count for ad-hoc inspection.
-
-**Logging** — a `*slog.Logger` via `WithLogger`; nil disables. Flush failures
-are the events worth alerting on, because a failed flush is a batch of caller
-commands that did not commit.
-
-**No command payload is logged.** It is application data.
+Logging goes to the `WithLogger` logger: WARN for a failed flush (with
+`indeterminate`), ERROR for an encode failure. A failed flush is a batch of
+caller commands that did not commit, so it is the event worth alerting on.
+Command payloads are never logged.

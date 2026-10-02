@@ -1,33 +1,31 @@
-# Shamir Primitive — API
+# Shamir primitive: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-09-02
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
 
-go-quicraft is a library. **The Go API is the API.**
+go-quicraft is a library, and the Go API is the only API.
 
 | Transport | This feature |
 |---|---|
-| **Embedded (Go call)** | The whole surface below. This is the transport. |
-| Unix socket | n/a — this repository serves no socket |
-| REST | n/a — this repository exposes no HTTP handler |
-| gRPC | n/a — this repository defines no gRPC service |
-| QUIC | n/a. The repository's QUIC listener carries Raft messages only (see [`../quic-transport/api.md`](../quic-transport/api.md)); no share ever crosses it. |
-| MCP | n/a — this repository registers no MCP tools |
+| Embedded (Go call) | The whole surface below. |
+| Unix socket | n/a: this repository serves no socket |
+| REST | n/a: no HTTP handler |
+| gRPC | n/a: no gRPC service |
+| QUIC | n/a. The QUIC listener carries Raft messages only (see [`../quic-transport/api.md`](../quic-transport/api.md)); no share ever crosses it. |
+| MCP | n/a: no MCP tools |
 
-These are not missing-capability rows. In the portfolio capability register the
-**primitive** is this repository's, re-exported one layer up as a type surface;
-the **custody** capability — which is what a remote transport would carry — is
-owned by go-qrdb and exposed on go-qrdb's transports. A share-bearing endpoint
-in this repository would be the defect, not the fix.
+These rows are not gaps. This repository owns the primitive; the custody
+capability, which is what a remote transport would carry, is owned by go-qrdb and
+exposed on go-qrdb's transports. A share-bearing endpoint here would be a defect.
 
-## Go API — the primitive
+## Go API: the primitive
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir`
 
-### Capability: split a secret into N shares (protected form — preferred)
+### Split a secret into N shares (protected form, preferred)
 
 ```go
 func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error)
@@ -35,17 +33,17 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 
 | | |
 |---|---|
-| Request | `secret` — 1..`MaxSecretBytes` (65536) bytes; `threshold` — 2..255; `total` — `threshold`..255 |
-| Response | `[]*ProtectedShare` in `Index` order. Each share's value lives in an `enclave.MemoryEnclave` — mlock'd, guard-paged, and genuinely wiped by `Destroy`. |
-| Errors | `*SplitError` on any bound violation or RNG failure, **including** a whole-set footprint above `MaxShareSetBytes` |
-| Permission | none — in-process call, no authorization boundary |
-| Caller obligation | **`Destroy` every share**, ideally as each is consumed rather than at the end of the ceremony |
+| Request | `secret`: 1..`MaxSecretBytes` (65536) bytes; `threshold`: 2..255; `total`: `threshold`..255 |
+| Response | `[]*ProtectedShare` in `Index` order. Each share's value lives in a frozen `enclave.MemoryEnclave`: mlock'd, guard-paged, and wiped by `Destroy`. |
+| Errors | `*SplitError` on any bound violation or RNG failure, including a whole-set footprint above `MaxShareSetBytes`; `*ProtectedMemoryError` when a lock is refused |
+| Permission | none; in-process call |
+| Caller obligation | `Destroy` every share, ideally as each is consumed rather than at the end of the ceremony |
 
 Native, not a wrapper: coefficients are read into locked memory and each share
-value is encoded directly into the locked buffer that share will own, so no
-secret-derived byte reaches an ordinary heap buffer.
+value is encoded directly into the locked buffer that share will own, then
+frozen, so no secret-derived byte reaches an ordinary heap buffer.
 
-### Capability: split a secret into N shares (bytes form)
+### Split a secret into N shares (bytes form)
 
 ```go
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
@@ -53,26 +51,24 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
 
 | | |
 |---|---|
-| Request | `secret` — 1..`MaxSecretBytes` (65536) bytes; `threshold` — 2..255; `total` — `threshold`..255 |
-| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the **base64 encoding** of `[version:1][x:1][y...]` — byte-for-byte what `Share.Value` holds, not the pre-encoding payload. |
+| Request | `secret`: 1..`MaxSecretBytes` (65536) bytes; `threshold`: 2..255; `total`: `threshold`..255 |
+| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the base64 encoding of `[version:1][x:1][y...]`, byte-for-byte what `Share.Value` holds, not the pre-encoding payload. |
 | Errors | `*SplitError` on any bound violation or RNG failure |
-| Permission | none — in-process call, no authorization boundary |
-| Caller obligation | **wipe the returned buffers** once distributed |
+| Permission | none; in-process call |
+| Caller obligation | wipe the returned buffers once distributed |
 
-### Capability: split a secret into N shares (struct form)
+### Split a secret into N shares (struct form, deprecated)
 
 ```go
 func Split(secret []byte, threshold, total int) ([]*Share, error)
 ```
 
-Same parameters and errors. Returns `[]*Share` with `Index` 1..N.
+Same parameters and errors. Returns `[]*Share` with `Index` 1..N. Deprecated:
+`Share.Value` is a Go string and cannot be zeroed, so it stays readable in the
+heap until GC, and a ceremony holds all N at once. Use `SplitProtected`, or
+`SplitBytes` if you manage the wipeable buffers yourself.
 
-`Share.Value` is a Go **string** and cannot be zeroed; it stays readable in the
-heap until GC. A ceremony holds all N at once, so this is the point of widest
-exposure in the scheme. Prefer `SplitProtected` in new custody code, or
-`SplitBytes` if the caller manages the wipeable buffers itself.
-
-### Capability: reconstruct a secret from M shares (protected form — preferred)
+### Reconstruct a secret from M shares (protected form, preferred)
 
 ```go
 func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
@@ -80,62 +76,62 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
 
 | | |
 |---|---|
-| Request | `shares` — at least `threshold` shares of one split; `Threshold` is taken from `shares[0]` and is unauthenticated |
-| Response | the reconstructed secret in a `*enclave.MemoryEnclave` |
-| Errors | `*CombineError` on any bound violation, duplicate/zero x-coordinate, or ragged share set |
-| Permission | none — in-process call, no authorization boundary |
-| Caller obligation | **`Destroy` the returned enclave**, and the input shares |
+| Request | `shares`: at least `threshold` shares of one split; `Threshold` is taken from `shares[0]` and is unauthenticated |
+| Response | the reconstructed secret in a frozen `*enclave.MemoryEnclave` |
+| Errors | `*CombineError` on any bound violation, duplicate/zero x-coordinate, ragged share set, or a share destroyed mid-reconstruction; `*ProtectedMemoryError` when a lock is refused |
+| Permission | none; in-process call |
+| Caller obligation | `Destroy` the returned enclave, and the input shares |
 
-Holds only **one decoded share at a time**, walking the set twice against a
-single reused buffer: peak locked memory is a property of the share size, not
-of how many shares were submitted.
+Holds only one decoded share at a time, walking the set twice against a single
+reused buffer, so peak locked memory depends on the share size, not on how many
+shares were submitted.
 
-### Capability: decode a share set that arrived from outside the process
+### Decode a share set that arrived from outside the process
 
 ```go
 func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error)
 func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error)
 ```
 
-Use `UnmarshalShareSet` — **never** `json.Unmarshal` into a
-`[]*ProtectedShare`. Shares are unauthenticated by construction, so a recovery
-endpoint decodes whatever it is handed; the generic decoder allocates one locked
-buffer per element as it visits them, which lets the submission rather than the
-service choose how much locked memory to take, exhausting a process-wide
-resource every other caller depends on. `UnmarshalShareSet` bounds the element
-count (255) and the page-rounded locked cost of the share values
-(`MaxShareSetBytes`) *before* allocating, and
-destroys the accepted prefix if a later element is rejected. A share whose
-locked memory is refused fails the set with a `*ProtectedMemoryError` naming the
-element, not a `*ValidationError`: the document was well formed, the host is out
-of locked memory. A consumer that bounds its locked memory with an allocator
-uses `UnmarshalShareSetWith` (§Capability: charge share memory to a
-locked-memory budget).
+Use `UnmarshalShareSet`, never `json.Unmarshal` into a `[]*ProtectedShare`.
+Shares are unauthenticated by construction, so a recovery endpoint decodes
+whatever it is handed. The generic decoder allocates one locked buffer per
+element as it visits them, which lets the submission rather than the service
+choose how much locked memory to take, exhausting a process-wide resource every
+other caller depends on. `UnmarshalShareSet` bounds the element count (255) and
+the page-rounded locked cost of the share values (`MaxShareSetBytes`) before
+allocating, and destroys the accepted prefix if a later element is rejected. A
+share whose locked memory is refused fails the set with a `*ProtectedMemoryError`
+naming the element, not a `*ValidationError`: the document was well formed, the
+host is out of locked memory. The caller's `data` buffer still holds share
+material afterwards and is the caller's to wipe. A consumer that bounds its
+locked memory with an allocator uses `UnmarshalShareSetWith` (see "Charge share
+memory to a locked-memory budget").
 
-`ProtectedShare.UnmarshalJSON` decodes one share and is **unbudgeted**: it
+`ProtectedShare.UnmarshalJSON` decodes one share and is unbudgeted: it
 implements `json.Unmarshaler`, whose signature has no room for an allocator.
 Under a budget, decode one share as a one-element set with
 `UnmarshalShareSetWith` (wrap the object in `[ ]`), or build it with
 `NewProtectedShareWith` when the value bytes are already in hand.
 
-`NewProtectedShare` builds one share at a time, and where it wipes the source
+`NewProtectedShare` builds one share at a time, and whether it wipes the source
 buffer follows the error type exactly:
 
 - **`*ValidationError`** (bad header, empty value, non-standard base64, oversized
-  value) — the source is **left untouched** and the caller must wipe it. Every
-  one of these checks runs before any locked memory is allocated, which is also
-  why an unauthenticated submission cannot size that allocation.
-- **Success, or `*ProtectedMemoryError`** — the source is **WIPED**. On success
+  value): the source is left untouched and the caller must wipe it. Every one of
+  these checks runs before any locked memory is allocated, which is also why an
+  unauthenticated submission cannot size that allocation.
+- **Success, or `*ProtectedMemoryError`**: the source is wiped. On success,
   ownership of the share material transfers to the returned share; on a refused
-  `mlock` the value is gone anyway, because the locked-memory constructor wipes
-  its source before reporting the refusal. Do not retry that error with the same
+  lock the value is gone anyway, because the locked-memory constructor wipes its
+  source before reporting the refusal. Do not retry that error with the same
   buffer.
 
-That split is the reason the two error types exist; see §Error vocabulary.
-A ceremony that legitimately needs more than the budget does its own accounting
-and decodes share by share with it.
+That split is the reason the two error types exist (see "Error vocabulary"). A
+ceremony that legitimately needs more than the budget does its own accounting
+and decodes share by share with `NewProtectedShare`.
 
-### Capability: charge share memory to a locked-memory budget
+### Charge share memory to a locked-memory budget
 
 ```go
 func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
@@ -147,26 +143,25 @@ func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error)
 
 | | |
 |---|---|
-| Request | as the allocator-less form, plus `a` — a go-enclave `*Allocator`, normally `enclave.ProcessAllocator()` |
+| Request | as the allocator-less form, plus `a`, a go-enclave `*Allocator`, normally `enclave.ProcessAllocator()` |
 | Response | as the allocator-less form; every locked region the call makes is charged to `a` until it is `Destroy`ed |
 | Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (decided before the input is read: nothing allocated, `value`/`data`/the `Share` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
-| Permission | none — in-process call, no authorization boundary |
+| Permission | none; in-process call |
 | Caller obligation | as the allocator-less form |
 
 The allocator-less `SplitProtected`, `CombineProtected`, `NewProtectedShare`,
 `UnmarshalShareSet`, `Share.Protect` and `ProtectedShare.UnmarshalJSON` lock
-memory through go-enclave's **unbudgeted** constructors, which no `Allocator`
-sees: a consumer that bounds its locked memory with a process allocator would
-have every share escape that bound. The `...With` forms charge **every** region
-they lock — for a split that is the coefficient pool, the coefficient vector,
-the payload scratch and each share's value; for a combine, the decode buffer and
-the returned secret; for a set decode or a `Protect`, each share's value — to
-the allocator they are handed (issues #204, #211). The allocator-less forms are
-unchanged and delegate to the same implementation. `UnmarshalJSON` alone has no
-`...With` form, because `json.Unmarshaler` fixes its signature; see §Capability:
-decode a share set for the budgeted route.
+memory through go-enclave's unbudgeted constructors, which no `Allocator` sees,
+so a consumer that bounds its locked memory with a process allocator would have
+every share escape that bound. The `...With` forms charge every region they lock
+to the allocator they are handed: for a split, the coefficient pool, the
+coefficient vector, the payload scratch and each share's value; for a combine,
+the decode buffer and the returned secret; for a set decode or a `Protect`, each
+share's value. Both forms share one implementation. `UnmarshalJSON` alone has no
+`...With` form, because `json.Unmarshaler` fixes its signature; see "Decode a
+share set" for the budgeted route.
 
-go-enclave's own unbudgeted constructors do **not** consult
+go-enclave's own unbudgeted constructors do not consult
 `enclave.ProcessAllocator()`, so neither does this package implicitly: the
 budget is opted into by passing it, and a nil allocator is refused rather than
 treated as "unbudgeted", exactly as `SealedEnclave.OpenWith` refuses one.
@@ -177,7 +172,7 @@ A budget refusal is recoverable and local to the call:
 - Everything the call had already allocated is destroyed before it returns, so
   a split refused partway through its share loop, or a set decode refused
   partway through its elements, gives its whole reservation back to `a`. Shares
-  returned by earlier calls — and the input shares to a combine — are untouched.
+  returned by earlier calls, and the input shares to a combine, are untouched.
 - `NewProtectedShareWith` keeps `NewProtectedShare`'s ownership contract: a
   `*ProtectedMemoryError`, budget refusal included, means `value` has already
   been wiped. `ProtectWith` never modifies the `Share` (its value is a string,
@@ -185,11 +180,11 @@ A budget refusal is recoverable and local to the call:
   retried against a larger budget.
 
 `MaxShareSetBytes` still bounds a single split, and a single set decode, up
-front — `UnmarshalShareSetWith` runs the 255-share and `MaxShareSetBytes` checks
-before it admits anything — while an allocator bounds everything the process
-holds, across calls, which no per-call figure can.
+front (`UnmarshalShareSetWith` runs the 255-share and `MaxShareSetBytes` checks
+before it admits anything). An allocator bounds everything the process holds
+across calls, which no per-call figure can.
 
-### Capability: reconstruct a secret from M shares (bytes form)
+### Reconstruct a secret from M shares (bytes form)
 
 ```go
 func CombineBytes(values [][]byte, threshold int) ([]byte, error)
@@ -197,7 +192,7 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error)
 
 | | |
 |---|---|
-| Request | `values` — M..255 base64-encoded share values (what `SplitBytes` returned); `threshold` — the true M, **from a trusted source** |
+| Request | `values`: M..255 base64-encoded share values (what `SplitBytes` returned); `threshold`: the true M, from a trusted source |
 | Response | the reconstructed secret |
 | Errors | `*CombineError` for structural violations: too few, too many, wrong format version, zero or duplicate x, mismatched payload length, oversized payload |
 | Permission | none |
@@ -206,23 +201,24 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error)
 Every decoded buffer is wiped on every return path, including partially decoded
 and validation-rejected shares.
 
-### Capability: reconstruct a secret from M shares (struct form)
+### Reconstruct a secret from M shares (struct form, deprecated)
 
 ```go
 func Combine(shares []*Share) ([]byte, error)
 func CombineUnverified(shares []*Share) ([]byte, error)
 ```
 
-Identical implementations; both names exist so a call site can state intent.
-`threshold` is taken from `shares[0].Threshold`, which is **unauthenticated**.
+Identical implementations, both deprecated for the reason given on `Split`; use
+`CombineProtected`. `threshold` is taken from `shares[0].Threshold`, which is
+unauthenticated.
 
 **Neither verifies the result.** With fewer than threshold genuine shares, a
 corrupted share, a share from another split, or a mislabelled `Threshold`, the
 return is `(indistinguishable garbage, nil)`. The canonical out-of-band check is
-to use the result as a key in an authenticated decrypt that fails on a wrong key
-— which is exactly what `Barrier.Unseal` does.
+to use the result as a key in an authenticated decrypt that fails on a wrong
+key, which is what `Barrier.Unseal` does. The same holds for every combine form.
 
-### Capability: cross-check one share against others
+### Cross-check one share against others
 
 ```go
 func VerifyShare(share *Share, otherShares []*Share) error
@@ -235,17 +231,17 @@ func VerifyShare(share *Share, otherShares []*Share) error
 | Errors | `*ValidationError` for a nil share (its position named), a `Threshold`/`Total` mismatch, or a duplicate `Index` |
 | Permission | none |
 
-This checks **metadata consistency**, not cryptographic validity. It cannot tell
-you a share is genuine.
+This checks metadata consistency, not cryptographic validity. It cannot tell you
+a share is genuine.
 
-### Capability: inspect and serialize a share
+### Inspect and serialize a share
 
 ```go
 type Share struct {
     Index     int               `json:"index"`
     Threshold int               `json:"threshold"`
     Total     int               `json:"total"`
-    Value     string            `json:"value"`
+    Value     string            `json:"value"` // Deprecated: un-wipeable
     Metadata  map[string]string `json:"metadata,omitempty"`
 }
 
@@ -262,9 +258,11 @@ func (s *Share) UnmarshalJSON([]byte) error
 `Threshold` and `Total` are unauthenticated caller metadata. `Metadata` carries
 no cryptographic meaning.
 
-The redaction asymmetry is deliberate: `String` and `LogValue` are the paths
-that reach humans and logs, `MarshalJSON` is the path that reaches storage and
-distribution. See [`engineering.md`](engineering.md) §7.
+The redaction asymmetry is deliberate: `String` and `LogValue` reach humans and
+logs, `MarshalJSON` reaches storage and distribution. `ProtectedShare` has
+`String`, `LogValue`, `MarshalJSON`, `UnmarshalJSON` and `Validate` with the same
+behaviour, plus `Value`, `WithValue` and `Destroy`.
+See [`engineering.md`](engineering.md) §7.
 
 ### Error vocabulary
 
@@ -273,61 +271,58 @@ type SplitError           struct{ Reason string }
 type CombineError         struct{ Reason string }
 type ValidationError      struct{ Field, Reason string }
 type ProtectedMemoryError struct{ Op string; Err error }  // Unwrap() error
-type IntegrityError       struct{}   // DEPRECATED — never returned
+type IntegrityError       struct{}   // Deprecated: never returned
 ```
 
 Match with `errors.As`. Never branch on `*IntegrityError`: shares carry no
 digest, so no code path constructs one.
 
-**`ProtectedMemoryError` vs `ValidationError` is an OWNERSHIP contract, not a
-wording choice, and `NewProtectedShare` is where it bites.** A `*ValidationError`
-means the value never reached protected memory and is **left untouched** — every
-syntactic check runs before any locked memory is allocated. A
-`*ProtectedMemoryError` means the kernel refused the `mlock`, and by then the
-value has **already been wiped**: go-enclave's constructor wipes its source
-before it reports a refusal. Do not retry with the same buffer on that error; it
-is zeroes. It is also the one an operator can act on — it says the host or
-container is out of locked memory, not that the input was wrong. It unwraps to
-the allocator's own error, so `errors.Is` reaches go-enclave's sentinels —
-`enclave.ErrLockedMemoryUnavailable` for a kernel refusal, and
+**`ProtectedMemoryError` versus `ValidationError` is an ownership contract**, and
+`NewProtectedShare` is where it matters. A `*ValidationError` means the value
+never reached protected memory and is left untouched: every syntactic check runs
+before any locked memory is allocated. A `*ProtectedMemoryError` means the lock
+was refused, and by then the value has already been wiped, because go-enclave's
+constructor wipes its source before it reports a refusal. Do not retry with the
+same buffer; it is zeroes. It is also the error an operator can act on: the host
+or container is out of locked memory, the input was fine. It unwraps to the
+allocator's own error, so `errors.Is` reaches go-enclave's sentinels:
+`enclave.ErrLockedMemoryUnavailable` for a kernel refusal and
 `enclave.ErrBudgetExhausted` when a `...With` call's allocator refused the
-admission. The value has been wiped in both cases.
+admission.
 
 ### Constants
 
 ```go
-const MaxSecretBytes = 64 << 10  // 65536 — one secret
-var MaxShareSetBytes             // 512 PAGES — whole-set locked-memory budget
+const MaxSecretBytes = 64 << 10  // 65536: one secret
+var MaxShareSetBytes             // 512 pages: whole-set locked-memory budget
 ```
 
-`MaxShareSetBytes` is a `var`, not a `const`, and its byte value depends on the
-host: it is 512 pages, derived from the allocator's page size at init (issue
-#102). On a 4 KiB-page host that is 2 MiB; on the 64 KiB-page arm64 kernels RHEL
-and CentOS Stream ship, 32 MiB. A consumer reads it; it cannot appear in a
-constant expression.
+`MaxShareSetBytes` is a `var`, not a `const`, because its byte value depends on
+the host: 512 pages, derived from the page size at init. On a 4 KiB-page host
+that is 2 MiB; on the 64 KiB-page arm64 kernels RHEL and CentOS Stream ship,
+32 MiB. It cannot appear in a constant expression.
 
 The share-set maximum is 255, from the GF(2^8) x-coordinate space.
 
 `MaxShareSetBytes` exists because individually legal arguments multiply into a
-footprint no host can lock — a 64 KiB secret split 255 ways needs ~16 MiB of
+footprint no host can lock: a 64 KiB secret split 255 ways needs about 16 MiB of
 coefficients alone.
 
-It is counted in the PAGES the kernel charges, not the bytes a caller asks for:
-every region is its own enclave and a 32-byte enclave locks a full page, so a
+It is counted in the pages the kernel charges, not the bytes a caller asks for.
+Every region is its own enclave and a 32-byte enclave locks a full page, so a
 figure summed from requested sizes cannot be compared to `RLIMIT_MEMLOCK` at
-all. A full 255-share ceremony over a 32-byte root key therefore costs 259 pages
-rather than the ~24 KiB the byte-summed accounting claimed — which is why the
-budget is 512 pages and not 256 (issue #94). 512 pages admits every
-split whose encoded share fits one page, meaning secrets up to 3,070 bytes at
-the full 255 ways; sharing a 4 KiB *payload* 255 ways does not fit and should be
-enveloped under a key that does.
+all. A full 255-share ceremony over a 32-byte root key costs 259 pages, which is
+why the budget is 512 pages rather than 256. 512 pages admits every split whose
+encoded share fits one page, meaning secrets up to 3,070 bytes at the full 255
+ways; sharing a 4 KiB payload 255 ways does not fit and should be enveloped under
+a key that does.
 
-## Go API — the custody interfaces
+## Go API: the custody interfaces
 
 Import: `github.com/jeremyhahn/go-quicraft/pkg/seal`
 
-**Declared here, implemented above.** This repository ships no implementation of
-either interface.
+Declared here, implemented above. This repository ships no implementation of
+either interface and never calls them.
 
 ```go
 type ProtectedShareSplitter interface {
@@ -343,41 +338,37 @@ type ProtectedShareAccumulator interface {
 }
 ```
 
-**These are the only custody interfaces.** The string-typed `ShareSplitter` and
-`ShareAccumulator` existed through `v0.8.0-alpha` and were removed in
-`v0.9.0-alpha` (#37, owner-ruled).
-A Go string cannot be zeroed: an implementation that split into locked memory
-still had to copy each share back out into an immortal heap string to satisfy
-`Split`'s return type, and `AddShare` received a share that was un-wipeable
-before any protected buffer could exist — so a consumer could migrate to the
-protected primitives, silence every `SA1019`, and leave the exposure exactly
-where it was. Keeping the string forms as deprecated siblings preserved a shape
-whose only use was to undo the guarantee.
+These are the only custody interfaces; there is no string-typed sibling. A Go
+string cannot be zeroed, so a string-valued splitter would force an
+implementation that split into locked memory to copy every share back out into an
+immortal heap string, and a string-valued accumulator would receive a share that
+was un-wipeable before any protected buffer existed. A consumer could then adopt
+the protected primitives and leave the exposure exactly where it was.
 
-The protected forms close both ends: `AddProtectedShare` **takes ownership** of
-the share it is given (and destroys it whether or not it is accepted, and whether
-or not the quorum completes), and `ReconstructProtected` returns the secret in an
+The protected forms close both ends: `AddProtectedShare` takes ownership of the
+share it is given (and destroys it whether or not it is accepted, and whether or
+not the quorum completes), and `ReconstructProtected` returns the secret in an
 enclave the caller owns and must `Destroy`.
 
 | Type | Role |
 |---|---|
-| `ShamirConfig{Threshold, TotalShares, QuorumTTL}` | configuration shape for an M-of-N setup; `QuorumTTL` defaults to `DefaultQuorumTTL` (5 minutes) when zero |
-| `ShamirInitResult{Shares, Threshold, TotalShares}` | output of a Shamir-based initialization. `Shares` is `[]*shamir.ProtectedShare`; the result OWNS them and `Destroy()` releases them all |
+| `ShamirConfig{Threshold, TotalShares, QuorumTTL}` | configuration shape for an M-of-N setup; implementations treat a zero `QuorumTTL` as `DefaultQuorumTTL` (5 minutes). This repository applies no default itself. |
+| `ShamirInitResult{Shares, Threshold, TotalShares}` | output of a Shamir-based initialization. `Shares` is `[]*shamir.ProtectedShare`; the result owns them and `Destroy()` releases them all |
 | `QuorumProgress{Required, Submitted, Complete}` | accumulator state |
 
 `ShamirInitResult` is where a ceremony holds all N shares at once. Its JSON
-`"shares"` is an array of share OBJECTS — the same encoding `shamir.Share` and
-`shamir.ProtectedShare` produce — not the array of bare values the `[]string`
-field emitted before #37.
+`"shares"` is an array of share objects, the same encoding `shamir.Share` and
+`shamir.ProtectedShare` produce. Its `UnmarshalJSON` decodes them through
+`shamir.UnmarshalShareSet`, so it inherits the budgeted ingestion bound.
 
 Implementer obligations: `ProtectedShareAccumulator` handles deduplication,
-ordering and TTL expiration, and is **not** required to be concurrency-safe —
-the `Barrier` serializes calls through its own mutex.
+ordering and TTL expiration, and is not required to be safe for concurrent use.
+The caller serializes access; nothing in this repository calls it.
 
-## Go API — the protected sealing pair
+## Go API: the protected sealing pair
 
 `SealingStrategy` keeps its `[]byte` root-key methods. Alongside them, a strategy
-MAY implement the protected pair (#37):
+may implement the protected pair:
 
 ```go
 type ProtectedSealingStrategy interface {
@@ -387,26 +378,26 @@ type ProtectedSealingStrategy interface {
     UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
 }
 
-// The passphrase is protected too, and since #41 it is the SAME Credentials
-// every strategy takes. Built by NewCredentials, which wipes the caller's
-// slice; the caller owns it and releases it with Destroy.
+// The passphrase is protected too: the same Credentials every strategy takes.
+// Built by NewCredentials, which wipes the caller's slice; the caller owns it
+// and releases it with Secret.Destroy.
 type Credentials struct {
     Secret *enclave.SealedEnclave
 }
 
 // Deprecated: aliases kept so implementations naming them still compile.
 type ProtectedCredentials = Credentials
-var  NewProtectedCredentials = NewCredentials
+func NewProtectedCredentials(secret []byte) (Credentials, error)
 ```
 
-It exists because the `[]byte` signatures force an implementation to RETAIN the
-root key in ordinary memory: go-qrdb's recovery strategy reconstructs the key
-into an enclave and then copies it into a plain field solely to be able to return
-it (go-qrdb PR #76). Sealing borrows the caller's enclave and never copies the
-key out of it; unsealing decrypts straight into a fresh enclave the caller owns
-and must `Destroy`.
+It exists because the `[]byte` signatures force an implementation to retain the
+root key in ordinary memory: a recovery strategy that reconstructs the key into
+an enclave would have to copy it into a plain field solely to be able to return
+it. Sealing borrows the caller's enclave and never copies the key out of it;
+unsealing decrypts straight into a fresh enclave the caller owns and must
+`Destroy`.
 
-Optional by design — a caller type-asserts for it, and there is no fallback,
+Optional by design: a caller type-asserts for it, and there is no fallback,
 because a fallback is the unprotected copy wearing the protected API's name.
 `SoftwareStrategy` implements both; `NoneStrategy` implements
 `SealRootKeyProtected` and answers `UnsealRootKeyProtected` with
@@ -415,15 +406,13 @@ cannot hold nothing.
 
 ## Versioning and deprecation
 
-- **Share format**: `version` byte is `0x01`, gated on exact equality. See the
-  repository-wide pre-1.0 pinning rule in
-  [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md): until
-  the first production release, a layout change is made in place at version 1
-  and consuming repositories are updated in the same change.
-- **`IntegrityError`**: deprecated, retained for API/SDK compatibility, never
-  returned.
-- **`CombineUnverified`**: not deprecated. It is an intent-naming alias for
-  `Combine` and both are supported.
+- **Share format**: the `version` byte is `0x01`, gated on exact equality. Until
+  the first production release a layout change is made in place at version 1 and
+  consumers are updated in the same change (see
+  [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md)).
+- **Deprecated**: `Split`, `Combine`, `CombineUnverified`, the `Share.Value`
+  field, `IntegrityError` (never returned), and `seal.ProtectedCredentials` /
+  `seal.NewProtectedCredentials`. Each is retained so existing callers compile.
 - A signature change to `ProtectedShareSplitter`, `ProtectedShareAccumulator` or
   `ProtectedSealingStrategy` breaks go-qrdb's implementations. Sequence such
   changes bottom-up.

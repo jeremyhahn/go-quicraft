@@ -1,86 +1,71 @@
 # Multi-Group Host — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg`, `pkg/config` ·
-> Last verified: 2026-09-15
+> Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-**No CLI surface: go-quicraft ships no binaries.**
+**No CLI surface: go-quicraft is a library and ships no binaries.**
 
-The repository has no `cmd/` directory. `make build` runs `go build ./...` and
-produces no executable, and `make clean` removes coverage output and profiles
-rather than an artifact. This is correct for the project: it is a consensus
-**library**, consumed by importing `pkg` and implementing its interfaces — not
-by invoking a client.
+There is no `cmd/` directory. `make build` runs `go build ./...` and produces no
+executable. You use the library by importing `pkg` and implementing its
+interfaces. Every feature folder in this repository points here for the same
+statement.
 
-Every feature folder in this repository states the same thing for its own
-scope; this file is where the repository-wide statement lives.
+Because there are no verbs, this repository contributes no command definitions
+to any CLI parity suite, and there is nothing here that can diverge from one.
 
-## Consequences for the parity suite
+## Where the operator commands live
 
-This repository contributes **no** `CommandDefinition` to any integration parity
-suite, and that absence is complete rather than partial: there is no verb here
-that is merely unimplemented. A divergence between the portfolio's locked CLI
-surface and this repository is therefore not possible, because this repository
-has no CLI surface to diverge.
-
-## Where the verbs an operator runs actually live
-
-The `Host` is embedded by the layer above, and that layer owns the operator
-surface:
-
-| Owner | What it exposes over this library |
-|---|---|
-| **go-qrdb** | the database and clustering product: peer discovery, cluster formation, bootstrap and firstboot, the ceremony, barrier and share custody, identity and RBAC — all through its own SDK and CLI |
-| **go-xkms** | hardware and cloud key custody, the CA, and the `xkey` desktop companion |
-| **go-quicbaas** | the composed product surface |
-| **go-trusted-platform** | `platformctl` and the platform control plane, re-exporting the composed stack |
-
-Those verbs are documented in their own repositories, against the portfolio's
-locked CLI surface. Nothing in this repository documents them, and a divergence
-there is raised there.
+An application embeds the `Host` and owns its operator surface. In this stack
+that is go-qrdb, which provides peer discovery, cluster formation, bootstrap,
+key custody and access control through its own SDK and CLI, documented in its
+own repository.
 
 ## Build and verification targets
 
-The complete list is `make help`. The ones that matter:
+`make help` lists every target. The ones you are most likely to need:
 
 | Target | Runs |
 |---|---|
-| `make build` | `go build ./...` — produces no artifact |
-| `make test` | the full unit suite |
+| `make build` | `go build ./...`. Produces no artifact |
+| `make test` | the unit suite (`go test ./...`, no build tags) |
 | `make lint` | golangci-lint |
-| `make ci` | the gate: `fmt no-mutants check-tool-versions vet lint security build test` |
-| `make coverage` | coverage against `COVER_MIN = 91` |
+| `make ci` | `fmt no-mutants check-tool-versions vet lint security build test` |
+| `make ci-full` | `ci` plus all modules, I/O faults, fuzz seeds and mutation, integration, network faults and the FIPS targets |
+| `make coverage` | module coverage against `COVER_MIN = 91` |
+| `make coverage-packages` | every package under `pkg/` against `COVER_MIN` |
 | `make integration-test` | real clusters in containers |
 | `make integration-test-linearizability` | the linearizability checker |
 | `make ci-errfs` | I/O fault injection |
 | `make ci-netfault` | partitions, delays, drops |
 | `make fuzz-all` | every fuzz target |
-| `make build-fips` | **a compile check only** — no artifact is produced and no cryptographic operation runs |
-| `make verify-fips` | approved-only enforcement over everything except `pkg/internal/transport/revocation/...` — the QUIC transport is inside this gate |
-| `make verify-fips-exempt` | that one excluded tree, at `GODEBUG=fips140=on` — see the quic-transport exemption record |
+| `make build-fips` | a compile check only. No artifact, and no cryptographic operation runs |
+| `make verify-fips` | approved-only enforcement (`GODEBUG=fips140=only`) over everything except `pkg/internal/transport/revocation/...`. The QUIC transport is inside this gate |
+| `make verify-fips-exempt` | that one excluded tree at `GODEBUG=fips140=on`; see the [exemption record](../quic-transport/architecture.md#fips-140-3-exemption-record) |
 | `make bench-compare` | benchmark regression against stored baselines |
 | `make security` | `gosec vuln modverify trivy` |
+| `make deps-check` | every module's dependencies against their current releases |
 
 Per-package `test-*`, `bench-*` and `fuzz-*` targets are listed in each feature
 folder's `cli.md`.
 
-**Do not read `build-fips` as a compliance gate.** This module is a library with
-no `main`, so it produces no artifact, and `GOFIPS140` alone never executes a
-cryptographic operation. `verify-fips` is the check that can actually fail on a
-non-approved primitive.
+Do not read `build-fips` as a compliance gate. The module has no `main`, and
+`GOFIPS140` alone never executes a cryptographic operation. `verify-fips` is the
+check that fails on a non-approved primitive.
 
-## Operational levers, since there are no flags
+## Settings that replace flags
 
-Everything is `HostConfig`, `Config` and `TransportConfig`, set by the embedding
-application. The four whose default will hurt a production deployment:
+All configuration is `HostConfig`, `Config` and `TransportConfig`, set by the
+embedding application. These four have defaults that will hurt a production
+deployment:
 
-| Lever | Default | Set it because |
+| Setting | Default | Why you set it |
 |---|---|---|
-| `MaxTotalInMemLogSize` | **0 = disabled** | one client can otherwise grow the in-memory log until the process dies |
-| `MaxWALDiskSize` | **0 = unbounded** | the WAL otherwise fills the volume until `fdatasync` poisons the store |
-| `MTLSConfig` | none | the transport refuses to start without it — which is the point |
-| `KeyRotationInterval` | 0 = no scheduled rotation | 24h is a reasonable production value when a barrier is configured |
+| `MaxTotalInMemLogSize` | 0 (disabled) | otherwise one client can grow the in-memory log until the process dies |
+| `MaxWALDiskSize` | 0 (unbounded) | otherwise the WAL fills the volume until a failed `fdatasync` poisons the store |
+| `TransportConfig.MTLSConfig` | none | the host refuses to start without it whenever the transport is enabled |
+| `KeyRotationInterval` | 0 (no scheduled rotation) | 24h is a reasonable production value when a barrier is configured |
 
-And the two whose zero value does not mean "off": `SnapshotEntries` and
-`SessionExpiryEntries`. Zero selects the default; `config.SnapshotsDisabled` and
-`config.SessionExpiryDisabled` are the values that disable.
+Two fields do not treat zero as "off": `SnapshotEntries` and
+`SessionExpiryEntries`. Zero selects the default. Assign
+`config.SnapshotsDisabled` or `config.SessionExpiryDisabled` to turn them off.

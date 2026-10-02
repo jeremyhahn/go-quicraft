@@ -1,65 +1,34 @@
 # Log Storage — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-08-19
+> `pkg/logdb/memdb` · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-**No CLI surface: this feature is reachable only as a Go package.**
+**No CLI surface.** go-quicraft is a library and ships no binaries: there is no
+`cmd/` directory, and `make build` runs `go build ./...`. This feature is used
+through the Go API in [api.md](api.md) and contributes no `CommandDefinition` to
+any parity suite.
 
-go-quicraft ships no binaries. The repository has no `cmd/` directory, and
-`make build` runs `go build ./...` and produces no executable.
+Two operations look like they should be commands and deliberately are not:
 
-This feature contributes **no** `CommandDefinition` to any integration parity
-suite. Two operations look like they should be verbs and deliberately are not:
+- **Repair.** `waldb.Repair` discards data. It takes an explicit shard, segment
+  and clean-prefix offset and refuses anything else. A command that guessed
+  those arguments would be the tool that turns a recoverable segment into a
+  shorter log, so it stays a Go function that the operator tooling above wraps
+  behind its own confirmation.
+- **Re-encryption.** `waldb.Reencrypt` needs a source and a destination barrier,
+  each already unsealed with its own credentials. Getting those from a command
+  line means a key-custody flow, which belongs to the layer that owns the keys.
 
-- **Repair.** `waldb.Repair` takes an explicit shard, segment and clean-prefix
-  offset, and refuses anything else. It **discards data**. A one-line command
-  that guesses those arguments is precisely the tool that turns a recoverable
-  segment into a shorter log, so the operation is exposed as a Go function that
-  a custody layer wraps behind whatever confirmation it considers adequate.
-- **Re-encryption.** `waldb.Reencrypt` needs both a source and a destination
-  barrier, each already unsealed with its own credentials. Reaching those from a
-  command line means a key-custody flow, which is not this repository's.
+Operator commands over a data directory (bootstrap, backup, restore, recovery)
+belong to the database layer built on this library and are documented there.
 
-## Where the operator verbs live
-
-The database layer above owns the operator surface over a data directory —
-bootstrap, backup, restore, compaction policy, and the recovery procedures that
-wrap the two functions above. Those verbs are documented in that repository,
-against the portfolio's locked CLI surface.
-
-## Build-time targets
+## Build targets
 
 | Target | Runs |
 |---|---|
 | `make test-waldb` | `go test ./pkg/logdb/waldb/...` |
 | `make test-logdb` | `go test ./pkg/logdb/...` |
-| `make bench-waldb` | the WAL write/fsync/compaction benchmarks |
-| `make fuzz-waldb` | the record and segment decode fuzz targets |
-| `make ci-errfs` | the `test/errfs` fault-injection suite — the I/O error paths |
-
-## Operational levers that are not verbs
-
-Everything is configuration passed at `Open` by the embedding application:
-
-| Lever | Option | Note |
-|---|---|---|
-| block size | `WithBlockSize` | **immutable** for the life of the data directory; `Open` refuses a change |
-| segment size | `WithMaxFileSize` | safe to raise on a populated directory; only affects future rotations. 256–512 MiB for clusters with thousands of shards |
-| durability | `WithNoSync` | **never in production.** Disables every fsync *and* every directory sync, so recovery is always free to truncate |
-| disk ceiling | `WithDiskMonitorOpts` | past the full threshold, proposals are rejected with `ErrDiskFull` instead of the WAL filling the volume |
-| encryption | `WithBarrier` | the barrier must be initialized **and unsealed** before `Open` |
-| instrumentation | `WithMetrics` | write and fsync latency are what separate "slow disk" from "slow pipeline" |
-
-## One thing to check after every restart
-
-Not a command; one call, silent if you do not make it. (A node that may have
-come back shorter than the log it acknowledged does not open — `Open` fails with
-`ErrAcknowledgedDataLost` — so there is nothing to poll for on that front.)
-
-```go
-protection := db.AtRestProtection()
-```
-
-Check the store's own answer rather than inferring encryption from the fact that
-you passed a barrier.
+| `make bench-waldb` | the `waldb` benchmarks |
+| `make fuzz-waldb` | the `waldb` fuzz targets (chunk, entry, state and bootstrap codecs, the address and removed maps, segment replay) |
+| `make ci-errfs` | the `test/errfs` fault-injection suite |

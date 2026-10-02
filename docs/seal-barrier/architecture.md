@@ -1,7 +1,7 @@
-# Seal & Barrier — Architecture
+# Seal and barrier: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` (and the `pkg/crypto`
-> compatibility shim) · Last verified: 2026-09-15
+> compatibility shim) · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -9,18 +9,27 @@
 A consensus engine writes everything it is told to a log and to snapshots, and
 those artifacts sit on disk long after the process that wrote them. Encrypting
 them needs a key; a key needs somewhere to live; and "somewhere" turns out to be
-a decision with hardware, cloud, and threshold-custody variants that a Layer-1
+a decision with hardware, cloud and threshold-custody variants that a Layer-1
 library must not know about.
 
-The barrier separates those two problems so hard that they compose freely:
+The barrier keeps those two problems fully separate, so they compose freely:
 
 | Layer | Responsibility |
 |---|---|
 | **`Barrier`** | derives DEKs from a root key via HKDF-SHA256, encrypts and decrypts every at-rest byte with an AEAD, manages epoch rotation, and enforces the AEAD safety bounds |
-| **`SealingStrategy`** | protects the root key *at rest*. Anything that can wrap and unwrap 32 bytes qualifies. |
+| **`SealingStrategy`** | protects the root key at rest. Anything that can wrap and unwrap 32 bytes qualifies. |
 
 A TPM-wrapped root key in a Raft-backed store, a passphrase-wrapped key in a
 file, an HSM-wrapped key in a KMS: all the same code path.
+
+**`pkg/seal` is the Layer-1 encryptor only.** It holds the `Barrier` (alias
+`EpochBarrier`: epoch DEKs, HKDF, the AEAD data path, rotation), the `None` and
+`Software` (passphrase) sealing strategies, the `SealingStrategy` interface and
+its optional `ProtectedSealingStrategy` sibling, and the
+`ProtectedShareSplitter` / `ProtectedShareAccumulator` interfaces. Shamir
+custody, M-of-N quorum, recovery, rekey, root tokens and the Security-Officer
+ceremony live in go-qrdb; this repository holds only the GF(256) primitive (see
+[`../shamir-primitive/architecture.md`](../shamir-primitive/architecture.md)).
 
 ## The shape chosen
 
@@ -44,9 +53,9 @@ file, an HSM-wrapped key in a KMS: all the same code path.
 ```
 
 **Per-node, not clustered.** Each node manages its own barrier and root key.
-QUIC/mTLS protects data in transit; the barrier protects it at rest. **Nodes
-cannot decrypt each other's at-rest data** — a snapshot sent between nodes is
-decrypted for transport and re-encrypted by the receiver under its own key.
+QUIC/mTLS protects data in transit; the barrier protects it at rest. Nodes cannot
+decrypt each other's at-rest data: a snapshot sent between nodes is decrypted
+for transport and re-encrypted by the receiver under its own key.
 
 **The barrier writes nothing to disk.** It holds sealed state in memory and
 hands it to a caller-supplied `StatePersister` when that state changes.
@@ -71,13 +80,13 @@ Ciphertext frame:
 ```
 
 The epoch and algorithm ID are unencrypted because both must be known before any
-key material is touched — the epoch selects the DEK, the algorithm ID gives the
+key material is touched: the epoch selects the DEK, the algorithm ID gives the
 nonce length. `N` is the algorithm's nonce size (12 for the AES-GCM family, 24
 for XChaCha20-Poly1305), so the header is not a fixed width.
 
-Note the deliberate endianness split: the epoch is **big-endian** in the header,
-for readability when inspecting raw ciphertext, and **little-endian** in the
-AAD. They are not interchangeable.
+The endianness split is deliberate: the epoch is big-endian in the header, for
+readability when inspecting raw ciphertext, and little-endian in the AAD. They
+are not interchangeable.
 
 ### Rejected: re-encrypting on rotation
 
@@ -96,9 +105,9 @@ to that node.
 
 ## Two safety bounds, and why both exist
 
-Nonces are **random**, not counters — there is no `[SegmentID|WriteEpoch|
-RecordSeq]` construction anywhere in the barrier, the WAL, or the snapshot
-pipeline. For AES-GCM the 12 nonce bytes are drawn **inside the FIPS module** by
+Nonces are random, not counters: there is no `[SegmentID|WriteEpoch|RecordSeq]`
+construction anywhere in the barrier, the WAL or the snapshot pipeline. For
+AES-GCM the 12 nonce bytes are drawn inside the FIPS module by
 `cipher.NewGCMWithRandomNonce` and prepended by the AEAD itself; FIPS 140-3
 (SP 800-38D §8.2.2, CMVP IG C.H) prohibits an IV generated in application code,
 and Go refuses it outright under `GODEBUG=fips140=only`.
@@ -117,7 +126,7 @@ argument. It reports its own state honestly through `Saturated()` and `Count()`
 rather than silently disabling itself.
 
 A GCM nonce collision yields keystream XOR and recovery of the GHASH
-authentication key — arbitrary forgery of at-rest records. That is why the cap
+authentication key, which means arbitrary forgery of at-rest records. That is why the cap
 fails closed rather than warning.
 
 One consequence of module-generated nonces: on the AES-GCM path the tracker runs
@@ -128,8 +137,8 @@ the construction FIPS forbids.
 
 ## AAD binding: epoch, then position
 
-**Baseline is epoch-only.** `Encrypt`/`Decrypt` bind the 8-byte little-endian
-epoch as AAD, which defeats cross-epoch splicing. It does **not** defeat
+**The baseline is epoch-only.** `Encrypt`/`Decrypt` bind the 8-byte
+little-endian epoch as AAD, which defeats cross-epoch splicing. It does not defeat
 same-epoch reorder, splice or truncation: two frames under one DEK authenticate
 identically wherever they sit.
 
@@ -144,8 +153,8 @@ pass one:
 | WAL records | 30 bytes | `"QRWAL1"(6) ‖ WALShardIdx:8 ‖ SegmentID:8 ‖ RecordSeq:8`, big-endian |
 
 Both are magic-tagged, fixed-width and delimiter-free, so no two distinct
-positions can produce the same bytes. **The magic is a scheme tag, not a version
-byte** — it is part of the authenticated context rather than a byte on disk, so
+positions can produce the same bytes. The magic is a scheme tag, not a version
+byte: it is part of the authenticated context rather than a byte on disk, so
 a frame sealed under a future layout can never authenticate against this one and
 there is no unauthenticated marker for an attacker to rewrite.
 
@@ -175,7 +184,7 @@ authenticating as the last. So:
 - **Truncated**: the frame the artifact now ends on was sealed with `Final=0`
   and fails authentication when read as the last.
 - **Extended**: an artifact's terminal frame followed by frames spliced in from
-  a longer artifact of the same identity — whose ordinals line up — fails on the
+  a longer artifact of the same identity (whose ordinals line up) fails on the
   terminal frame, read as non-terminal.
 - **Truncated to nothing**: no frame is left to authenticate, so a sealed
   artifact with no frames is refused structurally as `ErrSnapshotCorrupt`.
@@ -192,11 +201,10 @@ acknowledged data. An attacker with write access to the disk who removes
 trailing records *and* the sync mark after them produces bytes identical to a
 crash inside the writeback window, so recovery truncates as it would for the
 crash. Telling the two apart needs a trusted, monotonic record of the
-acknowledged end kept somewhere the attacker cannot rewrite — a hardware
+acknowledged end kept somewhere the attacker cannot rewrite: a hardware
 monotonic counter (a TPM NV index, via go-xkms), or confirmation from peers.
-Both are outside this layer, and the limit is stated rather than papered over:
-**at-rest rollback of the WAL by someone who can write the disk is not
-detected**. The consequence is not bounded by Raft: its safety argument assumes
+Both are outside this layer, so **at-rest rollback of the WAL by someone who can
+write the disk is not detected**. The consequence is not bounded by Raft: its safety argument assumes
 stable storage, and a replica rolled back past what it acknowledged may have
 forgotten entries it counted toward a commit, or a vote it cast in the current
 term. Treat write access to a replica's data directory as equivalent to
@@ -204,14 +212,15 @@ compromising that replica.
 
 **Cross-artifact splicing is accepted on the same grounds.** A snapshot frame's
 context carries nothing unique to one artifact, so two artifacts sealed under
-one key at the same `(shard, replica, index)` — a rebuild re-save, or a local
-save and a receive at one index — can exchange frames, and a spliced file still
+one key at the same `(shard, replica, index)` (a rebuild re-save, or a local
+save and a receive at one index) can exchange frames, and a spliced file still
 authenticates frame by frame. It needs write access to the data directory and a
-retained copy of the other artifact, which is the rollback threat above. A
-per-artifact random value folded into the context would close it, and was
-considered and declined for that reason (2026-09-23).
+retained copy of the other artifact, which is the rollback threat above.
+*Rejected: a per-artifact random value folded into the context.* It would close
+this case, but the attacker it stops already has the rollback capability, which
+no in-file value can stop.
 
-## Delegated (hardware) mode — total, by design
+## Delegated (hardware) mode is total, by design
 
 `SealingStrategy.BarrierEncryptor` decides which of two very different
 deployments you are in:
@@ -221,36 +230,35 @@ deployments you are in:
 | `(nil, nil)` | the **root key only**; the barrier derives epoch DEKs and encrypts itself | fully active |
 | a non-nil `SymmetricEncrypter` | the **entire data path**; the root key need never enter process memory | entirely bypassed |
 
-**`(nil, nil)` is correct and intended, not an unimplemented stub.** Every
-non-hardware strategy returns it, including this repository's own
-`SoftwareStrategy`.
+`(nil, nil)` is correct and intended, not an unimplemented stub. Every
+non-hardware strategy returns it, including this repository's `SoftwareStrategy`
+and `NoneStrategy`.
 
 Delegation is total. A non-nil encryptor bypasses epoch DEK derivation, the
 `[epoch][algID]` header, the nonce-reuse tracker, the SP 800-38D invocation
 counter, and the load-generation fence; `Rotate` and `PurgeEpochsBefore` return
-`ErrHardwareMode`. None of that is an oversight — the delegated encryptor owns
+`ErrHardwareMode`. None of that is an oversight: the delegated encryptor owns
 its key and nonce management, and the barrier cannot count invocations against a
 key it does not control. Every barrier setup logs this at WARN, naming exactly
 what is delegated.
 
-**As of this writing no shipped hardware strategy uses delegated mode.** Every
-production caller of go-xkms's TPM2, PKCS#11 and cloud-KMS strategies passes a
-nil encryptor, so hardware deployments wrap the root key in the device and keep
-the barrier's full AEAD stack, positional AAD included. The delegated path
-exists and is tested; choosing it is a deliberate act.
+The usual hardware deployment does not delegate: the strategy wraps the root key
+in the device and returns a nil encryptor, keeping the barrier's full AEAD stack,
+positional AAD included. The delegated path exists and is tested; choosing it is
+a deliberate act.
 
 ### The AAD capability contract, and why it is measured
 
 A delegated encryptor that can authenticate caller AAD end to end declares it by
 also implementing `AADSymmetricEncrypter`. **Do not implement it on an encryptor
-that accepts an `aad` argument and drops it** — advertising a binding that does
+that accepts an `aad` argument and drops it**: advertising a binding that does
 not exist is strictly worse than not advertising one. The failure is silent:
 `SupportsContextAAD()` reports true, callers stop suppressing their context,
 `RequireContextAAD` passes at startup, the context is discarded on every write,
 and nothing can retroactively bind ciphertext already at rest.
 
-So the declaration is **measured, not trusted**. At `Initialize` and `Unseal`
-only — never on the data path — `verifyAADBinding` runs one encrypt and two
+So the declaration is measured, not trusted. At `Initialize` and `Unseal` only
+(never on the data path), `verifyAADBinding` runs one encrypt and two
 decrypts with random 32-byte values: seal a probe under `aadA`, require it to
 open under `aadA` returning the same bytes, and require it to **fail** under an
 independently drawn `aadB`. An encryptor that drops the argument passes the
@@ -260,16 +268,16 @@ special-cased, and `aadB` is an independent draw rather than a mutation of
 
 A failing probe logs at ERROR and downgrades the encryptor to
 `ContextBindingUnsupported`, so `RequireContextAAD` then refuses the deployment
-rather than blessing it. The probe is a backstop, not a licence to implement the
+rather than accepting it. The probe is a backstop, not a licence to implement the
 interface speculatively.
 
-## Sealed-state integrity: three mechanisms, three different holes
+## Sealed-state integrity: three mechanisms for three different holes
 
 The wrapping AEAD covers only `SealedRootKey.Ciphertext`, with the constant
 strategy name as AAD. Every other field sits in plaintext beside it, bound to
 nothing.
 
-### `StateMAC` — authenticating the metadata
+### `StateMAC`: authenticating the metadata
 
 HMAC-SHA256 over a canonical, length-prefixed encoding, keyed by
 `HKDF-SHA256(rootKey, info="quicraft/barrier/state-mac/v1")`. Every
@@ -288,44 +296,43 @@ after a *failed* unseal when no root key is available to re-MAC with; and
 bookkeeping go-qrdb owns.
 
 The field that matters most is `Epoch`: rewriting it downward resurrects a spent
-DEK alongside a zeroed invocation counter and an empty nonce tracker — two
+DEK alongside a zeroed invocation counter and an empty nonce tracker: two
 independent random-nonce sequences under one key.
 
-A MAC failure is deliberately **not** counted as a failed unseal attempt. The
+A MAC failure is deliberately not counted as a failed unseal attempt. The
 credential was correct and the state is not, and driving brute-force backoff
 from a file an attacker can write would hand them a lockout primitive.
 
-The covered-field encoding is versioned by a leading byte, currently **2**; v2
-added `LoadGeneration` because the barrier now refuses to encrypt on the
-strength of that number. A v1 blob is recognized (only when `LoadGeneration ==
-0`, which a pre-fence blob always is), accepted once at WARN, and restamped at
-v2. That is not a downgrade: forging either version needs the same HKDF-derived
-MAC key, which comes from the root key the strategy just recovered.
+The covered-field encoding is versioned by a leading byte, currently 2, which
+covers `LoadGeneration` because the barrier refuses to encrypt on the strength of
+that number. A tag over the version-1 field set (which lacks `LoadGeneration`) is
+recognized only when `LoadGeneration == 0`, accepted once at WARN, and restamped
+at version 2. That is not a downgrade: forging either version needs the same
+HKDF-derived MAC key, which comes from the root key the strategy just recovered.
 
-A blob with **no** MAC is refused with `ErrSealedStateUnauthenticated` —
-accepting an absent tag would make the mechanism optional at the attacker's
-discretion. `AllowUnauthenticatedSealedState` is the explicit one-start
+A blob with no MAC is refused with `ErrSealedStateUnauthenticated`; accepting an
+absent tag would make the mechanism optional at the attacker's discretion. `AllowUnauthenticatedSealedState` is the explicit one-start
 migration hatch, and does not apply to a tag that is present but wrong.
 
-### `MinEpoch` — refusing replay
+### `MinEpoch`: refusing replay
 
 A MAC cannot detect replay: an attacker with write access can restore an older,
 genuinely-MACed copy. Only state the attacker cannot roll back in the same step
-catches that, and the barrier holds none — the embedder does.
+catches that, and the barrier holds none; the embedder does.
 `BarrierConfig.MinEpoch` is that floor, and the effective floor is
 `max(MinEpoch, b.epoch)`. Set it to the highest epoch any live WAL segment or
 retained snapshot still references; the engine already computes exactly this as
 its global safe-purge floor.
 
-### The load-generation fence — detecting a competing claim
+### The load-generation fence: detecting a competing claim
 
 `LoadGeneration` counts how many times a blob has been claimed. `Initialize`
-stamps 1; every `Unseal` that can persist writes `LoadGeneration+1` **before the
-barrier will encrypt**. A barrier later handed a blob naming a higher generation
-marks itself **permanently** superseded and refuses `Encrypt`, `Rotate` and
-`PurgeEpochsBefore`; `Decrypt` is unaffected, and it cannot launder the state by
-sealing and unsealing again. The winner's state is deliberately not adopted —
-quietly picking up the winner's epoch would make this instance a second writer
+stamps 1; every `Unseal` that can persist writes `LoadGeneration+1` before the
+barrier will encrypt. A barrier later handed a blob naming a higher generation
+marks itself permanently superseded and refuses `Encrypt`, `Rotate`,
+`PurgeEpochsBefore` and `Reset`; `Decrypt` is unaffected, and it cannot launder
+the state by sealing and unsealing again. The winner's state is deliberately not
+adopted: picking up the winner's epoch would make this instance a second writer
 of the winner's DEK, which is the failure being prevented.
 
 The ordering is the point: the claim must be durable before this barrier
@@ -333,9 +340,9 @@ encrypts, or a process that dies between encrypting and persisting leaves a
 generation the next loader increments without ever learning a DEK was used under
 it.
 
-**It is not a lock**, and this is stated plainly rather than implied:
+**It is not a lock:**
 
-- Not continuous — compared at load, enforced at write or use. The barrier never
+- Not continuous: compared at load, enforced at write or use. The barrier never
   re-reads the blob on its own, because that would put a disk read on the
   encrypt hot path. A barrier superseded while running keeps encrypting until
   the embedder hands it the newer state.
@@ -356,7 +363,7 @@ makes single-writer a guarantee.
 
 ## Trust boundaries
 
-- **Root key** lives in an `enclave.SealedEnclave` (see
+- **The root key** lives in an `enclave.SealedEnclave` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)),
   opened into a locked enclave only for derivation, export and unseal.
   `Initialize` and `Unseal` generate or receive it directly into locked memory and
@@ -365,25 +372,22 @@ makes single-writer a guarantee.
 - **Epoch DEKs are protected the same way and are never opened.** Each is held in
   its own `SealedEnclave` so a DEK can be re-derived, but neither `Encrypt` nor
   `Decrypt` touches one: both run off the `cipher.AEAD` cached per epoch in
-  `b.ciphers`. An older statement that opening a DEK sits on a per-frame
-  decrypt path was measured false in #54 and does not describe this barrier — the
-  key-opening cost is a setup, rotation and rekey cost. The AEAD cache is what
-  makes the DEK's protection free at steady state, and also what makes it
-  incomplete, which is the next bullet.
-- **Live `cipher.AEAD`s cannot be wiped, and they are now the ONLY un-erasable
+  `b.ciphers`. Opening a key is a setup, rotation and rekey cost, not a per-frame
+  one. The AEAD cache is what makes the DEK's protection free at steady state,
+  and also what makes it incomplete, which is the next bullet.
+- **Live `cipher.AEAD`s cannot be wiped, and they are the only un-erasable
   copy.** Each holds a copy of the DEK in its key schedule, and neither the
   standard library nor `x/crypto` offers a wipe API. Dropping the barrier's
   reference on seal or purge makes it GC-eligible, and that is the only bound: a
   core dump taken before collection contains every live and recently purged epoch
-  DEK. The sealed copies beside them ARE wiped — `SealedEnclave.Destroy` zeroes
-  the ciphertext, where the retired `ProtectedKey.Clear` could only drop a
-  reference (#54 stage two).
+  DEK. The sealed copies beside them are wiped: `SealedEnclave.Destroy` zeroes
+  the ciphertext.
 - **A purge revokes capability; it is not crypto-shredding.** After
   `PurgeEpochsBefore` returns, the barrier can no longer decrypt the epoch, and
-  the epoch's sealed DEK has been wiped — but the cached AEAD's copy of it
-  remains GC-bounded.
+  the epoch's sealed DEK has been wiped, but the cached AEAD's copy of it
+  remains until garbage collection.
 - **`Decrypt` returns one generic error** (`ErrDecryptionFailed`) for every
-  failure mode — unknown epoch, authentication failure, corruption — so error
+  failure mode (unknown epoch, authentication failure, corruption), so the error
   type cannot be used as an oracle.
 - **Metadata leaks.** The outer WAL framing (`CRC32`, `Length`, `Type`) and the
   `Epoch` are unencrypted, so a reader of the file sees record size
@@ -395,23 +399,20 @@ makes single-writer a guarantee.
 
 ## Component boundaries
 
-- **`pkg/seal`** — the whole barrier: epoch DEKs, the AEAD data path, the two
+- **`pkg/seal`**: the whole barrier (epoch DEKs, the AEAD data path, the two
   strategies, the safety trackers, the sealed-state format, the AAD binding
-  probe.
-- **`pkg/crypto`** — six type aliases and two `var` re-exports pointing at
-  `pkg/seal`. No cipher code lives there.
-- **`pkg.Barrier`** (in `pkg/host.go`) — the interface the `Host` accepts,
+  probe) and the `StrategyID` type.
+- **`pkg/crypto`**: five type aliases (`Barrier`, `BarrierConfig`,
+  `SealingStrategy`, `Credentials`, `SealedRootKey`) and three forwarding
+  functions (`NewBarrier`, `MustNewBarrier`, `NewCredentials`). No cipher code.
+- **`pkg.Barrier`** (in `pkg/host.go`): the interface the `Host` accepts,
   declared there to break an import cycle. `*seal.Barrier` satisfies it.
-- **`github.com/jeremyhahn/go-enclave`** (Layer 0) — memory protection for all
-  key material. This repository implements none of it; `pkg/enclave` was deleted
-  in #54.
+- **`github.com/jeremyhahn/go-enclave`** (Layer 0): memory protection for all
+  key material. This repository implements none of it and declares no
+  protected-memory type of its own.
 - **Consumers in this repo**: `pkg/logdb/waldb` through its own `WALBarrier`
   interface, and `pkg/internal/engine`'s snapshot pool. Neither imports
   `pkg/seal` directly.
-
-Capability rows in `docs/00 §R` this feature owns: the `Barrier` /
-`SealingStrategy` interfaces, `EpochBarrier`, `StrategyID`, and the `none` +
-`passphrase` strategies.
 
 ## What this feature deliberately does not do
 
@@ -425,7 +426,7 @@ Capability rows in `docs/00 §R` this feature owns: the `Barrier` /
   barrier or tenant setup.
 - **No storage.** No file, no KV, no fsync. See `StatePersister`.
 - **No `StorageBarrier`, `BarrierRegistry`, `TenantBarrier` or
-  `StrategyRegistry`** — all go-qrdb's.
+  `StrategyRegistry`.** All are go-qrdb's.
 - **No re-encryption of existing data** on rotation or compaction.
 - **No transport encryption.** That is mTLS on the QUIC transport; see
   [`../quic-transport/architecture.md`](../quic-transport/architecture.md).

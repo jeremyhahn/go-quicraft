@@ -1,18 +1,21 @@
-# Membership Changes — Usage
+# Membership changes: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-08-19
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-02
 > Conflicts with this document are defects. Fix them here first.
 
-Adding, removing and re-roling replicas in a shard that already exists. Forming
-the shard in the first place is `StartShard` —
+This page covers adding, removing and re-roling replicas in a shard that
+already exists. Forming the shard in the first place is `StartShard`; see
 [`../multi-group-host/user.md`](../multi-group-host/user.md).
 
 ## Before you start
 
-- The change must be sent to the **current leader** (`GetLeaderID`).
-- You need the current `ConfigChangeID`, read immediately before the change.
-- The new replica needs a certificate whose SAN covers the address you are about
-  to advertise for it, signed by the cluster's CA. See
+- Send the change to the current leader (`GetLeaderID`).
+- Read the current `ConfigChangeID` immediately before the change.
+- Collect the new node's identity: the value its host reports from
+  `NodeIdentity()`. It is a hash of the certificate's public key, safe to log
+  and copy.
+- The new node needs a certificate signed by the cluster's CA whose SAN covers
+  the address you will advertise for it. See
   [`../quic-transport/user.md`](../quic-transport/user.md).
 
 ## The pattern every membership change follows
@@ -26,72 +29,68 @@ err = host.SyncRequestAddNodeWithIdentity(ctx, shardID,
     newReplicaID, newAddr, newIdentity, m.ConfigChangeID)
 ```
 
-Two things that are not optional:
+Two rules:
 
-1. **Use the `Sync` read.** `GetShardMembership` reads local state, which may be
-   behind, and a stale `ConfigChangeID` guarantees the change is refused.
+1. **Use the `Sync` read.** `GetShardMembership` reads local state, which may
+   be behind, and a stale `ConfigChangeID` guarantees the change is refused.
 2. **Pass `ConfigChangeID`.** It is the replay guard. If another change landed
-   between your read and your write, you get `*StaleConfigChangeError` — re-read
-   and retry rather than working around it.
+   between your read and your write you get `*StaleConfigChangeError`; re-read
+   and retry. Passing 0 skips the guard; don't.
 
-Only one change at a time. Adding three replicas is three sequential
+Only one change can be in flight. Adding three replicas is three sequential
 changes, each with a fresh `ConfigChangeID`.
 
-## Task: add a voting member
+## Add a voting member
 
 ```go
 err := host.SyncRequestAddNodeWithIdentity(ctx, shardID,
     replicaID, "node4.example.com:4001", identity, m.ConfigChangeID)
 ```
 
-Then start the shard **on the new node** with `join = true`, anchored to the
-replicas it may take its bootstrap snapshot from — the leader at least:
+Then start the shard on the new node with `join = true` and an empty member
+map, anchored to the replicas it may take its first configuration from (the
+leader at least, or every member if leadership may move):
 
 ```go
 cfg.MemberIdentities = map[uint64]string{leaderReplicaID: leaderIdentity}
-err := newHost.StartShard(nil, true, createFn, cfg)   // join, empty member map
+err := newHost.StartShard(nil, true, createFn, cfg)
 ```
 
-The order matters: add first, then start. A node started with `join = true`
-before the cluster knows about it has nobody to catch up from.
+Add first, then start. A node started with `join = true` before the cluster
+knows about it has nobody to catch up from.
 
-`identity` is the SPKI pin the transport derives from the peer's mTLS leaf, the
-value the new node reports from `Host.NodeIdentity()`:
-
-```
-"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))
-```
-
-**The identity is required** on a host with a transport: `RequestAddNode`
+The identity is required whenever the host has a transport. `RequestAddNode`
 without one returns `ErrMemberIdentityRequired`, and a joiner started without
 an anchor is refused. A member is authorized by its committed identity and by
-nothing else.
+nothing else, never by its address.
 
-## Task: add an observer or a witness
+## Add an observer or a witness
 
 ```go
-// Observer: replicates and serves reads, does NOT vote.
-err := host.SyncRequestAddObserver(ctx, shardID, id, addr, m.ConfigChangeID)
+// Observer: replicates and serves reads, does not vote.
+err := host.SyncRequestAddObserverWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
 
-// Witness: votes, stores NO log data, cannot propose or serve reads.
-err := host.SyncRequestAddWitness(ctx, shardID, id, addr, m.ConfigChangeID)
+// Witness: votes, stores no log data, cannot propose or serve reads.
+err := host.SyncRequestAddWitnessWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
 ```
 
-Choose by what you actually want:
+Choose by what you want:
 
-- **An observer** is a read replica or a warm standby. It costs a full copy of
+- An **observer** is a read replica or a warm standby. It costs a full copy of
   the log.
-- **A witness** is a tiebreaker. It costs almost nothing to run — it stores no
-  log — and it makes a two-node cluster able to elect. Proposing to a witness or
-  reading from one returns `ErrInvalidOperation`.
+- A **witness** is a tiebreaker. It stores no log, so it is cheap to run, and it
+  lets a two-node cluster elect. Proposing to a witness or reading from one
+  returns `ErrInvalidOperation`.
 
-Both roles set `IsObserver` / `IsWitness` in that replica's own `Config`, and
-the two are **mutually exclusive**.
+Start the new replica with `join = true`, as for a voter, with `IsObserver` or
+`IsWitness` set in its own `Config` (never both). Do not list it in a founding
+member map: that map seeds the voting set, and `StartShard` refuses with
+`*NonVotingRoleInMembersError`.
 
-## Task: promote an observer to a voter
+## Promote an observer to a voter
 
-Add the observer again as a voting member, with the same replica ID, address and
-identity, once it has caught up:
+Once the observer has caught up, add it again as a voting member with the same
+replica ID, address and identity:
 
 ```go
 err := host.SyncRequestAddNodeWithIdentity(ctx, shardID,
@@ -101,16 +100,15 @@ err := host.SyncRequestAddNodeWithIdentity(ctx, shardID,
 The running replica becomes a voter as soon as it applies the change: it votes,
 can be elected leader, and serves linearizable reads. Do not restart it.
 `ShardInfo.IsObserver` on its host turns `false` when the change is applied
-there. Restarting it later with `IsObserver` still set in its `Config` is
-harmless: that bit is only consulted while the membership does not name the
-replica.
+there. Restarting it later with `IsObserver` still set is harmless; that bit is
+only consulted while the membership does not name the replica.
 
 A witness cannot be promoted; the add is refused with `ErrNodeAlreadyExists`.
 
-**The voting set is capped at 64**, counting voters plus witnesses plus self,
-because acknowledgements are tracked in a 64-bit word.
+The voting set is capped at 64, counting voters, witnesses and self, because
+acknowledgements are tracked in a 64-bit word.
 
-## Task: remove a replica
+## Remove a replica
 
 Three steps, in this order:
 
@@ -118,7 +116,7 @@ Three steps, in this order:
 // 1. If it is the leader, move leadership first.
 err := host.RequestLeaderTransfer(ctx, shardID, otherReplicaID)
 
-// 2. Remove it from the cluster. This IS a consensus operation.
+// 2. Remove it from the cluster. This is a consensus operation.
 m, _ := host.SyncGetShardMembership(ctx, shardID)
 err = host.SyncRequestDeleteNode(ctx, shardID, replicaID, m.ConfigChangeID)
 
@@ -127,12 +125,17 @@ err = removedHost.StopShard(shardID)
 err = removedHost.RemoveData(shardID, replicaID)
 ```
 
-**Steps 3's two calls do not reach consensus.** They act on the local copy and
-`RemoveData` deletes it. `*ShardNotStoppedError` catches running the second
-before the first; nothing catches running either before step 2, which leaves a
-node that still believes it is a member. It also **retires the replica ID on this host**: `StartShard` refuses it from then on with `*ReplicaRetiredError` (`ErrReplicaRetired`) (`ImportSnapshot` finds no data left to import into and returns `ErrShardNotFound`), because the deleted data held the replica's term, vote and owed lease vote window, and Raft never lets a removed replica return under the same ID. Rejoin under a new replica ID.
+Step 3 does not reach consensus. It acts on the local copy, and `RemoveData`
+deletes it. `*ShardNotStoppedError` catches deleting before stopping; nothing
+catches running step 3 before step 2, which leaves a cluster that still counts
+the node as a member.
 
-## Task: change the witness policy
+`RemoveData` also retires the replica ID on that host: `StartShard` refuses it
+from then on with `*ReplicaRetiredError`, because the deleted data held the
+replica's term, vote and lease vote window. To bring the machine back, rejoin
+it under a new replica ID.
+
+## Change the witness policy
 
 ```go
 policy := config.WitnessConfig{
@@ -142,66 +145,69 @@ policy := config.WitnessConfig{
 err := host.SyncRequestUpdateWitnessPolicy(ctx, shardID, policy, m.ConfigChangeID)
 ```
 
-`Config.Witness` is **only the bootstrap seed**. Once the shard is running the
-policy is replicated state and changes only through this call — a per-node value
-would let replicas disagree about which config changes are legal.
+`Config.Witness` is only the bootstrap seed. Once the shard is running, the
+policy is replicated state and changes only through this call, so every
+replica agrees on which config changes are legal. The new policy must already
+hold for the current membership; reshape the membership first, then tighten.
 
-## Task: check who is in the shard
+## Check who is in the shard
 
 ```go
 m, err := host.SyncGetShardMembership(ctx, shardID)
-// m.Nodes      — voting members
-// m.Observers  — non-voting replicas
-// m.Witnesses  — voting, log-less replicas
-// m.Removed    — replicaIDs that have been removed
-// m.ConfigChangeID — pass this as the next configChangeIndex
+// m.Nodes              voting members
+// m.Observers          non-voting replicas
+// m.Witnesses          voting, log-less replicas
+// m.Removed            replica IDs that have been removed
+// m.Identities         committed node identity per replica
+// m.RemovedIdentities  identities banned from the shard
+// m.ConfigChangeID     pass this as the next configChangeIndex
 ```
 
 ## Troubleshooting
 
-**`*StaleConfigChangeError`** — another change landed between your read and your
-write. Re-read `ConfigChangeID` and retry. Do not pass 0 to bypass it; the guard
-is what stops two changes applying out of order.
+**`*StaleConfigChangeError`**: another change landed between your read and
+your write. Re-read `ConfigChangeID` and retry.
 
-**`ErrTooManyWitnesses`, or a member add that is refused near 64 members** — the
-voting set is capped at 64. Voters and witnesses share the cap.
+**`ErrRejected` on a config change**: an earlier change is still uncommitted.
+Retry once it commits.
 
-**`ErrInvalidOperation` on a propose or read** — you are talking to a witness.
-Witnesses vote and store nothing; they cannot propose and cannot serve a
-ReadIndex.
+**`ErrTooManyVotingMembers`**: the voting set is capped at 64, shared by voters
+and witnesses. **`ErrTooManyWitnesses`** is the shard's own `MaxWitnesses`
+policy.
 
-**A newly added node never catches up** — check, in order: was it added *before*
+**`ErrInvalidOperation` on a propose or read**: you are talking to a witness.
+
+**A newly added node never catches up.** Check, in order: was it added before
 it was started with `join = true`; does its certificate SAN cover the address
-you advertised; does the identity you committed for it match the one it reports
-from `NodeIdentity()` (`identity_mismatch` in the drop counter).
-`host.DiagRemotes(shardID)` shows whether the leader is replicating to it at
-all.
+you advertised; does the identity you committed for it match the one it
+reports from `NodeIdentity()` (an `identity_mismatch` reason on the
+unauthorized-drop counter says it does not). `host.DiagRemotes(shardID)` on
+the leader shows whether it is replicating to the node at all.
 
-**A removed node keeps sending messages** — it has not been restarted and does
-not know. Its messages are refused for that shard; the log line naming an
-unauthorized member is expected, once. In volume it means the node was never
-actually stopped.
+**A removed node keeps sending messages.** It has not been stopped and does
+not know it was removed. Its messages are refused and counted under
+`removed_replica`, with a rate-limited warning. A steady stream means the node
+was never stopped.
 
-**`*NonVotingRoleInMembersError`** — an observer or witness appears in the
-voting member map. The roles come from that replica's own `IsObserver` /
-`IsWitness`, not from which map it is listed in.
+**`*NonVotingRoleInMembersError`**: the replica is configured as an observer or
+witness and is also listed in the founding member map. Start it with
+`join = true` and add it through a config change instead.
 
-**`ErrRemovedMemberIdentity`** — the identity you are adding belongs to a
-replica this shard removed. The ban is on the keypair, under any replica ID, and
-is permanent; `Membership.RemovedIdentities` lists every banned identity. Give
-the node a new keypair. Reusing its address under a new replica ID is fine.
+**`ErrRemovedMemberIdentity`**: the identity you are adding belongs to a
+replica this shard removed. The ban is on the keypair, under any replica ID,
+and is permanent; `Membership.RemovedIdentities` lists every banned identity.
+Give the node a new keypair. Reusing its address under a new replica ID is
+fine.
 
-**`*CorruptConfigEntryError` or `*BootstrapEntryMissingError` at startup** — the
-log's own membership record at index 1 is unreadable or absent. The shard cannot
-start, deliberately: a replica that cannot prove its configuration must not
-guess one.
+**`*CorruptConfigEntryError` or `*BootstrapEntryMissingError` at startup**: the
+log's own membership record at index 1 is unreadable or absent. The shard
+refuses to start, because a replica that cannot prove its configuration must
+not guess one.
 
-**An observer restarted at a new address and the leader cannot find it** — known
-and documented: there is **no self-advertisement**. The leader learns addresses
-only from committed config changes, so a replica that moves needs an
-operator-issued change. Use a stable advertised `RaftAddress` — the documented
-workaround — rather than expecting the cluster to rediscover it.
+**An observer restarted at a new address and the leader cannot find it**: there
+is no self-advertisement. The leader learns addresses only from committed
+config changes, so a replica that moves needs an operator-issued change. Use a
+stable advertised `RaftAddress`.
 
-**Nothing evicts a node that is down** — correct. There is no failure detector
-that removes members, deliberately: an automatic eviction during a partition is
-how a cluster loses quorum permanently.
+**Nothing evicts a node that is down.** That is deliberate: an automatic
+eviction during a partition is how a cluster loses quorum permanently.
