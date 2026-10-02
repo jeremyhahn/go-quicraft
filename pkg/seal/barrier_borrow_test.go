@@ -89,7 +89,7 @@ func newPlainStrategy(t *testing.T) *plainStrategy {
 
 // TestBarrier_WorksWithAPlainSealingStrategy pins that the barrier's
 // locked-memory handling does not quietly start depending on
-// ProtectedSealingStrategy, because most strategies in the portfolio implement
+// ProtectedSealingStrategy, because most strategies implement
 // only the []byte pair — go-xkms's TPM2, PKCS#11 and cloud-KMS strategies, and
 // go-qrdb's shamir and recovery strategies.
 //
@@ -284,7 +284,7 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 // added later cannot forget one". An allocator whose refusal is a nil enclave
 // rather than an error is such a path.
 //
-// Verified by mutation on 2026-09-04: moving the wipe back inside the borrow —
+// Verified by mutation: moving the wipe back inside the borrow —
 // deleting `defer enclave.Wipe(heapKey)` and restoring the four hand-written
 // calls — fails here with
 //
@@ -378,7 +378,7 @@ func TestUnseal_NoEncryptionModeStillWipesTheHeapKey(t *testing.T) {
 // statement than the end-state assertion, and it is the one that dies when the
 // eager wipe does.
 //
-// Verified by mutation on 2026-09-04: deleting the eager enclave.Wipe(heapKey)
+// Verified by mutation: deleting the eager enclave.Wipe(heapKey)
 // from inside the borrow leaves TestUnseal_WipesTheStrategysHeapKey PASSING and
 // fails only here, with
 //

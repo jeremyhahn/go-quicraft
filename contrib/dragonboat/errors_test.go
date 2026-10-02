@@ -496,7 +496,7 @@ func TestTranslateError_PackageLevelMappings(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C5: New error mappings
+// New error mappings
 // ---------------------------------------------------------------------------
 
 func TestTranslateError_LogDBWrite(t *testing.T) {
@@ -648,7 +648,7 @@ func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 	// And the bit now survives.
 	if !quicraft.MaybeApplied(translated) {
 		t.Error("quicraft.MaybeApplied = false for a post-delivery failure; the " +
-			"submission bit was discarded by the mapping, which is #156")
+			"submission bit was discarded by the mapping")
 	}
 	// IsTempError is unaffected, since it is errors.Is-based too.
 	if !IsTempError(translated) {

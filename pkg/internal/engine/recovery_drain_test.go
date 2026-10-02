@@ -44,7 +44,7 @@ func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) 
 	// The drain must NOT complete while the apply is still in flight.
 	time.Sleep(20 * time.Millisecond)
 	if drained.Load() {
-		t.Fatal("WaitForApplyDrain returned while an apply was still in flight (C3 race)")
+		t.Fatal("WaitForApplyDrain returned while an apply was still in flight")
 	}
 
 	// Complete the in-flight apply; the drain must now finish promptly.

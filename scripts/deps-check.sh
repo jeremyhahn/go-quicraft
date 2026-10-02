@@ -2,40 +2,14 @@
 # deps-check.sh -- fail when a DIRECT dependency of any module in this repo is
 # behind its newest release.
 #
-# WHY THIS EXISTS, AND WHY IT IS NOT DEPENDABOT (go-quicraft#86)
+# Runs `go list -m -u` over every module in the tree.
 #
-# `.github/dependabot.yml` in this repository is thorough: eleven update
-# entries covering every Go module, the Rust openraft rig, the actions and the
-# Docker bases. It has also never run, not once. Dependabot is a github.com
-# service, and this repository has no `github` remote -- it has never been
-# mirrored. `git ls-remote github` answers "does not appear to be a git
-# repository". So the config describes coverage that does not exist, and
-# nightly.yml cited it twice as the reason the benchmark and contrib trees do
-# not need scanning. A believed-in gate that never fires is worse than an
-# absent one: it stops anyone from building the real thing.
-#
-# All work happens on the Gitea plane, so the watcher has to run there. This
-# script is that watcher. It runs the `go list -m -u` CLAUDE.md names as the
-# per-module primitive, over every module, on a schedule -- so drift shows
-# up on its own
-# rather than when a CVE breaks the nightly Trivy gate, which is how the last
-# six bumps were found (#50 and #86).
-#
-# THE PIN ESCAPE HATCH
-#
-# conventions/devops.md §9 already says a `require` held below latest "must
-# carry a comment in the go.mod naming the reason ... an undocumented pin is a
-# defect". This script makes that sentence mechanical rather than aspirational:
-# a module is exempt if and only if the comment block directly above its
-# `require` line contains the words DOCUMENTED PIN. Nothing else exempts it --
-# there is no ignore list in this file and no flag to pass, because a pin
-# recorded anywhere but beside the version is a pin the next reader will not
-# find. Worked example: test/performance/etcd/go.mod held go.etcd.io/raft/v3
-# at v3.6.0 under this marker from #86 until #127 migrated it to v3.7.0 and
-# retired the pin; the tree carries no DOCUMENTED PIN today.
+# A module is exempt only if the comment block directly above its `require`
+# line in go.mod contains the words DOCUMENTED PIN. There is no ignore list or
+# flag, so a pin is always recorded beside the version it holds.
 #
 # Exit 0 = every module current or documented. Exit 1 = at least one
-# undocumented lag. Exit 2 = the check could not run, which is NOT a pass.
+# undocumented lag. Exit 2 = the check could not run, which is not a pass.
 
 set -eu
 
@@ -49,8 +23,8 @@ command -v go >/dev/null 2>&1 || {
 	exit 2
 }
 
-# Module directories, deepest-first is irrelevant; sorted for stable output.
-# -prune on vendor/node_modules keeps this from wandering into fetched trees.
+# Module directories, sorted for stable output; vendored and fetched trees are
+# pruned.
 mods=$(find . \( -name vendor -o -name node_modules -o -name .git \) -prune -o \
 	-name go.mod -print | sed 's|/go.mod$||' | sort)
 
@@ -62,27 +36,14 @@ test -n "$mods" || {
 status=0
 
 for dir in $mods; do
-	# The `go list -m -u` from CLAUDE.md and from issue #86's verification
-	# section, with one addition explained next. CLAUDE.md tells a developer
-	# to run THIS SCRIPT (`make deps-check`), so the thing CI runs and the
-	# thing a developer is told to run cannot answer differently.
+	# The exit status is checked: `go list -m -u` prints nothing when it
+	# cannot resolve the module graph (go.sum mismatch, unreachable proxy),
+	# and that must be exit 2, not a pass.
 	#
-	# Its exit status is CHECKED. `go list -m -u` prints nothing to stdout
-	# when it cannot resolve the module graph -- a go.sum mismatch, an
-	# unreachable proxy, a Gitea outage -- and an earlier draft of this
-	# script piped that straight into `|| true` and reported "everything
-	# current". A gate that answers "clean" when it could not look is the
-	# vacuous gate conventions/devops.md §1 calls worse than no gate, and it
-	# was caught here only because a negative test went green when it should
-	# have gone red. Failure to look is exit 2, never a pass.
-	# A module replaced by a DIRECTORY has no update: the directory is the
-	# source, and the newest tag `go list -m -u` still reports for it is a
-	# statement about the registry, not about this build. Every nested
-	# module here replaces the root that way (`=> ../..`), and the nightly
-	# was red on `go-quicraft v0.0.0 -> v0.11.0-alpha` for as long as a tag
-	# existed to report (#188). deps-latest skips the same shape the same
-	# way. The replacement path rides along as a fourth field and is judged
-	# below; a replacement by another module VERSION is still checked.
+	# A module replaced by a directory (the nested modules' `=> ../..`) has
+	# no update, whatever tag the registry reports. The replacement path is
+	# appended as a fourth field and judged below; a replacement by another
+	# module version is still checked.
 	if ! raw=$(cd "$dir" && go list -m -u \
 		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}' \
 		all 2>&1); then
@@ -104,9 +65,8 @@ for dir in $mods; do
 		esac
 
 		# Exempt iff the comment block immediately above this module's
-		# require line says DOCUMENTED PIN. Any non-comment, non-blank
-		# line clears the flag, so a marker attached to some OTHER
-		# require line further up does not leak down to this one.
+		# require line says DOCUMENTED PIN. Any other non-blank line clears
+		# the flag, so a marker cannot leak to a later require line.
 		documented=$(awk -v want="$path" '
 			/^[[:space:]]*\/\// { if (index($0, "DOCUMENTED PIN")) seen = 1; next }
 			/^[[:space:]]*$/    { next }
@@ -126,10 +86,8 @@ for dir in $mods; do
 			echo "LAG  $dir: $line"
 			status=1
 		fi
-	# Fed by a HEREDOC, not `printf ... | while read`. A pipe would run the
-	# loop in a subshell, `status=1` would die with it, and the script would
-	# exit 0 having just printed LAG lines -- the exact vacuous-gate shape
-	# the exit-status check above exists to prevent, one line further down.
+	# Fed by a heredoc, not a pipe: a piped loop runs in a subshell and
+	# would lose status=1.
 	done <<EOF
 $behind
 EOF
@@ -140,18 +98,14 @@ if [ "$status" -ne 0 ]; then
 
 deps-check: a direct dependency is behind its newest release.
 
-The standing instruction (owner, 2026-09-03) is that every library sits on its
-current production release. To clear this:
+Every dependency is kept on its current release. To clear this:
 
-  1. Read the release notes. conventions/devops.md §9 and this repo's CLAUDE.md
-     both say so, and both cite cases where it mattered -- x/crypto v0.55.0 was
-     a CRITICAL CVE (#50), quic-go v0.60.0 was a FIPS capability held three
-     months (#85), x/crypto v0.56.0 was CVE-2026-56855 (#86).
+  1. Read the release notes; crypto and transport libraries have changed
+     behaviour here before.
   2. go get <module>@<version> && go mod tidy && go mod verify, per module.
-  3. If the new version does not compile and adapting it is its own task, file
-     that task and add a DOCUMENTED PIN comment above the require line naming
-     what breaks and which issue unpins it (devops.md §9). Do NOT add an
-     exclusion here.
+  3. If the new version needs work before it compiles, add a comment containing
+     DOCUMENTED PIN above the require line saying what breaks and what would
+     unpin it. Do not add an exclusion to this script.
 EOF
 	exit 1
 fi

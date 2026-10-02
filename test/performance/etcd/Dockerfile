@@ -1,6 +1,3 @@
-# Copyright 2026 go-quicraft Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license.
-#
 # Multi-stage build for QuicRaft vs etcd/raft performance benchmarks.
 #
 # Usage:

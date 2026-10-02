@@ -1,12 +1,5 @@
-# Version control
-#
-# Six Dockerfiles here COPY the whole build context (the quicraft, etcd and
-# dragonboat benchmark images and the three devcontainer images), so without
-# this .git is baked into every one of them -- 9.7M of history in a 20M tree,
-# and the complete commit history of a private repository inside images that
-# may be published. Nothing in any build reads git metadata: there is no
-# version stamping, and the only `git` in a Dockerfile is apt installing the
-# client into the devcontainer.
+# Version control. Several Dockerfiles COPY the whole build context, and no
+# build reads git metadata, so keep the history out of every image.
 .git/
 
 # Build artifacts
@@ -35,9 +28,8 @@ test/performance/openraft/target/
 go.work
 go.work.sum
 
-# Agent / AI context files. The private development workflow never enters an
-# image build context: the same list .gitattributes keeps out of every archive,
-# enforced by test/releasability (docs/release/public-releasability.md).
+# Agent and editor context files: the same list .gitattributes keeps out of
+# every archive, enforced by test/releasability.
 **/CLAUDE.md
 **/AGENTS.md
 **/.claude
@@ -45,14 +37,12 @@ go.work.sum
 .cursor/
 .codex/
 
-# Private-forge and private-release workflow: the other half of the
-# .gitattributes exclusion list. No image build reads any of them.
+# The rest of the .gitattributes exclusion list. No image build reads them.
 .github/workflows/automerge.yml
 .release-allowed-signers
 
 # Module credentials for the benchmark image builds (test/performance/README.md).
-# Six Dockerfiles COPY the whole context, so without this line the token the
-# BuildKit secret exists to keep out of every layer would be copied into every
-# layer by the COPY that precedes the secret mount. .gitignore protects git
-# only; this is the docker half, and test/buildgates pins the two together.
+# Without this, the COPY of the whole context would put the token in a layer
+# before the BuildKit secret mount. test/buildgates pins this together with
+# .gitignore.
 .devcontainer/.env

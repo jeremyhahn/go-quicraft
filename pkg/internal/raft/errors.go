@@ -198,8 +198,8 @@ var (
 	// it reaches the live leader through ordinary Replicate/Heartbeat rejections
 	// and forces a step-down — one replica with a transient storage fault
 	// deposing a healthy leader while emitting no election traffic of its own.
-	// startElection has refused this since the same defect was fixed there;
-	// TimeoutNow is the OTHER campaign entry point and needs the same bar.
+	// startElection refuses this; TimeoutNow is the OTHER campaign entry point
+	// and needs the same bar.
 	//
 	// The condition is transient: the transfer target is retried by the leader's
 	// transfer timeout, and an ordinary election timeout campaigns normally once

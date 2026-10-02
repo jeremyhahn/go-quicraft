@@ -183,7 +183,7 @@ Secondary dataset, omega, 2026-08-17:
 |--------|---------|----------|------|-----|--------|-------|-------------|-----|
 | **QuicRaft** | this tree | Go | Engine | waldb (sharded) | memdb | SyncRead, StaleRead | Yes (10K+ shards) | QUIC mTLS (always on) |
 | **etcd-io/raft** | v3.6.0 | Go | Library | User-provided | MemoryStorage | User-implemented | No | TCP mutual TLS (3N/5N only) |
-| **Dragonboat** | jeremyhahn fork v4.0.1 | Go | Engine | Tan (custom log-file DB) | N/A | SyncRead, StaleRead | Yes | TCP MutualTLS |
+| **Dragonboat** | jeremyhahn fork v4.0.1 | Go | Engine | sharded Pebble (default `sharded-pebble` LogDB) | N/A | SyncRead, StaleRead | Yes | TCP MutualTLS |
 | **OpenRaft** | 0.9.21 | Rust | Library | Disk WAL, write-only (benchmark) | BTreeMap | User-implemented | No | TCP mutual TLS, 3N/5N only (tokio-rustls) |
 
 The Dragonboat row is a fork, `github.com/jeremyhahn/dragonboat/v4`, not
@@ -291,7 +291,7 @@ See individual comparison documents for detailed analysis:
 | Feature | QuicRaft | etcd | Dragonboat | OpenRaft |
 |---------|----------|------|------------|----------|
 | Memory-Only Mode | Yes (memdb) | Yes | No | Yes (1N only) |
-| Multi-Node WAL | waldb (sharded, fsync) | File WAL (fsync) | Tan (fsync) | 16-shard WAL (bincode, fdatasync, write-only) |
+| Multi-Node WAL | waldb (sharded, fsync) | File WAL (fsync) | sharded Pebble (fsync) | 16-shard WAL (bincode, fdatasync, write-only) |
 | Built-in Transport | Yes (QUIC) | No (library) | Yes (TCP) | No (library) |
 | Built-in Encryption | AES-GCM | No | No | No |
 | Multi-Group | 10K+ shards | No | Yes | No |
@@ -407,7 +407,7 @@ entry rather than per batch, because `IStateMachine.Update` is per-entry.
 
 ### Persistence
 
-All four write and flush. QuicRaft uses real `waldb`; Dragonboat uses Tan at
+All four write and flush. QuicRaft uses real `waldb`; Dragonboat uses its default sharded Pebble LogDB at
 library defaults; the etcd harness writes entries plus hard state and calls
 `Sync()` once per ready.
 
@@ -471,7 +471,7 @@ Totals: QuicRaft 26 scenarios, Dragonboat 18, etcd 16, OpenRaft 16.
 ### Version pins
 
 `etcd/go.mod` pinned `go.etcd.io/raft/v3 v3.6.0` when this dataset was taken; the
-tree has since moved to v3.7.0 (#127), whose pointer-valued `raftpb` types
+tree has since moved to v3.7.0, whose pointer-valued `raftpb` types
 change the etcd harness's own allocation profile, so the etcd column here is
 not directly comparable to a fresh run without re-measuring (see
 `etcd/README.md`, "Baseline version"). `dragonboat/go.mod` pins
@@ -793,7 +793,7 @@ The following scenarios were only measured for QuicRaft (Dragonboat does not exp
 |--------|----------|------------|
 | **Type** | Engine (batteries-included) | Engine (batteries-included) |
 | **Transport** | QUIC with built-in mTLS | TCP with optional TLS |
-| **WAL** | waldb (16-shard, parallel fsync) | Tan (custom log-file DB, Pebble-backed) |
+| **WAL** | waldb (16-shard, parallel fsync) | sharded Pebble (default `sharded-pebble` LogDB) |
 | **State Machine** | Pluggable (in-memory and on-disk) | Pluggable (in-memory and on-disk) |
 | **Multi-Group** | 10K+ shards per host | Yes (multi-group support) |
 | **Read Path** | ReadIndex + LeaseRead | ReadIndex only |
@@ -803,7 +803,7 @@ The following scenarios were only measured for QuicRaft (Dragonboat does not exp
 
 **Transport**: QuicRaft uses QUIC with always-on mTLS. Dragonboat uses TCP with optional TLS that must be configured separately. QUIC provides 0-RTT connection establishment and multiplexed streams over a single UDP socket.
 
-**WAL Architecture**: QuicRaft's waldb distributes entries across 16 shards with parallel fsync, which benefits concurrent write workloads. Dragonboat's Tan is a Pebble-backed log-file DB optimized for sequential throughput.
+**WAL Architecture**: QuicRaft's waldb distributes entries across 16 shards with parallel fsync, which benefits concurrent write workloads. Dragonboat runs its default LogDB, Pebble sharded across instances; the harness sets no `Expert.LogDBFactory`.
 
 **Read Path**: QuicRaft supports both ReadIndex (quorum-confirmed) and LeaseRead (leader-lease-based, no network round-trip). Dragonboat supports ReadIndex only.
 <!-- END-VERBATIM test/performance/dragonboat.md -->

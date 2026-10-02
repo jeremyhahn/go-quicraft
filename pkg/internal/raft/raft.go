@@ -4778,8 +4778,8 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	// it — a healthy leader lost to a transient local storage fault, for an
 	// election that never happened.
 	//
-	// startElection has carried this bar since the identical defect was fixed
-	// there. TimeoutNow is the OTHER campaign entry point, which is why the bar
+	// startElection carries the same bar. TimeoutNow is the OTHER campaign
+	// entry point, which is why the bar
 	// is repeated here rather than left to the shared campaign() call below —
 	// the same reason every gate above it is repeated.
 	//

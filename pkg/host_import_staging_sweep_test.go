@@ -25,7 +25,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// H2: a killed import must not leave a PERMANENT plaintext state machine
+// A killed import must not leave a PERMANENT plaintext state machine
 // ---------------------------------------------------------------------------
 
 // TestStartShard_ReclaimsCrashOrphanedImportStaging is the regression guard for

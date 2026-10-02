@@ -27,8 +27,8 @@ import (
 // durable matches: an entry acknowledged by one follower must stay
 // uncommitted until the leader's own append reaches stable storage,
 // at which point the persistence-edge re-evaluation completes the
-// quorum. (C1: counting the in-memory tip allowed a commit backed by
-// only one durable copy.)
+// quorum. Counting the in-memory tip would allow a commit backed by
+// only one durable copy.
 func TestTryCommit_LeaderSelfMatchIsDurableIndex(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -84,8 +84,8 @@ func TestTryCommit_LeaderSelfMatchIsDurableIndex(t *testing.T) {
 // machine is restored from the snapshot, so entries at or below the
 // snapshot index are already represented in the recovered state; a
 // processed marker left behind would re-emit them to the apply worker
-// and double-apply them on top of the restored state. (C4: only
-// committed was advanced on the matching-log branch.)
+// and double-apply them on top of the restored state, which is what
+// happens if only committed advances on the matching-log branch.
 func TestHandleSnapshot_MatchingLogAdvancesProcessed(t *testing.T) {
 	const (
 		snapIndex = uint64(10)

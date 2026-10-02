@@ -427,7 +427,7 @@ func TestReadsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	}
 	if errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SyncRead on a latched shard timed out (%v) instead of being refused; "+
-			"this is #185 — the reader paid the deadline to learn nothing", err)
+			"the reader paid the deadline to learn nothing", err)
 	}
 	if elapsed > budget/10 {
 		t.Fatalf("SyncRead on a latched shard took %v of a %v budget; a refusal should "+
@@ -513,7 +513,7 @@ func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
 
 	if errors.Is(got.err, ErrTimeout) || errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("a read pending across the halt timed out (%v) after %v; OnShardFailed "+
-			"did not fail it, so it waited for an apply that can never come (#185)",
+			"did not fail it, so it waited for an apply that can never come",
 			got.err, got.elapsed)
 	}
 	if !errors.Is(got.err, ErrShardFailed) {
@@ -602,7 +602,7 @@ func TestReadsRacingTheLatchNeverTimeOut(t *testing.T) {
 	if timedOut > 0 {
 		t.Fatalf("%d of %d reads racing the latch timed out (%v elapsed): a read "+
 			"registered between the IsFailed check and the drain was orphaned; the "+
-			"post-registration re-check is missing (#185)", timedOut, readers, elapsed)
+			"post-registration re-check is missing", timedOut, readers, elapsed)
 	}
 	if other > 0 {
 		t.Fatalf("%d of %d reads returned something other than ErrShardFailed", other, readers)
@@ -702,7 +702,7 @@ func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the follower read never returned: with context.Background() and " +
-			"no latch check in the poll loop, this is the hang #185's second review found")
+			"no latch check in the poll loop, the read hangs")
 	}
 
 	// And one that ARRIVES after the halt is refused before the wait.

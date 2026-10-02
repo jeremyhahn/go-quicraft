@@ -135,7 +135,7 @@ func TestSavingGateQuiescesApplies(t *testing.T) {
 
 	if v := probe.violations.Load(); v != 0 {
 		t.Fatalf("Apply ran during the snapshot capture window %d times (of %d applies): "+
-			"the saving gate failed to quiesce applies — this is the C2 concurrent-map crash",
+			"the saving gate failed to quiesce applies — this is the concurrent-map crash",
 			v, probe.applies.Load())
 	}
 	if probe.applies.Load() == 0 {

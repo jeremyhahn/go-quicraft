@@ -39,7 +39,7 @@ import (
 
 // TestNewCredentials_ConsumesTheCallersPassphrase is the mutation target.
 //
-// Verified by mutation on 2026-09-03: changing NewCredentials to seal a COPY —
+// Verified by mutation: changing NewCredentials to seal a COPY —
 // `enclave.NewSealed(append([]byte(nil), secret...))` — fails here with
 //
 //	credentials_test.go:64: the caller's passphrase must be wiped by
@@ -122,8 +122,8 @@ func TestCredentials_ZeroValueMeansNoneSupplied(t *testing.T) {
 }
 
 // TestCredentials_DeferredRoundTripThroughTheByteAPI is the end-to-end half:
-// the []byte root-key pair — the surface every strategy in the portfolio
-// implements — carries a protected passphrase and still round-trips.
+// the []byte root-key pair, the surface every strategy
+// implements, carries a protected passphrase and still round-trips.
 //
 // The credential is reused across both calls on purpose. The seal layer opens
 // it, derives from it and destroys the opened copy; it never destroys the

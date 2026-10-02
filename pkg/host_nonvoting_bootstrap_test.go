@@ -28,7 +28,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M2: a witness/observer bootstrapped through the members map is a full voter
+// A witness/observer bootstrapped through the members map is a full voter
 // ---------------------------------------------------------------------------
 
 // TestStartShard_RejectsWitnessOrObserverInMembers pins the fail-closed half of
@@ -111,7 +111,7 @@ func TestStartShard_RejectsWitnessOrObserverInMembers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H2: the refusal above must not apply to a RESTART
+// The refusal above must not apply to a RESTART
 // ---------------------------------------------------------------------------
 
 // TestStartShard_NonVotingRestartWithRecoveredMembership pins the other side of

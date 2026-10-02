@@ -83,7 +83,7 @@ const membershipFormatVersion uint8 = membershipV1
 // below membershipFormatVersion the difference is negative, a negative value is
 // not representable in uint64, and the package does not compile. Bumping
 // Membership without bumping the wire version is a build error instead of a
-// review miss. The blank name is deliberate — nothing should ever READ this;
+// silent mismatch. The blank name is deliberate — nothing should ever READ this;
 // its only job is to be type-checked.
 const _ uint64 = WireVersion - uint64(membershipFormatVersion)
 

@@ -33,7 +33,7 @@ func (s *closeCounterSM) Close(ctx context.Context) error {
 	return s.mockStateMachine.Close(ctx)
 }
 
-// TestStartShard_ClosesStateMachineOnFailure is the M7 regression test. A
+// TestStartShard_ClosesStateMachineOnFailure is the regression test. A
 // StartShard that opens the state machine (acquiring its persistent
 // resources/file lock) but then fails on a LATER step must Close it, or a retry
 // on the same data directory is permanently bricked with "lock held by current

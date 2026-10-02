@@ -417,7 +417,7 @@ func TestValidateFrameHeaderVersionZeroRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L5: Frame version validation is EXACT
+// Frame version validation is EXACT
 // ---------------------------------------------------------------------------
 
 // TestValidateFrameHeaderVersionIsExact sweeps every one of the 256 values the

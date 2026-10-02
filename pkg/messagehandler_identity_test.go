@@ -63,7 +63,7 @@ func identityRig(t *testing.T, ms proto.Membership) (
 }
 
 // TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom is the
-// central regression for Part A.
+// central regression for per-member identity binding.
 //
 // The attacker is a GENUINE, authenticated member of the shard whose
 // certificate is a cluster wildcard: it covers replica 2's committed address
@@ -205,7 +205,7 @@ func TestHandleMessage_IdentitySurvivesAnAddressChange(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_MissingIdentityIsRefused pins Part B: a replica the
+// TestHandleMessage_MissingIdentityIsRefused pins that a replica the
 // configuration records NO identity for is refused, and the refusal is
 // observable in the drop reason. There is no fallback to the committed
 // address: admission requires the identity on every host with a transport.

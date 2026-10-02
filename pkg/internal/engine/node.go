@@ -188,7 +188,7 @@ type Node struct {
 	// applied when the queue reaches maxLen -- dropped messages are safe
 	// because Raft handles retransmission.
 	//
-	// After the O19 optimization, proposals are routed through proposalQ
+	// Proposals are routed through proposalQ
 	// instead. inboxQ carries only non-proposal transport messages
 	// (Replicate, Heartbeat, ReadIndex, etc.).
 	inboxQ *queue.EntryQueue[proto.Message]
@@ -1200,10 +1200,9 @@ func (n *Node) publishDiagLocked() {
 	}
 	term, committed, processed, lastIdx, msgs, state := n.peer.DiagRaftState()
 	// Publish STRUCTURED progress and format only when a caller asks for text.
-	// This used to publish the rendered DiagRemotes string, which meant an
-	// fmt.Sprintf per follower per tick for as long as diagnostics stayed
-	// enabled — paid whether or not anyone read it, and enabled permanently by
-	// the first reader.
+	// Publishing the rendered DiagRemotes string would cost an fmt.Sprintf per
+	// follower per tick for as long as diagnostics stay enabled, whether or not
+	// anyone reads it.
 	progress := n.peer.RemoteProgress()
 	n.diagSnap.Store(&diagSnapshot{
 		term:      term,

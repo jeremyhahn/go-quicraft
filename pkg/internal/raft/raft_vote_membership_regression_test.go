@@ -52,7 +52,7 @@ func newTestRaftQuiesce(replicaID uint64) *raft {
 
 // followerWithKnownLeader returns replica 2 as a follower that learned
 // leader 1 at the given term from a heartbeat, WITHOUT having voted. This
-// is the state the M1 finding turns on: term advanced by the leader, so
+// is the state this guard turns on: term advanced by the leader, so
 // r.vote is noNode while r.leaderID names a live leader.
 func followerWithKnownLeader(t *testing.T, term uint64) *raft {
 	t.Helper()
@@ -91,7 +91,7 @@ func voteResp(t *testing.T, r *raft) proto.Message {
 }
 
 // ---------------------------------------------------------------------------
-// M1: no same-term vote while a leader is known
+// No same-term vote while a leader is known
 // ---------------------------------------------------------------------------
 
 // TestRaft_VoteRequest_RejectedWhenLeaderKnownAtSameTerm asserts the
@@ -129,7 +129,7 @@ func TestRaft_VoteRequest_RejectedWhenLeaderKnownAtSameTerm(t *testing.T) {
 }
 
 // TestRaft_VoteRequest_GrantDoesNotArmVoteBlackout is the second half of
-// the M1 finding. Granting sets electionTick = 0 but leaves leaderID
+// the defect. Granting sets electionTick = 0 but leaves leaderID
 // pointing at the old leader, which re-arms dropHighTermVote and makes the
 // follower SILENTLY DISCARD every higher-term RequestVote for a full
 // election timeout. With the leader-lease already expired, a stale
@@ -178,7 +178,7 @@ func TestRaft_VoteRequest_GrantDoesNotArmVoteBlackout(t *testing.T) {
 }
 
 // TestRaft_VoteRequest_GrantedWhenNoLeaderKnown is the liveness control for
-// the M1 fix: with no leader known for the term the vote must still be
+// the guard: with no leader known for the term the vote must still be
 // granted, otherwise no election could ever complete.
 func TestRaft_VoteRequest_GrantedWhenNoLeaderKnown(t *testing.T) {
 	r := newTestRaft(2)
@@ -355,7 +355,7 @@ func TestRaft_DropHighTermVote_FollowerSilentlyDiscards(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M2: a self-removed replica must not campaign
+// A self-removed replica must not campaign
 // ---------------------------------------------------------------------------
 
 // TestRaft_SelfRemoved_DerivedFromMembership asserts the flag is derived at
@@ -414,7 +414,7 @@ func TestRaft_SelfRemoved_DerivedFromMembership(t *testing.T) {
 	}
 }
 
-// TestRaft_SelfRemoved_DoesNotCampaignOnElectionTimeout is the core M2
+// TestRaft_SelfRemoved_DoesNotCampaignOnElectionTimeout is the core
 // regression: replica 1 has been removed from a configuration that still
 // holds {2,3}. Its own quorum arithmetic counts self (quorum 2 of
 // remotes+self), so 1 real grant would "win" a term the surviving
@@ -491,9 +491,9 @@ func TestRaft_SelfRemoved_OwnVoteNotTallied(t *testing.T) {
 // TestPeer_SelfRemovedFollower_DoesNotCampaign drives the whole production
 // path: propose RemoveNode(self) on the leader, commit it, watch the leader
 // step down via checkLeaderSelfRemoval, and then confirm the resulting
-// follower never campaigns. Before the fix the stepped-down leader simply
-// started a new election at the next election timeout and could win it with
-// a single grant while {2,3} elected their own leader in the same term.
+// follower never campaigns. Without the guard the stepped-down leader would
+// start a new election at the next election timeout and could win it with
+// a single grant while {2,3} elect their own leader in the same term.
 func TestPeer_SelfRemovedFollower_DoesNotCampaign(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 
@@ -540,7 +540,7 @@ func TestPeer_SelfRemovedFollower_DoesNotCampaign(t *testing.T) {
 
 // TestPeer_ReAddedReplica_CampaignsAgain is the liveness control: a replica
 // added back to the configuration must resume campaigning, otherwise the
-// M2 guard would permanently disable a legitimate voter.
+// self-removal guard would permanently disable a legitimate voter.
 func TestPeer_ReAddedReplica_CampaignsAgain(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -664,7 +664,7 @@ func TestRaft_RebuildRemotesFromMembership_UpdatesSelfMembership(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M3: becomeLeader must clear inherited remote.active flags
+// becomeLeader must clear inherited remote.active flags
 // ---------------------------------------------------------------------------
 
 // TestRaft_BecomeLeader_ClearsStaleRemoteActivity asserts that a node
@@ -710,7 +710,7 @@ func TestRaft_BecomeLeader_ClearsStaleRemoteActivity(t *testing.T) {
 }
 
 // TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum is the
-// behavioural half of M3: a re-elected leader that hears from nobody must
+// behavioural half: a re-elected leader that hears from nobody must
 // step down at the end of its FIRST CheckQuorum window.
 func TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum(t *testing.T) {
 	r := newTestRaft(1)
@@ -741,7 +741,7 @@ func TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
-// M4: quiesce is a local setting a peer cannot impose
+// Quiesce is a local setting a peer cannot impose
 // ---------------------------------------------------------------------------
 
 // TestRaft_QuiesceMessage_IgnoredWhenDisabled asserts a node configured with

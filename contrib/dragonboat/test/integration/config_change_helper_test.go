@@ -30,8 +30,7 @@ import (
 // which errors count as a submission, which are retried, and above all that
 // "already exists" / "not found" / "stale ConfigChangeID" become a success
 // ONLY behind a submitted attempt AND a linearizable read showing the exact
-// change requested. Each rule has a test that fails when it is removed; the
-// PR that introduced them lists the mutations.
+// change requested. Each rule has a test that fails when it is removed.
 
 // scriptedAttempts returns each error in errs in turn, then the last one
 // forever, and counts the calls.

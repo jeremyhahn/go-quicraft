@@ -219,7 +219,7 @@ func readSnapshotMetaFields(t *testing.T, dir string) (epoch, index, term uint64
 	return meta.Epoch, meta.Index, meta.Term
 }
 
-// H3. The DataDir layout must be DISCOVERED, not declared.
+// The DataDir layout must be DISCOVERED, not declared.
 //
 // WithImportDataDir was documented as required whenever Config.DataDir is
 // non-empty, but nothing validated it and ImportSnapshot could not detect the
@@ -358,7 +358,7 @@ func TestImportSnapshot_RejectsDataDirContradictingTheRecord(t *testing.T) {
 	}
 }
 
-// H1. A bootstrap record written BEFORE logdb.Bootstrap.DataDir existed decodes
+// A bootstrap record written BEFORE logdb.Bootstrap.DataDir existed decodes
 // the field as "", which is indistinguishable from a shard that genuinely roots
 // its snapshot tree under the host's NodeHostDir. Reading that as PROOF was
 // wrong in both directions, and every shard bootstrapped before the field

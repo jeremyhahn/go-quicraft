@@ -2645,7 +2645,7 @@ func TestReceiveChunks_BudgetExhaustedFiresRejectedListener(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Inbound snapshot admission fairness and liveness regression tests (H3, M5)
+// Inbound snapshot admission fairness and liveness regression tests
 // ---------------------------------------------------------------------------
 
 // zeroLengthFrames returns n back-to-back zero-length chunk frame headers.
@@ -2660,7 +2660,7 @@ func zeroLengthFrames(t *testing.T, n int) []byte {
 	return buf.Bytes()
 }
 
-// TestSnapshotPerPeerSlotFairness is the H3 regression test for slot
+// TestSnapshotPerPeerSlotFairness is the regression test for slot
 // allocation: one remote address must not be able to occupy the whole global
 // snapshot-receive budget, which would silently drop every legitimate snapshot
 // to a recovering follower and leave the shard unable to restore quorum.
@@ -2702,7 +2702,7 @@ func TestSnapshotPerPeerSlotFairness(t *testing.T) {
 }
 
 // TestSnapshotPerPeerLimitFiresRejection verifies that hitting the per-peer
-// cap routes through the rejection path (M5) instead of returning silently.
+// cap routes through the rejection path instead of returning silently.
 func TestSnapshotPerPeerLimitFiresRejection(t *testing.T) {
 	sr := newSnapshotReceiver(2, 1<<20, 0, 0, newTestHandler())
 	var rejected atomic.Int64
@@ -2724,7 +2724,7 @@ func TestSnapshotPerPeerLimitFiresRejection(t *testing.T) {
 	}
 }
 
-// TestSnapshotGlobalLimitFiresRejection verifies the M5 gap on the global
+// TestSnapshotGlobalLimitFiresRejection verifies the gap on the global
 // concurrency limit: the drop was silent while the per-connection equivalent
 // warned, so an operator saw nothing when snapshots were being discarded.
 func TestSnapshotGlobalLimitFiresRejection(t *testing.T) {
@@ -2763,7 +2763,7 @@ func TestSnapshotShutdownAdmissionFiresRejection(t *testing.T) {
 	}
 }
 
-// TestReceiveChunksRejectsZeroLengthFrameFlood is the H3 regression test for
+// TestReceiveChunksRejectsZeroLengthFrameFlood is the regression test for
 // the trickle attack: a sender can declare a huge ChunkCount and emit
 // zero-length frames indefinitely, resetting the per-frame read deadline on
 // every iteration and holding its concurrency slot for years. A legitimate
@@ -2795,7 +2795,7 @@ func TestReceiveChunksRejectsZeroLengthFrameFlood(t *testing.T) {
 	}
 }
 
-// TestReceiveChunksRejectsStalledProgress is the H3 regression test for the
+// TestReceiveChunksRejectsStalledProgress is the regression test for the
 // throughput floor: a transfer that trickles bytes past the grace period is
 // aborted so it cannot occupy a concurrency slot indefinitely. The bounds are
 // shrunk on the receiver so the test does not wait out production timeouts.

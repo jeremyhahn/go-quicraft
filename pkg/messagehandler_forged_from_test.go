@@ -43,7 +43,7 @@ func (r *recordingDeliverer) RequestSnapshotRecovery(_, _ uint64, _ *engine.Node
 	return nil
 }
 
-// TestHostMessageHandler_HandleMessage_ForgedFromDropped is the H7 regression
+// TestHostMessageHandler_HandleMessage_ForgedFromDropped is the regression
 // test: msg.From is the replica ID raft counts toward election/commit quorum,
 // so it must be bound to the authenticated peer. A forged-From injection must be
 // dropped BEFORE it reaches the engine inbox — otherwise any authenticated

@@ -12,31 +12,13 @@ COVER_DIR     := $(BUILD_DIR)/coverage
 
 # Version injection.
 #
-# Two separate defences here, because renaming alone was not enough.
-#
-# 1. BUILD_VERSION, not VERSION. `VERSION` is the release-alpha ARGUMENT
-#    (`make release-alpha VERSION=vX.Y.Z-alpha`). A variable read in an
-#    immediate `:=` assignment is EXPANDED AT PARSE TIME, before any target is
-#    selected and before any recipe guard exists, so while this read was
-#    spelled $(VERSION), `make <anything> VERSION='$(shell ...)'` executed that
-#    function -- on `build`, on `release-alpha`, and on a target that does not
-#    exist at all.
-#
-# 2. `override`, because a command-line variable BEATS an ordinary makefile
-#    assignment. Renaming alone just moved the hole to the new name:
-#    `make build BUILD_VERSION='$(shell ...)'` reproduced it exactly, and so did
-#    GIT_COMMIT and BUILD_DATE, which LDFLAGS expands on the same line.
-#    `override` makes the assignment below win, so a command-line value for any
-#    of the three is discarded and never reaches an expansion.
-#
-# THE LINE THIS DRAWS, so the next reader can place a new variable correctly.
-# These three are DERIVED -- from a file, from git, from the clock. Nothing a
-# caller supplies for them could be meaningful, so they are `override`. A
-# documented knob (GO, BUILD_DIR) stays settable and is NOT covered here: naming
-# the program make should run is choosing a command on purpose, whereas
-# `VERSION=v1.2.3-alpha` looks like pure data and is the value someone copies
-# from an issue or a release note without reading it as code. The rule is that
-# no variable expanded at parse time may carry a value a caller supplies.
+# The build reads BUILD_VERSION, not VERSION: VERSION is the release target's
+# argument, and a variable read in a `:=` assignment is expanded at parse time,
+# so a command-line value such as VERSION='$(shell ...)' would execute before
+# any target runs. These values are derived (from a file, git and the clock) and
+# are `override` so a command-line value is discarded. Rule: no variable
+# expanded at parse time may carry a caller-supplied value. Tool knobs such as
+# GO and BUILD_DIR stay settable.
 override BUILD_VERSION := $(shell cat VERSION 2>/dev/null || echo "0.0.1-alpha")
 override GIT_COMMIT    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 override BUILD_DATE    := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -49,67 +31,46 @@ GOTEST        := $(GO) test -race -count=1 -v
 GOBENCH       := $(GO) test -run=^$$ -bench=. -benchmem
 GOVET         := $(GO) vet
 GOFMT         := gofmt
-# The analyser's name on PATH. Which BINARY `make lint` actually runs is
-# GOLANGCI_BIN below, which prefers the one `make install-lint` builds.
+# The analyser's name on PATH. `make lint` runs GOLANGCI_BIN, which prefers the
+# one `make install-lint` builds.
 GOLINT        := golangci-lint
-# Must match the version quality.yml installs. A different MAJOR version is not
-# a cosmetic difference: v2 moved flags (`--timeout`) and changed which linters
-# are enabled by default, so a developer and CI would gate on different rules.
+# The golangci-lint version. Every literal pin in the CI workflows and
+# devcontainer Dockerfiles must match it (check-tool-versions enforces this).
 GOLANGCI_VERSION := v2.13.2
-# Where `make install-lint` puts the analyser, and the first place `make lint`
-# looks. Repo-local so the binary this repo lints with is built by this repo's
-# Go and cannot be replaced by another project's `go install` into GOPATH/bin.
+# Where `make install-lint` puts the analyser and the first place `make lint`
+# looks. Repo-local so another project's `go install` cannot replace it.
 TOOLS_BIN     := $(CURDIR)/.tools/bin
-# The analyser `make lint` runs, resolved at use time: the repo-local build
-# first, then PATH (which is where CI's baked runner-image tool lives). Kept
-# recursive (`=`) rather than `:=` so an uninstalled tool is not a parse-time
-# failure for every other target. See the guard at check-lint-toolchain.
+# The analyser `make lint` runs: the repo-local build first, then PATH.
+# Recursive (`=`) so a missing tool is not a parse-time failure for every target.
 GOLANGCI_BIN   = $(shell if [ -x '$(TOOLS_BIN)/golangci-lint' ]; then \
 			echo '$(TOOLS_BIN)/golangci-lint'; \
 		else command -v $(GOLINT) 2>/dev/null; fi)
-# The module's own language floor. DERIVED from go.mod, hence `override` per
-# the rule above: nothing a caller supplies for it could be meaningful, and it
-# is the value the analyser's build toolchain is checked against.
+# The module's `go` directive, derived from go.mod (hence `override`). The
+# analyser's build toolchain is checked against it.
 override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod)
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 
-# gosec exclusions. Keep this list identical to the -exclude flag in
-# .github/workflows/ci.yml, and keep the reasons here so the next person does
-# not have to re-derive them:
-#   G103: unsafe calls — the proto codec is a fixed-layout zero-copy encoding
-#   G104: unhandled errors — false positive on hash.Write, which returns none
-#   G115: integer overflow on conversion — the flagged conversions sit behind an
-#         explicit bounds check on the same value (frame and entry sizes are
-#         validated against MaxFrameSize / MaxReplicationPayloadBytes first).
-#         This is NOT a blanket acceptance of overflow: a new narrowing
-#         conversion without a preceding bound is a real finding this exclusion
-#         hides, so review narrowing conversions by hand
-#   G301: directory permissions — 0755 is the intended posture for data dirs
-#   G304: file path via variable — snapshot/WAL paths are built internally from
+# gosec exclusions. Keep identical to the -exclude flag in
+# .github/workflows/ci.yml.
+#   G103: unsafe calls; the proto codec is a fixed-layout zero-copy encoding
+#   G104: unhandled errors; false positive on hash.Write, which returns none
+#   G115: integer overflow on conversion; flagged conversions follow a bounds
+#         check (MaxFrameSize / MaxReplicationPayloadBytes). This exclusion
+#         hides new unbounded narrowing conversions, so review those by hand
+#   G301: directory permissions; 0755 is intended for data dirs
+#   G304: file path via variable; snapshot/WAL paths are built internally from
 #         (shard, replica, index), never from a request
-#   G306: file write permissions — 0644 for data files; secret material is
-#         written 0600 explicitly
-#   G404: weak random — false positive. The only math/rand use is election
-#         jitter in pkg/internal/raft/raft.go, whose PRNG newRaft seeds from
-#         crypto/rand. Jitter desynchronizes campaigns; it is not a security
-#         primitive
+#   G306: file write permissions; 0644 for data files, secrets are written 0600
+#   G404: weak random; the only math/rand use is election jitter, seeded from
+#         crypto/rand, and is not a security primitive
 GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 
 # Trivy
 TRIVY         := trivy
 
-# Coverage
-#
-# COVER_MIN is the floor every coverage target enforces; the run-coverage canned
-# recipe further down is the single place the flags live.
-#
-# Two variables used to sit here — COVER_FLAGS (`-coverprofile`) and
-# COVER_EXCLUDE (`-coverpkg=./...`, a name that says the opposite of its value)
-# — and NEITHER was referenced by any target, so both are gone. -coverpkg was
-# measured before dropping it rather than wired in on the strength of the
-# variable's name: see the note on run-coverage for why passing it would loosen
-# this gate rather than tighten it.
+# Coverage floor enforced by every coverage target. The flags live in the
+# run-coverage recipe below.
 COVER_MIN     := 91
 
 # Docker
@@ -169,10 +130,8 @@ clean:
 	$(GO) clean ./...
 	rm -rf $(COVER_DIR) $(BUILD_DIR)/quicraft *.log *.test *.out *.prof .build-cache
 	rm -rf test/performance/openraft/target
-	@# test/performance/profiles/ is DATA, not build output: stored result JSON,
-	@# captured machine specifications, and the hand-written analysis.md of a
-	@# machine that is currently offline and cannot be re-measured. `clean` used
-	@# to delete the whole tree. It does not go near it now.
+	@# test/performance/profiles/ holds stored results and is not build output;
+	@# clean leaves it alone.
 	rm -f test/performance/perfcompare test/performance/perfcompare.remote
 	rm -f test/performance/cmd/perfcompare/perfcompare
 	rm -f test/performance/quicraft/*.prof test/performance/quicraft/*.test
@@ -185,10 +144,8 @@ clean:
 # run-tests: run one test-<pkg> selection, failing when it selects no tests.
 # Usage: $(call run-tests,<package pattern>[,<-run regexp>])
 #
-# `go test` passes vacuously on a -run regexp that matches no test ("no tests to
-# run") and on packages that have no test files, so a stale selection reads as a
-# green suite. The selection is listed first, with the same -race build the run
-# reuses from the cache, and an empty listing fails the target.
+# `go test` passes when a -run regexp matches nothing, so the selection is
+# listed first (same -race build, reused from cache) and an empty list fails.
 define run-tests
 	@listing=$$($(GO) test -race -list='$(or $(2),.)' $(1)) || { printf '%s\n' "$$listing"; exit 1; }; \
 	if ! printf '%s\n' "$$listing" | grep -qE '^(Test|Example)'; then \
@@ -289,9 +246,7 @@ test-crypto:
 # Integration tests (always run in devcontainer)
 # ============================================================================
 
-# Public targets: build devcontainer image and run tests inside it.
-# Build is a separate quiet step so test output is not drowned by Docker layer logs.
-# These are the targets users invoke on the host.
+# Host targets: build the devcontainer image quietly, then run the tests in it.
 
 .PHONY: integration-test
 integration-test:
@@ -319,18 +274,13 @@ integration-test-e2e:
 	docker compose -f $(INT_COMPOSE) up --build --abort-on-container-exit --exit-code-from test-runner
 	docker compose -f $(INT_COMPOSE) down -v
 
-# Internal targets: executed inside the devcontainer. Not intended for host use.
+# Internal targets, run inside the devcontainer.
 
-# -p 1 serializes package execution: each integration package spins up
-# multi-node QUIC clusters with -race, and running all four concurrently
-# in the container starves CPU enough that snapshot catch-up tests
-# (30s waits) flake. Every package is stable standalone.
+# -p 1 serializes packages: concurrent multi-node QUIC clusters under -race
+# starve the CPU and make the 30s snapshot catch-up waits flake.
 .PHONY: _integration-test
 _integration-test:
-	# 900s, not 300s: the linearizability package alone runs ~305s now that it
-	# carries the rolling-restart catch-up probe, and -p 1 means every package
-	# shares one deadline. A 300s cap failed the suite with a timeout panic and
-	# zero test failures, which reads as a product bug rather than a budget.
+	# 900s: -p 1 shares one deadline and linearizability alone takes ~305s.
 	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/...
 
 .PHONY: _integration-test-raft
@@ -356,39 +306,21 @@ integration-test-linearizability:
 _integration-test-linearizability:
 	$(GOTEST) -tags=integration -timeout=600s $(INT_TEST_DIR)/linearizability/...
 
-# CI-parity target: byte-identical to the `integration` job in
-# .github/workflows/ci.yml and the `integration` gate in release.yml. It runs
-# on the HOST, not in the devcontainer, because that is what a CI runner does —
-# `integration-test` above is the devcontainer path and is the one to use when
-# you want the container's tuned UDP buffers and pinned toolchain.
-#
-# The differences from _integration-test are deliberate and must not be
-# "harmonised" away: no -v (CI logs are already large), and -timeout=1800s
-# rather than 900s because a shared CI runner is slower than a dev box and -p 1
-# makes every package share the one deadline.
+# CI parity: identical to the `integration` job in .github/workflows/ci.yml and
+# the `integration` gate in release.yml. Runs on the host, as a CI runner does.
+# Unlike _integration-test: no -v (large logs), and 1800s because shared runners
+# are slower and -p 1 shares one deadline.
 .PHONY: ci-integration
 ci-integration:
 	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 
-# Real network partitions between LIVE replicas.
+# Network partitions between live replicas. Needs the quicraft_netfault tag,
+# which compiles the transport's send-path drop hook in. Every test asserts
+# netfault.BlockedCount() is non-zero, so a missing tag fails loudly. -p 1
+# because the injector state is process-global.
 #
-# A separate lane rather than part of ci-integration because it needs a second
-# build tag: quicraft_netfault compiles the send-path drop hook into the
-# transport, which a normal build folds away as a false constant. The suite is
-# self-guarding — every test asserts netfault.BlockedCount() is non-zero — so
-# running it with the tag missing fails loudly instead of silently exercising a
-# healthy cluster, which is exactly the defect it was written to correct.
-#
-# -p 1 for the same reason ci-integration uses it: the injector state is
-# process-global and multi-node QUIC clusters under -race starve a shared
-# runner when run concurrently.
-#
-# NETFAULT_PKGS lists every package holding a quicraft_netfault-tagged test.
-# Each package runs whole, not filtered by test name, so a netfault test cannot
-# be skipped for not matching a pattern; the untagged tests that come along
-# with it are the price (about a minute for host). The recipe refuses to run
-# when a package under $(INT_TEST_DIR) carries the tag but is missing from
-# this list, since such a package's netfault tests would otherwise never run.
+# NETFAULT_PKGS lists every package with a quicraft_netfault test. Packages run
+# whole (no -run filter); the recipe fails if a tagged package is missing here.
 NETFAULT_PKGS := $(INT_TEST_DIR)/e2e/... $(INT_TEST_DIR)/host/...
 
 .PHONY: ci-netfault
@@ -458,40 +390,29 @@ bench-crypto:
 # ----------------------------------------------------------------------------
 # Regression-grade benchmarking (release gate)
 #
-# The bench-<pkg> targets above are smoke tests: a single unreplicated run on
-# whatever machine you happen to be on. They CANNOT detect a hot-path
-# regression - run-to-run spread on a loaded dev box reaches 5x.
-#
-# bench-compare is the gate. It builds baseline and current test binaries from
-# the same toolchain, interleaves the two sides across many rounds at a fixed
-# iteration count, and compares the distributions with benchstat.
-#
-# The binaries run on this machine by default, or on PERF_HOST when set. The
-# method is identical either way; only the execution location changes. Both
-# modes are supported, including from CI.
-#
-# See docs/testing/benchmarking.md.
+# The bench-<pkg> targets above are single-run smoke tests and cannot detect a
+# regression. bench-compare builds baseline and current test binaries with the
+# same toolchain, interleaves them over many rounds at a fixed iteration count,
+# and compares the distributions with benchstat. Binaries run locally, or on
+# PERF_HOST when set. See docs/testing/benchmarking.md.
 # ----------------------------------------------------------------------------
 
 BENCH_SCRIPT   := scripts/bench-compare.sh
 
 # Git ref to compare the working tree against.
 BASELINE       ?= origin/main
-# Where the benchmark binaries execute. Unset = this machine. Set to an ssh
-# destination (user@host) to run them on a quiet, dedicated machine instead,
-# which yields tighter confidence intervals.
+# Where the benchmark binaries run: unset for this machine, or an ssh
+# destination (user@host) for a quiet dedicated host.
 PERF_HOST      ?=
-# Hot path per CLAUDE.md: append (raft log), replicate (proto codec), apply (engine).
+# Hot path: append (raft log), replicate (proto codec), apply (engine).
 BENCH_PKGS     ?= ./pkg/internal/raft/ ./pkg/internal/engine/ ./pkg/proto/
 BENCH_FILTER   ?= .
 BENCH_ROUNDS   ?= 8
 BENCH_ITERS    ?= 100000x
 BENCH_TIMEOUT  ?= 30m
 
-# $(value ...) passes these through UNEXPANDED. A benchmark filter such as
-# 'BenchmarkA$|BenchmarkB$' contains '$|', which make would otherwise expand as
-# the automatic variable for order-only prerequisites (empty), silently
-# corrupting the regex into 'BenchmarkABenchmarkB$'.
+# $(value ...) passes these through unexpanded, so a filter such as
+# 'BenchmarkA$|BenchmarkB$' keeps its '$|' instead of make expanding it.
 BENCH_ENV = BASELINE='$(value BASELINE)' PERF_HOST='$(value PERF_HOST)' \
             BENCH_PKGS='$(value BENCH_PKGS)' BENCH_FILTER='$(value BENCH_FILTER)' \
             BENCH_ROUNDS='$(value BENCH_ROUNDS)' BENCH_ITERS='$(value BENCH_ITERS)' \
@@ -501,8 +422,8 @@ BENCH_ENV = BASELINE='$(value BASELINE)' PERF_HOST='$(value PERF_HOST)' \
 bench-compare:
 	@$(BENCH_ENV) $(BENCH_SCRIPT) compare
 
-# BASELINE_REF pins the stored baseline to a committed revision (recommended:
-# a baseline recorded from a dirty tree is not reproducible).
+# BASELINE_REF pins the stored baseline to a committed revision; a baseline
+# from a dirty tree is not reproducible.
 .PHONY: bench-baseline
 bench-baseline:
 	@$(BENCH_ENV) BASELINE_REF='$(BASELINE_REF)' BASELINE_LABEL='$(BASELINE_LABEL)' \
@@ -514,30 +435,21 @@ install-benchstat:
 	$(GO) install golang.org/x/perf/cmd/benchstat@latest
 
 # ============================================================================
-# Fuzz Testing (Phase 1)
+# Fuzz Testing
 # ============================================================================
 
-# Per-target fuzzing budget for the fuzz-<pkg> targets. A duration or an
-# execution count (`FUZZ_TIME=20000x`); see ci-fuzz-mutation below for why the
-# gates use a count.
+# Per-target budget for the fuzz-<pkg> targets: a duration or an execution
+# count (`FUZZ_TIME=20000x`).
 FUZZ_TIME     ?= 60s
 FUZZ_TAGS     := -tags=quicraft_fuzz
 
-# Shell functions shared by every recipe that mutation-fuzzes.
-#
-# `go test -fuzz` accepts exactly ONE package, and its pattern must match
-# exactly ONE target in it, so no recipe can hand it a package pattern or a
-# prefix such as -fuzz=Fuzz. Each recipe instead lists the targets of one
-# package and runs them one at a time:
+# Shell functions shared by the mutation-fuzzing recipes. `go test -fuzz`
+# takes one package and a pattern matching one target, so targets run singly:
 #
 #   fuzz_targets <pkg>              prints the fuzz targets in <pkg>; fails if
 #                                   the package does not build or has none
 #   fuzz_run <pkg> <target> <flag>… mutation-fuzzes one target; -run='^$'
-#                                   skips the unit tests so the whole budget is
-#                                   spent mutating
-#
-# The listing is captured on its own so that a package that does not compile
-# fails with the Go tool's error rather than as "no fuzz targets found".
+#                                   skips the unit tests
 FUZZ_SH = \
 	fuzz_targets() { \
 		listing=$$($(GO) test $(FUZZ_TAGS) -list='^Fuzz' "$$1") || return 1; \
@@ -594,18 +506,9 @@ fuzz-raft:
 .PHONY: fuzz-all
 fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft
 
-# CI-parity target: byte-identical to the `fuzz-seeds` job in
-# .github/workflows/ci.yml.
-#
-# -run=Fuzz WITHOUT -fuzz is not fuzzing. It executes each target once per
-# f.Add seed and once per file in its testdata/fuzz/<Target>/ corpus, then
-# exits — a deterministic regression suite over every input a previous fuzzing
-# run found interesting. That is what belongs in a PR gate; the unbounded
-# search lives in .github/workflows/fuzz.yml on a nightly schedule, and in the
-# fuzz-<pkg> targets above for local use.
-#
-# ./... rather than the six fuzzing packages: a new fuzz target in a package
-# not on that list would otherwise never run.
+# CI parity: identical to the `fuzz-seeds` job in .github/workflows/ci.yml.
+# -run=Fuzz without -fuzz runs each target over its seeds and committed corpus
+# once, deterministically. Covers ./... so a new fuzz target is never missed.
 .PHONY: ci-fuzz-seeds
 ci-fuzz-seeds:
 	$(GO) test -race -count=1 $(FUZZ_TAGS) -run=Fuzz ./...
@@ -613,31 +516,15 @@ ci-fuzz-seeds:
 # ============================================================================
 # Bounded mutation fuzzing — the release gate
 #
-# This is a REGRESSION gate, not a fuzzing campaign: a short mutation budget per
-# target, enough to catch a codec change that the committed corpus does not
-# already encode. The real campaign is fuzz.yml's nightly schedule.
-#
-# It lives here rather than inline in release.yml so CI runs the target a
-# developer runs (devops.md §4), and the release gate can be reproduced locally.
-#
-# # Why the budget is an execution count, never a duration
-#
-# With `-fuzztime=<duration>` Go's fuzzing coordinator installs a deadline
-# context and can lose the race against it at shutdown, reporting a bare
-# "context deadline exceeded" AFTER the full budget has elapsed — a failure
-# that reads exactly like a crash, writes no reproducer, and is not a finding.
-# With `-fuzztime=<N>x` no deadline context exists and the run ends on an
-# explicit stop once N executions are done, so the race has no participants
-# and every failure is real. fuzz.yml carries the full analysis. -parallel=2
-# bounds the workers, which keeps several of these gates on one runner from
-# starving each other.
+# A short regression pass per target, not a search; the nightly fuzz.yml does
+# the searching. The budget is an execution count (-fuzztime=<N>x) because a
+# duration budget can end in a spurious "context deadline exceeded" at shutdown.
+# -parallel=2 keeps concurrent gates on one runner from starving each other.
 # ============================================================================
 
 FUZZ_MUT_PKGS ?= ./pkg/proto ./pkg/internal/transport ./pkg/internal/session \
                  ./pkg/internal/raft ./pkg/logdb/waldb ./pkg/seal
-# The release gate is a SMOKE gate: the nightly's depth divided by
-# FUZZ_MUT_DIVISOR. It exists to catch a target that is broken outright on a
-# tag, not to search — the nightly does the searching.
+# Each budget is the nightly's depth divided by FUZZ_MUT_DIVISOR.
 FUZZ_MUT_DIVISOR ?= 6
 
 .PHONY: ci-fuzz-mutation
@@ -677,29 +564,22 @@ ci-fuzz-mutation:
 	echo "All bounded mutation fuzz targets passed"
 
 # ============================================================================
-# ErrorFS I/O Error Injection (Phase 3)
+# ErrorFS I/O Error Injection
 # ============================================================================
 
 ERRFS_TAGS    := -tags=quicraft_errfs
 ERRFS_PKGS    := ./test/errfs/...
 GOERRFS       := $(GO) test $(ERRFS_TAGS) -race -count=1 -v
 
-# Verbose developer variant. -v is what you want when an injected-error test
-# fails, because the failure is a sequence of I/O outcomes and the test names
-# are the only way to tell which injection point produced it.
-#
-# Nothing depends on this target: ci-errfs below is the wired-in path for the
-# quicraft_errfs suite (ci-full -> ci-errfs), and this is the target you reach
-# for once something is red.
+# Verbose developer run of the quicraft_errfs suite; -v shows which injection
+# point failed. CI uses ci-errfs.
 .PHONY: errfs-waldb
 errfs-waldb:
 	$(GOERRFS) $(ERRFS_PKGS)
 
-# CI-parity target: byte-identical to the `errfs` job in
-# .github/workflows/ci.yml and the `errfs` gate in release.yml. Same suite as
-# errfs-waldb without -v. -race is kept in both: these tests drive the WAL
-# through injected I/O failures from concurrent goroutines, which is exactly
-# where a torn recovery path shows up as a race rather than a wrong answer.
+# CI parity: identical to the `errfs` job in .github/workflows/ci.yml and the
+# `errfs` gate in release.yml. -race stays on because the tests inject I/O
+# failures from concurrent goroutines.
 .PHONY: ci-errfs
 ci-errfs:
 	$(GO) test -race -count=1 $(ERRFS_TAGS) $(ERRFS_PKGS)
@@ -709,29 +589,20 @@ ci-errfs:
 # ============================================================================
 
 PERF_CMD := $(PERF_DIR)/cmd/perfcompare
-# The dragonboat comparison engine is the published fork
-# github.com/jeremyhahn/dragonboat/v4, pinned in
-# test/performance/dragonboat/go.mod. It needs no local checkout and no
-# DRAGONBOAT_SRC override.
+# The dragonboat engine is the fork github.com/jeremyhahn/dragonboat/v4, pinned
+# in test/performance/dragonboat/go.mod.
 #
-# Everything these targets store lives under a MACHINE PROFILE,
-# test/performance/profiles/<name>/, named after the machine that measured it
-# (test/performance/README.md lists the profiles on record). A
-# throughput number is a property of the machine as much as of the code, so
-# there is no profile-less place to put one.
-#
-# PERF_PROFILE is required by every target that reads or writes stored results,
-# and has no default. The name cannot be inferred from the hardware — lscpu
-# cannot tell you which of your machines is the reference desktop — so the
-# operator supplies it, and capture-env.sh derives everything else on the target.
+# Stored results live under a machine profile, test/performance/profiles/<name>/
+# (see test/performance/README.md). PERF_PROFILE is required by every target
+# that reads or writes stored results and has no default; capture-env.sh
+# records the machine's specs.
 SYSTEMS ?= all
 BENCHTIME ?= 30s
 PERF_TIMEOUT ?= 3600s
 PERF_EXTRA ?=
 PERF_PROFILE ?=
-# Systems to run, and the systems the generated documents must cover.
-# Generation refuses to run if anything named here has no results, so a profile
-# that is genuinely missing an engine is narrowed explicitly:
+# Systems to run and to cover in generated documents. Generation fails if a
+# named system has no results, so narrow it explicitly:
 #   make perf-generate PERF_PROFILE=<profile> PERF_SYSTEMS=quicraft,dragonboat,openraft
 PERF_SYSTEMS ?= all
 # ssh destination for the remote targets, e.g. PERF_HOST=user@bench-host.example.
@@ -742,23 +613,17 @@ PROFILE_DIR = profiles/$(PERF_PROFILE)
 # Internal: common perfcompare flags.
 PERF_FLAGS = --benchtime=$(BENCHTIME) --timeout=$(PERF_TIMEOUT) $(PERF_EXTRA)
 
-# Internal: module credentials for the image builds. The quicraft benchmark
-# image runs `go mod download` inside a container, and go-enclave lives on
-# Gitea, so the build needs the four variables of
-# ../handbook/software/conventions/dependency-resolution.md section 6. They
-# come from the job environment when a runner injected them; otherwise from
-# the gitignored .devcontainer/.env, which holds that section's block
-# verbatim. perfcompare turns them into the BuildKit secret the Dockerfile
-# mounts, and run-remote.sh carries them to the bench host over stdin, so the
-# token is never on a command line or in an image. Absent both, the build
-# resolves github.com/jeremyhahn/* from the public proxy only and says so.
+# Internal: module credentials (GIT_CONFIG_* variables) for the benchmark image
+# builds, from the environment or else the gitignored .devcontainer/.env.
+# perfcompare passes them as a BuildKit secret and run-remote.sh sends them over
+# stdin, so the token never appears on a command line or in an image. Without
+# them, modules resolve from the public proxy only.
 MODULE_AUTH_ENV = if [ -z "$${GIT_CONFIG_KEY_0:-}" ] && [ -f $(CURDIR)/.devcontainer/.env ]; then \
 	set -a; . $(CURDIR)/.devcontainer/.env; set +a; fi;
 # Internal: every local perfcompare invocation, credentials staged.
 PERFCOMPARE = cd $(PERF_DIR) && $(MODULE_AUTH_ENV) ./perfcompare
 
-# Internal: refuse to touch a nameless profile. Writing results into a directory
-# whose machine nobody recorded is how a number ends up uninterpretable.
+# Internal: refuse to run without a named profile.
 REQUIRE_PROFILE = @if [ -z "$(PERF_PROFILE)" ]; then \
 	echo "PERF_PROFILE is required (e.g. PERF_PROFILE=<profile>). Profiles: $$(ls $(PERF_DIR)/profiles 2>/dev/null | tr '\n' ' ')"; \
 	exit 1; fi
@@ -768,8 +633,7 @@ perf-build:
 	cd $(PERF_DIR) && $(GO) build -o perfcompare ./cmd/perfcompare/
 
 # ----------------------------------------------------------------------------
-# Ad-hoc runs. These print a terminal report and store nothing, so they need no
-# profile: nothing they produce can later be mistaken for a machine's record.
+# Ad-hoc runs: print a report, store nothing, need no profile.
 # ----------------------------------------------------------------------------
 .PHONY: perf-quicraft
 perf-quicraft: perf-build
@@ -817,9 +681,7 @@ perf-generate: perf-build
 .PHONY: perf-all
 perf-all: perf-run perf-generate
 
-# Capture a machine's specifications into a profile. With PERF_HOST it captures
-# the remote machine; without, this one. Either way the values are derived where
-# the benchmarks run, never typed in.
+# Capture a machine's specs into the profile: PERF_HOST if set, else this one.
 .PHONY: perf-env
 perf-env:
 	$(REQUIRE_PROFILE)
@@ -832,15 +694,13 @@ perf-env:
 	fi
 	@cat $(PERF_DIR)/$(PROFILE_DIR)/env.json
 
-# The whole pipeline against any machine, in one command: stage the working
-# tree, capture the target's specs, run the suite, fetch results AND env.json
-# back into profiles/<name>/, regenerate that profile's documents.
+# The whole pipeline on a remote machine: stage the tree, capture specs, run,
+# fetch results and env.json into profiles/<name>/, regenerate documents.
 #
 #   make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
 #
-# The remote run is detached, so a dropped ssh costs the tail and not the run;
-# reattach with 'test/performance/run-remote.sh wait'. Knobs: BENCHTIME,
-# PERF_TIMEOUT, PERF_SYSTEMS, BENCH_TMPDIR, REMOTE_DIR.
+# The remote run is detached; reattach with 'test/performance/run-remote.sh
+# wait'. Knobs: BENCHTIME, PERF_TIMEOUT, PERF_SYSTEMS, BENCH_TMPDIR, REMOTE_DIR.
 .PHONY: perf-remote
 perf-remote:
 	$(REQUIRE_PROFILE)
@@ -863,28 +723,11 @@ perf-remote-status:
 # Coverage
 # ============================================================================
 
-# check-coverage: extract the percentage from a coverage profile and fail if it
-# is below the threshold, if the profile does not exist, or if no percentage can
-# be read out of it.
+# check-coverage: fail if the profile is missing or empty, if no percentage can
+# be read from it, or if coverage is below COVER_MIN. Without the first two
+# checks an empty value makes the `bc` comparison error out and the gate pass.
+# `/^total:/` avoids matching functions whose names contain "total".
 # Usage: $(call check-coverage,profile.out,package-name)
-#
-# The three guards before the comparison are not defensive padding. The previous
-# version went straight to
-#
-#	COVERAGE=$$(go tool cover -func=$(1) | grep total | ...)
-#	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]
-#
-# and on an empty or missing profile COVERAGE is the empty string, `bc` fails
-# with a syntax error and prints NOTHING, so the test reads `[ -eq 1 ]`, the
-# shell reports "unary operator expected", the if takes the else branch, and the
-# gate PASSES. A coverage gate that passes precisely when it has no coverage
-# data is the failure mode the gate exists to prevent, so every way of ending up
-# without a number is now an explicit failure.
-#
-# `awk '/^total:/'` rather than `grep total`: the old filter also matched any
-# function whose name contains "total", and with more than one match `awk
-# {print $$3}` emitted two values, which lands right back in the unparseable
-# case above.
 define check-coverage
 	@if [ ! -s $(1) ]; then \
 		echo "FAIL: $(2) coverage profile $(1) is missing or empty; the test run produced no coverage data"; \
@@ -906,20 +749,8 @@ endef
 # run-coverage: measure one scope's coverage and enforce COVER_MIN on it.
 # Usage: $(call run-coverage,<label>,<package pattern>)
 #
-# Every coverage target below goes through here, so the flags a coverage run
-# needs are decided once instead of being copied twenty-three times, and a new
-# package target cannot be added with a different set by accident.
-#
-# On -coverpkg, which the dead COVER_EXCLUDE variable used to hold and which is
-# deliberately NOT passed here: it does not do what the variable's presence
-# suggests. `go test -coverprofile` already emits an entry for a package that
-# has no test file at all, at 0%, so a test-less package is ALREADY in the
-# denominator and already drags the total down — measured, not assumed: adding a
-# 270-statement package with no tests moved the module total from 91.3% to 89.7%
-# without -coverpkg. What -coverpkg adds is credit for statements covered by
-# some OTHER package's tests, which raises the same tree from 91.3% to 92.0%.
-# Against an unchanged COVER_MIN that is a 0.7-point loosening of the gate, so
-# adopting it is a threshold decision for the owner, not a wiring fix.
+# -coverpkg is deliberately not passed: packages without tests already count at
+# 0%, and -coverpkg would credit cross-package coverage and loosen the gate.
 define run-coverage
 	$(GOTEST) -coverprofile=$(COVER_DIR)/$(1).out $(2)
 	$(call check-coverage,$(COVER_DIR)/$(1).out,$(1))
@@ -929,9 +760,8 @@ endef
 coverage: | $(COVER_DIR)
 	$(call run-coverage,total,./...)
 
-# coverage-packages holds EVERY package under pkg/ to COVER_MIN, from the same
-# profile `coverage` writes, so no package can hide under the total's average.
-# CI runs the same script at COVERAGE_THRESHOLD (see ci.yml's per-package gate).
+# Holds every package under pkg/ to COVER_MIN, from the profile `coverage`
+# writes, so no package hides under the total. CI runs the same script.
 .PHONY: coverage-packages
 coverage-packages: coverage
 	scripts/check-coverage-packages.sh $(COVER_DIR)/total.out $(COVER_MIN) github.com/jeremyhahn/go-quicraft/pkg
@@ -1022,61 +852,27 @@ $(COVER_DIR):
 # ============================================================================
 # FIPS
 #
-# Three checks, deliberately named apart, because they make three different
-# claims and only two of them can fail on a non-approved primitive.
 #
-# build-fips COMPILES. It proves the tree builds under the Go Cryptographic
-# Module both with and without the `fips` tag. It produces no artifact and makes
-# no compliance claim: this module is a library with no main package, so
-# `go build` over a package pattern discards its output. GOFIPS140 is a build
-# setting and by itself never executes a cryptographic operation.
+# build-fips compiles the tree under the Go Cryptographic Module with and
+# without the `fips` tag. It runs no crypto and makes no compliance claim.
 #
-# verify-fips RUNS the code under GODEBUG=fips140=only, which rejects every
-# non-approved algorithm at the point of use. That is the compliance check, and
-# `only` rather than `on` is the whole point of it: `on` loads the module but
-# still PERMITS non-approved algorithms, so MD5, SHA-1 and arbitrary-IV AES-GCM
-# succeed and the gate reports green on exactly the thing it exists to catch.
-# Ratified by the owner (conventions/configuration.md section 5); do not weaken
-# it, and do not add exclusions to route around a failure.
+# verify-fips runs the tests under GODEBUG=fips140=only, which rejects every
+# non-approved algorithm at use. `on` would still permit MD5, SHA-1 and
+# arbitrary-IV AES-GCM, so do not weaken it or add exclusions to route around a
+# failure. The QUIC transport passes under `only` and stays inside this gate.
 #
-# verify-fips-exempt RUNS pkg/internal/transport/revocation under
-# GODEBUG=fips140=on, one notch lower, and that gap is a documented exemption
-# rather than an oversight. ONE primitive on that path is mandated by protocol
-# and lives in a dependency, so it cannot be made approved from this repository:
+# verify-fips-exempt runs pkg/internal/transport/revocation under
+# GODEBUG=fips140=on. OCSP CertID is SHA-1 by definition (RFC 6960 section
+# 4.1.1), an identifier inside golang.org/x/crypto/ocsp. Revocation Mode: crl
+# never reaches it. The exemption is recorded in
+# docs/quic-transport/architecture.md.
 #
-#   * OCSP CertID is SHA-1 by definition. RFC 6960 section 4.1.1 mandates it for
-#     issuerNameHash/issuerKeyHash, where it is an identifier and protects
-#     nothing. Inside golang.org/x/crypto/ocsp.
-#
-# It is permitted under `on`, so this target is a real gate and not a formality:
-# it proves a `-tags fips` build of the revocation checker still passes its
-# suite, and that nothing OTHER than the CertID hash on that path is
-# non-approved.
-#
-# QUIC PACKET PROTECTION USED TO BE THE SECOND EXEMPTION AND IS NOT ANY MORE.
-# quic-go v0.60.0 (go-quicraft#85) routes packet AEADs through Go's TLS 1.3
-# AES-GCM implementation instead of the general cipher.NewGCM -- see
-# internal/handshake/cipher_suite.go, which dispatches to
-# aeadAESGCMTLS13FIPS140 when the module is active. The whole
-# pkg/internal/transport tree therefore passes under fips140=only, and it is
-# INSIDE the approved-only gate. Do not move it back out; if it goes red, the
-# failure is the finding.
-#
-# The split is a partition, not a hole: verify-fips is a deny-list of exactly
-# the one tree verify-fips-exempt then runs, so a package added tomorrow is
-# inside the approved-only gate by default rather than silently outside every
-# gate. test/buildgates/fips_gate_test.go fails if that stops being true.
-#
-# So: `-tags fips` makes go-quicraft FIPS at rest AND on the wire — the seal
-# layer, the WAL, snapshots and the QUIC transport execute only approved
-# primitives and are proven to. The residual is one SHA-1 identifier on the OCSP
-# path, and a deployment that configures revocation Mode: crl never reaches it.
-# docs/quic-transport/architecture.md carries the citation as the exemption
-# record.
+# verify-fips excludes exactly the tree verify-fips-exempt runs, so a new
+# package is inside the approved-only gate by default
+# (test/buildgates/fips_gate_test.go enforces this).
 # ============================================================================
 
-# The one package tree outside the approved-only gate, and the exact tree
-# verify-fips-exempt covers instead. See above.
+# The one package tree outside the approved-only gate.
 FIPS_EXCLUDED := github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation
 
 .PHONY: build-fips
@@ -1103,37 +899,19 @@ verify-fips-exempt:
 # ============================================================================
 
 .PHONY: ci
-# nancy is intentionally NOT in this list: it requires OSS Index credentials
-# and fails closed without them, and govulncheck + trivy already cover Go
-# dependency vulnerabilities. Run `make nancy` explicitly where credentials
-# are configured. This is not a reduction in coverage — with a 401 the scan
-# was never running, it was only reporting that it had.
+# nancy is not included: it needs OSS Index credentials, and govulncheck and
+# trivy cover the same ground. Run `make nancy` where credentials exist.
 ci: fmt no-mutants check-tool-versions vet lint security build test
 	@echo "CI pipeline passed"
 
 # ============================================================================
 # Analyser-version guard
 #
-# GOLANGCI_VERSION is the single source of truth, but the CI workflows and
-# devcontainer Dockerfiles cannot read a make variable — ci.yml, release.yml
-# (each installing it independently since quality.yml was retired,
-# go-quicraft#22) and the two devcontainer Dockerfiles each carry a literal
-# pin. They had once drifted to THREE different versions at once
-# (Makefile/quality.yml v2.12.2, .devcontainer/Dockerfile v2.11.1,
-# Dockerfile.dev and install-tools v2.7.2), which is the failure mode
-# the remote-tools comment describes: an analyser of the wrong version is worse
-# than none, because it gates on a different rule set while looking like it
-# passed. golangci-lint v2 also moved flags and changed which linters are on by
-# default, so this is not cosmetic drift.
-#
-# Mechanical rather than a matter of remembering, for the same reason
-# no-mutants is. The floor matters: a discovery that finds nothing must fail,
-# or a renamed file silently turns this into a gate over an empty set.
-#
-# The literal pins are only half of it. A version pin says WHICH ANALYSER, not
-# WHICH GO BUILT IT, and the second half is invisible to any amount of grepping
-# — so check-lint-toolchain below inspects the installed binary itself. That
-# gap cost a CI round trip in #118; the two checks together are the gate.
+# The CI workflows and devcontainer Dockerfiles carry literal golangci-lint
+# pins because they cannot read a make variable. This fails if any pin differs
+# from GOLANGCI_VERSION, since an analyser of another version gates on a
+# different rule set. Finding no pins at all is also a failure.
+# check-lint-toolchain covers the other half: which Go built the binary.
 # ============================================================================
 .PHONY: check-tool-versions
 check-tool-versions: check-lint-toolchain
@@ -1160,36 +938,11 @@ check-tool-versions: check-lint-toolchain
 # ============================================================================
 # Analyser build-toolchain guard
 #
-# A version pin constrains WHICH ANALYSER, not WHICH GO BUILT IT — and an
-# analysis tool built by an older Go cannot analyse a module targeting a newer
-# one. When go.mod moved to `go 1.27.0` (#83), every locally installed
-# golangci-lint refused the module before reading a line of source:
-#
-#   Error: can't load config: the Go language version (go1.26) used to build
-#   golangci-lint is lower than the targeted Go version (1.27.0)
-#
-# and staticcheck failed differently, choking on the 1.27 standard library
-# ("unknown field rfd in struct literal of type splicePipe").
-#
-# CI never saw it. The runner image bakes v2.13.2 built with its own 1.27
-# toolchain and passes; the identically-versioned release binary in ~/go/bin
-# was built with go1.26.2 and refuses. Same version string, opposite outcome —
-# which is exactly why the literal-pin check above could not see it, and why
-# nobody could lint before pushing. Lint findings then surfaced only after a
-# full CI round trip on a contended runner pool (#117 burned a cycle on a
-# one-line ST1023 a five-second local run would have caught).
-#
-# So the guard reads the build toolchain out of the binary's own self-report
-# ("built with go1.26.2") and compares it to the module's `go` directive, and
-# `make lint` runs $(GOLANGCI_BIN) rather than whatever PATH offers first.
-# A mismatch prints what to run; the alternative is a developer meeting the
-# analyser's own version-comparison error with no idea what produced it.
-#
-# staticcheck gets NO guard of its own, deliberately: it runs as a
-# golangci-lint linter (.golangci.yml `linters.enable`), never as a standalone
-# binary — nothing in this Makefile or under .github/ invokes it directly. A
-# second guard would gate a tool this repository does not run. Installing the
-# analyser with a 1.27 toolchain fixes its half of #118 along with the rest.
+# An analyser built by an older Go cannot analyse a module targeting a newer
+# one, even at the pinned version. This reads the build toolchain from the
+# binary's `--version` output ("built with goX.Y.Z"), compares it to the
+# module's `go` directive, and prints the fix on a mismatch. staticcheck runs
+# inside golangci-lint, so it needs no separate guard.
 # ============================================================================
 .PHONY: check-lint-toolchain
 check-lint-toolchain:
@@ -1241,17 +994,9 @@ check-lint-toolchain:
 # ============================================================================
 # Full CI pipeline, including every build-tagged suite.
 #
-# `ci` above stops at `test`, which is `go test ./...` with NO build tags. The
-# Go toolchain does not warn when a build constraint excludes a file — it just
-# compiles a smaller program — so that quietly skipped 147 integration tests,
-# 21 errfs fault-injection tests and 35 fuzz targets, and it computed the 91%
-# coverage threshold over what was left.
-#
-# ci-full is the target that matches what .github/workflows/ci.yml now runs.
-# `ci` is kept as the fast inner loop; ci-full is what to run before opening a
-# PR and what to reproduce a red CI run with. The tagged suites come LAST
-# because they are the slow ones (~10 min, dominated by ci-integration) and
-# there is no reason to pay for them when gofmt is going to fail anyway.
+# `ci` runs untagged tests only, which silently skips the integration, errfs,
+# netfault and fuzz suites. ci-full matches .github/workflows/ci.yml; run it
+# before opening a PR. The slow tagged suites run last.
 # ============================================================================
 
 .PHONY: ci-full
@@ -1262,35 +1007,20 @@ ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci
 # ============================================================================
 # Heavyweight test offload to a remote build host
 #
-# Every test target here runs under `-race` (see GOTEST), and ci-integration
-# stands up multi-node QUIC clusters. On a developer workstation that is also
-# running editors, browsers and other agents, that is enough contention to make
-# the 30-second catch-up waits in the snapshot tests flake — the failures are
-# environmental, they look like raft defects, and chasing them has cost real
-# days (see the CI runner-contention and load-generator incidents).
-#
-# Point REMOTE_HOST at a machine with spare capacity — ideally the one CI
-# already executes on, so a local failure and a CI failure mean the same thing.
-# There is no default host: the target refuses to run without one rather than
-# reaching for somebody else's machine.
+# The -race suites and multi-node integration clusters are sensitive to load; on
+# a busy workstation the 30-second snapshot catch-up waits can flake. These
+# targets run any target on REMOTE_HOST instead. There is no default host.
 #
 #   make remote-ci-full REMOTE_HOST=build-host.example        # the full gate, off-box
 #   make remote-test REMOTE_HOST=build-host.example           # remote-<target> runs <target> there
 #   make remote-integration-test REMOTE_HOST=build-host.example REMOTE_USER=ci
 #
-# REMOTE_USER is optional (ssh's own default, or ~/.ssh/config, applies when it
-# is empty); REMOTE_WORKDIR is where the tree lands on the host. It is not
-# called REMOTE_DIR because test/performance/run-remote.sh already reads that
-# name from the environment for the benchmark staging directory.
+# REMOTE_USER is optional. REMOTE_WORKDIR is where the tree lands; it is not
+# named REMOTE_DIR because test/performance/run-remote.sh already uses that.
+# `remote-sync` is an explicit rule, so it wins over the remote-% pattern.
 #
-# The pattern rule means no target needs enrolling by hand. `remote-sync` is an
-# explicit rule, so it wins over the pattern and does not recurse.
-#
-# --delete keeps the remote tree an exact mirror, so a file deleted locally
-# cannot linger there and turn a broken build green. .git is excluded
-# deliberately: this ships the WORKING TREE, including uncommitted edits, which
-# is the whole point during development, and it means nothing on the remote can
-# perform a git operation against this repository's history.
+# rsync --delete keeps the remote tree an exact mirror. .git is excluded: the
+# working tree, including uncommitted edits, is what ships.
 # ============================================================================
 
 REMOTE_HOST    ?=
@@ -1298,14 +1028,9 @@ REMOTE_USER    ?=
 REMOTE_WORKDIR ?= ~/ci/go-quicraft
 # The ssh destination: user@host when REMOTE_USER is set, the bare host otherwise.
 REMOTE_DEST     = $(if $(REMOTE_USER),$(REMOTE_USER)@)$(REMOTE_HOST)
-# The host keeps its toolchain in ~/sdk and its go-installed tools in ~/go/bin;
-# a non-interactive ssh does not source the profile that would add them.
-#
-# The toolchain is the one go.mod's `go` directive names, installed the
-# golang.org/dl way (`go install golang.org/dl/go<ver>@latest && go<ver>
-# download`, which unpacks into ~/sdk/go<ver>). The directive is what CI pins
-# GO_VERSION to as well. A host without that SDK is refused rather than left to
-# whatever `go` its PATH happens to hold.
+# The remote PATH, which a non-interactive ssh does not set up. The toolchain is
+# the go.mod `go` directive version installed via golang.org/dl into
+# ~/sdk/go<ver>; a host without it is refused.
 REMOTE_GO_SDK   := $$HOME/sdk/go$(GO_DIRECTIVE)
 REMOTE_ENV_PATH := test -x $(REMOTE_GO_SDK)/bin/go || { \
 	echo "remote host has no $(REMOTE_GO_SDK): install go$(GO_DIRECTIVE) with golang.org/dl" >&2; exit 1; }; \
@@ -1329,32 +1054,18 @@ remote-sync:
 	@rsync -az --delete $(RSYNC_EXCLUDE) ./ $(REMOTE_DEST):$(REMOTE_WORKDIR)/
 	@echo "synced working tree to $(REMOTE_DEST):$(REMOTE_WORKDIR)"
 
-# remote-<target>: sync, then run <target> on REMOTE_HOST. Output is streamed
-# back, so a failure reads exactly as it would locally.
+# remote-<target>: sync, then run <target> on REMOTE_HOST, streaming output.
 .PHONY: remote-%
 remote-%: remote-sync
 	@echo "==> running 'make $*' on $(REMOTE_HOST)"
 	@$(REMOTE_SSH) '$(REMOTE_ENV_PATH); cd $(REMOTE_WORKDIR) && make $*'
 
-# One-time (or after a toolchain bump) provisioning of the scanners the remote
-# host does not ship with. Kept separate from remote-sync so the common path
-# stays fast.
+# Install the scanners on the remote host (once, or after a toolchain bump).
+# Tools are installed unconditionally so a stale binary already on PATH is
+# replaced; golangci-lint is pinned to GOLANGCI_VERSION.
 #
-# Every tool is installed UNCONDITIONALLY, not "if absent". The first remote
-# host had a v1 golangci-lint AND a years-old gosec on PATH, so `command -v`
-# guards skipped both installs: `make lint` died on `unknown flag: --timeout`
-# (v2 moved it) and `make gosec` died printing its usage, because the old
-# binary has no -exclude-dir and a rule set predating G115/G306.
-#
-# An analyser of the wrong version is worse than none. It gates on a different
-# rule set from CI while looking like it passed — the precise failure mode this
-# repository's review keeps turning up. golangci-lint is pinned to the version
-# quality.yml installs; gosec and govulncheck follow quality.yml's @latest.
-#
-# FORGE_SSH_HOST names a private forge that a global insteadOf on the remote
-# host rewrites module fetches to; its host key is seeded alongside
-# github.com's. There is no default: leave it empty when modules resolve from
-# the public proxy and github.com alone.
+# FORGE_SSH_HOST optionally names a private forge that the remote host's git
+# insteadOf rewrites module fetches to; its host key is seeded with github.com's.
 FORGE_SSH_HOST ?=
 FORGE_SSH_PORT ?= 22
 
@@ -1369,11 +1080,8 @@ remote-tools:
 			https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
 			| sh -s -- -b $$HOME/go/bin >/dev/null; \
 		echo "remote tools ready ($(GOLANGCI_VERSION))"'
-	@# ci-modules builds test/performance/dragonboat, which requires
-	@# github.com/jeremyhahn/dragonboat. A global insteadOf may rewrite that to
-	@# a forge over ssh, so the module download fails with "Host key
-	@# verification failed" until the host key is known -- an error that reads
-	@# like a missing repository rather than a missing known_hosts entry.
+	@# Seed known_hosts so module fetches rewritten to ssh do not fail with
+	@# "Host key verification failed".
 	@$(REMOTE_SSH) 'mkdir -p $$HOME/.ssh && chmod 700 $$HOME/.ssh; \
 		for hk in $(if $(FORGE_SSH_HOST),"-p $(FORGE_SSH_PORT) $(FORGE_SSH_HOST)") "github.com"; do \
 			ssh-keyscan $$hk 2>/dev/null >> $$HOME/.ssh/known_hosts; \
@@ -1386,33 +1094,19 @@ remote-tools:
 # ============================================================================
 # Multi-module build
 #
-# This repository is not one Go module: contrib/dragonboat and the benchmark
-# harnesses under test/performance/ are separate modules that require or
-# `replace` the root. Building only the root let a root-module change break a
-# sibling silently — contrib/dragonboat sat broken because its `go` directive
-# was below what the parent it replaces requires, and nothing built it.
+# contrib/dragonboat and the harnesses under test/performance/ are separate
+# modules that require or replace the root, so a root change can break them.
+# Every go.mod is discovered from the tree, skipping what the go command ignores
+# (names starting with `.` or `_`, and testdata). `git ls-files` is not used
+# because remote-% ships the tree without .git. Mirrors the `modules` job in
+# .github/workflows/ci.yml.
 #
-# The list is DISCOVERED from the tree rather than written down here, so a new
-# go.mod is enrolled the moment it appears. Mirrors the `modules` job in
-# .github/workflows/ci.yml, which discovers the same way.
+# GOWORK=off (exported below) matters: in a workspace the modules would resolve
+# the root through it rather than their own require/replace directives.
 #
-# Discovery skips the directories the go command itself ignores: names that
-# begin with `.` or `_`, and testdata. That keeps .git, .tools, .build-cache and
-# the agent worktrees under .claude/ (each a full checkout with its own go.mod
-# files) out of the list. `git ls-files` is not used because remote-% ships the
-# tree without .git.
-#
-# GOWORK=off (exported at the bottom of this file) is load-bearing: inside a
-# workspace these modules resolve the root through the workspace instead of
-# through their own require/replace directives, and the `go` directive mismatch
-# this target exists to catch does not reproduce.
+# Every module is attempted even after a failure, so one broken module cannot
+# hide another.
 # ============================================================================
-
-#
-# Every module is attempted even after one fails, mirroring `fail-fast: false`
-# on the CI matrix: one broken sibling must not hide a second one. Stopping at
-# the first failure is how contrib/dragonboat's breakage masked the identical
-# breakage in three test/performance modules.
 .PHONY: ci-modules
 ci-modules:
 	@rc=0; \
@@ -1434,9 +1128,8 @@ ci-modules:
 # Linting and static analysis
 # ============================================================================
 
-# Runs the analyser resolved by GOLANGCI_BIN, NOT the first golangci-lint on
-# PATH, and only after check-lint-toolchain has established that the binary can
-# actually analyse this module (#118).
+# Runs the analyser resolved by GOLANGCI_BIN, after check-lint-toolchain has
+# confirmed it can analyse this module.
 .PHONY: lint
 lint: check-lint-toolchain
 	$(GOLANGCI_BIN) run --timeout=5m ./...
@@ -1448,22 +1141,10 @@ vet:
 # ============================================================================
 # Mutation-marker guard
 #
-# Mutation testing is how correctness is verified in this repository: a fix is
-# not trusted until the defect it closes has been re-introduced and the test
-# seen to fail. That workflow edits PRODUCTION code and relies on restoring it
-# afterwards -- and a restore that never happens is invisible, because a
-# disabled guard makes tests pass, not fail.
-#
-# It has already happened once. A `if false {` around the rollback fsync in
-# waldb reached a commit: a failed SaveState whose bytes had reached the medium
-# through ordinary writeback could be resurrected by a crash and replayed as
-# committed entries the caller had been told were REJECTED. Every suite stayed
-# green, because the site had no test -- which is precisely why it was being
-# mutated.
-#
-# So the guard is mechanical rather than a matter of remembering. Test files are
-# excluded: `if false` is legitimate there (pinning a compile-time branch), and
-# a mutation left in a test file cannot silently weaken production behaviour.
+# Mutation testing edits production code to confirm a test fails, and an
+# unrestored mutation keeps tests green while disabling a guard. This fails on
+# `if false {`, MUTANT or MUTATION in non-test Go files. Test files are excluded
+# because `if false` is legitimate there.
 # ============================================================================
 .PHONY: no-mutants
 no-mutants:
@@ -1494,77 +1175,42 @@ fmt:
 # Security scanning
 # ============================================================================
 
-# Comprehensive security target - the full devops.md §8 suite.
-#
-# gosec + govulncheck + go mod verify + trivy fs. `trivy-image` is NOT a
-# prerequisite here: it builds the devcontainer image, which is slow and needs
-# a Docker daemon. Run `make trivy-image` explicitly when an image changes.
+# gosec, govulncheck, go mod verify and trivy fs. trivy-image is excluded
+# because it builds the devcontainer image and needs Docker; run it explicitly.
 .PHONY: security
 security: gosec vuln modverify trivy
 	@echo "All security scans passed"
 	@echo "Note: container images are scanned separately -- run 'make trivy-image'"
 
 .PHONY: modverify
-# Module integrity against go.sum (devops.md §8). Catches a tampered or
-# corrupted module cache before any of the scanners read it.
+# Verify the module cache against go.sum before the scanners read it.
 modverify:
 	$(GO) mod verify
 
 .PHONY: deps-check
-# Fail when a DIRECT dependency of any module here is behind its newest release
-# (#86). This is the freshness watcher; `deps-latest` beside it is the
-# first-party UPDATER, and they are not the same thing -- deps-latest only ever
-# looks at github.com/jeremyhahn/*, which is why six third-party dependencies
-# drifted a release or more without anything noticing.
-#
-# NOT a prerequisite of `security`, and not in ci.yml's gate. A dependency
-# publishing a release does not make this commit wrong, and a push-path gate
-# that fails for something no one in the PR did trains people to ignore it. It
-# runs in nightly.yml, which is the channel that actually caught the last two
-# (#50's CVE and #85's FIPS fix) -- see the script header for why this had to be
-# built on the Gitea plane rather than left to .github/dependabot.yml.
-#
-# Run it by hand any time; it needs only a go toolchain and network.
+# Fail when a direct dependency of any module here is behind its newest
+# release. deps-latest, by contrast, only updates github.com/jeremyhahn/*.
+# Runs nightly rather than in the push gate, since an upstream release does not
+# make a commit wrong. Needs only a go toolchain and network.
 deps-check:
 	@./scripts/deps-check.sh
 
 .PHONY: gosec
-# Deliberately scans MORE than the CI job does. ci.yml excludes test/, and
-# contrib/ wholesale; this excludes only test/performance (separate modules
-# that never ship). A finding here that CI would not report is still a real
-# finding — do not narrow this to match CI.
+# Scans more than the CI job: only test/performance (separate modules that
+# never ship) is excluded. Do not narrow this to match CI.
 gosec:
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
 
 .PHONY: vuln
-# Fails the build on any vulnerability govulncheck finds reachable from our
-# code. It previously swallowed a non-zero exit into a WARNING, which meant a
-# real finding printed a message and PASSED — a security gate that cannot fail
-# is not a gate. If a stdlib vulnerability is genuinely unfixable without a Go
-# upgrade, record that decision explicitly rather than hiding it here.
+# Fails on any reachable vulnerability govulncheck finds. Record any accepted
+# exception explicitly rather than hiding it here.
 vuln:
 	$(GOVULNCHECK) ./...
 
 .PHONY: trivy
-# Scoped to what actually ships. test/performance/* are SEPARATE modules with
-# their own go.mod, pulled in only to benchmark against dragonboat and etcd, so
-# their transitive CVEs (x/net, x/crypto/ssh, x/text via dragonboat) never
-# reach a consumer of this library — `go get github.com/jeremyhahn/go-quicraft`
-# does not fetch them. .build-cache is a local build artifact. Excluding them
-# is what makes this gate mean "the shipped library is clean" rather than
-# failing permanently on benchmark tooling and training everyone to ignore it.
-#
-# A missing binary FAILS rather than skipping. This target used to print
-# "trivy not installed, skipping fs scan" and return success, so `make security`
-# announced "All security scans passed" with one of its four scanners absent —
-# and that is exactly what happened on the remote test host, silently, until the
-# tool inventory was printed. `vuln` and `nancy` were both hardened against this
-# same shape earlier ("a security gate that cannot fail is not a gate"); trivy
-# was left behind.
-#
-# The nancy reasoning does NOT transfer here. nancy may skip because govulncheck
-# and trivy cover the same ground; nothing else in the suite scans for leaked
-# secrets, so a skipped trivy is a real hole rather than a redundant one.
+# Scoped to what ships: test/performance/* are separate benchmark modules that
+# consumers never fetch, and .build-cache is a local artifact. A missing binary
+# fails rather than skips, because trivy is the only secret scanner here.
 trivy:
 	@if ! command -v $(TRIVY) >/dev/null 2>&1; then \
 		echo "FAIL: trivy is not installed, so the dependency-CVE and secret scan"; \
@@ -1575,9 +1221,8 @@ trivy:
 	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
 		--skip-dirs .build-cache --skip-dirs test/performance .
 
-# Scans the images this repo builds locally: the devcontainer dev image and the
-# integration image. Neither is built in CI, so this is the only gate they get
-# -- run it when either Dockerfile or its base image changes.
+# Scans the locally built devcontainer image. CI does not build it, so run this
+# when a Dockerfile or its base image changes.
 .PHONY: trivy-image
 trivy-image: docker-build
 	@if command -v $(TRIVY) >/dev/null 2>&1; then \
@@ -1586,17 +1231,11 @@ trivy-image: docker-build
 		echo "trivy not installed, skipping image scan (install: make install-trivy)"; \
 	fi
 
-# Nancy scans go.sum for known vulnerable dependencies
-# Note: nancy requires Sonatype OSS Index API access. If it fails, govulncheck
-# provides similar coverage for Go module vulnerabilities.
+# Nancy scans dependencies against Sonatype OSS Index, which needs credentials
+# (~/.oss-index-config or OSSI_USERNAME / OSSI_TOKEN). An installed nancy fails
+# closed on findings or errors; a missing one is skipped because govulncheck and
+# trivy cover the same ground.
 .PHONY: nancy
-# nancy exits non-zero BOTH when it finds vulnerabilities and when it cannot
-# reach OSS Index, so the previous `|| echo "scan completed"` reported success
-# for a real CVE, an expired credential, and a network failure alike. It now
-# fails closed. Not-installed is still a legitimate skip, because govulncheck
-# and trivy cover the same ground; an installed-but-failing nancy is not.
-# OSS Index requires credentials (~/.oss-index-config or OSSI_USERNAME /
-# OSSI_TOKEN); a 401 will now stop the build rather than pass silently.
 nancy:
 	@if command -v nancy >/dev/null 2>&1; then \
 		$(GO) list -json -m all | nancy sleuth --quiet; \
@@ -1604,18 +1243,8 @@ nancy:
 		echo "nancy not installed, skipping (govulncheck and trivy cover this)"; \
 	fi
 
-# Generate SARIF reports for all security tools (for CI integration).
-#
-# Both tools previously ended in `|| true`, so this target reported success for
-# a CRITICAL finding, an unparsable config and a missing binary alike — a CI job
-# that gates on this target could never fail, exactly the vacuous-gate pattern
-# `security` (gosec/vuln/trivy) was already fixed for.
-#
-# It now fails closed on findings while still WRITING the SARIF files, which is
-# the whole point of the target: each tool's exit status is captured, the report
-# is left on disk for the CI uploader, and the target exits non-zero afterwards.
-# Trivy is scoped identically to the `trivy` gate so the two agree on what
-# "clean" means.
+# Write gosec and trivy SARIF reports, then exit non-zero if either reported
+# findings or failed. Trivy is scoped the same as the `trivy` target.
 .PHONY: security-sarif
 security-sarif:
 	@mkdir -p $(BUILD_DIR)
@@ -1650,29 +1279,14 @@ install-trivy:
 install-nancy:
 	$(GO) install github.com/sonatype-nexus-community/nancy@latest
 
-# golangci-lint is installed at $(GOLANGCI_VERSION), not at a second hardcoded
-# version. This recipe said v2.7.2 while GOLANGCI_VERSION and quality.yml said
-# v2.12.2, so a developer who ran `make install-tools` and then `make lint`
-# gated against a different rule set from CI while looking like they had passed
-# the same gate. That is the exact failure remote-tools was hardened against —
-# see the note above it: an analyser of the wrong version is worse than none.
-# `make check-tool-versions` now enforces this mechanically.
-#
-# It installs golangci-lint by delegating to install-lint rather than fetching
-# a release binary through install.sh. The published binaries are built by the
-# upstream project's own Go, which is how a correctly pinned analyser came to
-# be built with go1.26.2 and refused this 1.27 module (#118). `go install`
-# builds it with the toolchain that is about to lint with it, so the two can
-# never disagree.
+# golangci-lint comes from install-lint, which builds it with the local Go
+# rather than downloading a release binary built by an older toolchain.
 .PHONY: install-tools
 install-tools: install-gosec install-govulncheck install-trivy install-nancy install-lint
 	@echo "All CI tools installed ($(GOLANGCI_VERSION))"
 
-# Builds the pinned analyser WITH THIS REPO'S GO and puts it where `make lint`
-# looks first, which is the whole point: `go install` compiles it against the
-# toolchain running the install, so its language version is by construction at
-# least the module's `go` directive. Installing into $(TOOLS_BIN) rather than
-# GOPATH/bin keeps it out of reach of every other project's `go install`.
+# Builds the pinned analyser with this repo's Go into $(TOOLS_BIN), where
+# `make lint` looks first.
 .PHONY: install-lint
 install-lint:
 	@echo "==> golangci-lint $(GOLANGCI_VERSION), built with $$($(GO) env GOVERSION), into $(TOOLS_BIN)"
@@ -1814,7 +1428,7 @@ help:
 	@echo "  vet                    Run go vet"
 	@echo "  fmt                    Check gofmt formatting"
 	@echo ""
-	@echo "Security (devops.md §8):"
+	@echo "Security:"
 	@echo "  security               Full suite: gosec, govulncheck, go mod verify, trivy fs"
 	@echo "  gosec                  Run gosec security scanner"
 	@echo "  vuln                   Run govulncheck vulnerability scanner"
@@ -1840,151 +1454,57 @@ help:
 	@echo "  docker-test                    Run unit tests in devcontainer"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
-# Builds never resolve through a workspace: modules come from published tags.
-# Immunizes against stray go.work files.
+# Builds never resolve through a workspace; this ignores stray go.work files.
 export GOWORK=off
 
 # ---------------------------------------------------------------------------
-# Release plumbing — software/templates/make/release-alpha.mk (template v2.3.3).
+# Release
 #
-# The v1 recipe this replaces auto-incremented PATCH only (so an API addition
-# shipped labelled as a bugfix, and a breaking pre-1.0 MINOR could not be cut at
-# all -- v0.9.0-alpha had to be tagged by hand), created LIGHTWEIGHT UNSIGNED
-# tags as the OWNER's local git identity, pushed EVERY local tag with --tags,
-# and let `|| true` swallow a failed VERSION commit so a tag could disagree with
-# its own VERSION file. None of it failed loudly (#42, #44).
-#
-# v2 contract: the version is EXPLICIT -- `make release-alpha VERSION=vX.Y.Z-alpha`
-# -- because release-versioning.md decides patch-vs-minor and the recipe refuses
-# to guess; every git write goes through agent-git.sh for identity and SSH
-# signing; the tag is ANNOTATED; only the release commit and the one named tag
-# are pushed, atomically; and there is no `|| true` anywhere, so any failing
-# step aborts BEFORE the tag exists.
-#
-# NOTE, repo-specific: VERSION used to double as this Makefile's build-metadata
-# variable, expanded at parse time into LDFLAGS. That made every settable
-# `VERSION=` value a parse-time expansion -- a command-injection vector that no
-# guard in this recipe could reach, because it fired before target selection.
-# The build metadata now reads BUILD_VERSION (top of file) and VERSION belongs
-# to this target alone. A bare `make release-alpha` therefore finds VERSION
-# UNSET and stops on the first guard with the message that names the fix.
-#
-# SUBMODULE_TAGS is gone with the v1 recipe: it was empty in this repo, so the
-# tag loop it drove was dead code, and the nested modules under contrib/ and
-# test/ are not published for consumption.
+# `make release-alpha VERSION=vX.Y.Z-alpha` or `make release VERSION=vX.Y.Z`.
+# The version is explicit; the recipe never guesses. Every git write goes
+# through AGENT_GIT for identity and SSH signing, the tag is annotated, only the
+# release commit and its tags are pushed (atomically), and any failing step
+# aborts before anything is pushed.
 # ---------------------------------------------------------------------------
 
-# IDENTITY. The recipe's central claim is that every release git write goes
-# through agent-git.sh as agent-go-quicraft, signed. As plain `?=` variables
-# that claim was falsifiable from the command line: `make release-alpha
-# VERSION=v0.9.1-alpha AGENT_GIT=/path/to/anything REPO_NAME=whatever` passed
-# every guard -- the path only had to be executable and the name non-empty --
-# and then that executable ran add/commit/tag/push, producing a release commit
-# that could be unsigned or attributed to the wrong agent.
-#
-# The two are handled differently, because only one of them has a legitimate
-# reason to vary.
-#
-# REPO_NAME is `override`: it IS this repository's name, no caller value could
-# be correct, and it must never be $(notdir $(CURDIR)) -- deriving the signing
-# identity from the checkout directory signs a release as the wrong agent from
-# any worktree or CI workspace named something else.
-#
-# AGENT_GIT stays settable, because the company checkout is not at the same
-# absolute path on every machine and a hardcoded one makes the target unusable
-# elsewhere (and untestable anywhere without it). Its integrity is enforced by
-# VERIFYING THE OUTCOME instead of trusting the tool: after the commit and tag
-# are made, and BEFORE anything is pushed, the recipe checks that the release
-# commit is AUTHORED by agent-<repo> and that the commit and the annotated tag
-# both carry signatures that VERIFY against that agent's published key.
-#
-# Verification is real -- `git verify-commit` / `verify-tag` against
-# .release-allowed-signers, an IN-REPO trust anchor. Two earlier attempts were
-# both insufficient and are recorded so neither is reintroduced:
-#
-#   1. Grepping `cat-file` output for `gpgsig` / `SSH SIGNATURE`. Those are
-#      marker strings; a substituted helper puts either in a commit MESSAGE and
-#      sails past. Only asking git to check the cryptography answers it.
-#   2. Building the allowed-signers file from a key found under AGENT_GIT's own
-#      tree. That verifies nothing: the helper supplies the key it is checked
-#      against, so it signs with its own and drops the matching public half
-#      where the recipe looks. An anchor reachable from the thing it checks is
-#      not an anchor.
-#
-# A substituted AGENT_GIT therefore fails here, with everything it produced
-# still local and retractable. That is a stronger claim than any path check
-# could make -- it holds whatever produced the objects.
-# The wrapper is host-local since the company-repo cutover of 2026-09-05
-# (CLAUDE.md, "Identity"); the company repo is no longer checked out beside
-# this one, so the old default resolved to nothing and the recipe stopped at
-# its executable guard on every host.
+# AGENT_GIT is the signing git wrapper and stays settable because its path
+# varies by host. It is not trusted: before pushing, the recipe checks that the
+# release commit is authored by agent-<repo> and that the commit and tag
+# signatures verify against RELEASE_SIGNERS. REPO_NAME is `override` and
+# literal, never derived from the checkout directory.
 AGENT_GIT      ?= /usr/local/bin/agent-git.sh
 override REPO_NAME := go-quicraft
 
-# RELEASE_SIGNERS is the TRUST ANCHOR, and it is `override` for the reason the
-# whole check exists. Deriving the verification key from AGENT_GIT's own tree --
-# the first attempt -- verified nothing: a substituted helper can ship its own
-# keypair, sign the release with it, and drop the matching public key exactly
-# where the recipe looked, and every pre-push check then passes against the
-# attacker's key. An anchor reachable from the thing it is meant to check is not
-# an anchor. This file is in-repo and settable only by a reviewed commit.
+# The in-repo trust anchor for signature verification. `override` so it cannot
+# come from anything the wrapper being checked controls.
 override RELEASE_SIGNERS := $(CURDIR)/.release-allowed-signers
 
-# RELEASE_REMOTE is the git remote release-alpha pushes the release commit and
-# tag to: the GITEA remote, named `dev` per conventions/version-control.md 1.
-#
-# This defaulted to `origin` until 2026-09-01, argued from a measurement of the
-# checkout rather than from the convention. The checkout has since been renamed
-# and the measurement expired, which is the general trap: a default justified by
-# "what the machine currently looks like" needs re-checking whenever the machine
-# changes, while a convention-based one does not (#63, reversing the position
-# taken on #42).
-#
-# It stays a VARIABLE, not a constant, so a checkout that has not been renamed
-# overrides it in one place. Its existence is asserted before it is trusted --
-# an unreachable remote is not an absent tag -- so a wrong value here is a clear
-# refusal before anything is written, never a half-completed release.
+# The git remote the release commit and tags are pushed to. Its existence is
+# checked before anything is written.
 RELEASE_REMOTE ?= dev
 
-# deps-latest runs before compiling in a consumer repo. It picks the highest tag
-# INCLUDING -alpha prereleases -- bare 'go get @latest' ignores prereleases and
-# would downgrade to legacy v0.0.0.
+# deps-latest updates first-party dependencies to their highest tag, including
+# -alpha prereleases, which a bare 'go get @latest' ignores.
 
 .PHONY: release release-alpha deps-latest
 
-# Every settable Make variable crosses into the recipe ONCE, via these
-# target-specific exports, and the body references only the shell parameters
-# ($$REL_*). Without that, the value would be expanded into double-quoted recipe
-# TEXT before the grammar guard ran, so a backtick inside it would execute at the
-# first guard line -- quoting is no boundary against a value that becomes recipe
-# source.
+# Each settable variable reaches the recipe once, through these target-specific
+# exports, and the body reads only the $$REL_* shell parameters, so a value is
+# never expanded into recipe text. $(value ...) keeps make from expanding a
+# $(shell ...) in a command-line value. $(origin ...) accepts VERSION only from
+# the command line, not from an inherited environment variable.
 #
-# ALL FOUR use $(value ...), which the company template (v2.3.3) applies to
-# VERSION alone. Measured on GNU Make 4.3: a plain $(RELEASE_REMOTE) EXECUTES a
-# $(shell ...) embedded in a command-line value, while $(value RELEASE_REMOTE)
-# does not -- so the three unwrapped reads were live make-function injection on
-# a release path. None of the in-file defaults contains a `$`, so taking their
-# raw text changes nothing for ordinary use.
-# $(origin ...) restricts VERSION to the COMMAND LINE. `$(value VERSION)` alone
-# also imports an ambient environment variable, so a bare `make release-alpha`
-# in a shell or CI job that happens to export VERSION would sail past the
-# explicit-version guard and cut whatever it inherited. An inherited value is
-# not an operator stating a version, which is the whole contract here.
-# The release recipe, shared by release-alpha (a pre-release, vX.Y.Z-alpha) and
-# release (a STABLE release, vX.Y.Z -- ruling R13). The two differ ONLY in the
-# version form they accept, carried in REL_PATTERN / REL_FORM; every other
-# guard -- main only, explicit version, clean tree, no existing tag, CHANGELOG
-# heading, agent authorship, verified signatures, one atomic push -- is the
-# same recipe text, so a safeguard added to one cannot be missing from the
-# other. release.yml publishes a tag with no alpha/beta/rc as a full release.
+# release-body is shared by release-alpha (vX.Y.Z-alpha) and release (vX.Y.Z);
+# they differ only in REL_PATTERN / REL_FORM, so every guard applies to both.
+# release.yml publishes a tag with no alpha/beta/rc suffix as a full release.
 define release-body
 @test -n "$$REL_VERSION" || { echo "ERROR: state the version explicitly: make $$REL_TARGET VERSION=$$REL_FORM (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)"; exit 1; }
 @printf '%s' "$$REL_VERSION" | grep -Eq "$$REL_PATTERN" || { echo "ERROR: VERSION is not of the form $$REL_FORM (no leading zeroes): $$REL_VERSION"; exit 1; }
 @test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). 'push $$REL_REMOTE HEAD' would publish this branch."; exit 1; }
 @test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty -- set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
 @test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh -- every git write in this recipe signs through it, and a bad path must fail before VERSION is written'; exit 1; }
-@test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the Gitea remote'; exit 1; }
-@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the Gitea remote; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
+@test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the remote the release tag is pushed to'; exit 1; }
+@git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the remote the release tag is pushed to; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
 @! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
 @rc=0; git ls-remote --exit-code --tags "$$REL_REMOTE" "refs/tags/$$REL_VERSION" >/dev/null 2>&1 || rc=$$?; \
 case "$$rc" in \
@@ -2021,11 +1541,7 @@ release-alpha: export override REL_PATTERN   := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]
 release-alpha:
 	$(release-body)
 
-# release cuts a STABLE version -- no -alpha. Taking one is the owner's
-# decision (release-versioning.md: drop -alpha "when the API is settled enough
-# that a consumer can pin it"); for go-quicraft the first one also unfreezes
-# the format version constants (CLAUDE.md), so the recipe states the form but
-# never chooses the moment.
+# release cuts a stable version (no -alpha suffix).
 release: export override REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
 release: export override REL_REMOTE    := $(value RELEASE_REMOTE)
 release: export override REL_REPO      := $(value REPO_NAME)

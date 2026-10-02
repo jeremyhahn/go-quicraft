@@ -25,7 +25,7 @@ import (
 )
 
 // TestUpdate_MalformedEntryYieldsResultNotError is the regression test for
-// H13: a committed entry whose payload cannot be decoded (e.g. a single
+// A committed entry whose payload cannot be decoded (e.g. a single
 // stray byte) must produce the reserved sm.ResultInvalidCommand result for
 // that entry only. Update must return nil and the remaining entries in the
 // batch must still apply, otherwise the engine marks the shard failed and
@@ -76,7 +76,7 @@ func twoBucketKeys(t *testing.T) ([]byte, []byte) {
 	return nil, nil
 }
 
-// TestConcurrentStore_UpdateBatchAtomicity is the regression test for H14:
+// TestConcurrentStore_UpdateBatchAtomicity is a regression test:
 // a concurrent Lookup must never observe a partially applied Update batch.
 // Each batch writes the same round number to two keys in different buckets
 // (keyA first, then keyB). A reader that loads keyA and then keyB must
@@ -151,7 +151,7 @@ func TestConcurrentStore_UpdateBatchAtomicity(t *testing.T) {
 }
 
 // TestConcurrentStore_RecoverFromSnapshotTruncatedPreservesState is the
-// regression test for H15: RecoverFromSnapshot on a truncated stream must
+// regression test: RecoverFromSnapshot on a truncated stream must
 // return an error AND leave the pre-recovery contents fully intact, instead
 // of destroying every bucket before discovering the stream is bad.
 func TestConcurrentStore_RecoverFromSnapshotTruncatedPreservesState(t *testing.T) {

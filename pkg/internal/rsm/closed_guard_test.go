@@ -35,7 +35,7 @@ func newClosedGuardSM(t *testing.T) *StateMachine {
 }
 
 // TestStateMachine_SetLastApplied verifies the applied-counter seeding used
-// by the engine's snapshot pool after RecoverFromSnapshot (H8): the counter
+// by the engine's snapshot pool after RecoverFromSnapshot: the counter
 // is the index source for the next snapshot save and must be settable to the
 // recovered index.
 func TestStateMachine_SetLastApplied(t *testing.T) {
@@ -49,7 +49,7 @@ func TestStateMachine_SetLastApplied(t *testing.T) {
 	}
 }
 
-// TestStateMachine_Apply_Closed verifies the H7 defence-in-depth guard:
+// TestStateMachine_Apply_Closed verifies the defence-in-depth guard:
 // Apply on a closed state machine must return ErrClosed without running
 // user code.
 func TestStateMachine_Apply_Closed(t *testing.T) {

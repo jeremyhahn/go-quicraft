@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// TestStopShard_ConcurrentClaimDecrementsOnce is the H3 regression test. Many
+// TestStopShard_ConcurrentClaimDecrementsOnce is a regression test. Many
 // goroutines call StopShard for the same shard concurrently. Teardown — and the
 // activeNodes decrement — must happen exactly once (claimed via CompareAndSwap),
 // or activeNodes drifts negative and a later monitoring call panics in

@@ -269,9 +269,8 @@ func goldenMembershipFixture() Membership {
 // only thing standing between a layout change and a silent one. The version
 // byte no longer moves when the layout does, so a diff that alters these bytes
 // produces two mutually unreadable binaries both stamping 1, which is the cost
-// the pinning policy accepts and this golden makes visible in review. A change
-// here means every consuming repo (go-qrdb, go-xkms, go-quicbaas,
-// go-trusted-ca) is rebuilt in lockstep and every dev cluster is wiped.
+// the pinning policy accepts and this golden makes visible in a diff. A change
+// here means every consuming repo (go-qrdb and any other embedder) is rebuilt in lockstep and every dev cluster is wiped.
 //
 // The golden is spelled as its regions — fixed head, session policy, four maps,
 // Identities, RemovedIdentities — so the layout is checked by construction
@@ -687,7 +686,7 @@ func marshalUnversionedMembershipLong(ccID, maxWit uint64, policy bool, addrs ma
 // decoder discriminated layouts with a heuristic on bytes 16..24 ("must be a
 // bare 0 or 1"), which is undecidable for an empty unversioned section: it
 // encodes those bytes as [WitnessCount:4=0][RemovedCount:4=0], byte-identical
-// to a section with RequireFullReplicaMajority=false. Such a buffer used to
+// to a section with RequireFullReplicaMajority=false. Such a buffer must not
 // parse on and surface as ErrBufferTooSmall / ErrTooManyMembershipEntries — or,
 // embedded in a larger buffer, misparse into a plausible membership.
 //

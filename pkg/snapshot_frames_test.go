@@ -426,7 +426,7 @@ func TestReencryptSnapshotFile_FilesystemFailures(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M3: positional context-AAD binding of snapshot frames
+// Positional context-AAD binding of snapshot frames
 //
 // Every frame is sealed against magic || ShardID || ReplicaID || SnapshotIndex
 // || ChunkSeq. These tests run over the REAL seal.Barrier, so they assert the
@@ -585,7 +585,7 @@ func TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt(t *testing.T) {
 }
 
 // TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected pins the ABSENCE of a
-// fallback. A frame sealed with NO context (the pre-M3 shape, and what a
+// fallback. A frame sealed with NO context (an epoch-only frame, and what a
 // downgrade attacker would supply) must not decrypt through the reader, which
 // never retries with a weaker AAD.
 func TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected(t *testing.T) {

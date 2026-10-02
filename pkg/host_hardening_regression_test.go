@@ -28,10 +28,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// H1: speculative address pre-registration must restore, not delete
+// Speculative address pre-registration must restore, not delete
 // ---------------------------------------------------------------------------
 
-// TestRequestConfigChange_RollbackRestoresPriorAddress is the H1 regression
+// TestRequestConfigChange_RollbackRestoresPriorAddress is the regression
 // test. Observer -> voter promotion targets a replicaID that ALREADY has a
 // live registry entry. requestConfigChange pre-registers the new address
 // speculatively (Register is a Swap), so a rollback that unconditionally
@@ -118,7 +118,7 @@ func TestRequestConfigChange_RollbackRestoresPriorAddress(t *testing.T) {
 }
 
 // TestRequestConfigChange_RollbackRemovesFirstTimeAdd is the other half of
-// H1: when the target replica had NO prior registry entry, the rollback of a
+// When the target replica had NO prior registry entry, the rollback of a
 // never-committed add must remove the speculative entry rather than leave a
 // mapping for a replica that never became a member.
 func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
@@ -183,11 +183,11 @@ func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M4: rollbacks must claim the pending entry before releasing references
+// Rollbacks must claim the pending entry before releasing references
 // ---------------------------------------------------------------------------
 
 // TestRequestSnapshot_RollbackDoesNotDoubleReleaseOnConcurrentCompletion is
-// the M4 regression test for the snapshot path. OnSnapshotCompleted drains
+// the regression test for the snapshot path. OnSnapshotCompleted drains
 // the ENTIRE pendingSnapshots map on any completion for the shard, so a
 // completion can complete, remove and release an entry between the Store in
 // RequestSnapshot and its submit-failure rollback. An unconditional
@@ -296,10 +296,10 @@ func TestReadIndex_QueueFullRollbackReleasesCallerReference(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M5: ShardError/ShardLagging/ShardNoLeader must actually be reported
+// ShardError/ShardLagging/ShardNoLeader must actually be reported
 // ---------------------------------------------------------------------------
 
-// TestShardHealth_DerivesLiveState is the M5 regression test. ns.health only
+// TestShardHealth_DerivesLiveState is the regression test. ns.health only
 // records the coarse lifecycle state (healthy once started, unloaded once
 // stopped), so ShardError, ShardNoLeader and ShardLagging were never assigned
 // and HealthCheck's "degraded" branch was dead code: a wedged shard still
@@ -363,7 +363,7 @@ func TestShardHealth_DerivesLiveState(t *testing.T) {
 }
 
 // TestHealthCheck_ReportsDegradedForErroredShard pins the HealthCheck
-// contract that M5 made reachable: a shard reporting ShardError degrades the
+// contract that live health derivation makes reachable: a shard reporting ShardError degrades the
 // whole host so /healthz stops returning 200 for a dead shard.
 func TestHealthCheck_ReportsDegradedForErroredShard(t *testing.T) {
 	h := newTestHost(t)
@@ -385,10 +385,10 @@ func TestHealthCheck_ReportsDegradedForErroredShard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M6: ExportSnapshot must pin the in-flight epoch while it decrypts
+// ExportSnapshot must pin the in-flight epoch while it decrypts
 // ---------------------------------------------------------------------------
 
-// TestExportSnapshot_PinsInFlightEpoch is the M6 regression test.
+// TestExportSnapshot_PinsInFlightEpoch is the regression test.
 // decryptSnapshotForSend and ReencryptSnapshotFile both pin the epochs they
 // read, but ExportSnapshot decrypted with no pin at all: a long multi-GB
 // export racing keyRotationLoop -> rotateBarrierKey -> PurgeEpochsBefore
@@ -549,7 +549,7 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LOW: ImportSnapshot must bound the artifact and map context errors
+// ImportSnapshot must bound the artifact and map context errors
 // ---------------------------------------------------------------------------
 
 // TestImportSnapshot_RejectsWhenDiskFull pins the disk-full precondition: the
@@ -580,7 +580,7 @@ func TestSnapshotTooLargeError_MatchesSentinel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LOW: FollowerRead's slow path must observe shutdown
+// FollowerRead's slow path must observe shutdown
 // ---------------------------------------------------------------------------
 
 // TestFollowerRead_SlowPathExitsOnShardStop pins the shutdown exit. A poll loop
@@ -632,7 +632,7 @@ func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LOW: the exported TransportDisabled field must actually disable transport
+// The exported TransportDisabled field must actually disable transport
 // ---------------------------------------------------------------------------
 
 // TestNewHost_ExportedTransportDisabledSkipsTransport pins the gate. The field

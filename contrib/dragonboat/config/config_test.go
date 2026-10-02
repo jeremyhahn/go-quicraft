@@ -218,8 +218,8 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsFalsePreservesSnapshotEntries(t
 // two projects' zero values disagree.
 //
 // Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is off; I
-// will call RequestSnapshot myself". Quicraft used to read it the same way and
-// no longer does: a zero there means "I did not choose", and SetDefaults
+// will call RequestSnapshot myself". In quicraft a zero there means "I did not
+// choose", and SetDefaults
 // substitutes DefaultSnapshotEntries. Passing the zero through would therefore
 // silently ENABLE snapshotting on a config that explicitly asked for it off.
 //

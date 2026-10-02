@@ -211,10 +211,10 @@ func BenchmarkSendAdmission(b *testing.B) {
 // TestOversizedReplicateDoesNotStormDials is the regression test for the
 // leader/follower dial storm: a Replicate message carrying more entries than
 // the decoder accepts (proto.MaxEntriesPerMessage) is rejected by the RECEIVER,
-// which resets the stream. Before the fix the sender read that reset as a
-// generic write failure, tore the whole connection down and re-dialed, then
-// retried the identical message — an unbounded dial loop that also starved the
-// follower, because every attempt to ship it the entries it needed destroyed
+// which resets the stream. A sender that reads that reset as a generic write
+// failure tears the whole connection down and re-dials, then retries the
+// identical message — an unbounded dial loop that also starves the
+// follower, because every attempt to ship it the entries it needs destroys
 // the connection.
 //
 // The batch is unsendable by construction, so the fix is not that it is

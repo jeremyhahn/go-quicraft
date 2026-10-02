@@ -2261,7 +2261,7 @@ func TestPeer_MultiNodeElection_VoteRejectionsLeadToFollower(t *testing.T) {
 	}
 }
 
-// --- Fix 5: OrderedConfigChange via Peer.ProposeConfigChange ---
+// --- OrderedConfigChange via Peer.ProposeConfigChange ---
 
 func TestPeer_ProposeConfigChange_RejectsWhilePending(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
@@ -2587,7 +2587,7 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 	}
 }
 
-// --- Fix 9: Leader step-down on self-removal ---
+// --- Leader step-down on self-removal ---
 
 func TestPeer_LeaderStepsDown_WhenRemovedFromConfig(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
@@ -2707,7 +2707,7 @@ func TestPeer_LeaderContinues_WhenOtherNodeRemoved(t *testing.T) {
 	}
 }
 
-// --- Fix 7: Snapshot membership update via Peer.Handle ---
+// --- Snapshot membership update via Peer.Handle ---
 
 func TestPeer_Handle_SnapshotUpdatesMembership(t *testing.T) {
 	cfg := testConfig()
@@ -3323,7 +3323,7 @@ func BenchmarkPeerGetUpdate(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// M4: AppliedToTerm returns cached term even after compaction
+// AppliedToTerm returns cached term even after compaction
 // ---------------------------------------------------------------------------
 
 func TestPeer_AppliedToTerm_AfterSnapshotRestore(t *testing.T) {
@@ -3373,7 +3373,7 @@ func TestPeer_AppliedToTerm_ZeroBeforeAnyApply(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M5: handleSnapshot retains membership when entries are retained
+// handleSnapshot retains membership when entries are retained
 // ---------------------------------------------------------------------------
 
 // TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership verifies the
@@ -3562,7 +3562,7 @@ func TestPeer_Handle_InstallSnapshot_MismatchOverwritesMembership(t *testing.T) 
 	}
 }
 
-// --- processConfigChanges logging (M7) ---
+// --- processConfigChanges logging ---
 
 // captureSlog installs a text handler writing to a buffer, returning the
 // buffer and a cleanup function that restores the previous logger.
@@ -4038,7 +4038,7 @@ func TestPeer_GetPiggybackUpdate_DrainsMessages(t *testing.T) {
 	// Merge 1 entry and set committed so there are entries to apply.
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
 	p.r.log.committed = 1
-	p.r.log.inmem.savedTo = 1 // durable, so the piggyback applies it (see H6 clamp)
+	p.r.log.inmem.savedTo = 1 // durable, so the piggyback applies it
 
 	// Add 2 outbound messages.
 	p.r.msgs = append(p.r.msgs, proto.Message{Type: proto.Heartbeat, From: 1})
@@ -4070,7 +4070,7 @@ func TestPeer_GetPiggybackUpdate_DefersPrevState(t *testing.T) {
 	p.r.term = 5
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 5}})
 	p.r.log.committed = 1
-	p.r.log.inmem.savedTo = 1   // durable, so the piggyback produces an update (see H6 clamp)
+	p.r.log.inmem.savedTo = 1   // durable, so the piggyback produces an update
 	p.prevState = proto.State{} // zero
 
 	if !p.hasStateChanged() {
@@ -4128,7 +4128,7 @@ func TestPeer_GetPiggybackUpdate_DoesNotTouchReadStates(t *testing.T) {
 	// Merge 1 entry and set committed.
 	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
 	p.r.log.committed = 1
-	p.r.log.inmem.savedTo = 1 // durable, so the piggyback produces an update (see H6 clamp)
+	p.r.log.inmem.savedTo = 1 // durable, so the piggyback produces an update
 
 	// Add a ReadyToRead state.
 	p.r.readStates = append(p.r.readStates, proto.ReadyToRead{Key: 42, Index: 1})
@@ -5218,7 +5218,7 @@ func TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R1: syncRaftRemotes clears transferTarget when target removed
+// syncRaftRemotes clears transferTarget when target removed
 // ---------------------------------------------------------------------------
 
 func TestPeer_SyncRaftRemotes_ClearsTransferTargetOnRemoval(t *testing.T) {
@@ -5352,7 +5352,7 @@ func TestPeer_SyncRaftRemotes_ProposalsSucceedAfterTransferTargetRemoved(t *test
 }
 
 // ---------------------------------------------------------------------------
-// R12-1: syncRaftRemotes includes witnesses in remoteLastAck
+// syncRaftRemotes includes witnesses in remoteLastAck
 // ---------------------------------------------------------------------------
 
 func TestPeer_SyncRaftRemotes_TracksWitnessLeaseAcks(t *testing.T) {
@@ -5453,7 +5453,7 @@ func TestPeer_SyncRaftRemotes_TracksWitnessLeaseAcks(t *testing.T) {
 
 func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	// Verify that a witness heartbeat ack added by handleHeartbeatResp is
-	// NOT deleted by syncRaftRemotes cleanup (the bug from R12-1).
+	// NOT deleted by syncRaftRemotes cleanup.
 	cfg := testConfigWithID(1, 1)
 	cfg.PreVote = config.BoolPtr(false)
 	cfg.LeaseRead = true
@@ -5526,7 +5526,7 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	}
 }
 
-// --- ValidateConfigChange (H4) ---
+// --- ValidateConfigChange ---
 
 // TestPeer_ValidateConfigChange_DuplicateAdd verifies that validating an
 // AddNode for a replica that is already a voting member returns

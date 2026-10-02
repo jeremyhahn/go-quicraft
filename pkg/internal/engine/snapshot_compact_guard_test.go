@@ -169,7 +169,7 @@ func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 		}
 	})
 	t.Run("marker exactly at compactIndex", func(t *testing.T) {
-		// Confirmation review LOW-1: Compact at the current marker is a nil
+		// Compact at the current marker is a nil
 		// no-op, so a nil error alone reported a compaction that moved nothing
 		// — reachable when a received snapshot set the marker to S and a later
 		// save lands at exactly S + CompactionOverhead.

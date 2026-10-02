@@ -32,7 +32,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// C1: an import must never damage a snapshot it did not create
+// An import must never damage a snapshot it did not create
 // ---------------------------------------------------------------------------
 //
 // Snapshot directories are named by the snapshot's own INDEX so the tree ORDERS
@@ -172,7 +172,7 @@ func assertUnchanged(t *testing.T, before, after snapshotState) {
 	}
 }
 
-// TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact is the C1 regression
+// TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact is the regression
 // guard. A second import of an artifact whose index does not ADVANCE the shard's
 // recorded snapshot must be refused before the tree is touched, and the live
 // snapshot must be byte-for-byte what it was.
@@ -353,7 +353,7 @@ func TestImportSnapshot_ConcurrentImportsOfTheSameIndex(t *testing.T) {
 	assertShardRecoversPayload(t, f, []byte("CONCURRENT-RESTORE"))
 }
 
-// TestImportSnapshot_RejectsIndexZero covers L2. Index 0 means "no snapshot",
+// TestImportSnapshot_RejectsIndexZero pins that index 0 is refused. It means "no snapshot",
 // and as a directory name snapshot-00000000000000000000 sorts FIRST: the
 // restore would be the first thing snapshot GC destroys and would never be the
 // one latestSnapshotDir recovers.
@@ -374,7 +374,7 @@ func TestImportSnapshot_RejectsIndexZero(t *testing.T) {
 	}
 }
 
-// TestMockLogDB_RejectsStaleSnapshotSave is the M4 mock-fidelity guard.
+// TestMockLogDB_RejectsStaleSnapshotSave is the mock-fidelity guard.
 //
 // mockLogDB stored every snapshot unconditionally while memdb.MemDB and
 // waldb.DB both refuse a save that does not advance the recorded index. Every

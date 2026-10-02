@@ -284,7 +284,7 @@ func generateTestCertPair(t testing.TB) ([]byte, []byte, []byte, []byte) {
 }
 
 // ---------------------------------------------------------------------------
-// S2: VerifyConnection revocation callback tests
+// VerifyConnection revocation callback tests
 // ---------------------------------------------------------------------------
 
 // TestBuildMTLSTLSNilCheckerNoCallback verifies that when no revocation
@@ -615,10 +615,10 @@ func TestBuildMTLSTLS_ClientSessionCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H2: CA bundle parsing for revocation issuer selection
+// CA bundle parsing for revocation issuer selection
 // ---------------------------------------------------------------------------
 
-// TestParseCACertificatesReturnsWholeBundle is the H2 regression test on the
+// TestParseCACertificatesReturnsWholeBundle is the regression test on the
 // transport side: TLS verification consumes every block of the CA bundle
 // (pool.AppendCertsFromPEM), so revocation must receive every issuer candidate
 // too. Taking only the first PEM block wires revocation to the root in a

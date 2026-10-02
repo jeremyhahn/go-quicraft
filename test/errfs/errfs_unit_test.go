@@ -15,13 +15,10 @@
 // This file deliberately carries NO build tag, unlike the fault-injection suites
 // that use ErrorFS. The injector's own behaviour must be verified in an ordinary
 // build, because a defect in it does not produce a failing test — it produces a
-// suite of recovery tests that pass without ever injecting anything.
-//
-// That is not hypothetical here. Nineteen of the twenty-one errfs tests ran with
-// WithNoSync(true), so no injection target could ever land on a flush, and the
-// sweeps self-calibrated onto whatever operation happened to fail — both
-// discovered in this review. An injector that silently does nothing is the most
-// expensive kind of test infrastructure, because it reads as coverage.
+// suite of recovery tests that pass without ever injecting anything. A test run
+// with WithNoSync(true) can never land an injection on a flush, and a sweep that
+// self-calibrates onto whatever operation happens to fail proves nothing. An
+// injector that silently does nothing reads as coverage.
 package errfs
 
 import (
@@ -83,7 +80,7 @@ func TestInjectAtFiresOnTheNthOperationExactly(t *testing.T) {
 	}
 }
 
-// TestOnlyOpsRestrictsWhichOperationCanFire is the fix this review made to the
+// TestOnlyOpsRestrictsWhichOperationCanFire pins the guard against
 // self-calibrating sweeps: a sweep must fail the operation it NAMES. If the
 // filter were ignored, a test claiming to cover an fsync failure could be
 // passing on an unrelated Open failure instead.

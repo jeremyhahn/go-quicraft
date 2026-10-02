@@ -528,7 +528,7 @@ Unit only. Target: `make test-crypto` (runs `./pkg/crypto/...`).
 | `shamir_test.go` | split/combine round trips, every bound in §3, error paths, nil shares, duplicate x, mismatched sets, the bytes API and its wiping |
 | `gf256_test.go` | the field arithmetic against known values |
 | `zerox_test.go` | rejection of a zero x-coordinate, the share that would leak the secret directly |
-| `hardening_round14_test.go` | regression tests for a hardening review's findings |
+| `share_hardening_test.go` | hardening regression tests |
 | `protected_share_test.go` | the protected split/combine/decode paths, ownership of the source buffer, redaction |
 | `protected_share_allocator_test.go` | the `...With` forms: every region charged, nil allocator refused, refusals give the reservation back |
 | `protected_memory_error_test.go` | locked-memory refusals reported as `*ProtectedMemoryError`, partial sets torn down |

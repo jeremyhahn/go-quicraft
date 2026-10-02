@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M1: membership.apply's replay guard
+// membership.apply's replay guard
 // ---------------------------------------------------------------------------
 //
 // The guard skips a config change whose log index is at or below the current

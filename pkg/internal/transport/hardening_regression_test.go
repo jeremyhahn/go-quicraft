@@ -642,7 +642,7 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 	// stand-in can provoke.
 	if raceEnabled {
 		t.Skip("quic-go's Conn.peerParams race (connection.go:2375 write vs :2932 read) " +
-			"fails the detector on the client this test dials; run by CI's no-race 0-RTT job (#199)")
+			"fails the detector on the client this test dials; run by CI's no-race 0-RTT job")
 	}
 	mtls := testMTLSConfig(t)
 	rec := &dropRecorder{}

@@ -335,9 +335,9 @@ func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
 	// spending a full SP 800-38D budget against one key, neither able to see
 	// the other's nonces.
 	//
-	// This used to be shown by pinning both barriers' randReader to a constant
-	// and comparing ciphertexts byte for byte. It cannot be shown that way any
-	// more: the AES-GCM nonce is generated inside the FIPS module boundary
+	// It cannot be shown by pinning both barriers' randReader to a constant
+	// and comparing ciphertexts byte for byte: the AES-GCM nonce is generated
+	// inside the FIPS module boundary
 	// (cipher.NewGCMWithRandomNonce), so no test can force two encryptions to
 	// collide. Cross-decryption proves the same shared DEK without needing to.
 	a, err := first.Encrypt(nil, []byte("duplicate writer"))

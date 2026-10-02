@@ -93,7 +93,7 @@ func flipSnapshotByte(t *testing.T, path string, off int64) {
 }
 
 // egressInstallMsg is the InstallSnapshot the leader would stream for the
-// artifact at path, addressed so the medlow handler fixture admits it.
+// artifact at path, addressed so the routing handler fixture admits it.
 func egressInstallMsg(t *testing.T, path string, shardID, to, from uint64) proto.Message {
 	t.Helper()
 	info, err := os.Stat(path)
@@ -128,7 +128,7 @@ func TestSnapshotSend_CorruptPlaintextWithholdsFinalChunk(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			eng, h, handler := newMedlowHandlerFixture(t)
+			eng, h, handler := newRoutingHandlerFixture(t)
 			const shardID, localReplicaID, fromReplicaID = uint64(71), uint64(1), uint64(2)
 			authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 
@@ -165,7 +165,7 @@ func TestSnapshotSend_CorruptPlaintextWithholdsFinalChunk(t *testing.T) {
 // TestSnapshotSend_IntactPlaintextIsDeliveredWhole is the positive control:
 // an artifact that matches its record streams in full and installs.
 func TestSnapshotSend_IntactPlaintextIsDeliveredWhole(t *testing.T) {
-	eng, h, handler := newMedlowHandlerFixture(t)
+	eng, h, handler := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(72), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 

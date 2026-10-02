@@ -11,14 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CI tooling.
-#
-# The golangci-lint version MUST equal GOLANGCI_VERSION in the Makefile, which
-# is the single source of truth and which quality.yml also matches. Docker
-# cannot read a make variable, so `make check-tool-versions` asserts the pins
-# agree; it runs as part of `make ci`. This file said v2.11.1 while CI ran
-# v2.13.2 — a container that lints against a different rule set from CI passes
-# while proving nothing.
+# Install CI tooling. The golangci-lint version must equal GOLANGCI_VERSION in
+# the Makefile; `make check-tool-versions` (part of `make ci`) asserts it.
 RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 && \
     go install github.com/securego/gosec/v2/cmd/gosec@latest && \
     go install golang.org/x/vuln/cmd/govulncheck@latest && \

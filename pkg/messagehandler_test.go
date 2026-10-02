@@ -1465,7 +1465,7 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned is the M2
+// TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned is the
 // regression test: when the batch SourceAddress is NOT bound to the sender's
 // certificate (senderAuthorized returns false, or is nil), the handler must not
 // learn it into the return-path registry — otherwise a peer could teach the

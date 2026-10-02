@@ -773,7 +773,7 @@ Targets: `make test-seal` (`./pkg/seal/...`), `make bench-seal`, `make fuzz-seal
 | `legacy_format_test.go` | checked-in ciphertext bytes from a caller-supplied-nonce writer decode under the current reader, proving `cipher.NewGCMWithRandomNonce` produces the same frame format |
 | `strategy_params_api_fips_test.go` | an external package, so the FIPS run fails to build if an exported symbol disappears under the tag |
 | `algorithm_table_fips_test.go` / `_nofips_test.go` | the registry contents in each build |
-| `hardening_round14_test.go` | regression tests for a hardening review's findings |
+| `barrier_hardening_test.go` | hardening regression tests |
 
 **Fuzz**: `pkg/seal/fuzz_test.go`: `FuzzBarrierEncryptDecryptRoundTrip`,
 `FuzzBarrierDecryptGarbage`, `FuzzBarrierDecryptWrongEpoch`,

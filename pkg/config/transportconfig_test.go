@@ -599,7 +599,7 @@ func assertTransportValidationError(t *testing.T, err error, expectedField strin
 	}
 }
 
-// TestTransportConfig_Validate_RejectsEmptyMTLS is the regression test for M3:
+// TestTransportConfig_Validate_RejectsEmptyMTLS is a regression test:
 // an enabled transport with present-but-empty mTLS material must fail at
 // config validation, not at handshake time.
 func TestTransportConfig_Validate_RejectsEmptyMTLS(t *testing.T) {

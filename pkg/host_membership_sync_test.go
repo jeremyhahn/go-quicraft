@@ -587,8 +587,7 @@ func TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem(t *te
 	// The claimed proposal's rs.releaseRef/completePendingOp must have run
 	// for the caller to see addErr at all (RequestState.complete alone does
 	// not unblock ResultC's buffer past a leak in the pool accounting), but
-	// Drain is the direct assertion on the pendingOps invariant the review
-	// finding was about: if the claimed proposal's completePendingOp were
+	// Drain is the direct assertion on the pendingOps invariant: if the claimed proposal's completePendingOp were
 	// skipped, pendingOps would never reach zero and Drain would time out.
 	if drainErr := h.Drain(); drainErr != nil {
 		t.Fatalf("Drain did not complete — a claimed proposal's pendingOp was stranded by the routing panic: %v", drainErr)
@@ -774,8 +773,8 @@ func TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims(t *testing
 
 	cb := &hostEngineCallback{h: h}
 	func() {
-		// Expected to propagate by design — see the sibling round-7/round-5
-		// tests. This test only inspects the aftermath.
+		// Expected to propagate by design (see the sibling tests). This test
+		// only inspects the aftermath.
 		defer func() { recover() }()
 		cb.OnApplied(1, entries, []sm.Result{{}, {}})
 	}()

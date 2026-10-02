@@ -157,8 +157,8 @@ func TestMessageBatchMarshalRejectsInvalidNestedTypes(t *testing.T) {
 	})
 }
 
-// TestMessageMarshalRefusesPositionlessSnapshot pins the field a message used to
-// drop without a word.
+// TestMessageMarshalRefusesPositionlessSnapshot pins that a message cannot
+// drop the field without a word.
 //
 // The presence flag is Snapshot.IsEmpty, which asks only about Index and Term.
 // A snapshot carrying a filepath, a size and a whole membership but no log
@@ -257,10 +257,9 @@ func TestMessageMarshalAcceptsGenuinelyAbsentSnapshot(t *testing.T) {
 
 // TestGetBytesAndGetStringApplyAZeroLimit pins the semantics of a zero limit.
 //
-// Both helpers used to SKIP the bound when maxLen was zero, so the only way to
-// reach that branch — forgetting to pass a field's limit — was rewarded with an
-// unbounded length prefix straight off the wire. A zero limit now admits only
-// an empty value.
+// A zero limit admits only an empty value. Skipping the bound when maxLen is
+// zero would reward forgetting to pass a field's limit with an unbounded
+// length prefix straight off the wire.
 func TestGetBytesAndGetStringApplyAZeroLimit(t *testing.T) {
 	buf := make([]byte, 4+16)
 	putBytes(buf, make([]byte, 16))

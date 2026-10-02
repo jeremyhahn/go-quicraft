@@ -165,7 +165,7 @@ func TestResolveRecoveredTerm(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // errStatInjected is the injected Stat failure.
-var errStatInjected = errors.New("review12 test: stat failed")
+var errStatInjected = errors.New("injected: stat failed")
 
 // statFailFS fails Stat for snapshot.dat and behaves like the real filesystem
 // for everything else, modelling the transient stat error (EIO, a racing

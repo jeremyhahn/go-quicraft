@@ -765,8 +765,8 @@ are in each feature folder's `cli.md`.
 
 The host-level regression suites each encode a bug that was found once, and must
 not be deleted in a refactor: `host_hardening_regression_test.go`,
-`host_medlow_regression_test.go`, `host_review12_test.go`,
-`host_review16_test.go`, `host_config_fault_regression_test.go`,
+`host_pending_lifecycle_test.go`, `host_state_regression_test.go`,
+`host_api_regression_test.go`, `host_config_fault_regression_test.go`,
 `messagehandler_hardening_test.go`.
 
 **Coverage.** The Makefile floor is `COVER_MIN = 91`: `make coverage` checks the

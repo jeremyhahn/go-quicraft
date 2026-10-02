@@ -67,7 +67,7 @@ func localInstallSnapshotMsg(ss proto.Snapshot) proto.Message {
 // rewinds the tracked range behind the apply frontier (or rejects it outright
 // with ErrSnapshotOutOfDate, which fails the shard in Peer.Commit), and the
 // entries in (A.Index, B.Index] are never emitted for apply because processed
-// already moved past them. (F8)
+// already moved past them.
 func TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -157,7 +157,7 @@ func TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded(t *testing.T) {
 // config changes the snapshot subsumes. Deriving "restored" from a merely
 // non-nil pending snapshot makes a REJECTED retransmission of an older
 // snapshot inherit the newer snapshot's restore and roll the membership (and
-// the raft remotes derived from it) backwards. (F8)
+// the raft remotes derived from it) backwards.
 func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -326,7 +326,7 @@ func TestPeer_InstallSnapshot_LocalInjectionAdoptsMembership(t *testing.T) {
 	}
 }
 
-// C1. The same message arriving from the WIRE must be refused outright.
+// The same message arriving from the WIRE must be refused outright.
 //
 // InstallSnapshot never travels as a message between replicas — a snapshot is
 // streamed as a SnapshotHeader plus chunks and the RECEIVER rebuilds the
@@ -389,7 +389,7 @@ func TestPeer_InstallSnapshot_WireDeliveredIsRefused(t *testing.T) {
 	}
 }
 
-// C1, joining-node variant. A joining node adopts membership UNCONDITIONALLY
+// Joining-node variant. A joining node adopts membership UNCONDITIONALLY
 // (its own ConfigChangeID equals the snapshot's, so the strictly-newer test
 // cannot protect it), which makes it the softest target for the forgery. Its
 // adoption must be gated on the delivery path just the same.

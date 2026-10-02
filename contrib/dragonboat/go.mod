@@ -1,19 +1,14 @@
 module github.com/jeremyhahn/go-quicraft/contrib/dragonboat
 
-// This directive must not fall behind the parent's. The replace below pins this
-// module to the parent tree, and Go evaluates the language version from the MAIN
-// module — so a parent requiring a newer Go than this line fails the build with
-// "module ../.. requires go >= X (running go Y)" rather than upgrading. Keep the
-// two in lockstep; CI builds every module in the repo so a one-sided bump is
-// caught at the commit that makes it.
+// Keep this in step with the parent's go directive. The replace below builds
+// against the parent tree, and Go fails the build rather than upgrading when
+// the parent requires a newer Go than this line.
 go 1.27.0
 
 require github.com/jeremyhahn/go-quicraft v0.0.0
 
-// This adapter lives in the go-quicraft repo and is always built against the
-// parent tree it ships with, never a published version. Without this the
-// module only resolves through a go.work that lives outside the repo, so it
-// cannot be built or tested in CI.
+// Always built against the parent tree it ships with, never a published
+// version.
 replace github.com/jeremyhahn/go-quicraft => ../..
 
 require (

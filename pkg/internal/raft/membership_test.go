@@ -470,7 +470,7 @@ func TestMembership_AddNonVoting_Success(t *testing.T) {
 	}
 }
 
-// TestMembership_AddNonVoting_DemotesSeededVoter is the C1 unit-level
+// TestMembership_AddNonVoting_DemotesSeededVoter is the unit-level
 // regression. Host.StartShard seeds Membership.Addresses from the caller's
 // members map on a restart that recovered no snapshot, so an observer the
 // operator lists — as it must, join=false requires self in the map — is seeded
@@ -582,7 +582,7 @@ func TestMembership_AddWitness_Success(t *testing.T) {
 	}
 }
 
-// TestMembership_AddWitness_DemotesSeededVoter is the C1/H1 unit-level
+// TestMembership_AddWitness_DemotesSeededVoter is the unit-level
 // regression for the witness half. A witness listed in the restart members map
 // is seeded into Addresses — the full voter set — and the leader then selects
 // sendAppend over sendWitnessAppend for it, replicating the complete command
@@ -1379,7 +1379,7 @@ func TestMembershipSnapshot_SuccessiveSnapshots(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R2: Witness-only cluster prevention
+// Witness-only cluster prevention
 // ---------------------------------------------------------------------------
 
 func TestMembership_RemoveNode_LastFullReplicaWithWitnesses(t *testing.T) {
@@ -1520,7 +1520,7 @@ func TestMembership_VotingCapEnforced(t *testing.T) {
 	}
 }
 
-// --- Replicated witness policy (C1) ---
+// --- Replicated witness policy ---
 
 // membershipWith builds a membership with the given full-replica and witness
 // counts and the given replicated policy for validator testing.

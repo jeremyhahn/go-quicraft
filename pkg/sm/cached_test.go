@@ -1327,7 +1327,7 @@ func BenchmarkLRUGet(b *testing.B) {
 }
 
 // ---------------------------------------------------------------------------
-// M12 regression tests: owned copies on the way out of the cache, and
+// Regression tests: owned copies on the way out of the cache, and
 // invalidate-before-inner-write ordering in Update.
 // ---------------------------------------------------------------------------
 

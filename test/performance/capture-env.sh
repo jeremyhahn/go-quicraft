@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
 # capture-env.sh — describe the machine this script is running on, as env.json.
 #
-# This runs ON THE BENCHMARK TARGET, not on the workstation that drives it. That
-# is the whole point: the specification table printed beside a benchmark number
-# is derived from the machine that produced the number, at the moment it
-# produced it, so it cannot go stale and cannot be hand-edited into something
-# the hardware never was.
+# This runs on the benchmark target, not on the workstation that drives it, so
+# the specification table beside a benchmark number describes the machine that
+# produced it, at the time it produced it.
 #
-# The profile name is the one thing that is NOT derived. No amount of lscpu
-# output says "this is our desktop-class reference box"; that is a decision the
-# operator makes, so it is an argument.
+# The profile name is the one thing not derived; the operator chooses it.
 #
-# Anything this script cannot obtain is emitted as an empty string, never as a
-# guess and never as a zero. Consumers render an empty field as "not captured",
-# which is visibly different from a measurement — an uncaptured core count and a
-# genuine zero must never be the same bytes on disk.
+# Anything this script cannot obtain is emitted as an empty string, never a
+# guess or a zero. Consumers render an empty field as "not captured", so an
+# uncaptured core count is distinct from a real zero.
 #
 # Usage:
 #   ./capture-env.sh <profile-name> > env.json

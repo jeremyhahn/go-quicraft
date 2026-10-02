@@ -338,7 +338,7 @@ func mustRead(t *testing.T, path string) []byte {
 }
 
 // pinRecordingBarrier wraps a real Barrier and records every in-flight epoch
-// registration so tests can assert the L12 pinning contract.
+// registration so tests can assert the pinning contract.
 type pinRecordingBarrier struct {
 	Barrier
 	mu                  sync.Mutex
@@ -376,7 +376,7 @@ func (p *pinRecordingBarrier) DeregisterInFlightEpoch(epoch uint64) {
 	p.Barrier.DeregisterInFlightEpoch(epoch)
 }
 
-// TestReencryptSnapshotFile_PinsSourceEpochs is the L12 regression test for
+// TestReencryptSnapshotFile_PinsSourceEpochs is the regression test for
 // the missing RegisterInFlightEpoch: while the source is decrypted, every
 // epoch its frames reference must be pinned on the source barrier so a
 // concurrent PurgeEpochsBefore cannot remove a DEK mid-migration — and the
@@ -476,7 +476,7 @@ func TestSnapshotFrameEpochs_ScansHeadersWithoutDecrypting(t *testing.T) {
 	}
 }
 
-// TestReencryptSnapshotFile_CreatesNestedDestination exercises the L12
+// TestReencryptSnapshotFile_CreatesNestedDestination exercises the
 // durability path: a destination several directories deep that does not
 // exist yet must be created, populated, and dir-synced (SyncDirChain up to
 // the deepest pre-existing ancestor) without error.

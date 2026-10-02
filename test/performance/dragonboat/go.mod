@@ -31,20 +31,13 @@ require (
 	github.com/hashicorp/go-sockaddr v1.0.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
 	github.com/hashicorp/memberlist v0.3.1 // indirect
-	// go-quicraft is here only for test/netport, the one port-reservation
-	// window benchutil delegates to. A `replace` binds the MAIN
-	// module only, so the pair repeats in every module that reaches benchutil
-	// rather than being inherited from test/performance.
-	//
-	// It is NOT free, and the cost is not the import. Only test/netport is
-	// imported and it is stdlib-only, but MVS reads the required module's WHOLE
-	// requirement list, so go-quicraft's own floors raise this module's
-	// versions whether or not a line of that code is reached.
-	//
-	// Measured here: klauspost/compress moves v1.16.0 -> v1.19.1, floored by the
-	// parent's prometheus/client_golang. Pebble uses it for sstable zstd, so
-	// the baseline's compression library follows the parent's floor; re-run
-	// the profiles when it moves rather than compare across the change.
+	// go-quicraft is here only for test/netport, which benchutil uses for port
+	// reservation. A replace binds the main module only, so the pair repeats
+	// in every module that reaches benchutil. MVS reads go-quicraft's whole
+	// requirement list, so its floors can raise this module's versions:
+	// klauspost/compress, which Pebble uses for sstable zstd, follows the
+	// parent's prometheus/client_golang. Re-run the profiles when it moves
+	// rather than compare across the change.
 	github.com/jeremyhahn/go-quicraft v0.0.0 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
@@ -71,36 +64,13 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
-// The benchmark measures a FORK of dragonboat, github.com/jeremyhahn/
-// dragonboat/v4, and says so in the import paths rather than disguising it as
-// upstream. The fork exists because the benchmark needs a dragonboat that
-// compiles against PebbleDB v1.1.5, which upstream v4.0.0 does not.
+// The benchmark measures a fork of dragonboat, github.com/jeremyhahn/
+// dragonboat/v4, under its own import path. The fork compiles against
+// PebbleDB v1.1.5, which upstream v4.0.0 does not. It is required by version:
+// replacing github.com/lni/dragonboat/v4 with it would load one module under
+// two paths, which is an error.
 //
-// Requiring github.com/lni/dragonboat/v4 and redirecting it with a replace
-// such as
-//
-//	github.com/lni/dragonboat/v4 => ../../../../dragonboat
-//
-// would escape the repository altogether: it resolves only on a machine that
-// happens to have the fork checked out four levels up, and fails on every
-// clean checkout.
-//
-// Pinning the fork by version rather than replacing upstream with it is not
-// just tidier, it is the only form that works: once the fork declares its own
-// module path, its internal imports resolve under that path too, and a
-// `replace lni => jeremyhahn` makes go load one module version under two
-// different paths, which is an error.
-//
-// The fork is published in two places on purpose, and both serve the same
-// commit, so the one go.sum entry verifies either way. Public consumers
-// resolve github.com/jeremyhahn/dragonboat/v4 from GitHub through
-// proxy.golang.org. Development machines and the CI runner set
-// GOPRIVATE=github.com/jeremyhahn/* and rewrite that prefix to the internal
-// Gitea, so they resolve it from the mirror there instead — which is why the
-// fork must be mirrored there even though the GitHub repository is public.
-//
-// The perf module is unpublished, so that one still resolves from the sibling
-// directory.
+// The perf module is unpublished, so it resolves from the sibling directory.
 replace github.com/jeremyhahn/go-quicraft/test/performance => ../
 
 replace github.com/jeremyhahn/go-quicraft => ../../..

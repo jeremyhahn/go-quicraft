@@ -175,7 +175,7 @@ func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 	}
 }
 
-// M1. The grow-by-join flow never evaluated the precondition at all.
+// The grow-by-join flow never evaluated the precondition at all.
 //
 // StartShard checks the INITIAL members map. A cluster grown by join starts
 // its seed node with members={self} — the peer list is empty after

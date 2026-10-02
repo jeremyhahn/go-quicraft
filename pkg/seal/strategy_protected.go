@@ -36,7 +36,7 @@ import (
 // is that extension.
 //
 // It is a SIBLING, not a replacement, and deliberately so. SealingStrategy
-// stays exactly as it is: every strategy in the portfolio (go-xkms's TPM2,
+// stays exactly as it is: every existing strategy (go-xkms's TPM2,
 // PKCS#11 and cloud-KMS strategies, go-qrdb's shamir and recovery strategies,
 // and the two in this package) keeps compiling unchanged, and an implementation
 // adopts the protected pair when it has something to gain from it. A caller

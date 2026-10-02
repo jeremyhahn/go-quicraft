@@ -52,7 +52,7 @@ func TestNewHost_ShardBarriersWithHostBarrierAccepted(t *testing.T) {
 	defer h.Close()
 }
 
-// TestNewHost_ShardBarriersWithPlaintextLogDBRefused is the H-1 regression
+// TestNewHost_ShardBarriersWithPlaintextLogDBRefused is the regression
 // test: the SIXTH at-rest plaintext downgrade, and the first on the "which
 // barrier applies to this shard" axis rather than the sealed-vs-nil axis the
 // five before it shared.
@@ -105,7 +105,7 @@ func TestNewHost_ShardBarriersWithPlaintextLogDBRefused(t *testing.T) {
 }
 
 // TestNewHost_ShardBarriersWithEncryptedLogDBAccepted is the positive half of
-// H-1: the same construction with the WAL actually encrypted must be accepted,
+// The same construction with the WAL actually encrypted must be accepted,
 // so the guard above discriminates on the at-rest property and not merely on
 // the presence of a caller-supplied LogDB.
 func TestNewHost_ShardBarriersWithEncryptedLogDBAccepted(t *testing.T) {

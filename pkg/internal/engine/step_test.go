@@ -2269,7 +2269,7 @@ func TestTick_CommitPending_FiltersFreeOrderOnly(t *testing.T) {
 	}
 }
 
-// --- OPT-B: Memory-Mode Pipeline Collapse Tests ---
+// --- Memory-Mode Pipeline Collapse Tests ---
 
 // sequenceSender records each Send/SendSnapshot call as a numbered event,
 // allowing tests to verify the temporal ordering of message sends relative

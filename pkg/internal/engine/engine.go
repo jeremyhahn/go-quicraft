@@ -889,21 +889,19 @@ func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
 				"stack", string(stack),
 				"error", panicErr,
 			)
-			// commitC is deliberately NOT drained here. The recovery used to
-			// drain it and FAIL every node it won an item for, on the rationale
-			// that a queued item would let the restarted worker reuse the shard's
-			// commitItem slot and enqueue the same pointer twice. That rationale
-			// is vacuous: getCommitSlot has exactly one caller
+			// commitC is deliberately NOT drained here. A queued item cannot let
+			// the restarted worker reuse the shard's commitItem slot and enqueue
+			// the same pointer twice: getCommitSlot has exactly one caller
 			// (enqueueForCommit), reachable only when commitPending is false;
 			// commitPending is set BEFORE the commitC send and is cleared only by
 			// paths that have already RECEIVED the item from the channel. While a
 			// shard's item sits in commitC its slot is therefore provably
 			// unreachable.
 			//
-			// Draining was actively harmful: commitWorkers[i] consumes the SAME
-			// channel concurrently, so the drain raced the live consumer and
-			// PERMANENTLY failed every unrelated healthy shard whose item it
-			// happened to win — up to CommitCBufferSize (64 by default) of them,
+			// Draining would be actively harmful: commitWorkers[i] consumes the
+			// SAME channel concurrently, so a drain races the live consumer and
+			// PERMANENTLY fails every unrelated healthy shard whose item it
+			// happens to win — up to CommitCBufferSize (64 by default) of them,
 			// with no automatic reset, from one panic on one shard. The one node
 			// that genuinely needs unwedging is the one mid-enqueueForCommit, and
 			// clearStepCommitPending below handles exactly that. Items left in the

@@ -29,7 +29,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M6: an imported snapshot directory must not sort as the OLDEST
+// An imported snapshot directory must not sort as the OLDEST
 // ---------------------------------------------------------------------------
 
 // TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots is the

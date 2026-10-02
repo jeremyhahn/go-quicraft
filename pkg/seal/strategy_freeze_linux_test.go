@@ -38,7 +38,7 @@ import (
 // KERNEL what it believes about the page, which is the only witness that cannot
 // be fooled by the library's own bookkeeping.
 //
-// Verified by mutation on 2026-09-03: deleting the `out.Freeze()` call in
+// Verified by mutation: deleting the `out.Freeze()` call in
 // UnsealRootKeyProtected fails here with
 //
 //	strategy_freeze_linux_test.go:81: the unsealed root key is mapped "rw-p":
@@ -131,7 +131,7 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 // missing Freeze is invisible to every other assertion, since the key still
 // round-trips and only a page protection differs.
 //
-// Verified by mutation on 2026-09-04: deleting the out.Freeze() call in
+// Verified by mutation: deleting the out.Freeze() call in
 // RootKeyProtected fails here with
 //
 //	strategy_freeze_linux_test.go:194: RootKeyProtected returned a region mapped

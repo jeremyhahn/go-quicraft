@@ -1742,8 +1742,8 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	// which counts entries still in memory and not yet fsynced. Applying that
 	// tail here, and returning a HardState.Commit that covers it, would let
 	// executePiggyback fsync a Commit past the last durable log entry: after a
-	// crash HardState.Commit would exceed the recovered log — the invariant
-	// this fix protects. Extract and advertise only up to the durable marker;
+	// crash HardState.Commit would exceed the recovered log, breaking the
+	// durability invariant. Extract and advertise only up to the durable marker;
 	// the remainder re-emits on a later cycle once it is persisted, because
 	// NotePiggybackPersisted records the CLAMPED hard state as prevState rather
 	// than the raw one.

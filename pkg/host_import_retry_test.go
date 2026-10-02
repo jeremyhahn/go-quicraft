@@ -30,7 +30,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// H1: a failed import must not block its own retry
+// A failed import must not block its own retry
 // ---------------------------------------------------------------------------
 
 // errImportTransient models the transient failure a disaster-recovery restore
@@ -56,7 +56,7 @@ func (d *flakySaveSnapshotDB) SaveSnapshot(shardID, replicaID uint64, ss logdb.S
 	return d.LogDB.SaveSnapshot(shardID, replicaID, ss)
 }
 
-// TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry is the H1
+// TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry is the
 // regression guard.
 //
 // The publishing rename creates the canonical, index-named directory. An error

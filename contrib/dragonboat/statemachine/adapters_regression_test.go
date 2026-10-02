@@ -25,7 +25,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// C-M6: external snapshot files must fail the snapshot loudly instead of
+// External snapshot files must fail the snapshot loudly instead of
 // being silently discarded (which would be unrecoverable data loss).
 // ---------------------------------------------------------------------------
 
@@ -102,7 +102,7 @@ func TestSnapshotFileCollection_RecordsFiles(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-L2: Update result slices whose length differs from the entry batch
+// Update result slices whose length differs from the entry batch
 // must be rejected with a typed error instead of panicking (longer) or
 // silently zero-filling trailing proposals (shorter).
 // ---------------------------------------------------------------------------

@@ -1105,7 +1105,7 @@ func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
-// C6: Result code mappings for ErrBusy, ErrSystemBusy, ErrDraining
+// Result code mappings for ErrBusy, ErrSystemBusy, ErrDraining
 // ---------------------------------------------------------------------------
 
 func TestTranslateResultCode_Busy(t *testing.T) {
@@ -1151,7 +1151,7 @@ func TestTranslateResultCode_DrainingNotAborted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C7: Resolved RequestState multiple independent reads
+// Resolved RequestState multiple independent reads
 // ---------------------------------------------------------------------------
 
 func TestResolvedRequestState_MultipleReads(t *testing.T) {

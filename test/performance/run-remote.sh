@@ -10,12 +10,10 @@
 # AND the capture back into profiles/<name>/, and regenerate that profile's
 # documents locally.
 #
-# The profile name is an argument because it cannot be derived. lscpu describes
-# hardware; it does not know which of our machines is the desktop-class
-# reference box and which is the dual-socket server. Everything else about the
-# machine IS derived, on the target, at run time — see capture-env.sh — so the
-# specification table beside a number is never hand-maintained and can never go
-# stale.
+# The profile name is an argument because hardware description cannot tell
+# which machine profile a host belongs to. Everything else about the machine is
+# captured on the target at run time (see capture-env.sh), so the
+# specification table beside a number is never hand-maintained.
 #
 # The benchmark itself runs under nohup on the target and this script tails it.
 # A dropped ssh session therefore costs you the tail, not the run; reconnect
@@ -56,14 +54,9 @@ PERF_TIMEOUT="${PERF_TIMEOUT:-7200s}"
 PERF_SYSTEMS="${PERF_SYSTEMS:-all}"
 # Scratch dir on the bench host for every engine's WAL (bind-mounted into each
 # container as /bench-tmp), so fsync I/O lands on the storage tier you mean to
-# characterize rather than on a container overlay.
-#
-# The default must be creatable by the login user on ANY bench host, which is
-# why it is under $HOME rather than a mount point. It used to default to
-# /mnt/disk1/bench-tmp, a path that exists on one particular server; everywhere
-# else `mkdir -p` failed on the missing mount and the run never started.
-# Override it to put the WAL on the storage tier you actually mean to
-# characterize -- $HOME is correct for portability, not necessarily for I/O.
+# characterize rather than on a container overlay. The default under $HOME is
+# chosen because the login user can create it on any host; override it to put
+# the WAL on the storage you actually want to measure.
 BENCH_TMPDIR="${BENCH_TMPDIR:-\$HOME/bench-tmp}"
 # Target platform for the cross-built orchestrator. The bench host needs Docker
 # but no Go toolchain.
@@ -75,17 +68,13 @@ LOCAL_PROFILE="$PERF_DIR/$PROFILE_REL"
 REMOTE_PERF="$REMOTE_DIR/test/performance"
 RUN_LOG="$REMOTE_PERF/bench-run.log"
 RUN_PID="$REMOTE_PERF/bench-run.pid"
-# The suite's EXIT STATUS, written by the wrapper below once perfcompare exits.
-# Without it a failed run was indistinguishable from a successful one to this
-# script: wait_for_run returns `tail`'s status, not the benchmark's (#181).
+# The suite's exit status, written by the wrapper below once perfcompare exits.
+# wait_for_run returns `tail`'s status, not the benchmark's.
 RUN_RC="$REMOTE_PERF/bench-run.rc"
-# RUN_RC_ABS is RUN_RC as a path that means the same thing from ANY directory
-# on the target. The status file is written from inside a subshell that has
-# already cd'd into $REMOTE_PERF, and read back from the login home, so a
-# relative RUN_RC needs anchoring at $HOME -- but only a relative one. The
-# documented REMOTE_DIR override may be absolute (/mnt/bench), and prefixing
-# that gives $HOME//mnt/bench/..., a directory staging never created, so every
-# run would report "no exit status" and the gate would refuse everything.
+# RUN_RC_ABS is RUN_RC as a path that means the same from any directory on the
+# target. The status file is written from a subshell that has already cd'd
+# into $REMOTE_PERF, so a relative RUN_RC is anchored at $HOME. An absolute
+# REMOTE_DIR is left as it is.
 case "$RUN_RC" in
   /*) RUN_RC_ABS="$RUN_RC" ;;
   *)  RUN_RC_ABS="\$HOME/$RUN_RC" ;;
@@ -93,14 +82,10 @@ esac
 
 say() { echo ">> $*"; }
 
-# module_auth prints the module credentials of THIS environment as the lines a
-# shell sources, with perfcompare's precedence: a composed GOMODAUTH payload
-# verbatim (it is already sourceable K='V' lines), else the four variables of
-# dependency-resolution.md section 6, and only when the rewrite that makes
-# them a credential is set. Values are taken as they are -- a Gitea token, a
-# host:port and a glob carry no whitespace or quotes, and a value that did
-# would be the wrong value. Reports presence on stderr by shape, never by
-# content.
+# module_auth prints this environment's module credentials as lines a shell
+# sources, with perfcompare's precedence: a composed GOMODAUTH payload verbatim
+# (already sourceable K='V' lines), else GOPRIVATE and the GIT_CONFIG_* rewrite,
+# only when the rewrite is set. It reports presence on stderr, never content.
 module_auth() {
   if [ -n "${GOMODAUTH:-}" ]; then
     say "module credentials: forwarding the composed GOMODAUTH payload to $HOST over stdin" >&2
@@ -121,12 +106,9 @@ stage() {
   # Refuse to stage over an active run: rsync --delete below would clobber the
   # suite's working tree mid-flight.
   #
-  # The bracket around the first character is load-bearing. `pgrep -f` matches
-  # full command lines, and ssh runs this check via `bash -c '<the command>'`,
-  # so a plain `pgrep -f perfcompare` MATCHES ITSELF -- the guard fired on every
-  # invocation and staging could never proceed. `[p]erfcompare` is a regex that
-  # matches the text "perfcompare" while the command line carrying it does not
-  # contain that text, so the check sees real runs and not its own shell.
+  # `[p]erfcompare` rather than `perfcompare`: pgrep -f matches full command
+  # lines, and ssh runs this via `bash -c`, so the plain pattern would match
+  # the check's own shell.
   if ssh "$HOST" "pgrep -f '[p]erfcompare' >/dev/null 2>&1"; then
     echo "ERROR: a perfcompare run is active on $HOST; refusing to stage" >&2
     exit 1
@@ -139,13 +121,10 @@ stage() {
   say "rsyncing working tree -> $HOST:$REMOTE_DIR"
   ssh "$HOST" "mkdir -p '$REMOTE_DIR'"
   # .git is included: the orchestrator's findRepoRoot locates the Docker build
-  # context by it. The profiles tree is excluded in both directions — on the
-  # target it is output only, so --delete can never reach back and destroy a
-  # stored result or a hand-written analysis.
-  # The credential file is excluded, and any copy an earlier staging left is
-  # removed by hand: rsync ignores .gitignore, and --delete never touches an
-  # excluded path on the receiver, so an exclude alone would leave a stale
-  # token sitting on the bench host. The run's credentials cross on stdin.
+  # context by it. The profiles tree is excluded in both directions, so --delete
+  # can never destroy a stored result or a hand-written analysis.
+  # The credential file is excluded and any earlier copy removed by hand
+  # (--delete never touches an excluded path). Credentials cross on stdin.
   rsync -a --delete \
     --exclude '.devcontainer/.env' \
     --exclude 'test/performance/openraft/target/' \
@@ -173,51 +152,31 @@ env_capture() {
 run() {
   say "launching suite on $HOST (profile=$PROFILE systems=$PERF_SYSTEMS benchtime=$BENCHTIME WAL=$BENCH_TMPDIR)"
 
-  # Preflight the scratch directory in its OWN command, not as the head of a
-  # backgrounded && chain. It used to be `mkdir -p ... && cd ... && nohup ... &`,
-  # where the & backgrounds the WHOLE list: a mkdir that failed took the launch
-  # with it silently, and the `echo $!` that followed still wrote a pidfile --
-  # for the subshell, not for perfcompare. A failed launch was therefore
-  # indistinguishable from a running one, and `wait` sat tailing a log that
-  # would never be created against a pid that was already gone.
+  # Preflight the scratch directory in its own command. As the head of a
+  # backgrounded && chain, a failed mkdir would take the launch with it while
+  # the pidfile still got written.
   if ! ssh "$HOST" "mkdir -p \"$BENCH_TMPDIR\"" 2>&1; then
     echo "ERROR: cannot create the scratch directory $BENCH_TMPDIR on $HOST." >&2
     echo "       Set BENCH_TMPDIR to a path the login user can create." >&2
     exit 1
   fi
 
-  # The cd is confined to a SUBSHELL. $RUN_PID and $RUN_LOG are relative to the
-  # login home, so a cd left in the foreground would make the pidfile write
-  # land somewhere that does not exist and silently produce no pidfile at all.
+  # The cd is confined to a subshell, because $RUN_PID and $RUN_LOG are
+  # relative to the login home.
   #
-  # The subshell no longer `exec`s perfcompare: it runs it and then records the
-  # exit status, so $! is a one-line wrapper's pid rather than perfcompare's.
-  # That is deliberate (#181), and it preserves the property the exec was
-  # protecting -- the pidfile must name a process whose death means the run is
-  # over. The wrapper does nothing after perfcompare but write $RUN_RC, so it
-  # dies microseconds later, and `tail --pid` in wait_for_run now returns AFTER
-  # the status file exists rather than racing it.
+  # The subshell runs perfcompare and then records its exit status, so $! is
+  # the wrapper's pid. The wrapper exits right after perfcompare, so
+  # `tail --pid` in wait_for_run returns after the status file exists.
   #
-  # A stale $RUN_RC is removed first. Reading a previous run's status would be
-  # worse than reading none, because it looks authoritative.
-  # $RUN_RC is written with a path anchored at $HOME on the target, NOT the
-  # bare relative one. Every other remote path here is relative to the login
-  # home and is used from there, but this one is written from INSIDE the
-  # subshell that has already cd'd into $REMOTE_PERF -- so a relative path
-  # would land at $REMOTE_PERF/$REMOTE_PERF/... and require_run_success, which
-  # reads from the home directory, would never find it. The failure mode is
-  # every run reporting "recorded no exit status", i.e. the gate refusing
-  # everything.
+  # A stale $RUN_RC is removed first: a previous run's status would look
+  # authoritative. It is written via RUN_RC_ABS because the subshell has
+  # already cd'd into $REMOTE_PERF.
   ssh "$HOST" "rm -f \"$RUN_RC_ABS\""
-  # Module credentials cross to the bench host on ssh's STDIN, never its
-  # command line: the quicraft image's `go mod download` needs Gitea to reach
-  # go-enclave (#184), and the four variables of dependency-resolution.md
-  # section 6 are exported here when a runner injected them or the operator
-  # did. The remote shell sources stdin under set -a before launching, so the
-  # token lands in perfcompare's environment and nowhere else -- not in `ps` on
-  # either host, not in a file, not in the run log. With no credentials the
-  # pipe is empty, sourcing it is a no-op, and the build resolves from the
-  # public proxy only; module_auth reports which, once, in this log.
+  # Module credentials cross to the bench host on ssh's stdin, never its
+  # command line. The remote shell sources stdin under set -a, so the token
+  # reaches perfcompare's environment and nowhere else: not `ps` on either
+  # host, not a file, not the run log. With no credentials the pipe is empty
+  # and the build resolves from the public proxy only.
   module_auth | ssh "$HOST" "set -a; . /dev/stdin; set +a; \
     ( cd '$REMOTE_PERF' && BENCH_TMPDIR=\"$BENCH_TMPDIR\" \
       nohup sh -c './perfcompare --benchtime=\"$BENCHTIME\" --timeout=\"$PERF_TIMEOUT\" \
@@ -246,10 +205,8 @@ wait_for_run() {
 }
 
 status() {
-  # The container consoles are listed beside the results because a failed run
-  # produces the second and not the first, and they stay on the target: nothing
-  # is fetched for a run that failed. Naming the path here is the difference
-  # between "dragonboat exited 1" and being able to read why (#184).
+  # The container consoles stay on the target, and a failed run produces only
+  # those, so list them beside the results.
   ssh "$HOST" "tail -40 '$RUN_LOG' 2>/dev/null; echo '--- results ---'; \
     ls -la '$REMOTE_PERF/$PROFILE_REL/results/' 2>/dev/null || echo 'none yet'; \
     echo '--- container consoles ---'; \
@@ -275,16 +232,10 @@ generate() {
 
 # require_run_success refuses to touch the local profile when the suite failed.
 #
-# This is the other half of #181, and the more insidious half. A failed run is
-# not inert: fetch copies the target's results over the local ones and generate
-# rewrites the profile's charts, per-system documents and env.json. On
-# 2026-09-10 a run whose ONLY requested system produced no results still
-# rewrote five charts, three results/*.json, env.json and two documents -- a
-# "refreshed" profile built on no new measurement, which only a git status
-# caught before it was committed.
-#
-# A profile is a published record. When the run that was meant to update it
-# failed, the right outcome is that it stays exactly as it was.
+# fetch overwrites the local results and generate rewrites the profile's charts
+# and documents, so a failed run would otherwise produce a "refreshed" profile
+# with no new measurement behind it. A profile is a published record; when the
+# run meant to update it failed, it stays as it was.
 require_run_success() {
   local rc
   rc="$(ssh "$HOST" "cat \"$RUN_RC_ABS\" 2>/dev/null" || true)"

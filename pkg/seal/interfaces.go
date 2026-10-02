@@ -91,7 +91,7 @@ type StorageBackend interface {
 	//     successfully removed it.
 	//
 	// A NIL expected IS A VALUE, NOT A WILDCARD, and this is stated explicitly
-	// because an adjacent guarded verb elsewhere in the portfolio reads it the
+	// because other guarded compare-and-set APIs read it the
 	// other way. nil compares equal to a stored EMPTY value and to nothing else;
 	// an ABSENT key is refused whatever expected holds, because the compare has
 	// nothing to compare against. So nil never means "require the key absent",

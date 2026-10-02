@@ -344,7 +344,7 @@ func TestRemoveNodeDataPreservesSharedSegment(t *testing.T) {
 	}
 }
 
-// TestCompactRespectsCommittedHWM verifies the R6 guard: a Compact must never
+// TestCompactRespectsCommittedHWM verifies the guard: a Compact must never
 // delete a segment that is durably written but not yet reflected in the
 // in-memory index or meta pins. SaveState releases shard.mu between its durable
 // WAL write (Phase 1) and its in-memory commit (Phase 3); a concurrent Compact

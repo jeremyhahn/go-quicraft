@@ -1346,7 +1346,7 @@ func TestSampledMetricsCollector_ObserveApplyLatency_Sampling(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_IncMessagesSent_Unsampled is the L11
+// TestSampledMetricsCollector_IncMessagesSent_Unsampled is a
 // regression test: counters must record EVERY increment. Sampling a
 // prometheus.Counter.Inc() makes *_total under-report by SampleRate, so
 // every rate()/increase() built on it is off by orders of magnitude.
@@ -1366,7 +1366,7 @@ func TestSampledMetricsCollector_IncMessagesSent_Unsampled(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_IncMessagesReceived_Unsampled is the L11
+// TestSampledMetricsCollector_IncMessagesReceived_Unsampled is the
 // regression test for the receive counter; see IncMessagesSent_Unsampled.
 func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
 	inner := newPerShardTestCollector()
@@ -1384,7 +1384,7 @@ func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_InterleavedSamplingIndependent is the L11
+// TestSampledMetricsCollector_InterleavedSamplingIndependent is the
 // regression test for the per-metric sampling counters. With a single
 // counter shared across metrics, a strictly alternating commit/apply call
 // pattern at an even SampleRate lands every even count on one metric —
@@ -1531,7 +1531,7 @@ func shardSeriesExists(t *testing.T, reg *prometheus.Registry, name, shardID str
 	return false
 }
 
-// TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality is the M8
+// TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality is a
 // regression test: the security drop counter must not key on the attacker
 // controlled "from" replica id, or it accumulates unbounded child series.
 func TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality(t *testing.T) {
@@ -1585,7 +1585,7 @@ func TestPrometheus_UnauthorizedMessageMetric_ReasonsAreSeparateSeries(t *testin
 	}
 }
 
-// TestPrometheus_UnregisterShard_DeletesSeries is the M9 regression test:
+// TestPrometheus_UnregisterShard_DeletesSeries is the regression test:
 // UnregisterShard must delete the underlying per-shard Prometheus child series,
 // not just the local cache entry, so shard churn does not leak series forever.
 func TestPrometheus_UnregisterShard_DeletesSeries(t *testing.T) {

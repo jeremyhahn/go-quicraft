@@ -52,7 +52,7 @@ func newRegressionRaft(t *testing.T, replicaID uint64, members map[uint64]string
 }
 
 // ---------------------------------------------------------------------------
-// F1: vote tally must be taken over the configuration voters
+// Vote tally must be taken over the configuration voters
 // ---------------------------------------------------------------------------
 
 // A vote response from a replica that is not in the current configuration
@@ -160,7 +160,7 @@ func TestRebuildRemotesFromMembership_PurgesDepartedVotes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F2: Term==0 is a local-injection escape hatch, not a wire value
+// Term==0 is a local-injection escape hatch, not a wire value
 // ---------------------------------------------------------------------------
 
 // A Replicate carrying Term 0 bypasses every term check. Accepting it lets
@@ -267,7 +267,7 @@ func TestStep_AllowsZeroTermLocalControlMessages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C1/L4: the Term==0 bypass belongs to the LOCAL delivery path, not to the
+// The Term==0 bypass belongs to the LOCAL delivery path, not to the
 // message TYPE. Every type in localControlMessages is decodable from the wire
 // (proto.Message.UnmarshalFrom accepts any known type), the transport hands
 // whole batches to the message handler with no type filter, and the handler
@@ -372,7 +372,7 @@ func TestStep_AcceptsForwardedProposeAndReadIndexFromWire(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F3: a joining node must not be elected on its own one-member view
+// A joining node must not be elected on its own one-member view
 // ---------------------------------------------------------------------------
 
 // A joining node that caught up by log replay holds only itself in its
@@ -452,7 +452,7 @@ func TestJoiningNode_AdoptsSnapshotWithEqualConfigChangeID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F4/F5: SetProcessedIndex must never outrun the recovered commit index
+// SetProcessedIndex must never outrun the recovered commit index
 // ---------------------------------------------------------------------------
 
 // An on-disk state machine whose durable marker outruns the recovered
@@ -511,7 +511,7 @@ func TestSetProcessedIndex_ClampedSoCommitDoesNotPanic(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F6: a newly added member must earn its lease contribution
+// A newly added member must earn its lease contribution
 // ---------------------------------------------------------------------------
 
 // A member added during leadership must not contribute to hasValidLease
@@ -550,7 +550,7 @@ func TestSyncLeaseAcks_NewMemberCannotGrantLease(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F7: quiesce must not freeze the lease or the CheckQuorum step-down
+// Quiesce must not freeze the lease or the CheckQuorum step-down
 // ---------------------------------------------------------------------------
 
 // A quiesced, partitioned leader must still lose its lease and step down.
@@ -728,7 +728,7 @@ func TestHasConfigChangeToApply_CoversArbitrarilyWideRanges(t *testing.T) {
 	}
 }
 
-// H2. becomeLeader must not do work proportional to the unapplied log.
+// becomeLeader must not do work proportional to the unapplied log.
 //
 // A gate that re-read (processed, lastIndex] with no byte bound, synchronously
 // on the step worker, would not scale. On a restart processed starts at the
@@ -881,7 +881,7 @@ func TestConfigChangeGate_ClearedBySnapshotRestore(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F2: the config change gate must be anchored at the APPLIED frontier
+// The config change gate must be anchored at the APPLIED frontier
 // ---------------------------------------------------------------------------
 
 // newConfigChangeGateRaft builds a leader-elect over a log whose last entry is
@@ -913,7 +913,7 @@ func newConfigChangeGateRaft(t *testing.T, applied uint64) *raft {
 	return r
 }
 
-// TestConfigChangeGate_ArmedByCommittedButUnappliedChange is the F2
+// TestConfigChangeGate_ArmedByCommittedButUnappliedChange is the
 // regression.
 //
 // Membership does not take effect at commit; it takes effect in Peer.Commit
@@ -999,7 +999,7 @@ func TestConfigChangeGate_ReleasedOnceChangeIsApplied(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F4: the local witness role must be cross-checked against replicated
+// The local witness role must be cross-checked against replicated
 // membership
 // ---------------------------------------------------------------------------
 
@@ -1014,7 +1014,7 @@ func witnessMismatchMembership() proto.Membership {
 	}
 }
 
-// TestWitnessRoleMismatch_CannotCampaign is the F4 regression.
+// TestWitnessRoleMismatch_CannotCampaign is the regression.
 //
 // r.isWitness comes only from local config; nothing validated it against the
 // replicated membership. A node the configuration lists as a witness but that

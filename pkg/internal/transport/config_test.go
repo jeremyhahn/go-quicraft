@@ -484,7 +484,7 @@ func TestDefaultConstantValues(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// S1: 0-RTT replay defense-in-depth
+// 0-RTT replay defense-in-depth
 // ---------------------------------------------------------------------------
 
 // TestValidate0RTTWithoutMTLSReturnsInsecure0RTT verifies that enabling 0-RTT
@@ -519,7 +519,7 @@ func TestValidate0RTTWithMTLSPasses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// S4: MaxStreamsPerConnection config + validation
+// MaxStreamsPerConnection config + validation
 // ---------------------------------------------------------------------------
 
 // TestConfigMaxStreamsPerConnectionDefault verifies that SetDefaults

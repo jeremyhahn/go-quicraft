@@ -113,7 +113,7 @@
 // quic-go supports exactly that (quic.Transport{Conn: ...}), but
 // QUICTransport.Start binds from Config.ListenAddress, a string, and no
 // PacketConn appears anywhere in pkg/. Adding one is a change to the engine's
-// public configuration, which is the owner's call, not this package's.
+// public configuration, which is outside this package's scope.
 package netport
 
 import (

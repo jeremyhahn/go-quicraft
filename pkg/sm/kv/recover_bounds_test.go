@@ -23,7 +23,7 @@ import (
 )
 
 // TestRecoverFromSnapshot_RejectsOversizedLengths is the regression test for
-// H4: a corrupt/malicious snapshot length prefix must be rejected before the
+// A corrupt/malicious snapshot length prefix must be rejected before the
 // oversized allocation, for both KV backends.
 func TestRecoverFromSnapshot_RejectsOversizedLengths(t *testing.T) {
 	// count=1, keyLen=huge.

@@ -526,9 +526,9 @@ func TestPurgeEpochsBefore_PersisterFailureRetainsDEKs(t *testing.T) {
 // --- Strategy downgrade ---
 
 // TestUnseal_StrategyFieldDowngradeRejected is the regression test for the
-// unauthenticated SealedRootKey.Strategy field: flipping it to "none" used to
-// steer Unseal into the no-encryption branch, producing a "successfully
-// unsealed" barrier with no cipher whose first Encrypt panicked.
+// SealedRootKey.Strategy field: flipping it to "none" must not steer Unseal
+// into the no-encryption branch and produce a "successfully unsealed" barrier
+// with no cipher whose first Encrypt panics.
 func TestUnseal_StrategyFieldDowngradeRejected(t *testing.T) {
 	b, s, _ := testPersistingBarrier(t)
 	defer s.Close()

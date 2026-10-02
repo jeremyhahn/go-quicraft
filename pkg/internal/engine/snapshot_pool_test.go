@@ -5130,7 +5130,7 @@ func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testin
 	}
 	if midSaveHadCanary {
 		t.Fatalf("the canonical %s held the state machine IN THE CLEAR during the "+
-			"save (%d bytes on disk): this is #116, and it is durable under the name "+
+			"save (%d bytes on disk), and it is durable under the name "+
 			"every consumer, backup and operator reads", snapshotDataFile, midSaveSize)
 	}
 

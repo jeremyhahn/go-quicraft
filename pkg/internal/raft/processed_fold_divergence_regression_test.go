@@ -36,7 +36,6 @@ import (
 // The replica then campaigns against the configuration its BASE described,
 // having skipped every config change in the window — soliciting votes from
 // replicas the shard removed, and computing quorum over the wrong denominator.
-// Two reviewers found this independently.
 //
 // The fix is to stop conflating the two facts: configFoldedThrough records what
 // the FOLD covered, and only a fold that really offered the entries to
@@ -112,7 +111,7 @@ func TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign(t *testing.T
 // TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign is the POSITIVE
 // CONTROL. With a readable log the identical sequence must fold the tail, clear
 // the watermark, and campaign against the RESOLVED 4-voter set — otherwise the
-// gate is just a permanent election block, which is the round-10 failure mode.
+// gate is just a permanent election block.
 func TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign(t *testing.T) {
 	quietLogs(t)
 

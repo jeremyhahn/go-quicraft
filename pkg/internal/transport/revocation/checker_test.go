@@ -932,8 +932,8 @@ func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
 	}
 }
 
-// TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable verifies the R4
-// precedence fix: a query failure must NOT overwrite an unexpired definitive
+// TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable verifies verdict
+// precedence: a query failure must NOT overwrite an unexpired definitive
 // "revoked" verdict already in the cache with a short-TTL unavailable entry. In
 // soft-fail mode this guarantees a peer the checker already knows to be revoked
 // stays rejected even while the responder is down, rather than being silently
@@ -1881,7 +1881,7 @@ func newTestIntermediate(t *testing.T, root *testCA) *testCA {
 	}
 }
 
-// TestIssuerSelectedPerLeafInTwoTierPKI is the H2 regression test: with a
+// TestIssuerSelectedPerLeafInTwoTierPKI is the regression test: with a
 // root-first CA bundle and leaves signed by the issuing intermediate, the
 // checker must select the INTERMEDIATE as the issuer. Wiring revocation to the
 // bundle's first block (the root) builds OCSP requests whose
@@ -1934,7 +1934,7 @@ func TestOCSPWorksWithIntermediateIssuedLeaf(t *testing.T) {
 	}
 }
 
-// TestCRLSignedByIntermediateAccepted verifies the CRL half of H2: a CRL
+// TestCRLSignedByIntermediateAccepted verifies the CRL half of per-leaf issuer selection: a CRL
 // signed by the issuing intermediate must load successfully when the bundle
 // contains both the root and the intermediate. Verifying only against the
 // root would mark the set stale on every reload interval, so under
@@ -1999,7 +1999,7 @@ func newUnknownOCSPServer(t *testing.T, ca *testCA, queries *atomic.Int64) *http
 	}))
 }
 
-// TestOCSPUnknownStatusFailsClosedUnderEnforcement is the H1 regression test:
+// TestOCSPUnknownStatusFailsClosedUnderEnforcement is the regression test:
 // RFC 6960 "unknown" is NOT "not revoked". Under enforcement a leaf the
 // responder has no record of must be rejected, not admitted.
 func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
@@ -2028,7 +2028,7 @@ func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
 	}
 }
 
-// TestOCSPUnknownStatusNotCachedAsGood verifies the second half of H1: an
+// TestOCSPUnknownStatusNotCachedAsGood verifies the second half: an
 // unknown verdict must never populate the definitive cache. If it did, the
 // "good" verdict would be served for the full OCSPCacheSeconds to every
 // subsequent handshake. Only the short-TTL negative cache may hold it, which
@@ -2100,7 +2100,7 @@ func TestOCSPUnknownStatusSoftFailAllows(t *testing.T) {
 // Empty-CRL, post-dated CRL, cache TTL, mode validation regression tests
 // ---------------------------------------------------------------------------
 
-// TestReloadCRLsRejectsFileWithNoCRLBlocks is the M11 regression test:
+// TestReloadCRLsRejectsFileWithNoCRLBlocks is the regression test:
 // replacing a CRL with a PEM that holds no "X509 CRL" block must NOT commit a
 // fresh empty revoked set. Doing so would un-revoke every listed certificate
 // and mark the set current, so a fail-closed deployment would silently accept
@@ -2251,7 +2251,7 @@ func TestModeOCSPConsultsRevokedSet(t *testing.T) {
 	}
 }
 
-// TestConfigValidateRejectsUnsatisfiableModes is the M10 regression test: a
+// TestConfigValidateRejectsUnsatisfiableModes is the regression test: a
 // mode whose sources are not configured is unsatisfiable, and must be rejected
 // at construction rather than failing every handshake at runtime (or silently
 // checking nothing).

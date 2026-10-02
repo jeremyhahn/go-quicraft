@@ -27,7 +27,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// H2: HandleSnapshot must validate the TARGET replica, not just the sender
+// HandleSnapshot must validate the TARGET replica, not just the sender
 // ---------------------------------------------------------------------------
 
 // TestHandleSnapshot_RejectsForeignTargetReplica pins that the in-band target
@@ -38,7 +38,7 @@ import (
 // LogDB record under a replica ID this host does not own, and reaches raft
 // through DeliverMessage, which performs no destination check of its own.
 func TestHandleSnapshot_RejectsForeignTargetReplica(t *testing.T) {
-	eng, h, handler := newMedlowHandlerFixture(t)
+	eng, h, handler := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(40), uint64(1), uint64(2)
 	const foreignReplicaID = uint64(7)
@@ -93,7 +93,7 @@ func TestHandleSnapshot_RejectsForeignTargetReplica(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H3: a failed InstallSnapshot delivery is a FAILED receive
+// A failed InstallSnapshot delivery is a FAILED receive
 // ---------------------------------------------------------------------------
 
 // refusingInstallDeliverer refuses to deliver InstallSnapshot control
@@ -151,7 +151,7 @@ func (d *refusingInstallDeliverer) RequestSnapshotRecovery(shardID, replicaID ui
 // and no artifact: the leader's retry is received afresh rather than answered
 // from a record of a snapshot raft never saw.
 func TestHandleSnapshot_FailedInstallDeliveryFailsReceive(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(41), uint64(1), uint64(2)
 	const snapIndex = uint64(700)
@@ -231,7 +231,7 @@ func (d *countingRecoveryDeliverer) RequestSnapshotRecovery(shardID, replicaID u
 // queued recovery the log could never reach, failing the shard. Under the two-phase
 // receive nothing is durable until raft adopts the install.
 func TestHandleSnapshot_RaftRefusalLeavesNothingDurable(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)

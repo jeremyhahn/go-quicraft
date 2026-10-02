@@ -364,8 +364,8 @@ func (s *holdDownShard) leaders() []uint64 {
 // TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease drives the
 // reported scenario end to end. L (1) leads; F2 (2) has lost it and its
 // election timer is about to fire; L holds a lease on its own ack and F1's
-// (3). F1 restarts, and F2 campaigns for a higher term. Before the fix F1
-// granted at once, F1 and F2 elected F2, and L kept serving lease reads on
+// (3). F1 restarts, and F2 campaigns for a higher term. Without the hold-down
+// F1 grants at once, F1 and F2 elect F2, and L keeps serving lease reads on
 // F1's pre-restart ack. With the hold-down no replica other than L may lead
 // while L's lease holds, and a new leader is elected once F1's window ends.
 func TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease(t *testing.T) {

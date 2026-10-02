@@ -1,11 +1,9 @@
 name: Release
 
-# go-quicraft is a LIBRARY: it has no cmd/ directory and no package main, so a
-# release ships no binaries. What a Go module release actually consists of is
-# the tag itself — `go get github.com/jeremyhahn/go-quicraft@vX.Y.Z` resolves
-# straight from the VCS and the module proxy. This workflow therefore validates
-# that the tag is releasable and publishes the GitHub release notes; it does
-# not build, checksum or upload artifacts.
+# go-quicraft is a library with no binaries, so a release is the tag itself:
+# `go get github.com/jeremyhahn/go-quicraft@vX.Y.Z` resolves from the VCS and the
+# module proxy. This workflow checks that the tag is releasable, runs the
+# release gates on the tagged tree, and publishes the release notes.
 
 on:
   push:
@@ -14,28 +12,18 @@ on:
 
 permissions:
   contents: write
-  # Needed by the inlined lint/security/trivy jobs' SARIF uploads
-  # (github/codeql-action/upload-sarif), copied here from the retired
-  # quality.yml's own permissions block when those jobs moved into this file
-  # (go-quicraft#22).
+  # Needed by the SARIF uploads in the lint, security and trivy jobs.
   security-events: write
 
 env:
-  # Kept in lockstep with ci.yml's pin (issue #23). This workflow ships no
-  # binaries (see the header): its job is to prove the tag is releasable. That
-  # proof is only meaningful if it runs on the same toolchain the push gate
-  # used — otherwise the tag is certified against a Go version nothing else
-  # verified. Must never drift from ci.yml.
+  # Must match ci.yml, so the tag is certified on the toolchain the push gate
+  # used.
   GO_VERSION: "1.27.0"
-  # Same rationale as the GOWORK=off inside the tag validation below, applied
-  # to every job: nothing here may resolve through a workspace.
+  # Nothing here may resolve through a workspace.
   GOWORK: "off"
 
 jobs:
-  # Split out of the old single `release` job so that a malformed tag fails in
-  # seconds instead of after the ~10 minutes of gates below it. The step bodies
-  # are unchanged — this is the same semver / VERSION / CHANGELOG / v2-suffix
-  # validation, just hoisted into a job the gates and the publish depend on.
+  # A separate job so a malformed tag fails in seconds, before the gates.
   validate:
     name: Validate tag
     runs-on: ubuntu-latest
@@ -43,7 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
-      # The commit this job APPROVED. The publish job refuses anything else —
+      # The commit this job approved. The publish job refuses anything else;
       # see the immutability guard there.
       approved_sha: ${{ steps.approved.outputs.sha }}
     steps:
@@ -117,34 +105,15 @@ jobs:
   # ==========================================================================
   # Release gates
   #
-  # The old comment here said the full gate "runs in ci.yml on the commit this
-  # tag points at". That was an assumption, not a guarantee: ci.yml triggers on
-  # pushes and pull requests against master/main/develop, never on a tag, so a
-  # tag placed on any other commit — a release branch, a cherry-pick, a commit
-  # that was force-pushed away — published with nothing but this job's smoke
-  # check behind it. And even a tag on main had only the UNTAGGED suite behind
-  # it, because until now that was all ci.yml ran.
-  #
-  # A module tag cannot be retracted, so these run here, on the exact tagged
-  # tree, and `release` cannot start until every one of them is green. They are
-  # the same commands as the corresponding ci.yml jobs; keep them in step.
+  # ci.yml does not run on tags, and a tag can point at a commit ci.yml never
+  # saw. A module tag cannot be retracted, so the gates run here on the exact
+  # tagged tree, and `release` waits for all of them. They are the same
+  # commands as the matching ci.yml jobs; keep them in step.
   # ==========================================================================
 
-  # The lint / security / trivy gates, on the EXACT commit being released.
-  #
-  # These ran only in ci.yml, which triggers on branches; release.yml triggers
-  # on tags, so a tag published with no gosec, govulncheck, Trivy, gofmt, vet
-  # or golangci-lint having run on that commit. Advisories are time-sensitive:
-  # one published after the last branch build shipped unseen.
-  #
-  # Inlined rather than a `uses: ./.github/workflows/quality.yml` call
-  # (go-quicraft#22, adopting ci-template v1.9): ci.yml's own quality.yml call
-  # was retired in the same change because a workflow_call is one opaque unit
-  # from the caller's side, which defeated ci.yml's staged fail-fast ordering.
-  # release.yml has no such ordering to protect — nothing here needs to start
-  # before lint/security/trivy finish — so these three are copied verbatim
-  # from the retired quality.yml rather than kept behind an indirection only
-  # one remaining caller uses.
+  # Lint, security and trivy on the exact commit being released. Advisories
+  # are time-sensitive, so one published since the last branch build is caught
+  # here.
   lint:
     name: Gate - lint
     needs: validate
@@ -168,32 +137,10 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # The analysis tools are BAKED INTO THE RUNNER IMAGE at pinned versions
-      # (`/etc/ci-runner-tools.txt`; the image build fails closed if any tool's
-      # self-report disagrees with its pin), so there is nothing to install.
-      #
-      # This replaces `go install` steps that fetched over the network at job
-      # time. They were a live flake, not a theoretical one: DNS returns an AAAA
-      # record for sum.golang.org and the runner hosts have no default IPv6
-      # route, so the fallback occasionally fails to complete and the install
-      # dies with ENETUNREACH. Each had grown a hand-rolled 3-attempt retry loop
-      # — the flake worked around locally instead of removed. Two of the three
-      # also installed `@latest`, so a scan could not be attributed to a scanner
-      # version at all (gosec@latest self-reports "dev").
-      #
-      # THIS STEP IS PER-JOB ON PURPOSE. Each job gets its own runner, and
-      # nothing guarantees two jobs land on the same machine or the same image
-      # instance. A verification performed in `lint` says nothing about the
-      # environment `security` actually runs its scanners in — that job could
-      # find no tool at all, or a different version, with the assertion never
-      # applying. So every job asserts exactly the tools it itself runs.
-      #
-      # A tag push is the worst place to lose a run to a network blip: the tag is
-      # the artifact and it is permanent, so a spurious gate failure blocks a
-      # release that is actually sound.
-      #
-      # To change a version, do NOT add a `go install` back: ask agent-company
-      # to rebuild the image, then update the pins here and in the Makefile.
+      # On the self-hosted runners the analysis tools are baked into the runner
+      # image at pinned versions. Each job verifies the tools it runs itself,
+      # because jobs do not share a machine. To change a version, rebuild the
+      # image and update the pins here, in ci.yml and in the Makefile.
       - name: Verify baked analysis tools
         if: github.server_url != 'https://github.com'
         run: |
@@ -222,17 +169,8 @@ jobs:
           check golangci-lint v2.13.2 "$(modver golangci-lint)"
           exit $rc
 
-      # THE PUBLIC GITHUB MIRROR is a different machine entirely. There
-      # `ubuntu-latest` resolves to GitHub's stock Ubuntu image, which bakes none
-      # of these, so the verification above would fail before any analysis ran
-      # and the mirror's CI would be a false negative on every push. Provision
-      # them there, at the SAME pins, so the mirror gates on the same rule set.
-      #
-      # No retry loop, deliberately: the flake these steps were removed for is
-      # the AAAA-record/no-IPv6-route defect on OUR runner hosts, which is not a
-      # property of GitHub-hosted runners. Re-adding a retry here would be
-      # cargo-culting a workaround into the one environment that never had the
-      # problem.
+      # GitHub-hosted runners bake none of these tools, so install them at the
+      # same pins.
       - name: Provision analysis tools (GitHub-hosted)
         if: github.server_url == 'https://github.com'
         run: |
@@ -254,32 +192,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # The analysis tools are BAKED INTO THE RUNNER IMAGE at pinned versions
-      # (`/etc/ci-runner-tools.txt`; the image build fails closed if any tool's
-      # self-report disagrees with its pin), so there is nothing to install.
-      #
-      # This replaces `go install` steps that fetched over the network at job
-      # time. They were a live flake, not a theoretical one: DNS returns an AAAA
-      # record for sum.golang.org and the runner hosts have no default IPv6
-      # route, so the fallback occasionally fails to complete and the install
-      # dies with ENETUNREACH. Each had grown a hand-rolled 3-attempt retry loop
-      # — the flake worked around locally instead of removed. Two of the three
-      # also installed `@latest`, so a scan could not be attributed to a scanner
-      # version at all (gosec@latest self-reports "dev").
-      #
-      # THIS STEP IS PER-JOB ON PURPOSE. Each job gets its own runner, and
-      # nothing guarantees two jobs land on the same machine or the same image
-      # instance. A verification performed in `lint` says nothing about the
-      # environment `security` actually runs its scanners in — that job could
-      # find no tool at all, or a different version, with the assertion never
-      # applying. So every job asserts exactly the tools it itself runs.
-      #
-      # A tag push is the worst place to lose a run to a network blip: the tag is
-      # the artifact and it is permanent, so a spurious gate failure blocks a
-      # release that is actually sound.
-      #
-      # To change a version, do NOT add a `go install` back: ask agent-company
-      # to rebuild the image, then update the pins here and in the Makefile.
+      # Verify the tools baked into the runner image; see the lint job.
       - name: Verify baked analysis tools
         if: github.server_url != 'https://github.com'
         run: |
@@ -309,17 +222,8 @@ jobs:
           check govulncheck  v1.7.0  "$(modver govulncheck)"
           exit $rc
 
-      # THE PUBLIC GITHUB MIRROR is a different machine entirely. There
-      # `ubuntu-latest` resolves to GitHub's stock Ubuntu image, which bakes none
-      # of these, so the verification above would fail before any analysis ran
-      # and the mirror's CI would be a false negative on every push. Provision
-      # them there, at the SAME pins, so the mirror gates on the same rule set.
-      #
-      # No retry loop, deliberately: the flake these steps were removed for is
-      # the AAAA-record/no-IPv6-route defect on OUR runner hosts, which is not a
-      # property of GitHub-hosted runners. Re-adding a retry here would be
-      # cargo-culting a workaround into the one environment that never had the
-      # problem.
+      # GitHub-hosted runners bake none of these tools, so install them at the
+      # same pins.
       - name: Provision analysis tools (GitHub-hosted)
         if: github.server_url == 'https://github.com'
         run: |
@@ -394,16 +298,11 @@ jobs:
   integration:
     name: Gate - integration suite
     runs-on: ubuntu-latest
-    # Runs alone, for the same reason ci.yml chains its heavy jobs:
-    # this suite stands up multi-node QUIC clusters under -race, and its waits
-    # are measured in seconds. Fanned out beside six fuzz gates, the errfs
-    # suite and the module build on one 20-core self-hosted runner, it lost a
-    # 30-second replication wait — which is exactly how the v0.4.0-alpha
-    # release gate failed. The fuzz, errfs and module gates are cheap and
-    # stay parallel with each other; nothing here needs their OUTPUT, so the
-    # dependency is purely to keep them off the runner at the same time.
-    # `netfault` is chained AFTER this job for the same reason, so the two heavy
-    # QUIC lanes never share the runner either.
+    # Runs after the cheap gates rather than beside them. This suite starts
+    # multi-node QUIC clusters under -race, and sharing the runner with the
+    # fuzz, errfs and module gates expires its 30s replication waits. Nothing
+    # here needs their output; the dependency only keeps them apart.
+    # `netfault` runs after this job for the same reason.
     needs: [validate, errfs, fuzz, modules]
     timeout-minutes: 45
     steps:
@@ -416,30 +315,14 @@ jobs:
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
-      # -p 1: see the identical step in ci.yml. Concurrent multi-node QUIC
-      # packages under -race starve the runner and flake snapshot catch-up.
+      # -p 1: see the matching step in ci.yml.
       - name: Run integration suite
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
 
-  # The one lane that can construct a LIVE network partition.
-  #
-  # This gate existed in ci.yml but not here, so it ran on branches and pull
-  # requests and NOT on the tag pipeline that publishes — and a tag can sit on a
-  # commit ci.yml never saw (release branch, cherry-pick, force-push), which is
-  # the whole reason the other gates were moved into this file.
-  #
-  # What it protects is not incremental. Every other "partition" test in the
-  # repository calls stopNode, which is a process kill, so a quorum weakened
-  # from a strict majority to n/2 passed 18 of 19 linearizability tests. This
-  # suite catches that mutant in about 1.1 seconds because it deposes a leader
-  # that is still RUNNING and still believes it leads.
-  #
-  # Serialised behind `integration`, exactly as in ci.yml. `integration` already
-  # waits on errfs/fuzz/modules, so by the time this starts the runner is empty:
-  # adding it lengthens the pipeline by one job but puts nothing new beside the
-  # heavy QUIC lanes. That ordering is deliberate — these tests wait on election
-  # timeouts, and a contended 20-core self-hosted runner turns a real timing
-  # assertion into a flake, which is how the v0.4.0-alpha release gate failed.
+  # The only suite that builds a live network partition: it deposes a leader
+  # that is still running and still believes it leads. Every other partition
+  # test stops the node outright. Serialised behind `integration`, as in
+  # ci.yml, because these tests wait on election timeouts.
   netfault:
     name: Gate - network partitions [build tag quicraft_netfault]
     runs-on: ubuntu-latest
@@ -455,10 +338,9 @@ jobs:
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
-      # Same Makefile target ci.yml and a developer run. The suite is
-      # self-guarding: every test asserts netfault.BlockedCount() is non-zero,
-      # so a missing build tag fails the job instead of silently exercising a
-      # healthy cluster.
+      # Same Makefile target as ci.yml. Every test asserts
+      # netfault.BlockedCount() is non-zero, so a missing build tag fails the
+      # job.
       - name: Run network-partition suite
         run: make ci-netfault
 
@@ -489,11 +371,10 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Publish only BUILDS the FIPS variant. Whether the code actually runs
-      # under the approved-only module is what the nightly's verify-fips
-      # proves, and a release cut on a day the nightly was red would otherwise
-      # ship without that proof. Same three steps as nightly.yml's FIPS job.
-      # The transport suite starts real QUIC listeners.
+      # Publish only builds the FIPS variant. These steps prove the code runs
+      # under the approved-only module, matching nightly.yml's FIPS job, so a
+      # release does not depend on the last nightly being green. The transport
+      # suite starts real QUIC listeners.
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
@@ -518,12 +399,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Publish's own `go test -race ./...` cannot cover this policy: the
-      # test skips under the detector because the race is quic-go's, on the
-      # client connection the test dials through DialAddrEarly (#199). This
-      # gate is where a release verifies that a snapshot arriving as 0-RTT
-      # early data is refused, so the guarantee is not merely asserted in the
-      # CHANGELOG.
+      # Publish runs `go test -race`, and this test skips under the race
+      # detector (the race is inside quic-go's DialAddrEarly path). This gate
+      # verifies that a snapshot arriving as 0-RTT early data is refused.
       - name: Run the 0-RTT tests without the race detector
         run: go test -count=1 -run '0RTT' ./pkg/internal/transport/
 
@@ -534,19 +412,11 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Go's fuzzing engine starts one worker per CPU, so six of these jobs at
-      # once put ~24 workers on a 20-core runner. That does not corrupt a
-      # result — a fuzz worker has no timing assertions — but it does starve
-      # the coordinator's shutdown RPC, which surfaces as a bare
-      # "context deadline exceeded" AFTER the full -fuzztime has elapsed and
-      # reads exactly like a crash. It is not one; it is the gate failing on
-      # its own scheduling.
-      #
-      # max-parallel is declared for hosts that honour it. Gitea's act_runner
-      # does NOT: on release 424 all six jobs started within the same second
-      # with this set to 3. The enforceable half of the fix is -parallel on the
-      # fuzz command itself, below, which Go applies rather than the runner.
-      # The integration gate no longer overlaps these at all (see its `needs`).
+      # Go's fuzzer starts one worker per CPU. Too many concurrent fuzz jobs
+      # starve the coordinator's shutdown RPC, which shows up as "context
+      # deadline exceeded" after -fuzztime and looks like a crash.
+      # max-parallel is ignored by some runners (act_runner among them), so
+      # the Makefile target also limits -parallel.
       max-parallel: 3
       matrix:
         package:
@@ -563,20 +433,15 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Two passes with different jobs to do. The seed pass is the gate: it is
-      # deterministic, it covers every target, and it must pass. The bounded
-      # mutation pass afterwards is a last look for a crash that the committed
-      # corpus does not already encode — 10s per target, not a real fuzzing
-      # budget (that is fuzz.yml's nightly schedule), but a release is the one
-      # moment where spending a couple of extra minutes is obviously correct.
+      # The seed pass is the gate: deterministic, covers every target, and must
+      # pass. The bounded mutation pass afterwards is a short last look for a
+      # crash the committed corpus does not encode; real fuzzing is fuzz.yml's
+      # nightly schedule.
       - name: Seed and committed-corpus pass
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
 
-      # Runs the same Makefile target a developer runs (devops.md §4), so the
-      # release gate can be reproduced locally. ci-fuzz-mutation budgets each
-      # target as an execution count rather than a duration, which keeps Go's
-      # coordinator from reporting its own shutdown deadline as a failure; the
-      # Makefile header on that target explains why.
+      # The same Makefile target a developer runs. ci-fuzz-mutation budgets each
+      # target as an execution count rather than a duration; see the Makefile.
       - name: Bounded mutation pass
         run: make ci-fuzz-mutation FUZZ_MUT_PKGS='${{ matrix.package }}'
 
@@ -592,12 +457,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Discovered rather than listed: a go.mod nobody remembered to enrol is
-      # precisely the failure being prevented. ci.yml runs the same loop — it
-      # used to fan out across a matrix instead, which turned out never to
-      # expand, leaving this job as the only one that has ever built a nested
-      # module. Keep the two in step, MODULE_FLOOR included: without the floor
-      # a discovery that returns nothing reads as a clean gate.
+      # Discovered rather than listed, so a new go.mod is enrolled
+      # automatically. Keep this in step with ci.yml, MODULE_FLOOR included:
+      # without the floor, a discovery that finds nothing passes.
       - name: Build and vet every module in the tree
         run: |
           set -uo pipefail
@@ -627,22 +489,12 @@ jobs:
   contrib-dragonboat:
     name: Gate - contrib/dragonboat compatibility [unit + integration]
     runs-on: ubuntu-latest
-    # Runs after the other heavy suites rather than beside them: this stands up
-    # multi-node QUIC clusters through the dragonboat compatibility API under
-    # -race, and sharing a runner with `integration`/`netfault` starves CPU
-    # enough to flake 30s waits. Same reasoning as ci.yml's chaining.
+    # Runs after the other heavy suites: it starts multi-node QUIC clusters
+    # under -race, and sharing the runner flakes the 30s waits.
     needs: [validate, integration, netfault]
     timeout-minutes: 45
-    # WHY THIS EXISTS (go-quicraft#3). CI proves the compatibility API works on
-    # a commit; this proves it for the ARTIFACT being shipped. The two are not
-    # the same claim — a tag is built from a tree that no CI run necessarily
-    # examined in this exact combination, and for a compatibility shim the
-    # thing consumers depend on is precisely that it still behaves like
-    # dragonboat at the released version.
-    #
-    # It runs the SAME two suites as ci.yml's contrib-dragonboat job, not a
-    # reduced smoke subset: a release gate that verifies less than the push
-    # gate would let a defect through exactly when it is most expensive to fix.
+    # Runs the same two suites as ci.yml's contrib-dragonboat job, on the
+    # exact tree being tagged.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -657,9 +509,8 @@ jobs:
         working-directory: contrib/dragonboat
         run: go test -race -count=1 -timeout=900s ./...
 
-      # -p 1 is load-bearing, not caution: every package here spins up
-      # multi-node QUIC clusters under -race, and running them concurrently
-      # starves runner CPU enough to flake the tests with 30s waits.
+      # -p 1 is required: every package here starts multi-node QUIC clusters
+      # under -race, and running them concurrently flakes the 30s waits.
       - name: Run contrib/dragonboat integration suite
         working-directory: contrib/dragonboat
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
@@ -667,8 +518,7 @@ jobs:
   release:
     name: Publish
     runs-on: ubuntu-latest
-    # Nothing publishes until every gate above is green. This is the whole
-    # point of the restructuring: the tag is the artifact, and it is permanent.
+    # Nothing publishes until every gate above is green.
     needs: [validate, lint, security, trivy, integration, netfault, errfs, fips, zero-rtt, fuzz, modules, contrib-dragonboat]
     timeout-minutes: 30
     steps:
@@ -681,9 +531,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # Smoke check only; the gate jobs above carry the real weight. What this
-      # still catches on its own is a tag placed on a commit that does not
-      # build at all.
+      # Smoke check; the gate jobs above carry the real weight.
       - name: Build
         run: go build ./...
 
@@ -693,9 +541,8 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # Byte-identical to the ci.yml `test` job, deliberately. This step used
-      # to drop BOTH -race and the coverage threshold, so the race-enabled unit
-      # suite never ran on a tag at all.
+      # Runs the race-enabled suite with a coverage floor, like ci.yml's
+      # `test` job.
       - name: Test
         run: |
           go test -race -count=1 -timeout=900s -coverprofile=coverage.out ./...
@@ -715,9 +562,8 @@ jobs:
             exit 1
           fi
 
-      # Consumers read the release page, not the repository, so the notes have
-      # to carry the section verbatim — including the on-disk break warnings,
-      # which are the whole upgrade procedure for this project today.
+      # The release notes carry the changelog section verbatim, including any
+      # on-disk format break warnings.
       - name: Extract changelog section
         env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -743,32 +589,19 @@ jobs:
             echo "See [docs/compatibility.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/compatibility.md) for the API-stability guarantee and the upgrade path."
           } >> release-notes.md
 
-      # TAG IMMUTABILITY, checked against the REMOTE.
+      # Tag immutability, checked against the remote.
       #
-      # `validate` and this job are separate jobs on separate runners. The
-      # obvious guard -- compare this job's `git rev-parse HEAD` against the
-      # commit validate approved -- CANNOT WORK, and it is worth saying why
-      # because it looks correct: on a tag-push event actions/checkout checks
-      # out the SHA captured in the triggering event, so BOTH jobs check out the
-      # same commit whatever the tag does afterwards. HEAD always equals
-      # APPROVED and the guard always passes.
+      # Comparing this job's HEAD with the approved commit cannot fail: on a
+      # tag push, actions/checkout checks out the event SHA in every job. The
+      # publish step resolves `tag_name` by name at publish time, so a tag
+      # force-moved mid-release would publish an unvalidated commit. So resolve
+      # what the tag points at on the remote now, peeled (`^{}`) because an
+      # annotated tag's ref names the tag object, and require the approved
+      # commit.
       #
-      # Meanwhile the publish step below uses `tag_name: ${{ github.ref_name }}`,
-      # a NAME, resolved by the forge at publish time. So a tag force-moved
-      # mid-release publishes a release pointing at an unvalidated commit while
-      # every check above reports success.
-      #
-      # The only thing that answers the question is the remote itself: resolve
-      # what the tag points at NOW, immediately before publishing, and require
-      # it to be the commit validate approved. Peeled first (`^{}`) because an
-      # annotated tag's ref names the tag object, not the commit.
-      #
-      # Fails on missing, ambiguous, or mismatched -- and on an ABSENT approved
-      # value, since an empty guard is not a passing guard. It does NOT fall
-      # back to checking out the approved commit: a mid-release tag move is an
-      # immutability breach, and quietly publishing the right tree would hide
-      # it. Server-side immutable tags would be the definitive fix; this is the
-      # strongest check available from inside the workflow.
+      # Fails on a missing, ambiguous or mismatched tag, and on an empty
+      # approved value. It does not fall back to checking out the approved
+      # commit: a moved tag needs a human to look at it.
       - name: Refuse a tag that moved after validation
         env:
           APPROVED: ${{ needs.validate.outputs.approved_sha }}
@@ -815,15 +648,8 @@ jobs:
             exit 1
           fi
           echo "OK: $TAG still points at the commit validate approved ($APPROVED)"
-      # ORDERING IS THE CONTROL. This sits immediately before the publishing
-      # action, with no executable step between, and that is not tidiness: the
-      # guard only covers the window it precedes. It was originally placed at
-      # the top of this job, which left the build, the FIPS build, vet, the full
-      # race suite (900s timeout), coverage and release-note generation between
-      # the check and the publish -- minutes in which the tag could move and
-      # `softprops/action-gh-release` would still resolve `tag_name` by NAME and
-      # publish the moved commit. Narrowing a TOCTOU window is not closing it;
-      # the check has to be the last thing that happens.
+      # This guard must stay immediately before the publish step, with no
+      # executable step between: it only covers the window it precedes.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:

@@ -34,7 +34,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-func newMedlowHandlerFixture(t *testing.T) (*engine.Engine, *Host, *hostMessageHandler) {
+func newRoutingHandlerFixture(t *testing.T) (*engine.Engine, *Host, *hostMessageHandler) {
 	t.Helper()
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -57,15 +57,15 @@ func newMedlowHandlerFixture(t *testing.T) (*engine.Engine, *Host, *hostMessageH
 }
 
 // ---------------------------------------------------------------------------
-// L15: HandleMessage must drop messages addressed to a different replica
+// HandleMessage must drop messages addressed to a different replica
 // ---------------------------------------------------------------------------
 
-// TestHandleMessage_DropsMisroutedTo is the L15 regression test: a message
+// TestHandleMessage_DropsMisroutedTo is the regression test: a message
 // whose To field names a different replica of a locally-loaded shard must
 // be dropped via the unauthorized-message path, not stepped into the local
 // raft state. To == 0 (broadcast/control) and To == local replica pass.
 func TestHandleMessage_DropsMisroutedTo(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
 	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
@@ -120,7 +120,7 @@ func (r *dropCountRecorder) IncUnauthorizedMessageDropped(uint64, uint64, string
 // write thousands of synchronous lines. The warning is sampled; the counter
 // still records every drop.
 func TestHandleMessage_DropWarningsAreRateLimited(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
 	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
 		localReplicaID: "127.0.0.1:6001",
@@ -160,7 +160,7 @@ func TestHandleMessage_DropWarningsAreRateLimited(t *testing.T) {
 // identity membership binds to the replica — what an inbound sender from it is
 // held to — and "" for a shard not loaded here, so nothing is sent there.
 func TestReplicaIdentity_IsTheIdentityASenderIsHeldTo(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
 	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
 		localReplicaID: "127.0.0.1:6001",
@@ -179,17 +179,17 @@ func TestReplicaIdentity_IsTheIdentityASenderIsHeldTo(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M16: concurrent same-index snapshot receives must be serialized
+// Concurrent same-index snapshot receives must be serialized
 // ---------------------------------------------------------------------------
 
 // TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn is the deterministic
-// half of the M16 regression: while a receive for (shard, replica, index)
+// half of the regression: while a receive for (shard, replica, index)
 // is claimed, a second HandleSnapshot for the same key must take the same
 // early-return path as the LogDB dedup — return nil WITHOUT touching the
 // snapshot directory or LogDB. After the claim is released, the receive
 // proceeds normally.
 func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
-	eng, h, handler := newMedlowHandlerFixture(t)
+	eng, h, handler := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(30), uint64(1), uint64(2)
 	const snapIndex = uint64(400)
@@ -251,7 +251,7 @@ func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 }
 
 // TestHandleSnapshot_ConcurrentSameIndexReceives is the concurrency half of
-// the M16 regression: many simultaneous deliveries of the same snapshot
+// the regression: many simultaneous deliveries of the same snapshot
 // must produce exactly one intact on-disk snapshot and a consistent LogDB
 // record — no interleaved snapshot.dat writes, and no loser cleanup
 // removing the directory the winner recorded in LogDB.
@@ -264,7 +264,7 @@ func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 // TestHandleSnapshot_RestoredMembershipGovernsLaterReceives for what a snapshot
 // that genuinely drops the sender does instead.
 func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
-	eng, h, handler := newMedlowHandlerFixture(t)
+	eng, h, handler := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(31), uint64(1), uint64(2)
 	const snapIndex = uint64(500)
@@ -377,7 +377,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 // not, which is why a same-snapshot fixture must not change the configuration
 // at all.
 func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
-	eng, h, handler := newMedlowHandlerFixture(t)
+	eng, h, handler := newRoutingHandlerFixture(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(32), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)

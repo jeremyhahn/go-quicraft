@@ -147,7 +147,7 @@ func (r rejectingProposer) SyncPropose(context.Context, uint64, []byte) error {
 	return r.err
 }
 
-// TestSubmit_TimeoutIsReportedIndeterminate is the M7(b) regression test. A
+// TestSubmit_TimeoutIsReportedIndeterminate is the regression test. A
 // proposer timeout or cancellation does NOT mean the proposal was rejected:
 // the entry may already be replicated and will apply. Reporting a hard
 // failure told the caller a committed write failed, and a blind retry
@@ -185,7 +185,7 @@ func TestSubmit_TimeoutIsReportedIndeterminate(t *testing.T) {
 }
 
 // TestSubmit_DefiniteRejectionIsNotIndeterminate pins the other side of the
-// M7(b) distinction: an ordinary rejection is a definite failure and is safe
+// timeout distinction: an ordinary rejection is a definite failure and is safe
 // to surface as one.
 func TestSubmit_DefiniteRejectionIsNotIndeterminate(t *testing.T) {
 	rejected := errors.New("quicraft: not leader")

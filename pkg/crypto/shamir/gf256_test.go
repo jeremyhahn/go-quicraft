@@ -153,7 +153,7 @@ func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 	}
 }
 
-// TestCombineTamperedShareYieldsGarbage verifies the M4 contract: flipping a
+// TestCombineTamperedShareYieldsGarbage verifies the contract: flipping a
 // byte in a share is NOT self-detected (shares carry no secret digest — that
 // would be an offline oracle). Combine returns garbage, not an error; the caller
 // must catch this via out-of-band authentication.
@@ -223,7 +223,7 @@ func TestCombineRejectsDuplicateXCoordinate(t *testing.T) {
 // TestCombineRequiresDigest verifies that Combine refuses digest-less
 // shares and CombineUnverified accepts them (explicit opt-out, not a
 // silent sentinel).
-// TestCombineEqualsCombineUnverified verifies the M4 contract: shares carry no
+// TestCombineEqualsCombineUnverified verifies the contract: shares carry no
 // secret digest, so Combine performs no self-verification and is identical to
 // CombineUnverified — both reconstruct the secret and leave integrity to the
 // caller's out-of-band authentication.

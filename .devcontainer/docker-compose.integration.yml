@@ -4,32 +4,11 @@
 #   docker compose -f .devcontainer/docker-compose.integration.yml up --build \
 #       --abort-on-container-exit --exit-code-from test-runner
 #
-# WHY THERE IS ONLY ONE SERVICE
-#
-# This file used to declare node1/node2/node3 as well, each built from a
-# `target: node` stage and started with `start --listen=... --peers=...`, plus
-# INTEGRATION_NODE{1,2,3}_ADDR and INTEGRATION_SHARD_ID on the runner. All of
-# that was decorative, in three independent ways:
-#
-#   1. Nothing read the variables. `git grep INTEGRATION_NODE` matched this file
-#      and two docs pages, and no line of Go anywhere in the tree.
-#   2. Dockerfile.integration has no `node` stage — only `builder` and
-#      `test-runner` — so those three services could not be built at all.
-#   3. There is no node server to run. go-quicraft is a library: it has no cmd/
-#      directory and the only `package main` in the tree is the benchmark
-#      harness under test/performance/. The `start` command never existed.
-#
-# The suite builds its own clusters: newTestCluster in test/integration/e2e
-# stands up N real quicraft.Host instances over real QUIC with mandatory mTLS on
-# loopback ports. That is genuine multi-replica coverage — 63 tests across 13
-# files covering election and failover, membership change, partition,
-# asymmetric partition, quorum loss, replication, snapshot catch-up and barrier
-# replacement — it just does not need a cross-container topology. What the
-# container still contributes is the pinned toolchain and the tuned QUIC UDP
+# There is a single service. The suite builds its own clusters:
+# newTestCluster in test/integration/e2e starts N quicraft.Host instances over
+# real QUIC with mTLS on loopback ports, so no cross-container topology is
+# needed. The container provides the pinned toolchain and the tuned QUIC UDP
 # buffers the entrypoint sets.
-#
-# If cross-container coverage is wanted later, it needs a real node binary
-# first. Re-adding the services without one only restores the illusion.
 
 services:
 
@@ -42,13 +21,7 @@ services:
     hostname: test-runner
     cap_add:
       - NET_ADMIN
-    # -test.v for verbose output; -test.timeout is a hard ceiling.
-    #
-    # 600s, not the 120s that used to be here. That 120s was never exercised —
-    # the stack could not build — and 63 tests that each stand up a multi-node
-    # QUIC cluster and wait on election timeouts do not fit in it. Under-budget
-    # ceilings have bitten this repository before: see the note on
-    # _integration-test in the Makefile, where a 300s cap produced a timeout
-    # panic with zero test failures and read as a product bug rather than as a
-    # budget. Raise this rather than trimming coverage if it is ever hit.
+    # -test.v for verbose output; -test.timeout is a hard ceiling. Each test
+    # starts a multi-node QUIC cluster and waits on election timeouts, so raise
+    # this rather than trimming coverage if it is ever hit.
     command: ["-test.v", "-test.timeout=600s"]

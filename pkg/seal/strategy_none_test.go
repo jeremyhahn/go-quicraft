@@ -39,9 +39,9 @@ func TestNoneStrategy_Identity(t *testing.T) {
 }
 
 // TestNoneStrategy_BarrierEncryptor_RoundTrip asserts that the no-encryption
-// encrypter round-trips, never aliases the caller's buffer (M8), and prepends
+// encrypter round-trips, never aliases the caller's buffer, and prepends
 // the 8-byte sentinel-zero epoch prefix so the output is wire-format
-// compatible with epoch-aware readers (H5).
+// compatible with epoch-aware readers.
 func TestNoneStrategy_BarrierEncryptor_RoundTrip(t *testing.T) {
 	s := NewNoneStrategy()
 	enc, err := s.BarrierEncryptor(context.Background(), nil)
@@ -58,7 +58,7 @@ func TestNoneStrategy_BarrierEncryptor_RoundTrip(t *testing.T) {
 		t.Fatalf("Encrypt: %v", err)
 	}
 
-	// H5: leading 8 bytes are the (zero) epoch header that WAL/snapshot
+	// Leading 8 bytes are the (zero) epoch header that WAL/snapshot
 	// readers parse; the payload follows.
 	if len(ciphertext) != len(plaintext)+8 {
 		t.Fatalf("ciphertext len = %d, want %d (8-byte epoch prefix + payload)", len(ciphertext), len(plaintext)+8)
@@ -69,7 +69,7 @@ func TestNoneStrategy_BarrierEncryptor_RoundTrip(t *testing.T) {
 		}
 	}
 
-	// M8: Encrypt must not alias the input. Mutating plaintext after Encrypt
+	// Encrypt must not alias the input. Mutating plaintext after Encrypt
 	// must not change the produced ciphertext payload.
 	cipherCopy := append([]byte(nil), ciphertext...)
 	for i := range plaintext {
@@ -125,7 +125,7 @@ func TestNoneStrategy_BarrierRestartCycle(t *testing.T) {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
 	if err := b2.Unseal(ctx, s, Credentials{}); err != nil {
-		t.Fatalf("Unseal(None) after restart failed (C5 regression): %v", err)
+		t.Fatalf("Unseal(None) after restart failed: %v", err)
 	}
 	if b2.IsSealed() {
 		t.Fatal("barrier should be unsealed after restart")

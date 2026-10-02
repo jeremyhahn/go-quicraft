@@ -23,7 +23,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M2: the witness DATA PATH is driven by the replicated membership alone
+// The witness DATA PATH is driven by the replicated membership alone
 // ---------------------------------------------------------------------------
 
 // TestWitnessDataPath_FollowsReplicatedMembership pins the consequence that
@@ -175,10 +175,10 @@ func TestWitnessBootstrapShape_LatchesRoleMismatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H1: a RESTARTED leader must not replicate full payloads to a seeded witness
+// A RESTARTED leader must not replicate full payloads to a seeded witness
 // ---------------------------------------------------------------------------
 
-// TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange is the H1
+// TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange is the
 // regression, seen from the LEADER.
 //
 // Host.StartShard seeds proto.Membership.Addresses from the caller's members

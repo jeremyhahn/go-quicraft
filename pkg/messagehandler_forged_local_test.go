@@ -25,7 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership is the C1
+// TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership is the
 // end-to-end regression test. It drives the full inbound path a remote peer
 // actually has — hostMessageHandler.HandleMessage (what the transport calls
 // with a decoded MessageBatch) into the engine inbox into the step worker into
@@ -113,7 +113,7 @@ func TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership(t *testing.T
 }
 
 // TestHandleMessage_ForgedProcessLocalTypesAreNotStepped covers the rest of
-// the class (L4). localControlMessages exempts Propose, ReadIndex,
+// the class. localControlMessages exempts Propose, ReadIndex,
 // InstallSnapshot, SnapshotStatus, Unreachable and LeaderTransfer from the
 // term gate; all six decode off the wire, and HandleMessage applies no type
 // filter. Delivering each of them from a "member" must leave the shard's

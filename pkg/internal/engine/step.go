@@ -970,10 +970,10 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 // the one that produces a proto.Update. A node can win an election entirely
 // inside processCommitPendingInbox (a RequestVoteResp there drives
 // handleVoteResp -> becomeLeader), and a CheckQuorum step-down changes no
-// hard-state field at all, so neither produces an update and neither used to
-// publish anything. The result was a real Raft leader that the public API
-// reported as a follower, and a stepped-down node that kept reporting itself
-// leader — clients route writes by exactly this flag.
+// hard-state field at all, so neither produces an update. Publishing only on
+// updates would leave a real Raft leader that the public API reports as a
+// follower, and a stepped-down node that keeps reporting itself leader —
+// clients route writes by exactly this flag.
 // The leader and term are read as a PAIR (Peer.LeaderAndTerm). All three publish
 // sites run outside raftMu, so reading the two mirrors separately could report a
 // combination that never co-existed — telling a listener a replica led in a term

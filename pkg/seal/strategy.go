@@ -80,7 +80,7 @@ const (
 // core-dumpable memory — and for a deferred strategy the passphrase is not a
 // lesser secret than the root key it wraps, it IS that key's protection. An
 // obligation to wipe, written in a doc comment, is weaker than a type that
-// cannot be got wrong: every strategy in the portfolio implements against this
+// cannot be got wrong: every strategy implements against this
 // struct, so with a []byte every one of them would have to remember.
 //
 // A [enclave.SealedEnclave] holds the passphrase as CIPHERTEXT at rest and

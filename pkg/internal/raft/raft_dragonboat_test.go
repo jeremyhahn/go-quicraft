@@ -28,7 +28,7 @@ import (
 )
 
 // ===========================================================================
-// CRITICAL: Entry Validation Tests
+// Entry Validation Tests
 // ===========================================================================
 
 // TestDragonboat_AppendRejectsIndexHole verifies that tryAppend rejects a
@@ -175,7 +175,7 @@ func TestDragonboat_EntryMergeSafety(t *testing.T) {
 }
 
 // ===========================================================================
-// CRITICAL: Leader Transfer Edge Cases
+// Leader Transfer Edge Cases
 // ===========================================================================
 
 // TestDragonboat_LeaderTransferAfterSnapshot verifies that leadership can
@@ -594,7 +594,7 @@ func TestDragonboat_LeaderTransferFromFollower(t *testing.T) {
 }
 
 // ===========================================================================
-// CRITICAL: Config Change Recovery
+// Config Change Recovery
 // ===========================================================================
 
 // TestDragonboat_RecoverPendingConfigChange verifies that a new leader
@@ -674,7 +674,7 @@ func TestDragonboat_RecoverDoublePendingConfigChange(t *testing.T) {
 }
 
 // ===========================================================================
-// CRITICAL: Snapshot Safety
+// Snapshot Safety
 // ===========================================================================
 
 // TestDragonboat_SnapshotAbort verifies that when a snapshot send is
@@ -869,7 +869,7 @@ func TestDragonboat_RestoreIgnoresStaleSnapshot(t *testing.T) {
 }
 
 // ===========================================================================
-// HIGH: State Transition Matrix
+// State Transition Matrix
 // ===========================================================================
 
 // TestDragonboat_StateTransitionMatrix tests all valid and invalid state
@@ -1048,7 +1048,7 @@ func TestDragonboat_VoteFromAnyState(t *testing.T) {
 }
 
 // ===========================================================================
-// HIGH: Commit Safety
+// Commit Safety
 // ===========================================================================
 
 // TestDragonboat_CommitAfterRemoveNode verifies that after removing a node,
@@ -1168,7 +1168,7 @@ func TestDragonboat_ProposalByProxy_NoLeader(t *testing.T) {
 }
 
 // ===========================================================================
-// CRITICAL: Section 5.4.2 - Cannot commit without new term entry
+// Section 5.4.2 - Cannot commit without new term entry
 // ===========================================================================
 
 // TestDragonboat_CannotCommitWithoutNewTermEntry verifies the Raft safety

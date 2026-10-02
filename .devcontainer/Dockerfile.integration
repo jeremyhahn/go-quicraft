@@ -1,7 +1,7 @@
 # Dockerfile.integration - Multi-stage build for integration testing.
 #
 # Stage 1 (builder): compiles the integration test binary.
-# Stage 2 (test-runner): runs the compiled integration test binary against the cluster.
+# Stage 2 (test-runner): runs the compiled integration test binary.
 
 # ---------------------------------------------------------------------------
 # Stage 1: Build
@@ -17,29 +17,13 @@ RUN go mod download 2>/dev/null || true
 # Copy the full source tree and build.
 COPY . .
 
-# Build the integration test binary. The -c flag compiles without running,
-# and -tags=integration gates the test files so they are not included in
-# regular test runs.
+# Build the integration test binary. -c compiles without running, and
+# -tags=integration selects the integration test files.
 #
-# There is deliberately no "no tests yet" fallback and stderr is deliberately
-# not suppressed. What used to sit on these lines was
-#
-#   go test -c ... 2>/dev/null || echo "...placeholder" && touch ... && chmod ...
-#
-# and `||` and `&&` are equal-precedence and left-associative, so that parsed as
-# ((go test || echo) && touch) && chmod. A compile failure was hidden by
-# 2>/dev/null, `echo` succeeded, and a ZERO-BYTE executable was installed.
-# execve on an empty file returns ENOEXEC, the shell falls back to running it as
-# a shell script, an empty script exits 0, and
-# `docker compose --exit-code-from test-runner` reported the whole suite green.
-# Measured: the old construct exits 0 on a failing build, and the empty binary
-# it leaves behind exits 0 when executed.
-#
-# The two assertions after the build are the anti-vacuity gate. `go test -c` on
-# a package with no test files writes NO output file and still exits 0, so
-# `test -s` is what turns "compiled nothing" into a build failure, and
-# `-test.list` proves the binary actually contains tests rather than merely
-# existing.
+# No fallback and no suppressed stderr: a failed compile must fail the build.
+# `go test -c` on a package with no test files writes nothing and exits 0, so
+# `test -s` catches an empty build and `-test.list` proves the binary contains
+# tests.
 RUN set -eux; \
     go test -c -o /integration-tests -tags=integration ./test/integration/e2e/...; \
     test -s /integration-tests; \

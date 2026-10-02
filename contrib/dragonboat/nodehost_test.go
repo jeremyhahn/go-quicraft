@@ -2848,7 +2848,7 @@ func TestNodeHost_GetShardMembership_InvalidShard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// D-10: SnapshotOption CompactionIndex descriptive error message
+// SnapshotOption CompactionIndex descriptive error message
 // ---------------------------------------------------------------------------
 
 func TestSnapshotOption_Validate_CompactionIndex_DescriptiveMessage(t *testing.T) {
@@ -2878,7 +2878,7 @@ func TestSnapshotOption_Validate_CompactionIndex_StillMatchesErrInvalidOption(t 
 }
 
 // ---------------------------------------------------------------------------
-// D-1: Async context lifetime - verify cancel not called prematurely
+// Async context lifetime - verify cancel not called prematurely
 // ---------------------------------------------------------------------------
 
 func TestNodeHost_Propose_Async_ContextNotCanceledPrematurely(t *testing.T) {
@@ -2922,7 +2922,7 @@ func TestNodeHost_Propose_Async_InvalidShard_CancelsClearly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// D-2: Entry Term field in QueryRaftLog
+// Entry Term field in QueryRaftLog
 // ---------------------------------------------------------------------------
 
 func TestNodeHost_QueryRaftLog_EntryTermField(t *testing.T) {

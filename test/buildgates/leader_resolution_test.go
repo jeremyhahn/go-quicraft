@@ -439,7 +439,7 @@ func formatDirectCalls(calls []directCall) string {
 // do not end the class, because the next test to be written reintroduces the
 // pattern.
 //
-// The reason it kept escaping review is that it has two shapes. The direct one
+// The class is easy to miss because it has two shapes. The direct one
 //
 //	cluster.hosts[leaderIdx].Propose(ctx, shardID, cmd)
 //

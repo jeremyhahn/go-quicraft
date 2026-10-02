@@ -30,7 +30,7 @@
 // EXACT equality with 1.
 //
 // A layout change during this period is made IN PLACE, at version 1, and the
-// consuming repositories (go-qrdb, go-xkms, go-quicbaas, go-trusted-ca) are
+// consuming repositories (go-qrdb and any other embedder) are
 // updated to match in the same change. Development clusters are WIPED and
 // re-synced rather than migrated. There is no dual-read path, no migration
 // window, and no legacy decode case, because there is no deployed data and no

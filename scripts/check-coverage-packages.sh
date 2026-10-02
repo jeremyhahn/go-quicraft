@@ -1,29 +1,15 @@
 #!/usr/bin/env bash
 #
-# check-coverage-packages.sh — enforce a coverage floor on EVERY package in a
-# Go coverage profile, not only on the module total.
+# check-coverage-packages.sh — enforce a coverage floor on every package in a
+# Go coverage profile, so no package hides under the module total.
 #
 # Usage: scripts/check-coverage-packages.sh <profile> <minimum-percent> [<import-path-prefix>]
 #
-# Why this exists: a total can clear its floor while one package sits far below
-# it. pkg/internal/registry was at 78.4% under a 91.3% module total, because
-# every other package's surplus averaged it away. This reads the same profile
-# the total gate reads and fails if any package with statements is below the
-# minimum, naming each one.
-#
-# The per-package percentage is computed the way `go test -cover` prints it:
-# covered statements over all statements, where a block counts as covered when
-# its hit count is non-zero. Blocks are keyed by file position and deduplicated
-# first, since a profile merged from several runs can list one block more than
-# once.
-#
-# Only the package at the optional import-path prefix and the packages beneath
-# it are judged; test helpers and fixture packages elsewhere in the module are
-# reported but never fail the gate.
-#
-# Like check-coverage in the Makefile, every way of ending up without numbers
-# is a FAILURE: an absent or empty profile, or one with no package under the
-# prefix, is never read as "nothing below the floor".
+# Percentages match `go test -cover`: covered statements over all statements,
+# with blocks deduplicated by file position (merged profiles can repeat them).
+# Only packages at or beneath the optional prefix are judged; others are
+# reported but never fail. A missing or empty profile, or no package under the
+# prefix, is a failure.
 set -euo pipefail
 
 profile=${1:?usage: $0 <profile> <minimum-percent> [<import-path-prefix>]}

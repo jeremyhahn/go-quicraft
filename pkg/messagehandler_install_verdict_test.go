@@ -32,8 +32,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// These pin the confirmation review's findings against the two-phase receive
-// (HIGH-1, MEDIUM-1): a verdict of "abandoned" never licenses deleting an
+// These pin properties of the two-phase receive:
+// a verdict of "abandoned" never licenses deleting an
 // artifact raft may have adopted, an install never crosses to a reloaded
 // shard's new node, and a failed shard's receive does not wait forever.
 
@@ -67,7 +67,7 @@ func (d *stopAfterDeliver) DeliverLocalTo(node *engine.Node, msg proto.Message) 
 // depend on. A stopped node adopts nothing, and "abandoned" keeps the
 // artifact.
 func TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
@@ -115,7 +115,7 @@ func (d *swappingDeliverer) DeliverLocalTo(node *engine.Node, msg proto.Message)
 // install now goes to exactly the node its verdict is awaited on, and a
 // stopped node accepts nothing, so the new node never sees it.
 func TestHandleSnapshot_ReloadDuringReceiveNeverReachesTheNewNode(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
@@ -149,7 +149,7 @@ func TestHandleSnapshot_ReloadDuringReceiveNeverReachesTheNewNode(t *testing.T) 
 // host-wide transport receive slot and its memory budget — until an operator
 // reloaded the shard.
 func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 	handler := &hostMessageHandler{engine: eng, host: h}
@@ -184,7 +184,7 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 // staging anything; the retry waits for the next incarnation, which UnloadNode
 // releases only once the old one can no longer write LogDB.
 func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
@@ -228,7 +228,7 @@ func TestHandleSnapshot_AuthorizationIsCheckedBeforeShardState(t *testing.T) {
 		{"stopping", func(n *engine.Node) { n.Stop() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			eng, h, _ := newMedlowHandlerFixture(t)
+			eng, h, _ := newRoutingHandlerFixture(t)
 			const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 			authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 			handler := &hostMessageHandler{engine: eng, host: h}
@@ -265,7 +265,7 @@ func (r *snapshotDropRecorder) IncUnauthorizedSnapshotDropped(shardID, _ uint64)
 // number of metric series by cycling shard IDs; it is counted under shard 0.
 // A loaded shard's drop keeps its own label.
 func TestHandleSnapshot_UnloadedShardIsNotAMetricLabel(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 	rec := &snapshotDropRecorder{}
@@ -293,7 +293,7 @@ func TestHandleSnapshot_UnloadedShardIsNotAMetricLabel(t *testing.T) {
 // certificate holder with the wrong identity, a misaddressed transfer, a shard
 // not loaded — is refused before the transfer costs the receiver anything.
 func TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 	handler := &hostMessageHandler{engine: eng, host: h}
@@ -351,7 +351,7 @@ func (d *stopThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bo
 // own adopted install at this index, which this receive's publish replaced —
 // so the discard takes the write lease, and a stopped node keeps it.
 func TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
@@ -392,7 +392,7 @@ func (d *recordThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) 
 // compacted. The discard now runs under the snapshot-directory lock and keeps
 // a directory the record names.
 func TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
@@ -446,7 +446,7 @@ func (d *claimProbe) DeliverLocalTo(node *engine.Node, msg proto.Message) bool {
 // index treats an unclaimed, unrecorded directory as an orphan to replace. The
 // receive claims its index from the publish until it returns.
 func TestHandleSnapshot_ClaimsItsIndexUntilSettled(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	const snapIndex = uint64(900)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)

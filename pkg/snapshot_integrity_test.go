@@ -61,7 +61,7 @@ func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			eng, h, handler := newMedlowHandlerFixture(t)
+			eng, h, handler := newRoutingHandlerFixture(t)
 			if tc.encrypted {
 				h.barrier = createTestBarrier(t)
 			}
@@ -106,7 +106,7 @@ func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 // stream a single metadata-only chunk once it becomes leader, erasing the
 // receiving follower's state.
 func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
-	eng, h, _ := newMedlowHandlerFixture(t)
+	eng, h, _ := newRoutingHandlerFixture(t)
 	h.barrier = createTestBarrier(t)
 
 	const shardID, localReplicaID, fromReplicaID = uint64(62), uint64(1), uint64(2)

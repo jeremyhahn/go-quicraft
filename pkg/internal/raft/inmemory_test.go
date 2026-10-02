@@ -845,8 +845,8 @@ func TestInMemory_WastedPrefix_ResetOnMergeOverlap(t *testing.T) {
 // TestInMemory_Merge_AfterRestoreGap verifies that merge Case 3 does not
 // panic when entries is nil (after snapshot restore) and leader sends entries
 // starting beyond markerIndex. Also verifies savedTo is updated so
-// entriesToSave() returns the new entries (regression for M3 bug where
-// savedTo stayed at the snapshot index, causing a uint64 underflow in
+// entriesToSave() returns the new entries (a savedTo left at the snapshot
+// index causes a uint64 underflow in
 // entriesToSave offset calculation).
 func TestInMemory_Merge_AfterRestoreGap(t *testing.T) {
 	im := newInMemory(0)

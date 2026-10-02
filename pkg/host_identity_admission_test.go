@@ -92,8 +92,8 @@ func TestStartShard_TransportHostRequiresFounderIdentities(t *testing.T) {
 }
 
 // TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap
-// pins the two shapes the second-round review found the founding map could
-// still commit: one identity bound to two members (one keypair, two votes —
+// pins the two shapes the founding map could otherwise
+// commit: one identity bound to two members (one keypair, two votes —
 // the forgery identities exist to defeat, and the shape a later add refuses),
 // and an identity for a replica the members map does not hold. The second is
 // not refused — it is the operator anchor, and a restarted replica that missed

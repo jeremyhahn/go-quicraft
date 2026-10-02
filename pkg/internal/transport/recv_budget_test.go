@@ -25,7 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestMsgRecvBudget_ReserveReleaseBounds is the H2 regression test for the
+// TestMsgRecvBudget_ReserveReleaseBounds is the regression test for the
 // aggregate message-receive memory budget: reservations succeed only up to the
 // cap, a rejected reservation restores the budget exactly, and releases free
 // capacity for subsequent frames.
@@ -106,7 +106,7 @@ func TestMsgRecvBudget_ConcurrentNeverOverCommits(t *testing.T) {
 	}
 }
 
-// TestMsgRecvBudget_CompressedDeltaCharged is the H9 regression test for the
+// TestMsgRecvBudget_CompressedDeltaCharged is the regression test for the
 // compressed receive path: the aggregate budget must be charged with the
 // DECLARED DECOMPRESSED length, not just the compressed frame length. Snappy
 // achieves >1000:1 ratios, so charging only the compressed length would let a
@@ -147,7 +147,7 @@ func TestMsgRecvBudget_CompressedDeltaCharged(t *testing.T) {
 }
 
 // TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess verifies the success path
-// of the H9 fix: a compressed frame whose declared decompressed size fits the
+// of the fix: a compressed frame whose declared decompressed size fits the
 // budget is processed normally, and both the compressed-length reservation and
 // the decompression delta are released afterward, restoring the baseline.
 func TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess(t *testing.T) {

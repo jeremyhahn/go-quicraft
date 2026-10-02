@@ -2620,7 +2620,7 @@ Targets: `make test-raft`, `make test-engine`, `make test-queue`,
 |---|---|
 | **Unit** (`pkg/internal/raft`) | role transitions, elections, replication, commit calculation, ReadIndex, quiescence, leader transfer, the remote state machine |
 | **Unit** (`pkg/internal/engine`) | the three worker tiers, the ready map, panic recovery, ordered shutdown, the listener dispatcher |
-| **Unit** (`pkg/*_test.go`) | the host-level regression suites, among them `host_hardening_regression_test.go`, `host_medlow_regression_test.go`, `host_review12_test.go`, `host_review16_test.go` and the `messagehandler_*_test.go` files |
+| **Unit** (`pkg/*_test.go`) | the host-level regression suites, among them `host_hardening_regression_test.go`, `host_pending_lifecycle_test.go`, `host_state_regression_test.go`, `host_api_regression_test.go` and the `messagehandler_*_test.go` files |
 | **Fuzz** (`make fuzz-raft`) | message handling against arbitrary inputs |
 | **Integration** (`test/integration`) | real multi-node clusters, elections under real transport |
 | **Linearizability** (`make integration-test-linearizability`) | that observed histories are actually linearizable: the only check that can falsify the whole feature |

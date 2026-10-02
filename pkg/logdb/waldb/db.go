@@ -3216,13 +3216,13 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 	// Lock every WAL shard this batch touches for the ENTIRE batch lifecycle:
 	// checkpoint capture -> record write -> fsync -> in-memory commit (or
 	// rollback). Holding each shard's lock across the whole lifecycle makes the
-	// batch atomic per WAL segment. Previously SaveState released shard.mu
-	// between its durable write and its rollback, so a concurrent same-shard
+	// batch atomic per WAL segment. If SaveState released shard.mu
+	// between its durable write and its rollback, a concurrent same-shard
 	// SaveState (two Raft shards that hash to one WAL shard are served by
 	// different commit workers whenever NumWorkers does not divide
 	// DefaultShardCount) could write, fsync, and COMMIT a record past this
-	// batch's checkpoint; a later partial-failure rollback then truncated the
-	// shared segment back to this batch's offset and silently erased the other
+	// batch's checkpoint; a later partial-failure rollback would then truncate
+	// the shared segment back to this batch's offset and silently erase the other
 	// batch's already-acknowledged committed records. Locks are acquired in
 	// ascending shard-index order so two batches with overlapping shard sets
 	// share a canonical lock order and cannot deadlock; single-shard lockers
@@ -4736,7 +4736,7 @@ func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
 	// Recompute minWriteEpoch from the segments that actually survived ON
 	// DISK, and only after a fully successful GC. Without a recompute, the
 	// minimum live epoch can stay pinned to an epoch whose segments were just
-	// GC'd, indefinitely blocking DEK purging for that epoch (M9). Driving
+	// GC'd, indefinitely blocking DEK purging for that epoch. Driving
 	// the recompute from the intended liveSegments set instead of the on-disk
 	// survivors would be unsafe: a GC that failed partway (or whose ReadDir
 	// failed outright) leaves non-live segment files on disk, and dropping

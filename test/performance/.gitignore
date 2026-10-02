@@ -1,14 +1,10 @@
-# Anchored. `go build ./cmd/perfcompare` from this directory drops the binary
-# at test/performance/perfcompare, which is what these patterns are for. Written
-# bare, they also matched the cmd/perfcompare/ DIRECTORY, so that package's
-# main.go was invisible to `git add .` and was never committed.
+# Anchored, so they match the binaries `go build ./cmd/perfcompare` writes here
+# and not the cmd/perfcompare/ directory.
 /perfcompare
 /perfcompare.remote
 
 # Log of a detached remote run (see run-remote.sh).
 bench-run.log
 
-# NOTE: there is deliberately no `results/` pattern here. It used to exist for
-# the flat test/performance/results/ directory, and it also matched
-# profiles/<name>/results/ — which is the measured data of record, and which
-# must be committed. The flat directory is gone; the profiles are tracked.
+# No `results/` pattern: profiles/<name>/results/ is the measured data of
+# record and must be committed.

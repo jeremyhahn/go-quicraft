@@ -5,23 +5,14 @@ WORKDIR /src/test/performance/quicraft
 # go mod download (not tidy) so the committed go.mod/go.sum are used
 # verbatim and builds stay reproducible.
 #
-# go-enclave is an internal Gitea module (#54), and nothing in this container
-# can reach it unless the build is told how: with no credentials, Go goes to
-# github.com, where the module is not, and dies at "could not read Username"
-# (#184). The credentials arrive as a BuildKit secret mounted for this one RUN
-# -- dependency-resolution.md section 6 -- sourced into the shell and never
-# exported into the layer, so the token reaches neither the image, its
-# metadata, nor a command line. The payload is the four variables of that
-# section as K=V lines; set -a exports them for the git that go invokes.
+# Optional module credentials for a private module host arrive as a BuildKit
+# secret (K=V lines) mounted for this RUN only. They are sourced into the
+# shell, never written to a layer or a command line; set -a exports them for
+# the git that go invokes. With no secret, modules resolve from the public
+# proxy. Requires BuildKit (docker-buildx); the legacy builder rejects --mount.
 #
-# The binary is stamped with the project's VERSION file, copied in with the
-# context, so a stored result names the release it measured -- the same
-# value `make build` stamps into every other binary (#189).
-#
-# The mount is optional at both ends. With no secret the build resolves
-# github.com/jeremyhahn/* from the public proxy only, which is the correct
-# shape for a build outside the Gitea network. Requires BuildKit (the
-# docker-buildx plugin); the legacy builder rejects --mount outright.
+# The binary is stamped with the project's VERSION file, so a stored result
+# names the release it measured.
 RUN --mount=type=secret,id=gomodauth \
     set -eu; \
     if [ -s /run/secrets/gomodauth ]; then \

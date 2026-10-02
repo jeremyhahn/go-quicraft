@@ -256,7 +256,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 
 	// Both release targets run ONE recipe (define release-body) and differ only
 	// in the version form they accept, so every guard is exercised on each —
-	// the stable `release` (R13) as much as `release-alpha`.
+	// the stable `release` as much as `release-alpha`.
 	for _, target := range []struct {
 		name  string
 		good  string // a well-formed version, which reaches the remote guard
@@ -432,8 +432,8 @@ func TestReleaseRemoteDefaultsToDev(t *testing.T) {
 
 	if strings.Contains(string(out), "no git remote named") {
 		t.Errorf("release-alpha did not resolve the `dev` remote, so RELEASE_REMOTE does "+
-			"not default to `dev`. conventions/version-control.md 1 names the Gitea "+
-			"remote `dev`, and a default that points elsewhere makes the target "+
+			"not default to `dev`. The release remote is named "+
+			"`dev`, and a default that points elsewhere makes the target "+
 			"unrunnable on a conforming checkout.\n%s", out)
 	}
 	// It must still refuse — the fixture's CHANGELOG has no v99.0.0-alpha section

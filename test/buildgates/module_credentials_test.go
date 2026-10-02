@@ -33,7 +33,7 @@ const moduleCredentialFile = ".devcontainer/.env"
 // carried the file. And run-remote.sh rsyncs the tree to the bench host, where
 // rsync does not read .gitignore and --delete leaves excluded paths alone, so
 // staging must both exclude the file and remove any copy an earlier staging
-// left. A review caught the second and third missing after the first was in.
+// left.
 func TestTheCredentialFileLeavesTheTreeByNoRoute(t *testing.T) {
 	root := filepath.Join("..", "..")
 	for _, tc := range []struct {

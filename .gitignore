@@ -11,31 +11,24 @@ test/performance/openraft/target/
 test/performance/perfcompare
 test/performance/perfcompare.remote
 
-# test/performance/profiles/ is NOT ignored. It was, back when it was scratch
-# output. It now holds the measured data of record: the stored result JSON, the
-# machine specifications captured on each target, the generated comparison
-# documents, and analysis.md — including the R640 baseline, whose machine is
-# offline and whose numbers exist nowhere else.
+# test/performance/profiles/ is not ignored: it holds the measured data of
+# record (stored results, captured machine specifications, generated documents
+# and analysis.md), some of it from machines that are no longer available.
 
-# Snapshot trees a test accidentally rooted at the package directory instead of
-# t.TempDir(). Ignored so they can never be committed again; a test that needs
-# one must create it under t.TempDir().
+# Snapshot trees a test rooted at the package directory instead of t.TempDir().
 pkg/shard-*/
 
-# AI session handoff notes
+# Local session notes
 resume.txt
 
 .serena
 go.work
 go.work.sum
 
-# Analysers built by `make install-lint`. Repo-local so `make lint` runs a
-# binary built with this repo's Go, rather than whatever GOPATH/bin happens to
-# hold -- a correctly pinned golangci-lint built by an older Go cannot analyse
-# this module at all (#118).
+# Analysers built by `make install-lint`, kept repo-local so `make lint` runs a
+# binary built with this repo's Go.
 .tools/
 
-# Module credentials for the benchmark image builds: the four variables of
-# ../handbook/software/conventions/dependency-resolution.md section 6, read by
-# the perf-* targets. A token lives in no checkout, ever (version-control.md 4).
+# Module credentials for the benchmark image builds, read by the perf-*
+# targets (test/performance/README.md). Never commit a token.
 .devcontainer/.env

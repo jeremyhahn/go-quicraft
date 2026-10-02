@@ -115,7 +115,7 @@ func TestDataStreamSurvivesIdleOnLiveConnection(t *testing.T) {
 
 	// Idle well past StreamReadIdleTimeout (300ms) but far under the QUIC
 	// connection idle timeout (30s): the connection stays alive; the data
-	// stream goes idle and (before the fix) was abandoned by the receiver.
+	// stream goes idle and must not be abandoned by the receiver.
 	time.Sleep(900 * time.Millisecond)
 
 	// Second send reuses the SAME cached data stream. It must be delivered.
@@ -507,7 +507,7 @@ func TestExtractIP_NoPort(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M3: acceptLoop uses cancellable shutdown context for Accept
+// acceptLoop uses cancellable shutdown context for Accept
 // ---------------------------------------------------------------------------
 
 // TestAcceptLoopShutdownContextCancellation verifies that stopping the
@@ -591,7 +591,7 @@ func TestAcceptLoopShutdownContextCancelledBeforeListenerClose(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M4: handleConnection uses conn.Context() for AcceptStream
+// handleConnection uses conn.Context() for AcceptStream
 // ---------------------------------------------------------------------------
 
 // TestHandleConnectionUsesConnContext verifies that handleConnection
@@ -702,7 +702,7 @@ func TestHandleConnectionExitsOnHalfOpenConnection(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L8: getRecvBuf returns undersized buffer to pool
+// getRecvBuf returns undersized buffer to pool
 // ---------------------------------------------------------------------------
 
 // TestGetRecvBufReturnsUndersizedToPool verifies that when the pooled
@@ -782,7 +782,7 @@ func TestGetRecvBufPooledBufferSufficientCapacity(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// S-6: ShardID zero check at transport boundary
+// ShardID zero check at transport boundary
 // ---------------------------------------------------------------------------
 
 // TestHandleMessageFrameDropsZeroShardID verifies that messages with
@@ -3187,7 +3187,7 @@ func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 	}
 }
 
-// TestHandleStream_ErrorExitCancelsRead is the H10 regression test: when
+// TestHandleStream_ErrorExitCancelsRead is the regression test: when
 // handleStream abandons a stream on a non-idle error (here, an invalid frame
 // header), it must CancelRead in addition to Close. In quic-go, Close only
 // closes the SEND direction, so without CancelRead the receive direction stays
@@ -3342,7 +3342,7 @@ func TestPutSnappyDecBuf_OversizedNotPooled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M5: header-stage snapshot rejections must be observable
+// Header-stage snapshot rejections must be observable
 // ---------------------------------------------------------------------------
 
 // newRejectionCountingTransport builds a transport whose OnSnapshotRejected
@@ -3364,7 +3364,7 @@ func newRejectionCountingTransport(t *testing.T, rejected *atomic.Int64) *QUICTr
 	return tr
 }
 
-// TestProcessSnapshotHeaderRejectionsAreReported is the M5 regression test:
+// TestProcessSnapshotHeaderRejectionsAreReported is the regression test:
 // every header-stage drop must fire OnSnapshotRejected and a structured
 // warning. Returning silently would leave an operator seeing nothing while
 // the sender waited out its ack timeout.
@@ -3425,10 +3425,10 @@ func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M8: receive-budget exhaustion is retryable, not a stream teardown
+// Receive-budget exhaustion is retryable, not a stream teardown
 // ---------------------------------------------------------------------------
 
-// TestHandleMessageFrameDrainsBodyOnBudgetExhaustion is the M8 regression
+// TestHandleMessageFrameDrainsBodyOnBudgetExhaustion is the regression
 // test. If budget exhaustion were fatal to the stream, one peer filling the
 // aggregate budget would tear down every OTHER peer's replication stream and
 // cascade into cluster-wide connection churn. The frame body is therefore
@@ -3488,7 +3488,7 @@ func TestBudgetExhaustionIsNotAProtocolViolation(t *testing.T) {
 	}
 }
 
-// TestPerConnectionMsgRecvBudgetBoundsOnePeer verifies the M8 partitioning:
+// TestPerConnectionMsgRecvBudgetBoundsOnePeer verifies the partitioning:
 // a single connection cannot reserve the whole aggregate budget, so one peer's
 // burst cannot push every other peer into the exhaustion path.
 func TestPerConnectionMsgRecvBudgetBoundsOnePeer(t *testing.T) {

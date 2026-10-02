@@ -417,7 +417,7 @@ func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
 	}
 }
 
-// TestSnapshotReceive_PinsInFlightEpoch is the M-3 regression test.
+// TestSnapshotReceive_PinsInFlightEpoch is the regression test.
 //
 // The receive path chooses the at-rest epoch it seals under RIGHT HERE: the
 // sender decrypts before streaming (doSendSnapshot sets Epoch=0), so hdr.Epoch

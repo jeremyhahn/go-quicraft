@@ -2409,7 +2409,7 @@ func TestLogReaderApplySnapshotSameIndexAfterState(t *testing.T) {
 	}
 }
 
-// --- OPT-4: Buffer reuse tests ---
+// --- Buffer reuse tests ---
 
 func TestLogReaderGetRangeReusesProtoEntryBuffer(t *testing.T) {
 	db := newMemLogDB()
@@ -2642,7 +2642,7 @@ func TestLogReaderLogdbEntriesToProtoReuseNilBuffer(t *testing.T) {
 	}
 }
 
-// --- OPT-7: termBuf bounding tests ---
+// --- termBuf bounding tests ---
 
 func TestLogReaderTermBufBoundsAfterManyAppends(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)

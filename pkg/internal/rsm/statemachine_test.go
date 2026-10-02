@@ -4719,8 +4719,8 @@ func (c *countingSM) Close(_ context.Context) error { return nil }
 // TestApply_InBatchDuplicateAppliedOnce verifies that when a single Apply
 // batch contains two entries with the SAME (clientID, seriesID) — a committed
 // client retry — the user operation is applied EXACTLY ONCE and both results[]
-// entries carry the identical (first-occurrence) result. This is the R1
-// at-most-once correctness fix.
+// entries carry the identical (first-occurrence) result, which is what
+// at-most-once delivery requires.
 func TestApply_InBatchDuplicateAppliedOnce(t *testing.T) {
 	cs := newCountingSM()
 	createFn := func(shardID, replicaID uint64) interface{} {
@@ -4840,7 +4840,7 @@ func TestApply_BatchExceedsMaxResponses(t *testing.T) {
 	}
 }
 
-// TestStateMachineApply_ExpiryBatchShapeInvariant is the C1 regression test:
+// TestStateMachineApply_ExpiryBatchShapeInvariant is the regression test:
 // session expiry must be a pure function of the committed entry SEQUENCE, never
 // of how a replica groups those entries into Apply batches. It replays the SAME
 // committed log in three batch shapes (one big batch, per-entry batches, and an

@@ -1,14 +1,7 @@
 # Dockerfile for building and running the QuicRaft vs Dragonboat benchmark.
 #
-# Build context must be the go-quicraft repository root.
-#
-# This used to require the dragonboat fork to be staged into
-# .build-cache/dragonboat and then rewrote the module's `replace` to point at
-# the staged copy, because the fork was consumable only as a directory. The
-# fork is published now (github.com/jeremyhahn/dragonboat/v4), so it is an
-# ordinary versioned dependency and `go mod download` fetches it like any
-# other — no staging, no rewriting, and the image no longer depends on what
-# happens to be checked out on the build host.
+# Build context must be the go-quicraft repository root. The dragonboat fork
+# (github.com/jeremyhahn/dragonboat/v4) is an ordinary versioned dependency.
 #
 # Usage (via Makefile):
 #   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat

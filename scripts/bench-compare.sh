@@ -2,45 +2,27 @@
 #
 # bench-compare.sh — statistically defensible hot-path benchmark comparison.
 #
-# The problem this solves: raw `go test -bench` numbers on a loaded developer
-# box are worthless for regression detection. BenchmarkInMemoryMerge has been
-# observed at 1137 ns and 5507 ns across two *identical* back-to-back runs on
-# the dev machine — a 5x spread. Any regression smaller than that disappears
-# into the noise, and naive "run baseline block, then run current block"
-# measurement invents regressions that do not exist.
+# Single `go test -bench` runs on a loaded machine are too noisy to detect a
+# regression. The method:
 #
-# The method implemented here (validated: variance fell to ~5%, medians matched
-# to within 0.5% on an unmodified tree):
-#
-#   1. COMPILE BOTH SIDES ON THE INVOKING MACHINE, with the same toolchain and
-#      GOWORK=off, so the baseline and current test binaries differ only by
-#      source revision. Go test binaries are self-contained, so they can then
-#      be shipped anywhere.
-#   2. RUN THEM SOMEWHERE. Two supported modes, identical in every respect
-#      except execution location:
-#        - local  (PERF_HOST unset): run on the invoking machine. This is the
-#          default and is fully supported, including in CI.
-#        - remote (PERF_HOST=user@host): ssh the binaries to a dedicated host
-#          and run them there. A quiet, dedicated machine yields tighter
-#          confidence intervals; a shared or loaded one widens them.
-#   3. INTERLEAVE the two sides round-robin (cur, base, cur, base, ...) rather
-#      than running them as two contiguous blocks. Slow thermal/scheduler
-#      drift is then shared equally by both sides instead of being attributed
-#      entirely to whichever side ran second. Back-to-back blocks are exactly
-#      what produced a bogus 2x "regression" on InMemoryMerge/RaftLogAppend
-#      that vanished under this method.
-#   4. USE A FIXED ITERATION COUNT (-test.benchtime=Nx), never a duration.
-#      With a duration, a slow round silently runs fewer iterations, so the two
-#      sides are not doing the same work and the samples are not comparable.
-#   5. TAKE MANY ROUNDS and compare distributions (benchstat: median + CI +
-#      p-value), never single numbers.
+#   1. Compile both sides on the invoking machine with the same toolchain and
+#      GOWORK=off, so the binaries differ only by source revision.
+#   2. Run them locally (PERF_HOST unset, the default, also used in CI) or on
+#      PERF_HOST=user@host over ssh. A quiet dedicated host gives tighter
+#      confidence intervals.
+#   3. Interleave the sides round-robin (cur, base, cur, base, ...) so slow
+#      thermal or scheduler drift is shared by both instead of landing on
+#      whichever block ran second.
+#   4. Use a fixed iteration count (-test.benchtime=Nx), never a duration, so
+#      both sides do the same work.
+#   5. Take many rounds and compare distributions with benchstat (median, CI,
+#      p-value).
 #
 # Usage:
 #   scripts/bench-compare.sh compare    # baseline vs working tree (default)
 #   scripts/bench-compare.sh baseline   # record working tree as a stored baseline
 #
-# See docs/testing/benchmarking.md for the full rationale and for how to
-# read the output.
+# See docs/testing/benchmarking.md for how to read the output.
 
 set -euo pipefail
 
@@ -73,9 +55,8 @@ BASELINE="${BASELINE:-origin/main}"
 # Set it to a quiet, dedicated machine when you want the tightest intervals.
 PERF_HOST="${PERF_HOST:-}"
 
-# Packages to benchmark. The default is the hot path CLAUDE.md requires to be
-# benchmarked on every change: append (raft log), replicate (proto codec on the
-# wire path) and apply (engine).
+# Packages to benchmark. The default is the hot path: append (raft log),
+# replicate (proto codec) and apply (engine).
 BENCH_PKGS="${BENCH_PKGS:-./pkg/internal/raft/ ./pkg/internal/engine/ ./pkg/proto/}"
 
 # -test.bench regex. "." means every benchmark in the selected packages.
@@ -192,10 +173,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Scratch space for the compiled test binaries. Deliberately under build/ (which
-# is gitignored) rather than TMPDIR: a CI runner's /tmp is not guaranteed to be
-# shared between steps or to have room for several hundred MB of test binaries,
-# whereas the workspace always is and always does.
+# Scratch space for the compiled test binaries, under the gitignored build/
+# rather than TMPDIR, which on a CI runner may be small or not shared between
+# steps.
 mkdir -p "$REPO_ROOT/build/bench-compare"
 LOCAL_TMP="$(mktemp -d "$REPO_ROOT/build/bench-compare/tmp-XXXXXXXX")" ||
 	die "cannot create a scratch directory under $REPO_ROOT/build/bench-compare"
@@ -240,13 +220,9 @@ if [[ -n "$WORKTREE_REF" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Execution host. Local (PERF_HOST unset) and remote (PERF_HOST=user@host) are
-# both first-class: the measurement method below is byte-for-byte identical, and
-# only the machine that runs the binaries changes.
-#
-# What is NOT allowed is falling back from remote to local. If PERF_HOST is set,
-# the caller asked for numbers from that machine; quietly substituting a
-# different one would attach the wrong provenance to the result.
+# Execution host: local (PERF_HOST unset) or remote (PERF_HOST=user@host), with
+# an identical method. There is no fallback from remote to local, which would
+# attach the wrong provenance to the result.
 # ---------------------------------------------------------------------------
 
 RUN_HOSTNAME=""
@@ -325,10 +301,9 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ -n "$BASELINE_SHA" ]]; then
-	# Under build/, which is gitignored and therefore invisible to `git status`,
-	# and which `./...` will not descend into because the worktree carries its
-	# own go.mod (module boundaries stop package-pattern expansion). Keeping it
-	# in the workspace means CI needs no writable path outside the checkout.
+	# Under the gitignored build/. `./...` does not descend into it because
+	# the worktree has its own go.mod, and CI needs no path outside the
+	# checkout.
 	WORKTREE_ROOT="${BENCH_WORKTREE_ROOT:-$REPO_ROOT/build/bench-worktrees}"
 	WORKTREE_DIR="$WORKTREE_ROOT/$(git rev-parse --short "$BASELINE_SHA")"
 	if [[ -d "$WORKTREE_DIR" ]]; then
@@ -431,15 +406,12 @@ run_sample() {
 info "running $BENCH_ROUNDS interleaved round(s), $BENCH_ITERS iterations, filter '$BENCH_FILTER'"
 for ((round = 1; round <= BENCH_ROUNDS; round++)); do
 	for s in "${SLUGS[@]}"; do
-		# Interleave: current then baseline, every round. Never two contiguous
-		# blocks — that is what manufactures phantom regressions.
+		# Interleave: current then baseline, every round.
 		info "round $round/$BENCH_ROUNDS  $s  current"
 		run_sample "cur-$s.test" "$CUR_RESULTS" "current/$s round $round"
 
-		# Fail after the FIRST sample rather than burning every round on a
-		# filter that matches nothing. Note that `make` expands '$' in
-		# variables: pass a regex containing '$|' via the Makefile and it
-		# arrives mangled unless the recipe uses $(value ...).
+		# Fail after the first sample if the filter matches nothing. (A '$|'
+		# regex passed through make survives only via $(value ...).)
 		if [[ "$round" -eq 1 && "$s" == "${SLUGS[0]}" ]]; then
 			grep -q '^Benchmark' "$CUR_RESULTS" ||
 				die "BENCH_FILTER='$BENCH_FILTER' matched no benchmarks in ${PKG_LIST[0]}.
@@ -463,8 +435,7 @@ if [[ "$MODE" == compare ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Provenance. A baseline without provenance is worse than no baseline: it
-# invites comparison against numbers from unknown hardware.
+# Provenance: record the hardware and revision a baseline was measured on.
 # ---------------------------------------------------------------------------
 
 if [[ "$MODE" == compare ]]; then

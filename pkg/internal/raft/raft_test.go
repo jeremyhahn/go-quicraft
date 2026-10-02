@@ -677,7 +677,7 @@ func TestRaft_Election_PreVoteRejected(t *testing.T) {
 }
 
 // TestRaft_PreVoteReject_UsesResponderTerm is the regression test for the
-// PreVote term-inflation bug (C4). It drives a real RequestPreVote through
+// PreVote term-inflation bug. It drives a real RequestPreVote through
 // handleVoteRequest on a follower that currently has an active leader, then
 // asserts the emitted rejection carries the responder's OWN term, not the
 // prospective (T+1) term. Echoing the prospective term on a rejection let the
@@ -5903,7 +5903,7 @@ func TestRaft_LeaderTransfer_UsesFromWhenHintZero(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 2: ReadIndex hasCommittedEntryAtCurrentTerm
+// ReadIndex hasCommittedEntryAtCurrentTerm
 // ---------------------------------------------------------------------------
 
 func TestRaft_ReadIndex_RejectsBeforeNoopCommitted(t *testing.T) {
@@ -5962,7 +5962,7 @@ func TestRaft_ReadIndex_AcceptsAfterNoopCommitted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 3: ReadIndex forwarding response
+// ReadIndex forwarding response
 // ---------------------------------------------------------------------------
 
 func TestRaft_ReadIndex_ForwardedFromFollowerGetsResponse(t *testing.T) {
@@ -6098,7 +6098,7 @@ func TestRaft_ReadIndex_LocalRequestAddsReadState(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 4: Multiple pending ReadIndex requests
+// Multiple pending ReadIndex requests
 // ---------------------------------------------------------------------------
 
 func TestRaft_ReadIndex_MultiplePendingRequests(t *testing.T) {
@@ -6223,7 +6223,7 @@ func TestRaft_ReadIndex_PendingClearedOnBecomeFollower(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 5: OrderedConfigChange enforcement
+// OrderedConfigChange enforcement
 // ---------------------------------------------------------------------------
 
 func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
@@ -6425,7 +6425,7 @@ func TestRaft_BecomeLeader_NoUncommittedConfigChange_AllowsProposal(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// Fix 7: handleSnapshot updates membership/remotes
+// handleSnapshot updates membership/remotes
 // ---------------------------------------------------------------------------
 
 func TestRaft_HandleSnapshot_UpdatesRemotes(t *testing.T) {
@@ -6509,7 +6509,7 @@ func TestRaft_HandleSnapshot_ExcludesSelfFromRemotes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix 8: handleSnapshot retains following entries
+// handleSnapshot retains following entries
 // ---------------------------------------------------------------------------
 
 func TestRaft_HandleSnapshot_RetainsFollowingEntries(t *testing.T) {
@@ -6602,7 +6602,7 @@ func TestRaft_HandleSnapshot_DiscardsOnMismatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M5: handleSnapshot does NOT rebuild remotes when entries are retained
+// handleSnapshot does NOT rebuild remotes when entries are retained
 // ---------------------------------------------------------------------------
 
 func TestRaft_HandleSnapshot_MatchDoesNotRebuildRemotes(t *testing.T) {
@@ -6705,10 +6705,10 @@ func TestRaft_HandleSnapshot_MismatchRebuildsRemotes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Fix 17 - becomePreCandidate resets pendingConfigChange
+// becomePreCandidate resets pendingConfigChange
 // ---------------------------------------------------------------------------
 
-func TestFix17_BecomePreCandidate_ResetsPendingConfigChange(t *testing.T) {
+func TestBecomePreCandidate_ResetsPendingConfigChange(t *testing.T) {
 	r := newTestRaft(1)
 	r.pendingConfigChange = true
 
@@ -6719,7 +6719,7 @@ func TestFix17_BecomePreCandidate_ResetsPendingConfigChange(t *testing.T) {
 	}
 }
 
-func TestFix17_BecomePreCandidate_PendingConfigChangeFalseRemainsFalse(t *testing.T) {
+func TestBecomePreCandidate_PendingConfigChangeFalseRemainsFalse(t *testing.T) {
 	r := newTestRaft(1)
 	// pendingConfigChange starts false (default).
 	if r.pendingConfigChange {
@@ -6734,10 +6734,10 @@ func TestFix17_BecomePreCandidate_PendingConfigChangeFalseRemainsFalse(t *testin
 }
 
 // ---------------------------------------------------------------------------
-// Test: Fix 18 - becomeLeader resets witness remotes
+// becomeLeader resets witness remotes
 // ---------------------------------------------------------------------------
 
-func TestFix18_BecomeLeader_ResetsWitnessRemotes(t *testing.T) {
+func TestBecomeLeader_ResetsWitnessRemotes(t *testing.T) {
 	// Create a raft node with 2 voting members + 1 witness.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
 	cfg := raftTestCfgPreVote(1, 1, false)
@@ -6804,7 +6804,7 @@ func TestFix18_BecomeLeader_ResetsWitnessRemotes(t *testing.T) {
 	}
 }
 
-func TestFix18_BecomeLeader_ResetsWitnessRemotes_NoWitnesses(t *testing.T) {
+func TestBecomeLeader_ResetsWitnessRemotes_NoWitnesses(t *testing.T) {
 	// Verify that becomeLeader works correctly when there are no witnesses.
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -6827,10 +6827,10 @@ func TestFix18_BecomeLeader_ResetsWitnessRemotes_NoWitnesses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Fix 19 - stepFollower Propose exits quiesce
+// stepFollower Propose exits quiesce
 // ---------------------------------------------------------------------------
 
-func TestFix19_StepFollower_Propose_ExitsQuiesce(t *testing.T) {
+func TestStepFollower_Propose_ExitsQuiesce(t *testing.T) {
 	cfg := raftTestCfgQuiesce(1, 1)
 	members := map[uint64]string{
 		1: "addr1",
@@ -6871,7 +6871,7 @@ func TestFix19_StepFollower_Propose_ExitsQuiesce(t *testing.T) {
 	}
 }
 
-func TestFix19_StepFollower_Propose_NoLeader_DoesNotExitQuiesce(t *testing.T) {
+func TestStepFollower_Propose_NoLeader_DoesNotExitQuiesce(t *testing.T) {
 	cfg := raftTestCfgQuiesce(1, 1)
 	members := map[uint64]string{
 		1: "addr1",
@@ -6916,10 +6916,10 @@ func TestFix19_StepFollower_Propose_NoLeader_DoesNotExitQuiesce(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Fix 20 - checkReadIndexQuorum resolves out-of-order (no HOL blocking)
+// checkReadIndexQuorum resolves out-of-order (no HOL blocking)
 // ---------------------------------------------------------------------------
 
-func TestFix20_CheckReadIndexQuorum_ResolvesOutOfOrder(t *testing.T) {
+func TestCheckReadIndexQuorum_ResolvesOutOfOrder(t *testing.T) {
 	// Create a 3-node cluster leader (self=1, remotes=2,3).
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -6989,7 +6989,7 @@ func TestFix20_CheckReadIndexQuorum_ResolvesOutOfOrder(t *testing.T) {
 	}
 }
 
-func TestFix20_CheckReadIndexQuorum_EmptyPendingIsNoop(t *testing.T) {
+func TestCheckReadIndexQuorum_EmptyPendingIsNoop(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
 	r.drainMessages()
@@ -7003,10 +7003,10 @@ func TestFix20_CheckReadIndexQuorum_EmptyPendingIsNoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: OPT-1 - ReadIndex bitset ack tracking
+// ReadIndex bitset ack tracking
 // ---------------------------------------------------------------------------
 
-func TestOPT1_ReadIndex_BitsetQuorumDetection(t *testing.T) {
+func TestReadIndex_BitsetQuorumDetection(t *testing.T) {
 	tests := []struct {
 		name      string
 		members   map[uint64]string
@@ -7115,7 +7115,7 @@ func TestOPT1_ReadIndex_BitsetQuorumDetection(t *testing.T) {
 	}
 }
 
-func TestOPT1_ReadIndex_DuplicateAckDoesNotDoubleCount(t *testing.T) {
+func TestReadIndex_DuplicateAckDoesNotDoubleCount(t *testing.T) {
 	// Use a 5-node cluster where quorum = 3. Duplicate acks from a single
 	// peer should not inflate the count to reach quorum.
 	members := map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"}
@@ -7198,7 +7198,7 @@ func TestOPT1_ReadIndex_DuplicateAckDoesNotDoubleCount(t *testing.T) {
 	}
 }
 
-func TestOPT1_ReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
+func TestReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
 	// Use a 5-node cluster where quorum = 3.
 	// Send duplicate acks from node 2 only. Should NOT reach quorum
 	// (self + node 2 = 2, need 3).
@@ -7283,7 +7283,7 @@ func TestOPT1_ReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
 	}
 }
 
-func TestOPT1_ReadIndex_ReplicaToBitBuiltOnBecomeLeader(t *testing.T) {
+func TestReadIndex_ReplicaToBitBuiltOnBecomeLeader(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 
 	// Before election, replicaToBit should be nil.
@@ -7327,7 +7327,7 @@ func TestOPT1_ReadIndex_ReplicaToBitBuiltOnBecomeLeader(t *testing.T) {
 	}
 }
 
-func TestOPT1_ReadIndex_UnknownReplicaAckIgnored(t *testing.T) {
+func TestReadIndex_UnknownReplicaAckIgnored(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
 	r.drainMessages()
@@ -7609,7 +7609,7 @@ func TestReadIndexHeartbeatResp_RegularHeartbeatCtxZeroDoesNotConfirm(t *testing
 }
 
 func TestReadIndexBatching_TickHeartbeatPiggybacksCtx(t *testing.T) {
-	// O10: broadcastHeartbeat() (from tick) should piggyback the ReadIndex ctx
+	// broadcastHeartbeat() (from tick) should piggyback the ReadIndex ctx
 	// when there are pending reads. This allows regular tick heartbeats to
 	// satisfy pending ReadIndex requests without a separate heartbeat round.
 	r := newTestRaftPreVoteDisabled(1)
@@ -7722,10 +7722,10 @@ func TestReadIndexBatching_BroadcastPendingClearedOnBecomeFollower(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// Test: OPT-8 - campaign() message template reuse
+// campaign() message template reuse
 // ---------------------------------------------------------------------------
 
-func TestOPT8_Campaign_TemplateReuse_CorrectMessages(t *testing.T) {
+func TestCampaign_TemplateReuse_CorrectMessages(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 
 	// Become candidate to trigger campaign.
@@ -7764,7 +7764,7 @@ func TestOPT8_Campaign_TemplateReuse_CorrectMessages(t *testing.T) {
 	}
 }
 
-func TestOPT8_Campaign_PreVote_UsesTermPlusOne(t *testing.T) {
+func TestCampaign_PreVote_UsesTermPlusOne(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomePreCandidate()
 	r.msgs = r.msgs[:0]
@@ -7786,10 +7786,10 @@ func TestOPT8_Campaign_PreVote_UsesTermPlusOne(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Fix 21 - hasPendingSnapshot set on InstallSnapshot
+// hasPendingSnapshot set on InstallSnapshot
 // ---------------------------------------------------------------------------
 
-func TestFix21_Peer_Handle_InstallSnapshot_SetsPendingSnapshot(t *testing.T) {
+func TestPeer_Handle_InstallSnapshot_SetsPendingSnapshot(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
@@ -7830,7 +7830,7 @@ func TestFix21_Peer_Handle_InstallSnapshot_SetsPendingSnapshot(t *testing.T) {
 	}
 }
 
-func TestFix21_Peer_Handle_InstallSnapshot_RejectedDoesNotSetPendingSnapshot(t *testing.T) {
+func TestPeer_Handle_InstallSnapshot_RejectedDoesNotSetPendingSnapshot(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
@@ -9171,7 +9171,7 @@ func TestResetLeaseAcks_NilMap(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: H3 - replicaToBit 64-member guard
+// replicaToBit 64-member guard
 // ---------------------------------------------------------------------------
 
 // TestBecomeLeader_RefusesTooManyVotingMembers pins how an over-cap voting
@@ -9557,7 +9557,7 @@ func TestHasConfigChangeToApplyBoundedScan(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// AppendEntries Pipelining (OPT-A)
+// AppendEntries Pipelining
 // ---------------------------------------------------------------------------
 
 // TestSendAppendPipelining verifies that sendAppend sends multiple Replicate
@@ -9948,7 +9948,7 @@ func TestSendAppendPipeliningSnapshotState(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Bug C3: Leadership transfer exits quiesce
+// Leadership transfer exits quiesce
 // ---------------------------------------------------------------------------
 
 func TestRaft_LeaderTransfer_ExitsQuiesce(t *testing.T) {
@@ -10053,7 +10053,7 @@ func TestRaft_LeaderTransfer_ExitsQuiesce_InvalidTarget(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Bug M6: TimeoutNow exits quiesce
+// TimeoutNow exits quiesce
 // ---------------------------------------------------------------------------
 
 func TestRaft_TimeoutNow_ExitsQuiesce(t *testing.T) {
@@ -10118,7 +10118,7 @@ func TestRaft_TimeoutNow_NotQuiesced_StillWorks(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Bug LOW: Leader ignores TimeoutNow
+// Leader ignores TimeoutNow
 // ---------------------------------------------------------------------------
 
 func TestRaft_TimeoutNow_IgnoredByLeader(t *testing.T) {
@@ -10176,7 +10176,7 @@ func TestRaft_TimeoutNow_IgnoredByLeader_NoMessages(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H1: Stale-term InstallSnapshot sends response
+// Stale-term InstallSnapshot sends response
 // ---------------------------------------------------------------------------
 
 func TestRaft_Step_StaleInstallSnapshotFromOldTermSendsResponse(t *testing.T) {
@@ -10260,7 +10260,7 @@ func TestRaft_Step_StaleInstallSnapshotNoStateChange(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H2: Leader transfer invalidates lease and blocks ReadIndex
+// Leader transfer invalidates lease and blocks ReadIndex
 // ---------------------------------------------------------------------------
 
 func TestRaft_LeaderTransfer_InvalidatesLease(t *testing.T) {
@@ -10420,7 +10420,7 @@ func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: M1 - Witness ack must not satisfy ReadIndex quorum
+// Witness ack must not satisfy ReadIndex quorum
 // ---------------------------------------------------------------------------
 
 func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
@@ -10586,7 +10586,7 @@ func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testin
 }
 
 // ---------------------------------------------------------------------------
-// Test: M2 - Witness ack must not satisfy lease quorum
+// Witness ack must not satisfy lease quorum
 // ---------------------------------------------------------------------------
 
 func TestRaft_Witness_HeartbeatAckCountsForLeaseQuorum(t *testing.T) {
@@ -10817,7 +10817,7 @@ func TestRaft_Witness_HeartbeatRespReplicateStateSkipsCorrectly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R1: pendingReadIndex max capacity
+// pendingReadIndex max capacity
 // ---------------------------------------------------------------------------
 
 func TestHandleLeaderReadIndex_RejectsWhenPendingReadIndexFull(t *testing.T) {
@@ -10902,7 +10902,7 @@ func TestHandleLeaderReadIndex_AcceptsAfterDrainingPendingReads(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R3: readIndexCtx wrap guard
+// readIndexCtx wrap guard
 // ---------------------------------------------------------------------------
 
 func TestHandleLeaderReadIndex_CtxWrapsToOneNotZero(t *testing.T) {
@@ -12694,11 +12694,11 @@ func TestRaft_FastBacktrack_ReplicateStateFallsBackToMatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Witnesses count toward the unified commit quorum (C1 regression)
+// Witnesses count toward the unified commit quorum
 // ---------------------------------------------------------------------------
 
 // TestRaft_WitnessCountsTowardCommitQuorum_Unified is the regression guard for
-// the C1 fix: witnesses vote in elections, so they MUST also be counted toward
+// the unified quorum: witnesses vote in elections, so they MUST also be counted toward
 // the commit quorum. Using a single unified quorum for both election and commit
 // is required for Leader Completeness — if the commit quorum excluded witnesses
 // (the old behavior), a commit set (a data-node minority) and an election-
@@ -12812,7 +12812,7 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 
 	// (b) A single full-replica ack (leader + remote 2 = 2 matches) is a
 	// MINORITY (< unified quorum of 3) and must NOT advance commit. Under a
-	// split quorum this would have committed — the core of the C1 defect.
+	// split quorum this would commit.
 	if err := r.step(proto.Message{
 		Type:     proto.ReplicateResp,
 		From:     2,
@@ -13149,7 +13149,7 @@ func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask_NormalEntryNotBlocked
 }
 
 // ---------------------------------------------------------------------------
-// R2: becomeLeader resets InMemRateLimiter
+// becomeLeader resets InMemRateLimiter
 // ---------------------------------------------------------------------------
 
 func TestRaft_BecomeLeader_ResetsRateLimiter(t *testing.T) {
@@ -13207,7 +13207,7 @@ func TestRaft_BecomeLeader_StaleFollowerSizesDoNotPersist(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// R3: handleLeaderTransfer returns ErrTransferTargetNotVoter for witnesses/observers
+// handleLeaderTransfer returns ErrTransferTargetNotVoter for witnesses/observers
 // ---------------------------------------------------------------------------
 
 func TestRaft_LeaderTransfer_WitnessReturnsNotVoter(t *testing.T) {
@@ -13296,7 +13296,7 @@ func TestRaft_LeaderTransfer_ValidVoterSucceeds(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M1: Batch config change does not leave pendingConfigChange stuck
+// Batch config change does not leave pendingConfigChange stuck
 // ---------------------------------------------------------------------------
 
 // TestRaft_BatchConfigChange_DoesNotStickPendingFlag verifies that proposing
@@ -13359,7 +13359,7 @@ func TestRaft_BatchConfigChange_SubsequentSingleSucceeds(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L1: readStates bounded growth
+// readStates bounded growth
 // ---------------------------------------------------------------------------
 
 // TestRaft_ReadStates_BoundedGrowth verifies that readStates does not grow
@@ -13434,10 +13434,10 @@ func TestRaft_ReadStates_AcceptsAfterDrain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H1: replicaToBit rebuilt on config change during leadership
+// replicaToBit rebuilt on config change during leadership
 // ---------------------------------------------------------------------------
 
-func TestH1_ReplicaToBitRebuiltAfterMemberAddDuringLeadership(t *testing.T) {
+func TestReplicaToBitRebuiltAfterMemberAddDuringLeadership(t *testing.T) {
 	// When a new voting member is added during leadership,
 	// rebuildReplicaToBit must be called so the new member's heartbeat
 	// acks count toward ReadIndex quorum checks.
@@ -13474,7 +13474,7 @@ func TestH1_ReplicaToBitRebuiltAfterMemberAddDuringLeadership(t *testing.T) {
 	}
 }
 
-func TestH1_ReplicaToBitRebuiltAfterMemberRemoveDuringLeadership(t *testing.T) {
+func TestReplicaToBitRebuiltAfterMemberRemoveDuringLeadership(t *testing.T) {
 	// When a voting member is removed during leadership,
 	// rebuildReplicaToBit must remove the departed member's bit position
 	// so stale heartbeat acks do not count toward quorum.
@@ -13497,7 +13497,7 @@ func TestH1_ReplicaToBitRebuiltAfterMemberRemoveDuringLeadership(t *testing.T) {
 	}
 }
 
-func TestH1_NewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
+func TestNewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
 	// End-to-end: after adding a new member and rebuilding replicaToBit,
 	// the new member's heartbeat ack must count toward ReadIndex quorum.
 	r := newTestRaftPreVoteDisabled(1)
@@ -13553,10 +13553,10 @@ func TestH1_NewMemberHeartbeatAckCountsForReadIndexAfterRebuild(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: S1+S2 - ReadIndex/LeaseRead quorum uses quorum with witnesses
+// ReadIndex/LeaseRead quorum uses quorum with witnesses
 // ---------------------------------------------------------------------------
 
-func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
+func TestReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 	// 5-node cluster: node 1 (leader), nodes 2,3 (remotes), nodes 4,5 (witnesses).
 	// Unified quorum = 3 (5 voting / 2 + 1) for both election and commit.
 	// ReadIndex must use quorum so the confirmation quorum overlaps
@@ -13641,7 +13641,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses(t *testing.T) {
 	}
 }
 
-func TestS1_ReadIndex_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
+func TestReadIndex_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 	// Verify that heartbeat ack from an unknown node does not affect
 	// ReadIndex quorum in a cluster with witnesses.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
@@ -13687,7 +13687,7 @@ func TestS1_ReadIndex_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 	}
 }
 
-func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
+func TestLeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	// 5-node cluster: node 1 (leader), nodes 2,3 (remotes), nodes 4,5 (witnesses).
 	// quorum = 3. LeaseRead must use quorum. Verify that
 	// self + 1 remote = 2 < 3 does not satisfy lease, but adding a witness does.
@@ -13739,7 +13739,7 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses(t *testing.T) {
 	}
 }
 
-func TestS2_LeaseRead_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
+func TestLeaseRead_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 	// Verify that heartbeat ack from an unknown node does not contribute
 	// to lease validity in a cluster with witnesses.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
@@ -13771,7 +13771,7 @@ func TestS2_LeaseRead_ElectionQuorumWithWitnesses_InvalidInput(t *testing.T) {
 	}
 }
 
-func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
+func TestWitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 	// Verify that witnesses are included in both replicaToBit (for
 	// ReadIndex) and tracked in remoteLastAck (for LeaseRead).
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
@@ -13815,7 +13815,7 @@ func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 	}
 }
 
-func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck_NoWitnesses(t *testing.T) {
+func TestWitnessInReplicaToBitAndRemoteLastAck_NoWitnesses(t *testing.T) {
 	// Verify that a cluster without witnesses still works correctly.
 	// replicaToBit should only contain self + remotes.
 	r := newTestRaftPreVoteDisabled(1)
@@ -13830,10 +13830,10 @@ func TestS1S2_WitnessInReplicaToBitAndRemoteLastAck_NoWitnesses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: S3 - Frozen transferElapsed during quiesce
+// Frozen transferElapsed during quiesce
 // ---------------------------------------------------------------------------
 
-func TestS3_QuiesceBlockedDuringLeaderTransfer(t *testing.T) {
+func TestQuiesceBlockedDuringLeaderTransfer(t *testing.T) {
 	// When a leader transfer is active, quiesce entry must be blocked.
 	// Otherwise transferElapsed would never increment in the quiesce
 	// branch, causing the transfer timer to stall indefinitely.
@@ -13898,7 +13898,7 @@ func TestS3_QuiesceBlockedDuringLeaderTransfer(t *testing.T) {
 	}
 }
 
-func TestS3_QuiesceBlockedDuringLeaderTransfer_InvalidTarget(t *testing.T) {
+func TestQuiesceBlockedDuringLeaderTransfer_InvalidTarget(t *testing.T) {
 	// When no transfer is active (transferTarget == noNode), quiesce
 	// should still be able to enter normally.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
@@ -13931,10 +13931,10 @@ func TestS3_QuiesceBlockedDuringLeaderTransfer_InvalidTarget(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: S4 - Stale lease reads after quiesce exit on partitioned leader
+// Stale lease reads after quiesce exit on partitioned leader
 // ---------------------------------------------------------------------------
 
-func TestS4_LeaseInvalidatedOnQuiesceEntry(t *testing.T) {
+func TestLeaseInvalidatedOnQuiesceEntry(t *testing.T) {
 	// When a leader enters quiesce, the lease must be invalidated to
 	// prevent stale reads: heartbeats drop to the liveness-probe cadence,
 	// so the lease must be re-earned once normal ticking resumes.
@@ -13991,7 +13991,7 @@ func TestS4_LeaseInvalidatedOnQuiesceEntry(t *testing.T) {
 	}
 }
 
-func TestS4_LeaseInvalidatedOnQuiesceEntry_LeaseDisabled(t *testing.T) {
+func TestLeaseInvalidatedOnQuiesceEntry_LeaseDisabled(t *testing.T) {
 	// When leaseRead is disabled, quiesce entry should not panic or
 	// cause issues with lease invalidation (remoteLastAck is nil).
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}

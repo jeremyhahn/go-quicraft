@@ -58,7 +58,7 @@ func newTestNodeHostWithConfig(t *testing.T, nhConfig dbConfig.NodeHostConfig) *
 }
 
 // ---------------------------------------------------------------------------
-// C-M2: Release must wait for the bridge goroutines to exit before
+// Release must wait for the bridge goroutines to exit before
 // releasing (and thereby recycling) the inner pooled RequestState. A
 // stale bridge selecting on the recycled channel could otherwise steal a
 // successor request's result.
@@ -122,7 +122,7 @@ func TestRequestState_ReleaseWithoutRead_DoesNotStealSuccessorResult(t *testing.
 }
 
 // ---------------------------------------------------------------------------
-// C-M3: the RemoveData guard must survive a NodeHost restart. Dragonboat
+// The RemoveData guard must survive a NodeHost restart. Dragonboat
 // persists a marker; a restarted host must keep rejecting StartReplica
 // with ErrReplicaRemoved.
 // ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ func TestParseRemovedMarkerName(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-M4: the register path returns without blocking on consensus and does
+// The register path returns without blocking on consensus and does
 // not corrupt the session's series tracking when the caller follows the
 // documented dragonboat pattern (register → wait → PrepareForPropose).
 // ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ func TestNodeHost_ProposeSession_RegisterAsyncPattern(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-M5: a live in-use session passed to ProposeSession must be rejected
+// A live in-use session passed to ProposeSession must be rejected
 // with ErrInvalidSession, never silently unregistered.
 // ---------------------------------------------------------------------------
 
@@ -337,7 +337,7 @@ func TestNodeHost_ProposeSession_NoOPSessionRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-L1: a node user must reject sessions belonging to a different shard.
+// A node user must reject sessions belonging to a different shard.
 // ---------------------------------------------------------------------------
 
 func TestNodeUser_Propose_ForeignSessionRejected(t *testing.T) {
@@ -360,7 +360,7 @@ func TestNodeUser_Propose_ForeignSessionRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-L3: Start*Replica must validate the shard config and reject
+// Start*Replica must validate the shard config and reject
 // join=true with non-empty initialMembers (dragonboat's
 // ErrInvalidShardSettings).
 // ---------------------------------------------------------------------------
@@ -404,7 +404,7 @@ func TestNodeHost_StartReplica_InvalidConfigRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C-L4: ErrReplicaRemoved must be distinct from quicraft's "replica not
+// ErrReplicaRemoved must be distinct from quicraft's "replica not
 // found" so an unrelated lookup miss is never reported as a permanent
 // removal.
 // ---------------------------------------------------------------------------
@@ -425,7 +425,7 @@ func TestErrReplicaRemoved_DistinctFromReplicaNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H1: NewNodeHost must validate the NodeHostConfig
+// NewNodeHost must validate the NodeHostConfig
 // ---------------------------------------------------------------------------
 
 func TestNewNodeHost_RejectsInvalidConfig(t *testing.T) {
@@ -515,7 +515,7 @@ func TestNodeHost_NotLeaderSurfacesAsShardNotReady(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H5: configChangeIndex is ignored unless OrderedConfigChange is true
+// configChangeIndex is ignored unless OrderedConfigChange is true
 // ---------------------------------------------------------------------------
 
 func TestNodeHost_ConfigChangeIndexIgnoredWhenUnordered(t *testing.T) {
@@ -715,7 +715,7 @@ func TestShardInfo_PendingIsNothingAppliedYet(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H2: ResultC must aggregate committed+applied when NotifyCommit is on
+// ResultC must aggregate committed+applied when NotifyCommit is on
 // ---------------------------------------------------------------------------
 
 func TestRequestState_ResultC_AggregatesCommittedThenApplied(t *testing.T) {

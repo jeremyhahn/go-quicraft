@@ -1634,7 +1634,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			OnDiskIndex: first.OnDiskIndex,
 		},
 	}
-	// Two-phase from here (whole-project review, M1). Nothing above made this
+	// Two-phase from here. Nothing above made this
 	// snapshot durable beyond its own directory: the LogDB record, the log
 	// floor, reclaiming older directories and the state-machine recovery all
 	// wait for raft's verdict on the install. Raft can still refuse an install

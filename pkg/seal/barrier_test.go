@@ -388,7 +388,7 @@ func TestBarrier_EncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBarrier_DecryptTamperedAlgIDDoesNotPanic is the H1 regression test. The
+// TestBarrier_DecryptTamperedAlgIDDoesNotPanic is the regression test. The
 // algID header byte is unauthenticated and does not select the cipher (the
 // active AEAD is fixed by the epoch DEK). A tampered algID whose nonce-size
 // class differs from the active 12-byte cipher (0x05 = XChaCha20, 24-byte) or
@@ -1422,7 +1422,7 @@ func TestDeriveDEK_DifferentSalts(t *testing.T) {
 	}
 }
 
-// --- HKDF Deployment ID Binding (OPT-D) ---
+// --- HKDF Deployment ID Binding ---
 
 // TestHKDFDeploymentIDBinding verifies that the same root key, salt, and epoch
 // produce different DEKs when the deployment ID differs. This ensures
@@ -2829,7 +2829,7 @@ func TestBarrier_SetSealedRootKey_RejectsEmptyKnownEpochs(t *testing.T) {
 	}
 }
 
-// --- M13: Epoch AAD binding (cross-epoch splice prevention) ---
+// --- Epoch AAD binding (cross-epoch splice prevention) ---
 
 func TestBarrier_EpochAADPreventsCrossEpochSplice(t *testing.T) {
 	b, s := testInitializedBarrier(t)
@@ -2949,7 +2949,7 @@ func TestNewAEAD_ValidKey(t *testing.T) {
 	}
 }
 
-// --- M4-sec/M6-sec: Brute-force backoff persistence ---
+// --- Brute-force backoff persistence ---
 
 func TestBarrier_BackoffPersistence(t *testing.T) {
 	// Verify that brute-force backoff state is persisted to the sealed key
@@ -3051,7 +3051,7 @@ func TestBarrier_BackoffPersistenceZeroValuesBackwardCompat(t *testing.T) {
 	}
 }
 
-// --- M1-sec: Root key Seal AAD binding ---
+// --- Root key Seal AAD binding ---
 // (The AAD binding is inherently tested by existing round-trip tests. These
 // additional tests verify that AAD mismatch causes decryption failure.)
 
@@ -3124,7 +3124,7 @@ func TestSoftwareStrategy_SealUnsealRoundTripWithAAD(t *testing.T) {
 	enclave.Wipe(decrypted)
 }
 
-// --- M2-sec: Epoch monotonicity validation in SetSealedRootKey ---
+// --- Epoch monotonicity validation in SetSealedRootKey ---
 
 func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
 	b := MustNewBarrier(DefaultBarrierConfig(1))

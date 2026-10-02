@@ -1,50 +1,23 @@
 name: Fuzz
 
-# Mutation fuzzing, deliberately separated from ci.yml.
+# Mutation fuzzing, kept out of ci.yml.
 #
-# `go test -fuzz` is unbounded and nondeterministic: it explores until its
-# budget runs out, and a crash it finds is a property of the RNG schedule, not
-# of the commit under test. Putting it on a PR would fail unrelated pull
-# requests at random and train everyone to re-run the job, which is how a gate
-# stops being a gate. So the PR gate in ci.yml (`fuzz-seeds`) runs the targets
-# against their seeds and the committed corpus only — deterministic — and the
-# actual searching happens here on a schedule, where a discovery becomes a bug
-# report rather than a merge blocker.
+# `go test -fuzz` is unbounded and nondeterministic, so on a PR it would fail
+# unrelated changes at random. ci.yml's `fuzz-seeds` job runs the targets
+# against their seeds and committed corpus only; the searching happens here on
+# a schedule. Promote an interesting input to the PR gate by committing it
+# under pkg/*/testdata/fuzz/.
 #
-# The committed corpora under pkg/*/testdata/fuzz/ are what carry findings from
-# here back into the PR gate: promote an interesting input by committing it.
-#
-# # The budget is a COUNT of executions, never a duration (issue #49)
-#
-# `-fuzztime=<duration>` makes Go's coordinator race itself at shutdown, and
-# the loser is this workflow. In Go 1.26.6 `internal/fuzz.CoordinateFuzzing`
-# installs a deadline context ONLY when a duration was given:
-#
-#     if opts.Timeout > 0 { ctx, cancel = context.WithTimeout(ctx, ...) }
-#     fuzzCtx, cancelWorkers := context.WithCancel(ctx)
-#
-# At the deadline `coordinate()` returns `ctx.Err()` and `stop()` tries to
-# suppress it with `if err == fuzzCtx.Err()`. But `fuzzCtx` is the CHILD: the
-# parent's `Done()` channel closes before the child's `Err()` is populated, so
-# the comparison can miss and a clean, expected timeout is recorded as a test
-# failure. That is exactly what run 23893 reported —
-# `--- FAIL: FuzzSnapshotChunkRoundTrip (60.08s)` / `context deadline exceeded`
-# with NO reproducer file, i.e. a failure Go itself does not consider a finding.
-#
-# With `-fuzztime=<N>x` the budget is an execution count: `opts.Timeout` is 0,
-# no deadline context is created at all, and the coordinator ends the run
-# through an explicit `stop(nil)` at `c.count >= c.opts.Limit`. The race has no
-# participants. A count is also the better unit for a regression-oriented
-# nightly: it makes the search depth reproducible across runners of different
-# speeds instead of varying with whatever the host was doing that night.
-#
-# Removing the deadline means Go no longer bounds the wall clock, so
-# `timeout-minutes` below IS the backstop. It is the only one.
+# The budget is an execution count (`-fuzztime=<N>x`), never a duration. With
+# a duration, Go's fuzz coordinator can record its own expected deadline as a
+# "context deadline exceeded" failure with no reproducer. A count creates no
+# deadline and keeps the search depth the same across runners of different
+# speeds. Go then no longer bounds the wall clock, so `timeout-minutes` below
+# is the only backstop.
 
 on:
   schedule:
-    # 04:00 UTC daily. Nothing downstream reads this, so the time only needs to
-    # be outside working hours for the runner pool.
+    # 04:00 UTC daily.
     - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
@@ -57,33 +30,28 @@ permissions:
   contents: read
 
 env:
-  # Kept in lockstep with ci.yml's pin (issue #23).
+  # Must match ci.yml's pin.
   GO_VERSION: "1.27.0"
-  # Same rationale as ci.yml: never resolve through a stray workspace.
+  # Never resolve through a stray workspace.
   GOWORK: "off"
 
 jobs:
   fuzz:
     name: Fuzz ${{ matrix.package }}
     runs-on: ubuntu-latest
-    # The ONLY wall-clock bound on the run, because an execution budget bounds
-    # work and not time: per-exec cost climbs as the corpus grows, and running
-    # the calibration a second time on a loaded host moved two waldb targets by
-    # 40x. So the budgets below were also run end to end: on an idle 24-core
-    # host the largest package, pkg/proto with 13 targets, took 220s, which
-    # scales to roughly 12 minutes on the runner against the ~16 that 60s per
-    # target cost it. 60 minutes is therefore ~5x headroom, and a job that
-    # reaches it has a target whose per-exec cost exploded — worth reading, not
-    # worth hiding behind a tighter number.
+    # The only wall-clock bound, since an execution budget bounds work, not
+    # time, and per-exec cost grows with the corpus. The largest package,
+    # pkg/proto with 13 targets, takes about 12 minutes on the runner, so 60
+    # leaves ~5x headroom. A job that hits it has a target whose per-exec cost
+    # exploded, which is worth investigating.
     timeout-minutes: 60
     strategy:
       # A crash in one package must not cancel the search in the others.
       fail-fast: false
       matrix:
-        # The six packages carrying `quicraft_fuzz` targets. One job per package
-        # rather than one per target: `go test -fuzz` accepts exactly one target
-        # per invocation, so the targets are enumerated inside the step instead
-        # (a new FuzzXxx is then picked up with no workflow edit).
+        # The six packages carrying `quicraft_fuzz` targets, one job per
+        # package. `go test -fuzz` takes one target per invocation, so the step
+        # enumerates them and picks up a new FuzzXxx without a workflow edit.
         package:
           - ./pkg/proto
           - ./pkg/internal/transport
@@ -106,20 +74,16 @@ jobs:
           set -euo pipefail
 
           # Per-package execution budgets, calibrated 2026-09-01 to land near a
-          # minute per target ON THE RUNNER — the same budget the duration they
-          # replace was worth.
+          # minute per target on the runner.
           #
           # Method: every target was run once at -fuzztime=60s on an idle
-          # 24-core host and its execution count recorded. Run 23893 measured
-          # the runner at 4.2M execs/60s on FuzzSnapshotChunkRoundTrip against
-          # 18.6M here, so the runner is ~0.23x this host and the local counts
-          # are scaled by that. Each package's budget is derived from its
-          # SLOWEST target, so nothing overruns; a faster target in the same
-          # package simply finishes earlier.
+          # 24-core host and its execution count recorded. The runner measured
+          # 4.2M execs/60s on FuzzSnapshotChunkRoundTrip against 18.6M on that
+          # host, so the local counts are scaled by ~0.23. Each package's
+          # budget comes from its slowest target, so nothing overruns.
           #
-          # One global number cannot work: the measured spread is 20k to 36M
-          # execs per minute, a factor of 1800, and it is not aligned with
-          # package boundaries either — hence the per-target overrides below.
+          # The measured spread is 20k to 36M execs per minute and does not
+          # follow package boundaries, hence the per-target overrides below.
           case "${PACKAGE}" in
             # 13 targets, 18.2M–36.1M execs/min; slowest FuzzMembershipRoundTrip.
             ./pkg/proto)              EXECS=4000000 ;;
@@ -143,13 +107,8 @@ jobs:
           esac
 
           if [ -n "${INPUT_EXECS}" ]; then
-            # A POSITIVE integer: leading digit 1-9, then digits. The obvious
-            # `*[!0-9]*|0)` rejects non-digits and a literal "0" but accepts
-            # "00" and "000", which are neither positive nor rejected — the step
-            # would announce the override, pass `-fuzztime=00x`, and produce a
-            # GREEN RUN THAT FUZZED NOTHING. A suite that reports success having
-            # done no work is the exact failure this whole change exists to
-            # remove, so the validation has to be as strict as the claim.
+            # A positive integer with no leading zero. "00" would otherwise
+            # pass `-fuzztime=00x` and produce a green run that fuzzed nothing.
             case "${INPUT_EXECS}" in
               [1-9]*[!0-9]*|*[!0-9]*|0*)
                 echo "FAIL: the execs input must be a positive integer with no leading zeroes, got '${INPUT_EXECS}'"
@@ -181,12 +140,9 @@ jobs:
             esac
           }
 
-          # The listing is captured into a variable of its own so that a package
-          # that does not compile fails HERE, with the Go tool's own error. A
-          # command substitution consumed directly by `for` does not trip
-          # `set -e`, and a pipe into grep would hide it behind grep's exit
-          # status, so either would report the generic "no fuzz targets found"
-          # below for what is really a build failure.
+          # Captured into a variable so a package that does not compile fails
+          # here with the Go tool's error. A command substitution in `for` does
+          # not trip `set -e`, and a pipe would hide it behind grep's status.
           LISTING="$(go test -tags=quicraft_fuzz -list='^Fuzz' "${PACKAGE}")"
           # `go test -list` prints the matching names plus a trailing
           # "ok <pkg> <time>" line, so the names are filtered out here.
@@ -210,15 +166,10 @@ jobs:
               -fuzz="^${target}\$" -fuzztime="${count}x" "${PACKAGE}"
           done
 
-      # A crash writes its reproducer to testdata/fuzz/<Target>/ in the working
-      # tree, where it would otherwise be discarded with the runner. Preserving
-      # it is the entire deliverable of a failed fuzzing run: commit the file
-      # and ci.yml's fuzz-seeds job turns it into a permanent regression test.
-      #
-      # The job log is the primary channel because it is the only one that
-      # works on both hosts. A reproducer is a few lines of `go test fuzz v1`
-      # text, so the log holds it whole and it can be copied straight out of a
-      # failed nightly.
+      # A crash writes its reproducer to testdata/fuzz/<Target>/, which would
+      # be discarded with the runner. Print it to the job log, which works on
+      # every host; commit the file and ci.yml's fuzz-seeds job turns it into
+      # a regression test.
       - name: Print crash reproducers
         if: failure()
         run: |
@@ -248,12 +199,8 @@ jobs:
           done
           echo "Commit these files as-is: ci.yml's fuzz-seeds job replays every file under pkg/*/testdata/fuzz/, which turns each one into a permanent regression test."
 
-      # On top of the log, never instead of it. actions/upload-artifact@v4
-      # refuses to run against a non-github.com server (devops.md §1) and this
-      # Gitea runner serves no artifact endpoint at all: run 23893 reported
-      # "Failed to CreateArtifact: Unable to make request: ECONNREFUSED", so the
-      # upload turned one fuzz failure into two and discarded the reproducer
-      # anyway. Guarding it to github.com skips it here rather than failing it.
+      # In addition to the log. upload-artifact fails on servers without an
+      # artifact endpoint, so this runs on github.com only.
       - name: Upload crash reproducers
         if: failure() && github.server_url == 'https://github.com'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

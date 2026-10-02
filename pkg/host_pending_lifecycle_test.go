@@ -43,10 +43,10 @@ func waitUntil(timeout time.Duration, cond func() bool) bool {
 }
 
 // ---------------------------------------------------------------------------
-// M14: sweepPendingReads must expire a batch key's unreachable aliases
+// sweepPendingReads must expire a batch key's unreachable aliases
 // ---------------------------------------------------------------------------
 
-// TestSweepPendingReads_ExpiresUnconfirmedAliasGroup is the M14 regression
+// TestSweepPendingReads_ExpiresUnconfirmedAliasGroup is a regression
 // test. Coalesced ReadIndex alias keys are reachable ONLY through the batch
 // key's pendingRead: OnReadyToRead looks up the batch key and walks
 // pr.aliases. When the sweeper expires the batch key while the group is
@@ -101,7 +101,7 @@ func TestSweepPendingReads_ExpiresUnconfirmedAliasGroup(t *testing.T) {
 	}
 }
 
-// TestSweepPendingReads_KeepsConfirmedAliases verifies the M14 fix leaves
+// TestSweepPendingReads_KeepsConfirmedAliases verifies the alias sweep leaves
 // CONFIRMED aliases in place when their batch key expires: a confirmed
 // alias carries its own readIndex and is independently completable by the
 // OnApplied read scan, so timing it out would discard a read that is about
@@ -161,7 +161,7 @@ func TestSweepPendingReads_KeepsConfirmedAliases(t *testing.T) {
 	aliasRS.Release()
 }
 
-// TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases covers the M14
+// TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases covers the
 // edge where the batch key was swept BEFORE the aliases could attach to it:
 // the raft confirmation arrives keyed by the batch key, so aliases
 // registered against a removed batch entry are unreachable from birth and
@@ -197,10 +197,10 @@ func TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M15: registration racing Host.Close must never orphan the caller
+// Registration racing Host.Close must never orphan the caller
 // ---------------------------------------------------------------------------
 
-// TestPendingRegistration_CloseRace_CallerNeverOrphaned is the M15
+// TestPendingRegistration_CloseRace_CallerNeverOrphaned is a
 // regression test: ReadIndex, RequestSnapshot, and config-change
 // registrations racing Host.Close() must always resolve — either with
 // ErrClosed from the post-store re-check, or with a completion from the
@@ -258,7 +258,7 @@ func TestPendingRegistration_CloseRace_CallerNeverOrphaned(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L13: StartShard bootstrap failure must mark the nodeState stopped
+// StartShard bootstrap failure must mark the nodeState stopped
 // ---------------------------------------------------------------------------
 
 // stashBootstrapLogDB fails SaveBootstrap after stashing the nodeState the
@@ -279,7 +279,7 @@ func (f *stashBootstrapLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap
 	return errors.New("bootstrap write failed")
 }
 
-// TestStartShard_BootstrapFailureMarksNodeStateStopped is the L13
+// TestStartShard_BootstrapFailureMarksNodeStateStopped is a
 // regression test: the SaveBootstrap failure path deletes the node from
 // h.nodes and the deferred rollback closes the state machine. A reader
 // that resolved the nodeState just before the Delete must fail its
@@ -310,13 +310,13 @@ func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L14: queue-full rollbacks must claim with LoadAndDelete
+// Queue-full rollbacks must claim with LoadAndDelete
 // ---------------------------------------------------------------------------
 
-// TestProposeEntry_QueueFullRollback_RacesSweeper is the L14 regression
-// test. The queue-full rollback used an unconditional Delete, so when the
-// sweeper had already claimed and completed the entry the rollback still
-// ran releaseRef (driving outstanding negative — the RequestState is
+// TestProposeEntry_QueueFullRollback_RacesSweeper is a regression
+// test. With an unconditional Delete in the queue-full rollback, when the
+// sweeper has already claimed and completed the entry the rollback still
+// runs releaseRef (driving outstanding negative — the RequestState is
 // permanently lost from the pool) and completePendingOp a second time
 // (undercounting pendingOps so Drain can close early). With the
 // LoadAndDelete claim, exactly one claimant rolls the entry back: the

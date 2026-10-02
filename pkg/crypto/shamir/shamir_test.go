@@ -852,7 +852,7 @@ func TestCombine_ReconstructsSecret(t *testing.T) {
 	}
 }
 
-// TestCombine_TamperedShareYieldsGarbageNotError documents the M4 contract:
+// TestCombine_TamperedShareYieldsGarbageNotError documents the contract:
 // shares carry NO secret digest (it would be an offline oracle), so a tampered
 // share is NOT self-detected — Combine returns garbage, not an error. The caller
 // must authenticate the reconstructed secret out-of-band.

@@ -356,7 +356,7 @@ func (b *mockBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]b
 }
 
 // ---------------------------------------------------------------------------
-// Context-AAD support for the test barriers (M3)
+// Context-AAD support for the test barriers
 //
 // The real seal.Barrier folds the caller context into the AEAD AAD, so a frame
 // sealed under one context cannot be opened under another. The pass-through
@@ -4566,7 +4566,7 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 // if OnReadyToRead fires for a batchKey that has no aliases (because
 // OnReadIndexBatched was never called or the batchKey was deleted),
 // only the batchKey is completed. A subsequent OnReadIndexBatched for the
-// already-removed batch key must then FAIL the alias reads (M14): aliases
+// already-removed batch key must then FAIL the alias reads: aliases
 // are reachable only through the batch entry, so leaving them pending
 // would block deadline-less callers forever. This defensive path backs up
 // the fixed ordering (OnReadIndexBatched before Handle(ReadIndex)).
@@ -4619,7 +4619,7 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 
 	// Now call OnReadIndexBatched. The batchKey is already gone, so the
 	// aliases can never be confirmed — they must be failed and removed
-	// rather than left to orphan (M14 fix).
+	// rather than left to orphan.
 	cb.OnReadIndexBatched(1, 400, []uint64{401, 402})
 
 	ns.pendingReadsMu.Lock()
@@ -5873,9 +5873,9 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 // TestExportImportSnapshot_PreservesIdentityAndMembership verifies Bug D: the
 // exported artifact carries the original snapshot Index, Term, OnDiskIndex,
 // and Membership, and ImportSnapshot persists them verbatim (using importSeq
-// only for the on-disk directory name). Before the fix, import synthesized
-// Index=importSeq, Term=1, and dropped Membership/OnDiskIndex, producing a
-// different logical snapshot.
+// only for the on-disk directory name). Synthesizing Index=importSeq, Term=1
+// and dropping Membership/OnDiskIndex would produce a different logical
+// snapshot.
 func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -7991,7 +7991,7 @@ func TestSyncRequestDeleteNode_Success(t *testing.T) {
 
 	// Replica 2 is not a member, so the delete is now rejected at propose
 	// time with ErrNodeNotFound rather than committing a no-op config change
-	// entry (H4: the Host pre-validates membership changes).
+	// entry (the Host pre-validates membership changes).
 	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
 	if !errors.Is(err, raft.ErrNodeNotFound) {
 		t.Fatalf("SyncRequestDeleteNode error = %v, want ErrNodeNotFound", err)
@@ -8730,7 +8730,7 @@ func TestProtoMembershipToPublic_NoAliasing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M1: ShardInfo.Pending field populated from pendingProposals
+// ShardInfo.Pending field populated from pendingProposals
 // ---------------------------------------------------------------------------
 
 func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
@@ -8840,7 +8840,7 @@ func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M2: diskFull flag recovery
+// diskFull flag recovery
 // ---------------------------------------------------------------------------
 
 func TestBuildWALOptions_DiskFullRecovery(t *testing.T) {
@@ -8908,7 +8908,7 @@ func TestBuildWALOptions_DiskFullRecoveryWithEventListener(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M3: Close() completes pending proposals/reads/snapshots with ErrClosed
+// Close() completes pending proposals/reads/snapshots with ErrClosed
 // ---------------------------------------------------------------------------
 
 func TestHost_Close_CompletesPendingProposals(t *testing.T) {
@@ -9114,7 +9114,7 @@ func TestHost_Close_NoPendingNoError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// openStopper lifecycle (C4)
+// openStopper lifecycle
 // ---------------------------------------------------------------------------
 
 // TestStopShard_ClosesOpenStopper verifies that StopShard closes the
@@ -9235,7 +9235,7 @@ func TestHost_Close_ClosesOpenStoppers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Host logger (C2)
+// Host logger
 // ---------------------------------------------------------------------------
 
 // TestNewHost_DoesNotMutateGlobalLogger verifies that NewHost does not
@@ -9315,7 +9315,7 @@ func TestNewHost_DefaultLogger_DoesNotMutateGlobal(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix H7: ImportSnapshot monotonic counter
+// ImportSnapshot monotonic counter
 // ---------------------------------------------------------------------------
 
 // TestImportSnapshot_MonotonicCounter verifies that ImportSnapshot uses a
@@ -9430,7 +9430,7 @@ func TestImportSnapshot_MonotonicCounterConcurrent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix H6: transportSender snapshot WaitGroup
+// transportSender snapshot WaitGroup
 // ---------------------------------------------------------------------------
 
 // TestTransportSender_Wait_BlocksUntilDone verifies that transportSender.Wait()
@@ -9495,7 +9495,7 @@ func TestTransportSender_Wait_NoInFlight(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix M3: Context in RequestLeaderTransfer and ImportSnapshot
+// Context in RequestLeaderTransfer and ImportSnapshot
 // ---------------------------------------------------------------------------
 
 // TestRequestLeaderTransfer_CanceledContext verifies that RequestLeaderTransfer
@@ -9614,7 +9614,7 @@ func TestImportSnapshot_DeadlineExceeded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix M8: Event-driven Drain (additional tests)
+// Event-driven Drain (additional tests)
 // ---------------------------------------------------------------------------
 
 // TestHost_Drain_EventDrivenNotification verifies that the event-driven drain
@@ -9702,7 +9702,7 @@ func TestHost_Drain_CompletePendingOpIdempotent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix M2: Snapshot membership reconciliation
+// Snapshot membership reconciliation
 // ---------------------------------------------------------------------------
 
 // TestReconcileMembershipFromPeer_AddsAndRemovesNodes verifies that
@@ -9902,7 +9902,7 @@ func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix H6: Close waits for snapshot sends
+// Close waits for snapshot sends
 // ---------------------------------------------------------------------------
 
 // TestHost_Close_WaitsForSnapshotSends verifies that Host.Close() calls
@@ -10720,7 +10720,7 @@ func TestSafeNotifySnapshotRejected_NilEngine(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M8: Context cancellation returns ErrCanceled (not context.Canceled)
+// Context cancellation returns ErrCanceled (not context.Canceled)
 // ---------------------------------------------------------------------------
 
 func TestSyncRequestAddNode_ContextCanceled(t *testing.T) {
@@ -14000,7 +14000,7 @@ func TestRequestRemoveNode_WithConfigChangeID(t *testing.T) {
 	// Request removal of node 2 (phantom) using the current ConfigChangeID.
 	// The staleness check passes (the ID matches), but pre-validation now
 	// rejects the removal of a non-member with ErrNodeNotFound instead of
-	// delivering a change whose apply would be silently swallowed (H4).
+	// delivering a change whose apply would be silently swallowed.
 	rs, err := h.RequestRemoveNode(ctx, 1, 2, membership.ConfigChangeID)
 	if rs != nil {
 		rs.Release()
@@ -14451,7 +14451,7 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 	}
 }
 
-// TestBuildTransportConfig_RevocationFailsClosedByDefault is the M3 regression
+// TestBuildTransportConfig_RevocationFailsClosedByDefault is the regression
 // test, driven through the CHECKER the mapped config produces rather than
 // through the value of a field. A RevocationConfig that does not opt into
 // soft-fail must reject a peer whose status cannot be established, and the
@@ -20496,7 +20496,7 @@ func TestOnReadIndexBatched_NonexistentShard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H4: Host config-change API pre-validates against current membership.
+// Host config-change API pre-validates against current membership.
 // ---------------------------------------------------------------------------
 
 // TestRequestAddNode_DuplicateReturnsErrorPromptly verifies that adding a
@@ -20578,12 +20578,12 @@ func TestRequestAddWitness_DuplicateReturnsErrorPromptly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H5: ExportSnapshot/ImportSnapshot operate on plaintext with a barrier.
+// ExportSnapshot/ImportSnapshot operate on plaintext with a barrier.
 // ---------------------------------------------------------------------------
 
 // TestExportSnapshot_DecryptsWithBarrier verifies that ExportSnapshot emits
 // PLAINTEXT when a barrier is configured and the on-disk snapshot is encrypted
-// (Epoch > 0). Before the fix, ExportSnapshot copied raw ciphertext.
+// (Epoch > 0), never raw ciphertext.
 func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -20735,9 +20735,9 @@ func exportShardSnapshotSetup(t *testing.T, db *mockLogDB, b Barrier, plaintext 
 // TestExportSnapshot_PerShardBarrier_Decrypts verifies ExportSnapshot resolves
 // the decrypting barrier per shard (barrierForShard). With ONLY per-shard
 // barriers configured (no host-wide barrier), an encrypted snapshot must
-// still export as plaintext. Before the fix, ExportSnapshot consulted only
-// h.barrier and returned ErrSnapshotEncryptedBarrierUnavailable even though
-// the shard's own barrier was unsealed.
+// still export as plaintext. Consulting only h.barrier would return
+// ErrSnapshotEncryptedBarrierUnavailable even though the shard's own barrier
+// is unsealed.
 func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -20776,9 +20776,9 @@ func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
 // TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier verifies that
 // when BOTH a host-wide barrier and a per-shard barrier are configured, the
 // shard's snapshot is decrypted with the per-shard barrier it was encrypted
-// under. Before the fix, ExportSnapshot decrypted with the host-wide barrier
-// (the wrong key), failed AEAD after already writing the artifact header,
-// and left the caller with a truncated header-only artifact.
+// under. Decrypting with the host-wide barrier (the wrong key) fails AEAD
+// after the artifact header is already written and leaves the caller with a
+// truncated header-only artifact.
 func TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -21047,14 +21047,14 @@ func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H6: StartShard fails when a snapshot record exists but its data file is
+// StartShard fails when a snapshot record exists but its data file is
 // missing/unreadable, instead of silently skipping recovery.
 // ---------------------------------------------------------------------------
 
 // TestStartShard_MissingSnapshotFileIsFatal verifies that StartShard returns a
 // fatal HostInitError when LogDB has a snapshot record whose data file cannot
-// be opened. Before the fix, recovery was silently skipped while the raft
-// processed index was set to the snapshot index, losing in-memory SM data.
+// be opened. Silently skipping recovery while the raft processed index is set
+// to the snapshot index would lose in-memory SM data.
 func TestStartShard_MissingSnapshotFileIsFatal(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()

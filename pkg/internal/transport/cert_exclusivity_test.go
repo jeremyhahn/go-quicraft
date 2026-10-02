@@ -309,7 +309,7 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 			wantFail: false,
 		},
 
-		// H4. The SKIP used a raw, case-sensitive string compare while the
+		// The SKIP used a raw, case-sensitive string compare while the
 		// MATCH used x509.VerifyHostname, which lower-cases names, tolerates
 		// the trailing-dot FQDN form and canonicalises IP literals. Every row
 		// below is a legitimate deployment that the mismatch REJECTED at

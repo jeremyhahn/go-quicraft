@@ -239,7 +239,7 @@ func TestDeriveKey_PBKDF2_CustomKeyLen(t *testing.T) {
 }
 
 // TestKDFParamsBelowFloor verifies the production KDF work-factor floor
-// catches the pathological near-free parameter sets the reviewer flagged
+// catches pathological near-free parameter sets
 // (PBKDF2 Iterations=1, tiny KeyLen) while accepting the defaults. It checks
 // the pure predicate directly so it is independent of the package-wide test
 // bypass. The Argon2id work-factor floors are pinned in
