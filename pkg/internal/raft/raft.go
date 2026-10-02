@@ -342,8 +342,23 @@ type raft struct {
 	// Feature flags.
 	checkQuorum bool
 	preVote     bool
-	isObserver  bool
-	isWitness   bool
+
+	// isObserver is this replica's EFFECTIVE non-voting role. It is seeded
+	// from config.IsObserver, which is only an initial hint: it governs while
+	// the configuration says nothing about this replica (a joiner that has not
+	// yet learned the entry adding it), and from then on the replicated
+	// membership decides. checkSelfRole re-derives it wherever the
+	// configuration is (re)established, so an observer whose own promotion
+	// (AddNode for its replica ID) commits becomes a voter in place — it
+	// campaigns, promises vote windows and serves ReadIndex — with no restart,
+	// as etcd's learner promotion does. See checkSelfRole for why the observer
+	// role may follow the configuration while the witness role may not.
+	isObserver bool
+	// isWitness is the LOCALLY configured witness role (config.IsWitness). It
+	// is never re-derived: a witness keeps no state machine, so the role
+	// decides what this replica physically holds, and a disagreement with the
+	// replicated membership is latched as roleMismatch instead.
+	isWitness bool
 
 	// selfRemoved records that this replica is not part of the current
 	// configuration: it is absent from the membership's voters, observers
@@ -366,7 +381,8 @@ type raft struct {
 	// role contradicts the REPLICATED membership. It is the witness
 	// analogue of selfRemoved: a safety latch, derived (never proposed)
 	// from the configuration, re-evaluated everywhere the configuration is
-	// (re)established.
+	// (re)established. The observer role is not latched here: it follows
+	// the configuration instead (see isObserver).
 	//
 	// The two roles run different data paths: a leader sends witnesses
 	// metadata-only entries (sendAppend strips the payload). A replica the
@@ -727,67 +743,128 @@ func (r *raft) initRemotes(membership proto.Membership) {
 	r.checkSelfRole(membershipHasSelf(membership, r.replicaID), listedWitness, listedObserver)
 }
 
-// checkSelfRole cross-checks this replica's LOCALLY configured witness and
-// non-voting roles against the REPLICATED membership and latches roleMismatch
-// when either disagrees. Called wherever the configuration is (re)established:
-// construction, snapshot restore, and commit-time config change application.
+// checkSelfRole reconciles this replica's role with the REPLICATED membership.
+// Called wherever the configuration is (re)established: construction, snapshot
+// restore, and commit-time config change application.
 //
-// Nothing else validates the two against each other. config.IsWitness feeds
-// r.isWitness and every host-side propose/read gate, while the replicated
-// membership is what the LEADER uses to decide whether to strip entry
-// payloads for this replica. A replica on the wrong side of that split runs
-// a state machine that never saw the entry data while believing itself a
-// full replica, and the disagreement is invisible until it wins an election
-// and starts answering reads out of it.
+// The two non-voting roles are handled differently because they differ in what
+// the replica physically holds.
 //
-// The OBSERVER half matters for a different and worse reason. startElection
-// gates campaigning on the LOCAL r.isObserver, while quorum() and countVotes()
-// size the voting set from the REPLICATED membership plus an unconditional +1
-// for self (numVotingMembers). A replica the configuration lists as an observer
-// but which is configured locally as a voter therefore computes
-// quorumOf(V+1) over a real voting set of V — for even V that is strictly
-// FEWER grants than the configuration requires — counts its own vote, and can
-// win. Two such replicas can be elected in the same term. Both halves must be
-// compared here or that state is reachable with nothing latched.
+// The OBSERVER role follows the configuration (setObserver). An observer and a
+// voter are replicated identically — the leader's sendAppend ships both the
+// full entry payloads — so they hold the same state machine and differ only in
+// which gates apply: whether they campaign, promise vote windows in heartbeat
+// acks, and count themselves toward quorum. Moving between the two needs no
+// local repair, only a different answer from those gates, which is why a
+// committed promotion takes effect in place. Deriving the role is also what
+// keeps it safe. startElection gates campaigning on r.isObserver while
+// quorum() and countVotes() size the voting set from the replicated membership
+// plus an unconditional +1 for self, so a replica the configuration lists as an
+// observer but that believes itself a voter computes quorumOf(V+1) over a real
+// voting set of V, counts its own vote, and can win — two of them in the same
+// term. Taking the role from the configuration closes that by construction,
+// and every voter's refusal to grant a listed observer a vote
+// (handleVoteRequest) stays as the independent second half. config.IsObserver
+// is therefore only the INITIAL hint, consulted while the configuration does
+// not mention this replica; etcd likewise makes the learner role a property of
+// the ConfState rather than of local configuration.
 //
-// dragonboat fails closed by panicking (internal/raft/raft.go addNode /
-// addWitness / addNonVoting). Panicking a whole host over one shard's
-// configuration is not available here — a host carries thousands of shards —
-// so the latch refuses the two operations that can turn the bad state machine
+// The WITNESS role is latched (roleMismatch). A witness keeps no state
+// machine, and the leader strips entry payloads for any replica the
+// configuration lists as one. A replica on the wrong side of that split runs a
+// state machine that never saw the entry data while believing itself a full
+// replica — or, the other way round, a witness listed as a full replica would
+// answer reads from an empty one. That is a statement about what the replica
+// holds, not about which gates apply, and nothing done in place repairs it.
+// The latch refuses the two operations that can turn the bad state machine
 // into an authoritative answer: campaigning and serving reads. Voting is
 // deliberately NOT refused; witnesses vote, and a replica that stopped voting
 // would remove itself from a quorum the rest of the cluster still counts it in.
+//
+// dragonboat fails closed on the witness disagreement by panicking
+// (internal/raft/raft.go addNode / addWitness). Panicking a whole host over one
+// shard's configuration is not available here — a host carries thousands of
+// shards — so the latch is the non-fatal equivalent.
 func (r *raft) checkSelfRole(inConfig, listedWitness, listedObserver bool) {
 	// A replica the configuration does not mention makes no statement about
-	// its role. setSelfMembership already makes it unelectable.
+	// its role, so the current one — the config.IsObserver hint on a joiner —
+	// stands. setSelfMembership already makes such a replica unelectable.
 	if !inConfig {
 		return
 	}
-	mismatch := listedWitness != r.isWitness || listedObserver != r.isObserver
+	r.setObserver(listedObserver)
+	mismatch := listedWitness != r.isWitness
 	if mismatch == r.roleMismatch {
 		return
 	}
 	r.roleMismatch = mismatch
 	if !mismatch {
-		slog.Info("replica role now agrees with the replicated membership",
+		slog.Info("replica witness role now agrees with the replicated membership",
 			"shard", r.shardID,
 			"replica", r.replicaID,
-			"is_witness", r.isWitness,
-			"is_observer", r.isObserver)
+			"is_witness", r.isWitness)
 		return
 	}
-	slog.Error("replica role contradicts the replicated membership: refusing to campaign or serve reads until they agree",
+	slog.Error("replica witness role contradicts the replicated membership: refusing to campaign or serve reads until they agree",
 		"shard", r.shardID,
 		"replica", r.replicaID,
 		"configured_witness", r.isWitness,
 		"membership_witness", listedWitness,
-		"configured_observer", r.isObserver,
 		"membership_observer", listedObserver,
 		"term", r.term)
 	// A leader that only now learns the configuration calls it a witness has
 	// been answering reads and counting quorums it had no right to. Step
 	// down immediately rather than waiting for an election timeout.
 	if r.state == leader {
+		r.becomeFollower(r.term, noLeader)
+	}
+}
+
+// setObserver moves this replica's effective role to the one the replicated
+// membership records for it: a non-voting observer, or a voting member. It is
+// edge-triggered, so it logs and acts only when the role actually changes.
+//
+// PROMOTION (observer to voter) is etcd's learner promotion: from the moment
+// the AddNode naming this replica is applied here it campaigns, counts its own
+// vote, and serves ReadIndex like any other voter, with no restart. Before
+// that moment it was already replicated with full payloads and already
+// answered vote requests, so the only new obligation is the vote window its
+// heartbeat acks now promise (voteWindow). sizeVoteHoldDown records that
+// window as owed in the hard state BEFORE any ack carries it — the hard state
+// is persisted ahead of every message the next update sends — so a restart
+// straight after the promotion still honours the promise. It also sizes a
+// LeaseRead replica's post-restart hold-down, which an observer (promising
+// nothing) left at zero, i.e. holding votes down indefinitely; without this
+// the promoted replica could never vote or campaign.
+//
+// DEMOTION (voter to observer) is not something a live voter can be asked for
+// — validateAddNonVoting refuses an add whose target is already a member — but
+// a committed AddNonVoting can still converge a voter placement that came from
+// the StartShard members-map seed (see the "Convergent application" comment in
+// membership.go), and a snapshot can carry a configuration that lists this
+// replica as an observer. Either way a non-voter must not be leading or
+// running a campaign whose quorum counts its own vote, so it steps down.
+// The vote window already owed is kept: sizeVoteHoldDown only ever raises the
+// record, and the promises already made must still be honoured.
+func (r *raft) setObserver(observer bool) {
+	if r.isObserver == observer {
+		return
+	}
+	r.isObserver = observer
+	if !observer {
+		r.sizeVoteHoldDown()
+		slog.Info("replica promoted in place: the replicated membership lists it as a voting member",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"term", r.term)
+		return
+	}
+	slog.Info("replica is a non-voting observer in the replicated membership and will not campaign",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"state", r.state,
+		"term", r.term)
+	if r.state != follower {
 		r.becomeFollower(r.term, noLeader)
 	}
 }
@@ -1732,7 +1809,7 @@ func (r *raft) configCurrentForCampaign() bool {
 // either: it is no longer replicated to and its removal is already
 // committed.
 func (r *raft) startElection() {
-	if r.isObserver || r.isWitness || r.selfRemoved {
+	if r.isWitness || r.selfRemoved {
 		// Reaching here means the election timeout expired without a heartbeat.
 		// Forget the leader for the SAME reason the joining branch below does:
 		// tickFollower has already zeroed electionTick, so leaving leaderID set
@@ -1755,11 +1832,18 @@ func (r *raft) startElection() {
 	// current configuration wins on a minority of the real voting set, in a
 	// term the real configuration can elect in as well.
 	//
-	// It runs BEFORE the three gates below because folding the tail is exactly
-	// what can turn any of them on or off: a committed RemoveNode for self sets
-	// selfRemoved, a committed AddWitness sets roleMismatch, and learning any
+	// It runs BEFORE the gates below because folding the tail is exactly what
+	// can turn any of them on or off: a committed RemoveNode for self sets
+	// selfRemoved, a committed AddNode promoting this replica clears
+	// isObserver, a committed AddWitness sets roleMismatch, and learning any
 	// member other than self clears joining. Deciding those against the base
 	// configuration would answer them for a configuration the shard has left.
+	// That is why the observer test is NOT in the pre-fold gate above: a
+	// replica restarted after its promotion committed, from a base that still
+	// lists it as an observer, would otherwise never fold the tail that
+	// promotes it. A real observer pays nothing for the move — the fold is a
+	// no-op unless a recovered tail is still outstanding, and then it is paid
+	// once.
 	//
 	// This never latches. It resolves by reading THIS replica's own log — no
 	// leader, no peer, no state machine and no external call is involved — and
@@ -1778,6 +1862,13 @@ func (r *raft) startElection() {
 	// a RemoveNode for this replica committed since the base was written would
 	// have been invisible to it.
 	if r.selfRemoved {
+		r.leaderID = noLeader
+		return
+	}
+	// A non-voting observer never campaigns: it is not in the voting set its
+	// own quorum() would count it in (see checkSelfRole). Same stale-leaderID
+	// hazard as the pre-fold branch: an observer still answers RequestVote.
+	if r.isObserver {
 		r.leaderID = noLeader
 		return
 	}
@@ -4619,7 +4710,7 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	// to a replica the configuration no longer contains. The same applies to
 	// a replica whose local role contradicts the replicated configuration —
 	// TimeoutNow is the campaign entry point that bypasses startElection.
-	if r.isObserver || r.isWitness || r.selfRemoved {
+	if r.isWitness || r.selfRemoved {
 		return nil
 	}
 	// TimeoutNow campaigns IMMEDIATELY and bypasses PreVote, so a stale voting
@@ -4632,8 +4723,10 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 		return ErrStaleConfigCannotCampaign
 	}
 	// The fold may have applied a committed RemoveNode for this replica that
-	// the base configuration did not carry.
-	if r.selfRemoved {
+	// the base configuration did not carry — or the AddNode promoting it, which
+	// is why the observer test sits here and not in the pre-fold gate (see
+	// startElection).
+	if r.selfRemoved || r.isObserver {
 		return nil
 	}
 	if r.roleMismatch {

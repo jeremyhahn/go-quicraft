@@ -1423,25 +1423,29 @@ func observerMismatchMembership() proto.Membership {
 	}
 }
 
-// TestObserverRoleMismatch_CannotCampaign is the observer counterpart to
-// TestWitnessRoleMismatch_CannotCampaign.
+// TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig is the
+// observer counterpart to TestWitnessRoleMismatch_CannotCampaign.
 //
-// checkSelfRole compared only the WITNESS bit against the replicated
-// membership. A replica the configuration lists as a non-voting observer, but
-// which was started with IsObserver=false, latched no mismatch: startElection
-// gates on the local r.isObserver, so it campaigned. Voters granted it a vote
-// because handleVoteRequest's configuration test is isKnownMember, and
-// getRemote searches observers as well as voters. numVotingMembers then added
-// an unconditional +1 for self, so it sized quorum over V+1 while the real
-// voting set was V and counted its own vote toward it.
-//
-// The failure is not merely that a non-voter leads: two such replicas can each
+// A replica the configuration lists as a non-voting observer, but which was
+// started with IsObserver=false, once campaigned: startElection gated on the
+// LOCAL flag, voters granted it a vote because handleVoteRequest's
+// configuration test is isKnownMember, and numVotingMembers added an
+// unconditional +1 for self, so it sized quorum over V+1 while the real voting
+// set was V and counted its own vote toward it. Two such replicas could each
 // collect a "majority" from disjoint halves of the real voting set and both be
-// elected in the SAME term, after which followers accept Replicate from both
-// and truncate each other's entries.
-func TestObserverRoleMismatch_CannotCampaign(t *testing.T) {
+// elected in the SAME term.
+//
+// That was first closed by latching the disagreement (roleMismatch). The
+// observer role now FOLLOWS the replicated membership instead (#218):
+// config.IsObserver is only the initial hint, so the replica simply IS an
+// observer here — it cannot campaign, by either entry point — and nothing is
+// latched, because nothing is wrong with it: observers and voters are
+// replicated identically, so the replica serves the same reads any observer
+// does. This test pins the property the latch existed for (no candidacy) and
+// the deliberate change (no latch, role adopted).
+func TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig(t *testing.T) {
 	cfg := raftTestCfgPreVote(1, 1, false)
-	cfg.IsObserver = false // contradicts the replicated membership below
+	cfg.IsObserver = false // the replicated membership below says otherwise
 
 	lr := newTestLogReader(nil, proto.State{})
 	lr.membership = observerMismatchMembership()
@@ -1450,11 +1454,14 @@ func TestObserverRoleMismatch_CannotCampaign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRaft: %v", err)
 	}
-	if !r.roleMismatch {
-		t.Fatal("a replicated membership that lists this replica as a " +
-			"non-voting OBSERVER while it was started with IsObserver=false " +
-			"was not detected: startElection gates on the local flag, so " +
-			"nothing else stops it campaigning")
+	if !r.isObserver {
+		t.Fatal("a replica the replicated membership lists as a non-voting " +
+			"OBSERVER did not take that role: startElection gates on it, so " +
+			"nothing else stops it campaigning against a quorum it is not in")
+	}
+	if r.roleMismatch {
+		t.Fatal("an observer/voter difference was latched as a role mismatch: " +
+			"the observer role follows the membership and must not refuse reads")
 	}
 
 	// The election timer must not produce a candidacy.
@@ -1468,12 +1475,11 @@ func TestObserverRoleMismatch_CannotCampaign(t *testing.T) {
 	}
 
 	// TimeoutNow is the other campaign entry point and bypasses startElection.
-	// The error is deliberately ignored: a refusal may surface as an error OR
-	// as a silent no-op depending on which gate fires first, and the assertion
-	// that matters is the resulting STATE either way.
-	_ = r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1})
+	if err := r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1}); err != nil {
+		t.Fatalf("TimeoutNow on an observer: %v", err)
+	}
 	if r.state == candidate || r.state == leader {
-		t.Fatalf("TimeoutNow made a role-mismatched observer a %v", r.state)
+		t.Fatalf("TimeoutNow made an observer a %v", r.state)
 	}
 }
 

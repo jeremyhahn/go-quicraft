@@ -60,6 +60,13 @@ disagreeing about the member set.
 | **Observer** (`IsObserver`) | no | yes | yes | yes |
 | **Witness** (`IsWitness`) | **yes** | **no** | **no** | **no** |
 
+The role is replicated state. `IsObserver` only says what a replica starts as:
+once the committed membership names the replica, it decides, so an observer
+promoted with `AddNode` becomes a voter in place, without a restart, as etcd
+promotes a learner. `IsWitness` cannot change in place, because a witness has no
+state machine; a disagreement between it and the membership is latched and the
+replica refuses to campaign or serve reads.
+
 A witness is a tiebreaker that costs almost nothing to run: it participates in
 elections and in commit quorums without storing the log. Both proposing and
 serving a ReadIndex return `ErrInvalidOperation` on one.

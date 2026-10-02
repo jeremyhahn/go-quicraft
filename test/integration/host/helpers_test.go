@@ -1484,6 +1484,42 @@ func addNodeToCluster(
 	cfgFn func(shardID, replicaID uint64) config.Config,
 ) addNodeResult {
 	t.Helper()
+	return joinNodeToCluster(t, cluster, shardID, newReplicaID, cfgFn, membership.TryAddNode)
+}
+
+// addObserverToCluster is addNodeToCluster for a non-voting observer: the
+// membership addition is an AddNonVoting, and the new replica is started with
+// Config.IsObserver set, as an operator adding a learner would.
+func addObserverToCluster(
+	t *testing.T,
+	cluster *testCluster,
+	shardID, newReplicaID uint64,
+	cfgFn func(shardID, replicaID uint64) config.Config,
+) addNodeResult {
+	t.Helper()
+	observerCfg := func(shardID, replicaID uint64) config.Config {
+		cfg := cfgFn(shardID, replicaID)
+		cfg.IsObserver = true
+		return cfg
+	}
+	return joinNodeToCluster(t, cluster, shardID, newReplicaID, observerCfg, membership.TryAddObserver)
+}
+
+// joinAdd commits a new member's admission through whichever node leads the
+// shard; membership.TryAddNode and membership.TryAddObserver are the two.
+type joinAdd func(resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) error
+
+// joinNodeToCluster is the add-first join both helpers above share: build a
+// host under its own leaf, commit its admission with add, then start the
+// shard in join mode.
+func joinNodeToCluster(
+	t *testing.T,
+	cluster *testCluster,
+	shardID, newReplicaID uint64,
+	cfgFn func(shardID, replicaID uint64) config.Config,
+	add joinAdd,
+) addNodeResult {
+	t.Helper()
 
 	// Create a new host on a fresh port, under its own leaf from the
 	// cluster's CA: its own keypair, its own identity.
@@ -1499,7 +1535,7 @@ func addNodeToCluster(
 	// through whichever node leads the shard at each attempt, and accept only
 	// a change a linearizable membership read confirms. See test/membership
 	// for why neither the leader nor "did it commit" may be sampled once.
-	if err := membership.TryAddNode(cluster.leaderHost, shardID, newReplicaID, addr, h.NodeIdentity(), membershipTimeout); err != nil {
+	if err := add(cluster.leaderHost, shardID, newReplicaID, addr, h.NodeIdentity(), membershipTimeout); err != nil {
 		h.Close()
 		t.Fatal(err)
 	}

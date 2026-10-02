@@ -1979,13 +1979,25 @@ func (p *Peer) IsLeader() bool {
 // IsFollower returns true if this peer is a follower (not the leader and
 // not an observer or witness).
 func (p *Peer) IsFollower() bool {
-	return !p.IsLeader() && !p.cfg.IsObserver && !p.cfg.IsWitness
+	return !p.IsLeader() && !p.IsObserver() && !p.cfg.IsWitness
 }
 
-// IsObserver returns true if this peer is configured as a non-voting
-// observer.
+// IsObserver reports whether this peer is currently a non-voting observer.
+//
+// It reports the EFFECTIVE role, which follows the committed membership: an
+// observer whose promotion to voter has been applied here reports false
+// without a restart. config.IsObserver is only the initial hint, returned while
+// the membership does not mention this replica (a joiner that has not yet
+// learned the entry adding it). See raft.checkSelfRole.
+//
+// Safe for concurrent access from any goroutine. Reads an atomic pointer to an
+// immutable membership snapshot.
 func (p *Peer) IsObserver() bool {
-	return p.cfg.IsObserver
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return p.cfg.IsObserver
+	}
+	return snap.isObserverOr(p.replicaID, p.cfg.IsObserver)
 }
 
 // IsWitness returns true if this peer is configured as a witness.

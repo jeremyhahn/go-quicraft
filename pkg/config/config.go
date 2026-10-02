@@ -232,21 +232,31 @@ type Config struct {
 	// replicated data but does not participate in elections or quorum.
 	// Mutually exclusive with IsWitness.
 	//
-	// The role lives in REPLICATED membership, not here: this bit only tells
-	// the local replica what it was started as. A replica with this bit set
-	// must be added through a committed AddObserver config change, so
-	// Host.StartShard refuses to bootstrap it through the initial members map
-	// (which seeds the full voting set). Start it with join=true and add it
-	// with Host.RequestAddObserver.
+	// The role lives in REPLICATED membership, not here: this bit is only the
+	// INITIAL hint, consulted while the shard's configuration does not yet
+	// mention this replica. Once it does, the committed membership decides,
+	// in either direction. An observer whose promotion (Host.RequestAddNode
+	// for its replica ID) commits becomes a voter in place — it votes,
+	// campaigns and serves linearizable reads with no restart — and a replica
+	// started without this bit that the shard added as an observer behaves as
+	// one. Restarting a promoted replica with the bit still set is harmless.
+	//
+	// A replica with this bit set must be added through a committed
+	// AddObserver config change, so Host.StartShard refuses to bootstrap it
+	// through the initial members map (which seeds the full voting set). Start
+	// it with join=true and add it with Host.RequestAddObserver.
 	IsObserver bool
 
 	// IsWitness marks this replica as a voting member that participates
 	// in elections and quorum but does not maintain a state machine.
 	// Mutually exclusive with IsObserver.
 	//
-	// As for IsObserver, the authoritative role lives in replicated
-	// membership. Host.StartShard refuses to bootstrap a witness through the
-	// initial members map; start it with join=true and add it with
+	// Unlike IsObserver, this bit is binding: a witness keeps no state
+	// machine, so the replicated membership must agree with it. A replica
+	// whose configured witness role contradicts the membership refuses to
+	// campaign or serve reads until the two agree, and a witness can never be
+	// promoted to a voter. Host.StartShard refuses to bootstrap a witness
+	// through the initial members map; start it with join=true and add it with
 	// Host.RequestAddWitness.
 	IsWitness bool
 

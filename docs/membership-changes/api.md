@@ -139,6 +139,7 @@ Not a membership change, but the operation you run before removing a leader.
 | `*SelfNotInMembersError` | this replica is not in the map it was given |
 | `*NonVotingRoleInMembersError` / `ErrNonVotingRoleInMembers` | an observer or witness appears in the voting map |
 | `ErrTooManyWitnesses` | the 64-voting-member cap |
+| `ErrRemovedMemberIdentity` | the add binds a node identity this shard has removed, under any replica ID; see `Membership.RemovedIdentities` |
 | `*ReplicaNotFoundError` | no such replica in this shard |
 | `*ShardNotStoppedError` | a local data operation on a running shard |
 | `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable or absent — the shard cannot start |
@@ -160,7 +161,7 @@ func proto.ConfigChangeTypeName(t uint64) string
 | Field | Owner | Default | Note |
 |---|---|---|---|
 | `OrderedConfigChange` | `config.Config` | `*bool`, nil = **enabled** | serialize membership changes |
-| `IsObserver` / `IsWitness` | `config.Config` | false | **mutually exclusive** |
+| `IsObserver` / `IsWitness` | `config.Config` | false | **mutually exclusive**. `IsObserver` is an initial hint: the committed membership decides once it names the replica |
 | `Witness` | `config.Config` | `WitnessConfig{}` | bootstrap seed only |
 | `MemberIdentities` | `config.Config` | `nil` | required on a host with a transport: every founder's members (join=false), at least one anchor replica (join=true); entries beyond the members map are the operator anchor the receive gate consults for a sender no configuration names |
 

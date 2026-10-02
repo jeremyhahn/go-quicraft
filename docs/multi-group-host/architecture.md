@@ -623,6 +623,9 @@ Three replica roles:
 
 - **Voter** — the default. Votes, stores log data, serves reads.
 - **Observer** (`Config.IsObserver`) — replicates the log but does not vote.
+  `Config.IsObserver` is only the initial hint. The committed membership decides,
+  so an observer whose `AddNode` promotion commits becomes a voter in place, with no
+  restart.
 - **Witness** (`Config.IsWitness`) — votes but stores no log data. Cannot
   propose and cannot serve a ReadIndex; both return `ErrInvalidOperation`.
 

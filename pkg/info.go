@@ -128,7 +128,10 @@ type ShardInfo struct {
 	// IsLeader is true if this replica is the current leader.
 	IsLeader bool `json:"is_leader"`
 
-	// IsObserver is true if this replica is a non-voting observer.
+	// IsObserver is true if this replica is currently a non-voting observer.
+	// It follows the committed membership, not Config.IsObserver: an observer
+	// whose promotion to voter has been applied on this host reports false
+	// without a restart.
 	IsObserver bool `json:"is_observer"`
 
 	// IsWitness is true if this replica is a voting witness without a

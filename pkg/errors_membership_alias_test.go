@@ -55,6 +55,7 @@ var membershipAliases = []struct {
 	{"ErrZeroReplicaID", ErrZeroReplicaID, raft.ErrZeroReplicaID},
 	{"ErrEmptyAddress", ErrEmptyAddress, raft.ErrEmptyAddress},
 	{"ErrMemberIdentityRequired", ErrMemberIdentityRequired, raft.ErrMemberIdentityRequired},
+	{"ErrRemovedMemberIdentity", ErrRemovedMemberIdentity, raft.ErrRemovedMemberIdentity},
 }
 
 // TestMembershipAliasesAreTheRaftValues pins the IDENTITY of the
@@ -136,8 +137,8 @@ type aliasRejectionCase struct {
 //
 //   - every case must produce a non-nil error, so a validator that stopped
 //     refusing fails here rather than being reported as a match;
-//   - the error must match the expected alias and NOT match any of the other
-//     six, so an alias pointed at the wrong sentinel fails;
+//   - the error must match the expected alias and NOT match any of the
+//     others, so an alias pointed at the wrong sentinel fails;
 //   - the error must not match a look-alike built from the expected
 //     sentinel's own text, so the match cannot be coming from message equality.
 func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
@@ -210,6 +211,31 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 				return err
 			},
 			want: ErrNodeRemoved,
+		},
+		{
+			// The identity tombstone outlives the replica ID it was bound to:
+			// a NEW replica ID presenting a removed member's keypair is the
+			// case a host has to classify (#218), and it is refused before it
+			// can commit a member every replica would black-hole.
+			name: "add a removed member's identity under a new replica ID",
+			setup: func(t *testing.T, ctx context.Context, h *Host) {
+				t.Helper()
+				if err := h.SyncRequestAddObserverWithIdentity(ctx, 1, 10, "127.0.0.1:6000", testIdentity(10), 0); err != nil {
+					t.Fatalf("SyncRequestAddObserverWithIdentity: %v", err)
+				}
+				added, err := h.SyncGetShardMembership(ctx, 1)
+				if err != nil {
+					t.Fatalf("SyncGetShardMembership: %v", err)
+				}
+				if err := h.SyncRequestDeleteNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
+					t.Fatalf("SyncRequestDeleteNode: %v", err)
+				}
+			},
+			call: func(ctx context.Context, h *Host) error {
+				_, err := h.RequestAddNodeWithIdentity(ctx, 1, 11, "127.0.0.1:6001", testIdentity(10), 0)
+				return err
+			},
+			want: ErrRemovedMemberIdentity,
 		},
 	}
 

@@ -350,25 +350,29 @@ The `configChangeIndex` parameter is an optimistic concurrency guard. Pass 0 to 
 
 #### Membership validation errors
 
-These sentinels are declared in `pkg/internal/raft`, which external code cannot import. Three of them are re-exported from `quicraft` and can be matched with `errors.Is`:
+These sentinels are declared in `pkg/internal/raft`, which external code cannot import. Most are re-exported from `quicraft` as the SAME error value, so they match with `errors.Is` through any wrapping:
 
 | Error                          | Condition                                                                 |
 |--------------------------------|---------------------------------------------------------------------------|
 | `ErrTooManyWitnesses`          | A witness add would exceed the shard's replicated `MaxWitnesses`          |
 | `ErrBreaksFullReplicaMajority` | The change would leave the full replicas unable to form a quorum on their own, violating the shard's `RequireFullReplicaMajority` policy |
 | `ErrRemoveLastFullReplica`     | The change would remove the shard's only full replica. Witnesses cannot become leader, so the shard would be permanently headless |
+| `ErrZeroReplicaID`             | `replicaID == 0`                                                          |
+| `ErrEmptyAddress`              | Add operation with an empty address                                       |
+| `ErrNodeNotFound`              | Remove targets a replica that is not a current member                     |
+| `ErrNodeAlreadyExists`         | Add targets a replica already present in the requested role, or a witness. Promoting an observer with `RequestAddNode` is not refused |
+| `ErrNodeRemoved`               | Add or remove targets a replica ID carrying a removal tombstone           |
+| `ErrTooManyVotingMembers`      | The add would exceed `raft.MaxVotingMembers` (64). The bound comes from the ReadIndex quorum bitfield, which is a `uint64` |
+| `ErrRemoveLastVoter`           | Remove targets the last voting member                                     |
+| `ErrMemberIdentityRequired`    | An identity-less add on a host with a transport                           |
+| `ErrRemovedMemberIdentity`     | The add binds a node identity this shard has removed, under any replica ID. The tombstone is on the identity and is never evicted, so the remedy is a new keypair. `Membership.RemovedIdentities` lists every such identity, so a host can classify a joiner before proposing it |
 
-The remaining validation failures are returned but have no importable sentinel. They are listed here so the messages are recognizable; do not match them by string, and open an issue if you need one of them as a typed error:
+Two validation failures are returned but have no importable sentinel. They are listed here so the messages are recognizable; do not match them by string, and open an issue if you need one of them as a typed error:
 
-| Message fragment                   | Condition                                                             |
-|------------------------------------|-----------------------------------------------------------------------|
-| `replica ID must be non-zero`      | `replicaID == 0`                                                      |
-| `address required for add`         | Add operation with an empty address                                   |
-| `target node not found`            | Remove targets a replica that is not a current member                 |
-| `node already exists`              | Add targets a replica already present as a voter or witness           |
-| `node was previously removed`      | Add or remove targets a replica carrying a removal tombstone          |
-| `exceeds 64 voting members`        | The add would exceed `raft.MaxVotingMembers` (64). The bound comes from the ReadIndex quorum bitfield, which is a `uint64` |
-| `cannot remove last voting member` | Remove targets the last voting member                                 |
+| Message fragment                              | Condition                                                  |
+|-----------------------------------------------|------------------------------------------------------------|
+| `address already held by another member`      | Add binds an address an active replica already holds       |
+| `node identity already held by another member` | Add binds an identity an active replica already holds     |
 
 Removing a replica that is not a current member is an error, not a silent success.
 
@@ -936,6 +940,10 @@ type Membership struct {
     // Committed node identities. Sparse: a replica absent from this map
     // has none. replicaID -> the value that node reports from NodeIdentity.
     Identities map[uint64]string
+
+    // The identity deny-list: removed replicaID -> the identity it held.
+    // Never evicted; an identity here is refused under any replica ID.
+    RemovedIdentities map[uint64]string
 }
 
 func NewMembership() *Membership
@@ -947,6 +955,8 @@ The committed cluster membership for a shard, returned by `Host.SyncGetShardMemb
 **Session policy is replicated, not node-local.** A replica evaluating these limits from its own configuration would expire different sessions at different log indexes and diverge its state machine silently, so the founder's values are committed at bootstrap and every replica reads the shard's copy. They are exposed here so an operator can see what the shard actually committed rather than what any one node is configured with. The two differ exactly when someone edited a node's `Config` after bootstrap, in which case the shard's value governs and the node logs the disagreement at startup. A shard bootstrapped before the policy was replicated reports all four as zero.
 
 Note the naming: `MaxSessionsPerClient` is the **response-cache depth**, how many cached results one session retains for duplicate detection. It does not limit sessions. `MaxSessionsPerOwner` is the per-principal session cap and `MaxTotalSessions` the shard-wide one.
+
+**`RemovedIdentities` is the shard's identity deny-list.** A committed removal tombstones the identity the removed replica held, not only its replica ID, and nothing ever evicts it: every replica refuses traffic from that keypair whatever replica ID it presents, and an add that would bind it again is refused with `ErrRemovedMemberIdentity`. Reading it lets a host classify a returning keypair before it proposes anything. A replica removed without a committed identity has no entry.
 
 **`Identities` is complete on any shard this build bootstrapped behind a transport**: every entry in `Nodes`, `Observers` and `Witnesses` appears here, because admission requires it. A replica absent from the map has every message refused (`missing_identity`); the only way to hold such a configuration is data written by a build that did not require identities, or a host started `WithoutTransport()`.
 
@@ -1102,6 +1112,9 @@ Aliases of the internal raft sentinels, matchable with `errors.Is`.
 | `ErrTooManyWitnesses`          | Witness add would exceed the shard's replicated `MaxWitnesses` |
 | `ErrBreaksFullReplicaMajority` | Change would leave full replicas unable to form a quorum      |
 | `ErrRemoveLastFullReplica`     | Change would remove the shard's only full replica             |
+| `ErrRemovedMemberIdentity`     | Add binds a node identity this shard has removed (any replica ID) |
+
+The full set of re-exported membership sentinels is in [Membership validation errors](#membership-validation-errors).
 
 #### Sessions
 
@@ -1693,7 +1706,7 @@ Source: `pkg/config/config.go`
 |--------------------------|------------------|----------------|------------------------------------------|
 | `ShardID`                | `uint64`         | (required)     | Globally unique shard identifier         |
 | `ReplicaID`              | `uint64`         | (required)     | Unique replica ID within the shard       |
-| `IsObserver`             | `bool`           | `false`        | Non-voting learner. Join-only, see below |
+| `IsObserver`             | `bool`           | `false`        | Non-voting learner. Initial hint only: the committed membership decides, see below |
 | `IsWitness`              | `bool`           | `false`        | Voting member with no state machine. Join-only, see below |
 | `Witness`                | `WitnessConfig`  | zero value     | Seeds the shard's replicated witness policy at bootstrap |
 | `MemberIdentities`       | `map[uint64]string` | `nil`       | Founders: seeds the replicated node identities, every member named. Joiners: the anchor. Any entry beyond the members map is operator trust for the receive gate. Required on a host with a transport |
@@ -1729,14 +1742,20 @@ Source: `pkg/config/config.go`
 
 `MaxProposalPayloadSize` and `MaxEntrySize` are both enforced at `Propose`; the effective limit is the minimum of the two. Set the former to impose a tighter user-facing cap while leaving the latter at the transport default.
 
-> **`IsObserver` / `IsWitness` are join-only.** The authoritative role lives in
-> replicated membership (`Membership.Observers` / `Membership.Witnesses`), not in
-> the local config. These bits only tell the local replica what it was started
-> as. The `members` map passed to `StartShard` seeds the **full voter set** on
-> every replica that lists it, so a witness or observer named there is a full
-> voter in the configuration the whole shard agrees on: the leader replicates
-> full entry payloads to it, it counts toward every quorum, and only this host's
-> local read gate still behaves like a non-voter. `StartShard` rejects that shape
+> **`IsObserver` is an initial hint; `IsWitness` is binding.** The authoritative
+> role lives in replicated membership (`Membership.Observers` /
+> `Membership.Witnesses`), not in the local config. `IsObserver` is consulted only
+> while the shard's configuration does not mention this replica; once it does,
+> the committed membership decides. An observer promoted with `RequestAddNode`
+> (same replica ID, address and identity) becomes a voter in place — it votes,
+> campaigns, and serves linearizable reads without a restart — and `ShardInfo.IsObserver`
+> reports the effective role. `IsWitness` cannot change in place: a witness keeps
+> no state machine, so a replica whose configured witness role contradicts the
+> membership refuses to campaign or serve reads until the two agree.
+>
+> The `members` map passed to `StartShard` seeds the **full voter set** on every
+> replica that lists it, so a witness or observer named there is a full voter in
+> the configuration the whole shard agrees on. `StartShard` rejects that shape
 > with `*NonVotingRoleInMembersError`. Bootstrap the voters first, then start the
 > replica with `join=true` and add it with `RequestAddWitness` or
 > `RequestAddObserver`.
@@ -2085,6 +2104,8 @@ type ShardInfo struct {
 ```
 
 Point-in-time snapshot of a shard's state, returned by `GetShardInfo`. It is a copy and is not live-updated: `LeaderID` and `Pending` reflect the state at call time. `StateMachineType` is 0 regular, 1 concurrent, 2 on-disk.
+
+`IsObserver` is this replica's EFFECTIVE role, read from the committed membership it has applied: an observer whose promotion has been applied reports `false` without a restart, and `Config.IsObserver` is reported only while the membership does not yet mention the replica. `IsWitness` is the configured witness role.
 
 `Nodes` covers all known members; use `SyncGetShardMembership` when you need observers and witnesses broken out separately.
 

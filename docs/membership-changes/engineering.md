@@ -160,6 +160,52 @@ participate in elections and the commit quorum.
 Used to bring new nodes up to speed before promotion. They receive no
 RequestVote, get no ReadIndex ack bit, and are never counted in `quorum()`.
 
+### A replica's observer role follows the committed membership
+
+`raft.isObserver` is the replica's EFFECTIVE role. It is seeded from
+`Config.IsObserver`, which is only the initial hint, and `checkSelfRole`
+re-derives it from the replicated membership wherever the configuration is
+(re)established: construction, snapshot restore, and commit-time config change
+application. The hint governs only while the configuration does not mention the
+replica (a joiner that has not yet applied the entry adding it). This is etcd's
+learner model, where the role is a property of the `ConfState`.
+
+**Promotion happens in place.** An `AddNode` for an existing observer moves it
+from `observers` to `addresses` (`handleAddNode`; `validateAddNode` exempts the
+promotion from `ErrNodeAlreadyExists`). On the leader, `syncRaftRemotes` moves
+the observer's `remote` into `remotes` with its replication progress intact. On
+the promoted replica, `checkSelfRole` clears `isObserver` when it applies the
+same entry, and from that moment the replica campaigns, can be elected and
+serves ReadIndex, with no restart. Before that moment it was already replicated
+with full payloads and already answered vote requests, so the only new
+obligation is the vote window its heartbeat acks promise under `LeaseRead`.
+`setObserver` raises the persisted `VoteWindow` to that promise (and sizes the
+post-restart vote hold-down) before any ack can carry it, because the hard state
+is persisted ahead of every message the next update sends.
+
+**Why the observer role may follow the membership and the witness role may
+not.** An observer and a voter are replicated identically, so they hold the
+same state machine and differ only in which gates apply. Deriving the observer
+role is also the safe answer to the quorum hazard: `quorum()` counts self
+unconditionally, so a replica the configuration lists as an observer but that
+believes itself a voter would size a quorum it is not in. A witness keeps no
+state machine and the leader strips payloads for it, so a witness-role
+disagreement is about what the replica holds and is still latched
+(`roleMismatch`).
+
+**The campaign gates test the observer role after the configuration fold.** A
+replica restarted after its promotion committed, from a base that still lists it
+as an observer, folds the committed tail when its election timer fires and then
+campaigns as a voter. A replica seeded as a voter from the `StartShard` members
+map (see Convergent Apply below) is likewise brought back to observer by
+that fold before it can campaign, and every voter independently refuses to grant
+a vote to a candidate it lists as an observer.
+
+**Demotion** (a voter listed as an observer) cannot be asked of a live voter —
+`validateAddNonVoting` refuses an existing member — but a snapshot, or a
+committed `AddNonVoting` converging a members-map seed, can deliver it. The
+replica then steps down if it was leading or campaigning.
+
 **Witnesses**: vote in elections and count toward the unified commit quorum,
 but store only entry metadata (Index/Term, no command payload). See Section 6
 for the durability trade-off.
@@ -292,8 +338,9 @@ gave those replicas their real roles are still in the log, since config changes
 are compacted only behind a snapshot, and are re-applied on restart. Refusing
 them left the wrong roles in place permanently: nothing else repairs the seed,
 and `configChangeID` never advanced past the skipped entry. `checkSelfRole` is
-not a substitute; it is a latch rather than a repair, and it only reports on
-the local replica.
+not a substitute: it repairs nothing in the membership and acts only on the
+local replica, whose observer role it then derives from the repaired
+membership and whose witness disagreement it latches.
 
 Converging is not a weakening. When the membership was built from committed
 entries alone, `validate` ran on the leader before the entry was proposed and
@@ -348,11 +395,13 @@ Per shard, on `config.Config`:
 | Field | Default | Meaning |
 |---|---|---|
 | `OrderedConfigChange` | `*bool`, nil = **enabled** | serialize membership changes; no concurrent config changes |
-| `IsObserver` | `false` | this replica replicates but does not vote |
+| `IsObserver` | `false` | this replica starts as an observer: replicates but does not vote. Initial hint only — the committed membership decides from the moment it names the replica |
 | `IsWitness` | `false` | this replica votes but stores no log data |
 | `Witness` | `WitnessConfig{}` | `MaxWitnesses` and `RequireFullReplicaMajority` — **bootstrap seed only** |
 
-`IsObserver` and `IsWitness` are **mutually exclusive**.
+`IsObserver` and `IsWitness` are **mutually exclusive**. `IsWitness` is binding;
+`IsObserver` is not (see "A replica's observer role follows the committed
+membership").
 
 `OrderedConfigChange` is a `*bool` so its zero value means "unset, use the
 default" rather than "off". Use `config.BoolPtr(false)` to disable deliberately.

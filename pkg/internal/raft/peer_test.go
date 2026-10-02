@@ -1698,7 +1698,7 @@ func TestPeer_IsFollower_FalseWhenLeader(t *testing.T) {
 func TestPeer_IsFollower_FalseWhenObserver(t *testing.T) {
 	cfg := testConfig()
 	cfg.IsObserver = true
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+	p := newTestPeer(t, cfg, proto.State{}, selfObserverMembership())
 
 	if p.IsFollower() {
 		t.Fatal("expected IsFollower to be false when observer")
@@ -1708,7 +1708,7 @@ func TestPeer_IsFollower_FalseWhenObserver(t *testing.T) {
 func TestPeer_IsObserver_True(t *testing.T) {
 	cfg := testConfig()
 	cfg.IsObserver = true
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+	p := newTestPeer(t, cfg, proto.State{}, selfObserverMembership())
 
 	if !p.IsObserver() {
 		t.Fatal("expected IsObserver to be true")

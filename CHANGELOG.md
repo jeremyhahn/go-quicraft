@@ -16,6 +16,24 @@ implementation that leaned on the old, undocumented serialization must
 synchronise itself, as its interface requires.
 
 ### Added
+- **A promoted observer becomes a voter in place (#218).** A replica's
+  non-voting role now follows the committed membership. `Config.IsObserver`
+  is only the initial hint, used while the configuration does not yet mention
+  the replica. When an observer applies the committed `AddNode` naming it
+  (same replica ID, same pinned identity), it votes, campaigns, can be elected
+  and serves ReadIndex with no shard restart, as in etcd's learner promotion.
+  Under `LeaseRead`, the persisted vote window is raised before any heartbeat
+  ack carries the new promise, so lease safety holds across a restart straight
+  after promotion. A replica the committed membership lists as an observer
+  behaves as one even if it was started without the bit, and steps down if it
+  was leading or campaigning. Promotion takes effect only from the committed
+  configuration tail, never from an uncommitted entry. The witness role is
+  still binding: a witness contradiction is latched as before, and a witness
+  is never promoted. `ShardInfo.IsObserver` reports the effective role.
+- **`quicraft.ErrRemovedMemberIdentity`** (#218): a membership add refused
+  because the identity belongs to a removed member is now a public sentinel,
+  so hosts can classify it with `errors.Is`. The public `Membership` view also
+  carries the removed identities.
 - **`seal.Barrier.Reset`** returns a sealed barrier to the uninitialized state
   so `Initialize` can run again (#208). It lets an embedder roll back a first
   boot it could not finish, such as go-qrdb's Shamir initialization whose share

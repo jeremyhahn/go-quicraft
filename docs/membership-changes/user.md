@@ -88,6 +88,25 @@ Choose by what you actually want:
 Both roles set `IsObserver` / `IsWitness` in that replica's own `Config`, and
 the two are **mutually exclusive**.
 
+## Task: promote an observer to a voter
+
+Add the observer again as a voting member, with the same replica ID, address and
+identity, once it has caught up:
+
+```go
+err := host.SyncRequestAddNodeWithIdentity(ctx, shardID,
+    id, addr, identity, m.ConfigChangeID)
+```
+
+The running replica becomes a voter as soon as it applies the change: it votes,
+can be elected leader, and serves linearizable reads. Do not restart it.
+`ShardInfo.IsObserver` on its host turns `false` when the change is applied
+there. Restarting it later with `IsObserver` still set in its `Config` is
+harmless: that bit is only consulted while the membership does not name the
+replica.
+
+A witness cannot be promoted; the add is refused with `ErrNodeAlreadyExists`.
+
 **The voting set is capped at 64**, counting voters plus witnesses plus self,
 because acknowledgements are tracked in a 64-bit word.
 
@@ -166,6 +185,11 @@ actually stopped.
 **`*NonVotingRoleInMembersError`** — an observer or witness appears in the
 voting member map. The roles come from that replica's own `IsObserver` /
 `IsWitness`, not from which map it is listed in.
+
+**`ErrRemovedMemberIdentity`** — the identity you are adding belongs to a
+replica this shard removed. The ban is on the keypair, under any replica ID, and
+is permanent; `Membership.RemovedIdentities` lists every banned identity. Give
+the node a new keypair. Reusing its address under a new replica ID is fine.
 
 **`*CorruptConfigEntryError` or `*BootstrapEntryMissingError` at startup** — the
 log's own membership record at index 1 is unreadable or absent. The shard cannot

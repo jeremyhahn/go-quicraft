@@ -100,6 +100,16 @@ type Membership struct {
 	// Seeded at bootstrap from Config.MemberIdentities; changed via
 	// Host.RequestAddNodeWithIdentity and its observer/witness variants.
 	Identities map[uint64]string
+
+	// RemovedIdentities maps each removed replicaID to the node identity the
+	// shard had committed for it when the removal was applied. It is the
+	// shard's identity deny-list: an identity listed here is banned from the
+	// shard permanently, under ANY replica ID, and nothing ever evicts it.
+	// Every replica refuses traffic from it, and a membership add that would
+	// bind it again is refused with ErrRemovedMemberIdentity. A host can
+	// consult it to classify a joiner before proposing the add. A replica
+	// removed without a committed identity has no entry.
+	RemovedIdentities map[uint64]string
 }
 
 // ConfigChangeIndex returns the ConfigChangeID. This alias exists for
@@ -114,10 +124,11 @@ func (m *Membership) ConfigChangeIndex() uint64 {
 // This prevents nil map dereference when adding entries.
 func NewMembership() *Membership {
 	return &Membership{
-		Nodes:      make(map[uint64]string),
-		Observers:  make(map[uint64]string),
-		Witnesses:  make(map[uint64]string),
-		Removed:    make(map[uint64]struct{}),
-		Identities: make(map[uint64]string),
+		Nodes:             make(map[uint64]string),
+		Observers:         make(map[uint64]string),
+		Witnesses:         make(map[uint64]string),
+		Removed:           make(map[uint64]struct{}),
+		Identities:        make(map[uint64]string),
+		RemovedIdentities: make(map[uint64]string),
 	}
 }

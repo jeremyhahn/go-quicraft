@@ -597,7 +597,8 @@ func observe(r *raft) raftObservation {
 
 // configFingerprint renders the shard configuration as seen by this replica.
 // Two states with the same fingerprint agree on every input to quorum(), on
-// the replicated witness policy, and on the self-role latches.
+// the replicated witness policy, and on the self-role latches and the derived
+// observer role.
 func configFingerprint(r *raft) string {
 	var sb strings.Builder
 	writeIDs := func(label string, m map[uint64]*remote) {
@@ -615,8 +616,8 @@ func configFingerprint(r *raft) string {
 	writeIDs("v=", r.remotes)
 	writeIDs("o=", r.observers)
 	writeIDs("w=", r.witnesses)
-	fmt.Fprintf(&sb, "maxw=%d;rfm=%t;selfRemoved=%t;roleMismatch=%t",
-		r.maxWitnesses, r.requireFullReplicaMajority, r.selfRemoved, r.roleMismatch)
+	fmt.Fprintf(&sb, "maxw=%d;rfm=%t;selfRemoved=%t;observer=%t;roleMismatch=%t",
+		r.maxWitnesses, r.requireFullReplicaMajority, r.selfRemoved, r.isObserver, r.roleMismatch)
 	return sb.String()
 }
 

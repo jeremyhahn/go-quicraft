@@ -132,6 +132,23 @@ func (s *membershipSnapshot) isMember(replicaID uint64) bool {
 	return ok
 }
 
+// isObserverOr reports whether this configuration lists replicaID as a
+// non-voting observer, and returns hint when it does not mention the replica in
+// any role — the configuration makes no statement about it then, so the
+// caller's own belief stands. It is the published-snapshot form of the rule
+// raft.checkSelfRole applies to r.isObserver, so a reader on another goroutine
+// sees the same effective role the step worker acts on. Safe for concurrent
+// reads because the snapshot maps are never modified after construction.
+func (s *membershipSnapshot) isObserverOr(replicaID uint64, hint bool) bool {
+	if _, ok := s.observers[replicaID]; ok {
+		return true
+	}
+	if s.isMember(replicaID) {
+		return false
+	}
+	return hint
+}
+
 // memberAddress returns the address this configuration holds for replicaID in
 // any active role, and whether the replica is present at all.
 //

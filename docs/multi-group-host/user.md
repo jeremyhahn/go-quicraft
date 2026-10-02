@@ -180,7 +180,7 @@ Source: `pkg/config/config.go`
 |-------|------|---------|-------------|
 | `ShardID` | uint64 | (required, > 0) | Shard identifier (caller-provided) |
 | `ReplicaID` | uint64 | (required, > 0, <= MaxUint32) | Replica identifier (caller-provided) |
-| `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Join-only: never list it in the `StartShard` members map — see below |
+| `IsObserver` | bool | `false` | Non-voting replica (no quorum contribution). Initial hint only — the committed membership decides, so a promoted observer becomes a voter in place. Never list it in the `StartShard` members map — see below |
 | `IsWitness` | bool | `false` | Non-storage replica (participates in quorum only). Join-only: never list it in the `StartShard` members map — see below |
 | `Witness` | WitnessConfig | zero | Bootstrap seed for the shard's replicated witness policy. After bootstrap the policy lives in `proto.Membership` |
 | `MemberIdentities` | map[uint64]string | `nil` | **Required on a host with a transport.** Founders: the committed node identity of every member, an identical map on each. Joiners: the anchor — the replicas the bootstrap snapshot may come from. Any start: entries beyond the members map are the operator anchor, how a restarted replica that missed an `AddNode` is told who now leads |
@@ -218,8 +218,13 @@ behaviour.
 #### Starting a witness or an observer
 
 A replica's witness/observer role is REPLICATED state (`Membership.Witnesses` /
-`Membership.Observers`); `IsWitness` / `IsObserver` only tell the local replica
-what it was started as. The `members` map passed to `StartShard` seeds
+`Membership.Observers`). `IsObserver` is only the initial hint: it is consulted
+while the shard's configuration does not yet mention the replica, and from then
+on the committed membership decides — in particular, an observer promoted with
+`SyncRequestAddNodeWithIdentity` (same replica ID, address and identity) becomes
+a voter in place, with no restart. `IsWitness` is binding: a witness keeps no
+state machine, so a replica whose configured witness role contradicts the
+membership refuses to campaign or serve reads until they agree. The `members` map passed to `StartShard` seeds
 `Membership.Addresses` — the **full voter set** — on every replica that lists
 it, so naming a witness there makes it a full voter in the configuration the
 whole shard agrees on: the leader replicates full entry payloads to it (no
@@ -241,6 +246,10 @@ Use the two-step flow:
 3. On the leader, `SyncRequestAddWitness` / `SyncRequestAddObserver` for that
    replica ID. The role then enters membership through a committed config change
    every replica applies identically.
+4. To promote an observer once it has caught up, `SyncRequestAddNodeWithIdentity`
+   for the same replica ID, address and identity. The running replica becomes a
+   voter as soon as it applies the change; there is nothing to restart, and
+   restarting it later with `IsObserver` still set is harmless.
 
 ### TransportConfig
 
@@ -1084,13 +1093,16 @@ aliasing with internal state. Its fields:
 | `MaxSessionsPerClient` | `uint64` | Replicated cap on cached responses per session |
 | `MaxSessionsPerOwner` | `uint64` | Replicated cap on concurrent sessions per `OwnerID` |
 | `Identities` | `map[uint64]string` | Committed node identity per replica (sparse) |
+| `RemovedIdentities` | `map[uint64]string` | Identity deny-list: removed replica ID to the identity it held; never evicted |
 
 `ConfigChangeIndex()` is a method returning the `ConfigChangeID` field; the
 field and the accessor differ by one word, which is easy to mistype.
 
-The public `Membership` does **not** expose `RemovedIdentities`. That map exists
-in the wire and persisted `proto.Membership` and drives the removal deny-list,
-but the host-level view does not surface it.
+`RemovedIdentities` (`map[uint64]string`, removed replica ID to the identity it
+held) is the shard's identity deny-list. Nothing ever evicts an entry: the
+keypair is refused under any replica ID, and an add that would bind it again
+fails with `ErrRemovedMemberIdentity`. Read it to classify a returning node
+before proposing its admission.
 
 The witness and session policy fields are exposed so an operator can read
 what a shard actually **committed**, rather than what any one node happens to

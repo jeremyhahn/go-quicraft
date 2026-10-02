@@ -429,6 +429,12 @@ func TestTry_NoLeaderExhaustsBudgetWithoutAHost(t *testing.T) {
 			return membership.TryAddNode(noLeader, 1, 11, "127.0.0.1:1", "spki:11", 300*time.Millisecond)
 		},
 		"delete": func() error { return membership.TryDeleteNode(noLeader, 1, 11, 300*time.Millisecond) },
+		"add observer": func() error {
+			return membership.TryAddObserver(noLeader, 1, 11, "127.0.0.1:1", "spki:11", 300*time.Millisecond)
+		},
+		"promote": func() error {
+			return membership.TryPromoteNode(noLeader, 1, 11, "127.0.0.1:1", "spki:11", 300*time.Millisecond)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			resolves = 0
@@ -444,5 +450,80 @@ func TestTry_NoLeaderExhaustsBudgetWithoutAHost(t *testing.T) {
 				t.Errorf("the leader must be re-resolved on every attempt, resolved %d time(s)", resolves)
 			}
 		})
+	}
+}
+
+// TestAddObserverLanded pins the observer add's confirmation: only an observer
+// at the requested address has landed, and every other occupant of the replica
+// ID is a conflict naming its role.
+func TestAddObserverLanded(t *testing.T) {
+	const addr = "127.0.0.1:59436"
+	tests := []struct {
+		name     string
+		m        *quicraft.Membership
+		landed   bool
+		conflict string
+	}{
+		{name: "nil membership", m: nil},
+		{name: "absent", m: &quicraft.Membership{}},
+		{name: "observer at addr", m: &quicraft.Membership{Observers: map[uint64]string{11: addr}}, landed: true},
+		{name: "observer elsewhere", m: &quicraft.Membership{Observers: map[uint64]string{11: "127.0.0.1:1"}}, conflict: "observer"},
+		{name: "voter", m: &quicraft.Membership{Nodes: map[uint64]string{11: addr}}, conflict: "voting member"},
+		{name: "witness", m: &quicraft.Membership{Witnesses: map[uint64]string{11: addr}}, conflict: "witness"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			landed, conflict := membership.AddObserverLanded(11, addr)(tt.m)
+			assertConfirm(t, landed, conflict, tt.landed, tt.conflict)
+		})
+	}
+}
+
+// TestPromoteNodeLanded pins the promotion's confirmation. The observer being
+// promoted, at its own address, is the starting state and must read as "not
+// yet" — AddNodeLanded reports it as a conflict, which would fail a promotion
+// whose first attempt was delivered but not yet applied.
+func TestPromoteNodeLanded(t *testing.T) {
+	const addr = "127.0.0.1:59436"
+	tests := []struct {
+		name     string
+		m        *quicraft.Membership
+		landed   bool
+		conflict string
+	}{
+		{name: "nil membership", m: nil},
+		{name: "still the observer", m: &quicraft.Membership{Observers: map[uint64]string{11: addr}}},
+		{name: "voter at addr", m: &quicraft.Membership{Nodes: map[uint64]string{11: addr}}, landed: true},
+		{name: "voter elsewhere", m: &quicraft.Membership{Nodes: map[uint64]string{11: "127.0.0.1:1"}}, conflict: "voting member"},
+		{name: "observer elsewhere", m: &quicraft.Membership{Observers: map[uint64]string{11: "127.0.0.1:1"}}, conflict: "observer"},
+		{name: "witness", m: &quicraft.Membership{Witnesses: map[uint64]string{11: addr}}, conflict: "witness"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			landed, conflict := membership.PromoteNodeLanded(11, addr)(tt.m)
+			assertConfirm(t, landed, conflict, tt.landed, tt.conflict)
+		})
+	}
+}
+
+// assertConfirm checks one Confirm verdict: landed, and either no conflict or
+// a *ConflictError naming wantRole.
+func assertConfirm(t *testing.T, landed bool, conflict error, wantLanded bool, wantRole string) {
+	t.Helper()
+	if landed != wantLanded {
+		t.Fatalf("landed = %v, want %v", landed, wantLanded)
+	}
+	if wantRole == "" {
+		if conflict != nil {
+			t.Fatalf("unexpected conflict: %v", conflict)
+		}
+		return
+	}
+	var c *membership.ConflictError
+	if !errors.As(conflict, &c) {
+		t.Fatalf("conflict = %v, want a *ConflictError", conflict)
+	}
+	if c.Role != wantRole {
+		t.Fatalf("conflict role = %q, want %q", c.Role, wantRole)
 	}
 }

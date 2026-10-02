@@ -116,6 +116,9 @@ func sentinelTable() []sentinelClassification {
 		// different one.
 		{"ErrNodeNotFound", ErrNodeNotFound, false},
 		{"ErrNodeAlreadyExists", ErrNodeAlreadyExists, false},
+		// Permanent: a removed member's identity is banned from the shard for
+		// good, under any replica ID, so retrying the same add never succeeds.
+		{"ErrRemovedMemberIdentity", ErrRemovedMemberIdentity, false},
 		{"ErrNodeRemoved", ErrNodeRemoved, false},
 		{"ErrRemoveLastVoter", ErrRemoveLastVoter, false},
 		{"ErrTooManyVotingMembers", ErrTooManyVotingMembers, false},

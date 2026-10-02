@@ -2233,10 +2233,12 @@ func TestRaft_TimeoutNow_StartsElection(t *testing.T) {
 }
 
 func TestRaft_TimeoutNow_IgnoredByObserver(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfg(1, 1)
 	cfg.IsObserver = true
-	logdb := newTestLogReaderWithMembership(members)
+	// The configuration must agree: the role follows the replicated
+	// membership, and config.IsObserver is only the initial hint.
+	logdb := newTestLogReader(nil, proto.State{})
+	logdb.membership = selfObserverMembership()
 	r, err := newRaft(cfg, logdb)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2703,11 +2705,13 @@ func TestRaft_Witness_VotesInElection(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRaft_Observer_DoesNotStartElection(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfg(1, 1)
 	cfg.IsObserver = true
 	cfg.PreVote = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
+	// The configuration must agree: the role follows the replicated
+	// membership, and config.IsObserver is only the initial hint.
+	logdb := newTestLogReader(nil, proto.State{})
+	logdb.membership = selfObserverMembership()
 	r, err := newRaft(cfg, logdb)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2721,10 +2725,12 @@ func TestRaft_Observer_DoesNotStartElection(t *testing.T) {
 }
 
 func TestRaft_Observer_DoesNotStartElectionOnTimeoutNow(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfg(1, 1)
 	cfg.IsObserver = true
-	logdb := newTestLogReaderWithMembership(members)
+	// The configuration must agree: the role follows the replicated
+	// membership, and config.IsObserver is only the initial hint.
+	logdb := newTestLogReader(nil, proto.State{})
+	logdb.membership = selfObserverMembership()
 	r, err := newRaft(cfg, logdb)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

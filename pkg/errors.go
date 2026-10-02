@@ -432,6 +432,17 @@ var (
 	// member with no address is unreachable and cannot be replicated to.
 	ErrEmptyAddress = raft.ErrEmptyAddress
 
+	// ErrRemovedMemberIdentity is returned when a membership add would bind a
+	// node identity this shard has already committed a removal for, under any
+	// replica ID. The removal tombstone is on the IDENTITY, not on the replica
+	// ID it was bound to, and is never evicted (Membership.RemovedIdentities),
+	// so a keypair whose replica was removed is banned from the shard
+	// permanently: every replica refuses its traffic whatever ID it presents.
+	// The add is refused at propose time rather than committed as a member no
+	// replica will ever hear from. The remedy is a NEW keypair; recycling the
+	// removed machine's address under a new replica ID remains legal.
+	ErrRemovedMemberIdentity = raft.ErrRemovedMemberIdentity
+
 	// ErrMemberIdentityRequired is returned by RequestAddNode,
 	// RequestAddObserver and RequestAddWitness — the identity-less forms — on
 	// a host with a transport, and by their WithIdentity forms given an empty
@@ -962,12 +973,12 @@ var ErrNonVotingRoleInMembers = errors.New(
 //   - and the raft layer permanently latches the disagreement (roleMismatch),
 //     after which the replica can neither campaign nor serve reads.
 //
-// An observer bootstrapped this way is likewise a full VOTER: it is counted in
-// every quorum and it grants votes, while the local Config.IsObserver gate only
-// stops it from campaigning. The operator asks for a non-voting learner and
-// silently gets a voter that never stands for election — the voting set is
-// larger than the operator believes, so the shard tolerates fewer failures than
-// intended.
+// An observer bootstrapped this way is likewise a full VOTER, on this replica
+// as much as on every other: Config.IsObserver is only an initial hint and
+// yields to a membership that names the replica, so it votes, campaigns and is
+// counted in every quorum. The operator asks for a non-voting learner and
+// silently gets a voter — the voting set is larger than the operator believes,
+// so the shard tolerates fewer failures than intended.
 //
 // The supported flow is the two-step one etcd and dragonboat use for learners:
 // bootstrap the full voters, then start the witness/observer with join=true and

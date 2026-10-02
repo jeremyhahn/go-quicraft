@@ -188,30 +188,44 @@ snapshot has its election timer fire mid-transfer.
 
 ### Derived Campaign Gates
 
-Four latches derived from the replicated configuration suppress campaigning.
-None of them is ever proposed; each is re-evaluated everywhere the
-configuration is (re)established (construction, snapshot restore, commit-time
-config change).
+Four latches and one derived role, all taken from the replicated
+configuration, suppress campaigning. None of them is ever proposed; each is
+re-evaluated everywhere the configuration is (re)established (construction,
+snapshot restore, commit-time config change).
 
 - **`selfRemoved`** — this replica is in none of the configuration's voter,
   observer or witness sets. The surviving configuration computes its quorum
   without it, so a removed replica counting its own vote against its own stale
   voting set can win a term the real configuration also elects in (PhD 4.2.2).
   An empty configuration counts as "not a member".
-- **`roleMismatch`** — the locally configured witness or observer role
-  contradicts the replicated membership (`checkSelfRole`). The two roles run
-  different data paths: the leader strips entry payloads for a replica the
-  configuration calls a witness, so a replica started with `IsWitness=false`
-  applies stripped entries into a full state machine while every local gate
-  believes it is a full replica. The observer half is worse: `startElection`
-  gates on the LOCAL `isObserver` while `quorum()` sizes the voting set from
-  the replicated membership plus an unconditional +1 for self, so a replica
-  the configuration lists as an observer but configured locally as a voter
-  computes `quorumOf(V+1)` over a real voting set of V, and two such replicas
-  can be elected in the same term. The latch refuses campaigning and read
-  serving; voting is deliberately still allowed, because a replica that stopped
-  voting would remove itself from a quorum the rest of the cluster still counts
-  it in. A leader that learns of the mismatch steps down immediately.
+- **`isObserver`** — the replica's EFFECTIVE non-voting role, derived
+  (`checkSelfRole` / `setObserver`) from the replicated membership whenever the
+  membership names the replica; `Config.IsObserver` is only the initial hint for
+  a replica the membership does not yet mention. `quorum()` sizes the voting
+  set from the replicated membership plus an unconditional +1 for self, so a
+  replica the configuration lists as an observer that believed itself a voter
+  would compute `quorumOf(V+1)` over a real voting set of V, and two such
+  replicas could be elected in the same term; taking the role from the
+  configuration closes that by construction. It also makes promotion take
+  effect in place: when an observer applies the `AddNode` naming it, it stops
+  being an observer and campaigns, is electable and serves ReadIndex with no
+  restart (etcd's learner promotion). On promotion `setObserver` raises the
+  persisted `VoteWindow` to the window its heartbeat acks now promise under
+  `LeaseRead`, before any ack carries it. A leader or candidate that learns it
+  is an observer steps down. The observer test runs after the configuration
+  fold, so a replica restarted from a base that predates its promotion folds
+  the committed promotion before deciding.
+- **`roleMismatch`** — the locally configured WITNESS role contradicts the
+  replicated membership (`checkSelfRole`). The two roles run different data
+  paths: the leader strips entry payloads for a replica the configuration calls
+  a witness, so a replica started with `IsWitness=false` applies stripped
+  entries into a full state machine while every local gate believes it is a
+  full replica, and a witness listed as a full replica would answer reads from
+  an empty one. Unlike the observer role, nothing in place can repair that, so
+  it is latched. The latch refuses campaigning and read serving; voting is
+  deliberately still allowed, because a replica that stopped voting would
+  remove itself from a quorum the rest of the cluster still counts it in. A
+  leader that learns of the mismatch steps down immediately.
 - **`joining`** — a replica started with `join=true` holds a known-incomplete
   membership and would win with a quorum of one. It gates CAMPAIGNING ONLY: the
   election clock keeps ticking, because freezing `electionTick` left `leaderID`
@@ -283,7 +297,8 @@ incrementing its term from forcing the cluster to advance when it rejoins.
 ```
 startElection()
   |
-  +-- gates: isObserver / isWitness / selfRemoved / stale config /
+  +-- gates: isWitness / selfRemoved / stale config fold /
+  |          selfRemoved / isObserver (after the fold) /
   |          roleMismatch / joining / unreadable last log term
   |
   +-- preVote enabled?
@@ -348,10 +363,11 @@ Four gates run before the grant decision.
 
 3. **Candidate is not a non-voting observer**: gate 2 is "known in any role",
    which is right for witnesses and wrong for observers. Without this, an
-   observer whose local config says `IsObserver=false` collects grants from
-   real voters, counts its own vote, and can be elected. This is the
-   independent second half of `checkSelfRole`: it holds even if the observer's
-   own latch is bypassed, because every voter enforces it.
+   observer that believed itself a voter would collect grants from real voters,
+   count its own vote, and could be elected. This is the independent second
+   half of `checkSelfRole`'s derived observer role: it holds even if the
+   candidate's own view of its role is stale or wrong, because every voter
+   enforces it.
 
 4. **Vote availability**:
    - Real vote: `logOK && (vote == msg.From || (vote == noNode && noCompetingLeader))`,
@@ -1076,8 +1092,9 @@ After a snapshot restore the peer set may have changed. This rebuilds
 `remotes`, `observers` and `witnesses` from the snapshot's membership with
 fresh `remote` structs, mirrors the snapshot's replicated witness policy into
 `maxWitnesses`/`requireFullReplicaMajority`, re-derives `selfRemoved` and
-`roleMismatch` (a snapshot can carry a configuration this replica is no longer
-in), and calls `purgeDepartedVotes`.
+the observer role and `roleMismatch` (a snapshot can carry a configuration this
+replica is no longer in, or one that promotes or demotes it), and calls
+`purgeDepartedVotes`.
 
 ### Snapshot Recovery vs Apply Race
 
@@ -1526,9 +1543,10 @@ transfer is active.
 The target campaigns IMMEDIATELY, bypassing PreVote, and its RequestVotes carry
 `Hint = self` so peers with a fresh leader lease still grant them. Because it
 is decided in a single round with no pre-vote to catch a stale voting set,
-`handleTimeoutNow` repeats every campaign gate rather than delegating: observer
-or witness or `selfRemoved`, the on-demand configuration fold
-(`ErrStaleConfigCannotCampaign`), `selfRemoved` re-checked after the fold,
+`handleTimeoutNow` repeats every campaign gate rather than delegating: witness
+or `selfRemoved`, the on-demand configuration fold
+(`ErrStaleConfigCannotCampaign`), `selfRemoved` and the observer role checked
+after the fold,
 `roleMismatch` (`ErrWitnessRoleMismatch`), `joining`
 (`ErrJoiningNodeCannotCampaign`), already-leader, and an unreadable last log
 term (`ErrUnreadableLogCannotCampaign`). `Peer.Handle` additionally refuses a

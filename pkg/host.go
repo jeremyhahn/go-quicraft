@@ -6420,9 +6420,13 @@ func protoMembershipToPublic(pm *proto.Membership) *Membership {
 		Witnesses:                  make(map[uint64]string, len(pm.Witnesses)),
 		Removed:                    make(map[uint64]struct{}, len(pm.Removed)),
 		Identities:                 make(map[uint64]string, len(pm.Identities)),
+		RemovedIdentities:          make(map[uint64]string, len(pm.RemovedIdentities)),
 	}
 	for k, v := range pm.Identities {
 		m.Identities[k] = v
+	}
+	for k, v := range pm.RemovedIdentities {
+		m.RemovedIdentities[k] = v
 	}
 	for k, v := range pm.Addresses {
 		m.Nodes[k] = v
@@ -10322,7 +10326,7 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		LeaderID:             leaderID,
 		Term:                 term,
 		IsLeader:             isLeader,
-		IsObserver:           ns.cfg.IsObserver,
+		IsObserver:           h.shardIsObserver(ns),
 		IsWitness:            ns.cfg.IsWitness,
 		StateMachineType:     ns.smType,
 		StateMachineTypeName: proto.StateMachineTypeName(ns.smType),
@@ -10333,6 +10337,20 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
 		Replicas:             h.replicaProgress(ns.shardID),
 	}
+}
+
+// shardIsObserver reports whether this replica is currently a non-voting
+// observer of the shard. The role follows the committed membership — an
+// observer whose promotion has been applied here is a voter without a restart —
+// so it is read from the Raft peer's published membership. Config.IsObserver is
+// only the initial hint, and is what a shard whose peer is not yet published
+// reports.
+func (h *Host) shardIsObserver(ns *nodeState) bool {
+	engNode := h.engine.GetNode(ns.shardID)
+	if engNode == nil || engNode.Peer() == nil {
+		return ns.cfg.IsObserver
+	}
+	return engNode.Peer().IsObserver()
 }
 
 // replicaProgress converts the engine's published follower progress into the

@@ -43,7 +43,7 @@ group; something else decides what the group should be.
 | Lever | Where | Note |
 |---|---|---|
 | `OrderedConfigChange` | `config.Config` | `*bool`, nil = **enabled**. Leave it. |
-| `IsObserver` / `IsWitness` | `config.Config` | mutually exclusive; set at `StartShard` |
+| `IsObserver` / `IsWitness` | `config.Config` | mutually exclusive; set at `StartShard`. `IsObserver` is only the initial role — a committed promotion makes the replica a voter in place |
 | `Witness` (`MaxWitnesses`, `RequireFullReplicaMajority`) | `config.Config` | **bootstrap seed only** — change it live through `RequestUpdateWitnessPolicy` |
 | `MemberIdentities` | `config.Config` | required on a host with a transport: every founder's members, or a joiner's anchor |
 

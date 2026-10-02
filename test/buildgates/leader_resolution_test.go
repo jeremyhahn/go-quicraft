@@ -117,18 +117,19 @@ var proposalCalls = map[string]bool{
 // wrapped around either form hides nothing from this gate.
 var configChangeCalls = map[string]bool{
 	// quicraft.Host (pkg/host.go).
-	"RequestAddNode":                 true,
-	"RequestAddNodeWithIdentity":     true,
-	"SyncRequestAddNode":             true,
-	"SyncRequestAddNodeWithIdentity": true,
-	"RequestRemoveNode":              true,
-	"SyncRequestDeleteNode":          true,
-	"RequestAddObserver":             true,
-	"RequestAddObserverWithIdentity": true,
-	"SyncRequestAddObserver":         true,
-	"RequestAddWitness":              true,
-	"RequestAddWitnessWithIdentity":  true,
-	"SyncRequestAddWitness":          true,
+	"RequestAddNode":                     true,
+	"RequestAddNodeWithIdentity":         true,
+	"SyncRequestAddNode":                 true,
+	"SyncRequestAddNodeWithIdentity":     true,
+	"RequestRemoveNode":                  true,
+	"SyncRequestDeleteNode":              true,
+	"RequestAddObserver":                 true,
+	"RequestAddObserverWithIdentity":     true,
+	"SyncRequestAddObserver":             true,
+	"SyncRequestAddObserverWithIdentity": true,
+	"RequestAddWitness":                  true,
+	"RequestAddWitnessWithIdentity":      true,
+	"SyncRequestAddWitness":              true,
 	// dragonboat.NodeHost (contrib/dragonboat/nodehost.go). RequestAddWitness
 	// and SyncRequestAddWitness are spelled the same in both modules.
 	"RequestAddReplica":                   true,

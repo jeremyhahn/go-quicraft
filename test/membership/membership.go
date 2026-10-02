@@ -196,6 +196,46 @@ func AddNodeLanded(replicaID uint64, addr string) Confirm {
 	}
 }
 
+// AddObserverLanded confirms an AddNonVoting: replicaID must be an OBSERVER at
+// exactly addr. Any other occupant of the replica ID is a ConflictError.
+func AddObserverLanded(replicaID uint64, addr string) Confirm {
+	return func(m *quicraft.Membership) (bool, error) {
+		if m == nil {
+			return false, nil
+		}
+		if got, ok := m.Observers[replicaID]; ok {
+			if got != addr {
+				return false, &ConflictError{ReplicaID: replicaID, Role: roleObserver, Addr: got, Requested: addr}
+			}
+			return true, nil
+		}
+		if got, ok := m.Nodes[replicaID]; ok {
+			return false, &ConflictError{ReplicaID: replicaID, Role: roleVoter, Addr: got, Requested: addr}
+		}
+		if got, ok := m.Witnesses[replicaID]; ok {
+			return false, &ConflictError{ReplicaID: replicaID, Role: roleWitness, Addr: got, Requested: addr}
+		}
+		return false, nil
+	}
+}
+
+// PromoteNodeLanded confirms the AddNode that promotes an observer: replicaID
+// must be a FULL VOTER at exactly addr. It differs from AddNodeLanded in one
+// state only — the observer being promoted, at the same address, is the state
+// the change STARTS from, so it reads as "not landed yet" rather than as a
+// conflict. An observer at a different address, or a witness, still conflicts.
+func PromoteNodeLanded(replicaID uint64, addr string) Confirm {
+	voter := AddNodeLanded(replicaID, addr)
+	return func(m *quicraft.Membership) (bool, error) {
+		if m != nil {
+			if got, ok := m.Observers[replicaID]; ok && got == addr {
+				return false, nil
+			}
+		}
+		return voter(m)
+	}
+}
+
 // DeleteNodeLanded confirms a RemoveNode: replicaID must hold no role at all.
 //
 // Absence alone is weak evidence — a replica that was never a member is also
@@ -440,6 +480,31 @@ func TryAddNode(resolve proposer.Resolver, shardID, replicaID uint64, addr, iden
 	return Drive(desc, budget, attempt, read, AddNodeLanded(replicaID, addr))
 }
 
+// TryAddObserver adds replicaID as a non-voting observer at addr, committing
+// identity as its node identity, through whichever replica leads shardID at
+// each attempt, and returns nil once a linearizable read of the membership
+// shows it there. It is AddObserver's error-returning form.
+func TryAddObserver(resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) error {
+	attempt, read := resolved(resolve, shardID, func(ctx context.Context, h *quicraft.Host) error {
+		return h.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, identity, 0) //quicraft:direct-config-change the single attempt Drive is built from
+	})
+	desc := fmt.Sprintf("SyncRequestAddObserverWithIdentity(replica=%d, addr=%s)", replicaID, addr)
+	return Drive(desc, budget, attempt, read, AddObserverLanded(replicaID, addr))
+}
+
+// TryPromoteNode promotes the observer replicaID at addr to a full voting
+// member — an AddNode for the same replica ID, address and identity — through
+// whichever replica leads shardID at each attempt, and returns nil once a
+// linearizable read of the membership shows it as a voter. It is
+// PromoteNode's error-returning form.
+func TryPromoteNode(resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) error {
+	attempt, read := resolved(resolve, shardID, func(ctx context.Context, h *quicraft.Host) error {
+		return h.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, 0) //quicraft:direct-config-change the single attempt Drive is built from
+	})
+	desc := fmt.Sprintf("SyncRequestAddNodeWithIdentity(promote replica=%d, addr=%s)", replicaID, addr)
+	return Drive(desc, budget, attempt, read, PromoteNodeLanded(replicaID, addr))
+}
+
 // TryDeleteNode removes replicaID through whichever replica leads shardID at
 // each attempt, and returns nil once a linearizable read of the membership
 // shows it holding no role. It is DeleteNode's error-returning form.
@@ -456,6 +521,24 @@ func TryDeleteNode(resolve proposer.Resolver, shardID, replicaID uint64, budget 
 func AddNode(t *testing.T, resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) {
 	t.Helper()
 	if err := TryAddNode(resolve, shardID, replicaID, addr, identity, budget); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// AddObserver is TryAddObserver for the test goroutine: it fails the test on
+// any error.
+func AddObserver(t *testing.T, resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) {
+	t.Helper()
+	if err := TryAddObserver(resolve, shardID, replicaID, addr, identity, budget); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// PromoteNode is TryPromoteNode for the test goroutine: it fails the test on
+// any error.
+func PromoteNode(t *testing.T, resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) {
+	t.Helper()
+	if err := TryPromoteNode(resolve, shardID, replicaID, addr, identity, budget); err != nil {
 		t.Fatal(err)
 	}
 }
