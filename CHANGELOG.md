@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-01
+
+Release candidate, published to Gitea only, for upstream projects to pin and
+test. The code is identical to [0.16.0-alpha]; see that section for every
+change and the behaviour changes a consumer should check. This is **not** the
+public release, which will be v1.0.0. The pre-release compatibility policy
+(release-versioning §1) still applies: on-disk and wire formats may change in
+place before v1.0.0, and the upgrade path is to wipe and re-sync.
+
 ## [0.16.0-alpha] - 2026-10-01
 
 Removes the shard-wide stall that one slow read caused on concurrent and
