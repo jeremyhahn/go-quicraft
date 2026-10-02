@@ -385,9 +385,6 @@ type Credentials struct {
     Secret *enclave.SealedEnclave
 }
 
-// Deprecated: aliases kept so implementations naming them still compile.
-type ProtectedCredentials = Credentials
-func NewProtectedCredentials(secret []byte) (Credentials, error)
 ```
 
 It exists because the `[]byte` signatures force an implementation to retain the
@@ -411,8 +408,9 @@ cannot hold nothing.
   consumers are updated in the same change (see
   [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md)).
 - **Deprecated**: `Split`, `Combine`, `CombineUnverified`, the `Share.Value`
-  field, `IntegrityError` (never returned), and `seal.ProtectedCredentials` /
-  `seal.NewProtectedCredentials`. Each is retained so existing callers compile.
+  field and `IntegrityError` (never returned). Each is retained so existing
+  callers compile. `seal.ProtectedCredentials` and `seal.NewProtectedCredentials`
+  were removed in 0.17.0; use `seal.Credentials` and `seal.NewCredentials`.
 - A signature change to `ProtectedShareSplitter`, `ProtectedShareAccumulator` or
   `ProtectedSealingStrategy` breaks go-qrdb's implementations. Sequence such
   changes bottom-up.

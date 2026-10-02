@@ -50,7 +50,7 @@ func epochFiveBarrier(t *testing.T) (*Barrier, *SoftwareStrategy, []*SealedRootK
 		if _, err := b.Encrypt(nil, []byte("epoch traffic")); err != nil {
 			t.Fatalf("Encrypt: %v", err)
 		}
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate: %v", err)
 		}
 	}
@@ -570,7 +570,7 @@ func TestFIPS_ConstrainsKDF(t *testing.T) {
 		t.Fatalf("DeriveKey(PBKDF2) under FIPS: %v", err)
 	}
 	// The auto-selecting constructor picks the approved KDF and succeeds.
-	s, err := NewSoftwareStrategy(pass)
+	s, err := NewSoftwareStrategy(context.Background(), pass)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategy under FIPS: %v", err)
 	}
@@ -721,7 +721,7 @@ func TestTwoLiveBarriersOverOneBlobGoStale(t *testing.T) {
 	}
 	// Rotate explicitly, so the contract is demonstrated independently of the
 	// restart-rotation that already moved this barrier to epoch 2.
-	if _, err := second.Rotate(); err != nil {
+	if _, err := second.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 

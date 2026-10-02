@@ -219,11 +219,8 @@ type Credentials struct {
     Secret *enclave.SealedEnclave
 }
 
-func NewCredentials(secret []byte) (Credentials, error) // moves and WIPES secret
+func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) // moves and WIPES secret
 
-// Deprecated: aliases kept so implementations naming them still compile.
-type ProtectedCredentials = Credentials
-func NewProtectedCredentials(secret []byte) (Credentials, error)
 ```
 
 It answers a defect no implementer can avoid while the signature demands a
@@ -260,8 +257,7 @@ reference implementation ignores is not a contract.
 Both sides of the boundary are protected. For a deferred-passphrase strategy the
 passphrase is that key's protection, not a lesser secret, so accepting it in a
 plain `[]byte` would protect the wrong half. `Credentials.Secret` is a
-`*enclave.SealedEnclave` for every strategy method, and `ProtectedCredentials` is
-a deprecated alias for the same type.
+`*enclave.SealedEnclave` for every strategy method.
 
 Every root-key method derives straight from the credential's sealed passphrase
 rather than building a temporary inner strategy from a plain slice, so a
@@ -348,7 +344,7 @@ have been decoded and copied.
 
 **Protected-memory obligations**
 
-Three obligations come with `ProtectedShare`:
+Three obligations, and one limit, come with `ProtectedShare`:
 
 - **Every `ProtectedShare` must be `Destroy`ed, including one produced by
   `json.Unmarshal`**: decoding is a construction. An abandoned share holds a
@@ -356,6 +352,13 @@ Three obligations come with `ProtectedShare`:
 - **Locked memory is a finite kernel resource** (`RLIMIT_MEMLOCK`), and each
   share is one locked allocation. Destroy shares as they are consumed rather than
   at the end of a ceremony.
+- **`Destroy` does not report a refused release.** go-enclave's
+  `MemoryEnclave.Destroy` returns an error, and `ProtectedShare.Destroy` returns
+  nothing: a release the kernel refuses stays on go-enclave's `WipeAll` ledger
+  for a later retry, and a release that ran without a wipe (a denied
+  `mprotect`) has already returned the pages, which the kernel zeroes before
+  reuse. The package's internal cleanup paths drop the report the same way,
+  through one helper (`release`) whose comment records why nothing is lost.
 - **A slice from `Value` does not outlive the share.** `Value` and `Destroy` are
   safe to call concurrently; what no lock can bound is a slice a caller kept after
   `Value` returned, and `Destroy` unmaps the pages, so reading it faults. Where

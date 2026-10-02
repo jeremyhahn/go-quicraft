@@ -26,7 +26,7 @@ func TestStampSealedStateMACLetsAnEmbedderRewrapTheRootKey(t *testing.T) {
 	rewrapped := cloneSealedRootKey(existing)
 	rewrapped.StateMAC = nil
 
-	if err := b.StampSealedStateMAC(rewrapped); err != nil {
+	if err := b.StampSealedStateMAC(context.Background(), rewrapped); err != nil {
 		t.Fatalf("StampSealedStateMAC: %v", err)
 	}
 	if len(rewrapped.StateMAC) == 0 {
@@ -73,7 +73,7 @@ func TestStampSealedStateMACCoversTheMetadata(t *testing.T) {
 
 	edited := cloneSealedRootKey(b.SealedRootKeyData())
 	edited.StateMAC = nil
-	if err := b.StampSealedStateMAC(edited); err != nil {
+	if err := b.StampSealedStateMAC(context.Background(), edited); err != nil {
 		t.Fatalf("StampSealedStateMAC: %v", err)
 	}
 
@@ -101,7 +101,7 @@ func TestStampSealedStateMACRequiresAnUnsealedBarrier(t *testing.T) {
 	if err := b.Seal(); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
-	if err := b.StampSealedStateMAC(sealed); err != ErrBarrierSealed {
+	if err := b.StampSealedStateMAC(context.Background(), sealed); err != ErrBarrierSealed {
 		t.Fatalf("StampSealedStateMAC on a sealed barrier: got %v, want %v", err, ErrBarrierSealed)
 	}
 }
@@ -110,7 +110,7 @@ func TestStampSealedStateMACRequiresAnUnsealedBarrier(t *testing.T) {
 // rather than a nil dereference.
 func TestStampSealedStateMACRejectsNil(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
-	if err := b.StampSealedStateMAC(nil); err != ErrNilSealedData {
+	if err := b.StampSealedStateMAC(context.Background(), nil); err != ErrNilSealedData {
 		t.Fatalf("StampSealedStateMAC(nil): got %v, want %v", err, ErrNilSealedData)
 	}
 }
@@ -122,7 +122,7 @@ func TestStampSealedStateMACWithRootKeyStampsForALaterUnseal(t *testing.T) {
 	ctx := context.Background()
 	b, strategy := testInitializedBarrier(t)
 
-	rootKey, err := b.RootKey()
+	rootKey, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestStampSealedStateMACWithRootKeyBindsTheDeployment(t *testing.T) {
 	ctx := context.Background()
 	b, strategy := testInitializedBarrier(t)
 
-	rootKey, err := b.RootKey()
+	rootKey, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}

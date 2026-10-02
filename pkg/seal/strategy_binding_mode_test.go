@@ -35,9 +35,11 @@ func newBoundStrategies(t *testing.T, passphrase []byte) map[string]*SoftwareStr
 	t.Helper()
 	out := make(map[string]*SoftwareStrategy, 3)
 	for name, ctor := range map[string]func() (*SoftwareStrategy, error){
-		"NewSoftwareStrategy":     func() (*SoftwareStrategy, error) { return NewSoftwareStrategy(passphrase) },
-		"NewSoftwareStrategyFIPS": func() (*SoftwareStrategy, error) { return NewSoftwareStrategyFIPS(passphrase, 1000) },
-		"newTestStrategy":         func() (*SoftwareStrategy, error) { return newTestStrategy(passphrase) },
+		"NewSoftwareStrategy": func() (*SoftwareStrategy, error) { return NewSoftwareStrategy(context.Background(), passphrase) },
+		"NewSoftwareStrategyFIPS": func() (*SoftwareStrategy, error) {
+			return NewSoftwareStrategyFIPS(context.Background(), passphrase, 1000)
+		},
+		"newTestStrategy": func() (*SoftwareStrategy, error) { return newTestStrategy(passphrase) },
 	} {
 		s, err := ctor()
 		if err != nil {

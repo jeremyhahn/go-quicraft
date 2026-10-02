@@ -427,7 +427,7 @@ func (b *mockBarrier) IsHardwareMode() bool { return false }
 // SupportsContextAAD is true: the mock authenticates the caller context.
 func (b *mockBarrier) SupportsContextAAD() bool { return true }
 
-func (b *mockBarrier) Rotate() (uint64, error) {
+func (b *mockBarrier) Rotate(ctx context.Context) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.sealed {
@@ -436,7 +436,7 @@ func (b *mockBarrier) Rotate() (uint64, error) {
 	return 2, nil
 }
 
-func (b *mockBarrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
+func (b *mockBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.sealed {
@@ -3187,12 +3187,14 @@ func (b *errorBarrier) DecryptWithContext(_, _, _ []byte) ([]byte, error) {
 func (b *errorBarrier) IsHardwareMode() bool     { return false }
 func (b *errorBarrier) SupportsContextAAD() bool { return true }
 
-func (b *errorBarrier) Rotate() (uint64, error)               { return 0, ErrBarrierSealed }
-func (b *errorBarrier) PurgeEpochsBefore(uint64) (int, error) { return 0, ErrBarrierSealed }
-func (b *errorBarrier) RegisterInFlightEpoch(uint64)          {}
-func (b *errorBarrier) DeregisterInFlightEpoch(uint64)        {}
-func (b *errorBarrier) CurrentEpoch() uint64                  { return 0 }
-func (b *errorBarrier) ShouldRotateKey() bool                 { return false }
+func (b *errorBarrier) Rotate(context.Context) (uint64, error) { return 0, ErrBarrierSealed }
+func (b *errorBarrier) PurgeEpochsBefore(context.Context, uint64) (int, error) {
+	return 0, ErrBarrierSealed
+}
+func (b *errorBarrier) RegisterInFlightEpoch(uint64)   {}
+func (b *errorBarrier) DeregisterInFlightEpoch(uint64) {}
+func (b *errorBarrier) CurrentEpoch() uint64           { return 0 }
+func (b *errorBarrier) ShouldRotateKey() bool          { return false }
 
 func TestClose_BarrierSealError(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -6568,7 +6570,7 @@ func (b *testHostBarrier) IsHardwareMode() bool { return false }
 // SupportsContextAAD is true: the fake authenticates the caller context.
 func (b *testHostBarrier) SupportsContextAAD() bool { return true }
 
-func (b *testHostBarrier) Rotate() (uint64, error) {
+func (b *testHostBarrier) Rotate(ctx context.Context) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.rotateErr != nil {
@@ -6580,7 +6582,7 @@ func (b *testHostBarrier) Rotate() (uint64, error) {
 	return b.epoch, nil
 }
 
-func (b *testHostBarrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
+func (b *testHostBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error) {
 	b.lastPurgeAt.Store(minEpoch)
 	b.purgeCount.Add(1)
 	return 1, nil
@@ -6848,7 +6850,7 @@ func TestHost_RotateBarrierKey_FailSafeNoFloor(t *testing.T) {
 	}
 	defer h.Close()
 
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if barrier.purgeCount.Load() != 0 {
 		t.Fatalf("expected 0 purge calls when global floor is unknown, got %d (lastPurge=%d)",
@@ -6882,7 +6884,7 @@ func TestHost_RotateBarrierKey_ClampsToGlobalFloor(t *testing.T) {
 
 	// Rotate: epoch 9 -> 10. Retention threshold = 10 - 1 = 9, but the global
 	// safe floor (snapshot epoch 2) must clamp the purge floor to 2.
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if barrier.purgeCount.Load() == 0 {
 		t.Fatalf("expected a purge call, got none")
@@ -6918,7 +6920,7 @@ func TestHost_RotateBarrierKey_RetentionBelowFloor(t *testing.T) {
 
 	// Rotate: epoch 9 -> 10. Retention threshold = 10 - 4 = 6, global floor = 8.
 	// min(6, 8) = 6, so the retention threshold governs.
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if barrier.purgeCount.Load() == 0 {
 		t.Fatalf("expected a purge call, got none")
@@ -6985,12 +6987,12 @@ func newPanickingBarrier(epoch uint64, numPanics int64, msg string) *panickingBa
 	return pb
 }
 
-func (b *panickingBarrier) Rotate() (uint64, error) {
+func (b *panickingBarrier) Rotate(ctx context.Context) (uint64, error) {
 	if b.panicCount.Add(-1) >= 0 {
 		panic(b.panicMessage)
 	}
 	b.successCount.Add(1)
-	return b.testHostBarrier.Rotate()
+	return b.testHostBarrier.Rotate(ctx)
 }
 
 var _ Barrier = (*panickingBarrier)(nil)
@@ -7009,7 +7011,7 @@ func TestKeyRotationLoopOnce_PanicsReturnTrue(t *testing.T) {
 		logger:      slog.Default(),
 	}
 
-	panicked := h.keyRotationLoopOnce(50 * time.Millisecond)
+	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
 	if !panicked {
 		t.Fatal("expected keyRotationLoopOnce to report panic from barrier.Rotate()")
 	}
@@ -7029,7 +7031,7 @@ func TestKeyRotationLoopOnce_NormalReturnsFalse(t *testing.T) {
 		logger:      slog.Default(),
 	}
 
-	panicked := h.keyRotationLoopOnce(50 * time.Millisecond)
+	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
 	if panicked {
 		t.Fatal("expected keyRotationLoopOnce to return false on normal shutdown")
 	}
@@ -11939,7 +11941,7 @@ type rotatingBarrier struct {
 	purgeResult  int
 }
 
-func (b *rotatingBarrier) Rotate() (uint64, error) {
+func (b *rotatingBarrier) Rotate(ctx context.Context) (uint64, error) {
 	b.rotateCalled.Add(1)
 	if b.rotateErr != nil {
 		return 0, b.rotateErr
@@ -11947,7 +11949,7 @@ func (b *rotatingBarrier) Rotate() (uint64, error) {
 	return b.rotateEpoch, nil
 }
 
-func (b *rotatingBarrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
+func (b *rotatingBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error) {
 	b.purgedBefore.Store(int64(minEpoch))
 	return b.purgeResult, b.purgeErr
 }
@@ -11965,7 +11967,7 @@ func TestRotateBarrierKey_NilBarrier(t *testing.T) {
 	defer h.Close()
 
 	// With no barrier attached, rotateBarrierKey must not panic.
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 }
 
 // TestRotateBarrierKey_SealedBarrier verifies that rotateBarrierKey skips
@@ -11981,7 +11983,7 @@ func TestRotateBarrierKey_SealedBarrier(t *testing.T) {
 	}
 	defer h.Close()
 
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if rb.rotateCalled.Load() != 0 {
 		t.Error("Rotate should not be called when barrier is sealed")
@@ -12000,7 +12002,7 @@ func TestRotateBarrierKey_RotateError(t *testing.T) {
 	}
 	defer h.Close()
 
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if rb.rotateCalled.Load() != 1 {
 		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
@@ -12023,7 +12025,7 @@ func TestRotateBarrierKey_RotateSuccessNoPurge(t *testing.T) {
 	}
 	defer h.Close()
 
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if rb.rotateCalled.Load() != 1 {
 		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
@@ -12052,7 +12054,7 @@ func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	}
 	defer h.Close()
 
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if rb.rotateCalled.Load() != 1 {
 		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
@@ -12078,7 +12080,7 @@ func TestRotateBarrierKey_PurgeError(t *testing.T) {
 	defer h.Close()
 
 	// Must not panic or return an error even when purge fails.
-	h.rotateBarrierKey()
+	h.rotateBarrierKey(context.Background())
 
 	if rb.rotateCalled.Load() != 1 {
 		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
@@ -12098,7 +12100,7 @@ type thresholdBarrier struct {
 	rotateEpoch  uint64
 }
 
-func (b *thresholdBarrier) Rotate() (uint64, error) {
+func (b *thresholdBarrier) Rotate(ctx context.Context) (uint64, error) {
 	b.rotateCalled.Add(1)
 	return b.rotateEpoch, nil
 }
@@ -12124,7 +12126,7 @@ func TestBarrier_ShouldRotateKey_TriggersRotation(t *testing.T) {
 
 	// Simulate what the thresholdCheck ticker case does.
 	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey()
+		h.rotateBarrierKey(context.Background())
 	}
 
 	if tb.rotateCalled.Load() != 1 {
@@ -12147,7 +12149,7 @@ func TestBarrier_ShouldRotateKey_NoRotationWhenFalse(t *testing.T) {
 
 	// Simulate what the thresholdCheck ticker case does.
 	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey()
+		h.rotateBarrierKey(context.Background())
 	}
 
 	if tb.rotateCalled.Load() != 0 {
@@ -19348,7 +19350,7 @@ func TestKeyRotationLoopOnce_StopChannel(t *testing.T) {
 		close(stopCh)
 	}()
 
-	panicked := h.keyRotationLoopOnce(10 * time.Millisecond)
+	panicked := h.keyRotationLoopOnce(context.Background(), 10*time.Millisecond)
 	if panicked {
 		t.Error("expected normal exit, got panic")
 	}
@@ -20640,7 +20642,7 @@ func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncryptWithEpochContext(1) failed: %v", err)
 	}
-	if _, rotErr := barrier.Rotate(); rotErr != nil {
+	if _, rotErr := barrier.Rotate(context.Background()); rotErr != nil {
 		t.Fatalf("Rotate failed: %v", rotErr)
 	}
 	p2 := []byte("frame-two-sealed-after-rotation-at-a-higher-epoch")

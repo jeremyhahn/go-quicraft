@@ -166,8 +166,8 @@ binding exists to prevent.
 ### Rotate and purge epochs
 
 ```go
-func (b *Barrier) Rotate() (uint64, error)
-func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error)
+func (b *Barrier) Rotate(ctx context.Context) (uint64, error)
+func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error)
 func (b *Barrier) CurrentEpoch() uint64
 func (b *Barrier) ShouldRotateKey() bool
 func (b *Barrier) RegisterInFlightEpoch(epoch uint64)
@@ -226,9 +226,9 @@ true for both `ContextBindingUnsupported` and `ContextBindingPlaintext`;
 ### Root-key access (rare)
 
 ```go
-func (b *Barrier) RootKey() ([]byte, error)
-func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error)
-func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error
+func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
 func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error
 ```
 
@@ -240,6 +240,11 @@ decrypts into a fresh enclave. **Do not zero the borrowed bytes yourself before
 `Destroy`**: that is a write to a read-only region and faults; `Destroy` is the
 release. `RootKey` returns an ordinary slice the caller must zero itself.
 Both return `ErrNoRootKeyAvailable` in no-encryption mode.
+
+All three open the sealed root key, and `ctx` bounds that open: go-enclave hands
+it to the process sealer's provider, which may block. A context that has ended
+fails the call with an error matching both `enclave.ErrOpenFailed` and
+`ctx.Err()`.
 
 ### Interfaces you implement
 
@@ -317,9 +322,9 @@ type StatePersister func(*SealedRootKey) error
 const StrategyPassphrase StrategyID = "passphrase"
 const StrategyNone       StrategyID = "none"
 
-func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error)
-func NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error)
-func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
+func NewSoftwareStrategy(ctx context.Context, passphrase []byte) (*SoftwareStrategy, error)
+func NewSoftwareStrategyFIPS(ctx context.Context, passphrase []byte, iterations int) (*SoftwareStrategy, error)
+func NewSoftwareStrategyWithParams(ctx context.Context, passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
 func NewDeferredSoftwareStrategy() *SoftwareStrategy
 func NewDeferredSoftwareStrategyWithParams(version KDFVersion, params KDFParams) (*SoftwareStrategy, error)
 func NewNoneStrategy() *NoneStrategy
@@ -329,6 +334,9 @@ func (s *SoftwareStrategy) KDFParams() KDFParams    // which work factor
 func (s *SoftwareStrategy) DeferredPassphrase() bool
 ```
 
+- The three bound constructors take a `context.Context` because they seal a
+  copy of the passphrase into a `SealedEnclave`, which go-enclave may hand to a
+  blocking provider. The deferred constructors hold no passphrase and take none.
 - `NewSoftwareStrategy` auto-selects the KDF from `FIPSEnabled()`.
 - `NewSoftwareStrategyWithParams` names Argon2id explicitly and is refused with
   `ErrKDFNotFIPSApproved` in FIPS mode; in a `-tags fips` build it exists and
@@ -398,7 +406,7 @@ type SealedRootKey   = seal.SealedRootKey
 type SealingStrategy = seal.SealingStrategy
 func NewBarrier(config BarrierConfig) (*Barrier, error)   // calls seal.NewBarrier
 func MustNewBarrier(config BarrierConfig) *Barrier        // calls seal.MustNewBarrier
-func NewCredentials(secret []byte) (Credentials, error)   // calls seal.NewCredentials, consuming secret
+func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) // calls seal.NewCredentials, consuming secret
 ```
 
 Type aliases and forwarding functions only (functions, not `var`s holding
@@ -420,8 +428,8 @@ lives there. New code should import `pkg/seal`.
   `LoadGeneration == 0`, and is restamped at version 2.
 - **`KDFVersion`**: `KDFArgon2id` (1) and `KDFPbkdf2SHA256` (2). Both identifiers
   stay defined in every build because they appear in data already on disk.
-- **Deprecated**: `ProtectedCredentials` and `NewProtectedCredentials`, aliases
-  for `Credentials` and `NewCredentials`. `EpochBarrier`, `NewEpochBarrier` and
+- **Removed in 0.17.0**: `ProtectedCredentials` and `NewProtectedCredentials`,
+  the deprecated aliases for `Credentials` and `NewCredentials`. `EpochBarrier`, `NewEpochBarrier` and
   `MustNewEpochBarrier` are supported aliases, not legacy names.
 - A signature change to `SealingStrategy`, `SymmetricEncrypter` or
   `AADSymmetricEncrypter` breaks go-xkms and go-qrdb implementations. Sequence

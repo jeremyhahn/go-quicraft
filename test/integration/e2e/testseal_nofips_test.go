@@ -16,7 +16,11 @@
 
 package e2e_test
 
-import "github.com/jeremyhahn/go-quicraft/pkg/seal"
+import (
+	"context"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
+)
 
 // newTestSealStrategy returns a passphrase sealing strategy with the cheapest
 // KDF this build supports, so tests do not each hard-code one that a FIPS build
@@ -27,5 +31,5 @@ import "github.com/jeremyhahn/go-quicraft/pkg/seal"
 // every build, cannot succeed there and the fips variant of this file uses
 // PBKDF2-SHA256 instead. Callers must have enabled seal.AllowWeakKDFParams.
 func newTestSealStrategy(passphrase []byte) (*seal.SoftwareStrategy, error) {
-	return seal.NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	return seal.NewSoftwareStrategyWithParams(context.Background(), passphrase, 1, 64*1024, 1)
 }

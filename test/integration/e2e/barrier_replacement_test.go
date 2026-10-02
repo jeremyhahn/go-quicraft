@@ -17,6 +17,7 @@
 package e2e_test
 
 import (
+	"context"
 	"testing"
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
@@ -160,7 +161,7 @@ func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 		if cluster.stopped[i].Load() {
 			continue
 		}
-		newEpoch, err := b.Rotate()
+		newEpoch, err := b.Rotate(context.Background())
 		if err != nil {
 			t.Fatalf("barrier.Rotate[%d]: %v", i, err)
 		}

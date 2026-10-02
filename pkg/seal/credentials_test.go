@@ -30,7 +30,7 @@ import (
 // uncompilable, which the compiler proves. What it does not
 // prove is that NewCredentials — the only supported way to get from a caller's
 // bytes to that type — actually consumes those bytes rather than copying them.
-// A constructor that read `enclave.NewSealed(append([]byte(nil), secret...))`
+// A constructor that read `enclave.NewSealed(ctx, append([]byte(nil), secret...))`
 // would type-check, satisfy every other test in this package, and leave the
 // passphrase in the caller's slice for the collector to move around.
 //
@@ -40,7 +40,7 @@ import (
 // TestNewCredentials_ConsumesTheCallersPassphrase is the mutation target.
 //
 // Verified by mutation: changing NewCredentials to seal a COPY —
-// `enclave.NewSealed(append([]byte(nil), secret...))` — fails here with
+// `enclave.NewSealed(ctx, append([]byte(nil), secret...))` — fails here with
 //
 //	credentials_test.go:64: the caller's passphrase must be wiped by
 //	NewCredentials; byte 0 is 0x61 ("a-passphrase-worth-protecting" survived)
@@ -50,7 +50,7 @@ func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 	const passphrase = "a-passphrase-worth-protecting"
 	secret := []byte(passphrase)
 
-	creds, err := NewCredentials(secret)
+	creds, err := NewCredentials(context.Background(), secret)
 	if err != nil {
 		t.Fatalf("NewCredentials: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 	// And the other half of "consumed": the material is really in the credential,
 	// so the wipe above is a MOVE rather than a loss. A constructor that wiped and
 	// stored nothing would pass the loop and fail here.
-	opened, err := creds.Secret.Open()
+	opened, err := creds.Secret.Open(context.Background())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 // instead of reporting an allocation fault two layers down.
 func TestNewCredentials_RefusesEmpty(t *testing.T) {
 	for name, secret := range map[string][]byte{"nil": nil, "empty": {}} {
-		creds, err := NewCredentials(secret)
+		creds, err := NewCredentials(context.Background(), secret)
 		if !errors.Is(err, ErrInvalidPassphrase) {
 			t.Fatalf("NewCredentials(%s) = %v, want ErrInvalidPassphrase", name, err)
 		}
@@ -165,35 +165,5 @@ func TestCredentials_DeferredRoundTripThroughTheByteAPI(t *testing.T) {
 	defer wrong.Secret.Destroy()
 	if _, err := s.UnsealRootKey(ctx, sealed, wrong); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("UnsealRootKey with the wrong credential = %v, want ErrDecryptionFailed", err)
-	}
-}
-
-// TestCredentials_ProtectedAliasIsTheSameType pins that ProtectedCredentials
-// and Credentials are one type.
-//
-// ONE interface must not carry TWO credential types, because a reader can no
-// longer tell from a signature which one is the real contract.
-// ProtectedCredentials survives as an ALIAS so implementations that name it
-// still satisfy ProtectedSealingStrategy — a defined type would break every one
-// of them for no gain — and these assertions are what keep it an alias.
-var (
-	_ Credentials          = ProtectedCredentials{}
-	_ ProtectedCredentials = Credentials{}
-)
-
-func TestCredentials_ProtectedAliasIsTheSameType(t *testing.T) {
-	// Identity is proven at compile time above. What runs is that the deprecated
-	// constructor is the same function, so a caller on either name gets the same
-	// consume-the-source behaviour rather than two that could drift.
-	secret := []byte("a-passphrase-through-the-old-name")
-	creds, err := NewProtectedCredentials(secret)
-	if err != nil {
-		t.Fatalf("NewProtectedCredentials: %v", err)
-	}
-	defer creds.Secret.Destroy()
-	for i, b := range secret {
-		if b != 0 {
-			t.Fatalf("the deprecated constructor must consume its source too; byte %d is %#x", i, b)
-		}
 	}
 }

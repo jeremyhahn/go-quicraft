@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 
@@ -38,14 +39,14 @@ func shardEpochState(s *walShard) (minEpoch uint64, segEpochs map[uint64]uint64)
 func rotateBarrierTo(t *testing.T, db *DB, want uint64) {
 	t.Helper()
 	type rotator interface {
-		Rotate() (uint64, error)
+		Rotate(ctx context.Context) (uint64, error)
 	}
 	r, ok := db.barrier.(rotator)
 	if !ok {
 		t.Fatalf("barrier %T does not support Rotate", db.barrier)
 	}
 	for i := uint64(1); i < want; i++ {
-		if _, err := r.Rotate(); err != nil {
+		if _, err := r.Rotate(context.Background()); err != nil {
 			t.Fatalf("barrier.Rotate: %v", err)
 		}
 	}

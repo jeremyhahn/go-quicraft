@@ -24,6 +24,7 @@
 package seal_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -34,7 +35,7 @@ import (
 // symbol is present (this file compiles), and calling it fails closed with the
 // same error the absent Argon2id deriver gives everywhere else in a FIPS build.
 func TestFIPSBuildKeepsWithParamsConstructor(t *testing.T) {
-	s, err := seal.NewSoftwareStrategyWithParams([]byte("a-passphrase-long-enough-to-not-warn"), 4, 128*1024, 4)
+	s, err := seal.NewSoftwareStrategyWithParams(context.Background(), []byte("a-passphrase-long-enough-to-not-warn"), 4, 128*1024, 4)
 	if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
 		t.Fatalf("NewSoftwareStrategyWithParams in a FIPS build = %v, want ErrKDFUnsupportedVersion", err)
 	}
@@ -59,7 +60,7 @@ func TestFIPSBuildRefusesWithParamsBeforeValidation(t *testing.T) {
 		{"zero", 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := seal.NewSoftwareStrategyWithParams([]byte("a-passphrase-long-enough-to-not-warn"), tc.time, tc.memory, tc.threads); !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
+			if _, err := seal.NewSoftwareStrategyWithParams(context.Background(), []byte("a-passphrase-long-enough-to-not-warn"), tc.time, tc.memory, tc.threads); !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
 				t.Fatalf("NewSoftwareStrategyWithParams(%d, %d, %d) = %v, want ErrKDFUnsupportedVersion", tc.time, tc.memory, tc.threads, err)
 			}
 		})

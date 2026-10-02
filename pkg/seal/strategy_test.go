@@ -25,7 +25,7 @@ import (
 )
 
 func TestNewSoftwareStrategy_ValidPassphrase(t *testing.T) {
-	s, err := NewSoftwareStrategy([]byte("test-passphrase"))
+	s, err := NewSoftwareStrategy(context.Background(), []byte("test-passphrase"))
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategy returned unexpected error: %v", err)
 	}
@@ -38,14 +38,14 @@ func TestNewSoftwareStrategy_ValidPassphrase(t *testing.T) {
 }
 
 func TestNewSoftwareStrategy_EmptyPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategy([]byte{})
+	_, err := NewSoftwareStrategy(context.Background(), []byte{})
 	if !errors.Is(err, ErrInvalidPassphrase) {
 		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
 	}
 }
 
 func TestNewSoftwareStrategy_NilPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategy(nil)
+	_, err := NewSoftwareStrategy(context.Background(), nil)
 	if !errors.Is(err, ErrInvalidPassphrase) {
 		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
 	}
@@ -56,7 +56,7 @@ func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 	passphrase := make([]byte, len(original))
 	copy(passphrase, original)
 
-	s, err := NewSoftwareStrategy(passphrase)
+	s, err := NewSoftwareStrategy(context.Background(), passphrase)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategy returned unexpected error: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 	}
 
 	// Create a fresh strategy with the original passphrase to unseal.
-	s2, err := NewSoftwareStrategy(original)
+	s2, err := NewSoftwareStrategy(context.Background(), original)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategy returned unexpected error: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	defer s.Close()
 
 	// The passphrase should be stored in a sealed enclave.
-	buf, openErr := s.passphrase.Load().Open()
+	buf, openErr := s.passphrase.Load().Open(context.Background())
 	if openErr != nil {
 		t.Fatalf("passphrase.Open() failed: %v", openErr)
 	}
@@ -471,7 +471,7 @@ func TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 // --- FIPS KDF integration tests ---
 
 func TestNewSoftwareStrategyFIPS_Valid(t *testing.T) {
-	s, err := NewSoftwareStrategyFIPS([]byte("fips-passphrase"), 1000)
+	s, err := NewSoftwareStrategyFIPS(context.Background(), []byte("fips-passphrase"), 1000)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyFIPS returned unexpected error: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestNewSoftwareStrategyFIPS_Valid(t *testing.T) {
 }
 
 func TestNewSoftwareStrategyFIPS_EmptyPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategyFIPS(nil, 1000)
+	_, err := NewSoftwareStrategyFIPS(context.Background(), nil, 1000)
 	if !errors.Is(err, ErrInvalidPassphrase) {
 		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
 	}
@@ -494,7 +494,7 @@ func TestNewSoftwareStrategyFIPS_EmptyPassphrase(t *testing.T) {
 
 func TestSoftwareStrategyFIPS_SealUnsealRoundTrip(t *testing.T) {
 	passphrase := []byte("fips-round-trip-passphrase")
-	s, err := NewSoftwareStrategyFIPS(passphrase, 1000)
+	s, err := NewSoftwareStrategyFIPS(context.Background(), passphrase, 1000)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyFIPS returned unexpected error: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestSoftwareStrategy_KDFVersion(t *testing.T) {
 		t.Fatalf("expected KDF version %d, got %d", testKDFVersion, standard.KDFVersion())
 	}
 
-	fips, err := NewSoftwareStrategyFIPS([]byte("test"), 1000)
+	fips, err := NewSoftwareStrategyFIPS(context.Background(), []byte("test"), 1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -641,7 +641,7 @@ func TestSoftwareStrategy_IDAvailableHardwareBacked(t *testing.T) {
 }
 
 func TestSoftwareStrategyFIPS_UnsealWrongPassphrase(t *testing.T) {
-	correct, err := NewSoftwareStrategyFIPS([]byte("correct-fips"), 1000)
+	correct, err := NewSoftwareStrategyFIPS(context.Background(), []byte("correct-fips"), 1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -657,7 +657,7 @@ func TestSoftwareStrategyFIPS_UnsealWrongPassphrase(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	wrong, err := NewSoftwareStrategyFIPS([]byte("wrong-fips"), 1000)
+	wrong, err := NewSoftwareStrategyFIPS(context.Background(), []byte("wrong-fips"), 1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_FIPSToArgon2Defaults(t *test
 	t.Parallel()
 
 	// Create a FIPS strategy but present Argon2id metadata.
-	s, err := NewSoftwareStrategyFIPS([]byte("test"), 1000)
+	s, err := NewSoftwareStrategyFIPS(context.Background(), []byte("test"), 1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -785,7 +785,7 @@ func TestNewSoftwareStrategy_InvalidKDFVersion(t *testing.T) {
 	t.Parallel()
 
 	// Call the internal constructor with an invalid KDF version.
-	_, err := newSoftwareStrategy([]byte("test"), KDFVersion(0xFF), KDFParams{KeyLen: 32, SaltLen: 32})
+	_, err := newSoftwareStrategy(context.Background(), []byte("test"), KDFVersion(0xFF), KDFParams{KeyLen: 32, SaltLen: 32})
 	if !errors.Is(err, ErrKDFUnsupportedVersion) {
 		t.Fatalf("expected ErrKDFUnsupportedVersion, got %v", err)
 	}

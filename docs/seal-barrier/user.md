@@ -122,7 +122,7 @@ func main() {
 	}
 
 	passphrase := readPassphrase() // []byte you can wipe; see below
-	strategy, err := seal.NewSoftwareStrategy(passphrase)
+	strategy, err := seal.NewSoftwareStrategy(ctx, passphrase)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -180,7 +180,7 @@ value is already an immutable string in the process. Read it from a pipe, a
 prompt, or an agent socket if the distinction matters to you. A strategy bound
 at construction ignores `Credentials`; the deferred form reads
 `Credentials.Secret` per call, which is a `*enclave.SealedEnclave` built with
-`seal.NewCredentials(secret)`. That call moves the secret into protected memory
+`seal.NewCredentials(ctx, secret)`. That call moves the secret into protected memory
 and wipes the slice it was given; you destroy the credential when you are done.
 
 ## Recover from a failed first boot
@@ -247,7 +247,7 @@ its minimum live epoch from the engine and constructs the barrier afterwards.
 ## Rotate keys
 
 ```go
-newEpoch, err := barrier.Rotate()
+newEpoch, err := barrier.Rotate(ctx)
 ```
 
 Or let the host do it on a schedule with `HostConfig.KeyRotationInterval` (24h
@@ -264,7 +264,7 @@ their epoch's DEK until compaction deletes them.
 
 ```go
 minEpoch := min(minWALEpoch, minSnapshotEpoch, minInFlightEpoch)
-n, err := barrier.PurgeEpochsBefore(minEpoch)
+n, err := barrier.PurgeEpochsBefore(ctx, minEpoch)
 ```
 
 **Do this.** It is not housekeeping. Every restart without an injected

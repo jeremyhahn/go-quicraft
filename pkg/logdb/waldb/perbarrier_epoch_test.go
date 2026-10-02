@@ -15,6 +15,7 @@
 package waldb
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -38,7 +39,7 @@ func TestMinLiveEpochForBarrier_IdentityMatch(t *testing.T) {
 	if err := db.SaveEntries(1, 1, makeEntries(1, 5, 1)); err != nil {
 		t.Fatalf("SaveEntries (epoch 1): %v", err)
 	}
-	if _, err := own.Rotate(); err != nil {
+	if _, err := own.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	if err := db.SaveEntries(1, 1, makeEntries(6, 5, 1)); err != nil {

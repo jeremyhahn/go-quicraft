@@ -14,6 +14,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are re-exported from `pkg`, so membership-add and `StartShard` rejections
   match with `errors.Is` / `errors.As`.
 
+### Changed
+
+- **BREAKING**: every exported function that seals material into, or opens it
+  from, a go-enclave `SealedEnclave` takes a leading `ctx context.Context` and
+  passes it to go-enclave, whose process sealer may be backed by a provider
+  that blocks. The changed signatures:
+  - `seal.NewCredentials(ctx, secret)` and `crypto.NewCredentials(ctx, secret)`
+  - `seal.NewSoftwareStrategy(ctx, passphrase)`,
+    `seal.NewSoftwareStrategyWithParams(ctx, passphrase, time, memory, threads)`
+    and `seal.NewSoftwareStrategyFIPS(ctx, passphrase, iterations)`
+  - `(*seal.Barrier).Rotate(ctx)` and `(*seal.Barrier).PurgeEpochsBefore(ctx, minEpoch)`
+  - `(*seal.Barrier).RootKey(ctx)`, `(*seal.Barrier).RootKeyProtected(ctx)` and
+    `(*seal.Barrier).StampSealedStateMAC(ctx, sealed)`
+  - `Rotate(ctx)` and `PurgeEpochsBefore(ctx, minEpoch)` on the exported
+    `quicraft.Barrier` interface. A custom `Barrier` implementation must add
+    the context parameter to both methods.
+
+  A context that has ended fails the call with an error matching both the
+  go-enclave sentinel (`enclave.ErrSealFailed` for a seal,
+  `enclave.ErrOpenFailed` for an open) and `ctx.Err()`. The `SealingStrategy`
+  methods already took a context; `SoftwareStrategy` now passes it on instead
+  of ignoring it. The deferred `NewDeferredSoftwareStrategy*` constructors hold
+  no passphrase and are unchanged.
+- **BREAKING**: go-enclave is v0.7.0-alpha (was v0.6.2-alpha). What changes for
+  an embedder that uses go-enclave alongside this library:
+  - `enclave.NewSealed`, `SealedEnclave.Open` and `SealedEnclave.OpenWith` take
+    a leading context, and `WipeAll` takes one and returns a typed
+    `*SweepError`.
+  - `SealedEnclave.Open` and `OpenWith` return a FROZEN enclave. Code that wrote
+    into an opened enclave must copy into its own sized enclave instead; a write
+    now faults. `Barrier.RootKeyProtected` returns `Open`'s result as it is,
+    still frozen.
+  - `MemoryEnclave.Destroy` returns an error and `DestroyErr` is gone.
+    `ErrReleasedWithoutWipe` (pages unmapped without a wipe) and
+    `ErrLockedMemoryUnavailable` (release refused, pages still held) no longer
+    overlap. A bare `defer e.Destroy()` still compiles and discards the report.
+    This library's own cleanup paths log it at WARN in `pkg/seal` and drop it in
+    `pkg/crypto/shamir`, where `ProtectedShare.Destroy` still returns nothing.
+  - `ErrSealerWiped` means the sealer's hierarchy is dead; a per-call key
+    destroyed by a concurrent sweep is `ErrEnclaveDestroyed`. `ErrOpenFailed`
+    is new.
+  - `SealedEnclave.Destroy` no longer waits for an `Open` in flight.
+  - `github.com/awnumar/memcall` is no longer in the dependency graph.
+- The rotation `Unseal` forces when the loaded epoch's invocation budget cannot
+  be recovered runs on `context.WithoutCancel` of the unseal's context, so the
+  caller's cancellation cannot leave an unsealed barrier refusing to encrypt.
+- The host's key-rotation loop rotates and purges under a context it cancels
+  when `Close` stops the loop, and the snapshot pool purges under one it
+  cancels when the pool stops, so a sealer blocked in a provider call cannot
+  hold shutdown open. A rotation or purge abandoned this way — its error
+  matches the cancelled context's `ctx.Err()` — is logged at DEBUG; nothing is
+  persisted and the current epoch stays active. A failure of its own that only
+  happens to surface during shutdown (a missing state persister, a
+  `*StatePersistError`, `ErrBarrierSuperseded`) keeps its normal level: ERROR
+  for the host's rotation and post-rotation purge, WARN for the snapshot pool's
+  purge.
+- `Barrier.Unseal` does not count a cancelled or timed-out attempt against the
+  brute-force backoff. A context that has already ended is refused before the
+  strategy runs, and a strategy error caused by the context ending is returned
+  without incrementing the failed-attempt counter or writing the backoff state
+  — unless it also carries an authentication verdict
+  (`enclave.ErrSealedAuthentication` or `seal.ErrDecryptionFailed`), which
+  counts as before, so cancelling cannot be used to try a credential for free.
+- A passphrase `Open` that fails with `ErrEnclaveDestroyed` is reported as
+  `seal.ErrStrategyClosed` only when the passphrase enclave itself is gone. A
+  per-call enclave destroyed by a concurrent `WipeAll` while the passphrase is
+  intact now stays `ErrEnclaveDestroyed`.
+- Dependencies updated to their current releases: `prometheus/common` v0.72.0,
+  `prometheus/procfs` v0.22.0 and `golang.org/x/net` v0.59.0 across every
+  module, and the dragonboat benchmark's transitive dependencies (Pebble's
+  `cockroachdb/*` modules, `klauspost/compress` v1.20.1, `DataDog/zstd`
+  v1.5.7, `hashicorp/memberlist` v0.7.0 and others). The dragonboat fork stays
+  at v4.0.1, its newest tag.
+- `scripts/deps-check.sh` skips the directories the go tool ignores (names
+  starting with `.` or `_`, and `testdata`), the rule `make ci-modules` uses, so
+  it no longer walks agent worktrees under `.claude/`.
+
+### Removed
+
+- **BREAKING**: `seal.ProtectedCredentials` and `seal.NewProtectedCredentials`,
+  the aliases deprecated in favour of `seal.Credentials` and
+  `seal.NewCredentials`. They were the same type and function; rename the
+  references.
+
 ### Fixed
 
 - `make test-snapshot` now runs the snapshot tests across `./pkg/...` instead

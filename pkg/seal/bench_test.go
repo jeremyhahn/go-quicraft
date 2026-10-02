@@ -151,7 +151,7 @@ func BenchmarkBarrier_Rotate(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _ = barrier.Rotate()
+		_, _ = barrier.Rotate(context.Background())
 	}
 }
 

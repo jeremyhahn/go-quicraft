@@ -15,6 +15,7 @@
 package crypto
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -141,7 +142,7 @@ func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
 // source slice is CONSUMED.
 func TestNewCredentialsReexport(t *testing.T) {
 	secret := []byte("a-passphrase-long-enough-to-pass")
-	creds, err := NewCredentials(secret)
+	creds, err := NewCredentials(context.Background(), secret)
 	if err != nil {
 		t.Fatalf("NewCredentials: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestNewCredentialsReexport(t *testing.T) {
 		t.Fatal("the re-exported constructor did not produce a seal.Credentials")
 	}
 
-	if _, err := NewCredentials(nil); !errors.Is(err, seal.ErrInvalidPassphrase) {
+	if _, err := NewCredentials(context.Background(), nil); !errors.Is(err, seal.ErrInvalidPassphrase) {
 		t.Fatalf("NewCredentials(nil) = %v, want seal.ErrInvalidPassphrase", err)
 	}
 }

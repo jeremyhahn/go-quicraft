@@ -43,13 +43,13 @@ func TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge(t *testing.T) {
 
 	// The interleaving that would orphan the frame: rotate twice past
 	// the sealed epoch, then purge everything below the new current epoch.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
-	if _, err := b.PurgeEpochsBefore(b.CurrentEpoch()); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), b.CurrentEpoch()); err != nil {
 		t.Fatalf("PurgeEpochsBefore: %v", err)
 	}
 
@@ -98,14 +98,14 @@ func TestEncryptWithEpochPinned_BalancesRefcount(t *testing.T) {
 func TestPurgeEpochsBefore_SyncsSealedKnownEpochs(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 
-	if _, err := b.Rotate(); err != nil { // epoch 2
+	if _, err := b.Rotate(context.Background()); err != nil { // epoch 2
 		t.Fatalf("Rotate: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil { // epoch 3
+	if _, err := b.Rotate(context.Background()); err != nil { // epoch 3
 		t.Fatalf("Rotate: %v", err)
 	}
 
-	purged, err := b.PurgeEpochsBefore(3)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 3)
 	if err != nil {
 		t.Fatalf("PurgeEpochsBefore: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestUnseal_MultiEpochRederivation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encrypt epoch 1: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	ct2, epoch2, err := b.EncryptWithEpoch(nil, []byte("epoch-two-data"))
@@ -286,7 +286,7 @@ func TestRotate_PersistsNewEpochBeforeActivating(t *testing.T) {
 	b, s, p := testPersistingBarrier(t)
 	defer s.Close()
 
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestRotate_PersisterFailureAbortsRotation(t *testing.T) {
 	before := b.CurrentEpoch()
 	countBefore := b.invocations.Count()
 
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("Rotate error = %v, want wrapped %v", err, sentinel)
 	}
@@ -385,7 +385,7 @@ func TestRotate_WithoutPersisterFailsClosed(t *testing.T) {
 		t.Fatalf("Initialize: %v", err)
 	}
 
-	if _, err := b.Rotate(); !errors.Is(err, ErrNoStatePersister) {
+	if _, err := b.Rotate(context.Background()); !errors.Is(err, ErrNoStatePersister) {
 		t.Fatalf("Rotate = %v, want ErrNoStatePersister", err)
 	}
 	if b.CurrentEpoch() != 1 {
@@ -410,7 +410,7 @@ func TestRotate_DataSurvivesRestartFromPersistedBlob(t *testing.T) {
 	b, s, p := testPersistingBarrier(t)
 	defer s.Close()
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	ct, epoch, err := b.EncryptWithEpoch(nil, []byte("post-rotation-payload"))
@@ -451,7 +451,7 @@ func TestPurgeEpochsBefore_WithoutPersisterFailsClosed(t *testing.T) {
 	b, s, p := testPersistingBarrier(t)
 	defer s.Close()
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -460,7 +460,7 @@ func TestPurgeEpochsBefore_WithoutPersisterFailsClosed(t *testing.T) {
 	b.config.StatePersister = nil
 	b.mu.Unlock()
 
-	if _, err := b.PurgeEpochsBefore(2); !errors.Is(err, ErrNoStatePersister) {
+	if _, err := b.PurgeEpochsBefore(context.Background(), 2); !errors.Is(err, ErrNoStatePersister) {
 		t.Fatalf("PurgeEpochsBefore = %v, want ErrNoStatePersister", err)
 	}
 	b.mu.RLock()
@@ -471,7 +471,7 @@ func TestPurgeEpochsBefore_WithoutPersisterFailsClosed(t *testing.T) {
 	}
 
 	// A no-op purge is allowed without a persister.
-	purged, err := b.PurgeEpochsBefore(1)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 1)
 	if err != nil || purged != 0 {
 		t.Fatalf("no-op PurgeEpochsBefore = (%d, %v), want (0, nil)", purged, err)
 	}
@@ -481,7 +481,7 @@ func TestPurgeEpochsBefore_WithoutPersisterFailsClosed(t *testing.T) {
 	b.mu.Lock()
 	b.config.StatePersister = p.persist
 	b.mu.Unlock()
-	purged, err = b.PurgeEpochsBefore(2)
+	purged, err = b.PurgeEpochsBefore(context.Background(), 2)
 	if err != nil || purged != 1 {
 		t.Fatalf("PurgeEpochsBefore = (%d, %v), want (1, nil)", purged, err)
 	}
@@ -501,7 +501,7 @@ func TestPurgeEpochsBefore_PersisterFailureRetainsDEKs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncryptWithEpoch: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -510,7 +510,7 @@ func TestPurgeEpochsBefore_PersisterFailureRetainsDEKs(t *testing.T) {
 	p.err = sentinel
 	p.mu.Unlock()
 
-	purged, err := b.PurgeEpochsBefore(2)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 2)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("PurgeEpochsBefore error = %v, want wrapped %v", err, sentinel)
 	}
@@ -647,7 +647,7 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 	if sealed.HKDFVersion != currentHKDFVersion {
 		t.Fatalf("Initialize stamped HKDFVersion %d, want %d", sealed.HKDFVersion, currentHKDFVersion)
 	}
-	rootKey, err := b.RootKey()
+	rootKey, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}
@@ -679,7 +679,7 @@ func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
 	b2.mu.RLock()
 	dek := b2.deks[legacy.Epoch]
 	b2.mu.RUnlock()
-	buf, err := dek.Open()
+	buf, err := dek.Open(context.Background())
 	if err != nil {
 		t.Fatalf("open DEK: %v", err)
 	}

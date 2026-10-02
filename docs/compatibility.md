@@ -337,7 +337,7 @@ A blob with no MAC at all is refused with `ErrSealedStateUnauthenticated`.
 Accepting an absent MAC would be a downgrade an attacker triggers by deleting
 the field. Embedders that re-wrap the root key themselves (password change,
 rekey, key import, Shamir re-split) must stamp the MAC last, after the
-ciphertext: `(*Barrier).StampSealedStateMAC(sealed)` with the barrier unsealed,
+ciphertext: `(*Barrier).StampSealedStateMAC(ctx, sealed)` with the barrier unsealed,
 or `StampSealedStateMACWithRootKey(rootKey, deploymentID, sealed)` when only the
 root key is in hand.
 
@@ -547,6 +547,7 @@ this table summarises them.
 
 | Target | Data directories | What changes for an embedder |
 |---|---|---|
+| **0.17.0** (unreleased) | carry over from 0.16.0; no format changed | API break, no format change. `seal.NewCredentials`, `crypto.NewCredentials`, `seal.NewSoftwareStrategy`, `NewSoftwareStrategyWithParams`, `NewSoftwareStrategyFIPS`, and `(*Barrier).Rotate`, `PurgeEpochsBefore`, `RootKey`, `RootKeyProtected` and `StampSealedStateMAC` take a leading `context.Context`; so do `Rotate` and `PurgeEpochsBefore` on the `quicraft.Barrier` interface, so a custom `Barrier` must add it. `seal.ProtectedCredentials` and `seal.NewProtectedCredentials` are removed: use `Credentials` and `NewCredentials`. go-enclave is v0.7.0-alpha: `NewSealed` and `SealedEnclave.Open`/`OpenWith` take a context, `Open` returns a frozen enclave (copy into your own sized enclave to write), and `MemoryEnclave.Destroy` returns an error (`DestroyErr` is gone). |
 | **0.16.0** | carry over from 0.16.0-alpha (identical code) | release candidate; nothing beyond 0.16.0-alpha |
 | **0.16.0-alpha** | carry over from 0.15.x; no format changed | No API removed. `ConcurrentStateMachine` and `DiskStateMachine` now see `Lookup` and `GetHash` concurrently with `Update`, as documented: synchronise them and hash whole batches in `GetHash`. `UnmarshalShareSet` returns `*ProtectedMemoryError` when the kernel refuses a lock. A replica's observer role follows committed membership, so a promoted observer becomes a voter without a restart. Added `ErrRemovedMemberIdentity`. |
 | **0.15.0-alpha** | **wipe**: hard-state record moved `0x02` → `0x0d` (adds `VoteWindow`); `0x06` retired | `logdb.LogDB` gains `NodeRemoved`. `RemoveData` retires the replica ID for good; a replica that rejoins needs a new ID. Exported artifacts carry a trailer; artifacts from earlier builds are refused, so re-export them. |

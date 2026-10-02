@@ -35,7 +35,7 @@ defer secret.Destroy()
 var creds seal.Credentials
 if err := secret.WithBytes(func(b []byte) error {
 	var err error
-	creds, err = seal.NewCredentials(append([]byte(nil), b...)) // consumes the copy
+	creds, err = seal.NewCredentials(ctx, append([]byte(nil), b...)) // consumes the copy
 	return err
 }); err != nil {
 	return err

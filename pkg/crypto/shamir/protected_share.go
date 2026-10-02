@@ -98,6 +98,40 @@ func lockSized(a *enclave.Allocator, n int) (*enclave.MemoryEnclave, error) {
 	return a.NewSized(n)
 }
 
+// release destroys an enclave on a cleanup path whose outcome is already
+// decided, and deliberately drops go-enclave's report of a refused release.
+//
+// Every caller is either a scratch buffer of a call that has produced its
+// result, or a partial result being torn down on the way to returning the
+// error that caused the teardown. Neither can do anything useful with a second
+// error: replacing the result would discard material the caller owns, and
+// replacing the error would hide the failure that matters. Dropping the report
+// changes nothing about the material; what that material's state is after a
+// refusal depends on whether the region was frozen:
+//
+//   - A WRITABLE region is wiped before any step the kernel can refuse, so a
+//     refused munlock or munmap holds pages that are already zero, on
+//     go-enclave's WipeAll ledger for a later retry.
+//   - A FROZEN region (every finished share value and recovered secret this
+//     package hands out, and under go-enclave v0.7 every buffer
+//     SealedEnclave.Open returns) must be made writable before it can be wiped. A denied mprotect falls back to a bare
+//     unmap and ErrReleasedWithoutWipe — no in-process wipe, but the pages are
+//     gone and the kernel zeroes them before reuse. If that unmap is refused
+//     too, the mapping stays held UNWIPED — read-only and mlock'd, never
+//     swapped, but still holding the material — on the WipeAll ledger until a
+//     later Destroy or a shutdown WipeAll releases it.
+//
+// So a refused release of a frozen region is not a wipe, and the WipeAll at
+// shutdown is what bounds it. This package is a primitive with no logger; a
+// consumer that must observe a refused release holds the enclave itself and
+// checks what Destroy returns.
+//
+// Detected canary corruption still panics inside Destroy, as go-enclave
+// documents; that is not dropped here.
+func release(e *enclave.MemoryEnclave) {
+	_ = e.Destroy()
+}
+
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
 // function restoring the previous one. It PANICS outside a test binary.
 func testOnlyProtectedMemory(fn func([]byte) (*enclave.MemoryEnclave, error)) func() {
@@ -571,7 +605,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient memory", Err: err}
 	}
-	defer randCoeffs.Destroy()
+	defer release(randCoeffs)
 	rc, err := randCoeffs.Open()
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "opening coefficient memory", Err: err}
@@ -587,7 +621,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
 	}
-	defer coeffs.Destroy()
+	defer release(coeffs)
 	cf, err := coeffs.Open()
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "opening coefficient vector", Err: err}
@@ -600,7 +634,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking share payload", Err: err}
 	}
-	defer raw.Destroy()
+	defer release(raw)
 	rw, err := raw.Open()
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "opening share payload", Err: err}
@@ -649,7 +683,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 			base64.StdEncoding.Encode(sb, rw)
 			return nil
 		}); err != nil {
-			value.Destroy()
+			release(value)
 			return nil, failed("encoding share value", err)
 		}
 		// A refused freeze leaves the region alive and WRITABLE. A share whose
@@ -657,7 +691,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 		// Value documents the buffer as read-only and callers rely on a stray
 		// write faulting — so it is torn down rather than returned.
 		if err := value.Freeze(); err != nil {
-			value.Destroy()
+			release(value)
 			return nil, failed("freezing share value", err)
 		}
 		shares = append(shares, &ProtectedShare{
@@ -813,7 +847,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking decode buffer", Err: err}
 	}
-	defer buf.Destroy()
+	defer release(buf)
 
 	// Materialized HERE, outside every WithValue below. buf is created in this
 	// function and never escapes it, so no other goroutine can destroy it while
@@ -872,7 +906,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	// Materialized outside the borrow for the same reason as bufBytes above.
 	secretBytes, err := secret.Open()
 	if err != nil {
-		secret.Destroy()
+		release(secret)
 		return nil, &ProtectedMemoryError{Op: "opening secret buffer", Err: err}
 	}
 	for i, share := range shares {
@@ -888,7 +922,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 			accumulateShareInto(secretBytes, bufBytes[rawShareOverhead:n], basis[i])
 			return nil
 		}); werr != nil {
-			secret.Destroy()
+			release(secret)
 			return nil, werr
 		}
 	}
@@ -901,7 +935,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	// A refused freeze is destroyed rather than returned: the caller is promised
 	// material it can read and destroy, not a buffer it can silently corrupt.
 	if ferr := secret.Freeze(); ferr != nil {
-		secret.Destroy()
+		release(secret)
 		return nil, &ProtectedMemoryError{Op: "freezing reconstructed secret", Err: ferr}
 	}
 	return secret, nil
@@ -974,11 +1008,15 @@ func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
 // allocation for the life of the process; nothing reclaims it, because the
 // wipe is the whole point and a finalizer that ran at the collector's
 // convenience would not be one.
+//
+// A release the kernel refuses is not reported: Destroy returns nothing, and the
+// refused mapping stays on go-enclave's WipeAll ledger for a later retry. See
+// release for why dropping that report loses no material.
 func (s *ProtectedShare) Destroy() {
 	if s == nil || s.value == nil {
 		return
 	}
-	s.value.Destroy()
+	release(s.value)
 }
 
 // Validate checks that the share has valid parameters and still holds a value.

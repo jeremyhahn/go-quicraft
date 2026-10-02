@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5 // indirect
+	github.com/cockroachdb/datadriven v1.0.3 // indirect
 	// go-quicraft is here only for test/netport, which benchutil uses for port
 	// reservation. A replace binds the main module only, so the pair repeats
 	// in every module that reaches benchutil. MVS reads go-quicraft's whole

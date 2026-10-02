@@ -398,7 +398,7 @@ func TestBarrier_Rotate_HardwareMode(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	_, err := b.Rotate()
+	_, err := b.Rotate(context.Background())
 	if !errors.Is(err, ErrHardwareMode) {
 		t.Fatalf("expected ErrHardwareMode from Rotate in hardware mode, got %v", err)
 	}
@@ -415,7 +415,7 @@ func TestBarrier_PurgeEpochsBefore_HardwareMode(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	_, err := b.PurgeEpochsBefore(1)
+	_, err := b.PurgeEpochsBefore(context.Background(), 1)
 	if !errors.Is(err, ErrHardwareMode) {
 		t.Fatalf("expected ErrHardwareMode from PurgeEpochsBefore in hardware mode, got %v", err)
 	}
@@ -649,7 +649,7 @@ func TestCredentials_WithSecret(t *testing.T) {
 	c := mustCreds(t, "my-secret")
 	defer c.Secret.Destroy()
 
-	opened, err := c.Secret.Open()
+	opened, err := c.Secret.Open(context.Background())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

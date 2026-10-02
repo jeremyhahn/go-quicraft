@@ -202,7 +202,7 @@ func TestBarrier_RootKeyInEnclave(t *testing.T) {
 	defer s.Close()
 
 	// Root key should be accessible via Open().
-	buf, err := b.rootKey.Open()
+	buf, err := b.rootKey.Open(context.Background())
 	if err != nil {
 		t.Fatalf("rootKey.Open() failed: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestBarrier_RootKeyInEnclave(t *testing.T) {
 	buf.Destroy()
 
 	// Root key returned by RootKey() should match.
-	rk, err := b.RootKey()
+	rk, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey() failed: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestBarrier_DEKsInEnclaves(t *testing.T) {
 	defer s.Close()
 
 	// Current DEK should be in an enclave.
-	buf, err := b.currentDEK.Open()
+	buf, err := b.currentDEK.Open(context.Background())
 	if err != nil {
 		t.Fatalf("currentDEK.Open() failed: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestBarrier_DEKsInEnclaves(t *testing.T) {
 
 	// All epoch DEKs should be in enclaves.
 	for epoch, pk := range b.deks {
-		buf, err := pk.Open()
+		buf, err := pk.Open(context.Background())
 		if err != nil {
 			t.Fatalf("deks[%d].Open() failed: %v", epoch, err)
 		}
@@ -254,13 +254,13 @@ func TestBarrier_RotateOpensEnclave(t *testing.T) {
 	defer s.Close()
 
 	// Capture the root key for comparison.
-	rkBefore, err := b.RootKey()
+	rkBefore, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey() failed: %v", err)
 	}
 	defer enclave.Wipe(rkBefore)
 
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestBarrier_RotateOpensEnclave(t *testing.T) {
 	}
 
 	// Root key should be unchanged after rotate.
-	rkAfter, err := b.RootKey()
+	rkAfter, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey() after rotate failed: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestBarrier_RotateOpensEnclave(t *testing.T) {
 	if !ok {
 		t.Fatalf("deks[%d] not found", newEpoch)
 	}
-	buf, err := pk.Open()
+	buf, err := pk.Open(context.Background())
 	if err != nil {
 		t.Fatalf("deks[%d].Open() failed: %v", newEpoch, err)
 	}
@@ -659,7 +659,7 @@ func TestBarrier_Rotate(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
 
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
@@ -680,7 +680,7 @@ func TestBarrier_RotateWhenSealed(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	_, err := b.Rotate()
+	_, err := b.Rotate(context.Background())
 	if !errors.Is(err, ErrBarrierSealed) {
 		t.Fatalf("expected ErrBarrierSealed, got %v", err)
 	}
@@ -691,7 +691,7 @@ func TestBarrier_RotateMultipleTimes(t *testing.T) {
 	defer s.Close()
 
 	for i := uint64(2); i <= 5; i++ {
-		epoch, err := b.Rotate()
+		epoch, err := b.Rotate(context.Background())
 		if err != nil {
 			t.Fatalf("Rotate to epoch %d failed: %v", i, err)
 		}
@@ -717,7 +717,7 @@ func TestBarrier_RotateAndDecryptOldData(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -818,15 +818,15 @@ func TestBarrier_PurgeEpochsBefore(t *testing.T) {
 		t.Fatalf("Encrypt at epoch 1 failed: %v", err)
 	}
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 2 failed: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 3 failed: %v", err)
 	}
 
 	// Purge epochs before 2 (removes epoch 1).
-	purged, err := b.PurgeEpochsBefore(2)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 2)
 	if err != nil {
 		t.Fatalf("PurgeEpochsBefore failed: %v", err)
 	}
@@ -863,7 +863,7 @@ func TestBarrier_PurgeEpochsBeforeWhenSealed(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	_, err := b.PurgeEpochsBefore(1)
+	_, err := b.PurgeEpochsBefore(context.Background(), 1)
 	if !errors.Is(err, ErrBarrierSealed) {
 		t.Fatalf("expected ErrBarrierSealed, got %v", err)
 	}
@@ -874,7 +874,7 @@ func TestBarrier_PurgeEpochsBeforeCurrentEpoch(t *testing.T) {
 	defer s.Close()
 
 	// Trying to purge with minEpoch > current epoch.
-	_, err := b.PurgeEpochsBefore(100)
+	_, err := b.PurgeEpochsBefore(context.Background(), 100)
 	if !errors.Is(err, ErrPurgeCurrentEpoch) {
 		t.Fatalf("expected ErrPurgeCurrentEpoch, got %v", err)
 	}
@@ -885,12 +885,12 @@ func TestBarrier_PurgeEpochsPreservesCurrentEpoch(t *testing.T) {
 	defer s.Close()
 
 	// Rotate to have multiple epochs.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
 	// Purge all before current. The current epoch must be preserved.
-	if _, err := b.PurgeEpochsBefore(b.CurrentEpoch()); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), b.CurrentEpoch()); err != nil {
 		t.Fatalf("PurgeEpochsBefore failed: %v", err)
 	}
 
@@ -923,7 +923,7 @@ func TestBarrier_RegisterDeregisterInFlightEpoch(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -931,7 +931,7 @@ func TestBarrier_RegisterDeregisterInFlightEpoch(t *testing.T) {
 	b.RegisterInFlightEpoch(1)
 
 	// Purge before 2 should skip epoch 1 because it is in-flight.
-	if _, err := b.PurgeEpochsBefore(2); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), 2); err != nil {
 		t.Fatalf("PurgeEpochsBefore failed: %v", err)
 	}
 
@@ -948,7 +948,7 @@ func TestBarrier_RegisterDeregisterInFlightEpoch(t *testing.T) {
 	b.DeregisterInFlightEpoch(1)
 
 	// Now purge should remove epoch 1.
-	if _, err := b.PurgeEpochsBefore(2); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), 2); err != nil {
 		t.Fatalf("PurgeEpochsBefore after deregister failed: %v", err)
 	}
 
@@ -963,7 +963,7 @@ func TestBarrier_MultipleInFlightRegistrations(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -1226,7 +1226,7 @@ func TestBarrier_ConcurrentEncryptAndRotate(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			if _, err := b.Rotate(); err != nil {
+			if _, err := b.Rotate(context.Background()); err != nil {
 				errCh <- err
 				return
 			}
@@ -1700,7 +1700,7 @@ func TestBarrier_EncryptDecryptAfterSealUnsealCycle(t *testing.T) {
 
 	// Rotate a few times.
 	for i := 0; i < 3; i++ {
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate failed: %v", err)
 		}
 	}
@@ -1745,7 +1745,7 @@ func TestBarrier_UnsealReDerivesOldEpochDEKs(t *testing.T) {
 	}
 
 	// Rotate to epoch 2 and encrypt.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 2 failed: %v", err)
 	}
 	plaintext2 := []byte("epoch 2 data across seal/unseal")
@@ -1755,7 +1755,7 @@ func TestBarrier_UnsealReDerivesOldEpochDEKs(t *testing.T) {
 	}
 
 	// Rotate to epoch 3 and encrypt.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 3 failed: %v", err)
 	}
 	plaintext3 := []byte("epoch 3 data across seal/unseal")
@@ -1849,7 +1849,7 @@ func TestBarrier_EncryptWithEpochAfterRotation(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -2443,7 +2443,7 @@ func TestBarrier_RotateSealUnsealDecryptForEpoch(t *testing.T) {
 	}
 
 	// Rotate to epoch 2 and encrypt.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 	pt2 := []byte("epoch-2-data")
@@ -2489,7 +2489,7 @@ func TestBarrier_PurgeSkipsInFlightEpochs(t *testing.T) {
 
 	// Rotate to epochs 2, 3, 4.
 	for i := 0; i < 3; i++ {
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate failed: %v", err)
 		}
 	}
@@ -2499,7 +2499,7 @@ func TestBarrier_PurgeSkipsInFlightEpochs(t *testing.T) {
 	b.RegisterInFlightEpoch(1)
 
 	// Purge before 4: should skip epoch 1 (in-flight) but remove 2 and 3.
-	if _, err := b.PurgeEpochsBefore(4); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), 4); err != nil {
 		t.Fatalf("PurgeEpochsBefore failed: %v", err)
 	}
 
@@ -2652,7 +2652,7 @@ func TestBarrier_RotateUpdatesSealedEpoch(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
@@ -2667,7 +2667,7 @@ func TestBarrier_RotateUpdatesSealedEpoch(t *testing.T) {
 	}
 
 	// Rotate again to epoch 3.
-	newEpoch, err = b.Rotate()
+	newEpoch, err = b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate to 3 failed: %v", err)
 	}
@@ -2703,7 +2703,7 @@ func TestBarrier_RotateUpdatesSealedEpoch_WhenSealed(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 
-	_, err := b.Rotate()
+	_, err := b.Rotate(context.Background())
 	if !errors.Is(err, ErrBarrierSealed) {
 		t.Fatalf("expected ErrBarrierSealed, got %v", err)
 	}
@@ -2729,7 +2729,7 @@ func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
 	}
 
 	// Rotate to epoch 2, encrypt.
-	if _, err := b1.Rotate(); err != nil {
+	if _, err := b1.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 2 failed: %v", err)
 	}
 	pt2 := []byte("epoch-2-payload")
@@ -2739,7 +2739,7 @@ func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
 	}
 
 	// Rotate to epoch 3, encrypt.
-	if _, err := b1.Rotate(); err != nil {
+	if _, err := b1.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 3 failed: %v", err)
 	}
 	pt3 := []byte("epoch-3-payload")
@@ -2843,7 +2843,7 @@ func TestBarrier_EpochAADPreventsCrossEpochSplice(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -2882,7 +2882,7 @@ func TestBarrier_EpochAADPreventsCrossEpochSpliceViaDecryptForEpoch(t *testing.T
 	}
 
 	// Rotate to epoch 2.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
@@ -3226,7 +3226,7 @@ func TestBarrier_RootKey(t *testing.T) {
 		b, s := testInitializedBarrier(t)
 		defer s.Close()
 
-		key1, err := b.RootKey()
+		key1, err := b.RootKey(context.Background())
 		if err != nil {
 			t.Fatalf("RootKey failed: %v", err)
 		}
@@ -3235,7 +3235,7 @@ func TestBarrier_RootKey(t *testing.T) {
 		}
 
 		// Verify a second call returns equal but independent copy.
-		key2, err := b.RootKey()
+		key2, err := b.RootKey(context.Background())
 		if err != nil {
 			t.Fatalf("second RootKey call failed: %v", err)
 		}
@@ -3258,7 +3258,7 @@ func TestBarrier_RootKey(t *testing.T) {
 			t.Fatalf("Seal failed: %v", err)
 		}
 
-		_, err := b.RootKey()
+		_, err := b.RootKey(context.Background())
 		if !errors.Is(err, ErrBarrierSealed) {
 			t.Fatalf("expected ErrBarrierSealed, got %v", err)
 		}
@@ -3267,7 +3267,7 @@ func TestBarrier_RootKey(t *testing.T) {
 	t.Run("ReturnsErrorWhenUninitialized", func(t *testing.T) {
 		b := MustNewBarrier(DefaultBarrierConfig(1))
 
-		_, err := b.RootKey()
+		_, err := b.RootKey(context.Background())
 		if !errors.Is(err, ErrBarrierSealed) {
 			t.Fatalf("expected ErrBarrierSealed for uninitialized barrier, got %v", err)
 		}
@@ -3282,7 +3282,7 @@ func TestBarrier_PurgeEpochsBeforeReturnsCount(t *testing.T) {
 
 	// Create epochs 1, 2, 3, 4, 5.
 	for i := 0; i < 4; i++ {
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate %d failed: %v", i+1, err)
 		}
 	}
@@ -3291,7 +3291,7 @@ func TestBarrier_PurgeEpochsBeforeReturnsCount(t *testing.T) {
 	}
 
 	// Purge epochs before 4 (should remove 1, 2, 3 = 3 epochs).
-	purged, err := b.PurgeEpochsBefore(4)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 4)
 	if err != nil {
 		t.Fatalf("PurgeEpochsBefore failed: %v", err)
 	}
@@ -3300,7 +3300,7 @@ func TestBarrier_PurgeEpochsBeforeReturnsCount(t *testing.T) {
 	}
 
 	// Purge again with the same threshold: nothing more to remove.
-	purged, err = b.PurgeEpochsBefore(4)
+	purged, err = b.PurgeEpochsBefore(context.Background(), 4)
 	if err != nil {
 		t.Fatalf("second PurgeEpochsBefore failed: %v", err)
 	}
@@ -3314,15 +3314,15 @@ func TestBarrier_PurgeEpochsBeforeZeroEpochNothingRemoved(t *testing.T) {
 	defer s.Close()
 
 	// Rotate to have epochs 1, 2, 3.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 2 failed: %v", err)
 	}
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate to 3 failed: %v", err)
 	}
 
 	// Purge with epoch 0 means nothing before 0 exists.
-	purged, err := b.PurgeEpochsBefore(0)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("PurgeEpochsBefore(0) failed: %v", err)
 	}
@@ -3360,7 +3360,7 @@ func TestBarrier_PurgeEpochsPreservesCurrentAndRecentEpochs(t *testing.T) {
 	ciphertexts[1] = ct
 
 	for i := uint64(2); i <= 5; i++ {
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate to %d failed: %v", i, err)
 		}
 		ct, err := b.Encrypt(nil, plaintext)
@@ -3371,7 +3371,7 @@ func TestBarrier_PurgeEpochsPreservesCurrentAndRecentEpochs(t *testing.T) {
 	}
 
 	// Purge before 3: should remove epochs 1 and 2, keep 3, 4, 5.
-	purged, err := b.PurgeEpochsBefore(3)
+	purged, err := b.PurgeEpochsBefore(context.Background(), 3)
 	if err != nil {
 		t.Fatalf("PurgeEpochsBefore(3) failed: %v", err)
 	}
@@ -3499,7 +3499,7 @@ func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	}
 
 	oldEpoch := b.CurrentEpoch()
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate should not return a fatal error on a fail-safe tracker reset failure: %v", err)
 	}
@@ -3559,7 +3559,7 @@ func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
 	}
 
 	oldEpoch := b.CurrentEpoch()
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate should not return a fatal error on a fail-safe tracker clear failure: %v", err)
 	}
@@ -3630,7 +3630,7 @@ func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
 	}
 
 	oldEpoch := b.CurrentEpoch()
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate should not return a fatal error on a fail-safe clear failure: %v", err)
 	}
@@ -3750,7 +3750,7 @@ func TestBarrier_RotateResetsBothTrackers(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	newEpoch, err := b.Rotate()
+	newEpoch, err := b.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
@@ -3800,7 +3800,7 @@ func TestBarrier_RotateResetsBothTrackers_VerifyEncryptAfterRotate(t *testing.T)
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate failed: %v", err)
 	}
 

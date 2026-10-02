@@ -129,7 +129,7 @@ func TestBarrier_ResetClearsState(t *testing.T) {
 // under the discarded key decrypts.
 func TestBarrier_ResetThenInitializeNewRootKey(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
-	oldRoot, err := b.RootKey()
+	oldRoot, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestBarrier_ResetThenInitializeNewRootKey(t *testing.T) {
 		t.Fatalf("LoadGeneration after re-Initialize = %d, want %d", got, firstLoadGeneration)
 	}
 
-	newRoot, err := b.RootKey()
+	newRoot, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestBarrier_ResetAfterLoadOverOwnInitialize(t *testing.T) {
 // must refuse.
 func TestBarrier_ResetAfterRotate(t *testing.T) {
 	b, s := testInitializedBarrier(t)
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	if err := b.Seal(); err != nil {
@@ -317,7 +317,7 @@ func TestBarrier_RefusedResetKeepsRollbackFloor(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	oldBlob := b.SealedRootKeyData()
 	for i := 0; i < 2; i++ {
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("Rotate: %v", err)
 		}
 	}

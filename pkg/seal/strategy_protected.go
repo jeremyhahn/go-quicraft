@@ -51,8 +51,6 @@ import (
 //
 // Credentials.Secret is itself an [enclave.SealedEnclave], so there is exactly
 // ONE credential type in this package and these methods take it.
-// ProtectedCredentials survives only as a deprecated alias for the
-// implementations that still name it.
 //
 // # What this does NOT change
 //
@@ -104,33 +102,3 @@ var (
 	_ ProtectedSealingStrategy = (*SoftwareStrategy)(nil)
 	_ ProtectedSealingStrategy = (*NoneStrategy)(nil)
 )
-
-// ProtectedCredentials is [Credentials].
-//
-// Deprecated: use Credentials. Credentials.Secret is an
-// [enclave.SealedEnclave], so a separate protected credential type has nothing
-// left to express.
-//
-// It is an ALIAS, not a defined type, so an implementation whose method
-// signatures still say ProtectedCredentials satisfies ProtectedSealingStrategy
-// unchanged. It is kept for exactly that reason and goes at the next breaking
-// release; new code names Credentials.
-type ProtectedCredentials = Credentials
-
-// NewProtectedCredentials calls [NewCredentials], including its contract:
-// the caller's slice is CONSUMED.
-//
-// Deprecated: use NewCredentials. Same function; with one credential type the
-// name distinguishes nothing.
-//
-// It is a FUNCTION, not `var NewProtectedCredentials = NewCredentials`. A
-// deprecation shim is the one place where the wrapper costs nothing, and an
-// exported function VARIABLE in a crypto package is writable by every package
-// that can import this one: an init() anywhere in a consumer's transitive graph
-// could reassign it and route every passphrase still reaching the deprecated
-// name through its own code, with no call site changed to notice.
-// staticcheck's SA1019 flags a deprecated func exactly as it flags a deprecated
-// var, so the deprecation still lands on consumers.
-func NewProtectedCredentials(secret []byte) (Credentials, error) {
-	return NewCredentials(secret)
-}

@@ -49,8 +49,8 @@ func (b *Barrier) DecryptForEpochContext(dst, ciphertext []byte, epoch uint64, c
 ### Epoch management
 
 ```go
-func (b *Barrier) Rotate() (uint64, error)
-func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error)
+func (b *Barrier) Rotate(ctx context.Context) (uint64, error)
+func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error)
 func (b *Barrier) RegisterInFlightEpoch(epoch uint64)
 func (b *Barrier) DeregisterInFlightEpoch(epoch uint64)
 func (b *Barrier) CurrentEpoch() uint64
@@ -73,10 +73,20 @@ func (b *Barrier) LoadGeneration() uint64
 func (b *Barrier) InvocationCounter() InvocationCounter
 func (b *Barrier) NonceTracker() NonceTrackerProvider
 func (b *Barrier) SealedRootKeyData() *SealedRootKey
-func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error
-func (b *Barrier) RootKey() ([]byte, error)
-func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error)
+func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
+func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
 ```
+
+The three methods that open the sealed root key take the caller's context and
+pass it to go-enclave's `SealedEnclave.Open`, which may reach a blocking
+provider. `Rotate` and `PurgeEpochsBefore` take one too, as do the `Host`-facing
+and snapshot-pool interfaces below; their background callers pass a context
+cancelled when the host's key-rotation loop or the snapshot pool stops. The rotation
+`Unseal` forces when an epoch's invocation budget cannot be recovered runs on
+`context.WithoutCancel` of the unseal's context, because the barrier is already
+unsealed when it starts and a rotation cut short would only leave encryption
+refused.
 
 ### Interfaces this repository declares
 
@@ -133,9 +143,9 @@ const StrategyNone       StrategyID = "none"
 
 func NewNoneStrategy() *NoneStrategy
 
-func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error)
-func NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error)
-func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
+func NewSoftwareStrategy(ctx context.Context, passphrase []byte) (*SoftwareStrategy, error)
+func NewSoftwareStrategyFIPS(ctx context.Context, passphrase []byte, iterations int) (*SoftwareStrategy, error)
+func NewSoftwareStrategyWithParams(ctx context.Context, passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error)
 func NewDeferredSoftwareStrategy() *SoftwareStrategy
 func NewDeferredSoftwareStrategyWithParams(version KDFVersion, params KDFParams) (*SoftwareStrategy, error)
 
@@ -205,8 +215,8 @@ type Barrier interface {
     DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]byte, error)
     IsHardwareMode() bool
     SupportsContextAAD() bool
-    Rotate() (uint64, error)
-    PurgeEpochsBefore(minEpoch uint64) (int, error)
+    Rotate(ctx context.Context) (uint64, error)
+    PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error)
     RegisterInFlightEpoch(epoch uint64)
     DeregisterInFlightEpoch(epoch uint64)
     CurrentEpoch() uint64
@@ -437,9 +447,15 @@ Backoff is measured against the wall clock, so a backward clock step could
 otherwise lock a node out permanently; `Unseal` treats negative elapsed time as
 satisfying the delay and re-anchors `lastFailedAt` to now.
 
-Three things deliberately do not count as a failed attempt: a `StateMAC`
-verification failure, a superseded barrier, and, in no-encryption mode, the
-empty root key that would otherwise trip the 32-byte size gate every restart.
+Four things deliberately do not count as a failed attempt: a `StateMAC`
+verification failure, a superseded barrier, in no-encryption mode the empty
+root key that would otherwise trip the 32-byte size gate every restart, and a
+cancelled or timed-out `Unseal`. An already-ended context is refused before the
+strategy runs; a strategy error matching `ctx.Err()` is returned without
+touching the counter or the persisted backoff, unless it also matches
+`enclave.ErrSealedAuthentication` or `ErrDecryptionFailed`, which still count —
+go-enclave joins an authentication verdict with a cancellation that arrives at
+the same moment, and cancelling must not try a credential for free.
 
 The primary defence is the KDF's cost, not the backoff: roughly 93 ms per
 attempt at the Argon2id defaults on fast 2025 desktop hardware.
@@ -481,7 +497,7 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrAADProbeRoundTrip` / `ErrAADProbeNotBound` | the behavioural AAD probe failed |
 | `ErrUnsupportedAlgorithm` / `ErrAlgorithmNotFIPSApproved` / `ErrFIPSUnavailable` | `BarrierConfig.Validate` failures |
 | `ErrKDFNotFIPSApproved` / `ErrKDFUnsupportedVersion` / `ErrKDFWeakParams` / `ErrKDFInvalidSalt` / `ErrKDFInvalidPassphrase` | KDF selection and work-factor failures |
-| `ErrNoRootKeyAvailable` | `RootKey()` in no-encryption mode |
+| `ErrNoRootKeyAvailable` | `RootKey(ctx)` in no-encryption mode |
 | `ErrInvalidKeySize` | key size does not match the algorithm |
 | `ErrInvocationBudgetUnknown` | logged, never returned: the cause recorded when a restart cannot re-establish a provable budget |
 

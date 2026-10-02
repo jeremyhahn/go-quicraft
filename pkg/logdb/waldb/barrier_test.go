@@ -775,7 +775,7 @@ func TestEncryptedWALKeyRotation(t *testing.T) {
 	}
 
 	// Rotate the key.
-	newEpoch, err := barrier.Rotate()
+	newEpoch, err := barrier.Rotate(context.Background())
 	if err != nil {
 		t.Fatalf("barrier.Rotate: %v", err)
 	}
@@ -820,7 +820,7 @@ func TestEncryptedWALKeyRotationSealed(t *testing.T) {
 	}
 
 	// Rotate should fail.
-	_, err := barrier.Rotate()
+	_, err := barrier.Rotate(context.Background())
 	if err == nil {
 		t.Fatal("barrier.Rotate on sealed barrier: expected error, got nil")
 	}
@@ -996,7 +996,7 @@ func TestMinLiveEpoch_MultiEpoch(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -1006,7 +1006,7 @@ func TestMinLiveEpoch_MultiEpoch(t *testing.T) {
 	}
 
 	// Rotate to epoch 3.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -1055,7 +1055,7 @@ func TestMinLiveEpoch_AfterCompaction(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -1147,7 +1147,7 @@ func TestMinLiveEpoch_MultipleShards(t *testing.T) {
 	}
 
 	// Rotate to epoch 2.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
@@ -1185,7 +1185,7 @@ func TestMinLiveEpoch_RecoveryPreservesEpoch(t *testing.T) {
 	if err := db.SaveEntries(1, 1, makeEntries(1, 5, 1)); err != nil {
 		t.Fatalf("SaveEntries epoch 1: %v", err)
 	}
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	if err := db.SaveEntries(1, 1, makeEntries(6, 5, 1)); err != nil {
@@ -1241,7 +1241,7 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 		t.Fatalf("SaveEntries: %v", err)
 	}
 
-	if _, err := barrier.Rotate(); !errors.Is(err, seal.ErrNoStatePersister) {
+	if _, err := barrier.Rotate(context.Background()); !errors.Is(err, seal.ErrNoStatePersister) {
 		t.Fatalf("Rotate = %v, want seal.ErrNoStatePersister", err)
 	}
 

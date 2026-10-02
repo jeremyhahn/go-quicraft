@@ -169,12 +169,13 @@ type Barrier interface {
 	SupportsContextAAD() bool
 
 	// Rotate increments the epoch, derives a new DEK, and installs it
-	// as the current cipher. Returns the new epoch number.
-	Rotate() (uint64, error)
+	// as the current cipher. Returns the new epoch number. ctx bounds the
+	// rotation; the host passes one cancelled when the host closes.
+	Rotate(ctx context.Context) (uint64, error)
 
 	// PurgeEpochsBefore removes DEKs for epochs strictly less than minEpoch.
-	// Returns the number of epochs actually purged.
-	PurgeEpochsBefore(minEpoch uint64) (int, error)
+	// Returns the number of epochs actually purged. ctx bounds the purge.
+	PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error)
 
 	// RegisterInFlightEpoch increments the in-flight reference count for
 	// an epoch, preventing PurgeEpochsBefore from removing it.
@@ -9017,10 +9018,24 @@ func (h *Host) IsDraining() bool {
 // In addition to the scheduled interval, a faster threshold-check ticker
 // detects when the AEAD invocation counter has reached its rotation threshold
 // and triggers an immediate rotation to prevent exceeding NIST SP 800-38D limits.
+//
+// Every rotation and purge the loop starts runs under a context cancelled when
+// keyRotStopC closes, so a barrier whose sealer blocks in a provider call
+// cannot hold the host's shutdown open past the provider's own honouring of
+// the cancellation.
 func (h *Host) keyRotationLoop(interval time.Duration) {
 	defer close(h.keyRotDone)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-h.keyRotStopC:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	for {
-		panicked := h.keyRotationLoopOnce(interval)
+		panicked := h.keyRotationLoopOnce(ctx, interval)
 		if !panicked {
 			return
 		}
@@ -9043,7 +9058,7 @@ func (h *Host) keyRotationLoop(interval time.Duration) {
 // keyRotationLoopOnce runs the key rotation loop body and recovers from
 // panics. Returns true if the loop panicked, false if it returned
 // normally (stop channel closed).
-func (h *Host) keyRotationLoopOnce(interval time.Duration) (panicked bool) {
+func (h *Host) keyRotationLoopOnce(ctx context.Context, interval time.Duration) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			panicked = true
@@ -9080,24 +9095,45 @@ func (h *Host) keyRotationLoopOnce(interval time.Duration) (panicked bool) {
 		case <-h.keyRotStopC:
 			return false
 		case <-scheduledC:
-			h.rotateBarrierKey()
+			h.rotateBarrierKey(ctx)
 		case <-thresholdCheck.C:
 			if h.barrier != nil && !h.barrier.IsSealed() && h.barrier.ShouldRotateKey() {
 				h.logger.Info("invocation threshold reached, triggering key rotation")
-				h.rotateBarrierKey()
+				h.rotateBarrierKey(ctx)
 			}
 		}
 	}
 }
 
+// endedBy reports whether err was caused by ctx ending: ctx has ended and err
+// matches the reason. A failure of its own that merely happens while ctx is
+// ending — a missing state persister, a persist error, a superseded barrier —
+// does not match, and is reported at its normal level.
+func endedBy(ctx context.Context, err error) bool {
+	ended := ctx.Err()
+	return ended != nil && errors.Is(err, ended)
+}
+
 // rotateBarrierKey performs a barrier key rotation and optionally purges old
 // DEKs when MaxRetainedEpochs is configured. Extracted from keyRotationLoop
 // to avoid duplication between scheduled and threshold-triggered rotations.
-func (h *Host) rotateBarrierKey() {
+//
+// A rotation or purge cut short by ctx — the loop's lifetime context, cancelled
+// when the host closes — is logged at DEBUG: nothing was persisted and the
+// current epoch stays active. Any other failure keeps its normal level even
+// when it surfaces during shutdown.
+func (h *Host) rotateBarrierKey(ctx context.Context) {
 	if h.barrier == nil || h.barrier.IsSealed() {
 		return
 	}
-	newEpoch, err := h.barrier.Rotate()
+	newEpoch, err := h.barrier.Rotate(ctx)
+	if err != nil && endedBy(ctx, err) {
+		// The host is closing and cancelled the rotation. Nothing was
+		// persisted, the current epoch stays active, and the misconfiguration
+		// report below would be untrue.
+		h.logger.Debug("key rotation abandoned: host is closing", "error", err)
+		return
+	}
 	if err != nil {
 		// Rotate fails closed when the barrier has no state persister: a
 		// rotation that is not persisted would leave every record written
@@ -9138,7 +9174,17 @@ func (h *Host) rotateBarrierKey() {
 			purgeFloor = safeFloor
 		}
 
-		purged, purgeErr := h.barrier.PurgeEpochsBefore(purgeFloor)
+		purged, purgeErr := h.barrier.PurgeEpochsBefore(ctx, purgeFloor)
+		if purgeErr != nil && endedBy(ctx, purgeErr) {
+			// The host is closing and cancelled the purge before anything was
+			// persisted or dropped; the next rotation after a restart purges
+			// again.
+			h.logger.Debug("epoch purge after rotation abandoned: host is closing",
+				"purge_floor", purgeFloor,
+				"error", purgeErr,
+			)
+			return
+		}
 		if purgeErr != nil {
 			h.logger.Error("epoch purge after rotation failed",
 				"purge_floor", purgeFloor,

@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io/fs"
 	"path/filepath"
@@ -133,7 +134,7 @@ func TestRemoveNodeData_GCFailureKeepsEpochFloor(t *testing.T) {
 	rotateShard(t, db, nodeA)
 
 	// Rotate the barrier key so node B writes at epoch 2 into segment 1.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("barrier.Rotate: %v", err)
 	}
 	if err := db.SaveEntries(nodeB, 1, makeEntries(1, 5, 1)); err != nil {
@@ -202,7 +203,7 @@ func TestCompact_PartialGCFailureKeepsEpochFloor(t *testing.T) {
 	rotateShard(t, db, nodeA)
 
 	// Node B writes at epoch 2 into segment 2 (the active segment).
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("barrier.Rotate: %v", err)
 	}
 	if err := db.SaveEntries(nodeB, 1, makeEntries(1, 5, 1)); err != nil {
@@ -958,7 +959,7 @@ func TestCompact_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 	rotateShard(t, db, nodeA)
 
 	// Node B writes at epoch 2 into the active segment.
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("barrier.Rotate: %v", err)
 	}
 	if err := db.SaveEntries(nodeB, 1, makeEntries(1, 5, 1)); err != nil {
@@ -1016,7 +1017,7 @@ func TestRemoveNodeData_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 		t.Fatalf("SaveEntries A: %v", err)
 	}
 	rotateShard(t, db, nodeA)
-	if _, err := barrier.Rotate(); err != nil {
+	if _, err := barrier.Rotate(context.Background()); err != nil {
 		t.Fatalf("barrier.Rotate: %v", err)
 	}
 	if err := db.SaveEntries(nodeB, 1, makeEntries(1, 5, 1)); err != nil {

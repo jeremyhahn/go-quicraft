@@ -1322,7 +1322,7 @@ func (b *testBarrier) DeregisterInFlightEpoch(epoch uint64) {
 	b.mu.Unlock()
 }
 
-func (b *testBarrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
+func (b *testBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.purgedBefore = minEpoch

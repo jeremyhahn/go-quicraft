@@ -33,7 +33,7 @@ func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 	passphrase := []byte("a-passphrase-long-enough-to-not-warn")
 
 	t.Run("NewSoftwareStrategy uses the defaults for the selected version", func(t *testing.T) {
-		s, err := NewSoftwareStrategy(passphrase)
+		s, err := NewSoftwareStrategy(context.Background(), passphrase)
 		if err != nil {
 			t.Fatalf("NewSoftwareStrategy: %v", err)
 		}
@@ -50,7 +50,7 @@ func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 
 	t.Run("NewSoftwareStrategyFIPS reports its iteration count", func(t *testing.T) {
 		const iterations = 123_456
-		s, err := NewSoftwareStrategyFIPS(passphrase, iterations)
+		s, err := NewSoftwareStrategyFIPS(context.Background(), passphrase, iterations)
 		if err != nil {
 			t.Fatalf("NewSoftwareStrategyFIPS: %v", err)
 		}
@@ -65,7 +65,7 @@ func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 	})
 
 	t.Run("NewSoftwareStrategyWithParams reports its Argon2id factors", func(t *testing.T) {
-		s, err := NewSoftwareStrategyWithParams(passphrase, 7, 96*1024, 3)
+		s, err := NewSoftwareStrategyWithParams(context.Background(), passphrase, 7, 96*1024, 3)
 		if err != nil {
 			// A -tags fips build has no Argon2id deriver at all. That refusal is
 			// the documented behaviour, not a failure of this accessor.
@@ -120,7 +120,7 @@ func TestNewDeferredSoftwareStrategyWithParams_ComposesWithKDFParams(t *testing.
 	restore := AllowWeakKDFParams()
 	defer restore()
 
-	old, err := NewSoftwareStrategyFIPS([]byte("the-original-passphrase-value"), 150_000)
+	old, err := NewSoftwareStrategyFIPS(context.Background(), []byte("the-original-passphrase-value"), 150_000)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyFIPS: %v", err)
 	}

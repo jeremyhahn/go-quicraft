@@ -1,7 +1,11 @@
 // Package crypto re-exports seal types for backward compatibility.
 package crypto
 
-import "github.com/jeremyhahn/go-quicraft/pkg/seal"
+import (
+	"context"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
+)
 
 // Barrier wraps go-quicraft/pkg/seal.Barrier.
 type Barrier = seal.Barrier
@@ -39,4 +43,6 @@ func MustNewBarrier(config BarrierConfig) *Barrier { return seal.MustNewBarrier(
 // *enclave.SealedEnclave, so seal.NewCredentials is the only supported way to
 // populate one. Without this re-export the package would expose a type its own
 // consumers could not construct.
-func NewCredentials(secret []byte) (Credentials, error) { return seal.NewCredentials(secret) }
+func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) {
+	return seal.NewCredentials(ctx, secret)
+}

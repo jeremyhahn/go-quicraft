@@ -36,12 +36,17 @@ bytes are read.
 import "github.com/jeremyhahn/go-enclave"
 
 // keyBytes came from a KDF, a file read, or a KMS response.
-key, err := enclave.NewSealed(keyBytes)
+key, err := enclave.NewSealed(ctx, keyBytes)
 if err != nil {
 	return err
 }
 // keyBytes is now zeroed, on the error path too. Do not read it again.
 ```
+
+`ctx` bounds the seal. go-enclave hands it to the process sealer's provider,
+which may be a device or a remote service that blocks; a context that has ended
+fails the call with an error matching both `enclave.ErrSealFailed` and
+`ctx.Err()`, and still wipes `keyBytes`.
 
 Store `key` in your struct. Its material is ciphertext until you open it.
 
@@ -50,7 +55,7 @@ Store `key` in your struct. Its material is ciphertext until you open it.
 Open it, use it, destroy the opened copy, every time:
 
 ```go
-buf, err := key.Open()
+buf, err := key.Open(ctx)
 if err != nil {
 	return err
 }
@@ -85,6 +90,15 @@ Two rules the compiler will not enforce:
    only where you own the enclave and nothing else can destroy it. Storing
    either in a struct field is a use-after-free, and it faults rather than
    reading zeros, because `Destroy` unmaps the pages.
+3. **Do not write into it.** The enclave `Open` returns is frozen read-only, so
+   a write through either slice faults. If you need a writable copy, allocate
+   your own with `NewMemoryEnclaveSized` and copy into it inside `WithBytes`.
+
+`buf.Destroy()` returns an error. A bare `defer buf.Destroy()` discards it, which
+loses nothing secret: `ErrLockedMemoryUnavailable` means the kernel refused the
+release and the pages stay on go-enclave's `WipeAll` ledger for a retry, and
+`ErrReleasedWithoutWipe` means a denied `mprotect` forced a bare unmap of pages
+the kernel zeroes before reuse. Check it where you want to see either condition.
 
 The `cipher.AEAD` above holds its own expanded copy of the key, and neither the
 standard library nor `x/crypto` can wipe it. Build it inside the window, use it,
@@ -99,7 +113,8 @@ key.Destroy()
 
 After this, `Open` returns `ErrEnclaveDestroyed`. Calling `Destroy` twice is
 fine, it is safe on a nil handle, and it is safe while another goroutine is in
-`Open`: it takes the write lock and waits that call out.
+`Open`. It does not wait for that call: an open already in flight completes
+against the envelope it pinned, and the last open out wipes the ciphertext.
 
 `Destroy` wipes the ciphertext and the wrapped-key blob before releasing them.
 Enclaves a previous `Open` handed out are not affected; those are yours to
@@ -129,8 +144,7 @@ if err := buf.Freeze(); err != nil {
 }
 ```
 
-A sized enclave, and the one `SealedEnclave.Open` returns, stays writable until
-you freeze it. That is what makes filling it possible, and what lets a retained
+A sized enclave stays writable until you freeze it. That is what makes filling it possible, and what lets a retained
 slice corrupt the material instead of faulting. `Freeze` is idempotent and
 irreversible. A refused freeze leaves the enclave alive and writable, so destroy
 it rather than hand back material whose protection was not established.
@@ -155,7 +169,7 @@ it bounds how long they linger.
 constructor, which consumes your slice:
 
 ```go
-creds, err := seal.NewCredentials([]byte(passphrase))
+creds, err := seal.NewCredentials(ctx, []byte(passphrase))
 if err != nil {
 	return err
 }
@@ -184,9 +198,15 @@ from `buf.Open()` past a `Destroy()`. Copy what you need inside the window, use
 `WithBytes` so `Destroy` has to wait, or move the work inside the window.
 
 **A write faults**: you wrote through a slice from a frozen enclave (one built
-by `NewMemoryEnclave` or `NewMemoryEnclaveCopy`, or a sized one you already
-froze). That fault is the protection working. The same stray write to an
+by `NewMemoryEnclave` or `NewMemoryEnclaveCopy`, one returned by
+`SealedEnclave.Open`, or a sized one you already froze). That fault is the protection working. The same stray write to an
 unfrozen enclave corrupts the material silently, which is why `Freeze` exists.
+
+**An open fails with `enclave: could not open sealed material`**
+(`ErrOpenFailed`): the context you passed to `Open` ended, or a
+per-operation provider's infrastructure failed. `errors.Is(err, ctx.Err())`
+tells the first apart. The sealed value is intact; open it again with a live
+context.
 
 **Tests are flaky under `-race` around key teardown**: you are probably holding
 a slice from `buf.Open()` across a `Destroy` on another goroutine. Every accessor

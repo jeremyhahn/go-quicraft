@@ -17,6 +17,7 @@
 package seal
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -30,7 +31,7 @@ import (
 // TestMain installs. Tests that are ABOUT a specific KDF must name it directly
 // rather than go through this helper.
 func newTestStrategy(passphrase []byte) (*SoftwareStrategy, error) {
-	return NewSoftwareStrategyFIPS(passphrase, 1000)
+	return NewSoftwareStrategyFIPS(context.Background(), passphrase, 1000)
 }
 
 // testKDFVersion is the KDF version newTestStrategy seals with, for tests that

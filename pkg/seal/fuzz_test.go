@@ -202,7 +202,7 @@ func FuzzBarrierDecryptWrongEpoch(f *testing.F) {
 		}
 
 		// Rotate to epoch 2.
-		newEpoch, err := barrier.Rotate()
+		newEpoch, err := barrier.Rotate(context.Background())
 		if err != nil {
 			t.Fatalf("Rotate failed: %v", err)
 		}

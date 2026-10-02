@@ -109,10 +109,10 @@ func TestPinnedEpochSurvivesPurgeAfterStrayReleases(t *testing.T) {
 	}
 	defer b.DeregisterInFlightEpoch(sealedEpoch)
 
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
-	if _, err := b.PurgeEpochsBefore(b.CurrentEpoch()); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), b.CurrentEpoch()); err != nil {
 		t.Fatalf("PurgeEpochsBefore: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func TestSetSealedRootKeyRejectsZeroKnownEpoch(t *testing.T) {
 	blob.KnownEpochs = []uint64{0, blob.Epoch}
 	// Stamped so the metadata MAC is valid: the structural gate must stand on
 	// its own, not lean on authentication that a root-key holder can satisfy.
-	if err := src.StampSealedStateMAC(blob); err != nil {
+	if err := src.StampSealedStateMAC(context.Background(), blob); err != nil {
 		t.Fatalf("StampSealedStateMAC: %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestSetSealedRootKeyAcceptsValidKnownEpochs(t *testing.T) {
 	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	if _, err := src.Rotate(); err != nil {
+	if _, err := src.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	blob := src.SealedRootKeyData()

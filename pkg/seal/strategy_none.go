@@ -108,7 +108,7 @@ func (s *NoneStrategy) UnsealRootKey(_ context.Context, sealed *SealedRootKey, _
 // until an unseal it can no longer perform. Size alone answers all three cases
 // — nil, destroyed and wrong-sized all report a size that is not rootKeySize —
 // without reading a byte of the key.
-func (s *NoneStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, _ ProtectedCredentials) (*SealedRootKey, error) {
+func (s *NoneStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, _ Credentials) (*SealedRootKey, error) {
 	if rootKey.Size() != rootKeySize {
 		return nil, ErrInvalidRootKeySize
 	}
@@ -135,7 +135,7 @@ func (s *NoneStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclav
 // The sealed blob is still validated first, so a mismatched or nil blob reports
 // the same error it does through UnsealRootKey rather than being masked by this
 // one.
-func (s *NoneStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, _ ProtectedCredentials) (*enclave.MemoryEnclave, error) {
+func (s *NoneStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, _ Credentials) (*enclave.MemoryEnclave, error) {
 	if _, err := s.UnsealRootKey(ctx, sealed, Credentials{}); err != nil {
 		return nil, err
 	}

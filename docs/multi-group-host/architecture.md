@@ -469,7 +469,7 @@ Design:
   layout binds the algorithm identifier and DEK length; v1 remains readable
 - ciphertext is `[epoch:8][algID:1][nonce:N][ciphertext+tag]`, so a ciphertext
   names the AEAD that wrote it
-- `Rotate()` increments the epoch and derives a new DEK. Old DEKs stay for
+- `Rotate(ctx)` increments the epoch and derives a new DEK. Old DEKs stay for
   reading prior-epoch data, bounded by `MaxRetainedEpochs`, and are purged once
   nothing on disk references them
 - after 5 consecutive failed unseal attempts, backoff starts at 1s and doubles

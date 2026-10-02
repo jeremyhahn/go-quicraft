@@ -31,7 +31,7 @@ import (
 // strategy_params_api_fips_test.go.
 
 func TestNewSoftwareStrategyWithParams_Valid(t *testing.T) {
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 2)
+	s, err := NewSoftwareStrategyWithParams(context.Background(), []byte("test"), 1, 64*1024, 2)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyWithParams returned unexpected error: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestNewSoftwareStrategyWithParams_Valid(t *testing.T) {
 }
 
 func TestNewSoftwareStrategyWithParams_EmptyPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategyWithParams(nil, 1, 64*1024, 2)
+	_, err := NewSoftwareStrategyWithParams(context.Background(), nil, 1, 64*1024, 2)
 	if !errors.Is(err, ErrInvalidPassphrase) {
 		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
 	}
@@ -62,7 +62,7 @@ func TestSoftwareStrategy_CrossKDFUnseal_FIPSMismatch(t *testing.T) {
 	}
 
 	// Seal with Argon2id (custom params: time=1, memory=64KB, threads=1).
-	argon2Strategy, err := NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	argon2Strategy, err := NewSoftwareStrategyWithParams(context.Background(), passphrase, 1, 64*1024, 1)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyWithParams failed: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSoftwareStrategy_CrossKDFUnseal_FIPSMismatch(t *testing.T) {
 	// for Argon2id are used (time=4, memory=128KB). Since the original
 	// was sealed with time=1, memory=64KB, the derived key differs and
 	// the AES-GCM authentication fails.
-	fipsStrategy, err := NewSoftwareStrategyFIPS(passphrase, 1000)
+	fipsStrategy, err := NewSoftwareStrategyFIPS(context.Background(), passphrase, 1000)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyFIPS failed: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_CrossVersionDefaults(t *test
 	t.Parallel()
 
 	// Create an Argon2id strategy but present PBKDF2 metadata.
-	s, err := NewSoftwareStrategyWithParams([]byte("test"), 1, 64*1024, 2)
+	s, err := NewSoftwareStrategyWithParams(context.Background(), []byte("test"), 1, 64*1024, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

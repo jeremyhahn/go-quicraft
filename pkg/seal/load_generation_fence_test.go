@@ -166,10 +166,10 @@ func TestLoadGenerationFenceSupersedesEarlierLoader(t *testing.T) {
 	}
 	// Writing the blob is refused too: rotating or purging would stamp this
 	// instance's stale state over the winner's claim.
-	if _, err := first.Rotate(); !errors.Is(err, ErrBarrierSuperseded) {
+	if _, err := first.Rotate(context.Background()); !errors.Is(err, ErrBarrierSuperseded) {
 		t.Fatalf("Rotate on a superseded barrier returned %v, want ErrBarrierSuperseded", err)
 	}
-	if _, err := first.PurgeEpochsBefore(first.CurrentEpoch()); !errors.Is(err, ErrBarrierSuperseded) {
+	if _, err := first.PurgeEpochsBefore(context.Background(), first.CurrentEpoch()); !errors.Is(err, ErrBarrierSuperseded) {
 		t.Fatalf("PurgeEpochsBefore on a superseded barrier returned %v, want ErrBarrierSuperseded", err)
 	}
 
@@ -290,7 +290,7 @@ func TestSingleWriterUnaffectedByFence(t *testing.T) {
 		}
 		lastCiphertext, lastEpoch = ct, epoch
 
-		if _, err := b.Rotate(); err != nil {
+		if _, err := b.Rotate(context.Background()); err != nil {
 			t.Fatalf("restart %d: Rotate: %v", restart, err)
 		}
 		if _, err := b.Encrypt(nil, []byte("after rotate")); err != nil {
@@ -298,7 +298,7 @@ func TestSingleWriterUnaffectedByFence(t *testing.T) {
 		}
 		// A realistic retention floor: retire everything strictly below the
 		// frame this run must keep readable.
-		if _, err := b.PurgeEpochsBefore(epoch); err != nil {
+		if _, err := b.PurgeEpochsBefore(context.Background(), epoch); err != nil {
 			t.Fatalf("restart %d: PurgeEpochsBefore: %v", restart, err)
 		}
 		// Re-reading its OWN persisted state must be a no-op, not a
@@ -349,14 +349,14 @@ func TestLoadGenerationSurvivesPersistenceRoundTrip(t *testing.T) {
 
 	// cloneSealedRootKey feeds every persist; a rotation and a purge must both
 	// carry the claim forward rather than reset it.
-	if _, err := b.Rotate(); err != nil {
+	if _, err := b.Rotate(context.Background()); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 	if got := store.read(t).LoadGeneration; got != claim {
 		t.Fatalf("LoadGeneration after Rotate = %d, want %d (the claim was dropped by the "+
 			"rotate persist)", got, claim)
 	}
-	if _, err := b.PurgeEpochsBefore(b.CurrentEpoch()); err != nil {
+	if _, err := b.PurgeEpochsBefore(context.Background(), b.CurrentEpoch()); err != nil {
 		t.Fatalf("PurgeEpochsBefore: %v", err)
 	}
 	if got := store.read(t).LoadGeneration; got != claim {

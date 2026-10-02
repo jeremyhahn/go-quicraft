@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"runtime"
@@ -347,6 +348,48 @@ type Barrier struct {
 	lockRootKey func(int) (*enclave.MemoryEnclave, error)
 }
 
+// releaseEnclave destroys a locked-memory enclave this package created for its
+// own use and reports a release the kernel refused. what names the material for
+// the log line; it is never the material itself.
+//
+// Every caller is a cleanup step whose operation has already produced (or is
+// already returning) its real result, so the refusal is logged rather than
+// returned: turning a completed seal, unseal or rotation into a failure over
+// pages that go-enclave still accounts for would discard the work and keep the
+// pages anyway. Nothing more is lost by not returning it.
+//
+// What a refusal leaves behind depends on whether the region is frozen, and
+// most callers here release FROZEN regions: under go-enclave v0.7 every
+// buffer returned by SealedEnclave.Open (the root key, the passphrase) is
+// read-only.
+//
+//   - A WRITABLE region is wiped before any step the kernel can refuse, so a
+//     refused munlock or munmap holds pages that are already zero, on the
+//     WipeAll ledger for a later retry.
+//   - A FROZEN region must be made writable (mprotect) before it can be wiped.
+//     If that mprotect is denied, go-enclave unmaps the pages bare and reports
+//     ErrReleasedWithoutWipe: no in-process wipe ran, but the pages are gone
+//     and the kernel zeroes them before reuse. If the bare unmap is refused as
+//     well, the release fails with ErrLockedMemoryUnavailable and the mapping
+//     stays held UNWIPED — read-only and mlock'd, so it never reaches swap, but
+//     still holding the material — on the WipeAll ledger, where a later
+//     Destroy or a shutdown WipeAll retries it.
+//
+// So a refused release of a frozen region is not a wipe. What the log line buys
+// is an operator who can see that mprotect or munmap is being denied, or that
+// RLIMIT_MEMLOCK is being held, and that a sweep at shutdown is owed.
+//
+// Detected canary corruption still panics inside Destroy; that is go-enclave's
+// one deliberate panic and is not caught here.
+func releaseEnclave(e *enclave.MemoryEnclave, what string) {
+	if err := e.Destroy(); err != nil {
+		slog.Warn("quicraft/seal: locked memory release was refused or ran without a wipe",
+			"enclave", what,
+			"error", err,
+		)
+	}
+}
+
 // EpochBarrier is an alias for Barrier. Use this name in new code to
 // distinguish from go-qrdb's StorageBarrier.
 type EpochBarrier = Barrier
@@ -449,9 +492,9 @@ func MustNewBarrier(config BarrierConfig) *Barrier {
 // NewEpochBarrier calls NewBarrier. Use this name in new code to distinguish
 // from go-qrdb's NewStorageBarrier.
 //
-// These two are FUNCTIONS rather than `var NewEpochBarrier = NewBarrier`, for
-// the reason given at NewProtectedCredentials: an exported function variable in
-// a crypto package is writable by every importer, so an init() in a transitive
+// These two are FUNCTIONS rather than `var NewEpochBarrier = NewBarrier`,
+// because an exported function variable in a crypto package is writable by
+// every importer, so an init() in a transitive
 // dependency can substitute the constructor for the barrier that holds the root
 // key. A named alias is worth having; a reassignable one is not.
 func NewEpochBarrier(config BarrierConfig) (*Barrier, error) { return NewBarrier(config) }
@@ -530,7 +573,7 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	if err != nil {
 		return &Error{Strategy: "initialize", Err: err}
 	}
-	defer rootEnc.Destroy()
+	defer releaseEnclave(rootEnc, "root key")
 
 	// Everything that touches the root key runs inside the borrow, so a Destroy
 	// cannot unmap the pages underneath it. Nesting a second enclave operation in
@@ -627,7 +670,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 		// barrier uninitialized and retryable rather than half-installed. It
 		// consumes rootKey on EVERY path including this one, so a failure here
 		// still leaves nothing readable behind.
-		rootPK, sealErr := enclave.NewSealed(rootKey)
+		rootPK, sealErr := enclave.NewSealed(ctx, rootKey)
 		if sealErr != nil {
 			return &Error{Strategy: "initialize", Err: sealErr}
 		}
@@ -659,11 +702,11 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 	//
 	// The root key goes LAST because deriveEpochCipher above still needed it in
 	// the clear, and sealing it is what takes it away.
-	dekPK, err := enclave.NewSealed(dek)
+	dekPK, err := enclave.NewSealed(ctx, dek)
 	if err != nil {
 		return &Error{Strategy: "initialize", Err: err}
 	}
-	rootPK, err := enclave.NewSealed(rootKey)
+	rootPK, err := enclave.NewSealed(ctx, rootKey)
 	if err != nil {
 		dekPK.Destroy()
 		return &Error{Strategy: "initialize", Err: err}
@@ -715,6 +758,27 @@ func (b *Barrier) unsealPreconditionLocked() error {
 	return nil
 }
 
+// abandonedWithoutVerdict reports whether a strategy's unseal error is the
+// caller's context ending and nothing else: ctx has ended, err matches the
+// reason it ended, and err carries no authentication verdict.
+//
+// The verdict check is the qualification that keeps the brute-force counter
+// honest. go-enclave joins an authentication failure with the cancellation
+// when a provider rejects the material as the caller's context ends (see
+// enclave.ErrOpenFailed), so an error can match context.Canceled AND
+// enclave.ErrSealedAuthentication at once. Such an error still counts:
+// cancelling the context must not be a way to try a credential for free. The
+// software strategy's own wrong-passphrase verdict, ErrDecryptionFailed, is
+// treated the same way should a consumer's strategy ever join it with a
+// cancellation.
+func abandonedWithoutVerdict(ctx context.Context, err error) bool {
+	ended := ctx.Err()
+	if ended == nil || !errors.Is(err, ended) {
+		return false
+	}
+	return !errors.Is(err, enclave.ErrSealedAuthentication) && !errors.Is(err, ErrDecryptionFailed)
+}
+
 // Unseal decrypts the root key using the provided strategy and derives the
 // DEK for the current epoch. The barrier must be in the sealed state.
 //
@@ -729,6 +793,23 @@ func (b *Barrier) unsealPreconditionLocked() error {
 // Brute-force protection: After 5 consecutive failed attempts, an exponential
 // backoff delay is enforced (1s, 2s, 4s, ... capped at 60s). The counter
 // resets on successful unseal.
+//
+// A cancelled or timed-out Unseal is NOT a failed attempt. A ctx that has
+// already ended is refused before the backoff check and before the strategy is
+// called, and a strategy error caused by ctx ending mid-call is returned
+// without touching the counter or the persisted backoff state — unless that
+// error also carries an authentication verdict (enclave.ErrSealedAuthentication
+// or ErrDecryptionFailed), which counts exactly as it would under a live
+// context. See abandonedWithoutVerdict.
+//
+// ctx bounds the strategy's unseal, but not everything Unseal can do after it.
+// When the restored blob forces a rotation (resolveInvocationBudget), that
+// rotation runs under context.WithoutCancel(ctx): by then the barrier is
+// already unsealed, and a rotation cut short would only leave encryption
+// refused under an unprovable invocation budget. With a sealing provider that
+// blocks, Unseal
+// can therefore run past the caller's deadline by as long as the provider takes
+// to seal the new epoch's DEK.
 //
 // Unseal AUTHENTICATES the persisted metadata (SealedRootKey.StateMAC) against
 // the recovered root key before deriving anything from it, and fails with
@@ -754,6 +835,13 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	defer b.mu.Unlock()
 
 	if err := b.unsealPreconditionLocked(); err != nil {
+		return err
+	}
+
+	// A caller that has already stopped waiting is refused before the backoff
+	// check and before the strategy: nothing is attempted, so nothing is
+	// counted and nothing is written — not even the clock re-anchor below.
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -806,6 +894,14 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// the second zeroes zeroes. Where a return is IMMEDIATE the eager wipe is
 	// redundant and is gone.
 	defer enclave.Wipe(heapKey)
+	if err != nil && abandonedWithoutVerdict(ctx, err) {
+		// The strategy failed because the caller's context ended, and it
+		// reached no verdict on the credential. Counting it would let a caller
+		// that merely gave up — a shutdown, a short deadline in front of a slow
+		// provider — drive the persisted backoff that locks out the next
+		// honest attempt.
+		return err
+	}
 	if err != nil {
 		b.failedAttempts++
 		b.lastFailedAt = b.timeNow()
@@ -905,7 +1001,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	if encErr != nil {
 		return &Error{Strategy: "unseal", Err: encErr}
 	}
-	defer rootEnc.Destroy()
+	defer releaseEnclave(rootEnc, "root key")
 
 	return rootEnc.WithBytes(func(rootKey []byte) error {
 		copy(rootKey, heapKey)
@@ -960,7 +1056,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 		// Sealed before the first state assignment, so a refused allocation leaves
 		// the barrier SEALED rather than half-unsealed. rootKey is consumed on
 		// every path, failure included.
-		rootPK, sealErr := enclave.NewSealed(rootKey)
+		rootPK, sealErr := enclave.NewSealed(ctx, rootKey)
 		if sealErr != nil {
 			return &Error{Strategy: "unseal", Err: sealErr}
 		}
@@ -1026,7 +1122,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 		}
 		// Consumes d on every path, so there is no plain DEK left to wipe by
 		// hand — which is what the plainDEKs slice this replaced was for.
-		pk, serr := enclave.NewSealed(d)
+		pk, serr := enclave.NewSealed(ctx, d)
 		if serr != nil {
 			enclave.Wipe(dek)
 			return failed(&Error{Strategy: "unseal", Err: serr})
@@ -1039,7 +1135,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	// both BEFORE the first state assignment: the root key must stay in the
 	// clear until every derivation above has read it, and nothing below may be
 	// able to fail once the barrier starts calling itself unsealed.
-	dekPK, err := enclave.NewSealed(dek)
+	dekPK, err := enclave.NewSealed(ctx, dek)
 	if err != nil {
 		return failed(&Error{Strategy: "unseal", Err: err})
 	}
@@ -1049,7 +1145,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	newDEKs[b.epoch] = dekPK
 	newCiphers[b.epoch] = aead
 
-	rootPK, err := enclave.NewSealed(rootKey)
+	rootPK, err := enclave.NewSealed(ctx, rootKey)
 	if err != nil {
 		return failed(&Error{Strategy: "unseal", Err: err})
 	}
@@ -1070,7 +1166,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	// See resolveInvocationBudget: the loaded epoch's spent budget is
 	// unknowable, so the barrier either moves to a fresh epoch or refuses to
 	// encrypt under the loaded one.
-	b.resolveInvocationBudget()
+	b.resolveInvocationBudget(ctx)
 
 	slog.Info("barrier unsealed", "epoch", b.epoch, "algorithm", b.config.Algorithm.String())
 	return nil
@@ -1214,7 +1310,13 @@ func (b *Barrier) claimLoadGenerationLocked(rootKey []byte) error {
 // StateMAC cannot, because both copies are authentic. Exclusive ownership of
 // the blob remains the embedder's to guarantee; see the StatePersister
 // contract in barrier_config.go.
-func (b *Barrier) resolveInvocationBudget() {
+//
+// ctx is Unseal's. The forced rotation runs on context.WithoutCancel(ctx): by
+// the time it is reached the barrier is already unsealed, so the caller's
+// cancellation can no longer abort the unseal it was bounding, and a rotation
+// cut short here would only leave encryption refused under an unprovable
+// budget. It keeps ctx's values and drops its deadline and cancellation.
+func (b *Barrier) resolveInvocationBudget(ctx context.Context) {
 	if b.invocations == nil || !b.invocations.IsEnabled() {
 		// Counting is off by configuration (InvocationLimit == -1). The
 		// embedder has explicitly opted out of the bound; nothing to enforce.
@@ -1238,7 +1340,7 @@ func (b *Barrier) resolveInvocationBudget() {
 	}
 
 	if b.config.StatePersister != nil {
-		newEpoch, err := b.rotateLocked()
+		newEpoch, err := b.rotateLocked(context.WithoutCancel(ctx))
 		if err == nil {
 			// "known-zero for this process" is the accurate claim, and the
 			// qualifier is not pedantry: the rotated-to epoch is a pure function
@@ -2206,16 +2308,25 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 // Rotate holds b.mu.Lock for its full duration. No encryption can therefore
 // observe the window between the epoch commit (step 2) and the tracker reset
 // (step 3); both happen under the exclusive write lock before any reader runs.
-func (b *Barrier) Rotate() (uint64, error) {
+//
+// ctx bounds opening the sealed root key and sealing the new DEK, both of which
+// go-enclave may hand to a blocking provider, and NOTHING AFTER THEM. A context
+// that ends before enclave.NewSealed has returned the sealed DEK aborts the
+// rotation with nothing written. Once it has returned, ctx is not consulted
+// again: the state MAC re-stamp, the persist and the commit run to completion
+// even if ctx ends meanwhile, and Rotate returns the new epoch. Stopping
+// between a successful persist and the commit would leave the durable blob
+// describing an epoch this barrier never adopted.
+func (b *Barrier) Rotate(ctx context.Context) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.rotateLocked()
+	return b.rotateLocked(ctx)
 }
 
 // rotateLocked is Rotate's body. It is factored out because Unseal must also be
 // able to rotate — see resolveInvocationBudget — while already holding b.mu.
 // The caller must hold the exclusive write lock.
-func (b *Barrier) rotateLocked() (uint64, error) {
+func (b *Barrier) rotateLocked(ctx context.Context) (uint64, error) {
 	if b.state != barrierUnsealed {
 		return 0, ErrBarrierSealed
 	}
@@ -2253,11 +2364,11 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// the root key in the clear for the life of the process — a whole locked page
 	// that is never released and never re-readable, charged against the process's
 	// RLIMIT_MEMLOCK for as long as it runs.
-	rootBuf, err := b.rootKey.Open()
+	rootBuf, err := b.rootKey.Open(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer rootBuf.Destroy()
+	defer releaseEnclave(rootBuf, "root key")
 	// Aliases the locked pages for the rest of this function. rootBuf is opened
 	// and destroyed here and never escapes, so no concurrent Destroy can unmap it
 	// underneath the reads below — the condition go-enclave's Open requires.
@@ -2287,7 +2398,7 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	//
 	// It consumes dek on every path, which is why the two error paths below no
 	// longer wipe it by hand and destroy the sealed enclave instead.
-	dekPK, sealErr := enclave.NewSealed(dek)
+	dekPK, sealErr := enclave.NewSealed(ctx, dek)
 	if sealErr != nil {
 		return 0, &Error{Strategy: "rotate", Err: sealErr}
 	}
@@ -2375,7 +2486,11 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 // decided to retire — exactly the intended outcome.
 //
 // PurgeEpochsBefore is not supported in hardware mode (returns ErrHardwareMode).
-func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
+//
+// ctx bounds opening the sealed root key to re-stamp the state MAC, which
+// go-enclave may hand to a blocking provider. A context that ends there aborts
+// the purge before anything is persisted or dropped.
+func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -2435,7 +2550,7 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 	// KnownEpochs is covered by the metadata MAC, so a purge must re-stamp it
 	// for the same reason Rotate does: otherwise the reduced blob fails its own
 	// authentication on the next Unseal.
-	if macErr := b.restampStateMACFromEnclaveLocked(candidate); macErr != nil {
+	if macErr := b.restampStateMACFromEnclaveLocked(ctx, candidate); macErr != nil {
 		return 0, macErr
 	}
 	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
@@ -2592,7 +2707,10 @@ func (b *Barrier) IsHardwareMode() bool {
 // array. Prefer RootKeyProtected, which hands back the same material inside a
 // memory-locked, guard-paged buffer. This form stays for callers that must pass
 // a plain []byte to an API they do not control.
-func (b *Barrier) RootKey() ([]byte, error) {
+//
+// ctx bounds opening the sealed root key and is handed to go-enclave, whose
+// process sealer may be backed by a blocking provider.
+func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {
@@ -2603,7 +2721,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 	if b.rootKey == nil {
 		return nil, ErrNoRootKeyAvailable
 	}
-	buf, err := b.rootKey.Open()
+	buf, err := b.rootKey.Open(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -2611,7 +2729,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 	// stranded enclave holds the PLAINTEXT root key mlock'd for the life of the
 	// process and consumes RLIMIT_MEMLOCK, which then refuses later locks. The
 	// cleanup of key material must not depend on the happy path.
-	defer buf.Destroy()
+	defer releaseEnclave(buf, "root key")
 	keyCopy := make([]byte, buf.Size())
 	if err := buf.WithBytes(func(b []byte) error {
 		copy(keyCopy, b)
@@ -2639,17 +2757,15 @@ func (b *Barrier) RootKey() ([]byte, error) {
 // instead of silently rewriting the caller's copy of the key. (Only the
 // caller's copy was ever at stake — SealedEnclave.Open decrypts into a fresh,
 // independent enclave each time, so the barrier's own root key was never
-// reachable through this.) SealedEnclave.Open hands back a
-// SIZED enclave, whose pages would otherwise stay writable for its whole
-// lifetime — the window MemoryEnclave.Freeze exists to close — and this accessor
-// has nothing left to fill. That makes it agree with
+// reachable through this.) go-enclave's SealedEnclave.Open freezes the
+// enclave it returns, and fails the open closed — no enclave — when the kernel
+// refuses the freeze, so there is no writable window for this accessor to
+// close. That makes it agree with
 // ProtectedSealingStrategy.UnsealRootKeyProtected, the other method in this
 // package that hands a caller a root key it owns.
 //
-// A refused freeze destroys the enclave rather than returning it, for the reason
-// spelled out at that sibling: handing back a writable enclave from a method
-// whose documentation says the contents are final would report a guarantee that
-// was not established.
+// ctx bounds opening the sealed root key and is handed to go-enclave, whose
+// process sealer may be backed by a blocking provider.
 //
 // DO NOT WIPE THE RETURNED BYTES YOURSELF. Destroy is the release, and it is
 // the only one: a defensive enclave.Wipe or hand-rolled zeroing of the borrowed
@@ -2661,14 +2777,15 @@ func (b *Barrier) RootKey() ([]byte, error) {
 // THE TRADE, stated rather than left for a reader to find in go-enclave: a
 // frozen region has to be made writable again before Destroy can wipe it, so the
 // wipe sits behind an mprotect the kernel can deny. On a kernel that denies
-// it the pages are released still holding the key, and MemoryEnclave.DestroyErr
-// reports ErrReleasedWithoutWipe — where an unfrozen region would have been
+// it the pages are released still holding the key, and MemoryEnclave.Destroy
+// returns ErrReleasedWithoutWipe — where an unfrozen region would have been
 // overwritten before anything deniable was attempted. Nothing leaks either way,
 // since the pages were mlock'd for their whole life and the kernel zeroes an
 // anonymous page before reuse; a caller that wants to know its environment is
-// denying mprotect calls DestroyErr rather than Destroy. This is the same trade
-// UnsealRootKeyProtected and every from-bytes enclave already make.
-func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error) {
+// denying mprotect checks what Destroy returns rather than deferring it bare.
+// This is the same trade UnsealRootKeyProtected and every from-bytes enclave
+// already make.
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {
@@ -2677,20 +2794,11 @@ func (b *Barrier) RootKeyProtected() (*enclave.MemoryEnclave, error) {
 	if b.rootKey == nil {
 		return nil, ErrNoRootKeyAvailable
 	}
-	out, err := b.rootKey.Open()
-	if err != nil {
-		return nil, err
-	}
-	if ferr := out.Freeze(); ferr != nil {
-		// Returned UNWRAPPED, as the Open failure above is, and for the reason
-		// NewCredentials gives for enclave.NewSealed's: it already names its own
-		// origin — a *LockedMemoryError matching ErrLockedMemoryUnavailable —
-		// and a refused mprotect is not a strategy-level failure. Wrapping it in
-		// a *seal.Error would print a strategy name over a kernel refusal.
-		out.Destroy()
-		return nil, ferr
-	}
-	return out, nil
+	// Returned UNWRAPPED, for the reason NewCredentials gives for
+	// enclave.NewSealed's: go-enclave's error already names its own origin — a
+	// refused lock or freeze is a *LockedMemoryError matching
+	// ErrLockedMemoryUnavailable — and is not a strategy-level failure.
+	return b.rootKey.Open(ctx)
 }
 
 // CurrentEpoch returns the current key rotation epoch. Returns 0 if the
@@ -2977,15 +3085,15 @@ func (b *Barrier) restampStateMACLocked(rootKey []byte, s *SealedRootKey) error 
 // not already hold the root key open. The caller must hold b.mu and the barrier
 // must be unsealed in software mode (the delegated paths never reach here: both
 // Rotate and PurgeEpochsBefore refuse with ErrHardwareMode).
-func (b *Barrier) restampStateMACFromEnclaveLocked(s *SealedRootKey) error {
+func (b *Barrier) restampStateMACFromEnclaveLocked(ctx context.Context, s *SealedRootKey) error {
 	if b.rootKey == nil {
 		return ErrNoRootKeyAvailable
 	}
-	rootBuf, err := b.rootKey.Open()
+	rootBuf, err := b.rootKey.Open(ctx)
 	if err != nil {
 		return err
 	}
-	defer rootBuf.Destroy()
+	defer releaseEnclave(rootBuf, "root key")
 	return rootBuf.WithBytes(func(root []byte) error {
 		return b.restampStateMACLocked(root, s)
 	})
@@ -3014,7 +3122,10 @@ func (b *Barrier) restampStateMACFromEnclaveLocked(s *SealedRootKey) error {
 // StrategyNone deployment keeps no root key and expects no MAC; calling this
 // on one returns ErrNoRootKeyAvailable rather than inventing an authenticator
 // there is nothing to authenticate with.
-func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error {
+//
+// ctx bounds opening the sealed root key and is handed to go-enclave, whose
+// process sealer may be backed by a blocking provider.
+func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error {
 	if sealed == nil {
 		return ErrNilSealedData
 	}
@@ -3025,7 +3136,7 @@ func (b *Barrier) StampSealedStateMAC(sealed *SealedRootKey) error {
 	if b.state != barrierUnsealed {
 		return ErrBarrierSealed
 	}
-	return b.restampStateMACFromEnclaveLocked(sealed)
+	return b.restampStateMACFromEnclaveLocked(ctx, sealed)
 }
 
 // StampSealedStateMACWithRootKey is StampSealedStateMAC for a caller that

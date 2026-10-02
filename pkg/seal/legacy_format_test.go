@@ -92,7 +92,7 @@ func mustHex(t *testing.T, s string) []byte {
 func TestLegacyFormat_UnsealRootKey(t *testing.T) {
 	// The production PBKDF2 floor, so this test does not depend on the
 	// work-factor bypass and exercises the same path a real deployment does.
-	s, err := NewSoftwareStrategyFIPS([]byte(legacyRootKeyPassphrase), minPBKDF2Iter)
+	s, err := NewSoftwareStrategyFIPS(context.Background(), []byte(legacyRootKeyPassphrase), minPBKDF2Iter)
 	if err != nil {
 		t.Fatalf("NewSoftwareStrategyFIPS: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestLegacyFormat_UnsealRootKeyRejectsTamper(t *testing.T) {
 
 	for name, off := range offsets {
 		t.Run(name, func(t *testing.T) {
-			s, err := NewSoftwareStrategyFIPS([]byte(legacyRootKeyPassphrase), minPBKDF2Iter)
+			s, err := NewSoftwareStrategyFIPS(context.Background(), []byte(legacyRootKeyPassphrase), minPBKDF2Iter)
 			if err != nil {
 				t.Fatalf("NewSoftwareStrategyFIPS: %v", err)
 			}

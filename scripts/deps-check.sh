@@ -23,9 +23,12 @@ command -v go >/dev/null 2>&1 || {
 	exit 2
 }
 
-# Module directories, sorted for stable output; vendored and fetched trees are
-# pruned.
-mods=$(find . \( -name vendor -o -name node_modules -o -name .git \) -prune -o \
+# Module directories, sorted for stable output. Directories the go tool
+# ignores (names starting with . or _, and testdata) are pruned, the same rule
+# the Makefile's ci-modules uses, so agent worktrees under .claude/ are never
+# walked; vendored and fetched trees are pruned too.
+mods=$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \
+	-o -name vendor -o -name node_modules \) -prune -o \
 	-name go.mod -print | sed 's|/go.mod$||' | sort)
 
 test -n "$mods" || {

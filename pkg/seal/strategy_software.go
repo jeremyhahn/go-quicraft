@@ -84,7 +84,13 @@ type SoftwareStrategy struct {
 // NewSoftwareStrategy creates a SoftwareStrategy that auto-selects the KDF
 // based on FIPS mode: PBKDF2-SHA256 when GOFIPS140 is set, Argon2id otherwise.
 // Default parameters are used for the selected algorithm.
-func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error) {
+//
+// ctx bounds sealing a copy of the passphrase into protected memory, the one
+// step here that go-enclave may hand to a blocking provider. Every bound
+// constructor (this one, NewSoftwareStrategyWithParams and
+// NewSoftwareStrategyFIPS) takes it for that reason; the deferred constructors
+// hold no passphrase and take none.
+func NewSoftwareStrategy(ctx context.Context, passphrase []byte) (*SoftwareStrategy, error) {
 	version := DefaultKDFVersion()
 	var params KDFParams
 	if version == KDFPbkdf2SHA256 {
@@ -92,7 +98,7 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 	} else {
 		params = DefaultKDFParams()
 	}
-	return newSoftwareStrategy(passphrase, version, params)
+	return newSoftwareStrategy(ctx, passphrase, version, params)
 }
 
 // NewSoftwareStrategyWithParams creates a SoftwareStrategy with custom Argon2id
@@ -115,7 +121,7 @@ func NewSoftwareStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 // policy branch — the same mechanism, and the same error, that DeriveKey gives
 // for KDFArgon2id in a FIPS build. Identifiers and signatures stay; ciphers
 // leave.
-func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error) {
+func NewSoftwareStrategyWithParams(ctx context.Context, passphrase []byte, time, memory uint32, threads uint8) (*SoftwareStrategy, error) {
 	params := KDFParams{
 		Time:    time,
 		Memory:  memory,
@@ -123,20 +129,20 @@ func NewSoftwareStrategyWithParams(passphrase []byte, time, memory uint32, threa
 		KeyLen:  32,
 		SaltLen: 32,
 	}
-	return newSoftwareStrategy(passphrase, KDFArgon2id, params)
+	return newSoftwareStrategy(ctx, passphrase, KDFArgon2id, params)
 }
 
 // NewSoftwareStrategyFIPS creates a SoftwareStrategy that always uses
 // PBKDF2-SHA256 with the provided iteration count, regardless of FIPS mode.
 // This is useful when FIPS compliance is required by policy even when the
 // GOFIPS140 environment variable is not set.
-func NewSoftwareStrategyFIPS(passphrase []byte, iterations int) (*SoftwareStrategy, error) {
+func NewSoftwareStrategyFIPS(ctx context.Context, passphrase []byte, iterations int) (*SoftwareStrategy, error) {
 	params := KDFParams{
 		Iterations: iterations,
 		KeyLen:     32,
 		SaltLen:    32,
 	}
-	return newSoftwareStrategy(passphrase, KDFPbkdf2SHA256, params)
+	return newSoftwareStrategy(ctx, passphrase, KDFPbkdf2SHA256, params)
 }
 
 // NewDeferredSoftwareStrategy creates a SoftwareStrategy that defers passphrase
@@ -261,7 +267,7 @@ func warnIfPassphraseWeak(length int) {
 	)
 }
 
-func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams) (*SoftwareStrategy, error) {
+func newSoftwareStrategy(ctx context.Context, passphrase []byte, version KDFVersion, params KDFParams) (*SoftwareStrategy, error) {
 	if len(passphrase) == 0 {
 		return nil, ErrInvalidPassphrase
 	}
@@ -301,7 +307,7 @@ func newSoftwareStrategy(passphrase []byte, version KDFVersion, params KDFParams
 	// (ErrInvalidPassphrase, ErrKDFUnsupportedVersion, ErrKDFNotFIPSApproved) and
 	// for the reason NewCredentials gives: go-enclave's error names its own
 	// origin, and a constructor failing is not a seal failing.
-	sealed, err := enclave.NewSealed(p)
+	sealed, err := enclave.NewSealed(ctx, p)
 	if err != nil {
 		return nil, err
 	}
@@ -388,22 +394,24 @@ func (s *SoftwareStrategy) BarrierEncryptor(_ context.Context, _ []byte) (Symmet
 //
 // When deferPassphrase is false (default), creds is unused; the passphrase is
 // the one bound at construction. When deferPassphrase is true, the passphrase is
-// creds.Secret, and a zero credential is ErrEmptyCredentials. ctx is unused
-// either way — nothing on this path blocks or calls out.
+// creds.Secret, and a zero credential is ErrEmptyCredentials. ctx is handed to
+// go-enclave when the passphrase enclave is opened, which is the one step on
+// this path that can reach a sealing provider; an ended context fails the call
+// before the KDF runs.
 //
 // Ciphertext format: [KDFSalt:32 | Nonce:12 | EncryptedRootKey | Tag:16]
-func (s *SoftwareStrategy) SealRootKey(_ context.Context, rootKey []byte, creds Credentials) (*SealedRootKey, error) {
+func (s *SoftwareStrategy) SealRootKey(ctx context.Context, rootKey []byte, creds Credentials) (*SealedRootKey, error) {
 	passphrase, err := s.resolvePassphrase(creds, sealStrategyError)
 	if err != nil {
 		return nil, err
 	}
-	return s.sealRootKeyWith(passphrase, rootKey)
+	return s.sealRootKeyWith(ctx, passphrase, rootKey)
 }
 
 // sealRootKeyWith performs the seal operation under an already-resolved
 // passphrase — the credentials' for a deferred strategy, the bound one
 // otherwise. See resolvePassphrase for why the two cases stopped differing.
-func (s *SoftwareStrategy) sealRootKeyWith(passphrase *enclave.SealedEnclave, rootKey []byte) (*SealedRootKey, error) {
+func (s *SoftwareStrategy) sealRootKeyWith(ctx context.Context, passphrase *enclave.SealedEnclave, rootKey []byte) (*SealedRootKey, error) {
 	if len(rootKey) != 32 {
 		return nil, ErrInvalidRootKeySize
 	}
@@ -417,7 +425,7 @@ func (s *SoftwareStrategy) sealRootKeyWith(passphrase *enclave.SealedEnclave, ro
 	// Derive the wrapping key and build the AES-256-GCM cipher. The passphrase
 	// enclave is opened, used and destroyed inside this call; see
 	// wrappingCipher for why that is a separate step rather than inline here.
-	aead, err := wrappingCipher(passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
+	aead, err := wrappingCipher(ctx, passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
 	if err != nil {
 		return nil, err
 	}
@@ -468,16 +476,18 @@ func (s *SoftwareStrategy) sealedFromCipher(aead cipher.AEAD, salt, rootKey []by
 //
 // When deferPassphrase is false (default), creds is unused; the passphrase is
 // the one bound at construction. When deferPassphrase is true, the passphrase is
-// creds.Secret, and a zero credential is ErrEmptyCredentials. ctx is unused
-// either way — nothing on this path blocks or calls out.
+// creds.Secret, and a zero credential is ErrEmptyCredentials. ctx is handed to
+// go-enclave when the passphrase enclave is opened, which is the one step on
+// this path that can reach a sealing provider; an ended context fails the call
+// before the KDF runs.
 //
 // Expected ciphertext format: [KDFSalt:32 | Nonce:12 | EncryptedRootKey | Tag:16]
-func (s *SoftwareStrategy) UnsealRootKey(_ context.Context, sealed *SealedRootKey, creds Credentials) ([]byte, error) {
+func (s *SoftwareStrategy) UnsealRootKey(ctx context.Context, sealed *SealedRootKey, creds Credentials) ([]byte, error) {
 	passphrase, err := s.resolvePassphrase(creds, unsealStrategyError)
 	if err != nil {
 		return nil, err
 	}
-	return s.unsealRootKeyWith(passphrase, sealed)
+	return s.unsealRootKeyWith(ctx, passphrase, sealed)
 }
 
 // unsealCipher validates a sealed blob and prepares the AEAD that opens it,
@@ -487,7 +497,7 @@ func (s *SoftwareStrategy) UnsealRootKey(_ context.Context, sealed *SealedRootKe
 // split out so the []byte and protected paths cannot drift in what they
 // validate — and so the protected path can prepare its cipher before it takes
 // an enclave borrow, which is the ordering wrappingCipher explains.
-func (s *SoftwareStrategy) unsealCipher(passphrase *enclave.SealedEnclave, sealed *SealedRootKey) (cipher.AEAD, []byte, error) {
+func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase *enclave.SealedEnclave, sealed *SealedRootKey) (cipher.AEAD, []byte, error) {
 	if sealed == nil {
 		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
 	}
@@ -520,7 +530,7 @@ func (s *SoftwareStrategy) unsealCipher(passphrase *enclave.SealedEnclave, seale
 
 	// Derive the wrapping key from passphrase + KDF salt and build the AEAD
 	// (cipher.NewGCMWithRandomNonce; see newAESGCM).
-	aead, err := wrappingCipher(passphrase, salt, version, params, unsealStrategyError)
+	aead, err := wrappingCipher(ctx, passphrase, salt, version, params, unsealStrategyError)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -541,8 +551,8 @@ func (s *SoftwareStrategy) unsealCipher(passphrase *enclave.SealedEnclave, seale
 // unsealRootKeyWith performs the unseal operation under an already-resolved
 // passphrase, returning the root key as an ordinary slice the caller must wipe.
 // The protected sibling is UnsealRootKeyProtected.
-func (s *SoftwareStrategy) unsealRootKeyWith(passphrase *enclave.SealedEnclave, sealed *SealedRootKey) ([]byte, error) {
-	aead, rest, err := s.unsealCipher(passphrase, sealed)
+func (s *SoftwareStrategy) unsealRootKeyWith(ctx context.Context, passphrase *enclave.SealedEnclave, sealed *SealedRootKey) ([]byte, error) {
+	aead, rest, err := s.unsealCipher(ctx, passphrase, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -633,12 +643,12 @@ func unsealStrategyError(err error) error {
 // cipher first keeps the key-touching window as short as it can be, and the
 // AEAD holds only the expanded key schedule in ordinary memory, which the
 // borrow may touch freely.
-func wrappingCipher(passphrase *enclave.SealedEnclave, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
-	ppBuf, err := passphrase.Open()
+func wrappingCipher(ctx context.Context, passphrase *enclave.SealedEnclave, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
+	ppBuf, err := passphrase.Open(ctx)
 	if err != nil {
-		return nil, wrap(closedIfEnclaveGone(err))
+		return nil, wrap(closedIfEnclaveGone(passphrase, err))
 	}
-	defer ppBuf.Destroy()
+	defer releaseEnclave(ppBuf, "passphrase")
 
 	var wrappingKey []byte
 	if berr := ppBuf.WithBytes(func(pp []byte) error {
@@ -714,7 +724,7 @@ func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error)
 // Seal — which touches no protected memory but the root key itself — runs
 // inside the borrow. The key is therefore never copied out of its enclave, and
 // the borrow cannot deadlock against a process-wide purge. See wrappingCipher.
-func (s *SoftwareStrategy) SealRootKeyProtected(_ context.Context, rootKey *enclave.MemoryEnclave, creds ProtectedCredentials) (*SealedRootKey, error) {
+func (s *SoftwareStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error) {
 	passphrase, err := s.resolvePassphrase(creds, sealStrategyError)
 	if err != nil {
 		return nil, err
@@ -731,7 +741,7 @@ func (s *SoftwareStrategy) SealRootKeyProtected(_ context.Context, rootKey *encl
 		return nil, &Error{Strategy: passphraseStrategyName, Err: err}
 	}
 
-	aead, err := wrappingCipher(passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
+	aead, err := wrappingCipher(ctx, passphrase, salt, s.kdfVersion, s.kdfParams, sealStrategyError)
 	if err != nil {
 		return nil, err
 	}
@@ -769,13 +779,13 @@ func (s *SoftwareStrategy) SealRootKeyProtected(_ context.Context, rootKey *encl
 // The allocation happens BEFORE the borrow, because allocating locked memory is
 // a process-wide purge-exclusive operation that a borrow may not nest (see
 // wrappingCipher), and the KDF runs before that for the same reason.
-func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *SealedRootKey, creds ProtectedCredentials) (*enclave.MemoryEnclave, error) {
+func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error) {
 	passphrase, err := s.resolvePassphrase(creds, unsealStrategyError)
 	if err != nil {
 		return nil, err
 	}
 
-	aead, rest, err := s.unsealCipher(passphrase, sealed)
+	aead, rest, err := s.unsealCipher(ctx, passphrase, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -808,7 +818,7 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 	// hands ownership to the caller, which the contract on
 	// ProtectedSealingStrategy.UnsealRootKeyProtected makes explicit.
 	failed := func(err error) (*enclave.MemoryEnclave, error) {
-		out.Destroy()
+		releaseEnclave(out, "unsealed root key")
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
 	if err := out.WithBytes(func(dst []byte) error {
@@ -849,8 +859,21 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 // Close destroys the SealedEnclave, so a Close that lands after a seal or unseal
 // has already loaded the pointer surfaces as ErrEnclaveDestroyed from Open; that
 // is the same condition as "used after Close" and must report the same error.
-func closedIfEnclaveGone(err error) error {
-	if errors.Is(err, enclave.ErrEnclaveDestroyed) {
+//
+// ErrEnclaveDestroyed alone does not prove that, so the passphrase is asked.
+// Under go-enclave v0.7 an Open can also fail with ErrEnclaveDestroyed when a
+// concurrent enclave.WipeAll destroys one of the open's PER-CALL enclaves (its
+// destination or its DEK) while the passphrase envelope itself is intact. That
+// is a shutdown sweep taking the operation's working key, not this strategy
+// being closed, and it is returned as ErrEnclaveDestroyed rather than named as
+// a Close that never happened. Both answers fail the call; only the label
+// differs.
+//
+// For a deferred strategy the passphrase is the caller's credential, so a
+// credential the caller destroyed still reports ErrStrategyClosed — the rough
+// edge resolvePassphrase documents.
+func closedIfEnclaveGone(passphrase *enclave.SealedEnclave, err error) error {
+	if errors.Is(err, enclave.ErrEnclaveDestroyed) && !passphrase.IsAlive() {
 		return ErrStrategyClosed
 	}
 	return err
@@ -863,21 +886,23 @@ func closedIfEnclaveGone(err error) error {
 // blob before releasing them, so Close is erasure rather than revocation.
 //
 // This method is idempotent and safe to call concurrently with Seal/Unseal, and
-// every outcome is fail-closed. An operation that has ALREADY ACQUIRED the
-// borrow completes against the passphrase: Destroy takes the value's write lock
-// and waits that borrow out. An operation that starts after the swap sees a nil
-// pointer and fails with ErrStrategyClosed.
+// every outcome is fail-closed. Under go-enclave v0.7 Destroy does NOT wait for
+// an Open in flight. An operation whose Open has already pinned the envelope
+// completes against it — it is ordered before the Destroy — and the ciphertext
+// is wiped by whichever of Destroy or the last such Open finishes last. An
+// operation that starts after the swap sees a nil pointer and fails with
+// ErrStrategyClosed.
 //
-// Between those two lies a window that is easy to misread as the first case.
-// resolvePassphrase loads the pointer and wrappingCipher Opens
-// it later, so an operation can hold a live pointer and still lose the race —
-// and so can one already blocked inside Open on the enclave's read lock behind
-// Destroy's pending write lock, which is "in flight" by any ordinary reading of
-// the words but has not acquired anything. Both come back ErrEnclaveDestroyed,
-// which closedIfEnclaveGone reports as ErrStrategyClosed.
+// Between those two lies a window: resolvePassphrase loads the pointer and
+// wrappingCipher Opens it later, so an operation can hold a live pointer and
+// still find the envelope destroyed by the time its Open runs. That Open
+// returns ErrEnclaveDestroyed, which closedIfEnclaveGone reports as
+// ErrStrategyClosed.
 //
-// ACQUIRING the borrow is the line, not loading the pointer and not entering
-// Open. Nothing succeeds against a destroyed passphrase on any of these paths.
+// PINNING the envelope inside Open is the line, not loading the pointer.
+// Nothing opens a passphrase whose Destroy was ordered first, and nothing
+// stays readable after the last open out: the plaintext each Open returned is
+// the operation's own enclave, released by wrappingCipher before it returns.
 //
 // For deferred strategies (where the passphrase arrives in the credentials)
 // Close is a no-op, and the credential is the caller's to Destroy.

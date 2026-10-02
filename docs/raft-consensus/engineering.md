@@ -2415,7 +2415,7 @@ When the LogDB record says `Epoch > 0`:
 
 **Encryption**: When `SnapshotBarrier` configured and unsealed, encrypts data file after fsync (ensures durable plaintext) and before metadata persist. Frame format: [ChunkLen:4 LE | EncryptedChunk]... per 64KB chunks, each including barrier's epoch+nonce+tag. Atomic temp-file + fsync + rename pattern. `DecryptForEpoch()` supports key rotation: old snapshots decrypted with epoch-specific DEK even after rotation.
 
-**Epoch purge**: After garbage collection, scans remaining snapshot directories for oldest epoch in use, calls `barrier.PurgeEpochsBefore(minEpoch)` to zero/remove DEKs for epochs no longer referenced by retained snapshots or WAL segments. Limits key material exposure in memory.
+**Epoch purge**: After garbage collection, scans remaining snapshot directories for oldest epoch in use, calls `barrier.PurgeEpochsBefore(ctx, minEpoch)` (under the snapshot pool's lifetime context, cancelled when the pool stops) to zero/remove DEKs for epochs no longer referenced by retained snapshots or WAL segments. Limits key material exposure in memory.
 
 **Leader snapshot streaming**: Step worker routes `InstallSnapshot` messages to `transport.SendSnapshot()`, chunked streaming transfer to follower. Receiver handles chunked reassembly on disk, saves to LogDB, triggers recovery. Prevents unbounded memory usage during snapshot transfer.
 

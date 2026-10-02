@@ -117,26 +117,24 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 // TestRootKeyProtected_ReturnsFrozenPages is the same property on the barrier's
 // own accessor.
 //
-// enclave.SealedEnclave.Open allocates a SIZED enclave — writable for its whole lifetime, because a
-// sized enclave exists to be filled. This accessor has nothing to fill: it hands
-// a caller a key to read and destroy, exactly as UnsealRootKeyProtected above
-// does, so it freezes Open's result before returning it. The cost of a writable
-// result is not hypothetical: a consumer that retains the borrowed
-// slice past its window — the precise bug Freeze exists to turn into a fault —
+// This accessor hands a caller a key to read and destroy, exactly as
+// UnsealRootKeyProtected above does, so its result must be frozen. The cost of a
+// writable result is not hypothetical: a consumer that retains the borrowed
+// slice past its window — the precise bug a frozen region turns into a fault —
 // rewrites the root key it is about to derive a wrapping key from, every read
 // succeeds, and the corruption surfaces as an unexplained ErrDecryptionFailed
 // somewhere else entirely.
 //
+// The freeze is go-enclave's: SealedEnclave.Open returns a frozen enclave, and
+// fails the open closed when the kernel refuses the freeze, so RootKeyProtected
+// returns Open's result as it is. That makes this test the guard on a property
+// this package takes from go-enclave rather than establishing itself: a
+// go-enclave release that went back to writable plaintext, or an accessor that
+// stopped returning Open's enclave and built a writable one instead, fails here.
+//
 // The kernel is the witness, for the reason given at the sibling above: a
-// missing Freeze is invisible to every other assertion, since the key still
+// writable region is invisible to every other assertion, since the key still
 // round-trips and only a page protection differs.
-//
-// Verified by mutation: deleting the out.Freeze() call in
-// RootKeyProtected fails here with
-//
-//	strategy_freeze_linux_test.go:194: RootKeyProtected returned a region mapped
-//	"rw-p": a write through a slice retained past the borrow rewrites the root
-//	key instead of faulting
 func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 	s := testStrategy(t)
 	defer s.Close()
@@ -146,34 +144,7 @@ func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 		t.Fatalf("Initialize: %v", err)
 	}
 
-	// THE CONTROL, and it is what makes this an A/B rather than an assertion
-	// about the accessor alone. b.rootKey.Open() is what RootKeyProtected would
-	// return without its Freeze; asking the kernel about THAT region shows the
-	// writable mapping the Freeze removes, so a reader can see both states in
-	// one run rather than taking the mutation note on trust.
-	unfrozen, err := b.rootKey.Open()
-	if err != nil {
-		t.Fatalf("opening the sealed root key directly: %v", err)
-	}
-	defer unfrozen.Destroy()
-	unfrozenView, err := unfrozen.Open()
-	if err != nil {
-		t.Fatalf("Open on the control enclave: %v", err)
-	}
-	controlProt, err := lockedmem.ProtectionOf(unfrozenView)
-	if err != nil {
-		t.Skipf("this kernel cannot report mapping protections: %v", err)
-	}
-	if controlProt.ReadOnly() {
-		t.Fatalf("the control region is mapped %q: SealedEnclave.Open has started "+
-			"returning frozen pages, so this test no longer distinguishes anything "+
-			"and the fix it guards can be deleted without failing it", controlProt)
-	}
-	// The control really is writable, which is the whole claim: this store would
-	// fault against the frozen mapping asserted below.
-	unfrozenView[0] ^= 0xFF
-
-	got, err := b.RootKeyProtected()
+	got, err := b.RootKeyProtected(context.Background())
 	if err != nil {
 		t.Fatalf("RootKeyProtected: %v", err)
 	}
@@ -195,7 +166,7 @@ func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 
 	// The freeze must not have cost the caller the key itself. A frozen region
 	// that reads as zeroes would satisfy the assertion above and be useless.
-	plain, err := b.RootKey()
+	plain, err := b.RootKey(context.Background())
 	if err != nil {
 		t.Fatalf("RootKey: %v", err)
 	}

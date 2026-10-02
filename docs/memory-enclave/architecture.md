@@ -33,12 +33,12 @@ second. That is why every long-lived key in this repository is a
 `SealedEnclave` and every working copy is a `MemoryEnclave`.
 
 ```
-enclave.NewSealed(key []byte)        key []byte is WIPED by the constructor
+enclave.NewSealed(ctx, key []byte)   key []byte is WIPED by the constructor
         |
         v
-  SealedEnclave  ─── Open() ───►  MemoryEnclave  ── WithBytes() ──►  cipher.AEAD
+  SealedEnclave  ─ Open(ctx) ─►  MemoryEnclave  ── WithBytes() ──►  cipher.AEAD
    (ciphertext,                     (plaintext,           |
-    heap)                            mlock'd)             |
+    heap)                            mlock'd, frozen)     |
         |                               |                 v
     Destroy()                       Destroy()        (use, then discard)
   WIPES ciphertext                WIPES + unmaps
@@ -58,7 +58,7 @@ and frozen (see "Fill, freeze, hand over").
 | `seal.Credentials.Secret` | `*SealedEnclave` | the caller's passphrase, protected at the API boundary |
 | the root key inside `Initialize`/`Unseal` | `*MemoryEnclave` | live for the whole body, in continuous use |
 | `UnsealRootKeyProtected`'s result | `*MemoryEnclave` | the AEAD decrypts straight into it |
-| `Barrier.RootKeyProtected`'s result | `*MemoryEnclave` | opened from the sealed root key and frozen before it is handed over |
+| `Barrier.RootKeyProtected`'s result | `*MemoryEnclave` | opened from the sealed root key; go-enclave returns it frozen |
 | a `ProtectedShare`'s value, a reconstructed secret | `*MemoryEnclave` | read in place, frozen, caller-destroyed |
 
 `Barrier.Encrypt` and `Barrier.Decrypt` open nothing. They run off a
@@ -93,6 +93,8 @@ Guaranteed:
   hierarchy, which is held in locked memory and dies with the process.
 - Plaintext exposure is bounded to `Open`/`Destroy` windows.
 - `Destroy` erases on both types: each wipes what it holds before releasing it.
+  `MemoryEnclave.Destroy` reports a release the kernel refused, or one that ran
+  without a wipe because `mprotect` was denied; see "Releases are reported".
 
 Not guaranteed:
 
@@ -117,11 +119,15 @@ caller fills it inside a borrow, and `MemoryEnclave.Freeze` mprotects it
 read-only once the material is final. A stray write through a retained slice
 then faults instead of silently corrupting a key.
 
-Four sites use it: the unsealed root key (`UnsealRootKeyProtected`), the root key
-`Barrier.RootKeyProtected` hands out, a Shamir share value, and a reconstructed
-secret. `SealedEnclave.Open` returns a writable enclave, so
-`RootKeyProtected` freezes its result explicitly; each `Open` decrypts into a
-fresh, independent enclave, so freezing the caller's copy affects nothing else.
+Three sites use it: the unsealed root key (`UnsealRootKeyProtected`), a Shamir
+share value, and a reconstructed secret. The root key `Barrier.RootKeyProtected`
+hands out is frozen too, but not by this repository: `SealedEnclave.Open`
+freezes the enclave it returns and fails the open closed when the kernel refuses
+the freeze, so the accessor returns `Open`'s result as it is. Each `Open`
+decrypts into a fresh, independent enclave, so a caller's frozen copy affects
+nothing else. Code that needs a writable copy of opened material allocates its
+own sized enclave and copies into it inside a borrow; writing into the opened
+enclave faults.
 
 *Rejected: fill-then-move* (build a second, from-bytes enclave out of the
 first). Without a post-fill freeze it was the only way to get a frozen result,
@@ -196,6 +202,36 @@ the `Allocator` the caller passes.
 This repository never calls `WipeAll`. It is a shutdown sweep for whoever owns
 the process, and a library that called it would destroy enclaves its embedder
 still holds.
+
+### Releases are reported
+
+`MemoryEnclave.Destroy` returns an error. `ErrLockedMemoryUnavailable` means the
+kernel refused the release and the pages are still held; go-enclave keeps them
+on its `WipeAll` ledger and a later `Destroy` retries. `ErrReleasedWithoutWipe`
+means a denied `mprotect` forced a bare unmap: the pages are gone, and the
+kernel zeroes them before reuse. The two are disjoint.
+
+Every `MemoryEnclave` this repository destroys is a cleanup step whose operation
+already has its result, so the report never replaces that result. `pkg/seal`
+logs it at WARN through one helper; `pkg/crypto/shamir`, a primitive with no
+logger, drops it through one helper whose comment says why nothing is lost.
+`ProtectedShare.Destroy` returns nothing and so reports nothing; a caller that
+must observe a refused release holds the enclave itself.
+
+### Contexts reach the sealer
+
+Every go-enclave call that can reach the process sealer's provider takes a
+`context.Context`: `NewSealed`, `SealedEnclave.Open` and `OpenWith`. A provider
+can block for as long as its device does, so this repository passes the
+caller's context wherever it has one: `seal.NewCredentials`, the bound
+`NewSoftwareStrategy*` constructors, the `SealingStrategy` methods,
+`Barrier.Initialize`, `Unseal`, `Rotate`, `PurgeEpochsBefore`, `RootKey`,
+`RootKeyProtected` and `StampSealedStateMAC`. The host's key-rotation loop and
+the snapshot pool, which rotate and purge in the background, pass a context
+cancelled when they stop. The forced rotation `Unseal` runs when an epoch's
+invocation budget cannot be recovered uses `context.WithoutCancel` of the
+unseal's context: the barrier is already unsealed by then, and a rotation cut
+short would only leave encryption refused.
 
 ### Constructors consume their input
 

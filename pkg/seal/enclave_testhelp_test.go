@@ -1,6 +1,7 @@
 package seal
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jeremyhahn/go-enclave"
@@ -34,6 +35,19 @@ func mustSized(t testing.TB, n int) *enclave.MemoryEnclave {
 	return e
 }
 
+// destroyOnCleanup releases e when the test ends and fails the test if the
+// release is refused. go-enclave's Destroy reports a refused release rather than
+// hiding it, and a test environment that cannot release locked memory is one
+// whose later allocations would fail for reasons unrelated to the test.
+func destroyOnCleanup(t testing.TB, e *enclave.MemoryEnclave) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := e.Destroy(); err != nil {
+			t.Errorf("MemoryEnclave.Destroy: %v", err)
+		}
+	})
+}
+
 // mustFromBytes moves data into a locked, FROZEN enclave, failing the test if
 // the kernel refuses the lock.
 func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
@@ -52,7 +66,7 @@ func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
 // the string rather than a shared slice.
 func mustCreds(t testing.TB, passphrase string) Credentials {
 	t.Helper()
-	c, err := NewCredentials([]byte(passphrase))
+	c, err := NewCredentials(context.Background(), []byte(passphrase))
 	if err != nil {
 		t.Fatalf("NewCredentials(%q): %v", passphrase, err)
 	}

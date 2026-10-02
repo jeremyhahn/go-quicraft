@@ -18,6 +18,7 @@ package seal
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 )
@@ -31,7 +32,7 @@ import (
 // TestMain installs. Tests that are ABOUT a specific KDF must name it directly
 // rather than go through this helper.
 func newTestStrategy(passphrase []byte) (*SoftwareStrategy, error) {
-	return NewSoftwareStrategyWithParams(passphrase, 1, 64*1024, 1)
+	return NewSoftwareStrategyWithParams(context.Background(), passphrase, 1, 64*1024, 1)
 }
 
 // testKDFVersion is the KDF version newTestStrategy seals with, for tests that
@@ -71,7 +72,7 @@ func assertArgon2idRefusedUnderFIPS(t *testing.T, pass, salt []byte) {
 	if _, err := DeriveKey(pass, salt, KDFArgon2id, DefaultKDFParams()); !errors.Is(err, ErrKDFNotFIPSApproved) {
 		t.Fatalf("DeriveKey(Argon2id) under FIPS = %v, want ErrKDFNotFIPSApproved", err)
 	}
-	if _, err := NewSoftwareStrategyWithParams(pass, 4, 128*1024, 4); !errors.Is(err, ErrKDFNotFIPSApproved) {
+	if _, err := NewSoftwareStrategyWithParams(context.Background(), pass, 4, 128*1024, 4); !errors.Is(err, ErrKDFNotFIPSApproved) {
 		t.Fatalf("NewSoftwareStrategyWithParams under FIPS = %v, want ErrKDFNotFIPSApproved", err)
 	}
 }

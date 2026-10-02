@@ -115,7 +115,13 @@ type Credentials struct {
 // zero-length material with ErrEmptyEnclave. Refusing it here names the actual
 // fault (ErrInvalidPassphrase) at the point the caller can act on, rather than
 // surfacing a construction error two layers down.
-func NewCredentials(secret []byte) (Credentials, error) {
+//
+// ctx bounds the seal and is handed to go-enclave, whose process sealer may be
+// backed by a provider that blocks (a device, a remote KMS). A context that has
+// ended refuses the call with an error matching both enclave.ErrSealFailed and
+// ctx.Err(), and the secret is still wiped: a refused seal consumes its input
+// exactly as a successful one does.
+func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) {
 	if len(secret) == 0 {
 		return Credentials{}, ErrInvalidPassphrase
 	}
@@ -130,7 +136,7 @@ func NewCredentials(secret []byte) (Credentials, error) {
 	// print "seal failed (strategy=passphrase)" over a refused mlock, which is
 	// both untrue and specific to a strategy this constructor knows nothing
 	// about: Credentials is what a TPM2 or KMS strategy takes too.
-	sealed, err := enclave.NewSealed(secret)
+	sealed, err := enclave.NewSealed(ctx, secret)
 	if err != nil {
 		return Credentials{}, err
 	}

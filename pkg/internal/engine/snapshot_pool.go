@@ -110,7 +110,7 @@ type SnapshotBarrier interface {
 
 	// PurgeEpochsBefore removes DEKs for epochs strictly less than minEpoch.
 	// Returns the number of epochs actually purged.
-	PurgeEpochsBefore(minEpoch uint64) (int, error)
+	PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, error)
 }
 
 // snapshotRequest is sent to the snapshot pool to request a snapshot
@@ -2817,6 +2817,23 @@ func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
 	p.applyPurge(barrier, purgeFloor, shardID, replicaID)
 }
 
+// lifetimeContext returns a context cancelled when the pool's stopC closes, for
+// barrier calls that go-enclave may hand to a blocking provider. The caller
+// must call the returned cancel when the call is done; it also ends the
+// goroutine watching stopC. A nil stopC (standalone tests) is never closed, so
+// the context ends only through cancel.
+func (p *snapshotPool) lifetimeContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-p.stopC:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // applyPurge invokes PurgeEpochsBefore on the given barrier when the floor is
 // above the initial epoch. Epoch 1 has no predecessor to purge. Shared by the
 // global and per-barrier purge paths so both log and guard identically.
@@ -2824,7 +2841,21 @@ func (p *snapshotPool) applyPurge(barrier SnapshotBarrier, purgeFloor, shardID, 
 	if purgeFloor <= 1 {
 		return
 	}
-	purged, purgeErr := barrier.PurgeEpochsBefore(purgeFloor)
+	ctx, cancel := p.lifetimeContext()
+	defer cancel()
+	purged, purgeErr := barrier.PurgeEpochsBefore(ctx, purgeFloor)
+	if purgeErr != nil && ctx.Err() != nil && errors.Is(purgeErr, ctx.Err()) {
+		// The pool is stopping and cancelled the purge before anything was
+		// persisted or dropped; the next save after a restart purges again.
+		// Keyed to the error's CAUSE: a persist failure or a missing persister
+		// that merely surfaces during stop is still logged at WARN below.
+		slog.Debug("epoch purge abandoned: snapshot pool is stopping",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"error", purgeErr,
+		)
+		return
+	}
 	if purgeErr != nil {
 		slog.Warn("epoch purge failed",
 			"shard_id", shardID,

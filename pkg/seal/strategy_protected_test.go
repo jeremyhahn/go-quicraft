@@ -40,7 +40,7 @@ func protectedRootKey(t *testing.T) (*enclave.MemoryEnclave, []byte) {
 	// is filled and then Frozen; both end read-only.) want is copied first
 	// because this constructor wipes its source.
 	enc := mustFromBytes(t, append([]byte(nil), want...))
-	t.Cleanup(enc.Destroy)
+	destroyOnCleanup(t, enc)
 	return enc, want
 }
 
@@ -67,7 +67,7 @@ func TestSoftwareStrategy_ProtectedSealUnsealRoundTrip(t *testing.T) {
 
 	rootKey, want := protectedRootKey(t)
 
-	sealed, err := s.SealRootKeyProtected(context.Background(), rootKey, ProtectedCredentials{})
+	sealed, err := s.SealRootKeyProtected(context.Background(), rootKey, Credentials{})
 	if err != nil {
 		t.Fatalf("SealRootKeyProtected: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestSoftwareStrategy_ProtectedSealUnsealRoundTrip(t *testing.T) {
 	// in turn, which is exactly what a rekey does.
 	assertEnclaveHolds(t, rootKey, want)
 
-	recovered, err := s.UnsealRootKeyProtected(context.Background(), sealed, ProtectedCredentials{})
+	recovered, err := s.UnsealRootKeyProtected(context.Background(), sealed, Credentials{})
 	if err != nil {
 		t.Fatalf("UnsealRootKeyProtected: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestSoftwareStrategy_ProtectedAndStringPathsInteroperate(t *testing.T) {
 		defer s.Close()
 
 		rootKey, want := protectedRootKey(t)
-		sealed, err := s.SealRootKeyProtected(ctx, rootKey, ProtectedCredentials{})
+		sealed, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{})
 		if err != nil {
 			t.Fatalf("SealRootKeyProtected: %v", err)
 		}
@@ -142,7 +142,7 @@ func TestSoftwareStrategy_ProtectedAndStringPathsInteroperate(t *testing.T) {
 		}
 		enclave.Wipe(key)
 
-		recovered, err := s.UnsealRootKeyProtected(ctx, sealed, ProtectedCredentials{})
+		recovered, err := s.UnsealRootKeyProtected(ctx, sealed, Credentials{})
 		if err != nil {
 			t.Fatalf("UnsealRootKeyProtected: %v", err)
 		}
@@ -161,11 +161,11 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 	defer s.Close()
 
 	rootKey, _ := protectedRootKey(t)
-	sealed, err := s.SealRootKeyProtected(context.Background(), rootKey, ProtectedCredentials{})
+	sealed, err := s.SealRootKeyProtected(context.Background(), rootKey, Credentials{})
 	if err != nil {
 		t.Fatalf("SealRootKeyProtected: %v", err)
 	}
-	recovered, err := s.UnsealRootKeyProtected(context.Background(), sealed, ProtectedCredentials{})
+	recovered, err := s.UnsealRootKeyProtected(context.Background(), sealed, Credentials{})
 	if err != nil {
 		t.Fatalf("UnsealRootKeyProtected: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestSoftwareStrategy_ProtectedUnsealRefusesAnUnauthenticatedLength(t *testi
 				Metadata:   []byte{byte(testKDFVersion)},
 				Ciphertext: make([]byte, frame+tc.plaintextLen),
 			}
-			got, err := s.UnsealRootKeyProtected(ctx, blob, ProtectedCredentials{})
+			got, err := s.UnsealRootKeyProtected(ctx, blob, Credentials{})
 			if !errors.Is(err, ErrInvalidSealedKey) {
 				t.Fatalf("UnsealRootKeyProtected = %v, want ErrInvalidSealedKey", err)
 			}
@@ -231,7 +231,7 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 	destroyed.Destroy()
 
 	wrongSize := mustSized(t, rootKeySize-1)
-	t.Cleanup(wrongSize.Destroy)
+	destroyOnCleanup(t, wrongSize)
 
 	tests := []struct {
 		name    string
@@ -250,7 +250,7 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 			}
 			defer s.Close()
 
-			if _, err := s.SealRootKeyProtected(ctx, tc.rootKey, ProtectedCredentials{}); !errors.Is(err, tc.want) {
+			if _, err := s.SealRootKeyProtected(ctx, tc.rootKey, Credentials{}); !errors.Is(err, tc.want) {
 				t.Fatalf("SealRootKeyProtected = %v, want %v", err, tc.want)
 			}
 		})
@@ -267,7 +267,7 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 		rootKey, _ := protectedRootKey(t)
 		// Reported BEFORE the size check, matching the string-typed path: a
 		// closed strategy cannot seal anything, whatever it is handed.
-		if _, err := s.SealRootKeyProtected(ctx, rootKey, ProtectedCredentials{}); !errors.Is(err, ErrStrategyClosed) {
+		if _, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{}); !errors.Is(err, ErrStrategyClosed) {
 			t.Fatalf("SealRootKeyProtected on a closed strategy = %v, want ErrStrategyClosed", err)
 		}
 	})
@@ -283,7 +283,7 @@ func TestSoftwareStrategy_UnsealRootKeyProtectedErrors(t *testing.T) {
 	defer s.Close()
 
 	rootKey, _ := protectedRootKey(t)
-	good, err := s.SealRootKeyProtected(ctx, rootKey, ProtectedCredentials{})
+	good, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{})
 	if err != nil {
 		t.Fatalf("SealRootKeyProtected: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestSoftwareStrategy_UnsealRootKeyProtectedErrors(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := s.UnsealRootKeyProtected(ctx, tc.sealed, ProtectedCredentials{})
+			got, err := s.UnsealRootKeyProtected(ctx, tc.sealed, Credentials{})
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("UnsealRootKeyProtected = %v, want %v", err, tc.want)
 			}
@@ -322,7 +322,7 @@ func TestSoftwareStrategy_UnsealRootKeyProtectedErrors(t *testing.T) {
 		}
 		defer other.Close()
 
-		got, err := other.UnsealRootKeyProtected(ctx, good, ProtectedCredentials{})
+		got, err := other.UnsealRootKeyProtected(ctx, good, Credentials{})
 		if !errors.Is(err, ErrDecryptionFailed) {
 			t.Fatalf("UnsealRootKeyProtected with the wrong passphrase = %v, want ErrDecryptionFailed", err)
 		}
@@ -340,7 +340,7 @@ func TestSoftwareStrategy_UnsealRootKeyProtectedErrors(t *testing.T) {
 		if err := closed.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
-		if _, err := closed.UnsealRootKeyProtected(ctx, good, ProtectedCredentials{}); !errors.Is(err, ErrStrategyClosed) {
+		if _, err := closed.UnsealRootKeyProtected(ctx, good, Credentials{}); !errors.Is(err, ErrStrategyClosed) {
 			t.Fatalf("UnsealRootKeyProtected on a closed strategy = %v, want ErrStrategyClosed", err)
 		}
 	})
@@ -360,9 +360,9 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	s.kdfVersion = testKDFVersion
 	s.kdfParams = testKDFParams()
 
-	creds, err := NewProtectedCredentials([]byte("a-deferred-protected-passphrase"))
+	creds, err := NewCredentials(context.Background(), []byte("a-deferred-protected-passphrase"))
 	if err != nil {
-		t.Fatalf("NewProtectedCredentials: %v", err)
+		t.Fatalf("NewCredentials: %v", err)
 	}
 	defer creds.Secret.Destroy()
 
@@ -389,63 +389,21 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	defer again.Destroy()
 	assertEnclaveHolds(t, again, want)
 
-	if _, err := s.SealRootKeyProtected(ctx, rootKey, ProtectedCredentials{}); !errors.Is(err, ErrEmptyCredentials) {
+	if _, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{}); !errors.Is(err, ErrEmptyCredentials) {
 		t.Fatalf("SealRootKeyProtected with no credentials = %v, want ErrEmptyCredentials", err)
 	}
-	if _, err := s.UnsealRootKeyProtected(ctx, sealed, ProtectedCredentials{}); !errors.Is(err, ErrEmptyCredentials) {
+	if _, err := s.UnsealRootKeyProtected(ctx, sealed, Credentials{}); !errors.Is(err, ErrEmptyCredentials) {
 		t.Fatalf("UnsealRootKeyProtected with no credentials = %v, want ErrEmptyCredentials", err)
 	}
 
-	wrong, err := NewProtectedCredentials([]byte("the-wrong-passphrase-entirely"))
+	wrong, err := NewCredentials(context.Background(), []byte("the-wrong-passphrase-entirely"))
 	if err != nil {
-		t.Fatalf("NewProtectedCredentials: %v", err)
+		t.Fatalf("NewCredentials: %v", err)
 	}
 	defer wrong.Secret.Destroy()
 	if _, err := s.UnsealRootKeyProtected(ctx, sealed, wrong); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("UnsealRootKeyProtected with the wrong credentials = %v, want ErrDecryptionFailed", err)
 	}
-}
-
-// The constructor is the only supported way to build ProtectedCredentials, and
-// wiping its source is the whole reason it exists rather than a struct literal:
-// the passphrase reached it unprotected, and not leaving it there is the only
-// thing still worth doing about that.
-func TestNewProtectedCredentials(t *testing.T) {
-	t.Run("moves the secret and wipes the source", func(t *testing.T) {
-		secret := []byte("a-passphrase-worth-protecting")
-		want := append([]byte(nil), secret...)
-
-		creds, err := NewProtectedCredentials(secret)
-		if err != nil {
-			t.Fatalf("NewProtectedCredentials: %v", err)
-		}
-		defer creds.Secret.Destroy()
-
-		for i, b := range secret {
-			if b != 0 {
-				t.Fatalf("the caller's slice must be wiped; byte %d is %#x", i, b)
-			}
-		}
-
-		opened, err := creds.Secret.Open()
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		defer opened.Destroy()
-		assertEnclaveHolds(t, opened, want)
-	})
-
-	t.Run("refuses an empty secret", func(t *testing.T) {
-		for name, secret := range map[string][]byte{"nil": nil, "empty": {}} {
-			creds, err := NewProtectedCredentials(secret)
-			if !errors.Is(err, ErrInvalidPassphrase) {
-				t.Fatalf("NewProtectedCredentials(%s) = %v, want ErrInvalidPassphrase", name, err)
-			}
-			if creds.Secret != nil {
-				t.Fatalf("NewProtectedCredentials(%s) must not build a key", name)
-			}
-		}
-	})
 }
 
 // NoneStrategy seals nothing and therefore has nothing to hand back protected.
@@ -456,7 +414,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 	s := NewNoneStrategy()
 	rootKey, want := protectedRootKey(t)
 
-	sealed, err := s.SealRootKeyProtected(ctx, rootKey, ProtectedCredentials{})
+	sealed, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{})
 	if err != nil {
 		t.Fatalf("SealRootKeyProtected: %v", err)
 	}
@@ -469,7 +427,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 	// The caller's key is untouched: None reads nothing and owns nothing.
 	assertEnclaveHolds(t, rootKey, want)
 
-	got, err := s.UnsealRootKeyProtected(ctx, sealed, ProtectedCredentials{})
+	got, err := s.UnsealRootKeyProtected(ctx, sealed, Credentials{})
 	if !errors.Is(err, ErrNoRootKeyAvailable) {
 		t.Fatalf("UnsealRootKeyProtected = %v, want ErrNoRootKeyAvailable", err)
 	}
@@ -485,14 +443,14 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 		destroyed := mustSized(t, rootKeySize)
 		destroyed.Destroy()
 		wrongSize := mustSized(t, rootKeySize-1)
-		t.Cleanup(wrongSize.Destroy)
+		destroyOnCleanup(t, wrongSize)
 
 		for name, enc := range map[string]*enclave.MemoryEnclave{
 			"nil":        nil,
 			"destroyed":  destroyed,
 			"undersized": wrongSize,
 		} {
-			got, err := s.SealRootKeyProtected(ctx, enc, ProtectedCredentials{})
+			got, err := s.SealRootKeyProtected(ctx, enc, Credentials{})
 			if !errors.Is(err, ErrInvalidRootKeySize) {
 				t.Fatalf("SealRootKeyProtected(%s) = %v, want ErrInvalidRootKeySize", name, err)
 			}
@@ -504,59 +462,11 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 
 	// The blob is still validated first, so a caller learns that its sealed
 	// state is wrong rather than that no key exists.
-	if _, err := s.UnsealRootKeyProtected(ctx, nil, ProtectedCredentials{}); !errors.Is(err, ErrInvalidSealedKey) {
+	if _, err := s.UnsealRootKeyProtected(ctx, nil, Credentials{}); !errors.Is(err, ErrInvalidSealedKey) {
 		t.Fatalf("UnsealRootKeyProtected(nil) = %v, want ErrInvalidSealedKey", err)
 	}
 	mismatched := &SealedRootKey{Strategy: StrategyPassphrase}
-	if _, err := s.UnsealRootKeyProtected(ctx, mismatched, ProtectedCredentials{}); !errors.Is(err, ErrStrategyMismatch) {
+	if _, err := s.UnsealRootKeyProtected(ctx, mismatched, Credentials{}); !errors.Is(err, ErrStrategyMismatch) {
 		t.Fatalf("UnsealRootKeyProtected(mismatched) = %v, want ErrStrategyMismatch", err)
 	}
-}
-
-// TestNewProtectedCredentials_IsNewCredentials holds the deprecated shim to the
-// contract it delegates to. It is a declared FUNCTION rather than a
-// `var NewProtectedCredentials = NewCredentials`, so no package can reassign
-// it.
-//
-// That non-reassignability has no runtime witness — a func value and a
-// declared func are indistinguishable once called — and is enforced by the
-// compiler: a package assigning to it fails to build with "cannot assign to
-// seal.NewProtectedCredentials (neither addressable nor a map index
-// expression)". What a test CAN hold is that the wrapper does exactly what
-// NewCredentials does, which is the half a future edit could plausibly get
-// wrong.
-func TestNewProtectedCredentials_IsNewCredentials(t *testing.T) {
-	t.Run("moves the secret and wipes the caller's slice", func(t *testing.T) {
-		secret := []byte("a-passphrase-long-enough-to-pass")
-		creds, err := NewProtectedCredentials(secret)
-		if err != nil {
-			t.Fatalf("NewProtectedCredentials: %v", err)
-		}
-		if creds.Secret == nil {
-			t.Fatal("NewProtectedCredentials returned no sealed secret")
-		}
-		defer creds.Secret.Destroy()
-
-		for i, c := range secret {
-			if c != 0 {
-				t.Fatalf("byte %d of the caller's slice = %#x: the constructor "+
-					"must CONSUME it, as NewCredentials does", i, c)
-			}
-		}
-
-		opened, err := creds.Secret.Open()
-		if err != nil {
-			t.Fatalf("Open: %v", err)
-		}
-		defer opened.Destroy()
-		if !opened.EqualTo([]byte("a-passphrase-long-enough-to-pass")) {
-			t.Fatal("the sealed secret is not what was handed in")
-		}
-	})
-
-	t.Run("refuses an empty secret with the same error", func(t *testing.T) {
-		if _, err := NewProtectedCredentials(nil); !errors.Is(err, ErrInvalidPassphrase) {
-			t.Fatalf("NewProtectedCredentials(nil) = %v, want ErrInvalidPassphrase", err)
-		}
-	})
 }

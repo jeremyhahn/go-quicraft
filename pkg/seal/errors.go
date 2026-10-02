@@ -26,7 +26,7 @@ var (
 	// attempted while the barrier is sealed.
 	ErrBarrierSealed = errors.New("quicraft/seal: barrier is sealed")
 
-	// ErrNoRootKeyAvailable is returned by RootKey() when the barrier holds no
+	// ErrNoRootKeyAvailable is returned by RootKey(ctx) when the barrier holds no
 	// root key material — i.e. no-encryption mode (StrategyNone), where the
 	// identity encryptor needs no key.
 	ErrNoRootKeyAvailable = errors.New("quicraft/seal: no root key in no-encryption mode")

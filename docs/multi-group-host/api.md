@@ -813,6 +813,11 @@ an import cycle; `*seal.Barrier` satisfies it. Its methods: `IsSealed`, `Seal`,
 `RegisterInFlightEpoch`, `DeregisterInFlightEpoch`, `CurrentEpoch`,
 `ShouldRotateKey`.
 
+`Rotate(ctx)` and `PurgeEpochsBefore(ctx, minEpoch)` take a context, so a custom
+`Barrier` must accept one. The host's key-rotation loop passes a context it
+cancels when `Close` stops the loop; the snapshot pool's purge passes one it
+cancels when the pool stops.
+
 `IsHardwareMode` says only that sealing is delegated to an external encryptor.
 `SupportsContextAAD` says whether that encryptor can authenticate the caller
 context that snapshot frames are bound to: true for a software barrier and for a
