@@ -1933,7 +1933,7 @@ func TestLogReaderCompactLogDBErrorPropagation(t *testing.T) {
 	}
 }
 
-// TestLogReaderTermWhenLogDBReturnsEmpty is the M5 regression: an empty
+// TestLogReaderTermWhenLogDBReturnsEmpty is a regression test: an empty
 // LogDB result for an in-range index must surface as ErrUnavailable, never
 // as term 0 — Raft's "no term" sentinel — which would make followers reject
 // appends forever (as prevLogTerm) or grant votes to shorter logs (as the
@@ -3628,20 +3628,20 @@ func TestCreateSnapshot_RejectsRegressionAboveTheMarker(t *testing.T) {
 	}
 }
 
-// TestSetSnapshot_GuardsDoNotDependOnUnrelatedState pins the removal of the
-// zero-value proxy that used to gate both guards.
+// TestSetSnapshot_GuardsDoNotDependOnUnrelatedState pins that neither
+// staleness guard is gated on a zero-value proxy for "this reader has been
+// used".
 //
-// They sat behind `membership.ConfigChangeID != 0 || state.Commit != 0`, a
-// guess at "this reader has been used". ConfigChangeID 0 and Commit 0 are legal
-// for a replica that recovered from a snapshot and has committed nothing of its
-// own since, and for exactly that replica the guess switched BOTH guards off —
-// so the one state in which a stale snapshot is most likely to arrive was the
-// one state in which nothing rejected it.
+// A proxy such as `membership.ConfigChangeID != 0 || state.Commit != 0` reads
+// zero for a replica that recovered from a snapshot and has committed nothing
+// of its own since — both values are legal there — and would switch BOTH guards
+// off for exactly that replica, so the one state in which a stale snapshot is
+// most likely to arrive would be the one state in which nothing rejected it.
 func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
 
 	// A snapshot whose membership carries no config change, on a reader that
-	// has committed nothing: both halves of the old proxy read zero.
+	// has committed nothing: both halves of such a proxy read zero.
 	recorded := proto.Snapshot{
 		Index:      50,
 		Term:       3,
@@ -3652,11 +3652,11 @@ func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
 	}
 	_, membership := lr.NodeState()
 	if membership.ConfigChangeID != 0 {
-		t.Fatalf("fixture: ConfigChangeID = %d, want 0 so the old proxy reads zero",
+		t.Fatalf("fixture: ConfigChangeID = %d, want 0 so a zero-value proxy reads zero",
 			membership.ConfigChangeID)
 	}
 	if st, _ := lr.NodeState(); st.Commit != 0 {
-		t.Fatalf("fixture: Commit = %d, want 0 so the old proxy reads zero", st.Commit)
+		t.Fatalf("fixture: Commit = %d, want 0 so a zero-value proxy reads zero", st.Commit)
 	}
 
 	for _, ss := range []proto.Snapshot{
@@ -3666,8 +3666,8 @@ func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
 		if err := lr.ApplySnapshot(ss); !errors.Is(err, ErrSnapshotOutOfDate) {
 			t.Fatalf("ApplySnapshot(%d) over a recorded snapshot at 50 = %v, want "+
 				"ErrSnapshotOutOfDate: the reader's ConfigChangeID and Commit are "+
-				"both zero, which is legal after a snapshot recovery, and used to "+
-				"disable every staleness check on this path", ss.Index, err)
+				"both zero, which is legal after a snapshot recovery, and must not "+
+				"disable any staleness check on this path", ss.Index, err)
 		}
 		if err := lr.CreateSnapshot(ss); !errors.Is(err, ErrSnapshotOutOfDate) {
 			t.Fatalf("CreateSnapshot(%d) over a recorded snapshot at 50 = %v, want "+

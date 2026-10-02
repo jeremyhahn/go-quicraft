@@ -34,13 +34,10 @@ import (
 // a sound payload at the wrong log position or into the wrong configuration. The artifact header carries no length, so the trailer
 // is found by position — it is the last snapshotArtifactTrailerSize bytes of
 // the stream — and the magic is what makes that position self-checking. An
-// artifact written by a build that predates the trailer ends in payload
-// bytes, so its "trailer" fails the magic and the artifact is refused as
-// invalid rather than accepted unverified.
-//
-// No version constant changed for this: the header layout is untouched, and
-// the trailer's own magic is what distinguishes the two layouts (see the
-// pre-v1 format rule in CLAUDE.md).
+// artifact without a trailer ends in payload bytes, so its "trailer" fails
+// the magic and the artifact is refused as invalid rather than accepted
+// unverified. The header layout and its version are unaffected; the trailer's
+// own magic is what distinguishes the two layouts.
 var snapshotArtifactTrailerMagic = [8]byte{'Q', 'R', 'S', 'N', 'T', 'R', 'L', 'R'}
 
 // snapshotArtifactTrailerSize is the encoded size of the artifact trailer:

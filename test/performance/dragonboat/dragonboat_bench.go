@@ -173,8 +173,7 @@ func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresu
 		elapsed := time.Since(start)
 		if err != nil {
 			// A transient refusal is Raft weather, not a failed benchmark;
-			// requireFloor decides whether there were too many. See
-			// #181 for what b.Fatalf here used to cost.
+			// requireFloor decides whether there were too many.
 			if !tolerable(err) {
 				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
 			}
@@ -292,8 +291,7 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 		elapsed := time.Since(start)
 		if err != nil {
 			// A transient refusal is Raft weather, not a failed benchmark;
-			// requireFloor decides whether there were too many. See
-			// #181 for what b.Fatalf here used to cost.
+			// requireFloor decides whether there were too many.
 			if !tolerable(err) {
 				b.Fatalf("iteration %d: permanent error, not Raft weather: %v", i, err)
 			}
@@ -452,9 +450,9 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 		b.Fatalf("permanent error, not Raft weather: %v", *p)
 	}
 
-	// Counted AND checked. This loop tolerated every error and logged the
-	// total, but nothing read it, so a run in which every proposal failed
-	// reported no samples and passed clean (#181).
+	// Counted AND checked: a loop that tolerates every error and logs the
+	// total without checking it lets a run in which every proposal failed
+	// report no samples and pass clean.
 	requireFloor(b, "proposals", int(okCount.Load()), int(errCount.Load()))
 }
 
@@ -484,11 +482,11 @@ func (c *BenchCluster) Leader() *dragonboat.NodeHost {
 // seed writes key through the cluster's CURRENT leader before a read
 // benchmark times reads of it, on the warmup retry budget, re-resolving the
 // leader before every attempt. The cluster was warm a moment ago, but a
-// 3-node shard on a 112-core host lost its leader between the warmup and
-// the first benchmark (the dual-socket profile, #184 part 3), and dragonboat does not
-// forward: a proposal addressed to the deposed leader sits for its whole
-// 10s and reports "timeout", which took the run down with it. The retry
-// treats that the way #181 treats every other transient, and LeaderIdx is
+// 3-node shard on a large host can lose its leader between the warmup and
+// the first benchmark, and dragonboat does not forward: a proposal
+// addressed to the deposed leader sits for its whole 10s and reports
+// "timeout", which would take the run down with it. The retry treats that
+// the way the propose loops treat every other transient, and LeaderIdx is
 // updated so the loop that follows reads from the leader the seed actually
 // landed on.
 func (c *BenchCluster) seed(b *testing.B, key []byte) {
@@ -607,10 +605,8 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	// Warmup proposal with retry to ensure all TLS connections are fully
 	// established before timing begins. The retry budget is benchutil's, shared
 	// with every other engine, and a warmup that never succeeds is fatal HERE.
-	// It used to be swallowed: the loop broke on success and fell through on
-	// exhaustion either way, so an unready cluster was handed to the caller and
-	// surfaced later as a misleading downstream error — that is how
-	// BenchmarkStaleRead_5N_Dragonboat came to report "seed propose failed:
+	// Swallowing it would hand an unready cluster to the caller, to surface
+	// later as a misleading downstream error such as "seed propose failed:
 	// request dropped as the shard is not ready" instead of naming the setup
 	// that had already failed.
 	session := hosts[leaderIdx].GetNoOPSession(dbShardID)
@@ -812,9 +808,9 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 		completed++
 		rec.Record(elapsed)
 	}
-	// This loop already tolerated errors and counted them. What it did not do
-	// was check the count, so a run in which EVERY proposal failed reported
-	// zero samples and passed clean (#181).
+	// This loop tolerates errors and counts them, and the count must be
+	// checked, or a run in which EVERY proposal failed reports zero samples
+	// and passes clean.
 	requireFloor(b, "proposals", completed, errored)
 }
 
@@ -925,8 +921,8 @@ func BenchDragonboatCommitLatencyCluster(b *testing.B, cluster *BenchCluster, re
 		completed++
 		rec.Record(elapsed)
 	}
-	// Counted AND checked. The first pass at #181 missed this loop: it
-	// tolerated and logged, and nothing read the count.
+	// Counted AND checked: tolerating and logging is not enough unless
+	// something reads the count.
 	requireFloor(b, "proposals", completed, errored)
 }
 
@@ -993,7 +989,7 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 }
 
 // ---------------------------------------------------------------------------
-// Propose-loop error tolerance (#181)
+// Propose-loop error tolerance
 // ---------------------------------------------------------------------------
 
 // maxProposeErrorRate is the share of a propose loop's iterations that may fail
@@ -1033,17 +1029,16 @@ const minProposeSample = 100
 // tolerable reports whether err is transient Raft weather a benchmark loop may
 // count and continue past, as opposed to a real result that must stop the run.
 //
-// The tolerant loops used to count EVERY error, so a permanent failure --
-// ErrPayloadTooBig, ErrRejected, ErrInvalidSession, a state-machine failure --
-// at 5% was published as a clean run with a note. Codex review of the merged
-// tree caught it. The distinction is the one test/proposer already draws and
+// Counting EVERY error would let a permanent failure -- ErrPayloadTooBig,
+// ErrRejected, ErrInvalidSession, a state-machine failure -- at 5% be
+// published as a clean run with a note. The distinction is the one test/proposer already draws and
 // documents: a retry loop may absorb only the conditions that clear on their
 // own, because those are the only ones re-trying can change the answer to.
 // Everything else is the engine answering, and the benchmark must report it.
 //
 // dragonboat.IsTempError is the library's own classification -- "worth
-// retrying with the exact same input" -- and it covers the two failures
-// actually observed on 2026-09-10: ErrShardNotReady and ErrTimeout.
+// retrying with the exact same input" -- and it covers the two transient
+// failures actually observed: ErrShardNotReady and ErrTimeout.
 func tolerable(err error) bool { return dragonboat.IsTempError(err) }
 
 // requireFloor fails the benchmark unless enough of its proposals
@@ -1051,12 +1046,11 @@ func tolerable(err error) bool { return dragonboat.IsTempError(err) }
 //
 // # Why this exists at all
 //
-// The two sequential propose loops used to call b.Fatalf on the FIRST error,
-// under a 5-second per-proposal deadline. One transient "request dropped as the
-// shard is not ready" therefore destroyed a whole run, and the Dragonboat
-// baseline could not be measured at all on a host carrying ordinary CI load
-// (#181). Those are precisely the conditions this repository has spent #96,
-// #111, #123, #131 and #161 learning not to treat as failures.
+// Calling b.Fatalf on the FIRST error, under a 5-second per-proposal deadline,
+// would let one transient "request dropped as the shard is not ready" destroy
+// a whole run, so the Dragonboat baseline could not be measured at all on a
+// host carrying ordinary CI load. Those are precisely the conditions a
+// benchmark must not treat as failures.
 //
 // # Why a floor and not merely tolerance
 //
@@ -1066,7 +1060,7 @@ func tolerable(err error) bool { return dragonboat.IsTempError(err) }
 // benchmark that publishes percentiles over no samples is worse than one that
 // crashes, since the number reaches a comparison table.
 //
-// So both halves are here: a transient error no longer aborts the run, and a
+// So both halves are here: a transient error does not abort the run, and a
 // run that failed to measure the thing it exists to measure fails loudly and
 // says which of the two it was. This is the shape linearizability's
 // minSuccessfulReads floor already uses in the integration suites.

@@ -58,15 +58,13 @@ import (
 // TestBudgetsDescribeTheClusterTheyBudgetFor pins that they still agree.
 //
 // A budget written as a literal is a value that is not pinned treated as
-// though it were — the class this repository keeps being bitten by (#84, #88,
-// #90, #91, #103, #107, #111, #112, #115, #121). In those the unpinned value
-// was a leader index or a replica ID; here it is the shard configuration the
+// though it were — a recurring flake class. Elsewhere the unpinned value is a
+// leader index or a replica ID; here it is the shard configuration the
 // budget is supposed to describe. A literal cannot follow a config change and
 // gives no signal when it stops matching; a derivation cannot drift at all.
 //
-// This suite was the THIRD copy of the 5s literal (#130). The derivation is
-// the one contrib/dragonboat took in PR #124 and test/integration/e2e took in
-// PR #125, mirrored on purpose: the suites keep separate copies because each
+// The derivation is the one contrib/dragonboat and test/integration/e2e use,
+// mirrored on purpose: the suites keep separate copies because each
 // owns its own helpers and its own config builders; the shape is shared, the
 // constants are not.
 // ---------------------------------------------------------------------------
@@ -95,11 +93,10 @@ const testElectionRTT = config.DefaultElectionRTT
 const raftTick = testRTTMillisecond * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the ~60 lines of
-// reasoning behind it — why twice ElectionRTT, why thirty rounds, what was
-// measured on #111 — used to be copied into this file and four others. They
-// live in that package now (#133); the pin test below is the half that cannot
-// move, because it reads THIS suite's config builders.
+// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
+// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
+// live in that package; the pin test below is the half that cannot move,
+// because it reads THIS suite's config builders.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -507,8 +504,8 @@ func kvCreateFunc() (sm.CreateFunc, *smTracker) {
 // hostConfigAt is the ONE HostConfig this suite starts hosts from, over the
 // given directories and address. testHostConfig, newTestClusterWithRestart and
 // restartNode all build through it, so the Raft tick every budget in this file
-// is derived from is read from testRTTMillisecond in exactly one place; three
-// inline literals were three places for it to drift (#130).
+// is derived from is read from testRTTMillisecond in exactly one place; inline
+// literals would be places for it to drift.
 func hostConfigAt(walDir, nodeHostDir, addr string, mtls *config.MTLSConfig) config.HostConfig {
 	return config.HostConfig{
 		WALDir:                walDir,
@@ -547,8 +544,8 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 
 // freePort returns a loopback address for a host that does not exist yet,
 // reserved so that nothing else can be handed the same port before the host
-// binds it. It used to bind 127.0.0.1:0 and close the socket, which is #131.
-// test/netport carries the reasoning and the measurements.
+// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
+// carries the reasoning and the measurements.
 func freePort(t *testing.T) string {
 	t.Helper()
 	return netport.MustReserveUDP(t.Fatalf)
@@ -1274,9 +1271,9 @@ func proposeNEntries(
 // state machine of EVERY live node, and fails if it did not actually check
 // every one of them.
 //
-// Like waitForReplication, this used to skip a node whose state machine had
-// not registered — the exact symptom of a node that failed to start or to
-// recover — while the caller logged that all nodes were verified.
+// Like waitForReplication, it must not skip a node whose state machine has not
+// registered — the exact symptom of a node that failed to start or to recover —
+// while the caller logs that all nodes were verified.
 func verifyAllData(
 	t *testing.T,
 	cluster *testCluster,
@@ -1645,8 +1642,8 @@ const (
 // isSnapshotStagingDir reports whether name is a snapshot directory that has
 // not been published yet. A directory that is not yet published is not an
 // artifact: asserting "every artifact lives in snapshot-<index>/" over one of
-// these reports the receive path's ordinary staging discipline as a malformed
-// artifact (#130), which is the receive-path twin of #108.
+// these would report the receive path's ordinary staging discipline as a
+// malformed artifact.
 func isSnapshotStagingDir(name string) bool {
 	return strings.HasPrefix(name, recvStageDirPrefix) ||
 		strings.HasPrefix(name, importStageDirPrefix) ||
@@ -1717,7 +1714,7 @@ func snapshotArtifactIndex(path string) (uint64, error) {
 // artifacts under dir, ascending. A published artifact whose directory does not
 // parse as snapshot-<index> fails the test: that is a malformed artifact, not
 // one in flight, and the scan is deliberately not narrowed to the newest one
-// so that a stale artifact under a wrong name is still found (#116).
+// so that a stale artifact under a wrong name is still found.
 func snapshotArtifactIndexes(t *testing.T, dir string) []uint64 {
 	t.Helper()
 	var indexes []uint64
@@ -1776,8 +1773,8 @@ func assertSnapshotArtifact(t *testing.T, dir string, minIndex uint64, timeout t
 // engine reported.
 //
 // RequestSnapshot is asynchronous: it returns as soon as the request is
-// queued. Releasing the RequestState without reading its result — which every
-// snapshot test in this package used to do — asserts nothing beyond "the
+// queued. Releasing the RequestState without reading its result asserts
+// nothing beyond "the
 // request was accepted", and in particular does not wait for the snapshot to
 // be taken or notice that it failed.
 //
@@ -2048,7 +2045,7 @@ func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 // TestSnapshotScanJudgesOnlyPublishedArtifacts pins the two halves of the
 // artifact scan against each other over a tree laid out the way the engine
 // lays one out: a staging directory mid-flight is not an artifact and is not
-// judged, while a PUBLISHED directory under a malformed name still is (#130).
+// judged, while a PUBLISHED directory under a malformed name still is.
 //
 // The tree is built by hand rather than by driving a cluster into an
 // InstallSnapshot, because the window in which a .recv-<n> directory exists is

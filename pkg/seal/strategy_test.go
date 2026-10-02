@@ -298,7 +298,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	}
 	defer s.Close()
 
-	// The passphrase should be stored in a memguard enclave.
+	// The passphrase should be stored in a sealed enclave.
 	buf, openErr := s.passphrase.Load().Open()
 	if openErr != nil {
 		t.Fatalf("passphrase.Open() failed: %v", openErr)
@@ -428,14 +428,12 @@ func TestSoftwareStrategy_SealRandSaltFails(t *testing.T) {
 	}
 }
 
-// TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader replaces a test
-// that asserted the opposite, because the behaviour it asserted was the FIPS
-// violation this migration removes.
+// TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader pins that the
+// wrapping AEAD generates its own nonce.
 //
-// SealRootKey used to draw the AES-GCM nonce from s.randReader and hand it to
-// Seal — a caller-supplied IV, which SP 800-38D forbids. The wrapping AEAD is
-// now built by newAESGCM (cipher.NewGCMWithRandomNonce) and generates the nonce
-// itself, so s.randReader supplies the KDF salt and nothing else. A reader that
+// Drawing the AES-GCM nonce from s.randReader and handing it to Seal would be a
+// caller-supplied IV, which SP 800-38D forbids. The wrapping AEAD is built by
+// newAESGCM (cipher.NewGCMWithRandomNonce) and generates the nonce itself, so s.randReader supplies the KDF salt and nothing else. A reader that
 // yields exactly the salt and then fails must therefore produce a COMPLETE
 // sealed blob; if it does not, a caller-supplied IV has come back.
 func TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader(t *testing.T) {

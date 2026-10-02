@@ -484,12 +484,11 @@ func runOpenraft(cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 // runContainer runs a benchmark container, returning its stdout for parsing and
 // writing its complete console — stdout and stderr, verbatim — to logPath.
 //
-// The orchestrator only ever wanted the sentinel-delimited JSON, so it read
-// stdout into a buffer and dropped the buffer on the floor when the container
-// failed. Everything `go test -test.v` prints goes to that stdout: every
-// "=== RUN", every relayed b.Errorf, and the "--- FAIL:" naming the benchmark
-// that failed. A 41 MB run log of one such failure therefore contained not one
-// of them (#184), and the container's exit status was the only surviving fact.
+// The orchestrator only needs the sentinel-delimited JSON, but reading stdout
+// into a buffer and dropping it when the container fails loses everything
+// `go test -test.v` prints to that stdout: every "=== RUN", every relayed
+// b.Errorf, and the "--- FAIL:" naming the benchmark that failed. The
+// container's exit status would then be the only surviving fact.
 //
 // Stderr is still relayed live to the orchestrator's own stderr, so a run in
 // progress still shows the engines talking; it is teed into the same file so
@@ -511,17 +510,16 @@ func runContainer(cmd *exec.Cmd, logPath string) ([]byte, error) {
 	runErr := cmd.Run()
 
 	// The log's own failures are reported SEPARATELY from the container's
-	// exit, and neither is allowed to hide the other. Two things went wrong
+	// exit, and neither is allowed to hide the other. Two things go wrong
 	// with the obvious `defer file.Close()`:
 	//
-	//   - A write error on the log (disk full, an NFS mount going away) used
-	//     to stop that stream's copier, and a container blocked on a full
-	//     pipe stalls the benchmark. consoleLog keeps draining regardless.
+	//   - A write error on the log (disk full, an NFS mount going away) would
+	//     stop that stream's copier, and a container blocked on a full pipe
+	//     stalls the benchmark. consoleLog keeps draining regardless.
 	//   - os/exec discards a copier's write error when the process also exits
 	//     non-zero, and a deferred Close discards its own error always. So a
 	//     truncated console -- missing exactly the late `--- FAIL:` lines the
-	//     file exists to preserve -- would have been reported as a complete
-	//     one. That is the failure mode #184 was opened for, one layer down.
+	//     file exists to preserve -- would be reported as a complete one.
 	logErr := console.err()
 	if closeErr := file.Close(); closeErr != nil && logErr == nil {
 		logErr = closeErr

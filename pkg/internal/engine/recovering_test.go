@@ -261,10 +261,10 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 // extraction of committed entries, the only part of an update that reaches
 // the state machine the snapshot pool is replacing.
 //
-// The node used to be skipped entirely, which made it invisible to
-// consensus for the whole unbounded duration of user RecoverFromSnapshot
-// code: two replicas recovering at once dissolved a five-replica shard's
-// quorum with every node still up.
+// Skipping the node entirely would make it invisible to consensus for the
+// whole unbounded duration of user RecoverFromSnapshot code: two replicas
+// recovering at once would dissolve a five-replica shard's quorum with every
+// node still up.
 func TestRecovering_StepWorkerSuppressesOnlyCommittedEntries(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

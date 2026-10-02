@@ -26,7 +26,7 @@ import (
 )
 
 // The tests in this file drive the ...With variants against REAL go-enclave
-// allocators sized to refuse. That is the point of issue #204: a budget is a
+// allocators sized to refuse. That is the point: a budget is a
 // refusal this package can be shown to surface without any seam, because an
 // allocator's budget is local to the test that built it — unlike RLIMIT_MEMLOCK,
 // which every test in the binary shares.
@@ -119,8 +119,8 @@ func TestSplitProtectedWith_OnePageBudgetIsRefusedWithoutLeaking(t *testing.T) {
 	}
 }
 
-// TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact is the
-// verification issue #204 names. The budget fits exactly one split's PEAK, so
+// TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact pins partial
+// refusal on the split path. The budget fits exactly one split's PEAK, so
 // the first split succeeds and keeps its shares; the second gets its scratch
 // admitted and is refused partway through the share loop — the hardest refusal
 // to unwind — and must give back everything it took while the first set still
@@ -301,8 +301,8 @@ func TestUnmarshalShareSetWith_ChargesAndDestroyRefunds(t *testing.T) {
 	}
 }
 
-// TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact is the
-// verification issue #211 names for the recovery-ceremony ingestion path. An
+// TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact pins partial
+// refusal on the recovery-ceremony ingestion path. An
 // earlier decode holds one page; the second set fits two of its three shares in
 // what is left and is refused on the third — partway through the set, the
 // refusal that has to be unwound — and must give back what it took while the
@@ -469,8 +469,8 @@ func TestShareProtectWith_OnePageBudget(t *testing.T) {
 }
 
 // TestUnmarshalAndProtectWith_RefuseNilAllocator pins the nil-allocator refusal
-// for the variants issue #211 adds, and that it is decided before the input is
-// read: a document that does not parse and a nil Share both report
+// for the UnmarshalShareSetWith and ProtectWith variants, and that it is
+// decided before the input is read: a document that does not parse and a nil Share both report
 // ErrNilAllocator rather than their own errors.
 func TestUnmarshalAndProtectWith_RefuseNilAllocator(t *testing.T) {
 	shares, err := UnmarshalShareSetWith(nil, []byte("not json"))

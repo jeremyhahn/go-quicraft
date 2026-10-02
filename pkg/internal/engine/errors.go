@@ -293,7 +293,7 @@ func (e *SnapshotRecoveryBehindError) Retryable() bool { return true }
 // there is nothing to restore and nothing to repair. It reports a race the
 // protocol resolves on its own: raft answers the rejected InstallSnapshot with
 // the follower's real committed index and the leader stops sending it. Treating
-// it as terminal killed shards under load (#106).
+// it as terminal would kill shards under load.
 type SnapshotRecoveryStaleError struct {
 	ShardID       uint64
 	ReplicaID     uint64

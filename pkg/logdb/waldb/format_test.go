@@ -83,11 +83,10 @@ func writeTestWALFormat(t *testing.T, dir string, blockSize int) {
 // seedWAL writes one hard state and enough entries to carry a shard PAST a
 // block boundary, then closes the DB.
 //
-// Crossing a boundary was once load-bearing: the marker used to be stamped only
-// for a directory that could demonstrate its own grid. It no longer is — the
-// marker is written before the first segment exists — but the fixture is kept
-// multi-block so the geometry tests still exercise a directory whose block
-// boundaries a wrong block size would actually misparse.
+// The marker is written before the first segment exists, so crossing a
+// boundary is not needed to get one stamped; the fixture is multi-block so the
+// geometry tests exercise a directory whose block boundaries a wrong block
+// size would actually misparse.
 func seedWAL(t *testing.T, dir string, blockSize int) {
 	t.Helper()
 	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
@@ -202,19 +201,19 @@ func TestOpen_BlockSizeMismatchIsRefused(t *testing.T) {
 	}
 }
 
-// TestOpen_UnmarkedPopulatedDirectoryIsRefused pins the compatibility break.
+// TestOpen_UnmarkedPopulatedDirectoryIsRefused pins the refusal of a populated
+// directory with no format marker.
 //
-// The marker now records the RECORD FRAMING as well as the block geometry, and
-// a directory that holds segments without one was written by a build that had
-// neither. Its 7-byte chunk headers cannot be parsed by this build's 11-byte
-// parser: every chunk fails CRC from the first byte, the clean prefix comes back
+// The marker records the RECORD FRAMING as well as the block geometry, and a
+// directory that holds segments without one was not written by this build. Its
+// segments cannot be assumed parseable by this build's chunk parser: every
+// chunk may fail CRC from the first byte, the clean prefix comes back
 // empty, and — with nothing decodable above the damage to contradict it — the
 // torn-tail repair would truncate the entire log to zero and delete every
 // segment above it. Silent data destruction reported as a successful recovery.
 //
-// So the open is refused, by a named error that tells the operator what to do.
-// This reverses the previous rule, under which an unmarked populated directory
-// was adopted once recovery had proved its geometry.
+// So the open is refused, by a named error that tells the operator what to do,
+// rather than adopting the directory once recovery has proved its geometry.
 func TestOpen_UnmarkedPopulatedDirectoryIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	seedWAL(t, dir, 1024)
@@ -285,7 +284,7 @@ func TestOpen_MalformedMarkerIsRefused(t *testing.T) {
 }
 
 // TestOpen_ZeroMarkerOnAPopulatedDirectoryIsRefused pins how the two crash
-// residues a marker file can be left in are read now that the marker also
+// residues a marker file can be left in are read, given that the marker also
 // records the record framing.
 //
 // Both shapes — a zero-LENGTH file, and a full-length one that is all zeros —
@@ -294,10 +293,10 @@ func TestOpen_MalformedMarkerIsRefused(t *testing.T) {
 // magic is non-zero, so no valid marker can look like this, and calling it
 // damage would send an operator hunting for corruption that is not there.
 //
-// What absence MEANS has changed. It used to be adoptable, because the only
-// thing at stake was a block size the directory could be re-measured for. It is
-// now the difference between two record framings, one of which this build cannot
-// parse at all, so an absent marker over a populated directory is refused. An
+// Absence is not adoptable: the marker records the record framing as well as
+// the block size, and a populated directory without one may be in a framing
+// this build cannot parse at all, so an absent marker over a populated
+// directory is refused. An
 // EMPTY directory is still adopted — there is nothing there to misparse — which
 // is asserted alongside so the refusal is shown to be about the segments and not
 // about the file being empty.
@@ -385,16 +384,15 @@ func mustCreate(t *testing.T, path string) string {
 	return path
 }
 
-// TestOpen_SingleBlockUnmarkedDirectoryIsAlsoRefused covers the directory that
-// used to be the awkward case: one whose segments all fit inside a single block,
-// so replaying it proves nothing about its block size.
+// TestOpen_SingleBlockUnmarkedDirectoryIsAlsoRefused covers the awkward case of
+// an unmarked directory whose segments all fit inside a single block, so
+// replaying it proves nothing about its block size.
 //
-// The old rule left it unmarked and openable, because stamping a geometry it
-// could not demonstrate would have locked out the real one. The rule is gone —
-// the marker is written before the first segment now, so no directory this build
-// creates can be in this state — and what remains is a directory written by an
-// older build, which is refused like any other. Asserting it here keeps the
-// awkward case from quietly acquiring different behaviour from the rest.
+// The marker is written before the first segment, so no directory this build
+// creates can be in this state; one that is was not written by this build and
+// is refused like any other unmarked populated directory. Asserting it here
+// keeps the awkward case from quietly acquiring different behaviour from the
+// rest.
 func TestOpen_SingleBlockUnmarkedDirectoryIsAlsoRefused(t *testing.T) {
 	dir := t.TempDir()
 	seedWALSingleBlock(t, dir, 1024)
@@ -641,11 +639,10 @@ func TestWriteWALFormat_FailedWriteLeavesNothingBehind(t *testing.T) {
 }
 
 // TestOpen_FailedStampFailsTheOpen pins the fatality of a stamp that cannot be
-// written, and the reversal it represents.
+// written.
 //
-// A failed stamp used to be logged and ignored: refusing an otherwise healthy
-// WAL over a 16-byte metadata file was judged the worse outcome. That trade
-// reverses now the marker also records the record framing. Proceeding would
+// Refusing an otherwise healthy WAL over a 16-byte metadata file looks like the
+// worse outcome, but the marker records the record framing. Proceeding would
 // create segments whose format nothing on disk records, and the NEXT open —
 // finding segments with no marker — refuses the directory permanently, with
 // nothing to tell the operator that a metadata write failed months earlier.
@@ -781,9 +778,9 @@ func TestOpen_FailedOpensDoNotAccumulateEmptySegments(t *testing.T) {
 }
 
 // TestOpen_NoSyncDirectoryIsStamped covers the geometry gap a lazily created
-// root used to leave open. Under noSync the WAL root is not created at Open, so
-// there was nothing to stamp and the directory spent its entire first life
-// without a marker — exactly the window in which a changed block size produces
+// root would leave open. Under noSync the WAL root is not created at Open, so
+// without creating it for the stamp the directory would spend its entire first
+// life without a marker — exactly the window in which a changed block size produces
 // the misparse the marker exists to name.
 func TestOpen_NoSyncDirectoryIsStamped(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")

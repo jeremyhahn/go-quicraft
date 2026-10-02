@@ -85,7 +85,8 @@ const (
 // damage and the batch boundary usually are. Per chunk also survives losing the
 // batch's leading page: every record carries its own generation, so the evidence
 // does not depend on any single record surviving. The cost is measured, not
-// assumed; see docs/storage/wal.md.
+// assumed; see docs/log-storage/engineering.md ("Durability sequence and
+// generation start").
 //
 // The generation start is the second half of the discriminator, and it is what
 // makes the verdict EXACT. The sequence alone can say that a completed fdatasync
@@ -94,8 +95,8 @@ const (
 // among them: the ordinary power loss that drops the in-flight batch's leading
 // page produces exactly that shape with nothing acknowledged lost, and media
 // damage that begins a few bytes lower produces it with acknowledged records
-// gone. Recovery used to truncate in both cases and report a "residual". Every
-// chunk therefore also carries genStart: the file offset at which its
+// gone, and a recovery that truncated in both cases would destroy acknowledged
+// data in the second. Every chunk therefore also carries genStart: the file offset at which its
 // generation began, i.e. the acknowledged end when the fdatasync that closed the
 // previous generation returned. Any surviving chunk above the damage then says
 // exactly where acknowledged bytes ended, and the damage either begins at or
@@ -115,8 +116,8 @@ const (
 // with the next writeback. Whenever it survives, the final generation has the
 // higher-generation witness every earlier one has, and damage inside it takes
 // the fail-closed path. When it does not survive — a crash inside the writeback
-// window after the last fdatasync — recovery sees what it saw before the mark
-// existed and truncates, which is the interrupted-write verdict that window
+// window after the last fdatasync — recovery has no witness for the final
+// generation and truncates, which is the interrupted-write verdict that window
 // deserves. ReadAll never replays a mark; it is evidence only.
 const (
 	// recordSeqSize is the width of the durability sequence on disk.
@@ -319,8 +320,8 @@ func walRecordContext(dst []byte, shardIdx, segID, recordSeq uint64) []byte {
 }
 
 // isValidRecordType returns true if the given byte is a recognized chunk type.
-// The accepted range is intentionally tight (RecordFull..RecordLast): a chunk
-// type outside it is treated as corruption, which stops recovery at the bad
+// The accepted range is intentionally tight (RecordFull..RecordSyncMark, every
+// type the writer emits and nothing else): a chunk type outside it is treated as corruption, which stops recovery at the bad
 // record (a WAL is valid only as a prefix). Widening the set to include a
 // never-written type would make a random/forged header byte more likely to
 // pass the pre-CRC type check.

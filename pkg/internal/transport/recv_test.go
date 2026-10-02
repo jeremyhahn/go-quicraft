@@ -3366,8 +3366,8 @@ func newRejectionCountingTransport(t *testing.T, rejected *atomic.Int64) *QUICTr
 
 // TestProcessSnapshotHeaderRejectionsAreReported is the M5 regression test:
 // every header-stage drop must fire OnSnapshotRejected and a structured
-// warning. These paths previously returned silently, so an operator saw
-// nothing while the sender waited out its ack timeout.
+// warning. Returning silently would leave an operator seeing nothing while
+// the sender waited out its ack timeout.
 func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
 	validHdr := SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 3, ChunkCount: 1}
 	var validBuf [SnapshotHeaderSize]byte
@@ -3429,10 +3429,10 @@ func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestHandleMessageFrameDrainsBodyOnBudgetExhaustion is the M8 regression
-// test. Budget exhaustion used to be fatal to the stream, so one peer filling
-// the aggregate budget tore down every OTHER peer's replication stream and
-// cascaded into cluster-wide connection churn. The fix requires the frame body
-// to be consumed so the stream is left at a clean frame boundary and the
+// test. If budget exhaustion were fatal to the stream, one peer filling the
+// aggregate budget would tear down every OTHER peer's replication stream and
+// cascade into cluster-wide connection churn. The frame body is therefore
+// consumed so the stream is left at a clean frame boundary and the
 // caller can simply continue.
 func TestHandleMessageFrameDrainsBodyOnBudgetExhaustion(t *testing.T) {
 	tr, err := NewQUICTransport(Config{

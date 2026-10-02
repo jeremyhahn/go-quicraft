@@ -280,12 +280,9 @@ func TestSendHeartbeatBatch_StreamEvictionOnWriteError(t *testing.T) {
 
 	// Stop t2 to break the stream, then wait for t1 to actually SEE it.
 	//
-	// This was a fixed 500ms sleep because a peer's Stop was not observable
-	// from the sender: Stop closed the listener, its own outbound connections
-	// and the UDP socket, but never the connection t2 had ACCEPTED from t1, so
-	// no CONNECTION_CLOSE reached t1 and its cached connection context stayed
-	// live (a poll on it ran the full 10s and failed). Stop now announces
-	// itself on the inbound half (#78), so the real condition can be waited on.
+	// Stop closes the connection t2 ACCEPTED from t1 as well as its own
+	// outbound ones, so a CONNECTION_CLOSE reaches t1 and the real condition
+	// can be waited on rather than guessed at with a fixed sleep.
 	t2Addr := t2.Addr().String()
 	t2.Stop()
 	waitConnDown(t, t1, t2Addr, 10*time.Second)
@@ -673,9 +670,9 @@ func TestSendHeartbeatBatch_WriteDeadlineErrorEvicts(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", initialConns)
 	}
 
-	// Stop t2 to break the connection, then wait for t1 to see it. Stop now
-	// announces itself on the connection it accepted (#78), so this is a poll
-	// on the real condition rather than the fixed 500ms guess it replaces.
+	// Stop t2 to break the connection, then wait for t1 to see it. Stop
+	// announces itself on the connection it accepted, so this is a poll on the
+	// real condition rather than a fixed guess.
 	t2Addr := t2.Addr().String()
 	t2.Stop()
 	waitConnDown(t, t1, t2Addr, 10*time.Second)
@@ -777,9 +774,8 @@ func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
 	})
 	handler2.waitBatch(t, 10*time.Second)
 
-	// Stop t2 and wait for t1 to see the connection go down. Observable since
-	// Stop began announcing itself on the inbound half (#78); this was a fixed
-	// 500ms sleep while it was not.
+	// Stop t2 and wait for t1 to see the connection go down, observable because
+	// Stop announces itself on the inbound half.
 	t2.Stop()
 	waitConnDown(t, t1, t2Addr, 10*time.Second)
 

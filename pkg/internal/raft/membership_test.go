@@ -1858,7 +1858,7 @@ func TestVoteGrantedWhenTheConfigurationIsIncomplete(t *testing.T) {
 }
 
 // TestValidate_RequireIdentitiesRefusesIdentitylessAdds pins the local
-// admission policy (#197 A): under requireIdentities every add of a NET-NEW
+// admission policy: under requireIdentities every add of a NET-NEW
 // member must carry a node identity, at validate time only — the apply path
 // still applies whatever committed — and a role change for a member the
 // configuration already holds an identity for may leave the field empty.

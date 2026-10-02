@@ -46,15 +46,14 @@ var (
 
 	// ErrBarrierContextBindingUnreportable is returned by Open for a barrier
 	// that DOES implement context-bound encryption but not
-	// ContextBindingResolved, the method walContextBarrier gained so the WAL
+	// ContextBindingResolved, the method walContextBarrier requires so the WAL
 	// can tell "cannot bind" apart from "cannot say yet".
 	//
-	// This is a BREAKING change for embedders: the interface is asserted on the
-	// dynamic type, so a barrier written against the previous release compiles
-	// unchanged and then fails at Open. It gets its own error because the
+	// The interface is asserted on the dynamic type, so a barrier that lacks the
+	// method compiles and then fails at Open. It gets its own error because the
 	// generic one — "does not support context-bound encryption" — is false here
 	// and sends the reader looking for a missing capability instead of a
-	// missing method. See docs/operations/compatibility.md.
+	// missing method. See docs/compatibility.md.
 	ErrBarrierContextBindingUnreportable = errors.New(
 		"waldb: barrier is missing ContextBindingResolved() bool, required since the " +
 			"WAL must distinguish a barrier that cannot bind context from one that is " +
@@ -72,15 +71,11 @@ var (
 	// error and no log line — a silent, permanent downgrade of exactly the
 	// positional binding this package fails closed to obtain.
 	//
-	// SCOPE, precisely: that downgrade is NOT a bug the older seal package had.
-	// A sealed software barrier used to report ContextBindingBarrier — Binds()
-	// was true — so the WAL would have latched "can bind", not "cannot". The
-	// silent downgrade becomes REACHABLE only alongside the new
-	// ContextBindingUnresolved state, which is what finally distinguishes "no"
-	// from "cannot say yet". The two changes are therefore a matched pair: this
-	// guard closes a hole that the seal change opens, and reverting
-	// pkg/seal/barrier_binding.go on its own — leaving this guard in place —
-	// makes every encrypted WAL refuse to open. Ship them together.
+	// The downgrade is reachable because a sealed barrier reports
+	// ContextBindingUnresolved, which is what distinguishes "no" from "cannot
+	// say yet". This guard and that state in pkg/seal/barrier_binding.go are a
+	// matched pair: the state is what makes the guard necessary, and the guard
+	// is what makes the state safe.
 	//
 	// Fail closed at setup instead. A sealed barrier cannot serve the WAL
 	// anyway: replay decrypts every record at open and encryption fails on

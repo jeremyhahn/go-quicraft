@@ -29,12 +29,13 @@ import (
 //
 // BuildInitialMembershipEntry marshals the membership Host.StartShard assembled
 // from the caller's members map and Config.MemberIdentities, and the result is
-// committed at log index 1. Every limit in pkg/proto used to be enforced on READ
-// only, so an over-length address marshaled happily, the shard bootstrapped, and
-// the NEXT start of that shard could not decode its own index-1 entry:
+// committed at log index 1. A limit enforced on READ only would let an
+// over-length address marshal happily and the shard bootstrap, and then the
+// NEXT start of that shard could not decode its own index-1 entry:
 // reconstructShardMembership -> ReconstructMembership -> Membership.UnmarshalFrom
 // -> getMap returns ErrAddressTooLong, and StartShard propagates it. The shard
-// was permanently unstartable, with no remedy but deleting its data directory.
+// would be permanently unstartable, with no remedy but deleting its data
+// directory. The encoder therefore enforces every limit on WRITE as well.
 //
 // These tests drive the durable path itself — build the entry, then decode it
 // the way recovery does — rather than the codec in isolation.
@@ -72,9 +73,10 @@ func TestBuildInitialMembershipEntry_RefusesAnUnreadableMembership(t *testing.T)
 func TestBuildInitialMembershipEntry_TheRoundTripIsWhatBreaks(t *testing.T) {
 	ms := oversizedBootstrapMembership()
 
-	// The bytes the old encoder emitted, assembled by hand because the encoder
-	// now refuses to produce them. Size() and the map layout are unchanged, so
-	// this is byte-for-byte what used to be committed at index 1.
+	// The bytes a read-only-checking encoder would emit, assembled by hand
+	// because the encoder refuses to produce them. Size() and the map layout
+	// are the encoder's own, so this is byte-for-byte what such an encoder
+	// would commit at index 1.
 	entry := proto.Entry{
 		Index: BootstrapMembershipIndex,
 		Term:  bootstrapMembershipTerm,

@@ -97,14 +97,13 @@ func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 }
 
 // TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot is the end-to-end
-// regression for the critical chain. The leader re-sends a snapshot this
-// replica already holds, so the receive takes the DEDUP branch, which used to
-// rebuild the install from the persisted record's FileSize — 0, because the
-// receive path never set it — while pointing at a non-empty file. (Under the
-// two-phase receive a record exists only once raft adopted the snapshot, so
-// the first receive here is a successful one.) The
-// resulting LogReader snapshot ({Filepath: set, FileSize: 0}) made this node
-// stream a single metadata-only chunk once it became leader, erasing the
+// test of the FileSize chain. The leader re-sends a snapshot this replica
+// already holds, so the receive takes the DEDUP branch, which rebuilds the
+// install from the persisted record. (Under the two-phase receive a record
+// exists only once raft adopted the snapshot, so the first receive here is a
+// successful one.) A record with FileSize 0 beside a non-empty file would yield
+// a LogReader snapshot ({Filepath: set, FileSize: 0}) that makes this node
+// stream a single metadata-only chunk once it becomes leader, erasing the
 // receiving follower's state.
 func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
 	eng, h, _ := newMedlowHandlerFixture(t)
@@ -170,7 +169,7 @@ func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
 	}
 }
 
-// TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails pins finding 2: a
+// TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails pins that a
 // declared size of zero beside a NON-EMPTY file is a metadata/artifact
 // disagreement, not an empty snapshot. Shipping a metadata-only chunk for it
 // is what amplifies a bad FileSize into follower state erasure, so the send
@@ -247,10 +246,10 @@ func TestForEachSnapshotChunk_GenuinelyEmptyFile(t *testing.T) {
 // Compression is a property of the ARTIFACT
 // ---------------------------------------------------------------------------
 
-// TestExportImportSnapshot_CrossCompressionConfig pins finding 4 across hosts.
-// The exported artifact is decrypted but NEVER decompressed, so the header
-// must carry how it is encoded. Deriving that from the destination's own
-// SnapshotCompressionType — as both recovery paths used to — feeds the state
+// TestExportImportSnapshot_CrossCompressionConfig pins the artifact's encoding
+// across hosts. The exported artifact is decrypted but NEVER decompressed, so
+// the header must carry how it is encoded. Deriving that from the
+// destination's own SnapshotCompressionType would feed the state
 // machine Snappy frames (or, in reverse, tries to decompress plain bytes) on
 // every restore between hosts configured differently.
 func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {

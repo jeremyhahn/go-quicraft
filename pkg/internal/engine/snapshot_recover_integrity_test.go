@@ -128,10 +128,10 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 
 // TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier is the
 // fail-closed mirror of Host.StartShard. An artifact recorded with Epoch > 0
-// whose barrier is absent or sealed used to fall through the decrypt
-// condition silently: recoverPath stayed the ENCRYPTED file and the raw
-// ciphertext was handed to RecoverFromSnapshot with no error and no log.
-// Recovery must fail so the leader re-sends instead.
+// whose barrier is absent or sealed must not fall through the decrypt
+// condition silently, leaving recoverPath the ENCRYPTED file and handing the
+// raw ciphertext to RecoverFromSnapshot with no error and no log. Recovery
+// must fail so the leader re-sends instead.
 func TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier(t *testing.T) {
 	cases := []struct {
 		name    string

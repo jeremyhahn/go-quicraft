@@ -207,10 +207,8 @@ func TestHandleMessage_IdentitySurvivesAnAddressChange(t *testing.T) {
 
 // TestHandleMessage_MissingIdentityIsRefused pins Part B: a replica the
 // configuration records NO identity for is refused, and the refusal is
-// observable in the drop reason. There used to be a configurable fallback to
-// the committed address (TransportConfig.RequireMemberIdentity, default off);
-// admission now requires the identity on every host with a transport, and the
-// fallback was removed with it (#197 A).
+// observable in the drop reason. There is no fallback to the committed
+// address: admission requires the identity on every host with a transport.
 func TestHandleMessage_MissingIdentityIsRefused(t *testing.T) {
 	const legacyAddr = "10.0.0.2:5001"
 	// No Identities map at all: the shape of every membership written before
@@ -219,7 +217,7 @@ func TestHandleMessage_MissingIdentityIsRefused(t *testing.T) {
 		Addresses: map[uint64]string{1: "10.0.0.1:5001", 2: legacyAddr},
 	}
 	// The peer holds the right address and no identity the shard knows about,
-	// which is exactly what the address fallback used to admit.
+	// which is exactly what an address fallback would admit.
 	legacyPeer := certCovering(legacyAddr)
 
 	t.Run("no_identity_is_refused_whatever_the_address", func(t *testing.T) {

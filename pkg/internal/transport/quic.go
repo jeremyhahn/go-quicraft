@@ -192,10 +192,11 @@ type QUICTransport struct {
 	// It is what makes restart detection COMPLETE. peerEpoch alone only
 	// records incarnations we have HEARD FROM, and an outbound can easily
 	// exist for a target whose epoch we have never recorded (we dial before
-	// the peer's first batch reaches us, and every teardown used to drop the
-	// record while a later re-dial repopulated conns). In that state a
-	// restart is indistinguishable from first contact, so the black-holed
-	// outbound survived until MaxIdleTimeout -- 30s of one-way silence.
+	// the peer's first batch reaches us, or a teardown dropped the record
+	// while a later re-dial repopulated conns). In that state a restart is
+	// indistinguishable from first contact, so without this map the
+	// black-holed outbound would survive until MaxIdleTimeout -- 30s of
+	// one-way silence.
 	// Comparing the RECEIVED epoch against the epoch the outbound was dialed
 	// under decides the question without needing to remember history.
 	connEpoch map[string]uint64
@@ -250,13 +251,9 @@ type QUICTransport struct {
 	// It is per-instance for the reason this codebase gives elsewhere (see
 	// seal.Barrier.randReader): a mutable package global is reachable from
 	// production code and from every other test in the binary, and a field is
-	// reachable from neither.
-	//
-	// The unit test for the panic path used to wait a full 30-SECOND tick, and
-	// its own comment said "we can't wait 30s" in a branch that is only reached
-	// after doing exactly that. Thirty seconds of an otherwise fast package's
-	// runtime bought nothing, and a slower suite is a wider window for the
-	// load-induced timeouts tracked in #71.
+	// reachable from neither. It keeps the panic-path unit test from waiting
+	// a full 30-second tick, which would slow an otherwise fast package and
+	// widen the window for load-induced test timeouts.
 	cleanupInterval time.Duration
 
 	// stopOnce guards the teardown so exactly one caller runs it, and
@@ -558,8 +555,8 @@ func NewQUICTransport(
 		// The handshake idle limit follows the dial budget: quic-go abandons
 		// a handshake that idles this long and caps the whole handshake at
 		// twice it, so a dial context wider than this could never be
-		// reached. Production's DialTimeout is the 5s this always was; the
-		// test fixture's wider budget widens both together (#196).
+		// reached. Production's DialTimeout is 5s; the test fixture's wider
+		// budget widens both together.
 		HandshakeIdleTimeout:       cfg.DialTimeout,
 		MaxIncomingStreams:         int64(maxIncomingStreams),
 		MaxIncomingUniStreams:      -1,

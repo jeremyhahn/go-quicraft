@@ -318,18 +318,17 @@ func TestProposalsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Reads against a latched shard fail fast too (#185)
+// Reads against a latched shard fail fast too
 // ---------------------------------------------------------------------------
 //
-// The propose path above had its gate; the read path did not. A linearizable
+// The read path needs the same gate as the propose path above. A linearizable
 // read completes only when lastApplied reaches its read index, and a halted
-// shard never applies again — so a SyncRead against a latched shard was
-// accepted, confirmed by a leader that was still perfectly healthy, and then
-// waited for an apply that could not come. It returned at the caller's
-// deadline with ErrTimeout: measured at 5m6s under the default, and at
-// exactly 20.000482s against a 20s context. The message pointed at consensus,
-// the network or a lost leader; the cause was an Apply that had failed
-// earlier, on a healthy key, on the same replica.
+// shard never applies again — so without the gate a SyncRead against a latched
+// shard would be accepted, confirmed by a leader that is still perfectly
+// healthy, and then wait for an apply that cannot come, returning at the
+// caller's deadline with ErrTimeout (5m6s under the default). That message
+// points at consensus, the network or a lost leader; the cause is an Apply
+// that failed earlier, on a healthy key, on the same replica.
 //
 // Both tests assert on LATENCY and not only on the error, for the reason the
 // issue gives: a message-only assertion passes against the old behaviour right
@@ -357,7 +356,7 @@ func latchTheShard(t *testing.T, h *Host, failed <-chan config.ShardFailedInfo) 
 // that fails an assertion while the apply is parked has left a goroutine
 // blocked on holdPoison inside SM.Update -- and h.Close in the host's own
 // cleanup then waits on that apply forever, turning an ordinary test failure
-// into a hang until the suite timeout (Codex review of #185). The Once makes
+// into a hang until the suite timeout. The Once makes
 // the explicit release and the cleanup release safe together.
 func parkPoison(t *testing.T, m *poisonApplySM) (release func()) {
 	t.Helper()
@@ -529,14 +528,13 @@ func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
 	}
 }
 
-// TestReadsRacingTheLatchNeverTimeOut hammers the interleaving Codex review
-// found in the first cut of #185: a read that passes the IsFailed check at the
-// top of ReadIndex, then has the latch trip BEFORE its pendingReads entry is
+// TestReadsRacingTheLatchNeverTimeOut hammers the interleaving in which a read
+// passes the IsFailed check at the top of ReadIndex, then has the latch trip BEFORE its pendingReads entry is
 // stored. OnShardFailed scans an empty map and returns; the failed node stops
 // processing its queue; nothing ever completes the read, and it waits for its
 // deadline.
 //
-// The fix is a post-registration re-check with rollback, the same guard
+// The guard is a post-registration re-check with rollback, the same guard
 // ReadIndex already had for close/stop. The window is a few instructions
 // wide, so it cannot be hit on demand without a hook in production code —
 // which is not worth adding for a test. Instead this parks the poison apply,
@@ -618,12 +616,12 @@ func TestReadsRacingTheLatchNeverTimeOut(t *testing.T) {
 	}
 }
 
-// TestFollowerReadsAgainstALatchedShardFailFast covers the read path the
-// first two cuts of #185 missed. FollowerRead does not go through ReadIndex:
-// it polls lastApplied against CommittedIndex, and a halted shard freezes
-// lastApplied below committed forever, so the wait could never end. With a
-// deadline it returned ErrTimeout; with context.Background() it never
-// returned at all -- which is strictly worse than the original defect.
+// TestFollowerReadsAgainstALatchedShardFailFast covers the read path that does
+// not go through ReadIndex. FollowerRead polls lastApplied against
+// CommittedIndex, and a halted shard freezes lastApplied below committed
+// forever, so without its own gate the wait could never end: with a deadline it
+// would return ErrTimeout, and with context.Background() it would never return
+// at all.
 //
 // Both halves are exercised on the one fixture: a read that ARRIVES after
 // the halt is refused before entering the wait, and a read that is already

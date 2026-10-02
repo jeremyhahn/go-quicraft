@@ -26,13 +26,13 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Mandatory identities at admission (#197 A)
+// Mandatory identities at admission
 //
 // A member is authorized on the receive path by its committed node identity
 // and by nothing else, so every path that ADMITS a member on a host with a
 // transport must require the identity: the founding map, the join anchor,
 // every later add, and a snapshot import. A host with no transport has no
-// wire boundary and keeps the old ergonomics.
+// wire boundary and does not require one.
 // ---------------------------------------------------------------------------
 
 // TestStartShard_TransportHostRequiresFounderIdentities pins the founding

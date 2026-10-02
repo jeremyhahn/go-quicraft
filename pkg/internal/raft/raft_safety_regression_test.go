@@ -730,13 +730,13 @@ func TestHasConfigChangeToApply_CoversArbitrarilyWideRanges(t *testing.T) {
 
 // H2. becomeLeader must not do work proportional to the unapplied log.
 //
-// The gate used to re-read (processed, lastIndex] in 1024-index chunks with
-// maxSize 0 — no byte bound at all — synchronously on the step worker. On a
-// restart processed starts at the snapshot index, and Config.SnapshotEntries
-// has no default, so a default deployment never compacts: the range is the
-// whole log. 200k unapplied 1KB entries is ~200MB copied before the new
-// leader can send its first heartbeat, so the election it had just won timed
-// out and the shard election-looped.
+// A gate that re-read (processed, lastIndex] with no byte bound, synchronously
+// on the step worker, would not scale. On a restart processed starts at the
+// snapshot index, and Config.SnapshotEntries has no default, so a default
+// deployment never compacts: the range is the whole log. 200k unapplied 1KB
+// entries is ~200MB copied before the new leader can send its first heartbeat,
+// so the election it had just won would time out and the shard would
+// election-loop.
 //
 // A counting LogReader proves the property directly: answering the gate over
 // a large unapplied range must not read the log at all.
@@ -1427,22 +1427,21 @@ func observerMismatchMembership() proto.Membership {
 // observer counterpart to TestWitnessRoleMismatch_CannotCampaign.
 //
 // A replica the configuration lists as a non-voting observer, but which was
-// started with IsObserver=false, once campaigned: startElection gated on the
-// LOCAL flag, voters granted it a vote because handleVoteRequest's
-// configuration test is isKnownMember, and numVotingMembers added an
-// unconditional +1 for self, so it sized quorum over V+1 while the real voting
-// set was V and counted its own vote toward it. Two such replicas could each
-// collect a "majority" from disjoint halves of the real voting set and both be
-// elected in the SAME term.
+// started with IsObserver=false, must not campaign. If startElection gated on
+// the LOCAL flag, voters would grant it a vote because handleVoteRequest's
+// configuration test is isKnownMember, and an unconditional +1 for self in
+// numVotingMembers would size quorum over V+1 while the real voting set was V
+// and count its own vote toward it. Two such replicas could each collect a
+// "majority" from disjoint halves of the real voting set and both be elected
+// in the SAME term.
 //
-// That was first closed by latching the disagreement (roleMismatch). The
-// observer role now FOLLOWS the replicated membership instead (#218):
+// Rather than latching the disagreement (roleMismatch), the observer role
+// FOLLOWS the replicated membership:
 // config.IsObserver is only the initial hint, so the replica simply IS an
 // observer here — it cannot campaign, by either entry point — and nothing is
 // latched, because nothing is wrong with it: observers and voters are
 // replicated identically, so the replica serves the same reads any observer
-// does. This test pins the property the latch existed for (no candidacy) and
-// the deliberate change (no latch, role adopted).
+// does. This test pins both: no candidacy, and no latch (role adopted).
 func TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig(t *testing.T) {
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.IsObserver = false // the replicated membership below says otherwise

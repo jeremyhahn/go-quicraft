@@ -57,14 +57,13 @@ import (
 // pins that they still agree.
 //
 // A budget written as a literal is a value that is not pinned treated as
-// though it were — the class this repository has now been bitten by nine times
-// (#84, #88, #90, #91, #103, #105, #107, #112, #121). In those the unpinned
-// value was a leader index or a replica ID; here it is the shard configuration
+// though it were — a recurring flake class. Elsewhere the unpinned value is a
+// leader index or a replica ID; here it is the shard configuration
 // the budget is supposed to describe. A literal cannot follow a config change
 // and gives no signal when it stops matching; a derivation cannot drift at all.
 //
-// This is the root module's twin of what #115 fixed in contrib/dragonboat
-// (PR #124), and it mirrors that derivation on purpose. The two suites keep
+// This is the root module's twin of the derivation in contrib/dragonboat, and
+// it mirrors that derivation on purpose. The two suites keep
 // separate copies because contrib/dragonboat is a separate module that owns its
 // own helpers; the shape is shared, the constants are not.
 // ---------------------------------------------------------------------------
@@ -94,11 +93,10 @@ const testElectionRTT = config.DefaultElectionRTT
 const raftTick = testRTTMillisecond * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the ~60 lines of
-// reasoning behind it — why twice ElectionRTT, why thirty rounds, what was
-// measured on #111 — used to be copied into this file and four others. They
-// live in that package now (#133); the pin test below is the half that cannot
-// move, because it reads THIS suite's config builders.
+// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
+// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
+// live in that package; the pin test below is the half that cannot move,
+// because it reads THIS suite's config builders.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -719,8 +717,8 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 
 // freePort returns a loopback address for a host that does not exist yet,
 // reserved so that nothing else can be handed the same port before the host
-// binds it. It used to bind 127.0.0.1:0 and close the socket, which is #131.
-// test/netport carries the reasoning and the measurements.
+// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
+// carries the reasoning and the measurements.
 func freePort(t *testing.T) string {
 	t.Helper()
 	return netport.MustReserveUDP(t.Fatalf)
@@ -988,13 +986,11 @@ func (c *testCluster) findLeader(shardID uint64) int {
 // at indices 5 and 6, "to avoid collision with original replica IDs".
 //
 // A helper that computes idx+1 therefore asks for a replica that never existed
-// the moment a replacement node is the subject. proposeAndWait did exactly
-// that and reported "leader state machine not found" for a proposal that had
-// committed perfectly (#121).
+// the moment a replacement node is the subject, and reports "leader state
+// machine not found" for a proposal that committed perfectly.
 //
-// This is the repository's recurring flake class — a value that is not pinned
-// treated as if it were (#84, #88, #90, #91, #103, #107, #112, #115) — with the
-// slice index treated as the replica ID. The remedy is the one those took: read
+// This is the recurring flake class — a value that is not pinned treated as if
+// it were — with the slice index treated as the replica ID. The remedy is: read
 // the value from whatever owns it instead of recomputing it. A host's replica
 // ID for a shard is fixed when StartShard is called and never changes while the
 // host runs, so GetShardInfo is authoritative here and — unlike IsLeader — is
@@ -1002,8 +998,8 @@ func (c *testCluster) findLeader(shardID uint64) int {
 //
 // ok is false when idx is out of range, the node is stopped, or the host is not
 // running that shard. Each of those means "no replica here", which is a
-// different answer from "replica idx+1", and callers that conflated the two are
-// what #121 is about.
+// different answer from "replica idx+1", and callers must not conflate the
+// two.
 func (c *testCluster) replicaIDAt(shardID uint64, idx int) (uint64, bool) {
 	c.hostsMu.RLock()
 	defer c.hostsMu.RUnlock()
@@ -1105,8 +1101,8 @@ const awaitLeaderHostInterval = 5 * time.Millisecond
 //
 // It exists so a writer that finds a shard mid-election does not have to spend
 // one of its writes on a proposal it never attempted. Counting those as losses
-// is what made TestE2E_MultiShardFailover_UnderLoad score the runner's clock
-// instead of the cluster's recovery (#107).
+// would make TestE2E_MultiShardFailover_UnderLoad score the runner's clock
+// instead of the cluster's recovery.
 func (c *testCluster) awaitLeaderHost(shardID uint64, timeout time.Duration) *quicraft.Host {
 	ticker := time.NewTicker(awaitLeaderHostInterval)
 	defer ticker.Stop()
@@ -1353,7 +1349,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 //
 // The replica ID comes from replicaIDAt — the host's own answer — and falls
 // back to i+1 only when the host cannot be asked at all (it was stopped, or it
-// never started the shard). Deriving it arithmetically was #121.
+// never started the shard); it is never derived arithmetically.
 func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
 	replicaID, ok := cluster.replicaIDAt(shardID, i)
 	if !ok {
@@ -1516,11 +1512,11 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 		//
 		// The lookup goes through resolveStateMachine, which asks the host
 		// which replica it runs (replicaIDAt) instead of computing leaderIdx+1.
-		// The arithmetic held only for the founding members, so when a node
-		// added by addNodeToCluster won the election this asked the tracker for
-		// a replica that never existed, got nil, and failed the test with
+		// The arithmetic holds only for the founding members, so when a node
+		// added by addNodeToCluster wins the election it would ask the tracker
+		// for a replica that never existed, get nil, and fail the test with
 		// "leader state machine not found" for a proposal that had just
-		// committed (#121).
+		// committed.
 		leaderSM := resolveStateMachine(cluster, trackers, shardID, leaderIdx)
 		if leaderSM == nil {
 			replicaID, ok := cluster.replicaIDAt(shardID, leaderIdx)
@@ -1708,10 +1704,7 @@ func addNodeToCluster(
 // at the point of each attempt, and a duplicate refusal ("already exists in
 // membership") is accepted ONLY after an attempt in the same loop was
 // genuinely submitted to raft AND a linearizable membership read shows the
-// replica as a full voter at exactly addr. #112 found the second half missing
-// from the loop that lived here; #122 wrote the decision for this suite, #135
-// moved it to test/membership so the host and linearizability suites could
-// share it, and #145 retired this suite's copy. This is the binding of that
+// replica as a full voter at exactly addr. This is the binding of that
 // decision to testCluster.leaderHost, nothing more.
 func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr, identity string, timeout time.Duration) {
 	t.Helper()
@@ -1731,10 +1724,10 @@ func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint6
 // CURRENTLY the leader and returns nil once the entry commits, or an error the
 // caller should treat as fatal.
 //
-// It exists for the concurrent-writer goroutines, which used to pin the leader
+// It exists for the concurrent-writer goroutines, which must not pin the leader
 // index captured at the start of the test and treat every error — including
-// ErrNotLeader from a perfectly ordinary re-election — as a hard failure. That
-// is not a weaker assertion than "no errors": every entry must still commit,
+// ErrNotLeader from a perfectly ordinary re-election — as a hard failure.
+// Retrying is not a weaker assertion than "no errors": every entry must still commit,
 // and the caller still verifies all of them replicated afterwards. It only
 // stops a legal leadership change from being reported as a lost write.
 //
@@ -1742,11 +1735,10 @@ func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint6
 //
 // # Which retry policy this needs, and why it is not a third one
 //
-// This was the FOURTH copy of the propose-retry loop, and the fourth place a
-// change to the retry policy had to be remembered (#110). It now runs on the
-// same proposer.TryWith as the rest, and the predicate is chosen against the
-// principle #97/#109 settled on: retry an error when, and only when, what the
-// loop does between attempts can change that error's answer.
+// It runs on the same proposer.TryWith as the rest rather than a copy of the
+// propose-retry loop, and the predicate is chosen by one principle: retry an
+// error when, and only when, what the loop does between attempts can change
+// that error's answer.
 //
 // Between attempts this loop does BOTH of the things the package's two
 // remedies name. It re-resolves the leader, which is proposer.Try's remedy and
@@ -1765,12 +1757,10 @@ func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint6
 // budget, across partitions and heals, so a condition that clears on its own
 // is something to wait through rather than to report.
 //
-// quicraft.Temporary is also narrower than the isTransientLeadershipError it
-// replaces here, and deliberately so: that predicate retried ErrCanceled and a
-// bare context cancellation, which no amount of waiting or re-resolving fixes.
-// It is no longer narrower on the leadership-transfer case — #146 re-exported
-// ErrTransferInProgress and put it in temporaryErrors, so Temporary now covers
-// by sentinel what that predicate could only reach by substring.
+// quicraft.Temporary deliberately does not retry ErrCanceled or a bare context
+// cancellation, which no amount of waiting or re-resolving fixes. It does cover
+// a leadership transfer in flight: ErrTransferInProgress is in temporaryErrors,
+// matched by sentinel rather than by substring.
 //
 // Re-proposal is safe for what this writes. A not-leader error can arrive after
 // the entry already reached the log (quicraft.MaybeApplied — the form observed
@@ -1780,9 +1770,9 @@ func proposeUntilCommitted(cluster *testCluster, shardID uint64, key, value stri
 	_, err := proposer.TryWith(cluster.leaderHost, shardID, encodeKVPut(key, value),
 		timeout, quicraft.Temporary)
 	if err != nil {
-		// Not "never committed within <timeout>": that phrasing was true only
-		// for the deadline case and reported a permanent rejection as a slow
-		// shard, which is the misdiagnosis #97 named. TryWith returns a
+		// Not "never committed within <timeout>": that phrasing is true only
+		// for the deadline case and would report a permanent rejection as a
+		// slow shard. TryWith returns a
 		// permanent error on its first occurrence, so the budget is context
 		// here rather than a claim about how long this took.
 		return fmt.Errorf("%q did not commit (budget %v): %w", key, timeout, err)
@@ -1950,9 +1940,9 @@ func waitForMembershipSize(
 //
 // # Why this exists
 //
-// Every membership assertion in this package used to be made against ONE
-// replica — cluster.hosts[leaderIdx], or whichever node happened to be live —
-// through waitForMembershipSize. That asks the leader whether the leader
+// A membership assertion made against ONE replica — cluster.hosts[leaderIdx],
+// or whichever node happens to be live — through waitForMembershipSize asks
+// the leader whether the leader
 // applied the change, which it necessarily did: the leader is where the config
 // change was proposed, and it applies it on commit. The interesting failure is
 // the OTHER side of that: a config change that commits, applies on the leader,
@@ -2143,8 +2133,8 @@ type barrierTestCluster struct {
 // pipeline seals through it, so a test can assert that at-rest encryption was
 // actually INVOKED rather than merely configured.
 //
-// It exists because the only thing the barrier tests used to assert was
-// IsSealed() == false, an in-memory flag that no production code path touches.
+// It exists because IsSealed() == false alone is an in-memory flag that no
+// production code path touches.
 // A total plaintext downgrade — the engine resolving no barrier for the shard
 // and writing the snapshot in the clear — leaves that flag exactly as it was.
 //
@@ -2477,16 +2467,16 @@ func waitForSnapshotArtifact(t *testing.T, label, dir string, timeout time.Durat
 // What the completion wait buys, and what it costs: the engine's local save
 // path writes the state machine to snapshot.dat, fsyncs it, and encrypts it IN
 // PLACE afterwards, so between those steps the canonical name holds a COMPLETE
-// plaintext copy. Scanning during that window read a save in progress and
-// reported it as a downgrade — 4 of 41 runs of this suite on a 24-core box at
-// load average ~120 (issue #108). Waiting for every artifact to become
+// plaintext copy. Scanning during that window would read a save in progress
+// and report it as a downgrade, which happens on a heavily loaded host.
+// Waiting for every artifact to become
 // self-describing removes that window WITHOUT dropping anything from the
 // search: an artifact that never finishes fails the wait rather than being
 // skipped, which is what keeps a save killed inside the window a failure here.
 //
-// The window ITSELF is a property of the product, not of this test, and is
-// tracked as #116. Nothing about it is being asserted away: what this function
-// no longer does is report a save that is running right now as a downgrade.
+// The window ITSELF is a property of the product, not of this test. Nothing
+// about it is being asserted away: this function only declines to report a
+// save that is running right now as a downgrade.
 func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 	t.Helper()
 	if len(needles) == 0 {

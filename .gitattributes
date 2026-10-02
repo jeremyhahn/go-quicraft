@@ -11,14 +11,11 @@ AGENTS.md export-ignore
 **/.serena/** export-ignore
 
 # Private-forge and private-release workflow. These files drive only the
-# private forge's SDLC -- automated peer review (opencode-review, and the
-# disabled claude-review), arming the forge's auto-merge (automerge) -- and the
+# private forge's SDLC -- arming the forge's auto-merge (automerge) -- and the
 # private release recipe's trust anchor (.release-allowed-signers, which pins
 # the internal agent principal `make release-alpha` verifies against). Nothing a
 # public reader runs depends on them: ci.yml, release.yml, nightly.yml and
 # fuzz.yml neither call nor read them, and the Makefile reads the signers file
 # from the checkout, which export-ignore does not touch.
-.github/workflows/opencode-review.yml export-ignore
-.github/workflows/claude-review.yml export-ignore
 .github/workflows/automerge.yml export-ignore
 /.release-allowed-signers export-ignore

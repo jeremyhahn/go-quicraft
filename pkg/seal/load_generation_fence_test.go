@@ -545,6 +545,117 @@ func TestTamperedPreFenceBlobIsStillRefused(t *testing.T) {
 	}
 }
 
+// TestStateMACDowngradeIsRefused pins that the v1 recognition path cannot be
+// used to select the weaker coverage. An attacker with write access to the blob
+// and no root key holds only tags the barrier itself wrote, so the attacks
+// available are re-pairing a genuine tag with edited fields. Each must be
+// refused, and AllowUnauthenticatedSealedState must not rescue any of them:
+// that hatch is for a blob with no tag at all, never for a tag that is present
+// and wrong.
+func TestStateMACDowngradeIsRefused(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, deploymentID uint64, s *SealedRootKey)
+	}{
+		{
+			// A fenced blob's genuine v2 tag with the claim stripped to zero,
+			// so the v1 path is reachable. The stored tag is over the v2
+			// encoding, so it must match neither encoding.
+			name: "v2 tag with LoadGeneration stripped to zero",
+			mutate: func(t *testing.T, _ uint64, s *SealedRootKey) {
+				if s.LoadGeneration == 0 {
+					t.Fatal("fixture: the bootstrap blob carries no claim to strip")
+				}
+				s.LoadGeneration = 0
+			},
+		},
+		{
+			// A genuine v1 tag does not cover LoadGeneration, so an inflated
+			// number still matches the v1 encoding. Only the LoadGeneration == 0
+			// gate stops it from becoming a passphrase-free way to supersede a
+			// node.
+			name: "v1 tag with LoadGeneration inflated",
+			mutate: func(t *testing.T, deploymentID uint64, s *SealedRootKey) {
+				s.LoadGeneration = 0
+				s.StateMAC = legacyStateMAC(t, deploymentID, s)
+				s.LoadGeneration = 1 << 40
+			},
+		},
+		{
+			name: "v1 tag over edited metadata",
+			mutate: func(t *testing.T, deploymentID uint64, s *SealedRootKey) {
+				s.LoadGeneration = 0
+				s.StateMAC = legacyStateMAC(t, deploymentID, s)
+				s.Salt = append([]byte(nil), s.Salt...)
+				s.Salt[0] ^= 0xFF
+			},
+		},
+	}
+	for i, tc := range cases {
+		for _, allow := range []bool{false, true} {
+			deploymentID := uint64(920 + i)
+			name := tc.name
+			if allow {
+				name += " with AllowUnauthenticatedSealedState"
+			}
+			t.Run(name, func(t *testing.T) {
+				captureLogs(t)
+				store := bootstrapFenced(t, deploymentID)
+				blob := store.read(t)
+				tc.mutate(t, deploymentID, blob)
+				store.save(t, blob)
+
+				cfg := DefaultBarrierConfig(deploymentID)
+				cfg.StatePersister = store.persister(t)
+				cfg.AllowUnauthenticatedSealedState = allow
+				b := MustNewBarrier(cfg)
+				if err := b.SetSealedRootKey(store.read(t)); err != nil {
+					t.Fatalf("SetSealedRootKey: %v", err)
+				}
+				err := b.Unseal(context.Background(), testStrategy(t), Credentials{})
+				if !errors.Is(err, ErrSealedStateUnauthenticated) {
+					t.Fatalf("Unseal = %v, want ErrSealedStateUnauthenticated: a re-paired "+
+						"tag was accepted through the v1 recognition path", err)
+				}
+			})
+		}
+	}
+}
+
+// TestPreFenceBlobIsRestampedOnce pins that the v1 path is a one-time
+// migration: after the first unseal the persisted blob carries a claim and a
+// tag over the current encoding, so the v1 path can never apply to it again.
+func TestPreFenceBlobIsRestampedOnce(t *testing.T) {
+	const deploymentID = 930
+	store := bootstrapFenced(t, deploymentID)
+
+	blob := store.read(t)
+	blob.LoadGeneration = 0
+	blob.StateMAC = legacyStateMAC(t, deploymentID, blob)
+	store.save(t, blob)
+
+	b := fenceBarrier(t, deploymentID, store)
+	if err := b.Unseal(context.Background(), testStrategy(t), Credentials{}); err != nil {
+		t.Fatalf("Unseal of a pre-fence blob: %v", err)
+	}
+
+	migrated := store.read(t)
+	if migrated.LoadGeneration == 0 {
+		t.Fatal("the migrated blob was persisted without a claim; the v1 path still applies to it")
+	}
+	rootKey, err := testStrategy(t).UnsealRootKey(context.Background(), migrated, Credentials{})
+	if err != nil {
+		t.Fatalf("UnsealRootKey: %v", err)
+	}
+	want, err := sealedStateMAC(rootKey, deploymentID, migrated)
+	if err != nil {
+		t.Fatalf("sealedStateMAC: %v", err)
+	}
+	if !bytes.Equal(migrated.StateMAC, want) {
+		t.Fatalf("the migrated blob's tag is not over version %d of the encoding", sealedStateMACVersion)
+	}
+}
+
 // legacyStateMAC computes the v1 metadata tag the way a pre-fence build would
 // have, by recovering the root key through the same strategy the barrier uses.
 func legacyStateMAC(t *testing.T, deploymentID uint64, s *SealedRootKey) []byte {

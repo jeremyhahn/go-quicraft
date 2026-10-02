@@ -167,8 +167,8 @@ const aadProbeSize = 32
 // that it opens under aadA and returns the same bytes, and require that it
 // FAILS under a different aadB. An encryptor that accepts the aad argument and
 // drops it passes the first two and fails the third — which is precisely the
-// case AADSymmetricEncrypter's doc comment asks implementers not to create and
-// has, until now, had no way to detect. A structural type assertion cannot
+// case AADSymmetricEncrypter's doc comment asks implementers not to create,
+// and which nothing else can detect. A structural type assertion cannot
 // distinguish the two, because both have identical method sets.
 //
 // Both AAD values are random, so an encryptor cannot special-case a known probe

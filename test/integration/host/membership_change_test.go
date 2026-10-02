@@ -201,9 +201,9 @@ func TestHostAPI_MembershipChange_AddNodeWhileWriting(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, allData, membershipTimeout)
 
 	// Verify consistency via a linearizable read through whoever leads at
-	// each read. This loop is where #147 failed CI: a leader observed once
-	// above the loop, refused CORRECTLY thirty reads later when the election
-	// storm that followed the membership change moved leadership.
+	// each read. A leader observed once above the loop would be refused
+	// CORRECTLY reads later when the election storm that follows the
+	// membership change moves leadership.
 	for key, expectedVal := range allData {
 		got := readFromLeader(t, cluster, shardID, key, defaultTimeout)
 		val, ok := got.(string)

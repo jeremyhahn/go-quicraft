@@ -125,8 +125,7 @@ func TestBarrier_ResetClearsState(t *testing.T) {
 	}
 }
 
-// TestBarrier_ResetThenInitializeNewRootKey is the issue #208 acceptance test:
-// after Reset, Initialize succeeds with a NEW root key, and nothing encrypted
+// TestBarrier_ResetThenInitializeNewRootKey pins that after Reset, Initialize succeeds with a NEW root key, and nothing encrypted
 // under the discarded key decrypts.
 func TestBarrier_ResetThenInitializeNewRootKey(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
@@ -310,7 +309,8 @@ func TestBarrier_ResetFirstBootSurvivesInProcessUnseal(t *testing.T) {
 	}
 }
 
-// TestBarrier_RefusedResetKeepsRollbackFloor is the #216 scenario: a barrier
+// TestBarrier_RefusedResetKeepsRollbackFloor pins the rollback floor across a
+// refused Reset: a barrier
 // that has reached epoch 3 refuses Reset, and the older authentic epoch-1 blob
 // is still rejected by SetSealedRootKey's rollback floor afterwards.
 func TestBarrier_RefusedResetKeepsRollbackFloor(t *testing.T) {

@@ -145,9 +145,8 @@ type SecurityMetrics interface {
 	//     replica the configuration names. Admission requires one on every
 	//     host with a transport, so this is a configuration written by a
 	//     build that did not; the remedy is wipe and re-bootstrap.
-	//   - "address_mismatch" and "shared_address" were the address fallback's
-	//     two failures. The fallback is gone (#197); the label values are
-	//     retired and not reallocated.
+	//   - "address_mismatch" and "shared_address" are retired label values
+	//     and are not reallocated.
 	IncUnauthorizedMessageDropped(shardID, from uint64, reason string)
 
 	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped

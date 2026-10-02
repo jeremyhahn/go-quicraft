@@ -28,10 +28,10 @@ import (
 //
 // The lease rests on every follower that acked a heartbeat round granting no
 // vote until its election timeout has passed since. A restart discards that
-// timer: the replica comes back with no known leader, so it used to grant the
-// first up-to-date candidate at once, while the old leader kept counting its
-// pre-restart ack toward a lease — a new leader elected inside the old one's
-// lease, and a stale read. voteHeldDown restores the promise from the
+// timer: the replica comes back with no known leader, so without a hold-down it
+// would grant the first up-to-date candidate at once, while the old leader kept
+// counting its pre-restart ack toward a lease — a new leader elected inside the
+// old one's lease, and a stale read. voteHeldDown restores the promise from the
 // replica's own monotonic clock, anchored at construction.
 
 // holdDownTestTerm is the persisted term a restarted replica recovers with.

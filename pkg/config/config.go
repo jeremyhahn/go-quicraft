@@ -170,7 +170,7 @@ func BoolPtr(v bool) *bool { return &v }
 // full replica holding an entry makes it unrecoverable. These knobs bound
 // membership shape to limit that exposure; they do NOT constrain which nodes
 // form any individual commit quorum. The full safety and durability analysis
-// lives in docs/raft/protocol.md Section 6.
+// lives in docs/raft-consensus/engineering.md Section 6.
 //
 // Lifecycle: WitnessConfig is the BOOTSTRAP SEED for the shard's
 // replicated witness policy. When a shard is created, the policy is

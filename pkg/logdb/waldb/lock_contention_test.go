@@ -47,12 +47,12 @@ func (f *slowSyncFile) Sync() error {
 //
 // walShard.mu guards the segment file and is held by SaveState across
 // write -> fsync -> commit, which is load-bearing: releasing it between the
-// durable write and a rollback previously let a concurrent same-shard batch
-// commit past this batch's checkpoint, and the rollback then truncated the
-// segment and erased acknowledged records. But readers used to take that SAME
-// mutex, so every read for every raft group on the shard waited out the fsync.
-// The in-memory maps readers consult are now guarded separately by dataMu,
-// which SaveState takes only for its brief Phase 3 commit.
+// durable write and a rollback would let a concurrent same-shard batch commit
+// past this batch's checkpoint, and the rollback would then truncate the
+// segment and erase acknowledged records. Readers taking that SAME mutex would
+// make every read for every raft group on the shard wait out the fsync, so the
+// in-memory maps readers consult are guarded separately by dataMu, which
+// SaveState takes only for its brief Phase 3 commit.
 func TestReadsDoNotBlockOnFsync(t *testing.T) {
 	slow := &slowSyncFS{
 		FS:      osFS{},
@@ -107,8 +107,8 @@ func TestReadsDoNotBlockOnFsync(t *testing.T) {
 		if _, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 2, 1<<20); err != nil {
 			t.Errorf("IterateEntries during fsync: %v", err)
 		}
-		// ListNodeInfo walks every shard; it used to take all 16 mutexes and
-		// could serialize behind up to 16 in-flight fsyncs.
+		// ListNodeInfo walks every shard; taking all 16 mutexes would
+		// serialize it behind up to 16 in-flight fsyncs.
 		if _, err := db.ListNodeInfo(); err != nil {
 			t.Errorf("ListNodeInfo during fsync: %v", err)
 		}

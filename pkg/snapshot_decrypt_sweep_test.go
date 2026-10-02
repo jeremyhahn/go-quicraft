@@ -61,8 +61,8 @@ func orphanDecryptTemp(t *testing.T, dir, prefix string) string {
 // survives restarts and backups — while an operator spot-checking snapshot.dat
 // still sees ciphertext.
 //
-// The send scratch file previously used a prefix the orphan sweeper did not
-// match, and no other cleaner existed. This asserts a crash-ORPHANED file (not
+// The send scratch file must use a prefix the orphan sweeper matches, since no
+// other cleaner exists. This asserts a crash-ORPHANED file (not
 // one whose in-process owner removes it) is reclaimed at the next StartShard.
 func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	cfg := testHostConfig(t)

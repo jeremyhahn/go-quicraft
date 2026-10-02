@@ -502,11 +502,10 @@ func TestSnapshotChunkValidatesBinVer(t *testing.T) {
 // TestConfigChangeRejectsEveryStrictPrefix pins the collapse of ConfigChange to
 // ONE fixed layout, and with it the closure of a real defect.
 //
-// The type used to be LENGTH-discriminated: two of its trailing fields could be
-// absent, and the decoder read "the buffer ended" as a shorter layout rather
-// than as damage. The dangerous half was the trailing NodeIdentity. A payload
-// ending where its length prefix begins decoded with err == nil and an EMPTY
-// identity — and an empty identity is exactly the compatibility state that
+// A LENGTH-discriminated decoder, reading "the buffer ended" as a shorter
+// layout rather than as damage, is dangerous at the trailing NodeIdentity: a
+// payload ending where its length prefix begins would decode with err == nil
+// and an EMPTY identity — and an empty identity is exactly the compatibility state that
 // falls back to the weaker address-based authorization. So a truncated
 // ConfigChange was indistinguishable from a legitimate identity-less one, and
 // truncation silently downgraded an authorization check.
@@ -537,10 +536,9 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 	}
 
 	// EVERY strict prefix is refused. The sweep is exhaustive rather than
-	// sampled because the defect lived at ONE offset — the byte before the
-	// identity's length prefix — and a hand-picked set of cut points is exactly
-	// what missed it. Two offsets used to decode without error or with the
-	// wrong error, and both are inside this loop.
+	// sampled because the dangerous cut is at ONE offset — the byte before the
+	// identity's length prefix — and a hand-picked set of cut points can miss
+	// it.
 	for cut := 0; cut < len(buf); cut++ {
 		var decoded ConfigChange
 		consumed, err := decoded.UnmarshalFrom(buf[:cut])
@@ -561,10 +559,8 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 
 	// The cut that mattered, called out on its own so a regression names
 	// itself. A payload ending exactly where the identity's length prefix
-	// begins used to decode with err == nil and an EMPTY NodeIdentity — and an
-	// empty identity is the state that falls back to the weaker address-based
-	// authorization, so a truncated ConfigChange silently downgraded the gate
-	// the identity exists to raise.
+	// begins must not decode with err == nil and an EMPTY NodeIdentity, which
+	// would silently drop the identity the receive-side gate checks.
 	beforeIdentityPrefix := len(buf) - (4 + len(full.NodeIdentity))
 	var downgraded ConfigChange
 	if _, err := downgraded.UnmarshalFrom(buf[:beforeIdentityPrefix]); !errors.Is(err, ErrBufferTooSmall) {
@@ -573,8 +569,7 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 			beforeIdentityPrefix, len(buf), err)
 	}
 
-	// The shape that used to be reported as a pre-witness-policy LAYOUT — a
-	// payload ending right after Initialize — is now just another truncation.
+	// A payload ending right after Initialize is just another truncation.
 	// There is one layout, so there is no other layout to name.
 	endOfInitialize := 24 + 4 + len(full.Address) + 8
 	var legacyShape ConfigChange
@@ -606,7 +601,8 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 // truncation sweep: a change that genuinely carries no identity is a legal,
 // commonly committed payload and must still decode.
 //
-// It is what stops the fix from being "reject anything without an identity".
+// It is what stops the truncation check from becoming "reject anything
+// without an identity".
 // A shard added without RequestAddNodeWithIdentity commits exactly this, and
 // every RemoveNode and UpdateWitnessPolicy does too, so refusing it would leave
 // nodes unable to replay their own logs. The distinction the layout now draws
@@ -733,8 +729,8 @@ func TestMembershipRejectsUnversionedLayout(t *testing.T) {
 	}
 }
 
-// TestMembershipEmptyUnversionedEmbeddedRejected covers the residual exposure
-// the old heuristic could not reach: an empty unversioned membership embedded
+// TestMembershipEmptyUnversionedEmbeddedRejected covers the exposure a
+// length heuristic cannot reach: an empty unversioned membership embedded
 // in a larger buffer, where no length or trailing-byte check applies. Both
 // shapes are padded with enough trailing bytes to satisfy every downstream
 // bounds check, so only the version byte can reject them.
@@ -844,10 +840,8 @@ func TestMembershipRejectsTrailingBytesAtCallSite(t *testing.T) {
 }
 
 // TestOverLimitSentinelsPerField verifies that each length-limited field
-// reports its own dedicated sentinel (previously getBytes always returned
-// ErrEntrySizeLimitExceeded and getString always ErrAddressTooLong, leaving
-// ErrMetadataTooLong/ErrChunkDataTooLong/ErrFilepathTooLong
-// unreachable).
+// reports its own dedicated sentinel, so ErrMetadataTooLong,
+// ErrChunkDataTooLong and ErrFilepathTooLong are each reachable.
 func TestOverLimitSentinelsPerField(t *testing.T) {
 	// SnapshotFile.Filepath over MaxFilepathLen.
 	buf := make([]byte, 8)

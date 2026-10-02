@@ -363,7 +363,7 @@ func TestEngine_Stop_SurvivesMalformedNodeEntry(t *testing.T) {
 }
 
 // TestCommitWorker_SaveStateFailure_FailsUncommittedProposals pins the case the
-// batch-abandon path used to drop entirely: a proposal that has been accepted
+// batch-abandon path must not drop: a proposal that has been accepted
 // into a batch but has NOT yet committed.
 //
 // On a leader this is where every client proposal first appears — in

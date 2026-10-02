@@ -24,10 +24,9 @@ import (
 // ---------------------------------------------------------------------------
 // A removal must RETAIN the departing member's identity
 //
-// handleRemoveNode used to delete it along with the member. That left nothing
-// in replicated state for the receive-side deny-list to evaluate against the
-// AUTHENTICATED peer identity, so the gate could only ever consult the CLAIMED
-// msg.From — which a removed replica evades by naming a different replica ID,
+// Deleting it along with the member would leave nothing in replicated state for
+// the receive-side deny-list to evaluate against the AUTHENTICATED peer
+// identity, so the gate could only ever consult the CLAIMED msg.From — which a removed replica evades by naming a different replica ID,
 // while still holding the private key that authenticates it perfectly well.
 //
 // The tests below pin the three properties that make the retained fact usable:

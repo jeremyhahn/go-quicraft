@@ -161,15 +161,15 @@ func await(done <-chan error) (bool, error) {
 	}
 }
 
-// TestLookupDoesNotBlockApplyOnConcurrentTiers is the regression test for
-// #209. ConcurrentStateMachine and DiskStateMachine both document Lookup as
-// "May be called concurrently with Update", yet Apply took readGuard for
-// writing on every tier, so one read held open inside the user SM parked the
-// shard's Apply — and, through sync.RWMutex's writer preference, every read
-// that arrived after it.
+// TestLookupDoesNotBlockApplyOnConcurrentTiers pins that Apply does not
+// exclude Lookup on the concurrent tiers. ConcurrentStateMachine and
+// DiskStateMachine both document Lookup as "May be called concurrently with
+// Update"; if Apply took readGuard for writing on every tier, one read held
+// open inside the user SM would park the shard's Apply — and, through
+// sync.RWMutex's writer preference, every read that arrived after it.
 //
-// Fail-before-fix, observed: with Apply holding readGuard.Lock on every tier,
-// both the Apply and the second Lookup below time out.
+// Observed with Apply holding readGuard.Lock on every tier: both the Apply and
+// the second Lookup below time out.
 func TestLookupDoesNotBlockApplyOnConcurrentTiers(t *testing.T) {
 	concurrentTiers(t, func(t *testing.T, s *StateMachine, g *gateSM) {
 		slow := newPark()
@@ -393,7 +393,7 @@ var (
 // four goroutines issuing 20µs local reads back to back. On the basic tier
 // the readers exclude Apply by contract, so its "readers=4" time includes
 // waiting out a scan. On the concurrent and on-disk tiers they must not
-// (#209), so "readers=4" there should track "readers=0".
+// so "readers=4" there should track "readers=0".
 func BenchmarkApplyWithReaders(b *testing.B) {
 	const scan = 20 * time.Microsecond
 	tiers := []struct {

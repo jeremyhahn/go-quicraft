@@ -167,10 +167,10 @@ func TestWirePropose_EmptyAddressIsRefused(t *testing.T) {
 	}
 }
 
-// TestWirePropose_UndecodablePayloadIsRefused pins the fail-open that used to
-// sit at the top of the validator: an unmarshalable payload logged a warning and
-// returned nil, so the entry was appended having been judged by nothing. Every
-// rule above reads fields that failed to parse.
+// TestWirePropose_UndecodablePayloadIsRefused pins that the validator fails
+// closed on an unmarshalable payload. Logging a warning and returning nil would
+// append the entry having been judged by nothing: every rule above reads fields
+// that failed to parse.
 func TestWirePropose_UndecodablePayloadIsRefused(t *testing.T) {
 	quietLogs(t)
 

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ErrDuplicateMemberAddress`, `ErrDuplicateMemberIdentity`,
+  `ErrSharedPeerCertificate` and the `SharedPeerCertificateError` type alias
+  are re-exported from `pkg`, so membership-add and `StartShard` rejections
+  match with `errors.Is` / `errors.As` (#220).
+
+### Fixed
+
+- `make test-snapshot` pointed at a package that does not exist; it now runs
+  the snapshot tests across `./pkg/...`. Every `test-<pkg>` target fails when
+  its selection matches no tests. `coverage-snapshot` is removed (#220).
+- `make fuzz-<pkg>` and `make fuzz-all` failed outright; each now fuzzes every
+  target in its package one at a time (#220).
+- `make ci-netfault` now also runs the netfault test in `test/integration/host`
+  and fails if a tagged package is left out (#220).
+- `make remote-*` used a Go 1.26.5 toolchain path; it now follows `go.mod`
+  (#220).
+- Go doc comments that contradicted the code are corrected, including
+  NO-OP sessions on on-disk state machines, `EventListener` threading,
+  `SendBatchMaxSize`, `HostID`, WAL batch rollback and the `snapshot.meta`
+  layout (#220).
+
+### Removed
+
+- The build gate and export-ignore entries for the deleted
+  `opencode-review.yml` and `claude-review.yml` workflows (#220).
+
 ## [0.16.0] - 2026-10-01
 
 Release candidate, published to Gitea only, for upstream projects to pin and

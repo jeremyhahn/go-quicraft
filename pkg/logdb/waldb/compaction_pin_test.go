@@ -20,7 +20,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestRemoveEntriesTo_PinsCompactionMarkerSegment is the L1 regression test. A
+// TestRemoveEntriesTo_PinsCompactionMarkerSegment is a regression test. A
 // compaction marker is not tracked by any entry index, so its segment must be
 // pinned in metaSegments (at runtime AND restored on recovery) — otherwise GC
 // can reclaim the segment once its entries are compacted away, and compactedTo

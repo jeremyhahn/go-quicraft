@@ -112,11 +112,11 @@ func TestVerifySnapshotArtifact_DetectsTruncation(t *testing.T) {
 	}
 }
 
-// TestVerifySnapshotArtifact_RefusesUnverifiableMetadata is the regression
-// guard for the integrity check that switched itself off.
+// TestVerifySnapshotArtifact_RefusesUnverifiableMetadata guards against an
+// integrity check that switches itself off.
 //
-// VerifySnapshotArtifact used to return nil whenever snapshot.meta could not be
-// read or parsed, or carried no integrity fields, calling the artifact
+// VerifySnapshotArtifact must not return nil when snapshot.meta cannot be read
+// or parsed, or carries no integrity fields, by calling the artifact
 // "legacy". Every writer stamps the fields before a directory is published, so
 // no legitimately written artifact lacks them; what does is a partial restore
 // that dropped or damaged snapshot.meta. Paired with a same-length alteration

@@ -257,10 +257,10 @@ type Membership struct {
 	// TOMBSTONE's authorization key, and it is the reason the removal deny-list
 	// can be evaluated against something a sender cannot choose.
 	//
-	// The deny-list used to be answerable only against the CLAIMED msg.From,
-	// which a removed replica evades by naming a different replica ID: it still
-	// holds its private key, so it still authenticates, and nothing in
-	// replicated state connected the connection it opened to the removal that
+	// A deny-list answerable only against the CLAIMED msg.From is one a
+	// removed replica evades by naming a different replica ID: it still holds
+	// its private key, so it still authenticates, and nothing else in
+	// replicated state connects the connection it opens to the removal that
 	// was committed for it. Retaining the identity here closes that, because the
 	// receive path can ask "is the AUTHENTICATED identity on this connection one
 	// this shard has removed?" — a question whose answer does not depend on any
@@ -338,9 +338,8 @@ func (m *Membership) Size() int {
 // checkWritable refuses a membership this package's own UnmarshalFrom would
 // not accept back.
 //
-// Every limit in this package used to be enforced on READ only, so MarshalTo
-// happily produced bytes UnmarshalFrom refuses — and for Membership that is
-// reachable through a legal API call with a DURABLE consequence, not merely an
+// A limit enforced on READ only would let MarshalTo produce bytes UnmarshalFrom
+// refuses — and for Membership that is reachable through a legal API call with a DURABLE consequence, not merely an
 // asymmetry in a codec. Host.StartShard copies the caller's members map
 // straight into Addresses, raft.BuildInitialMembershipEntry marshals it
 // unchecked, and the result is committed as the EntryInitialMembership at log

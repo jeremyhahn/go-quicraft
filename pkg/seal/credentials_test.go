@@ -22,20 +22,17 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// This file is #41's verification. The issue asked for exactly one thing that a
-// type change alone does not give you:
+// This file proves the one thing a type change alone does not give you: that
+// the passphrase's caller-side buffer is wiped or never existed, with a
+// mutation of that wipe turning the test red.
 //
-//	"A test proving the passphrase's caller-side buffer is wiped or never
-//	 existed — and a mutation of that wipe turning it red."
-//
-// The retype of Credentials.Secret from []byte to *enclave.SealedEnclave makes
-// the WRONG shape uncompilable, which the compiler proves. What it does not
+// Typing Credentials.Secret as *enclave.SealedEnclave makes the WRONG shape
+// uncompilable, which the compiler proves. What it does not
 // prove is that NewCredentials — the only supported way to get from a caller's
 // bytes to that type — actually consumes those bytes rather than copying them.
 // A constructor that read `enclave.NewSealed(append([]byte(nil), secret...))`
 // would type-check, satisfy every other test in this package, and leave the
-// passphrase in the caller's slice for the collector to move around: the exact
-// gap the issue was filed against, reintroduced one line deeper.
+// passphrase in the caller's slice for the collector to move around.
 //
 // So the wipe is asserted directly, on the caller's own slice, and it is the
 // mutation target.
@@ -126,8 +123,7 @@ func TestCredentials_ZeroValueMeansNoneSupplied(t *testing.T) {
 
 // TestCredentials_DeferredRoundTripThroughTheByteAPI is the end-to-end half:
 // the []byte root-key pair — the surface every strategy in the portfolio
-// implements, and the one #41 is about — now carries a protected passphrase and
-// still round-trips.
+// implements — carries a protected passphrase and still round-trips.
 //
 // The credential is reused across both calls on purpose. The seal layer opens
 // it, derives from it and destroys the opened copy; it never destroys the
@@ -172,11 +168,11 @@ func TestCredentials_DeferredRoundTripThroughTheByteAPI(t *testing.T) {
 	}
 }
 
-// TestCredentials_ProtectedAliasIsTheSameType pins the collapse #41 performed.
+// TestCredentials_ProtectedAliasIsTheSameType pins that ProtectedCredentials
+// and Credentials are one type.
 //
-// The point of the issue was not only that the passphrase should be protected;
-// it was that ONE interface must not carry TWO credential types, because a
-// reader can no longer tell from a signature which one is the real contract.
+// ONE interface must not carry TWO credential types, because a reader can no
+// longer tell from a signature which one is the real contract.
 // ProtectedCredentials survives as an ALIAS so implementations that name it
 // still satisfy ProtectedSealingStrategy — a defined type would break every one
 // of them for no gain — and these assertions are what keep it an alias.

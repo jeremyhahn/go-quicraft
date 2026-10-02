@@ -79,20 +79,15 @@ const (
 	// rather than migrated.
 	//
 	// That policy needs the individual layout changes to stay detectable, and
-	// detection lives at the RECORD level rather than here. When the entry
-	// record header grew from 76 to 84 bytes and the snapshot record's session
-	// policy tail from 24 to 32, the payload-type bytes were reused, so an old
-	// record was either misparsed in silence or reported as corruption. That is
-	// fixed by retiring the old bytes rather than by moving this constant: the
-	// current formats carry new payload types and the retired values are left
-	// unallocated, so a record still carrying one is refused with
-	// ErrUnknownPayloadType. An old directory therefore passes this gate — every
-	// build records 1 — and is refused when its first stale record is replayed.
+	// detection lives at the RECORD level rather than here. A record whose
+	// layout changes is given the next free payload-type byte and its old byte
+	// is retired and left unallocated, so a stale record is refused with
+	// ErrUnknownPayloadType rather than misparsed in silence or reported as
+	// corruption. A directory with stale records therefore passes this gate —
+	// every build records 1 — and is refused when its first stale record is
+	// replayed.
 	//
-	// Earlier development commits wrote a 7-byte chunk header under other
-	// numbers, and those bytes are gone with the dev directories that held
-	// them, as are the 11-byte-header segments written before the generation
-	// start was added (#197). Today's framing is the 15-byte header
+	// The block framing is the 15-byte chunk header
 	// [CRC32:4][Len:2][Type:1][DurSeq:4][GenStart:4].
 	walFormatVersion uint32 = 1
 
@@ -114,8 +109,8 @@ var ErrWALFormatMalformed = errors.New("waldb: WAL format marker is malformed or
 // than a corruption investigation.
 //
 // There is no migration and no compatibility window. go-quicraft is pre-1.0 and
-// makes no on-disk guarantee across minor versions; see
-// docs/operations/compatibility.md. Wipe the data directory and let the node
+// makes no on-disk guarantee across minor versions; see docs/compatibility.md.
+// Wipe the data directory and let the node
 // re-sync from its peers, or restore from an exported snapshot.
 var ErrWALFormatUnsupportedVersion = errors.New("waldb: WAL directory was written in an on-disk format this build cannot read; wipe the data directory and re-sync this node")
 
@@ -130,11 +125,10 @@ var ErrWALFormatUnsupportedVersion = errors.New("waldb: WAL directory was writte
 // let the torn-tail repair truncate the entire log to zero: data destruction
 // reported as a successful recovery.
 //
-// It is fatal for that reason alone, and it stays fatal even though the marker
-// used to be adoptable. Adopting an absent marker means assuming the segments
-// are in the current format, and that assumption is exactly what may not be
-// made now that being wrong destroys the log. Wipe the data directory and
-// re-sync this node; see docs/operations/compatibility.md.
+// It is fatal for that reason alone. Adopting an absent marker would mean
+// assuming the segments are in the current format, and that assumption is
+// exactly what may not be made when being wrong destroys the log. Wipe the data
+// directory and re-sync this node; see docs/compatibility.md.
 var ErrWALFormatMissing = errors.New("waldb: WAL directory holds segments but no format marker, so it predates this on-disk format; wipe the data directory and re-sync this node")
 
 // WALFormatVersionError reports a marker recording a version this build cannot

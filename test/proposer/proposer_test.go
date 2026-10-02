@@ -86,8 +86,7 @@ func TestDrive_ReResolvesBeforeEveryAttempt(t *testing.T) {
 }
 
 // TestDrive_PostDeliveryNotLeaderIsRetried covers the form a pending read or
-// proposal sees when the leader loses the shard underneath it — the exact
-// error from the #147 CI failure — which is wrapped in MaybeAppliedError and
+// proposal sees when the leader loses the shard underneath it, which is wrapped in MaybeAppliedError and
 // must still be recognised as the not-leader rejection.
 func TestDrive_PostDeliveryNotLeaderIsRetried(t *testing.T) {
 	var resolves, attempts int
@@ -187,7 +186,7 @@ func TestIsNotLeaderRejection(t *testing.T) {
 }
 
 // TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes is the policy
-// TryReadWith exists to serve (#162).
+// TryReadWith exists to serve.
 //
 // A pinned caller's remedy is "wait, and ask the SAME replica again", so its
 // retryable is quicraft.Temporary rather than IsNotLeaderRejection. The

@@ -23,25 +23,24 @@ import (
 
 // InstallSnapshot from a replica that is not this term's leader
 //
-// handleSnapshot opened with the same two unconditional lines handleHeartbeat
-// used to:
+// handleSnapshot must not open with two unconditional lines:
 //
 //	r.electionTick = 0
 //	r.leaderID = msg.From
 //
-// The heartbeat path was gated on sender identity (ErrHeartbeatNotFromLeader)
+// The heartbeat path is gated on sender identity (ErrHeartbeatNotFromLeader)
 // precisely because a Heartbeat proves nothing about the sender's log. An
 // InstallSnapshot proves strictly less and does strictly more: no prevLogIndex,
 // no prevLogTerm, no entries, and its non-matching branch REPLACES the entire
-// log and rebuilds the voting set from a Membership the sender supplied. The
-// gate was never generalised to it.
+// log and rebuilds the voting set from a Membership the sender supplied, so it
+// needs the same gate.
 //
-// Two separate capabilities fall out of that, and both are exercised below.
+// Without it two separate capabilities fall out, and both are exercised below.
 //
-//  1. ELECTION SUPPRESSION, available even on the REJECT path. The two lines run
-//     before the ss.Index <= committed rejection, so retransmitting one obsolete
-//     snapshot holds a healthy follower's election timer at zero AND installs the
-//     sender as its leaderID — which makes handleVoteRequest's leader-lease test
+//  1. ELECTION SUPPRESSION, available even on the REJECT path. Run before the
+//     ss.Index <= committed rejection, those two lines mean retransmitting one
+//     obsolete snapshot holds a healthy follower's election timer at zero AND
+//     installs the sender as its leaderID — which makes handleVoteRequest's leader-lease test
 //     deny PreVotes and dropHighTermVote discard higher-term RequestVotes. A
 //     replica that cannot be made to campaign or to vote is removed from every
 //     quorum without ever being removed from the configuration.

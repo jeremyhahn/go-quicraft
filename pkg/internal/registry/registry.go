@@ -23,9 +23,8 @@
 // The underlying sync.Map provides lock-free reads on the Resolve hot path.
 // Addresses are stable after shard startup (written once on bootstrap, rarely
 // updated on membership change), making sync.Map's read-biased design ideal.
-// This eliminates RWMutex reader-count atomic contention that previously
-// caused cache-line bouncing across concurrent step workers and receive
-// handlers.
+// This avoids the RWMutex reader-count atomic contention that would cause
+// cache-line bouncing across concurrent step workers and receive handlers.
 package registry
 
 import (

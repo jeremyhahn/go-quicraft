@@ -97,11 +97,11 @@ func TestNoneStrategy_BarrierEncryptor_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestNoneStrategy_BarrierRestartCycle is the regression test for C5: a
-// barrier initialized with NoneStrategy must unseal again after a simulated
-// process restart (fresh Barrier + persisted marker + Unseal). Before the fix
-// Unseal rejected the empty root key with ErrInvalidRootKeySize and, after
-// repeated restarts, tripped the brute-force lockout.
+// TestNoneStrategy_BarrierRestartCycle pins that a barrier initialized with
+// NoneStrategy unseals again after a simulated process restart (fresh Barrier
+// + persisted marker + Unseal). An Unseal that rejected the empty root key with
+// ErrInvalidRootKeySize would, after repeated restarts, trip the brute-force
+// lockout.
 func TestNoneStrategy_BarrierRestartCycle(t *testing.T) {
 	ctx := context.Background()
 	s := NewNoneStrategy()

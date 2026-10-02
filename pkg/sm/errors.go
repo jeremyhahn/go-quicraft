@@ -50,6 +50,7 @@ type InvalidCacheConfigError struct {
 	Reason string
 }
 
+// Error returns a human-readable description of the invalid configuration.
 func (e *InvalidCacheConfigError) Error() string {
 	return "sm: invalid cache config: " + e.Reason
 }
@@ -59,6 +60,7 @@ type CacheMaxEntriesError struct {
 	Value int
 }
 
+// Error returns a human-readable description of the invalid MaxEntries.
 func (e *CacheMaxEntriesError) Error() string {
 	return "sm: cache max entries must be > 0, got " + strconv.Itoa(e.Value)
 }

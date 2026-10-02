@@ -37,12 +37,11 @@ const DefaultQuorumTTL = 5 * time.Minute
 // ProtectedShareSplitter splits a secret into M-of-N Shamir secret shares whose
 // values live in protected memory.
 //
-// It is the ONLY splitter shape this package defines. A string-valued sibling
-// existed through v0.8.0-alpha and is gone: an implementation that split into
-// locked memory still had to copy every share back out into an immortal heap
-// string to satisfy that signature, so the exposure the ProtectedShare family
-// exists to close survived a migration that satisfied the linter (reported by
-// go-qrdb, #35; retyped under the owner ruling on #37).
+// It is the ONLY splitter shape this package defines, and there is
+// deliberately no string-valued sibling: an implementation that split into
+// locked memory would still have to copy every share back out into an immortal
+// heap string to satisfy such a signature, so the exposure the ProtectedShare
+// family exists to close would survive.
 //
 // Nothing in this module implements or calls this — it is a SHAPE for
 // embedders. Custody itself lives in go-qrdb; see the package doc.
@@ -58,13 +57,14 @@ type ProtectedShareSplitter interface {
 
 // ProtectedShareAccumulator collects shares from individual custodians until the
 // threshold is met, holding every one of them in protected memory.
-// Implementations handle deduplication, ordering, and TTL expiration. The
-// accumulator is not safe for concurrent use without external synchronization
-// (the Barrier provides this via its mutex).
+// Implementations handle deduplication, ordering, and TTL expiration. An
+// implementation need not be safe for concurrent use; a caller that shares one
+// across goroutines must synchronize access itself. Nothing in this module
+// implements or calls it — like ProtectedShareSplitter, it is a SHAPE for
+// embedders.
 //
-// It is the ONLY accumulator shape this package defines; the string-valued
-// sibling that existed through v0.8.0-alpha is gone for the reason given on
-// ProtectedShareSplitter.
+// It is the ONLY accumulator shape this package defines, with no string-valued
+// sibling, for the reason given on ProtectedShareSplitter.
 //
 // Both ends are protected deliberately. AddProtectedShare takes ownership of a
 // share whose value already lives in locked memory, so a transport can decode
@@ -120,23 +120,18 @@ type ShamirConfig struct {
 // against RLIMIT_MEMLOCK for as long as it is held, and an abandoned result holds
 // N of them for the life of the process — N locked pages no other caller can
 // reclaim, and the next one to reach the ceiling is refused with
-// ErrLockedMemoryUnavailable. Under memguard reaching it terminated the process
-// outright.
+// ErrLockedMemoryUnavailable.
 //
 // SERIALISATION, stated rather than left to be inferred from the tags, in two
 // parts.
 //
-// The WIRE SHAPE CHANGES with this retype, and does not merely become
-// protected. Through v0.8.0-alpha this field was a []string and `"shares"`
-// marshalled as an array of bare share values; it is now an array of share
-// OBJECTS — the `{"index","threshold","total","value"}` encoding that
-// shamir.Share and shamir.ProtectedShare both already produce, which is the
-// shape shares are persisted and distributed in everywhere else in the stack.
-// So this result gains no third encoding, but a stored or in-flight init result
-// written by an older build does not decode into this type. Pre-release, that
-// change lands clean rather than behind a dual-format reader
-// (release-versioning.md §1); TestShamirInitResult_JSONMatchesTheShareObjectShape
-// pins what it now emits.
+// The WIRE SHAPE: `"shares"` is an array of share OBJECTS — the
+// `{"index","threshold","total","value"}` encoding that shamir.Share and
+// shamir.ProtectedShare both produce, which is the shape shares are persisted
+// and distributed in everywhere else in the stack. An array of bare share
+// value strings does not decode into this type; there is no dual-format
+// reader. TestShamirInitResult_JSONMatchesTheShareObjectShape pins what it
+// emits.
 //
 // The second part is what marshalling COSTS. It puts a copy of every share
 // value in an ordinary heap buffer: ProtectedShare.MarshalJSON is careful to
@@ -177,14 +172,12 @@ func (r *ShamirInitResult) Destroy() {
 // UnmarshalJSON decodes an init result while keeping the share-set bound that a
 // generic decode of this type would bypass.
 //
-// Retyping Shares to []*shamir.ProtectedShare turned the default decoder into a
+// With Shares typed []*shamir.ProtectedShare the default decoder is a
 // denial-of-service path: encoding/json calls ProtectedShare.UnmarshalJSON once
 // per array element AS IT VISITS THEM, and each call locks a page of memory, so
 // an attacker-controlled or malformed document with an oversized "shares" array
 // dictates how much of the finite RLIMIT_MEMLOCK budget is taken, denying it to
-// every other caller in the process until the decode is torn down — and under
-// memguard it was worse still, since a lock the kernel refused terminated the
-// process. The scheme's own count bound in shamir.CombineProtected runs on
+// every other caller in the process until the decode is torn down. The scheme's own count bound in shamir.CombineProtected runs on
 // shares already allocated, far too late to help. So the shares are held first
 // as raw JSON and decoded through
 // shamir.UnmarshalShareSet, which bounds the set (at most maxShares elements,

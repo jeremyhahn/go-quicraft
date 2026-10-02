@@ -21,20 +21,19 @@ import (
 	"github.com/jeremyhahn/dragonboat/v4"
 )
 
-// TestProposeFloorVerdict pins #181 at both ends, because the defect had two
-// ends and fixing one of them alone reintroduces the other.
+// TestProposeFloorVerdict pins the floor at both ends, because the failure has
+// two ends and guarding one of them alone reintroduces the other.
 //
-// Before: the sequential loops called b.Fatalf on the FIRST error, so a single
-// transient "shard is not ready" destroyed a whole run and the baseline could
-// not be measured on a host carrying ordinary CI load at all.
+// Calling b.Fatalf on the FIRST error lets a single transient "shard is not
+// ready" destroy a whole run, so the baseline cannot be measured on a host
+// carrying ordinary CI load at all.
 //
-// The naive fix — tolerate everything and log a count — is what the concurrent
-// loops already did, and it is worse in a quieter way: a run in which EVERY
-// proposal failed reported no samples and passed clean, so a comparison table
-// could publish percentiles over nothing.
+// The naive alternative — tolerate everything and log a count — is worse in a
+// quieter way: a run in which EVERY proposal failed reports no samples and
+// passes clean, so a comparison table could publish percentiles over nothing.
 //
-// The rows below are the two real runs that produced #181, plus the boundaries
-// of the threshold between them.
+// The rows below are two real runs, one at each end, plus the boundaries of
+// the threshold between them.
 func TestProposeFloorVerdict(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -125,8 +124,8 @@ func TestProposeFloorVerdict(t *testing.T) {
 }
 
 // TestFloorNamesTheOperationItJudged pins that a read loop's failure says
-// "reads", not "proposals". The two missed loops in the first pass at #181
-// included a SyncRead loop; a message calling its failures proposals would
+// "reads", not "proposals". The tolerant loops include a SyncRead loop; a
+// message calling its failures proposals would
 // send an operator looking at the wrong code path.
 func TestFloorNamesTheOperationItJudged(t *testing.T) {
 	note, fatal := proposeFloorVerdict("reads", 0, 50)
@@ -165,21 +164,21 @@ func TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne(t *testing.T) {
 }
 
 // TestTolerableAdmitsWeatherAndRefusesRealResults pins the boundary the
-// tolerant loops must not cross, found by Codex review of the merged tree.
+// tolerant loops must not cross.
 //
-// Before this, every error was counted as weather, so a PERMANENT failure at
-// 5% -- a payload the engine refuses, a session it does not know -- was
-// published as a clean run with a note. That is the engine answering, and a
+// Counting every error as weather would let a PERMANENT failure at 5% -- a
+// payload the engine refuses, a session it does not know -- be published as a
+// clean run with a note. That is the engine answering, and a
 // benchmark that averages past it reports a throughput the engine never
 // delivered. The rule is test/proposer's: a loop may absorb only the
 // conditions that clear on their own.
 func TestTolerableAdmitsWeatherAndRefusesRealResults(t *testing.T) {
-	// The two failures actually observed on 2026-09-10, which the loops MUST
-	// keep tolerating or #181 comes straight back.
+	// The two transient failures actually observed, which the loops MUST keep
+	// tolerating or a single transient aborts the run.
 	for _, err := range []error{dragonboat.ErrShardNotReady, dragonboat.ErrTimeout} {
 		if !tolerable(err) {
-			t.Errorf("tolerable(%v) = false; this is the weather #181 was opened "+
-				"to survive, and refusing it aborts the run on the first transient", err)
+			t.Errorf("tolerable(%v) = false; this is transient Raft weather the loops "+
+				"must survive, and refusing it aborts the run on the first transient", err)
 		}
 	}
 	// Real answers from the engine: none of these clears by waiting.

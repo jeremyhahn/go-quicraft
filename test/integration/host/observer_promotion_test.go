@@ -24,7 +24,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 )
 
-// TestHostAPI_ObserverPromotedInPlace is the end-to-end red/green for #218.
+// TestHostAPI_ObserverPromotedInPlace covers in-place observer promotion end to
+// end.
 //
 // A 3-voter cluster adds a 4th replica as an observer, starts it as one
 // (Config.IsObserver), and promotes it with an AddNode for the same replica
@@ -37,10 +38,11 @@ import (
 //     its ack; and
 //   - be elected leader, and serve reads as leader.
 //
-// Before #218 the committed promotion latched a role mismatch on the replica
-// (configured observer, listed voter): it refused every read with
-// ErrWitnessRoleMismatch and every campaign, including a leadership transfer,
-// until its shard was stopped and restarted with IsObserver=false.
+// The failure it guards against: a committed promotion latching a role
+// mismatch on the replica (configured observer, listed voter), so that it
+// refuses every read with ErrWitnessRoleMismatch and every campaign, including
+// a leadership transfer, until its shard is stopped and restarted with
+// IsObserver=false.
 //
 // It runs under the default configuration and under LeaseRead, where the
 // promotion also starts the replica promising vote windows in its heartbeat

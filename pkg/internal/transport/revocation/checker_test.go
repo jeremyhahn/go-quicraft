@@ -503,8 +503,8 @@ func TestAddRevokedSerial(t *testing.T) {
 }
 
 // TestAddRevokedSerial_SurvivesCRLReload: a CRL reload replaces the CRL-derived
-// set wholesale, and programmatic revocations used to live in that same set,
-// so every runtime revocation was silently undone at the next reload — every
+// set wholesale, so programmatic revocations must not live in that same set:
+// every runtime revocation would be silently undone at the next reload — every
 // 60s whenever CRL files are configured.
 func TestAddRevokedSerial_SurvivesCRLReload(t *testing.T) {
 	ca := newTestCA(t)

@@ -72,7 +72,7 @@ func TestSoftwareStrategy_DeferredPassphrase_ReportsConstructor(t *testing.T) {
 // credential semantics — a bound strategy ignores the credentials handed to
 // UnsealRootKey, a deferred one validates against them — and a consumer reads
 // the accessor precisely to preserve that behaviour when it replaces a
-// strategy (go-qrdb #157).
+// strategy.
 //
 // So the assertion is not "the getter echoes the field" but "the getter
 // predicts what unsealing with the WRONG passphrase does". A getter wired to

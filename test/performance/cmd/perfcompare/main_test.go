@@ -221,10 +221,10 @@ func TestRunBenchmarksFailsWhenSystemProducesNoResults(t *testing.T) {
 	}
 }
 
-// TestRunContainerPreservesTheWholeConsole is the regression test for the half
-// of #184 that made every other perf failure undiagnosable: the orchestrator
-// captured the container's stdout only to parse the JSON out of it, so a 41 MB
-// run log of a failing container held no "--- FAIL:", no "=== RUN" and no "ok".
+// TestRunContainerPreservesTheWholeConsole pins what makes a perf failure
+// diagnosable: capturing the container's stdout only to parse the JSON out of
+// it would leave the run log of a failing container with no "--- FAIL:", no
+// "=== RUN" and no "ok".
 // The container's console must survive verbatim, and the caller must still get
 // the stdout it parses.
 func TestRunContainerPreservesTheWholeConsole(t *testing.T) {
@@ -376,8 +376,8 @@ func TestExtractDiagnosticTruncates(t *testing.T) {
 	}
 }
 
-// TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail is the other half of
-// #184. `go test` prints every relayed b.Errorf BEFORE the "--- FAIL:" naming
+// TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail pins the verdict
+// budget. `go test` prints every relayed b.Errorf BEFORE the "--- FAIL:" naming
 // the benchmark, so a summary that kept the first maxDiagnosticLines matches and
 // stopped cut off at precisely the line the operator needed: the dragonboat run
 // relayed 40 tolerated propose errors and then said "(diagnostic truncated)".
@@ -471,16 +471,15 @@ func (f *failAfterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestConsoleLogKeepsDrainingAndReportsTheFailure pins the two properties a
-// Codex review of #184 found missing from the first cut of the console tee.
+// TestConsoleLogKeepsDrainingAndReportsTheFailure pins two properties of the
+// console tee.
 //
-// A short write from the log used to stop os/exec's copier for that stream,
-// and a container with nobody reading its pipe blocks -- so a full log disk
-// turned into a hung benchmark. And a write error was reported nowhere:
+// A short write from the log would stop os/exec's copier for that stream, and
+// a container with nobody reading its pipe blocks -- so a full log disk would
+// turn into a hung benchmark. And a write error would be reported nowhere:
 // os/exec drops a copier's error when the process exits non-zero, and a
 // deferred Close drops its own always, so a console truncated exactly where
-// the late `--- FAIL:` lines land was presented as complete. That is #184's
-// defect one layer down.
+// the late `--- FAIL:` lines land would be presented as complete.
 //
 // The writer must therefore do two things that pull in opposite directions:
 // never short-write (keep draining), and never hide the failure (report it).
@@ -571,7 +570,7 @@ func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 }
 
 // TestBuildImageKeepsTheTokenOffTheCommandLine stands a shell script in for
-// docker and checks the contract #184 sets for the fix: the token reaches the
+// docker and checks the credential contract: the token reaches the
 // build as a secret through the CLI's environment and appears in no argument,
 // and a build with no credentials asks for no secret at all.
 func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {

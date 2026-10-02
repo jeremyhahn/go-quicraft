@@ -49,7 +49,7 @@ func (f *shardOpenFailFS) OpenFile(name string, flag int, perm fs.FileMode) (Fil
 	return f.FS.OpenFile(name, flag, perm)
 }
 
-// TestSaveStateConcurrentRollbackPreservesCommitted is the C1 regression test.
+// TestSaveStateConcurrentRollbackPreservesCommitted is a regression test.
 //
 // Two Raft shards (0 and 16) hash to the SAME WAL shard (0). When NumWorkers
 // does not divide DefaultShardCount they are served by different commit workers,
@@ -58,10 +58,10 @@ func (f *shardOpenFailFS) OpenFile(name string, flag int, perm fs.FileMode) (Fil
 // whose segment open is rigged to fail, forcing a Phase-1 failure and a rollback
 // that truncates WAL shard 0 back to B's pre-batch checkpoint.
 //
-// Before the fix, SaveState released the shard lock between its durable write
-// and its rollback, so writer A could commit a record to WAL shard 0 inside that
-// window and B's absolute-offset rollback would silently erase A's already
-// acknowledged committed record. The fix holds the WAL-shard lock across the
+// If SaveState released the shard lock between its durable write and its
+// rollback, writer A could commit a record to WAL shard 0 inside that window
+// and B's absolute-offset rollback would silently erase A's already
+// acknowledged committed record. SaveState holds the WAL-shard lock across the
 // whole batch lifecycle, making each batch atomic per segment. This test asserts
 // that every record A observed as committed survives a reopen + WAL replay.
 func TestSaveStateConcurrentRollbackPreservesCommitted(t *testing.T) {

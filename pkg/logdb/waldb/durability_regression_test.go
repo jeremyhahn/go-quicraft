@@ -102,7 +102,7 @@ func segmentPath(db *DB, shardID, segID uint64) string {
 	return filepath.Join(db.getShard(shardID).dir, segmentFilename(segID))
 }
 
-// TestRemoveNodeData_GCFailureKeepsEpochFloor is the H1 regression test for
+// TestRemoveNodeData_GCFailureKeepsEpochFloor is a regression test for
 // the RemoveNodeData path. When garbage collection fails, the segments it
 // intended to delete remain on disk, so the minWriteEpoch floor must NOT rise
 // past an epoch those surviving segments still need — otherwise the engine
@@ -170,7 +170,7 @@ func TestRemoveNodeData_GCFailureKeepsEpochFloor(t *testing.T) {
 	}
 }
 
-// TestCompact_PartialGCFailureKeepsEpochFloor is the H1 regression test for
+// TestCompact_PartialGCFailureKeepsEpochFloor is a regression test for
 // the Compact path. GC deletes files one at a time; when it aborts partway
 // with deleted > 0, the not-yet-deleted segments survive on disk and the
 // epoch floor must NOT rise past their epochs.
@@ -247,15 +247,13 @@ func TestCompact_PartialGCFailureKeepsEpochFloor(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive is the H2
-// regression test, restated for the retired-replica registry. WAL shards are
+// TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive pins removal
+// durability through the retired-replica registry. WAL shards are
 // shared by many Raft groups, so a segment holding the removed node's records
 // can stay alive — pinned by another node — long after the removal. Replay of
-// that segment must not resurrect the removed replica. The removal used to be
-// a tombstone record whose segment was pinned forever to stay ahead of such
-// segments; now it is the registry, which replay applies after rebuilding, so
-// nothing is pinned for it and the removed node's own segments are ordinary
-// garbage.
+// that segment must not resurrect the removed replica. The removal is
+// recorded in the registry, which replay applies after rebuilding, so nothing
+// is pinned for it and the removed node's own segments are ordinary garbage.
 func TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
@@ -424,7 +422,7 @@ func corruptSegmentBlock(t *testing.T, path string, blockSize int) {
 	}
 }
 
-// TestRecovery_NonFinalCorruptionDoesNotMutateDisk is the H3 regression test.
+// TestRecovery_NonFinalCorruptionDoesNotMutateDisk is a regression test.
 // When recovery fails-stop on corruption in a non-final segment it must destroy
 // NOTHING on disk: the corrupt segment is not prefix-truncated and the
 // committed higher segments are not discarded. Any of those mutations would
@@ -496,7 +494,7 @@ func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	}
 }
 
-// TestRecovery_NonFinalCorruptionIsFatal verifies the H3 fail-stop rule:
+// TestRecovery_NonFinalCorruptionIsFatal verifies the fail-stop rule:
 // corruption in a segment that is NOT the highest-numbered one is bit rot /
 // a lying fsync / tampering, never a torn tail — a lower segment was fully
 // fdatasynced before any higher one was created, so everything above it is
@@ -566,7 +564,7 @@ func (f *dirSyncFailFS) Open(name string) (File, error) {
 	return file, nil
 }
 
-// TestRollback_DirSyncFailurePoisonsDB is the H4 regression test. When a
+// TestRollback_DirSyncFailurePoisonsDB is a regression test. When a
 // mid-batch rotation rollback deletes/truncates segments but the directory
 // fsync fails, the rollback cannot be proven durable: a crash could resurrect
 // a deleted segment's directory entry and recovery would replay CRC-valid
@@ -759,14 +757,11 @@ func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 // damaged tail (which the next restart would re-detect, repeating the repair
 // and the discard forever).
 //
-// The fixture used to rotate a SECOND segment on top of the corrupt one and
-// then assert that the discard of that segment "must not run before a failed
-// repair". Both halves were inert. A corruption in a non-final segment is
-// rejected by the prefix rule (ErrNonFinalSegmentCorruption) before the repair
-// path is reached at all, so the injected truncation failure was never
-// exercised and the surviving segment 1 was untouched for a reason that had
-// nothing to do with ordering. The corrupt segment is now the FINAL one, which
-// is the only shape that reaches the code the test names.
+// The corrupt segment is the FINAL one, which is the only shape that reaches
+// the code the test names: a corruption in a non-final segment is rejected by
+// the prefix rule (ErrNonFinalSegmentCorruption) before the repair path is
+// reached at all, so an injected truncation failure there would never be
+// exercised.
 func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -1054,9 +1049,9 @@ func TestRemoveNodeData_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 // TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint pins the
 // rotation rollback's ORDER.
 //
-// rollbackShard used to truncate the CHECKPOINT segment first and only then
-// delete the intermediate segments and empty the active one. A crash in that
-// window leaves segment K ending cleanly at a record boundary — no corruption
+// Truncating the CHECKPOINT segment first and only then deleting the
+// intermediate segments and emptying the active one would be wrong. A crash in
+// that window leaves segment K ending cleanly at a record boundary — no corruption
 // for recovery to detect — while segments K+1..N still hold their fsynced,
 // CRC-valid batch records. The next recovery therefore replays K in full and
 // then every segment above it, resurrecting exactly the records the caller was

@@ -37,8 +37,8 @@
 // # Why it is one package and not one copy per suite
 //
 // The e2e, raft, host and linearizability suites each define their own
-// testCluster, so the helper used to be copied into each of them. Four copies
-// of a retry loop is four places a fix has to land. The suites share nothing
+// testCluster, so without this package the helper would be copied into each of
+// them. Four copies of a retry loop is four places a fix has to land. The suites share nothing
 // but a way to name the current leader, so that is all this package asks for:
 // a Resolver.
 //
@@ -49,9 +49,9 @@
 // forwards a ReadIndex whenever the follower knows the leader and refuses it
 // with the same "not leader ... leader unknown" when it does not. A pending
 // read on a leader that loses the shard is failed the same way a pending
-// proposal is. So the twelve host-suite reads that pinned a leaderHost binding
-// (#147) failed on the same election the proposals used to fail on, and they
-// are fixed by the same loop: Read / TryRead and ReadIndex / TryReadIndex
+// proposal is. So a read that pins a leaderHost binding fails on the same
+// election a pinned proposal fails on, and the same loop serves both: Read /
+// TryRead and ReadIndex / TryReadIndex
 // re-resolve before every attempt and retry ONLY the not-leader rejection.
 //
 // Re-issuing a refused read is safe unconditionally — a read that was refused
@@ -64,10 +64,8 @@
 // # The pinned callers share the same loop
 //
 // Some suite helpers deliberately do NOT re-resolve, because the test is about
-// the replica it addressed. They had a second copy of this retry loop, with a
-// blanket retry-on-any-error that reported a permanent rejection as a timeout
-// (#97). They now use the same loop through Pinned, differing only in the
-// Retryable they pass; TryWith documents why that one difference is real.
+// the replica it addressed. They use the same loop through Pinned rather than a
+// copy of their own, differing only in the Retryable they pass; TryWith documents why that one difference is real.
 package proposer
 
 import (
@@ -192,8 +190,8 @@ func Try(
 // replica knows who that is, and ErrNotLeader is only the window before it
 // learns — a window that closes without any help from the caller.
 //
-// What neither policy is any longer is a blanket retry on every error. That is
-// the policy both of these replaced (#97): it reports ErrDiskFull,
+// Neither policy is a blanket retry on every error. That policy reports
+// ErrDiskFull,
 // ErrInvalidOperation or a state machine failure as "timed out", and burns the
 // whole budget to say so.
 //
@@ -340,10 +338,9 @@ func TryRead(
 // Pinned(h) and quicraft.Temporary: its remedy is "wait, and ask the SAME
 // replica again", which fixes the conditions that clear on their own.
 //
-// Before this existed such a caller had no home in this package and wrote the
-// loop out by hand, which is how test/integration/raft's syncReadExact came to
-// carry a third copy of the retry machinery drive already implements (#162).
-// Try, TryRead, TryWith and TryReadWith are now the four corners of one table —
+// Without it such a caller would write the loop out by hand, a copy of the retry
+// machinery drive already implements. Try, TryRead, TryWith and TryReadWith are
+// the four corners of one table —
 // proposal or read, re-resolving or pinned — over a single loop.
 //
 // retryable must not be nil.
@@ -377,10 +374,10 @@ func readOnce(
 // shardID at the moment of the call, waits for it to resolve, and fails the
 // test on any error. It returns the confirmed index.
 //
-// It exists for the tests whose subject is the ReadIndex API itself. Those
-// used to submit a ReadIndex to a pinned host and release the RequestState
-// without reading it, which asserted only that a request was accepted; a
-// not-leader outcome would have surfaced in the result they never read.
+// It exists for the tests whose subject is the ReadIndex API itself. Submitting
+// a ReadIndex to a pinned host and releasing the RequestState without reading
+// it asserts only that a request was accepted; a not-leader outcome would
+// surface in the result nobody read.
 func ReadIndex(
 	t *testing.T,
 	resolve Resolver,

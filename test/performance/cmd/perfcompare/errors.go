@@ -107,8 +107,8 @@ func (e *MissingResultsError) Error() string {
 }
 
 // DockerRunError reports a failed benchmark container together with the lines
-// of its output that explain why. The orchestrator used to attach the whole
-// captured stdout, hundreds of lines of benchmark rows in which the two lines
+// of its output that explain why. Attaching the whole captured stdout would bury
+// them in hundreds of lines of benchmark rows in which the two lines
 // that mattered were invisible; "docker run failed: exit status 1" on its own
 // says nothing at all.
 type DockerRunError struct {
@@ -183,9 +183,9 @@ type diagLine struct {
 //
 // The budget is spent on verdicts first. `go test` prints every relayed message
 // BEFORE the "--- FAIL:" that names the benchmark, so a summary that simply kept
-// the first maxDiagnosticLines matches cut off at exactly the line the operator
-// needed: a run that logged 40 tolerated propose errors reported 40 propose
-// errors and no verdict at all (#184). Detail lines are dropped to make room
+// the first maxDiagnosticLines matches would cut off at exactly the line the
+// operator needed: a run that logged 40 tolerated propose errors would report 40
+// propose errors and no verdict at all. Detail lines are dropped to make room
 // for verdicts, never the reverse.
 func extractDiagnostic(output string) []string {
 	var verdicts, details []diagLine

@@ -42,15 +42,15 @@ import (
 // a chunk boundary already emitted — so every sealed artifact has one, and a
 // reader can refuse an artifact truncated to nothing.
 //
-// # What it closes (#116)
+// # Why the save path streams through it
 //
-// The local save path could not use the read-then-encrypt form without leaving
-// a window. It wrote the state machine to the canonical snapshot.dat in the
-// clear, fsynced it, and encrypted in place afterwards, so between the
-// plaintext fsync and the rename a COMPLETE PLAINTEXT STATE MACHINE was
-// durable under the name every consumer, backup and operator reads. Measured
-// live at 206ms and 461ms under load; permanent if the process was killed in
-// the window, because the directory is then left with no snapshot.meta and the
+// The local save path cannot use a write-then-encrypt form without leaving a
+// window. Writing the state machine to the canonical snapshot.dat in the
+// clear, fsyncing it, and encrypting in place afterwards leaves a COMPLETE
+// PLAINTEXT STATE MACHINE durable between the plaintext fsync and the rename,
+// under the name every consumer, backup and operator reads — hundreds of
+// milliseconds under load, and permanent if the process is killed in the
+// window, because the directory is then left with no snapshot.meta and the
 // in-process discard guard never runs.
 //
 // A writer removes the window rather than narrowing it: no plaintext is ever
@@ -59,9 +59,7 @@ import (
 // # Ordering with compression
 //
 // The caller chains state machine -> snappy -> snapshotFrameWriter -> file.
-// Compression happens BEFORE sealing, which is both the correct order
-// (ciphertext does not compress) and the order the two-step form produced, so
-// the artifact is byte-compatible with what the previous code wrote.
+// Compression happens BEFORE sealing, because ciphertext does not compress.
 //
 // # Not safe for concurrent use
 //
@@ -213,8 +211,8 @@ func (w *snapshotFrameWriter) MinEpoch() uint64 { return w.minEpoch }
 // failure, because the pins were already released.
 func (w *snapshotFrameWriter) Epochs() []uint64 { return w.pins.epochs() }
 
-// PlaintextBytes is how much plaintext the writer consumed, which is what the
-// artifact would have measured under the old write-then-encrypt form.
+// PlaintextBytes is how much plaintext the writer consumed: the artifact's
+// size before sealing, which is what MaxSnapshotSize is measured against.
 func (w *snapshotFrameWriter) PlaintextBytes() int64 { return w.plain }
 
 // SealSnapshotFrames seals everything src yields into dst as one snapshot

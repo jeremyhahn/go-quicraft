@@ -70,11 +70,10 @@ const (
 //
 // It exists so that the set of valid Modes is defined exactly once. String,
 // Validate and all three durability predicates read it, which is what makes
-// them agree by construction: the predicates previously restated the membership
-// as `m == Sync || m == Batched` — twice, identically, in IsSynchronous and
-// RequiresQuorum — so adding a fourth Mode meant remembering four separate
-// places, and forgetting one produced a Mode that answered false to every
-// durability question while validating cleanly.
+// them agree by construction: predicates that each restated the membership
+// (`m == Sync || m == Batched`) would mean adding a Mode requires remembering
+// every one of them, and forgetting one would produce a Mode that answers false
+// to every durability question while validating cleanly.
 type modeSpec struct {
 	name string
 	// quorum reports that the mode does not acknowledge a write until it is

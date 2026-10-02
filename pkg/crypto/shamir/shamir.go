@@ -492,8 +492,7 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 //
 // It is a one-line adapter and stays one deliberately: the package-local name is
 // what every scratch buffer here is wiped through, so the primitive behind it
-// can move without touching forty call sites — which is exactly what happened
-// when this repository's own wrapper was deleted for go-enclave's (#54).
+// can move without touching forty call sites.
 func wipe(b []byte) {
 	enclave.Wipe(b)
 }

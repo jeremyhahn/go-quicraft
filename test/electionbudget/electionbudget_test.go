@@ -52,22 +52,20 @@ func TestRoundIsTwiceTheElectionTimeout(t *testing.T) {
 	}
 }
 
-// TestColdStartIsTheLargerBudget pins the correction #111 made, which is the
-// one a reader is most likely to "fix" back.
+// TestColdStartIsTheLargerBudget pins the ordering a reader is most likely to
+// "fix" back.
 //
 // The names suggest the opposite, so it is worth an assertion rather than a
 // comment alone: a cold start is the HARDER wait, because it pays for the QUIC
 // handshakes and mTLS exchange before the first RequestVote can be answered,
 // while a failover runs between survivors over transport that is already up.
-// Before #111 the easier case had 20s and the harder one 5s.
 func TestColdStartIsTheLargerBudget(t *testing.T) {
 	const electionRTT, rttMillisecond = 10, 50
 	cold := LeaderElection(electionRTT, rttMillisecond)
 	warm := Failover(electionRTT, rttMillisecond)
 	if cold <= warm {
 		t.Fatalf("LeaderElection=%v is not larger than Failover=%v; a cold start "+
-			"is the harder wait and #111 exists because the budgets were the other "+
-			"way round", cold, warm)
+			"is the harder wait, so its budget must be the larger one", cold, warm)
 	}
 	if cold != ColdStartRounds*Round(electionRTT, rttMillisecond) {
 		t.Errorf("LeaderElection = %v, want %d rounds", cold, ColdStartRounds)

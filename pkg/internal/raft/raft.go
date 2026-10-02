@@ -104,12 +104,12 @@ const persistedCeiling = math.MaxUint64 - 8
 // bitfield: it is a uint64, so positions 0..63 are available.
 //
 // Exported because the cap has to be enforced at ADMISSION, and the bootstrap
-// path lives in package quicraft. It was previously enforced only by the
-// config-change validators (validateAddNode, validateAddWitness), which the
-// bootstrap path does not run: StartShard accepted a 65-member map, committed
-// it as the EntryInitialMembership at index 1, and then rebuildReplicaToBit
-// panicked in becomeLeader on every election forever. The membership is
-// durable, so the shard could never elect a leader again, across restarts.
+// path lives in package quicraft. The config-change validators
+// (validateAddNode, validateAddWitness) do not run on the bootstrap path, so
+// without an admission check StartShard would accept a 65-member map, commit it
+// as the EntryInitialMembership at index 1, and the shard would then fail in
+// becomeLeader on every election. The membership is durable, so the shard could
+// never elect a leader again, across restarts.
 //
 // Do NOT add this check to applyMembershipEntry or the config-change handlers:
 // refusing an already-committed entry there makes replicas diverge, which is
@@ -1508,7 +1508,7 @@ func stepCandidate(r *raft, msg proto.Message) error {
 		// listed explicitly: letting it fall to the default drops it, and a
 		// dropped ReadIndex is never answered — nothing is queued, forwarded
 		// or resolved, so the host's pending read waits to the caller's
-		// deadline and reports a timeout for a not-leader condition (#153).
+		// deadline and reports a timeout for a not-leader condition.
 		return &NotLeaderError{LeaderID: 0}
 	default:
 		return nil
@@ -1571,23 +1571,17 @@ func tickFollower(r *raft) {
 		r.electionTick = 0
 		// A follower whose election timer just expired has heard nothing from
 		// a leader for a full timeout, which is precisely when it must
-		// campaign. This used to call quiesce.tryEnter() first and RETURN
-		// when it fired, suppressing the election and then running at
-		// quiesceElectionTimeout (30x the normal timeout).
-		//
-		// The call was also miscounted into near-irrelevance -- threshold is
-		// in ticks and tickLeader increments once per tick, but this site ran
-		// only once per election timeout, so it needed ~100 election timeouts
-		// to fire. Correcting the arithmetic would have ACTIVATED the
-		// liveness hazard rather than removed it. Nothing on the follower
-		// path resets that counter for heartbeats either (recordActivity is
-		// reached only from the write paths), so it advanced exactly while
-		// the follower was leaderless.
+		// campaign. It does NOT try to enter quiesce here: doing so would
+		// suppress the election and then run at quiesceElectionTimeout (30x
+		// the normal timeout). Nothing on the follower path resets the
+		// quiesce counter for heartbeats either (recordActivity is reached
+		// only from the write paths), so it would advance exactly while the
+		// follower was leaderless — a liveness hazard.
 		//
 		// Quiesce is leader-driven by design: the leader enters it and calls
 		// broadcastQuiesce, and followers enter via handleQuiesceMessage,
-		// which is now correctly gated on the local enabled flag. A follower
-		// self-quiescing independently of its leader was never the design.
+		// which is gated on the local enabled flag. A follower does not
+		// self-quiesce independently of its leader.
 		r.startElection()
 	}
 }
@@ -1752,17 +1746,16 @@ func tickLeader(r *raft) {
 // is etcd/raft's `applied >= pendingConfIndex` shape: no new config change
 // until every earlier one has actually been applied.
 //
-// This is O(1). It used to re-read the whole unapplied range in 1024-index
-// chunks with NO byte bound, from becomeLeader, on the step worker. On a
-// restart processed starts at the snapshot index and Config.SnapshotEntries has
-// no default, so a default deployment never compacts and the range is the
-// ENTIRE log: 200k unapplied 1KB entries meant ~200MB read synchronously
-// before the first heartbeat could go out, so the election that had just been
-// won timed out again — and a leader elected while IsRecovering() froze
-// processed hit the same wall on every attempt. The bound is now maintained
-// incrementally by the log itself (raftLog.confChangeIndex), which is also
-// strictly safer: the scan could fail to READ, and a failed read had to be
-// treated as "a change might be pending"; there is nothing to read here.
+// This is O(1). Scanning the whole unapplied range instead, from becomeLeader on
+// the step worker, does not scale: on a restart processed starts at the
+// snapshot index and Config.SnapshotEntries has no default, so a default
+// deployment never compacts and the range is the ENTIRE log — 200k unapplied
+// 1KB entries would mean ~200MB read synchronously before the first heartbeat
+// could go out, so the election that had just been won would time out again.
+// The bound is maintained incrementally by the log itself
+// (raftLog.confChangeIndex), which is also strictly safer: a scan could fail to
+// READ, and a failed read would have to be treated as "a change might be
+// pending"; there is nothing to read here.
 func (r *raft) hasConfigChangeToApply() bool {
 	return r.log.confChangeIndex > r.log.processed
 }
@@ -2068,7 +2061,7 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 	// not a statement about the candidate, and it denies EVERY candidate for as
 	// long as it lasts. Report it: hit a majority and the shard cannot elect at
 	// all, with a silently leaderless shard as the only symptom. The sibling
-	// check in startElection already warns; this one used to say nothing.
+	// check in startElection warns as well.
 	logOK, logReadable := r.log.isUpToDate(msg.LogIndex, msg.LogTerm)
 	if !logReadable {
 		r.recordUnreadableLogVoteDenial(msg.From)
@@ -2565,16 +2558,14 @@ func (r *raft) handleLeaderPropose(msg proto.Message) error {
 // committed-membership validator when a Peer installed one, falling back to the
 // raft-local policy subset on a bare raft.
 //
-// An undecodable payload is REJECTED, not warned past. It used to fall through
-// with `return nil` on the reasoning that the apply path is equally tolerant, so
-// propose and apply would never disagree about which entries are acceptable.
-// That symmetry was the bug: the apply path's tolerance exists because a
-// COMMITTED entry must produce the same outcome on every replica, which says
-// nothing about whether an entry should be allowed to commit in the first place.
+// An undecodable payload is REJECTED, not warned past. Matching the apply
+// path's tolerance would be wrong: that tolerance exists because a COMMITTED
+// entry must produce the same outcome on every replica, which says nothing
+// about whether an entry should be allowed to commit in the first place.
 // A payload nothing can decode is a payload no gate has judged — the cap, the
 // witness policy, the duplicate-identity and duplicate-address rules all read
-// fields that failed to parse — so admitting it put an unvalidated membership
-// change into the durable log of every replica. Rejecting costs a legitimate
+// fields that failed to parse — so admitting it would put an unvalidated
+// membership change into the durable log of every replica. Rejecting costs a legitimate
 // client nothing: it never produces bytes that do not decode.
 func (r *raft) validateProposedConfigChange(cmd []byte) error {
 	var cc proto.ConfigChange
@@ -2906,7 +2897,7 @@ func (r *raft) sendSnapshot(to uint64) {
 			"shard", r.shardID,
 			"to", to,
 		)
-		// Returning without touching the remote used to leave next wherever
+		// Returning without touching the remote would leave next wherever
 		// the caller had put it — including past the end of the leader's log,
 		// where term() fails on every retry and nothing is ever sent to this
 		// peer again. becomeProbe re-seats next at match+1, which is always a
@@ -3301,7 +3292,7 @@ func (r *raft) tryCommit() bool {
 // and witnesses. If there are pending ReadIndex requests, the heartbeat
 // carries the latest ReadIndex context so that follower responses can
 // satisfy pending reads without a separate heartbeat round. This matches
-// dragonboat's broadcastHeartbeatMessage() behavior (raft.go:849-856).
+// dragonboat's broadcastHeartbeatMessage() behavior.
 func (r *raft) broadcastHeartbeat() {
 	if len(r.pendingReadIndex) > 0 {
 		r.broadcastHeartbeatCtx(r.readIndexCtx)
@@ -5140,12 +5131,11 @@ func (r *raft) votingBitCount() int {
 // syncRaftRemotes when membership changes during leadership.
 //
 // Returns ErrTooManyVotingMembers rather than asserting when the voting set
-// does not fit the ackBits word. It used to be an invariant.Assert, which
-// panicked the raft STEP WORKER — a goroutine shared by every shard that
-// worker owns, and joined by Host.Close — over a fault that concerns exactly
-// one shard. Worse, the condition is durable: a membership persisted over the
-// cap panicked the node again on every restart, with no operator action that
-// could clear it. The three places that can grow the voting set all check the
+// does not fit the ackBits word. An assertion would panic the raft STEP WORKER
+// — a goroutine shared by every shard that worker owns, and joined by
+// Host.Close — over a fault that concerns exactly one shard. Worse, the
+// condition is durable: a membership persisted over the cap would panic the
+// node again on every restart, with no operator action that could clear it. The three places that can grow the voting set all check the
 // bound before they mutate (newRaft, Peer.syncRaftRemotes, and handleSnapshot's
 // gate), so reaching this return means one of them was bypassed; it is a
 // backstop, and it fails the shard rather than the process. Truncating the map

@@ -56,9 +56,10 @@ type segment struct {
 	// caller was already told was durable. Writing only the new suffix means an
 	// acknowledged byte is written exactly once and is never at risk again.
 	//
-	// It also removes a quadratic write amplification: filling one block over n
-	// syncs used to write ~n^2*recSize/2 bytes (~11 MiB to persist a 32 KiB
-	// block of 48-byte records) on the WAL hot path, per shard.
+	// It also avoids a quadratic write amplification: rewriting the whole block
+	// would make filling one block over n syncs write ~n^2*recSize/2 bytes
+	// (~11 MiB to persist a 32 KiB block of 48-byte records) on the WAL hot
+	// path, per shard.
 	//
 	// flushed <= blockOffset always: Write only grows blockOffset,
 	// padAndFlushBlock resets both to 0 in lockstep with advancing fileOffset,
@@ -109,9 +110,9 @@ type segment struct {
 	// ErrMidSegmentCorruption — because truncating to the clean prefix would
 	// silently destroy committed entries and roll term/vote backwards.
 	//
-	// Decodable records above the damage are no longer sufficient on their own.
+	// Decodable records above the damage are NOT sufficient on their own.
 	// They are exactly what an ordinary torn multi-block write leaves behind,
-	// and treating them as proof made a routine power loss unbootable. What
+	// and treating them as proof would make a routine power loss unbootable. What
 	// makes them proof is their GENERATION; see the durability-sequence
 	// commentary in record.go.
 	ackedDataAfterCorruption bool
@@ -439,7 +440,7 @@ func (s *segment) flushBlock() error {
 // exactly as the truth it is: no Sync ever completed here, so no record in it
 // was ever acknowledged, and truncating anywhere inside it destroys nothing that
 // was. A test that needs recovery to see acknowledged data must therefore let
-// the syncs run; see docs/storage/wal.md.
+// the syncs run; see docs/log-storage/engineering.md ("Durability guarantees").
 func (s *segment) Sync() error {
 	if s.closed {
 		return ErrClosed
@@ -527,17 +528,16 @@ func (s *segment) writeSyncMark() error {
 // spanning several blocks issues one WriteAt per block before a single
 // fdatasync, so writeback may persist any subset of those pages. Losing an
 // interior or leading page of block N while block N+1 survives leaves precisely
-// "decodable records above a CRC failure" — which recovery used to read as
-// corruption of acknowledged data and refuse to start on, forever, after a
-// routine power loss. See record.go for why the generation proves what it does.
+// "decodable records above a CRC failure", and reading that as corruption of
+// acknowledged data would refuse to start, forever, after a routine power loss.
+// See record.go for why the generation proves what it does.
 //
-// The zero-hole rule below is held to exactly the same standard. It used to
-// truncate on sight, without consulting the generations, which made a zeroed
-// sector under acknowledged data — a reallocated block, a partially restored
-// file, a filesystem hole — silently destroy committed entries and roll the
-// commit index backwards, while the IDENTICAL damage expressed as a flipped CRC
-// byte at the same offset correctly refused to open. The two classifiers now
-// share one verdict.
+// The zero-hole rule below is held to exactly the same standard. Truncating on
+// sight, without consulting the generations, would let a zeroed sector under
+// acknowledged data — a reallocated block, a partially restored file, a
+// filesystem hole — silently destroy committed entries and roll the commit
+// index backwards, while the IDENTICAL damage expressed as a flipped CRC byte at
+// the same offset refuses to open. The two classifiers share one verdict.
 //
 // A crash cannot produce a hole under acknowledged data in the first place:
 // writes are strictly ascending in file offset, so a block lying below a later

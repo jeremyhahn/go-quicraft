@@ -212,9 +212,9 @@ func TestWriteSnapshotExport_RefusesEmptyMetadata(t *testing.T) {
 }
 
 // TestSaveSnapshot_EncryptedExportCarriesAVerifiablePair covers the decrypted
-// export: its snapshot.meta is re-marshalled with Epoch 0, and it used to be
-// marshalled from the save's metadata WITHOUT the integrity fields, so the
-// exported plaintext carried a zero DataLen/DataHash that every verifier
+// export: its snapshot.meta is re-marshalled with Epoch 0, and marshalling it
+// from the save's metadata WITHOUT the integrity fields would leave the
+// exported plaintext carrying a zero DataLen/DataHash that every verifier
 // refuses. The fields must be stamped over the bytes the export holds.
 func TestSaveSnapshot_EncryptedExportCarriesAVerifiablePair(t *testing.T) {
 	f := newResaveFixture(t, 200)

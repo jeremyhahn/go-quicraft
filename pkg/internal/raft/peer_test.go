@@ -3667,14 +3667,13 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 // TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard pins the runtime
 // decode site as fail-CLOSED.
 //
-// It used to be the opposite: an undecodable committed config entry was logged
-// and skipped, and the scan carried on with the entries after it. That is not a
-// tolerant no-op — a config change that commits and is then dropped on one
+// Logging and skipping an undecodable committed config entry, and carrying on
+// with the entries after it, is not a tolerant no-op — a config change that commits and is then dropped on one
 // replica leaves that replica computing quorum over a membership the rest of the
 // shard does not hold, and a peer that catches up by SNAPSHOT instead of by log
 // replay gets the change, so the two genuinely diverge. Recovery already refuses
 // these bytes (ReconstructMembership / bootstrap.go); the runtime failing open
-// while recovery failed closed over the same input is the inconsistency.
+// while recovery fails closed over the same input would be the inconsistency.
 func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) {
 	cfg := testConfigWithID(1, 1)
 	ms := singleNodeMembership()
@@ -3761,12 +3760,11 @@ func TestPeer_processConfigChanges_SkipsEmptyCmd(t *testing.T) {
 // whose subject is the propose-time bookkeeping (pendingConfigChange, batch
 // rejection, entry-type masking) rather than the change itself.
 //
-// It exists because handleLeaderPropose now REJECTS a config-change payload that
-// does not decode (raft.validateProposedConfigChange). It used to warn and pass
-// one through, which let a wire-forwarded Propose put a membership change nobody
-// had validated into the log of every replica, so these tests could get away
-// with placeholder bytes like []byte("cc1"). They cannot any more, and that is
-// the point.
+// It exists because handleLeaderPropose REJECTS a config-change payload that
+// does not decode (raft.validateProposedConfigChange), so placeholder bytes like
+// []byte("cc1") cannot stand in for one. Passing such a payload through would
+// let a wire-forwarded Propose put a membership change nobody had validated
+// into the log of every replica.
 func testConfigChangeCmd(replicaID uint64) []byte {
 	cc := proto.ConfigChange{
 		Type:      proto.AddNode,

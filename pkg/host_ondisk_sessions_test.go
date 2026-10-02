@@ -135,9 +135,11 @@ func TestSessions_RefusedOnDiskStateMachine(t *testing.T) {
 
 // TestSessions_NoOPSessionStillWorksOnDiskStateMachine pins the other half:
 // dragonboat's model for an on-disk state machine is NO-OP sessions with
-// idempotent operations, so those must keep working. A fix that refused every
-// session shape would leave on-disk shards — go-qrdb's whole storage layer —
-// with no proposal path at all.
+// idempotent operations, which here is the sessionless proposal path, so that
+// must keep working. A refusal that covered it would leave on-disk shards with
+// no proposal path at all. A NO-OP session itself is not what the on-disk
+// refusal targets: ProposeWithSession refuses it on every shard with
+// ErrInvalidSession, never with ErrSessionsUnsupportedOnDisk.
 func TestSessions_NoOPSessionStillWorksOnDiskStateMachine(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -153,13 +155,12 @@ func TestSessions_NoOPSessionStillWorksOnDiskStateMachine(t *testing.T) {
 		t.Fatalf("GetNoOPSession returned %+v, want a no-op session", noop)
 	}
 	// A no-op session carries no session state, so it is not what
-	// ErrSessionsUnsupportedOnDisk refuses. It has never been valid for
+	// ErrSessionsUnsupportedOnDisk refuses. It is not valid for
 	// ProposeWithSession either (ValidForProposal rejects clientID 0), so the
 	// supported call for it is the plain proposal path.
 	if _, err := h.ProposeWithSession(ctx, noop, []byte("v")); errors.Is(err, ErrSessionsUnsupportedOnDisk) {
 		t.Fatalf("ProposeWithSession with a NO-OP session = %v; the on-disk refusal "+
-			"must not cover the one session form on-disk shards are supposed to use",
-			err)
+			"targets session-managed proposals, not the NO-OP session", err)
 	}
 
 	var result sm.Result

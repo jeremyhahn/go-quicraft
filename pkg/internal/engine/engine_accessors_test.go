@@ -109,9 +109,9 @@ func TestEngine_SetShardBarriers_RoutesPerShard(t *testing.T) {
 // than written in plaintext.
 //
 // The asymmetry this removes is the whole point. A SEALED barrier already fails
-// closed on every path; an ABSENT one used to fail OPEN, so the one tenant whose
-// shard the resolver missed — an async-provisioned tenant, a remapped shard ID,
-// any map miss — was the only shard on the host written in cleartext, while
+// closed on every path; an ABSENT one failing OPEN would make the one tenant
+// whose shard the resolver missed — an async-provisioned tenant, a remapped
+// shard ID, any map miss — the only shard on the host written in cleartext, while
 // every other tenant's snapshot directory still showed encryption working.
 func TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed(t *testing.T) {
 	cfg := newTestHostConfig()

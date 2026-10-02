@@ -47,12 +47,10 @@ import (
 // the other following, which is the entire point of the arrangement.
 //
 // A timeout literal is a value that is not pinned treated as though it were.
-// That is the class this repository has now been bitten by eight times (#84,
-// #88, #90, #91, #103, #105, #107, #112) — there the unpinned value is the
-// leader index; here it is the shard configuration the budget is supposed to
-// describe. #115 is what it looks like when it bites: ElectionRTT is 10 and
-// RTTMillisecond is 50, so a single election attempt can run a full second,
-// and the budget for a THREE-node cold start was five of them.
+// In the leadership helpers the unpinned value is the leader index; here it is
+// the shard configuration the budget is supposed to describe. ElectionRTT is 10
+// and RTTMillisecond is 50, so a single election attempt can run a full second,
+// and a literal sized for a few of them cannot cover a THREE-node cold start.
 // ---------------------------------------------------------------------------
 
 // testRTTMillisecond is the Raft tick interval, in milliseconds, that
@@ -71,13 +69,13 @@ const raftTick = testRTTMillisecond * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
 // testElectionRTT and testRTTMillisecond — the SAME package the root module's
-// four integration suites use (#133).
+// four integration suites use.
 //
 // It is importable across the module boundary because it takes two integers
-// and no engine types. That is exactly why test/proposer could not be shared
-// here (#114): its Resolver is typed on *quicraft.Host, which NodeHost does
-// not expose. A budget has no such coupling, so the fifth copy of the
-// derivation is gone rather than merely reduced to four.
+// and no engine types. That is exactly why test/proposer cannot be shared
+// here: its Resolver is typed on *quicraft.Host, which NodeHost does not
+// expose. A budget has no such coupling, so there is no separate copy of the
+// derivation here.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -1315,9 +1313,7 @@ func (c *dbTestCluster) waitForClusterLeader(shardID uint64, timeout time.Durati
 //
 // has read a value that was true when it looked and treated it as fixed. Raft
 // is free to hold an election in the gap, and the proposal is then refused
-// CORRECTLY while the test reports a failure the cluster never had. This is the
-// sixth confirmed instance of that class in this repository (#84, #88, #90,
-// #91, #103, #105).
+// CORRECTLY while the test reports a failure the cluster never had.
 //
 // The refusal is narrow, which is why the pattern survives most runs and fails
 // a loaded one. quicraft's Host.Propose FORWARDS to the leader whenever the
@@ -1328,7 +1324,7 @@ func (c *dbTestCluster) waitForClusterLeader(shardID uint64, timeout time.Durati
 // directly, because translateError folds quicraft's
 // "not leader for shard N, leader unknown" into the ErrShardNotReady sentinel
 // (see contrib/dragonboat/errors.go) -- bare for the pre-flight refusal, and
-// since #156 wrapped in *quicraft.MaybeAppliedError for the post-delivery one.
+// wrapped in *quicraft.MaybeAppliedError for the post-delivery one.
 // Either way the failure that reaches a test here says "shard not ready", with
 // no mention of leadership at all.
 //
@@ -1420,8 +1416,7 @@ func (c *dbTestCluster) waitForLeaderHost(shardID uint64, timeout time.Duration)
 // documented "unknown leader is the most common cause" error and, unlike
 // ErrNotLeader, satisfies IsTempError in a migrated retry loop
 // (contrib/dragonboat/errors.go). ErrShardNotReady is therefore the only
-// SENTINEL a not-leader rejection can have here. Since #156 the post-delivery
-// form keeps quicraft's *MaybeAppliedError wrapper around that sentinel, so it
+// SENTINEL a not-leader rejection can have here. The post-delivery form keeps quicraft's *MaybeAppliedError wrapper around that sentinel, so it
 // is distinguishable from the pre-flight refusal; this predicate deliberately
 // does not distinguish them, for the reason the parent's test/proposer gives:
 // every command these suites propose is a last-write-wins KV put, idempotent
@@ -1451,10 +1446,8 @@ func isNotLeaderRejection(err error) bool {
 // read index alike -- so the resolve-before-every-attempt rule, the minimum
 // attempt budget and the deadline arithmetic cannot drift between them.
 //
-// It was extracted when the read helpers landed (#161). Until then the loop was
-// written out twice; adding the reads without extracting it would have made
-// four copies, which is how a propose path and a read path start disagreeing
-// about which errors are retried.
+// One loop serves propose and read alike; separate copies are how a propose
+// path and a read path start disagreeing about which errors are retried.
 //
 // attempt is handed the NodeHost resolved for THIS attempt, its index in the
 // cluster, and the budget left for it. driveToLeader never calls attempt with a
@@ -1466,7 +1459,7 @@ func isNotLeaderRejection(err error) bool {
 // The retryable set is deliberately NOT a parameter. isNotLeaderRejection is
 // the only one this module has: the adapter maps every not-leader shape to the
 // ErrShardNotReady sentinel, and the submission bit the post-delivery form
-// carries since #156 does not change what this loop does with it (see
+// carries does not change what this loop does with it (see
 // isNotLeaderRejection), so there is nothing else to distinguish. The parent's
 // test/proposer takes a Retryable because it also serves Pinned callers; this
 // module has none, because a site that means one SPECIFIC replica keeps its
@@ -1757,23 +1750,23 @@ func (c *dbTestCluster) tryReadIndexFromLeader(
 // A config change has TWO values a test is tempted to pin and must not.
 //
 // The first is leadership -- the class the proposal helpers above exist for.
-// #123 is its config-change instance: a SyncRequestAddReplica on a host
-// observed leading seconds earlier, refused CORRECTLY after an election and
-// reported as "shard not ready". The second is whether the change COMMITTED:
+// Its config-change instance: a SyncRequestAddReplica on a host observed
+// leading seconds earlier, refused CORRECTLY after an election and reported as
+// "shard not ready". The second is whether the change COMMITTED:
 // a change is submitted, leadership moves before the response, the entry is in
 // the log and can still commit under the new leader (Leader Completeness
 // guarantees it if it reached a quorum), and a retry is then refused CORRECTLY
 // with "already exists" or "not found" while the test reports a failure the
-// cluster never had (#112, #132).
+// cluster never had.
 //
-// The parent module's test/membership package (#149) is the decision core for
-// this and is not reusable here, for the reason test/proposer was not (#114):
+// The parent module's test/membership package is the decision core for this
+// and is not reusable here, for the reason test/proposer is not:
 // its resolver is typed on *quicraft.Host, which NodeHost does not expose; its
 // Confirm on *quicraft.Membership rather than this adapter's; and it carries
 // no ConfigChangeID, which every converted site here passes. Its submission
-// bit, quicraft.MaybeApplied, IS readable here since #156: translateError
-// rebuilds the *quicraft.MaybeAppliedError wrapper around the mapped sentinel
-// instead of discarding it, so the post-delivery NotLeaderError arrives as
+// bit, quicraft.MaybeApplied, IS readable here: translateError rebuilds the
+// *quicraft.MaybeAppliedError wrapper around the mapped sentinel instead of
+// discarding it, so the post-delivery NotLeaderError arrives as
 // ErrShardNotReady with the bit intact, distinguishable from the pre-flight
 // refusal. What is the same is the rule, and the rule is what this section
 // mirrors:
@@ -1790,14 +1783,10 @@ func (c *dbTestCluster) tryReadIndexFromLeader(
 // submitted attempt behind it, or one whose change the read cannot find, is
 // the caller's own error and is reported as such.
 //
-// Half (a) is now the parent's rule exactly: submission is quicraft's own bit
-// or an ErrTimeout, which Sync{Add,Delete}Node can only return after delivery.
-// Until #156 it was WIDER by one error -- the only shape the post-delivery
-// leadership change had here was a bare ErrShardNotReady, so ErrShardNotReady
-// armed the bit too, and an engine that applied a change it had reported as
-// refused pre-flight was caught by the parent's helper and not by this one.
-// A bare ErrShardNotReady now means what it says and arms nothing; see
-// configChangeMaybeSubmitted. Half (b) is unchanged and carries the weight: a
+// Half (a) is the parent's rule exactly: submission is quicraft's own bit or an
+// ErrTimeout, which Sync{Add,Delete}Node can only return after delivery. A bare
+// ErrShardNotReady means what it says and arms nothing; see
+// configChangeMaybeSubmitted. Half (b) carries the weight: a
 // replica ID found in a different role, at a different address, or a delete
 // target still present fails regardless of (a).
 
@@ -1867,7 +1856,7 @@ func dbIdentityFor(replicaID uint64) string {
 	return fmt.Sprintf("spki:%064x", replicaID)
 }
 
-// String renders the change the way the converted sites used to log it.
+// String renders the change for log and failure messages.
 func (cc configChange) String() string {
 	if cc.kind == deleteReplica {
 		return fmt.Sprintf("%s(shard=%d, replica=%d, configChangeID=%d)",
@@ -2003,18 +1992,15 @@ var errNoLeaderObserved = errors.New("integration: no live replica reports leade
 //     select on ctx.Done() after RequestX returned a live RequestState, or the
 //     deadline sweep completing a registered pending proposal. Both are after
 //     delivery.
-//   - quicraft.MaybeApplied. The engine's own bit, which #156 taught
-//     translateError to preserve: it wraps the mapped sentinel in
-//     *quicraft.MaybeAppliedError rather than discarding the wrapper, so the
-//     post-delivery leadership change is now distinguishable here.
+//   - quicraft.MaybeApplied. The engine's own bit, which translateError
+//     preserves: it wraps the mapped sentinel in *quicraft.MaybeAppliedError
+//     rather than discarding the wrapper, so the post-delivery leadership
+//     change is distinguishable here.
 //
-// ErrShardNotReady used to be the second clause, and it was a FOLD rather than
-// a signal: quicraft's post-delivery *MaybeAppliedError{NotLeaderError}, its
-// pre-flight NotLeaderError and ErrDropped all translated to that one bare
-// sentinel, so the submission bit had to be armed for every one of them. The
-// cost was precise — an engine that applied a change it had reported as refused
-// PRE-FLIGHT was caught by the root module's helper and not by this one — and
-// it is gone with the fold.
+// A bare ErrShardNotReady is deliberately NOT a clause: it is the pre-flight
+// refusal, and arming the submission bit for it would let an engine that
+// applied a change it had reported as refused PRE-FLIGHT slip past this
+// helper.
 //
 // ErrCanceled is deliberately NOT here: an attempt's context is cancelled
 // only after the attempt has returned, so a cancellation seen here submitted
@@ -2050,9 +2036,7 @@ var configChangeRetryableSentinels = [...]error{
 	// It is the QUICRAFT sentinel, not a dragonboat one, and that is the whole
 	// point: translateError has no mapping for it, so it arrives wrapped in
 	// *AdapterError -- whose Unwrap returns the quicraft error, which
-	// errors.Is walks. Until #146 re-exported it there was nothing importable
-	// to compare against and this was a strings.Contains on "transfer in
-	// progress".
+	// errors.Is walks, so it is matched by sentinel rather than by text.
 	quicraft.ErrTransferInProgress,
 }
 

@@ -23,9 +23,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSnapshotReceive_ValidationCausesAreTyped pins that the three refusals
-// that used to be fmt.Errorf strings inside a SnapshotReceiveError (#193) are
-// reachable by errors.As with their fields: a caller can tell a truncated or
+// TestSnapshotReceive_ValidationCausesAreTyped pins that the three validation
+// refusals carried inside a SnapshotReceiveError are typed errors, reachable by errors.As with their fields: a caller can tell a truncated or
 // forged size from a defective chunk set, and which chunk, without reading
 // the message.
 func TestSnapshotReceive_ValidationCausesAreTyped(t *testing.T) {

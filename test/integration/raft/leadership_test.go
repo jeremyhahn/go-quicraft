@@ -59,9 +59,8 @@ func TestIntegration_GetLeaderID_MultiNode_AllAgree(t *testing.T) {
 // Leadership stability, transfer, and step-down
 // ---------------------------------------------------------------------------
 //
-// This file used to hold one test: that three nodes agree on a leader ID after
-// an election. That is the shallowest thing a leadership suite can assert. It
-// says nothing about whether the leader STAYS the leader while it is healthy,
+// That three nodes agree on a leader ID after an election is the shallowest
+// thing a leadership suite can assert. It says nothing about whether the leader STAYS the leader while it is healthy,
 // whether leadership can be moved on request, or whether a replica that has
 // lost leadership stops behaving like a leader — and each of those is a defect
 // class with real consequences: a cluster that re-elects under its own write
@@ -137,15 +136,15 @@ func waitForUnanimousLeader(t *testing.T, c *testCluster, shardID uint64, timeou
 // no traffic at all, a leader trivially remains leader, and this test would be
 // asserting nothing about behaviour under load.
 //
-// The property has a precondition the test did not used to check: Raft keeps
+// The property has a precondition the test checks: Raft keeps
 // a healthy leader only while heartbeats are delivered well inside the
 // election timeout, which here is ElectionRTT (10) ticks of 50ms randomised
 // up to twice that — 500ms to 1s. A follower cannot tell a leader whose
 // process is not being scheduled from a dead one, so once the host freezes
 // goroutines for longer than that, forgetting the leader and campaigning is
-// the protocol working, not failing. #143 reproduced exactly this on a
-// 24-core box at load ~200 with per-send and per-receive timestamps: in two
-// losses the leader sent on every tick while nothing crossed to one follower
+// the protocol working, not failing. Per-send and per-receive timestamps on a
+// 24-core box at load ~200 show exactly this: in two losses the leader sent
+// on every tick while nothing crossed to one follower
 // for 0.6-1.3s; in the third the leader's own step worker was frozen
 // mid-iteration for 1.6s, `runnable`, holding no lock, with no I/O in its
 // path. Nothing in the engine stopped; the kernel stopped running it.
@@ -258,9 +257,8 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 					v.index, v.leaderID, v.term, baselineLeader)
 			default:
 				// A follower with no leader at the baseline term: its election
-				// timer fired and it is a pre-candidate. That is the instant
-				// read this test used to fail on outright. It is still a
-				// failure unless a stall that could have fired the timer
+				// timer fired and it is a pre-candidate. That instant read is
+				// a failure unless a stall that could have fired the timer
 				// preceded it — and even then it is not yet a verdict: a
 				// leader that never stopped sending re-joins the follower at
 				// the SAME term as soon as delivery resumes, which a dead or
@@ -276,8 +274,7 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 							"after a %v goroutine stall and was not re-joined to it "+
 							"at term %d within %v. The stall exceeds the %v ceiling, "+
 							"so the host, not the engine, is the first suspect; "+
-							"re-run on a host that is not oversubscribed. #143 has "+
-							"the per-heartbeat timestamps for the CI box.",
+							"re-run on a host that is not oversubscribed.",
 							v.index, baselineLeader, forgottenStall, baselineTerm,
 							electionRound, followerStallCeiling)
 					}
@@ -339,9 +336,9 @@ const electionTimeoutFloor = time.Duration(testElectionRTT) * raftTick
 // be delivered, so two stalls of this size back to back — one per side of
 // the wire, with every other goroutine running perfectly — are a whole
 // election timeout of silence, and the follower's timer fires on a leader
-// that never stopped sending. #143 recorded stalls of 0.37s to 1.6s on the
-// CI box against this 0.5s floor; the losses they produced were all of that
-// shape.
+// that never stopped sending. Stalls of 0.37s to 1.6s have been recorded on a
+// loaded CI box against this 0.5s floor; the losses they produced were all of
+// that shape.
 //
 // Derived, not chosen: it follows the shard configuration through
 // electionTimeoutFloor, and TestBudgetsDescribeTheClusterTheyBudgetFor pins
@@ -500,8 +497,7 @@ func failUnlessStalled(t *testing.T, probe *schedulingProbe, observed time.Time,
 		"stalls, one on each side of the wire, are a full election timeout of "+
 		"silence from a leader that never stopped sending, so a follower's "+
 		"timer firing here says nothing about the engine. Re-run on a host that "+
-		"is not oversubscribed; #143 has the per-heartbeat timestamps for the "+
-		"CI box.", finding, stall, lookback, followerStallCeiling,
+		"is not oversubscribed.", finding, stall, lookback, followerStallCeiling,
 		electionTimeoutFloor, testElectionRTT, raftTick)
 }
 

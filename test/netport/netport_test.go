@@ -114,11 +114,11 @@ func portOf(t *testing.T, addr string) int {
 //
 // A port inside ip_local_port_range is a port the kernel may hand to somebody
 // else — the next reservation, or the local end of any outbound connection —
-// between the moment it is reserved and the moment the host binds it. That is
-// #131. A port outside the range cannot be assigned by the kernel to anything,
+// between the moment it is reserved and the moment the host binds it. A port
+// outside the range cannot be assigned by the kernel to anything,
 // so the interval stops mattering.
 //
-// The check is deterministic: the old close-then-return helper drew every port
+// The check is deterministic: a close-then-return helper draws every port
 // from inside the range and fails here on the first reservation, not on an
 // unlucky one.
 func TestReserveUDPAvoidsTheKernelEphemeralRange(t *testing.T) {
@@ -141,8 +141,7 @@ func TestReserveUDPAvoidsTheKernelEphemeralRange(t *testing.T) {
 	t.Logf("checked %d reservations against ephemeral range %d-%d", reservations, lo, hi)
 }
 
-// TestReserveUDPNeverRepeatsAPort binds the concurrent case #131 observed: a
-// cluster asks for several addresses at once and must not be handed one twice.
+// TestReserveUDPNeverRepeatsAPort binds the concurrent case: a cluster asks for several addresses at once and must not be handed one twice.
 func TestReserveUDPNeverRepeatsAPort(t *testing.T) {
 	const (
 		goroutines   = 8
@@ -323,7 +322,7 @@ func TestReserveTCPAndUDPShareOneWindow(t *testing.T) {
 // It is the sequence that failed in the benchmark smoke run this window was
 // built for — five ports reserved up front, then five servers started, the last
 // binding long after the first was handed out — and it comes over from
-// test/performance/benchutil, whose own copy of this window it replaces (#163).
+// test/performance/benchutil, which uses this window rather than its own.
 // A skip test proves the probe REFUSES a held port; only this proves it does
 // not also refuse, or hand out, a port that cannot be bound.
 func TestReserveTCPAddressesAreBindable(t *testing.T) {
@@ -521,7 +520,7 @@ func withWindow(t *testing.T, lo, hi int) {
 
 // holdAllBut fills the installed window with live SO_REUSEADDR listeners,
 // leaving at most free ports unheld, and reports how many it left. It stands in
-// for the condition #131 was reported under: a loaded host where most of the
+// for the condition duplicate ports appear under: a loaded host where most of the
 // window is already bound by other test binaries' nodes.
 //
 // The ports are discovered by binding rather than assumed free, so a port some
@@ -563,7 +562,7 @@ func holdAllBut(t *testing.T, lo, hi, free int) int {
 }
 
 // TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort covers the one
-// piece of state machinery whose failure is #131 coming back.
+// piece of state machinery whose failure would reissue an in-flight port.
 //
 // A window is finite and a long integration run allocates far more ports than
 // it holds, so reservations must eventually be forgotten and the window reused.
@@ -576,7 +575,7 @@ func holdAllBut(t *testing.T, lo, hi, free int) int {
 // port it hands out, so a port cannot come back until the cursor has lapped the
 // whole span, and the retain horizon is never consulted. The horizon only
 // carries weight when the window is SATURATED — most of it held by live hosts,
-// which is the loaded runner #131 was reported on. There a lap is as short as
+// which is a loaded runner. There a lap is as short as
 // the number of free ports, and the only thing standing between the caller and
 // a duplicate is the record of what is still in flight.
 //

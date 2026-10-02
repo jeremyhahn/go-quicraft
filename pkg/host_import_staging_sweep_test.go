@@ -36,12 +36,12 @@ import (
 // this host's barrier immediately afterwards. A process killed between the two
 // leaves the COMPLETE PLAINTEXT STATE MACHINE in the staging directory.
 //
-// Nothing used to reclaim it. Every sweep and every scan on the host enumerates
-// through engine.listSnapshotDirs, which skips any name without the "snapshot-"
-// prefix — the property that deliberately hides a half-written import from
-// snapshot GC, from the recovery fallback and from the DEK purge-floor scan.
-// The staging name therefore converted a plaintext exposure that GC would
-// eventually have reclaimed (a partial write under an index-named directory is
+// Only a dedicated sweep reclaims it. Every other sweep and every scan on the
+// host enumerates through engine.listSnapshotDirs, which skips any name without
+// the "snapshot-" prefix — the property that deliberately hides a half-written
+// import from snapshot GC, from the recovery fallback and from the DEK
+// purge-floor scan. Without the sweep the staging name would convert a
+// plaintext exposure that GC would eventually have reclaimed (a partial write under an index-named directory is
 // deleted once maxSnapshotsRetained newer snapshots exist) into a PERMANENT one
 // on a barrier-configured host.
 //

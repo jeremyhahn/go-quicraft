@@ -329,8 +329,10 @@ type Config struct {
 	// paragraph describes and does not contradict it.
 	MaxMessageReceiveMemory int64
 
-	// SendBatchMaxSize is the maximum byte size of a single send batch.
-	// Default: 64 KB.
+	// SendBatchMaxSize is the initial capacity in bytes (plus the frame
+	// header) of each pooled send buffer. It is a sizing hint only: it does
+	// not trigger a flush or cap a batch, and a batch that encodes larger
+	// gets a buffer of the size it needs. Default: 64 KB.
 	SendBatchMaxSize int
 
 	// MaxDecompressedSize is the maximum allowed decompressed payload size.
@@ -402,7 +404,7 @@ type Config struct {
 	// directly has no retransmission behind it: a handshake that exceeds the
 	// budget fails the test outright, and under CI saturation (-race,
 	// coverage, every package in parallel) a cold loopback handshake has
-	// been traced at 4.3s (#142) and past 5s (#196). The test fixture
+	// been traced at 4.3s and past 5s. The test fixture
 	// therefore runs with a wider budget; nothing in production sets this.
 	DialTimeout time.Duration
 

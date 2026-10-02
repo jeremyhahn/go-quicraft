@@ -215,18 +215,19 @@ func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 	}
 }
 
-// TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership is the F3
-// regression.
+// TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership pins that a
+// stale-term InstallSnapshot does not rewrite the membership.
 //
 // raft.step DROPS a message whose term is behind the local term and returns
-// nil. Peer.Handle gated membership adoption on `err == nil` alone, so a
-// stale-term InstallSnapshot — one raft refused to act on — still rewrote the
-// membership: the set quorum() is computed over, replaced with no term check,
-// no log proof and no committed entry behind it. The only guard left was the
-// ConfigChangeID carried in the message itself, which the sender chooses.
+// nil. If Peer.Handle gated membership adoption on `err == nil` alone, a
+// stale-term InstallSnapshot — one raft refused to act on — would still
+// rewrite the membership: the set quorum() is computed over, replaced with no
+// term check, no log proof and no committed entry behind it. The only guard
+// left would be the ConfigChangeID carried in the message itself, which the
+// sender chooses.
 //
-// Any authenticated member of the shard could therefore hand a peer an
-// arbitrary configuration — for example one in which it is the sole voter.
+// Any authenticated member of the shard could then hand a peer an arbitrary
+// configuration — for example one in which it is the sole voter.
 func TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)

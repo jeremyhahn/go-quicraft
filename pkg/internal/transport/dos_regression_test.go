@@ -28,9 +28,9 @@ import (
 // User callbacks must never run under the connection-pool write lock
 // ---------------------------------------------------------------------------
 
-// TestCleanStaleConnections_ListenerRunsOutsideConnLock is the regression test
-// for the OnConnectionFailed callback that used to be invoked from INSIDE the
-// t.connMu write section, during the map iteration itself.
+// TestCleanStaleConnections_ListenerRunsOutsideConnLock pins that the
+// OnConnectionFailed callback is never invoked from INSIDE the t.connMu write
+// section, during the map iteration itself.
 //
 // connMu is the transport's hottest lock: every outbound Raft message on every
 // shard reads it through getStream/getConnection. A listener is user code of
@@ -102,15 +102,16 @@ func TestCleanStaleConnections_ListenerRunsOutsideConnLock(t *testing.T) {
 // Snapshot per-peer fairness must key on identity, not on an ip:port
 // ---------------------------------------------------------------------------
 
-// TestSnapshotFairnessKey_IndependentOfPeerAddress is the regression test for
-// the per-peer snapshot slot limit, which used to be keyed on
-// conn.RemoteAddr().String() — an address whose PORT the peer chooses.
+// TestSnapshotFairnessKey_IndependentOfPeerAddress pins that the per-peer
+// snapshot slot limit is not keyed on conn.RemoteAddr().String() — an address
+// whose PORT the peer chooses.
 //
-// One authenticated host simply opened MaxConnectionsPerIP (16 by default)
-// connections from 16 source ports, presented 16 distinct keys, and became
-// entitled to 16 * maxPerPeer slots against a host-global budget of only
+// Keyed that way, one authenticated host could open MaxConnectionsPerIP (16 by
+// default) connections from 16 source ports, present 16 distinct keys, and
+// become entitled to 16 * maxPerPeer slots against a host-global budget of only
 // MaxConcurrentSnapshotRecv (4). Each slot is holdable while sustaining only
-// the throughput floor, so every legitimate InstallSnapshot was rejected — and
+// the throughput floor, so every legitimate InstallSnapshot would be rejected —
+// and
 // a follower below the leader's compaction floor cannot be repaired by
 // replication either, so the shard stays under-replicated indefinitely.
 //
@@ -261,7 +262,7 @@ func TestTransferBudget_DerivedFromDeclaredWork(t *testing.T) {
 
 // TestStop_ConcurrentCallersWaitForTeardown pins Stop's documented contract:
 // when it returns, every goroutine has finished. A second or concurrent call
-// used to return nil immediately off a failed CompareAndSwap, telling that
+// that returned nil immediately off a failed CompareAndSwap would tell that
 // caller the transport was fully torn down while the first Stop was still
 // closing connections and draining the WaitGroup.
 func TestStop_ConcurrentCallersWaitForTeardown(t *testing.T) {

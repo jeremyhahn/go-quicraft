@@ -99,8 +99,9 @@ func TestEntrySessionFieldsSurviveReopen(t *testing.T) {
 	checkEntries("post-restart", db2)
 }
 
-// TestLegacyEntryFormatRejected verifies that a WAL containing a V1
-// (pre-session-field) entry record fails recovery loudly instead of
+// TestLegacyEntryFormatRejected verifies that a WAL containing an entry
+// record in a retired layout, under the retired payload type, fails recovery
+// loudly instead of
 // being misparsed or silently skipped.
 func TestLegacyEntryFormatRejected(t *testing.T) {
 	t.Run("replayRecord returns ErrLegacyEntryFormat", func(t *testing.T) {
@@ -114,7 +115,7 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 			knownSegments: make(map[uint64]bool),
 		}
 
-		// Craft a V1 entry record: [type:1][44-byte header][cmd].
+		// Craft a retired-layout entry record: [type:1][44-byte header][cmd].
 		const legacyHeaderSize = 44
 		cmd := []byte("legacy")
 		rec := make([]byte, 1+legacyHeaderSize+len(cmd))
@@ -136,10 +137,10 @@ func TestLegacyEntryFormatRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("Open fails on a segment with a V1 record", func(t *testing.T) {
+	t.Run("Open fails on a segment with a retired-layout record", func(t *testing.T) {
 		dir := t.TempDir()
 
-		// Build a valid segment file in shard-0 containing one V1 record.
+		// Build a valid segment file in shard-0 containing one retired-layout record.
 		shardDir := filepath.Join(dir, shardDirName(0))
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)

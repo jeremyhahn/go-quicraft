@@ -22,8 +22,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSnapshotReceive_RefusesPositionOutsideProtocolRange pins #197 C at the
-// transport door: a chunk set that agrees on a position the protocol cannot
+// TestSnapshotReceive_RefusesPositionOutsideProtocolRange pins the snapshot
+// position bounds at the transport door: a chunk set that agrees on a position the protocol cannot
 // do arithmetic on is refused during validation — before the artifact is
 // written, before LogDB and before raft see it — as a SnapshotReceiveError
 // whose cause is the proto sentinel.

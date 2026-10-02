@@ -438,8 +438,8 @@ func TestSaveSnapshot_RebuildRefreshesTheLogReaderSize(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_FirstSaveProceedsWithNoRecord pins the branch the fixture
-// used to hide: every real LogDB reports "no snapshot yet" as ErrNoSnapshot,
+// TestSaveSnapshot_FirstSaveProceedsWithNoRecord pins the branch a fixture
+// returning a zero record would hide: every real LogDB reports "no snapshot yet" as ErrNoSnapshot,
 // not as a zero record with a nil error, and the guard must read that as "this
 // is the first save" rather than as a record-read failure.
 func TestSaveSnapshot_FirstSaveProceedsWithNoRecord(t *testing.T) {

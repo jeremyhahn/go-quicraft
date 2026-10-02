@@ -26,11 +26,11 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestRaft_ReadIndexResp_RefusedFromNonLeader is the raft half of the
-// ReadIndexResp defect. handleReadIndexResp used to resolve a pending
-// linearizable read from ANY sender: no check that the response came from the
-// leader this replica actually asked, no check that a matching read existed.
-// The correlation key is a plain monotonic counter, so it is guessable — one
-// forged message serves a read at an index of the sender's choosing with no
+// ReadIndexResp sender gate. A handleReadIndexResp that resolved a pending
+// linearizable read from ANY sender — no check that the response came from the
+// leader this replica actually asked, no check that a matching read existed —
+// would be exploitable: the correlation key is a plain monotonic counter, so it
+// is guessable, and one forged message would serve a read at an index of the sender's choosing with no
 // heartbeat quorum ever run, which is a silent linearizability violation and
 // the worst possible failure for a read the caller asked to be linearizable.
 func TestRaft_ReadIndexResp_RefusedFromNonLeader(t *testing.T) {

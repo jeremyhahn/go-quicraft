@@ -95,13 +95,13 @@ func TestConfigChangeMarshalUnmarshalAddWitness(t *testing.T) {
 
 // TestConfigChangeAddressTooLong pins the address bound at BOTH ends.
 //
-// The read half is the original assertion. The write half is what makes the two
-// agree: MarshalTo used to emit this payload happily, and a ConfigChange is
-// marshaled into an Entry.Cmd and COMMITTED, so an over-length operator-supplied
-// address produced a committed entry every replica then faulted on
+// The write half is what makes the two agree: a ConfigChange is marshaled into
+// an Entry.Cmd and COMMITTED, so if MarshalTo emitted this payload, an
+// over-length operator-supplied address would produce a committed entry every
+// replica then faulted on
 // (peer.applyMembershipEntry -> ErrCorruptConfigEntry). The buffer for the read
 // half is therefore built by hand rather than by marshaling, because the encoder
-// now refuses to produce it — which is the point.
+// refuses to produce it — which is the point.
 func TestConfigChangeAddressTooLong(t *testing.T) {
 	longAddr := strings.Repeat("x", MaxAddressLength+1)
 	cc := ConfigChange{
@@ -157,9 +157,8 @@ func TestConfigChangeBufferTooSmallUnmarshalInitialize(t *testing.T) {
 	}
 	// Cut INTO the witness-policy fields. There is one layout and every field
 	// in it is mandatory, so any prefix is a truncation — including the cut at
-	// -4, which used to land on the NodeIdentity length prefix and decode
-	// cleanly as a shorter layout. TestConfigChangeRejectsEveryStrictPrefix
-	// sweeps all of them; these two are the boundaries that moved.
+	// -4, which lands on the NodeIdentity length prefix.
+	// TestConfigChangeRejectsEveryStrictPrefix sweeps all of them.
 	for _, cut := range []int{4, 6} {
 		var cc2 ConfigChange
 		_, err := cc2.UnmarshalFrom(buf[:cc.Size()-cut])
@@ -228,7 +227,7 @@ func TestConfigChangeUpdateWitnessPolicyRoundTrip(t *testing.T) {
 
 // TestConfigChangeUnmarshalInvalidType pins the type bound at BOTH ends: the
 // encoder refuses an unknown type, and a buffer that carries one anyway — which
-// is now only reachable by patching the bytes, i.e. by corruption or tampering,
+// is only reachable by patching the bytes, i.e. by corruption or tampering,
 // exactly the case the decoder check exists for — is refused on read.
 func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 	for _, tc := range []struct {

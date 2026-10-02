@@ -32,7 +32,7 @@ import (
 // reportPartitionDiagnosis from CI runs that returned Unknown: key-43 of
 // TestSoak_RollingRestartUnderLoad and key-9 of
 // TestLinearizability_4Node_ElectionSafety. Offline, key-43 was still Unknown
-// after a 30-minute budget. Both are legal (#137).
+// after a 30-minute budget. Both are legal.
 var fixtureLine = regexp.MustCompile(`^client=(\d+) id=(\d+) (call|return)\s+\{(.*)\}$`)
 var fixtureCall = regexp.MustCompile(`^(put|get|append) (\S+) ?(.*)$`)
 var fixtureRet = regexp.MustCompile(`^(.*?) (true|false) (true|false)$`)

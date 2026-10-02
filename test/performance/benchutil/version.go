@@ -42,7 +42,7 @@ const versionFile = "VERSION"
 // file found by walking up from the working directory -- a bare
 // `go test -tags=benchmark` runs in the package directory, three levels
 // below it. It fails rather than returns a placeholder: a result that
-// records "0.0.0" (#189) is a result that cannot be attributed to anything.
+// records "0.0.0" is a result that cannot be attributed to anything.
 func ProjectVersion() (string, error) {
 	if Version != "" {
 		return Version, nil
@@ -70,8 +70,7 @@ func ProjectVersion() (string, error) {
 // ModuleVersion returns the version of the named module as linked into this
 // binary, from the build info the Go toolchain embeds -- so a benchmark that
 // measures dragonboat records the dragonboat its go.mod actually pins, and a
-// pin bump cannot leave the recorded version behind (#189: "v4.0.0" was
-// recorded while v4.0.1 was linked). A module replaced by a directory has no
+// pin bump cannot leave the recorded version behind. A module replaced by a directory has no
 // version; the error names it.
 func ModuleVersion(path string) (string, error) {
 	info, ok := debug.ReadBuildInfo()

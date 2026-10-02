@@ -162,35 +162,32 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 	}
 }
 
-// TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention is a
-// regression test for #20: OnApplied used to complete a config-change
-// RequestState — unblocking the caller of SyncRequestAddObserver /
-// SyncRequestDeleteNode — before advancing ns.configChangeIndex for that
-// same entry. A caller that immediately round-tripped
-// SyncGetShardMembership's ConfigChangeID into the next config-change call,
-// exactly as host.go:2059-2063 documents, could then receive a
-// false-positive StaleConfigChangeError.
+// TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention pins
+// that OnApplied advances ns.configChangeIndex for a config-change entry
+// BEFORE completing its RequestState — unblocking the caller of
+// SyncRequestAddObserver / SyncRequestDeleteNode. Completing first would let a
+// caller that immediately round-trips SyncGetShardMembership's ConfigChangeID
+// into the next config-change call, exactly as SyncGetShardMembership
+// documents, receive a false-positive StaleConfigChangeError.
 //
 // Deliberately a SINGLE actor doing config changes, serially: PhD 4.1 allows
 // only one config change in flight per shard, so a second concurrent actor
 // would race its own changes in and legitimately advance
 // ConfigChangeID between this actor's read and write — a real stale
-// rejection that has nothing to do with #20. Isolating the round trip to one
-// actor means every StaleConfigChangeError this test sees is the bug and
-// nothing else. Scheduling contention — the ingredient that actually exposed
-// #20 — comes instead from unrelated goroutines hammering regular proposals
+// rejection that has nothing to do with this ordering. Isolating the round
+// trip to one actor means every StaleConfigChangeError this test sees is the
+// ordering defect and nothing else. Scheduling contention — the ingredient
+// that exposes it — comes instead from unrelated goroutines hammering regular
+// proposals
 // and membership reads concurrently in the background, which cannot
 // legitimately move ConfigChangeID.
 //
-// Mutation-verified: with the fix in pkg/host.go reverted, this failed 27/30
-// runs under `go test -race -count=30`, always on the expected
-// StaleConfigChangeError; with the fix applied, 30/30 pass. The narrower
-// TestSyncRequestDeleteNode_RemovesObserver above — one add/read/remove, no
-// background load — is not a reliable repro on its own: it passed 50/50 in
-// isolation despite being the exact test CI caught the bug on, because CI's
-// win came from the scheduling contention of the full `-race ./...` suite,
-// not from that test alone. The noise load above stands in for that
-// contention.
+// Mutation-verified: with the ordering in pkg/host.go reversed, this fails in
+// most runs under `go test -race -count=30`, always on the expected
+// StaleConfigChangeError. The narrower TestSyncRequestDeleteNode_RemovesObserver
+// above — one add/read/remove, no background load — is not a reliable repro on
+// its own: the defect surfaces only under the scheduling contention of a full
+// `-race ./...` suite, and the noise load above stands in for that contention.
 func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *testing.T) {
 	h := startSingleVoterShard(t)
 
@@ -261,11 +258,11 @@ func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *tes
 }
 
 // TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt is a
-// deterministic regression test for the second finding on #20's PR: the
-// contention test above only exercises the original configChangeIndex race
-// and would keep passing even if OnApplied's pending-proposal claim
-// (LoadAndDelete) moved back to AFTER applyMembershipRouting — it never
-// forces the specific interleaving where that ordering matters.
+// deterministic test of claim ordering: the contention test above only
+// exercises the configChangeIndex race and would keep passing even if
+// OnApplied's pending-proposal claim (LoadAndDelete) moved to AFTER
+// applyMembershipRouting — it never forces the specific interleaving where
+// that ordering matters.
 //
 // That interleaving is: applyMembershipRouting takes ns.nodesMu while
 // registering a new member's address. If a config-change proposal is still
@@ -285,9 +282,8 @@ func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *tes
 // deadline. sweepPendingProposals takes "now" as an explicit parameter
 // (host.go), so this needs no real waiting and no goroutine-scheduling luck.
 //
-// Mutation-verified: reverting OnApplied to claim proposals after
-// applyMembershipRouting (the ordering the PR's second commit replaced)
-// makes this test fail — the proposal is still visible when the sweep runs,
+// Mutation-verified: making OnApplied claim proposals after
+// applyMembershipRouting makes this test fail — the proposal is still visible when the sweep runs,
 // so it gets reaped as a timeout.
 func TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt(t *testing.T) {
 	h := startSingleVoterShard(t)
@@ -397,11 +393,9 @@ pollClaimed:
 
 // TestOnApplied_ClaimsProposalBeforeReadsSoTheSweeperCannotStealIt is a
 // sibling of TestOnApplied_ClaimsProposalBeforeRoutingSoTheSweeperCannotStealIt
-// for the sixth finding on #20's PR: fixing the fourth finding (pending reads
-// stranded by a routing panic) by moving the lastApplied/pendingReads block
-// to run before proposal claiming — instead of merely before routing, which
-// is all it actually needed — reopened the exact sweeper race the second and
-// third findings closed, one level up. The reads scan can itself take a
+// one level up: running the lastApplied/pendingReads block before proposal
+// claiming — instead of merely before routing, which is all it needs — would
+// reopen the same sweeper race. The reads scan can itself take a
 // while (arbitrarily many confirmed reads, a metrics call per one), and
 // until a membership batch's proposal is claimed it is exposed to
 // sweepPendingProposals for that whole time.
@@ -410,8 +404,8 @@ pollClaimed:
 // ns.nodesMu: the pending-reads block cannot proceed past its Lock() call
 // while this goroutine holds it, so if claiming happens first (correct),
 // ns.pendingProposals is already empty by the time this test's sweep runs;
-// if claiming were moved back to after the reads block (the finding), the
-// proposal is still sitting there and the sweep reaps it.
+// if claiming were moved to after the reads block, the proposal is still
+// sitting there and the sweep reaps it.
 //
 // Mutation-verified: moving proposal claiming to after the pending-reads
 // block makes this test fail 10/10, always on the sweep's ErrTimeout.
@@ -531,13 +525,11 @@ func (panicOnMembershipChangedHandler) Handle(_ context.Context, r slog.Record) 
 func (h panicOnMembershipChangedHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h panicOnMembershipChangedHandler) WithGroup(string) slog.Handler      { return h }
 
-// TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem is a
-// deterministic regression test for the third finding on #20's PR: claiming
-// proposals (LoadAndDelete) before applyMembershipRouting means a panic
-// inside routing can no longer be recovered by the apply worker's
-// OnProposalFailed (apply.go:605-633) the way it always could before —
-// OnProposalFailed only fails entries still present in ns.pendingProposals,
-// and these were already removed. Without a local recover, such a panic
+// TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem pins
+// OnApplied's local recover: claiming proposals (LoadAndDelete) before
+// applyMembershipRouting means a panic inside routing cannot be recovered by
+// the apply worker's OnProposalFailed — OnProposalFailed only fails entries
+// still present in ns.pendingProposals, and these were already removed. Without a local recover, such a panic
 // would strand every already-claimed RequestState forever: no completion,
 // no releaseRef, no completePendingOp — so the caller hangs past any
 // deadline (the sweep cannot see them either) and Host.Drain never returns.
@@ -549,10 +541,9 @@ func (h panicOnMembershipChangedHandler) WithGroup(string) slog.Handler      { r
 // the claimed proposal is still completed (with a typed error, not left
 // hanging) and every pendingOp is still balanced (Drain returns).
 //
-// It also covers the fifth finding on the same PR: the first version of this
-// recovery called pendingProposal.onFailure (rollbackPreRegister) for every
-// claimed proposal, the same cleanup sweepPendingProposals does. That is
-// wrong here — applyMembershipRouting's own per-entry log call (the one that
+// It also pins that this recovery does NOT call pendingProposal.onFailure
+// (rollbackPreRegister) for the claimed proposals, the cleanup
+// sweepPendingProposals does. That would be wrong here — applyMembershipRouting's own per-entry log call (the one that
 // panics) runs AFTER that entry's registry.Register/ns.nodes update, so by
 // the time the panic fires, the AddNonVoting below has already landed. Every
 // entry OnApplied is invoked with is one raft's own authoritative fold has
@@ -620,28 +611,24 @@ func TestOnApplied_RoutingPanicFailsClaimedProposalsInsteadOfStrandingThem(t *te
 	}
 }
 
-// TestOnApplied_RoutingPanicDoesNotStrandPendingReads is a deterministic
-// regression test for the fourth finding on #20's PR: the fix above only
-// covers pending PROPOSALS. A pending READ confirmed by the same applied
-// batch (ns.lastApplied advance + the pendingReads scan) used to be
-// processed before applyMembershipRouting could ever run — so a routing
-// panic never reached it. Moving proposal claiming ahead of routing did not
-// change that ordering for reads, but the review caught that it easily could
-// have (and very nearly did, in an earlier revision of this PR): if the
-// pendingReads block is ever moved back to AFTER the membership branch, a
-// routing panic strands every read this batch had just confirmed until its
-// own deadline, and holds Drain's pendingOps count with it.
+// TestOnApplied_RoutingPanicDoesNotStrandPendingReads is a deterministic test
+// for pending READS, which the recovery above does not cover. A pending read
+// confirmed by the same applied batch (ns.lastApplied advance + the
+// pendingReads scan) is processed before applyMembershipRouting runs, so a
+// routing panic never reaches it. If the pendingReads block were moved to
+// AFTER the membership branch, a routing panic would strand every read this
+// batch had just confirmed until its own deadline, and hold Drain's pendingOps
+// count with it.
 //
 // This calls hostEngineCallback.OnApplied directly against a manually
 // constructed nodeState — the same construction addTestNodeState uses,
 // deliberately NOT wired up via StartShard — with a synthetic committed
 // batch and an already-confirmed pending read. No real raft engine or apply
 // worker is ever started for this shard, so nothing but this one direct call
-// can touch ns.pendingReads: an earlier revision of this test used a real
-// StartShard'd shard, and the live background apply pipeline it starts
-// raced this test's own assertion (completing the read through its own,
-// unrelated batches), which is exactly the kind of nondeterminism a
-// regression test for an ordering bug cannot afford.
+// can touch ns.pendingReads. A real StartShard'd shard would start a live
+// background apply pipeline that races this test's own assertion (completing
+// the read through its own, unrelated batches), which is exactly the kind of
+// nondeterminism a test for an ordering bug cannot afford.
 func TestOnApplied_RoutingPanicDoesNotStrandPendingReads(t *testing.T) {
 	h := newTestHost(t)
 	h.logger = slog.New(panicOnMembershipChangedHandler{})
@@ -716,22 +703,21 @@ func (p panicOnSecondObserveProposalLatency) ObserveProposalLatency(uint64, time
 	}
 }
 
-// TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims is a
-// regression test for the eighth finding on #20's PR (round 8 review): the
-// panic-recovery handler ranged over ALL of claimed unconditionally, so a
-// panic reaching it after the normal completeProposal loop had already
-// completed and released some of claimed's proposals would complete and
-// release those SAME proposals a second time. RequestState.complete is
+// TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims pins that
+// the panic-recovery handler completes only the NOT-yet-completed tail of
+// claimed. Ranging over ALL of claimed unconditionally would let a panic
+// reaching it after the normal completeProposal loop had already completed
+// and released some of claimed's proposals complete and release those SAME
+// proposals a second time. RequestState.complete is
 // idempotent (CAS-guarded), but releaseRef is not — it unconditionally
 // decrements a reference count and recycles the object at zero, so a second
 // call either underflows that count or touches an object already back in
 // the pool, potentially reused by an unrelated request by then.
 //
-// The review cited c.h.metrics.ObserveProposalLatency as the panic source.
-// That call is, in fact, already panic-safe in production —
-// pkg/metrics_safe.go wraps every WithMetrics collector so a panic in it
-// never reaches caller code (see the round-7 finding and fix, which found
-// and documented this for ObserveReadIndexLatency). This test does not
+// The panic source here is c.h.metrics.ObserveProposalLatency. That call is
+// already panic-safe in production — pkg/metrics_safe.go wraps every
+// WithMetrics collector so a panic in it never reaches caller code. This test
+// does not
 // pretend otherwise: it reaches h.metrics directly (an unexported field,
 // same package) to install a raw, UNWRAPPED collector — deliberate fault
 // injection to exercise the recovery handler's own bookkeeping in

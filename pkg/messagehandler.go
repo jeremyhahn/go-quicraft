@@ -179,12 +179,11 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transp
 //
 // Gate 3 deliberately does not consult the address registry. The registry is a
 // mutable routing cache that inbound traffic itself writes, so anything an
-// inbound message can teach it, an inbound message can forge — an earlier
-// version of this binding did read it, and a message could re-point the entry
-// and then be checked against what it had just written. The committed
-// membership is the one address source a peer cannot influence without going
-// through Raft consensus. Authorization reads it; routing continues to use the
-// registry, and the two are now independent.
+// inbound message can teach it, an inbound message can forge — a binding that
+// read it would let a message re-point the entry and then be checked against
+// what it had just written. The committed membership is the one address source
+// a peer cannot influence without going through Raft consensus. Authorization
+// reads it; routing uses the registry, and the two are independent.
 func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress string,
 	peer transport.PeerAuth) bool {
 
@@ -206,10 +205,10 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	//  2. The AUTHENTICATED peer.Identity. This is the one an attacker cannot
 	//     step around. A removed replica still holds its private key, so it
 	//     authenticates normally, and under the claimed-From check alone it
-	//     evaded its own tombstone by simply naming a different replica ID.
-	//     Closing that needed the removed member's identity RETAINED as
+	//     would evade its own tombstone by simply naming a different replica
+	//     ID. Closing that needs the removed member's identity RETAINED as
 	//     replicated state rather than deleted with the member — which is what
-	//     proto.Membership.RemovedIdentities now is, persisted alongside every
+	//     proto.Membership.RemovedIdentities is, persisted alongside every
 	//     other membership fact so it survives a snapshot restore and a log
 	//     replay identically.
 	//
@@ -335,12 +334,12 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 	//      shard is vouched for the same way, by a restart with a current
 	//      map, rather than by a wipe.
 	//
-	// There used to be type-based exemptions — leader-originated pushes and
-	// vote requests from a replica ID the configuration did not name were
-	// admitted, so a lagging replica could be brought up to date — and they
-	// were what let any certificate holder move a shard's term, install itself
-	// as leader on followers, and have proposals appended (#197 B). The pending
-	// configuration replaces them with a fact this replica holds itself.
+	// There are no type-based exemptions. Admitting leader-originated pushes
+	// and vote requests from a replica ID the configuration does not name, so
+	// a lagging replica could be brought up to date, would let any certificate
+	// holder move a shard's term, install itself as leader on followers, and
+	// have proposals appended. The pending configuration serves that need
+	// with a fact this replica holds itself.
 	//
 	// What this costs: a replica that never received the config change adding
 	// the new leader — it was down when the change committed and the old
@@ -388,29 +387,28 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 //
 // It is THE sender-binding predicate, and it is deliberately the only one:
 // HandleMessage and HandleSnapshot both call it, so the two paths cannot drift
-// apart again. They did — the message path was moved off the mutable address
-// registry while the snapshot path was left resolving the same registry, which
-// turned a poisoned routing entry into snapshot install rights and therefore
-// into a rewrite of the very membership this predicate reads.
+// apart. If the snapshot path resolved the mutable address registry while the
+// message path did not, a poisoned routing entry would become snapshot install
+// rights and therefore a rewrite of the very membership this predicate reads.
 //
 // There is one binding, and the COMMITTED CONFIGURATION decides it, never the
 // sender: when the configuration records a node identity for replicaID, the
 // connection's AUTHENTICATED identity must equal it, and that is the ONLY check
 // performed. The address is routing metadata and is not an authorization input.
-// This closes all three holes the address scheme had: a promiscuous certificate
-// proves nothing about a public key it does not hold; two replicas at one
-// address still have two keypairs; and — the liveness win — a member that
-// recovers at a NEW address keeps its identity, so its quorum-bearing responses
-// keep being counted with no config change at all. The address gate dropped
-// them until a config change committed, which during quorum loss is never.
+// This closes all three holes an address-based scheme has: a promiscuous
+// certificate proves nothing about a public key it does not hold; two replicas
+// at one address still have two keypairs; and — the liveness win — a member
+// that recovers at a NEW address keeps its identity, so its quorum-bearing
+// responses keep being counted with no config change at all. An address gate
+// would drop them until a config change committed, which during quorum loss is
+// never.
 //
 // A member the configuration records NO identity for is refused
-// (dropMissingIdentity). There used to be a per-replica fallback to the old
-// chain, replica ID -> committed address -> certificate, kept for shards
-// bootstrapped before identities existed; admission now requires the identity
-// on every host with a transport (config.Config.RequireMemberIdentities), so
-// the only way to reach this branch is a configuration written by a build that
-// did not, and the answer to that is wipe and re-bootstrap, not a weaker gate.
+// (dropMissingIdentity). There is no fallback to an address chain (replica ID
+// -> committed address -> certificate): admission requires the identity on
+// every host with a transport (config.Config.RequireMemberIdentities), so the
+// only way to reach this branch is a configuration written by a build that did
+// not, and the answer to that is wipe and re-bootstrap, not a weaker gate.
 //
 // A nil node — the shard is not loaded here — is always unbound. There is no
 // committed membership to authorize against, and a quorum outcome can only ever
@@ -419,9 +417,8 @@ func (h *hostMessageHandler) authorizeInbound(msg *proto.Message, sourceAddress 
 // It returns the committed identity it judged (empty when the configuration
 // holds none) and the REASON to refuse, empty when the sender is bound.
 // Returning the reason rather than a bool is what keeps the log line, the
-// metric label and the decision in one place for both callers; they used to be
-// assembled separately at each drop site, and that is how the snapshot path
-// came to be judged on weaker evidence than the message path.
+// metric label and the decision in one place for both callers, so neither drop
+// site can judge a sender on weaker evidence than the other.
 func committedSenderBinding(node *engine.Node, replicaID uint64, peer transport.PeerAuth) (string, string) {
 	if node == nil {
 		return "", dropUnknownMember
@@ -463,8 +460,8 @@ func committedSenderBinding(node *engine.Node, replicaID uint64, peer transport.
 //  3. The operator anchor: the Config.MemberIdentities the shard was started
 //     with, each entry bound to an identity (Host.anchorIdentity). A joiner
 //     holds no configuration, so nothing else can say who may hand it one —
-//     including who may send the bootstrap snapshot, the very message that
-//     used to authorize itself by the membership it carried (#197 A). An
+//     including who may send the bootstrap snapshot, which must never
+//     authorize itself by the membership it carries. An
 //     established replica that was down while a member was added and elected
 //     holds neither a committed nor a pending entry for that leader, and the
 //     anchor is how its operator vouches for it without wiping the replica.
@@ -573,8 +570,8 @@ func (h *hostMessageHandler) registeredAddress(shardID, replicaID uint64) string
 // stale identity after a key rotation. One aggregate counter makes an attack
 // indistinguishable from a rolling membership change.
 //
-// address_mismatch and shared_address were the address fallback's two
-// failures. The fallback is gone (#197); the labels are not reallocated.
+// address_mismatch and shared_address are retired label values; they are not
+// reallocated.
 const (
 	dropRemovedReplica = "removed_replica"
 	// dropRemovedIdentity is kept apart from dropRemovedReplica because the two
@@ -695,24 +692,24 @@ func (h *hostMessageHandler) learnFromSource(node *engine.Node, msg *proto.Messa
 // has proved it IS the replica this shard's COMMITTED configuration calls
 // replicaID, to the standard required to REPLACE that replica's routing entry.
 //
-// The overwrite used to be keyed on node.IsMember(msg.From) — the CLAIMED id —
-// which made it satisfiable by naming any real member. That was described as a
-// black-hole corrected by the next committed config change, and the description
-// understated it: the attacker holds a CA-valid certificate, so this host's
-// outbound dial to the re-pointed entry SUCCEEDS, and it then receives the
-// victim's share of this shard's Replicate traffic — committed log entries
-// streamed to a replica the configuration never named. That is exfiltration
-// from a shard the sender is not a member of, not a liveness dent.
+// Keying the overwrite on node.IsMember(msg.From) — the CLAIMED id — would make
+// it satisfiable by naming any real member, and the damage is not a black-hole
+// the next committed config change corrects: the attacker holds a CA-valid
+// certificate, so this host's outbound dial to the re-pointed entry SUCCEEDS,
+// and it then receives the victim's share of this shard's Replicate traffic —
+// committed log entries streamed to a replica the configuration never named.
+// That is exfiltration from a shard the sender is not a member of, not a
+// liveness dent.
 //
 // The test is therefore the same evidence the receive gate uses: the
 // committed IDENTITY must equal the connection's authenticated one. This costs
 // the recovered-at-a-new-address case nothing, because the identity is a
 // property of the keypair and not of where the replica is running. A member
 // the configuration holds NO identity for may not have its route replaced by
-// anyone: the pre-identity rule let any certificate holder naming a member
-// re-point that member's traffic at itself (#197), and admission now requires
-// the identity, so such a member only exists in a configuration written by a
-// build that did not.
+// anyone: without an identity to compare, any certificate holder naming the
+// member could re-point its traffic at itself. Admission requires the identity,
+// so such a member only exists in a configuration written by a build that did
+// not.
 func routingOverwriteAuthorized(node *engine.Node, replicaID uint64, peer transport.PeerAuth) bool {
 	binding, ok := node.MemberBinding(replicaID)
 	if !ok || binding.Identity == "" {
@@ -1643,7 +1640,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// wait for raft's verdict on the install. Raft can still refuse an install
 	// that passed every check above — its sender deposed since the stream
 	// began, a position or membership out of bounds — or decline one it is
-	// already past. Recording and recovering on DELIVERY left a refused
+	// already past. Recording and recovering on DELIVERY would leave a refused
 	// snapshot durably recorded, the log floor raised under it and a recovery
 	// queued that the log could never catch up to, failing the shard.
 	// Delivered to exactly the node the verdict is awaited on: by shard ID a

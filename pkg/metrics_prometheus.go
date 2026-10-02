@@ -92,9 +92,9 @@ type PrometheusMetricsCollector struct {
 	// unregisteredShards tombstones every shard whose child series
 	// UnregisterShard deleted, so a residual in-flight sample cannot
 	// re-create them through the fallback path. It holds only shard IDs that
-	// have been registered and then unregistered — exactly the set that used
-	// to leak a full set of Prometheus child series each — so it replaces
-	// per-shard histogram series with a single map key.
+	// have been registered and then unregistered — exactly the set that would
+	// otherwise leak a full set of Prometheus child series each — so it
+	// replaces per-shard histogram series with a single map key.
 	unregisteredShards sync.Map // map[uint64]struct{}
 
 	// perShard mirrors config.MetricsConfig.PerShardMetrics. It selects which

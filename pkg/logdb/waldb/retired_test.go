@@ -310,7 +310,7 @@ func TestReencrypt_CarriesTheRegistryInOneWrite(t *testing.T) {
 // TestOpen_ReclaimsARepairedFinalSegmentHoldingOnlyRetiredRecords verifies the
 // reclaim that follows replay can take the final segment even when recovery
 // had to repair a torn tail in it. The repaired segment's clean prefix is
-// recovered like any clean segment's, so it is committed; it used to be left
+// recovered like any clean segment's, so it is committed, rather than left
 // above the commit high-water mark, out of GC's reach, until some later write.
 func TestOpen_ReclaimsARepairedFinalSegmentHoldingOnlyRetiredRecords(t *testing.T) {
 	dir := t.TempDir()

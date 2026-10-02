@@ -24,7 +24,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// The removed-identity deny-list on the public Membership view (#218)
+// The removed-identity deny-list on the public Membership view
 //
 // A host classifying a joiner needs two things from the public API: a typed
 // refusal it can match (ErrRemovedMemberIdentity, pinned with the other

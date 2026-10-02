@@ -73,8 +73,7 @@ func (s *termShiftSnapshotter) LastApplied() uint64 {
 var _ Snapshotter = (*termShiftSnapshotter)(nil)
 var _ gatedSnapshotter = (*termShiftSnapshotter)(nil)
 
-// TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate is the H5 regression
-// test: the snapshot's term must be captured together with its index INSIDE
+// TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate is a regression test: the snapshot's term must be captured together with its index INSIDE
 // the apply gate. A term read after afterCapture releases the gate can observe
 // applies from a new leader at term T+1, recording (index@T, term=T+1) — a
 // Log Matching violation for any follower that installs the snapshot.
@@ -144,7 +143,7 @@ func TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate(t *testing.T) {
 
 // rsmLikeSnapshotter mirrors rsm.StateMachine's applied-counter behavior: its
 // RecoverFromSnapshot restores state but does NOT advance its own applied
-// counter — the snapshot pool must seed it via SetLastApplied (H8).
+// counter — the snapshot pool must seed it via SetLastApplied.
 type rsmLikeSnapshotter struct {
 	lastApplied atomic.Uint64
 	state       atomic.Uint64
@@ -188,8 +187,7 @@ func (s *rsmLikeSnapshotter) LastApplied() uint64 {
 var _ Snapshotter = (*rsmLikeSnapshotter)(nil)
 var _ appliedSetter = (*rsmLikeSnapshotter)(nil)
 
-// TestSnapshotPool_RecoverSeedsSnapshotterLastApplied is the H8 regression
-// test: after recovering to snapshot index N, the snapshotter's own applied
+// TestSnapshotPool_RecoverSeedsSnapshotterLastApplied is a regression test: after recovering to snapshot index N, the snapshotter's own applied
 // counter (the INDEX source for the next save) must equal N. Without the
 // seeding, a snapshot requested right after recovery records a stale
 // pre-recovery index against post-recovery state — a payload/metadata
@@ -266,7 +264,7 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 
 	// Phase 4: once applies advance past the recovered index, the save records
 	// the ADVANCED index against recovered state — never the stale
-	// pre-recovery counter (40), which is what H8 guards.
+	// pre-recovery counter (40), which is what the seeding guards.
 	recoverer.lastApplied.Store(150)
 	recoverer.state.Store(150)
 	if err := p.requestSnapshot(snapshotRequest{

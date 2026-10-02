@@ -24,7 +24,7 @@ import (
 )
 
 // TestSaveSnapshot_RefusesPositionOutsideProtocolRange is the MemDB half of
-// the waldb test of the same name (#197 C): the same bound on the same door.
+// the waldb test of the same name: the same bound on the same door.
 func TestSaveSnapshot_RefusesPositionOutsideProtocolRange(t *testing.T) {
 	db := New()
 	for _, tc := range []struct {

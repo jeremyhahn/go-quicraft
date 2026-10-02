@@ -29,10 +29,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// testPolicy builds a session policy from the three limits NewStateMachine
-// used to take as adjacent parameters, in the order it took them. It exists so
-// the existing tests keep reading the way they did; production code builds the
-// policy from a Config or reads it from the shard's membership.
+// testPolicy builds a session policy from three limits given as adjacent
+// parameters, so the tests read compactly; production code builds the policy
+// from a Config or reads it from the shard's membership.
 func testPolicy(maxTotalSessions, maxResponses, expiryEntries uint64) proto.SessionPolicy {
 	return proto.SessionPolicy{
 		ExpiryEntries:        expiryEntries,
@@ -4962,9 +4961,9 @@ func newRecoverTestSM(t *testing.T, failing bool) *StateMachine {
 // snapshot restore atomicity.
 //
 // The session table and the user state machine describe the SAME log index.
-// RecoverFromSnapshot used to decode the snapshot's session table directly
-// over the live one and only then call the user SM. A user restore that
-// failed after that point left the node running user data from index N beside
+// If RecoverFromSnapshot decoded the snapshot's session table directly over the
+// live one and only then called the user SM, a user restore that failed after
+// that point would leave the node running user data from index N beside
 // session metadata from a later index M — so a client retry could be answered
 // from a cached result for an operation the user SM never applied, or a
 // cached response could disappear and let a duplicate command execute twice.

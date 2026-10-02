@@ -1168,7 +1168,8 @@ exists to prevent.
 `Host.StartShard` therefore calls
 `QUICTransport.VerifyPeerAddressExclusivity(RaftAddress, memberAddresses)` and
 returns `transport.ErrSharedPeerCertificate` (a `*SharedPeerCertificateError`
-naming the offending hosts) when this node's own leaf also covers another
+naming the offending hosts, re-exported as `quicraft.ErrSharedPeerCertificate`
+and `quicraft.SharedPeerCertificateError`) when this node's own leaf also covers another
 member's host. It fails closed rather than warning because the weakness is
 invisible from a running cluster, the operator has no signal to act on, and the
 only remediation, re-issued certificates, has to happen before the cluster

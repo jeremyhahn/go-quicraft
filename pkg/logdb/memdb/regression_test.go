@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Regression tests for the memdb medium-severity findings: snapshot
-// metadata persisted through SaveState (M2), deep-copied Cmd payloads (M3),
-// and gap detection in EntryRange/IterateEntries (LogDB contract).
+// Regression tests for memdb: snapshot metadata persisted through
+// SaveState, deep-copied Cmd payloads, and gap detection in EntryRange/IterateEntries (LogDB contract).
 
 package memdb
 
@@ -328,7 +327,7 @@ func TestCopyMembershipPreservesNilMaps(t *testing.T) {
 	}
 }
 
-// TestIterateEntriesReportsHeadGap is the M1 regression test. A requested low
+// TestIterateEntriesReportsHeadGap is a regression test. A requested low
 // below the first stored entry with NO compaction floor is a head GAP, not a
 // compaction: the LogDB contract (and waldb) require ErrLogGapDetected there.
 // Reporting ErrCompacted told raft the range was legitimately truncated and
@@ -360,7 +359,7 @@ func TestIterateEntriesReportsHeadGap(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshotUpdatesMembership is the M2 regression test. SaveSnapshot
+// TestSaveSnapshotUpdatesMembership is a regression test. SaveSnapshot
 // stored the snapshot but left nd.membership untouched and kept the caller's
 // maps, so ReadState reported an EMPTY membership where waldb reports the
 // snapshot's real one, and a later caller mutation rewrote the stored copy.
@@ -543,12 +542,12 @@ func TestSaveSnapshotRejectsIndexZero(t *testing.T) {
 }
 
 // TestRemoveNodeDataWaitsForAnInFlightBatch pins that a removal never splits a
-// SaveState batch. A batch for replicas A and B used to be applied one update
-// at a time with nothing ordering it against RemoveNodeData, so removing B
-// between the two stored A and then refused B: SaveState returned an error
-// for a batch it had half applied, and a caller told the batch failed would
-// retry or abandon writes that were in fact kept. RemoveNodeData now waits for
-// every in-flight write (removalMu), so the batch is applied whole and the
+// SaveState batch. If a batch for replicas A and B were applied one update at
+// a time with nothing ordering it against RemoveNodeData, removing B between
+// the two would store A and then refuse B: SaveState would return an error for
+// a batch it had half applied, and a caller told the batch failed would retry
+// or abandon writes that were in fact kept. RemoveNodeData waits for every
+// in-flight write (removalMu), so the batch is applied whole and the
 // removal follows it.
 //
 // The window is HELD OPEN rather than raced for: the test holds B's node lock,
@@ -600,10 +599,10 @@ func TestRemoveNodeDataWaitsForAnInFlightBatch(t *testing.T) {
 }
 
 // TestCloseWaitsForAnInFlightBatch pins that Close never splits a SaveState
-// batch either. Close released the node map while holding only the map lock,
-// so a batch in flight across it stored part of itself in the discarded map
-// and the rest in the new one, and returned nil. Close now waits for every
-// in-flight write, and a write that starts after it is refused.
+// batch either. If Close released the node map while holding only the map
+// lock, a batch in flight across it would store part of itself in the
+// discarded map and the rest in the new one, and return nil. Close waits for
+// every in-flight write, and a write that starts after it is refused.
 func TestCloseWaitsForAnInFlightBatch(t *testing.T) {
 	db := New()
 	b := db.getOrCreateNode(2, 1)

@@ -22,15 +22,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
 )
 
-// The two sites #54 stage two moved from fill-then-MOVE to fill-then-FREEZE.
+// The two sites that fill a sized enclave and then FREEZE it in place.
 //
-// Both used to reach a read-only region by building a SECOND, from-bytes enclave
-// out of a writable one — a locked-to-locked copy, with both regions live for
-// its duration — because go-enclave had no post-fill freeze. go-enclave
-// v0.5.0-alpha's MemoryEnclave.Freeze (go-enclave #6) mprotects the region the
-// material was written into, so there is one region and no copy.
+// MemoryEnclave.Freeze mprotects the region the material was written into, so
+// there is one region and no locked-to-locked copy into a second, from-bytes
+// enclave.
 //
-// The PROPERTY is unchanged and is what these pin: `Value` documents the
+// The PROPERTY these pin: `Value` documents the
 // buffer as read-only, and callers rely on a stray write faulting rather than
 // silently corrupting a share or a reconstructed key. A missing Freeze is
 // invisible to every functional assertion — the share still decodes, the secret

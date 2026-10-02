@@ -297,14 +297,10 @@ func TestVerifyConnectionRejectsMissingPeerCertificate(t *testing.T) {
 // Snapshot is the worst possible place for that, because raft adopts its
 // Membership wholesale.
 //
-// This test used to cover Snapshot.Checksum, which was the one field here that
-// DID alias the pool and had to be bulk-copied out. Checksum left the wire
-// format in an earlier pre-release layout (never computed, never verified — see the
-// proto.Snapshot type doc), so the assertion is retargeted rather than dropped:
 // Filepath and every membership map are copied by their own decoders
 // (getString, getMap) and must stay that way. A future "zero-copy Filepath" or
-// a membership map aliased into the buffer would reintroduce exactly the class
-// of bug the original test was written for, and this is what catches it.
+// a membership map aliased into the buffer would reintroduce exactly this class
+// of bug, and this is what catches it.
 func TestSnapshotMetadataDetachedFromReceiveBuffer(t *testing.T) {
 	handler := newTestHandler()
 	tr, err := NewQUICTransport(Config{
@@ -629,7 +625,7 @@ func TestConnectionReceiveWindowDerivedFromMessageBudget(t *testing.T) {
 // exactly why it needs a test — nothing else would notice it regressing.
 func TestSnapshotOver0RTTRejected(t *testing.T) {
 	// Skipped under the race detector, and run instead by CI's dedicated
-	// "0-RTT replay policy [no -race]" job (#199). The race is quic-go's,
+	// "0-RTT replay policy [no -race]" job. The race is quic-go's,
 	// not ours: on the client connection this test dials, quic-go writes
 	// c.peerParams from the connection's run goroutine when the server's
 	// transport parameters arrive (connection.go:2375) and reads

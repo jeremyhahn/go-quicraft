@@ -24,12 +24,10 @@ import (
 	"testing"
 )
 
-// Regression cover for issue #15 on the Shamir path specifically. The defect was
-// in the protected-memory layer — this repository's own, at the time; it is
-// go-enclave's now — but ProtectedShare is how a custody ceremony actually
-// reaches it, and that is the reachability the issue was filed about: a
-// ceremony tearing shares down while a reader is still walking them is a
-// realistic shape, not a contrived one.
+// Read/Destroy race cover on the Shamir path specifically. The locking lives in
+// the protected-memory layer (go-enclave), but ProtectedShare is how a custody
+// ceremony actually reaches it: a ceremony tearing shares down while a reader
+// is still walking them is a realistic shape, not a contrived one.
 //
 // Meaningful under -race; `make test-race` covers this package.
 
@@ -49,8 +47,8 @@ func protectedTestShare(t *testing.T) *ProtectedShare {
 }
 
 // TestProtectedShare_ValueDestroyRace drives Value concurrently with Destroy.
-// Before the enclave fix this reports a race inside memguard reached through
-// ProtectedShare.Value; after it, Value returns either the live value or nil.
+// Value must return either the live value or nil, and -race must report
+// nothing.
 func TestProtectedShare_ValueDestroyRace(t *testing.T) {
 	const iterations = 100
 
@@ -209,15 +207,13 @@ func TestProtectedShare_WithValueSeesTheSameBytes(t *testing.T) {
 	}
 }
 
-// TestCombineProtected_RacesShareDestroy is the regression cover for the
-// reconstruction hazard raised in review of PR #16.
-//
-// WithValue was added as the teardown-safe accessor, and then CombineProtected
-// — the one path in this package that reads share values on the caller's
-// behalf — kept reading them through the bare alias. That is the scenario the
-// issue was actually filed about: a ceremony cancelled or timed out while
-// reconstruction is mid-decode. A caller cannot repair it from outside, because
-// CombineProtected obtains the slices itself.
+// TestCombineProtected_RacesShareDestroy covers the reconstruction hazard:
+// CombineProtected is the one path in this package that reads share values on
+// the caller's behalf, so if it read them through the bare alias rather than
+// the teardown-safe WithValue, a ceremony cancelled or timed out while
+// reconstruction is mid-decode could unmap the source under it. A caller
+// cannot guard that from outside, because CombineProtected obtains the slices
+// itself.
 //
 // Every read now runs inside the share's borrow, so a concurrent Destroy waits
 // rather than unmapping the decode's source operand. The outcome of any given
@@ -267,31 +263,22 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 	}
 }
 
-// --- The MarshalJSON alias (Codex round 3) ---
+// --- The MarshalJSON alias ---
 //
-// TestProtectedShare_WithValueHoldsOffDestroyDeterministically was DROPPED in the
-// go-enclave adoption, deliberately and not silently. It pinned "a Destroy
-// already entered cannot COMPLETE while a WithValue callback runs" by filtering
-// this repository's former pkg/enclave package-global park hooks
-// (TestOnlyOnMutatorParked) down to one target enclave. Those hooks were
-// instrumentation on this repository's own borrow machinery, and that machinery
-// is gone — the package with it: the property now belongs to
-// go-enclave, whose withLocked takes the enclave's read lock and whose Destroy
-// takes the write lock, and go-enclave tests it there. Re-implementing an
-// observation hook here to re-test it would be instrumenting a dependency
-// through its consumer.
-//
-// What survives is the behavioural coverage, which needed no hook:
-// TestProtectedShare_WithValueExcludesDestroy and
-// TestProtectedShare_ValueDestroyRace still run the same collision under -race.
+// "A Destroy already entered cannot COMPLETE while a WithValue callback runs" is
+// go-enclave's property — its withLocked takes the enclave's read lock and its
+// Destroy takes the write lock — and go-enclave tests it deterministically.
+// Re-implementing an observation hook here to re-test it would be
+// instrumenting a dependency through its consumer. The behavioural coverage
+// needs no hook: TestProtectedShare_WithValueExcludesDestroy and
+// TestProtectedShare_ValueDestroyRace run the same collision under -race.
 
-// TestProtectedShare_MarshalJSONRacesDestroy is the regression cover for the
-// third alias-lifetime finding. MarshalJSON used to take `val := s.Value()`,
-// which ends the borrow at the point it returns, and then append `val` into its
-// output buffer — a read of protected memory after the enclave was free to be
-// unmapped. Same defect class as the CombineProtected finding, one call site
-// further on, and unreachable by any caller-side discipline because MarshalJSON
-// obtains the slice itself.
+// TestProtectedShare_MarshalJSONRacesDestroy covers the MarshalJSON alias
+// lifetime. Taking `val := s.Value()` and then appending `val` into the output
+// buffer would end the borrow at the point Value returns and read protected
+// memory after the enclave was free to be unmapped. Same hazard class as
+// CombineProtected's, one call site further on, and unreachable by any
+// caller-side discipline because MarshalJSON obtains the slice itself.
 //
 // THIS PROBE IS PROBABILISTIC, AND UNLIKE THE HOLD-OFF PROBES ABOVE IT CANNOT
 // BE MADE DETERMINISTIC. The deterministic construction works by having the
@@ -308,7 +295,7 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 // ~44 KB copy rather than a ~44 byte one — roughly a thousandfold more time
 // spent holding the alias.
 //
-// MEASURED catch rate against the faithful pre-fix mutation, recorded so a
+// MEASURED catch rate against the `val := s.Value()` mutation, recorded so a
 // future reader knows what this test is and is not worth: 10/10 runs caught it
 // under -race, 0/10 without. The detector's instrumentation is what stretches
 // the window far enough, so THIS TEST IS ONLY MEANINGFUL UNDER -race — which is
@@ -318,7 +305,7 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 // appended into the document mid-encode.
 //
 // A passing run is therefore weak evidence of correctness and a failing run is
-// strong evidence of a defect. The reason the fix is trusted is that the encode
+// strong evidence of a defect. The reason the code is trusted is that the encode
 // provably runs inside the borrow, which is a property of the code; this probe
 // is the backstop that would notice if that stopped being true.
 //

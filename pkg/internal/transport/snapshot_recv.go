@@ -95,8 +95,8 @@ const (
 	// budget, so a small snapshot on a congested link is not failed by an
 	// arithmetically tight deadline. It is also the ceiling a peer gets by
 	// declaring the SMALLEST possible transfer — the cheapest way to occupy a
-	// slot — which is why it is minutes rather than the flat hour that used to
-	// apply to every transfer alike.
+	// slot — which is why it is minutes rather than a flat hour applied to
+	// every transfer alike.
 	minSnapshotTransferDuration = 5 * time.Minute
 
 	// snapshotTransferRateMultiple is how many times the receiver's own
@@ -431,10 +431,10 @@ func (sr *snapshotReceiver) releaseChunkMemory(peerKey string, n int64) {
 // count may run before it is failed regardless of progress.
 //
 // A flat ceiling is the wrong shape for this bound. Combined with the
-// throughput floor it fixed the work a single held slot represents at
-// ceiling * minBytesPerSec — a bit over 3 MB for the hour-and-1 KB/s pair the
-// constants used to give every transfer alike — while saying nothing about how
-// much work the sender actually claimed to be doing. Deriving the budget from
+// throughput floor it fixes the work a single held slot represents at
+// ceiling * minBytesPerSec — a bit over 3 MB for an hour-and-1 KB/s pair
+// applied to every transfer alike — while saying nothing about how much work
+// the sender actually claimed to be doing. Deriving the budget from
 // the DECLARED work ties the two together: a peer that wants a long slot has
 // to declare a large transfer, and a large declaration is already bounded at
 // the header by maxAdmissibleChunkCount, which the configured memory budget
@@ -536,10 +536,10 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	}
 
 	// Authorize the sender from the header BEFORE taking a slot or any
-	// memory. Authorization used to run only once the whole transfer had been
-	// buffered, so any cluster-certificate holder — a member of no shard —
-	// could hold a peer's slots and half the snapshot memory budget for the
-	// length of a transfer and starve every snapshot the node needed.
+	// memory. Authorizing only once the whole transfer had been buffered
+	// would let any cluster-certificate holder — a member of no shard — hold
+	// a peer's slots and half the snapshot memory budget for the length of a
+	// transfer and starve every snapshot the node needed.
 	if err := sr.handler.AuthorizeSnapshot(hdr.ShardID, hdr.ReplicaID, hdr.From, hdr.Index, peer); err != nil {
 		if errors.Is(err, ErrSnapshotNotAccepting) {
 			sr.rejectStream(snapshotRejectNotAccepting, "shard is not accepting snapshots", hdr, 0, err, slog.LevelDebug)

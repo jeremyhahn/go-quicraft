@@ -64,7 +64,7 @@ func newTestLogDB() *testLogDB {
 // AtRestProtection declares this test LogDB non-durable: it accumulates updates
 // in memory and writes nothing to disk, so no durable encrypted record can be
 // stranded by a DEK purge. Silence would (correctly) be read as "durable and
-// possibly encrypted" and would suppress purging entirely (L23).
+// possibly encrypted" and would suppress purging entirely.
 func (t *testLogDB) AtRestProtection() logdb.AtRestProtection { return logdb.AtRestNonDurable }
 
 func (t *testLogDB) Name() string { return "test" }
@@ -1939,14 +1939,14 @@ func TestApplyWorker_AutoSnapshot_ClearsSnapshottingOnPoolFull(t *testing.T) {
 	// the request rejected, and clears the flag again. Waiting on
 	// lastApplied alone can land between the set and the clear and read
 	// the flag as true. The deferred commitPending clear follows the whole
-	// trigger, so it pins the read below (#139).
+	// trigger, so it pins the read below.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"timed out waiting for the 5-entry batch to be processed",
 		func() bool { return !node.commitPending.Load() })
 
 	// The auto-snapshot request should have been rejected (pool full),
 	// and the snapshotting flag should have been cleared so future
-	// auto-snapshots can trigger. Before the fix, this flag would remain
+	// auto-snapshots can trigger. Left set, this flag would remain
 	// true forever, permanently disabling auto-snapshot for this shard.
 	if node.snapshotting.Load() {
 		t.Fatal("snapshotting flag should be cleared when snapshot request is rejected")
@@ -3295,7 +3295,7 @@ func TestCommitWorker_OrderedMsgsBuf_ClearedEachBatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M11: SaveState failure completes pending proposals via OnProposalFailed
+// SaveState failure completes pending proposals via OnProposalFailed
 // ---------------------------------------------------------------------------
 
 // TestCommitWorker_SaveStateError_CompletesPendingProposals verifies that
@@ -3544,8 +3544,8 @@ func TestCommitWorker_SaveStateError_NilCallback(t *testing.T) {
 // in the same batch (rapid stop/restart), each update is committed to
 // its own node rather than the last node for that shardID. This is a
 // regression test for a panic where the old update's applied index
-// exceeded the new incarnation's committed index because a shardID-keyed
-// nodesBuf clobbered the old node pointer with the new one.
+// exceeds the new incarnation's committed index because a shardID-keyed
+// nodesBuf clobbers the old node pointer with the new one.
 func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -3610,7 +3610,7 @@ func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 	cw.batch = []proto.Update{oldUpdate, newUpdate}
 	cw.batchNodes = []*Node{oldNode, newNode}
 
-	// With the old shardID-keyed nodesBuf approach, this would panic:
+	// With a shardID-keyed nodesBuf, this would panic:
 	// "appliedTo: applied index exceeds committed index" because both
 	// updates would be committed to newNode (whose committed index is
 	// lower than oldUpdate's applied entries). With per-entry
@@ -4202,7 +4202,7 @@ func TestCommitWorker_PiggybackMetrics(t *testing.T) {
 // clearStepCommitPending resets commitPending ONLY for the node that was mid
 // hand-off (enqueuingNode) when the step worker panicked. Nodes whose item is
 // owned by the commit worker's in-flight batch must be left untouched: a blanket
-// clear would race that batch and cause a double GetUpdate extraction (H4).
+// clear would race that batch and cause a double GetUpdate extraction.
 func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -5943,7 +5943,7 @@ func TestRecoverSnapshot_ZeroIndex(t *testing.T) {
 
 // TestRecoverSnapshot_FileNotExist verifies that recoverSnapshot FAILS with a
 // typed ErrSnapshotArtifactMissing when a LogDB-recorded snapshot's data file
-// is gone (M13). A recorded snapshot (Index != 0) whose snapshot.dat is missing
+// is gone. A recorded snapshot (Index != 0) whose snapshot.dat is missing
 // is NOT "cleaned up" — the record still points at it — so reporting recovery
 // success would clear the recovering gate without seeding lastApplied and later
 // fail the shard with ErrApplyGap or serve stale reads. The failure is what

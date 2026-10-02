@@ -71,12 +71,11 @@ type StorageBackend interface {
 	// their native compare-and-set primitive — for a replicated state machine,
 	// at the entry's log position, so replicas cannot diverge.
 	//
-	// Two obligations that are easy to get wrong, both learned from
-	// implementing this downstream (go-qrdb#41):
+	// Two obligations that are easy to get wrong:
 	//
 	//   - An ENCRYPTING backend must guard on the ciphertext it read, never on
-	//     a fresh encryption of expected. Since this package moved to
-	//     cipher.NewGCMWithRandomNonce, encrypting the same plaintext twice
+	//     a fresh encryption of expected. This package encrypts with
+	//     cipher.NewGCMWithRandomNonce, so encrypting the same plaintext twice
 	//     produces different bytes, so a re-encrypted guard refuses EVERY
 	//     release — every release silently a no-op, which is worse than the
 	//     race it was meant to fix. Read the stored ciphertext, decrypt to
@@ -103,9 +102,8 @@ type StorageBackend interface {
 	// contract; the reference store compares with bytes.Equal after an existence
 	// check, which is exactly the behaviour described above. go-qrdb's engine
 	// (handleCompareAndDelete) matches it. go-xkms's CompareAndSwapper does NOT
-	// — it reads nil as "require the key ABSENT" — which is tracked as go-xkms
-	// #186; an implementer coming from that interface must not carry the
-	// assumption across (go-quicraft #45).
+	// — it reads nil as "require the key ABSENT" — and an implementer coming
+	// from that interface must not carry the assumption across.
 	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 
 	Close() error

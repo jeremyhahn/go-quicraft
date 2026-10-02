@@ -2,7 +2,7 @@ module github.com/jeremyhahn/go-quicraft/test/performance
 
 go 1.27.0
 
-// benchutil's port reservation is test/netport's, not a copy of it (#163). The
+// benchutil's port reservation is test/netport's, not a copy of it. The
 // harnesses live in the go-quicraft repo and are always built against the
 // parent tree they ship with, never a published version -- the same reason
 // contrib/dragonboat and test/performance/quicraft carry this pair. Without it

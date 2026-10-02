@@ -511,10 +511,11 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | `NewHost` returns `ErrAtRestEncryptionUnspecified` | pass `WithBarrier`, `WithShardBarriers` or `WithoutEncryption()` |
 | `NewHost` returns `ErrBarrierPlaintextLogDB` or `ErrShardBarriersPlaintextWAL` | your custom LogDB would store the log unencrypted; use the default WAL or an encrypting LogDB |
 | `NewHost` fails validation on `MTLSConfig` | the transport needs a CA, certificate and key |
-| `StartShard` refuses a shared certificate | a node's certificate also covers another member's host; issue one certificate per node |
+| `StartShard` or a membership add returns `ErrSharedPeerCertificate` | a node's certificate also covers another member's host; issue one certificate per node |
 | `StartShard` returns `*InvalidMemberError` about identities | `MemberIdentities` is missing a member, binds one identity twice, names no other replica on a join, or contradicts the shard's recorded identities |
 | a membership add returns `ErrMemberIdentityRequired` | use the `...WithIdentity` form |
 | an add returns `ErrRemovedMemberIdentity` | that key was removed from the shard; issue a new key |
+| an add returns `ErrDuplicateMemberAddress` or `ErrDuplicateMemberIdentity` | another active member already holds that address or key; remove it first, or use a different one |
 | `StartShard` returns `*ReplicaRetiredError` | `RemoveData` retired the ID; use a new replica ID |
 | `StartShard` returns `ErrImportInProgress` or `ErrShardNotReady` | an import or another start of the shard is running; retry |
 | `NewHost` fails opening the WAL with `ErrUnknownPayloadType` | usually an encrypted WAL opened without its barrier; otherwise data from an incompatible build, which must be wiped and re-synced |

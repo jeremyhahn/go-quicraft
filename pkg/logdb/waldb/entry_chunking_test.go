@@ -12,7 +12,7 @@ import (
 // size exceeds a single WAL record is split across records instead of failing
 // permanently.
 //
-// One Update used to become exactly one record, and a record must fit inside
+// If one Update always became exactly one record, it would have to fit inside
 // one segment. The usable payload is strictly less than the segment size (a
 // record spends recordHeaderSize in every block it spans), and the WAL adds a
 // 84-byte header per entry that raft's batch cap does not account for. So raft

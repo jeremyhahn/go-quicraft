@@ -93,12 +93,12 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 	}
 }
 
-// TestNewHost_StatedBarrierMustCoverTheLog is the review finding H1: the
-// host-wide barrier is wired only into the default WAL, so a caller-supplied
-// LogDB never received it. WithBarrier plus an unencrypted waldb.Open(dir) —
-// the one-line change that relocates the WAL — encrypted snapshots and wrote
-// every proposed command to disk in plaintext, with no error. A stated
-// encryption must cover the Raft log.
+// TestNewHost_StatedBarrierMustCoverTheLog pins that a stated encryption covers
+// the Raft log: the host-wide barrier is wired only into the default WAL, so a
+// caller-supplied LogDB never receives it. Accepting WithBarrier plus an
+// unencrypted waldb.Open(dir) — the one-line change that relocates the WAL —
+// would encrypt snapshots and write every proposed command to disk in
+// plaintext, with no error.
 func TestNewHost_StatedBarrierMustCoverTheLog(t *testing.T) {
 	t.Run("unencrypted supplied WAL is refused", func(t *testing.T) {
 		db, err := waldb.Open(t.TempDir())

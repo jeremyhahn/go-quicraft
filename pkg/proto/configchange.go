@@ -142,20 +142,15 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 //
 // # Why a short buffer is an error and not a shorter layout
 //
-// The decoder used to discriminate on LENGTH: a payload ending after
-// Initialize was reported as a pre-witness-policy layout, and one ending after
-// RequireFullReplicaMajority decoded successfully with an EMPTY NodeIdentity.
-// The second of those was a security defect, not just dead compatibility code.
+// Length is not a safe discriminator for a field whose absence weakens a
+// check. Were a payload ending after RequireFullReplicaMajority decoded as one
+// with an EMPTY NodeIdentity, a truncated ConfigChange would be
+// byte-indistinguishable from one that genuinely carried no identity: a 61-byte
+// prefix of a valid 78-byte encoding would decode with err == nil and silently
+// drop the identity the receive-side gate checks.
 //
-// A truncated ConfigChange was byte-indistinguishable from one that genuinely
-// carried no identity, and an empty identity is precisely the state that falls
-// back to the weaker address-based authorization on the receive side. A 61-byte
-// prefix of a valid 78-byte encoding decoded with err == nil and silently
-// downgraded the gate the identity exists to raise. Length is not a safe
-// discriminator for a field whose absence weakens a check.
-//
-// Under the pinning policy there is nothing left to discriminate anyway — one
-// layout, all of it required — so the length test is now a bound: anything that
+// Under the pinning policy there is nothing to discriminate anyway — one
+// layout, all of it required — so the length test is a bound: anything that
 // does not span the layout is refused, and an identity-less change is spelled
 // with an explicit zero length prefix by MarshalTo.
 func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
@@ -209,8 +204,8 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	decoded.RequireFullReplicaMajority = getBool(buf[offset:])
 	offset += 8
 	// The trailing identity is read like any other field: getString requires
-	// its four-byte length prefix, so a payload that ends here — the shape that
-	// used to decode as "no identity" — returns ErrBufferTooSmall.
+	// its four-byte length prefix, so a payload that ends here — a truncation,
+	// not "no identity" — returns ErrBufferTooSmall.
 	identity, n, err := getString(buf[offset:], MaxNodeIdentityLength, ErrNodeIdentityTooLong)
 	if err != nil {
 		return 0, err

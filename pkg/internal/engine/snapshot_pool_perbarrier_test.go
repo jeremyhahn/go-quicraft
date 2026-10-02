@@ -453,11 +453,11 @@ func TestSnapshotPool_PerBarrier_WALQueryErrorFailSafe(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_PerBarrier_UnknownBarrierFailSafe verifies HIGH-1: when the
+// TestSnapshotPool_PerBarrier_UnknownBarrierFailSafe verifies that when the
 // LogDB does not OWN the target barrier (MinLiveEpochForBarrier reports
 // known=false), the floor is indeterminate and no purge happens — even though
-// the same call returns epoch 0. A bare epoch-0 return used to be mistaken for
-// a "zero live records" non-constraint, over-purging the barrier's DEKs.
+// the same call returns epoch 0. Mistaking a bare epoch-0 return for a "zero
+// live records" non-constraint would over-purge the barrier's DEKs.
 func TestSnapshotPool_PerBarrier_UnknownBarrierFailSafe(t *testing.T) {
 	baseDir := t.TempDir()
 	bKnown := newTenantBarrier(1, 4)
@@ -484,7 +484,7 @@ func TestSnapshotPool_PerBarrier_UnknownBarrierFailSafe(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe verifies MED-1: an
+// TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe verifies that an
 // unreadable/corrupt snapshot.meta makes the per-barrier floor fail safe (no
 // purge), rather than silently dropping that snapshot from the floor and
 // over-purging a DEK it still needs.
@@ -524,7 +524,7 @@ func TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted verifies MED-2: when
+// TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted verifies that when
 // a SINGLE barrier maps to MULTIPLE shards, the per-barrier snapshot scan must
 // include ALL of them. With every shard loaded the floor reflects the oldest
 // shard's retained snapshot; if a mapped shard is transiently absent (so its
@@ -759,12 +759,12 @@ func (b *tenantBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD
 	return ct, epoch, nil
 }
 
-// TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier is Codex
-// review finding #2 on the per-barrier path, where the shard enumerator is
-// OPTIONAL: without it the floor used to scan loaded shards only. In the
-// production layout each shard has its own snapshot base, so a stopped shard's
-// artifacts were invisible and its DEK purgeable. The LogDB's records must
-// now hold each barrier's floor at its own stopped shard's epoch — and ONLY
+// TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier covers
+// stopped shards on the per-barrier path, where the shard enumerator is
+// OPTIONAL: without it, a floor that scanned loaded shards only would miss
+// them. In the production layout each shard has its own snapshot base, so a
+// stopped shard's artifacts would be invisible and its DEK purgeable. The
+// LogDB's records must hold each barrier's floor at its own stopped shard's epoch — and ONLY
 // its own: the resolver attributes an unloaded shard to its barrier, so
 // tenant B's older stopped shard must not lower tenant A's floor.
 func TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier(t *testing.T) {

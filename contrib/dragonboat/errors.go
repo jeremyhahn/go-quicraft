@@ -293,7 +293,7 @@ var errorMappings = []errorMapping{
 // no mapping is wrapped in AdapterError rather than leaking a quicraft or
 // quicraft-internal type to a migrating caller.
 //
-// # The submission bit survives the mapping (#156)
+// # The submission bit survives the mapping
 //
 // quicraft marks the failures that happen AFTER an entry reached Raft by
 // wrapping them in *quicraft.MaybeAppliedError. That bit is the difference
@@ -302,26 +302,22 @@ var errorMappings = []errorMapping{
 // path it is what separates a stale "already exists" from somebody else's
 // change.
 //
-// It used to be discarded here. errors.Is(&MaybeAppliedError{&NotLeaderError{}},
-// quicraft.ErrNotLeader) is true, so both arrived as the bare ErrShardNotReady
-// and quicraft.MaybeApplied was false for both. The adapter's own helpers had to
-// widen their submission predicate to "ErrTimeout OR ErrShardNotReady" to
-// compensate, and the cost of that widening was precise: an engine that applied
-// a change it had reported as refused pre-flight was caught by the root module's
-// helper and not by this one.
+// Mapping to the bare sentinel would discard it:
+// errors.Is(&MaybeAppliedError{&NotLeaderError{}}, quicraft.ErrNotLeader) is
+// true, so a refused and a post-delivery failure would both arrive as the bare
+// ErrShardNotReady with quicraft.MaybeApplied false for both.
 //
-// So the wrapper is rebuilt around the mapped sentinel. Every existing
-// comparison keeps working — errors.Is walks Unwrap, and IsTempError is
-// unaffected — and quicraft.MaybeApplied now answers correctly through the
+// So the wrapper is rebuilt around the mapped sentinel. Every comparison by
+// errors.Is keeps working — errors.Is walks Unwrap, and IsTempError is
+// unaffected — and quicraft.MaybeApplied answers correctly through the
 // adapter.
 //
-// THE ONE CONTRACT CHANGE, stated plainly: a caller comparing by IDENTITY
-// against ANY mapped sentinel (`err == dragonboat.ErrShardNotReady` today;
-// the rebuild is generic, so a wrapped timeout or shard-closed is the same
-// shape whenever quicraft wraps one) no longer matches the post-delivery
-// case. Owner ruling 2026-09-07: accepted. Identity comparison against a
-// sentinel that may be wrapped has been the wrong tool since errors.Is landed
-// in Go 1.13, and this package's own IsTempError already uses errors.Is.
+// A caller comparing by IDENTITY against ANY mapped sentinel
+// (`err == dragonboat.ErrShardNotReady`; the rebuild is generic, so a wrapped
+// timeout or shard-closed is the same shape whenever quicraft wraps one) does
+// not match the post-delivery case. Use errors.Is: identity comparison against
+// a sentinel that may be wrapped is the wrong tool, and this package's own
+// IsTempError uses errors.Is.
 func translateError(err error) error {
 	if err == nil {
 		return nil

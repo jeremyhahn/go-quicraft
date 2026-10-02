@@ -53,13 +53,12 @@ func vmLockedKB(t *testing.T) int {
 }
 
 // TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave is the mutation target for
-// the borrow discipline this issue introduced.
+// the root-key borrow discipline.
 //
 // Initialize and Unseal each hold the root key in a locked enclave for the whole
-// of their body, and each releases it with a deferred Destroy that REPLACES the
-// eleven hand-written enclave.Wipe(rootKey) calls the old code carried on its error
-// paths. The wipes were visible in the diff; a missing Destroy is not — it leaks
-// silently, and every functional assertion in this package still passes.
+// of their body, and each releases it with a single deferred Destroy rather than
+// a hand-written wipe on every error path. A missing Destroy is invisible — it
+// leaks silently, and every functional assertion in this package still passes.
 //
 // So the assertion is on the kernel's own accounting. Each enclave costs one
 // locked PAGE (a 32-byte key is charged 4 KiB), so dropping either Destroy leaks

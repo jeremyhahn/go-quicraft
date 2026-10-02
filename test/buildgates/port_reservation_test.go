@@ -39,14 +39,13 @@ import (
 // and it is wrong every time. The port is free when it is read and nothing
 // holds it afterwards, so the kernel is free to give the same number to the
 // next caller — the next node of the same cluster, or the local end of any
-// outbound connection — before the host binds. That is #131, and it is one
-// instance of this repository's recurring class: a value that is not pinned,
-// treated as if it were.
+// outbound connection — before the host binds. It is one instance of a
+// recurring class: a value that is not pinned, treated as if it were.
 //
-// It had four copies of the helper and a fifth open-coded loop when #131 was
-// filed, which is why the remedy is a gate and not five edits. Reservation now
-// goes through test/netport, which allocates from a window OUTSIDE
-// ip_local_port_range, and this gate is what keeps a sixth copy from appearing.
+// The pattern is easy to copy, which is why the remedy is a gate and not a set
+// of edits. Reservation goes through test/netport, which allocates from a
+// window OUTSIDE ip_local_port_range, and this gate keeps a copy of the
+// close-then-return helper from appearing.
 //
 // # The rule
 //
@@ -69,10 +68,9 @@ import (
 // implementation covers every tree. See the integrationRoots comment for the
 // full reasoning.
 //
-// test/performance came under the gate with #163, when benchutil stopped
-// carrying a second, TCP-shaped copy of the reservation window and started
-// delegating to test/netport. Until then the rule could not be satisfied there
-// and a gate over it would have been a rule with a hole in it.
+// test/performance is under the gate because benchutil delegates to
+// test/netport rather than carrying a TCP-shaped copy of the reservation
+// window, so the rule can be satisfied there.
 //
 // # What is NOT scanned, and why
 //
@@ -82,10 +80,9 @@ import (
 //
 // # The marker
 //
-// This gate used to argue it needed none: netport.MustReserveUDP is strictly
-// better at the same call site, so there was nothing to excuse. That held while
-// only the integration trees were scanned. It does not hold in
-// test/performance, which has a harness that binds port 0 and KEEPS the
+// In the integration trees no marker would be needed: netport.MustReserveUDP is
+// strictly better at the same call site, so there is nothing to excuse. That
+// does not hold in test/performance, which has a harness that binds port 0 and KEEPS the
 // listener for the transport's lifetime — the pkg/ shape, in a scanned tree.
 // netport is not better there; it is not applicable, because nothing is closed
 // and handed on.
@@ -119,8 +116,7 @@ type portZeroSite struct {
 const directPortMarker = "//quicraft:direct-port"
 
 // portZeroRoots are the trees this gate walks: the two integration trees the
-// leader-resolution gates share, plus test/performance, which joined them in
-// #163.
+// leader-resolution gates share, plus test/performance.
 //
 // It is a separate list rather than an addition to integrationRoots because
 // test/performance holds benchmarks, not integration tests: the
@@ -232,7 +228,7 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 			"the same pool the kernel assigns to the next port-0 bind and to the local " +
 			"end of every outbound connection. Closing the socket and returning the " +
 			"address leaves nothing holding the port, so another caller can be given it " +
-			"before the host binds (#131). Use netport.MustReserveUDP(t.Fatalf) — or " +
+			"before the host binds. Use netport.MustReserveUDP(t.Fatalf) — or " +
 			"netport.MustReserveTCP for a TCP harness — which allocates outside that " +
 			"range.\n\nIf the socket is KEPT for the listener's lifetime rather than " +
 			"closed and handed on, the class cannot occur and netport is not " +

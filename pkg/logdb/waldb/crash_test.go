@@ -807,7 +807,7 @@ func runCrashIteration(t *testing.T, delay time.Duration, encrypted bool) {
 		// process re-reads that state — holding the pre-child barrier object
 		// instead assumes no other process ever moved the epoch on.
 		//
-		// That assumption is now false, and was always fragile: restoring a
+		// That assumption is false: restoring a
 		// barrier rotates, because the spent AEAD invocation budget of the
 		// loaded epoch is unknowable across a restart and reusing it would
 		// silently erode the 2^-32 nonce-collision bound. So the child writes

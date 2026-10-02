@@ -23,8 +23,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSaveSnapshot_RefusesPositionOutsideProtocolRange pins #197 C at the
-// door that makes the poisoning durable: raft restores a saved snapshot on
+// TestSaveSnapshot_RefusesPositionOutsideProtocolRange pins the snapshot
+// position bound at the door that makes the poisoning durable: raft restores a saved snapshot on
 // restart and wraps on Index+1 at the ceiling, so the WAL refuses to record
 // one there — whatever the caller checked — and records nothing on refusal.
 func TestSaveSnapshot_RefusesPositionOutsideProtocolRange(t *testing.T) {

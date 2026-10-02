@@ -775,8 +775,7 @@ func TestSplitProtected_RandomnessFailure(t *testing.T) {
 // between an unauthenticated submission and an mlock'd allocation of the
 // submitter's choosing. That matters more here than on the string path —
 // RLIMIT_MEMLOCK is a finite PROCESS-WIDE resource, so what the submission takes
-// is denied to every other caller, and under memguard a refused lock terminated
-// the process outright — and parseRawShare's MaxSecretBytes check is far too
+// is denied to every other caller — and parseRawShare's MaxSecretBytes check is far too
 // late, since it only sees the payload after CombineProtected has already
 // locked it.
 func TestNewProtectedShare_RejectsOversizedValue(t *testing.T) {
@@ -912,8 +911,7 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 // resource bound. Each element below is individually legal — the per-value
 // bound has nothing to say about any of them — and it is the SET that must be
 // refused, before the first locked buffer exists: locked memory is a finite
-// process-wide resource, and under memguard a refused lock killed the process
-// outright, so an unauthenticated submission must not get to choose how much of
+// process-wide resource, so an unauthenticated submission must not get to choose how much of
 // it to take.
 func TestUnmarshalShareSet_BoundsTheSetBeforeAllocating(t *testing.T) {
 	small := base64.StdEncoding.EncodeToString([]byte{shareFormatVersion, 0x01, 0xab})
@@ -1168,15 +1166,16 @@ func TestSplitProtected_AcceptsRealCeremonies(t *testing.T) {
 	}
 }
 
-// TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize is #102.
+// TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize pins MaxShareSetBytes as a
+// page budget.
 //
-// MaxShareSetBytes was a fixed 2 << 20, which is 512 pages on a 4 KiB-page host
-// and on no other. Every figure in its derivation is a page count, so stating
-// it in the bytes of one particular host made the primitive's headline case —
-// the 255-share split of a 32-byte root key — fail everywhere else: the same
-// 260 pages is 4,259,840 bytes at 16 KiB and 17,039,360 at 64 KiB, both refused
-// by a 2 MiB cap. RHEL and CentOS Stream arm64 ship 64 KiB pages, and CI is
-// amd64-only, so no gate could see it.
+// A fixed 2 << 20 is 512 pages on a 4 KiB-page host and on no other. Every
+// figure in the derivation is a page count, so stating it in the bytes of one
+// particular host would make the primitive's headline case — the 255-share
+// split of a 32-byte root key — fail everywhere else: the same 260 pages is
+// 4,259,840 bytes at 16 KiB and 17,039,360 at 64 KiB, both refused by a 2 MiB
+// cap. RHEL and CentOS Stream arm64 ship 64 KiB pages, and CI is amd64-only,
+// so no gate would see it.
 //
 // The test does not need a big-page host, because the quantity that matters is
 // page-size independent. It takes the footprint the REAL implementation prices
@@ -1216,15 +1215,15 @@ func TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize(t *testing.T) {
 		}
 	}
 
-	// And the pre-#102 constant, to show this is a real difference rather than
-	// a restatement: the byte-valued cap refuses that same set on both larger
-	// page sizes.
-	const oldConstant = 2 << 20
+	// And a fixed byte-valued cap, to show this is a real difference rather
+	// than a restatement: such a cap refuses that same set on both larger page
+	// sizes.
+	const fixedByteCap = 2 << 20
 	for _, ps := range []int{16384, 65536} {
-		if pages*ps <= oldConstant {
+		if pages*ps <= fixedByteCap {
 			t.Errorf("the 255-share split costs %d bytes at a %d-byte page, which "+
-				"the old %d-byte cap would have admitted; this test is not "+
-				"exercising the defect it was written for", pages*ps, ps, oldConstant)
+				"a fixed %d-byte cap would admit; this test is not exercising "+
+				"the page-size dependence it guards", pages*ps, ps, fixedByteCap)
 		}
 	}
 }

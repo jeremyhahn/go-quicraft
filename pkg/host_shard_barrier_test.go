@@ -57,11 +57,11 @@ func TestNewHost_ShardBarriersWithHostBarrierAccepted(t *testing.T) {
 // barrier applies to this shard" axis rather than the sealed-vs-nil axis the
 // five before it shared.
 //
-// The refusal used to be written as `if options.logdb == nil`, so it
-// discriminated on whether a LogDB was SUPPLIED rather than on what that LogDB
-// IS. Supplying one is the natural thing an integrator does to put the WAL on a
-// chosen directory, and it bought a full bypass: an unencrypted waldb.Open(dir)
-// plus WithShardBarriers and no WithBarrier produced byte-for-byte the state
+// A refusal written as `if options.logdb == nil` would discriminate on whether
+// a LogDB was SUPPLIED rather than on what that LogDB IS. Supplying one is the
+// natural thing an integrator does to put the WAL on a chosen directory, and it
+// would buy a full bypass: an unencrypted waldb.Open(dir) plus
+// WithShardBarriers and no WithBarrier would produce byte-for-byte the state
 // ErrShardBarriersPlaintextWAL exists to prevent -- encrypted snapshots over a
 // plaintext Raft log, every user command readable off the disk, while the
 // operator's spot-check of the snapshot directory shows encryption working.

@@ -38,15 +38,15 @@ import (
 // The snapshot tree is ORDERED by that name, not merely labelled by it:
 // engine.listSnapshotDirs parses "snapshot-<index>" and sorts ascending,
 // gcSnapshotDirs deletes everything but the last maxSnapshotsRetained, and
-// latestSnapshotDir — the recovery fallback — takes the highest. ImportSnapshot
-// used to name its directory from a per-host import sequence number that starts
-// at 1, so a disaster-recovery restore onto a node that already had snapshots
-// landed as the OLDEST directory in the tree: first in line for GC, and never
-// the one the recovery fallback picks, which would prefer a stale but
-// higher-numbered directory over the restore.
+// latestSnapshotDir — the recovery fallback — takes the highest. A directory
+// named from a per-host import sequence number starting at 1 would land a
+// disaster-recovery restore onto a node that already had snapshots as the
+// OLDEST directory in the tree: first in line for GC, and never the one the
+// recovery fallback picks, which would prefer a stale but higher-numbered
+// directory over the restore.
 //
-// The fix names the directory by the snapshot's own index, matching every other
-// writer (engine.SnapshotSaveDir).
+// ImportSnapshot therefore names the directory by the snapshot's own index,
+// matching every other writer (engine.SnapshotSaveDir).
 func TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots(t *testing.T) {
 	const shardID, replicaID uint64 = 3, 1
 	// The restore is NEWER than everything already on this node.

@@ -202,8 +202,7 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	}
 }
 
-// TestJoiningDoesNotClearBeforeLeaderIsKnown is the Codex-found regression: a
-// joiner following a leader that was ADDED AFTER the initial bootstrap must NOT
+// TestJoiningDoesNotClearBeforeLeaderIsKnown pins that a joiner following a leader that was ADDED AFTER the initial bootstrap must NOT
 // clear the auth bypass merely from learning the founding membership. If
 // replication delivers the bootstrap entry in an earlier batch than that
 // leader's AddNode, clearing on "knows any member" would then reject the current

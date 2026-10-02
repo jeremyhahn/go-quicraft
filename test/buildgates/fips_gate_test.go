@@ -37,7 +37,6 @@ import (
 //   * WIDENING the single exclusion. The deny-list is one Makefile variable
 //     matched as a path PREFIX, so appending `/..`-worth of parent directory to
 //     it removes a whole subtree while the list still holds exactly one entry.
-//     That is how pkg/internal/transport was outside the gate before #85.
 //   * dropping the step that covers the one tree already exempt from
 //     approved-only, which would turn a documented exemption into no coverage
 //     at all.
@@ -50,10 +49,9 @@ import (
 var (
 	makefilePath = filepath.Join("..", "..", "Makefile")
 
-	// The FIPS job moved from ci.yml to nightly.yml (go-quicraft#22, adopting
-	// ci-template v1.9): it is known-red under runner contention (#24) and a
-	// known-red job burning runner-minutes per push verifies nothing. It
-	// still runs -- nightly, plus on demand via workflow_dispatch -- so the
+	// The FIPS job runs from nightly.yml rather than ci.yml: it is known-red
+	// under runner contention, and a known-red job burning runner-minutes per
+	// push verifies nothing. It still runs -- nightly, plus on demand via workflow_dispatch -- so the
 	// gate this file protects is "some workflow still executes the FIPS
 	// targets," not "ci.yml specifically does."
 	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "nightly.yml")
@@ -192,10 +190,9 @@ func TestFIPSExclusionIsOneDocumentedTree(t *testing.T) {
 // Counting entries is not enough on its own. The deny-list is applied as a path
 // PREFIX (`grep -v '^$(FIPS_EXCLUDED)'`), so trimming the variable back to a
 // parent directory removes an entire subtree while the list still holds exactly
-// one entry and TestFIPSExclusionIsOneDocumentedTree still passes. That is not
-// hypothetical: until go-quicraft#85 the variable named the whole
-// pkg/internal/transport tree, and shrinking it to the revocation package is
-// what put the QUIC transport inside the approved-only gate.
+// one entry and TestFIPSExclusionIsOneDocumentedTree still passes. Naming the
+// whole pkg/internal/transport tree instead of the revocation package, for
+// example, would put the QUIC transport outside the approved-only gate.
 //
 // quic-go v0.60.0 made that possible by routing packet-protection AEADs through
 // Go's TLS 1.3 AES-GCM implementation instead of the general cipher.NewGCM, so

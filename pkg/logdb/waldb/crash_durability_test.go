@@ -657,7 +657,7 @@ func TestCrashFS_RemovalDurability(t *testing.T) {
 // durability-sequence scheme (record.go) exists to classify, driven end to end
 // through the real WAL rather than by editing bytes in a file.
 //
-// crashFS used to lose an unsynced file wholesale, which can only produce one
+// A crash model that loses an unsynced file wholesale can only produce one
 // shape of power loss: the log ends early at a clean record boundary. That
 // shape needs no discriminator — there is no damage under acknowledged data to
 // judge. The shape that DOES need one is the other one, and it is the common
@@ -665,10 +665,10 @@ func TestCrashFS_RemovalDurability(t *testing.T) {
 // single fdatasync, so writeback is free to persist page N+1 and drop page N.
 // What is left on the medium is a zero-filled hole with perfectly decodable
 // records above it — byte-for-byte what interior bit rot under acknowledged
-// data looks like, and the reason recovery used to refuse to open after an
-// ordinary power loss.
+// data looks like, and what a recovery that ignored the generations would
+// refuse to open after an ordinary power loss.
 //
-// crashWriteback closes that modelling gap, and this test spends it. It drops
+// crashWriteback models that shape, and this test exercises it. It drops
 // exactly one page of one in-flight batch, asserts the post-crash image really
 // has decodable data above a zero-filled hole (otherwise the case is vacuous),
 // and then requires the WAL to open, repair itself, and keep every
@@ -685,8 +685,8 @@ func TestCrashFS_RemovalDurability(t *testing.T) {
 //     fdatasync completed somewhere inside the destroyed bytes. The survivors'
 //     GENERATION START says exactly where: at the hole, because the lost page
 //     reverted to its durable content and the acknowledged bytes on it are
-//     intact. Recovery truncates, provably — this used to be a "residual" the
-//     operator was told to reconcile by hand (#197 D).
+//     intact. Recovery truncates, provably, with nothing left for the
+//     operator to reconcile by hand.
 //
 // The companion direction — the SAME hole shape, but with survivors whose
 // generations prove a completed fdatasync ABOVE the damage, which must refuse
@@ -864,7 +864,7 @@ func partialWritebackCase(t *testing.T, pageOffset int) {
 }
 
 // TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed is the case the
-// generation start exists to catch (#197 D): the same single-generation
+// generation start exists to catch: the same single-generation
 // survivors as an ordinary interrupted write, but the damage begins BELOW the
 // acknowledged end those survivors name, so the fdatasync that opened their
 // generation had acknowledged bytes the damage destroyed. No crash produces

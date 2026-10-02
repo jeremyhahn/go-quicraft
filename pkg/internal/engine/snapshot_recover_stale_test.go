@@ -59,9 +59,9 @@ func (s *failingRecoverSnapshotter) RecoverFromSnapshot(context.Context, io.Read
 // runs, so the state machine is untouched, and it is already at or past the
 // snapshot index — there is nothing to restore and nothing to repair.
 //
-// Failing the shard here is what turned this benign race into a dead shard
-// under load, taking TestE2E_SnapshotCatchUp_* red on an engine error rather
-// than an assertion (#106):
+// Failing the shard here turns this benign race into a dead shard under load,
+// taking TestE2E_SnapshotCatchUp_* red on an engine error rather than an
+// assertion:
 //
 //	engine: snapshot recovery for shard 1 replica 1 at index 62 is not ahead
 //	of applied index 63
@@ -117,8 +117,8 @@ func TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard(t *testing.T)
 }
 
 // TestSnapshotPool_FailedRecovery_StillFailsTheShard is the other half of the
-// pair above, and the reason the fix for #106 is narrow rather than a blanket
-// "recovery errors are not fatal".
+// pair above, and the reason the stale-recovery decline is narrow rather than a
+// blanket "recovery errors are not fatal".
 //
 // An error out of RecoverFromSnapshot is terminal: the user state machine is
 // free to have mutated itself before returning, sm.StateMachine promises

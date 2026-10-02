@@ -26,7 +26,7 @@ import (
 )
 
 // TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt settles
-// the question #126 posed about the barrier snapshot tests: is the stale
+// a question about the barrier snapshot tests: is the stale
 // refusal on the ENCRYPTED recovery path a different error, or wrapped such
 // that the engine's decline branch is bypassed?
 //
@@ -34,9 +34,9 @@ import (
 // and before the decrypt-to-scratch step, so an encrypted artifact and a
 // plaintext one produce the SAME *SnapshotRecoveryStaleError from the same
 // line, unwrapped. The barrier changes nothing about the refusal, which is why
-// #113's decline covers it — and why the surviving report in #126 had to be
-// somewhere other than the engine (it is: hostEngineCallback.OnSnapshotCompleted,
-// see TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure).
+// the engine's stale-recovery decline covers it; the host's handling of the
+// decline lives in hostEngineCallback.OnSnapshotCompleted (see
+// TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure).
 //
 // The positive control in the second half is what makes the first half mean
 // anything: the very same artifact, offered to a state machine that is
@@ -135,7 +135,7 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 		t.Fatalf("barrier recovery error = %T (%v), want *SnapshotRecoveryStaleError.\n"+
 			"If this is a wrapped or differently-typed error, the engine's decline "+
 			"branch is bypassed and every stale InstallSnapshot on the encrypted "+
-			"path kills the shard (#126 candidate B)", res.err, res.err)
+			"path kills the shard", res.err, res.err)
 	}
 	if stale.SnapshotIndex != snapshotIndex || stale.LastApplied != appliedAhead {
 		t.Errorf("stale error = %+v, want SnapshotIndex %d / LastApplied %d",

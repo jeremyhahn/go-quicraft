@@ -26,7 +26,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M7: Node.redeliver must PRESERVE the origin stamp
+// Node.redeliver must PRESERVE the origin stamp
 // ---------------------------------------------------------------------------
 
 // TestNode_RedeliverPreservesOrigin pins the origin stamp of a message the step

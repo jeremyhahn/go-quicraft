@@ -23,15 +23,15 @@ import (
 
 // Forged-heartbeat commit advance
 //
-// handleHeartbeat used to be four lines with no proof of anything:
+// A naive handleHeartbeat is four lines with no proof of anything:
 //
 //	r.electionTick = 0
 //	r.leaderID = msg.From
 //	if msg.Commit > r.log.committed { commitTo(min(msg.Commit, lastIndex)) }
 //
 // A Heartbeat carries no prevLogIndex, no prevLogTerm and no entries, so nothing
-// in it establishes that the sender's log matches this replica's — yet it
-// committed straight up to lastIndex. The attack is one frame: a follower
+// in it establishes that the sender's log matches this replica's — yet that
+// code commits straight up to lastIndex. The attack is one frame: a follower
 // holding entries 501..1000 that replicated to a MINORITY receives
 // Heartbeat{From: leader, Term: T+1, Commit: 1<<40}, step() adopts the higher
 // term, and the whole uncommitted tail is committed and handed to the state

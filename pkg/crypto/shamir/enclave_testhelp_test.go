@@ -6,11 +6,10 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// encBytes is the test-side replacement for the MemoryEnclave.Bytes accessor
-// this package used to own. go-enclave's Open reports a destroyed enclave as an
-// error where the old accessor reported it as a nil slice; these tests were
-// written against the nil, so the error is folded back into one here rather than
-// rewritten at ~30 assertion sites. Production code handles the error.
+// encBytes returns an enclave's bytes, or nil if it is nil or destroyed.
+// go-enclave's Open reports a destroyed enclave as an error; these tests
+// assert on a nil slice, so the error is folded into one here rather than
+// handled at ~30 assertion sites. Production code handles the error.
 func encBytes(e *enclave.MemoryEnclave) []byte {
 	if e == nil {
 		return nil
@@ -23,8 +22,8 @@ func encBytes(e *enclave.MemoryEnclave) []byte {
 }
 
 // mustFromBytes moves data into a locked, frozen enclave, failing the test if the
-// kernel refuses the lock. It replaces the bare-pointer constructor this package
-// used to own; go-enclave reports a refused mlock instead of hiding it.
+// kernel refuses the lock; go-enclave reports a refused mlock instead of hiding
+// it.
 func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
 	t.Helper()
 	e, err := enclave.NewMemoryEnclave(data)

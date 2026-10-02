@@ -469,7 +469,7 @@ func TestParseSegmentFilename(t *testing.T) {
 		{"large id", "999999.log", 999999, true},
 		// Only the canonical %06d form is a segment: a shorter or
 		// over-padded digit string is a foreign file that would alias a real
-		// segment ID (this case previously parsed as segment 1).
+		// segment ID ("0000001.log" must not parse as segment 1).
 		{"no padding", "1.log", 0, false},
 		{"over padded", "0000001.log", 0, false},
 		{"overflows uint64", "99999999999999999999.log", 0, false},

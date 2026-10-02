@@ -167,10 +167,9 @@ var configChangeCalls = map[string]bool{
 // class.
 //
 // SyncReadBuf is leader-bound and belongs here by the same reasoning as
-// SyncRead, but #154 fixed this call set at SyncRead and ReadIndex and it is
-// not this change's call to widen it. There is currently no SyncReadBuf call
-// in either integration tree (verified by the same AST walk), so the set is
-// complete against the trees as they stand; see the PR for the follow-up.
+// SyncRead. There is currently no SyncReadBuf call in either integration tree
+// (verified by the same AST walk), so the set is complete against the trees as
+// they stand; add it here when the first such call appears.
 var linearizableReadCalls = map[string]bool{
 	"SyncRead":  true,
 	"ReadIndex": true,
@@ -433,12 +432,12 @@ func formatDirectCalls(calls []directCall) string {
 //
 // # Why this gate exists
 //
-// Five times now a test has read the leader on one line and used it several
-// lines later as though the observation pinned it (#84, #88, #90, #91, #103).
-// It does not. Raft is free to hold an election in the gap, and the proposal is
-// then refused CORRECTLY while the test reports a failure the cluster never
-// had. Twice the class came back AFTER being fixed, because each fix was a
-// round of hand-edits and the next test to be written reintroduced the pattern.
+// A test that reads the leader on one line and uses it several lines later
+// treats the observation as though it pinned the leader. It does not. Raft is
+// free to hold an election in the gap, and the proposal is then refused
+// CORRECTLY while the test reports a failure the cluster never had. Hand-edits
+// do not end the class, because the next test to be written reintroduces the
+// pattern.
 //
 // The reason it kept escaping review is that it has two shapes. The direct one
 //
@@ -450,8 +449,8 @@ func formatDirectCalls(calls []directCall) string {
 //	...
 //	leaderHost.SyncPropose(ctx, shardID, cmd)
 //
-// #91 fixed sixteen sites of the first shape and missed every site of the
-// second, one of which failed CI four hours later. So this gate does not try to
+// A fix aimed at the first shape misses every site of the second. So this gate
+// does not try to
 // recognise the caching at all — it is a rule about the CALL, not about how the
 // receiver was obtained, and no binding can hide from it.
 //
@@ -526,10 +525,9 @@ type pendingSite struct {
 // deferred table. It is expected to shrink to nothing; see pendingSite for why
 // each entry exists and how it leaves.
 var pendingConfigChangeSites = []pendingSite{
-	// Empty since #123 retired the dragonboat adapter's fourteen rows: every
-	// contrib site is now either routed through that suite's idempotent
-	// helper or marked with its reason. #135 retired the six root-module
-	// rows before it. The type and the ratchet stay so the next deferred
+	// Empty: every site is either routed through its suite's idempotent
+	// helper or marked with its reason. The type and the ratchet stay so the
+	// next deferred
 	// site, if there is one, has somewhere to go that fails when it is fixed.
 }
 
@@ -545,19 +543,13 @@ var pendingConfigChangeSites = []pendingSite{
 // deferred conversion needs somewhere to go that fails when it lands. An empty
 // ratchet is the goal state, not a dead one.
 //
-// #161 held the adapter suite's 21 rows until #131 released
-// contrib/dragonboat/test/integration/helpers_test.go. They are gone: 20 sites
-// now route through the adapter's own readFromLeader / tryReadFromLeader, and
-// the twenty-first turned out not to be a conversion at all and took a waiver
-// (linearizable_test.go, the failover-without-warmup loop — it retries
+// The adapter suite's sites route through its own readFromLeader /
+// tryReadFromLeader, except one that is not a conversion at all and carries a
+// waiver (linearizable_test.go, the failover-without-warmup loop — it retries
 // IsTempError on a fixed slice, which is wider and differently budgeted than
-// any leader-resolving helper).
-//
-// #162 held the last row: syncReadExact's pinned read, deferred not because a
-// file could not be edited but because the disposition was not a gate
-// installation's to pick. It was settled by growing proposer.TryReadWith and
-// routing the site there, so the pinned-retry loop has one home rather than a
-// waiver blessing a third copy of it.
+// any leader-resolving helper). Pinned reads go through proposer.TryReadWith,
+// so the pinned-retry loop has one home rather than a waiver blessing a copy
+// of it.
 var pendingReadSites = []pendingSite{}
 
 // TestIntegrationConfigChangesAreIdempotent fails when an integration test
@@ -569,9 +561,8 @@ var pendingReadSites = []pendingSite{}
 //
 // A config change has everything a proposal has: it is submitted through the
 // leader, and a replica that has just lost leadership refuses it correctly
-// while the test reports a failure the cluster never had. #123 found exactly
-// that on OrderedMembershipChange's first add, and noted that proposalCalls did
-// not see it.
+// while the test reports a failure the cluster never had, and proposalCalls
+// does not see it.
 //
 // It also has a second unpinned value that a proposal does not. When the
 // response is lost — a leadership move fails every pending request with a
@@ -579,10 +570,9 @@ var pendingReadSites = []pendingSite{}
 // is IN THE LOG and can still commit. A retry loop that reads "no answer" as
 // "did not happen" then re-issues it, the engine refuses the duplicate
 // correctly, and the test fails with "node already exists in membership" or
-// "target node not found in membership" (#112, and #132 on the delete path).
-// PR #122 fixed that in the e2e suite's syncAddNode / syncDeleteNode, and
-// #135 moved the decision into test/membership so every suite shares one copy
-// (#145 retired the e2e original): the refusal is accepted ONLY after an
+// "target node not found in membership" on the delete path. test/membership
+// holds the one decision every suite shares: the refusal is accepted ONLY
+// after an
 // attempt in the same loop was genuinely submitted AND a linearizable
 // SyncGetShardMembership confirms the exact requested state — replica present
 // as a full voter at the requested address, or absent in every role. A blanket
@@ -590,8 +580,8 @@ var pendingReadSites = []pendingSite{}
 // TestRetry_AlreadyExistsAtDifferentAddressStillFails in test/membership is
 // where that line is pinned.
 //
-// #122 alone did not end the class, for the same reason #91 did not end the
-// propose class: it fixed the sites that happened to use its helper. Any test
+// A shared helper alone does not end the class, any more than it ends the
+// propose class: it covers only the sites that happen to use it. Any test
 // can still call SyncRequestDeleteNode itself, with its own retry, and get none
 // of it. So this is a rule about the CALL, like the propose gate above, and no
 // binding or private retry loop can hide from it.
@@ -632,7 +622,7 @@ func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 		"proposal, and it has a second unpinned value a proposal does not: "+
 		"whether it COMMITTED. A retry that reads \"no answer\" as \"did not "+
 		"happen\" turns a slow success into \"already exists in membership\" or "+
-		"\"target node not found in membership\" (#112, #132). Route these "+
+		"\"target node not found in membership\". Route these "+
 		"through test/membership (AddNode / DeleteNode, or TryAddNode / "+
 		"TryDeleteNode, over the suite's leader resolver), which resolves the "+
 		"leader at the point of use and accepts a duplicate refusal only after an "+
@@ -710,23 +700,20 @@ func pendingSiteFor(c directCall, table []pendingSite, seen []int) int {
 //
 // # Why this gate exists
 //
-// This is the READ half of the class the two gates above cover. #147 found
-// fifteen sites in the host suite where a leader was observed once
+// This is the READ half of the class the two gates above cover: a leader
+// observed once
 //
 //	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
 //	leaderHost := cluster.hosts[leaderIdx]
 //	...
 //	got, err := leaderHost.SyncRead(ctx, shardID, key)
 //
-// and then read from across a loop. One of them
-// (TestHostAPI_MembershipChange_AddNodeWhileWriting) failed CI under the
-// runners' own load with "not leader for shard 1, leader unknown" — refused
-// CORRECTLY by an engine that had held an election in the gap, reporting a
-// defect the cluster never had.
+// and then read from across a loop. Under load such a read fails with "not
+// leader for shard 1, leader unknown" — refused CORRECTLY by an engine that
+// held an election in the gap, reporting a defect the cluster never had.
 //
-// #155 converted those fifteen and marked five. Nothing stopped the next test
-// from reintroducing the pattern, which is precisely how the propose class came
-// back twice after being "fixed" (#91, #103). So, like the two gates above,
+// Converting sites by hand does not stop the next test from reintroducing the
+// pattern. So, like the two gates above,
 // this is a rule about the CALL rather than about how the receiver was
 // obtained, and no binding can hide from it.
 //
@@ -760,7 +747,7 @@ func TestIntegrationReadsResolveTheLeader(t *testing.T) {
 		"A linearizable read is bound to the leader exactly as a proposal is: "+
 		"SyncRead is a ReadIndex plus a local lookup, and a replica that has "+
 		"lost the shard without yet learning its successor refuses both on the "+
-		"same terms (#147). Observing a leader does not pin it. Route these "+
+		"same terms. Observing a leader does not pin it. Route these "+
 		"through the suite's readFromLeader / readIndexFromLeader (or "+
 		"tryReadFromLeader off the test goroutine), which resolves the leader "+
 		"when the call is made and retries the not-leader rejection.\n\n"+

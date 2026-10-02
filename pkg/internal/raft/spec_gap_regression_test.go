@@ -629,8 +629,8 @@ func TestOverCapStoredMembershipRefusesShardStartup(t *testing.T) {
 // returns the error up through processConfigChanges and Peer.Commit, which is
 // the path the engine's failCommit already treats as terminal: node.failed is
 // set and EventListener.OnShardFailed fires, while the host and every other
-// shard on that step worker keep running. Previously this was an
-// invariant.Assert one frame down.
+// shard on that step worker keep running, rather than an assertion panicking
+// the worker.
 func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 

@@ -150,8 +150,8 @@ func TestWitnessBootstrapShape_LatchesRoleMismatch(t *testing.T) {
 	cfg.IsWitness = true
 
 	lr := newTestLogReader(nil, proto.State{})
-	// Exactly what StartShard's bootstrap seed used to write: every member of
-	// the members map, this replica included, in Addresses.
+	// A bootstrap seed listing every member of the members map, this replica
+	// included, in Addresses.
 	lr.membership = proto.Membership{
 		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
 	}

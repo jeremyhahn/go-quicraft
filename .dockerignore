@@ -47,8 +47,6 @@ go.work.sum
 
 # Private-forge and private-release workflow: the other half of the
 # .gitattributes exclusion list. No image build reads any of them.
-.github/workflows/opencode-review.yml
-.github/workflows/claude-review.yml
 .github/workflows/automerge.yml
 .release-allowed-signers
 

@@ -325,8 +325,7 @@ func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 
 	// As in TestPeerRejectedHeartbeatFrameKeepsConnection, this pacing cannot
 	// become a poll on PeerFrameRejections: the counter trails the sends by one
-	// write, so waiting for attempt i before making attempt i+1 deadlocks. See
-	// #71.
+	// write, so waiting for attempt i before making attempt i+1 deadlocks.
 	const attempts = 20
 	for i := 0; i < attempts; i++ {
 		sender.Send([]proto.Message{{

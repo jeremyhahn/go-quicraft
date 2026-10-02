@@ -702,13 +702,13 @@ func (lr *LogReader) setSnapshot(ss proto.Snapshot) error {
 	// Each guard is conditioned on the state IT compares against, not on a
 	// proxy for "this reader has been used".
 	//
-	// Both used to sit behind `lr.membership.ConfigChangeID != 0 ||
-	// lr.state.Commit != 0`, which is a guess: ConfigChangeID 0 and Commit 0
-	// are perfectly legal values for a replica that has recovered from a
-	// snapshot and not yet committed anything of its own, and for that replica
-	// the guess switched BOTH guards off. A stale snapshot then overwrote the
-	// recorded one and, with it, lr.membership — the quorum set. The proxy also
-	// bought nothing: on a genuinely fresh reader markerIndex and
+	// Gating both behind a "has this reader been used" proxy such as
+	// `lr.membership.ConfigChangeID != 0 || lr.state.Commit != 0` would be a
+	// guess: ConfigChangeID 0 and Commit 0 are perfectly legal values for a
+	// replica that has recovered from a snapshot and not yet committed anything
+	// of its own, and for that replica the guess would switch BOTH guards off,
+	// letting a stale snapshot overwrite the recorded one and, with it,
+	// lr.membership — the quorum set. Such a proxy would also buy nothing: on a genuinely fresh reader markerIndex and
 	// snapshot.Index are both 0, which makes each guard inert on its own terms.
 	//
 	// The marker check alone is insufficient for CreateSnapshot: compaction

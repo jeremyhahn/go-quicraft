@@ -43,7 +43,7 @@ func (s *slowUnloadApplier) Apply(entries []proto.Entry, results []sm.Result) er
 	return nil
 }
 
-// TestEngine_UnloadNode_WaitsForInFlightApply is the H7 regression test:
+// TestEngine_UnloadNode_WaitsForInFlightApply is a regression test:
 // Engine.UnloadNode must be synchronous end-to-end. A slow SM.Apply that is
 // in flight when UnloadNode is called must COMPLETE before UnloadNode
 // returns — otherwise the caller (Host.StopShard) closes the state machine

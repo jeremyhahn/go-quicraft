@@ -114,11 +114,11 @@ func (r *dropCountRecorder) IncUnauthorizedMessageDropped(uint64, uint64, string
 	r.drops.Add(1)
 }
 
-// TestHandleMessage_DropWarningsAreRateLimited: every drop in the
-// authorization path used to write its own Warn line. A batch carries up to
-// proto.MaxMessagesPerBatch messages, so one frame from a peer the shard does
-// not admit wrote thousands of synchronous lines. The warning is sampled; the
-// counter still records every drop.
+// TestHandleMessage_DropWarningsAreRateLimited: a batch carries up to
+// proto.MaxMessagesPerBatch messages, so a Warn line per drop in the
+// authorization path would let one frame from a peer the shard does not admit
+// write thousands of synchronous lines. The warning is sampled; the counter
+// still records every drop.
 func TestHandleMessage_DropWarningsAreRateLimited(t *testing.T) {
 	eng, h, _ := newMedlowHandlerFixture(t)
 	const shardID, localReplicaID, peerReplicaID = uint64(7), uint64(1), uint64(2)
@@ -307,8 +307,8 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	// PER-ITERATION, and this module declares go 1.27.0, so each goroutine
 	// closes over its own copy. Under pre-1.22 semantics the same code writes
 	// through a shared variable and can panic on errs[8]; that is the footgun
-	// the language change removed, and it is why a reviewer reading this out of
-	// version context flags it (recorded here after it was raised on PR #59).
+	// the language change removed, and it is why a reader out of version
+	// context may flag it.
 	for i := 0; i < receivers; i++ {
 		wg.Add(1)
 		go func() {

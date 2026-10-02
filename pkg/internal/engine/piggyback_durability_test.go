@@ -235,10 +235,10 @@ func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 // obligations of the piggyback SaveState failure path.
 //
 // The path is documented as SELF-HEALING, and that is true of the entries: the
-// processed marker has not moved, so they are re-offered. It was NOT true of
-// the hard state. GetPiggybackUpdate used to advance prevState before the
-// engine attempted the persist, so a failed SaveState left the peer believing a
-// term/vote it had never written was durable. hasStateChanged() then reported
+// processed marker has not moved, so they are re-offered. It holds for the
+// hard state only if GetPiggybackUpdate does not advance prevState before the
+// engine attempts the persist: otherwise a failed SaveState leaves the peer
+// believing a term/vote it had never written was durable. hasStateChanged() then reported
 // no change, a later update could be ReadOnly, and the step worker's ReadOnly
 // bypass transmits messages with no LogDB write at all — a granted vote leaving
 // the replica with nothing on disk to stop it voting again after a crash.

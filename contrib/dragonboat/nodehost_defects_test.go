@@ -96,7 +96,7 @@ func TestRequestState_ReleaseWithoutRead_DoesNotStealSuccessorResult(t *testing.
 	// Releasing a RequestState without reading its result recycles the
 	// pooled inner object. The next proposal receives the recycled
 	// object; its result must reach the new wrapper, never the released
-	// one. Iterate to give a stale bridge (the pre-fix behavior) many
+	// one. Iterate to give a stale bridge many
 	// chances to steal.
 	for i := 0; i < 200; i++ {
 		abandoned, err := nh.Propose(session, []byte("abandoned"), 5*time.Second)
@@ -471,9 +471,8 @@ func TestNewNodeHost_RejectsInvalidConfig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// H4: quicraft's not-leader error must never reach the caller as
-// ErrNotLeader, an error dragonboat does not have and IsTempError used to
-// reject.
+// quicraft's not-leader error must never reach the caller as ErrNotLeader, an
+// error dragonboat does not have and IsTempError would reject.
 // ---------------------------------------------------------------------------
 
 func TestNodeHost_NotLeaderSurfacesAsShardNotReady(t *testing.T) {
@@ -494,10 +493,9 @@ func TestNodeHost_NotLeaderSurfacesAsShardNotReady(t *testing.T) {
 	session := nh.GetNoOPSession(7)
 	_, err := nh.Propose(session, []byte("cmd"), time.Second)
 	if err == nil {
-		// This used to be a t.Skip, which disarmed the whole test: the ONE
-		// outcome that makes the three assertions below unreachable was
-		// treated as a reason not to run them, so the H4 regression was
-		// covered only for as long as nothing else broke first. And the
+		// This is a failure, not a t.Skip, which would disarm the whole test:
+		// the ONE outcome that makes the three assertions below unreachable
+		// must not be treated as a reason not to run them. And the
 		// skipped outcome is not a benign "path not exercised" -- replica 2
 		// was started with join=true, so it is in no committed configuration
 		// and has no leader. A proposal it ACCEPTS is a raft safety defect on
@@ -761,24 +759,23 @@ func TestRequestState_ResultC_AggregatesCommittedThenApplied(t *testing.T) {
 }
 
 // TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered
-// deterministically targets the exact race window #13 was about, instead of
+// deterministically targets the commit-notification race window, instead of
 // relying on production goroutine scheduling the way
 // TestRequestState_ResultC_AggregatesCommittedThenApplied does (that test
 // calls ResultC immediately after Propose, so whether the commit
 // notification has actually landed on the source channel by the time the
-// aggregator's select runs is a scheduling accident -- it reproduced the
-// pre-fix bug in only ~2% of individual runs under mutation testing).
+// aggregator's select runs is a scheduling accident -- under mutation testing
+// it catches a relay-bridge design in only ~2% of individual runs).
 //
 // Each iteration busy-waits until BOTH rs.inner.CommittedC() and
 // rs.CompletedC already have a buffered value -- i.e. the source-of-truth
 // channels are populated with zero remaining asynchronous hop -- before
 // ResultC is called for the first time. A relay bridge reading a separate,
-// not-yet-relayed output channel (the pre-fix design) would need its own
-// extra goroutine schedule to catch up and could still lose the commit
-// notification here; reading the source directly (the fix) cannot. Under
-// mutation testing this raised the pre-fix per-iteration failure rate to
-// ~39%; the test loops enough iterations in one run (independently
-// verified: <1-in-10000 chance of a false pass against the pre-fix code)
+// not-yet-relayed output channel would need its own extra goroutine
+// schedule to catch up and could still lose the commit notification here;
+// reading the source directly cannot. Under mutation testing a relay bridge
+// fails ~39% of iterations; the test loops enough iterations in one run
+// (<1-in-10000 chance of a false pass against a relay bridge)
 // that a single `go test` invocation reliably catches a regression without
 // depending on an external -count flag.
 func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered(t *testing.T) {
@@ -805,10 +802,10 @@ func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffere
 
 		// Both source channels are buffered now; ResultC is called for the
 		// very first time only after this point, so its aggregator
-		// goroutine (and, in the pre-fix design, the separate
+		// goroutine (and, in a relay-bridge design, the separate
 		// commit-bridge goroutine) starts from a cold, unscheduled state
 		// racing against already-ready data -- exactly the scenario that
-		// dropped the commit notification.
+		// can drop the commit notification.
 		resultC := rs.ResultC()
 
 		select {

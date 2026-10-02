@@ -82,10 +82,10 @@ func TestSealedRootKeyTypeAlias(t *testing.T) {
 // valid Barrier instance, confirming the re-export from pkg/seal is wired
 // correctly.
 //
-// The nil check that stood here went with the var. These re-exports are declared
-// functions now (#95), so `NewBarrier == nil` is a vet failure — "comparison of
-// function NewBarrier == nil is always false" — and being unreassignable is the
-// whole point of the change.
+// There is no nil check: these re-exports are declared functions, so
+// `NewBarrier == nil` is a vet failure — "comparison of function NewBarrier ==
+// nil is always false" — and being unreassignable is the point of declaring
+// them as functions.
 func TestNewBarrierReexport(t *testing.T) {
 	cfg := BarrierConfig{
 		Algorithm: seal.AlgAES256GCM,
@@ -130,11 +130,11 @@ func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
 	})
 }
 
-// TestNewCredentialsReexport covers the gap #95 closed: Credentials is
-// re-exported above, but #41 retyped its Secret field to an
-// *enclave.SealedEnclave, and seal.NewCredentials — which was NOT re-exported —
-// became the only supported way to populate one. The shim therefore exposed a
-// type its own consumers could not construct.
+// TestNewCredentialsReexport covers the constructor re-export: Credentials is
+// re-exported above, and its Secret field is an *enclave.SealedEnclave, so
+// seal.NewCredentials is the only supported way to populate one. Without the
+// re-export the shim would expose a type its own consumers could not
+// construct.
 //
 // The delegation must carry NewCredentials's contract intact, including the part
 // a caller is most likely to depend on and least likely to notice missing: the

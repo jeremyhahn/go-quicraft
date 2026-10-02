@@ -24,15 +24,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
 )
 
-// TestUnsealRootKeyProtected_ReturnsFrozenPages pins the property #54 stage two
-// changed the mechanism of and must not have lost.
+// TestUnsealRootKeyProtected_ReturnsFrozenPages pins that the unsealed root key
+// is returned in frozen (read-only) pages.
 //
 // UnsealRootKeyProtected's contract is that it hands back a key to READ and
 // destroy, not a buffer to edit: a stray write through a retained slice must
-// fault rather than silently corrupt the root key. It used to get that by
-// decrypting into a sized enclave and MOVING the result into a second,
-// from-bytes one — two locked regions and a copy — because go-enclave had no
-// post-fill freeze. It now decrypts into one region and calls Freeze on it.
+// fault rather than silently corrupt the root key. It decrypts into one sized
+// region and calls Freeze on it — one locked region and no copy.
 //
 // A missing Freeze is invisible to every other assertion in this package: the
 // key still round-trips, Size and EqualTo still agree, and the only difference
@@ -117,14 +115,13 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 }
 
 // TestRootKeyProtected_ReturnsFrozenPages is the same property on the barrier's
-// own accessor, which did not have it (#95).
+// own accessor.
 //
-// RootKeyProtected returned enclave.SealedEnclave.Open's result unchanged, and
-// Open allocates a SIZED enclave — writable for its whole lifetime, because a
+// enclave.SealedEnclave.Open allocates a SIZED enclave — writable for its whole lifetime, because a
 // sized enclave exists to be filled. This accessor has nothing to fill: it hands
 // a caller a key to read and destroy, exactly as UnsealRootKeyProtected above
-// does. The two differing was an inconsistency nobody had stated a reason for,
-// and the cost of it is not hypothetical: a consumer that retains the borrowed
+// does, so it freezes Open's result before returning it. The cost of a writable
+// result is not hypothetical: a consumer that retains the borrowed
 // slice past its window — the precise bug Freeze exists to turn into a fault —
 // rewrites the root key it is about to derive a wrapping key from, every read
 // succeeds, and the corruption surfaces as an unexplained ErrDecryptionFailed
@@ -150,9 +147,9 @@ func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 	}
 
 	// THE CONTROL, and it is what makes this an A/B rather than an assertion
-	// about the accessor alone. b.rootKey.Open() is precisely what
-	// RootKeyProtected used to return; asking the kernel about THAT region shows
-	// the writable mapping the fix removes, so a reader can see both states in
+	// about the accessor alone. b.rootKey.Open() is what RootKeyProtected would
+	// return without its Freeze; asking the kernel about THAT region shows the
+	// writable mapping the Freeze removes, so a reader can see both states in
 	// one run rather than taking the mutation note on trust.
 	unfrozen, err := b.rootKey.Open()
 	if err != nil {

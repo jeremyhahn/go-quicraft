@@ -138,13 +138,12 @@ func TestMembershipBufferTooSmallUnmarshal(t *testing.T) {
 
 // TestMembershipAddressTooLong pins the address bound at BOTH ends.
 //
-// The read half is the original assertion. The write half is what closes the
-// DURABLE hole: Host.StartShard copies the caller's members map straight into
+// The write half is what closes the DURABLE hole: Host.StartShard copies the caller's members map straight into
 // Addresses and commits the marshaled result as the EntryInitialMembership at
-// log index 1, so an encoder that emitted this produced a bootstrap entry the
-// next start could not decode — and StartShard then aborted forever, on data the
-// shard itself wrote. The buffer for the read half is built by hand because the
-// encoder now refuses to produce it, which is exactly the fix.
+// log index 1, so an encoder that emitted this would produce a bootstrap entry
+// the next start could not decode — and StartShard would then abort forever, on
+// data the shard itself wrote. The buffer for the read half is built by hand
+// because the encoder refuses to produce it.
 func TestMembershipAddressTooLong(t *testing.T) {
 	longAddr := strings.Repeat("x", MaxAddressLength+1)
 	m := Membership{

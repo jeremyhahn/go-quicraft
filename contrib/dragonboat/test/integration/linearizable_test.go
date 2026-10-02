@@ -361,8 +361,8 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// how quickly the reader gets its 50 reads, and concurrentPhaseBudget is
 	// the point past which it gives up waiting for them.
 	//
-	// Three seconds used to be a DEADLINE: the phase ran for exactly that long
-	// and then asserted that at least 50 reads had landed inside it. That is a
+	// Three seconds is not a DEADLINE: running the phase for exactly that long
+	// and then asserting that at least 50 reads had landed inside it would be a
 	// throughput assertion wearing a correctness assertion's clothes, and on a
 	// saturated host it fails without anything being wrong. Measured on 24
 	// cores at load average 170-205: the same reader that completes 700-1100
@@ -371,14 +371,14 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// because each one took most of a second. Nothing about linearizability
 	// was ever in question.
 	//
-	// So three seconds is now the floor and the budget is the deadline. On a
-	// quiet machine the phase is three seconds and roughly a thousand reads,
-	// exactly as before — the monotonicity check is a sampling check and this
+	// So three seconds is the floor and the budget is the deadline. On a
+	// quiet machine the phase is three seconds and roughly a thousand reads —
+	// the monotonicity check is a sampling check and this
 	// keeps its sample size. On a starved machine the phase runs on past three
 	// seconds until it has the 50 reads its conclusions rest on, instead of
 	// stopping on the clock and reporting the shortfall as a defect.
 	//
-	// The budget is what remains of the old assertion's teeth: an
+	// The budget is the assertion's teeth: an
 	// implementation that cannot produce 50 good reads and one observed write
 	// in this long fails, and says so in terms of the shard rather than of the
 	// clock. It is written in election rounds so that it tracks ElectionRTT
@@ -396,9 +396,9 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	//
 	// A ReadIndex refused because the shard has no leader is refused in
 	// microseconds, so an un-throttled reader retries it tens of thousands of
-	// times per second. That is where "4252 errors against 85 successes" in
-	// #115 came from: not a 50:1 failure rate, but a tight loop measuring how
-	// fast it can spin through one leaderless window. One Raft tick is the
+	// times per second, so a count like "4252 errors against 85 successes" is
+	// not a 50:1 failure rate, but a tight loop measuring how fast it can spin
+	// through one leaderless window. One Raft tick is the
 	// finest granularity at which the shard's leadership can actually change,
 	// so retrying faster than that only burns a core the host has already run
 	// out of and inflates a counter into a number that looks like a defect.
@@ -495,10 +495,10 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 			default:
 			}
 
-			// tryReadFromLeader, not a pinned SyncRead: the reader used to
-			// poll the replica that accepted the seed, so every leadership
-			// move turned into a run of counted errors that said nothing
-			// about linearizability. It must be the Try form -- this is a
+			// tryReadFromLeader, not a pinned SyncRead: polling the replica
+			// that accepted the seed would turn every leadership move into a
+			// run of counted errors that said nothing about
+			// linearizability. It must be the Try form -- this is a
 			// goroutine and must not touch t. The counters below stay
 			// meaningful: what the helper absorbs is the not-leader refusal,
 			// which was never evidence of a defect, and everything that IS
@@ -628,7 +628,7 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// error taken while a leader is sitting right there, and every one is
 	// still caught.
 	//
-	// What it counted before, and must not, is a read refused because the
+	// What it must not count is a read refused because the
 	// shard genuinely had NO leader. Under CPU starvation a three-node shard
 	// on this configuration does lose its leader — an election timeout is 500ms
 	// of ticks, and a starved tick is late — and for the length of that window
@@ -638,10 +638,10 @@ func TestIntegration_DB_LinearizableRead_ConcurrentWritesAndReads(t *testing.T) 
 	// that against the engine asserts that Raft never holds an election, which
 	// is not a property Raft has.
 	//
-	// #115 measured the difference: of 6691 errors in one run, 6691 were taken
-	// with findLeader() == -1 — no replica anywhere considered itself leader —
-	// and 0 with a leader present. The old assertion was reading a leaderless
-	// window as an engine defect.
+	// Measured: of 6691 errors in one run, 6691 were taken with
+	// findLeader() == -1 — no replica anywhere considered itself leader — and 0
+	// with a leader present. Counting them all reads a leaderless window as an
+	// engine defect.
 	if ledFailures >= reads {
 		t.Fatalf("linearizable reads failed more often than they succeeded WHILE THE SHARD HAD A LEADER: "+
 			"%d such errors vs %d successes (%d errors total, so %d were taken during a leaderless "+

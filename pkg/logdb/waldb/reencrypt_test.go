@@ -248,7 +248,7 @@ func soleSegmentRel(t *testing.T, dir string, shardID uint64) string {
 	return filepath.Join(shardDir, filepath.Base(matches[0]))
 }
 
-// TestReencrypt_EntriesDurableBeforeState is the M3 regression test.
+// TestReencrypt_EntriesDurableBeforeState is a regression test.
 //
 // Reencrypt writes the destination WAL through a sequence of independently
 // fsynced SaveState calls, so the destination's durable record order IS that
@@ -529,7 +529,7 @@ func writeLegacyBootstrap(t *testing.T, db *DB, shardID, replicaID uint64, bs lo
 	}
 }
 
-// TestReencrypt_PreservesBootstrapDataDirProvenance is the H4 regression test.
+// TestReencrypt_PreservesBootstrapDataDirProvenance is a regression test.
 //
 // Reencrypt copied the bootstrap record through SaveBootstrap, which
 // unconditionally stamps DataDirRecorded true (the field is a property of the

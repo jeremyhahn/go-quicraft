@@ -36,9 +36,7 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 	t.Logf("concurrent SM cluster leader at node[%d]", leaderIdx)
 
 	// Warmup entry required after election (PhD 6.4). The read pass at the end
-	// used to be pinned to the replica that accepted this entry, because a
-	// direct SyncRead had no better target; it re-resolves now, so the host is
-	// no longer kept.
+	// re-resolves the leader, so the host that accepted this entry is not kept.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("warmup", "ok")
 	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
@@ -118,9 +116,7 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 	t.Logf("on-disk SM cluster leader at node[%d]", leaderIdx)
 
 	// Warmup entry required after election (PhD 6.4). The read pass at the end
-	// used to be pinned to the replica that accepted this entry, because a
-	// direct SyncRead had no better target; it re-resolves now, so the host is
-	// no longer kept.
+	// re-resolves the leader, so the host that accepted this entry is not kept.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("warmup", "ok")
 	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)

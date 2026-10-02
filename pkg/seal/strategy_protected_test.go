@@ -183,8 +183,7 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 // The plaintext length is a function of a blob nobody has authenticated yet, and
 // the enclave allocation is sized from it, so an oversized blob is a remote way
 // to drain a process-wide resource unless the length is refused BEFORE anything
-// is locked (Codex review of #40). Under memguard it was a remote kill switch: a
-// lock that could not be taken terminated the process.
+// is locked.
 //
 // The ORDERING is what this test pins, not merely the refusal: the payload here
 // is zeroes, so a check placed after the decrypt would report
@@ -481,7 +480,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 
 	// The enclave is validated even though its contents are never read: a
 	// caller that destroyed or lost its root key before sealing must learn so
-	// here, not at an unseal it can no longer perform (Codex review of #40).
+	// here, not at an unseal it can no longer perform.
 	t.Run("refuses a root key it cannot vouch for", func(t *testing.T) {
 		destroyed := mustSized(t, rootKeySize)
 		destroyed.Destroy()
@@ -515,17 +514,17 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 }
 
 // TestNewProtectedCredentials_IsNewCredentials holds the deprecated shim to the
-// contract it delegates to, now that it is a FUNCTION rather than
-// `var NewProtectedCredentials = NewCredentials` (#95).
+// contract it delegates to. It is a declared FUNCTION rather than a
+// `var NewProtectedCredentials = NewCredentials`, so no package can reassign
+// it.
 //
-// The reassignability the change removes has no runtime witness — a func value
-// and a declared func are indistinguishable once called — so the compile-time
-// half is verified out of band and recorded on the PR: a package assigning to
-// any of the five converted names now fails to build with "cannot assign to
+// That non-reassignability has no runtime witness — a func value and a
+// declared func are indistinguishable once called — and is enforced by the
+// compiler: a package assigning to it fails to build with "cannot assign to
 // seal.NewProtectedCredentials (neither addressable nor a map index
-// expression)", and the same file compiled cleanly against the previous commit.
-// What a test CAN hold is that turning the alias into a wrapper did not change
-// what it does, which is the half a future edit could plausibly get wrong.
+// expression)". What a test CAN hold is that the wrapper does exactly what
+// NewCredentials does, which is the half a future edit could plausibly get
+// wrong.
 func TestNewProtectedCredentials_IsNewCredentials(t *testing.T) {
 	t.Run("moves the secret and wipes the caller's slice", func(t *testing.T) {
 		secret := []byte("a-passphrase-long-enough-to-pass")

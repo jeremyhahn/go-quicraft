@@ -359,10 +359,10 @@ func writeLegacyShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, 
 	writeMetaFile(t, dir, legacyMetaRecord(size, index, 1, shardID, replicaID, 1, 0, 0))
 }
 
-// TestSnapshotFloorScan_ReportsEveryBlockingDirectory pins the diagnostic half
-// of the fix. The scan's VERDICT is settled by the first directory it cannot
-// evaluate, but it must still visit the rest: returning early meant the
-// operator log named one directory, and the next scan named the next, so a host
+// TestSnapshotFloorScan_ReportsEveryBlockingDirectory pins the scan's
+// diagnostics. The scan's VERDICT is settled by the first directory it cannot
+// evaluate, but it must still visit the rest: returning early would mean the
+// operator log names one directory, and the next scan named the next, so a host
 // with several legacy directories never learned what was actually holding key
 // purging off.
 func TestSnapshotFloorScan_ReportsEveryBlockingDirectory(t *testing.T) {
@@ -487,10 +487,10 @@ func TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier(t *testing.T) {
 	}
 }
 
-// TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase is the Codex review
-// finding #2, in the PRODUCTION layout: every shard has its own snapshot base
+// TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase covers a stopped
+// shard in the PRODUCTION layout: every shard has its own snapshot base
 // (…/snapshots/shard-N), so a stopped shard's artifacts sit under a base no
-// loaded node owns. The floor used to scan loaded bases only and came out at
+// loaded node owns. A floor that scanned loaded bases only would come out at
 // the loaded shard's epoch 8 — purging epoch 7, which the stopped shard's
 // recorded snapshot needs, and making its restart fail closed on decrypt
 // forever. The LogDB's record of that snapshot must hold the floor at 7.

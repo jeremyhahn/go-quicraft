@@ -138,17 +138,15 @@ type walContextBarrier interface {
 	ContextBindingResolved() bool
 }
 
-// legacyContextBarrier is the method set walContextBarrier had BEFORE
-// ContextBindingResolved was added to it. It exists only to make the assertion
-// failure diagnosable.
+// legacyContextBarrier is walContextBarrier without ContextBindingResolved. It
+// exists only to make the assertion failure diagnosable.
 //
 // The assertion is on the dynamic type, so an out-of-tree barrier that
-// satisfied the old set — which is every embedder that wrote one against the
-// previous release — now fails it and gets a hard startup failure. "Barrier
-// does not support context-bound encryption" is actively misleading in that
-// case: the barrier supports it perfectly well and is missing one reporting
-// method. Naming the method turns a mystifying refusal to boot into a one-line
-// fix. See docs/operations/compatibility.md.
+// implements context-bound encryption but not ContextBindingResolved fails it
+// and gets a hard startup failure. "Barrier does not support context-bound
+// encryption" is actively misleading in that case: the barrier supports it
+// perfectly well and is missing one reporting method. Naming the method turns
+// a mystifying refusal to boot into a one-line fix. See docs/compatibility.md.
 type legacyContextBarrier interface {
 	EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
 	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
@@ -668,26 +666,22 @@ func createWALRoot(o dbOptions, dir string) error {
 //   - The directory holds segments. Those bytes were written by a build that
 //     predates the marker, and therefore predates the durability sequence in the
 //     chunk header, so this build cannot parse them. Refuse
-//     (ErrWALFormatMissing). This is a change of posture from when the marker
-//     recorded only the block size: an unmarked populated directory used to be
-//     adopted once recovery had proved its geometry, because being unmarked was
-//     merely the status quo ante. It no longer is — guessing the record framing
+//     (ErrWALFormatMissing) rather than adopt: guessing the record framing
 //     wrong does not produce a detectable mismatch, it produces an empty clean
 //     prefix that the torn-tail repair truncates the whole log to.
 //   - The directory holds no segments. This process defines its format, so the
 //     marker is written NOW, before the first segment exists.
 //
-// The ordering is the point. Stamping after the shards were opened left a window
-// — a crash, or merely a failed stamp — in which segments existed with no marker
-// above them, which the rule above then reads as a pre-marker directory and
-// refuses FOREVER. Writing the marker first closes it: either the marker is
+// The ordering is the point. Stamping after the shards were opened would leave a
+// window — a crash, or merely a failed stamp — in which segments existed with no
+// marker above them, which the rule above then reads as a pre-marker directory
+// and refuses FOREVER. Writing the marker first closes it: either the marker is
 // there and segments may follow, or nothing was written at all.
 //
-// A stamp failure is fatal for the same reason. It used to be logged and ignored,
-// on the grounds that refusing an otherwise healthy WAL over a 16-byte metadata
-// file was the worse outcome. With the marker also recording the record framing
-// that trade reverses: proceeding would create segments this build could never
-// prove the format of, bricking the directory on the next Open with no record of
+// A stamp failure is fatal for the same reason. Refusing an otherwise healthy
+// WAL over a 16-byte metadata file looks like the worse outcome, but the marker
+// records the record framing: proceeding would create segments this build could
+// never prove the format of, bricking the directory on the next Open with no record of
 // why. Failing here leaves the directory empty and names the cause.
 //
 // Under noSync (tests only) createWALRoot leaves the root to be created lazily by
@@ -1278,8 +1272,9 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 	return nil
 }
 
-// reconcileCompactionFloors repairs (or refuses) a recovered state whose entry
-// index starts ABOVE the recovered compaction floor.
+// reconcileCompactionFloors repairs a recovered state whose entry index starts
+// ABOVE the recovered compaction floor, when a recorded snapshot explains the
+// gap, and leaves it unchanged otherwise.
 //
 // The floor is durable only as a WAL marker record, but its effect — the segment
 // holding the compacted entries being unlinked — is irreversible. Tear the block
@@ -1289,9 +1284,8 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 // That state FAILS OPEN, which is what makes it dangerous: the index itself is
 // self-consistent (a missing PREFIX keeps span == count, unlike an interior hole),
 // so EntryRange accepts it and the node starts. Reads below the real floor then
-// return ErrLogGapDetected instead of ErrCompacted — and db.go's own comment on
-// the monotonic guard spells out the consequence: "raft would never fall back to
-// InstallSnapshot". The regressed floor also defeats that guard, so a LOWER floor
+// return ErrLogGapDetected instead of ErrCompacted, and raft would never fall
+// back to InstallSnapshot (see the monotonic guard in RemoveEntriesTo). The regressed floor also defeats that guard, so a LOWER floor
 // can afterwards be accepted and made durable.
 //
 // The floor is re-derived from the REBUILT INDEX (firstIndex-1), never from the
@@ -1302,10 +1296,14 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 //
 // The snapshot is the VALIDITY CHECK on that derivation, not its source: the
 // advance is accepted only when a recorded snapshot actually covers the missing
-// prefix. Otherwise the prefix is unexplained data loss, and deriving a floor
-// from the index would let it masquerade as legitimate compaction — a replica
-// would then acknowledge entries whose state nothing ever captured. That case
-// fails closed, loudly.
+// prefix. Otherwise the floor is left UNCHANGED: deriving one from the index
+// would let an unexplained missing prefix masquerade as legitimate compaction,
+// so that a replica would acknowledge entries whose state nothing ever
+// captured. It is not an error either, because an absent prefix with no
+// covering snapshot is indistinguishable from a node that legitimately starts
+// at a high index; reads below the first index keep reporting
+// ErrLogGapDetected. Failing that case closed would need the floor to be
+// durable independently of one WAL block, which is a format change.
 func (s *walShard) reconcileCompactionFloors() error {
 	for key, idx := range s.indexes {
 		first, _, count := idx.Bounds()
@@ -1322,9 +1320,6 @@ func (s *walShard) reconcileCompactionFloors() error {
 		// Deliberately NOT an error otherwise: an absent prefix with no snapshot
 		// is INDISTINGUISHABLE from a node that legitimately starts at a high
 		// index, and rejecting it would refuse to start healthy replicas.
-		// Making that case fail closed needs the
-		// floor to be durable independently of one WAL block, which is a format
-		// change, not a recovery heuristic.
 		derived := first.Index - 1
 		snap, ok := s.snapshots[key]
 		if !ok || snap.Index < derived {
@@ -1709,10 +1704,10 @@ var ErrRecordSequenceRegression = errors.New("waldb: WAL record durability seque
 // ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
 // ErrRecordSequenceRegression all work.
 //
-// It used to be reachable from an ordinary power loss, because a torn
-// multi-block write and rot below acknowledged data were indistinguishable. The
-// durability sequence separated them, and the torn write now repairs itself, so
-// reaching this error means damage that an interrupted write does not explain.
+// An ordinary power loss does not reach it: the durability sequence separates
+// a torn multi-block write from rot below acknowledged data, and recovery
+// repairs the torn write itself, so reaching this error means damage that an
+// interrupted write does not explain.
 type SegmentCorruptionError struct {
 	// ShardIndex is the WAL shard directory holding the segment.
 	ShardIndex int
@@ -1736,8 +1731,9 @@ func (e *SegmentCorruptionError) Error() string {
 		"); if the loss is acceptable, authorize it with waldb.Repair"
 }
 
-// Unwrap returns the sentinel so errors.Is against ErrMidSegmentCorruption or
-// ErrNonFinalSegmentCorruption holds.
+// Unwrap returns the sentinel so errors.Is against ErrMidSegmentCorruption,
+// ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost or
+// ErrRecordSequenceRegression holds.
 func (e *SegmentCorruptionError) Unwrap() error {
 	return e.Err
 }
@@ -1852,7 +1848,7 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 	return skipped, "", nil
 }
 
-// Entry encoding layout (payloadTypeEntries, format V3):
+// Entry encoding layout (payloadTypeEntries):
 // [ShardID:8][ReplicaID:8][Index:8][Term:8][Type:8]
 // [Key:8][ClientID:8][SeriesID:8][RespondedTo:8][OwnerID:8][CmdLen:4][Cmd:N]
 const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 84 bytes
@@ -2046,9 +2042,7 @@ const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 // It is 1 because the project is PRE-RELEASE and every format in the repository
 // is pinned at 1 until the first production release: a layout change is made in
 // place, the consuming repos are rebuilt to match, and development clusters are
-// wiped and re-synced rather than migrated. Earlier development commits wrote
-// other layouts under other numbers; those bytes are gone with the clusters that
-// held them. See the compatibility contract in the proto package comment.
+// wiped and re-synced rather than migrated. See the compatibility contract in the proto package comment.
 const membershipSectionV1 byte = 1
 
 // membershipSectionVersion is the layout revision this binary WRITES for the
@@ -3172,34 +3166,26 @@ func (db *DB) Name() string {
 // This reduces the number of fsyncs from O(records) to O(shards), where
 // shards <= DefaultShardCount.
 //
-// Cross-shard atomicity:
+// Failure handling:
 //
-// SaveState is NOT atomic across shards. If a write error occurs mid-batch
-// (e.g., writing the 3rd of 5 shard updates fails), shards that were
-// written before the failure have records buffered in their WAL segments
-// but NOT fsynced (phase 2 is never reached). On crash, these buffered
-// records are lost because the OS page cache is not durable. On a
-// non-crashing error return, the caller sees the error and the buffered
-// records remain in memory until the next successful sync or process exit.
-//
-// This partial-write behavior is safe for Raft because:
-//
-//  1. Raft re-proposes uncommitted entries on leader election, so any
-//     entries lost due to a crash after a partial write are retransmitted.
-//  2. Individual shard WAL records are self-describing with CRC32
-//     checksums, so torn writes within a single record are detected and
-//     the record is discarded on recovery. This guarantees per-record
-//     atomicity even when cross-shard atomicity is not provided.
-//  3. Hard state (Term, Vote, Commit) is idempotent to replay: writing
-//     the same or newer hard state on recovery is always correct.
-//
-// Cleanup of already-written records on mid-batch failure is not feasible
-// because WAL segments are append-only by design. Truncation would
-// require tracking per-shard write offsets before the batch and rolling
-// back on error, adding complexity and reducing performance on the hot
-// path for a scenario that Raft's recovery protocol already handles.
-// This is the same design trade-off made by dragonboat and most WAL
-// implementations.
+//   - A write failure in phase 1 (e.g., writing the 3rd of 5 shard updates
+//     fails) rolls back EVERY shard the batch touched. Each shard's segment
+//     state is checkpointed before its first write, and rollbackBatch rewinds
+//     the segment to that checkpoint (segment.DiscardPending, or a
+//     multi-segment rollback if the batch rotated), so no record of the failed
+//     batch survives for a later Sync to make durable. In-memory state is
+//     untouched, since phase 3 never runs. If a rollback itself fails, the
+//     returned *BatchWriteError carries both the write error and the discard
+//     errors.
+//   - A sync failure in phase 2 poisons the DB and returns ErrDBPoisoned: the
+//     records are written but not provably durable, and a rollback truncation
+//     could not be proven durable either.
+//   - A crash before phase 2 completes loses the batch's unsynced records, and
+//     a crash during it can leave some shards' records durable and others
+//     not: SaveState is NOT a single atomic commit across shards on the
+//     medium. That is safe for Raft because SaveState had not returned
+//     success, so nothing in the batch was acknowledged, and CRC32-framed
+//     records make a torn write detectable on recovery.
 func (db *DB) SaveState(updates []logdb.Update) error {
 	if err := db.writeGate(); err != nil {
 		return err

@@ -139,7 +139,7 @@ func (b *pinCountBarrier) snapshotCountsLocked() string {
 var _ SnapshotBarrier = (*pinCountBarrier)(nil)
 
 // TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch proves the
-// SUCCESS contract of the frame writer, which is the save path since #116:
+// SUCCESS contract of the frame writer, which is the save path:
 // every epoch it sealed a frame under is held with a net count of exactly
 // ONE when Close returns -- not zero, because saveSnapshot relies on the pin
 // surviving until the artifact's durable record exists, and not two, which
@@ -357,12 +357,12 @@ func (s *bulkThenFailSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writ
 	return s.err
 }
 
-// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero covers the one
-// way out of saveSnapshot that did not release the frame writer's epoch pins.
+// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero covers the way
+// out of saveSnapshot taken when the state machine's SaveSnapshot fails.
 //
-// Found in review of the #116 PR. When the state machine's SaveSnapshot returns
-// an error, saveSnapshot returned immediately; any frames already emitted had
-// registered their epoch as in-flight, and nothing ever deregistered them. The
+// Any frames already emitted have registered their epoch as in-flight, so an
+// early return that skipped the frame writer's release would leave them
+// registered forever. The
 // effect is not a lost error but a key-lifecycle one: PurgeEpochsBefore can
 // never retire a DEK that still has an in-flight reference, so the key material
 // is retained for the life of the process.
@@ -404,20 +404,16 @@ func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) 
 	barrier.assertBalanced(t, "saveSnapshot state-machine failure")
 }
 
-// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero covers the class of
-// leak three independent reviews of #116 found after the first fix.
+// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero covers every return
+// between the last frame being sealed and the end of saveSnapshot: fsync
+// failure, stat failure, MaxSnapshotSize exceeded, and the deferred writeback
+// error Linux reports at Close. Each must release the frame writer's epoch
+// pins.
 //
-// The first fix released the frame writer's epoch pins on the two error paths
-// it noticed — the state-machine save error and the snappy-close error — and
-// left the deferred release registered late, after fsync, stat, the size check
-// and Close had all succeeded. Four returns sat between the last frame being
-// sealed and that defer, and every one of them dropped the pins on the floor:
-// fsync failure, stat failure, MaxSnapshotSize exceeded, and the deferred
-// writeback error Linux reports at Close.
-//
-// Chasing individual returns is what produced that gap twice. The release is
-// now a single deferred call registered where the pins begin to exist, so it
-// covers every exit by construction. This test pins the property using the one
+// Releasing on individual error paths is fragile, because every later return
+// is a new way to drop the pins. The release is a single deferred call
+// registered where the pins begin to exist, so it covers every exit by
+// construction. This test pins the property using the one
 // of those four paths a test can trigger deterministically: an artifact that
 // exceeds MaxSnapshotSize.
 //

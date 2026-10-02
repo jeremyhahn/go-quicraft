@@ -247,7 +247,7 @@ func (c *testCluster) waitForLeader(t *testing.T, timeout time.Duration, skip ..
 	return 0
 }
 
-// TestRecovering_ClusterElectsLeaderWhileReplicasRecover is the C1
+// TestRecovering_ClusterElectsLeaderWhileReplicasRecover is a
 // regression test. Two of five replicas are held in snapshot recovery (the
 // recovering gate raised exactly as snapshotPool.handleRequest raises it
 // around RecoverFromSnapshot) and the leader is then killed, together with

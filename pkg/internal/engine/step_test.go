@@ -3555,7 +3555,7 @@ func TestStepWorker_CommitPendingInbox_HeartbeatsProcessedDuringCommitPending(t 
 }
 
 // ---------------------------------------------------------------------------
-// M10: Failed ReadIndex completes pending reads via OnReadIndexFailed
+// Failed ReadIndex completes pending reads via OnReadIndexFailed
 // ---------------------------------------------------------------------------
 
 // TestStepWorker_ReadIndexFailed_CompletesAllKeys verifies that when

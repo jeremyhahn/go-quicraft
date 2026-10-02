@@ -654,12 +654,11 @@ const (
 //     would let a full apply queue stall the step worker's Tick and, with it,
 //     leader heartbeats for every shard this worker owns.
 //
-// The lock is therefore released exactly where processBatch's explicit unlocks
-// released it before — the only change is that a defer now guarantees it. A
-// panic inside Peer.Commit (a corrupt log, a torn-down peer) previously leaked
-// node.raftMu: the commit worker recovers and restarts, the restarted worker
-// blocks forever on Lock(), and every shard it owns stops committing, taking
-// Host.Close (which joins the same worker) with it.
+// The lock is released by a defer, so a panic inside Peer.Commit (a corrupt
+// log, a torn-down peer) cannot leak node.raftMu. A leaked lock would be fatal:
+// the commit worker recovers and restarts, the restarted worker blocks forever
+// on Lock(), and every shard it owns stops committing, taking Host.Close (which
+// joins the same worker) with it.
 //
 // The update is taken by pointer purely to avoid copying a proto.Update on the
 // commit hot path; it is neither retained nor mutated here.
@@ -1092,9 +1091,8 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	// sending ordered responses. The entries this piggyback APPLIES are
 	// already fsynced — GetPiggybackUpdate clamps them to the peer's durable
 	// marker — but the commit-index advance was not part of any earlier
-	// SaveState. Skipping it (the old behavior) meant a crash could leave an
-	// on-disk state machine whose durable lastApplied exceeded the recovered
-	// HardState.Commit — violating lastApplied <= committed and risking
+	// SaveState. Skipping it would let a crash leave an on-disk state machine
+	// whose durable lastApplied exceeds the recovered HardState.Commit — violating lastApplied <= committed and risking
 	// re-apply. piggyback.State is that same clamped hard state, so persisting
 	// it never advertises a commit past the durable log.
 	if w.logdb != nil {

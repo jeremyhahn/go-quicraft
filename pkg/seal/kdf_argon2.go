@@ -22,10 +22,10 @@
 // checking a flag and declining to.
 //
 // Reading data sealed under Argon2id is the capability this costs, and it is
-// unchanged from the pre-existing runtime behaviour: a FIPS-mode process already
-// refused such a blob with ErrKDFNotFIPSApproved, because unsealing re-derives
-// the same wrapping key. A FIPS build now answers ErrKDFUnsupportedVersion
-// instead. The migration is the same either way — unseal once with a non-FIPS
+// the same capability FIPS runtime mode gives up: a FIPS-mode process refuses
+// such a blob with ErrKDFNotFIPSApproved, because unsealing re-derives the same
+// wrapping key, and a FIPS build answers ErrKDFUnsupportedVersion. The
+// migration is the same either way — unseal once with a non-FIPS
 // build and re-seal with NewSoftwareStrategyFIPS, which stamps KDFPbkdf2SHA256
 // into SealedRootKey.Metadata and unseals in either build. See
 // docs/seal-barrier/engineering.md ("FIPS: runtime mode vs. build tag").

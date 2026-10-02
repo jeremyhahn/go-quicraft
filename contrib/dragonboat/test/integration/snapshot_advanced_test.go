@@ -308,7 +308,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	}
 
 	// Get current membership to obtain the ConfigChangeID, through whichever
-	// replica leads now (#123).
+	// replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
 	// Create the 4th node on a new NodeHost.

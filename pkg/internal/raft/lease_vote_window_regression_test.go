@@ -29,14 +29,14 @@ import (
 // restart.
 //
 // The lease is sound while every ack it counts comes from a replica that will
-// help elect no one else until the lease has ended. That promise used to be
+// help elect no one else until the lease has ended. If that promise were
 // assumed from the LEADER's configuration, and kept by the follower's own
 // configuration and, after a restart, by a hold-down sized from the
-// configuration it restarted into. A follower configured with a shorter
+// configuration it restarted into, a follower configured with a shorter
 // election timeout, a shorter tick, no CheckQuorum or no LeaseRead — while
-// running, or only after a restart — made a weaker promise than the leader
-// counted on, and a new leader could be elected inside the old one's lease.
-// Now every ack states its window (voteWindow), the leader counts only acks
+// running, or only after a restart — would make a weaker promise than the
+// leader counted on, and a new leader could be elected inside the old one's
+// lease. So every ack states its window (voteWindow), the leader counts only acks
 // whose window covers its lease span (ackBacksLease), and the window is
 // recorded in the hard state before any ack makes it, so a restarted replica
 // honours it whatever it restarted into (armVoteHoldDown).
@@ -408,8 +408,8 @@ func ackedFollower(t *testing.T) *raft {
 // TestLeaseVotePromise_SurvivesAHigherTermMessage drives the reported
 // scenario: a follower acks leader L, then a delayed higher-term response
 // from an old campaign moves it to a new term with no known leader. The
-// known-leader tests no longer apply, and it used to grant the next
-// candidate's vote at once while L still counted its ack. The promise holds
+// known-leader tests no longer apply, so without the window it would grant the
+// next candidate's vote at once while L still counted its ack. The promise holds
 // in real time until the window has passed.
 func TestLeaseVotePromise_SurvivesAHigherTermMessage(t *testing.T) {
 	for _, preVote := range []bool{false, true} {

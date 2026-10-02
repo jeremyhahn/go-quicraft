@@ -102,11 +102,10 @@ const entryTypeReservedMask = ^(EntryTypeMask | EntryCompressFlag)
 // both write and read back: a known entry type in the low four bits, the
 // compression flag optionally set, and nothing else.
 //
-// It is shared by MarshalTo and UnmarshalFrom deliberately. The two used to
-// disagree — the decoder checked the enum and the encoder checked nothing — so
-// the package could emit an entry it refused to parse, and an entry is the one
-// thing here that is committed to the raft log before anyone tries to read it
-// back.
+// It is shared by MarshalTo and UnmarshalFrom deliberately. If the two
+// disagreed, the package could emit an entry it refused to parse, and an entry
+// is the one thing here that is committed to the raft log before anyone tries
+// to read it back.
 func isValidEntryType(t uint64) bool {
 	if t&entryTypeReservedMask != 0 {
 		return false

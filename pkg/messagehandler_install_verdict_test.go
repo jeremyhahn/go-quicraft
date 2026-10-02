@@ -62,10 +62,10 @@ func (d *stopAfterDeliver) DeliverLocalTo(node *engine.Node, msg proto.Message) 
 }
 
 // TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact: a
-// node stopped after the install is delivered used to be stepped anyway
-// (the step worker skipped only FAILED nodes) and adopt it, while the receive,
-// told "abandoned", deleted the artifact raft now depended on. A stopped node
-// now adopts nothing, and "abandoned" keeps the artifact.
+// node stopped after the install is delivered must not be stepped and adopt it
+// while the receive, told "abandoned", deletes the artifact raft would then
+// depend on. A stopped node adopts nothing, and "abandoned" keeps the
+// artifact.
 func TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact(t *testing.T) {
 	eng, h, _ := newMedlowHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -178,7 +178,7 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 // TestHandleSnapshot_StoppingShardStagesNothing: a stopped incarnation may
 // still hold an adopted-but-unrecorded install in its commit pipeline, and
 // that install's artifact is retained, unrecorded, at the canonical path. A
-// same-index retry against the stopping node used to reach the publish step,
+// same-index retry against the stopping node must not reach the publish step,
 // which reclaims any unrecorded directory there as an orphan — moments before
 // the old pipeline's record naming it lands. The receive is refused before
 // staging anything; the retry waits for the next incarnation, which UnloadNode
@@ -345,7 +345,7 @@ func (d *stopThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bo
 }
 
 // TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory: a receive that
-// published and then failed used to discard the canonical directory
+// published and then failed must not discard the canonical directory
 // unconditionally. On a node stopped in between, that directory may be named
 // by a record the stopped incarnation's commit pipeline is still writing — its
 // own adopted install at this index, which this receive's publish replaced —

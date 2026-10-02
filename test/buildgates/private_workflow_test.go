@@ -27,8 +27,8 @@ import (
 // .gitattributes export-ignores it, and fails t when rel is absent for any
 // other reason.
 //
-// The private forge and release workflow (the review and auto-merge
-// workflows, the release trust anchor) is export-ignored: it stays in the
+// The private forge and release workflow (the auto-merge workflow and the
+// release trust anchor) is export-ignored: it stays in the
 // private repository and is left out of every published export
 // (docs/release/public-releasability.md). A gate that reads one of those files
 // checks private machinery, so a published export has nothing for it to check,
@@ -77,7 +77,7 @@ func exportIgnoresExactly(t *testing.T, rel string) bool {
 // honest in the private repository: every file it may skip on is present here
 // AND export-ignored, so the skip can only ever fire in a published export.
 func TestPrivateWorkflowFilesAreExportIgnored(t *testing.T) {
-	for _, rel := range []string{".release-allowed-signers", ".github/workflows/claude-review.yml"} {
+	for _, rel := range []string{".release-allowed-signers"} {
 		if !exportIgnoresExactly(t, rel) {
 			t.Errorf("%s is read by a gate through requirePrivateWorkflowFile but .gitattributes "+
 				"does not export-ignore it; the gate would fail, not skip, in an export", rel)

@@ -34,17 +34,16 @@ import (
 // at all. That posture is right, and nothing here changes it — Open still
 // refuses, every time, on its own.
 //
-// What it cannot be is the ONLY exit. It used to be reachable from an ordinary
-// power loss: a single fdatasync covers as many WriteAt calls as the batch had
+// What it cannot be is the ONLY exit. An ordinary power loss does not arrive
+// here: a single fdatasync covers as many WriteAt calls as the batch had
 // blocks, writeback can persist an arbitrary subset of those pages, and losing
-// an interior page left decodable records above the damage. That case is now
-// distinguishable — every surviving record carries the in-flight batch's
-// generation, and recovery truncates and boots (see segment.ReadAll) — so it no
-// longer arrives here at all.
+// an interior page leaves decodable records above the damage — but every
+// surviving record carries the in-flight batch's generation, so recovery
+// truncates and boots (see segment.ReadAll).
 //
-// What remains is damage below acknowledged data: bit rot, a misdirected write,
-// a lying fsync, tampering. Rarer, and no longer explicable as an interrupted
-// write, but not impossible. "Restore from a peer" answers it for a replicated
+// What does arrive here is damage below acknowledged data: bit rot, a
+// misdirected write, a lying fsync, tampering. Rare, and not explicable as an
+// interrupted write, but not impossible. "Restore from a peer" answers it for a replicated
 // shard and answers nothing at all for a single-node deployment, which would be
 // left with a node that will not start and no procedure that makes it start.
 //
@@ -81,8 +80,8 @@ var ErrRepairNoCorruption = errors.New("waldb: the named WAL segment is not corr
 var ErrRepairOffsetMismatch = errors.New("waldb: repair offset is not the clean-prefix end of the named segment")
 
 // RepairTarget names exactly one truncation an operator authorizes. Every field
-// is copied from the RecoveryError that Open returned; see
-// MidSegmentCorruptionError, which reports all three.
+// is copied from the *SegmentCorruptionError that Open's RecoveryError wraps:
+// ShardIndex and SegmentID carry over by name, and TruncateAt is its CleanEnd.
 type RepairTarget struct {
 	// ShardIndex is the WAL shard holding the segment, in [0, DefaultShardCount).
 	ShardIndex int
@@ -116,8 +115,7 @@ type RepairResult struct {
 //
 // It is the documented exit from ErrMidSegmentCorruption,
 // ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
-// ErrRecordSequenceRegression. It must be run
-// with the database CLOSED — no
+// ErrRecordSequenceRegression. It must be run with the database CLOSED — no
 // process may hold the directory — and the node it belongs to should be treated
 // as having lost its most recent writes until it has caught up from its peers.
 // On a single-node deployment there is nothing to catch up from and the loss is

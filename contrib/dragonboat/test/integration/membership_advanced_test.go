@@ -58,7 +58,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 
 	// Every membership read and change below goes through whichever replica
 	// leads AT THAT MOMENT, never through the host observed above. Observing
-	// a leader does not pin it (#123): a config change on a host that has
+	// a leader does not pin it: a config change on a host that has
 	// since been re-elected is refused correctly, and through this adapter
 	// that refusal reads only "shard not ready".
 	initialID := cluster.membershipFromLeader(t, 1, membershipTimeout).ConfigChangeID
@@ -132,7 +132,7 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Get current membership, through whichever replica leads now (#123).
+	// Get current membership, through whichever replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if len(membership.Nodes) != 3 {
 		t.Fatalf("expected 3 nodes, got %d", len(membership.Nodes))
@@ -176,7 +176,7 @@ func TestIntegration_DB_SyncRequestAddReplica(t *testing.T) {
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 
-	// Get current membership, through whichever replica leads now (#123).
+	// Get current membership, through whichever replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
 	// Add replica 10 at a dummy address, through the current leader, and
@@ -205,7 +205,7 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	// Warmup entry.
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 
-	// Get current membership, through whichever replica leads now (#123).
+	// Get current membership, through whichever replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
 	// Add non-voting replica 20 at a dummy address, through the current

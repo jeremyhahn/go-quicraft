@@ -151,14 +151,10 @@ func requireConflict(t *testing.T, err error) *membershipConflictError {
 
 // postDeliverySubmitted is what the adapter produces when leadership moves
 // AFTER the change reached Raft: the mapped sentinel with quicraft's submission
-// bit intact, exactly as translateError now returns it (#156).
+// bit intact, exactly as translateError returns it.
 //
-// These fixtures used a BARE dragonboat.ErrShardNotReady to mean "submitted",
-// which worked only because translateError folded the post-delivery and
-// pre-flight cases into that one sentinel and the helper had to arm the bit for
-// both. With the fold gone a bare ErrShardNotReady means what it says -- the
-// replica refused it, nothing was submitted -- so a fixture that means
-// "submitted" has to say so.
+// A bare ErrShardNotReady means what it says -- the replica refused it,
+// nothing was submitted -- so a fixture that means "submitted" has to say so.
 func postDeliverySubmitted() error {
 	return &quicraft.MaybeAppliedError{Err: dragonboat.ErrShardNotReady}
 }
@@ -254,19 +250,16 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsWithoutSubmissionStillFai
 		"no leader observed":    errNoLeaderObserved,
 		"system busy":           dragonboat.ErrSystemBusy,
 		"pending config change": dragonboat.ErrRejected,
-		// The real sentinel, not a look-alike built from the same text. This
-		// carried errors.New(...) while the engine's error was internal and
-		// unmatchable; matching it by sentinel (#146) means a fixture that
-		// only LOOKED like a transfer refusal would no longer be retried, so
-		// the fixture has to be the thing it models.
+		// The real sentinel, not a look-alike built from the same text:
+		// matching it by sentinel means a fixture that only LOOKED like a
+		// transfer refusal would not be retried, so the fixture has to be the
+		// thing it models.
 		"transfer in progress":  &dragonboat.AdapterError{Err: quicraft.ErrTransferInProgress},
 		"refused on first call": errAlreadyExistsHere,
-		// The BARE sentinel, with no submission bit. Before #156 this was
-		// indistinguishable from the post-delivery leadership change --
-		// translateError folded both into ErrShardNotReady -- so the helper had
-		// to arm the submission bit for it and this case could not be
-		// expressed. It is the one an engine that applied a change it reported
-		// as refused PRE-FLIGHT would slip through.
+		// The BARE sentinel, with no submission bit, distinguishable from the
+		// post-delivery leadership change. It is the one an engine that applied
+		// a change it reported as refused PRE-FLIGHT would slip through if the
+		// helper armed the submission bit for it.
 		"pre-flight not-leader": dragonboat.ErrShardNotReady,
 	}
 	landed := membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil)

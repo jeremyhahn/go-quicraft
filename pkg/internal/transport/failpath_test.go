@@ -760,7 +760,7 @@ func TestAcceptLoop_GlobalConnectionLimitRejects(t *testing.T) {
 
 // TestConfigValidate_RejectsNegativeDialTimeout pins that a DialTimeout below
 // zero is refused at construction rather than producing a transport whose
-// every dial context is already expired (#196). Zero is the "use the default"
+// every dial context is already expired. Zero is the "use the default"
 // value and is filled in by SetDefaults before Validate sees it.
 func TestConfigValidate_RejectsNegativeDialTimeout(t *testing.T) {
 	cfg := Config{ListenAddress: "127.0.0.1:0", MTLSConfig: testMTLSConfig(t)}

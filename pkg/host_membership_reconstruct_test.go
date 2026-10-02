@@ -186,13 +186,11 @@ func TestReconstructShardMembership_CorruptBootstrapCmdFailsClosed(t *testing.T)
 // fail-closed behaviour when index 1 holds something OTHER than the founding
 // configuration.
 //
-// This condition used to be treated as benign — reconstruction reported ok=false
-// with no error and StartShard re-seeded membership from the caller's members
-// map — on the rationale of a shard bootstrapped the legacy out-of-band way.
-// That path no longer exists: config-in-log is the only bootstrap this code base
-// performs, so on a shard it created an ordinary entry at index 1 means the log
-// is DAMAGED, and the re-seed drops witnesses, observers, Removed tombstones,
-// identities and the replicated witness/session policies.
+// The condition is not benign: config-in-log is the only bootstrap this code
+// base performs, so on a shard it created an ordinary entry at index 1 means the
+// log is DAMAGED. Reporting ok=false with no error would make StartShard re-seed
+// membership from the caller's members map, dropping witnesses, observers,
+// Removed tombstones, identities and the replicated witness/session policies.
 //
 // The original assertion survives inside the new one: reconstruction must never
 // FABRICATE a membership, and now it must not report a benign not-found either.
@@ -228,13 +226,10 @@ func TestReconstructShardMembership_NonBootstrapEntryAtIndexOne(t *testing.T) {
 // TestStartShard_MissingBootstrapEntryFailsClosed is the end-to-end counterpart.
 //
 // A replica restarts on a durable log that has persisted state and entries but
-// NO EntryInitialMembership at index 1. This test previously documented the
-// re-seed that followed — StartShard succeeded and rebuilt membership from
-// whatever map the call was handed, proven by handing it a map the log never
-// agreed to — and flagged itself as the test to update, deliberately, if the
-// fall-back was ever narrowed. It has been.
+// NO EntryInitialMembership at index 1. It hands StartShard a members map the
+// log never agreed to, so a re-seed from that map would be observable.
 //
-// StartShard must now FAIL, and the shard must not be left loaded: a silent
+// StartShard must FAIL, and the shard must not be left loaded: a silent
 // re-seed produces a replica whose voter set, non-voter roles and replicated
 // policies differ from every peer's, which is the divergence the fail-closed
 // path exists to prevent. Damaged durable state is an operator problem.

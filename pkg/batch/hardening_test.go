@@ -71,11 +71,11 @@ func (p *rendezvousProposer) SyncPropose(ctx context.Context, shardID uint64, _ 
 	}
 }
 
-// TestFlush_SlowShardDoesNotBlockOtherShards is the M7(a) regression test.
-// flush used to call flushShard sequentially on the single flushLoop
-// goroutine, so one slow or leaderless shard blocked every other shard's
-// flush for the full proposal timeout, backing the queue up to QueueSize and
-// producing QueueFullError for entirely unrelated shards.
+// TestFlush_SlowShardDoesNotBlockOtherShards pins per-shard flush concurrency.
+// Calling flushShard sequentially on the single flushLoop goroutine would let
+// one slow or leaderless shard block every other shard's flush for the full
+// proposal timeout, backing the queue up to QueueSize and producing
+// QueueFullError for entirely unrelated shards.
 //
 // The batch is filled one proposal at a time so both shards provably share a
 // single flush, and the proposer only returns once both are inside it. Reverting
@@ -227,13 +227,13 @@ func (p *ctxBoundProposer) SyncPropose(ctx context.Context, _ uint64, _ []byte) 
 	return ctx.Err()
 }
 
-// TestFlush_AllCallersCanceledSkipsPropose is the regression test for the
-// context.Background() fallback in pickContext. When every proposal context is
-// already cancelled — which is what mass caller cancellation under quorum loss
-// looks like — the batch used to be proposed on context.Background(). Nothing
-// can cancel that, so SyncPropose blocked forever ON THE SINGLE FLUSH
-// GOROUTINE: no later batch flushed, the queue filled to QueueSize, every
-// subsequent Submit returned QueueFullError, and Close hung on wg.Wait.
+// TestFlush_AllCallersCanceledSkipsPropose pins that pickContext has no
+// context.Background() fallback. When every proposal context is already
+// cancelled — which is what mass caller cancellation under quorum loss looks
+// like — proposing the batch on context.Background() would mean nothing can
+// cancel it, so SyncPropose would block forever ON THE SINGLE FLUSH GOROUTINE:
+// no later batch flushes, the queue fills to QueueSize, every subsequent Submit
+// returns QueueFullError, and Close hangs on wg.Wait.
 func TestFlush_AllCallersCanceledSkipsPropose(t *testing.T) {
 	p := &ctxBoundProposer{entered: make(chan struct{})}
 	// An hour-long flush interval keeps the background loop's timer out of the

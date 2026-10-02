@@ -125,6 +125,13 @@ func sentinelTable() []sentinelClassification {
 		{"ErrZeroReplicaID", ErrZeroReplicaID, false},
 		{"ErrEmptyAddress", ErrEmptyAddress, false},
 		{"ErrMemberIdentityRequired", ErrMemberIdentityRequired, false},
+		// Permanent: the address or identity stays held until the member
+		// holding it is removed, which the caller must do deliberately.
+		{"ErrDuplicateMemberAddress", ErrDuplicateMemberAddress, false},
+		{"ErrDuplicateMemberIdentity", ErrDuplicateMemberIdentity, false},
+		// Permanent: only re-issuing this node's certificate with per-node
+		// SANs clears it.
+		{"ErrSharedPeerCertificate", ErrSharedPeerCertificate, false},
 		// A malformed health value in a decoded document does not become
 		// well-formed by decoding it again.
 		{"ErrInvalidShardHealth", ErrInvalidShardHealth, false},
@@ -426,14 +433,15 @@ func TestNotLeader_AgreesWithTemporary(t *testing.T) {
 	}
 }
 
-// TestTransferInProgress_IsTemporaryAndNotMaybeApplied is #146.
+// TestTransferInProgress_IsTemporaryAndNotMaybeApplied pins the public
+// classification of ErrTransferInProgress.
 //
 // raft.handleLeaderPropose returns ErrTransferInProgress for EVERY proposal
 // type while a leadership transfer is in flight, and handleReadIndex returns it
-// for linearizable reads. It lived in an internal package, so no caller could
-// match it with errors.Is and two suites resorted to
-// strings.Contains(err.Error(), "transfer in progress") — the exact shape
-// conventions/errors.md §5 names.
+// for linearizable reads. It lives in an internal package, so without the
+// re-export no caller could match it with errors.Is and would resort to
+// strings.Contains(err.Error(), "transfer in progress") — string matching on
+// error text, the shape to avoid.
 //
 // The three properties a caller depends on, pinned here so a future change to
 // the classification has to be deliberate:

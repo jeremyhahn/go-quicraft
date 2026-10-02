@@ -435,8 +435,8 @@ func TestBuildMTLSTLS_PopulatesLeaf(t *testing.T) {
 // cannot force an unbounded number of connection teardowns.
 //
 // Past the supersededEpochRing hysteresis, a peer stamping a fresh SourceEpoch
-// on every batch used to force a full QUIC handshake plus stream-pool teardown
-// PER BATCH — arbitrary attacker-driven work, aimed at whichever address the
+// on every batch could otherwise force a full QUIC handshake plus stream-pool
+// teardown PER BATCH — arbitrary attacker-driven work, aimed at whichever address the
 // certificate covers. The budget caps that at evictionBudget per window; beyond
 // it the hint is ignored and recovery degrades to the QUIC MaxIdleTimeout path.
 func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {

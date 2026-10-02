@@ -22,8 +22,7 @@ import (
 )
 
 // getEntryForTest is a test helper that retrieves a single entry at the given
-// index from inMemory. This was previously a method on inMemory but was
-// removed as unused in production code.
+// index from inMemory. Production code has no need for it, so it lives here.
 func getEntryForTest(im *inMemory, index uint64) (*proto.Entry, error) {
 	entries, err := im.getEntries(index, index+1)
 	if err != nil {

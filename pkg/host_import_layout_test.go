@@ -29,15 +29,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestImportSnapshot_ReachesDEKPurgeFloorAndGC is the regression guard for the
-// import-path key-destruction bug.
+// TestImportSnapshot_ReachesDEKPurgeFloorAndGC guards against import-path key
+// destruction.
 //
-// ImportSnapshot used to hand-roll its on-disk path as
-// <NodeHostDir>/snapshots/shard-N/replica-M/snapshot-..., but the shard's
-// canonical BASE directory already ends in shard-N and the engine appends
-// shard-N/replica-M/snapshot-... to it. The import therefore landed one level
-// ABOVE the canonical tree, invisible to listSnapshotDirs. Two consequences,
-// both serious:
+// The shard's canonical BASE directory already ends in shard-N and the engine
+// appends shard-N/replica-M/snapshot-... to it, so an import that hand-rolled
+// its on-disk path as <NodeHostDir>/snapshots/shard-N/replica-M/snapshot-...
+// would land one level ABOVE the canonical tree, invisible to
+// listSnapshotDirs. Two consequences, both serious:
 //
 //  1. The DEK purge floor is computed by SCANNING snapshot directories, not
 //     from LogDB records. An invisible snapshot contributes no floor, so

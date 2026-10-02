@@ -1031,7 +1031,7 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	}
 
 	// The halt is announced ONCE, with the same error, and only after the
-	// batch's own proposals were completed (#185). OnShardFailed is what
+	// batch's own proposals were completed. OnShardFailed is what
 	// lets the host fail the reads the batch does not account for; if it
 	// fired before OnProposalFailed, the host would drain pendingReads
 	// while the proposals that caused the halt were still unresolved.

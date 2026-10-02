@@ -88,7 +88,7 @@ func (c logRecoveryCase) reachableFromRecovery() bool {
 }
 
 // outsideProtocolRange reports whether the case describes persisted state
-// newRaft refuses to open at all (#197 C): a snapshot, term or log tail at the
+// newRaft refuses to open at all: a snapshot, term or log tail at the
 // ceiling (persistedCeiling), where +1 wraps. newRaftLog is still total over
 // it -- the log constructor does not take the decision -- but no raft instance
 // is ever built on it, so the probe property has nothing to run against.
@@ -206,10 +206,8 @@ func checkProbeAcknowledgements(tb testing.TB, c logRecoveryCase, lr *testLogRea
 	cfg := raftTestCfg(adversarialShardID, adversarialSelfID)
 	r, err := newRaft(cfg, lr)
 	if c.outsideProtocolRange() {
-		// The ceiling case used to be tolerated here as "unreachable, but
-		// handleAppend must be total over it", with a note that the
-		// markerIndex overflow made the replica ack the ceiling index. That
-		// overflow is #197 C, and the answer is no longer tolerance: such a
+		// The ceiling case is not tolerated: running there would overflow
+		// markerIndex and make the replica ack the ceiling index, so such a
 		// store fails to open.
 		if !errors.Is(err, proto.ErrLogIndexOutOfRange) && !errors.Is(err, proto.ErrTermOutOfRange) {
 			tb.Fatalf("%s: newRaft = %v, want the store refused as outside the protocol range", c, err)

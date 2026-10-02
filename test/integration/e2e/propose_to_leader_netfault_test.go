@@ -44,7 +44,7 @@ import (
 
 // TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent asserts
 // that a proposal issued while leadership is moving out from under it still
-// commits, and that the pre-fix pattern in the same state does not.
+// commits, and that the cached-leader pattern in the same state does not.
 //
 // ORDERING IS THE WHOLE TEST. The write is issued IMMEDIATELY after the
 // incumbent is cut off, while it still believes it leads and findLeader still
@@ -90,8 +90,9 @@ func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing
 	}
 
 	// The entry committed, so the incumbent has necessarily lost the shard by
-	// now. Assert the pre-fix pattern against it: one cached index, one Propose,
-	// no retry. This is what the converted call sites used to do, and it doubles
+	// now. Assert the cached-leader pattern against it: one cached index, one
+	// Propose, no retry. This is the pattern the helpers exist to avoid, and it
+	// doubles
 	// as proof that the isolation produced the leader-unknown state rather than
 	// a healthy cluster that forwarded the proposal on.
 	waitForCondition(t, failoverTimeout, "the isolated incumbent steps down", func() bool {
@@ -110,7 +111,7 @@ func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing
 			"the not-leader rejection, so either the isolation did not take effect "+
 			"or the refusal came from an unrelated fault", staleIdx, err)
 	}
-	t.Logf("pre-fix pattern refused by the isolated incumbent: %v", err)
+	t.Logf("cached-leader pattern refused by the isolated incumbent: %v", err)
 
 	// Assert on the majority only: the isolated node is running but unreachable,
 	// so waitForReplication — which requires every node that is not STOPPED —

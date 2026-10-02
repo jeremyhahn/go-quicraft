@@ -90,11 +90,11 @@ func assertBarrierSealedEverything(t *testing.T, cluster *barrierTestCluster, ca
 // cluster can propose entries, replicate them, and serve linearizable reads,
 // and that the data those entries carry is ENCRYPTED where it lands on disk.
 //
-// The at-rest half is the reason this test exists. It used to assert only
+// The at-rest half is the reason this test exists. Asserting only
 // IsSealed() == false — an in-memory flag no production path touches — on a
-// shard whose SnapshotEntries was 0, so no snapshot was ever taken and the
-// barrier was never asked to encrypt a byte. A total plaintext downgrade passed
-// it. It now takes a real snapshot and asserts both that the barrier sealed
+// shard whose SnapshotEntries is 0 takes no snapshot and never asks the
+// barrier to encrypt a byte, so a total plaintext downgrade would pass. It
+// takes a real snapshot and asserts both that the barrier sealed
 // frames and that the plaintext canary is absent from the artifact.
 func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
@@ -128,7 +128,7 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	// serves it, so the leader is resolved at the point of the read rather
 	// than reused from the election above: thirty proposals and a
 	// verifyAllData walk have run since then, any of which can span an
-	// election (#147).
+	// election.
 	targetKey := "barrier-rw-005"
 	expectedValue := expected[targetKey]
 	result := proposer.Read(t, cluster.leaderHost, 1, encodeKVGet(targetKey), defaultTimeout)

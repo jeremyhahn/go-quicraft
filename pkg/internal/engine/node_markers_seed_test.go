@@ -23,10 +23,10 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestNewNode_SeedsLogMarkersFromRecoveredLog pins the #197 (G) fix: a node
-// built over a recovered log publishes its committed marker before any tick,
-// so a proposal registered the instant StartShard returns records a real
-// committed-index floor (#186) rather than 0.
+// TestNewNode_SeedsLogMarkersFromRecoveredLog pins that a node built over a
+// recovered log publishes its committed marker before any tick, so a proposal
+// registered the instant StartShard returns records a real committed-index
+// floor rather than 0.
 func TestNewNode_SeedsLogMarkersFromRecoveredLog(t *testing.T) {
 	const shardID, replicaID = 7, 1
 	lr := logdb.NewLogReader(shardID, replicaID, newTestLogDB())

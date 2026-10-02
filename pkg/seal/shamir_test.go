@@ -95,7 +95,7 @@ func TestShamirInitResult_EmptyShares(t *testing.T) {
 	}
 }
 
-// Destroy is the whole reason the field was retyped: a result that dropped its
+// Destroy is the whole reason the field holds protected shares: a result that dropped its
 // references without wiping would leave all N shares — the point of widest
 // exposure in the scheme — readable until the GC ran, which is exactly what the
 // []string it replaced did. The assertion is on the SHARES, deliberately, and
@@ -142,7 +142,7 @@ func TestShamirInitResult_DestroyIsSafeOnNilAndRepeated(t *testing.T) {
 	empty.Destroy()
 }
 
-// The retype changes what "shares" is on the wire: an array of share OBJECTS
+// Protected shares change what "shares" is on the wire: an array of share OBJECTS
 // rather than an array of bare values. This pins that it is the SAME object
 // encoding shamir.Share produces — the shape the rest of the stack already
 // persists and distributes shares in — so the protected types introduce no
@@ -186,12 +186,11 @@ func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
 	}
 }
 
-// The retype also made the DEFAULT decoder a denial-of-service path: decoding a
-// []*shamir.ProtectedShare through encoding/json locks a page per element as the
-// elements are visited, so an oversized "shares" array chooses how much of the
-// process-wide locked-memory budget to take from every other caller — and under
-// memguard it chose whether the process survived at all, since a refused lock
-// terminated it. This pins that ShamirInitResult.UnmarshalJSON routes the set
+// Protected shares make the DEFAULT decoder a denial-of-service path: decoding
+// a []*shamir.ProtectedShare through encoding/json locks a page per element as
+// the elements are visited, so an oversized "shares" array chooses how much of
+// the process-wide locked-memory budget to take from every other caller. This
+// pins that ShamirInitResult.UnmarshalJSON routes the set
 // through the bounded shamir.UnmarshalShareSet, which refuses the set BEFORE it
 // locks anything.
 //

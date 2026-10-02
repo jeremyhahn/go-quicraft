@@ -59,18 +59,17 @@ func (d *flakySaveSnapshotDB) SaveSnapshot(shardID, replicaID uint64, ss logdb.S
 // TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry is the H1
 // regression guard.
 //
-// The publishing rename creates the canonical, index-named directory. Every
-// error path AFTER it used to return without touching that directory, so the
-// import left the destination PUBLISHED and the retry — the same artifact, the
-// same index, therefore the same directory name — was refused by the
+// The publishing rename creates the canonical, index-named directory. An error
+// path AFTER it that returned without touching that directory would leave the
+// destination PUBLISHED, and the retry — the same artifact, the same index,
+// therefore the same directory name — would be refused by the
 // destination-exists precheck with *ImportSnapshotDirExistsError.
 //
 // That refusal is correct for a directory an import did not create, and it is
 // exactly wrong here: the import created it. A transient LogDB error during a
-// DR restore became a hard lockout whose only remedy was a manual rm -rf,
+// DR restore would become a hard lockout whose only remedy was a manual rm -rf,
 // performed against an error message telling the operator that an import never
-// removes a directory it did not touch. Before the staging rewrite the retry
-// simply overwrote and succeeded.
+// removes a directory it did not touch.
 //
 // The assertion is that the RETRY SUCCEEDS, not merely that some directory is
 // absent: recovering the restore is the property.

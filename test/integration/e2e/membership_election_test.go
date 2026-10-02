@@ -99,7 +99,7 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	// add whose response was lost to a second leadership move had already
 	// committed, the next attempt was refused CORRECTLY with "already exists
 	// in membership", and the loop ran to its deadline reporting a failure
-	// the cluster never had (#112, #132). syncAddNode accepts that refusal
+	// the cluster never had. syncAddNode accepts that refusal
 	// only after an attempt in this same loop was genuinely submitted AND a
 	// linearizable membership read shows replica 4 as a voter at newAddr; an
 	// add that never lands still fails, within the same budget.
@@ -309,7 +309,7 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 // statement about the RUNNER: the writers had whatever fitted into 50ms to
 // commit in, and after the kill every remaining iteration was spent instantly
 // on a nil leader without a proposal being attempted. A slow runner scored
-// 6-of-30 and the gate went red with nothing wrong (#107).
+// 6-of-30 and the gate went red with nothing wrong.
 //
 // A failed proposal is still permanent here. Nothing is re-sent, so the floor
 // cannot be met by retrying past a cluster that has not recovered.
@@ -415,9 +415,9 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 				// Resolve the leader at the point of proposal, and WAIT for one
 				// while the shard is mid-election. Waiting is not a retry: it
 				// refuses to score a write that was never attempted. Spending an
-				// iteration on a nil leader is what turned this test's count into
+				// iteration on a nil leader would turn this test's count into
 				// "how many writes fit in the pre-kill window on this machine"
-				// (#107) -- during the election every remaining iteration was
+				// -- during the election every remaining iteration would be
 				// consumed in microseconds without a proposal being made.
 				leaderHost := cluster.awaitLeaderHost(shardID, failoverTimeout)
 				if leaderHost == nil {
@@ -481,10 +481,9 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 		}(i, sid)
 	}
 
-	// Gate the kill on PROGRESS, not on a clock. The 50ms timer this replaces
-	// was the entire pre-kill budget, so the test scored how much work fitted
-	// into a fixed window on the runner rather than what the cluster did with
-	// it (#107).
+	// Gate the kill on PROGRESS, not on a clock. A fixed timer as the entire
+	// pre-kill budget would score how much work fitted into a fixed window on
+	// the runner rather than what the cluster did with it.
 	//
 	// Two barriers, because "under load" needs both halves: every shard has
 	// committed a write (so the cluster is warm and the writers are level), and
@@ -764,10 +763,10 @@ func TestE2E_LeaderTransfer_DuringConcurrentWrites(t *testing.T) {
 			numSuccessful, numWriters*writesPerWriter, transferWriteFloor, writeErrors.Load())
 	}
 
-	// Leadership must actually MOVE TO THE REQUESTED TARGET. This used to
-	// accept "any stable leader", which is satisfied by the old leader simply
-	// keeping the job -- the exact outcome a broken transfer produces, and the
-	// outcome observed at HEAD when the sample is taken too early. A transfer
+	// Leadership must actually MOVE TO THE REQUESTED TARGET. Accepting "any
+	// stable leader" would be satisfied by the old leader simply keeping the
+	// job -- the exact outcome a broken transfer produces, and the outcome
+	// observed when the sample is taken too early. A transfer
 	// racing an in-flight election is legitimately refused, so the request is
 	// re-issued until the cluster is able to honour it or the budget expires.
 	transferDeadline := time.Now().Add(failoverTimeout)
@@ -852,8 +851,7 @@ func isTransientLeadershipError(err error) bool {
 	}
 	// Leadership transfer in progress is transient — it clears after
 	// the transfer completes or the election timeout expires. Matched by
-	// sentinel since #146 re-exported it; it was a substring match on the
-	// error text while the engine's error was internal and unmatchable.
+	// sentinel, never by its error text.
 	if errors.Is(err, quicraft.ErrTransferInProgress) {
 		return true
 	}

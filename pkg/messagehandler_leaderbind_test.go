@@ -23,20 +23,20 @@ import (
 // ---------------------------------------------------------------------------
 // Leader-originated messages must be bound to the authenticated sender
 //
-// Replicate and Heartbeat are not TALLIED, so they are not quorum-bearing — and
-// they were therefore left with no sender binding at all. That was the largest
-// remaining hole in the receive path. handleHeartbeat carries no prevLogIndex,
-// no prevLogTerm and no entries, yet it set r.leaderID = msg.From and committed
-// up to a Commit index the sender named. Any holder of a CA-valid certificate
-// could send one frame claiming to be the leader and commit a follower's
-// minority-replicated tail, which the real leader then truncates: a State
-// Machine Safety violation.
+// Replicate and Heartbeat are not TALLIED, so they are not quorum-bearing — but
+// leaving them with no sender binding would be the largest hole in the receive
+// path. handleHeartbeat carries no prevLogIndex, no prevLogTerm and no entries,
+// yet it sets r.leaderID = msg.From and commits up to a Commit index the sender
+// names. Without a binding, any holder of a CA-valid certificate could send one
+// frame claiming to be the leader and commit a follower's minority-replicated
+// tail, which the real leader then truncates: a State Machine Safety
+// violation.
 //
 // The binding is deliberately WEAKER than the quorum-bearing one in exactly one
 // verdict — a sender the committed configuration does not name at all is still
 // admitted, because a lagging replica has not applied the config change that
 // added the current leader, and refusing there is the member allow-list that
-// wedged replicas out of their own shard in round 10. Every test below covers
+// wedges replicas out of their own shard. Every test below covers
 // both halves: the forgery is refused AND the lagging-replica first contact
 // still works.
 // ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing
 
 // TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches is the
 // LIVENESS control, and the reason the binding consults the PENDING
-// configuration as well as the committed one (#197 B).
+// configuration as well as the committed one.
 //
 // This replica's committed configuration names only replicas 1 and 2. The shard
 // has since added replica 4 and elected it. The AddNode that admits 4 reached
@@ -127,9 +127,9 @@ func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing
 // state of a lagging follower. Replica 4's Replicate and Heartbeat are the only
 // things that can commit it. If they are refused because the COMMITTED
 // configuration does not name the sender, the replica can never catch up: that
-// is the member allow-list, and round 10 turned it into a permanently leaderless
-// shard. If they were admitted because NO configuration names the sender, any
-// certificate holder could be replica 4 — the hole #197 B closed. The pending
+// is the member allow-list, which can leave a shard permanently leaderless. If
+// they were admitted because NO configuration names the sender, any
+// certificate holder could be replica 4. The pending
 // entry, with the identity it carries, is the fact between the two.
 func TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches(t *testing.T) {
 	const selfAddr, knownAddr, newLeaderAddr = "127.0.0.1:5001", "127.0.0.1:5002", "127.0.0.1:5004"
@@ -172,14 +172,13 @@ func TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches(t *testing
 }
 
 // TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused covers a shard
-// whose configuration names the leader WITHOUT an identity. There used to be an
-// address path here — the binding fell back to the committed address — and it
-// was what a wildcard or shared-SAN certificate satisfied for every member at
-// once. Admission now requires the identity, the fallback is gone, and a
-// leader-originated message from an identity-less member is refused whichever
-// certificate carries it: a configuration in this shape was written by a build
-// that did not require identities, and the remedy is re-bootstrap, not a weaker
-// gate (#197 A).
+// whose configuration names the leader WITHOUT an identity. There is no
+// fallback to the committed address — a wildcard or shared-SAN certificate
+// would satisfy it for every member at once. Admission requires the identity,
+// and a leader-originated message from an identity-less member is refused
+// whichever certificate carries it: a configuration in this shape was written
+// by a build that did not require identities, and the remedy is re-bootstrap,
+// not a weaker gate.
 func TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{Addresses: map[uint64]string{
@@ -273,10 +272,10 @@ func TestHandleMessage_RemovedReplicaCannotForgeALeaderPush(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity is the
-// exfiltration test. learnFromSource used to allow an OVERWRITE whenever the
-// CLAIMED msg.From named a member, so any authenticated peer re-pointed a
-// member's routing entry at itself. That was written off as a black-hole
-// corrected by the next config change; it is worse than that. The attacker holds
+// exfiltration test. If learnFromSource allowed an OVERWRITE whenever the
+// CLAIMED msg.From named a member, any authenticated peer could re-point a
+// member's routing entry at itself. That is not a black-hole corrected by the
+// next config change; it is worse than that. The attacker holds
 // a CA-valid certificate, so this host's outbound dial to the poisoned entry
 // SUCCEEDS, and it then receives the victim's Replicate frames — committed log
 // entries streamed to a replica the configuration never named.
@@ -339,11 +338,11 @@ func TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity(t *testing.T) 
 	}
 }
 
-// TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed is the closure of
-// the residual the previous version of this test documented. A shard whose
-// configuration held no identity for a member let ANY certificate holder naming
-// that member re-point its routing entry — and receive its share of the shard's
-// Replicate traffic (#197 A). The overwrite now requires the committed identity;
+// TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed: on a shard whose
+// configuration holds no identity for a member, letting ANY certificate holder
+// naming that member re-point its routing entry would let it receive its share
+// of the shard's Replicate traffic. The overwrite requires the committed
+// identity;
 // with none committed, nobody may replace the entry, and the member that moved
 // is reached again through the config change that commits its identity and new
 // address, which is the same remedy an identity-less shard needs anyway.

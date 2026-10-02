@@ -86,12 +86,12 @@ func writeSegmentRecords(t *testing.T, dir string, id uint64, blockSize, n, recS
 // TestReadAll_CorruptionWithValidDataAfterIsNotATornTail pins the mid-file
 // corruption detection in segment.ReadAll.
 //
-// ReadAll used to return at the FIRST decode failure without looking at
-// anything below it, which made every corruption indistinguishable from a torn
-// tail. recover() then truncated the file to the clean prefix and fsynced,
+// A ReadAll that returned at the FIRST decode failure without looking at
+// anything below it would make every corruption indistinguishable from a torn
+// tail. recover() would then truncate the file to the clean prefix and fsync,
 // making the loss permanent: one flipped bit early in a 64 MiB active segment
-// discarded everything after it — thousands of already-acknowledged entries
-// plus the newest HardState.
+// would discard everything after it — thousands of already-acknowledged
+// entries plus the newest HardState.
 //
 // The zero-hole path has always applied the correct test (does data FOLLOW the
 // suspect region?); this asserts the CRC path applies it too.
@@ -194,7 +194,7 @@ func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 }
 
 // TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating is the DB-level
-// half of the fix. Corruption in the highest-numbered (final) segment is a
+// half of mid-file corruption detection. Corruption in the highest-numbered (final) segment is a
 // legal torn tail ONLY when nothing decodable follows it. When records do
 // follow, Open must fail-stop with ErrMidSegmentCorruption and leave the file
 // byte-for-byte intact, so the operator can restore from snapshot/peers with
@@ -294,11 +294,11 @@ func (f *shortReadErrFile) ReadAt(p []byte, off int64) (int, error) {
 
 // TestReadAll_ShortReadWithErrorIsAnError pins the read guard in ReadAll.
 //
-// The guard used to be `err != nil && n == 0`, so a partial read that ALSO
-// reported an error had the error dropped on the floor: the truncated block was
-// parsed as if it simply ended there, the loop still strode a full block
-// forward, and every following block was replayed with neither a hole nor a
-// corruption recorded — a silently shortened WAL presented as a clean one.
+// A guard of `err != nil && n == 0` would drop the error of a partial read
+// that ALSO reported one: the truncated block would be parsed as if it simply
+// ended there, the loop would still stride a full block forward, and every
+// following block would be replayed with neither a hole nor a corruption
+// recorded — a silently shortened WAL presented as a clean one.
 func TestReadAll_ShortReadWithErrorIsAnError(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -474,8 +474,8 @@ func TestReadAll_ZeroPaddingAfterCorruptionIsStillATornTail(t *testing.T) {
 
 // zeroBlockAt zeroes one whole block of a segment file at an explicit offset,
 // simulating a lost or reallocated sector. Unlike flipByteAt it leaves no
-// decode-level damage at all: the region simply reads as zeros, which is what
-// used to route it into the permissive classifier.
+// decode-level damage at all: the region simply reads as zeros, which is the
+// shape a permissive zero-hole classifier would wave through.
 func zeroBlockAt(t *testing.T, path string, off int64, blockSize int) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
@@ -499,12 +499,12 @@ func zeroBlockAt(t *testing.T, path string, off int64, blockSize int) {
 //
 // Sixty single-entry SaveState calls, each its own fsynced batch and therefore
 // its own durability generation, then one zeroed block in the middle of the
-// segment. Before the fix the WAL reopened SUCCESSFULLY, returning nine of the
-// sixty entries with HardState.Commit rolled back from 60 to 9 — fifty-one
-// acknowledged, committed Raft log entries destroyed and the commit index moved
-// BACKWARDS, with Open returning nil. Flipping four bytes at the same offset
-// instead of zeroing them correctly refused to open, which is what made the
-// asymmetry visible: identical damage, opposite verdicts.
+// segment. A zero-hole classifier that ignored the generations would reopen
+// SUCCESSFULLY, returning nine of the sixty entries with HardState.Commit
+// rolled back from 60 to 9 — fifty-one acknowledged, committed Raft log
+// entries destroyed and the commit index moved BACKWARDS, with Open returning
+// nil — while flipping four bytes at the same offset instead of zeroing them
+// refuses to open: identical damage, opposite verdicts.
 //
 // The whole file must also survive untouched, because the operator is being told
 // to restore from snapshot/peers and the evidence has to still be there.

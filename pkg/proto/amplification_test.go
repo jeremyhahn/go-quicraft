@@ -127,10 +127,10 @@ func amplifyingFrames(t *testing.T) map[string][]byte {
 // TestDecodeMemoryAmplification is the enforcement of MaxDecodeMemoryFactor.
 //
 // It fails in exactly the case that matters: a decoder change that makes the
-// decoded form cost more per wire byte than a receiver was told to expect. The
-// clamped map size hint this package used to carry is the worked example — it
-// measured 9.8x on the membership-dense frame, so this test would have refused
-// it, and the frame that produced it is one of the cases below.
+// decoded form cost more per wire byte than a receiver was told to expect. A
+// clamped map size hint is the worked example — it measures 9.8x on the
+// membership-dense frame, so this test refuses it, and that frame is one of
+// the cases below.
 func TestDecodeMemoryAmplification(t *testing.T) {
 	for name, buf := range amplifyingFrames(t) {
 		t.Run(name, func(t *testing.T) {
@@ -157,7 +157,7 @@ func TestDecodeMemoryAmplification(t *testing.T) {
 	}
 }
 
-// TestGetMapSizesExactly pins the fix that halved the amplification above:
+// TestGetMapSizesExactly pins the sizing that halves the amplification above:
 // the map is sized from the (already cross-checked) wire count in one
 // allocation, not clamped to a fixed hint and grown by rehashing.
 //

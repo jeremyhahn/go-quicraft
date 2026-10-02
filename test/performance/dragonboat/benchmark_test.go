@@ -32,8 +32,7 @@ var suite = newDragonboatSuite()
 
 func newDragonboatSuite() *perfresult.BenchmarkSuite {
 	// The version is the dragonboat this binary links, from its build info,
-	// so a go.mod pin bump cannot leave the recorded version behind: the
-	// literal this replaces said v4.0.0 while v4.0.1 was linked (#189).
+	// so a go.mod pin bump cannot leave the recorded version behind.
 	version, err := benchutil.ModuleVersion("github.com/jeremyhahn/dragonboat/v4")
 	if err != nil {
 		log.Fatal(err)
@@ -57,11 +56,10 @@ func BenchmarkProposeThroughput_Dragonboat(b *testing.B) {
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchDragonboatPropose(b, nh, rec)
 
-	// rec.Count(), not b.N. The loop now tolerates a bounded share of
-	// transient errors (#181) and records only the proposals that completed,
-	// so b.N overstates completed work by exactly the error count -- up to
-	// 25% at the admission threshold. The cluster variants below already do
-	// this; these two single-host ones were the holdouts.
+	// rec.Count(), not b.N. The loop tolerates a bounded share of transient
+	// errors and records only the proposals that completed, so b.N overstates
+	// completed work by exactly the error count -- up to 25% at the admission
+	// threshold. The cluster variants below do the same.
 	suite.AddResult(perfresult.ScenarioProposeSEQWAL, rec.Count(), b.Elapsed(), rec)
 }
 

@@ -252,14 +252,14 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 	select {
 	case sem <- struct{}{}:
 		// Publish SYNCHRONOUSLY, on this goroutine, before the handler is
-		// launched. Publication used to happen inside handleConnection, which
-		// left every admitted connection invisible for as long as its goroutine
-		// took to be scheduled — and stop()'s inbound sweep walks exactly that
-		// map. A connection admitted just before a shutdown could therefore be
-		// missed by the sweep, have quicTr.Close() destroy it locally, and only
-		// then reach publication, by which point announcing anything on it is a
-		// no-op: the peer is left holding a dead connection, which is the whole
-		// defect this path exists to prevent.
+		// launched. Publishing inside handleConnection would leave every
+		// admitted connection invisible for as long as its goroutine took to
+		// be scheduled — and stop()'s inbound sweep walks exactly that map. A
+		// connection admitted just before a shutdown could then be missed by
+		// the sweep, have quicTr.Close() destroy it locally, and only then
+		// reach publication, by which point announcing anything on it is a
+		// no-op: the peer is left holding a dead connection, which is exactly
+		// what this path exists to prevent.
 		//
 		// Publishing here is what lets stop() close that off for good, because
 		// it makes "the accept loop has returned" mean "every connection it
@@ -1377,20 +1377,17 @@ func (t *QUICTransport) dropFrame(r io.Reader, length uint32, transient error) e
 // decodeCharge converts a frame's on-the-wire length into the heap it can
 // actually occupy while being decoded.
 //
-// The budget used to reserve the wire length alone, which is the one number the
-// decode is guaranteed NOT to be bounded by. Decoding a membership-dense frame
-// was measured at up to 9.77x its wire size — maps whose size hint was clamped
-// far below their real entry count reallocated the whole table at every
-// doubling, and the superseded tables stayed live until GC. Sizing those maps
-// exactly brought the worst case to 5.05x, and proto.MaxDecodeMemoryFactor
-// states the ceiling the codec now holds itself to.
+// The wire length alone is the one number the decode is guaranteed NOT to be
+// bounded by. Decoding a membership-dense frame can occupy several times its
+// wire size, and proto.MaxDecodeMemoryFactor states the ceiling the codec holds
+// itself to.
 //
-// Charging the wire length therefore let a 256 MB MaxMessageReceiveMemory admit
-// frames that could occupy roughly 2 GB of heap at once, which is the aggregate
-// bound the budget exists to enforce, defeated by construction. Charging the
+// Charging the wire length would therefore let a 256 MB MaxMessageReceiveMemory
+// admit frames that could occupy over 1 GB of heap at once, defeating by
+// construction the aggregate bound the budget exists to enforce. Charging the
 // factor makes the configured limit mean what it says. The visible effect is
 // that fewer frames are admitted concurrently for the same configured budget;
-// that is the correct reading of the setting, not a regression.
+// that is the correct reading of the setting.
 //
 // Saturating rather than wrapping: length is already bounded by MaxFrameSize
 // well below the overflow point, but a reservation that wrapped negative would

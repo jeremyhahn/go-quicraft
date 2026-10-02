@@ -23,12 +23,11 @@ import (
 
 // Config-in-log bootstrap.
 //
-// A shard's initial configuration used to be injected out-of-band
-// (LogReader.SetMembership from the caller's members map), so a replica's
-// membership was NOT a function of its durable log: a joining replica could
-// learn it only from a snapshot, and if no snapshot ever arrived it never
-// learned the full configuration at all. Instead, the initial configuration is
-// written to the log itself as one committed entry at index 1, and every
+// Injecting a shard's initial configuration out-of-band (from the caller's
+// members map) would make a replica's membership NOT a function of its durable
+// log: a joining replica could learn it only from a snapshot, and if no
+// snapshot ever arrived it would never learn the full configuration at all.
+// Instead, the initial configuration is written to the log itself as one committed entry at index 1, and every
 // replica reconstructs its membership by replaying the committed log. Membership
 // becomes a pure fold over the log — the property the whole design turns on.
 //
@@ -129,9 +128,7 @@ func initialMembershipFromEntry(e proto.Entry) (proto.Membership, error) {
 // set, silently, and durably once the next snapshot persists it. There is no
 // "recover as much as possible" answer for a configuration; a partial fold is
 // not a degraded membership, it is a DIFFERENT one, and a replica that adopted
-// it could commit on a quorum the real configuration never granted. Only the
-// EntryInitialMembership half used to fail closed; the EntryConfigChange half
-// skipped the entry and returned success, which is the divergence above.
+// it could commit on a quorum the real configuration never granted.
 //
 // A ZERO-LENGTH EntryConfigChange payload is deliberately not in that class. It
 // is the silent no-op it has always been on the runtime path too: every replica

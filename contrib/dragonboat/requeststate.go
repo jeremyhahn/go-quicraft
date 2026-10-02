@@ -282,11 +282,10 @@ type RequestState struct {
 	// RequestState.ResultC. Its goroutine reads rs.inner.CommittedC()
 	// directly (the true source, written to synchronously by quicraft's
 	// own commit path) rather than through a separate translating bridge:
-	// an earlier version raced a bridge's OUTPUT here instead of the
-	// source, and the extra asynchronous hop between the two — the bridge
-	// goroutine not yet having been scheduled to relay a value that was
-	// already sitting in the source channel — is what dropped the commit
-	// notification (#13).
+	// racing a bridge's OUTPUT here instead of the source would add an
+	// asynchronous hop between the two — the bridge goroutine not yet
+	// scheduled to relay a value already sitting in the source channel —
+	// which can drop the commit notification.
 	aggrC chan RequestResult
 
 	// shardID records the shard this request belongs to. This is used
@@ -441,12 +440,10 @@ func (rs *RequestState) ResultC() chan RequestResult {
 	}
 	// Read rs.inner.CommittedC() directly -- the true source, written to
 	// synchronously by quicraft's own commit path -- rather than through a
-	// separate translating bridge. See the aggrC field doc for why: an
-	// earlier version raced a bridge's translated OUTPUT here instead of
-	// the source, and the extra asynchronous hop between the two (the
-	// bridge goroutine not yet scheduled to relay a value already sitting
-	// in the source channel) is what dropped the commit notification
-	// (#13). This mirrors dragonboat's own RequestState.ResultC
+	// separate translating bridge. See the aggrC field doc for why: the
+	// extra asynchronous hop a bridge adds (the bridge goroutine not yet
+	// scheduled to relay a value already sitting in the source channel)
+	// can drop the commit notification. This mirrors dragonboat's own RequestState.ResultC
 	// (request.go), which races r.committedC/r.CompletedC directly for
 	// the same reason -- they are the fields the raft engine itself
 	// writes into, with nothing relaying between the writer and this

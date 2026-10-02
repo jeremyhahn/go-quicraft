@@ -29,7 +29,7 @@ passing quietly.
 |---|---|---|---|
 | Unit | none | `pkg/...`, plus the untagged tests under `test/` | `make test`, `make test-<pkg>` |
 | Integration | `integration` | `test/integration/{raft,host,e2e,linearizability}` | `make integration-test`, `make ci-integration` |
-| Network partition | `integration quicraft_netfault` | `test/integration/e2e`, `test/integration/host` | `make ci-netfault` (e2e only) |
+| Network partition | `integration quicraft_netfault` | `test/integration/e2e`, `test/integration/host` | `make ci-netfault` |
 | I/O fault injection | `quicraft_errfs` | `test/errfs` | `make errfs-waldb`, `make ci-errfs` |
 | Fuzz | `quicraft_fuzz` | six packages under `pkg/` | `make fuzz-<pkg>`, `make ci-fuzz-seeds`, `make ci-fuzz-mutation` |
 | FIPS | `fips` | `./...` | `make build-fips`, `make verify-fips`, `make verify-fips-exempt` |
@@ -125,8 +125,10 @@ Six tests use it:
 | `TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent` | e2e |
 | `TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent` | host |
 
-`make ci-netfault` and CI's `netfault` job run the e2e package only, so the
-host test runs only when invoked by hand with both tags.
+`make ci-netfault` and CI's `netfault` job run both packages (`NETFAULT_PKGS`),
+each whole rather than filtered by test name. The target fails if a package
+under `test/integration` carries the `quicraft_netfault` tag but is missing
+from that list.
 
 The older partition tests (`partition_test.go`, `asymmetric_partition_test.go`,
 `quorum_loss_test.go`) still use `stopNode`. They are worth keeping but do not
@@ -184,9 +186,11 @@ artifacts, and committing one makes it a permanent regression test.
 
 Three different things are called fuzzing here:
 
-- `make fuzz-<pkg>` and `make fuzz-all` mutate for `FUZZ_TIME` (default 60s),
-  for local use. `fuzz-raft` names its two targets because `go test -fuzz` runs
-  exactly one target per invocation.
+- `make fuzz-<pkg>` and `make fuzz-all` mutate each target for `FUZZ_TIME`
+  (default 60s, or an execution count such as `20000x`), for local use.
+  `go test -fuzz` accepts one package and one target per invocation, so each
+  target lists its package's targets and runs them one at a time, stopping at
+  the first failure. `ci-fuzz-mutation` uses the same helpers.
 - `make ci-fuzz-seeds` runs `-run=Fuzz` without `-fuzz` over `./...`: each
   target once per seed and once per corpus file, deterministically. It is the
   PR gate. It walks `./...` so a new target in a seventh package cannot go
@@ -319,7 +323,8 @@ mutation in a test cannot weaken production behaviour.
 ### The nested-module gate
 
 `make ci-modules` runs `go build` and `go vet` in every directory holding a
-`go.mod`, collecting failures instead of stopping at the first, so one broken
+`go.mod`, skipping the directories the go tool ignores (names starting with `.`
+or `_`, and `testdata`), and collecting failures instead of stopping at the first, so one broken
 module cannot hide a second.
 
 `GOWORK=off` is exported at the bottom of the Makefile and set in the workflow

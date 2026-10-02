@@ -116,8 +116,8 @@ func TestTimesBudgetControlsRepeatedInjection(t *testing.T) {
 	}
 }
 
-// TestWrappedFileMirrorsDelegateCapabilities is the regression test for the
-// silent degradation the harness used to force on production.
+// TestWrappedFileMirrorsDelegateCapabilities guards against the harness
+// silently degrading the production path it wraps.
 //
 // waldb selects the directory-metadata-sync and pre-allocation paths by type
 // assertion. A wrapper that answers assertions its delegate cannot honour

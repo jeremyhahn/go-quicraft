@@ -165,9 +165,10 @@ func TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier(t *test
 }
 
 // TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine pins the
-// ORDER of the upper-bound check. recoverSnapshot used to call
-// RecoverFromSnapshot first and read the committed index afterwards: the state
-// machine was replaced while the markers were refused, and nothing retried.
+// ORDER of the upper-bound check. Were recoverSnapshot to call
+// RecoverFromSnapshot first and read the committed index afterwards, the state
+// machine would be replaced while the markers were refused, and nothing
+// would retry.
 func TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)

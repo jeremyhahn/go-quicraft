@@ -2432,7 +2432,7 @@ func authorizationRigJoining(t *testing.T, ms proto.Membership) (*engine.Engine,
 
 // recordingDeliverWrapper wraps a real engineDeliverer, synchronously
 // recording every message DeliverMessage accepts before delegating to the
-// wrapped implementation (go-quicraft#26).
+// wrapped implementation.
 //
 // authorizationRig's eng.Start() runs a real background worker that
 // concurrently drains the same inbox queue a test would otherwise have to
@@ -2516,18 +2516,17 @@ func appendPendingAdd(t *testing.T, node *engine.Node, leaderID, term, replicaID
 	}
 }
 
-// TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange is the
-// regression for the wedge the member allow-list caused, in the form that is
-// sound (#197 B).
+// TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange pins the
+// sound answer to the wedge a member allow-list causes.
 //
 // A replica's configuration lags by design. Replica 5 is added to the shard and
 // becomes leader while this host is behind: the local COMMITTED configuration
 // still reads {1,2}, but the AddNode that admits 5 — replicated here by the old
 // leader — sits in this replica's own log, uncommitted. Under an allow-list
-// every Heartbeat and Replicate from leader 5 was dropped, so the replica was
-// deaf to its own leader for the life of the process. Under the old
-// unknown-member exemption ANY certificate holder naming replica 5 was
-// admitted, which was the hole. The pending configuration is the fact between
+// every Heartbeat and Replicate from leader 5 would be dropped, so the replica
+// would be deaf to its own leader for the life of the process. Under an
+// unknown-member exemption ANY certificate holder naming replica 5 would be
+// admitted, which is a hole. The pending configuration is the fact between
 // the two: this replica's own log names 5 and the identity it must present.
 func TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange(t *testing.T) {
 	const newLeaderAddr = "127.0.0.1:5005"
@@ -2576,8 +2575,7 @@ func TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange(t *testing.
 		t.Fatalf("HandleMessage: %v", err)
 	}
 	// rec.DeliveredCount, not a DiagState().InboxLen re-read: the recording
-	// wrapper observes delivery synchronously at the DeliverMessage call
-	// (go-quicraft#26).
+	// wrapper observes delivery synchronously at the DeliverMessage call.
 	if rec.DeliveredCount() == 0 {
 		t.Fatal("the heartbeat from leader 5 was dropped although this replica's own " +
 			"log holds the AddNode that admits it: the replica stays deaf to its " +

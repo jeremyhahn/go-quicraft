@@ -88,7 +88,7 @@ func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 	// waiting for attempt i to be counted before making attempt i+1 deadlocks
 	// (it ran the full 10s at i=0). The sleep also keeps the sends from being
 	// coalesced into one frame, which would leave a single write and therefore
-	// no second write to observe the rejection on. See #71.
+	// no second write to observe the rejection on.
 	const attempts = 20
 	for range attempts {
 		sender.Send([]proto.Message{{

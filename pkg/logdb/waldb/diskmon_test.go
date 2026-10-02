@@ -694,10 +694,10 @@ func TestDiskMonitorRecoveryRepeated(t *testing.T) {
 
 // TestWithCheckEveryZeroDoesNotDivideByZero pins the sampling-interval guard.
 //
-// MaybeCheck samples with count%checkEvery, so a zero interval used to panic
-// the commit worker on the very first monitored write: waldb.Open accepted
-// WithCheckEvery(0) without complaint and SaveState then died inside the
-// runtime with an integer divide by zero. A configuration typo must not be a
+// MaybeCheck samples with count%checkEvery, so an unguarded zero interval
+// would panic the commit worker on the very first monitored write: waldb.Open
+// would accept WithCheckEvery(0) without complaint and SaveState would then
+// die inside the runtime with an integer divide by zero. A configuration typo must not be a
 // runtime outage.
 func TestWithCheckEveryZeroDoesNotDivideByZero(t *testing.T) {
 	var usedBytes atomic.Uint64

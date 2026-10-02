@@ -33,7 +33,7 @@ func addNodeEntry(t *testing.T, index, term, replicaID uint64, identity string) 
 	return proto.Entry{Index: index, Term: term, Type: proto.EntryConfigChange, Cmd: cmd}
 }
 
-// TestPendingConfig_FollowsTheLog pins the pending configuration (#197 B):
+// TestPendingConfig_FollowsTheLog pins the pending configuration:
 // an identity-bearing add enters it when the entry is appended, leaves it when
 // a conflicting append truncates the entry, is cleared by a snapshot restore,
 // and is ignored by the reader once the applied configuration has moved past
@@ -285,8 +285,8 @@ func removeNodeEntry(t *testing.T, index, term, replicaID uint64) proto.Entry {
 	return proto.Entry{Index: index, Term: term, Type: proto.EntryConfigChange, Cmd: cmd}
 }
 
-// TestPendingConfig_RemovalsAreFoldedInLogOrder pins the pending tombstone
-// (#197 B, eleventh round): adds and removals are resolved in log order, so a
+// TestPendingConfig_RemovalsAreFoldedInLogOrder pins the pending tombstone:
+// adds and removals are resolved in log order, so a
 // removal above an add cancels the add and stands as a pending removal by ID
 // and by the identity the add bound; a removal of a COMMITTED member stands
 // with the committed identity; and an add above a removal supersedes it. A

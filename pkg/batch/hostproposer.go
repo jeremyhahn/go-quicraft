@@ -26,23 +26,21 @@ import (
 // would be an import cycle: the host is the thing this package is batched on
 // behalf of.
 type SyncProposer interface {
+	// SyncPropose proposes cmd to the shard and blocks until it is applied.
 	SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.Result, error)
 }
 
-// HostProposer adapts a Host to the Proposer interface.
+// HostProposer adapts a Host to the Proposer interface. *Host's SyncPropose
+// returns (sm.Result, error) while Proposer requires error alone, so a Host is
+// passed to NewAggregator wrapped in a HostProposer:
 //
-// It exists because the documented way to construct an Aggregator did not
-// compile: README showed batch.NewAggregator(host, ...), but *Host's
-// SyncPropose returns (sm.Result, error) while Proposer requires error alone,
-// so *Host never satisfied Proposer. No adapter existed anywhere in this
-// repository or downstream, and `git grep quicraft/pkg/batch` found no
-// importers — so every behaviour this package claims (ordering, indeterminate
-// flush handling, backpressure) was verified only against mocks.
+//	agg := batch.NewAggregator(batch.HostProposer{Host: host}, ...)
 //
 // The discarded sm.Result is not an oversight but the limitation it names: a
 // batched proposal carries commands from mutually unaware callers, and the
 // aggregate result cannot be attributed to any individual one. See Proposer.
 type HostProposer struct {
+	// Host is the proposer the adapter forwards to, normally a *quicraft.Host.
 	Host SyncProposer
 }
 

@@ -65,16 +65,23 @@ const maxSnapshotMetaFileLen = snapshotMetaHeaderSize + maxSnapshotMetaBodyLen
 //	 48     8  CreatedAt (unix seconds)
 //	 56     8  Epoch
 //	 64     8  Compression
+//	 72     8  DataLen (bytes of snapshot.dat as written)
+//	 80     8  DataHash (xxhash64 of snapshot.dat as written)
 //
 // # Evolution rule
 //
-// Body fields are APPEND-ONLY: an existing field never moves and never changes
-// meaning. A new field is appended and the version is incremented. Because the
-// body length is recorded, a reader can always tell a field that is ABSENT
-// (written by an older version) from one that is CORRUPT (a truncated or
-// foreign record) — the distinction the magic/version prefix exists to make.
-// Changing the meaning of an existing field is NOT permitted under this rule;
-// that requires a new magic.
+// snapshotMetaVersion is pinned at its current value until the first stable
+// v1 release, like every format version in this repository. Until then a
+// layout change is made IN PLACE, with every writer and reader updated in
+// lockstep and development data directories wiped rather than migrated; the
+// version is not incremented to record pre-release churn.
+//
+// The reader is driven by the recorded body length, not by the version: a
+// field whose offset lies past the end of the body is reported ABSENT (its
+// *Recorded flag false), and fields past the last one this binary knows are
+// ignored. Because the body length is recorded, a reader can always tell a
+// field that is absent from a record that is CORRUPT (a truncated or foreign
+// record) — the distinction the magic/length prefix exists to make.
 //
 // # Compatibility
 //
@@ -147,12 +154,12 @@ const (
 	// panics — inside the DEK purge-floor scan, which walks every snapshot
 	// directory on the host and whose entire input is bytes on disk. Rejecting
 	// above this cap makes that truncation UNREACHABLE by construction rather
-	// than merely unreached on a 64-bit build, so the guarantee no longer
-	// depends on the width of int.
+	// than merely unreached on a 64-bit build, so the guarantee does not
+	// depend on the width of int.
 	//
-	// 64 KiB is 8192 uint64 body fields against the current 7. The body is
-	// append-only and grows a field at a time, so no legitimate record can
-	// approach it; anything that does is corruption or a foreign file.
+	// 64 KiB is 8192 uint64 body fields against the current 9, so no
+	// legitimate record can approach it; anything that does is corruption or
+	// a foreign file.
 	// The same bounded-then-parsed shape waldb's replayBootstrap uses.
 	maxSnapshotMetaBodyLen = 1 << 16
 )
@@ -160,7 +167,7 @@ const (
 // SnapshotMeta is the decoded content of a snapshot.meta record.
 //
 // The *Recorded flags distinguish a field the record actually CARRIED from one
-// that was absent because an older version wrote it. A zero Epoch with
+// that was absent because the record's body ended before it. A zero Epoch with
 // EpochRecorded false means UNKNOWN, not plaintext — the two are opposite in
 // consequence for DEK purging, so they must never be conflated.
 type SnapshotMeta struct {
@@ -242,8 +249,8 @@ func MarshalSnapshotMeta(m SnapshotMeta) []byte {
 
 // ParseSnapshotMeta decodes a snapshot.meta image.
 //
-// It accepts a record written by this binary, one written by a DIFFERENT
-// version of the format (older or newer — see the append-only evolution rule),
+// It accepts a record carrying the magic whose declared body holds at least the
+// identity fields (see the evolution rule: fields are read by body length),
 // and the pre-magic v0 layouts. Anything else is rejected with
 // ErrSnapshotMetaCorrupt rather than parsed positionally: reading foreign bytes
 // as an epoch would feed a fabricated value to the DEK purge floor.
@@ -299,9 +306,8 @@ func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 		ReplicaID: binary.LittleEndian.Uint64(body[metaBodyReplicaIDOff:]),
 		CreatedAt: binary.LittleEndian.Uint64(body[metaBodyCreatedAtOff:]),
 	}
-	// Fields are append-only, so a field present in a LONGER body (written by
-	// a newer version) sits at the offset this binary already knows and is
-	// read here; anything beyond the known fields is ignored.
+	// Each field is read only if the declared body reaches it; anything
+	// beyond the known fields is ignored.
 	if bodyLen >= metaBodyEpochOff+8 {
 		m.Epoch = binary.LittleEndian.Uint64(body[metaBodyEpochOff:])
 		m.EpochRecorded = true
@@ -494,7 +500,7 @@ func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot frame context-AAD (M3)
+// Snapshot frame context-AAD
 // ---------------------------------------------------------------------------
 
 // snapshotAADMagic tags the context-AAD scheme. It is part of the authenticated

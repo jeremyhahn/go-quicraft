@@ -170,8 +170,8 @@ func transportPair(t testing.TB, deploymentID uint64) (
 // testDialTimeout is the dial budget the transport pair fixture runs with.
 // Production's 5s is a liveness budget backed by Raft retransmission; a test
 // that dials directly has no retransmission, so a handshake slowed past 5s by
-// CI saturation failed the test rather than the batch (#196: 5.01s on a
-// loaded runner, a Makefile-only commit; #142 had traced 4.3s before). The
+// CI saturation fails the test rather than the batch (handshakes of 4.3s and
+// 5.01s have been observed on loaded runners). The
 // budget here is wide enough that only a broken transport reaches it. Tests
 // that need the production figure -- the first-contact bound, the shutdown
 // promptness check -- build their own Config and get the default.
@@ -1993,12 +1993,11 @@ func TestSendBatch_MarshalFrameError(t *testing.T) {
 	t1.Send([]proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-	// 30s, not the file's usual 10s (#24): under GODEBUG=fips140=on the
+	// 30s, not the file's usual 10s: under GODEBUG=fips140=on the
 	// dial's TLS/QUIC handshake loses X25519 from its offered groups and
 	// falls back to a FIPS-approved curve, which is measurably slower under
 	// -race, and this test was observed to occasionally exceed a 10s budget
-	// specifically in that mode under shared-runner contention (CI run 4070,
-	// FIPS job). The other ~20 waitBatch(t, 10*time.Second) callers in this
+	// specifically in that mode under shared-runner contention. The other ~20 waitBatch(t, 10*time.Second) callers in this
 	// file are unaffected -- this is the one whose real send-then-observe
 	// path (dial + handshake + frame write) sits closest to that budget, not
 	// a general widening.
@@ -4071,7 +4070,7 @@ func TestSendSnapshotStreaming_OpenStreamSyncError(t *testing.T) {
 	reg1.Register(1, 2, t2Addr)
 
 	// Establish the connection: a cold Send, bounded by what the transport
-	// allows one and re-sent if it is abandoned (#142).
+	// allows one and re-sent if it is abandoned.
 	sendFirstContact(t, t1, handler2, []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})

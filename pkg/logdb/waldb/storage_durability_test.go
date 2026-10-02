@@ -23,7 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestOpen_StatFailureMustNotSkipRecovery is the C1 regression test. The
+// TestOpen_StatFailureMustNotSkipRecovery is a regression test. The
 // shard-directory probe treated EVERY Stat error as "directory absent", so an
 // EACCES/EIO/ELOOP (or a stale NFS handle) skipped recovery: the shard came up
 // with no known segments and nextSegmentID 0, and the first write recreated
@@ -91,7 +91,7 @@ func TestOpen_StatFailureMustNotSkipRecovery(t *testing.T) {
 	}
 }
 
-// TestOpen_SyncsWholeCreatedDirectoryChain is the H1 regression test. Open
+// TestOpen_SyncsWholeCreatedDirectoryChain is a regression test. Open
 // fsynced only the WAL root's immediate parent, so when MkdirAll created
 // several levels the intermediate directory entries were never durable: a
 // crash after an ACKED SaveState lost the entire tree and the node came back
@@ -137,7 +137,7 @@ func TestOpen_SyncsWholeCreatedDirectoryChain(t *testing.T) {
 	}
 }
 
-// TestRemoveEntriesTo_FloorIsMonotonic is the H2 regression test. The
+// TestRemoveEntriesTo_FloorIsMonotonic is a regression test. The
 // compaction floor was assigned unconditionally, so a lower follow-up call
 // (reachable through the caller-overridable snapshot overhead) lowered a floor
 // whose entries were already gone. Reads between the old and new floor then
@@ -203,7 +203,7 @@ type failingCloseFile struct {
 
 func (f *failingCloseFile) Close() error { return f.closeErr }
 
-// TestRollbackShard_RotationCloseFailureStillRollsBack is the H3 regression
+// TestRollbackShard_RotationCloseFailureStillRollsBack is a regression
 // test. When a mid-batch ErrSegmentFull rotation fsynced the checkpoint
 // segment (making THIS batch's earlier records durable) and then failed to
 // close it, rotateSegment dropped the segment handle. rollbackShard saw
@@ -269,7 +269,7 @@ func TestRollbackShard_RotationCloseFailureStillRollsBack(t *testing.T) {
 	}
 }
 
-// TestSaveState_ZeroIndexSnapshotIsNotPersisted is the M3 regression test.
+// TestSaveState_ZeroIndexSnapshotIsNotPersisted is a regression test.
 // waldb treated a snapshot as present when Index OR Term was non-zero, so a
 // zero-index snapshot was written, reported by GetSnapshot as a snapshot at
 // index 0, and pinned its segment against garbage collection forever. memdb
@@ -306,7 +306,7 @@ func TestSaveState_ZeroIndexSnapshotIsNotPersisted(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_RejectsOversizedMembership is the M7 regression test. WAL
+// TestSaveSnapshot_RejectsOversizedMembership is a regression test. WAL
 // replay rejects any membership map declaring more than maxMembershipMapEntries
 // entries as corruption, but the write path accepted one: the record was
 // fsynced and acked, and the node was then permanently unopenable.
@@ -341,7 +341,7 @@ func TestSaveSnapshot_RejectsOversizedMembership(t *testing.T) {
 	defer db2.Close()
 }
 
-// TestParseSegmentFilename_RequiresCanonicalForm is the L1 regression test.
+// TestParseSegmentFilename_RequiresCanonicalForm is a regression test.
 // Arbitrary-length digit strings parsed as valid segment IDs (and wrapped
 // silently on uint64 overflow), so a stray file could be adopted as a segment
 // or make an unrelated ID look live.
@@ -364,7 +364,7 @@ func TestParseSegmentFilename_RequiresCanonicalForm(t *testing.T) {
 		"0000001.log",               // seven digits with a leading zero
 		"1.log",                     // shorter than the canonical width
 		"99999999999999999999.log",  // overflows uint64
-		"184467440737095516151.log", // overflows uint64 (wraps to 1 on the old parser)
+		"184467440737095516151.log", // overflows uint64 (a wrapping parser reads 1)
 	}
 	for _, name := range invalid {
 		if got, ok := parseSegmentFilename(name); ok {
@@ -373,7 +373,7 @@ func TestParseSegmentFilename_RequiresCanonicalForm(t *testing.T) {
 	}
 }
 
-// TestDiscardPending_ReReservesSpace is the L2 regression test. The
+// TestDiscardPending_ReReservesSpace is a regression test. The
 // non-rotation rollback path truncated the segment back to the checkpoint,
 // dropping the whole fallocate reservation, and never re-reserved it — every
 // subsequent write paid a file extension and the ENOSPC pre-reservation the
@@ -425,7 +425,7 @@ func (f *failingWriteAtFile) WriteAt(p []byte, off int64) (int, error) {
 	return f.File.WriteAt(p, off)
 }
 
-// TestSaveSnapshot_RollsBackPartialRecord is the M5 regression test.
+// TestSaveSnapshot_RollsBackPartialRecord is a regression test.
 // SaveSnapshot captured a checkpoint and never used it, so a record that
 // failed midway left its already-flushed blocks in the segment even though the
 // caller was told the write failed.

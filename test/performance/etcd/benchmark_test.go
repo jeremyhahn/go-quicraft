@@ -40,7 +40,7 @@ var suite = newEtcdSuite()
 
 func newEtcdSuite() *perfresult.BenchmarkSuite {
 	// The version is the etcd raft module this binary links, from its build
-	// info, so the recorded version follows the go.mod pin (#189).
+	// info, so the recorded version follows the go.mod pin.
 	version, err := benchutil.ModuleVersion("go.etcd.io/raft/v3")
 	if err != nil {
 		log.Fatal(err)

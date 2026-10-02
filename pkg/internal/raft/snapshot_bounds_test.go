@@ -22,11 +22,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestHandleSnapshot_RefusesPositionOutsideProtocolRange pins #197 C on the
-// raft side: an InstallSnapshot is delivered process-locally after the artifact
-// is on disk, so it never meets step()'s wire term ceiling, and a snapshot at
-// Index = MaxUint64 used to restore cleanly and then wrap markerIndex,
-// firstIndex and every remote's next to 0. The position is refused before it
+// TestHandleSnapshot_RefusesPositionOutsideProtocolRange pins the snapshot
+// position bounds on the raft side: an InstallSnapshot is delivered
+// process-locally after the artifact is on disk, so it never meets step()'s
+// wire term ceiling, and a snapshot at Index = MaxUint64 would otherwise
+// restore cleanly and then wrap markerIndex, firstIndex and every remote's
+// next to 0. The position is refused before it
 // touches the log, and the refusal is the proto sentinel so callers can name it.
 func TestHandleSnapshot_RefusesPositionOutsideProtocolRange(t *testing.T) {
 	for _, tc := range []struct {
@@ -63,8 +64,8 @@ func TestHandleSnapshot_RefusesPositionOutsideProtocolRange(t *testing.T) {
 	}
 }
 
-// TestNewRaft_RefusesPersistedStateAtTheCeiling pins the open-time half of
-// #197 C: a store that holds a snapshot, term or log at the CEILING — where +1
+// TestNewRaft_RefusesPersistedStateAtTheCeiling pins the open-time half of the
+// position bounds: a store that holds a snapshot, term or log at the CEILING — where +1
 // wraps — fails to open rather than running there. The open bound is higher
 // than the admission bound on purpose: state admitted just below
 // proto.MaxLogIndex / proto.MaxTerm can be moved by local transitions (the

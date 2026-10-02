@@ -30,8 +30,7 @@ import (
 //
 // These drive membership.Drive with scripted attempts and a scripted
 // membership, so every branch the idempotence gate turns on is pinned WITHOUT
-// a cluster or a loaded box. They are the tests #122 wrote for the e2e copy of
-// this core, carried here with it. The two that define the line are
+// a cluster or a loaded box. The two that define the line are
 // TestRetry_AlreadyExistsAtDifferentAddressStillFails (a fix that confirms the
 // replica ID without the address passes every other test and fails that one)
 // and the two *WithoutSubmissionStillFails tests (a fix that swallows the
@@ -88,8 +87,8 @@ func preflightNotLeader() error {
 	return &quicraft.NotLeaderError{ShardID: 1, LeaderID: 2}
 }
 
-// TestRetry_AlreadyExistsAfterPostDeliveryLossIsSuccess is #112's benign
-// reading: the first add was delivered, leadership moved, the retry was
+// TestRetry_AlreadyExistsAfterPostDeliveryLossIsSuccess is the benign
+// reading of "already exists": the first add was delivered, leadership moved, the retry was
 // correctly rejected, and the membership shows exactly what was asked for.
 func TestRetry_AlreadyExistsAfterPostDeliveryLossIsSuccess(t *testing.T) {
 	calls := 0
@@ -125,7 +124,7 @@ func TestRetry_TimeoutIsASubmission(t *testing.T) {
 // Peer.validateAddNode answers ErrNodeAlreadyExists from the replica ID
 // alone, so "already exists" is also what a genuine replica-ID collision looks
 // like. Confirming the ID without the address would make this pass, which is
-// precisely the blanket swallow #112 warns against.
+// precisely the blanket swallow the gate exists to avoid.
 func TestRetry_AlreadyExistsAtDifferentAddressStillFails(t *testing.T) {
 	calls := 0
 	m := &quicraft.Membership{Nodes: map[uint64]string{11: "127.0.0.1:1234"}}
@@ -249,7 +248,8 @@ func TestRetry_NilMembershipIsNotEvidence(t *testing.T) {
 }
 
 // TestRetry_DeleteNotFoundAfterPostDeliveryLossIsSuccess is the remove path's
-// mirror of #112, observed as "raft: target node not found in membership".
+// mirror of the post-delivery loss, observed as "raft: target node not found
+// in membership".
 func TestRetry_DeleteNotFoundAfterPostDeliveryLossIsSuccess(t *testing.T) {
 	calls := 0
 	m := &quicraft.Membership{Nodes: map[uint64]string{2: "127.0.0.1:2"}}
@@ -301,8 +301,7 @@ func TestRetry_DeleteStillPresentFails(t *testing.T) {
 	}
 }
 
-// TestRetry_PendingConfigChangeIsRetried covers the second shape #122's
-// reproduction turned up: the add arriving while the preceding remove is
+// TestRetry_PendingConfigChangeIsRetried covers the add arriving while the preceding remove is
 // still committing, which the engine documents as retryable.
 func TestRetry_PendingConfigChangeIsRetried(t *testing.T) {
 	calls := 0
@@ -394,11 +393,9 @@ func TestIsRetryable(t *testing.T) {
 		{"pending config change", quicraft.ErrRejected, true},
 		{"context deadline", context.DeadlineExceeded, true},
 		{"context canceled", context.Canceled, true},
-		// The real sentinel, not a look-alike built from the same text. It was
-		// errors.New(...) while the engine's error was internal and
-		// unmatchable; since #146 re-exported it, IsRetryable matches by
-		// sentinel and a fixture that only LOOKS like a transfer refusal is
-		// correctly not retried.
+		// The real sentinel, not a look-alike built from the same text.
+		// IsRetryable matches by sentinel, so a fixture that only LOOKS like
+		// a transfer refusal is correctly not retried.
 		{"leadership transfer in progress", quicraft.ErrTransferInProgress, true},
 		{"already exists", quicraftAlreadyExists(), false},
 		{"not found", quicraftNodeNotFound(), false},

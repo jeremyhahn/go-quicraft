@@ -183,7 +183,7 @@ func TestCompareAndDeleteReportsRefusalAsAnOutcomeNotAnError(t *testing.T) {
 	}
 }
 
-// This is the defect the method exists to close (go-qrdb#41). A stale releaser
+// This is the hazard the method exists to close. A stale releaser
 // that read holder A, and never observed B at all, must not be able to remove
 // B's claim after B legitimately acquired the key.
 func TestCompareAndDeleteStopsAStaleReleaserFromRemovingTheNextHolder(t *testing.T) {
@@ -242,11 +242,11 @@ func TestCompareAndDeleteStopsAStaleReleaserFromRemovingTheNextHolder(t *testing
 //
 // This is written down as a test rather than only as prose because a sibling
 // interface one layer up reads nil the opposite way: go-xkms's
-// CompareAndSwapper treats nil as "require the key ABSENT" (go-xkms #186).
+// CompareAndSwapper treats nil as "require the key ABSENT".
 // go-qrdb's engine agrees with the behaviour asserted here. An implementer
 // arriving from the go-xkms interface would otherwise carry the assumption
 // across and produce a store that deletes on absence — silently, and only
-// under the interleaving that matters (go-quicraft #45).
+// under the interleaving that matters.
 func TestCompareAndDeleteNilExpectedIsAValueNotAWildcard(t *testing.T) {
 	ctx := context.Background()
 

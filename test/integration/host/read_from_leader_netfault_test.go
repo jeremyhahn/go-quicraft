@@ -14,10 +14,10 @@
 
 //go:build integration && quicraft_netfault
 
-// The regression fixture for the READ half of the cached-leader class (#147).
+// The regression fixture for the READ half of the cached-leader class.
 //
 // It is the read-path twin of the e2e suite's
-// TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent (#98), and
+// TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent, and
 // it lives in the netfault build for the same reason: the failure needs a live
 // replica that has lost leadership AND does not yet know who took over.
 // handleFollowerReadIndex forwards a ReadIndex whenever the follower knows the
@@ -26,10 +26,9 @@
 // ErrClosed, not not-leader — but isolation can: the node keeps running, steps
 // down when check-quorum fires, and hears nothing about its successor.
 //
-// The CI failure this guards (#147, membership_change_test.go:210) was the
-// same refusal on a healthy cluster: a leader observed once above a loop of
-// thirty reads, deposed by the election storm that followed a membership
-// change, refusing the eleventh read correctly.
+// The CI failure this guards is the same refusal on a healthy cluster: a
+// leader observed once above a loop of thirty reads, deposed by the election
+// storm that follows a membership change, refusing a later read correctly.
 
 package host_test
 
@@ -96,9 +95,9 @@ func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.
 	}
 
 	// The read was answered, so the majority elected past the incumbent.
-	// Assert the pre-fix pattern against it once it has stepped down: one
-	// cached index, one SyncRead, no retry. This is what the converted sites
-	// used to do, and it doubles as proof that the isolation produced the
+	// Assert the cached-leader pattern against it once it has stepped down:
+	// one cached index, one SyncRead, no retry. This is the pattern the
+	// helpers exist to avoid, and it doubles as proof that the isolation produced the
 	// leader-unknown refusal rather than a healthy cluster that forwarded the
 	// ReadIndex on.
 	waitForCondition(t, failoverTimeout, "the isolated incumbent steps down", func() bool {
@@ -119,7 +118,7 @@ func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.
 			"not-leader rejection, so either the isolation did not take effect or "+
 			"the refusal came from an unrelated fault", staleIdx, err)
 	}
-	t.Logf("pre-fix pattern refused by the isolated incumbent: %v", err)
+	t.Logf("cached-leader pattern refused by the isolated incumbent: %v", err)
 
 	// After the heal the incumbent rejoins as a follower and the read path is
 	// whole again: a read through the leader still answers, and the rejoined

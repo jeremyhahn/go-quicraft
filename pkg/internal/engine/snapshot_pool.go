@@ -420,8 +420,8 @@ func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bo
 		//
 		// The state machine is at or past the snapshot index, so it already
 		// holds everything that snapshot represents: declining IS the correct
-		// and complete action. Failing the shard here turned a race the
-		// protocol handles by itself into a dead shard (#106).
+		// and complete action. Failing the shard here would turn a race the
+		// protocol handles by itself into a dead shard.
 		slog.Info("snapshot recovery declined: the state machine is already past "+
 			"this snapshot, and raft rejected it too",
 			"shard_id", req.shardID,
@@ -931,7 +931,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 		term = req.appliedToTerm
 	}
 
-	// L21: capture cluster membership ONCE, here under the apply gate together
+	// Capture cluster membership ONCE, here under the apply gate together
 	// with the (index, term) pair. The LogDB record and the LogReader record
 	// below both derive from this single snapshot; reading membership twice
 	// (once per record, after the gate released) let a config change committing
@@ -1070,31 +1070,30 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	compression := node.cfg.SnapshotCompressionType
 	ctx := context.Background()
 
-	// SEAL AS WE WRITE (#116). The state machine's bytes reach the barrier
-	// before they reach the disk, so no plaintext state machine is ever durable
-	// under the canonical snapshot.dat.
+	// SEAL AS WE WRITE. The state machine's bytes reach the barrier before
+	// they reach the disk, so no plaintext state machine is ever durable under
+	// the canonical snapshot.dat.
 	//
-	// The previous form wrote the state machine in the clear, fsynced it, and
-	// encrypted in place afterwards. Between that fsync and the rename a
-	// COMPLETE PLAINTEXT STATE MACHINE was on disk under the name every
-	// consumer, backup and operator reads: measured live at 206ms and 461ms
-	// under load, and PERMANENT after a kill in the window, because the
-	// directory is then left with snapshot.dat and no snapshot.meta and the
-	// deferred discard guard never runs. This is the receive path's shape
-	// (messagehandler.go), which never had the window for the same reason.
+	// Writing the state machine in the clear, fsyncing it, and encrypting in
+	// place afterwards would leave a COMPLETE PLAINTEXT STATE MACHINE on disk
+	// between that fsync and the rename, under the name every consumer, backup
+	// and operator reads — hundreds of milliseconds under load, and PERMANENT
+	// after a kill in the window, because the directory is then left with
+	// snapshot.dat and no snapshot.meta and the deferred discard guard never
+	// runs. The receive path (messagehandler.go) has the same shape for the
+	// same reason.
 	//
-	// The on-disk frame layout is UNCHANGED -- same frames, same AAD, same
-	// per-frame epoch -- so no format version moves and nothing needs
-	// migrating; encryptSnapshotFile, which the recovery, import and
-	// re-encryption paths still use, now drives the same writer.
+	// The on-disk frame layout is the one encryptSnapshotFile produces -- same
+	// frames, same AAD, same per-frame epoch -- because encryptSnapshotFile,
+	// which the recovery, import and re-encryption paths use, drives the same
+	// writer.
 	//
 	// A nil barrier is the configured plaintext deployment and writes straight
 	// to the file, exactly as the receive path copies through for a nil
 	// barrier. There is nothing to seal with and nothing to leak.
 	//
 	// ORDER: state machine -> snappy -> frame writer -> file. Compression comes
-	// first because ciphertext does not compress, which is also the order the
-	// two-step form produced.
+	// first because ciphertext does not compress.
 	var w io.Writer = f
 	var frameW *snapshotFrameWriter
 	if barrier != nil {
@@ -1222,14 +1221,12 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	//
 	// The quantity measured is the state machine's output AFTER compression
 	// and BEFORE sealing -- the "post-compression size" the limit is
-	// documented against (docs/multi-group-host/user.md). Before inline
-	// sealing that was simply the file's size, because the file held
-	// plaintext at this point. It no longer does: the file now holds framed
-	// ciphertext, ~41 bytes larger per 64 KiB chunk, so stat would measure
-	// the encryption overhead against a limit that was never defined to
-	// include it -- and a snapshot exactly at the limit, which used to be
-	// admitted, would be refused. The frame writer counts what it was handed,
-	// which is precisely the old measurement. Without a barrier the file is
+	// documented against (docs/multi-group-host/user.md). With a barrier the
+	// file holds framed ciphertext, ~41 bytes larger per 64 KiB chunk, so stat
+	// would measure the encryption overhead against a limit that is not
+	// defined to include it -- and a snapshot exactly at the limit would be
+	// refused. The frame writer counts what it was handed, which is the
+	// post-compression, pre-sealing size. Without a barrier the file is
 	// plaintext and stat is that same number.
 	//
 	// FileSize on the LogDB record, below, stays the stat'd on-disk size:
@@ -1296,7 +1293,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 
 	// The artifact is ALREADY sealed: the frame writer above encrypted every
 	// byte on its way to the file, so there is no separate encrypt step and
-	// never was a plaintext file to replace (#116).
+	// no plaintext file to replace.
 	//
 	// The recorded epoch is the MINIMUM epoch across all frames, not a post-hoc
 	// CurrentEpoch() read. A key rotation can run concurrently on a separate
@@ -1325,7 +1322,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// gate above; do NOT re-read lastAppliedTerm here — applies may have
 	// resumed since afterCapture released the gate.
 	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression); err != nil {
-		// M14: the data file is (possibly encrypted) ciphertext with no
+		// The data file is (possibly encrypted) ciphertext with no
 		// snapshot.meta beside it. readSnapshotEpoch classifies such a directory
 		// UNEVALUABLE, which makes the global/per-barrier purge floor fail safe
 		// and suppresses DEK purging host-wide until three newer snapshots GC it.
@@ -1357,8 +1354,8 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 		}
 	}
 
-	// L22/M15: export the snapshot BEFORE it is recorded in LogDB and published
-	// to the LogReader. Running it afterwards failed a snapshot that was already
+	// Export the snapshot BEFORE it is recorded in LogDB and published to the
+	// LogReader. Running it afterwards would fail a snapshot that was already
 	// durable, recorded and published — skipping compaction and epoch purge —
 	// on an export error; doing it here means an export failure fails a snapshot
 	// that is not yet visible, and the caller's retry re-takes it cleanly. The
@@ -2008,7 +2005,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 		plain, err := os.Open(dataPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				// M13: a LogDB-recorded snapshot whose artifact is gone is a
+				// A LogDB-recorded snapshot whose artifact is gone is a
 				// FAILURE, not a no-op. Returning nil here clears the recovering
 				// gate without seeding lastApplied, which later fails the shard
 				// with ErrApplyGap or serves stale reads. Fail with a typed error
@@ -2497,8 +2494,8 @@ func (p *snapshotPool) globalSafePurgeFloor() (uint64, bool) {
 			return 0, false
 		}
 	} else if p.logdb != nil {
-		// L23: a NON-NIL LogDB that cannot report an epoch floor contributed 0
-		// and let the purge proceed on the snapshot floor alone — irreversibly
+		// A NON-NIL LogDB that cannot report an epoch floor must not contribute
+		// 0 and let the purge proceed on the snapshot floor alone — irreversibly
 		// destroying DEKs a durable, encrypted LogDB may still need. Only a
 		// POSITIVE AtRestNonDurable declaration proves otherwise: no durable
 		// artifact means no record can be stranded. Silence (an implementation
@@ -2555,7 +2552,7 @@ func engineLogDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
 // snapshot tree lives. That record is the snapshot a restart recovers from, so
 // counting it is what keeps a purge from stranding the shard. A stopped shard's
 // OLDER retained snapshots are superseded and not counted; a purge may leave
-// them undecryptable (owner ruling, 2026-09-23).
+// them undecryptable.
 //
 // It fails safe: an enumeration error, a record that cannot be read, or an
 // include that cannot decide returns ok == false, and the caller must not
@@ -2665,7 +2662,7 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		loadedForTarget[node.ShardID()] = node
 	}
 
-	// Completeness guard (MED-2): when the LogDB can enumerate the COMPLETE,
+	// Completeness guard: when the LogDB can enumerate the COMPLETE,
 	// fixed set of shards mapped to this barrier (a dedicated per-tenant
 	// barrier), every such shard MUST be currently loaded so its retained
 	// snapshots are visible to the scan below. A mapped shard that is
@@ -2735,7 +2732,7 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		}
 		if !known {
 			// The LogDB does not own / cannot attribute this barrier. This is
-			// the UNSAFE case a bare epoch==0 used to mask: we cannot prove no
+			// the UNSAFE case a bare epoch==0 would mask: we cannot prove no
 			// live WAL record needs an old DEK, so we must not purge.
 			return 0, false
 		}
@@ -3433,8 +3430,8 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	// observe a deferred writeback failure, and this record is exactly what
 	// readSnapshotEpoch consults: an unreadable one classifies the directory
 	// UNEVALUABLE and suppresses DEK purging for the whole barrier until it
-	// rolls off. Dropping the error here (the old Debug-only defer) is what let
-	// that happen silently, so it is returned like every other write error.
+	// rolls off. Dropping the error here would let that happen silently, so it
+	// is returned like every other write error.
 	closed := false
 	defer func() {
 		if closed {
@@ -3520,9 +3517,9 @@ func latestSnapshotDir(baseDir string, shardID, replicaID uint64) (string, uint6
 		return "", 0, err
 	}
 	if len(dirs) == 0 {
-		// L25: "no snapshot on disk" is a storage-state answer, not a shutdown
-		// signal. Reporting ErrStopped here conflated the two; ErrSnapshotNotFound
-		// keeps them distinct per the typed-errors convention.
+		// "No snapshot on disk" is a storage-state answer, not a shutdown
+		// signal. Reporting ErrStopped here would conflate the two;
+		// ErrSnapshotNotFound keeps them distinct per the typed-errors convention.
 		return "", 0, &SnapshotError{
 			ShardID:   shardID,
 			ReplicaID: replicaID,
@@ -3969,7 +3966,7 @@ func writeExportTemp(dir string, r io.Reader) (string, error) {
 // paths that PUBLISH a snapshot directory without going through saveSnapshot —
 // the inbound-snapshot receive path (hostMessageHandler.HandleSnapshot, which
 // creates Node.SnapshotSaveDir(index) per received snapshot) and
-// Host.ImportSnapshot — neither of which previously reclaimed anything.
+// Host.ImportSnapshot — neither of which reclaims anything on its own.
 //
 // It must be called AFTER the new snapshot is durably recorded, so retention is
 // computed against the set that includes it; calling it before would count the

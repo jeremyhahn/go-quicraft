@@ -5830,8 +5830,7 @@ func TestRaftLog_Entries_LogDBReturnsError(t *testing.T) {
 // is reported as NOT OK rather than fabricated as 0, and that isUpToDate then
 // refuses the vote.
 //
-// This test previously asserted the opposite -- that lastTerm returns 0 on
-// error -- and so pinned a Leader Completeness hazard in place. Term 0 is
+// Returning 0 on error would be a Leader Completeness hazard. Term 0 is
 // Raft's "no term" sentinel: fed to isUpToDate as our OWN last term it makes
 // every candidate compare as up to date, so a replica holding a committed
 // entry no other node has would vote for a candidate missing it. The
@@ -9175,23 +9174,22 @@ func TestResetLeaseAcks_NilMap(t *testing.T) {
 // Test: H3 - replicaToBit 64-member guard
 // ---------------------------------------------------------------------------
 
-// TestBecomeLeader_RefusesTooManyVotingMembers pins what replaced the panic
-// this test used to assert.
+// TestBecomeLeader_RefusesTooManyVotingMembers pins how an over-cap voting
+// set is refused.
 //
 // The ackBits bitfield is a uint64, so positions 0..63 are all there are, and a
-// 65th voting member cannot be tracked. That was enforced by an
-// invariant.Assert in rebuildReplicaToBit, which panicked the raft STEP WORKER
-// — a goroutine shared by every shard it owns, and joined by Host.Close — over
-// a fault confined to one shard. Because the offending membership is durable,
-// it panicked again on every restart, so the node could not be brought up to
-// repair it.
+// 65th voting member cannot be tracked. Enforcing that with an assertion would
+// panic the raft STEP WORKER — a goroutine shared by every shard it owns, and
+// joined by Host.Close — over a fault confined to one shard. Because the
+// offending membership is durable, it would panic again on every restart, so
+// the node could not be brought up to repair it.
 //
-// The refusal now happens at the constructor: newRaft will not build a replica
+// The refusal happens at the constructor: newRaft will not build a replica
 // whose recovered configuration does not fit, so NewPeer returns the error and
 // StartShard fails this shard while the host stays up. becomeLeader keeps an
 // independent guard as a backstop (see
 // TestBecomeLeaderDeclinesOverCapVotingSet), but it is not reachable through
-// this path any more — there is no replica to campaign with.
+// this path — there is no replica to campaign with.
 func TestBecomeLeader_RefusesTooManyVotingMembers(t *testing.T) {
 	// Create a membership with 65 voting members (self + 64 remotes).
 	members := make(map[uint64]string, 65)
@@ -12851,7 +12849,7 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 // TestRaft_WitnessOnlyCommitQuorum pins the documented durability trade-off
 // of the unified quorum: a commit CAN advance on {leader + witnesses} acks
 // alone, with the entry's payload held by the leader only. Deliberate,
-// matching dragonboat; see docs/raft/protocol.md Section 6. If this behavior
+// matching dragonboat; see docs/raft-consensus/engineering.md Section 6. If this behavior
 // is ever changed (e.g. commits additionally gated on a full-replica
 // majority), update this test alongside the docs.
 func TestRaft_WitnessOnlyCommitQuorum(t *testing.T) {

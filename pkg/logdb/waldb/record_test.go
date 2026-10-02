@@ -276,7 +276,7 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 // [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] + [GenStart:4] = 15 bytes.
 //
 // The constant is pinned rather than derived because it IS the on-disk format:
-// changing it leaves every previously written segment unreadable. Under the
+// changing it leaves every already-written segment unreadable. Under the
 // pre-release pinning policy that is a permitted change and walFormatVersion
 // does NOT move for it — the framing changes in place at version 1 and every
 // dev directory is wiped. What this test protects is that the change is
@@ -289,7 +289,7 @@ func TestRecordHeaderSize(t *testing.T) {
 }
 
 // TestRecordGenerationStartRoundTrip pins that the generation start is
-// carried per chunk, covered by the CRC, and decoded exactly (#197 D).
+// carried per chunk, covered by the CRC, and decoded exactly.
 func TestRecordGenerationStartRoundTrip(t *testing.T) {
 	buf := make([]byte, 64)
 	payload := []byte("payload")

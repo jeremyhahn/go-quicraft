@@ -24,8 +24,8 @@ type SealedRootKey = seal.SealedRootKey
 // function values. A `var NewBarrier = seal.NewBarrier` is writable by every
 // package that can import this one, so an init() anywhere in a consumer's
 // transitive graph could substitute the constructor for the barrier that holds
-// the root key, with no call site changed to notice (#95). The same change is
-// made to the pkg/seal originals. Callers are unaffected: a call expression
+// the root key, with no call site changed to notice. The pkg/seal originals are
+// functions for the same reason. Callers are unaffected: a call expression
 // reads identically either way.
 func NewBarrier(config BarrierConfig) (*Barrier, error) { return seal.NewBarrier(config) }
 
@@ -35,14 +35,8 @@ func MustNewBarrier(config BarrierConfig) *Barrier { return seal.MustNewBarrier(
 
 // NewCredentials calls seal.NewCredentials, CONSUMING the caller's slice.
 //
-// It completes the shim. Credentials is re-exported above, and #41 retyped its
-// Secret field to an *enclave.SealedEnclave, so seal.NewCredentials became the
-// only supported way to populate one — which left this package exposing a type
-// its own consumers could not construct (#95). The break is deliberate; the gap
-// was not.
-//
-// Deleting Credentials instead would retire the shim, and retiring it is not
-// this change's call to make: nothing in this repository imports pkg/crypto, so
-// the only consumers are external, and removing a re-exported type breaks them
-// where adding a constructor cannot.
+// Credentials is re-exported above, and its Secret field is an
+// *enclave.SealedEnclave, so seal.NewCredentials is the only supported way to
+// populate one. Without this re-export the package would expose a type its own
+// consumers could not construct.
 func NewCredentials(secret []byte) (Credentials, error) { return seal.NewCredentials(secret) }

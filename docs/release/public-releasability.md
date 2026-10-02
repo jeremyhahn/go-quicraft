@@ -61,8 +61,6 @@ Two groups of tracked files are never published:
 
   | Path | What it is |
   |---|---|
-  | `.github/workflows/opencode-review.yml` | Automated peer review on the private forge |
-  | `.github/workflows/claude-review.yml` | A second, disabled reviewer for the same forge |
   | `.github/workflows/automerge.yml` | Arms the private forge's auto-merge when a PR opens |
   | `.release-allowed-signers` | The release recipe's trust anchor: the internal agent principal and its public key |
 
@@ -93,15 +91,14 @@ A new agent tool's files go in `isDevelopmentTooling`, a new private-forge file
 in `privateWorkflowFiles` (both `test/releasability/manifest_test.go`), and
 either one in `.gitattributes` and `.dockerignore` together.
 
-Two build gates read private-forge files: `test/buildgates` checks that
-`claude-review.yml` can neither publish a status nor run, and drives
-`make release-alpha` against `.release-allowed-signers`. Both go through
+One build gate reads a private-forge file: `test/buildgates` drives
+`make release-alpha` against `.release-allowed-signers`. It goes through
 `requirePrivateWorkflowFile`, which skips when the file is absent *and*
 `.gitattributes` export-ignores it exactly (a published export, where there is
 no private machinery to check), and fails when it is absent for any other
-reason. `TestPrivateWorkflowFilesAreExportIgnored` pins that both files are
-export-ignored, so an export skips those gates instead of failing them. In the
-private repository both files are present and the gates run.
+reason. `TestPrivateWorkflowFilesAreExportIgnored` pins that the file is
+export-ignored, so an export skips the gate instead of failing it. In the
+private repository the file is present and the gate runs.
 
 **Not covered: the module zip and a history push.** The Go module zip
 (`proxy.golang.org`, `go mod download`) is built from the repository at the

@@ -21,7 +21,7 @@ import (
 )
 
 // moduleCredentialFile is the one place a workstation keeps the Gitea module
-// credentials the benchmark image builds need (#184). It is a token on disk,
+// credentials the benchmark image builds need. It is a token on disk,
 // so every path that copies the working tree somewhere has to leave it behind.
 const moduleCredentialFile = ".devcontainer/.env"
 

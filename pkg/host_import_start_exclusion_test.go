@@ -54,7 +54,7 @@ func TestStartShard_RefusedWhileAnImportIsInProgress(t *testing.T) {
 
 // TestStartShard_ConcurrentDuplicateIsNotReady: the start holds the import
 // lock for its whole length, so a second concurrent start of the same shard
-// used to be told an import was in progress. It is told the transient
+// must not be told an import is in progress. It is told the transient
 // ErrShardNotReady — not ErrShardAlreadyExists, since the first start may yet
 // fail and a caller reading "exists" as "running" would never start the shard.
 func TestStartShard_ConcurrentDuplicateIsNotReady(t *testing.T) {

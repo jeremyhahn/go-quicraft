@@ -710,8 +710,7 @@ func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 // which wakes the caller) in its claim loop and stores ns.lastApplied only
 // later in the same callback, and the engine stores node.lastApplied only
 // after OnApplied returns (apply.go). A read of either counter straight after
-// SyncPropose returns can therefore still see the pre-batch value (#141,
-// the host-layer instance of #139/#84).
+// SyncPropose returns can therefore still see the pre-batch value.
 //
 // The caller supplies the bound. Two bounds are always available after a
 // completed proposal: the result's Value when the state machine reports the
@@ -736,7 +735,7 @@ func waitForApplied(t *testing.T, h *Host, shardID, index uint64) {
 // pinned the moment StartShard returns. It does not stay put: the
 // single-member shard elects itself and applies its term-opening no-op at
 // want+1 asynchronously, and under load that apply can land before the
-// caller's read (#141 observed 81 for want 80). The no-op is the only writer
+// caller's read (81 observed for want 80). The no-op is the only writer
 // that can move it, so want+1 is the one value above want that is not a
 // seeding regression; anything below want means the marker came from the
 // wrong source (the snapshot record, OnDiskIndex, or nothing), which is what
@@ -4266,10 +4265,10 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 
 	// A ReadIndex is leader-bound, so the shard has to HAVE a leader before
 	// one is issued. StartShard returns before the single-node self-election
-	// runs, and a ReadIndex that arrives first is refused outright since #153
-	// ("not leader, no leader currently known") rather than dropped and
-	// retried — which turns the race into a completed-with-error result this
-	// test rejects, and is #164.
+	// runs, and a ReadIndex that arrives first is refused outright ("not
+	// leader, no leader currently known") rather than dropped and retried —
+	// which turns the race into a completed-with-error result this test
+	// rejects.
 	//
 	// waitForLeader is the right wait rather than a sleep: it blocks until
 	// lastApplied >= 2, so the CURRENT term's no-op is committed, which is
@@ -5047,10 +5046,10 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
 }
 
 // TestOnSnapshotCompleted_FiresNoCompactionEvents pins that a snapshot's
-// completion alone says nothing about compaction. It used to fire
-// OnLogCompacted and OnLogDBCompacted after every successful save, including
-// saves within CompactionOverhead that compacted nothing, so a listener was
-// told storage had been reclaimed when it had not.
+// completion alone says nothing about compaction. Firing OnLogCompacted and
+// OnLogDBCompacted after every successful save, including saves within
+// CompactionOverhead that compacted nothing, would tell a listener storage had
+// been reclaimed when it had not.
 func TestOnSnapshotCompleted_FiresNoCompactionEvents(t *testing.T) {
 	cfg := testHostConfig(t)
 	var fired atomic.Int64
@@ -5327,10 +5326,10 @@ func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 // TestOnLeaderUpdated_LeavesPendingSnapshotsAlone asserts that a leadership
 // change does NOT complete an in-flight snapshot request.
 //
-// This test previously asserted the opposite. Saving a snapshot is purely
-// LOCAL — it reads this replica's own state machine and writes its own disk —
-// so an election completing the caller with NotLeaderError while the save kept
-// running only produced a retry that hit ErrSnapshotInProgress. Teardown
+// Saving a snapshot is purely LOCAL — it reads this replica's own state machine
+// and writes its own disk — so an election completing the caller with
+// NotLeaderError while the save kept running would only produce a retry that
+// hit ErrSnapshotInProgress. Teardown
 // (StopShard/Close), where the save really is abandoned, still fails it; see
 // failPendingRequests vs failPendingClientRequests.
 func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
@@ -7687,10 +7686,10 @@ func TestRequestRemoveNode_Success(t *testing.T) {
 
 	waitForLeader(t, h, 1)
 
-	// Removing replica 2, which is not a member, must now be rejected
-	// promptly with ErrNodeNotFound. Previously the Host delivered the
-	// invalid change and the apply error was swallowed, leaving the returned
-	// RequestState to hang until its deadline (H4).
+	// Removing replica 2, which is not a member, must be rejected promptly
+	// with ErrNodeNotFound. Delivering the invalid change and swallowing the
+	// apply error would leave the returned RequestState to hang until its
+	// deadline.
 	ctx := context.Background()
 	rs, err := h.RequestRemoveNode(ctx, 1, 2, 0)
 	if rs != nil {
@@ -9877,17 +9876,16 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Request keys (M1, #186)
+// Request keys
 // ---------------------------------------------------------------------------
 
 // TestRequestKeysNeverRepeatAndAreNeverZero pins the two properties every
-// pending-request map depends on. Keys used to come from three independent
-// counters (M1: proposals, reads and snapshots must not share a sequence);
-// they are now random 64-bit draws from one generator (#186: a counter
-// restarts with the Host, and a restarted replica minted its previous
-// incarnation's keys while replaying that incarnation's log). One generator
-// serves all three paths, so the old cross-path independence is subsumed by
-// the draw: a million keys, no repeat, no zero.
+// pending-request map depends on. Proposals, reads and snapshots must not share
+// a key, and keys must not repeat across incarnations (a counter restarts with
+// the Host, so a restarted replica would mint its previous incarnation's keys
+// while replaying that incarnation's log). Keys are random 64-bit draws from
+// one generator serving all three paths, so cross-path independence is
+// subsumed by the draw: a million keys, no repeat, no zero.
 func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 	const draws = 1 << 20
 	seen := make(map[uint64]struct{}, draws)
@@ -11211,11 +11209,11 @@ func TestOnLeaderUpdated_FollowerLeaderChangeFailsForwardedProposals(t *testing.
 // leader as leaderID 0 FIRST, so by the time the new leader appears the
 // previous leader is already 0.
 //
-// The condition here used to require prevLeaderID != 0, so this second
-// transition never fired and every proposal submitted during the leaderless
-// window stayed pending after a leader existed again. The caller then blocked
-// until its OWN deadline: measured on a 5-node cluster, elections completed in
-// ~530ms but writes did not resume for ~5.2s in roughly one failover in three.
+// Requiring prevLeaderID != 0 here would mean this second transition never
+// fires and every proposal submitted during the leaderless window stays
+// pending after a leader exists again. The caller then blocks until its OWN
+// deadline: measured on a 5-node cluster, elections completed in ~530ms but
+// writes did not resume for ~5.2s in roughly one failover in three.
 // Those proposals were never forwarded anywhere and can never complete, so the
 // new leader's arrival is exactly when to fail them.
 func TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals(t *testing.T) {
@@ -11328,14 +11326,14 @@ func TestOnLeaderUpdated_FollowerSameLeaderReelectedDoesNotFail(t *testing.T) {
 // that a proposal still pending when a new leader appears is failed, even
 // though the previously observed leader was 0.
 //
-// This test previously asserted the OPPOSITE ("first-election should not fail
-// proposals"), reasoning there was no previous leader to lose. That reasoning
-// does not survive contact with the real transition. Raft rejects a proposal
+// It is tempting to reason that a first election should not fail proposals,
+// since there was no previous leader to lose. That reasoning does not survive
+// contact with the real transition. Raft rejects a proposal
 // outright with NotLeaderError when it knows no leader, so a proposal that is
 // still PENDING here is not a first-election proposal at all — it is one that
 // was forwarded to a leader which then died, arriving after the leaderID -> 0
 // transition had already been consumed. It can never complete, and leaving it
-// pending made the caller wait out its own deadline: ~5s on a cluster whose
+// pending makes the caller wait out its own deadline: ~5s on a cluster whose
 // election finished in ~530ms, in roughly one failover in three.
 func TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals(t *testing.T) {
 	h := newTestHost(t)
@@ -14799,8 +14797,8 @@ func TestSyncRead_SuccessImmediate(t *testing.T) {
 	// because mockStateMachine.Lookup echoes it: the echo is the only
 	// evidence available here that the state machine was actually consulted
 	// and its answer returned to the caller. Reading with a nil query and
-	// discarding the result — which is what this test used to do — passes
-	// against a SyncRead that returns (nil, nil) without touching the SM.
+	// discarding the result would pass against a SyncRead that returns
+	// (nil, nil) without touching the SM.
 	const query = "success-immediate"
 	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {

@@ -24,6 +24,7 @@ commands and documents them there.
 ## Tests
 
 The snapshot tests, including the crash-filesystem and I/O-failure suites, run
-with `go test ./pkg/ ./pkg/internal/engine/` or `make test`. `make test-snapshot`
-does not cover them. See
+with `make test`. `make test-snapshot` runs the tests whose names match
+`Snapshot|Import|Export` across `./pkg/...`; snapshot code has no package of
+its own, so there is no `coverage-snapshot`. See
 [engineering.md](engineering.md#6-test-strategy).

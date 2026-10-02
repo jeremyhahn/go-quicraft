@@ -38,7 +38,7 @@ func TestIntegration_DB_SyncRequestAddWitness(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Get current membership, through whichever replica leads now (#123).
+	// Get current membership, through whichever replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if len(membership.Witnesses) != 0 {
 		t.Fatalf("expected 0 witnesses initially, got %d", len(membership.Witnesses))

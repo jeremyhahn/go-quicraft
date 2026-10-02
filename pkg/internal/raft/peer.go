@@ -202,16 +202,16 @@ type Peer struct {
 	// resolveStaleStartupConfig resumes its scan from.
 	//
 	// It exists because "what the state machine APPLIED" and "what has been
-	// FOLDED into the membership" are different facts, and conflating them was a
-	// silent way to campaign against a superseded voting set. The fold used to
-	// resume at r.log.processed+1, on the reasoning that everything at or below
-	// processed had already been offered. SetProcessedIndex breaks that: it
+	// FOLDED into the membership" are different facts, and conflating them is a
+	// silent way to campaign against a superseded voting set. Resuming the fold
+	// at r.log.processed+1, on the reasoning that everything at or below
+	// processed had already been offered, does not hold: SetProcessedIndex
 	// advances processed UNCONDITIONALLY and then asks replayConfigChangesTo to
 	// fold the same window, DISCARDING the report of whether the fold reached the
-	// end. One unreadable chunk and the window is skipped forever — processed
-	// already covers it, so resolveStaleStartupConfig's low > index early-out
-	// declares the configuration resolved and clears the watermark over entries
-	// nobody read. Keeping the two markers apart makes the fold's own progress
+	// end. One unreadable chunk and the window would be skipped forever —
+	// processed already covers it, so resolveStaleStartupConfig's low > index
+	// early-out would declare the configuration resolved and clear the watermark
+	// over entries nobody read. Keeping the two markers apart makes the fold's own progress
 	// the only thing the fold trusts.
 	//
 	// Seeded from the recovered base's ConfigChangeID, which is by definition the
@@ -506,12 +506,12 @@ func (p *Peer) publishMembership() {
 //     trip commitUpdate's assertion and kill the commit worker.
 //   - The FATAL error of a committed config entry that does not decode.
 //
-// The error used to be swallowed here. This path cannot fault the shard itself —
-// it runs before the engine node exists — so the strongest thing it could do
-// alone was arm the staleness watermark and refuse to campaign, which it still
+// The error is returned rather than swallowed. This path cannot fault the shard
+// itself — it runs before the engine node exists — so the strongest thing it
+// can do alone is arm the staleness watermark and refuse to campaign, which it
 // does. But refusing to campaign is a LIVENESS answer to a SAFETY fact: the
-// replica came up on a configuration it knows is unreconstructable and then
-// served reads and acked the leader from it, with one ERROR line as the only
+// replica would come up on a configuration it knows is unreconstructable and
+// then serve reads and ack the leader from it, with one ERROR line as the only
 // signal. The commit path faults the shard for the identical bytes
 // (processConfigChanges -> failCommit) and recovery aborts StartShard for them
 // (ReconstructMembership); reporting it lets the startup path reach the same
@@ -1041,9 +1041,9 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 	// policy is part of the membership itself, so this path and the Host
 	// API path enforce identical rules.
 	//
-	// handleLeaderPropose now runs the SAME validator (raft.validateConfigChange
-	// is wired to validateProposedConfigChange in NewPeer), so this call is no
-	// longer the only gate — it is the one that answers the caller before the
+	// handleLeaderPropose runs the SAME validator (raft.validateConfigChange
+	// is wired to validateProposedConfigChange in NewPeer), so this call is not
+	// the only gate — it is the one that answers the caller before the
 	// change is marshaled, and it reports the membership error rather than
 	// whichever earlier propose-time refusal the step would have hit first.
 	err := p.membership.validate(cc)
@@ -1396,10 +1396,10 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 		p.membership = p.newMembership(ms)
 		return true, nil
 	case proto.EntryConfigChange:
-		// A zero-length payload is left as the silent no-op it has always been.
+		// A zero-length payload is left as a silent no-op.
 		// It is not the corruption case: every replica reads the same nothing and
 		// skips identically, and no legitimate producer emits one (the
-		// propose-time gate now refuses any payload that does not decode), so it
+		// propose-time gate refuses any payload that does not decode), so it
 		// is a shape that only appears in synthetic entries.
 		if len(e.Cmd) == 0 {
 			return false, nil
@@ -1442,9 +1442,8 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 // takes effect at commit time (etcd/dragonboat model), not on log append.
 // It returns the FATAL error of an undecodable committed config entry, which
 // Peer.Commit propagates and the engine turns into a shard fault (failCommit).
-// That is the point of the return value: at runtime this used to be a silent
-// no-op — logged and the bool ignored — while recovery treated the identical
-// bytes as fatal. Runtime failing open and recovery failing closed over the same
+// That is the point of the return value: recovery treats the identical bytes as
+// fatal, and runtime failing open while recovery fails closed over the same
 // input is a divergence generator: the live replica keeps serving on a
 // configuration only it holds, and persists it with the next snapshot.
 //
@@ -1809,10 +1808,10 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 // just written to stable storage on the piggyback path.
 //
 // It exists because GetPiggybackUpdate deliberately does NOT advance prevState:
-// the persist happens after the Update leaves this package and can fail. An
-// earlier version advanced it optimistically, so a failed piggyback SaveState
-// left prevState claiming a term/vote/commit that never reached disk. A vote
-// granted in that window became invisible to hasStateChanged(), letting a later
+// the persist happens after the Update leaves this package and can fail.
+// Advancing it optimistically would let a failed piggyback SaveState leave
+// prevState claiming a term/vote/commit that never reached disk. A vote granted
+// in that window would become invisible to hasStateChanged(), letting a later
 // update be ReadOnly and transmit its RequestVoteResp with no WAL write at all.
 //
 // hs must be the State carried by the Update that was persisted (the clamped
@@ -2380,10 +2379,10 @@ func (p *Peer) DiagRemotes() string {
 // currently understands it. It returns nil when this replica is not the leader,
 // because only a leader tracks remote progress at all.
 //
-// This is the structured form of what DiagRemotes renders as text. Answering
-// "which follower is behind, and why" was previously possible only by parsing
-// that string, which meant the answer was unavailable to metrics, to the public
-// ShardInfo, and to anything that is not a human reading a log line.
+// This is the structured form of what DiagRemotes renders as text, so the answer
+// to "which follower is behind, and why" is available to metrics, to the public
+// ShardInfo, and to anything that is not a human reading a log line, without
+// parsing that string.
 //
 // Caller must hold raftMu (or be the step worker): it reads Peer.r directly.
 func (p *Peer) RemoteProgress() []RemoteProgress {

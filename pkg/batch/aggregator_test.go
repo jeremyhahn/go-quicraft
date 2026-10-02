@@ -1044,10 +1044,9 @@ func TestConcurrentSubmit(t *testing.T) {
 // that makes the race safe: a Submit that reports SUCCESS must have had its
 // command proposed, and a Submit that reports failure must not have.
 //
-// It previously ended at "the test passes if there are no panics or data
-// races" — every Submit's return value was discarded, so nothing but the race
-// detector could fail it. A build that reported success for a command it never
-// proposed (or ClosedError for one it did) passed silently, and that is exactly
+// Every Submit's return value is checked, so more than the race detector can
+// fail it: a build that reported success for a command it never proposed (or
+// ClosedError for one it did) would otherwise pass silently, and that is exactly
 // the class of bug this shutdown race produces: the caller of a batched write
 // has no other signal, and the aggregator has no at-most-once path to repair a
 // wrong answer with.

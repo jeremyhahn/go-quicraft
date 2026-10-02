@@ -21,6 +21,7 @@ type SplitError struct {
 	Reason string
 }
 
+// Error implements the error interface.
 func (e *SplitError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: split failed: %s", e.Reason)
 }
@@ -30,6 +31,7 @@ type CombineError struct {
 	Reason string
 }
 
+// Error implements the error interface.
 func (e *CombineError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: combine failed: %s", e.Reason)
 }
@@ -53,6 +55,7 @@ type ProtectedMemoryError struct {
 	Err error
 }
 
+// Error implements the error interface.
 func (e *ProtectedMemoryError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: %s: locked memory unavailable: %v", e.Op, e.Err)
 }
@@ -67,6 +70,7 @@ type ValidationError struct {
 	Reason string
 }
 
+// Error implements the error interface.
 func (e *ValidationError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: validation failed for %s: %s", e.Field, e.Reason)
 }
@@ -80,6 +84,7 @@ func (e *ValidationError) Error() string {
 // caller. The type is retained only for API/SDK compatibility.
 type IntegrityError struct{}
 
+// Error implements the error interface.
 func (e *IntegrityError) Error() string {
 	return "quicraft/shamir: integrity verification failed: reconstructed secret digest does not match share digest"
 }

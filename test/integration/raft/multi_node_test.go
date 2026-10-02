@@ -53,10 +53,10 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	addrs := make([]string, numNodes)
 	for i := range numNodes {
 		// Reserve from a window outside the kernel's ephemeral range, so the
-		// port cannot be handed to anything else before NewHost binds it. The
-		// loop used to bind 127.0.0.1:0 and close it, which is #131: nothing
-		// held the port between the close and the bind, and two nodes of one
-		// cluster could be given the same one.
+		// port cannot be handed to anything else before NewHost binds it.
+		// Binding 127.0.0.1:0 and closing it would leave nothing holding the
+		// port between the close and the bind, and two nodes of one cluster
+		// could be given the same one.
 		addrs[i] = netport.MustReserveUDP(t.Fatalf)
 	}
 

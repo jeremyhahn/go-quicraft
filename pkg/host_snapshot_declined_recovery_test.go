@@ -49,25 +49,24 @@ func (r *shardFailedRecorder) reports() []config.ShardFailedInfo {
 
 // TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure pins the
 // half of the stale-recovery contract that lives in the HOST rather than the
-// engine, and that #113 left behind (#126).
+// engine.
 //
-// # What #113 fixed, and what it did not
+// # The engine half
 //
-// #113 stopped the snapshot pool calling Node.Fail on a stale recovery: the
-// refusal is produced before the recovering gate is raised and before
+// The snapshot pool does not call Node.Fail on a stale recovery: the refusal
+// is produced before the recovering gate is raised and before
 // RecoverFromSnapshot runs, so the state machine is untouched and already at or
 // past the snapshot index. The replica is alive and serving.
 //
 // The pool still reports that refusal as the completion's ERROR, and must -- a
 // declined recovery is not a successful one either, and calling it success
 // would fire OnSnapshotRecovered and reconcile membership from a snapshot
-// nothing restored. But OnSnapshotCompleted then handed every non-nil error
-// straight to EventListener.OnShardFailed, which is the only outward report
-// that a replica makes no further progress without an operator
-// StopShard/StartShard.
+// nothing restored. But handing every non-nil error straight to
+// EventListener.OnShardFailed is wrong: that is the only outward report that a
+// replica makes no further progress without an operator StopShard/StartShard.
 //
-// So the shard stayed alive and the host announced it dead. Under load that
-// took whole integration runs red on a healthy cluster, with the engine's own
+// The shard would stay alive while the host announced it dead. Under load that
+// fails whole integration runs on a healthy cluster, with the engine's own
 // "snapshot recovery declined" line sitting in the same log a few microseconds
 // earlier:
 //

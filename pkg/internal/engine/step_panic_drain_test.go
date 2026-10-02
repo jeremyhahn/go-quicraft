@@ -25,10 +25,10 @@ import (
 // regression test for the step-worker recovery stealing in-flight items from the
 // LIVE commit worker.
 //
-// The recovery used to call drainCommitC(sw.commitC) — the SAME channel
-// commitWorkers[i] is concurrently consuming — and for every item it won the
-// race for it marked that item's node permanently failed, fired OnShardFailed
-// and failed its proposals. With the default CommitCBufferSize of 64, one panic
+// Were the recovery to call drainCommitC(sw.commitC) — the SAME channel
+// commitWorkers[i] is concurrently consuming — then for every item it won the
+// race for it would mark that item's node permanently failed, fire
+// OnShardFailed and fail its proposals. With the default CommitCBufferSize of 64, one panic
 // on one shard could permanently fail up to 64 unrelated healthy shards, and
 // which ones was a coin flip against the live consumer. There is no automatic
 // reset: recovery needs an operator StopShard/StartShard.
@@ -44,7 +44,7 @@ import (
 // So the contract is: a step-worker panic touches NOTHING in commitC. The one
 // node that genuinely needs unwedging — the one mid-enqueueForCommit, whose item
 // never reached the channel — is handled by clearStepCommitPending, and this
-// test pins that half too so the fix cannot be read as "do less".
+// test pins that half too so the contract cannot be read as "do less".
 func TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()

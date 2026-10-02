@@ -143,11 +143,10 @@ func TestBarrier_ContextAADEpochVariants(t *testing.T) {
 	}
 }
 
-// TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs is the L5 regression: a
-// second SetSealedRootKey must make the loaded blob authoritative and must NOT
-// resurrect epochs a prior (reduced) blob had purged. Before the fix the epoch
-// set was merged into the existing map, so the union {1,2,3} survived reloading
-// a reduced {1,3}.
+// TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs pins that a second
+// SetSealedRootKey makes the loaded blob authoritative and does NOT resurrect
+// epochs a prior (reduced) blob had purged. Merging the epoch set into the
+// existing map would let the union {1,2,3} survive reloading a reduced {1,3}.
 func TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs(t *testing.T) {
 	b := MustNewBarrier(DefaultBarrierConfig(1))
 

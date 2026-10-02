@@ -21,7 +21,7 @@ import (
 )
 
 // TestSnapshotCheckBounds pins the one predicate every snapshot admission
-// path applies (#197 C): the position must lie below MaxLogIndex / MaxTerm so
+// path applies: the position must lie below MaxLogIndex / MaxTerm so
 // that Index+1 and term arithmetic cannot wrap.
 func TestSnapshotCheckBounds(t *testing.T) {
 	for _, tc := range []struct {

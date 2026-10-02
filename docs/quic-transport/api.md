@@ -120,7 +120,7 @@ too, and live connections are re-checked every 30 seconds.
 | `config.ErrMTLSConfigRequired` (`*MTLSConfigRequiredError`) | the transport is enabled with no `MTLSConfig` |
 | `*config.ValidationError` | a limit, the mTLS material or the revocation configuration is invalid; `Field` names it |
 | `quicraft.ErrMemberIdentityRequired` | a member admission on a host with a transport names no node identity |
-| `StartShard` error naming shared certificate hosts | the local leaf also covers another member's host. The sentinel (`ErrSharedPeerCertificate`) is in the internal transport package, so match it by message, not `errors.Is`. |
+| `quicraft.ErrSharedPeerCertificate` (`*quicraft.SharedPeerCertificateError`) | `StartShard` or a membership add where the local leaf also covers another member's host; `CoveredPeers` names them |
 | `*quicraft.SnapshotSendError` / `*quicraft.SnapshotReceiveError` | a snapshot transfer failed |
 | `IncUnauthorizedMessageDropped` / `IncUnauthorizedSnapshotDropped` (metrics) | an inbound message or snapshot came from a peer whose identity no configuration this replica holds binds to the claimed sender. The handler refuses it with `*quicraft.UnauthorizedMessageError`, which is logged, not returned to the embedder. |
 | `IncMessagesDropped` (metrics) | the transport dropped an outbound or inbound message; the reason labels are in [`engineering.md`](engineering.md#transport-metrics) |

@@ -125,11 +125,12 @@ type ConcurrentStateMachine interface {
 //
 // # Client sessions are not available
 //
-// A shard backed by a DiskStateMachine supports NO-OP sessions only. Every
-// session-managed entry point on the host — GetNewSession, RegisterSession,
-// ProposeWithSession, SyncProposeWithSession, CloseSession — refuses the shard
-// with ErrSessionsUnsupportedOnDisk, and idempotent operations proposed through
-// a no-op session are the supported substitute.
+// A shard backed by a DiskStateMachine supports no client sessions. Every
+// session-managed entry point on the host — GetNewSession,
+// GetNewSessionWithOwner, RegisterSession, ProposeWithSession,
+// SyncProposeWithSession, CloseSession — refuses the shard with
+// ErrSessionsUnsupportedOnDisk, and idempotent operations proposed without a
+// session (Propose, SyncPropose) are the supported substitute.
 //
 // The reason is Open. The session table is replicated state that travels only
 // inside the snapshot stream, so it is restored by RecoverFromSnapshot — and a
@@ -187,6 +188,7 @@ type DiskStateMachine interface {
 // reports a divergence between replicas that does not exist. kv.ConcurrentStore
 // does this by holding every bucket lock across both Update and GetHash.
 type Hasher interface {
+	// GetHash returns a hash of the state machine's current state.
 	GetHash() (uint64, error)
 }
 
@@ -194,6 +196,7 @@ type Hasher interface {
 // When implemented, the RSM adapter uses this instead of Lookup to
 // avoid heap allocation from interface{} boxing.
 type NALookup interface {
+	// BytesLookup returns the value stored under key.
 	BytesLookup(key []byte) ([]byte, error)
 }
 
@@ -207,5 +210,7 @@ type NALookup interface {
 // on the pooled read path to eliminate per-call heap allocation.
 type NALookupInto interface {
 	NALookup
+	// BytesLookupInto copies the value stored under key into dst and
+	// returns the populated slice.
 	BytesLookupInto(key, dst []byte) ([]byte, error)
 }

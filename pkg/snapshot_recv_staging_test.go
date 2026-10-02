@@ -65,15 +65,15 @@ func recvStageDirs(f *recvFixture, index uint64) []string {
 // TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact is the
 // regression guard for the destructive receive.
 //
-// The receive used to open snapshot.dat in the CANONICAL snapshot-<index>
+// A receive that opened snapshot.dat in the CANONICAL snapshot-<index>
 // directory with O_CREATE|O_TRUNC, before a single received byte had been
-// authenticated, and its failure defer then called RemoveAll on that same
-// directory. Same-index re-sends are routine and supported — msg.Hint carries a
-// transfer sequence precisely to disambiguate them — so a re-send that failed
-// anywhere in the write truncated and then DELETED a complete artifact the
-// receive had not created.
+// authenticated, and whose failure defer called RemoveAll on that same
+// directory would be destructive. Same-index re-sends are routine and supported
+// — msg.Hint carries a transfer sequence precisely to disambiguate them — so a
+// re-send that failed anywhere in the write would truncate and then DELETE a
+// complete artifact the receive had not created.
 //
-// The fix is the discipline ImportSnapshot already uses: stage in a directory
+// The receive uses the discipline ImportSnapshot uses: stage in a directory
 // this receive created, publish with one rename, and never remove a directory
 // it merely found.
 func TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact(t *testing.T) {

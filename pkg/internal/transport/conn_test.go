@@ -1836,13 +1836,10 @@ func TestConnectionCleanupOnce_PanicReturnsTrueAndRecovers(t *testing.T) {
 
 	// Drive the sweep immediately instead of waiting a real tick.
 	//
-	// This test used to take THIRTY SECONDS, because connectionCleanupOnce
-	// tickered on the 30s production interval and the panic can only fire once
-	// the ticker fires. Its own comment said "we can't wait 30s" — in a branch
-	// that was only ever reached after waiting exactly that. So it paid the full
-	// interval and then asserted the fallback, and the panic path it is named
-	// for was never actually exercised. Both problems go away with the interval
-	// as a field (#71).
+	// connectionCleanupOnce tickers on cleanupInterval, and the panic can only
+	// fire once the ticker fires. On the 30s production interval this test
+	// would pay the full interval; with the interval as a field it exercises
+	// the panic path at once.
 	tr.cleanupInterval = time.Millisecond
 
 	tr.stopC = make(chan struct{})
@@ -1864,10 +1861,8 @@ func TestConnectionCleanupOnce_PanicReturnsTrueAndRecovers(t *testing.T) {
 // TestConnectionCleanupOnce_StopCReturnsFalse covers the other exit: a clean
 // shutdown returns panicked=false and does not sweep.
 //
-// It used to be the FALLBACK half of the panic test above, reached only when
-// that test's 30-second tick had already elapsed without panicking — so it ran
-// only in the case the panic assertion had effectively failed. Split out, it
-// runs every time and says which path it is testing.
+// It is a separate test rather than a fallback branch of the panic test above,
+// so it runs every time and says which path it is testing.
 func TestConnectionCleanupOnce_StopCReturnsFalse(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()

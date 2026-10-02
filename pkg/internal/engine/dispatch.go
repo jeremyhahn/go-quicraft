@@ -65,8 +65,8 @@ const listenerQueueSize = 1024
 // relationships with raft.Peer.Handle — OnReadIndexBatched must register its
 // aliases before the ReadIndex reaches raft, or a single-node shard completes
 // the batch key before the aliases exist — so they cannot be queued behind user
-// code. They were already unordered with respect to each other (they run on
-// three different worker tiers), so nothing that previously held stops holding.
+// code. They are also unordered with respect to each other (they run on three
+// different worker tiers).
 //
 // # Queue-full policy
 //

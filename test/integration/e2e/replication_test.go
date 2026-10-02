@@ -91,11 +91,11 @@ func TestE2E_Replication_ConcurrentProposals(t *testing.T) {
 	errCh := make(chan error, numWorkers*entriesPerWorker)
 
 	// Every entry must still commit -- the verification below requires all of
-	// them on every node. What changed is that a leadership change during the
-	// run is retried against the NEW leader instead of being reported as a
-	// failed proposal: the workers used to pin the leader index sampled before
-	// they started and fatal on ErrNotLeader, so an ordinary re-election failed
-	// the test with a message that reads like a lost write.
+	// them on every node. A leadership change during the run is retried
+	// against the NEW leader instead of being reported as a failed proposal:
+	// workers that pinned the leader index sampled before they started and
+	// failed on ErrNotLeader would let an ordinary re-election fail the test
+	// with a message that reads like a lost write.
 	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
@@ -261,11 +261,11 @@ func TestE2E_FiveNode_Replication_MultipleEntries(t *testing.T) {
 	// pipeline is not a leadership problem.
 	//
 	// The predicate is the typed error rather than a substring of its message,
-	// and it now covers the commit half of the round trip as well as the
+	// and it covers the commit half of the round trip as well as the
 	// submission — the helper reports one error for both, and a rate limiter
 	// that rejected at admission cannot be told apart here from one that did
-	// not. That is marginally more permissive than the previous version, which
-	// failed outright on a busy error raised after submission.
+	// not. That is marginally more permissive than failing outright on a busy
+	// error raised after submission.
 	for i := range numEntries {
 		key := fmt.Sprintf("f5-key-%03d", i)
 		value := fmt.Sprintf("f5-value-%03d", i)

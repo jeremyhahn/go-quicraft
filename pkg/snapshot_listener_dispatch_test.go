@@ -26,9 +26,9 @@ import (
 
 // TestSnapshotCallbacks_DispatchUserListeners: the snapshot callbacks are
 // invoked INLINE on a snapshot-pool worker, and a recovery reports while
-// holding its node's write lease, which UnloadNode waits out. The host used to
-// call the user's EventListener from them directly, so a listener doing the
-// natural thing — StopShard on a failed recovery — waited on its own lease
+// holding its node's write lease, which UnloadNode waits out. Calling the
+// user's EventListener from them directly would make a listener doing the
+// natural thing — StopShard on a failed recovery — wait on its own lease
 // forever. The fan-out is dispatched: the callback returns while the listener
 // is still running.
 func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {

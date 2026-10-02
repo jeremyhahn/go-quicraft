@@ -265,10 +265,10 @@ func WithMetrics(c MetricsCollector) HostOption {
 			return
 		}
 		// Wrap so a panic in the caller's collector cannot escape into engine
-		// code. The engine calls it from inside node.raftMu, whose unlocks are
-		// plain statements rather than defers, so an escaping panic leaves the
-		// lock held forever and deadlocks every shard on that worker plus
-		// Host.Close. See safeMetricsCollector.
+		// code. The engine calls it from inside critical sections in its step
+		// and commit workers; an escaping panic would unwind the worker and
+		// cost a restart that drops the in-flight update. See
+		// safeMetricsCollector.
 		o.metrics = newSafeMetricsCollector(c)
 	}
 }
@@ -374,8 +374,7 @@ type transportSender struct {
 	engine    *engine.Engine
 	barrier   Barrier
 	// shardBarriers, when non-nil, routes snapshot decrypt-for-send to a
-	// per-shard barrier. When nil the single host-wide barrier is used,
-	// preserving the original behavior exactly.
+	// per-shard barrier. When nil the single host-wide barrier is used.
 	shardBarriers func(shardID uint64) Barrier
 	logger        *slog.Logger
 	snapshotWg    sync.WaitGroup // tracks in-flight snapshot sends
@@ -442,9 +441,8 @@ func requireEncryptedLogDB(db logdb.LogDB, refusal error) error {
 // configured, the resolver returns nil, and there is no host-wide barrier to
 // fall back on. That combination has no encrypting outcome: the caller asked
 // for per-shard encryption and this shard resolved to nothing, so writing it in
-// plaintext would downgrade exactly one tenant invisibly. Note the asymmetry
-// this removes -- a SEALED barrier already fails closed everywhere, while an
-// ABSENT one used to fail open.
+// plaintext would downgrade exactly one tenant invisibly. An ABSENT barrier
+// therefore fails closed exactly as a SEALED one does everywhere else.
 //
 // A nil return with a nil error is the legitimate unencrypted deployment:
 // WithShardBarriers was never configured and no host-wide barrier exists.
@@ -1426,13 +1424,13 @@ type pendingProposal struct {
 	// This is the second line of defence behind nextRequestKey's random draw,
 	// and the exact one: a key repeats across incarnations only by a 2^-64
 	// accident, but an entry at or below the floor is provably not this
-	// proposal's, whatever its key. It was the first fix for #186 -- the
-	// keys were (replicaID, per-Host sequence) then, and a restarted replica
-	// minted its previous incarnation's keys while replaying that
-	// incarnation's log, so 64 of 64 proposals issued through a restarting
-	// replica were acknowledged with an old entry's result -- and it stays
-	// because it costs one atomic load and turns a probabilistic guarantee
-	// into a certain one for every entry a replay can deliver -- the marker
+	// proposal's, whatever its key. A deterministic key scheme such as
+	// (replicaID, per-Host sequence) would let a restarted replica mint its
+	// previous incarnation's keys while replaying that incarnation's log and
+	// acknowledge new proposals with an old entry's result; the floor rules
+	// that out regardless of how keys are drawn. It costs one atomic load
+	// and turns a probabilistic guarantee into a certain one for every entry
+	// a replay can deliver -- the marker
 	// is seeded from the recovered log when the engine Node is built
 	// (engine.NewNode), before StartShard returns, so no proposal can
 	// register against a floor the replay has not already cleared.
@@ -1553,21 +1551,21 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// applyMembershipRouting. pendingProposals is a lock-free sync.Map
 	// shared with the deadline sweep (sweepPendingProposals) and
 	// OnProposalFailed; whichever of them calls LoadAndDelete on a key first
-	// owns that entry. Two earlier versions of this fix got the relative
-	// position wrong in each direction: claiming AFTER applyMembershipRouting
-	// reopened the window #20 itself was about, one level down — an entry
-	// whose deadline expired while routing was still running could be
-	// claimed by the sweeper instead, which treats it as a timeout and, via
-	// pendingProposal.onFailure, could act on an already-committed change.
-	// Claiming after the pending-reads scan (rather than before it)
-	// reopened the SAME window one level up: the reads scan can itself take
-	// a while (arbitrarily many confirmed reads, a metrics call per one),
-	// and until claiming happens the config-change proposal is just as
-	// exposed to the sweeper. Claiming first, before any other work at all,
-	// closes both. Only the actual completion (rs.complete, inside
-	// completeProposal) is deferred until after routing, for the #20 reason
-	// below — and only for a membership-changing batch, which is the only
-	// case that has routing to defer it past.
+	// owns that entry. Claiming AFTER applyMembershipRouting would leave a
+	// window in which an entry whose deadline expired while routing was
+	// still running could be claimed by the sweeper instead, which treats
+	// it as a timeout and, via pendingProposal.onFailure, could act on an
+	// already-committed change. Claiming after the pending-reads scan
+	// (rather than before it) would leave the same window one level up:
+	// the reads scan can itself take a while (arbitrarily many confirmed
+	// reads, a metrics call per one), and until claiming happens the
+	// config-change proposal is just as exposed to the sweeper. Claiming
+	// first, before any other work at all, closes both. Only the actual
+	// completion (rs.complete, inside completeProposal) is deferred until
+	// after routing, so ns.configChangeIndex reflects this batch before a
+	// woken caller can round-trip its ConfigChangeID (see below) — and only for a
+	// membership-changing batch, which is the only case that has routing to
+	// defer it past.
 	type claimedProposal struct {
 		entry  proto.Entry
 		result sm.Result
@@ -1619,8 +1617,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// Ordinary path (no config change in this batch, the
 			// overwhelming majority of apply traffic — regular client
 			// proposals and follower replication): there is no routing
-			// work to order around, so complete immediately, same as
-			// before #20.
+			// work to order around, so complete immediately.
 			completeProposal(c.h, shardID, entry, pp, results[i])
 		}
 	}
@@ -1628,7 +1625,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// Everything below — the pending-reads scan, applyMembershipRouting, and
 	// completing the claimed proposals — runs inside ONE recover, installed
 	// before any of it, rather than one scoped only around
-	// applyMembershipRouting (an earlier version of this fix). Every piece
+	// applyMembershipRouting. Every piece
 	// in here calls at least one user-supplied callback that can panic:
 	// c.h.metrics.ObserveReadIndexLatency in the reads scan, c.h.logger in
 	// applyMembershipRouting's per-entry log call, c.h.metrics.
@@ -1637,18 +1634,15 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// reads scan's own metrics call is exactly as capable of leaving
 	// claimed's proposals unclaimed-from-the-map-but-never-completed as
 	// applyMembershipRouting's logger call is, and a recover that only
-	// wraps the latter does nothing for the former (#20 review finding,
-	// round 6). One recover around the whole region means the next
-	// user-callback panic this function grows does not need its own
-	// bespoke guard rediscovered the same way three times running.
+	// wraps the latter does nothing for the former. One recover around the
+	// whole region means the next user-callback panic this function grows
+	// is covered without a bespoke guard of its own.
 	//
 	// This is harmless for a batch with no membership change: claimed is
 	// nil there (proposals were already claimed AND completed together, in
 	// the loop above, before this closure even starts), so the recover
-	// handler's range over claimed is a no-op and the reads scan's
-	// behavior is unchanged from every version of this code before #20 —
-	// a panic there still reaches the apply worker's own recover
-	// (apply.go:605-633) and fails the shard, exactly as it always has.
+	// handler's range over claimed is a no-op and a panic in the reads
+	// scan reaches the apply worker's own recover and fails the shard.
 	func() {
 		// completedClaims counts how many of claimed[0:] the normal
 		// completeProposal loop below has already finished — see the
@@ -1669,8 +1663,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				}
 
 				// Complete/release the NOT-yet-completed tail,
-				// claimed[completedClaims:], BEFORE any logging below —
-				// not after, which is where this was originally written.
+				// claimed[completedClaims:], BEFORE any logging below.
 				// A panic value's concrete type is caller-controlled and
 				// may implement String/Error/Format with a bug of its own,
 				// and slog.Error here is the package-level default logger,
@@ -1679,10 +1672,9 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// unlike c.h.logger (WithLogger), it is not even this
 				// Host's own configured logger, so a Host built with no
 				// logger option at all is still exposed to it. Logging
-				// first meant a panic in fmt.Sprint(r) or the handler
-				// itself skipped this whole deferred function, recreating
-				// exactly the stranding this recovery exists to prevent —
-				// now one level further in (review finding, round 9).
+				// first would let a panic in fmt.Sprint(r) or the handler
+				// itself skip this whole deferred function, recreating
+				// exactly the stranding this recovery exists to prevent.
 				//
 				// Only the NOT-yet-completed tail: a panic reaching here
 				// after the completeProposal loop below has already
@@ -1693,8 +1685,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// recycles the object at zero, so a second call for an
 				// already-released RequestState underflows that count or
 				// touches an object already back in the pool and
-				// potentially reused by an unrelated request (review
-				// finding, round 8).
+				// potentially reused by an unrelated request.
 				//
 				// This does NOT call pp.failed() (rollbackPreRegister) the
 				// way the deadline sweep does, and must not:
@@ -1715,7 +1706,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// come yet — the change is committed either way, and the
 				// shard failing after this recovers will re-derive ns.nodes
 				// and the registry from the persisted log on reload
-				// regardless (review finding, round 5).
+				// regardless.
 				for _, cp := range claimed[completedClaims:] {
 					cp.pp.rs.complete(RequestResult{Err: panicErr})
 					cp.pp.rs.releaseRef()
@@ -1749,10 +1740,10 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		// applyMembershipRouting. A read confirmed by this exact batch has
 		// nothing to do with routing or ns.configChangeIndex — it is keyed
 		// off entries[].Index alone — so there is no correctness reason to
-		// run it after routing, and every reason not to: leaving it later
-		// meant a routing panic stranded any read this batch had just
-		// confirmed until its own deadline, and held Drain's pendingOps
-		// count with it (#20 review finding, third round).
+		// run it after routing, and every reason not to: running it later
+		// would let a routing panic strand any read this batch had just
+		// confirmed until its own deadline, and hold Drain's pendingOps
+		// count with it.
 		//
 		// The lastApplied store MUST happen under pendingReadsMu, before
 		// the read scan, and OnReadyToRead must read lastApplied under the
@@ -1799,16 +1790,16 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// can wake a caller blocked on RequestState.ResultC() while
 			// this function is still executing on the apply worker's
 			// goroutine. A caller unblocked by a config-change proposal's
-			// completion is documented (host.go:2059-2063) to be able to
+			// completion is documented (see SyncGetShardMembership) to be able to
 			// immediately call SyncGetShardMembership and round-trip its
 			// ConfigChangeID into the next config-change call; that
 			// round-trip is only race-free if ns.configChangeIndex already
 			// reflects this batch by the time completion is visible to the
 			// caller. Running applyMembershipRouting first — same
 			// goroutine, program order — makes that true; running it after
-			// (the original order) left a window where the caller's next
-			// call raced advanceConfigChangeIndex and lost, producing a
-			// false-positive StaleConfigChangeError (#20).
+			// would leave a window where the caller's next call races
+			// advanceConfigChangeIndex and loses, producing a
+			// false-positive StaleConfigChangeError.
 			//
 			// This does NOT move the user-supplied OnMembershipChanged
 			// listener earlier too — see fireMembershipChanged below. Only
@@ -1820,7 +1811,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// code must be dispatched by the Host, or the hazard returns
 			// through them). A panicking listener is caught by the apply
 			// worker's recover, which calls OnProposalFailed for this
-			// whole batch (apply.go:605-633) — but by the time the
+			// whole batch — but by the time the
 			// listener runs (after completion, below), every proposal in
 			// this batch has already been claimed, so that recovery path
 			// finds nothing left in pendingProposals to fail.
@@ -1834,8 +1825,8 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	}()
 
 	// Fire OnMembershipChanged last, after every pending proposal and read in
-	// this batch has been completed — its original position (this is why
-	// applyMembershipRouting above no longer fires it itself). See the
+	// this batch has been completed (this is why applyMembershipRouting
+	// above does not fire it itself). See the
 	// comment on the early applyMembershipRouting call for why: the
 	// callback is arbitrary user code running synchronously on the apply
 	// worker's goroutine, so a panic here is caught by that goroutine's
@@ -1978,7 +1969,7 @@ func (c *hostEngineCallback) failShardOnCorruptConfig(shardID, index uint64, kin
 		// Node.Fail reports to the event listener only; the engine's
 		// OnShardFailed fan-out runs at the engine's own latch sites and does
 		// not see this one. Drain the reads here, or a read pending across
-		// this halt waits for its deadline exactly as #185 describes.
+		// this halt waits for its deadline (see OnShardFailed).
 		c.OnShardFailed(shardID, corrupt)
 	}
 }
@@ -2392,12 +2383,11 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 			})
 		}
 	}
-	// A DECLINED stale recovery is NOT a failed shard, and reporting it as
-	// one is the same defect #113 fixed one layer down (#126).
+	// A DECLINED stale recovery is NOT a failed shard.
 	//
 	// The engine refuses a recovery whose snapshot is not ahead of the
-	// apply frontier, and since #113 it DECLINES that refusal rather than
-	// failing the node: recoveryBlockedByLog produces it before the
+	// apply frontier, and it DECLINES that refusal rather than failing the
+	// node: recoveryBlockedByLog produces it before the
 	// recovering gate is raised and before RecoverFromSnapshot runs, so the
 	// state machine is untouched and already at or past the snapshot index.
 	// engine.Node.Fail is never called and the replica keeps serving.
@@ -2410,8 +2400,7 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 	// outward report that a replica makes no further progress without an
 	// operator StopShard/StartShard. A false one is not cosmetic: an
 	// operator acts on it, and a harness that fast-fails on it aborts a
-	// healthy run — which is exactly how #126 was observed, with the
-	// engine's own "snapshot recovery declined" line in the same log.
+	// healthy run.
 	if err != nil && el.OnShardFailed != nil && !declinedStaleRecovery(err) {
 		el.OnShardFailed(config.ShardFailedInfo{
 			ShardID:   shardID,
@@ -2498,11 +2487,10 @@ func (c *hostEngineCallback) reconcileMembershipFromPeer(shardID uint64, ns *nod
 // wedging every membership change on that shard until something else happens to
 // advance it.
 //
-// It exists because only one of the three writers was monotonic. The snapshot
-// reconcile path used a never-regress compare-and-swap and explained why, while
-// the incremental OnApplied path stored unconditionally, so an apply landing
-// after a snapshot install undid it. Both now go through here, and there is no
-// second copy of the loop to drift out of step with the first.
+// Every writer goes through here so that all of them are monotonic: an
+// unconditional store on the incremental OnApplied path would let an apply
+// landing after a snapshot install undo it. There is no second copy of the
+// loop to drift out of step with the first.
 func advanceConfigChangeIndex(ns *nodeState, idx uint64) {
 	for {
 		cur := ns.configChangeIndex.Load()
@@ -2626,7 +2614,7 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 			// increments from zero), then re-verify the map still holds
 			// the SAME pendingProposal. The comparison is on POINTER
 			// identity (v2 != v below), not on the key: keys are random
-			// 64-bit draws since #186, so a repeat is possible in principle,
+			// 64-bit draws, so a repeat is possible in principle,
 			// but a re-registration under a repeated key allocates a new
 			// pendingProposal and fails the identity test. A matching
 			// re-Load therefore proves the entry — and the map's own
@@ -2738,7 +2726,7 @@ func (c *hostEngineCallback) OnReadIndexFailed(shardID uint64, keys []uint64, er
 // scan sees lastApplied reach its read index, and a halted shard never applies
 // again. So every read registered before the halt — confirmed by a leader that
 // is still healthy, waiting on an apply that cannot come — would otherwise sit
-// until sweepPendingReads expired it at its deadline with ErrTimeout (#185).
+// until sweepPendingReads expired it at its deadline with ErrTimeout.
 //
 // The gate in ReadIndex handles reads that arrive AFTER the latch; this is the
 // other half, for the ones already inside. The error is the sentinel rather
@@ -2839,16 +2827,16 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 // request into a public error.
 //
 // The pool refuses for two structurally different reasons and the caller's
-// correct response differs, but both used to collapse into
-// ErrSnapshotInProgress. A *SnapshotPoolBusyError means every snapshot worker
+// correct response differs, so they map to different errors rather than both
+// to ErrSnapshotInProgress. A *SnapshotPoolBusyError means every snapshot worker
 // in the process is occupied — nothing is snapshotting THIS shard, so the
 // request simply found no worker and an operator told "already in progress"
 // goes looking for a concurrent snapshot that does not exist. A
 // *SnapshotDuplicateError is this shard's single-flight slot genuinely being
 // held, which is the only case ErrSnapshotInProgress describes.
 //
-// Both remain Temporary, so a retry loop is unaffected by the distinction; what
-// changes is that the two conditions are now tellable apart.
+// Both are Temporary, so a retry loop is unaffected by the distinction; an
+// operator can still tell the two conditions apart.
 func translateSnapshotSubmitError(err error) error {
 	var poolBusy *engine.SnapshotPoolBusyError
 	if errors.As(err, &poolBusy) {
@@ -3109,7 +3097,7 @@ func (h *Host) clearShardJoining(shardID uint64) {
 // (Peer.IdentityHolder), and applyMembershipRouting reports a committed
 // binding for this replica that the host does not present. Folding the
 // committed tail here instead would read the whole log on every restart of a
-// shard that never snapshots (the StartShard latency regression
+// shard that never snapshots (the StartShard latency cost
 // reconstructShardMembership exists to avoid).
 //
 // An anchor entry whose identity the shard has since REMOVED is tolerated,
@@ -3826,10 +3814,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// raft.BuildInitialMembershipEntry marshals it, and the result is COMMITTED
 	// as the EntryInitialMembership at log index 1. An over-length address or an
 	// over-sized map produced bytes this package's own decoder refuses, so the
-	// shard bootstrapped successfully and then failed to start FOREVER: the next
+	// shard would bootstrap successfully and then fail to start FOREVER: the next
 	// StartShard reconstructs membership from that entry, Membership.UnmarshalFrom
 	// returns ErrAddressTooLong, and reconstructShardMembership propagates it.
-	// proto.Membership.MarshalTo now refuses to write such a membership at all,
+	// proto.Membership.MarshalTo refuses to write such a membership at all,
 	// which turns the permanent brick into an error; checking here as well is what
 	// turns that error into one naming the replica and the reason, at the call the
 	// operator actually made, before anything is persisted.
@@ -5334,8 +5322,11 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 //
 // It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
 // sm.DiskStateMachine and the session is session-managed, for the reason given
-// on that error. A NO-OP session (Host.GetNoOPSession) is the supported form
-// there and is not affected.
+// on that error. A NO-OP session (Host.GetNoOPSession) is refused with
+// ErrInvalidSession on any shard that gets as far as session validation (a
+// closed or draining host, an unknown shard and a witness shard fail earlier
+// with their own errors): it carries no session state, so a caller holding
+// one proposes through Propose or SyncPropose instead.
 func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []byte) (*RequestState, error) {
 	// See Propose: an already-done context must not submit work, or the
 	// outcome is a coin flip between the result and the cancellation.
@@ -5482,17 +5473,16 @@ func pendingDeadlineWithin(ctx context.Context, backstop time.Duration) time.Tim
 // carries the key through the raft log to every replica, so the key must not
 // repeat across HOSTS -- replica B, holding key 7 for its own request, must
 // not complete that caller with replica A's unrelated entry 7 -- and must not
-// repeat across INCARNATIONS of one host either. That second requirement is
-// #186: the key used to be (replicaID, per-Host sequence), unique across hosts
-// by construction, and a restarted replica -- a new Host under the same
-// replica ID, its sequence back at zero -- minted exactly the keys its
-// previous incarnation had left in the log. A snapshot-less restart replays
-// that log through OnApplied, and a replayed old entry completed the fresh
-// proposal registered under its key with the old entry's result. A counter
-// cannot be made incarnation-unique without persisting something or
-// narrowing the replica half; a random draw needs neither, and it is what
-// dragonboat does (keyGenerator.nextKey is rand.Uint64). Uniqueness is now
-// probabilistic at 2^-64 per pair of keys, the guarantee a UUID gives, over a
+// repeat across INCARNATIONS of one host either. A (replicaID, per-Host
+// sequence) key would be unique across hosts by construction, but a restarted
+// replica -- a new Host under the same replica ID, its sequence back at zero --
+// would mint exactly the keys its previous incarnation had left in the log. A
+// snapshot-less restart replays that log through OnApplied, and a replayed old
+// entry would complete the fresh proposal registered under its key with the
+// old entry's result. A counter cannot be made incarnation-unique without
+// persisting something or narrowing the replica half; a random draw needs
+// neither, and it is what dragonboat does (keyGenerator.nextKey is
+// rand.Uint64). Uniqueness is probabilistic at 2^-64 per pair of keys, the guarantee a UUID gives, over a
 // population that is only ever the requests currently pending. The draw comes
 // from math/rand/v2's process-wide generator, which is safe for concurrent
 // use and seeded from the OS; it is not secret and need not be.
@@ -5707,13 +5697,12 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	//
 	// A linearizable read completes only when lastApplied reaches its read
 	// index (the OnApplied scan), and a shard whose failure latch has tripped
-	// never applies again. Without this gate the read was accepted, registered,
-	// confirmed by a leader that is still perfectly healthy, and then waited
-	// for an apply that could not come — returning at the caller's deadline
-	// with ErrTimeout, which points at consensus, the network or a lost leader
-	// and not at the Apply that failed earlier (#185). Measured at 5m6s under
-	// the default deadline, for a read the replica knew at 0s it could not
-	// serve. SyncRead and SyncReadBuf both come through here, so one gate
+	// never applies again. Without this gate the read would be accepted,
+	// registered, confirmed by a leader that is still perfectly healthy, and
+	// then wait for an apply that cannot come — returning at the caller's
+	// deadline with ErrTimeout, which points at consensus, the network or a
+	// lost leader and not at the Apply that failed earlier, for a read the
+	// replica knew immediately it could not serve. SyncRead and SyncReadBuf both come through here, so one gate
 	// covers every read.
 	//
 	// ErrShardFailed is a refusal, not a retry hint: it is deliberately not in
@@ -5758,7 +5747,7 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	//   - Failure latch: OnShardFailed may have scanned pendingReads between
 	//     the IsFailed check and the store, found it empty, and returned. The
 	//     failed node stops processing its queue, so no later callback ever
-	//     completes this read (#185, Codex review). Re-checking here means
+	//     completes this read. Re-checking here means
 	//     either the registration observed the latch or the drain observed
 	//     the entry; there is no interleaving in which neither happens.
 	if h.closed.Load() || ns.stopped.Load() || engNode.IsFailed() {
@@ -5929,9 +5918,9 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 
 	// A halted shard never applies again, so lastApplied is frozen below
 	// committed and the catch-up wait below can never end. Refuse before
-	// entering it, the way ReadIndex does: this loop only checked stop/close,
-	// so a follower read across an SM.Apply failure waited for its deadline
-	// -- or, with context.Background(), forever (#185, Codex review).
+	// entering it, the way ReadIndex does: this loop checks only stop/close,
+	// so without the gate a follower read across an SM.Apply failure would
+	// wait for its deadline -- or, with context.Background(), forever.
 	if engNode.IsFailed() {
 		return nil, ErrShardFailed
 	}
@@ -5982,9 +5971,10 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 }
 
 // ErrSessionsUnsupportedOnDisk is returned by every client-session entry point
-// on a shard whose state machine is an sm.DiskStateMachine. Use NO-OP sessions
-// (Host.GetNoOPSession) there and make the operations idempotent, which is the
-// same constraint dragonboat places on IOnDiskStateMachine.
+// on a shard whose state machine is an sm.DiskStateMachine. Propose there
+// without a session (Propose, SyncPropose) and make the operations idempotent,
+// which is the same constraint dragonboat places on IOnDiskStateMachine through
+// its NO-OP session.
 //
 // The client session table is REPLICATED STATE that lives only inside the
 // snapshot stream: rsm.StateMachine serializes it ahead of the user state
@@ -6025,7 +6015,8 @@ func rejectSessionsOnDisk(ns *nodeState) error {
 // It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
 // sm.DiskStateMachine: an on-disk state machine cannot carry the session table
 // across a restart, so a registered session would silently stop existing on any
-// replica that restarts. Use Host.GetNoOPSession on those shards.
+// replica that restarts. Propose without a session (Propose, SyncPropose) on
+// those shards and make the operations idempotent.
 //
 // The session declares no owner, so it is exempt from the shard's per-owner
 // session cap. Use GetNewSessionWithOwner to declare one.
@@ -6266,7 +6257,7 @@ func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Sessio
 // create a proto.Entry with the session fields, deliver via engine inbox,
 // and return a RequestState the caller can wait on.
 func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Session) (*RequestState, error) {
-	// Same already-cancelled guard as Propose (834088c). Without it a
+	// Same already-cancelled guard as Propose. Without it a
 	// cancelled GetNewSession/RegisterSession/CloseSession still appends its
 	// session entry: a session the caller discarded gets registered, a retry
 	// fails as a duplicate, or a session the caller believes is live is
@@ -6309,12 +6300,15 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 }
 
 // GetNoOPSession returns a no-op session for proposals that do not require
-// at-most-once semantics. The no-op session has a fixed clientID of 0.
-// Use for idempotent operations only.
+// at-most-once semantics. The no-op session has a fixed clientID of 0 and
+// carries no session state. Use for idempotent operations only.
 //
-// It is the ONLY session form a shard backed by an sm.DiskStateMachine
-// supports; every session-managed entry point returns
-// ErrSessionsUnsupportedOnDisk there.
+// A no-op session is not accepted by ProposeWithSession, which refuses it with
+// ErrInvalidSession; the operation it stands for is a sessionless Propose or
+// SyncPropose. It exists for callers that model a NO-OP session explicitly
+// and route it to the sessionless path themselves. On a shard backed by an sm.DiskStateMachine
+// that sessionless path is the only way to propose: every session-managed entry
+// point returns ErrSessionsUnsupportedOnDisk there.
 func (h *Host) GetNoOPSession(shardID uint64) *Session {
 	return NewNoOPSession(shardID)
 }
@@ -6606,10 +6600,10 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 // CompactionOverhead replaces the shard-level value for this snapshot's
 // log compaction.
 func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (*RequestState, error) {
-	// Same already-cancelled guard as Propose (834088c). A cancelled call used
-	// to claim the shard's single-flight snapshot slot and enqueue disk work
-	// before the wait observed the cancellation, so it both started expensive
-	// I/O the caller had abandoned and made concurrent callers see
+	// Same already-cancelled guard as Propose. Without it a cancelled call
+	// would claim the shard's single-flight snapshot slot and enqueue disk
+	// work before the wait observed the cancellation, so it would both start
+	// expensive I/O the caller had abandoned and make concurrent callers see
 	// ErrSnapshotInProgress for a snapshot nobody was waiting on.
 	if err := ctx.Err(); err != nil {
 		return nil, mapContextError(err)
@@ -6941,10 +6935,9 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // header preserves the logical snapshot identity so ImportSnapshot can
 // reconstruct the SAME snapshot on the destination host: recovery relies on
 // Index (compaction boundary), Term, Membership (routing table), and
-// OnDiskIndex (on-disk state machine cursor). Emitting only the raw data —
-// as an earlier version did — silently dropped membership and reset the
-// Raft index/term, so the imported snapshot was a different logical
-// snapshot.
+// OnDiskIndex (on-disk state machine cursor). Emitting only the raw data
+// would silently drop membership and reset the Raft index/term, so the
+// imported snapshot would be a different logical snapshot.
 //
 // Exported snapshot data is always PLAINTEXT. When a barrier is configured
 // the on-disk snapshot.dat is stored in the encrypted frame format; this
@@ -7633,7 +7626,7 @@ func resolveImportMembership(
 // Config.DataDir. Passing "" asserts that the shard has none and roots its
 // snapshot tree under the host's NodeHostDir.
 //
-// It is no longer REQUIRED: StartShard records the shard's DataDir in its
+// It is not REQUIRED: StartShard records the shard's DataDir in its
 // LogDB bootstrap record, and ImportSnapshot reads it back, so the layout is
 // discovered rather than declared. When the option IS supplied it must match
 // the recorded value exactly; a disagreement is refused with
@@ -7755,9 +7748,9 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // destination that already exists, stages everything in a directory MkdirTemp
 // created — one this call provably owns, and the only thing a failure is ever
 // allowed to delete — and renames it into place once the artifact is complete
-// and durable. Writing in place would have truncated a LIVE snapshot.dat before
+// and durable. Writing in place would truncate a LIVE snapshot.dat before
 // anything was validated, leaving the shard's LogDB record describing a file it
-// no longer matched: a short FileSize ships a truncated snapshot that erases the
+// no longer matches: a short FileSize ships a truncated snapshot that erases the
 // receiving follower's state, and a stale Epoch makes StartShard fail closed on
 // an undecryptable snapshot.
 //
@@ -8833,11 +8826,11 @@ func (h *Host) Close() error {
 // Drain is idempotent, and every caller gets the SAME answer: there is one
 // drain attempt, and a concurrent second caller blocks until it has finished
 // and then returns its result. This is what makes Drain a join barrier for
-// Close, which calls it first: a Close that raced an in-progress Drain used
-// to get nil back immediately, tear the engine down while that drain was
-// still waiting, fail the in-flight work with ErrClosed — which drove
-// pendingOps to zero and released the FIRST caller with nil as well — and so
-// both reported a clean graceful shutdown after accepted work had been
+// Close, which calls it first: a Close that raced an in-progress Drain and
+// got nil back immediately would tear the engine down while that drain was
+// still waiting and fail the in-flight work with ErrClosed — driving
+// pendingOps to zero and releasing the FIRST caller with nil as well — so
+// both would report a clean graceful shutdown after accepted work had been
 // aborted. A call after the attempt has completed returns its recorded result
 // without waiting.
 //
@@ -10039,7 +10032,7 @@ func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
 //nolint:gocyclo // one funnel for every membership change: role validation, witness-policy gating, cert exclusivity, claim/rollback and the pending-op bookkeeping; splitting it would move validation away from the rollback that pairs with it, which is exactly where this path has produced defects
 func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto.ConfigChange) (*RequestState, error) {
 	// A context that is ALREADY done must not submit a QUORUM CHANGE. This is
-	// the same guard Propose grew in 834088c, applied to the path where the
+	// the same guard Propose has, applied to the path where the
 	// consequence is worst: without it the caller receives ErrCanceled while
 	// the membership change commits and applies, so it cannot tell whether the
 	// voting set changed. A retry after that answer issues a duplicate or
@@ -10047,7 +10040,7 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	//
 	// Cancellation racing an in-flight config change remains undecidable — see
 	// MaybeAppliedError — but a context that was done BEFORE the call is not a
-	// race, and it now neither submits nor reports success.
+	// race, and it neither submits nor reports success.
 	if err := ctx.Err(); err != nil {
 		return nil, mapContextError(err)
 	}
@@ -10188,10 +10181,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// speculatively wrote: a later config change — or the apply-path
 	// registration of THIS change after it committed — must win over a late
 	// rollback from this superseded attempt. The compare and the mutation are a
-	// single atomic step (CompareAndRegister / CompareAndRemove): the previous
-	// Resolve-then-Remove had a check-to-act gap in which a concurrent apply
-	// could register the committed member between the Resolve and the Remove,
-	// and the unconditional Remove would then delete that committed member's
+	// single atomic step (CompareAndRegister / CompareAndRemove): a
+	// Resolve-then-Remove would have a check-to-act gap in which a concurrent
+	// apply could register the committed member between the Resolve and the
+	// Remove, and the unconditional Remove would then delete that committed member's
 	// mapping, silently black-holing the leader's Replicate traffic to it.
 	rollbackPreRegister := func() {
 		if !preRegistered {
@@ -10586,8 +10579,8 @@ const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 // (config-in-log).
 //
 // It reads exactly ONE entry: the bootstrap EntryInitialMembership at
-// BootstrapMembershipIndex. That is deliberate and is a correctness-preserving
-// O(1) replacement for the full-log scan this function used to perform.
+// BootstrapMembershipIndex. That is deliberate: it is O(1), where scanning the
+// whole committed log for config entries is not, and it loses nothing.
 //
 // # Why one entry is enough
 //
@@ -10596,19 +10589,15 @@ const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 // committed EntryConfigChange, and a restarting replica re-applies its committed
 // entries through the normal pipeline (Peer.Commit -> processConfigChanges, and
 // replayConfigChangesTo for an on-disk state machine that skips ahead), which
-// folds each one into the membership exactly as it did before config-in-log.
-// So the base comes from here and the deltas come from replay; nothing is lost.
+// folds each one into the membership. So the base comes from here and the deltas come from replay; nothing is lost.
 //
-// # Why the full scan had to go
+// # Why not scan the whole log
 //
 // A shard with SnapshotEntries=0 never compacts, so nothingRecovered is true on
-// EVERY restart and the old scan read the ENTIRE committed log from disk — every
-// data entry, just to find the rare config entries — on every restart. Under
-// sustained write load that delayed StartShard enough that a restarted replica
-// could not catch up within the harness's budget: measured as a REPRODUCIBLE
-// regression (TestSoak_RollingRestartUnderLoad at 10m failed 2/2 at HEAD, passed
-// 2/2 both at the pre-config-in-log baseline and at HEAD with this reconstruction
-// disabled).
+// EVERY restart and a full scan would read the ENTIRE committed log from disk —
+// every data entry, just to find the rare config entries — on every restart.
+// Under sustained write load that delays StartShard enough that a restarted
+// replica cannot catch up (TestSoak_RollingRestartUnderLoad exercises this).
 //
 // It returns ok=true only when the bootstrap entry is present. ok=false means
 // the entry is simply NOT AVAILABLE — compacted away, or below the reader's
@@ -10617,9 +10606,8 @@ const maxMembershipReconstructBytes = 4 << 20 // 4 MiB
 //
 // An index that IS readable and holds something OTHER than the bootstrap entry
 // is a different thing entirely and fails closed with *BootstrapEntryMissingError.
-// It used to return ok=false on the rationale of a legacy, out-of-band-bootstrapped
-// shard; config-in-log is now the only bootstrap path this code base creates, so
-// on a shard it made that condition means the log is damaged, and the fall-back
+// Config-in-log is the only bootstrap path this code base creates, so on a shard
+// it made that condition means the log is damaged, and falling back
 // would re-seed membership from the caller's members map — dropping witnesses,
 // observers, Removed tombstones, identities and the replicated policies.
 //
@@ -10660,12 +10648,9 @@ func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (p
 	if entries[0].Type&proto.EntryTypeMask != proto.EntryInitialMembership {
 		// The log HAS an index 1 and it is not the founding configuration.
 		//
-		// This used to be the legacy path: a shard bootstrapped out of band,
-		// whose initial voters lived only in the caller's members map. That
-		// path no longer exists — config-in-log is the only bootstrap this code
-		// base performs, and every shard it creates lays an
-		// EntryInitialMembership down at BootstrapMembershipIndex before any
-		// other entry can be appended. On a shard this code made, an ordinary
+		// Config-in-log is the only bootstrap this code base performs, and
+		// every shard it creates lays an EntryInitialMembership down at
+		// BootstrapMembershipIndex before any other entry can be appended. On a shard this code made, an ordinary
 		// entry sitting at index 1 therefore means the log is DAMAGED.
 		//
 		// Returning "not found" here sends StartShard to the nothingRecovered
@@ -10845,10 +10830,11 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 		// recorded holds {1..k} U {N+1..M} — a hole EntryRange correctly reports
 		// as ErrLogGapDetected, which otherwise makes StartShard fail FOREVER:
 		// nothing compacts it (SnapshotEntries has no default) and
-		// RequestCompaction cannot run on an unloaded shard. Two ways in: the
-		// receive path before it advanced the floor (now fixed), and a crash
-		// inside ImportSnapshot between recording the snapshot and advancing the
-		// floor — a window that still exists by construction.
+		// RequestCompaction cannot run on an unloaded shard. The way in is a
+		// crash inside ImportSnapshot between recording the snapshot and
+		// advancing the floor — a window that exists by construction — or a
+		// data directory written by a receive path that did not advance the
+		// floor.
 		//
 		// The snapshot subsumes every index at or below it, so removing that
 		// prefix loses nothing and is exactly what the writer should have done.

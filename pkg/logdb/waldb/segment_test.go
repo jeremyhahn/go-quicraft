@@ -941,8 +941,8 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 	// cleanFileOffset + cleanBlockOffset (the truncation target). The FILE is
 	// larger than that: DiscardPending re-takes the fallocate reservation the
 	// truncation dropped, so writes after a rollback do not pay a file
-	// extension. (This test previously asserted the truncated size, pinning
-	// the lost reservation.)
+	// extension. (Asserting the truncated size here would pin a lost
+	// reservation.)
 	wantEnd := cleanFileOffset + int64(cleanBlockOffset)
 	if seg.Size() != wantEnd {
 		t.Errorf("logical size = %d, want %d", seg.Size(), wantEnd)

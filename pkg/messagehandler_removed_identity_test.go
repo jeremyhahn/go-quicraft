@@ -150,7 +150,7 @@ func TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard(t *testing.T)
 // from any other such connection, so an empty-matches-empty rule would classify
 // every identity-less peer as a removed one on any shard that had ever removed
 // a member. Such a peer is refused anyway — a member is authorized by its
-// committed identity and by nothing else (#197 A) — but it must be refused for
+// committed identity and by nothing else — but it must be refused for
 // the reason that is TRUE (missing_identity), not reported as a removed member
 // trying to sneak back, which is the label an operator alerts on.
 func TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone(t *testing.T) {

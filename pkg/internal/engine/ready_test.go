@@ -266,8 +266,8 @@ func BenchmarkReadyMap_ConcurrentSet(b *testing.B) {
 }
 
 // BenchmarkReadyMap_SwapEmpty measures Swap() performance when the map
-// is empty. This is the critical hot path that was previously O(64 locks)
-// and is now O(1).
+// is empty. This is the critical hot path, and it must stay O(1) rather than
+// taking a lock per stripe.
 func BenchmarkReadyMap_SwapEmpty(b *testing.B) {
 	rm := NewReadyMap()
 	b.ResetTimer()

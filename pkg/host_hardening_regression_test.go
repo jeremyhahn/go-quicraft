@@ -583,9 +583,9 @@ func TestSnapshotTooLargeError_MatchesSentinel(t *testing.T) {
 // LOW: FollowerRead's slow path must observe shutdown
 // ---------------------------------------------------------------------------
 
-// TestFollowerRead_SlowPathExitsOnShardStop pins the shutdown exit. The poll
-// loop previously had no terminator other than ctx.Done(), so a caller with a
-// deadline-less context on a partitioned follower spun at 1000Hz forever and
+// TestFollowerRead_SlowPathExitsOnShardStop pins the shutdown exit. A poll loop
+// with no terminator other than ctx.Done() would let a caller with a
+// deadline-less context on a partitioned follower spin at 1000Hz forever, and
 // Host.Close could not interrupt it.
 func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 	h := newTestHost(t)
@@ -666,8 +666,8 @@ func TestNewHost_ExportedTransportDisabledSkipsTransport(t *testing.T) {
 // issued, and B's real entry later found no pending proposal at all.
 func TestProposalKeysAreUniqueAcrossTheShard(t *testing.T) {
 	// Three hosts stand in for replicas A and B and for A's next incarnation
-	// -- a new Host under the same replica ID, which is the case that broke
-	// (#186). Keys are random draws, so uniqueness across hosts and across
+	// -- a new Host under the same replica ID, the case a deterministic key
+	// scheme gets wrong. Keys are random draws, so uniqueness across hosts and across
 	// incarnations is the same property, and neither the replica ID nor a
 	// persisted counter is involved: a Host literal with no state at all
 	// mints keys as well as a started one.

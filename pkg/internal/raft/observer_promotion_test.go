@@ -23,7 +23,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// In-place observer promotion (#218)
+// In-place observer promotion
 //
 // A replica's observer role follows the COMMITTED membership. config.IsObserver
 // is only the initial hint, consulted while the configuration does not mention
@@ -74,9 +74,9 @@ func promote(t *testing.T, p *Peer) {
 	}
 }
 
-// TestPromotion_ObserverBecomesVoterInPlace is the raft-level red/green for
-// #218. Before the change, the committed promotion latched roleMismatch
-// (configured observer, listed voter): the replica refused every campaign and
+// TestPromotion_ObserverBecomesVoterInPlace is the raft-level test of in-place
+// promotion. Latching roleMismatch on the committed promotion (configured
+// observer, listed voter) would make the replica refuse every campaign and
 // every linearizable read until its shard was stopped and restarted with
 // IsObserver=false.
 func TestPromotion_ObserverBecomesVoterInPlace(t *testing.T) {
@@ -191,9 +191,8 @@ func TestPromotion_JoinerKeepsTheHintUntilListed(t *testing.T) {
 	}
 }
 
-// TestPromotion_VoterAddedAsObserverBecomesOne is the first symptom #218
-// reported: a joiner started as a voter that the leader added as an observer.
-// The role now follows the membership, so it is an ordinary observer — not
+// TestPromotion_VoterAddedAsObserverBecomesOne: a joiner started as a voter
+// that the leader added as an observer. The role follows the membership, so it is an ordinary observer — not
 // latched, still able to serve reads — rather than a replica that refuses
 // reads and makes its host exit.
 func TestPromotion_VoterAddedAsObserverBecomesOne(t *testing.T) {

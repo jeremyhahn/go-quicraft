@@ -152,7 +152,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `*SelfNotInMembersError` | `cfg.ReplicaID` absent from `members` on a bootstrap |
 | `*InvalidMemberError` | A member has a zero replica ID, an empty or malformed address, or a duplicate address; a required identity is missing or bound twice; a joiner names no anchor; or `MemberIdentities` contradicts the recovered membership. Matches `ErrInvalidMember` |
 | `*NonVotingRoleInMembersError` | First start with `cfg.IsWitness` or `cfg.IsObserver` while this replica appears in `members` |
-| shared certificate | This node's certificate also covers another member's host. The error is `transport.SharedPeerCertificateError` from an internal package, so match it by its message, not by type |
+| `*SharedPeerCertificateError` (`ErrSharedPeerCertificate`) | This node's certificate also covers another member's host. `CoveredPeers` names those hosts |
 | `ErrShardBarrierUnresolved`, `ErrShardBarrierLogDBMismatch` | Per-shard barrier problems; see [Constructor](#constructor) |
 | `*BootstrapEntryMissingError` | The durable log holds something other than the founding configuration at the bootstrap index |
 | `ErrInvalidSMType` | `CreateFunc` returned nil or a type implementing none of the three SM interfaces |
@@ -468,14 +468,9 @@ wrapping:
 | `ErrRemoveLastVoter` | Remove targets the last voting member |
 | `ErrMemberIdentityRequired` | An identity-less add on a host with a transport |
 | `ErrRemovedMemberIdentity` | The add binds a node identity this shard has removed, under any replica ID. The tombstone is never evicted, so the remedy is a new keypair. `Membership.RemovedIdentities` lists these identities, so a host can classify a joiner before proposing it |
-
-Two refusals have no importable sentinel. Do not match them by string; file an
-issue if you need a typed error for either:
-
-| Message fragment | Condition |
-|---|---|
-| `address already held by another member` | The add binds an address an active replica already holds |
-| `node identity already held by another member` | The add binds an identity an active replica already holds |
+| `ErrDuplicateMemberAddress` | The add names a new replica at an address another active member already holds. Promoting an observer at its own address is allowed |
+| `ErrDuplicateMemberIdentity` | The add binds a node identity another active member already holds. There is no co-location exception |
+| `ErrSharedPeerCertificate` / `*SharedPeerCertificateError` | This node's own certificate also covers the host of the replica being added; issue one certificate per node |
 
 **Other errors:** the delivery errors `Propose` returns (`ErrClosed`,
 `ErrDraining`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrSystemBusy`,
@@ -1378,7 +1373,11 @@ in [Membership validation errors](#membership-validation-errors)):
 `ErrRemoveLastFullReplica`, `ErrNodeNotFound`, `ErrNodeAlreadyExists`,
 `ErrNodeRemoved`, `ErrRemoveLastVoter`, `ErrTooManyVotingMembers`,
 `ErrZeroReplicaID`, `ErrEmptyAddress`, `ErrMemberIdentityRequired`,
-`ErrRemovedMemberIdentity`.
+`ErrRemovedMemberIdentity`, `ErrDuplicateMemberAddress`,
+`ErrDuplicateMemberIdentity`.
+
+Certificate exclusivity (re-exported from the internal transport package):
+`ErrSharedPeerCertificate`, the sentinel form of `*SharedPeerCertificateError`.
 
 Sessions:
 

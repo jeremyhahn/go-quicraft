@@ -147,13 +147,13 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 // It exists because a wire-byte budget is not a memory budget. The decoded form
 // of a frame is materially larger than the frame: a 100-byte heartbeat becomes a
 // 320-byte Message in a slice, and a membership map entry costs 12 bytes on the
-// wire and about 57 in a Go map (see mapAllocBytesPerEntry). The
-// transport reserves the FRAME LENGTH against its aggregate
+// wire and about 57 in a Go map (see mapAllocBytesPerEntry). A budget charged
+// in wire bytes describes bytes read rather than bytes held: 256 MB of admitted
+// frames can occupy up to 2 GB of heap. The QUIC transport therefore reserves
+// each frame's length MULTIPLIED by this factor against its aggregate
 // message-receive budget (MaxMessageReceiveMemory) before reading the body, so
-// without a stated ratio that budget describes bytes read rather than bytes
-// held, and an operator sizing it has no way to know the difference. A frame
-// admitted under a 256 MB budget can occupy up to 2 GB of heap; the reservation
-// has to be multiplied by this factor for the budget to mean what its name says.
+// that budget bounds decoded heap, not wire bytes. A receiver built on this
+// package without that transport must apply the factor itself.
 //
 // The bound is MEASURED, not derived — TestDecodeMemoryAmplification builds the
 // densest frames this format admits and fails if any exceeds it — and the
@@ -162,9 +162,8 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 // whole 8-slot group). The constant carries headroom above that because the
 // dominant term is the Go runtime's map layout, which this package does not
 // control and cannot assert at compile time. It is not headroom for adding
-// allocations: 8 was already exceeded once, by a decoder that clamped its map
-// size hint and paid for the growth (9.8x), which is the regression the test
-// catches.
+// allocations: a decoder that clamps its map size hint and pays for the growth
+// reaches 9.8x, which is the regression the test catches.
 const MaxDecodeMemoryFactor = 8
 
 // MaxTerm is the exclusive upper bound on a Raft term this library adopts from

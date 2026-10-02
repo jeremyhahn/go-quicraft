@@ -66,9 +66,9 @@ func TestHostProposer_PropagatesError(t *testing.T) {
 	}
 }
 
-// TestHostProposer_DrivesAnAggregator is the integration the package never
-// had: the adapter actually used to construct and flush an Aggregator, rather
-// than a mock shaped like whatever the test needed.
+// TestHostProposer_DrivesAnAggregator is the integration test: the adapter
+// constructs and flushes a real Aggregator, rather than a mock shaped like
+// whatever the test needed.
 func TestHostProposer_DrivesAnAggregator(t *testing.T) {
 	fake := &fakeSyncProposer{}
 	cfg := DefaultConfig()

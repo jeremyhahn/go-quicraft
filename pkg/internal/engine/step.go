@@ -1043,9 +1043,8 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 // diff, so the next cycle re-derives it — except for the readStates, which
 // GetUpdate drained out of the peer and which are gone: those ReadIndex callers
 // wait for the host's sweeper. It is left as-is deliberately: the remaining
-// panic surface here is engine-owned plumbing rather than user code (the user
-// callbacks that used to run here now run on the dispatcher, under its own
-// recover), so a panic in it is an engine bug that the step worker's
+// panic surface here is engine-owned plumbing rather than user code (user
+// callbacks run on the dispatcher, under its own recover), so a panic in it is an engine bug that the step worker's
 // restart-on-panic must surface, not an expected condition to be absorbed.
 func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.Update) {
 	// Detect leader change and notify callback.

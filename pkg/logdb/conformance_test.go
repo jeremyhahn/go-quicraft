@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Conformance suite pinning the LogDB interface contract against every
-// implementation (memdb and waldb). It guards the contract items that
-// previously diverged: IterateEntries error semantics and maxSize budget
+// implementation (memdb and waldb). It guards the contract items most prone
+// to diverging between implementations: IterateEntries error semantics and maxSize budget
 // accounting, EntryRange span semantics, snapshot persistence through
 // SaveState, and Cmd deep-copy on SaveState.
 
@@ -983,15 +983,14 @@ func TestConformanceGetEntriesDoesNotAliasStoredPayloads(t *testing.T) {
 }
 
 // TestConformanceSaveStateBelowCompactionFloorIsRefused pins the rejection both
-// backends now perform, and the state that made it necessary.
+// backends perform, and the state that makes it necessary.
 //
-// The measured behaviour before the fix, identical in memdb and waldb: with
-// entries [10..20] stored and the floor at 9, a SaveState starting at index 5
-// returned nil, DESTROYED the live suffix [10..20] (truncate-and-append
-// replaces everything from the first new index onward), and left the store
-// describing itself inconsistently — EntryRange answered (5, 2) while
-// IterateEntries(5, ...) refused the very range it had just advertised with
-// ErrCompacted. Nothing reported any of it.
+// Without it, with entries [10..20] stored and the floor at 9, a SaveState
+// starting at index 5 would return nil, DESTROY the live suffix [10..20]
+// (truncate-and-append replaces everything from the first new index onward),
+// and leave the store describing itself inconsistently — EntryRange answering
+// (5, 2) while IterateEntries(5, ...) refused the very range it had just
+// advertised with ErrCompacted. Nothing would report any of it.
 //
 // A write below the floor is always a caller bug: those indexes are provably
 // applied and already deleted, raft sends a lagging follower an InstallSnapshot

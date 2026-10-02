@@ -21,15 +21,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Regression tests for four review findings:
+// Regression tests pinning that:
 //
-//	M1 handleVoteRequest granted a same-term vote while a live leader was known
-//	M2 a self-removed replica could still campaign and self-elect
-//	M3 becomeLeader inherited remote.active flags from a previous tenure
-//	M4 handleQuiesceMessage ignored the local quiesce.enabled setting
+//	handleVoteRequest grants no same-term vote while a live leader is known
+//	a self-removed replica cannot campaign or self-elect
+//	becomeLeader does not inherit remote.active flags from a previous tenure
+//	handleQuiesceMessage honours the local quiesce.enabled setting
 //
 // plus direct coverage for dropHighTermVote, purgeDepartedVotes and
-// isVotingMember, which the review found to be untested.
+// isVotingMember.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -256,12 +256,11 @@ func TestRaft_VoteRequest_TransferHintOverridesKnownLeader(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// dropHighTermVote (previously untested on a follower)
+// dropHighTermVote on a follower
 // ---------------------------------------------------------------------------
 
 // TestRaft_DropHighTermVote_FollowerBranches exercises every arm of
-// dropHighTermVote on a FOLLOWER, including the `return true` branch, which
-// had no coverage at all.
+// dropHighTermVote on a FOLLOWER, including the `return true` branch.
 func TestRaft_DropHighTermVote_FollowerBranches(t *testing.T) {
 	newFollower := func() *raft { return followerWithKnownLeader(t, 5) }
 
@@ -568,7 +567,7 @@ func TestPeer_ReAddedReplica_CampaignsAgain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// purgeDepartedVotes / isVotingMember (previously untested)
+// purgeDepartedVotes / isVotingMember
 // ---------------------------------------------------------------------------
 
 func TestRaft_IsVotingMember(t *testing.T) {

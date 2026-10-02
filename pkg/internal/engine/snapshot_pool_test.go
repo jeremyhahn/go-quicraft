@@ -103,7 +103,7 @@ func newSnapshotTestLogDB() *snapshotTestLogDB {
 // AtRestProtection declares this test LogDB non-durable: it holds every record
 // in a map and writes nothing to disk, so no durable encrypted record can be
 // stranded by a DEK purge. The DECLARATION is what the purge floor keys on —
-// silence is read as "durable and possibly encrypted" and fails safe (L23).
+// silence is read as "durable and possibly encrypted" and fails safe.
 func (db *snapshotTestLogDB) AtRestProtection() logdb.AtRestProtection {
 	return logdb.AtRestNonDurable
 }
@@ -1147,7 +1147,7 @@ func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Context-AAD support for the test barriers (M3)
+// Context-AAD support for the test barriers
 //
 // The real seal.Barrier folds the caller context into the AEAD AAD, so a frame
 // sealed with one context cannot be opened with another. The XOR-based test
@@ -1620,8 +1620,8 @@ func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
 // leaves the canonical encrypted file untouched, so it must:
 //  1. leave snapshot.dat byte-for-byte unchanged (still ciphertext),
 //  2. return the plaintext in a distinct sibling file, and
-//  3. be safe to run again on the same source (retry-safe) — which would have
-//     failed under the old in-place behavior because the source was now plaintext.
+//  3. be safe to run again on the same source (retry-safe) — which an
+//     in-place decrypt would fail, because the source would then be plaintext.
 func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T) {
 	tmpDir := t.TempDir()
 	barrier := newTestBarrier(7)
@@ -1679,8 +1679,8 @@ func TestSnapshotPool_DecryptToSiblingDoesNotMutateEncryptedSource(t *testing.T)
 	}
 
 	// Retry-safety: a second decrypt of the same (still encrypted) source must
-	// also succeed. Under the old in-place behavior the source would now be
-	// plaintext, so this second decrypt would fail.
+	// also succeed. An in-place decrypt would have left the source plaintext,
+	// so this second decrypt would fail.
 	plainPath2, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 7, barrier)
 	if err != nil {
 		t.Fatalf("second (retry) decrypt failed: %v", err)
@@ -1937,10 +1937,9 @@ func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
 
 // TestSnapshotPool_EncryptFile_SealedBarrier pins the fail-closed save.
 //
-// This test previously asserted the OPPOSITE — "even with barrier sealed, save
-// should work (encryption is skipped)" and epoch == 0 — which encoded the
-// plaintext-downgrade defect rather than a requirement: a configured barrier
-// that is sealed means encryption is UNAVAILABLE, not disabled, so a snapshot
+// Asserting the opposite — "even with barrier sealed, save should work
+// (encryption is skipped)" and epoch == 0 — would encode a plaintext-downgrade
+// defect rather than a requirement: a configured barrier that is sealed means encryption is UNAVAILABLE, not disabled, so a snapshot
 // written then would be durable plaintext for a shard required to be encrypted
 // at rest. The assertion is inverted deliberately.
 func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
@@ -2033,7 +2032,7 @@ func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 }
 
 // TestSnapshotPool_ReadSnapshotEpoch_ArtifactWithoutRecord pins the distinction
-// the missing-record case used to erase: "the METADATA is absent" is strictly
+// the missing-record case must not erase: "the METADATA is absent" is strictly
 // weaker than "the ARTIFACT is absent", and only the latter means the directory
 // imposes no purge floor.
 //
@@ -2431,9 +2430,9 @@ type unprotectedTestLogDB struct {
 }
 
 // TestSnapshotPool_PurgeOldEpochs_DurableNonEpochAwareLogDBBlocksPurge is the
-// L23 regression test. A non-nil LogDB that cannot report an epoch floor used to
-// contribute walMinEpoch=0 silently, letting the purge proceed on the snapshot
-// floor alone and IRREVERSIBLY destroying DEKs a durable, encrypted log may
+// A non-nil LogDB that cannot report an epoch floor must not contribute
+// walMinEpoch=0 silently, which would let the purge proceed on the snapshot
+// floor alone and IRREVERSIBLY destroy DEKs a durable, encrypted log may
 // still need. Only a positive AtRestNonDurable declaration proves otherwise;
 // anything else -- including AtRestUnprotected and total silence -- must fail
 // safe (ok == false, nothing purged).
@@ -2669,15 +2668,15 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 
 	// Orphaned decrypt scratch files (should be removed). BOTH decrypt paths
 	// must be swept: the send path's scratch file is a full plaintext copy of
-	// the state machine, and it was previously left behind forever because the
-	// sweeper only matched the recovery path's prefix.
+	// the state machine, and a sweeper matching only the recovery path's
+	// prefix would leave it behind forever.
 	stale := []string{
 		".decrypt-123.tmp", ".decrypt-abcdef.tmp",
 		".send-decrypt-123.tmp", ".send-decrypt-abcdef.tmp",
 		// The save path's encrypt scratch holds a full CIPHERTEXT copy of the
-		// snapshot. It was previously created from a hardcoded literal that no
-		// prefix in the swept set matched, so a crash inside the encrypt loop
-		// orphaned it until the whole snapshot directory rolled off.
+		// snapshot. Were its name not matched by a prefix in the swept set, a
+		// crash inside the encrypt loop would orphan it until the whole
+		// snapshot directory rolled off.
 		".encrypt-999.tmp",
 	}
 	for _, name := range stale {
@@ -3503,7 +3502,7 @@ func TestSnapshotPool_Metrics_NilSafe(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M4: Snapshot term resolved from Peer.AppliedToTerm, not LogReader
+// Snapshot term resolved from Peer.AppliedToTerm, not LogReader
 // ---------------------------------------------------------------------------
 
 func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
@@ -3568,7 +3567,7 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 	}
 
 	// The LogReader has no entries at index 100 (they were never
-	// persisted), so lr.Term(100) would fail. The term is now captured
+	// persisted), so lr.Term(100) would fail. The term is captured
 	// at request creation time (before pool dispatch) to eliminate the
 	// data race between the snapshot pool worker and step worker.
 	ss := newSnapshotTestSnapshotter(100)
@@ -3605,7 +3604,7 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 
 func TestSnapshotPool_SaveSnapshot_NilPeerTermZero(t *testing.T) {
 	// When the Peer is nil (e.g. during recovery), the term should be 0
-	// as a safe fallback. This verifies the nil check in the fix.
+	// as a safe fallback. This verifies the nil check.
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
 	defer close(stopC)
@@ -3868,7 +3867,7 @@ func TestSnapshotRequest_TermOverridesStaleValue(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M9: LogReader.CreateSnapshot error handling
+// LogReader.CreateSnapshot error handling
 // ---------------------------------------------------------------------------
 
 func TestSnapshotPool_SaveSnapshot_CreateSnapshotOutOfDate(t *testing.T) {
@@ -4786,7 +4785,7 @@ func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// M3: positional context-AAD for snapshot frames
+// Positional context-AAD for snapshot frames
 // ---------------------------------------------------------------------------
 
 // aadCapability is a minimal contextAADBarrier stand-in for the SnapshotAAD
@@ -5033,21 +5032,22 @@ func (s *canarySnapshotter) RecoverFromSnapshot(_ context.Context, r io.Reader, 
 	return err
 }
 
-// TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath is #116.
+// TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath pins
+// sealing on the save path.
 //
-// The save path used to write the state machine to the canonical snapshot.dat
-// in the clear, fsync it, and encrypt in place afterwards. Between that fsync
-// and the rename a COMPLETE PLAINTEXT STATE MACHINE was durable under the name
-// every consumer, backup and operator reads — measured live at 206ms and 461ms
+// Writing the state machine to the canonical snapshot.dat in the clear,
+// fsyncing it, and encrypting in place afterwards would leave a COMPLETE
+// PLAINTEXT STATE MACHINE durable between that fsync and the rename, under the
+// name every consumer, backup and operator reads — hundreds of milliseconds
 // under load, and permanent after a kill in the window, because the directory
 // is then left with no snapshot.meta and the in-process discard guard never
 // runs.
 //
 // The assertion is deliberately about the CANONICAL PATH DURING THE SAVE, not
 // about the finished artifact. A test that only inspects the result passes just
-// as happily against the old two-step form, because the artifact was correctly
-// encrypted by the time the save returned — the defect was never in the
-// artifact, it was in what the path held on the way there.
+// as happily against a write-then-encrypt form, because the artifact is
+// correctly encrypted by the time the save returns — the hazard is not in the
+// artifact, it is in what the path holds on the way there.
 func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -5160,20 +5160,18 @@ func TestSnapshotPool_SaveSnapshot_NeverWritesPlaintextToCanonicalPath(t *testin
 }
 
 // TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext pins
-// the contract inline sealing (#116) nearly broke.
+// the contract inline sealing must preserve.
 //
 // MaxSnapshotSize is documented against the state machine's output after
 // compression -- "the actual on-disk size (post-compression when Snappy is
-// enabled)". That was literally the file's size only because the file held
-// plaintext at the point of the check. With sealing inline the file holds
-// framed ciphertext, ~41 bytes larger per 64 KiB chunk, and a stat there
-// measures encryption overhead against a limit that was never defined to
-// include it. A snapshot exactly at the limit -- admitted before, and
-// documented as admitted -- would be refused, and SnapshotTooLargeError.Size
+// enabled)". With sealing inline the file holds framed ciphertext, ~41 bytes
+// larger per 64 KiB chunk, so a stat at the point of the check would measure
+// encryption overhead against a limit that is not defined to include it. A
+// snapshot exactly at the limit -- documented as admitted -- would be refused, and SnapshotTooLargeError.Size
 // would report a number the operator's configuration does not describe.
 //
-// Codex review of the branch found it. The fix measures what the frame writer
-// was handed, which is the old quantity exactly; this test sets the limit to
+// The save path measures what the frame writer was handed, which is the
+// post-compression size exactly; this test sets the limit to
 // the payload size and asserts the save is admitted with a barrier configured.
 func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *testing.T) {
 	snapDir := t.TempDir()
@@ -5229,7 +5227,7 @@ func TestSnapshotPool_MaxSnapshotSize_MeasuresPostCompressionNotCiphertext(t *te
 }
 
 // sealSnapshotFile writes plaintext to path through snapshotFrameWriter -- the
-// sealed artifact exactly as saveSnapshot produces it since #116 -- and
+// sealed artifact exactly as saveSnapshot produces it -- and
 // returns the epoch the artifact would record. The tests that read an
 // artifact back (decryptSnapshotToScratch, the frame-context binding, the
 // mixed-epoch minimum) build their input here, so they exercise the writer

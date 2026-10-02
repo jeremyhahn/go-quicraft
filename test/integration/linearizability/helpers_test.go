@@ -50,14 +50,13 @@ import (
 // pins that they still agree.
 //
 // A budget written as a literal is a value that is not pinned treated as
-// though it were — the class this repository keeps being bitten by (#84, #88,
-// #90, #91, #103, #107, #111, #112, #115, #121). In those the unpinned value
-// was a leader index or a replica ID; here it is the shard configuration the
+// though it were — a recurring flake class. Elsewhere the unpinned value is a
+// leader index or a replica ID; here it is the shard configuration the
 // budget is supposed to describe. A literal cannot follow a config change and
 // gives no signal when it stops matching; a derivation cannot drift at all.
 //
-// This suite was the FIFTH copy of the 5s literal, found while #130 fixed the third. The derivation is the one contrib/dragonboat took in PR #124
-// and test/integration/e2e took in PR #125, mirrored on purpose: the suites
+// The derivation is the one contrib/dragonboat and test/integration/e2e use,
+// mirrored on purpose: the suites
 // keep separate copies because each owns its own helpers and its own config
 // builders; the shape is shared, the constants are not.
 // ---------------------------------------------------------------------------
@@ -86,11 +85,10 @@ const testElectionRTT = config.DefaultElectionRTT
 const raftTick = testRTTMillisecond * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the ~60 lines of
-// reasoning behind it — why twice ElectionRTT, why thirty rounds, what was
-// measured on #111 — used to be copied into this file and four others. They
-// live in that package now (#133); the pin test below is the half that cannot
-// move, because it reads THIS suite's config builders.
+// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
+// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
+// live in that package; the pin test below is the half that cannot move,
+// because it reads THIS suite's config builders.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -271,8 +269,8 @@ type kvStateMachine struct {
 // applyGates parks kvStateMachine.Update on a put to a chosen key, for a test
 // that needs a replay to stand still: a restarted replica replays its whole
 // log, and the only way to be certain something happens DURING that replay
-// -- rather than to race it against the machine's speed, which is how #187
-// failed on the CI runner -- is to stop the replay at a known entry until
+// -- rather than to race it against the machine's speed, which fails on a
+// slow CI runner -- is to stop the replay at a known entry until
 // the something is done. Armed by gateApply before the entry is proposed,
 // released by the function it returns. Keyed by the KV key, process-wide,
 // because the state machine that parks is created inside StartShard by a
@@ -657,8 +655,8 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 
 // freePort returns a loopback address for a host that does not exist yet,
 // reserved so that nothing else can be handed the same port before the host
-// binds it. It used to bind 127.0.0.1:0 and close the socket, which is #131.
-// test/netport carries the reasoning and the measurements.
+// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
+// carries the reasoning and the measurements.
 func freePort(t *testing.T) string {
 	t.Helper()
 	return netport.MustReserveUDP(t.Fatalf)

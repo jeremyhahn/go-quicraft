@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// TestSession_InFlightReservation pins the reservation primitives (#197 E):
+// TestSession_InFlightReservation pins the reservation primitives:
 // one series at a time, released only by the series that holds it, and
 // released by ProposalCompleted as it advances.
 func TestSession_InFlightReservation(t *testing.T) {
@@ -110,10 +110,11 @@ func TestRequestState_ErrorCompletionReleasesSession(t *testing.T) {
 }
 
 // TestProposeWithSession_RefusesConcurrentProposal is the host-level pin for
-// #197 E. Two concurrent proposals on one session used to both carry the same
-// series number; the state machine applied the first and answered the second
-// with the first's result, and both callers were told their command ran. The
-// second is now refused with ErrSessionBusy until the first has completed.
+// the session reservation. Two concurrent proposals on one session would both
+// carry the same series number; the state machine would apply the first and
+// answer the second with the first's result, and both callers would be told
+// their command ran. The second is refused with ErrSessionBusy until the first
+// has completed.
 func TestProposeWithSession_RefusesConcurrentProposal(t *testing.T) {
 	h := newTestHost(t)
 	members := map[uint64]string{1: "127.0.0.1:5000"}

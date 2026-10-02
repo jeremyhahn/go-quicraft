@@ -31,11 +31,11 @@ import (
 // signature drifting away from what consumers implement would otherwise be
 // invisible from inside this repository until it broke their build.
 //
-// The fixtures below are also the answer to #37's acceptance criterion, "a
-// consumer can implement the custody interfaces without ever materialising a
-// share as a string" — demonstrated by construction rather than asserted in
-// prose. There is no `string` anywhere in this file's custody path, and after
-// #37 there is no string-valued interface left for one to leak through.
+// The fixtures below also demonstrate, by construction rather than in prose,
+// that a consumer can implement the custody interfaces without ever
+// materialising a share as a string. There is no `string` anywhere in this
+// file's custody path, and there is no string-valued interface for one to leak
+// through.
 
 // protectedSplitter implements ProtectedShareSplitter by delegating to the
 // primitive. Share values go from the polynomial straight into locked memory.

@@ -443,11 +443,11 @@ func NewNode(
 	// Seed the published log markers from the peer's recovered log before
 	// anyone else can read them. publishLogMarkers otherwise first runs on the
 	// step worker's first tick, and until then CommittedIndex reports 0. The
-	// host records that value as a pending proposal's committed-index floor
-	// (#186), so a proposal registered between StartReplica returning and the
-	// first tick had floor 0 and rested on the random key alone against a
-	// replayed entry — the exact restart window #186 was about. Nothing owns
-	// the peer yet, so reading it here is as race-free as the worker path.
+	// host records that value as a pending proposal's committed-index floor,
+	// so without the seed a proposal registered between StartReplica returning
+	// and the first tick would get floor 0 and rest on the random key alone
+	// against a replayed entry after a restart. Nothing owns the peer yet, so
+	// reading it here is as race-free as the worker path.
 	n.publishLogMarkers()
 	return n
 }

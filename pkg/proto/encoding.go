@@ -103,12 +103,12 @@ func putBytes(buf []byte, data []byte) int {
 // call site reports its own sentinel (ErrMetadataTooLong, ErrChunkDataTooLong,
 // ...) and errors.Is matching works per field.
 //
-// maxLen is ALWAYS applied. It used to be skipped when it was zero, which read
-// as "unlimited" — precisely backwards for a decoder, because the one way a
-// caller reaches that branch is by forgetting to pass its field's limit, and the
-// reward for forgetting was an unbounded length prefix taken straight off the
-// wire. A limit of zero now means what it says: only an empty payload is
-// admissible. No in-package caller passes zero.
+// maxLen is ALWAYS applied. Treating zero as "unlimited" would be precisely
+// backwards for a decoder, because the one way a caller reaches that branch is
+// by forgetting to pass its field's limit, and the reward for forgetting would
+// be an unbounded length prefix taken straight off the wire. A limit of zero
+// means what it says: only an empty payload is admissible. No in-package
+// caller passes zero.
 func getBytes(buf []byte, maxLen uint32, errOverLimit error) ([]byte, int, error) {
 	if len(buf) < 4 {
 		return nil, 0, ErrBufferTooSmall
@@ -230,18 +230,18 @@ func putMap(buf []byte, m map[uint64]string) int {
 //
 // # The map is sized from the wire count, and that ALLOCATES LESS
 //
-// The capacity hint used to be clamped to 64, on the theory that a count off
-// the wire must never size an allocation. The cross-check below makes that
-// reasoning obsolete — a count that reaches the make() is one the caller
-// genuinely supplied bytes for — and the clamp was not conservative, it was
-// expensive: a map that starts at 64 slots and grows to N reallocates its whole
-// table at every doubling, so the decode touches roughly twice the memory the
-// final map occupies and every superseded table stays live until the next GC.
+// Clamping the capacity hint (to 64, say) on the theory that a count off the
+// wire must never size an allocation buys nothing — the cross-check below means
+// a count that reaches the make() is one the caller genuinely supplied bytes
+// for — and a clamp is not conservative, it is expensive: a map that starts at
+// 64 slots and grows to N reallocates its whole table at every doubling, so the
+// decode touches roughly twice the memory the final map occupies and every
+// superseded table stays live until the next GC.
 //
 // Measured on a membership-dense frame (five string maps of 897 zero-length
-// entries), the clamped hint allocated 528 KB for a 54 KB frame: 9.8x against a
-// receive budget that charges the 54 KB. Sizing the map once brings the same
-// frame to 5.05x and drops the rehashing as a side effect. See
+// entries), a hint clamped to 64 allocates 528 KB for a 54 KB frame: 9.8x the
+// wire size. Sizing the map once brings the same frame to 5.05x and drops the
+// rehashing as a side effect. See
 // MaxDecodeMemoryFactor for the bound this buys and the test that holds it.
 func getMap(buf []byte) (map[uint64]string, int, error) {
 	if len(buf) < 4 {

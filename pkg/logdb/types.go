@@ -131,11 +131,10 @@ type Membership struct {
 	// every EntryConfigChange — so a replica that rebuilds its configuration
 	// from a SNAPSHOT whose log has been compacted past those entries has
 	// only this record to learn them from. A backend that drops the field
-	// therefore does not fail; it comes back with an identity-free
-	// configuration and silently downgrades every member to address-based
-	// authorization, which is exactly the forgery the identity binding
-	// closes. Under the strict posture the same replica instead drops all
-	// quorum-bearing traffic and the shard stops making progress.
+	// therefore does not fail at the storage layer; the replica comes back
+	// with an identity-free configuration, the receive-side gate refuses every
+	// message from every member — a missing entry is never a permission — and
+	// the shard stops making progress.
 	Identities map[uint64]string
 	// RemovedIdentities maps a REMOVED replica ID to the identity the
 	// configuration held for it when the removal committed (see
@@ -144,8 +143,8 @@ type Membership struct {
 	// against the claimed msg.From that a removed replica can simply change.
 	//
 	// It must survive this round-trip for a sharper reason than Identities. A
-	// dropped Identities map degrades authorization to the address check; a
-	// dropped RemovedIdentities map REVOKES A REVOCATION. The replica comes
+	// dropped Identities map stops the shard; a dropped RemovedIdentities map
+	// REVOKES A REVOCATION. The replica comes
 	// back having forgotten which keypairs it ejected, so a decommissioned node
 	// that still holds its certificate is readmitted — silently, with no error
 	// anywhere, and precisely on the restart an operator performs after

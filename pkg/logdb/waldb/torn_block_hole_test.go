@@ -33,8 +33,7 @@ import (
 // gap in the Raft log: entries before the tear and after it survive, the ones
 // inside it do not, and nothing reports corruption.
 //
-// The guard was previously uncovered -- removing it left the entire waldb suite
-// green.
+// Without this test, removing the guard leaves the entire waldb suite green.
 //
 // The segment is closed WITHOUT a Sync, so every record in it carries generation
 // 0: nothing here was ever acknowledged, and truncating at the tear destroys
@@ -393,10 +392,10 @@ func TestSegment_RepairOffsetIsTheFirstHoleNotTheLast(t *testing.T) {
 // short remainder containing any non-zero byte is a shape this writer cannot
 // produce: a torn final flush, or damage to the padding of an interior block.
 //
-// Recovery used to `break` on it, which was untested in either direction and
-// wrong in the interior case: the scan strode to the next block with no hole
-// recorded and replayed every record above the damage, manufacturing exactly
-// the Raft log gap the prefix rule exists to prevent.
+// A recovery that merely `break`s on it would be wrong in the interior case:
+// the scan would stride to the next block with no hole recorded and replay
+// every record above the damage, manufacturing exactly the Raft log gap the
+// prefix rule exists to prevent.
 func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
 	const blockSize = 1024
 	// A record that leaves a 5-byte remainder in its block: too small for a

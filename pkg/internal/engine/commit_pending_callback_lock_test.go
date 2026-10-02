@@ -153,8 +153,9 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 
 var _ Callback = (*raftMuProbeCallback)(nil)
 
-// TestNotePiggybackFailure_CountsAndRateLimits covers L4: a GetPiggybackUpdate
-// error used to be a bare repeated slog.Warn. It is not terminal for the shard —
+// TestNotePiggybackFailure_CountsAndRateLimits covers the reporting of a
+// GetPiggybackUpdate error, which must be more than a bare repeated
+// slog.Warn. It is not terminal for the shard —
 // the commit worker falls back to the skip-apply path — but it PERMANENTLY
 // degrades the multi-node fast path for as long as the condition persists,
 // turning every two-phase proposal back into a full extra pipeline cycle. A

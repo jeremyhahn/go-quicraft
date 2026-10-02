@@ -424,8 +424,8 @@ func TestValidateFrameHeaderVersionZeroRejected(t *testing.T) {
 // version byte can hold and asserts that exactly one of them — WireVersion — is
 // accepted.
 //
-// The exhaustive form is the point. The gate used to read
-// `buf[2] < 1 || buf[2] > WireVersion`, which is the same test as equality
+// The exhaustive form is the point. A gate reading
+// `buf[2] < 1 || buf[2] > WireVersion` is the same test as equality
 // while WireVersion is 1 and becomes a compatibility WINDOW the moment the
 // constant moves. A table of hand-picked values passes against both shapes; a
 // sweep that asserts a single accepted value cannot.

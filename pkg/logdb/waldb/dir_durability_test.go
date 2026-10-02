@@ -295,7 +295,7 @@ func TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto(t *testing.
 	}
 }
 
-// TestEnsureActiveSegment_FsyncsShardDirParent is the M1 regression test. When a
+// TestEnsureActiveSegment_FsyncsShardDirParent is a regression test. When a
 // shard directory is lazily created on first write, its PARENT (the WAL root)
 // must be fsynced so the shard directory's own entry is durable — otherwise a
 // crash on a non-journaled filesystem can lose the entire shard directory even

@@ -33,7 +33,7 @@ type NodeInfo struct {
 
 // EntryOverheadBytes is the fixed per-entry byte overhead every LogDB
 // implementation charges against the IterateEntries maxSize budget, in
-// addition to len(Entry.Cmd). It equals the WAL V2 entry record header size
+// addition to len(Entry.Cmd). It equals the WAL entry record header size
 // (waldb entryRecordHeaderSize), so size budgets computed by callers are
 // portable across implementations: the same maxSize admits the same entries
 // regardless of the backing store.

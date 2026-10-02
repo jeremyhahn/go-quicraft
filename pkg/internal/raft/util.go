@@ -53,7 +53,7 @@ func quorumOf(n int) int {
 // trade-off (a commit may rest on {leader + witnesses} with its payload on
 // one node, unrecoverable if that node suffers permanent storage loss) and
 // the WitnessConfig membership-shape bounds are documented canonically in
-// docs/raft/protocol.md Section 6. Matches the dragonboat reference.
+// docs/raft-consensus/engineering.md Section 6. Matches the dragonboat reference.
 func quorum(remotes map[uint64]*remote, witnesses map[uint64]*remote) int {
 	return quorumOf(numVotingMembers(remotes, witnesses))
 }

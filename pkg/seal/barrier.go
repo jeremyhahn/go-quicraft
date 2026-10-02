@@ -453,7 +453,7 @@ func MustNewBarrier(config BarrierConfig) *Barrier {
 // the reason given at NewProtectedCredentials: an exported function variable in
 // a crypto package is writable by every importer, so an init() in a transitive
 // dependency can substitute the constructor for the barrier that holds the root
-// key. A named alias is worth having; a reassignable one is not (#95).
+// key. A named alias is worth having; a reassignable one is not.
 func NewEpochBarrier(config BarrierConfig) (*Barrier, error) { return NewBarrier(config) }
 
 // MustNewEpochBarrier calls MustNewBarrier, completing the EpochBarrier alias
@@ -508,24 +508,23 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 
 	// THE ROOT KEY IS GENERATED INTO LOCKED MEMORY AND NEVER EXISTS OUTSIDE IT.
 	//
-	// This used to be `rootKey := make([]byte, rootKeySize)` — an ordinary heap
-	// slice, swappable and core-dumpable, kept alive across sealing, MAC
-	// stamping, encryptor resolution and DEK derivation, and wiped by hand on
-	// each of the seven error paths that could return in between. The wipes were
-	// correct; what they could not do was stop the key being written to disk by
-	// the pager, or captured in a core file, while it was in use.
+	// An ordinary heap slice would be swappable and core-dumpable while it is
+	// kept alive across sealing, MAC stamping, encryptor resolution and DEK
+	// derivation. Wiping it by hand on every error path would be correct and
+	// still could not stop the key being written to disk by the pager, or
+	// captured in a core file, while it was in use.
 	//
 	// A SIZED enclave, not a from-bytes one: the material is produced IN PLACE by
 	// the read below, so it never transits the heap on its way in. The pages stay
-	// writable for the enclave's life, and DELIBERATELY are not frozen even though
-	// MemoryEnclave.Freeze now exists — the terminal enclave.NewSealed wipes this
+	// writable for the enclave's life, and DELIBERATELY are not frozen with
+	// MemoryEnclave.Freeze — the terminal enclave.NewSealed wipes this
 	// slice as it consumes it, and a wipe of frozen read-only pages faults the
 	// process. Freezing here would trade a stray-write fault for a certain one.
 	// The borrowed slice never escapes initializeWithRootKey, which is the
 	// condition that makes a writable enclave safe.
 	//
-	// Destroy replaces every enclave.Wipe(rootKey) that used to stand on the error
-	// paths: it wipes and unmaps, and being deferred it cannot be skipped by a
+	// Destroy stands in for a hand-written enclave.Wipe(rootKey) on every error
+	// path: it wipes and unmaps, and being deferred it cannot be skipped by a
 	// return that a later edit adds.
 	rootEnc, err := b.lockRootKey(rootKeySize)
 	if err != nil {
@@ -535,9 +534,8 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 
 	// Everything that touches the root key runs inside the borrow, so a Destroy
 	// cannot unmap the pages underneath it. Nesting a second enclave operation in
-	// here — enclave.NewSealed below does exactly that — is legal since the
-	// go-enclave adoption; under this repository's old process-wide purgeMu it
-	// was a self-deadlock, which is why this could not be written before #54.
+	// here — enclave.NewSealed below does exactly that — is legal: go-enclave
+	// borrows take only the borrowed enclave's own read lock.
 	return rootEnc.WithBytes(func(rootKey []byte) error {
 		if _, err := io.ReadFull(b.randReader, rootKey); err != nil {
 			return &Error{Strategy: "initialize", Err: err}
@@ -554,8 +552,7 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 // must not destroy or re-borrow that enclave either — the caller owns it.
 //
 // There is deliberately no enclave.Wipe(rootKey) anywhere below. The borrow's
-// lifetime is the wipe now, which is the point of the change: an error path
-// added later cannot forget one.
+// lifetime is the wipe, so an error path added later cannot forget one.
 func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStrategy, creds Credentials, rootKey []byte) error {
 	// Generate HKDF salt. Not secret — it is stored in the sealed blob — so it
 	// stays an ordinary allocation.
@@ -788,14 +785,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// returning partial material ALONGSIDE an error, and a backstop registered
 	// after the check would step over exactly that case.
 	//
-	// It replaces two of the five hand-written wipes this used to rely on. The
-	// one that mattered lived INSIDE the borrow at the bottom:
+	// A wipe placed only INSIDE the borrow at the bottom would not be enough:
 	// MemoryEnclave.WithBytes returns ErrEnclaveDestroyed BEFORE it calls fn
-	// when the enclave is nil, destroyed OR wiped, so on that path the key was
-	// never wiped and survived to the collector (#95).
+	// when the enclave is nil, destroyed OR wiped, so on that path the key would
+	// never be wiped and would survive to the collector.
 	//
-	// That path is REACHABLE IN PRODUCTION, which an earlier draft of this
-	// comment denied. The (nil, nil) shape needs the lockRootKey seam, true —
+	// That path is REACHABLE IN PRODUCTION. The (nil, nil) shape needs the lockRootKey seam, true —
 	// but enclave.NewMemoryEnclaveSized documents that a successful return can
 	// hand back an ALREADY-DESTROYED enclave when enclave.WipeAll runs between
 	// publication and return, and WipeAll is a shutdown sweep belonging to
@@ -894,18 +889,17 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// THE STRATEGY'S HEAP COPY DIES HERE, at the earliest point it can — the
 	// defer above is only the floor under it.
 	//
-	// SealingStrategy.UnsealRootKey returns an ordinary []byte and stays that way
-	// (this issue's scope note is explicit that the interface does not move), so
-	// the root key does reach the heap on this path — unlike Initialize, which
+	// SealingStrategy.UnsealRootKey returns an ordinary []byte (the protected
+	// form is the optional ProtectedSealingStrategy), so the root key does reach the heap on this path — unlike Initialize, which
 	// generates straight into locked memory. What this controls is how LONG it
 	// stays there: it is copied into locked pages and wiped immediately, instead
 	// of living across MAC verification, encryptor resolution, the load-generation
-	// claim and one DEK derivation per known epoch, guarded by nine hand-written
-	// wipes on the error paths in between.
+	// claim and one DEK derivation per known epoch, which would need a
+	// hand-written wipe on every error path in between.
 	//
 	// Sized rather than from-bytes for the same reason as Initialize: the pages
 	// must stay writable so the terminal enclave.NewSealed can wipe them as it
-	// consumes them. MemoryEnclave.Freeze exists now and is deliberately NOT used
+	// consumes them. MemoryEnclave.Freeze is deliberately NOT used
 	// here — a wipe of frozen pages faults the process.
 	rootEnc, encErr := b.lockRootKey(rootKeySize)
 	if encErr != nil {
@@ -1318,13 +1312,6 @@ func (b *Barrier) seal() error {
 
 	// Destroy every live key enclave before dropping the map/field references.
 	//
-	// WHAT THIS BUYS CHANGED WITH THE TYPE, and it changed for the better.
-	// pkg/enclave's ProtectedKey could only Clear — drop the reference, so the
-	// key could no longer be OPENED — because memguard.Enclave exposed no API to
-	// zero its ciphertext and registered no finalizer. The encrypted DEK bytes
-	// therefore stayed resident until the collector reclaimed them, and seal()
-	// could promise revocation but not erasure.
-	//
 	// enclave.SealedEnclave.Destroy WIPES the ciphertext and the wrapped-key blob
 	// before releasing them, under the value's write lock, waiting out any Open
 	// in flight. So after seal() the sealed copy of every key is gone rather than
@@ -1344,12 +1331,12 @@ func (b *Barrier) seal() error {
 	b.currentDEK = nil
 	b.cipher = nil
 	b.deks = make(map[uint64]*enclave.SealedEnclave)
-	// Caveat, and it is now the ONLY one: each cipher.AEAD below holds a COPY of
+	// Caveat, and it is the ONLY one: each cipher.AEAD below holds a COPY of
 	// its DEK inside its internal key schedule (AES expanded key / ChaCha key).
 	// Go's stdlib and x/crypto AEADs expose no key-wipe API, so dropping these
 	// references cannot zero that copy — it lingers in freed heap until GC
-	// reclaims it. The sealed copies above ARE zeroed now (see the Destroy calls),
-	// so what used to be two GC-bounded copies is one.
+	// reclaims it. The sealed copies above ARE zeroed (see the Destroy calls),
+	// so this is the one GC-bounded copy.
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.hwEncryptor = nil
 	// The encryptor is gone, so the capability it carried is gone with it. A
@@ -2265,11 +2252,7 @@ func (b *Barrier) rotateLocked() (uint64, error) {
 	// that some caller recovers would otherwise strand an mlock'd buffer holding
 	// the root key in the clear for the life of the process — a whole locked page
 	// that is never released and never re-readable, charged against the process's
-	// RLIMIT_MEMLOCK for as long as it runs. Under memguard the leak was worse
-	// still: a later lock the kernel refused TERMINATED THE PROCESS. Since the
-	// go-enclave adoption that refusal is a returned ErrLockedMemoryUnavailable on
-	// exactly the allocation that hit the ceiling, which lowers the stakes without
-	// making a stranded root key acceptable.
+	// RLIMIT_MEMLOCK for as long as it runs.
 	rootBuf, err := b.rootKey.Open()
 	if err != nil {
 		return 0, err
@@ -2466,9 +2449,7 @@ func (b *Barrier) PurgeEpochsBefore(minEpoch uint64) (int, error) {
 		//
 		// What this guarantees, stated the same way seal() states it:
 		// SealedEnclave.Destroy WIPES the epoch's sealed DEK, so that copy is
-		// gone rather than merely unreachable — which is what changed when
-		// ProtectedKey (memguard, no way to zero an Enclave's ciphertext) was
-		// replaced. Deleting b.ciphers[epoch] is still only a reference drop:
+		// gone rather than merely unreachable. Deleting b.ciphers[epoch] is still only a reference drop:
 		// the cipher.AEAD holds a verbatim copy of the DEK in its key schedule
 		// (x/crypto's ChaCha20-Poly1305 keeps `key [32]byte`; AES-GCM keeps the
 		// expanded round keys, from which the key is recoverable), and neither
@@ -2548,9 +2529,9 @@ func (b *Barrier) RegisterInFlightEpoch(epoch uint64) {
 // positive: from the barrier's side that call is indistinguishable from the
 // legitimate one, and no reference count can tell them apart. Preventing that
 // requires a single-use release handle rather than a bare epoch number, which is
-// a public API change and is deliberately not made here. The previous
-// unconditional decrement additionally erased its own underflow (`<= 0` deleted
-// the entry), so the caller bug left no trace at all.
+// a public API change and is deliberately not made here. Deleting the entry on
+// `<= 0` instead would erase the underflow itself, so the caller bug would
+// leave no trace at all.
 func (b *Barrier) DeregisterInFlightEpoch(epoch uint64) {
 	b.inFlightMu.Lock()
 	n, held := b.inFlightEpochs[epoch]
@@ -2663,8 +2644,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 // lifetime — the window MemoryEnclave.Freeze exists to close — and this accessor
 // has nothing left to fill. That makes it agree with
 // ProtectedSealingStrategy.UnsealRootKeyProtected, the other method in this
-// package that hands a caller a root key it owns; the two differed for no reason
-// anyone had stated (#95).
+// package that hands a caller a root key it owns.
 //
 // A refused freeze destroys the enclave rather than returning it, for the reason
 // spelled out at that sibling: handing back a writable enclave from a method
@@ -2680,7 +2660,7 @@ func (b *Barrier) RootKey() ([]byte, error) {
 //
 // THE TRADE, stated rather than left for a reader to find in go-enclave: a
 // frozen region has to be made writable again before Destroy can wipe it, so the
-// wipe now sits behind an mprotect the kernel can deny. On a kernel that denies
+// wipe sits behind an mprotect the kernel can deny. On a kernel that denies
 // it the pages are released still holding the key, and MemoryEnclave.DestroyErr
 // reports ErrReleasedWithoutWipe — where an unfrozen region would have been
 // overwritten before anything deniable was attempted. Nothing leaks either way,
@@ -2808,12 +2788,19 @@ const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
 // covered field set later produces unrelated tags rather than an ambiguous
 // re-parse of the same bytes.
 //
-// v2 adds LoadGeneration to the covered set. Blobs stamped under v1 do not
-// authenticate under v2 — the format is pinned pre-release and changed in
-// place, so a pre-fence blob is migrated by loading it once with
-// BarrierConfig.AllowUnauthenticatedSealedState and re-persisting, not by a
-// compatibility path that would let an attacker choose the older, weaker
-// coverage.
+// v2 adds LoadGeneration to the covered set, and only v2 is ever written. A
+// blob stamped under v1 is still recognised, once, by verifySealedStateMAC:
+// only when its LoadGeneration is 0 (the field did not exist under v1, so a
+// blob that carries a claim can only have been written at v2), and only if the
+// v1 tag verifies under the root key just recovered. The next persist restamps
+// it at v2 with a claim, after which the v1 path no longer applies to it.
+// AllowUnauthenticatedSealedState plays no part in this: it admits a blob with
+// NO tag, never one whose tag is present and wrong.
+//
+// This is not a downgrade. Both encodings are keyed by the same HKDF-derived
+// MAC key, so an attacker with write access to the blob and no root key can
+// forge neither, and the LoadGeneration == 0 gate pins the one field v1 does
+// not cover.
 const sealedStateMACVersion byte = 2
 
 // sealedStateMAC computes the metadata authentication tag for a sealed root
@@ -2832,7 +2819,7 @@ const sealedStateMACVersion byte = 2
 // itself, so that genuine metadata from one blob cannot be paired with a
 // genuine ciphertext from another. Metadata carries the KDF version byte, which
 // selects the unwrapping KDF and is otherwise unauthenticated. LoadGeneration
-// is covered because the barrier now REFUSES TO ENCRYPT on the strength of it:
+// is covered because the barrier REFUSES TO ENCRYPT on the strength of it:
 // left unauthenticated, inflating one number in a plaintext field would be a
 // durable, passphrase-free way to stop a node from writing.
 //
@@ -2856,8 +2843,9 @@ func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]by
 // same HKDF-derived MAC key as forging a v2 one, and that key comes from the
 // root key the sealing strategy just recovered — an attacker with write access
 // to the blob but no root key cannot produce either. What v1 gives up is
-// coverage of LoadGeneration, which a pre-fence blob does not carry at all, so
-// there is nothing for the older encoding to leave unprotected.
+// coverage of LoadGeneration, which a pre-fence blob does not carry at all, and
+// verifySealedStateMAC tries v1 only when LoadGeneration is 0, so there is
+// nothing for the older encoding to leave unprotected.
 func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]byte, error) {
 	macKey := make([]byte, sha256.Size)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, rootKey, nil, []byte(sealedStateMACInfo)), macKey); err != nil {

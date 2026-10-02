@@ -156,10 +156,10 @@ func TestNonceTrackerSaturatedStillDetectsRetainedReuse(t *testing.T) {
 	}
 }
 
-// TestNonceTrackerCountAndContainsReportTrueState pins the metric honesty fix.
-// Count and Contains used to be gated on the enabled flag, so a saturated
-// tracker — one holding maxTracked nonces with detection degraded to a prefix —
-// reported "0 tracked" and "false" for nonces sitting in its own map. That is
+// TestNonceTrackerCountAndContainsReportTrueState pins metric honesty. Were
+// Count and Contains gated on the enabled flag, a saturated tracker — one
+// holding maxTracked nonces with detection degraded to a prefix — would report
+// "0 tracked" and "false" for nonces sitting in its own map. That is
 // the same reading as a tracker that was never enabled, which is the one
 // conclusion an operator must not draw from it.
 func TestNonceTrackerCountAndContainsReportTrueState(t *testing.T) {

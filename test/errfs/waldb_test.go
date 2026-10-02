@@ -108,9 +108,8 @@ const compactionEntryPayload = 768
 // before declaring failure. It is intentionally generous to handle machines
 // with many open-phase ops.
 //
-// It has to cover the PRODUCTION operation stream, which is longer than the one
-// this suite used to walk. Every phase here now runs with fsync enabled, so the
-// counter also advances through the segment flushes and directory metadata
+// It has to cover the PRODUCTION operation stream. Every phase here runs with
+// fsync enabled, so the counter also advances through the segment flushes and directory metadata
 // syncs that WithNoSync skipped entirely — and under WithNoSync no injection
 // target could ever land on a flush at all, which made the whole fsync surface
 // unreachable from a suite whose job is to fault every filesystem call the WAL
@@ -411,10 +410,10 @@ func openDBWithEFS(t *testing.T, dir string, efs *errfs.ErrorFS, opts ...waldb.O
 // acknowledgement rests on fails, the error propagates to the caller and
 // previously-committed entries survive recovery.
 //
-// The injection is constrained to File.Sync. It used to be unconstrained, which
-// meant the sweep settled on whatever operation failed first — routinely an
-// OpenFile or a WriteAt — so a test named for a sync failure never had to reach
-// one. Every phase runs with fsync enabled, as the whole suite now does: under
+// The injection is constrained to File.Sync. Unconstrained, the sweep would
+// settle on whatever operation failed first — routinely an OpenFile or a
+// WriteAt — so a test named for a sync failure would never have to reach one.
+// Every phase runs with fsync enabled, as the whole suite does: under
 // WithNoSync segment.Sync returns before touching the file, and there is no
 // fsync left to fail.
 func TestErrorFS_WAL_SyncFailure(t *testing.T) {
@@ -1619,8 +1618,8 @@ func TestErrorFS_WAL_Compaction_ReadDirFailure(t *testing.T) {
 
 	// Open with the injection DISARMED and arm it afterwards. Open reads every
 	// shard directory, so a fault armed from op 1 fires there and the test
-	// returns before Compact — which is how this test used to "pass" without
-	// ever reaching the garbage collector it names.
+	// returns before Compact — "passing" without ever reaching the garbage
+	// collector it names.
 	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).OnlyOps(errfs.OpReadDir)
 
 	db, openErr := waldb.Open(injectDir,
@@ -1868,12 +1867,11 @@ func TestErrorFS_WAL_StatFailureDuringReplay(t *testing.T) {
 		// Open survived this target. That is NOT a reason to stop: the open
 		// path stats several different things — the WAL root, the format
 		// marker, each shard directory — and only some of them are load-bearing.
-		// The loop used to `break` the moment an injection fired without
-		// failing the open, so the sweep gave up at whichever tolerated stat
-		// came first and never reached the ones this test is about. It is also
-		// why the test could only run with fsync disabled: enabling it changes
-		// which stat the counter lands on first, and the sweep then quit at
-		// target 1 having proved nothing.
+		// Breaking the moment an injection fired without failing the open
+		// would give up at whichever tolerated stat came first and never reach
+		// the ones this test is about — and with fsync enabled, which changes
+		// which stat the counter lands on first, the sweep would quit at target
+		// 1 having proved nothing.
 		//
 		// Not firing at all is the real stop condition: it means the open path
 		// has no stats left above this target.

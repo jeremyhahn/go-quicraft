@@ -199,9 +199,8 @@ func newJoiningEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node 
 // marked joining, a sender named by the JOIN ANCHOR the operator started the
 // shard with (Config.MemberIdentities) is admitted when the connection's
 // authenticated identity is the one the anchor binds it to. The snapshot's own
-// membership is not consulted — it used to be, and it let any certificate
-// holder bootstrap a joiner (#197 A). The window closes on the first accepted
-// snapshot.
+// membership is not consulted — consulting it would let any certificate holder
+// bootstrap a joiner. The window closes on the first accepted snapshot.
 func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	const leaderAddr = "127.0.0.1:7001"
 	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
@@ -221,8 +220,8 @@ func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	}
 
 	// A holder of a valid cluster certificate that covers the leader's
-	// address but is not the leader's keypair: the shape that used to
-	// bootstrap a joiner. Refused.
+	// address but is not the leader's keypair: the shape an address-based
+	// check would let bootstrap a joiner. Refused.
 	err := f.handler.HandleSnapshot(chunks, certCoveringAs(strangerID, leaderAddr))
 	var authErr *UnauthorizedMessageError
 	if !errors.As(err, &authErr) {

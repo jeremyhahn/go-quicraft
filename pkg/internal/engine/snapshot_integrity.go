@@ -160,11 +160,11 @@ func checkSnapshotArtifact(dir string, meta SnapshotMeta, metaErr error, hash fu
 //
 // Recovery verifies an artifact before it reads it, at the cost of a second
 // pass over the file. The egress paths — the transport send and
-// Host.ExportSnapshot — cannot afford that on a multi-gigabyte artifact, and
-// used to not check at all: a same-size bit flip in a retained plaintext
-// snapshot was streamed to a lagging follower, which hashed the corrupt bytes
-// on arrival, stamped THAT hash as authoritative and discarded the log the
-// snapshot covers. Egress instead tees every byte it reads into a verifier and
+// Host.ExportSnapshot — cannot afford that on a multi-gigabyte artifact, yet
+// must not skip the check: unchecked, a same-size bit flip in a retained
+// plaintext snapshot would be streamed to a lagging follower, which hashes the
+// corrupt bytes on arrival, stamps THAT hash as authoritative and discards the
+// log the snapshot covers. Egress instead tees every byte it reads into a verifier and
 // calls Verify before the LAST byte leaves the node, so a mismatch fails the
 // transfer while it is still incomplete — and an incomplete transfer is one
 // the receiver discards.

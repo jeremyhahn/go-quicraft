@@ -37,10 +37,10 @@ func reopenReadOnly(t *testing.T, dir string, id uint64, blockSize int) [][]byte
 	return recs
 }
 
-// TestSegment_MidBlockSyncRecovery is the regression test for C1: a mid-block
-// Sync must not move fileOffset off the block grid, so every record written
-// across many interleaved syncs is recoverable. Before the fix this lost
-// roughly half the records.
+// TestSegment_MidBlockSyncRecovery is a regression test: a mid-block Sync must
+// not move fileOffset off the block grid, so every record written across many
+// interleaved syncs is recoverable. Moving it off the grid loses roughly half
+// the records.
 func TestSegment_MidBlockSyncRecovery(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 32 * 1024
@@ -59,7 +59,7 @@ func TestSegment_MidBlockSyncRecovery(t *testing.T) {
 		want = append(want, cp)
 	}
 
-	// Small record then a mid-block sync (the trigger for the old bug).
+	// Small record then a mid-block sync (the shape a whole-block rewrite breaks).
 	write(bytes.Repeat([]byte{0xAB}, 5000))
 	if err := seg.Sync(); err != nil {
 		t.Fatalf("Sync: %v", err)
@@ -131,7 +131,7 @@ func TestSegment_MidBlockSyncRecoveryWithoutClose(t *testing.T) {
 	}
 }
 
-// TestSegment_StopsAtFirstCorruption is the regression test for C2: recovery
+// TestSegment_StopsAtFirstCorruption is a regression test: recovery
 // must return the clean prefix and stop at the first corrupt record rather
 // than skipping ahead and recovering a non-prefix.
 func TestSegment_StopsAtFirstCorruption(t *testing.T) {
@@ -369,12 +369,13 @@ func (w *writeRecordingFile) WriteAt(p []byte, off int64) (int, error) {
 
 // TestSegment_FlushWritesOnlyNewBytes pins the flush watermark.
 //
-// flushBlock used to write the open block FROM BYTE 0 on every Sync. That is a
-// durability defect before it is a performance one: bytes an earlier fdatasync
-// already made durable — a HardState carrying a vote grant, say — were put back
-// in flight inside the next batch's write, so a power loss during that rewrite
-// could destroy a record the caller had already been told was durable. It is
-// also quadratic: filling one block over n syncs wrote ~n^2*recSize/2 bytes.
+// A flushBlock that wrote the open block FROM BYTE 0 on every Sync would be a
+// durability defect before a performance one: bytes an earlier fdatasync
+// already made durable — a HardState carrying a vote grant, say — would be put
+// back in flight inside the next batch's write, so a power loss during that
+// rewrite could destroy a record the caller had already been told was durable.
+// It would also be quadratic: filling one block over n syncs would write
+// ~n^2*recSize/2 bytes.
 //
 // The assertion is the durability one: no byte is ever written twice. The
 // amplification bound follows from it.
@@ -593,16 +594,15 @@ func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, h
 }
 
 // TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable is the segment-level
-// regression test for the asymmetric damage classifier.
+// test that ReadAll's two damage classifiers agree.
 //
-// ReadAll had two classifiers and only one of them consulted the durability
-// generations. A failed CRC swept the rest of the file, found that the surviving
-// records spanned a completed fdatasync, and refused to truncate. A zero-filled
-// hole returned on the spot, with ackedDataAfterCorruption and
-// sequenceRegression both left false — so replaySegment reported an ordinary
-// torn tail, recovery truncated the file to the clean prefix and deleted every
-// segment above it, and acknowledged committed entries were destroyed while Open
-// returned nil.
+// A failed CRC sweeps the rest of the file, finds that the surviving records
+// span a completed fdatasync, and refuses to truncate. A zero-filled hole must
+// reach the same verdict. If it returned on the spot, with
+// ackedDataAfterCorruption and sequenceRegression both left false,
+// replaySegment would report an ordinary torn tail, recovery would truncate the
+// file to the clean prefix and delete every segment above it, and acknowledged
+// committed entries would be destroyed while Open returned nil.
 //
 // A crash cannot produce this layout. Writes are strictly ascending in file
 // offset, so a block sitting below a later generation was covered by that
@@ -688,8 +688,8 @@ func TestSegment_ZeroHoleInsideOneGenerationStillTruncates(t *testing.T) {
 	}
 	if rs.ackedDataAfterCorruption {
 		t.Fatal("ackedDataAfterCorruption is set for a hole whose survivors all " +
-			"belong to ONE unsynced generation: recovery now refuses to open a WAL " +
-			"that an ordinary power loss produces and that used to boot")
+			"belong to ONE unsynced generation: recovery would refuse to open a WAL " +
+			"that an ordinary power loss produces")
 	}
 	if rs.sequenceRegression {
 		t.Fatal("sequenceRegression is set for a single-generation segment")

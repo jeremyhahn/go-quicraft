@@ -21,6 +21,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
@@ -296,8 +297,8 @@ var (
 	ErrDraining = errors.New("quicraft: host is draining")
 
 	// ErrInvalidSession is returned when a session is not valid for the
-	// requested operation, e.g. wrong shard ID or a no-op session used
-	// for a session operation.
+	// requested operation, e.g. wrong shard ID, or a no-op session passed
+	// to ProposeWithSession or to a session register/unregister operation.
 	ErrInvalidSession = errors.New("quicraft: invalid session")
 
 	// ErrSessionBusy is returned by ProposeWithSession and
@@ -306,9 +307,9 @@ var (
 	// machine treats every entry stamped with the same (ClientID, SeriesID)
 	// as a retransmission of one command: it applies the first and answers
 	// the rest with its result. Two concurrent proposals on one session
-	// therefore used to both report success while only one of them ran.
-	// The second is refused instead; it may be resubmitted once the first
-	// has completed (ProposalCompleted, an error result, or Release).
+	// would therefore both report success while only one of them ran, so
+	// the second is refused; it may be resubmitted once the first has
+	// completed (ProposalCompleted, an error result, or Release).
 	ErrSessionBusy = errors.New("quicraft: session has a proposal in flight")
 
 	// ErrSnapshotSizeMismatch is returned when the snapshot file size
@@ -443,6 +444,27 @@ var (
 	// removed machine's address under a new replica ID remains legal.
 	ErrRemovedMemberIdentity = raft.ErrRemovedMemberIdentity
 
+	// ErrDuplicateMemberAddress is returned when an add (RequestAddNode,
+	// RequestAddObserver, RequestAddWitness, their *WithIdentity forms and
+	// their Sync variants) names a new replica at an address another ACTIVE
+	// member of the shard already holds. Routing is per address: this host
+	// dials a member at its committed address and learns, replaces and evicts
+	// routes by address, so two replica IDs at one address would share one
+	// route and the transport's address-scoped checks could not tell them
+	// apart. Promoting an observer at its
+	// own address is not a duplicate. Remove the current holder first, or use
+	// a different address.
+	ErrDuplicateMemberAddress = raft.ErrDuplicateMemberAddress
+
+	// ErrDuplicateMemberIdentity is returned when an add (the same methods as
+	// ErrDuplicateMemberAddress) would bind a node identity another ACTIVE
+	// member of the shard already holds. One identity is one keypair, and the
+	// keypair is what every replica authenticates a sender by, so binding it to
+	// a second replica ID would give its holder two votes. Unlike addresses
+	// there is no co-location exception: two replicas on one machine still need
+	// distinct keypairs.
+	ErrDuplicateMemberIdentity = raft.ErrDuplicateMemberIdentity
+
 	// ErrMemberIdentityRequired is returned by RequestAddNode,
 	// RequestAddObserver and RequestAddWitness — the identity-less forms — on
 	// a host with a transport, and by their WithIdentity forms given an empty
@@ -459,10 +481,9 @@ var (
 	// It is re-exported for the reason ErrPendingConfigChange was mapped: an
 	// internal sentinel lives in an internal package, so no caller can match it
 	// with errors.Is and every consumer falls through to its own catch-all,
-	// reporting a retryable rejection as a fatal error. Until this line existed
-	// the only way to recognise it was `strings.Contains(err.Error(), "transfer
-	// in progress")`, which two suites carried (#135) and which
-	// conventions/errors.md §5 names as the shape to avoid.
+	// reporting a retryable rejection as a fatal error, or matches it with
+	// `strings.Contains(err.Error(), "transfer in progress")` — string
+	// matching on error text, the shape to avoid.
 	//
 	// It is Temporary: the transfer completes or times out on its own, and the
 	// IDENTICAL request then succeeds. It is NOT MaybeApplied — raft returns it
@@ -470,6 +491,32 @@ var (
 	// log, so nothing was submitted and nothing can commit later.
 	ErrTransferInProgress = raft.ErrTransferInProgress
 )
+
+// ErrSharedPeerCertificate is returned by StartShard when this host's own TLS
+// leaf certificate also covers the host of another member in the initial
+// members map, and by the membership-add API (RequestAddNode,
+// RequestAddObserver, RequestAddWitness, their *WithIdentity forms and their
+// Sync variants) when it covers the host of the replica being added. The
+// concrete error is a *SharedPeerCertificateError naming the covered hosts.
+//
+// The transport authorizes a sender by checking that the address it claims is
+// named in its verified certificate, which only means something while every
+// node's certificate names that node alone. A wildcard SAN, or one certificate
+// carrying every node's SAN, lets any single replica speak for every peer, so
+// the shard refuses to start (or the add is refused) until certificates are
+// re-issued per node. Replicas on the same machine are exempt: a certificate
+// is matched on host alone and cannot tell them apart.
+//
+// It is the same value the internal transport package returns, so errors.Is
+// matches through any wrapping.
+var ErrSharedPeerCertificate = transport.ErrSharedPeerCertificate
+
+// SharedPeerCertificateError is the error behind ErrSharedPeerCertificate.
+// SelfAddress is this host's advertised Raft address and CoveredPeers the
+// other members' hosts its certificate also covers, sorted. It is an alias of
+// the transport type, so errors.As into it matches the error StartShard and
+// the membership-add API return.
+type SharedPeerCertificateError = transport.SharedPeerCertificateError
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
 // It carries the current leader's identity so clients can redirect
@@ -648,9 +695,9 @@ func (e *SnapshotSizeMismatchError) Error() string {
 
 // SnapshotFailedError reports a snapshot operation the engine's snapshot pool
 // could not complete. It is the public face of the engine-internal snapshot
-// error: RequestSnapshot's RequestState used to carry that internal error
-// verbatim, so a caller of SyncRequestSnapshot had no errors.Is it could write
-// against the failure and fell back to string matching.
+// error: RequestSnapshot's RequestState carries it rather than the internal
+// error verbatim, so a caller of SyncRequestSnapshot has an errors.Is or
+// errors.As it can write against the failure instead of string matching.
 //
 // Only the RECOVERY direction claims a sentinel. Installing an artifact into
 // the state machine is what ErrSnapshotRecoveryFailed describes, so a recovery
@@ -1133,10 +1180,10 @@ func (e *ImportDataDirMismatchError) Is(target error) bool {
 // The check runs BEFORE the import touches the shard's snapshot tree. Every
 // production LogDB (memdb, waldb) refuses such a save with
 // logdb.ErrSnapshotOutOfDate, so leaving the check to the final SaveSnapshot
-// meant the artifact had already been written — over the LIVE snapshot
+// would mean the artifact had already been written — over the LIVE snapshot
 // directory, whose name is the same index — by the time the refusal arrived.
-// The operator saw an error and believed nothing had happened while the LogDB
-// record described a file it no longer matched: a wrong FileSize ships a short
+// The operator would see an error and believe nothing had happened while the
+// LogDB record described a file it no longer matched: a wrong FileSize ships a short
 // snapshot that erases the receiving follower's state, and a wrong Epoch makes
 // StartShard fail closed on an undecryptable snapshot.
 //
@@ -1344,10 +1391,12 @@ func Temporary(err error) bool {
 // so a caller that does not know about this type behaves exactly as before.
 type MaybeAppliedError struct{ Err error }
 
+// Error returns the wrapped error's message, marked as already submitted.
 func (e *MaybeAppliedError) Error() string {
 	return e.Err.Error() + " (already submitted to raft; it may still commit)"
 }
 
+// Unwrap returns the wrapped error.
 func (e *MaybeAppliedError) Unwrap() error { return e.Err }
 
 // MaybeApplied reports whether err's request had been delivered to Raft before

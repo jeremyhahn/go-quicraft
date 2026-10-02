@@ -22,8 +22,8 @@
 // Hosts that share a leaf share an identity, so every one of them authenticates
 // as every other: the promiscuous-certificate shape identities exist to defeat,
 // and one the membership validator refuses to commit twice
-// (raft.ErrDuplicateMemberIdentity). The four suites used to carry four copies
-// of a generator that handed every host the same leaf.
+// (raft.ErrDuplicateMemberIdentity). This package is the one generator every
+// suite shares, so no suite can hand every host the same leaf.
 package testpki
 
 import (

@@ -175,8 +175,8 @@ func TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard(t *testing.T) 
 }
 
 // TestCommitWorker_UnloadFenceWaitsForInFlightSaveState pins the unload fence.
-// UnloadNode used to hand the commit worker an asynchronous unload and return,
-// so a batch holding the stopped incarnation's update could reach SaveState
+// Were UnloadNode to hand the commit worker an asynchronous unload and return,
+// a batch holding the stopped incarnation's update could reach SaveState
 // after a new incarnation of the same shard had loaded LogDB: its HardState
 // (a vote) overwriting the new one's, or its adopted snapshot recorded against
 // an artifact a later receive had already reclaimed.
@@ -285,12 +285,14 @@ func TestCommitWorker_AdmitDropsStoppedIncarnation(t *testing.T) {
 	}
 }
 
-// TestStepWorker_AnswerDroppedInstalls is LOW-B from the confirmation review.
-// It also pins that the recovery never reads the peer on a poisoned reading
-// and fails a node whose install step was interrupted.
+// TestStepWorker_AnswerDroppedInstalls pins that a local install dropped by a
+// recovered step-worker panic is answered rather than left waiting. It also
+// pins that the recovery never reads the peer on a poisoned reading and fails a
+// node whose install step was interrupted.
 // A recovered step-worker panic loses the rest of the drained inbox batch, and
-// a local install in it has a receive waiting on its verdict that used to wait
-// until the shard stopped, holding a transport receive slot the whole time.
+// a local install in it has a receive waiting on its verdict; unanswered, that
+// receive would wait until the shard stopped, holding a transport receive slot
+// the whole time.
 func TestStepWorker_AnswerDroppedInstalls(t *testing.T) {
 	newNode := func(t *testing.T, committed uint64) *Node {
 		t.Helper()
@@ -489,9 +491,9 @@ func TestSnapshotPool_StoppedNodeRecoveryIsAbandoned(t *testing.T) {
 }
 
 // TestApplyWorker_UnloadDuringShutdownWaitsForTheJoin: an unload arriving once
-// the apply tier is stopping used to be acknowledged at once, and the ack is
-// what lets the host close the shard's state machine — while the stopping
-// dispatcher's drain could still be inside that state machine's Apply. It now
+// the apply tier is stopping must not be acknowledged at once, because the ack
+// is what lets the host close the shard's state machine — while the stopping
+// dispatcher's drain could still be inside that state machine's Apply. It
 // completes only once the dispatcher has joined every per-shard goroutine.
 func TestApplyWorker_UnloadDuringShutdownWaitsForTheJoin(t *testing.T) {
 	stopC := make(chan struct{})
@@ -516,9 +518,9 @@ func TestApplyWorker_UnloadDuringShutdownWaitsForTheJoin(t *testing.T) {
 
 // TestEngine_ApplyLoopJoinsWhenStoppedDuringRestart: the apply dispatcher
 // panics while the engine runs, and the shutdown lands during its restart
-// delay. The loop used to return without running the dispatcher's stop path,
-// so the per-shard goroutines were never joined and joinedC never closed —
-// an UnloadNode racing that shutdown then waited on it forever.
+// delay. The loop must still run the dispatcher's stop path: otherwise the
+// per-shard goroutines are never joined and joinedC never closes, and an
+// UnloadNode racing that shutdown waits on it forever.
 func TestEngine_ApplyLoopJoinsWhenStoppedDuringRestart(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()
@@ -588,9 +590,9 @@ func TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain(t *testing.T) {
 }
 
 // TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards: a
-// dispatcher blocked on a FULL shard channel used to abandon the committed
-// item the moment the engine began stopping, failing proposals whose entries
-// were committed and durable. The shard goroutine keeps consuming during
+// dispatcher blocked on a FULL shard channel must not abandon the committed
+// item the moment the engine begins stopping, which would fail proposals whose
+// entries are committed and durable. The shard goroutine keeps consuming during
 // shutdown, so the item is delivered; it is discarded only when that
 // goroutine has exited and can read nothing more.
 func TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards(t *testing.T) {
@@ -1060,9 +1062,9 @@ func (c *fenceProbeCallback) OnShardFailed(shardID uint64, err error) {
 }
 
 // TestStepWorker_PanicFailureReportIsFencedByUnload: the panic recovery's
-// failure report used to follow a stop check it did not hold, so an unload
-// landing in between let OnShardFailed — resolved by shard ID — reach the
-// incarnation that followed.
+// failure report must be fenced by the unload; a report that merely followed a
+// stop check it did not hold would let an unload landing in between route
+// OnShardFailed — resolved by shard ID — to the incarnation that followed.
 func TestStepWorker_PanicFailureReportIsFencedByUnload(t *testing.T) {
 	node := newFenceTestNode(1)
 	cb := &fenceProbeCallback{node: node, fenceHeld: make(chan bool, 1), fenced: make(chan struct{})}

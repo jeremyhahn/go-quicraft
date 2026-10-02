@@ -56,8 +56,7 @@ var injectableInputs = []string{
 
 // fixtureRemote is the name the release fixtures give their throwaway bare
 // repository. Deliberately not "origin" or "dev": a test that borrows the
-// repo's real remote name breaks the day that name changes, which is exactly
-// what happened when the Gitea remote was renamed (#63).
+// repo's real remote name breaks the day that name changes.
 const fixtureRemote = "fixture-remote"
 
 // makeTargets are the three places the payload was observed to fire before the
@@ -435,7 +434,7 @@ func TestReleaseRemoteDefaultsToDev(t *testing.T) {
 		t.Errorf("release-alpha did not resolve the `dev` remote, so RELEASE_REMOTE does "+
 			"not default to `dev`. conventions/version-control.md 1 names the Gitea "+
 			"remote `dev`, and a default that points elsewhere makes the target "+
-			"unrunnable on a conforming checkout (#63).\n%s", out)
+			"unrunnable on a conforming checkout.\n%s", out)
 	}
 	// It must still refuse — the fixture's CHANGELOG has no v99.0.0-alpha section
 	// — which is what proves the run got PAST remote resolution rather than
@@ -533,8 +532,7 @@ func TestReleaseAlphaRefusesAnUnsignedOrMisattributedRelease(t *testing.T) {
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture")
 	// Named explicitly and passed below, so these tests do not depend on
-	// whatever RELEASE_REMOTE defaults to — that default has changed once
-	// already (origin -> dev, #63) and broke them.
+	// whatever RELEASE_REMOTE defaults to, which can change.
 	git("remote", "add", fixtureRemote, remote)
 
 	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -615,15 +613,15 @@ func bumpPatch(v string) string {
 // substitution, which is the failure mode that makes "we verify the signature"
 // worth anything.
 //
-// An earlier version built the allowed-signers file from a key found under
-// AGENT_GIT's own directory tree. That verifies nothing: a substituted helper
+// Building the allowed-signers file from a key found under AGENT_GIT's own
+// directory tree would verify nothing: a substituted helper
 // supplies the key it is checked against, so it signs the release with its own
 // keypair, drops the matching public half where the recipe looks, and every
 // pre-push check passes against the attacker's key.
 //
 // This test is that attack. The helper generates a fresh ed25519 key, signs the
 // release commit and tag with it as the correct author, and plants the matching
-// public key at the exact path the old implementation read
+// public key at the exact path a helper-relative lookup would read
 // (<root>/infra/gitea/agent-keys/agent-go-quicraft.key.pub) beneath a fabricated
 // company root it also controls. The recipe must still refuse, because its
 // anchor is the in-repo .release-allowed-signers and nothing else.
@@ -692,8 +690,7 @@ func TestReleaseAlphaRefusesAKeyItWasNotPinnedTo(t *testing.T) {
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
 	git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture")
 	// Named explicitly and passed below, so these tests do not depend on
-	// whatever RELEASE_REMOTE defaults to — that default has changed once
-	// already (origin -> dev, #63) and broke them.
+	// whatever RELEASE_REMOTE defaults to, which can change.
 	git("remote", "add", fixtureRemote, remote)
 
 	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)

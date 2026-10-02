@@ -129,7 +129,11 @@ PKG_WALDB       := ./pkg/logdb/waldb/...
 PKG_SEAL        := ./pkg/seal/...
 PKG_RSM         := ./pkg/internal/rsm/...
 PKG_SESSION     := ./pkg/internal/session/...
-PKG_SNAPSHOT    := ./pkg/internal/snapshot/...
+# Snapshot code has no package of its own: it is spread across the root
+# package, the engine, the transport, rsm, raft, proto and the log databases.
+# test-snapshot therefore selects by test name across all of them.
+PKG_SNAPSHOT    := ./pkg/...
+RUN_SNAPSHOT    := Snapshot|Import|Export
 PKG_ENGINE      := ./pkg/internal/engine/...
 PKG_REGISTRY    := ./pkg/internal/registry/...
 PKG_TRANSPORT   := ./pkg/internal/transport/...
@@ -178,93 +182,108 @@ clean:
 # Unit tests
 # ============================================================================
 
+# run-tests: run one test-<pkg> selection, failing when it selects no tests.
+# Usage: $(call run-tests,<package pattern>[,<-run regexp>])
+#
+# `go test` passes vacuously on a -run regexp that matches no test ("no tests to
+# run") and on packages that have no test files, so a stale selection reads as a
+# green suite. The selection is listed first, with the same -race build the run
+# reuses from the cache, and an empty listing fails the target.
+define run-tests
+	@listing=$$($(GO) test -race -list='$(or $(2),.)' $(1)) || { printf '%s\n' "$$listing"; exit 1; }; \
+	if ! printf '%s\n' "$$listing" | grep -qE '^(Test|Example)'; then \
+		echo "FAIL: $(1)$(if $(2), -run '$(2)') selects no tests"; exit 1; \
+	fi
+	$(GOTEST)$(if $(2), -run '$(2)') $(1)
+endef
+
 .PHONY: test
 test:
 	$(GOTEST) ./...
 
 .PHONY: test-proto
 test-proto:
-	$(GOTEST) $(PKG_PROTO)
+	$(call run-tests,$(PKG_PROTO))
 
 .PHONY: test-config
 test-config:
-	$(GOTEST) $(PKG_CONFIG)
+	$(call run-tests,$(PKG_CONFIG))
 
 .PHONY: test-queue
 test-queue:
-	$(GOTEST) $(PKG_QUEUE)
+	$(call run-tests,$(PKG_QUEUE))
 
 .PHONY: test-invariant
 test-invariant:
-	$(GOTEST) $(PKG_INVARIANT)
+	$(call run-tests,$(PKG_INVARIANT))
 
 .PHONY: test-logdb
 test-logdb:
-	$(GOTEST) $(PKG_LOGDB)
+	$(call run-tests,$(PKG_LOGDB))
 
 .PHONY: test-raft
 test-raft:
-	$(GOTEST) $(PKG_RAFT)
+	$(call run-tests,$(PKG_RAFT))
 
 .PHONY: test-waldb
 test-waldb:
-	$(GOTEST) $(PKG_WALDB)
+	$(call run-tests,$(PKG_WALDB))
 
 .PHONY: test-seal
 test-seal:
-	$(GOTEST) $(PKG_SEAL)
+	$(call run-tests,$(PKG_SEAL))
 
 .PHONY: test-rsm
 test-rsm:
-	$(GOTEST) $(PKG_RSM)
+	$(call run-tests,$(PKG_RSM))
 
 .PHONY: test-session
 test-session:
-	$(GOTEST) $(PKG_SESSION)
+	$(call run-tests,$(PKG_SESSION))
 
 .PHONY: test-snapshot
 test-snapshot:
-	$(GOTEST) $(PKG_SNAPSHOT)
+	$(call run-tests,$(PKG_SNAPSHOT),$(RUN_SNAPSHOT))
 
 .PHONY: test-engine
 test-engine:
-	$(GOTEST) $(PKG_ENGINE)
+	$(call run-tests,$(PKG_ENGINE))
 
 .PHONY: test-registry
 test-registry:
-	$(GOTEST) $(PKG_REGISTRY)
+	$(call run-tests,$(PKG_REGISTRY))
 
 .PHONY: test-transport
 test-transport:
-	$(GOTEST) $(PKG_TRANSPORT)
+	$(call run-tests,$(PKG_TRANSPORT))
 
 .PHONY: test-quicraft
 test-quicraft:
-	$(GOTEST) $(PKG_QUICRAFT)
+	$(call run-tests,$(PKG_QUICRAFT))
 
 .PHONY: test-errors
 test-errors:
-	$(GOTEST) $(PKG_ERRORS)
+	$(call run-tests,$(PKG_ERRORS))
 
 .PHONY: test-sm
 test-sm:
-	$(GOTEST) $(PKG_SM)
+	$(call run-tests,$(PKG_SM))
 
 .PHONY: test-server
 test-server:
-	$(GOTEST) $(PKG_SERVER)
+	$(call run-tests,$(PKG_SERVER))
 
 .PHONY: test-writemode
 test-writemode:
-	$(GOTEST) $(PKG_WRITEMODE)
+	$(call run-tests,$(PKG_WRITEMODE))
 
 .PHONY: test-batch
 test-batch:
-	$(GOTEST) $(PKG_BATCH)
+	$(call run-tests,$(PKG_BATCH))
 
 .PHONY: test-crypto
 test-crypto:
-	$(GOTEST) $(PKG_CRYPTO)
+	$(call run-tests,$(PKG_CRYPTO))
 
 # ============================================================================
 # Integration tests (always run in devcontainer)
@@ -363,10 +382,26 @@ ci-integration:
 # -p 1 for the same reason ci-integration uses it: the injector state is
 # process-global and multi-node QUIC clusters under -race starve a shared
 # runner when run concurrently.
+#
+# NETFAULT_PKGS lists every package holding a quicraft_netfault-tagged test.
+# Each package runs whole, not filtered by test name, so a netfault test cannot
+# be skipped for not matching a pattern; the untagged tests that come along
+# with it are the price (about a minute for host). The recipe refuses to run
+# when a package under $(INT_TEST_DIR) carries the tag but is missing from
+# this list, since such a package's netfault tests would otherwise never run.
+NETFAULT_PKGS := $(INT_TEST_DIR)/e2e/... $(INT_TEST_DIR)/host/...
+
 .PHONY: ci-netfault
 ci-netfault:
+	@missing=""; \
+	for d in $$(grep -rl --include='*_test.go' '^//go:build.*quicraft_netfault' $(INT_TEST_DIR) | xargs -r -n1 dirname | sort -u); do \
+		case " $(NETFAULT_PKGS) " in *" $$d/... "*) ;; *) missing="$$missing $$d" ;; esac; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "FAIL: quicraft_netfault tests in packages missing from NETFAULT_PKGS:$$missing"; exit 1; \
+	fi
 	$(GO) test -race -count=1 -tags='integration quicraft_netfault' -timeout=1800s -p 1 \
-		$(INT_TEST_DIR)/e2e/...
+		$(NETFAULT_PKGS)
 
 # ============================================================================
 # Benchmarks
@@ -435,7 +470,7 @@ bench-crypto:
 # method is identical either way; only the execution location changes. Both
 # modes are supported, including from CI.
 #
-# See docs/performance/benchmarking.md.
+# See docs/testing/benchmarking.md.
 # ----------------------------------------------------------------------------
 
 BENCH_SCRIPT   := scripts/bench-compare.sh
@@ -482,36 +517,79 @@ install-benchstat:
 # Fuzz Testing (Phase 1)
 # ============================================================================
 
+# Per-target fuzzing budget for the fuzz-<pkg> targets. A duration or an
+# execution count (`FUZZ_TIME=20000x`); see ci-fuzz-mutation below for why the
+# gates use a count.
 FUZZ_TIME     ?= 60s
 FUZZ_TAGS     := -tags=quicraft_fuzz
-GOFUZZ        := $(GO) test $(FUZZ_TAGS) -count=1
+
+# Shell functions shared by every recipe that mutation-fuzzes.
+#
+# `go test -fuzz` accepts exactly ONE package, and its pattern must match
+# exactly ONE target in it, so no recipe can hand it a package pattern or a
+# prefix such as -fuzz=Fuzz. Each recipe instead lists the targets of one
+# package and runs them one at a time:
+#
+#   fuzz_targets <pkg>              prints the fuzz targets in <pkg>; fails if
+#                                   the package does not build or has none
+#   fuzz_run <pkg> <target> <flag>… mutation-fuzzes one target; -run='^$'
+#                                   skips the unit tests so the whole budget is
+#                                   spent mutating
+#
+# The listing is captured on its own so that a package that does not compile
+# fails with the Go tool's error rather than as "no fuzz targets found".
+FUZZ_SH = \
+	fuzz_targets() { \
+		listing=$$($(GO) test $(FUZZ_TAGS) -list='^Fuzz' "$$1") || return 1; \
+		found=""; \
+		for name in $$listing; do \
+			case "$$name" in Fuzz*) found="$$found $$name" ;; esac; \
+		done; \
+		if [ -z "$$found" ]; then \
+			echo "FAIL: no fuzz targets found in $$1" >&2; return 1; \
+		fi; \
+		echo $$found; \
+	}; \
+	fuzz_run() { \
+		pkg=$$1; target=$$2; shift 2; \
+		$(GO) test $(FUZZ_TAGS) -count=1 -run='^$$' -fuzz="^$$target\$$" "$$@" "$$pkg"; \
+	}
+
+# fuzz-pkg: mutation-fuzz every target in one package for FUZZ_TIME each,
+# stopping at the first failure so its reproducer is the last thing printed.
+# Usage: $(call fuzz-pkg,<package>)
+define fuzz-pkg
+	@set -u; $(FUZZ_SH); \
+	targets=$$(fuzz_targets $(1)) || exit 1; \
+	for t in $$targets; do \
+		echo "==> $(1) $$t"; \
+		fuzz_run $(1) "$$t" -fuzztime=$(FUZZ_TIME) || exit 1; \
+	done
+endef
 
 .PHONY: fuzz-proto
 fuzz-proto:
-	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_PROTO)
+	$(call fuzz-pkg,./pkg/proto)
 
 .PHONY: fuzz-transport
 fuzz-transport:
-	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_TRANSPORT)
+	$(call fuzz-pkg,./pkg/internal/transport)
 
 .PHONY: fuzz-waldb
 fuzz-waldb:
-	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_WALDB)
+	$(call fuzz-pkg,./pkg/logdb/waldb)
 
 .PHONY: fuzz-seal
 fuzz-seal:
-	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_SEAL)
+	$(call fuzz-pkg,./pkg/seal)
 
 .PHONY: fuzz-session
 fuzz-session:
-	$(GOFUZZ) -fuzz=Fuzz -fuzztime=$(FUZZ_TIME) $(PKG_SESSION)
+	$(call fuzz-pkg,./pkg/internal/session)
 
-# The raft package has two targets and `go test -fuzz` runs exactly one per
-# invocation, so they are listed explicitly rather than matched by -fuzz=Fuzz.
 .PHONY: fuzz-raft
 fuzz-raft:
-	$(GOFUZZ) -run=Fuzz -fuzz=FuzzRaftStepSequence -fuzztime=$(FUZZ_TIME) $(PKG_RAFT)
-	$(GOFUZZ) -run=Fuzz -fuzz=FuzzRaftLogRecovery -fuzztime=$(FUZZ_TIME) $(PKG_RAFT)
+	$(call fuzz-pkg,./pkg/internal/raft)
 
 .PHONY: fuzz-all
 fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft
@@ -540,27 +618,19 @@ ci-fuzz-seeds:
 # already encode. The real campaign is fuzz.yml's nightly schedule.
 #
 # It lives here rather than inline in release.yml so CI runs the target a
-# developer runs (devops.md §4). It previously existed only as shell inside the
-# workflow, which meant the release gate could not be reproduced locally at all.
+# developer runs (devops.md §4), and the release gate can be reproduced locally.
 #
-# # Why the retry, and why it is not a weakened gate
+# # Why the budget is an execution count, never a duration
 #
-# Go's fuzzing coordinator can lose its shutdown RPC to the scheduler and report
-# a bare "context deadline exceeded" AFTER the full -fuzztime has elapsed. It
-# reads exactly like a crash and is not one. -parallel bounds the workers, which
-# reduced it, but it still occurs — reproduced on an IDLE host running one target
-# at a time, so it is not cross-job contention.
-#
-# A gate that fails randomly is not a stricter gate, it is a gate people re-run
-# until it passes. So the two outcomes are separated on the signal Go itself
-# gives: a crash ALWAYS writes a reproducer and says "Failing input written to".
-#
-#   - that string present            -> real finding, fail immediately, never retry
-#   - absent, deadline message only  -> shutdown artefact, retry
-#   - anything else                  -> unknown failure, fail
-#
-# A real crash therefore cannot be retried away, because the retry is gated on
-# the ABSENCE of the reproducer Go writes for one.
+# With `-fuzztime=<duration>` Go's fuzzing coordinator installs a deadline
+# context and can lose the race against it at shutdown, reporting a bare
+# "context deadline exceeded" AFTER the full budget has elapsed — a failure
+# that reads exactly like a crash, writes no reproducer, and is not a finding.
+# With `-fuzztime=<N>x` no deadline context exists and the run ends on an
+# explicit stop once N executions are done, so the race has no participants
+# and every failure is real. fuzz.yml carries the full analysis. -parallel=2
+# bounds the workers, which keeps several of these gates on one runner from
+# starving each other.
 # ============================================================================
 
 FUZZ_MUT_PKGS ?= ./pkg/proto ./pkg/internal/transport ./pkg/internal/session \
@@ -572,7 +642,7 @@ FUZZ_MUT_DIVISOR ?= 6
 
 .PHONY: ci-fuzz-mutation
 ci-fuzz-mutation:
-	@set -u; overall=0; \
+	@set -u; overall=0; $(FUZZ_SH); \
 	budget() { \
 		case "$$1" in \
 		  ./pkg/proto)              base=4000000 ;; \
@@ -594,14 +664,10 @@ ci-fuzz-mutation:
 		echo "$$n"; \
 	}; \
 	for pkg in $(FUZZ_MUT_PKGS); do \
-		targets=$$($(GO) test $(FUZZ_TAGS) -list='^Fuzz' "$$pkg" | grep '^Fuzz' || true); \
-		if [ -z "$$targets" ]; then \
-			echo "FAIL: no fuzz targets found in $$pkg"; overall=1; continue; \
-		fi; \
+		targets=$$(fuzz_targets "$$pkg") || { overall=1; continue; }; \
 		for t in $$targets; do \
 			n=$$(budget "$$pkg" "$$t") || { overall=1; break; }; \
-			if ! $(GO) test $(FUZZ_TAGS) -count=1 -run='^$$$$' -parallel=2 \
-				-fuzz="^$$t\$$$$" -fuzztime=$${n}x "$$pkg"; then \
+			if ! fuzz_run "$$pkg" "$$t" -parallel=2 -fuzztime=$${n}x; then \
 				echo "FAIL: $$pkg $$t"; overall=1; \
 			fi; \
 		done; \
@@ -622,10 +688,9 @@ GOERRFS       := $(GO) test $(ERRFS_TAGS) -race -count=1 -v
 # fails, because the failure is a sequence of I/O outcomes and the test names
 # are the only way to tell which injection point produced it.
 #
-# This target previously had no caller: no other target depended on it and no
-# workflow ran it, so the 21 tests behind quicraft_errfs were only ever run by
-# hand. ci-errfs below is now the wired-in path (ci-full -> ci-errfs), and this
-# stays as the target you reach for once something is red.
+# Nothing depends on this target: ci-errfs below is the wired-in path for the
+# quicraft_errfs suite (ci-full -> ci-errfs), and this is the target you reach
+# for once something is red.
 .PHONY: errfs-waldb
 errfs-waldb:
 	$(GOERRFS) $(ERRFS_PKGS)
@@ -910,10 +975,6 @@ coverage-rsm: | $(COVER_DIR)
 .PHONY: coverage-session
 coverage-session: | $(COVER_DIR)
 	$(call run-coverage,session,$(PKG_SESSION))
-
-.PHONY: coverage-snapshot
-coverage-snapshot: | $(COVER_DIR)
-	$(call run-coverage,snapshot,$(PKG_SNAPSHOT))
 
 .PHONY: coverage-engine
 coverage-engine: | $(COVER_DIR)
@@ -1239,7 +1300,16 @@ REMOTE_WORKDIR ?= ~/ci/go-quicraft
 REMOTE_DEST     = $(if $(REMOTE_USER),$(REMOTE_USER)@)$(REMOTE_HOST)
 # The host keeps its toolchain in ~/sdk and its go-installed tools in ~/go/bin;
 # a non-interactive ssh does not source the profile that would add them.
-REMOTE_ENV_PATH := export PATH=$$HOME/sdk/go1.26.5/bin:$$HOME/go/bin:$$PATH
+#
+# The toolchain is the one go.mod's `go` directive names, installed the
+# golang.org/dl way (`go install golang.org/dl/go<ver>@latest && go<ver>
+# download`, which unpacks into ~/sdk/go<ver>). The directive is what CI pins
+# GO_VERSION to as well. A host without that SDK is refused rather than left to
+# whatever `go` its PATH happens to hold.
+REMOTE_GO_SDK   := $$HOME/sdk/go$(GO_DIRECTIVE)
+REMOTE_ENV_PATH := test -x $(REMOTE_GO_SDK)/bin/go || { \
+	echo "remote host has no $(REMOTE_GO_SDK): install go$(GO_DIRECTIVE) with golang.org/dl" >&2; exit 1; }; \
+	export PATH=$(REMOTE_GO_SDK)/bin:$$HOME/go/bin:$$PATH
 REMOTE_SSH      = ssh -o BatchMode=yes -o ConnectTimeout=10 $(REMOTE_DEST)
 RSYNC_EXCLUDE  := --exclude .git --exclude .build-cache --exclude $(COVER_DIR) \
                   --exclude $(BUILD_DIR) --exclude '*.test' --exclude '*.prof' \
@@ -1326,6 +1396,12 @@ remote-tools:
 # go.mod is enrolled the moment it appears. Mirrors the `modules` job in
 # .github/workflows/ci.yml, which discovers the same way.
 #
+# Discovery skips the directories the go command itself ignores: names that
+# begin with `.` or `_`, and testdata. That keeps .git, .tools, .build-cache and
+# the agent worktrees under .claude/ (each a full checkout with its own go.mod
+# files) out of the list. `git ls-files` is not used because remote-% ships the
+# tree without .git.
+#
 # GOWORK=off (exported at the bottom of this file) is load-bearing: inside a
 # workspace these modules resolve the root through the workspace instead of
 # through their own require/replace directives, and the `go` directive mismatch
@@ -1340,7 +1416,8 @@ remote-tools:
 .PHONY: ci-modules
 ci-modules:
 	@rc=0; \
-	for dir in $$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort); do \
+	for dir in $$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune \
+			-o -name go.mod -printf '%h\n' | sort); do \
 		echo "==> $$dir"; \
 		if ! ( cd "$$dir" && $(GO) build ./... && $(GOVET) ./... ); then \
 			echo "    FAIL: $$dir"; rc=1; \
@@ -1674,7 +1751,7 @@ help:
 	@echo "    packages: proto, raft, waldb, seal, registry, engine, transport, quicraft,"
 	@echo "              server, writemode"
 	@echo ""
-	@echo "Benchmark Regression Gate (see docs/performance/benchmarking.md):"
+	@echo "Benchmark Regression Gate (see docs/testing/benchmarking.md):"
 	@echo "  bench-compare          Interleaved baseline-vs-current comparison (benchstat)"
 	@echo "  bench-baseline         Record the working tree as a stored baseline"
 	@echo "  install-benchstat      Install benchstat (required for proper statistics)"
@@ -1709,7 +1786,7 @@ help:
 	@echo "  coverage               Run total coverage report"
 	@echo "  coverage-<pkg>         Run coverage for a specific package"
 	@echo "    packages: proto, config, queue, invariant, logdb,"
-	@echo "              raft, waldb, seal, rsm, session, snapshot,"
+	@echo "              raft, waldb, seal, rsm, session,"
 	@echo "              registry, engine, transport, quicraft, errors, sm,"
 	@echo "              server, writemode"
 	@echo ""

@@ -1906,7 +1906,7 @@ func (t *QUICTransport) inboundAuthorizedForCached(conn *quic.Conn, target strin
 // anything.
 //
 // It is called from acceptLoopIteration, SYNCHRONOUSLY, before the connection's
-// handler goroutine is launched — not from the handler, where it used to live.
+// handler goroutine is launched — not from the handler.
 // That is the load-bearing half of the shutdown guarantee, and it only works in
 // concert with stop() joining the accept loop: publishing on this goroutine is
 // what makes "the accept loop has returned" mean "every connection it admitted

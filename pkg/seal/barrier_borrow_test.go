@@ -87,16 +87,16 @@ func newPlainStrategy(t *testing.T) *plainStrategy {
 	return &plainStrategy{inner: testStrategy(t)}
 }
 
-// TestBarrier_WorksWithAPlainSealingStrategy is #39's explicit requirement: the
-// barrier's borrow rewrite must not quietly start depending on
+// TestBarrier_WorksWithAPlainSealingStrategy pins that the barrier's
+// locked-memory handling does not quietly start depending on
 // ProtectedSealingStrategy, because most strategies in the portfolio implement
 // only the []byte pair — go-xkms's TPM2, PKCS#11 and cloud-KMS strategies, and
 // go-qrdb's shamir and recovery strategies.
 //
-// Initialize now generates the root key into locked memory and Unseal copies the
+// Initialize generates the root key into locked memory and Unseal copies the
 // strategy's return into locked memory, but BOTH still hand the strategy an
-// ordinary []byte, because SealingStrategy is deliberately out of this issue's
-// scope. This test is what holds that line.
+// ordinary []byte, because SealingStrategy is deliberately a []byte interface.
+// This test is what holds that line.
 func TestBarrier_WorksWithAPlainSealingStrategy(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -137,9 +137,9 @@ func TestBarrier_WorksWithAPlainSealingStrategy(t *testing.T) {
 // TestUnseal_WipesTheStrategysHeapKey pins the one place the root key still
 // reaches the ordinary heap, and how briefly.
 //
-// SealingStrategy.UnsealRootKey returns a plain []byte and is not moving (#39
-// scope), so on the unseal path the key does exist outside protected memory.
-// What the rewrite controls is the WINDOW: the slice is copied into locked pages
+// SealingStrategy.UnsealRootKey returns a plain []byte, so on the unseal path
+// the key does exist outside protected memory. What the barrier controls is
+// the WINDOW: the slice is copied into locked pages
 // and wiped immediately, instead of staying live across MAC verification,
 // encryptor resolution, the load-generation claim and one DEK derivation per
 // known epoch — nine hand-written wipes' worth of error paths.
@@ -268,20 +268,21 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 }
 
 // TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey is the sibling failure to
-// the one above, and the one the wipe used to miss (#95).
+// the one above.
 //
-// The wipe of the strategy's heap key lived INSIDE the borrow that copies it
-// into locked memory. MemoryEnclave.WithBytes returns ErrEnclaveDestroyed
-// BEFORE it calls fn when the enclave is nil or wiped, so on that path fn never
-// ran and the full plaintext root key stayed on the ordinary Go heap —
-// swappable, core-dumpable, alive until the collector reclaimed it.
+// A wipe of the strategy's heap key placed only INSIDE the borrow that copies
+// it into locked memory is skipped on one path: MemoryEnclave.WithBytes returns
+// ErrEnclaveDestroyed BEFORE it calls fn when the enclave is nil or wiped, so
+// fn never runs and the full plaintext root key stays on the ordinary Go heap —
+// swappable, core-dumpable, alive until the collector reclaims it. The deferred
+// wipe is the floor that covers it.
 //
 // A (nil, nil) allocator is the shape that reaches it. The default lockRootKey
 // is enclave.NewMemoryEnclaveSized, which cannot return one, so this is not
 // reachable in production — but lockRootKey is an injectable field, and the
 // comment at the borrow says the redesign exists precisely so "an error path
 // added later cannot forget one". An allocator whose refusal is a nil enclave
-// rather than an error is such a path, and it forgot.
+// rather than an error is such a path.
 //
 // Verified by mutation on 2026-09-04: moving the wipe back inside the borrow —
 // deleting `defer enclave.Wipe(heapKey)` and restoring the four hand-written
@@ -335,8 +336,8 @@ func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 
 // TestUnseal_NoEncryptionModeStillWipesTheHeapKey covers the branch that returns
 // before the borrow exists at all. NoneStrategy's key is empty, so the wipe has
-// nothing to erase — what this holds is that the defer introduced by #95 did not
-// change the branch's OUTCOME while retiring its two hand-written wipes.
+// nothing to erase — what this holds is that the deferred wipe leaves the
+// branch's OUTCOME unchanged.
 func TestUnseal_NoEncryptionModeStillWipesTheHeapKey(t *testing.T) {
 	none := NewNoneStrategy()
 
@@ -363,11 +364,11 @@ func TestUnseal_NoEncryptionModeStillWipesTheHeapKey(t *testing.T) {
 //
 // TestUnseal_WipesTheStrategysHeapKey inspects s.lastUnsealed after Unseal
 // RETURNS, so it is satisfied by any wipe that happens at all — including the
-// deferred backstop #95 added. That made the eager wipe inside the borrow
-// deletable with a green suite, which is the reverse of what the backstop was
+// deferred backstop. That alone would leave the eager wipe inside the borrow
+// deletable with a green suite, which is the reverse of what the backstop is
 // for: the defer is meant to be a floor UNDER the eager wipe, not a substitute
 // that quietly retires it. A future edit dropping the eager wipe as dead code
-// would restore the long plaintext-on-heap window #39 closed — across
+// would reopen the long plaintext-on-heap window — across
 // verifySealedStateMAC, the load-generation claim (which calls the embedder's
 // StatePersister, so real I/O) and one DEK derivation per known epoch.
 //

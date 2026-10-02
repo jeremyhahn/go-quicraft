@@ -132,13 +132,35 @@ type MetricsConfig struct {
 }
 
 // EventListener holds per-type optional event callbacks. Only non-nil
-// callbacks are invoked. Callbacks are called synchronously on engine
-// worker goroutines and must not block. See the package-level
-// documentation for callback guidelines.
+// callbacks are invoked. They fall into two classes.
+//
+// Engine-produced notifications — OnLeaderUpdated, OnLeaderLost,
+// OnCampaignLaunched, OnShardFailed, OnSnapshotCreated, OnSnapshotCompacted,
+// OnSnapshotRecovered, OnLogCompacted and OnLogDBCompacted — run on a
+// dedicated dispatcher goroutine that holds no engine lock, so a listener may
+// call any Host API from them, including the synchronous StopShard. They are
+// delivered FIFO by that one goroutine and are therefore ordered per shard.
+// The queue is bounded and never blocks the producer: a refused leader change
+// is re-published on the next tick, and any other refused notification is
+// dropped and logged.
+//
+// Every other callback runs inline on the goroutine that produced the event
+// and must not block: connection and snapshot-transfer events on transport
+// goroutines, disk events on the WAL write path, OnMembershipChanged on the
+// apply path, OnSnapshotRejected on the snapshot path, and OnNodeReady,
+// OnNodeUnloaded, OnNodeDeleted, OnProposalDropped, OnReadIndexDropped and
+// OnNodeHostShuttingDown on the goroutine calling the Host method that caused
+// them. There is no ordering guarantee between the two classes.
 type EventListener struct {
 	// Raft events
-	OnLeaderUpdated    func(info LeaderInfo)
-	OnLeaderLost       func(info EventShardInfo)
+
+	// OnLeaderUpdated fires when the engine reports a leader update for a
+	// shard. LeaderID is 0 when no leader is known.
+	OnLeaderUpdated func(info LeaderInfo)
+	// OnLeaderLost fires when this replica was the shard's leader and no
+	// longer is.
+	OnLeaderLost func(info EventShardInfo)
+	// OnCampaignLaunched fires when this replica starts an election.
 	OnCampaignLaunched func(info EventShardInfo)
 
 	// OnCampaignSkipped NEVER FIRES. A callback installed here is never
@@ -146,7 +168,7 @@ type EventListener struct {
 	// and correct, but nothing in the engine invokes the hook it forwards,
 	// so no event is ever produced.
 	//
-	// It was intended to report an election the replica refused to start.
+	// It is reserved to report an election the replica refused to start.
 	// Do NOT build alerting on it: the conditions it would report are the
 	// ones that leave a shard without a leader while quorum looks intact,
 	// and silence here is indistinguishable from health. Detect a
@@ -154,32 +176,75 @@ type EventListener struct {
 	// ShardNoLeader instead.
 	OnCampaignSkipped func(info EventShardInfo)
 
+	// OnSnapshotRejected fires when a snapshot is refused or abandoned: a
+	// snapshot request the snapshot pool would not accept, an accepted request
+	// abandoned when the pool stops or failed by a panic mid-save, or an
+	// inbound snapshot transfer the receiver rejected.
 	OnSnapshotRejected func(info SnapshotInfo)
-	OnProposalDropped  func(info EventShardInfo)
+	// OnProposalDropped fires when a proposal could not be handed to the
+	// shard and was failed with ErrDropped.
+	OnProposalDropped func(info EventShardInfo)
+	// OnReadIndexDropped fires when a ReadIndex request could not be handed
+	// to the shard and was refused with ErrSystemBusy.
 	OnReadIndexDropped func(info EventShardInfo)
 
 	// System events
-	OnNodeHostShuttingDown  func()
-	OnNodeReady             func(info EventShardInfo)
-	OnNodeUnloaded          func(info EventShardInfo)
-	OnNodeDeleted           func(info EventShardInfo)
-	OnMembershipChanged     func(info EventShardInfo)
+
+	// OnNodeHostShuttingDown fires once, when Host.Close begins.
+	OnNodeHostShuttingDown func()
+	// OnNodeReady fires when StartShard has loaded a replica and it is
+	// processing.
+	OnNodeReady func(info EventShardInfo)
+	// OnNodeUnloaded fires when a replica has been stopped and unloaded.
+	OnNodeUnloaded func(info EventShardInfo)
+	// OnNodeDeleted fires after RemoveData has deleted a replica's data.
+	OnNodeDeleted func(info EventShardInfo)
+	// OnMembershipChanged fires after an applied entry changed the shard's
+	// membership.
+	OnMembershipChanged func(info EventShardInfo)
+	// OnConnectionEstablished fires when an outbound connection to a peer
+	// is established.
 	OnConnectionEstablished func(info ConnectionInfo)
-	OnConnectionFailed      func(info ConnectionInfo)
-	OnSnapshotSendStarted   func(info SnapshotInfo)
-	OnSnapshotSent          func(info SnapshotInfo)
-	OnSnapshotSendAborted   func(info SnapshotInfo)
-	OnSnapshotReceived      func(info SnapshotInfo)
-	OnSnapshotRecovered     func(info SnapshotInfo)
-	OnSnapshotCreated       func(info SnapshotInfo)
-	OnSnapshotCompacted     func(info SnapshotInfo)
-	OnLogCompacted          func(info EventShardInfo)
-	OnLogDBCompacted        func(info EventShardInfo)
+	// OnConnectionFailed fires when a connection to a peer fails to
+	// establish or is lost.
+	OnConnectionFailed func(info ConnectionInfo)
+	// OnSnapshotSendStarted fires when an outbound snapshot transfer starts.
+	OnSnapshotSendStarted func(info SnapshotInfo)
+	// OnSnapshotSent fires when an outbound snapshot transfer completes.
+	OnSnapshotSent func(info SnapshotInfo)
+	// OnSnapshotSendAborted fires when an outbound snapshot transfer fails.
+	OnSnapshotSendAborted func(info SnapshotInfo)
+	// OnSnapshotReceived fires when an inbound snapshot transfer has been
+	// received in full.
+	OnSnapshotReceived func(info SnapshotInfo)
+	// OnSnapshotRecovered fires when a replica has restored its state
+	// machine from a snapshot.
+	OnSnapshotRecovered func(info SnapshotInfo)
+	// OnSnapshotCreated fires when a snapshot save completes.
+	OnSnapshotCreated func(info SnapshotInfo)
+	// OnSnapshotCompacted fires after a successful snapshot save, alongside
+	// OnSnapshotCreated.
+	OnSnapshotCompacted func(info SnapshotInfo)
+	// OnLogCompacted fires when a snapshot save compacted the in-memory log;
+	// Index is the index compaction ran through.
+	OnLogCompacted func(info EventShardInfo)
+	// OnLogDBCompacted fires when the LogDB also removed the compacted
+	// entries; it does not fire when that step failed.
+	OnLogDBCompacted func(info EventShardInfo)
 
 	// Failure events
-	OnShardFailed      func(info ShardFailedInfo)
+
+	// OnShardFailed fires when a replica's failure latch trips and it stops
+	// making progress until it is stopped and restarted.
+	OnShardFailed func(info ShardFailedInfo)
+	// OnLogDBDiskWarning fires when WAL disk usage crosses the warning
+	// threshold of HostConfig.MaxWALDiskSize. It requires MaxWALDiskSize > 0.
 	OnLogDBDiskWarning func(info DiskInfo)
-	OnLogDBDiskFull    func(info DiskInfo)
+	// OnLogDBDiskFull fires when WAL disk usage reaches the full threshold
+	// (95% of MaxWALDiskSize; the warning fires at 85%); new proposals are
+	// refused with ErrDiskFull until usage drops. It requires
+	// MaxWALDiskSize > 0.
+	OnLogDBDiskFull func(info DiskInfo)
 }
 
 // LeaderInfo describes a leader change event.
@@ -324,8 +389,10 @@ type HostConfig struct {
 	// read-after-write consistency should use ApplyResultC() instead.
 	NotifyCommit bool
 
-	// HostID is the unique host identifier. When empty, a new UUID is
-	// generated or loaded from NodeHostDir/host.id.
+	// HostID is the unique host identifier. When empty, it is loaded from
+	// NodeHostDir/host.id, or, when that file cannot be read (absent,
+	// unreadable or malformed), generated as 16 random bytes hex-encoded (32
+	// characters) and written there, replacing any existing file.
 	HostID string
 
 	// EventListener holds per-type event callbacks. Nil means no events

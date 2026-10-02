@@ -687,7 +687,7 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	// it too, so the wait ends promptly whichever way the item went and
 	// every read below is pinned. testSM.Update bumps applyCount on ENTRY,
 	// so waiting on that alone observes the batch mid-apply, before the
-	// worker has advanced lastApplied (#139).
+	// worker has advanced lastApplied.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"committed batch of the re-loaded shard was never processed",
 		func() bool { return !node.commitPending.Load() })
@@ -804,7 +804,7 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	// the node failed, so waiting on the callback count alone reads
 	// IsFailed before the worker has set it. commitPending is cleared by
 	// the per-shard goroutine's defer after failApply has returned, which
-	// pins every read below (#139).
+	// pins every read below.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"timed out waiting for the gapped batch to be processed",
 		func() bool { return !node.commitPending.Load() })
@@ -874,7 +874,7 @@ func TestApplyWorker_GapDetection_FailsShardWhenNothingApplied(t *testing.T) {
 	applyC <- item
 
 	// See TestApplyWorker_GapDetection_FailsShard: the deferred commitPending
-	// clear is the only mark that follows failed.Store (#139).
+	// clear is the only mark that follows failed.Store.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"timed out waiting for the gapped batch to be processed",
 		func() bool { return !node.commitPending.Load() })

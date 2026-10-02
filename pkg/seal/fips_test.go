@@ -134,8 +134,7 @@ func TestFIPSEnabled_NonEmptyArbitraryValue(t *testing.T) {
 }
 
 // TestFIPSEnabledOffValue verifies GOFIPS140=off is honored as DISABLED
-// (the old detection treated any non-empty value, including "off", as
-// FIPS mode).
+// rather than treated as FIPS mode merely for being non-empty.
 func TestFIPSEnabledOffValue(t *testing.T) {
 	skipIfModuleActive(t)
 

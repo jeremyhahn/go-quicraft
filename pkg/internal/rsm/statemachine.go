@@ -211,11 +211,11 @@ type StateMachine struct {
 	//     READ lock. Both document Lookup as "May be called concurrently with
 	//     Update ... responsible for its own internal synchronization", so
 	//     excluding reads here would serialise a state machine that was built
-	//     not to be. It did, until #209: one long read (a range scan, an
-	//     export) blocked the shard's Apply, and sync.RWMutex then parked
-	//     every new reader behind that waiting writer, so a single slow read
-	//     stalled reads and writes for the whole shard. The read lock still
-	//     excludes Close.
+	//     not to be: one long read (a range scan, an export) would block the
+	//     shard's Apply, and sync.RWMutex would then park every new reader
+	//     behind that waiting writer, so a single slow read would stall reads
+	//     and writes for the whole shard. The read lock still excludes
+	//     Close.
 	//
 	// Cost on the basic tier: a local read parks behind an in-flight Apply,
 	// which during follower catch-up can carry up to maxEntriesToApplySize of
@@ -230,10 +230,10 @@ type StateMachine struct {
 	// state is the session manager (not safe for concurrent use), the session
 	// policy and the expiry checkpoint walk.
 	//
-	// readGuard used to carry this exclusion as a side effect of Apply holding
-	// its write lock. Once Apply became a READER on the concurrent and on-disk
-	// tiers, two readGuard readers no longer exclude each other, so the role
-	// moves here — the same split streamGuard made for Close. The engine's
+	// readGuard cannot carry this exclusion: Apply is a READER on the
+	// concurrent and on-disk tiers, and two readGuard readers do not exclude
+	// each other, so the role lives here — the same split streamGuard makes
+	// for Close. The engine's
 	// apply gate quiesces applies around both snapshot paths as well; this is
 	// what keeps a misordered caller from racing the session table instead of
 	// relying on that gate alone.
@@ -977,9 +977,9 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 // overlap — the contract its doc comment publishes. Concurrent and on-disk
 // state machines are documented as handling their own synchronization, and
 // their Apply holds the guard for reading, so this runs alongside Update; on
-// those tiers the guard keeps out only Close (see lockApply). Note the earlier claim that the CALLER serialized this was never
-// true: Host.SyncRead, FollowerRead, QueryLocalNode and StaleRead all reach
-// this on their own goroutine while the apply worker runs.
+// those tiers the guard keeps out only Close (see lockApply). The caller does
+// not serialize this: Host.SyncRead, FollowerRead, QueryLocalNode and
+// StaleRead all reach it on their own goroutine while the apply worker runs.
 //
 // For a []byte query answered by the sm.NALookup fast path, an absent key is
 // reported as an untyped nil interface, so `result == nil` at the call site is
@@ -1120,7 +1120,7 @@ func nopRelease() {}
 // excludes only Close, so GetHash runs alongside Update, and the sm.Hasher
 // contract makes the implementation responsible for hashing whole batches.
 // Holding applyMu here instead would let a long hash stall the shard's
-// applies, which is the stall #209 removed. On every tier the guard keeps a
+// applies. On every tier the guard keeps a
 // closed SM from being read.
 func (s *StateMachine) GetHash() (uint64, bool, error) {
 	s.readGuard.RLock()
@@ -1360,9 +1360,8 @@ func (s *StateMachine) SMType() SMType {
 // invariants span calls, so a caller reading Count and then acting on it needs
 // the whole window, not one method's worth.
 //
-// It has no production caller. The comment it used to carry claimed one — "by
-// the leader for TTL expiration scans" — and no such scan exists anywhere:
-// session expiry is driven from Apply at fixed log-index checkpoints precisely
+// It has no production caller. In particular there is no leader-driven TTL
+// expiration scan: session expiry is driven from Apply at fixed log-index checkpoints precisely
 // BECAUSE a leader-local wall-clock scan would not be deterministic across
 // replicas (see Apply). The accessor is kept for the shard-level tests in this
 // package and for the host's session-policy tests, which assert the limits the

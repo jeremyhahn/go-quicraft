@@ -27,9 +27,8 @@
 //	cluster.hosts[leaderIdx].SyncRequestDeleteNode(ctx, shardID, id, 0)
 //
 // has read a value that was true when it looked and treated it as fixed.
-// Package test/proposer records that class for proposals (#84, #88, #90, #91,
-// #103, #107); a membership change addressed the same way is refused the same
-// way.
+// Package test/proposer records that class for proposals; a membership change
+// addressed the same way is refused the same way.
 //
 // The second is WHETHER THE CHANGE COMMITTED. A config change is submitted,
 // leadership moves before the response, and the caller sees a
@@ -39,7 +38,7 @@
 // "did not happen". The entry is in the log and can still commit under the
 // new leader (Leader Completeness guarantees it if it reached a quorum), so
 // the retry is then refused CORRECTLY with "already exists" or "not found"
-// while the test reports a failure the cluster never had (#112, #132).
+// while the test reports a failure the cluster never had.
 //
 // # What the loop does, and deliberately does not do
 //
@@ -67,13 +66,11 @@
 //
 // # Why it is one package and not one copy per suite
 //
-// The decision core was written for the e2e suite in #122, in package
-// e2e_test, which no other suite can import. The host and linearizability
-// suites needed the same core (#135), and CLAUDE.md forbids a second copy.
-// test/proposer is the precedent: the suites share nothing but a way to name
-// the current leader, so that is all this package asks for — the same
-// proposer.Resolver. The e2e copy was retired in #145; every suite now binds
-// this package to its own resolver.
+// The e2e, host and linearizability suites all need the same decision core,
+// and a copy per suite would drift. test/proposer is the precedent: the suites
+// share nothing but a way to name the current leader, so that is all this
+// package asks for — the same proposer.Resolver. Every suite binds this package
+// to its own resolver.
 package membership
 
 import (
@@ -309,9 +306,8 @@ var retryableSentinels = [...]error{
 	quicraft.ErrRejected,
 	// A leadership transfer is in flight, so the leader is deliberately not
 	// accepting work it may be about to hand off. It clears when the transfer
-	// completes or times out. This was matched by the text "transfer in
-	// progress" until #146 re-exported the sentinel: the engine returns it for
-	// EVERY proposal, config changes included, and before the entry enters the
+	// completes or times out. It is matched by sentinel, never by its text:
+	// the engine returns it for EVERY proposal, config changes included, and before the entry enters the
 	// log, so it is retryable and never counts as a submission.
 	quicraft.ErrTransferInProgress,
 	context.DeadlineExceeded,

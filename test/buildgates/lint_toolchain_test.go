@@ -35,7 +35,7 @@ import (
 // correctly pinned golangci-lint built with go1.26.2 refuses the module before
 // reading a line of source, while CI's identically-versioned binary — built
 // with the runner image's 1.27 — passes. Same version string, opposite
-// outcome (#118).
+// outcome.
 //
 // `make check-lint-toolchain` closes that half by reading the build toolchain
 // out of the binary's own self-report. Unlike the pin recipe, this one is
@@ -118,13 +118,13 @@ func pinnedAnalyserVersion(t *testing.T) string {
 	return strings.TrimPrefix(declaredGolangciVersion(t), "v")
 }
 
-// TestGuardRejectsAnAnalyserBuiltByAnOlderGo is the regression test for #118.
+// TestGuardRejectsAnAnalyserBuiltByAnOlderGo pins the toolchain guard.
 //
-// The message matters as much as the exit code. Before the guard, a developer
-// met golangci-lint's own "the Go language version (go1.26) used to build
+// The message matters as much as the exit code. Without the guard, a developer
+// meets golangci-lint's own "the Go language version (go1.26) used to build
 // golangci-lint is lower than the targeted Go version" with nothing saying
-// which binary produced it or what to run — so the failure was diagnosed once
-// per developer, and in the meantime nobody linted before pushing.
+// which binary produced it or what to run — so the failure is diagnosed once
+// per developer, and in the meantime nobody lints before pushing.
 func TestGuardRejectsAnAnalyserBuiltByAnOlderGo(t *testing.T) {
 	need := moduleGoDirective(t)
 	bin := stubAnalyser(t, pinnedAnalyserVersion(t), "1.26.2")

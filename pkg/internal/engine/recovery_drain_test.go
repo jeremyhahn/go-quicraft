@@ -21,7 +21,7 @@ import (
 )
 
 // TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes is the
-// regression test for C3: snapshot recovery must not touch the state machine
+// regression test that snapshot recovery must not touch the state machine
 // while an apply closure that already passed the recovering gate is still
 // executing. WaitForApplyDrain must block until applyInFlight reaches 0.
 func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) {

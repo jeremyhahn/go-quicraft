@@ -383,10 +383,10 @@ func writeSeqFixture(t *testing.T) seqFixture {
 // A batch spanning several blocks issues one WriteAt per block before a single
 // fdatasync, so an ordinary power loss can persist an arbitrary SUBSET of those
 // pages. Losing an interior page leaves records that still pass CRC sitting
-// above the damage, which recovery used to read as proof that acknowledged data
-// lay above it — and refuse to start, permanently, on every subsequent boot. It
-// was reachable from a routine crash, and on a single-node deployment there was
-// no way out except an operator-authorized Repair.
+// above the damage. Reading them as proof that acknowledged data lay above it
+// would refuse to start, permanently, on every subsequent boot after a routine
+// crash, and on a single-node deployment there would be no way out except an
+// operator-authorized Repair.
 //
 // The durability generations say what the framing cannot: every record above the
 // damage belongs to the ONE batch that was still in flight, with no completed
@@ -629,7 +629,7 @@ func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 			"the first production release, and a pre-release framing change is made "+
 			"IN PLACE, with detection carried by retiring the record's payload-type "+
 			"byte rather than by bumping this constant (see "+
-			"docs/operations/compatibility.md)", walFormatVersion)
+			"docs/compatibility.md)", walFormatVersion)
 	}
 }
 
@@ -850,7 +850,7 @@ func TestSegment_ExhaustedDurabilitySequenceRotates(t *testing.T) {
 }
 
 // TestSegment_GenerationStartAdvancesOnlyOnCompletedSync pins the writer half
-// of the exact interrupted-write discriminator (#197 D): the generation start
+// of the exact interrupted-write discriminator: the generation start
 // is the acknowledged end at the moment a Sync completed, every chunk written
 // afterwards carries it, and a rollback does not rewind it.
 func TestSegment_GenerationStartAdvancesOnlyOnCompletedSync(t *testing.T) {

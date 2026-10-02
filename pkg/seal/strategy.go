@@ -74,17 +74,14 @@ const (
 // value, and cloud KMS strategies typically ignore it, relying on ambient
 // credentials.
 //
-// # Secret is protected memory, and that is the whole point (#41)
+// # Secret is protected memory, and that is the whole point
 //
-// It used to be a []byte, documented as "wipeable from this boundary inward":
-// the seal layer copied it into protected memory and the caller's original
-// stayed the caller's obligation. Two things were wrong with that. The
-// passphrase spent the whole call in collectable, swappable, core-dumpable
-// memory — and for a deferred strategy the passphrase is not a lesser secret
-// than the root key it wraps, it IS that key's protection. And an obligation
-// written in a doc comment is weaker than a type that cannot be got wrong: every
-// strategy in the portfolio implements against this struct, so every one of them
-// had to remember.
+// A plain []byte Secret would spend the whole call in collectable, swappable,
+// core-dumpable memory — and for a deferred strategy the passphrase is not a
+// lesser secret than the root key it wraps, it IS that key's protection. An
+// obligation to wipe, written in a doc comment, is weaker than a type that
+// cannot be got wrong: every strategy in the portfolio implements against this
+// struct, so with a []byte every one of them would have to remember.
 //
 // A [enclave.SealedEnclave] holds the passphrase as CIPHERTEXT at rest and
 // produces plaintext only inside an Open, which is the posture this material
@@ -92,8 +89,7 @@ const (
 // time in between. A locked-plaintext [enclave.MemoryEnclave] would keep it
 // present-but-locked continuously and buy less.
 //
-// Build one with [NewCredentials], which CONSUMES the caller's slice — that is
-// the "wipeable from this boundary inward" contract made mechanical, since the
+// Build one with [NewCredentials], which CONSUMES the caller's slice, since the
 // only thing left worth doing about material that already exists unprotected is
 // not leaving it there.
 //

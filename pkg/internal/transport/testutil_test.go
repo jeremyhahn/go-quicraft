@@ -94,13 +94,10 @@ func countRequests(h *testHandler) int {
 // until a later send or the cleanup sweep evicts it, so polling for an empty
 // pool waits for a different event that may never happen within the test.
 //
-// It is usable for a connection closed on EITHER side. It was once only usable
-// for a local close: a stopped transport closed its listener, its own outbound
-// connections and its socket but never the connections it had ACCEPTED, so no
-// CONNECTION_CLOSE reached the sender and its context stayed live for the whole
-// idle timeout. Stop now announces itself on the inbound half too (#78), so a
-// peer's Stop is a condition a test can wait on instead of guessing at with a
-// fixed sleep.
+// It is usable for a connection closed on EITHER side: Stop announces itself on
+// the connections it ACCEPTED as well as its own outbound ones, so a
+// CONNECTION_CLOSE reaches the sender and a peer's Stop is a condition a test
+// can wait on instead of guessing at with a fixed sleep.
 func waitConnDown(t *testing.T, tr *QUICTransport, target string, timeout time.Duration) {
 	t.Helper()
 	pollUntil(t, timeout, 2*time.Millisecond,
@@ -140,13 +137,13 @@ func waitForChan(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg st
 // The bound is their sum, read from the transport's own constants rather than
 // restated, so it follows a change to any of them.
 //
-// #142: the wait at every first-contact site was a 10s literal, BELOW this
-// bound. Under CI saturation (load 150-200 on 24 cores, -race and coverage
-// instrumentation, 24 packages in parallel) a cold handshake was traced at
-// 4.3s against the 5s dial deadline and delivery at 5.35s, with the whole
-// process descheduled for seconds at a time; the batcher itself flushes on
-// dequeue with no timer. A literal below the transport's own ceiling could
-// neither outlast a slow-but-legal handshake nor survive an abandoned one.
+// A fixed literal below this bound is not enough. Under CI saturation (load
+// 150-200 on 24 cores, -race and coverage instrumentation, 24 packages in
+// parallel) a cold handshake has been traced at 4.3s against the 5s dial
+// deadline and delivery at 5.35s, with the whole process descheduled for
+// seconds at a time; the batcher itself flushes on dequeue with no timer. A
+// literal below the transport's own ceiling could neither outlast a
+// slow-but-legal handshake nor survive an abandoned one.
 const firstContactBound = dialTimeout + streamOpenTimeout + sendWriteDeadline
 
 // firstContactAttempts is how many cold Sends sendFirstContact makes before

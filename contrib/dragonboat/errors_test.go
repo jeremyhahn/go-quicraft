@@ -618,21 +618,23 @@ func BenchmarkTranslateError(b *testing.B) {
 	})
 }
 
-// TestTranslateError_PreservesTheMaybeAppliedBit is #156.
+// TestTranslateError_PreservesTheMaybeAppliedBit pins that translateError keeps
+// the submission bit.
 //
 // quicraft marks failures that happen AFTER an entry reached Raft by wrapping
-// them in *MaybeAppliedError. translateError used to discard that wrapper and
-// return the bare mapped sentinel, so the post-delivery leadership change and
-// the pre-flight refusal became indistinguishable here — both ErrShardNotReady,
-// both MaybeApplied false.
+// them in *MaybeAppliedError. Discarding that wrapper and returning the bare
+// mapped sentinel would make the post-delivery leadership change and the
+// pre-flight refusal indistinguishable here — both ErrShardNotReady, both
+// MaybeApplied false.
 //
 // That is not a cosmetic loss. On the config-change path the submission bit is
 // what separates "the leader refused this, nothing happened" from "the leader
 // took it and then lost the shard, so it may still commit", which decides
 // whether a later "already exists" is this caller's own change landing or
-// somebody else's. The adapter's helper had to widen its predicate to cover the
-// fold, and the cost was that an engine applying a change it had reported as
-// refused PRE-FLIGHT went undetected here while the root module caught it.
+// somebody else's. Without the bit the adapter's helper would have to widen its
+// predicate to cover the fold, and an engine applying a change it had reported
+// as refused PRE-FLIGHT would go undetected here while the root module caught
+// it.
 func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 	postDelivery := &quicraft.MaybeAppliedError{Err: &quicraft.NotLeaderError{ShardID: 1}}
 	translated := translateError(postDelivery)
@@ -668,7 +670,7 @@ func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 }
 
 // TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping is the generic
-// half of #156. translateError rebuilds the wrapper for ANY mapped sentinel,
+// half. translateError rebuilds the wrapper for ANY mapped sentinel,
 // not only the not-leader one the focused test above pins, so a mutation that
 // preserved the bit for ErrNotLeader alone would pass that test and silently
 // drop it for a wrapped timeout, a wrapped shard-closed, or whatever quicraft

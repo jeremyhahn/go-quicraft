@@ -317,8 +317,7 @@ func TestLengthPrefixPastMaxInt32IsRefusedBeforeTheLimit(t *testing.T) {
 }
 
 // marshalEntryUnchecked encodes an Entry with the write-side type check
-// BYPASSED, reproducing what the old encoder emitted, so the read-side half of
-// the round-trip assertion can still be driven. It mirrors
+// BYPASSED, so the read-side half of the round-trip assertion can be driven. It mirrors
 // marshalMembershipUnchecked in writeside_limits_test.go.
 func marshalEntryUnchecked(e Entry) []byte {
 	buf := make([]byte, e.Size())

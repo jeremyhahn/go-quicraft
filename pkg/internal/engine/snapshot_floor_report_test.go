@@ -25,7 +25,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// M2: the floor scan's diagnostics must be bounded
+// The floor scan's diagnostics must be bounded
 // ---------------------------------------------------------------------------
 
 // TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport pins the cost
@@ -134,7 +134,7 @@ func captureWarnOutput(t *testing.T) (*bytes.Buffer, func()) {
 }
 
 // ---------------------------------------------------------------------------
-// L1: a declared body length must be compared unsigned
+// A declared body length must be compared unsigned
 // ---------------------------------------------------------------------------
 
 // TestParseSnapshotMeta_HugeDeclaredBodyLength covers a record that declares an

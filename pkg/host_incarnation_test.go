@@ -22,11 +22,11 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestPendingProposal_OwnsPlacesAnEntryByIndex pins the floor: the one check
-// #186 added to proposal matching that is exact rather than probabilistic. A
-// key match used to be the whole test; a key now repeats across hosts or
-// incarnations only by a 2^-64 accident, and when it does, an entry at or
-// below the committed index recorded at registration is still refused.
+// TestPendingProposal_OwnsPlacesAnEntryByIndex pins the floor: the one check in
+// proposal matching that is exact rather than probabilistic. A key repeats
+// across hosts or incarnations only by a 2^-64 accident, and when it does, an
+// entry at or below the committed index recorded at registration is still
+// refused.
 func TestPendingProposal_OwnsPlacesAnEntryByIndex(t *testing.T) {
 	pp := &pendingProposal{floor: 100}
 	if !pp.owns(proto.Entry{Index: 101, Key: 7}) {

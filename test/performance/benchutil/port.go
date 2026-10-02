@@ -38,17 +38,16 @@ import "github.com/jeremyhahn/go-quicraft/test/netport"
 // 127.0.0.1:39458 and 127.0.0.1:38009 -- neighbours of 41461 in the very same
 // range.
 //
-// # Why this file is now four lines
+// # Why this file is four lines
 //
 // The fix -- allocate from a window OUTSIDE the kernel's ephemeral range, and
 // remember what has been handed out -- is identical to the one the integration
-// suites needed for UDP, and this file used to be a second, TCP-shaped copy of
-// it: the same window derivation, the same two-pass scan, the same recycle
-// policy, the same PID start offset, ~200 lines of it. Two copies of a
-// guarantee are two things to keep in step, and the guarantee is then only as
-// strong as whichever copy a caller reached for.
+// suites need for UDP. A second, TCP-shaped copy of it here would duplicate the
+// window derivation, the two-pass scan, the recycle policy and the PID start
+// offset; two copies of a guarantee are two things to keep in step, and the
+// guarantee is then only as strong as whichever copy a caller reached for.
 //
-// test/netport is the one implementation (#163). It grew ReserveTCP for these
+// test/netport is the one implementation. It provides ReserveTCP for these
 // harnesses; everything else about the reservation -- window, taken set,
 // cursor, recycling -- is shared, and its package comment carries the full
 // reasoning and the measurements.

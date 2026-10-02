@@ -626,14 +626,13 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 // pins that they still agree.
 //
 // A budget written as a literal is a value that is not pinned treated as
-// though it were — the class this repository keeps being bitten by (#84, #88,
-// #90, #91, #103, #107, #111, #112, #115, #121). In those the unpinned value
-// was a leader index or a replica ID; here it is the shard configuration the
+// though it were — a recurring flake class. Elsewhere the unpinned value is a
+// leader index or a replica ID; here it is the shard configuration the
 // budget is supposed to describe. A literal cannot follow a config change and
 // gives no signal when it stops matching; a derivation cannot drift at all.
 //
-// This suite was the FOURTH copy of the 5s literal, found while #130 fixed the third. The derivation is the one contrib/dragonboat took in PR #124
-// and test/integration/e2e took in PR #125, mirrored on purpose: the suites
+// The derivation is the one contrib/dragonboat and test/integration/e2e use,
+// mirrored on purpose: the suites
 // keep separate copies because each owns its own helpers and its own config
 // builders; the shape is shared, the constants are not.
 // ---------------------------------------------------------------------------
@@ -662,11 +661,10 @@ const testElectionRTT = config.DefaultElectionRTT
 const raftTick = testRTTMillisecond * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the ~60 lines of
-// reasoning behind it — why twice ElectionRTT, why thirty rounds, what was
-// measured on #111 — used to be copied into this file and four others. They
-// live in that package now (#133); the pin test below is the half that cannot
-// move, because it reads THIS suite's config builders.
+// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
+// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
+// live in that package; the pin test below is the half that cannot move,
+// because it reads THIS suite's config builders.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -678,7 +676,7 @@ const coldStartElectionRounds = electionbudget.ColdStartRounds
 
 // pollInterval is the cadence of every retry loop in this file that waits on
 // something outside its own goroutine. It is one constant, and a ticker rather
-// than a sleep, because CLAUDE.md forbids time.Sleep and because a single
+// than a sleep, because the suite does not use time.Sleep and because a single
 // cadence is one thing to change when a runner turns out to be slower than
 // this. waitForLeader, waitForApplied and waitForCondition keep their own
 // tighter cadences: they poll cheap in-process state, not a network round trip
@@ -701,10 +699,9 @@ const pollInterval = 20 * time.Millisecond
 // after an election the new leader briefly rejects ReadIndex while it commits
 // its no-op entry.
 //
-// It used to write that loop out by hand, which made it a third copy of retry
-// machinery proposer.drive already implements. #162 grew TryReadWith rather
-// than marking this site with a waiver, so the pinned-retry loop has ONE home
-// the way #96 and #133 gave the propose and election budgets one home each.
+// It goes through proposer.TryReadWith rather than writing that loop out by
+// hand, so the pinned-retry loop has ONE home, as the propose and election
+// budgets do.
 //
 // A read that SUCCEEDS with the wrong value is never retried and fails
 // immediately — an entry that was committed before the read cannot legally
@@ -763,9 +760,9 @@ func assertSMHasExact(t *testing.T, machine *kvStateMachine, label, key, want st
 // that clear on their own while the caller waits and asks the same replica
 // again — a shard still coming up, a momentarily busy pipeline, the window
 // after an election before this replica learns the new leader. Everything else
-// fails on its FIRST occurrence, naming the error. Under the blanket retry this
-// replaced (#97) an ErrDiskFull or an ErrInvalidOperation was retried for the
-// full budget and then reported as "timed out", which reads as a slow cluster
+// fails on its FIRST occurrence, naming the error. Under a blanket retry an
+// ErrDiskFull or an ErrInvalidOperation would be retried for the full budget
+// and then reported as "timed out", which reads as a slow cluster
 // rather than the deterministic rejection it is. See proposer.TryWith for why
 // this set and proposeToLeader's differ.
 //

@@ -30,9 +30,15 @@ import "github.com/jeremyhahn/go-quicraft/pkg/proto"
 //     against the leaf's SANs, which a wildcard or shared certificate makes
 //     true for every member of the cluster at once.
 //
-// A handler with a committed identity for the claimed sender must use Identity
-// and nothing else. AuthorizesAddress remains the only available binding for a
-// replica whose configuration predates identities.
+// A handler binds the claimed sender by Identity and nothing else: the committed
+// configuration records an identity for every member, and a member with none is
+// refused. AuthorizesAddress never admits a message or binds a sender, because a
+// wildcard or shared certificate satisfies it for every member. It still gates
+// the address-scoped decisions: learning a route from a message's source
+// address, and the transport's in-band address checks (SourceAddress clearing,
+// peer-epoch changes, live-outbound eviction, snapshot-sender binding). That is
+// why StartShard and every membership add refuse a certificate shared between
+// members (ErrSharedPeerCertificate).
 //
 // The value is valid ONLY for the duration of the call. AuthorizesAddress
 // captures the inbound *quic.Conn, so a handler that stores it (or hands it to

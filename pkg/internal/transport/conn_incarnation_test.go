@@ -30,13 +30,13 @@ import "testing"
 // kills the connection.
 //
 // Restart detection is therefore the only thing standing between a peer restart
-// and a multi-second outage, and it must not have holes. It used to fire only
-// when a PREVIOUS epoch had been recorded for the peer, which is a strictly
-// smaller set than "we hold an outbound of unproven provenance": we dial peers
-// before their first batch reaches us, and connection teardown used to drop the
-// epoch record while a later re-dial repopulated the connection cache. In both
-// states a restart is indistinguishable from first contact and the black-holed
-// outbound survived.
+// and a multi-second outage, and it must not have holes. Firing only when a
+// PREVIOUS epoch had been recorded for the peer covers a strictly smaller set
+// than "we hold an outbound of unproven provenance": we dial peers before their
+// first batch reaches us, and a connection teardown can drop the epoch record
+// while a later re-dial repopulates the connection cache. In both states a
+// restart is indistinguishable from first contact and the black-holed outbound
+// would survive.
 //
 // The invariant asserted here is the complete one: an outbound that cannot be
 // attributed to the incarnation whose batch just arrived is not trustworthy and

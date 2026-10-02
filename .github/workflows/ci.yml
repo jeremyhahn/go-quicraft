@@ -756,7 +756,7 @@ jobs:
         run: |
           set -uo pipefail
           MODULE_FLOOR=6
-          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort)"
+          MODULES="$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune -o -name go.mod -printf '%h\n' | sort)"
           COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
           echo "Discovered ${COUNT} module(s) for ${GOOS}/${GOARCH}:"
           printf '%s\n' "${MODULES}"
@@ -796,7 +796,7 @@ jobs:
         run: |
           set -uo pipefail
           MODULE_FLOOR=6
-          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort)"
+          MODULES="$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune -o -name go.mod -printf '%h\n' | sort)"
           COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
           echo "Discovered ${COUNT} module(s):"
           printf '%s\n' "${MODULES}"

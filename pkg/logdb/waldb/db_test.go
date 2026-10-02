@@ -3552,20 +3552,17 @@ func BenchmarkDBIterateEntries(b *testing.B) {
 // the next write attempts.
 //
 // The batch-rollback tests below all need exactly one shard in a batch to fail
-// its WAL write. They used to arrange that by chmod'ing the shard directory to
-// 0444, which only denies a NON-root euid: root bypasses the permission bits,
-// so under a CI container running as root the sabotaged write SUCCEEDED, the
-// batch did not fail, and every rollback assertion after it was vacuous. The
-// tests therefore carried a skipIfRoot guard — which meant the rollback gate
-// was silently absent in the one environment CI actually uses.
+// its WAL write. chmod'ing the shard directory to 0444 would not do it: that
+// denies only a NON-root euid, so under a CI container running as root the
+// sabotaged write would SUCCEED and every rollback assertion after it would be
+// vacuous.
 //
 // Pre-creating a DIRECTORY at the path of the next segment file removes the
 // euid from the question entirely: createSegment opens that path with
 // O_RDWR|O_CREATE, and open(2) on a directory with write intent is EISDIR for
-// root exactly as it is for anyone else. The failure lands in the same place
-// the chmod produced it (ensureActiveSegment -> createSegment -> a
-// *SegmentCreateError), so the tests below assert on the same path they always
-// did, now in every environment.
+// root exactly as it is for anyone else. The failure lands on
+// ensureActiveSegment -> createSegment -> a *SegmentCreateError in every
+// environment.
 func blockNextSegment(t *testing.T, s *walShard) {
 	t.Helper()
 	s.mu.Lock()
@@ -4116,8 +4113,8 @@ func TestSaveStateSuccessAppliesInMemoryUpdates(t *testing.T) {
 
 // TestUnmarshalAddrMapRejectsHugeCount feeds an address-map record whose
 // declared entry count is enormous (near uint32 max) but whose body is tiny.
-// Before the fix this forced make() to size a multi-GB map from the untrusted
-// count prefix, an OOM/DoS during recovery. The decoder must now reject it as
+// Trusting the count would size a multi-GB map with make() from the untrusted
+// prefix, an OOM/DoS during recovery. The decoder must reject it as
 // corruption (-1) without allocating.
 func TestUnmarshalAddrMapRejectsHugeCount(t *testing.T) {
 	// 4-byte count = 0xFFFFFFFF, then no entry bytes at all.
@@ -4208,7 +4205,7 @@ func TestBoundedMapHintClampsToBody(t *testing.T) {
 	}
 }
 
-// TestBootstrapDataDirSurvivesReopen covers the H3 field: the shard's DataDir
+// TestBootstrapDataDirSurvivesReopen covers the bootstrap DataDir field: the shard's DataDir
 // must survive a WAL close and reopen, because the only consumer
 // (Host.ImportSnapshot) runs on a host where the shard is STOPPED and has
 // nothing else to learn the snapshot-tree root from. A DataDir that did not

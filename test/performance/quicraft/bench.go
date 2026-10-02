@@ -86,17 +86,17 @@ func (c *BenchCluster) Leader() *quicraft.Host {
 
 // reservePorts returns n loopback addresses for hosts that do not exist yet.
 //
-// It used to bind 127.0.0.1:0 for each and hold the socket open until the
-// caller was ready, closing them "immediately before" the transport bound the
-// same addresses. That NARROWED the race rather than removing it: the addresses
-// still came from the kernel's ephemeral range, which is the same pool the
+// Binding 127.0.0.1:0 for each and holding the socket open until the caller is
+// ready, closing them "immediately before" the transport binds the same
+// addresses, only NARROWS the race rather than removing it: the addresses
+// still come from the kernel's ephemeral range, which is the same pool the
 // kernel draws from for the local end of every outbound connection, so a
 // transport still running from the previous benchmark could be handed one in
 // the close-then-bind window.
 //
 // test/netport removes the class instead: it allocates from a window OUTSIDE
 // the ephemeral range, which the kernel never auto-assigns, so there is no
-// window to be tight about and no socket for the caller to release (#163).
+// window to be tight about and no socket for the caller to release.
 func reservePorts(b *testing.B, n int) []string {
 	b.Helper()
 	addrs := make([]string, n)

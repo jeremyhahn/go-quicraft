@@ -55,7 +55,7 @@ func testDeadlineContext(t *testing.T) (context.Context, context.CancelFunc) {
 // timeout, and a save takes as long as the state machine, the barrier and the
 // disk take. Budgeting it with a wall-clock literal treats "2s have elapsed"
 // as if it were "the save did not complete", which under a saturated runner
-// it is not (#150). The only budget that honestly describes the wait is the
+// it is not. The only budget that honestly describes the wait is the
 // test binary's own, so the wait ends at the harness deadline less a grace
 // for reporting.
 //

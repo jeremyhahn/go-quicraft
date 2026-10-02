@@ -332,9 +332,9 @@ func TestSendQueueWorkerOnceReturnsFalseOnNormalExit(t *testing.T) {
 
 // TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery verifies that
 // sendQueueWorker restarts after a panic and continues to deliver messages
-// that were buffered in the send queue channel. This tests the critical
-// fix: previously a panic caused the worker to exit permanently, leaving
-// buffered messages stranded in a dead queue.
+// that were buffered in the send queue channel. A worker that exited
+// permanently on a panic would leave buffered messages stranded in a dead
+// queue.
 func TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()

@@ -169,7 +169,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 		if cluster.stopped[i].Load() {
 			continue
 		}
-		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// See replicaIDAt: the host's own answer, not i+1. A live host
 		// that reports no replica for this shard never started it or has
 		// already lost it, which this loop fails on a line below when the SM
 		// lookup comes back nil -- so it fails here too, rather than becoming
@@ -424,7 +424,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 			continue
 		}
 
-		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// See replicaIDAt: the host's own answer, not i+1. A live host
 		// that reports no replica for this shard never started it or has
 		// already lost it, which this loop fails on a line below when the SM
 		// lookup comes back nil -- so it fails here too, rather than becoming
@@ -487,11 +487,11 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 // It verifies that the old leader, once cut off from the majority, cannot
 // commit new proposals.
 //
-// The proposal now goes to the OLD LEADER, which stays RUNNING. The previous
-// version stopped (closed) the old leader and then proposed to the NEW one, so
-// the only thing it established was that a healthy leader can commit — the
-// named property, that an isolated old leader cannot, was never exercised at
-// all, and the test passed on a build with no quorum rule.
+// The proposal goes to the OLD LEADER, which stays RUNNING. Stopping (closing)
+// the old leader and proposing to the NEW one would establish only that a
+// healthy leader can commit — the named property, that an isolated old leader
+// cannot, would never be exercised at all, and the test would pass on a build
+// with no quorum rule.
 //
 // The harness has no per-link filtering (see the file header), so isolation is
 // produced the only way it can be: three of the five nodes are stopped, leaving
@@ -698,7 +698,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 			continue
 		}
 
-		// See replicaIDAt (#121): the host's own answer, not i+1. A live host
+		// See replicaIDAt: the host's own answer, not i+1. A live host
 		// that reports no replica for this shard never started it or has
 		// already lost it, which this loop fails on a line below when the SM
 		// lookup comes back nil -- so it fails here too, rather than becoming

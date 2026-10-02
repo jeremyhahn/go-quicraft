@@ -2067,16 +2067,13 @@ func TestBarrier_InitializeRandFailSalt(t *testing.T) {
 	}
 }
 
-// TestBarrier_EncryptRandNonceFail tests that Encrypt handles rand failure
-// during nonce generation.
-// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader is the inverse of the
-// test it replaces, and it is deliberately phrased as an assertion about where
-// the nonce comes from rather than about an error.
+// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader is deliberately phrased
+// as an assertion about where the nonce comes from rather than about an error.
 //
-// Encrypt used to draw the AES-GCM nonce from b.randReader and hand it to
-// Seal, so a failing reader failed the encryption. That is a caller-supplied
-// IV, which FIPS 140-3 (SP 800-38D, CMVP IG C.H) forbids: the IV must be
-// generated inside the module. cipher.NewGCMWithRandomNonce now generates it,
+// Drawing the AES-GCM nonce from b.randReader and handing it to Seal would be a
+// caller-supplied IV, which FIPS 140-3 (SP 800-38D, CMVP IG C.H) forbids: the
+// IV must be generated inside the module. cipher.NewGCMWithRandomNonce
+// generates it,
 // and b.randReader is not on the data path at all — so a reader that cannot
 // produce a single byte must NOT be able to affect Encrypt. If someone
 // reintroduces a caller-supplied IV, this test fails.
@@ -2187,7 +2184,7 @@ func TestBarrier_DoubleCheckPatternEncrypt_FastPath(t *testing.T) {
 // TestBarrier_EncryptWithEpochDoesNotDrawTheNonceFromRandReader is
 // TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader for the epoch-reporting
 // entry point, which funnels through the same encryptLocked. See there for why
-// a failing reader must no longer be able to fail an encryption.
+// a failing reader must not be able to fail an encryption.
 func TestBarrier_EncryptWithEpochDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -4205,8 +4202,8 @@ func TestBarrier_RestartRotatesRatherThanReGrantingBudget(t *testing.T) {
 		t.Fatal("invocation counter must be enabled by default")
 	}
 	// Assert the ACTUAL counter, not a proxy: the fresh epoch starts at zero,
-	// where the old code left 4080218932 of a 4294967296 budget "already spent"
-	// on a key that had in truth performed one encryption.
+	// not 4080218932 of a 4294967296 budget "already spent" on a key that had
+	// in truth performed one encryption.
 	if got := ic.Count(); got != 0 {
 		t.Fatalf("invocation count on the fresh epoch = %d, want 0", got)
 	}
@@ -4251,8 +4248,7 @@ func TestBarrier_RestartWithoutPersisterRefusesToEncrypt(t *testing.T) {
 	}
 
 	// The counter is seeded to the FULL limit, not to the 95% threshold: the
-	// remaining 5% is precisely the headroom the old code re-granted on every
-	// restart.
+	// remaining 5% would otherwise be headroom re-granted on every restart.
 	ic := b2.InvocationCounter()
 	if got, limit := ic.Count(), ic.Limit(); got != limit {
 		t.Fatalf("seeded count = %d, want the full limit %d (no re-granted headroom)", got, limit)

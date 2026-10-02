@@ -174,17 +174,16 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 // has passed MaxBatchSize.
 //
 // The comparison is WIDENED, never narrowed: offset is an int and MaxBatchSize
-// is a uint64, and the H9 fix was replacing a uint32(offset) cast that wrapped
-// silently past 4 GB and let a crafted batch decode without limit.
+// is a uint64. A uint32(offset) cast would wrap silently past 4 GB and let a
+// crafted batch decode without limit.
 //
 // It is a named function rather than an inline expression for one reason: the
 // regression it guards needs a 4 GB frame to reach through UnmarshalFrom, and no
-// test can allocate one. The test that used to stand in for it asserted
-// uint32(1<<32+1) == 1 and uint64(1<<32+1) > MaxBatchSize — two facts about Go's
-// arithmetic, true whatever this package does, so it could not fail if the cast
-// came back. Calling this instead puts the PRODUCTION comparison under a test at
-// an offset the decoder cannot be driven to. See
-// TestExceedsMaxBatchSizeDoesNotTruncate.
+// test can allocate one. A test asserting uint32(1<<32+1) == 1 and
+// uint64(1<<32+1) > MaxBatchSize would check two facts about Go's arithmetic,
+// true whatever this package does, so it could not fail if the cast came back.
+// Calling this instead puts the PRODUCTION comparison under a test at an offset
+// the decoder cannot be driven to. See TestExceedsMaxBatchSizeDoesNotTruncate.
 func exceedsMaxBatchSize(offset int) bool {
 	return uint64(offset) > MaxBatchSize
 }

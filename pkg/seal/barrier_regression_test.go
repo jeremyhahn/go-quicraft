@@ -41,7 +41,7 @@ func TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge(t *testing.T) {
 	}
 	defer b.DeregisterInFlightEpoch(epoch)
 
-	// The exact interleaving that used to orphan the frame: rotate twice past
+	// The interleaving that would orphan the frame: rotate twice past
 	// the sealed epoch, then purge everything below the new current epoch.
 	if _, err := b.Rotate(); err != nil {
 		t.Fatalf("Rotate: %v", err)
@@ -957,8 +957,8 @@ func TestSetSealedRootKey_RejectsAlgorithmMismatch(t *testing.T) {
 }
 
 // TestSetSealedRootKey_ClonesCallerBlob pins that the barrier neither aliases
-// nor mutates the caller's *SealedRootKey. b.salt used to alias the caller's
-// slice, so an embedder reusing its decode buffer silently changed the HKDF
+// nor mutates the caller's *SealedRootKey. If b.salt aliased the caller's
+// slice, an embedder reusing its decode buffer would silently change the HKDF
 // salt and every derived DEK with it — surfacing as ErrDecryptionFailed on data
 // that was written correctly.
 func TestSetSealedRootKey_ClonesCallerBlob(t *testing.T) {

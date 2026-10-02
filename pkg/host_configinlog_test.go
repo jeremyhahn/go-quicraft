@@ -35,8 +35,8 @@ func bootstrapEntryForTest(t *testing.T, voters map[uint64]string) proto.Entry {
 	return proto.Entry{Index: 1, Term: 1, Type: proto.EntryInitialMembership, Cmd: buf}
 }
 
-// TestReconstructShardMembership_ClampsToRecoveredLastIndex is the Codex-found
-// torn-tail regression: the recovered HardState.Commit can outrun the recovered
+// TestReconstructShardMembership_ClampsToRecoveredLastIndex pins the torn-tail
+// case: the recovered HardState.Commit can outrun the recovered
 // entry range (the state record survived while later entries were lost).
 // Reconstruction must still yield the bootstrap entry at index 1, not ask for a
 // range past the log's end — which returns ErrUnavailable before index 1 and
@@ -79,11 +79,11 @@ func (c *countingReadLogDB) IterateEntries(entries []logdb.Entry, size, shardID,
 }
 
 // TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry pins the cost of
-// restart membership recovery. It previously scanned the ENTIRE committed log —
-// every data entry, from disk, on every restart of a shard that never compacts
-// (SnapshotEntries=0) — which delayed StartShard enough that a restarted replica
-// could not catch up under sustained load. That was a REPRODUCIBLE regression:
-// the 10m rolling-restart soak failed 2/2 with the scan and passed 2/2 without it.
+// restart membership recovery. Scanning the ENTIRE committed log — every data
+// entry, from disk, on every restart of a shard that never compacts
+// (SnapshotEntries=0) — delays StartShard enough that a restarted replica cannot
+// catch up under sustained load; the 10m rolling-restart soak fails with such a
+// scan and passes without it.
 //
 // The bootstrap entry lives at a known index, and every membership change above
 // it is folded by the ordinary commit-time replay, so exactly one entry must be

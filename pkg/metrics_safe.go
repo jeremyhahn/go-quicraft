@@ -25,28 +25,19 @@ import (
 // it can never reach engine code.
 //
 // This is not defensive programming for its own sake. The engine calls the
-// collector from inside critical sections in the step and commit workers. When
-// this wrapper was written those sections released node.raftMu with a plain
-// statement rather than a defer, so a panic escaping a collector method left
-// raftMu held forever: the worker's recover-and-restart loop then blocked on
-// it, and with it every shard that worker owned, and Host.Close, which waits on
-// the same workers. One embedder bug became a permanent whole-partition
-// deadlock with no diagnostic beyond a stuck process.
+// collector from inside critical sections in the step and commit workers. Every
+// node.raftMu acquisition there releases the lock with defer, so an escaping
+// panic does not leak the lock, but it would still unwind the engine worker:
+// the worker's recover-and-restart loop then drops the in-flight update, and
+// with it the readStates that GetUpdate already drained out of the peer, every
+// time a metrics backend hiccups. Containing the panic where it happens is
+// strictly better than recovering from it three frames up.
 //
-// Every raftMu acquisition in the engine now uses defer, so that specific
-// escape no longer leaks the lock. This barrier is still the right thing: it
-// keeps an embedder panic from unwinding engine workers at all, which would
-// otherwise cost a worker restart — dropping the in-flight update, and with it
-// the readStates that GetUpdate already drained out of the peer — every time a
-// metrics backend hiccups. Containing the panic where it happens is strictly
-// better than recovering from it three frames up.
-//
-// MetricsCollector was the last embedder-implemented interface still called
-// inline and unguarded; the state machine and the snapshot sender already have
-// recover barriers of their own. The interface is deliberately not documented
-// as "must not panic" — a library cannot enforce that, and a metrics backend
-// that panics on a full buffer or a closed registry is an ordinary bug, not a
-// contract violation.
+// The state machine and the snapshot sender have recover barriers of their
+// own; this is the one for MetricsCollector. The interface is deliberately not
+// documented as "must not panic" — a library cannot enforce that, and a
+// metrics backend that panics on a full buffer or a closed registry is an
+// ordinary bug, not a contract violation.
 //
 // Cost is one deferred call per metric observation on paths that already do a
 // map lookup and an atomic; measurable only in a microbenchmark of the wrapper

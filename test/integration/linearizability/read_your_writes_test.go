@@ -50,10 +50,10 @@ func (s staleRead) String() string {
 		s.client, s.host, s.replica, s.key, s.wrote, s.readIndex, s.smApplied, s.hostApplied, s.observed, s.value, s.leader)
 }
 
-// TestSoak_RollingRestart_ReadYourWrites is #186's reproduction. The rolling
-// restart soak returned porcupine Illegal once in 27 runs: a SyncRead served
-// a value two acknowledged writes old, one of them the reading client's own,
-// right after a restarted replica caught up. The soak could say that much and
+// TestSoak_RollingRestart_ReadYourWrites reproduces the stale-read shape a
+// rolling-restart soak can return as porcupine Illegal: a SyncRead serving a
+// value two acknowledged writes old, one of them the reading client's own,
+// right after a restarted replica caught up. The soak can say that much and
 // no more -- its history does not record which host served a read, what read
 // index the leader confirmed, or whether the serving state machine had
 // applied the write when the read was released.
@@ -67,8 +67,8 @@ func (s staleRead) String() string {
 // sequence SyncRead performs, so the diagnosis is of SyncRead's own path.
 //
 // Even clients go leader-first (the soak's choice); odd clients are pinned to
-// one host each and keep knocking through its restarts, because the window
-// #186 lives in is the replay a restarted replica performs before it is caught
+// one host each and keep knocking through its restarts, because the window of
+// interest is the replay a restarted replica performs before it is caught
 // up, and only a client standing at that replica during it can be lied to.
 func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 	const (
@@ -109,7 +109,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 	// and keeps knocking while it is down or restarting: a restarted replica
 	// replays its whole log before it is caught up, and the proposals it
 	// accepts during that replay are the ones a previous incarnation's keys
-	// can collide with (#186). A client that wanders off to another host at
+	// could collide with. A client that wanders off to another host at
 	// the first refusal never stands in that window.
 	pickHost := func(clientID, turn int) (*quicraft.Host, int) {
 		cluster.hostsMu.RLock()
@@ -161,7 +161,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 				// Write. The leader's applied marker BEFORE the write begins
 				// bounds every entry that existed then: an acknowledgement
 				// carrying an index at or below it is another entry's result
-				// handed to this caller -- the false acknowledgement of #186 --
+				// handed to this caller -- a false acknowledgement --
 				// and is recorded as such, since the value's provenance alone
 				// cannot see it (the old entry's index arrives in res.Data too).
 				var appliedBefore uint64

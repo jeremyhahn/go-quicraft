@@ -57,10 +57,11 @@ func newCompactor(fs FS, dir string, blockSize int) *compactor {
 // The maxCommittedID guard keeps GC away from any segment whose records are
 // not yet reflected in the in-memory index and meta pins. SaveState writes a
 // record durably in its Phase 1 (possibly rotating to a new segment) but
-// updates the index and pins only in its Phase 3. It now holds shard.mu across
-// both, so a concurrent same-shard Compact cannot run in between; the guard is
-// what keeps GC correct regardless of that locking, and it was the fix when
-// SaveState released shard.mu between the phases. maxCommittedID advances only
+// updates the index and pins only in its Phase 3. It holds shard.mu across
+// both, so a concurrent same-shard Compact cannot run in between; the guard
+// keeps GC correct independently of that locking, so a future change that
+// released shard.mu between the phases would not reopen the race.
+// maxCommittedID advances only
 // at the Phase-3 commit point, the writeBootstrap commit and recovery, so a
 // durably-written-but-not-yet-indexed segment has an ID above it and is
 // preserved.

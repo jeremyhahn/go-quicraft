@@ -356,8 +356,8 @@ func TestIterateEntriesCompactedRange(t *testing.T) {
 
 	// A range entirely below the stored entries holds nothing and no
 	// compaction floor was ever recorded, so the range is unavailable — not
-	// compacted. (This test previously asserted ErrCompacted, the divergence
-	// from waldb that told raft the prefix had been legitimately truncated.)
+	// compacted. (ErrCompacted here would diverge from waldb and tell raft the
+	// prefix had been legitimately truncated.)
 	_, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 3, 0)
 	if !errors.Is(err, logdb.ErrUnavailable) {
 		t.Errorf("IterateEntries() range below the log: got %v, want ErrUnavailable", err)
@@ -881,8 +881,8 @@ func TestRemoveEntriesToIndexZeroIsNoOp(t *testing.T) {
 // DISTURB a populated node is a cross-backend property and is asserted in
 // TestConformanceCompactPreservesEverythingAboveTheFloor; asserting it here as
 // well would only duplicate it. Keeping the scope explicit matters because this
-// test used to be the only test of Compact in the package, and a Compact
-// rewritten to delete the node's entries, hard state and snapshot passed it.
+// test alone does not catch a Compact rewritten to delete the node's entries,
+// hard state and snapshot.
 func TestCompactIsNoOp(t *testing.T) {
 	db := New()
 	if err := db.Compact(1, 1); err != nil {

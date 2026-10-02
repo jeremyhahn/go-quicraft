@@ -167,13 +167,12 @@ func NewDeferredSoftwareStrategy() *SoftwareStrategy {
 // derives with an EXPLICIT KDF version and work factor, instead of the defaults
 // NewDeferredSoftwareStrategy selects.
 //
-// It closes the gap that deferred binding and tunability used to be disjoint:
-// the two tunable constructors above are both BOUND, and the only deferred one
-// took no parameters, so a caller could have a tuned strategy or a deferred one
-// and never both. A consumer that must preserve a work factor across a strategy
-// replacement — go-qrdb's ChangePassword, which since #43 always installs a
-// deferred strategy — therefore had nothing to preserve it WITH, and reset every
-// hardened deployment to defaults on each password change.
+// It is the only constructor that is both deferred and tunable: the two
+// tunable constructors above are both BOUND, and NewDeferredSoftwareStrategy
+// takes no parameters. A consumer that must preserve a work factor across a
+// strategy replacement that installs a deferred strategy — a password change,
+// say — needs it, or every hardened deployment would be reset to defaults on
+// each such replacement.
 //
 // # Why it takes the version as well as the params
 //
@@ -333,13 +332,13 @@ func (s *SoftwareStrategy) KDFVersion() KDFVersion { return s.kdfVersion }
 // KDFVersion above names the algorithm; this is the cost.
 //
 // It exists so a consumer replacing a strategy can PRESERVE the work factor it
-// finds rather than resetting it. That is not a hypothetical: go-qrdb's
-// ChangePassword installs a replacement strategy on every password change, and
-// without this the tuned factor of a hardened deployment was silently discarded
-// — drifting toward the WEAKER setting, on the credential that wraps the root
-// key. Pair it with NewDeferredSoftwareStrategyWithParams, which is the other
-// half: this reads the factor off the old strategy, that carries it into the new
-// one. Either alone is insufficient (go-qrdb #156).
+// finds rather than resetting it. A consumer that installs a replacement
+// strategy on every password change would otherwise silently discard the tuned
+// factor of a hardened deployment — drifting toward the WEAKER setting, on the
+// credential that wraps the root key. Pair it with
+// NewDeferredSoftwareStrategyWithParams, which is the other half: this reads
+// the factor off the old strategy, that carries it into the new one. Either
+// alone is insufficient.
 //
 // The work factor is not recoverable any other way. A sealed blob records only
 // the KDF VERSION byte, never the params — see unsealKDFVersionAndParams, whose
@@ -366,9 +365,8 @@ func (s *SoftwareStrategy) KDFParams() KDFParams { return s.kdfParams }
 // a new passphrase, say) must construct the replacement in the same mode as the
 // one it replaces. Installing a bound strategy where a deferred one stood turns
 // a barrier that authenticates its unsealer into one that accepts any
-// passphrase for the lifetime of the process — a silent authentication bypass,
-// measured on the production shape in go-qrdb #157. Without this accessor the
-// mode is invisible and the replacement is a coin flip.
+// passphrase for the lifetime of the process — a silent authentication bypass.
+// Without this accessor the mode is invisible and the replacement is a coin flip.
 //
 // The mode is fixed at construction and never changes, so the value is stable
 // for the lifetime of the strategy and safe to read concurrently.
@@ -438,9 +436,8 @@ func (s *SoftwareStrategy) sealRootKeyWith(passphrase *enclave.SealedEnclave, ro
 // not depend on the SealedRootKey.Salt field.
 //
 // The nonce is not appended by hand: aead.Seal emits it as the first
-// wrappingGCMNonceSize bytes of its own output, in the same position the
-// hand-written append used to put it, so this blob has the identical layout to
-// every blob this strategy has ever written.
+// wrappingGCMNonceSize bytes of its own output, which is the position the
+// layout above names.
 //
 // AAD binds the strategy name to the ciphertext, preventing cross-context key
 // substitution where a ciphertext sealed by one strategy could be presented to
@@ -627,23 +624,15 @@ func unsealStrategyError(err error) error {
 // caller injects on that path) would otherwise strand an mlock'd buffer holding
 // the PLAINTEXT passphrase for the life of the process — a whole locked page that
 // is never released, charged against RLIMIT_MEMLOCK for as long as the process
-// runs. Under memguard the consequence was harsher: a later lock the kernel
-// refused TERMINATED THE PROCESS. Since the go-enclave adoption it is a returned
-// ErrLockedMemoryUnavailable on that one allocation, so a stranded page degrades
-// the process rather than ending it — which is a reason to keep the defer, not to
-// drop it.
+// runs, which degrades every later locked allocation in the process.
 //
-// It is a separate step, rather than inline in the seal/unseal bodies, for a
-// reason that outlives the deduplication, though it is no longer a hard one: the
-// protected paths run their key-touching half inside a MemoryEnclave borrow.
-// Until the go-enclave adoption, this repository's own pkg/enclave (since
-// deleted) held a process-wide purgeMu across every borrow and took it
-// exclusively to open a key, so opening the passphrase inside a root-key borrow
-// was a self-deadlock rather than merely a documented hazard. go-enclave borrows
-// take only the borrowed enclave's own read lock, so the nesting is now legal —
-// but preparing the cipher first still keeps the key-touching window as short as
-// it can be, and the AEAD holds only the expanded key schedule in ordinary
-// memory, which the borrow may touch freely.
+// It is a separate step, rather than inline in the seal/unseal bodies, because
+// the protected paths run their key-touching half inside a MemoryEnclave
+// borrow. go-enclave borrows take only the borrowed enclave's own read lock, so
+// opening the passphrase inside that borrow would be legal — but preparing the
+// cipher first keeps the key-touching window as short as it can be, and the
+// AEAD holds only the expanded key schedule in ordinary memory, which the
+// borrow may touch freely.
 func wrappingCipher(passphrase *enclave.SealedEnclave, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
 	ppBuf, err := passphrase.Open()
 	if err != nil {
@@ -661,7 +650,7 @@ func wrappingCipher(passphrase *enclave.SealedEnclave, salt []byte, version KDFV
 	}
 	defer enclave.Wipe(wrappingKey)
 
-	// newAESGCM's own error is returned unwrapped, as it always has been: a
+	// newAESGCM's own error is returned unwrapped: a
 	// CipherError names its own origin and is not a strategy-level failure.
 	return newAESGCM(wrappingKey)
 }
@@ -671,31 +660,20 @@ func wrappingCipher(passphrase *enclave.SealedEnclave, salt []byte, version KDFV
 // otherwise. Neither is opened here and neither is ever copied out — the
 // returned pointer is handed straight to wrappingCipher.
 //
-// EVERY root-key method now goes through this, which is what #41 bought. The
-// []byte siblings used to build a TEMPORARY INNER STRATEGY from creds.Secret on
-// the deferred path — a whole second SoftwareStrategy, holding a second copy of
-// the passphrase in a second enclave, constructed and closed per call — purely
-// because creds.Secret was a plain slice that had to be moved into protected
-// memory somewhere. Now it arrives already protected, so there is nothing for
-// that construction to do, and the deferred and bound paths differ only in which
-// pointer they read.
+// EVERY root-key method goes through this. creds.Secret arrives already
+// protected, so the deferred and bound paths differ only in which pointer they
+// read; no per-call inner strategy holding a second copy of the passphrase is
+// ever built.
 //
-// One behaviour moved with the inner strategy: newSoftwareStrategy refuses a
-// FIPS-unapproved KDF at CONSTRUCTION, and without that construction the refusal
-// lands at DeriveKey instead. Same error, same call, one frame later — and the
-// protected pair has behaved this way since PR #40, so this makes the four
-// methods agree rather than changing three of them.
+// Consequences a consumer can observe, named here so none is a surprise:
 //
-// TWO OTHER OBSERVABLE CHANGES came with the inner strategy, both improvements
-// and both named here so a consumer diffing behaviour is not surprised:
-//
-//   - The deferred path now draws its KDF salt from THIS strategy's randReader.
-//     The inner strategy was built by newSoftwareStrategy, which always set
-//     crypto/rand.Reader, so an injected reader on a deferred strategy was
-//     silently ignored on the []byte paths and honoured on the protected ones.
-//     They agree now. Nothing in production sets randReader; the default is
-//     crypto/rand.Reader on every constructor.
-//   - warnIfPassphraseWeak fires ONCE, at NewCredentials, instead of on every
+//   - A deferred strategy with a FIPS-unapproved KDF is refused at DeriveKey,
+//     on the seal or unseal call, rather than at construction. All four
+//     root-key methods agree on this.
+//   - The deferred path draws its KDF salt from THIS strategy's randReader.
+//     Nothing in production sets randReader; the default is crypto/rand.Reader
+//     on every constructor.
+//   - warnIfPassphraseWeak fires ONCE, at NewCredentials, rather than on every
 //     deferred seal and unseal. The warning is about the credential, not the
 //     operation, and the point at which an operator can act on it is the point
 //     at which the credential is built.
@@ -708,9 +686,8 @@ func wrappingCipher(passphrase *enclave.SealedEnclave, salt []byte, version KDFV
 // credential and can destroy it between any check and the Open. Distinguishing
 // the two would mean threading the passphrase's PROVENANCE into that mapping,
 // which is a new public error for a case a caller reaches only by using a
-// credential it has already released. It is pre-existing on the protected pair
-// (PR #40) and is now uniform across all four methods rather than uniform on two
-// of them.
+// credential it has already released. It is uniform across all four root-key
+// methods.
 func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error) error) (*enclave.SealedEnclave, error) {
 	if s.deferPassphrase {
 		if creds.Secret == nil {
@@ -811,17 +788,12 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 	// blob, which is UNAUTHENTICATED at this point — the AEAD has not run — so
 	// sizing an mlock'd allocation from it hands whoever can write the blob a
 	// way to demand an arbitrary amount of a finite process-wide resource,
-	// before the tag that would have rejected the blob is ever checked (Codex
-	// review of PR #40). Under memguard that was a remote kill switch: a lock
-	// the kernel refused TERMINATED THE PROCESS. Since the go-enclave adoption
-	// it fails exactly this allocation with ErrLockedMemoryUnavailable and
-	// leaves every enclave already held untouched — which lowers the stakes
-	// from a dead service to locked memory denied to every other caller, and
-	// leaves the reason for the check standing.
+	// before the tag that would have rejected the blob is ever checked —
+	// locked memory denied to every other caller.
 	//
 	// Pinning it to rootKeySize rather than merely bounding it costs nothing:
 	// both seal paths refuse anything but a 32-byte key, so no blob this
-	// strategy has ever written has another length, and Barrier.Unseal refuses
+	// strategy writes has another length, and Barrier.Unseal refuses
 	// one that does immediately after the string-typed call returns.
 	plaintextLen := len(rest) - wrappingGCMNonceSize - wrappingGCMTagSize
 	if plaintextLen != rootKeySize {
@@ -860,15 +832,8 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 
 	// FROZEN once the material is final: the contract hands the caller a key to
 	// read and destroy, not a buffer to edit, and a read-only region faults on a
-	// stray write instead of silently corrupting the root key.
-	//
-	// This used to be a MOVE. A sized enclave stays writable for its whole life
-	// and go-enclave had no post-fill freeze, so the only way to get a frozen
-	// result was to build a second, from-bytes enclave out of the first — two
-	// locked regions live at once, a copy between them, and the scratch wiped on
-	// the way. go-enclave v0.5.0-alpha grew MemoryEnclave.Freeze (go-enclave #6),
-	// which mprotects the region this decrypt already wrote into. One region, no
-	// copy, same property.
+	// stray write instead of silently corrupting the root key. Freeze mprotects
+	// the region this decrypt already wrote into: one region, no copy.
 	//
 	// A refused freeze leaves the enclave ALIVE and WRITABLE, so it is destroyed
 	// rather than returned: handing back a writable enclave from a method whose
@@ -884,11 +849,6 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(_ context.Context, sealed *Sea
 // Close destroys the SealedEnclave, so a Close that lands after a seal or unseal
 // has already loaded the pointer surfaces as ErrEnclaveDestroyed from Open; that
 // is the same condition as "used after Close" and must report the same error.
-//
-// The sentinel changed with the type and the meaning did not: pkg/enclave's
-// ProtectedKey reported a CLEARED reference as ErrEnclaveNil, while a
-// SealedEnclave reports its own destroyed state. Both are "the passphrase is
-// gone", which is the only thing this function has ever needed to know.
 func closedIfEnclaveGone(err error) error {
 	if errors.Is(err, enclave.ErrEnclaveDestroyed) {
 		return ErrStrategyClosed
@@ -899,13 +859,8 @@ func closedIfEnclaveGone(err error) error {
 // Close releases strategy-held resources by destroying the passphrase enclave,
 // after which the passphrase can no longer be opened.
 //
-// IT NOW WIPES, which it could not before. pkg/enclave's ProtectedKey could only
-// drop its reference — memguard exposed no API to zero an Enclave's ciphertext
-// and registered no finalizer that would — so the encrypted passphrase stayed on
-// the heap until the collector reclaimed it. enclave.SealedEnclave.Destroy zeroes
-// both the ciphertext and the wrapped-key blob before releasing them, so Close is
-// erasure rather than revocation. Nothing about the caller's contract changes;
-// what changes is what is true afterwards.
+// enclave.SealedEnclave.Destroy zeroes both the ciphertext and the wrapped-key
+// blob before releasing them, so Close is erasure rather than revocation.
 //
 // This method is idempotent and safe to call concurrently with Seal/Unseal, and
 // every outcome is fail-closed. An operation that has ALREADY ACQUIRED the
@@ -913,8 +868,8 @@ func closedIfEnclaveGone(err error) error {
 // and waits that borrow out. An operation that starts after the swap sees a nil
 // pointer and fails with ErrStrategyClosed.
 //
-// Between those two is everything this comment used to fold into the first and
-// should not have. resolvePassphrase loads the pointer and wrappingCipher Opens
+// Between those two lies a window that is easy to misread as the first case.
+// resolvePassphrase loads the pointer and wrappingCipher Opens
 // it later, so an operation can hold a live pointer and still lose the race —
 // and so can one already blocked inside Open on the enclave's read lock behind
 // Destroy's pending write lock, which is "in flight" by any ordinary reading of
@@ -922,9 +877,7 @@ func closedIfEnclaveGone(err error) error {
 // which closedIfEnclaveGone reports as ErrStrategyClosed.
 //
 // ACQUIRING the borrow is the line, not loading the pointer and not entering
-// Open (#95). Nothing succeeds against a destroyed passphrase on any of these
-// paths, which is why this was a documentation defect and not a behavioural
-// one.
+// Open. Nothing succeeds against a destroyed passphrase on any of these paths.
 //
 // For deferred strategies (where the passphrase arrives in the credentials)
 // Close is a no-op, and the credential is the caller's to Destroy.

@@ -27,14 +27,14 @@
 //
 // test/proposer is the precedent: its own doc records that four per-suite
 // copies of the propose-retry loop were "four places a fix has to land", and
-// consolidated them. #96 did the same for the propose budget. This is #133.
+// consolidated them. This package does the same for the election budget.
 //
 // # Why it takes numbers and not a Config
 //
 // The signature is (electionRTT, rttMillisecond) rather than a
 // quicraft.Config, and that is deliberate: it is what lets contrib/dragonboat
 // share this package. test/proposer could NOT be shared across that module
-// boundary (#114) because its Resolver is typed on *quicraft.Host, which
+// boundary because its Resolver is typed on *quicraft.Host, which
 // dragonboat's NodeHost does not expose. A budget is arithmetic over two
 // integers and couples to nothing, so the boundary is not in its way.
 //
@@ -86,7 +86,7 @@ func Round(electionRTT, rttMillisecond uint64) time.Duration {
 // 120-190 (5-8x oversubscribed, the CI runners that box hosts). The
 // distribution is not merely slow, it is heavy-tailed — the common case sits
 // near the four rounds above and a small minority runs an order of magnitude
-// past it. The distribution is recorded on #111.
+// past it.
 //
 // Thirty rounds is thirty seconds at the standard test tick. It is BOUNDED on
 // purpose, and the bound is the point of the number rather than an
@@ -111,16 +111,16 @@ const FailoverRounds = 20
 //
 // It is a SETUP budget and nothing else. Every one of its call sites waits on
 // a shard started moments earlier, before the test's subject is reached, so a
-// test that exhausts it has asserted nothing at all — which is what made #111
-// worth fixing rather than merely worth widening. A wait for a SUBSEQUENT
+// test that exhausts it has asserted nothing at all, so the budget must be
+// right rather than merely wide. A wait for a SUBSEQUENT
 // leader, after one has been stopped or partitioned away, is a different
 // question and takes Failover.
 //
-// It is LARGER than Failover even though the names suggest the opposite, and
-// that is the correction #111 made. A cold start is the HARDER of the two
+// It is LARGER than Failover even though the names suggest the opposite. A
+// cold start is the HARDER of the two
 // waits: a failover happens over transport that is already established between
 // survivors that already know one another, while a cold start pays for the
-// handshakes first. The easier case had 20s and the harder one had 5s.
+// handshakes first.
 func LeaderElection(electionRTT, rttMillisecond uint64) time.Duration {
 	return ColdStartRounds * Round(electionRTT, rttMillisecond)
 }

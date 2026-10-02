@@ -91,8 +91,8 @@ func TestStopShard_ReportsStateMachineCloseFailure(t *testing.T) {
 }
 
 // TestHostClose_JoinsStateMachineCloseFailure requires Host.Close to carry the
-// same error out. Close previously returned only the LogDB's error, so a failed
-// state machine flush was invisible to the caller.
+// same error out. Returning only the LogDB's error would make a failed state
+// machine flush invisible to the caller.
 func TestHostClose_JoinsStateMachineCloseFailure(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -137,10 +137,10 @@ func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 
 // TestHostDrain_ConcurrentCallersJoinTheSameAttempt pins that a second Drain
 // — Close's, in the case that matters — waits for the attempt already in
-// progress and reports ITS result, instead of returning nil immediately. The
-// second caller used to see draining=true and return success at once, so a
-// Close racing an explicit Drain proceeded to tear the engine down under the
-// first drain and both reported a clean shutdown after aborting accepted work.
+// progress and reports ITS result, instead of returning nil immediately. A
+// second caller that saw draining=true and returned success at once would let a
+// Close racing an explicit Drain tear the engine down under the first drain, and
+// both would report a clean shutdown after aborting accepted work.
 func TestHostDrain_ConcurrentCallersJoinTheSameAttempt(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())

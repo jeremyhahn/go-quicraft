@@ -44,12 +44,12 @@ import (
 // taken at a deterministic trigger (processed - lastSnapshotIndex >=
 // SnapshotEntries).
 //
-// The import used to assume the directory was fresh in every step: MkdirAll
-// succeeds on an existing directory, and the data file was opened
-// O_RDWR|O_CREATE|O_TRUNC — truncating a LIVE snapshot.dat before ANYTHING was
-// validated. The final SaveSnapshot then failed with logdb.ErrSnapshotOutOfDate,
-// so the operator was told nothing had happened while the LogDB record now
-// described a file it no longer matched:
+// An import that assumed the directory was fresh in every step would be
+// destructive: MkdirAll succeeds on an existing directory, and opening the data
+// file O_RDWR|O_CREATE|O_TRUNC truncates a LIVE snapshot.dat before ANYTHING is
+// validated. The final SaveSnapshot then fails with logdb.ErrSnapshotOutOfDate,
+// so the operator is told nothing happened while the LogDB record describes a
+// file it no longer matches:
 //
 //   - a wrong FileSize is precisely the "ships a short/empty snapshot and erases
 //     the receiving follower's state" hazard guarded on the send path, and
@@ -227,9 +227,9 @@ func TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact(t *testing.T) {
 // import whose LogDB write was lost, or a retained snapshot older than the
 // recorded one). The import must refuse and leave it alone.
 //
-// discardImportDir used to be handed this canonical path, so a FAILED import at
-// a colliding index removed the pre-existing snapshot outright while LogDB
-// still pointed at it.
+// Handing discardImportDir this canonical path would let a FAILED import at a
+// colliding index remove the pre-existing snapshot outright while LogDB still
+// pointed at it.
 func TestImportSnapshot_RefusesAPreExistingDestinationDirectory(t *testing.T) {
 	f := newLiveImportFixture(t, false)
 

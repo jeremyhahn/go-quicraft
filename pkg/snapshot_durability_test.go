@@ -349,10 +349,10 @@ func TestSnapshotReceive_CrashDuringReceiveLeavesNoPartialSnapshot(t *testing.T)
 // the reassembled state machine must never exist in cleartext in any file, at
 // any point of the receive, including every point a SIGKILL can land on.
 //
-// The receive path used to write the plaintext chunks into the canonical
-// snapshot-<index>/snapshot.dat, fsync them, and re-encrypt in place
-// afterwards. A kill between the fsync and the re-encryption left a COMPLETE
-// PLAINTEXT STATE MACHINE durably under the canonical name. The deferred
+// A receive path that wrote the plaintext chunks into the canonical
+// snapshot-<index>/snapshot.dat, fsynced them, and re-encrypted in place
+// afterwards would let a kill between the fsync and the re-encryption leave a
+// COMPLETE PLAINTEXT STATE MACHINE durably under the canonical name. The deferred
 // RemoveAll covers error returns, not a kill, and snapshot GC only reclaims a
 // directory once maxSnapshotsRetained NEWER snapshots exist — on a follower
 // that catches up once and never snapshots again, never.

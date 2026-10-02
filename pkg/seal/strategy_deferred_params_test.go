@@ -24,8 +24,7 @@ import (
 // TestKDFParams_RoundTripsEveryConstructor pins that KDFParams() reports what
 // the strategy was actually built with, for every constructor that exists.
 //
-// This is the read half of go-qrdb #156. The work factor is not recoverable any
-// other way: a sealed blob records the KDF VERSION byte and nothing else, so the
+// The work factor is not recoverable any other way: a sealed blob records the KDF VERSION byte and nothing else, so the
 // live strategy object is the only place the number exists.
 func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 	restore := AllowWeakKDFParams()
@@ -143,9 +142,8 @@ func TestNewDeferredSoftwareStrategyWithParams_ComposesWithKDFParams(t *testing.
 	}
 }
 
-// TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal is the
-// assertion the issue asks for by name, and the one a defaults-only fixture
-// cannot make: default-in/default-out passes whether params are preserved or
+// TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal makes
+// the assertion a defaults-only fixture cannot make: default-in/default-out passes whether params are preserved or
 // reset, so it proves nothing.
 //
 // A blob sealed at a NON-default work factor must unseal through a strategy
@@ -212,8 +210,8 @@ func TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal(t *tes
 	}
 }
 
-// TestNewDeferredSoftwareStrategyWithParams_FIPS pins the asymmetry the issue
-// asked to be explicit about, so a consumer preserving a work factor cannot
+// TestNewDeferredSoftwareStrategyWithParams_FIPS pins the FIPS asymmetry
+// explicitly, so a consumer preserving a work factor cannot
 // compile everywhere and fail on the FIPS leg only.
 //
 // The two FIPS mechanisms give different errors, and both are the bound

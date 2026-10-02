@@ -175,9 +175,9 @@ type Callback interface {
 	// It exists for the requests the batch does not account for. A pending
 	// linearizable read completes only when lastApplied reaches its read
 	// index, and a halted shard never applies again, so without this every
-	// read registered before the halt blocked until its deadline and then
-	// reported ErrTimeout — pointing the caller at consensus, the network or
-	// a lost leader, none of which was the cause (#185). MUST be non-blocking.
+	// read registered before the halt would block until its deadline and then
+	// report ErrTimeout — pointing the caller at consensus, the network or a
+	// lost leader, none of which was the cause. MUST be non-blocking.
 	OnShardFailed(shardID uint64, err error)
 }
 

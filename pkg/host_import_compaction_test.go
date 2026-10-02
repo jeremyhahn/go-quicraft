@@ -26,14 +26,15 @@ import (
 // The offline restore flow bootstraps a shard (StartShard) before importing, so
 // the shard can be imported into at all — ImportSnapshot refuses an unrecorded
 // shard. That bootstrap writes an initial configuration entry at index 1.
-// Importing an artifact whose snapshot index is higher records the snapshot but
-// used to leave the index-1 entry orphaned below it: because the default
-// CompactionOverhead (5000) dwarfs a freshly restored node's entry count, the
-// running snapshotter's compaction never fires to clean it up. The shard then
-// appends post-restore writes, and on the next restart log recovery rebuilds the
-// entry index as {1, ...tail} whose span exceeds the entry count — reported as
-// ErrLogGapDetected — and host init fails closed. The restored node is
-// unrecoverable without wiping and restoring again.
+// Importing an artifact whose snapshot index is higher records the snapshot,
+// and without advancing the floor would leave the index-1 entry orphaned below
+// it: because the default CompactionOverhead (5000) dwarfs a freshly restored
+// node's entry count, the running snapshotter's compaction never fires to clean
+// it up. The shard would then append post-restore writes, and on the next
+// restart log recovery would rebuild the entry index as {1, ...tail} whose span
+// exceeds the entry count — reported as ErrLogGapDetected — and host init would
+// fail closed. The restored node would be unrecoverable without wiping and
+// restoring again.
 //
 // ImportSnapshot must therefore advance the compaction floor to the imported
 // snapshot index, exactly as a normal InstallSnapshot does, removing every entry

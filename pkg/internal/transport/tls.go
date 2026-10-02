@@ -199,8 +199,8 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 	// intra-cluster traffic between endpoints we control does not need.
 	//
 	// WHICH groups is build-dependent, because X25519 is not FIPS 140-3
-	// approved and this list used to hold nothing else: every intra-cluster
-	// handshake — which carries all replicated user data — failed with
+	// approved: a list holding nothing else fails every intra-cluster
+	// handshake — which carries all replicated user data — with
 	// `tls: no supported elliptic curves for ECDHE` under GODEBUG=fips140=on
 	// as well as =only, so the library could not run inside a FIPS process at
 	// all. A `-tags fips` build compiles the non-approved group out

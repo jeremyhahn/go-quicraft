@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// --- DEFECT 2: persisted metadata is authenticated, and epochs cannot roll back ---
+// --- Persisted metadata is authenticated, and epochs cannot roll back ---
 
 // epochFiveBarrier returns a barrier that has been rotated to epoch 5, together
 // with the strategy that seals it and every sealed blob the rotations persisted
@@ -60,14 +60,13 @@ func epochFiveBarrier(t *testing.T) (*Barrier, *SoftwareStrategy, []*SealedRootK
 	return b, s, blobs
 }
 
-// TestSealedStateMAC_RejectsEpochRewrite is the DEFECT 2 regression, in the
-// exact shape the probe demonstrated: a barrier live at epoch 5 with
-// KnownEpochs [1..5] has its persisted blob rewritten to Epoch 2 /
-// KnownEpochs [1,2] — touching nothing the root-key AEAD covers, since its AAD
-// is the constant strategy name — and the doctored blob previously loaded and
-// unsealed cleanly. The barrier then resumed encrypting under epoch 2's
+// TestSealedStateMAC_RejectsEpochRewrite pins the epoch-rewrite rejection: a
+// barrier live at epoch 5 with KnownEpochs [1..5] has its persisted blob
+// rewritten to Epoch 2 / KnownEpochs [1,2] — touching nothing the root-key AEAD
+// covers, since its AAD is the constant strategy name. Were the doctored blob
+// to load and unseal cleanly, the barrier would resume encrypting under epoch 2's
 // already-spent DEK with a counter freshly seeded from zero and a nonce tracker
-// with no memory of the first lifetime's nonces: two independent random-nonce
+// with no memory of the first lifetime's nonces — two independent random-nonce
 // sequences under one key, which is precisely what the invocation cap bounds.
 func TestSealedStateMAC_RejectsEpochRewrite(t *testing.T) {
 	b, s, _ := epochFiveBarrier(t)
@@ -258,14 +257,15 @@ func TestSealedEpochRollback_ReplayFloor(t *testing.T) {
 	}
 }
 
-// --- DEFECT 3: NonceTracking's zero value must not disable detection ---
+// --- NonceTracking's zero value must not disable detection ---
 
-// TestNonceTracking_ZeroValueDefaultsOn is the DEFECT 3 regression. The field
-// was a plain bool documented as "Default: true", so the hand-built config an
+// TestNonceTracking_ZeroValueDefaultsOn pins that the hand-built config an
 // embedder writes when it pins Algorithm and DeploymentID explicitly —
-// seal.NewBarrier(seal.BarrierConfig{Algorithm: ..., DeploymentID: 7}) — passed
-// Validate and produced a barrier with nonceTracker == nil. Only
-// DefaultBarrierConfig ever wrote true.
+// seal.NewBarrier(seal.BarrierConfig{Algorithm: ..., DeploymentID: 7}) —
+// produces a barrier WITH a nonce tracker. Were the field a plain bool
+// documented as "Default: true", that config would pass Validate and produce a
+// barrier with nonceTracker == nil, since only DefaultBarrierConfig writes
+// true.
 //
 // It asserts the ACTUAL tracker, not a proxy for it, and then that the tracker
 // actually rejects a repeat.
@@ -319,13 +319,13 @@ func TestNonceTracking_ZeroValueDefaultsOn(t *testing.T) {
 }
 
 // TestNonceTracking_CeilingIsDocumentedAndAdjustable pins the second half of
-// DEFECT 3: detection is NOT unconditional for the life of the epoch. Past the
-// ceiling the tracker saturates — it admits nothing further — and the only
-// lever is SetMaxTrackedNonces, which was documented nowhere.
+// the nonce-tracking contract: detection is NOT unconditional for the life of
+// the epoch. Past the ceiling the tracker saturates — it admits nothing
+// further — and the only lever is SetMaxTrackedNonces.
 //
-// Updated for the saturation semantics: the tracker no longer clears its
-// enabled flag at the ceiling, because that conflated an operator's switch with
-// a memory bound and made a saturated tracker report "off, zero tracked". What
+// Saturation semantics: the tracker does not clear its enabled flag at the
+// ceiling, because that would conflate an operator's switch with
+// a memory bound and make a saturated tracker report "off, zero tracked". What
 // it stops is ADMISSION; the nonces it already holds stay checked.
 func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 	nt := NewNonceTracker(true)
@@ -367,7 +367,7 @@ func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 	}
 }
 
-// --- DEFECT 4: the context-AAD capability must be measured, not declared ---
+// --- The context-AAD capability must be measured, not declared ---
 
 // lyingAADEncryptor implements AADSymmetricEncrypter and IGNORES the aad,
 // exactly what that interface's doc comment begs implementers not to do — and
@@ -450,12 +450,13 @@ func (e *honestAADEncryptor) DecryptWithAAD(ciphertext, aad []byte) ([]byte, err
 	return e.aead.Open(nil, ciphertext[:n], ciphertext[n:], aad)
 }
 
-// TestContextBinding_ProbeCatchesLyingEncryptor is the DEFECT 4 regression.
-// SupportsContextAAD used to be satisfied by a Go METHOD SET: an encryptor that
-// accepted the aad and dropped it reported ContextBindingDelegated, callers
-// stopped suppressing their positional context, and RequireContextAAD — which
-// is documented as refusing a misconfigured deployment "before it writes a
-// single unbound byte" — passed at startup. The implementations live in another
+// TestContextBinding_ProbeCatchesLyingEncryptor pins that context binding is
+// established by a behavioural probe, not a Go METHOD SET. Were a method set
+// enough, an encryptor that accepted the aad and dropped it would report
+// ContextBindingDelegated, callers would stop suppressing their positional
+// context, and RequireContextAAD — which is documented as refusing a
+// misconfigured deployment "before it writes a single unbound byte" — would
+// pass at startup. The implementations live in another
 // repository, so the interface's warning comment was the entire enforcement.
 func TestContextBinding_ProbeCatchesLyingEncryptor(t *testing.T) {
 	ctx := context.Background()
@@ -541,14 +542,13 @@ func TestVerifyAADBinding_Stages(t *testing.T) {
 	}
 }
 
-// --- DEFECT 5: FIPS mode must constrain the KDF, and must be requestable ---
+// --- FIPS mode must constrain the KDF, and must be requestable ---
 
-// TestFIPS_ConstrainsKDF is the DEFECT 5 regression. fips.go stated
-// categorically that FIPS mode "constrains BOTH the KDF (PBKDF2-SHA256 instead
-// of Argon2id) and the data-path cipher", but only the cipher was constrained:
-// DeriveKey never consulted FIPS at all, and NewSoftwareStrategyWithParams
-// hardcoded Argon2id "regardless of FIPS mode", so a FIPS-140 deployment
-// wrapped its root key under a non-approved KDF with no error and no warning.
+// TestFIPS_ConstrainsKDF pins that FIPS mode constrains BOTH the KDF
+// (PBKDF2-SHA256 instead of Argon2id) and the data-path cipher, as fips.go
+// states. If DeriveKey ignored FIPS, or NewSoftwareStrategyWithParams hardcoded
+// Argon2id, a FIPS-140 deployment would wrap its root key under a non-approved
+// KDF with no error and no warning.
 func TestFIPS_ConstrainsKDF(t *testing.T) {
 	salt := make([]byte, 32)
 	pass := []byte("a-passphrase-for-the-kdf")
@@ -611,17 +611,16 @@ func TestRequireFIPS_FailsClosedWhenUnavailable(t *testing.T) {
 	}
 }
 
-// --- DEFECT 6: what positional binding does and does not deliver ---
+// --- What positional binding does and does not deliver ---
 
 // TestContextAAD_ResistsReorderAndSpliceButNotTruncation is a CHARACTERIZATION
-// test. EncryptWithContext claimed the AAD "prevents an at-rest attacker from
-// reordering, splicing, or TRUNCATING same-epoch frames". The first two hold;
-// the third never did, and nothing in this package can make it hold, because
-// nothing in the AAD names the number of frames or the total length. The fix
-// for DEFECT 6 is therefore the doc comment plus a design the frame owner must
-// implement — and this test is what keeps the corrected statement honest: it
-// asserts each half, including the negative one, so a future reader can see the
-// gap rather than infer protection from a sentence.
+// test. The positional AAD prevents an at-rest attacker from reordering or
+// splicing same-epoch frames, but not from TRUNCATING them, and nothing in this
+// package can make it, because nothing in the AAD names the number of frames
+// or the total length. Truncation resistance is a design the frame owner must
+// implement — and this test is what keeps EncryptWithContext's doc comment
+// honest: it asserts each half, including the negative one, so a future reader
+// can see the gap rather than infer protection from a sentence.
 func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 
@@ -654,8 +653,8 @@ func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 
 	// TRUNCATION is NOT caught. Drop the tail and every surviving frame still
 	// authenticates perfectly at its own position; a reader that stops at EOF
-	// sees a complete, shorter artifact. This is the claim the doc comment used
-	// to make and no longer does.
+	// sees a complete, shorter artifact. The doc comment makes no claim of
+	// truncation resistance.
 	truncated := artifact[:2]
 	for i, ct := range truncated {
 		got, err := b.DecryptWithContext(nil, ct, frameAAD(7, i))

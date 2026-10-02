@@ -36,11 +36,11 @@ func (unreadableRecordLogDB) GetSnapshot(uint64, uint64) (logdb.Snapshot, error)
 }
 
 // TestSnapshotRecordGuards_FailClosedOnAnUnreadableRecord: the snapshot GC and
-// a receive's publish spare the directory the LogDB record names, and both
-// used to read an UNREADABLE record as "no record" — so one transient read
-// error let GC, under retention pressure, delete the recorded snapshot whose
-// log below it was already compacted. An unreadable record now makes GC
-// reclaim nothing, and makes any directory count as possibly recorded.
+// a receive's publish spare the directory the LogDB record names. Reading an
+// UNREADABLE record as "no record" would let one transient read error make GC,
+// under retention pressure, delete the recorded snapshot whose log below it was
+// already compacted. An unreadable record makes GC reclaim nothing, and makes
+// any directory count as possibly recorded.
 func TestSnapshotRecordGuards_FailClosedOnAnUnreadableRecord(t *testing.T) {
 	const shardID, replicaID = uint64(9), uint64(1)
 	base := t.TempDir()

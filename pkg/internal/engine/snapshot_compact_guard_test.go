@@ -22,7 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSaveSnapshot_CompactFailureSkipsLogDBRemoval is the H3 regression test.
+// TestSaveSnapshot_CompactFailureSkipsLogDBRemoval is a regression test.
 //
 // saveSnapshot advances the LogReader's compaction marker BEFORE removing the
 // entries from LogDB, and the comment above that ordering states exactly why:
@@ -124,7 +124,7 @@ func advancingReader(t *testing.T, shardID, replicaID uint64, db logdb.LogDB, la
 // TestSaveSnapshot_ReportsWhatCompactionDid pins the outcome the pool hands to
 // OnLogCompacted, which is what the host's compaction events report: a
 // compaction is reported only when THIS save advanced the reader's marker.
-// The listener used to hear "compacted" for every case below.
+// The listener must not hear "compacted" for every case below.
 func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 	t.Run("compacted", func(t *testing.T) {
 		f := newResaveFixture(t, 200)
@@ -151,9 +151,9 @@ func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 		}
 	})
 	t.Run("marker already past", func(t *testing.T) {
-		// Review finding L1: an earlier snapshot, a receive or an import took
-		// the marker past compactIndex, so Compact answers ErrCompacted and
-		// this save compacted nothing — yet it was reported at index 190.
+		// An earlier snapshot, a receive or an import took the marker past
+		// compactIndex, so Compact answers ErrCompacted and this save
+		// compacted nothing — it must not be reported at index 190.
 		f := newResaveFixture(t, 200)
 		lr := advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
 		if err := lr.Compact(195); err != nil {

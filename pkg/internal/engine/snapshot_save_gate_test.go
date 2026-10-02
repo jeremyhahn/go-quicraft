@@ -29,7 +29,7 @@ import (
 // gateProbeSM is an Applier that flags any Apply that executes while a snapshot
 // is in its consistent-capture window. In the real pipeline that window reads
 // shared in-memory state (the session manager, which is not safe for concurrent
-// use) — an overlapping Apply is exactly the C2 bug: a fatal "concurrent map
+// use) — so an overlapping Apply is a crash: a fatal "concurrent map
 // iteration and map write" that crashes the whole host.
 type gateProbeSM struct {
 	capturing  atomic.Bool
@@ -50,7 +50,7 @@ func (s *gateProbeSM) Apply(entries []proto.Entry, results []sm.Result) error {
 	return nil
 }
 
-// TestSavingGateQuiescesApplies is the C2 regression test. It drives real
+// TestSavingGateQuiescesApplies is a regression test. It drives real
 // applies through the apply worker while a second goroutine repeatedly runs the
 // exact gate sequence snapshotPool.saveSnapshot uses around the consistent
 // capture — SetSaving(true) -> WaitForApplyDrain -> capture window ->
@@ -76,7 +76,7 @@ func TestSavingGateQuiescesApplies(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Saver: run the C2 gate sequence repeatedly. During the capture window no
+	// Saver: run the save-gate sequence repeatedly. During the capture window no
 	// Apply may run.
 	const saves = 250
 	saverDone := make(chan struct{})

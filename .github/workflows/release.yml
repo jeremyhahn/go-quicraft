@@ -572,13 +572,11 @@ jobs:
       - name: Seed and committed-corpus pass
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
 
-      # Runs the same Makefile target a developer runs (devops.md §4). This was
-      # inline shell, which meant the release gate could not be reproduced
-      # locally at all — and it failed release 425 on the coordinator shutdown
-      # artefact, not on a finding. ci-fuzz-mutation separates the two on the
-      # signal Go itself gives: a crash always writes a reproducer, so only the
-      # no-reproducer deadline case is retried, and a real crash cannot be
-      # retried away.
+      # Runs the same Makefile target a developer runs (devops.md §4), so the
+      # release gate can be reproduced locally. ci-fuzz-mutation budgets each
+      # target as an execution count rather than a duration, which keeps Go's
+      # coordinator from reporting its own shutdown deadline as a failure; the
+      # Makefile header on that target explains why.
       - name: Bounded mutation pass
         run: make ci-fuzz-mutation FUZZ_MUT_PKGS='${{ matrix.package }}'
 
@@ -604,7 +602,7 @@ jobs:
         run: |
           set -uo pipefail
           MODULE_FLOOR=6
-          MODULES="$(find . -name go.mod -not -path './.git/*' -printf '%h\n' | sort)"
+          MODULES="$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune -o -name go.mod -printf '%h\n' | sort)"
           COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
           echo "Discovered ${COUNT} module(s):"
           printf '%s\n' "${MODULES}"
@@ -742,7 +740,7 @@ jobs:
             echo "go get github.com/jeremyhahn/go-quicraft@v$VERSION"
             echo "\`\`\`"
             echo ""
-            echo "See [docs/operations/compatibility.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/operations/compatibility.md) for the API-stability guarantee and the upgrade path."
+            echo "See [docs/compatibility.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/compatibility.md) for the API-stability guarantee and the upgrade path."
           } >> release-notes.md
 
       # TAG IMMUTABILITY, checked against the REMOTE.

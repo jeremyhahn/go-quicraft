@@ -6,12 +6,10 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// encBytes is the test-side replacement for the MemoryEnclave.Bytes accessor
-// this repository's former pkg/enclave used to own. go-enclave's Open reports a
-// destroyed enclave as an ERROR where the old accessor reported it as a nil
-// slice; these tests were written against the nil, so the error is folded back
-// into one here rather than rewritten at every assertion site. Production code
-// handles the error.
+// encBytes returns an enclave's bytes, or nil if it is nil or destroyed.
+// go-enclave's Open reports a destroyed enclave as an ERROR; these tests assert
+// on a nil slice, so the error is folded into one here rather than handled at
+// every assertion site. Production code handles the error.
 func encBytes(e *enclave.MemoryEnclave) []byte {
 	if e == nil {
 		return nil
@@ -24,9 +22,8 @@ func encBytes(e *enclave.MemoryEnclave) []byte {
 }
 
 // mustSized allocates n bytes of locked, writable memory, failing the test if
-// the kernel refuses the lock. It replaces the bare-pointer constructor this
-// repository's former pkg/enclave used to own: go-enclave reports a refused
-// mlock rather than hiding it, and a test that ignored the refusal would assert
+// the kernel refuses the lock. go-enclave reports a refused mlock rather than
+// hiding it, and a test that ignored the refusal would assert
 // against a nil enclave for reasons unrelated to what it is testing.
 func mustSized(t testing.TB, n int) *enclave.MemoryEnclave {
 	t.Helper()
@@ -49,10 +46,9 @@ func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
 }
 
 // mustCreds builds Credentials over a passphrase, failing the test if the
-// sealing is refused. It exists because #41 retyped Credentials.Secret onto
-// protected memory, so the `Credentials{Secret: []byte("pw")}` literal that
-// every deferred-strategy test used no longer compiles — and because
-// NewCredentials CONSUMES its argument, so each call site needs its own copy of
+// sealing is refused. It exists because Credentials.Secret is protected
+// memory, so a `Credentials{Secret: []byte("pw")}` literal does not compile —
+// and because NewCredentials CONSUMES its argument, so each call site needs its own copy of
 // the string rather than a shared slice.
 func mustCreds(t testing.TB, passphrase string) Credentials {
 	t.Helper()

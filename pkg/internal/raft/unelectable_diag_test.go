@@ -45,17 +45,17 @@ func newTestPeerForDiag(t *testing.T) *Peer {
 	return newTestPeer(t, raftTestCfg(1, 1), proto.State{}, threeNodeMembership())
 }
 
-// TestHandleVoteRequest_UnreadableLogDenialIsReported covers the fail-closed
-// vote denial that used to happen in complete silence.
+// TestHandleVoteRequest_UnreadableLogDenialIsReported pins that the fail-closed
+// vote denial is reported rather than silent.
 //
 // isUpToDate must refuse a vote it cannot justify — granting on a fabricated
 // term 0 would make every candidate look up to date and break Leader
 // Completeness — but the refusal is caused by LOCAL storage and applies to
 // every candidate equally. Hit a majority of replicas and the shard cannot
 // elect a leader while every node is up, reachable, and reporting nothing at
-// all. Its sibling check in startElection has warned all along; this one had
-// no log, no counter and no diagnostic field, so the only observable was a
-// leaderless shard with quorum apparently intact.
+// all. Its sibling check in startElection warns; without a log, a counter and
+// a diagnostic field here, the only observable would be a leaderless shard
+// with quorum apparently intact.
 func TestHandleVoteRequest_UnreadableLogDenialIsReported(t *testing.T) {
 	buf, cleanup := captureSlog(slog.LevelWarn)
 	defer cleanup()

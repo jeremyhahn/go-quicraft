@@ -749,11 +749,10 @@ func newSealableTestBarrier(t *testing.T) (*seal.Barrier, seal.SealingStrategy) 
 //
 // waldb.Open therefore fails closed with ErrBarrierContextUnresolved.
 //
-// The ASSERTION IS ON OPEN, and that is the whole point of the test. An earlier
-// version asserted only that a later write failed, which the pre-fix code
-// satisfied too: it latched the sealed barrier's "false", and the writes were
-// then rejected by EncryptWithContext anyway because the barrier was still
-// sealed. The test passed against the very bug it was written for. Open
+// The ASSERTION IS ON OPEN, and that is the whole point of the test. Asserting
+// only that a later write fails would be satisfied by a WAL that latched the
+// sealed barrier's "false" too, since the writes would then be rejected by
+// EncryptWithContext anyway while the barrier was still sealed. Open
 // returning ErrBarrierContextUnresolved is the one observable that distinguishes
 // failing closed from latching a downgrade, so it is the one asserted here.
 // TestUnsealedBarrierBindsRecordsPositionally carries the positive half.

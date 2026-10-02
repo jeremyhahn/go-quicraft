@@ -215,8 +215,10 @@ type TransportConfig struct {
 	// stream. Default: 30s.
 	StreamReadIdleTimeout time.Duration
 
-	// SendBatchMaxSize is the maximum send buffer size in bytes before a
-	// flush is triggered. Default: 64 KB.
+	// SendBatchMaxSize is the initial capacity in bytes (plus the frame
+	// header) of each pooled send buffer. It is a sizing hint only: it does
+	// not trigger a flush or cap a batch, and a batch that encodes larger
+	// gets a buffer of the size it needs. Default: 64 KB.
 	SendBatchMaxSize int
 
 	// UDPRecvBufSize is the SO_RCVBUF size for the UDP socket. Larger

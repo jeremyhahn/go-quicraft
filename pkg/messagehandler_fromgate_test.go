@@ -378,7 +378,7 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	// a real background worker that can drain the message out of the live
 	// queue before a delayed read ever samples the increase -- the
 	// recording wrapper instead observes delivery synchronously at the
-	// DeliverMessage call itself (go-quicraft#26).
+	// DeliverMessage call itself.
 	if rec.DeliveredCount() == 0 {
 		t.Fatal("the leader's Replicate never reached the raft inbox: the joining " +
 			"replica has nothing to append and nothing to ack, so the join never " +
@@ -460,9 +460,8 @@ func TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate(t *testing.T) 
 	eng, handler := fromGateRig(t, ms, map[uint64]string{2: victimAddr})
 
 	// Step 1: an exempt message claiming replica 2's From. It is delivered
-	// (raft validates its term and it hands the sender no quorum outcome). It
-	// used to re-point the routing entry too, on an address-only shard; with
-	// the victim's identity committed the overwrite is refused as well, and
+	// (raft validates its term and it hands the sender no quorum outcome). With
+	// the victim's identity committed the routing overwrite is refused, and
 	// that is asserted so a regression in routingOverwriteAuthorized shows up
 	// here rather than only in the exfiltration test.
 	poison := proto.MessageBatch{
@@ -566,9 +565,8 @@ func TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot(t *testing.T) 
 
 	eng, handler := fromGateRig(t, ms, map[uint64]string{1: leaderAddr})
 
-	// Step 1: try to poison the routing entry for the leader. On an
-	// address-only shard this used to SUCCEED (routing stayed learnable); with
-	// the leader's identity committed the overwrite is refused too. Either
+	// Step 1: try to poison the routing entry for the leader. With the
+	// leader's identity committed the overwrite is refused. Either
 	// way the snapshot path below must not consult the registry, so the
 	// registry is driven to whichever value it will take and the step-2
 	// assertion stands on the committed membership alone.
@@ -674,11 +672,11 @@ func TestHandleMessage_SharedCommittedAddressFailsClosed(t *testing.T) {
 // off proto's OWN type space rather than off any list in the handler, so it
 // cannot pass by testing the author's answer against itself.
 //
-// There used to be an exempt list here — types whose acceptance "could not hand
-// the sender a quorum outcome" — and it was exactly the set a certificate
-// holder could use to move a shard's term (RequestVote), install itself as
-// leader (Heartbeat), and have commands appended (a forwarded Propose). Every
-// type is bound now (#197 B): a sender the committed configuration, the pending
+// There is no exempt list — types whose acceptance "could not hand the sender a
+// quorum outcome" — because such a list is exactly the set a certificate holder
+// could use to move a shard's term (RequestVote), install itself as leader
+// (Heartbeat), and have commands appended (a forwarded Propose). Every type is
+// bound: a sender the committed configuration, the pending
 // configuration and the join anchor all fail to name is refused whatever it
 // sends, and an unrecognised type is refused with the rest. The positive
 // control is the same message from a configured member on its own connection.

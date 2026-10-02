@@ -421,11 +421,8 @@ func TestIntegration_DB_StartReplicaWaitForReadiness(t *testing.T) {
 	// correctly per the Raft specification.
 	session := dbClient.NewNoOPSession(1, nil)
 	warmupCmd := encodeKVPut("readiness-check", "ready")
-	// The proposal's own host used to be captured here, because the read below
-	// was a direct SyncRead and pinning it to the replica that accepted the
-	// warmup entry was the closest thing to a leader it could get. The read
-	// re-resolves now, and waitForReplication below proves every node holds the
-	// entry, so a linearizable read answers correctly whichever replica leads.
+	// The proposal's own host is not captured: the read below re-resolves the
+	// leader, and waitForReplication below proves every node holds the entry, so a linearizable read answers correctly whichever replica leads.
 	cluster.proposeToLeader(t, session, warmupCmd, defaultTimeout)
 
 	// Verify the warmup entry replicated to all nodes, confirming

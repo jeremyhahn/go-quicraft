@@ -255,9 +255,9 @@ func (c Config) ToQuicraft() qcConfig.Config {
 		}
 	} else {
 		// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is
-		// off; the user will call RequestSnapshot". Quicraft used to read a
-		// zero the same way, but no longer does: a zero there now means "I did
-		// not choose" and SetDefaults substitutes DefaultSnapshotEntries.
+		// off; the user will call RequestSnapshot". Quicraft does not: a zero
+		// there means "I did not choose" and SetDefaults substitutes
+		// DefaultSnapshotEntries.
 		// Passing the zero through would therefore silently ENABLE snapshotting
 		// on a config that explicitly asked for it off — and would do it to
 		// every witness, since dragonboat REQUIRES SnapshotEntries == 0 for

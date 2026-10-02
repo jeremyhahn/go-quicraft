@@ -229,10 +229,10 @@ func TestCloseWaitsForStreamingSnapshot(t *testing.T) {
 	}
 }
 
-// TestGetHashAfterCloseReturnsErrClosed pins the guard added to GetHash.
+// TestGetHashAfterCloseReturnsErrClosed pins the guard GetHash takes.
 //
-// GetHash previously took no guard at all, so Host.StateMachineHash could hash a
-// user SM concurrently with Apply — a replica-divergence check reporting a
+// Without a guard Host.StateMachineHash could hash a user SM concurrently with
+// Apply — a replica-divergence check reporting a
 // mismatch that does not exist — or read one that Close had already torn down.
 // The Apply exclusion is covered by TestApplyExcludesLookupOnBasicTier, which
 // drives GetHash alongside Lookup; this covers the closed case.

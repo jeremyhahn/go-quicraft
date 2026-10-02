@@ -47,7 +47,7 @@ The package table and the reasoning behind `-p 1` and the timeouts are in
 | `integration-test-linearizability` | `test/integration/linearizability/`, 600s | devcontainer |
 | `integration-test-e2e` | `test/integration/e2e/` as a compiled binary | Docker Compose test-runner container |
 | `ci-integration` | all four packages, `-p 1`, 1800s | host; same command as the `integration` job in ci.yml |
-| `ci-netfault` | `test/integration/e2e/` with `quicraft_netfault` | host |
+| `ci-netfault` | `test/integration/e2e/` and `test/integration/host/` with `quicraft_netfault` | host |
 
 `make integration-test-e2e` brings up
 `.devcontainer/docker-compose.integration.yml`, a single `test-runner`
@@ -250,8 +250,12 @@ targets on the remote host. Why is in
 | `test-writemode` | `./pkg/writemode/...` |
 | `test-batch` | `./pkg/batch/...` |
 | `test-crypto` | `./pkg/crypto/...` |
+| `test-snapshot` | `./pkg/...`, tests matching `Snapshot\|Import\|Export` |
 
-Each `test-<pkg>` has a matching `coverage-<pkg>`. `make coverage` measures
+Every `test-<pkg>` lists its selection first and fails if it selects no tests,
+so a stale package path or `-run` pattern cannot pass vacuously. Each has a
+matching `coverage-<pkg>` except `test-snapshot`, whose name-filtered run cannot
+meet the per-package coverage floor. `make coverage` measures
 `./...` and `make coverage-packages` checks every package from it.
 
 ### Fault injection and fuzzing
@@ -260,9 +264,8 @@ Each `test-<pkg>` has a matching `coverage-<pkg>`. `make coverage` measures
 |---|---|---|
 | `errfs-waldb` | `quicraft_errfs` | `./test/errfs/...` with `-v` |
 | `ci-errfs` | `quicraft_errfs` | the same without `-v` (CI parity) |
-| `ci-netfault` | `integration quicraft_netfault` | `./test/integration/e2e/...` |
-| `fuzz-proto`, `fuzz-waldb`, `fuzz-transport`, `fuzz-session`, `fuzz-seal` | `quicraft_fuzz` | `-fuzz=Fuzz` for `FUZZ_TIME` (60s) |
-| `fuzz-raft` | `quicraft_fuzz` | `FuzzRaftStepSequence` and `FuzzRaftLogRecovery`, one invocation each |
+| `ci-netfault` | `integration quicraft_netfault` | `./test/integration/e2e/...` and `./test/integration/host/...` |
+| `fuzz-proto`, `fuzz-waldb`, `fuzz-transport`, `fuzz-session`, `fuzz-seal`, `fuzz-raft` | `quicraft_fuzz` | every target in the package, one at a time, for `FUZZ_TIME` (60s) each |
 | `fuzz-all` | `quicraft_fuzz` | all six of the above |
 | `ci-fuzz-seeds` | `quicraft_fuzz` | `-run=Fuzz` over `./...`: seeds and committed corpus only |
 | `ci-fuzz-mutation` | `quicraft_fuzz` | a fixed execution count per target; the release gate |

@@ -17,7 +17,7 @@ require (
 require (
 	github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5 // indirect
 	// go-quicraft is here only for test/netport, the one port-reservation
-	// window benchutil now delegates to (#163). A `replace` binds the MAIN
+	// window benchutil delegates to. A `replace` binds the MAIN
 	// module only, so the pair repeats in every module that reaches benchutil
 	// rather than being inherited from test/performance.
 	//
@@ -27,7 +27,7 @@ require (
 	// versions whether or not a line of that code is reached.
 	//
 	// Measured here: davecgh/go-spew drops out of the indirect set and nothing
-	// in the runtime graph moves. Owner ruling 2026-09-07: accepted.
+	// in the runtime graph moves.
 	github.com/jeremyhahn/go-quicraft v0.0.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 )

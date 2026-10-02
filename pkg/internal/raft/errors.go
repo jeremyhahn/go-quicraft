@@ -208,10 +208,10 @@ var (
 
 	// ErrDuplicateMemberAddress is returned when a config change would add a
 	// replica at an address another ACTIVE member of the shard already holds.
-	// The inbound authorization chain is replica ID -> committed address ->
-	// certificate, so two replicas at one address let the single host behind it
-	// speak as both: two votes and two match indices in a quorum that believes
-	// they are independent. See membership.addressHolder.
+	// Routing is per address: a replica is dialled at its committed address and
+	// routes are learned, replaced and evicted by address, so two replica IDs at
+	// one address would share one route and the transport's address-scoped
+	// checks could not tell them apart. See membership.addressHolder.
 	ErrDuplicateMemberAddress = errors.New("raft: address already held by another member of this shard")
 
 	// ErrDuplicateMemberIdentity is returned when a config change would bind a

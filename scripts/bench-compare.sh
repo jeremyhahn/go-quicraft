@@ -39,7 +39,7 @@
 #   scripts/bench-compare.sh compare    # baseline vs working tree (default)
 #   scripts/bench-compare.sh baseline   # record working tree as a stored baseline
 #
-# See docs/performance/benchmarking.md for the full rationale and for how to
+# See docs/testing/benchmarking.md for the full rationale and for how to
 # read the output.
 
 set -euo pipefail

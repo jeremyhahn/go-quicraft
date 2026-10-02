@@ -16,8 +16,8 @@
 //
 // # Why this exists
 //
-// Every "partition" test in the suite used to call stopNode — a process kill.
-// A killed node is not a partitioned node: it holds no leadership belief, it
+// A "partition" test that calls stopNode performs a process kill, and a killed
+// node is not a partitioned node: it holds no leadership belief, it
 // answers nothing, and it returns with cold in-memory state. The single most
 // dangerous configuration in Raft — a LIVE leader deposed by a quorum it can no
 // longer reach — could not be constructed anywhere in the suite. The cost of

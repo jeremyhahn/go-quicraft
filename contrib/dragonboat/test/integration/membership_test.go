@@ -177,7 +177,7 @@ func TestIntegration_DB_RequestLeaderTransfer(t *testing.T) {
 	// request the engine does not retry, and the budget is derived from what
 	// one attempt is bounded by (see leaderTransferRounds in helpers_test.go).
 	// The host observed above is not used: leadership is not pinned by having
-	// been observed (#123).
+	// been observed.
 	cluster.transferLeadershipTo(t, 1, targetReplicaID, leaderTransferTimeout)
 
 	// Verify via GetLeaderID from the target host.

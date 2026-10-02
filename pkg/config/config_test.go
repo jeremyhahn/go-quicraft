@@ -107,17 +107,15 @@ func TestConfig_SetDefaults(t *testing.T) {
 	})
 }
 
-// TestConfig_SetDefaults_SnapshotEntries pins the tri-state that this field
-// used to get wrong.
+// TestConfig_SetDefaults_SnapshotEntries pins the field's tri-state.
 //
-// The old behaviour was that zero meant "never snapshot", which made "never"
-// the DEFAULT — the one configuration a practical Raft deployment cannot run
-// in (Ongaro, "Consensus: Bridging Theory and Practice", ch. 5 treats
-// compaction as a requirement, not a feature). In this implementation it also
-// silently disabled three things that advance only inside saveSnapshot: the
-// snapshot-directory GC, the epoch purge floor, and the at-rest barrier — the
-// last of which is how a set of barrier end-to-end tests came to assert
-// nothing at all.
+// If zero meant "never snapshot", "never" would be the DEFAULT — the one
+// configuration a practical Raft deployment cannot run in (Ongaro, "Consensus:
+// Bridging Theory and Practice", ch. 5 treats compaction as a requirement, not
+// a feature). In this implementation it would also silently disable three
+// things that advance only inside saveSnapshot: the snapshot-directory GC, the
+// epoch purge floor, and the at-rest barrier — the last of which would leave
+// barrier end-to-end tests asserting nothing at all.
 //
 // Three states, three distinct meanings, and the test asserts each separately
 // because collapsing any two of them is exactly the defect.
@@ -775,11 +773,11 @@ func TestConfig_Validate_MaxProposalPayloadSize(t *testing.T) {
 // TestConfig_SetDefaults_SessionExpiryEntries pins the default that replicating
 // the threshold made safe.
 //
-// This test previously asserted the OPPOSITE: that SetDefaults must leave the
-// field at 0, because a defaulted threshold in node-local configuration would
-// make a cluster with one un-upgraded replica expire different sessions and
-// diverge silently. The threshold is now seeded into the shard's replicated
-// membership at bootstrap and read from there by the apply path
+// Defaulting is safe only because of where the threshold lives: a defaulted
+// threshold read from node-local configuration would make a cluster with one
+// un-upgraded replica expire different sessions and diverge silently. The
+// threshold is seeded into the shard's replicated membership at bootstrap and
+// read from there by the apply path
 // (proto.SessionPolicy), so a replica adopts what its shard committed rather
 // than what its binary defaults to, and the default is the fix for the leak an
 // unexpiring session table represents.

@@ -56,6 +56,8 @@ var membershipAliases = []struct {
 	{"ErrEmptyAddress", ErrEmptyAddress, raft.ErrEmptyAddress},
 	{"ErrMemberIdentityRequired", ErrMemberIdentityRequired, raft.ErrMemberIdentityRequired},
 	{"ErrRemovedMemberIdentity", ErrRemovedMemberIdentity, raft.ErrRemovedMemberIdentity},
+	{"ErrDuplicateMemberAddress", ErrDuplicateMemberAddress, raft.ErrDuplicateMemberAddress},
+	{"ErrDuplicateMemberIdentity", ErrDuplicateMemberIdentity, raft.ErrDuplicateMemberIdentity},
 }
 
 // TestMembershipAliasesAreTheRaftValues pins the IDENTITY of the
@@ -215,7 +217,7 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 		{
 			// The identity tombstone outlives the replica ID it was bound to:
 			// a NEW replica ID presenting a removed member's keypair is the
-			// case a host has to classify (#218), and it is refused before it
+			// case a host has to classify, and it is refused before it
 			// can commit a member every replica would black-hole.
 			name: "add a removed member's identity under a new replica ID",
 			setup: func(t *testing.T, ctx context.Context, h *Host) {
@@ -236,6 +238,33 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 				return err
 			},
 			want: ErrRemovedMemberIdentity,
+		},
+		{
+			// The local voter holds localAddr. A second replica ID at the same
+			// address would give the one host behind it two votes.
+			name: "add a new replica at an address an active member holds",
+			call: func(ctx context.Context, h *Host) error {
+				_, err := h.RequestAddNode(ctx, 1, 10, localAddr, 0)
+				return err
+			},
+			want: ErrDuplicateMemberAddress,
+		},
+		{
+			// One keypair bound to two active replica IDs authenticates as
+			// both, so the second binding is refused while the first holder is
+			// still a member.
+			name: "add a new replica with an identity an active member holds",
+			setup: func(t *testing.T, ctx context.Context, h *Host) {
+				t.Helper()
+				if err := h.SyncRequestAddObserverWithIdentity(ctx, 1, 10, "127.0.0.1:6000", testIdentity(10), 0); err != nil {
+					t.Fatalf("SyncRequestAddObserverWithIdentity: %v", err)
+				}
+			},
+			call: func(ctx context.Context, h *Host) error {
+				_, err := h.RequestAddObserverWithIdentity(ctx, 1, 11, "127.0.0.1:6001", testIdentity(10), 0)
+				return err
+			},
+			want: ErrDuplicateMemberIdentity,
 		},
 	}
 
@@ -279,7 +308,7 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 }
 
 // TestMembershipAliasesUnreachableFromASingleVoterHost records, as an
-// executable statement rather than a comment, WHICH of the seven re-exports
+// executable statement rather than a comment, WHICH of the re-exports
 // this package cannot drive through the public API, and why.
 //
 // ErrRemoveLastVoter fires only for a witness-only membership (no full

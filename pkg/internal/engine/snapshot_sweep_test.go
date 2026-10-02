@@ -25,7 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestSweepStaleDecryptTmp_FailureIsReported is the L2 regression guard.
+// TestSweepStaleDecryptTmp_FailureIsReported is a regression guard.
 //
 // The sweeper cannot report a failure to any caller — it must never abort
 // startup or recovery — so a failed removal is invisible unless the sweeper

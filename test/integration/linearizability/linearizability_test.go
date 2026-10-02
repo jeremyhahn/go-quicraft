@@ -260,8 +260,8 @@ type opRecord struct {
 // An operation that never reaches the history cannot be checked, and a
 // per-key history containing no operations is trivially linearizable. A
 // recorder that skips failed operations therefore reports "Ok" for a cluster
-// that is losing writes, which is precisely how this harness used to pass
-// while 50% of committed entries were being discarded.
+// that is losing writes, which would let this harness pass while half of the
+// committed entries were being discarded.
 type opRecorder struct {
 	mu         sync.Mutex
 	seq        int64
@@ -691,8 +691,8 @@ func formatPartition(part []porcupine.Event) string {
 // Porcupine cannot know a branch is irrelevant; its power-set construction
 // explores both for every indeterminate write. A leader kill under load fails a
 // burst of writes that nobody reads, and 2^23 such branches is where a
-// 30-minute budget went on a history that decides in 1ms once they are gone
-// (#137). This removes the one shape of Unknown that is provably noise; a
+// 30-minute budget can go on a history that decides in 1ms once they are gone.
+// This removes the one shape of Unknown that is provably noise; a
 // history still Unknown AFTER pruning is backtracking on constraints that
 // matter, and the check must still fail on it.
 //
@@ -1281,8 +1281,7 @@ func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 	// goes through proposer.Read now. One resolution and one attempt leaves
 	// the same gap the proposals above closed, only narrower: this helper runs
 	// at the start of nearly every test in this package, immediately after an
-	// election, which is exactly when leadership is most likely to move (#147,
-	// #154).
+	// election, which is exactly when leadership is most likely to move.
 	result := proposer.Read(t, cluster.leaderHost, shardID, encodeKVGet("warmup-0"), defaultTimeout)
 	val, ok := result.(string)
 	if !ok || val != "ok" {
@@ -1912,17 +1911,16 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 
 	// Re-read the leader HERE rather than reusing the one from setup.
 	//
-	// The old code picked the first index that was not the leader as observed
-	// at the TOP of the test — more than eight seconds, a node addition and a
-	// catch-up wait earlier. Leadership does not hold still across that window:
-	// under a loaded runner the campaign lands differently and elections recur,
-	// and when leadership had moved to the index this loop chose, removeNode
-	// correctly refused with "cannot remove the leader" and the test failed
-	// having proven nothing — checkLinearizability, the entire point, is the
-	// last line and was never reached. That is how main went red at 0cb4eb8.
+	// Picking the first index that was not the leader as observed at the TOP
+	// of the test — more than eight seconds, a node addition and a catch-up
+	// wait earlier — would not hold: leadership does not hold still across
+	// that window. Under a loaded runner the campaign lands differently and
+	// elections recur, and if leadership had moved to the index this loop
+	// chose, removeNode would correctly refuse with "cannot remove the leader"
+	// and the test would fail having proven nothing — checkLinearizability,
+	// the entire point, is the last line and would never be reached.
 	//
-	// The comment this block always carried said "not the leader, not the newly
-	// added node". It now means it.
+	// So "not the leader, not the newly added node" is evaluated now.
 	currentLeader := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	removeIdx := -1
 	for i := range numNodes {

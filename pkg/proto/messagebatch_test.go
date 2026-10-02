@@ -495,11 +495,10 @@ func TestMessageBatchUnmarshalFromBatchSizeBoundary(t *testing.T) {
 // TestExceedsMaxBatchSizeDoesNotTruncate drives the PRODUCTION comparison at an
 // offset UnmarshalFrom cannot be driven to.
 //
-// It replaces a test that asserted uint32(1<<32+1) == 1 and
-// uint64(1<<32+1) > MaxBatchSize. Both are facts about Go's arithmetic, true no
-// matter what this package does, so that test passed identically against the
-// vulnerable code and against the fix — it could not fail. The H9 defect is a
-// truncating cast inside the decoder's cumulative-size gate, and reaching it
+// Asserting uint32(1<<32+1) == 1 and uint64(1<<32+1) > MaxBatchSize instead
+// would check facts about Go's arithmetic, true no matter what this package
+// does, so such a test could not fail. The hazard is a truncating cast inside
+// the decoder's cumulative-size gate, and reaching it
 // through UnmarshalFrom needs a 4 GB frame no test can allocate; calling the
 // gate directly is what makes it testable at all.
 func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
@@ -522,7 +521,7 @@ func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
 		{"just under the limit", int(MaxBatchSize) - 1, false},
 		{"exactly the limit", int(MaxBatchSize), false},
 		{"one byte over", int(MaxBatchSize) + 1, true},
-		// The H9 case. uint32(4GB+1) is 1, which is under MaxBatchSize, so a
+		// The truncation case. uint32(4GB+1) is 1, which is under MaxBatchSize, so a
 		// decoder that narrows the offset waves this through and keeps parsing.
 		{"4GB+1 truncates to 1 under a uint32 cast", fourGB + 1, true},
 		{"4GB+64MB truncates to 64MB under a uint32 cast", fourGB + int(MaxBatchSize), true},
@@ -623,7 +622,7 @@ func TestMessageBatchUnmarshalFromCraftedOffsetBeyondBuffer(t *testing.T) {
 
 func TestMessageBatchUnmarshalFromMaxBatchSizeIsUint64(t *testing.T) {
 	// Verify the MaxBatchSize constant is typed as uint64. This prevents
-	// accidental regression to uint32 which would reintroduce the H9
+	// accidental regression to uint32 which would reintroduce the offset
 	// truncation vulnerability. The reflected kind is the assertion: a
 	// `var check uint64 = MaxBatchSize` declaration says the same thing, but
 	// reads as a redundant type annotation rather than as the check it is.

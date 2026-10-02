@@ -274,10 +274,9 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	// Verify membership is 4 before removal, on every replica rather than only
 	// on the leader.
 	//
-	// This used to query the leader alone, on the stated grounds that a joining
-	// node learns the full membership only from a snapshot. That has not been
-	// true since initial membership became a committed EntryInitialMembership
-	// at log index 1: a joiner replays that entry like any other and ends up
+	// Querying the leader alone is not enough. A joining node does not learn
+	// the full membership only from a snapshot: initial membership is a
+	// committed EntryInitialMembership at log index 1, and a joiner replays that entry like any other and ends up
 	// with the same configuration as everyone else. Asserting it here is what
 	// keeps that guarantee honest — if a joiner ever again comes up knowing
 	// only its own AddNode, this fails instead of being documented around.

@@ -631,10 +631,10 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestSendSnapshot_SurvivesItsDirectoryBeingRemoved: a send used to read its
-// artifact by PATH — the decrypt, then every chunk — and a newer snapshot's GC,
-// or the next incarnation's, or an offline import's, could remove the
-// directory underneath it. The send now opens the artifact before the
+// TestSendSnapshot_SurvivesItsDirectoryBeingRemoved: a send that read its
+// artifact by PATH — the decrypt, then every chunk — could have the directory
+// removed underneath it by a newer snapshot's GC, or the next incarnation's, or
+// an offline import's. The send opens the artifact before the
 // hand-off and reads only through handles, decrypting into an anonymous
 // scratch file, so removing the directory after the open changes nothing.
 func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
@@ -718,9 +718,9 @@ func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
 // TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly drives the real
 // SendSnapshot — its goroutine, its source handling, its panic recovery — with
 // a witness's snapshot: no data file, but the encrypted cluster's epoch on the
-// record. It used to reach the decrypt with no source, create a scratch file
-// in the process's working directory and panic on a nil read, leaking that
-// descriptor on every send the leader retried. It is metadata only, sent as
+// record. It must not reach the decrypt with no source, which would create a
+// scratch file in the process's working directory and panic on a nil read,
+// leaking that descriptor on every send the leader retried. It is metadata only, sent as
 // its single empty chunk at epoch 0; nothing is opened or created.
 func TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly(t *testing.T) {
 	b := createTestBarrier(t)

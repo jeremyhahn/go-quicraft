@@ -34,10 +34,12 @@ type ReencryptError struct {
 	Err error
 }
 
+// Error implements the error interface.
 func (e *ReencryptError) Error() string {
 	return "waldb: reencrypt: " + e.Op + ": " + e.Err.Error()
 }
 
+// Unwrap returns the underlying error.
 func (e *ReencryptError) Unwrap() error { return e.Err }
 
 // SnapshotReencryptFunc re-encrypts a node's snapshot DATA FILE from the source

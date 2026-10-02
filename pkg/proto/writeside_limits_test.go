@@ -64,9 +64,8 @@ func TestMembershipMarshalRefusesOversizedAddress(t *testing.T) {
 			"deleting the data directory", err)
 	}
 
-	// The round trip is what the durable path performs, and it is the half that
-	// used to break. Encode the same membership by hand — the encoder now refuses
-	// — and show the decoder rejects it, so the two ends genuinely agree.
+	// The round trip is what the durable path performs. Encode the same
+	// membership by hand — the encoder refuses — and show the decoder rejects it, so the two ends genuinely agree.
 	raw := marshalMembershipUnchecked(t, oversized)
 	var decoded Membership
 	if _, err := decoded.UnmarshalFrom(raw); !errors.Is(err, ErrAddressTooLong) {
@@ -230,9 +229,8 @@ func TestMarshalRefusesWhatUnmarshalRefuses(t *testing.T) {
 }
 
 // marshalMembershipUnchecked encodes a Membership with the write-side limits
-// BYPASSED, reproducing exactly what the old encoder emitted. It exists so the
-// read-side half of the round-trip assertion can still be driven now that
-// MarshalTo refuses to produce these bytes.
+// BYPASSED. It exists so the read-side half of the round-trip assertion can
+// be driven even though MarshalTo refuses to produce these bytes.
 func marshalMembershipUnchecked(t *testing.T, m Membership) []byte {
 	t.Helper()
 	buf := make([]byte, m.Size())
@@ -258,19 +256,19 @@ func marshalMembershipUnchecked(t *testing.T, m Membership) []byte {
 // Membership.UnmarshalFrom must be all-or-nothing
 // ---------------------------------------------------------------------------
 
-// TestMembershipUnmarshalLeavesNoPartialState pins the defence in depth the
-// file's own comment claimed and did not provide.
+// TestMembershipUnmarshalLeavesNoPartialState pins that a failed decode leaves
+// the receiver untouched.
 //
-// The decoder used to clear some fields AFTER the field reads and write others
-// BEFORE them, so a failure left a mixture of old and new: a decode that failed
-// early kept a STALE Identities map — which authorizes a replica the decoded
+// A decoder that cleared some fields AFTER the field reads and wrote others
+// BEFORE them would leave a mixture of old and new on failure: a decode that
+// failed early would keep a STALE Identities map — which authorizes a replica the decoded
 // configuration never named — and one that failed in the maps left a NEW
 // session policy sitting on an OLD configuration, which the apply path reads.
 // Decoding into a local and assigning the receiver only on success is what
 // removes the whole class.
 //
 // Latent today, because all three call sites abandon the value on error. That
-// is exactly why it needs a test: the invariant is now a property of the
+// is exactly why it needs a test: the invariant is a property of the
 // decoder, and nothing else would notice if a future refactor moved it back
 // into the callers.
 func TestMembershipUnmarshalLeavesNoPartialState(t *testing.T) {

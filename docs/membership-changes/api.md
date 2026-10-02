@@ -173,6 +173,9 @@ All are exported from `quicraft` and match with `errors.Is` / `errors.As`.
 | `ErrRejected` | another config change is still uncommitted. Retry once it commits. |
 | `ErrMemberIdentityRequired` | an add without a node identity on a host with a transport |
 | `ErrRemovedMemberIdentity` | the add binds an identity this shard has removed, under any replica ID; see `Membership.RemovedIdentities` |
+| `ErrDuplicateMemberAddress` | the add names a new replica at an address another active member holds |
+| `ErrDuplicateMemberIdentity` | the add binds an identity another active member holds |
+| `ErrSharedPeerCertificate` / `*SharedPeerCertificateError` | this host's own certificate also covers the added replica's host |
 | `ErrNodeAlreadyExists` | the target already holds the requested role, or is a witness (a witness cannot be promoted) |
 | `ErrNodeRemoved` | the replica ID was removed from this shard; IDs are never reused |
 | `ErrNodeNotFound` | a removal targets a replica that is not a member |
@@ -188,11 +191,6 @@ All are exported from `quicraft` and match with `errors.Is` / `errors.As`.
 | `*NonVotingRoleInMembersError` (`ErrNonVotingRoleInMembers`) | `StartShard` for a replica configured as observer or witness that is also listed in the founding member map |
 | `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable or absent; the shard cannot start |
 | `*UnauthorizedMessageError` | an inbound snapshot transfer from a sender not authorized for the shard. Ordinary Raft messages from such a sender are dropped and counted, not returned. |
-
-`ErrDuplicateMemberAddress` and `ErrDuplicateMemberIdentity` (an address or
-identity already held by another active member) are returned by the same
-validation but are not re-exported, so a caller cannot match them with
-`errors.Is`.
 
 ### Wire types
 

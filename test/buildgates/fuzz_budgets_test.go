@@ -152,7 +152,7 @@ func TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry(t *testing.T) {
 		t.Error("ci-fuzz-mutation does not budget by execution count. A duration budget " +
 			"installs a deadline context, and the coordinator's shutdown race then reports " +
 			"`context deadline exceeded` with no reproducer — a failure that is not a finding " +
-			"(#49). `-fuzztime=<N>x` creates no deadline at all.")
+			"`-fuzztime=<N>x` creates no deadline at all.")
 	}
 	if strings.Contains(recipe, "FUZZ_MUT_TIME") {
 		t.Error("ci-fuzz-mutation still references FUZZ_MUT_TIME, a duration budget")

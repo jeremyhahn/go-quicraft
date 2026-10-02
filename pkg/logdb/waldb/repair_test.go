@@ -253,14 +253,14 @@ func TestRepair_RefusesTheWrongBlockSize(t *testing.T) {
 // TestRepair_DirSyncFailureIsReported is the regression test for the dropped
 // error in discardSegmentsAbove.
 //
-// The directory fsync that makes the orphan unlinks durable used to be
-// slog.Warn'd and swallowed, and the function returned nil regardless. Inside
-// recover() that was masked by a second, fatal directory fsync a few lines
-// later; Repair has no such backstop. It therefore returned a RepairResult
-// naming the segments it had deleted while the deletions might never reach the
-// medium — and a crash then resurrects segments holding CRC-valid records ABOVE
-// the offset the operator authorized truncating at, whose stale HardState
-// replays and lets the node vote twice in one term. That is precisely what the
+// The directory fsync that makes the orphan unlinks durable must not be
+// logged and swallowed. Inside recover() a swallowed failure would be masked by
+// a second, fatal directory fsync a few lines later; Repair has no such
+// backstop. It would therefore return a RepairResult naming the segments it
+// had deleted while the deletions might never reach the medium — and a crash
+// would then resurrect segments holding CRC-valid records ABOVE the offset the
+// operator authorized truncating at, whose stale HardState replays and lets
+// the node vote twice in one term. That is precisely what the
 // directory fsync exists to prevent, reached through the one code path an
 // operator drives by hand.
 func TestRepair_DirSyncFailureIsReported(t *testing.T) {

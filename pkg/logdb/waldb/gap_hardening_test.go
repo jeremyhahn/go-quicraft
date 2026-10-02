@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Regression tests for the medium/low-severity hardening findings:
-// fatal replay of malformed entry batches (M1), write-side Cmd size cap
-// (M1), span-derived EntryRange and gap-rejecting IterateEntries (M1/M6),
-// locked shard shutdown (M4), compaction-floor propagation through
-// Reencrypt (M6), legacy snapshot format detection (M7), non-wedging
-// segment rotation (L1), 32-bit-safe snapshot length guard (L2), and
-// functional-option validation in Open (L3).
+// Regression tests for WAL hardening: fatal replay of malformed entry
+// batches, write-side Cmd size cap, span-derived EntryRange and
+// gap-rejecting IterateEntries, locked shard shutdown, compaction-floor
+// propagation through Reencrypt, retired snapshot payload type detection,
+// non-wedging segment rotation, 32-bit-safe snapshot length guard, and
+// functional-option validation in Open.
 
 package waldb
 
@@ -113,7 +112,7 @@ func findRawShardRecord(t *testing.T, walDir string, shardIdx int, payloadType b
 	return found
 }
 
-// --- M1: fatal replay of malformed entry batch records ---
+// --- fatal replay of malformed entry batch records ---
 
 // TestOpenFailsOnTruncatedEntryBatch verifies that a CRC-valid entry batch
 // record that ends mid-entry fails recovery with ErrTruncatedEntryRecord
@@ -181,7 +180,7 @@ func TestReplayEntriesTruncatedCmdIsFatal(t *testing.T) {
 	}
 }
 
-// --- M1: write-side Cmd cap symmetry ---
+// --- write-side Cmd cap symmetry ---
 
 // TestWriteEntriesRejectsOversizedCmd verifies SaveState refuses an entry
 // whose Cmd exceeds maxCmdLen with ErrCmdTooLarge, keeping the write side
@@ -209,7 +208,7 @@ func TestWriteEntriesRejectsOversizedCmd(t *testing.T) {
 	}
 }
 
-// --- M1: EntryRange derives a contiguous span ---
+// --- EntryRange derives a contiguous span ---
 
 // TestEntryRangeRejectsIndexGap verifies EntryRange returns
 // ErrLogGapDetected when the entry index holds a hole, instead of a bare
@@ -232,7 +231,7 @@ func TestEntryRangeRejectsIndexGap(t *testing.T) {
 	}
 }
 
-// --- M6/L4: IterateEntries rejects shifted and holed ranges ---
+// --- IterateEntries rejects shifted and holed ranges ---
 
 // TestIterateEntriesRejectsShiftedRange verifies that a request starting
 // below the first stored entry (with no compaction marker explaining the
@@ -271,7 +270,7 @@ func TestIterateEntriesRejectsInteriorHole(t *testing.T) {
 	}
 }
 
-// --- M4: shard shutdown is atomic with respect to writers ---
+// --- shard shutdown is atomic with respect to writers ---
 
 // TestShardCloseGateBlocksSegmentResurrection verifies that after a shard
 // is closed, a writer that raced past the DB-level gate cannot recreate an
@@ -302,7 +301,7 @@ func TestShardCloseGateBlocksSegmentResurrection(t *testing.T) {
 
 // TestCloseConcurrentWithWriters exercises DB.Close racing SaveState
 // writers. Run under -race this fails if shutdown touches segment state
-// without the shard lock (the M4 data race on segment.closed /
+// without the shard lock (a data race on segment.closed /
 // activeSegment). Writers must observe either success or ErrClosed — never
 // a torn write or a panic.
 func TestCloseConcurrentWithWriters(t *testing.T) {
@@ -336,7 +335,7 @@ func TestCloseConcurrentWithWriters(t *testing.T) {
 	wg.Wait()
 }
 
-// --- M6: Reencrypt carries the compaction floor ---
+// --- Reencrypt carries the compaction floor ---
 
 // TestReencryptPropagatesCompactionFloor verifies that a migrated WAL
 // keeps the source's compaction marker: requests at or below the floor
@@ -393,16 +392,17 @@ func TestReencryptPropagatesCompactionFloor(t *testing.T) {
 	}
 }
 
-// --- M7: legacy snapshot format fails loud ---
+// --- Retired snapshot payload types fail loud ---
 
-// TestOpenFailsOnLegacySnapshotFormat verifies that a snapshot record with
-// the reserved V1 payload type fails recovery with ErrLegacySnapshotFormat
-// instead of soft-skipping it and booting the node with empty membership.
+// TestOpenFailsOnRetiredSnapshotPayloadType0x03 verifies that a snapshot
+// record carrying the retired 0x03 payload type fails recovery with
+// ErrUnknownPayloadType instead of soft-skipping it and booting the node with
+// empty membership.
 func TestOpenFailsOnRetiredSnapshotPayloadType0x03(t *testing.T) {
 	dir := t.TempDir()
 
-	// A V1-layout snapshot record: base header + zero fpLen + old membership
-	// section (ConfigChangeID + four empty map counts, no witness fields).
+	// A retired-layout snapshot record: base header + zero fpLen + a membership
+	// section of ConfigChangeID + four empty map counts, no witness fields.
 	payload := make([]byte, 1+snapshotRecordBaseSize+8+4*4)
 	payload[0] = 0x03                               // retired snapshot payload type, pinned as a literal
 	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
@@ -425,7 +425,7 @@ func TestOpenFailsOnRetiredSnapshotPayloadType0x03(t *testing.T) {
 func TestOpenFailsOnRetiredSnapshotPayloadType0x08(t *testing.T) {
 	dir := t.TempDir()
 
-	// A V2-layout snapshot record: base header + zero fpLen + membership
+	// A retired-layout snapshot record: base header + zero fpLen + membership
 	// section without the leading version byte
 	// (ConfigChangeID + MaxWitnesses + PolicyFlags + four empty map counts).
 	payload := make([]byte, 1+snapshotRecordBaseSize+8+8+1+4*4)
@@ -449,13 +449,12 @@ func TestOpenFailsOnRetiredSnapshotPayloadType0x08(t *testing.T) {
 // its fields interpreted at this layout's offsets.
 //
 // Every format in the repository is pinned at version 1 pre-release, so there
-// is no earlier layout to fall back to and no window to widen. A section
-// stamped with anything else was written by a binary built from a different
-// pre-release commit — the record is length-correct and CRC-clean, so the
+// is no other layout to fall back to and no window to widen. A section stamped
+// with anything else was not written by this build — the record is length-correct and CRC-clean, so the
 // version byte is the only thing that can catch it.
 func TestOpenFailsOnUnsupportedMembershipVersion(t *testing.T) {
-	// The numbers earlier pre-release commits stamped, the two ends of the byte
-	// range and both neighbours of the supported value.
+	// Small values near the supported one, the two ends of the byte range and
+	// both neighbours of the supported value.
 	for _, bad := range []byte{0, 2, 3, 4, 5, 6, 0xFF} {
 		if bad == membershipSectionVersion {
 			t.Fatalf("fixture %d is the supported version; the table must list "+
@@ -553,7 +552,7 @@ func TestSnapshotRoundTripUsesCurrentPayloadType(t *testing.T) {
 	}
 }
 
-// --- L1: failed rotation must not wedge the shard ---
+// --- failed rotation must not wedge the shard ---
 
 // truncateFailFile wraps a File and fails Truncate, driving the
 // segment.Close error path inside rotateSegment.
@@ -606,7 +605,7 @@ func TestRotateSegmentClearsSegmentOnCloseFailure(t *testing.T) {
 	}
 }
 
-// --- L2: 32-bit-safe snapshot filepath length guard ---
+// --- 32-bit-safe snapshot filepath length guard ---
 
 // TestReplaySnapshotHugeFpLenDoesNotPanic verifies a corrupt fpLen near
 // MaxUint32 is rejected as a truncated record without a slice panic. The
@@ -629,7 +628,7 @@ func TestReplaySnapshotHugeFpLenDoesNotPanic(t *testing.T) {
 	}
 }
 
-// --- L3: functional-option validation in Open ---
+// --- functional-option validation in Open ---
 
 // TestOpenValidatesFunctionalOptions verifies Open rejects invalid
 // blockSize/maxFileSize values with the same typed errors as
@@ -709,7 +708,7 @@ func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 			want:    ErrTruncatedSnapshotRecord,
 		},
 		{
-			// Base header only: the V2 writer ALWAYS emits at least 33
+			// Base header only: the writer ALWAYS emits at least 33
 			// membership bytes, so a wholly absent section is corruption.
 			name:    "snapshot missing membership section",
 			payload: append([]byte{payloadTypeSnapshot}, make([]byte, snapshotRecordBaseSize)...),
@@ -785,12 +784,12 @@ func TestReplaySnapshotAcceptsFullMembershipSection(t *testing.T) {
 }
 
 // TestReplaySnapshotRoundTripsEveryMembershipField is the equivalence
-// statement for the single-version collapse of this section: every field the
+// statement for this section's single layout: every field the
 // layout carries — all six maps, the witness policy and the replicated session
 // policy — must survive SaveSnapshot and replay intact.
 //
-// The version gate is EXACT, so there is no longer a tail this replayer may
-// skip and no earlier layout whose absent fields would decode as empty. That
+// The version gate is EXACT, so there is no tail this replayer may skip and no
+// other layout whose absent fields would decode as empty. That
 // makes a dropped field silent rather than loud: it would come back as an empty
 // map with no error anywhere, and for the two identity maps that is a security
 // regression, not a data-loss one. Identities is the receive gate's only

@@ -17,8 +17,7 @@
 //
 // # The race this exists to remove
 //
-// Every integration suite in this repository used to spell the reservation the
-// same way:
+// The obvious way to spell the reservation is:
 //
 //	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
 //	addr := pc.LocalAddr().String()
@@ -35,9 +34,10 @@
 //
 // which is the identical pool the kernel draws from for the local port of an
 // OUTBOUND connection, and the identical pool the NEXT call to this helper
-// draws from. #131 is the second of those: a four-node cluster asked for four
-// ports and was handed the same one twice, and the engine's membership
-// validation refused the shard before the test had asserted anything.
+// draws from. The second of those is the common failure: a four-node cluster
+// asks for four ports and is handed the same one twice, and the engine's
+// membership validation refuses the shard before the test has asserted
+// anything.
 //
 //	lease_read_test.go:716: StartShard[0] shard=1 failed: quicraft: invalid
 //	member in shard 1: replica 2 address "127.0.0.1:36761": address is already
@@ -69,7 +69,7 @@
 //	netport      :  0                                   ,   0
 //
 // That is roughly one duplicate per 6,900 adjacent reservations, which is why
-// #131 reads as an occasional CI failure rather than a reproducible one: a full
+// it reads as an occasional CI failure rather than a reproducible one: a full
 // suite makes a few thousand adjacent pairs, so it loses this coin every few
 // runs. The 150 failed binds are the same race caught one step later, and are
 // the EADDRINUSE documented in test/performance/benchutil.
@@ -84,19 +84,18 @@
 // outbound connect() — so nothing but this package can be handed a port it has
 // handed out, and the interval between reservation and bind stops mattering.
 //
-// This is the reasoning of #104 applied to the port instead of the host. There,
-// dummy member addresses were colliding with live nodes and the fix moved them
-// to a distinct loopback host rather than to a higher port, because "high
+// The same reasoning places dummy member addresses on a distinct loopback host
+// rather than on a higher port, so they cannot collide with live nodes: "high
 // enough" is a guess that a differently-configured runner invalidates while a
 // space the kernel cannot choose from is not. The window here is derived from
 // the running kernel's own sysctl for the same reason.
 //
 // Three collision sources, and what happens to each:
 //
-//   - Kernel re-assignment between reservation and bind — the #131 defect and
-//     the EADDRINUSE documented in test/performance/benchutil. REMOVED: the
+//   - Kernel re-assignment between reservation and bind — the duplicate-port
+//     failure and the EADDRINUSE documented in test/performance/benchutil. REMOVED: the
 //     window is disjoint from the pool the kernel assigns from.
-//   - Two reservations in one process — what #131 actually observed. REMOVED:
+//   - Two reservations in one process — the case a cluster hits. REMOVED:
 //     a port handed out is recorded, and never handed out again while it may
 //     still be in flight.
 //   - Two reservations in different processes, which `go test ./...` creates by
@@ -183,7 +182,7 @@ func ReserveUDP() (string, error) {
 // nothing about that is specific to UDP. It is here rather than in a second
 // copy of this package because a copy is how the two drift — the window, the
 // recycle policy and the PID offset all have to agree or the guarantee is only
-// as good as whichever copy a caller reached for (#163).
+// as good as whichever copy a caller reached for.
 //
 // This engine speaks QUIC and reserves UDP; the TCP form exists for the
 // comparison harnesses in test/performance, whose baselines (etcd/raft,

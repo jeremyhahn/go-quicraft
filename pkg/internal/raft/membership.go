@@ -830,12 +830,11 @@ func handleRemoveNode(m *membership, cc proto.ConfigChange) error {
 	// operation addressHolder deliberately permits by not counting removed
 	// replicas.
 	//
-	// Not deleted either, which is the half of the removal that used to be
-	// missing. Deleting it left NOTHING in replicated state to evaluate the
-	// removal deny-list against, so the gate could only ever consult the CLAIMED
-	// msg.From — and a removed replica still holds its private key, so it
-	// authenticates perfectly well and evades its own tombstone by naming any
-	// other replica ID. Retaining it here is what lets the receive path ask the
+	// Not deleted either. Deleting it would leave NOTHING in replicated state to
+	// evaluate the removal deny-list against, so the gate could only ever
+	// consult the CLAIMED msg.From — and a removed replica still holds its
+	// private key, so it authenticates perfectly well and would evade its own
+	// tombstone by naming any other replica ID. Retaining it here is what lets the receive path ask the
 	// question of the AUTHENTICATED identity instead.
 	//
 	// The record is UNCONDITIONAL and deterministic, like every other apply-path

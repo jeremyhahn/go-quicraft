@@ -22,16 +22,14 @@ import (
 	"testing"
 )
 
-// TestEveryTolerantLoopIsFloored is the gate the first two passes at #181
-// were missing.
+// TestEveryTolerantLoopIsFloored gates every tolerant loop on the floor.
 //
 // A benchmark loop that tolerates errors -- `errored++` or `errCount.Add(1)`
 // followed by `continue` -- MUST hand its counts to requireFloor, or a run in
 // which every operation failed reports zero samples and passes clean. The
 // unit tests over proposeFloorVerdict prove the floor's arithmetic; nothing
-// proved that each loop actually calls it. The first pass floored five loops
-// and missed two; a peer review caught one of them and a scan found the
-// other. Both were the same shape: counted, logged, never checked.
+// proved that each loop actually calls it, and the easy miss is a loop that is
+// counted, logged, and never checked.
 //
 // The gate parses this file rather than running it, so it costs nothing and
 // needs no cluster. For every function that increments an error counter, it
@@ -82,7 +80,7 @@ func TestEveryTolerantLoopIsFloored(t *testing.T) {
 		if !floors {
 			t.Errorf("%s counts tolerated errors but never calls requireFloor: a run "+
 				"in which every operation failed would report no samples and pass "+
-				"clean (#181)", fn.Name.Name)
+				"clean", fn.Name.Name)
 		}
 		if !stops {
 			t.Errorf("%s counts tolerated errors without classifying them through "+

@@ -112,8 +112,17 @@ func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 		t.Fatal("StartShard accepted a wildcard certificate covering every peer; " +
 			"a single compromised replica can speak for every node")
 	}
-	if !errors.Is(startErr, transport.ErrSharedPeerCertificate) {
-		t.Fatalf("StartShard error = %v, want transport.ErrSharedPeerCertificate", startErr)
+	// Matched through the PUBLIC re-exports, the only names an embedder can
+	// write.
+	if !errors.Is(startErr, ErrSharedPeerCertificate) {
+		t.Fatalf("StartShard error = %v, want ErrSharedPeerCertificate", startErr)
+	}
+	var shared *SharedPeerCertificateError
+	if !errors.As(startErr, &shared) {
+		t.Fatalf("StartShard error = %v (%T), want *SharedPeerCertificateError", startErr, startErr)
+	}
+	if len(shared.CoveredPeers) != 2 {
+		t.Fatalf("CoveredPeers = %v, want the two other members' hosts", shared.CoveredPeers)
 	}
 	// The shard must not have been created by the rejected call.
 	if _, loaded := h.nodes.Load(uint64(1)); loaded {
@@ -202,8 +211,12 @@ func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 			"(SourceAddress clearing, peerEpoch/eviction, snapshot-sender " +
 			"binding) now succeeds for that address from any replica")
 	}
-	if !errors.Is(addErr, transport.ErrSharedPeerCertificate) {
-		t.Fatalf("RequestAddNode error = %v, want transport.ErrSharedPeerCertificate", addErr)
+	if !errors.Is(addErr, ErrSharedPeerCertificate) {
+		t.Fatalf("RequestAddNode error = %v, want ErrSharedPeerCertificate", addErr)
+	}
+	var shared *SharedPeerCertificateError
+	if !errors.As(addErr, &shared) {
+		t.Fatalf("RequestAddNode error = %v (%T), want *SharedPeerCertificateError", addErr, addErr)
 	}
 
 	// The membership must be unchanged: the rejection happens before the

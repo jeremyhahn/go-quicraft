@@ -37,15 +37,11 @@ var (
 		"AGENTS.md export-ignore",
 		"**/.claude/** export-ignore",
 		"**/.serena/** export-ignore",
-		".github/workflows/opencode-review.yml export-ignore",
-		".github/workflows/claude-review.yml export-ignore",
 		".github/workflows/automerge.yml export-ignore",
 		"/.release-allowed-signers export-ignore",
 	}
 	dockerignoreEntries = []string{
 		"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena",
-		".github/workflows/opencode-review.yml",
-		".github/workflows/claude-review.yml",
 		".github/workflows/automerge.yml",
 		".release-allowed-signers",
 	}
@@ -135,7 +131,7 @@ func TestThePlantedViolationIsCaught(t *testing.T) {
 }
 
 // TestTheAllowListDoesNotReachTheValuesThisChangeRemoved pins the scrub: the
-// files #213 neutralised are scanned in full, not excused. If an allow-list
+// files whose lab values were neutralised are scanned in full, not excused. If an allow-list
 // entry ever widens to cover one of them, this fails.
 func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 	for _, name := range []string{
@@ -189,8 +185,7 @@ func TestIsDevelopmentTooling(t *testing.T) {
 
 func TestIsPrivateWorkflowFile(t *testing.T) {
 	cases := map[string]bool{
-		".github/workflows/opencode-review.yml":  true,
-		".github/workflows/claude-review.yml":    true,
+		".github/workflows/claude-review.yml":    false,
 		".github/workflows/automerge.yml":        true,
 		".release-allowed-signers":               true,
 		".github/workflows/ci.yml":               false,
@@ -268,23 +263,21 @@ func TestGitArchiveHonoursTheExclusionList(t *testing.T) {
 		t.Fatalf("reading .gitattributes: %v", err)
 	}
 	root, _ := writeTree(t, map[string]string{
-		".gitattributes":                        string(attrs),
-		"go.mod":                                "module example.com/m\n",
-		"pkg/a/a.go":                            "package a\n",
-		"CLAUDE.md":                             "private\n",
-		"AGENTS.md":                             "private\n",
-		"pkg/a/CLAUDE.md":                       "private\n",
-		".claude/agents/go-quicraft.md":         "private\n",
-		".serena/memories/notes.md":             "private\n",
-		"test/x/.serena/project.yml":            "private\n",
-		"docs/claude-review.md":                 "public\n",
-		".github/workflows/ci.yml":              "public\n",
-		".github/dependabot.yml":                "public\n",
-		".github/workflows/opencode-review.yml": "private\n",
-		".github/workflows/claude-review.yml":   "private\n",
-		".github/workflows/automerge.yml":       "private\n",
-		".release-allowed-signers":              "private\n",
-		"sub/.release-allowed-signers":          "public\n",
+		".gitattributes":                  string(attrs),
+		"go.mod":                          "module example.com/m\n",
+		"pkg/a/a.go":                      "package a\n",
+		"CLAUDE.md":                       "private\n",
+		"AGENTS.md":                       "private\n",
+		"pkg/a/CLAUDE.md":                 "private\n",
+		".claude/agents/go-quicraft.md":   "private\n",
+		".serena/memories/notes.md":       "private\n",
+		"test/x/.serena/project.yml":      "private\n",
+		"docs/claude-review.md":           "public\n",
+		".github/workflows/ci.yml":        "public\n",
+		".github/dependabot.yml":          "public\n",
+		".github/workflows/automerge.yml": "private\n",
+		".release-allowed-signers":        "private\n",
+		"sub/.release-allowed-signers":    "public\n",
 	})
 	runGit(t, root, "init", "-q")
 	runGit(t, root, "add", "-A")

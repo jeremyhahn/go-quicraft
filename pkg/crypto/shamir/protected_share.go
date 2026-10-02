@@ -35,8 +35,7 @@ import (
 // It exists because the failure it stands in for cannot be produced otherwise.
 // Reaching a refused mlock for real means driving RLIMIT_MEMLOCK to its ceiling
 // across the whole process, which would fail allocations in every unrelated test
-// sharing the binary rather than the one under test — and under memguard it was
-// worse still, taking the binary down and destroying every enclave in it. The
+// sharing the binary rather than the one under test. The
 // ownership contract on that path — the value is already wiped, and the error is
 // a *ProtectedMemoryError rather than a *ValidationError — is exactly what a
 // caller gets wrong silently, so it is worth being able to test.
@@ -53,13 +52,13 @@ var newProtectedMemory = enclave.NewMemoryEnclave
 // share value is written straight into these pages and frozen there.
 //
 // EVERY sized allocation in this package goes through it, not only the per-share
-// one in SplitProtected's loop. SplitProtected's three pre-loop buffers (the
+// one in SplitProtected's loop: SplitProtected's three pre-loop buffers (the
 // coefficient pool, the coefficient vector and the share payload) and both of
-// CombineProtected's (the decode scratch and the returned secret) used to call
-// enclave.NewMemoryEnclaveSized directly, which left their refusal paths — a
-// kernel that denies the lock, and the *ProtectedMemoryError each maps it to —
-// as the only ones the errLockRefused injection could not reach, and the only
-// ones untested (#95). A seam half the call sites bypass is not a seam.
+// CombineProtected's (the decode scratch and the returned secret) included. A
+// call site that bypassed it would leave its refusal path — a kernel that
+// denies the lock, and the *ProtectedMemoryError it maps to — out of reach of
+// the errLockRefused injection, and so untested. A seam half the call sites
+// bypass is not a seam.
 //
 // Both seams stand in for the UNBUDGETED constructors only. A call that was
 // handed an [enclave.Allocator] — the ...With variants — allocates through it
@@ -133,7 +132,7 @@ func testOnlySizedProtectedMemory(fn func(int) (*enclave.MemoryEnclave, error)) 
 // is not page-rounded. NewProtectedShare makes exactly one allocation, whose
 // real cost is lockedBytes of that value — at most one page more than this
 // number, and no share count multiplies it. The under-counting that page
-// rounding fixes (issue #94) is a property of the SET paths, where one page of
+// rounding prevents is a property of the SET paths, where one page of
 // slack per share is the dominant term; here it cannot compound. The paths that
 // build a set from many NewProtectedShare calls — UnmarshalShareSet, and
 // seal.ShamirInitResult.UnmarshalJSON through it — price the set page-rounded
@@ -177,8 +176,8 @@ func lockedBytes(n int) int {
 // MaxShareSetBytes is the locked memory this package will spend on ONE share
 // set, counted in the PAGES the kernel charges rather than the bytes a caller
 // asks for. It is maxShareSetPages pages, so its BYTE value depends on the
-// host's page size (#102). Both paths that can allocate a whole set enforce it before they
-// allocate any of it: SplitProtected against the page-rounded footprint its
+// host's page size. Both paths that can allocate a whole set enforce it before
+// they allocate any of it: SplitProtected against the page-rounded footprint its
 // parameters imply, and UnmarshalShareSet against the page-rounded sum of the
 // undecoded elements (every share value is a substring of its element, so the
 // element bounds the buffer it will produce).
@@ -192,24 +191,20 @@ func lockedBytes(n int) int {
 // combination of legal arguments must produce an error rather than a refusal
 // deep inside a half-built share set.
 //
-// The stakes used to be higher and the sentence here said so: under memguard a
-// failed lock TERMINATED THE PROCESS. Since the go-enclave adoption a refusal is
-// a typed *ProtectedMemoryError that fails exactly the allocation that hit the
-// ceiling. The bound is still worth enforcing up front — refusing before
-// allocating is the difference between a clean error and a partially built set
-// that has to be torn down — but it no longer stands between a caller and a
-// dead service.
+// A refused lock is a typed *ProtectedMemoryError that fails exactly the
+// allocation that hit the ceiling. The bound is still worth enforcing up front:
+// refusing before allocating is the difference between a clean error and a
+// partially built set that has to be torn down.
 //
-// # Why it is a page count and not a byte count (#102)
+// # Why it is a page count and not a byte count
 //
-// It was a fixed 2 << 20, and that number is 512 pages on a 4 KiB-page host
-// only. The budget it expresses is a PAGE budget — every figure the derivation
-// below turns on is a page count — so stating it in the bytes of one particular
-// host made the primitive's headline case fail on every other. On a 16 KiB-page
-// host the 255-share split of a 32-byte root key costs the same 260 pages,
-// which is 4,259,840 bytes and was refused; at 64 KiB it missed by a factor of
-// eight. 64 KiB pages are not exotic — RHEL and CentOS Stream arm64 kernels
-// ship with them — and CI is amd64-only, so no gate could see it.
+// The budget is a PAGE budget — every figure the derivation below turns on is a
+// page count — so stating it in the bytes of one particular host would make the
+// primitive's headline case fail on every other. A fixed 2 << 20 is 512 pages
+// on a 4 KiB-page host only: on a 16 KiB-page host the 255-share split of a
+// 32-byte root key costs the same 260 pages, which is 4,259,840 bytes and would
+// be refused; at 64 KiB it would miss by a factor of eight. 64 KiB pages are not
+// exotic — RHEL and CentOS Stream arm64 kernels ship with them.
 //
 // The page size comes from enclave.LockedSize(1), the allocator's own answer,
 // for the reason lockedBytes gives: the page size is the allocator's property,
@@ -222,23 +217,21 @@ func lockedBytes(n int) int {
 // Linux host commonly defaults to, a maximal set is a quarter of the ceiling at
 // 4 KiB pages and FOUR TIMES it at 64 KiB. That is not this cap admitting more
 // than it should: the kernel charges 512 pages either way, so the operator on a
-// large-page host must raise RLIMIT_MEMLOCK. The old constant did not make that
-// cost smaller, it just refused the operation instead of naming the cost.
+// large-page host must raise RLIMIT_MEMLOCK. A byte-valued constant would not
+// make that cost smaller, it would just refuse the operation instead of naming
+// the cost.
 //
-// # Why 512 pages, and why it is not 256 any more
+// # Why 512 pages
 //
-// It was 256 pages (1 MiB) while the accounting summed REQUESTED bytes, and
-// both halves of that were wrong together: the pricing under-counted a
-// 255-share split by ~680x (issue #94), so the cap looked generous while
-// admitting sets that lock far more than it names. Page-rounded, a share set
-// costs at least one page per share, and the arithmetic that fixes the pricing
-// moves the budget with it.
+// Page-rounded, a share set costs at least one page per share. Summing
+// REQUESTED bytes instead under-counts a 255-share split by ~680x, so a cap
+// stated that way looks generous while admitting sets that lock far more than
+// it names.
 //
 // The floor is the headline case this primitive exists to serve — the full
-// 255-share split of a 32-byte root key, which is 259 pages and no longer fits
-// 256. A cap that refuses the operation the package
-// is for is not a cap, it is a bug, so the constant had to rise; what follows is
-// where it was put and why.
+// 255-share split of a 32-byte root key, which is 259 pages and does not fit
+// 256. A cap that refuses the operation the package is for is not a cap, it is
+// a bug; what follows is where the cap is put and why.
 //
 // 512 pages is set at the natural edge of the regime the primitive serves: a
 // split whose ENCODED SHARE FITS ONE PAGE. That is every secret up to 3070
@@ -251,8 +244,7 @@ func lockedBytes(n int) int {
 // rather than a key. Envelope large payloads under a key that IS this size,
 // exactly as MaxSecretBytes says.
 //
-// Every one of those figures is a page count and holds at any page size, which
-// is the property the byte-valued constant did not have.
+// Every one of those figures is a page count and holds at any page size.
 //
 // This bounds ONE call: a process running several at once — or holding sets
 // after they return — still has to bound itself.
@@ -282,10 +274,9 @@ const maxShareSetPages = 512
 //
 // The derivation is a function rather than an expression inlined above so a
 // test can evaluate it at page sizes this host does not have. On a 4 KiB-page
-// host the derived budget and the fixed 2 << 20 it replaced are the SAME
-// NUMBER, so no assertion on MaxShareSetBytes can tell them apart here; what a
-// test can pin is that the budget scales with the page size, and that is this
-// function.
+// host the derived budget equals a fixed 2 << 20, so no assertion on
+// MaxShareSetBytes can tell the two apart there; what a test can pin is that
+// the budget scales with the page size, and that is this function.
 func maxShareSetBytesFor(pageSize int) int { return maxShareSetPages * pageSize }
 
 // splitLockedBytes reports the locked memory SplitProtected holds at its peak
@@ -295,23 +286,17 @@ func maxShareSetBytesFor(pageSize int) int { return maxShareSetPages * pageSize 
 //
 // Every term is priced through lockedBytes, SEPARATELY, because each is its own
 // enclave and the kernel charges each a whole page. Summing the requested sizes
-// first and rounding once at the end is the bug this replaces: it prices 255
-// four-byte share values at 1020 bytes when the kernel charges 255 pages, and
-// measured against VmLck a 255-share split of a one-byte secret came out 680x
-// over its own price — 1,044,480 charged against 1,536 priced (issue #94). The
-// per-share rounding, not the secret size, is what dominates a wide split.
+// first and rounding once at the end would price 255 four-byte share values at
+// 1020 bytes when the kernel charges 255 pages: measured against VmLck, a
+// 255-share split of a one-byte secret priced that way comes out 680x over its
+// own price — 1,044,480 charged against 1,536 priced. The per-share rounding,
+// not the secret size, is what dominates a wide split.
 //
-// THE ENCODING SCRATCH USED TO BE A TERM HERE and no longer is, because the
-// scratch itself is gone. go-enclave had no post-fill freeze, so a share's
-// frozen value had to be built by copying OUT of a reused writable scratch, and
-// for the duration of that copy both regions were live — which made the scratch
-// part of the PEAK rather than an implementation detail. Omitting it was not a
-// rounding error; it made MaxShareSetBytes stop being an upper bound (caught by
-// Codex on PR #69). Each share is now encoded directly into its own sized
-// enclave and frozen in place (go-enclave #6, adopted in #83), so nothing is
-// live that this does not count. The figures that used to be quoted here for
-// that defect were summed in requested BYTES and correspond to nothing this
-// function computes any more, so they are gone with the term.
+// There is no encoding-scratch term. Each share is encoded directly into its
+// own sized enclave and frozen in place with go-enclave's Freeze, so no second
+// writable region is live alongside it. Were a reused scratch reintroduced, it
+// would be live for the duration of every copy out of it and would have to be
+// priced here, or MaxShareSetBytes would stop being an upper bound.
 //
 // The multiplication cannot overflow because validateSplitParams runs first and
 // bounds each factor — the secret to MaxSecretBytes (64 KiB) and both threshold
@@ -459,8 +444,7 @@ func newProtectedShare(a *enclave.Allocator, index, threshold, total int, value 
 	// and parseRawShare rejects it during combine. Here the allocation is
 	// mlock'd memory: a finite PROCESS-WIDE resource (RLIMIT_MEMLOCK), so what
 	// one caller takes is denied to every other, and the next to reach the
-	// ceiling is refused with ErrLockedMemoryUnavailable. Under memguard the
-	// same exhaustion TERMINATED THE PROCESS. UnmarshalJSON constructs from
+	// ceiling is refused with ErrLockedMemoryUnavailable. UnmarshalJSON constructs from
 	// operator-supplied JSON, which at a recovery ceremony is unauthenticated
 	// by construction, so a value made of arbitrarily many legal base64
 	// characters must not be able to reach the locking allocator at all.
@@ -524,11 +508,10 @@ func newProtectedShare(a *enclave.Allocator, index, threshold, total int, value 
 // every returned value — is priced against MaxShareSetBytes before the first
 // allocation and refused with a *SplitError if it does not fit. Arguments that
 // are individually legal can multiply into one that is not: see MaxShareSetBytes
-// for what fits and what to do instead. That pricing used to carry more weight
-// still: under memguard a lock the kernel refused terminated the process, so
-// there was no failure left to report. It is now an ErrLockedMemoryUnavailable
-// on the one allocation that hit the ceiling — recoverable, and still not what
-// this API should hand back for arguments it could have priced.
+// for what fits and what to do instead. Without that pricing the failure would
+// be an ErrLockedMemoryUnavailable on the one allocation that hit the ceiling —
+// recoverable, but not what this API should hand back for arguments it could
+// have priced.
 //
 // Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator]. A
 // caller that bounds its locked memory with one uses SplitProtectedWith.
@@ -573,9 +556,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 	// first allocation, so a caller that asks for too much gets a *SplitError
 	// naming the arithmetic rather than an ErrLockedMemoryUnavailable partway
 	// through a set it must then tear down — and rather than draining the
-	// process-wide locked-memory budget on its way to failing. Under memguard
-	// there was no error to get back at all: the lock that could not be taken
-	// terminated the process.
+	// process-wide locked-memory budget on its way to failing.
 	if need := splitLockedBytes(len(secret), threshold, total); need > MaxShareSetBytes {
 		return nil, &SplitError{Reason: fmt.Sprintf(
 			"%d-of-%d shares of a %d-byte secret need %d bytes of locked memory, exceeding the %d-byte budget",
@@ -638,10 +619,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 	// is a locked-memory refusal — an allocation for a share value, or the
 	// mprotect that freezes it — so they fire when locked memory is already
 	// scarce, and a leak there makes the shortage permanent rather than
-	// transient. They are REACHABLE now, which they were not before the freeze
-	// collapse: the loop used to allocate nothing (a single scratch was hoisted
-	// above it) and the only per-share call was a copy that could not fail once
-	// the scratch existed.
+	// transient.
 	failed := func(op string, err error) error {
 		for _, s := range shares {
 			s.Destroy()
@@ -659,14 +637,10 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 		}
 		// Encoded DIRECTLY into the region the share will own, then frozen. The
 		// share material exists in exactly one place from the moment it exists at
-		// all, and that place is locked and wipeable.
-		//
-		// This used to go through a reused writable scratch and a
-		// NewMemoryEnclave copy out of it, because a sized enclave could not be
-		// frozen after the fill. go-enclave v0.5.0-alpha's Freeze (go-enclave #6)
-		// removed the copy, one whole locked region from the peak footprint (see
-		// splitLockedBytes), and the window in which two copies of a share value
-		// were live at once.
+		// all, and that place is locked and wipeable. Freezing after the fill
+		// avoids a reused writable scratch and a copy out of it, which would add
+		// a locked region to the peak footprint (see splitLockedBytes) and a
+		// window in which two copies of a share value were live at once.
 		value, err := lockSized(a, encodedLen)
 		if err != nil {
 			return nil, failed("locking share value", err)
@@ -719,11 +693,9 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 // locked footprint of a reconstruction proportional to the submission — 255
 // shares of a MaxSecretBytes secret would be another ~16 MiB on top of the
 // shares themselves — and locked memory is PROCESS-WIDE, so a peak taken here
-// is a peak denied to every other caller until this call returns. Under memguard
-// it could not be failed gracefully at all, since a refused lock terminated the
-// process; it is now an ErrLockedMemoryUnavailable, which is reportable and
-// still not something an untrusted share set should get to provoke.
-// So the shares are walked twice against a single reusable buffer: once to
+// is a peak denied to every other caller until this call returns, and its
+// failure — an ErrLockedMemoryUnavailable — is not something an untrusted share
+// set should get to provoke. So the shares are walked twice against a single reusable buffer: once to
 // validate them and collect the x-coordinates, then, with the Lagrange basis
 // those fix, once more to accumulate each share's contribution into the
 // result. Decoding base64 twice is cheap; a peak that an untrusted share set
@@ -733,8 +705,8 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 // to get wrong. It allocates TWO regions whatever the size of the set — the
 // decode buffer and the secret scratch — each bounded by a share value the
 // constructor already bounded, so page rounding costs at most two pages of
-// slack in total and nothing multiplies by the share count. The under-counting
-// fixed in issue #94 was per-share rounding summed 255 times, which cannot
+// slack in total and nothing multiplies by the share count. Per-share rounding
+// summed 255 times, the under-count that matters on the split path, cannot
 // arise here. The shares themselves were locked by whoever built them, against
 // MaxShareSetBytes on that path.
 //
@@ -846,14 +818,9 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	// Materialized HERE, outside every WithValue below. buf is created in this
 	// function and never escapes it, so no other goroutine can destroy it while
 	// the loop runs — which is the condition go-enclave's Open documents as the
-	// one that makes an aliasing view safe.
-	//
-	// It used to be hoisted for a stronger reason: borrowing was process-wide —
-	// this repository's own pkg/enclave (since deleted) serialized every borrow
-	// against any memguard operation that could purge the process — so touching a
-	// second enclave from inside a share's borrow DEADLOCKED. go-enclave holds only
-	// the borrowed enclave's own read lock, so nesting is merely unnecessary here
-	// rather than fatal.
+	// one that makes an aliasing view safe. go-enclave holds only the borrowed
+	// enclave's own read lock, so opening buf inside a share's borrow would also
+	// be safe; hoisting it is a clarity choice.
 	bufBytes, err := buf.Open()
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "opening decode buffer", Err: err}
@@ -896,8 +863,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	// decoded and its payload immediately overwritten by the next.
 	basis := gfLagrangeZero(xs)
 	// THE ENCLAVE THIS FUNCTION RETURNS, allocated before a single share is
-	// accumulated and written into in place. It is not a scratch — which is what
-	// it used to be, when a frozen result had to be copied out of it — so it is
+	// accumulated and written into in place. It is not a scratch, so it is
 	// destroyed on every error path below and on none of the success path.
 	secret, err := lockSized(a, secretLen)
 	if err != nil {
@@ -927,14 +893,10 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 		}
 	}
 	// FROZEN for the same reason a share value is: the reconstructed key is final,
-	// and nothing should mutate it in place.
-	//
-	// It used to be a MOVE into a second, from-bytes enclave, because a sized
-	// enclave could not be frozen after its fill. That paid a locked-to-locked
-	// copy and held two regions holding the same secret for its duration.
-	// go-enclave v0.5.0-alpha's Freeze (go-enclave #6) mprotects the region the
+	// and nothing should mutate it in place. Freeze mprotects the region the
 	// accumulation already wrote into, so the secret exists in exactly one place
-	// for its whole life and this function returns the enclave it built.
+	// for its whole life and this function returns the enclave it built — no
+	// locked-to-locked copy, and no second region holding the same secret.
 	//
 	// A refused freeze is destroyed rather than returned: the caller is promised
 	// material it can read and destroy, not a buffer it can silently corrupt.
@@ -959,14 +921,14 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 // bytes. Value is appropriate where the share is owned by one goroutine, which
 // is the ordinary custody shape. Where a ceremony may tear shares down while a
 // reader is still working — a cancelled or timed-out reconstruction — use
-// WithValue, which holds the lock across the callback. See issue #15.
+// WithValue, which holds the lock across the callback.
 func (s *ProtectedShare) Value() []byte {
 	if s == nil || s.value == nil {
 		return nil
 	}
 	// Open aliases the locked pages without holding a lock past this return,
-	// which is the contract Value has always had; an error here means the share
-	// was destroyed, which Value reports as nil exactly as it always did.
+	// which is Value's contract; an error here means the share was destroyed,
+	// which Value reports as nil.
 	b, err := s.value.Open()
 	if err != nil {
 		return nil
@@ -987,14 +949,10 @@ func (s *ProtectedShare) Value() []byte {
 // while that mutator waits on fn's own borrow; a nested Destroy waits on the
 // borrow directly.
 //
-// fn MAY touch a different share or enclave, and that is a relaxation of what
-// this comment previously said. Under the old process-wide borrow lock
-// (go-quicraft#18) a nested borrow of any second share deadlocked against an
-// allocation, Destroy or Freeze queued anywhere in the process. go-enclave holds
-// only the borrowed enclave's own read lock, so that hazard is gone with the lock
-// that created it. Re-entering THIS share is still forbidden, for the ordinary
-// reason above. CombineProtected still hoists its decode buffer, now as a
-// clarity choice rather than a requirement.
+// fn MAY touch a different share or enclave: go-enclave holds only the
+// borrowed enclave's own read lock, so a nested borrow of a second share does
+// not contend with anything but that share. Re-entering THIS share is
+// forbidden, for the reason above.
 func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
 	if s == nil || s.value == nil {
 		return enclave.ErrEnclaveDestroyed
@@ -1004,8 +962,8 @@ func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
 
 // Destroy wipes the share's value and releases its protected memory. It is
 // safe to call on a nil receiver, more than once, and concurrently with
-// itself, with Value and with WithValue — exactly one caller reaches memguard,
-// and the enclave's lock keeps teardown from interleaving with a read in
+// itself, with Value and with WithValue — exactly one caller performs the
+// wipe, and the enclave's lock keeps teardown from interleaving with a read in
 // progress.
 //
 // What it cannot make safe is a slice a caller already took from Value and is
@@ -1042,7 +1000,6 @@ func (s *ProtectedShare) Validate() error {
 	// header rather than the protected pages — but "no read of a share's value
 	// outside a borrow" is only a useful rule if it is mechanical, and an
 	// exception here is one a later change would copy without the reasoning.
-	// Taken from the parallel work on PR #16, whose argument this is.
 	empty := false
 	if err := s.WithValue(func(v []byte) error {
 		empty = len(v) == 0
@@ -1108,11 +1065,10 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 	const metaKey = `,"metadata":`
 
 	// The WHOLE encoding happens inside the borrow, not just the read of the
-	// value. An earlier version took `val := s.Value()`, which ends the borrow
-	// at the point it returns, and then appended `val` into the output — a read
-	// of the aliasing slice after the enclave was free to be destroyed, which is
-	// the same use-after-destroy this change exists to close (issue #15,
-	// Codex round 3). Copying the value out first would be worse, not better:
+	// value. Taking `val := s.Value()` and appending it afterwards would end the
+	// borrow at the point Value returns and then read the aliasing slice after
+	// the enclave was free to be destroyed — a use-after-destroy. Copying the
+	// value out first would be worse, not better:
 	// it would mint exactly the unprotected copy of share material this type
 	// holds an enclave to avoid. So the append runs where the bytes are still
 	// guaranteed mapped.
@@ -1233,9 +1189,9 @@ func decodeProtectedShare(a *enclave.Allocator, data []byte) (*ProtectedShare, e
 //
 // It is the SINGLE copy of that arithmetic, called by the guard and asserted
 // against by its tests. A test that recomputed the sum for itself would track
-// whatever the right answer is regardless of what the guard does, which is the
-// same "witness derived from the code under test" failure that let the
-// under-counting of issue #94 stand certified for as long as it did.
+// whatever the right answer is regardless of what the guard does — a witness
+// derived from the code under test, which certifies an under-count as readily
+// as a correct sum.
 //
 // The sum STOPS at the first element that carries it past the budget. That is
 // what keeps it from overflowing: rounding adds up to a page per element on top
@@ -1266,7 +1222,7 @@ func shareSetLockedBytes(raw []json.RawMessage) int {
 // itself produced. Priced per value the two agree by construction — this sum is
 // exactly splitLockedBytes' total*lockedBytes(encoded) term, and that function
 // adds four more positive terms on top — so whatever a split admits, this
-// admits. Caught in review of #94.
+// admits.
 //
 // The value is read out as a RAW token, so its length is the length of the
 // literal NewProtectedShare will be handed, escapes and all; the enclave is
@@ -1302,11 +1258,9 @@ func elementLockedBytes(elem json.RawMessage) int {
 // The generic decoder allocates one mlock'd buffer per element AS IT VISITS
 // THEM, which lets the submission pick how much of a finite PROCESS-WIDE
 // resource to take: an oversized one starves every other caller of locked
-// memory, on a path that cannot authenticate the submitter. Under memguard the
-// answer to it was a dead service rather than an error, since a refused lock
-// terminated the process; it is now an ErrLockedMemoryUnavailable on whichever
-// allocation reaches the ceiling — a smaller loss, and still not one an
-// unauthenticated caller should get to choose. CombineProtected's 255-share
+// memory, on a path that cannot authenticate the submitter, and the failure —
+// an ErrLockedMemoryUnavailable on whichever allocation reaches the ceiling —
+// is not one an unauthenticated caller should get to choose. CombineProtected's 255-share
 // bound cannot help: it runs on shares that have already been allocated.
 //
 // Two checks run against the undecoded document, in this order and before the
@@ -1319,8 +1273,8 @@ func elementLockedBytes(elem json.RawMessage) int {
 //     as the sum over the elements of each element's VALUE rounded up to a whole
 //     page. Each element becomes exactly one enclave over that value, and the
 //     kernel charges it a page whatever it holds. Summing the raw lengths
-//     instead under-counts a wide set of small shares by the page size
-//     (issue #94); pricing the element rather than the value over-counts by a
+//     instead under-counts a wide set of small shares by the page size;
+//     pricing the element rather than the value over-counts by a
 //     page and puts this bound out of step with SplitProtected's, so a set the
 //     library produced could not be read back.
 //
@@ -1403,7 +1357,7 @@ func unmarshalShareSet(a *enclave.Allocator, data []byte) ([]*ProtectedShare, er
 	// one becomes exactly one enclave, and the kernel charges a whole page for
 	// it however few bytes the value holds — so summing the raw lengths prices
 	// 255 shares of a 32-byte key at ~25 KiB when they lock 255 pages, and the
-	// bound stops bounding the resource it names (issue #94).
+	// bound stops bounding the resource it names.
 	if size := shareSetLockedBytes(raw); size > MaxShareSetBytes {
 		return nil, &ValidationError{Field: "shares", Reason: fmt.Sprintf(
 			"share set needs at least %d bytes of locked memory, exceeding the %d-byte budget",

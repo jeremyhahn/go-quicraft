@@ -86,11 +86,9 @@ const slackBytes = 64 << 10
 // TestSplitProtected_BudgetIsATrueUpperBound is the witness that splitLockedBytes
 // prices what the KERNEL charges.
 //
-// This is the test issue #94 exists because of. Its predecessor asserted the
-// same property by name and could not detect the gap, because everything it
-// measured came from the accounting under test: the price said 1,536 bytes, the
-// kernel charged 1,044,480, and nothing in the assertion could tell the
-// difference. go-enclave rounds every allocation up to a whole page
+// A test that asserts this property from the accounting under test cannot
+// detect a gap: byte-summed pricing says 1,536 bytes where the kernel charges
+// 1,044,480, and nothing in such an assertion can tell the difference. go-enclave rounds every allocation up to a whole page
 // (mapping.go), a 255-share split takes 255 SEPARATE allocations, and the
 // per-share rounding — not the secret — is then the whole figure.
 //
@@ -100,7 +98,7 @@ const slackBytes = 64 << 10
 // what the kernel charges is no more than what was priced.
 //
 // MUTATION CHECK. Drop the page rounding from splitLockedBytes — price the terms
-// in requested bytes, as the code did before this issue — and the 255-share case
+// in requested bytes — and the 255-share case
 // prices at 1,536 against a measured 1,044,480, and this fails. Restore it and it
 // passes. That is the property; the count of regions handed out is not.
 func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
@@ -110,8 +108,8 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 		name                        string
 		secretLen, threshold, total int
 	}{
-		// The issue's own measurement: the per-share page rounding is 100% of
-		// the true cost and 0% of the old price.
+		// The per-share page rounding is 100% of the true cost and 0% of a
+		// byte-summed price.
 		{"255 shares of a one-byte secret", 1, maxShares, maxShares},
 		// The case the primitive exists for.
 		{"255 shares of a 32-byte root key", 32, maxShares, maxShares},
@@ -166,7 +164,7 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 				t.Fatalf("splitLockedBytes(%d,%d,%d) priced %d bytes and the kernel "+
 					"charged %d (VmLck %d -> %d, slack %d): the budget is not an "+
 					"upper bound, so MaxShareSetBytes cannot be compared to "+
-					"RLIMIT_MEMLOCK — see issue #94",
+					"RLIMIT_MEMLOCK",
 					tc.secretLen, tc.threshold, tc.total, priced, measured,
 					before, after, slackBytes)
 			}
@@ -249,8 +247,7 @@ func TestUnmarshalShareSet_BudgetIsATrueUpperBound(t *testing.T) {
 	if measured > priced+slackBytes {
 		t.Fatalf("UnmarshalShareSet priced the set at %d bytes and the kernel "+
 			"charged %d (slack %d): the ingestion bound is not an upper bound on "+
-			"the locked memory an unauthenticated submission can take — see "+
-			"issue #94", priced, measured, slackBytes)
+			"the locked memory an unauthenticated submission can take", priced, measured, slackBytes)
 	}
 
 	for _, s := range decoded {

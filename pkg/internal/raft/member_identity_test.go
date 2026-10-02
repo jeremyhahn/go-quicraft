@@ -21,13 +21,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress closes the
-// gap the first duplicate-address check documented and left open.
+// TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress pins that the
+// duplicate-address check compares canonical endpoints.
 //
-// The comparison used to be a literal string compare, so "10.0.0.5:5001" and
-// "10.0.0.05:5001" — or an uppercase hostname, or the long form of an IPv6
-// literal — were two distinct members to the configuration validator and ONE
-// host to x509.VerifyHostname, which is what the receive-side gate ultimately
+// Under a literal string compare, "10.0.0.5:5001" and "10.0.0.05:5001" — or an
+// uppercase hostname, or the long form of an IPv6 literal — would be two
+// distinct members to the configuration validator and ONE host to
+// x509.VerifyHostname, which is what the receive-side gate ultimately
 // matches on. Two committed replica IDs the certificate cannot tell apart is
 // exactly the forgery the duplicate check exists to prevent: the single host
 // behind them casts two votes and advances two match indices.

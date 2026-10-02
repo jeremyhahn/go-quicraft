@@ -681,7 +681,7 @@ session policy.
 `StartShard` calls
 `QUICTransport.VerifyPeerAddressExclusivity(RaftAddress, memberAddresses)` and
 refuses to start when this node's own leaf certificate also covers another
-member's host (`transport.ErrSharedPeerCertificate`, from an internal package).
+member's host (`ErrSharedPeerCertificate`, a `*SharedPeerCertificateError`).
 
 A wildcard certificate (`*.raft.svc.cluster.local`), or one carrying every
 node's SAN, would make every in-band authorization decision in the transport

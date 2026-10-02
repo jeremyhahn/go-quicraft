@@ -47,10 +47,9 @@ import (
 // compressed bytes — silent state corruption on restart.
 //
 // The epoch-0 + uncompressed cell is the ONE configuration in which BOTH
-// omissions are invisible, and it used to be the only configuration recovery
-// was tested in: that blind spot shipped two data-integrity bugs. Recovery
-// tests therefore run as subtests over the whole matrix so a regression names
-// the exact configuration that broke.
+// omissions are invisible, so testing recovery in that cell alone is a blind
+// spot. Recovery tests therefore run as subtests over the whole matrix so a
+// regression names the exact configuration that broke.
 // ---------------------------------------------------------------------------
 
 // snapshotVariant is one cell of the {plaintext, encrypted} × {uncompressed,
@@ -179,9 +178,9 @@ func seedLocalSnapshot(t *testing.T, db *mockLogDB, v snapshotVariant, barrier B
 // index recovery seeded it with. Measured on this fixture with a poll straight
 // after StartShard: the counter went 40 -> 41 within milliseconds on all four
 // artifact variants, so whether the assertion samples 40 or 41 is a race
-// against that tick. It was seen losing on CI (#84,
-// "ns.lastApplied = 41, want 40") while recoverCalled and the payload
-// comparison — the assertions the test exists for — passed in the same run.
+// against that tick, which can fail with "ns.lastApplied = 41, want 40" while
+// recoverCalled and the payload comparison — the assertions the test exists
+// for — pass in the same run.
 //
 // Two voters and no transport make the counter quiescent instead of merely
 // slow: the replica can never collect a second vote, so it never becomes

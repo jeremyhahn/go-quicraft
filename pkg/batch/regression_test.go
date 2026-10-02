@@ -463,12 +463,12 @@ func TestProposeContext_DoesNotAdoptShortestCallerDeadline(t *testing.T) {
 	}
 }
 
-// TestProposeContext_CapsLongCallerDeadline is the regression test for the
-// other direction. ProposeTimeout used to apply ONLY when the caller supplied
-// no deadline of its own, so a caller passing a legitimate one-hour deadline
-// bypassed it entirely: flush runs on the single flush loop and waits for the
-// shard goroutines, so the aggregator stopped flushing FOR EVERY SHARD and
-// Close blocked behind wg.Wait — exactly the wedge ProposeTimeout exists to
+// TestProposeContext_CapsLongCallerDeadline is the test for the other
+// direction. If ProposeTimeout applied ONLY when the caller supplied no
+// deadline of its own, a caller passing a legitimate one-hour deadline would
+// bypass it entirely: flush runs on the single flush loop and waits for the
+// shard goroutines, so the aggregator would stop flushing FOR EVERY SHARD and
+// Close would block behind wg.Wait — exactly the wedge ProposeTimeout exists to
 // prevent.
 func TestProposeContext_CapsLongCallerDeadline(t *testing.T) {
 	p := &ctxBoundProposer{entered: make(chan struct{})}

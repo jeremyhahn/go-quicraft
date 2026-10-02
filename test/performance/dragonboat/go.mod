@@ -32,7 +32,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
 	github.com/hashicorp/memberlist v0.3.1 // indirect
 	// go-quicraft is here only for test/netport, the one port-reservation
-	// window benchutil now delegates to (#163). A `replace` binds the MAIN
+	// window benchutil delegates to. A `replace` binds the MAIN
 	// module only, so the pair repeats in every module that reaches benchutil
 	// rather than being inherited from test/performance.
 	//
@@ -43,9 +43,8 @@ require (
 	//
 	// Measured here: klauspost/compress moves v1.16.0 -> v1.19.1, floored by the
 	// parent's prometheus/client_golang. Pebble uses it for sstable zstd, so
-	// THIS BASELINE'S COMPRESSION LIBRARY CHANGED at this commit and results
-	// either side of it are not strictly comparable. Owner ruling 2026-09-07:
-	// accepted -- re-run the profiles rather than avoid the dependency.
+	// the baseline's compression library follows the parent's floor; re-run
+	// the profiles when it moves rather than compare across the change.
 	github.com/jeremyhahn/go-quicraft v0.0.0 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
@@ -73,20 +72,18 @@ require (
 )
 
 // The benchmark measures a FORK of dragonboat, github.com/jeremyhahn/
-// dragonboat/v4, and now says so in the import paths rather than disguising it
-// as upstream. The fork exists because the benchmark needs a dragonboat that
+// dragonboat/v4, and says so in the import paths rather than disguising it as
+// upstream. The fork exists because the benchmark needs a dragonboat that
 // compiles against PebbleDB v1.1.5, which upstream v4.0.0 does not.
 //
-// This used to require github.com/lni/dragonboat/v4 and redirect it with
+// Requiring github.com/lni/dragonboat/v4 and redirecting it with a replace
+// such as
 //
 //	github.com/lni/dragonboat/v4 => ../../../../dragonboat
 //
-// a replace that escaped the repository altogether: it resolved only on a
-// machine that happened to have the fork checked out four levels up, and
-// failed on every clean checkout. Nothing caught it, because the CI job meant
-// to build the nested modules never expanded its matrix and silently rebuilt
-// the root module instead — the release gate was the first to build this for
-// real, and it stopped there.
+// would escape the repository altogether: it resolves only on a machine that
+// happens to have the fork checked out four levels up, and fails on every
+// clean checkout.
 //
 // Pinning the fork by version rather than replacing upstream with it is not
 // just tidier, it is the only form that works: once the fork declares its own
@@ -99,9 +96,8 @@ require (
 // resolve github.com/jeremyhahn/dragonboat/v4 from GitHub through
 // proxy.golang.org. Development machines and the CI runner set
 // GOPRIVATE=github.com/jeremyhahn/* and rewrite that prefix to the internal
-// Gitea, so they resolve it from the mirror there instead — which is why CI
-// failed with "repository not found" until the fork was mirrored, despite the
-// GitHub repository being public.
+// Gitea, so they resolve it from the mirror there instead — which is why the
+// fork must be mirrored there even though the GitHub repository is public.
 //
 // The perf module is unpublished, so that one still resolves from the sibling
 // directory.

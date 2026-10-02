@@ -632,9 +632,8 @@ func TestSealedRootKeyData_NilNonceAndPayload(t *testing.T) {
 // --- Credentials ---
 
 // TestCredentials_ZeroValue pins the contract every ambient-credential strategy
-// relies on: the zero value is legal and means "none supplied". #41 retyped
-// Secret from []byte to a *enclave.SealedEnclave, and a nil pointer has to keep
-// meaning what a nil slice meant.
+// relies on: the zero value is legal and means "none supplied". Secret is a
+// *enclave.SealedEnclave, and a nil pointer means no secret.
 func TestCredentials_ZeroValue(t *testing.T) {
 	c := Credentials{}
 	if c.Secret != nil {

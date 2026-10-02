@@ -54,14 +54,14 @@ func rotateBarrierTo(t *testing.T, db *DB, want uint64) {
 // TestSaveState_RolledBackBatchDoesNotLowerEpochFloor pins the epoch floor to
 // DURABLE records only.
 //
-// The floor (minWriteEpoch / segmentEpochs) used to be applied inside
-// writeRecord, in SaveState's Phase 1 — before the fsync and before the batch
-// was known to commit. A batch that then rolled back left its epoch behind
-// permanently: rollbackShard drops segmentEpochs only for the intermediate
-// segments it unlinks, and never restores minWriteEpoch or recomputes the
-// checkpoint segment's entry. MinLiveEpoch therefore reported a floor pinned
-// to an epoch no live record was ever encrypted under, and the engine could
-// never purge that DEK.
+// Applying the floor (minWriteEpoch / segmentEpochs) inside writeRecord, in
+// SaveState's Phase 1 — before the fsync and before the batch is known to
+// commit — would leave a rolled-back batch's epoch behind permanently:
+// rollbackShard drops segmentEpochs only for the intermediate segments it
+// unlinks, and never restores minWriteEpoch or recomputes the checkpoint
+// segment's entry. MinLiveEpoch would then report a floor pinned to an epoch
+// no live record was ever encrypted under, and the engine could never purge
+// that DEK.
 func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -91,8 +91,8 @@ func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	// Fail the first block flush. Small records live entirely in the block
 	// buffer and never flush, so the first update below lands successfully and
 	// only the second — large enough to span blocks — fails. That is the shape
-	// the defect needs: a record that WAS written (and whose epoch the old code
-	// applied on the spot) inside a batch that then rolls back.
+	// the property needs: a record that WAS written (and whose epoch an eager
+	// floor update would apply on the spot) inside a batch that then rolls back.
 	simulated := errors.New("simulated EIO on block flush")
 	shard.mu.Lock()
 	realFile := shard.activeSegment.f

@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// TestSegment_Write_RecordTooLarge is the L2 regression test: a single record
+// TestSegment_Write_RecordTooLarge is a regression test: a single record
 // whose framed size exceeds the segment size limit must fail with the permanent
 // ErrRecordTooLarge (so the caller splits it), NOT ErrSegmentFull — which would
 // make writeRecord rotate to a fresh segment and retry forever, exhausting the

@@ -23,8 +23,8 @@ import (
 // TestSyncDirChainWith_WalksToEveryRoot is the regression test for
 // SyncDirChainWith silently degrading to a LEAF-ONLY fsync.
 //
-// Containment used to be decided with a string prefix over leaf+sep and
-// stopAt+sep. That breaks for exactly the two values deepestExistingAncestor
+// Deciding containment with a string prefix over leaf+sep and stopAt+sep
+// breaks for exactly the two values deepestExistingAncestor
 // returns when nothing above the leaf pre-exists: stopAt "/" builds the prefix
 // "//" and stopAt "." builds "./", and neither prefixes a CLEANED leaf. Both
 // fell through to syncing the leaf alone, skipping every ancestor os.MkdirAll
