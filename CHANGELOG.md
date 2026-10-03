@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-02
+
+Release candidate. **Breaking API change, no format change:** pkg/seal
+functions that can reach a key provider now take a `context.Context` (see
+Changed), following go-enclave v0.7.0-alpha. Every on-disk and wire format is
+unchanged, so 0.16.0 data directories open as they are. Embedders update call
+sites and any custom `Barrier` implementation.
+
 ### Added
 
 - `ErrDuplicateMemberAddress`, `ErrDuplicateMemberIdentity`,
