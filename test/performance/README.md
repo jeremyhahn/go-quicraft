@@ -15,7 +15,7 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
-| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-09-14, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-02, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17, etcd not measured | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18, preserved as rendered tables |
 
@@ -174,13 +174,14 @@ what is on the target and prints the command to read one.
 |--------|---------|----------|------|-----|--------|-------|-------------|-----|
 | **QuicRaft** | this tree | Go | Engine | waldb (16 shards) | memdb | SyncRead, StaleRead | Yes | QUIC mTLS (always on) |
 | **etcd-io/raft** | v3.7.0 | Go | Library | User-provided | MemoryStorage | User-implemented | No | TCP mutual TLS (3N/5N only) |
-| **Dragonboat** | fork v4.0.1 | Go | Engine | sharded-pebble (the default LogDB) | N/A | SyncRead, StaleRead | Yes | TCP MutualTLS |
+| **Dragonboat** | fork v4.0.1 | Go | Engine | Tan (log-structured LogDB) | N/A | SyncRead, StaleRead | Yes | TCP MutualTLS |
 | **OpenRaft** | 0.9.21 | Rust | Library | Disk WAL, write-only (benchmark) | BTreeMap | User-implemented | No | TCP mutual TLS, 3N/5N only |
 
 The Dragonboat row is the fork `github.com/jeremyhahn/dragonboat/v4`, not
 upstream `lni/dragonboat`; it exists so the benchmark can compile against
-Pebble v1.1.5. The harness sets no `Expert.LogDBFactory`, so Dragonboat runs
-its default `sharded-pebble` LogDB.
+Pebble v1.1.5. The harness sets `Expert.LogDBFactory` to `tan.Factory`, so
+Dragonboat runs Tan, its log-structured LogDB, rather than the default
+`sharded-pebble` key-value store. `TestNodeHostConfigUsesTan` pins this.
 
 All benchmarks run inside Docker containers with `--net=host` (QuicRaft also
 uses `--privileged` for UDP buffer tuning). Systems are benchmarked sequentially

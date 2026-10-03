@@ -9,10 +9,10 @@
 |---|---|
 | Profile | `ci-node-2` |
 | Hardware | Intel(R) Xeon(R) Gold 6258R CPU @ 2.70GHz, 2 socket(s), 112 threads, 372.2 GiB, Ubuntu 26.04.1 LTS (Resolute Raccoon), kernel 7.0.0-31-generic |
-| Specs captured | 2026-09-14T02:02:53Z |
-| QuicRaft run | 2026-09-14T02:03:22Z (version 0.0.0) |
-| Etcd run | 2026-09-14T02:25:36Z (version v3.7.0) |
-| Document generated | 2026-09-14 03:45:09 UTC |
+| Specs captured | 2026-10-02T22:44:29Z |
+| QuicRaft run | 2026-10-02T22:44:47Z (version 0.16.0) |
+| Etcd run | 2026-10-02T23:07:29Z (version v3.7.0) |
+| Document generated | 2026-10-02 23:48:09 UTC |
 
 Numbers below were measured on this profile's machine only. Nothing here is
 comparable with a number from another profile; do not compute a ratio across two.
@@ -42,7 +42,7 @@ Captured on the target at run time by `capture-env.sh`; never hand-edited.
 | Kernel | 7.0.0-31-generic |
 | Docker | 29.1.3 |
 | Go | **not captured** |
-| Specs captured | 2026-09-14T02:02:53Z |
+| Specs captured | 2026-10-02T22:44:29Z |
 
 The capture could not obtain: Go.
 
@@ -54,24 +54,24 @@ The capture could not obtain: Go.
 
 | Scenario | QuicRaft | Etcd | Winner | Ratio |
 |---|---|---|---|---|
-| Election (WAL) | 51.8 ops/s, P50 20.74ms, P95 26.19ms, P99 27.09ms | 58.0 ops/s, P50 17.36ms, P95 22.28ms, P99 23.76ms | etcd | 1.12x |
-| Election (Memory) | 52.5 ops/s, P50 20.34ms, P95 26.00ms, P99 26.46ms | 60.9 ops/s, P50 16.44ms, P95 21.33ms, P99 22.51ms | etcd | 1.16x |
-| Propose Sequential (WAL) | 1.30K ops/s, P50 699.6us, P95 1.21ms, P99 1.40ms | 657.3 ops/s, P50 1.49ms, P95 1.76ms, P99 2.39ms | quicraft | 1.98x |
-| Propose Sequential (Memory) | 55.31K ops/s, P50 14.5us, P95 38.0us, P99 50.9us | 3.56K ops/s, P50 67.8us, P95 1.26ms, P99 1.29ms | quicraft | 15.52x |
-| Propose Concurrent/8 (WAL) | 5.03K ops/s, P50 1.50ms, P95 2.07ms, P99 2.22ms | 3.67K ops/s, P50 2.20ms, P95 2.55ms, P99 2.82ms | quicraft | 1.37x |
-| Propose Concurrent/8 (Memory) | 112.82K ops/s, P50 66.3us, P95 106.3us, P99 130.6us | 44.38K ops/s, P50 136.8us, P95 431.8us, P99 1.13ms | quicraft | 2.54x |
-| Commit Latency (WAL) | 1.28K ops/s, P50 708.6us, P95 1.26ms, P99 1.50ms | 663.5 ops/s, P50 1.48ms, P95 1.73ms, P99 2.32ms | quicraft | 1.93x |
-| Commit Latency (Memory) | 45.04K ops/s, P50 17.4us, P95 48.1us, P99 67.8us | 2.30K ops/s, P50 64.0us, P95 1.15ms, P99 1.23ms | quicraft | 19.62x |
-| Election 3N (WAL) | 52.1 ops/s, P50 17.72ms, P95 23.41ms, P99 32.53ms | 11.4 ops/s, P50 85.54ms, P95 110.23ms, P99 129.48ms | quicraft | 4.59x |
-| Propose Sequential 3N (WAL) | 454.3 ops/s, P50 2.01ms, P95 3.76ms, P99 4.28ms | 365.5 ops/s, P50 2.67ms, P95 3.28ms, P99 3.76ms | quicraft | 1.24x |
-| Propose Concurrent/8 3N (WAL) | 2.27K ops/s, P50 3.39ms, P95 4.87ms, P99 5.58ms | 1.43K ops/s, P50 5.51ms, P95 6.96ms, P99 8.71ms | quicraft | 1.59x |
-| Commit Latency 3N (WAL) | 412.8 ops/s, P50 2.20ms, P95 3.88ms, P99 4.32ms | 332.5 ops/s, P50 2.91ms, P95 3.78ms, P99 4.37ms | quicraft | 1.24x |
-| Election 5N (WAL) | 51.9 ops/s, P50 18.88ms, P95 24.12ms, P99 33.43ms | 6.2 ops/s, P50 156.99ms, P95 195.91ms, P99 211.06ms | quicraft | 8.35x |
-| Propose Sequential 5N (WAL) | 357.4 ops/s, P50 2.71ms, P95 4.23ms, P99 5.03ms | 278.5 ops/s, P50 3.51ms, P95 4.44ms, P99 5.23ms | quicraft | 1.28x |
-| Propose Concurrent/8 5N (WAL) | 1.53K ops/s, P50 5.11ms, P95 7.62ms, P99 9.12ms | 1.20K ops/s, P50 6.54ms, P95 8.43ms, P99 10.25ms | quicraft | 1.27x |
-| Commit Latency 5N (WAL) | 278.2 ops/s, P50 3.46ms, P95 4.97ms, P99 5.73ms | 288.3 ops/s, P50 3.38ms, P95 4.33ms, P99 4.89ms | etcd | 1.04x |
+| Election (WAL) | 52.3 ops/s, P50 19.06ms, P95 26.22ms, P99 27.10ms | 59.0 ops/s, P50 16.90ms, P95 22.09ms, P99 23.10ms | etcd | 1.13x |
+| Election (Memory) | 53.8 ops/s, P50 17.61ms, P95 25.60ms, P99 26.64ms | 61.4 ops/s, P50 16.31ms, P95 21.30ms, P99 22.20ms | etcd | 1.14x |
+| Propose Sequential (WAL) | 1.24K ops/s, P50 730.3us, P95 1.30ms, P99 1.57ms | 716.1 ops/s, P50 1.33ms, P95 1.70ms, P99 2.67ms | quicraft | 1.73x |
+| Propose Sequential (Memory) | 46.22K ops/s, P50 17.1us, P95 47.0us, P99 62.9us | 1.91K ops/s, P50 101.2us, P95 1.14ms, P99 1.18ms | quicraft | 24.21x |
+| Propose Concurrent/8 (WAL) | 4.60K ops/s, P50 1.67ms, P95 2.31ms, P99 2.98ms | 3.87K ops/s, P50 2.05ms, P95 2.48ms, P99 2.99ms | quicraft | 1.19x |
+| Propose Concurrent/8 (Memory) | 97.92K ops/s, P50 75.8us, P95 123.9us, P99 153.0us | 42.86K ops/s, P50 121.2us, P95 764.4us, P99 1.15ms | quicraft | 2.28x |
+| Commit Latency (WAL) | 1.28K ops/s, P50 701.1us, P95 1.23ms, P99 1.55ms | 708.4 ops/s, P50 1.36ms, P95 1.64ms, P99 2.44ms | quicraft | 1.81x |
+| Commit Latency (Memory) | 49.94K ops/s, P50 14.9us, P95 46.2us, P99 66.9us | 1.80K ops/s, P50 151.1us, P95 1.15ms, P99 1.22ms | quicraft | 27.70x |
+| Election 3N (WAL) | 51.5 ops/s, P50 18.67ms, P95 24.64ms, P99 29.68ms | 11.6 ops/s, P50 83.59ms, P95 107.43ms, P99 113.08ms | quicraft | 4.43x |
+| Propose Sequential 3N (WAL) | 474.6 ops/s, P50 1.93ms, P95 3.53ms, P99 4.60ms | 373.3 ops/s, P50 2.59ms, P95 3.34ms, P99 3.81ms | quicraft | 1.27x |
+| Propose Concurrent/8 3N (WAL) | 2.07K ops/s, P50 3.39ms, P95 5.45ms, P99 6.96ms | 1.49K ops/s, P50 5.29ms, P95 6.47ms, P99 7.15ms | quicraft | 1.39x |
+| Commit Latency 3N (WAL) | 557.0 ops/s, P50 1.67ms, P95 2.63ms, P99 3.23ms | 346.5 ops/s, P50 2.79ms, P95 3.63ms, P99 3.99ms | quicraft | 1.61x |
+| Election 5N (WAL) | 51.7 ops/s, P50 19.30ms, P95 24.37ms, P99 27.82ms | 6.5 ops/s, P50 148.96ms, P95 187.87ms, P99 284.58ms | quicraft | 8.00x |
+| Propose Sequential 5N (WAL) | 378.0 ops/s, P50 2.49ms, P95 4.27ms, P99 5.73ms | 341.9 ops/s, P50 2.77ms, P95 4.03ms, P99 6.34ms | quicraft | 1.11x |
+| Propose Concurrent/8 5N (WAL) | 1.45K ops/s, P50 5.00ms, P95 7.68ms, P99 9.48ms | 1.26K ops/s, P50 6.22ms, P95 8.26ms, P99 10.24ms | quicraft | 1.15x |
+| Commit Latency 5N (WAL) | 366.8 ops/s, P50 2.62ms, P95 4.16ms, P99 5.04ms | 332.4 ops/s, P50 2.92ms, P95 3.66ms, P99 4.91ms | quicraft | 1.10x |
 
-**Score: QuicRaft 13, Etcd 3, across 16 head-to-head scenarios.**
+**Score: QuicRaft 14, Etcd 2, across 16 head-to-head scenarios.**
 
 ## Measured for QuicRaft only
 
@@ -79,16 +79,16 @@ The Etcd harness implements no equivalent scenario.
 
 | Scenario | Throughput | Latency |
 |---|---|---|
-| Sync Read (WAL) | 242.79K ops/s | P50 3.3us, P95 8.2us, P99 11.6us |
-| Sync Read (Memory) | 255.36K ops/s | P50 3.1us, P95 7.8us, P99 11.6us |
-| Stale Read (WAL) | 5.06M ops/s | P50 126ns, P95 149ns, P99 284ns |
-| Stale Read (Memory) | 5.19M ops/s | P50 124ns, P95 149ns, P99 353ns |
-| Sync Read 3N (WAL) | 6.76K ops/s | P50 130.1us, P95 247.4us, P99 360.5us |
-| Sync Read 3N (WAL+LeaseRead) | 122.89K ops/s | P50 5.1us, P95 11.8us, P99 26.3us |
-| Stale Read 3N (WAL) | 5.27M ops/s | P50 124ns, P95 150ns, P99 451ns |
-| Sync Read 5N (WAL) | 5.14K ops/s | P50 157.6us, P95 370.0us, P99 467.5us |
-| Sync Read 5N (WAL+LeaseRead) | 94.84K ops/s | P50 6.6us, P95 15.9us, P99 37.9us |
-| Stale Read 5N (WAL) | 5.04M ops/s | P50 127ns, P95 171ns, P99 471ns |
+| Sync Read (WAL) | 224.45K ops/s | P50 3.4us, P95 9.8us, P99 14.0us |
+| Sync Read (Memory) | 223.52K ops/s | P50 3.4us, P95 9.8us, P99 14.1us |
+| Stale Read (WAL) | 5.08M ops/s | P50 122ns, P95 150ns, P99 311ns |
+| Stale Read (Memory) | 4.77M ops/s | P50 132ns, P95 221ns, P99 330ns |
+| Sync Read 3N (WAL) | 7.16K ops/s | P50 126.7us, P95 210.0us, P99 302.3us |
+| Sync Read 3N (WAL+LeaseRead) | 146.60K ops/s | P50 4.2us, P95 10.9us, P99 20.2us |
+| Stale Read 3N (WAL) | 4.63M ops/s | P50 133ns, P95 251ns, P99 412ns |
+| Sync Read 5N (WAL) | 5.74K ops/s | P50 149.5us, P95 320.2us, P99 419.6us |
+| Sync Read 5N (WAL+LeaseRead) | 122.82K ops/s | P50 4.9us, P95 13.3us, P99 28.3us |
+| Stale Read 5N (WAL) | 4.48M ops/s | P50 134ns, P95 263ns, P99 448ns |
 
 ## Run configuration
 

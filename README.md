@@ -241,8 +241,11 @@ etcd-io/raft, Dragonboat and OpenRaft on single-node, 3-node and 5-node
 configurations. Each result set is tied to the machine that measured it. The
 most recent full run is the
 [`ci-node-2` profile](test/performance/profiles/ci-node-2/), a dual-socket <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
-Xeon Gold 6258R server, measured 2026-09-14, one run per system. On it QuicRaft
-led Dragonboat in 15 of 18 head-to-head scenarios and etcd-io/raft in 13 of 16.
+Xeon Gold 6258R server, measured 2026-10-02, one run per system, with
+Dragonboat on its Tan LogDB. On it QuicRaft led Dragonboat in 15 of 18
+head-to-head scenarios and etcd-io/raft in 14 of 16. OpenRaft led QuicRaft in
+9 of 16: six single-node scenarios, sequential proposals on 3 and 5 nodes, and
+5-node commit latency.
 Treat these as one machine's numbers, and read the
 [fairness notes](test/performance/profiles/r640/analysis.md#fairness-and-comparability)
 before drawing a conclusion from any row.

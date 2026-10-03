@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting with `.` or `_`, and `testdata`), the rule `make ci-modules` uses, so
   it no longer walks agent worktrees under `.claude/`.
 
+- The Dragonboat benchmark harness runs Dragonboat on its Tan LogDB instead of
+  the default sharded Pebble store, and its election benchmarks rotate through
+  a fixed ring of shard IDs so Tan's per-shard preallocated log files no longer
+  fill the disk. The `ci-node-2` profile is re-measured on 2026-10-02 with all
+  four systems.
+
 ### Removed
 
 - **BREAKING**: `seal.ProtectedCredentials` and `seal.NewProtectedCredentials`,

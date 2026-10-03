@@ -20,9 +20,10 @@ Both engines run with the same Raft timing:
 | `PreVote` | on (default) | off (Dragonboat default; the harness does not set it) |
 
 Storage differs by design. QuicRaft uses its own 16-shard WAL
-(`pkg/logdb/waldb`). The Dragonboat harness sets no `Expert.LogDBFactory`, so
-Dragonboat runs its default `sharded-pebble` LogDB, a key-value store rather
-than a log-structured WAL. Every scenario is measured in WAL mode with fsync.
+(`pkg/logdb/waldb`). The Dragonboat harness builds every NodeHost through
+`nodeHostConfig`, which sets `Expert.LogDBFactory` to `tan.Factory`, so
+Dragonboat runs Tan, its own log-structured LogDB, instead of the default
+`sharded-pebble` key-value store. Every scenario is measured in WAL mode with fsync.
 QuicRaft is also measured with its in-memory LogDB; Dragonboat has no
 memory-only LogDB, so those rows have no Dragonboat counterpart.
 
@@ -40,7 +41,7 @@ the same thing in both columns.
 Results are stored per machine under [`../profiles/`](../profiles/). The most
 recent full comparison is
 [`profiles/ci-node-2/dragonboat.md`](../profiles/ci-node-2/dragonboat.md), <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
-measured 2026-09-14. Numbers from different profiles are not comparable.
+measured 2026-10-02. Numbers from different profiles are not comparable.
 
 ## Running
 

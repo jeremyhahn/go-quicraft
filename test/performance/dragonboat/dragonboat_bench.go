@@ -26,6 +26,7 @@ import (
 
 	"github.com/jeremyhahn/dragonboat/v4"
 	dbconfig "github.com/jeremyhahn/dragonboat/v4/config"
+	"github.com/jeremyhahn/dragonboat/v4/plugin/tan"
 	dbsm "github.com/jeremyhahn/dragonboat/v4/statemachine"
 	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
@@ -77,16 +78,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 
 	addr := freeTCPPort(b)
 
-	nhCfg := dbconfig.NodeHostConfig{
-		WALDir:         dir + "/wal",
-		NodeHostDir:    dir + "/data",
-		RaftAddress:    addr,
-		RTTMillisecond: dbRTT,
-		MutualTLS:      true,
-		CAFile:         certs[0].CAFile,
-		CertFile:       certs[0].CertFile,
-		KeyFile:        certs[0].KeyFile,
-	}
+	nhCfg := nodeHostConfig(dir, addr, certs[0])
 
 	nh, err := dragonboat.NewNodeHost(nhCfg)
 	if err != nil {
@@ -323,16 +315,7 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 
 	addr := freeTCPPort(b)
 
-	nhCfg := dbconfig.NodeHostConfig{
-		WALDir:         dir + "/wal",
-		NodeHostDir:    dir + "/data",
-		RaftAddress:    addr,
-		RTTMillisecond: dbRTT,
-		MutualTLS:      true,
-		CAFile:         certs[0].CAFile,
-		CertFile:       certs[0].CertFile,
-		KeyFile:        certs[0].KeyFile,
-	}
+	nhCfg := nodeHostConfig(dir, addr, certs[0])
 
 	nh, err := dragonboat.NewNodeHost(nhCfg)
 	if err != nil {
@@ -352,7 +335,7 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		iterShardID := dbShardID + uint64(i)
+		iterShardID := electionShardID(i)
 
 		raftCfg := dbconfig.Config{
 			ReplicaID:    dbReplicaID,
@@ -520,6 +503,41 @@ func freeTCPPort(b *testing.B) string {
 	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
 
+// nodeHostConfig returns the NodeHostConfig every benchmark NodeHost uses:
+// WAL and data directories under dir, mutual TLS from cert, and Tan as the
+// LogDB. Dragonboat falls back to its sharded Pebble LogDB when no factory is
+// set, so the factory is explicit to benchmark Dragonboat's own log store.
+func nodeHostConfig(dir, addr string, cert tlsCertBundle) dbconfig.NodeHostConfig {
+	return dbconfig.NodeHostConfig{
+		WALDir:         dir + "/wal",
+		NodeHostDir:    dir + "/data",
+		RaftAddress:    addr,
+		RTTMillisecond: dbRTT,
+		MutualTLS:      true,
+		CAFile:         cert.CAFile,
+		CertFile:       cert.CertFile,
+		KeyFile:        cert.KeyFile,
+		Expert:         dbconfig.ExpertConfig{LogDBFactory: tan.Factory},
+	}
+}
+
+// electionShardRing is how many shard IDs the election benchmarks rotate
+// through. Tan gives every shard/replica pair its own database with a 64 MiB
+// preallocated log file that neither StopShard nor RemoveData deletes, so a new
+// shard ID per iteration fills the disk (about 300 MiB per 5-node iteration).
+// Reusing one ID is not possible either: StopShard unloads the node
+// asynchronously and StartReplica refuses the ID until it has. A ring bounds the
+// disk to electionShardRing databases per replica and returns to an ID only
+// after many iterations, long after its unload finished. An iteration that
+// reuses an ID restarts the replicas from their log and runs a fresh election,
+// as the QuicRaft harness does with its single shard ID.
+const electionShardRing = 16
+
+// electionShardID returns the shard ID for election benchmark iteration i.
+func electionShardID(i int) uint64 {
+	return dbShardID + uint64(i%electionShardRing)
+}
+
 // SetupDragonboatCluster creates a multi-node Dragonboat cluster with
 // MutualTLS enabled. It generates ephemeral ECDSA certificates, starts
 // numNodes NodeHost instances, forms a Raft group, waits for leader
@@ -546,16 +564,7 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	for i := range numNodes {
 		nodeDir := filepath.Join(dir, fmt.Sprintf("node-%d", i))
 
-		nhCfg := dbconfig.NodeHostConfig{
-			WALDir:         nodeDir + "/wal",
-			NodeHostDir:    nodeDir + "/data",
-			RaftAddress:    addrs[i],
-			RTTMillisecond: dbRTT,
-			MutualTLS:      true,
-			CAFile:         certs[i].CAFile,
-			CertFile:       certs[i].CertFile,
-			KeyFile:        certs[i].KeyFile,
-		}
+		nhCfg := nodeHostConfig(nodeDir, addrs[i], certs[i])
 
 		nh, err := dragonboat.NewNodeHost(nhCfg)
 		if err != nil {
@@ -683,16 +692,7 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 	hosts := make([]*dragonboat.NodeHost, numNodes)
 	for j := range numNodes {
 		nodeDir := filepath.Join(dir, fmt.Sprintf("node-%d", j))
-		nhCfg := dbconfig.NodeHostConfig{
-			WALDir:         nodeDir + "/wal",
-			NodeHostDir:    nodeDir + "/data",
-			RaftAddress:    addrs[j],
-			RTTMillisecond: dbRTT,
-			MutualTLS:      true,
-			CAFile:         certs[j].CAFile,
-			CertFile:       certs[j].CertFile,
-			KeyFile:        certs[j].KeyFile,
-		}
+		nhCfg := nodeHostConfig(nodeDir, addrs[j], certs[j])
 
 		nh, err := dragonboat.NewNodeHost(nhCfg)
 		if err != nil {
@@ -722,7 +722,7 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		iterShardID := dbShardID + uint64(i)
+		iterShardID := electionShardID(i)
 
 		start := time.Now()
 
