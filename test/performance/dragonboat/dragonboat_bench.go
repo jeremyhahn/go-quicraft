@@ -16,6 +16,7 @@ package dragonboat_perf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,11 +61,70 @@ const (
 	// the commit-latency measurement loop, so the first timed proposal does
 	// not include one-time pipeline initialization. Shared across all engines.
 	commitLatencyWarmup = 100
+
+	// setupWarmupProposals is the number of unmeasured proposals a setup
+	// helper makes, followed by one linearizable read, before handing the
+	// shard to a benchmark. Every engine's setup does the same, so no engine
+	// starts its timer on a colder pipeline than another.
+	setupWarmupProposals = 10
+
+	// leaderPollInterval is how often the leader waits poll GetLeaderID. It
+	// bounds how late an election benchmark can notice a leader, so every
+	// engine's harness polls at the same 1 ms.
+	leaderPollInterval = time.Millisecond
 )
 
+// raftConfig returns the Raft configuration every benchmark replica uses. The
+// timing is the cross-engine common configuration: a 1 ms tick (dbRTT), an
+// election timeout of 10 ticks that Dragonboat randomizes over [10, 20), a
+// 1-tick heartbeat, CheckQuorum, and PreVote. PreVote is off by default in
+// Dragonboat and on in QuicRaft, so it is set explicitly here.
+func raftConfig(shardID, replicaID uint64) dbconfig.Config {
+	return dbconfig.Config{
+		ReplicaID:    replicaID,
+		ShardID:      shardID,
+		ElectionRTT:  10,
+		HeartbeatRTT: 1,
+		CheckQuorum:  true,
+		PreVote:      true,
+	}
+}
+
+// warmupShard makes setupWarmupProposals proposals and then one linearizable
+// read through nh, each on the shared warmup retry budget. It establishes the
+// transport connections and exercises the propose and ReadIndex paths so the
+// first timed operation carries no one-time initialization.
+func warmupShard(nh *dragonboat.NodeHost, shardID uint64) error {
+	session := nh.GetNoOPSession(shardID)
+	for i := 0; i < setupWarmupProposals; i++ {
+		cmd := encodeKVCmd([]byte(fmt.Sprintf("warmup-%d", i)), []byte("ok"))
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := nh.SyncPropose(ctx, session, cmd)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("warmup proposal %d failed after %d attempts: %w",
+				i, benchutil.WarmupAttempts, err)
+		}
+	}
+	err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := nh.SyncRead(ctx, shardID, []byte("warmup-0"))
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("warmup read failed after %d attempts: %w", benchutil.WarmupAttempts, err)
+	}
+	return nil
+}
+
 // SetupDragonboatHost creates a single-node Dragonboat NodeHost with one
-// shard running the KV state machine. It returns the host and a cleanup
-// function that must be called when the benchmark completes.
+// shard running the KV state machine, waits for leader election and runs
+// warmupShard. It returns the host and a cleanup function that must be
+// called when the benchmark completes.
 func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 	b.Helper()
 
@@ -85,13 +145,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 		b.Fatalf("dragonboat.NewNodeHost failed: %v", err)
 	}
 
-	raftCfg := dbconfig.Config{
-		ReplicaID:    dbReplicaID,
-		ShardID:      dbShardID,
-		ElectionRTT:  10,
-		HeartbeatRTT: 1,
-		CheckQuorum:  true,
-	}
+	raftCfg := raftConfig(dbShardID, dbReplicaID)
 
 	members := map[uint64]dragonboat.Target{
 		dbReplicaID: addr,
@@ -112,6 +166,11 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 		b.Fatalf("leader election timed out: %v", err)
 	}
 
+	if err := warmupShard(nh, dbShardID); err != nil {
+		nh.Close()
+		b.Fatalf("single-node setup: %v", err)
+	}
+
 	cleanup := func() {
 		nh.Close()
 	}
@@ -120,7 +179,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 
 // waitForDragonboatLeader polls until a leader is elected or timeout expires.
 func waitForDragonboatLeader(nh *dragonboat.NodeHost, shardID uint64, timeout time.Duration) error {
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -301,7 +360,8 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 // excluding NodeHost infrastructure setup (TLS cert generation, gRPC
 // transport initialization). The NodeHost is created once outside the
 // timed loop; only StartReplica + waitForLeader is measured per iteration.
-// Each iteration uses a unique clusterID to avoid on-disk state conflicts.
+// primeElectionRing bootstraps every ring shard ID before the timer starts, so
+// each timed iteration restarts an existing group (see electionShardRing).
 func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
@@ -331,19 +391,15 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		return newDragonboatKVSM()
 	}
 
+	primeElectionRing(b, []*dragonboat.NodeHost{nh}, members, createFn)
+
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
 		iterShardID := electionShardID(i)
 
-		raftCfg := dbconfig.Config{
-			ReplicaID:    dbReplicaID,
-			ShardID:      iterShardID,
-			ElectionRTT:  10,
-			HeartbeatRTT: 1,
-			CheckQuorum:  true,
-		}
+		raftCfg := raftConfig(iterShardID, dbReplicaID)
 
 		start := time.Now()
 
@@ -498,7 +554,7 @@ func (c *BenchCluster) seed(b *testing.B, key []byte) {
 // one from outside the kernel's ephemeral range so no outbound connection can
 // be assigned it in the gap. See benchutil/port.go for the failure this
 // replaced.
-func freeTCPPort(b *testing.B) string {
+func freeTCPPort(b testing.TB) string {
 	b.Helper()
 	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
@@ -538,11 +594,56 @@ func electionShardID(i int) uint64 {
 	return dbShardID + uint64(i%electionShardRing)
 }
 
+// primeElectionRing runs one untimed election cycle for every ring shard ID:
+// start the replica on every host, wait for a leader, stop the shard. It runs
+// before the election benchmarks reset their timer, so Tan's per-shard database
+// creation (including its 64 MiB log preallocation) and the first-ever
+// bootstrap of each group stay out of the measurement, and every timed
+// iteration restarts an existing group, as the QuicRaft harness restarts its
+// one shard ID.
+//
+// StopShard returns before the engine has unloaded the node, and StartReplica
+// refuses the ID with ErrShardAlreadyExist until it has. Every ID here is fresh,
+// so that cannot happen while priming; the start is still retried on that error
+// rather than assumed. The timed loop does not retry: the ring order puts
+// electionShardRing-1 other cycles between a stop and the next start of the
+// same ID, and a start that still collides fails the run loudly instead of
+// folding a wait into the measurement.
+func primeElectionRing(b *testing.B, hosts []*dragonboat.NodeHost,
+	members map[uint64]dragonboat.Target, createFn dbsm.CreateStateMachineFunc) {
+	b.Helper()
+	for k := 0; k < electionShardRing; k++ {
+		shardID := electionShardID(k)
+		for j, nh := range hosts {
+			cfg := raftConfig(shardID, uint64(j+1))
+			deadline := time.Now().Add(dbElectionWait)
+			for {
+				err := nh.StartReplica(members, false, createFn, cfg)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, dragonboat.ErrShardAlreadyExist) || time.Now().After(deadline) {
+					b.Fatalf("priming shard %d: StartReplica[%d]: %v", shardID, j, err)
+				}
+				time.Sleep(leaderPollInterval)
+			}
+		}
+		if _, err := waitForDragonboatClusterLeader(hosts, shardID, 30*time.Second); err != nil {
+			b.Fatalf("priming shard %d: %v", shardID, err)
+		}
+		for j, nh := range hosts {
+			if err := nh.StopShard(shardID); err != nil {
+				b.Fatalf("priming shard %d: StopShard[%d]: %v", shardID, j, err)
+			}
+		}
+	}
+}
+
 // SetupDragonboatCluster creates a multi-node Dragonboat cluster with
 // MutualTLS enabled. It generates ephemeral ECDSA certificates, starts
 // numNodes NodeHost instances, forms a Raft group, waits for leader
-// election, and performs a warmup proposal to ensure all transport
-// connections are fully established.
+// election, and runs warmupShard (10 proposals and a linearizable read) so
+// all transport connections are fully established.
 func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
@@ -584,13 +685,7 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 
 	// Start replicas on all hosts.
 	for i, nh := range hosts {
-		raftCfg := dbconfig.Config{
-			ReplicaID:    uint64(i + 1),
-			ShardID:      dbShardID,
-			ElectionRTT:  10,
-			HeartbeatRTT: 1,
-			CheckQuorum:  true,
-		}
+		raftCfg := raftConfig(dbShardID, uint64(i+1))
 		createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
 			return newDragonboatKVSM()
 		}
@@ -611,27 +706,17 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 		b.Fatalf("leader election failed: %v", err)
 	}
 
-	// Warmup proposal with retry to ensure all TLS connections are fully
-	// established before timing begins. The retry budget is benchutil's, shared
-	// with every other engine, and a warmup that never succeeds is fatal HERE.
-	// Swallowing it would hand an unready cluster to the caller, to surface
-	// later as a misleading downstream error such as "seed propose failed:
-	// request dropped as the shard is not ready" instead of naming the setup
-	// that had already failed.
-	session := hosts[leaderIdx].GetNoOPSession(dbShardID)
-	warmupCmd := encodeKVCmd([]byte("warmup"), []byte("ok"))
-	warmupErr := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
-		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer warmupCancel()
-		_, err := hosts[leaderIdx].SyncPropose(warmupCtx, session, warmupCmd)
-		return err
-	})
-	if warmupErr != nil {
+	// Warm up so all TLS connections are fully established before timing
+	// begins. The retry budget is benchutil's, shared with every other engine,
+	// and a warmup that never succeeds is fatal HERE. Swallowing it would hand
+	// an unready cluster to the caller, to surface later as a misleading
+	// downstream error such as "seed propose failed: request dropped as the
+	// shard is not ready" instead of naming the setup that had already failed.
+	if err := warmupShard(hosts[leaderIdx], dbShardID); err != nil {
 		for _, h := range hosts {
 			h.Close()
 		}
-		b.Fatalf("%d-node cluster warmup propose failed after %d attempts: %v",
-			numNodes, benchutil.WarmupAttempts, warmupErr)
+		b.Fatalf("%d-node cluster setup: %v", numNodes, err)
 	}
 
 	return &BenchCluster{
@@ -644,7 +729,7 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 // waitForDragonboatClusterLeader polls all hosts until one reports itself
 // as the leader. Returns the host index of the leader.
 func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64, timeout time.Duration) (int, error) {
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -669,9 +754,10 @@ func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64
 
 // BenchDragonboatElectionCluster benchmarks leader election time for a
 // multi-node cluster with MutualTLS. NodeHost infrastructure (TLS, gRPC
-// transport) is created once outside the timed loop. Each iteration starts
-// replicas on all hosts with a unique clusterID, waits for leader election,
-// records the elapsed time, and stops the shard on all hosts.
+// transport) is created once outside the timed loop, and primeElectionRing
+// bootstraps every ring shard ID before the timer starts. Each iteration
+// restarts replicas on all hosts with the next ring shard ID, waits for leader
+// election, records the elapsed time, and stops the shard on all hosts.
 func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
@@ -718,6 +804,8 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 		return newDragonboatKVSM()
 	}
 
+	primeElectionRing(b, hosts, members, createFn)
+
 	b.ResetTimer()
 	b.ReportAllocs()
 
@@ -728,13 +816,7 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 
 		// Start replicas on all hosts with this iteration's shard ID.
 		for j, nh := range hosts {
-			raftCfg := dbconfig.Config{
-				ReplicaID:    uint64(j + 1),
-				ShardID:      iterShardID,
-				ElectionRTT:  10,
-				HeartbeatRTT: 1,
-				CheckQuorum:  true,
-			}
+			raftCfg := raftConfig(iterShardID, uint64(j+1))
 			if err := nh.StartReplica(members, false, createFn, raftCfg); err != nil {
 				b.Fatalf("StartReplica[%d] failed at iteration %d: %v", j, i, err)
 			}

@@ -10,110 +10,110 @@
   <rect x="0" y="122" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="145" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election (WAL)</text>
   <rect x="200" y="126" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="145" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">54.0 ops/s</text>
-  <text x="904" y="145" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 17.40ms</text>
+  <text x="764" y="145" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">59.8 ops/s</text>
+  <text x="904" y="145" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 16.72ms</text>
   <line x1="20" y1="167" x2="1080" y2="167" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="164" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="187" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential (WAL)</text>
   <rect x="200" y="168" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="187" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">746.3 ops/s</text>
-  <text x="904" y="187" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.32ms</text>
+  <text x="764" y="187" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">711.7 ops/s</text>
+  <text x="904" y="187" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.37ms</text>
   <line x1="20" y1="209" x2="1080" y2="209" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="206" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="229" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 (WAL)</text>
   <rect x="200" y="210" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="229" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.94K ops/s</text>
-  <text x="904" y="229" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.33ms</text>
+  <text x="764" y="229" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.56K ops/s</text>
+  <text x="904" y="229" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.41ms</text>
   <line x1="20" y1="251" x2="1080" y2="251" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="248" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="271" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency (WAL)</text>
   <rect x="200" y="252" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="271" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">744.6 ops/s</text>
-  <text x="904" y="271" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.32ms</text>
+  <text x="764" y="271" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">730.5 ops/s</text>
+  <text x="904" y="271" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 1.35ms</text>
   <line x1="20" y1="293" x2="1080" y2="293" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="290" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="313" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read (WAL)</text>
   <rect x="200" y="294" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="313" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">125.69K ops/s</text>
-  <text x="904" y="313" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 6.4us</text>
+  <text x="764" y="313" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">99.73K ops/s</text>
+  <text x="904" y="313" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 7.8us</text>
   <line x1="20" y1="335" x2="1080" y2="335" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="332" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="355" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read (WAL)</text>
   <rect x="200" y="336" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="355" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.71M ops/s</text>
-  <text x="904" y="355" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 143ns</text>
+  <text x="764" y="355" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.45M ops/s</text>
+  <text x="904" y="355" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 142ns</text>
   <line x1="20" y1="377" x2="1080" y2="377" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="374" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="397" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election 3N (WAL)</text>
   <rect x="200" y="378" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="397" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">44.3 ops/s</text>
-  <text x="904" y="397" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 19.77ms</text>
+  <text x="764" y="397" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">50.8 ops/s</text>
+  <text x="904" y="397" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 18.44ms</text>
   <line x1="20" y1="419" x2="1080" y2="419" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="416" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="439" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential 3N (WAL)</text>
   <rect x="200" y="420" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="439" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">257.8 ops/s</text>
-  <text x="904" y="439" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 2.75ms</text>
+  <text x="764" y="439" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">359.3 ops/s</text>
+  <text x="904" y="439" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 2.74ms</text>
   <line x1="20" y1="461" x2="1080" y2="461" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="458" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="481" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 3N (WAL)</text>
   <rect x="200" y="462" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="481" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.94K ops/s</text>
-  <text x="904" y="481" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 2.71ms</text>
+  <text x="764" y="481" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.71K ops/s</text>
+  <text x="904" y="481" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 2.90ms</text>
   <line x1="20" y1="503" x2="1080" y2="503" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="500" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="523" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency 3N (WAL)</text>
   <rect x="200" y="504" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="523" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">185.3 ops/s</text>
-  <text x="904" y="523" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.45ms</text>
+  <text x="764" y="523" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">235.1 ops/s</text>
+  <text x="904" y="523" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.47ms</text>
   <line x1="20" y1="545" x2="1080" y2="545" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="542" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="565" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read 3N (WAL)</text>
   <rect x="200" y="546" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="565" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.89K ops/s</text>
-  <text x="904" y="565" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 198.3us</text>
+  <text x="764" y="565" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.34K ops/s</text>
+  <text x="904" y="565" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 115.0us</text>
   <line x1="20" y1="587" x2="1080" y2="587" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="584" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="607" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read 3N (WAL)</text>
   <rect x="200" y="588" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="607" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.43M ops/s</text>
-  <text x="904" y="607" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 147ns</text>
+  <text x="764" y="607" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.37M ops/s</text>
+  <text x="904" y="607" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 145ns</text>
   <line x1="20" y1="629" x2="1080" y2="629" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="626" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="649" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Election 5N (WAL)</text>
   <rect x="200" y="630" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="649" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">48.7 ops/s</text>
-  <text x="904" y="649" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 19.79ms</text>
+  <text x="764" y="649" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">49.5 ops/s</text>
+  <text x="904" y="649" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 18.87ms</text>
   <line x1="20" y1="671" x2="1080" y2="671" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="668" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="691" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Sequential 5N (WAL)</text>
   <rect x="200" y="672" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="691" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">174.4 ops/s</text>
-  <text x="904" y="691" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.69ms</text>
+  <text x="764" y="691" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">140.2 ops/s</text>
+  <text x="904" y="691" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 4.09ms</text>
   <line x1="20" y1="713" x2="1080" y2="713" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="710" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="733" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Propose Concurrent/8 5N (WAL)</text>
   <rect x="200" y="714" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="733" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.35K ops/s</text>
-  <text x="904" y="733" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 4.43ms</text>
+  <text x="764" y="733" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.28K ops/s</text>
+  <text x="904" y="733" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.50ms</text>
   <line x1="20" y1="755" x2="1080" y2="755" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="752" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="775" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Commit Latency 5N (WAL)</text>
   <rect x="200" y="756" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="775" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">124.2 ops/s</text>
-  <text x="904" y="775" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.98ms</text>
+  <text x="764" y="775" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">206.7 ops/s</text>
+  <text x="904" y="775" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 3.83ms</text>
   <line x1="20" y1="797" x2="1080" y2="797" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="794" width="1100" height="42" fill="#ffffff"/>
   <text x="188" y="817" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Sync Read 5N (WAL)</text>
   <rect x="200" y="798" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="817" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.03K ops/s</text>
-  <text x="904" y="817" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 180.1us</text>
+  <text x="764" y="817" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.70K ops/s</text>
+  <text x="904" y="817" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 168.3us</text>
   <line x1="20" y1="839" x2="1080" y2="839" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="836" width="1100" height="42" fill="#f8f9fa"/>
   <text x="188" y="859" font-size="15" font-weight="normal" text-anchor="end" fill="#333333">Stale Read 5N (WAL)</text>
   <rect x="200" y="840" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="859" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.39M ops/s</text>
-  <text x="904" y="859" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 147ns</text>
+  <text x="764" y="859" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.36M ops/s</text>
+  <text x="904" y="859" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">P50: 143ns</text>
   <line x1="20" y1="881" x2="1080" y2="881" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="922" width="1100" height="60" fill="#f8f9fa"/>
   <line x1="0" y1="922" x2="1100" y2="922" stroke="#dee2e6" stroke-width="1"/>

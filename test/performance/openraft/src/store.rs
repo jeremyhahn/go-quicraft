@@ -52,6 +52,17 @@ fn parse_kv(cmd: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&cmd[3..3 + key_len], &cmd[3 + key_len..]))
 }
 
+/// Encode a KV Put command in the wire format shared by all benchmark engines:
+/// `[op:1][keyLen:2 BE][key][value]`. The inverse of `parse_kv`.
+pub fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut cmd = Vec::with_capacity(3 + key.len() + value.len());
+    cmd.push(0x01u8); // opPut
+    cmd.extend_from_slice(&(key.len() as u16).to_be_bytes());
+    cmd.extend_from_slice(key);
+    cmd.extend_from_slice(value);
+    cmd
+}
+
 // ── shared inner state ────────────────────────────────────────────────────────
 
 /// All mutable state wrapped in a single `Mutex` so it can be shared between

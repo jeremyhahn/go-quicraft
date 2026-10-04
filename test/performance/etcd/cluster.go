@@ -16,7 +16,7 @@ package etcd_perf
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,10 +28,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// clusterTickInterval is the tick interval for cluster node tickers.
-// Matches QuicRaft's RTTMillisecond.
-const clusterTickInterval = 1 * time.Millisecond
-
 // clusterLeaderTimeout is the maximum time to wait for leader election
 // in a multi-node cluster.
 const clusterLeaderTimeout = 30 * time.Second
@@ -41,9 +37,9 @@ const clusterLeaderTimeout = 30 * time.Second
 const clusterConfChangeTimeout = 10 * time.Second
 
 // etcdClusterNode bundles a single node in a multi-node etcd/raft cluster.
-// Each node has its own transport, WAL, state machine, and event loop
-// goroutine that processes Ready structs and delivers messages via the
-// TCP+TLS transport layer.
+// Each node has its own WAL, state machine, and event loop goroutine that
+// processes Ready structs and delivers messages through its slot's TCP+TLS
+// transport.
 type etcdClusterNode struct {
 	id           uint64
 	node         raft.Node
@@ -52,11 +48,77 @@ type etcdClusterNode struct {
 	sm           *benchStateMachineEtcd
 	transport    *raftTransport
 	confDone     *confChangeTracker
+	proposals    *waiters
+	reads        *waiters
+	appliedIndex atomic.Uint64
 	stopCh       chan struct{}
 	loopDone     sync.WaitGroup
 	tickDone     chan struct{}
-	totalApplied atomic.Int64
 	stopped      atomic.Bool
+}
+
+// etcdClusterInfra is the infrastructure of an N-node cluster that outlives
+// any one set of raft nodes: the TLS material, the reserved loopback
+// addresses, and one transport (TLS listener plus cached peer connections) per
+// node slot. It is the counterpart of QuicRaft's and Dragonboat's hosts, which
+// the election benchmarks create once, outside the timer.
+type etcdClusterInfra struct {
+	addrs      []string
+	transports []*raftTransport
+	// current is the node each slot's inbound messages are delivered to; nil
+	// while no node is running in the slot.
+	current []atomic.Pointer[etcdClusterNode]
+}
+
+// newEtcdClusterInfra generates the shared mutual-TLS configuration, reserves
+// one address per node and binds a transport listener on each.
+func newEtcdClusterInfra(b *testing.B, numNodes int) *etcdClusterInfra {
+	b.Helper()
+
+	tlsCfg, err := generateSharedTLS()
+	if err != nil {
+		b.Fatalf("generateSharedTLS failed: %v", err)
+	}
+
+	infra := &etcdClusterInfra{
+		addrs:      make([]string, numNodes),
+		transports: make([]*raftTransport, 0, numNodes),
+		current:    make([]atomic.Pointer[etcdClusterNode], numNodes),
+	}
+	for slot := range numNodes {
+		infra.addrs[slot] = freeTCPPort(b)
+	}
+	for slot := range numNodes {
+		t, err := newRaftTransport(infra.addrs[slot], tlsCfg, func(msg *raftpb.Message) {
+			infra.deliver(slot, msg)
+		})
+		if err != nil {
+			infra.close()
+			b.Fatalf("newRaftTransport for slot %d: %v", slot, err)
+		}
+		infra.transports = append(infra.transports, t)
+	}
+	return infra
+}
+
+// deliver steps msg into the node currently running in slot. A message that
+// arrives before the slot's node has started, or that is addressed to a node
+// of an earlier election round, is dropped, as a network drops traffic for a
+// replica that is not running; raft retransmits.
+func (infra *etcdClusterInfra) deliver(slot int, msg *raftpb.Message) {
+	cn := infra.current[slot].Load()
+	if cn == nil || msg.GetTo() != cn.id {
+		return
+	}
+	// Errors from Step are expected during shutdown.
+	cn.node.Step(context.Background(), msg)
+}
+
+// close closes every transport.
+func (infra *etcdClusterInfra) close() {
+	for _, t := range infra.transports {
+		t.close()
+	}
 }
 
 // EtcdCluster holds a multi-node etcd/raft cluster for benchmarks.
@@ -64,6 +126,7 @@ type etcdClusterNode struct {
 // framing.
 type EtcdCluster struct {
 	Nodes []*etcdClusterNode
+	infra *etcdClusterInfra
 }
 
 // NoLeaderError indicates that no node in the cluster currently reports
@@ -72,21 +135,6 @@ type NoLeaderError struct{}
 
 func (e NoLeaderError) Error() string {
 	return "no leader available in cluster"
-}
-
-// clusterElectionTick returns the appropriate ElectionTick value scaled
-// by cluster size. Larger clusters need more headroom to avoid spurious
-// elections under load, because the leader must complete 2 fsyncs plus
-// N-1 serial sends within the election timeout window.
-func clusterElectionTick(numNodes int) int {
-	switch {
-	case numNodes >= 5:
-		return 100
-	case numNodes >= 3:
-		return 50
-	default:
-		return 10
-	}
 }
 
 // CurrentLeaderNode polls all nodes' Status() and returns the node
@@ -103,19 +151,15 @@ func (c *EtcdCluster) CurrentLeaderNode() (*etcdClusterNode, error) {
 }
 
 // waitForLeader polls all nodes until one reports itself as the current
-// leader, returning that node. This is used for dynamic leader
-// re-discovery during benchmarks when leadership changes occur.
+// leader, returning that node.
 func (c *EtcdCluster) waitForLeader(timeout time.Duration) (*etcdClusterNode, error) {
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
-		for _, cn := range c.Nodes {
-			status := cn.node.Status()
-			if status.Lead == cn.id && status.RaftState == raft.StateLeader {
-				return cn, nil
-			}
+		if cn, err := c.CurrentLeaderNode(); err == nil {
+			return cn, nil
 		}
 		select {
 		case <-deadline.C:
@@ -123,6 +167,23 @@ func (c *EtcdCluster) waitForLeader(timeout time.Duration) (*etcdClusterNode, er
 		case <-ticker.C:
 		}
 	}
+}
+
+// proposeAndWait proposes cmd (built by newRequest with id) on leader and
+// waits for its own entry to apply there. If raft rejects the proposal, for
+// instance because leadership moved, the current leader is re-discovered and
+// the proposal is retried on it once. It returns the node the proposal
+// finally went to.
+func (c *EtcdCluster) proposeAndWait(leader *etcdClusterNode, id uint64, cmd []byte) (*etcdClusterNode, error) {
+	err := proposeAndWait(leader.node, leader.proposals, id, cmd, proposalApplyTimeout)
+	if err == nil || errors.Is(err, errApplyTimeout) {
+		return leader, err
+	}
+	newLeader, reErr := c.waitForLeader(5 * time.Second)
+	if reErr != nil {
+		return leader, err
+	}
+	return newLeader, proposeAndWait(newLeader.node, newLeader.proposals, id, cmd, proposalApplyTimeout)
 }
 
 // freeTCPPort reserves a loopback address for a cluster node's transport
@@ -135,160 +196,99 @@ func freeTCPPort(b *testing.B) string {
 	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
 
-// SetupEtcdCluster creates an N-node etcd/raft cluster with TCP+TLS
-// transport, WAL persistence, and state machines. It waits for initial
-// configuration changes to be applied on all nodes, then waits for
-// natural leader election (no Campaign shortcut). A warmup proposal is
-// sent to ensure all connections are fully established before returning.
-func SetupEtcdCluster(b *testing.B, numNodes int) *EtcdCluster {
+// newEtcdCluster prepares, without starting, one raft node per infra slot,
+// with raft ids firstID+1 .. firstID+N: its MemoryStorage, WAL file, state
+// machine and trackers, and points every slot's transport at the new ids.
+// Nothing here is part of an election measurement; start is.
+func newEtcdCluster(b *testing.B, infra *etcdClusterInfra, firstID uint64) *EtcdCluster {
 	b.Helper()
 
-	// Generate a single shared TLS configuration for all cluster nodes.
-	tlsCfg, err := generateSharedTLS()
-	if err != nil {
-		b.Fatalf("generateSharedTLS failed: %v", err)
+	numNodes := len(infra.addrs)
+	peerAddrs := make(map[uint64]string, numNodes)
+	for slot, addr := range infra.addrs {
+		peerAddrs[firstID+uint64(slot)+1] = addr
 	}
 
-	// Allocate unique ports for each node.
-	addrs := make(map[uint64]string, numNodes)
-	for i := 1; i <= numNodes; i++ {
-		addrs[uint64(i)] = freeTCPPort(b)
-	}
-
-	electionTick := clusterElectionTick(numNodes)
 	nodes := make([]*etcdClusterNode, numNodes)
+	for slot := range numNodes {
+		nodeID := firstID + uint64(slot) + 1
 
-	for i := 0; i < numNodes; i++ {
-		nodeID := uint64(i + 1)
-
-		storage := raft.NewMemoryStorage()
-		cfg := &raft.Config{
-			ID:              nodeID,
-			ElectionTick:    electionTick,
-			HeartbeatTick:   1,
-			Storage:         storage,
-			MaxSizePerMsg:   1024 * 1024,
-			MaxInflightMsgs: 256,
-			CheckQuorum:     true,
-			PreVote:         true,
-		}
-
-		peers := make([]raft.Peer, numNodes)
-		for j := 0; j < numNodes; j++ {
-			peers[j] = raft.Peer{ID: uint64(j + 1)}
-		}
-
-		node := raft.StartNode(cfg, peers)
-
-		walDir := b.TempDir()
-		wal, walErr := newWALWriter(walDir)
-		if walErr != nil {
-			node.Stop()
-			b.Fatalf("newWALWriter for node %d: %v", nodeID, walErr)
-		}
-
-		cn := &etcdClusterNode{
-			id:       nodeID,
-			node:     node,
-			storage:  storage,
-			wal:      wal,
-			sm:       newBenchStateMachineEtcd(),
-			confDone: newConfChangeTrackerWithCount(numNodes),
-			stopCh:   make(chan struct{}),
-		}
-
-		// Build peer address map excluding self.
-		peerAddrs := make(map[uint64]string, numNodes-1)
-		for id, addr := range addrs {
-			if id != nodeID {
-				peerAddrs[id] = addr
+		wal, err := newWALWriter(b.TempDir())
+		if err != nil {
+			for _, cn := range nodes[:slot] {
+				cn.wal.close()
 			}
+			b.Fatalf("newWALWriter for node %d: %v", nodeID, err)
 		}
 
-		// Create transport with message delivery into the raft node.
-		// Capture node in closure to avoid data race.
-		localNode := node
-		transport, transportErr := newRaftTransport(
-			nodeID,
-			addrs[nodeID],
-			peerAddrs,
-			tlsCfg,
-			func(msg *raftpb.Message) {
-				// Deliver received message into the raft node.
-				// Errors from Step are expected during shutdown.
-				localNode.Step(context.Background(), msg)
-			},
-		)
-		if transportErr != nil {
-			node.Stop()
-			wal.close()
-			b.Fatalf("newRaftTransport for node %d: %v", nodeID, transportErr)
-		}
-		cn.transport = transport
+		transport := infra.transports[slot]
+		transport.setPeers(peerAddrs)
 
-		// Start event loop that processes Ready structs and sends
-		// messages via the transport.
+		nodes[slot] = &etcdClusterNode{
+			id:        nodeID,
+			storage:   raft.NewMemoryStorage(),
+			wal:       wal,
+			sm:        newBenchStateMachineEtcd(),
+			transport: transport,
+			confDone:  newConfChangeTrackerWithCount(numNodes),
+			proposals: newWaiters(),
+			reads:     newWaiters(),
+			stopCh:    make(chan struct{}),
+			tickDone:  make(chan struct{}),
+		}
+	}
+	return &EtcdCluster{Nodes: nodes, infra: infra}
+}
+
+// start starts every prepared node: raft.StartNode, the Ready event loop and
+// the 1 ms ticker, and makes the node its slot's message recipient. Starting
+// the replicas and waiting for a leader is all an election benchmark times.
+func (c *EtcdCluster) start() {
+	peers := make([]raft.Peer, len(c.Nodes))
+	for i, cn := range c.Nodes {
+		peers[i] = raft.Peer{ID: cn.id}
+	}
+	for slot, cn := range c.Nodes {
+		cn.node = raft.StartNode(benchRaftConfig(cn.id, cn.storage), peers)
+		c.infra.current[slot].Store(cn)
+
 		cn.loopDone.Add(1)
 		go func() {
 			defer cn.loopDone.Done()
 			cn.clusterEventLoop()
 		}()
-
-		// Start ticker goroutine that drives raft ticks at 1ms intervals.
-		cn.tickDone = make(chan struct{})
-		go func() {
-			defer close(cn.tickDone)
-			ticker := time.NewTicker(clusterTickInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					cn.node.Tick()
-				case <-cn.stopCh:
-					return
-				}
-			}
-		}()
-
-		nodes[i] = cn
+		go runTicker(cn.node, cn.stopCh, cn.tickDone)
 	}
+}
 
-	cluster := &EtcdCluster{Nodes: nodes}
+// SetupEtcdCluster creates an N-node etcd/raft cluster with TCP+TLS
+// transport, WAL persistence, and state machines. It waits for initial
+// configuration changes to be applied on all nodes, then waits for
+// natural leader election (no Campaign shortcut), then runs the setup
+// warmup (10 proposals and one linearizable read) on the leader.
+func SetupEtcdCluster(b *testing.B, numNodes int) *EtcdCluster {
+	b.Helper()
 
-	// Wait for all initial ConfChange entries to be applied on every node.
-	for _, cn := range nodes {
+	infra := newEtcdClusterInfra(b, numNodes)
+	cluster := newEtcdCluster(b, infra, 0)
+	cluster.start()
+
+	for _, cn := range cluster.Nodes {
 		if !cn.confDone.wait(clusterConfChangeTimeout) {
 			cluster.Close()
 			b.Fatalf("initial ConfChange not applied for node %d", cn.id)
 		}
 	}
 
-	// Wait for leader election via natural randomized timeout.
-	_, leaderErr := waitForEtcdClusterLeader(nodes, clusterLeaderTimeout)
-	if leaderErr != nil {
+	leader, err := cluster.waitForLeader(clusterLeaderTimeout)
+	if err != nil {
 		cluster.Close()
-		b.Fatalf("cluster leader election failed: %v", leaderErr)
+		b.Fatalf("cluster leader election failed: %v", err)
 	}
 
-	// Warmup proposal to prime TLS connections and the full pipeline.
-	leader, findErr := cluster.CurrentLeaderNode()
-	if findErr != nil {
+	if err := setupWarmup(leader.node, leader.proposals, leader.reads, &leader.appliedIndex, leader.sm); err != nil {
 		cluster.Close()
-		b.Fatalf("warmup: %v", findErr)
-	}
-
-	warmupPayload := make([]byte, 128)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if propErr := leader.node.Propose(ctx, warmupPayload); propErr != nil {
-		cancel()
-		cluster.Close()
-		b.Fatalf("warmup propose failed: %v", propErr)
-	}
-	cancel()
-
-	if !leader.waitForApplied(1, 10*time.Second) {
-		cluster.Close()
-		b.Fatalf("warmup apply did not complete")
+		b.Fatalf("cluster setup warmup failed: %v", err)
 	}
 
 	return cluster
@@ -296,9 +296,11 @@ func SetupEtcdCluster(b *testing.B, numNodes int) *EtcdCluster {
 
 // clusterEventLoop processes Ready structs from the raft node, persisting
 // entries and hard state to the WAL, appending to MemoryStorage, sending
-// messages to peers via the transport, and applying committed entries
-// through the state machine.
+// messages to peers via the transport (a leader in parallel with the WAL
+// write, a follower after it), and applying committed entries through the
+// state machine.
 func (cn *etcdClusterNode) clusterEventLoop() {
+	isLeader := false
 	for {
 		select {
 		case rd, ok := <-cn.node.Ready():
@@ -306,11 +308,40 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 				return
 			}
 
-			// Persist entries and hard state to WAL with a single fsync.
+			// SoftState is non-nil only when it changed; it reflects this
+			// Ready, so a leader that steps down in it is not a leader here.
+			if rd.SoftState != nil {
+				isLeader = rd.SoftState.RaftState == raft.StateLeader
+			}
+
+			// A leader sends its messages in parallel with persisting, as
+			// the raft package documents (go.etcd.io/raft/v3 doc.go and
+			// README, "Usage" step 2: "an optimization can be applied to
+			// make leader write to disk in parallel with its followers (as
+			// explained at section 10.2.1 in Raft thesis)") and as the etcd
+			// server's raftNode does. A follower persists first, because its
+			// messages (append and vote responses) promise durable state.
+			// Either way an entry is applied, and so acknowledged, only after
+			// this Ready's single fsync below, and the send finishes before
+			// Advance so no message is marshalled while the next Ready's
+			// entries are persisted.
+			var leaderSend sync.WaitGroup
+			if isLeader && len(rd.Messages) > 0 {
+				leaderSend.Add(1)
+				go func() {
+					defer leaderSend.Done()
+					cn.transport.send(rd.Messages)
+				}()
+			}
+
+			// Persist entries and hard state to WAL with a single fsync,
+			// before anything from this Ready is applied, and on a follower
+			// before anything is sent.
 			hasEntries := len(rd.Entries) > 0
 			hasHardState := !raft.IsEmptyHardState(rd.HardState)
 			if cn.wal != nil && (hasEntries || hasHardState) {
 				if err := cn.wal.persistReady(rd.Entries, rd.HardState); err != nil {
+					leaderSend.Wait()
 					return
 				}
 			}
@@ -325,37 +356,35 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 				cn.storage.Append(rd.Entries)
 			}
 
-			// Send messages to peers via TCP+TLS transport.
-			if len(rd.Messages) > 0 {
+			// A follower sends only now that its state is durable.
+			if !isLeader && len(rd.Messages) > 0 {
 				cn.transport.send(rd.Messages)
 			}
 
 			// Apply committed entries through the state machine.
 			if len(rd.CommittedEntries) > 0 {
-				applied := int64(0)
 				for _, entry := range rd.CommittedEntries {
-					switch entry.GetType() {
-					case raftpb.EntryConfChange:
+					if entry.GetType() == raftpb.EntryConfChange {
 						var cc raftpb.ConfChange
 						if unmarshalErr := proto.Unmarshal(entry.Data, &cc); unmarshalErr == nil {
 							cn.node.ApplyConfChange(&cc)
 						}
 						cn.confDone.signal()
-					case raftpb.EntryNormal:
-						if len(entry.Data) > 0 {
-							applied++
-						}
 					}
 				}
 
 				// Batch-apply all normal entries through state machine.
 				cn.sm.apply(rd.CommittedEntries)
+				cn.appliedIndex.Store(rd.CommittedEntries[len(rd.CommittedEntries)-1].GetIndex())
 
-				if applied > 0 {
-					cn.totalApplied.Add(applied)
-				}
+				// Wake each proposer whose own entry just applied.
+				cn.proposals.completeEntries(rd.CommittedEntries)
 			}
 
+			// Hand each ReadIndex result to its reader.
+			cn.reads.completeReadStates(rd.ReadStates)
+
+			leaderSend.Wait()
 			cn.node.Advance()
 
 		case <-cn.stopCh:
@@ -364,70 +393,39 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 	}
 }
 
-// waitForApplied polls the atomic totalApplied counter until it reaches
-// or exceeds the target count, or the timeout expires. Returns true if
-// the target was reached. Uses tight polling with runtime.Gosched to
-// avoid channel signal drops under sustained load.
-func (cn *etcdClusterNode) waitForApplied(target int64, timeout time.Duration) bool {
-	ticker := time.NewTicker(50 * time.Microsecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		if cn.totalApplied.Load() >= target {
-			return true
-		}
-		select {
-		case <-deadline.C:
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
-// stop shuts down the cluster node: stops the raft node, signals the
-// event loop and ticker to exit, waits for goroutine cleanup, closes
-// the transport, and closes the WAL file.
-func (cn *etcdClusterNode) stop() {
+// stop shuts down the cluster node: detaches it from its slot's transport,
+// stops the raft node, signals the event loop and ticker to exit, waits for
+// goroutine cleanup, and closes the WAL file. The transport itself belongs
+// to the cluster infrastructure and stays open.
+func (cn *etcdClusterNode) stop(slot *atomic.Pointer[etcdClusterNode]) {
 	if !cn.stopped.CompareAndSwap(false, true) {
 		return
 	}
-	cn.node.Stop()
+	slot.CompareAndSwap(cn, nil)
+	if cn.node != nil {
+		cn.node.Stop()
+	}
 	close(cn.stopCh)
 	cn.loopDone.Wait()
-	<-cn.tickDone
-	cn.transport.close()
+	if cn.node != nil {
+		<-cn.tickDone
+	}
 	if cn.wal != nil {
 		cn.wal.close()
 	}
 }
 
-// Close shuts down all nodes in the cluster.
-func (c *EtcdCluster) Close() {
-	for _, cn := range c.Nodes {
-		cn.stop()
+// stopNodes stops every node and leaves the infrastructure running, so an
+// election benchmark can start the next round's nodes on the same
+// transports.
+func (c *EtcdCluster) stopNodes() {
+	for slot, cn := range c.Nodes {
+		cn.stop(&c.infra.current[slot])
 	}
 }
 
-// waitForEtcdClusterLeader polls all nodes until one reports itself as
-// leader, returning its index in the nodes slice. Returns an error if
-// no leader is elected within the timeout.
-func waitForEtcdClusterLeader(nodes []*etcdClusterNode, timeout time.Duration) (int, error) {
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		for i, cn := range nodes {
-			status := cn.node.Status()
-			if status.Lead == cn.id && status.RaftState == raft.StateLeader {
-				return i, nil
-			}
-		}
-		select {
-		case <-deadline.C:
-			return -1, fmt.Errorf("no leader elected within %v", timeout)
-		case <-ticker.C:
-		}
-	}
+// Close shuts down all nodes in the cluster and its infrastructure.
+func (c *EtcdCluster) Close() {
+	c.stopNodes()
+	c.infra.close()
 }

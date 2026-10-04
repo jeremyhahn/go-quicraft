@@ -27,13 +27,10 @@ RUN --mount=type=secret,id=gomodauth \
       -o /bench-quicraft .
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates procps && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /bench-quicraft /usr/local/bin/bench-quicraft
 
-# Entrypoint script raises kernel UDP buffer limits (requires --privileged)
-# and then execs the benchmark binary. Without these limits, multi-node QUIC
-# benchmarks suffer packet drops under burst traffic.
-COPY test/performance/quicraft/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Host socket buffer limits are raised once for every engine by perfcompare
+# (prepareHostNetwork), so this container needs no privileges of its own.
+ENTRYPOINT ["/usr/local/bin/bench-quicraft"]
 CMD ["-test.bench=.", "-test.run=^$", "-test.benchtime=5s", "-test.timeout=600s", "-test.v"]

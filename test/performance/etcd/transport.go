@@ -52,15 +52,15 @@ const connWriteDeadline = 1 * time.Second
 
 // raftTransport provides TCP+TLS message delivery between etcd/raft nodes.
 // Messages are length-prefixed protobuf frames over persistent TLS connections.
-// Outbound connections are lazily dialed and cached. Inbound connections are
-// accepted and each served by a dedicated goroutine that reads frames and
-// delivers them to the node via the recvFn callback.
+// Outbound connections are lazily dialed and cached by peer address, so they
+// survive a change of the raft ids served at those addresses (setPeers).
+// Inbound connections are accepted and each served by a dedicated goroutine
+// that reads frames and delivers them via the recvFn callback.
 type raftTransport struct {
 	mu        sync.Mutex
-	nodeID    uint64
 	addr      string
 	peers     map[uint64]string   // nodeID -> addr
-	conns     map[uint64]net.Conn // nodeID -> cached outbound TLS conn
+	conns     map[string]net.Conn // peer addr -> cached outbound TLS conn
 	listener  net.Listener
 	clientCfg *tls.Config
 	recvFn    func(*raftpb.Message) // callback when a message is received
@@ -176,14 +176,12 @@ func generateSharedTLS() (*sharedTLSConfig, error) {
 	return &sharedTLSConfig{server: serverCfg, client: clientCfg}, nil
 }
 
-// newRaftTransport creates a TCP+TLS transport for one raft node. It binds
-// a TLS listener on the given address, starts the accept loop for inbound
-// connections, and prepares outbound connection caching for peer addresses.
-// The recvFn callback is invoked for each successfully decoded inbound message.
+// newRaftTransport creates a TCP+TLS transport for one node slot. It binds
+// a TLS listener on the given address and starts the accept loop for inbound
+// connections. Peers are named with setPeers. The recvFn callback is invoked
+// for each successfully decoded inbound message.
 func newRaftTransport(
-	nodeID uint64,
 	addr string,
-	peers map[uint64]string,
 	tlsCfg *sharedTLSConfig,
 	recvFn func(*raftpb.Message),
 ) (*raftTransport, error) {
@@ -194,10 +192,9 @@ func newRaftTransport(
 	}
 
 	t := &raftTransport{
-		nodeID:    nodeID,
 		addr:      listener.Addr().String(),
-		peers:     peers,
-		conns:     make(map[uint64]net.Conn),
+		peers:     make(map[uint64]string),
+		conns:     make(map[string]net.Conn),
 		listener:  listener,
 		clientCfg: tlsCfg.client,
 		recvFn:    recvFn,
@@ -209,6 +206,14 @@ func newRaftTransport(
 	go t.acceptLoop()
 
 	return t, nil
+}
+
+// setPeers replaces the raft-id-to-address map used to route outbound
+// messages. Cached connections are keyed by address and are kept.
+func (t *raftTransport) setPeers(peers map[uint64]string) {
+	t.mu.Lock()
+	t.peers = peers
+	t.mu.Unlock()
 }
 
 // acceptLoop accepts inbound TLS connections and spawns a goroutine
@@ -237,6 +242,21 @@ func (t *raftTransport) acceptLoop() {
 func (t *raftTransport) handleConn(conn net.Conn) {
 	defer t.done.Done()
 	defer conn.Close()
+
+	// Complete the TLS handshake under its own deadline before applying the
+	// short per-frame read deadline below. A handshake that times out leaves
+	// crypto/tls with a sticky error, and every later Read would return that
+	// timeout again: the loop would spin forever without reading, while the
+	// sender's cached connection kept accepting writes, silently losing that
+	// direction of the link. On failure the connection is closed instead, so
+	// the sender's next write fails and it redials.
+	if tc, ok := conn.(*tls.Conn); ok {
+		tc.SetDeadline(time.Now().Add(connDialTimeout))
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		tc.SetDeadline(time.Time{})
+	}
 
 	lengthBuf := make([]byte, 4)
 	for {
@@ -289,7 +309,7 @@ func (t *raftTransport) send(msgs []*raftpb.Message) {
 	}
 
 	// Group messages by target node.
-	byTarget := make(map[uint64][]*raftpb.Message, len(t.peers))
+	byTarget := make(map[uint64][]*raftpb.Message)
 	for i := range msgs {
 		to := msgs[i].GetTo()
 		byTarget[to] = append(byTarget[to], msgs[i])
@@ -325,14 +345,14 @@ func (t *raftTransport) send(msgs []*raftpb.Message) {
 // so the next attempt will re-dial.
 func (t *raftTransport) sendOne(msg *raftpb.Message) {
 	t.mu.Lock()
-	conn, ok := t.conns[msg.GetTo()]
+	peerAddr, exists := t.peers[msg.GetTo()]
+	conn, ok := t.conns[peerAddr]
 	t.mu.Unlock()
+	if !exists {
+		return
+	}
 
 	if !ok {
-		peerAddr, exists := t.peers[msg.GetTo()]
-		if !exists {
-			return
-		}
 		var err error
 		conn, err = tls.DialWithDialer(
 			&net.Dialer{Timeout: connDialTimeout},
@@ -344,7 +364,7 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 			return
 		}
 		t.mu.Lock()
-		t.conns[msg.GetTo()] = conn
+		t.conns[peerAddr] = conn
 		t.mu.Unlock()
 	}
 
@@ -358,23 +378,23 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 
 	conn.SetWriteDeadline(time.Now().Add(connWriteDeadline))
 	if _, err := conn.Write(lengthBuf[:]); err != nil {
-		t.removeConn(msg.GetTo())
+		t.removeConn(peerAddr)
 		return
 	}
 	if _, err := conn.Write(data); err != nil {
-		t.removeConn(msg.GetTo())
+		t.removeConn(peerAddr)
 		return
 	}
 }
 
-// removeConn evicts and closes a cached outbound connection for the
-// given peer. This is called after a send failure to force re-dial
+// removeConn evicts and closes the cached outbound connection to the
+// given peer address. This is called after a send failure to force re-dial
 // on the next message.
-func (t *raftTransport) removeConn(nodeID uint64) {
+func (t *raftTransport) removeConn(peerAddr string) {
 	t.mu.Lock()
-	if conn, ok := t.conns[nodeID]; ok {
+	if conn, ok := t.conns[peerAddr]; ok {
 		conn.Close()
-		delete(t.conns, nodeID)
+		delete(t.conns, peerAddr)
 	}
 	t.mu.Unlock()
 }
@@ -386,9 +406,9 @@ func (t *raftTransport) close() {
 	close(t.stopCh)
 	t.listener.Close()
 	t.mu.Lock()
-	for id, conn := range t.conns {
+	for addr, conn := range t.conns {
 		conn.Close()
-		delete(t.conns, id)
+		delete(t.conns, addr)
 	}
 	t.mu.Unlock()
 	t.done.Wait()

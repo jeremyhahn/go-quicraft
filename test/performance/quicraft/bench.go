@@ -44,6 +44,13 @@ const (
 	// quicraftRTT is the RTT in milliseconds for benchmarks.
 	quicraftRTT uint64 = 1
 
+	// quicraftElectionRTT and quicraftHeartbeatRTT are the election timeout
+	// and heartbeat interval in ticks (one tick is quicraftRTT ms), pinned to
+	// the cross-engine fairness spec (go-quicraft #228) rather than taken
+	// from library defaults, so a default change cannot move the benchmark.
+	quicraftElectionRTT  uint64 = 10
+	quicraftHeartbeatRTT uint64 = 1
+
 	// quicraftElectionWait is the maximum time to wait for leader election.
 	quicraftElectionWait = 10 * time.Second
 
@@ -52,6 +59,11 @@ const (
 	// 60s to accommodate Docker and CI environments where scheduling
 	// latency can delay the first election round.
 	quicraftClusterElectionWait = 60 * time.Second
+
+	// leaderPollInterval is how often the leader-wait helpers poll for a leader.
+	// It bounds the polling error in every election sample and is the same
+	// 1 ms across all benchmarked engines (go-quicraft #228).
+	leaderPollInterval = time.Millisecond
 
 	// commitLatencyWarmup is the number of unmeasured proposals run before
 	// the commit-latency measurement loop, so the first timed proposal does
@@ -106,10 +118,28 @@ func reservePorts(b *testing.B, n int) []string {
 	return addrs
 }
 
+// benchShardConfig returns the shard configuration every benchmark replica
+// runs with. The timing and safety settings the fairness spec fixes
+// (election 10 ticks, heartbeat 1 tick, CheckQuorum and PreVote on) are set
+// explicitly; everything else takes the library default.
+func benchShardConfig(replicaID uint64, identities map[uint64]string) config.Config {
+	cfg := config.Config{
+		ShardID:          quicraftShardID,
+		ReplicaID:        replicaID,
+		ElectionRTT:      quicraftElectionRTT,
+		HeartbeatRTT:     quicraftHeartbeatRTT,
+		CheckQuorum:      config.BoolPtr(true),
+		PreVote:          config.BoolPtr(true),
+		MemberIdentities: identities,
+	}
+	cfg.SetDefaults()
+	return cfg
+}
+
 // SetupQuicRaftCluster creates a multi-node QuicRaft cluster with real
 // QUIC transport and auto-generated TLS certificates. It starts one shard
-// across all nodes, waits for leader election, and performs a warmup
-// proposal to establish all QUIC connections and TLS handshakes.
+// across all nodes, waits for leader election, and runs the setup warmup
+// (verifyClusterReady) to establish all QUIC connections and TLS handshakes.
 func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
@@ -169,12 +199,7 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		identities[uint64(i+1)] = h.NodeIdentity()
 	}
 	for i, h := range hosts {
-		shardCfg := config.Config{
-			ShardID:          quicraftShardID,
-			ReplicaID:        uint64(i + 1),
-			MemberIdentities: identities,
-		}
-		shardCfg.SetDefaults()
+		shardCfg := benchShardConfig(uint64(i+1), identities)
 
 		if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
 			for _, hh := range hosts {
@@ -209,7 +234,7 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 // for the given shard, or the timeout expires. On timeout, it returns
 // diagnostic information about each node's last observed state.
 func waitForClusterLeader(hosts []*quicraft.Host, shardID uint64, timeout time.Duration) (int, error) {
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -249,42 +274,51 @@ func warmupPropose(ctx context.Context, h *quicraft.Host, shardID uint64, cmd []
 	return nil
 }
 
-// verifyClusterReady performs post-election readiness verification by
-// running a series of proposals with retry tolerance. This ensures the
-// leader can actually process proposals and all peer QUIC connections
-// are fully established before the benchmark timer starts.
+// setupWarmupProposals is the number of unmeasured proposals every scenario's
+// group setup runs once a leader is known, before any timer starts. It is the
+// cross-engine fairness spec's setup warmup (go-quicraft #228): exactly this
+// many proposals, then one linearizable read. commitLatencyWarmup is separate
+// and runs in addition, inside the commit-latency scenarios.
+const setupWarmupProposals = 10
+
+// verifyClusterReady runs the setup warmup on a freshly elected group of any
+// size (a single-node group included): setupWarmupProposals proposals, then
+// one linearizable read, each on the shared warmup retry budget. It
+// establishes the peer QUIC connections and primes the propose and ReadIndex
+// paths so the first timed operation pays no one-time initialization. Both
+// calls return only once their own operation has completed (applied, or the
+// read index confirmed and reached), so nothing is left in flight that would
+// need a settle delay before the timer starts.
 func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int, shardID uint64) {
 	b.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	for i := 0; i < 10; i++ {
+	fail := func(err error) {
+		for _, h := range hosts {
+			h.Close()
+		}
+		b.Fatalf("cluster readiness verification failed: %v", err)
+	}
+
+	leader := hosts[leaderIdx]
+	for i := 0; i < setupWarmupProposals; i++ {
 		warmupCmd := encodeKVCmd([]byte(fmt.Sprintf("warmup-%d", i)), []byte("ok"))
 		label := fmt.Sprintf("proposal %d on node %d", i, leaderIdx)
-		if err := warmupPropose(ctx, hosts[leaderIdx], shardID, warmupCmd, label); err != nil {
-			for _, h := range hosts {
-				h.Close()
-			}
-			b.Fatalf("cluster readiness verification failed: %v", err)
+		if err := warmupPropose(ctx, leader, shardID, warmupCmd, label); err != nil {
+			fail(err)
 		}
 	}
 
-	// Warm up ReadIndex path so the first benchmark read does not
-	// include one-time initialization overhead.
-	if _, err := hosts[leaderIdx].SyncRead(ctx, shardID, []byte("warmup-0")); err != nil {
-		// SyncRead may return a "key not found" type error from the SM
-		// lookup, which is fine. Only fail on infrastructure errors that
-		// indicate the ReadIndex path itself is broken. Log and continue.
-		b.Logf("warmup SyncRead (non-fatal): %v", err)
+	// One linearizable read of a key the warmup just wrote, so a failure here
+	// is the ReadIndex path itself and is fatal like a failed proposal.
+	if err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+		_, rerr := leader.SyncRead(ctx, shardID, []byte("warmup-0"))
+		return rerr
+	}); err != nil {
+		fail(fmt.Errorf("warmup SyncRead on node %d failed after %d attempts: %w", leaderIdx, benchutil.WarmupAttempts, err))
 	}
-
-	// Brief pause to let the pipeline settle after warmup. This allows
-	// in-flight heartbeats and acks to complete so the first benchmark
-	// iteration does not include pipeline drain latency.
-	settleTimer := time.NewTimer(50 * time.Millisecond)
-	<-settleTimer.C
-	settleTimer.Stop()
 }
 
 // BenchQuicRaftElectionCluster benchmarks leader election time for a
@@ -355,19 +389,19 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 	b.ResetTimer()
 	b.ReportAllocs()
 
+	shardCfgs := make([]config.Config, numNodes)
 	for i := 0; i < b.N; i++ {
+		// Build each replica's config before the timer, as the single-node
+		// variant does, so the timed span is only StartShard plus the wait.
+		for j := range hosts {
+			shardCfgs[j] = benchShardConfig(uint64(j+1), identities)
+		}
+
 		start := time.Now()
 
 		// Start shard on all hosts.
 		for j, h := range hosts {
-			shardCfg := config.Config{
-				ShardID:          quicraftShardID,
-				ReplicaID:        uint64(j + 1),
-				MemberIdentities: identities,
-			}
-			shardCfg.SetDefaults()
-
-			if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
+			if err := h.StartShard(members, false, createFn, shardCfgs[j]); err != nil {
 				b.Fatalf("StartShard[%d] failed at iteration %d: %v", j, i, err)
 			}
 		}
@@ -635,12 +669,7 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		return newQuicraftKVSM()
 	})
 
-	shardCfg := config.Config{
-		ShardID:          quicraftShardID,
-		ReplicaID:        quicraftReplicaID,
-		MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
-	}
-	shardCfg.SetDefaults()
+	shardCfg := benchShardConfig(quicraftReplicaID, map[uint64]string{quicraftReplicaID: h.NodeIdentity()})
 
 	members := map[uint64]string{
 		quicraftReplicaID: quicraftAddr,
@@ -656,6 +685,9 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		h.Close()
 		b.Fatalf("leader election timed out: %v", err)
 	}
+
+	// The same setup warmup every group size runs; it closes h on failure.
+	verifyClusterReady(b, []*quicraft.Host{h}, 0, quicraftShardID)
 
 	cleanup := func() {
 		h.Close()
@@ -695,12 +727,7 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		return newQuicraftKVSM()
 	})
 
-	shardCfg := config.Config{
-		ShardID:          quicraftShardID,
-		ReplicaID:        quicraftReplicaID,
-		MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
-	}
-	shardCfg.SetDefaults()
+	shardCfg := benchShardConfig(quicraftReplicaID, map[uint64]string{quicraftReplicaID: h.NodeIdentity()})
 
 	members := map[uint64]string{
 		quicraftReplicaID: quicraftAddr,
@@ -716,6 +743,9 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		b.Fatalf("leader election (memory) timed out: %v", err)
 	}
 
+	// The same setup warmup every group size runs; it closes h on failure.
+	verifyClusterReady(b, []*quicraft.Host{h}, 0, quicraftShardID)
+
 	cleanup := func() {
 		h.Close()
 	}
@@ -724,7 +754,7 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 
 // waitForQuicRaftLeader polls until a leader is elected or the timeout expires.
 func waitForQuicRaftLeader(h *quicraft.Host, shardID uint64, timeout time.Duration) error {
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -899,12 +929,7 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		shardCfg := config.Config{
-			ShardID:          quicraftShardID,
-			ReplicaID:        quicraftReplicaID,
-			MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
-		}
-		shardCfg.SetDefaults()
+		shardCfg := benchShardConfig(quicraftReplicaID, map[uint64]string{quicraftReplicaID: h.NodeIdentity()})
 
 		start := time.Now()
 
@@ -968,12 +993,7 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		shardCfg := config.Config{
-			ShardID:          quicraftShardID,
-			ReplicaID:        quicraftReplicaID,
-			MemberIdentities: map[uint64]string{quicraftReplicaID: h.NodeIdentity()},
-		}
-		shardCfg.SetDefaults()
+		shardCfg := benchShardConfig(quicraftReplicaID, map[uint64]string{quicraftReplicaID: h.NodeIdentity()})
 
 		start := time.Now()
 
@@ -1081,13 +1101,8 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		identities[uint64(i+1)] = h.NodeIdentity()
 	}
 	for i, h := range hosts {
-		shardCfg := config.Config{
-			ShardID:          quicraftShardID,
-			ReplicaID:        uint64(i + 1),
-			LeaseRead:        true,
-			MemberIdentities: identities,
-		}
-		shardCfg.SetDefaults()
+		shardCfg := benchShardConfig(uint64(i+1), identities)
+		shardCfg.LeaseRead = true
 
 		if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
 			for _, hh := range hosts {

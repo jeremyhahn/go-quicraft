@@ -56,13 +56,12 @@ var knownSystems = perfprofile.KnownSystems
 type dockerGoConfig struct {
 	image      string
 	dockerfile string // relative to the perf dir (orchestrator cwd)
-	privileged bool   // QuicRaft needs --privileged for UDP buffer tuning
 }
 
 // dockerGoSystems maps each Go benchmark system to its Docker configuration.
 // OpenRaft is handled separately (different run-arg convention).
 var dockerGoSystems = map[string]dockerGoConfig{
-	"quicraft":   {image: "quicraft-bench-quicraft", dockerfile: "quicraft/Dockerfile", privileged: true},
+	"quicraft":   {image: "quicraft-bench-quicraft", dockerfile: "quicraft/Dockerfile"},
 	"etcd":       {image: "quicraft-bench-etcd", dockerfile: "etcd/Dockerfile"},
 	"dragonboat": {image: "quicraft-bench-dragonboat", dockerfile: "dragonboat/Dockerfile"},
 }
@@ -149,6 +148,10 @@ func runBenchmarks(args []string) error {
 
 	fmt.Printf("Running benchmarks: %s\n", strings.Join(systems, ", "))
 	fmt.Printf("  benchtime=%s  timeout=%s  logs=%s\n\n", *benchtime, *timeout, cfg.logDir)
+
+	if err := prepareHost(); err != nil {
+		return err
+	}
 
 	table := perfresult.NewComparisonTable()
 	var failed []string
@@ -304,8 +307,8 @@ func runSystem(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error)
 
 // runGoDocker builds (unless --no-build) and runs a Go benchmark system inside
 // a Docker container, then parses the sentinel-delimited JSON from stdout.
-// Every engine runs with --net=host; QuicRaft additionally runs --privileged
-// so its entrypoint can raise the kernel UDP buffers QUIC needs.
+// Every engine runs with the same container flags (goRunArgs); host socket
+// buffer limits are set once for all engines by prepareHostNetwork.
 func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	docker := dockerGoSystems[system]
 
@@ -320,12 +323,7 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 		}
 	}
 
-	runArgs := []string{"run", "--rm", "--network=host"}
-	if docker.privileged {
-		runArgs = append(runArgs, "--privileged")
-	}
-	runArgs = append(runArgs, benchTmpMount()...)
-	runArgs = append(runArgs, docker.image,
+	runArgs := append(goRunArgs(docker),
 		"-test.bench=.", "-test.run=^$",
 		"-test.benchtime="+cfg.benchtime, "-test.timeout="+cfg.timeout, "-test.v")
 
@@ -351,6 +349,52 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 	}
 
 	return suite, nil
+}
+
+// goRunArgs returns the docker run arguments shared by every Go engine's
+// container, up to and including the image. No engine gets extra flags or
+// privileges: host-level tuning is applied once, for all of them, by
+// prepareHostNetwork.
+func goRunArgs(docker dockerGoConfig) []string {
+	args := []string{"run", "--rm", "--network=host"}
+	args = append(args, benchTmpMount()...)
+	return append(args, docker.image)
+}
+
+// hostSocketBufferBytes is the value every net.core socket buffer limit on the
+// bench host is raised to before a run. QUIC needs large UDP buffers for
+// multi-node scenarios on loopback; TCP engines are unaffected or helped.
+// Setting it once for every engine, instead of from one engine's container,
+// keeps the host identical for all of them regardless of run order.
+const hostSocketBufferBytes = "26214400"
+
+// hostNetworkArgs returns the docker run arguments of the one-shot container
+// that applies hostSocketBufferBytes to the host network namespace.
+func hostNetworkArgs() []string {
+	var cmds []string
+	for _, key := range []string{"rmem_max", "wmem_max", "rmem_default", "wmem_default"} {
+		cmds = append(cmds, "echo "+hostSocketBufferBytes+" > /proc/sys/net/core/"+key)
+	}
+	script := "set -e; " + strings.Join(cmds, "; ")
+	return []string{"run", "--rm", "--privileged", "--network=host",
+		"debian:bookworm-slim", "sh", "-c", script}
+}
+
+// prepareHost is the host preparation runBenchmarks performs before any engine
+// runs. It is a variable so unit tests, which have no docker, can replace it.
+var prepareHost = prepareHostNetwork
+
+// prepareHostNetwork raises the bench host's socket buffer limits before any
+// engine runs. It fails the run rather than continuing on defaults, because a
+// run where the limits differ between engines is not a fair comparison.
+func prepareHostNetwork() error {
+	args := hostNetworkArgs()
+	fmt.Printf("Host network: net.core.{r,w}mem_{max,default} = %s\n", hostSocketBufferBytes)
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("set host socket buffer limits: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // moduleAuthEnv names both the BuildKit secret the benchmark Dockerfiles mount

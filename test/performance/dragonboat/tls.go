@@ -42,7 +42,7 @@ type tlsCertBundle struct {
 // node certificates written to PEM files in dir. Each node cert includes
 // 127.0.0.1 SAN for localhost Dragonboat transport and both server/client
 // extended key usage for MutualTLS.
-func generateTLSCerts(b *testing.B, dir string, numNodes int) []tlsCertBundle {
+func generateTLSCerts(b testing.TB, dir string, numNodes int) []tlsCertBundle {
 	b.Helper()
 
 	// Generate CA key pair.
@@ -123,7 +123,7 @@ func generateTLSCerts(b *testing.B, dir string, numNodes int) []tlsCertBundle {
 }
 
 // writePEM encodes the given DER data as a PEM block and writes it to path.
-func writePEM(b *testing.B, path, blockType string, data []byte) {
+func writePEM(b testing.TB, path, blockType string, data []byte) {
 	b.Helper()
 	f, err := os.Create(path)
 	if err != nil {

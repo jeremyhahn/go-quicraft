@@ -202,6 +202,7 @@ func TestGenerateFailsWhenResultsDirEmpty(t *testing.T) {
 // to run here — which is precisely the condition under test.
 func TestRunBenchmarksFailsWhenSystemProducesNoResults(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // no docker binary reachable
+	stubPrepareHost(t, nil)
 	profileDir := newProfileDir(t)
 
 	err := runBenchmarks([]string{"--benchtime=1x", "--no-build", "--profile=" + profileDir, "dragonboat"})

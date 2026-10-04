@@ -15,7 +15,7 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
-| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-02, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-04, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17, etcd not measured | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18, preserved as rendered tables |
 
@@ -113,11 +113,9 @@ make perf-generate PERF_PROFILE=<profile> PERF_SYSTEMS=quicraft,dragonboat,openr
 - [`profiles/r640/analysis.md`](profiles/r640/analysis.md): the R640 baseline.
   It holds the 2026-03-18 measurements themselves, because those numbers were
   never captured as JSON. It also holds two sections that describe the
-  harnesses rather than one machine, and so apply to every profile: the
-  [fairness audit](profiles/r640/analysis.md#fairness-and-comparability) and
-  the [scenario definitions](profiles/r640/analysis.md#scenario-definitions).
-  Read the fairness audit before drawing a conclusion from any row; the
-  election rows in particular are not like-for-like across columns.
+  harnesses rather than one machine: a fairness audit of the harnesses as they
+  were then, and the [scenario definitions](profiles/r640/analysis.md#scenario-definitions).
+  The current harnesses follow [Fairness](#fairness) below.
 - No other profile has an `analysis.md` yet. Nothing generates one, and nothing
   overwrites it once it exists.
 
@@ -183,9 +181,51 @@ Pebble v1.1.5. The harness sets `Expert.LogDBFactory` to `tan.Factory`, so
 Dragonboat runs Tan, its log-structured LogDB, rather than the default
 `sharded-pebble` key-value store. `TestNodeHostConfigUsesTan` pins this.
 
-All benchmarks run inside Docker containers with `--net=host` (QuicRaft also
-uses `--privileged` for UDP buffer tuning). Systems are benchmarked sequentially
-to avoid interference.
+All benchmarks run inside Docker containers with `--net=host` and identical
+flags; no engine's container is privileged. Before the first engine runs,
+`perfcompare` raises the host's `net.core.{r,w}mem_{max,default}` to 25 MiB
+from a one-shot container, so every engine sees the same socket limits whatever
+the run order. Systems are benchmarked one at a time.
+
+## Fairness
+
+Every head-to-head row compares the engines under one configuration. Each
+harness sets these values explicitly instead of inheriting library defaults,
+so a default changing upstream cannot move a result.
+
+| Parameter | Value, all four harnesses |
+|---|---|
+| Tick | 1 ms |
+| Election timeout | 10 ticks, randomized to [10, 20), at every cluster size |
+| Heartbeat | 1 tick (OpenRaft: 5 ms, see below) |
+| CheckQuorum, PreVote | on wherever the engine has them |
+| Payload | 128 bytes, `[op:1][keyLen:2 BE][key][value padding]` |
+| Keys | `bench-key` sequential, `key-<writer>` per concurrent writer, `commit-key` for commit latency |
+| Concurrency | 8 writers |
+| Setup warmup | 10 proposals, then one linearizable read, before any timer; commit latency adds 100 more |
+| Warmup retries | 4 attempts, 500 ms apart |
+| Completion | a proposal's latency ends when that proposal is applied |
+| Election timer | covers starting the group's replicas and waiting for a leader; hosts, transports, TLS and storage are built outside it |
+| Leader detection | polled every 1 ms |
+| Durability | every acknowledged write is synced to disk first |
+| Transport | mutual TLS 1.3 between nodes; no network traffic at 1N |
+| WAL location | the bind-mounted scratch directory |
+
+Where an engine cannot match a row, the difference is stated here rather than
+hidden:
+
+| Engine | Difference | Effect |
+|---|---|---|
+| OpenRaft | Heartbeat is 5 ms. openraft 0.9 uses the heartbeat interval as the timeout for every replication RPC, and at 1 ms it abandons and resends ordinary round trips. Its internal timer then ticks every 7 ms. | OpenRaft election times can read up to about 7 ms high. |
+| OpenRaft | No single-node election rows. A sole voter elects itself without waiting out a timeout, by design. | Those two rows show N/A and are left out of the score. |
+| OpenRaft | No PreVote or CheckQuorum switch; a leader lease covers part of CheckQuorum. | Elections skip the PreVote round the others pay for. |
+| OpenRaft | The benchmark WAL is write-only: it syncs every write with `fdatasync` but is never read back. | Same sync cost; not a recoverable log. |
+| Dragonboat | Requires no TLS minimum; it negotiates TLS 1.3, which `TestTransportNegotiatesTLS13` checks. | None in practice. |
+| Dragonboat | An election reuses one of 16 shard IDs (Tan keeps a 64 MiB file per shard, and unload is asynchronous); each ID is primed once outside the timer. | Every timed election restarts an existing group, as QuicRaft's does. |
+| etcd-io/raft | The library leaves transport, storage and the event loop to the user. The harness follows etcd's own pattern: one `fsync` per Ready, and the leader sends while it persists. | Measures etcd/raft used the way etcd uses it. |
+
+Sync calls differ by design: QuicRaft and OpenRaft use `fdatasync`, Dragonboat
+(Tan) and the etcd harness use `fsync`.
 
 ### Module credentials for the image builds
 

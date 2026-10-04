@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The four benchmark harnesses run one common configuration: 1 ms tick,
+  10-tick election timeout at every cluster size, PreVote and CheckQuorum where
+  supported, the same keys and warmup, per-proposal completion, elections timed
+  over replica start and leader wait only, 1 ms leader polling and mutual TLS
+  1.3. Host socket buffers are set once for every engine and no engine's
+  container runs privileged. Where an engine cannot match a setting it is
+  listed in `test/performance/README.md`. The `ci-node-2` profile is
+  re-measured on 2026-10-04.
+
 ## [0.17.0] - 2026-10-02
 
 Release candidate. **Breaking API change, no format change:** pkg/seal

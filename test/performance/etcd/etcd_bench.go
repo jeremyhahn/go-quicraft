@@ -24,6 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -168,53 +169,11 @@ func newWALWriter(dir string) (*walWriter, error) {
 	return &walWriter{f: f}, nil
 }
 
-// persistEntries serializes raft entries to disk with a length-prefix
-// framing protocol and calls fsync to ensure durability. This matches
-// the I/O pattern of QuicRaft's WAL: encode entries, write, fsync.
-func (w *walWriter) persistEntries(entries []*raftpb.Entry) error {
-	for i := range entries {
-		data, err := proto.Marshal(entries[i])
-		if err != nil {
-			return fmt.Errorf("walWriter: marshal entry index=%d: %w", entries[i].GetIndex(), err)
-		}
-		binary.LittleEndian.PutUint32(w.lengthBuf[:], uint32(len(data)))
-		if _, err := w.f.Write(w.lengthBuf[:]); err != nil {
-			return fmt.Errorf("walWriter: write length: %w", err)
-		}
-		if _, err := w.f.Write(data); err != nil {
-			return fmt.Errorf("walWriter: write entry: %w", err)
-		}
-	}
-	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("walWriter: fsync: %w", err)
-	}
-	return nil
-}
-
-// persistHardState serializes the hard state to disk with fsync.
-func (w *walWriter) persistHardState(hs *raftpb.HardState) error {
-	data, err := proto.Marshal(hs)
-	if err != nil {
-		return fmt.Errorf("walWriter: marshal hard state: %w", err)
-	}
-	binary.LittleEndian.PutUint32(w.lengthBuf[:], uint32(len(data)))
-	if _, err := w.f.Write(w.lengthBuf[:]); err != nil {
-		return fmt.Errorf("walWriter: write hs length: %w", err)
-	}
-	if _, err := w.f.Write(data); err != nil {
-		return fmt.Errorf("walWriter: write hs data: %w", err)
-	}
-	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("walWriter: fsync hs: %w", err)
-	}
-	return nil
-}
-
 // persistReady writes both entries and hard state to the WAL in a single
-// write+fsync cycle. This eliminates the dual-fsync overhead that occurs
-// when persistEntries and persistHardState are called separately within
-// the same Ready cycle. Entries are written first, then the hard state,
-// followed by a single fsync to ensure durability of both.
+// write+fsync cycle: entries first, then the hard state, then one
+// (*os.File).Sync, which is fsync(2) on Linux. Every event loop calls it
+// before it sends, applies or acknowledges anything from the same Ready, so
+// no write is acknowledged before it is durable.
 func (w *walWriter) persistReady(entries []*raftpb.Entry, hs *raftpb.HardState) error {
 	// Write entries without fsyncing.
 	for i := range entries {
@@ -297,8 +256,138 @@ func (sm *benchStateMachineEtcd) apply(entries []*raftpb.Entry) {
 	sm.mu.Unlock()
 }
 
+// get returns the value stored under key, or nil if none.
+func (sm *benchStateMachineEtcd) get(key []byte) []byte {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.data[string(key)]
+}
+
+// errApplyTimeout reports that a proposal was accepted by raft but its own
+// entry was not applied on the proposing node within the wait budget.
+var errApplyTimeout = errors.New("etcd bench: proposal not applied within timeout")
+
+// proposalApplyTimeout bounds how long a proposer waits for its own entry to
+// be applied before the attempt is counted as failed.
+const proposalApplyTimeout = 10 * time.Second
+
+// nextRequestID issues the request ids embedded in proposals and read
+// contexts. Ids are unique across every node in the process; zero is never
+// issued.
+var nextRequestID atomic.Uint64
+
+// waiters routes completion of one request, identified by its id, to the one
+// goroutine waiting for it. The apply loop completes proposal waiters with the
+// applied entry's index; the Ready loop completes read waiters with a
+// ReadState's index. This is the per-proposal acknowledgement raw etcd/raft
+// does not provide, so a proposer's latency ends when ITS entry applies, not
+// when the node's applied count reaches some number another proposer's entry
+// could satisfy.
+type waiters struct {
+	mu sync.Mutex
+	m  map[uint64]chan uint64
+}
+
+// newWaiters returns an empty waiter registry.
+func newWaiters() *waiters {
+	return &waiters{m: make(map[uint64]chan uint64)}
+}
+
+// register returns the channel on which id's completion value is delivered.
+// It must be called before the request is submitted so completion cannot
+// overtake it.
+func (w *waiters) register(id uint64) <-chan uint64 {
+	ch := make(chan uint64, 1)
+	w.mu.Lock()
+	w.m[id] = ch
+	w.mu.Unlock()
+	return ch
+}
+
+// cancel forgets id after its waiter has given up.
+func (w *waiters) cancel(id uint64) {
+	w.mu.Lock()
+	delete(w.m, id)
+	w.mu.Unlock()
+}
+
+// complete delivers value to id's waiter, if one is registered.
+func (w *waiters) complete(id, value uint64) {
+	w.mu.Lock()
+	ch, ok := w.m[id]
+	if ok {
+		delete(w.m, id)
+	}
+	w.mu.Unlock()
+	if ok {
+		ch <- value
+	}
+}
+
+// completeEntries completes the waiter of every applied normal entry that
+// carries a request id, delivering the entry's index.
+func (w *waiters) completeEntries(entries []*raftpb.Entry) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.m) == 0 {
+		return
+	}
+	for _, entry := range entries {
+		if entry.GetType() != raftpb.EntryNormal {
+			continue
+		}
+		id, ok := requestID(entry.Data)
+		if !ok {
+			continue
+		}
+		if ch, found := w.m[id]; found {
+			delete(w.m, id)
+			ch <- entry.GetIndex()
+		}
+	}
+}
+
+// completeReadStates completes the waiter of each ReadState whose request
+// context is a request id, delivering the state's read index.
+func (w *waiters) completeReadStates(states []raft.ReadState) {
+	for _, rs := range states {
+		if len(rs.RequestCtx) == 8 {
+			w.complete(binary.BigEndian.Uint64(rs.RequestCtx), rs.Index)
+		}
+	}
+}
+
+// newRequest builds the 128-byte command for key carrying a fresh request
+// id. Callers build it before starting their latency clock.
+func newRequest(key []byte) (uint64, []byte) {
+	id := nextRequestID.Add(1)
+	return id, makeRequestCmd(key, id)
+}
+
+// proposeAndWait proposes cmd, built by newRequest with id, on node and blocks
+// until that entry has been persisted, committed and applied on node. A
+// rejected proposal returns raft's error; an accepted proposal whose entry
+// does not apply within timeout returns errApplyTimeout.
+func proposeAndWait(node raft.Node, w *waiters, id uint64, cmd []byte, timeout time.Duration) error {
+	done := w.register(id)
+	if err := node.Propose(context.Background(), cmd); err != nil {
+		w.cancel(id)
+		return err
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		w.cancel(id)
+		return errApplyTimeout
+	}
+}
+
 // etcdRaftTestNode bundles an etcd/raft Node, its MemoryStorage, WAL
-// writer, state machine, and a stop channel for the event loop goroutine.
+// writer, state machine, and a stop channel for the event loop and ticker
+// goroutines.
 type etcdRaftTestNode struct {
 	node        raft.Node
 	storage     *raft.MemoryStorage
@@ -307,46 +396,165 @@ type etcdRaftTestNode struct {
 	confTracker *confChangeTracker
 	stopCh      chan struct{}
 	loopDone    sync.WaitGroup
+	tickDone    chan struct{}
 	stopped     atomic.Bool
 
-	// totalApplied tracks how many normal entries have been fully
-	// persisted to WAL, committed, and applied through the state machine.
-	// Waiters poll this atomic counter directly rather than using channel
-	// signals, which eliminates dropped signals under sustained load.
-	totalApplied atomic.Int64
+	// proposals is signalled by the event loop as each proposal's own entry
+	// is applied.
+	proposals *waiters
+
+	// reads is signalled by the event loop with the index of each ReadState
+	// returned for a ReadIndex request.
+	reads *waiters
+
+	// appliedIndex is the index of the last entry the event loop applied.
+	appliedIndex atomic.Uint64
 }
 
-// setupEtcdRaftNode creates a single-node etcd/raft cluster with both
-// in-memory storage (for raft internals) and a file-based WAL (for I/O
-// parity with QuicRaft). It starts the event-loop goroutine that
-// persists entries to the WAL file, applies committed entries through
-// a state machine, and advances the raft node. The caller must call
-// stop() or rely on b.Cleanup to shut down.
-func setupEtcdRaftNode(b *testing.B) *etcdRaftTestNode {
-	b.Helper()
+// benchElectionTick, benchHeartbeatTick and benchTickInterval are the raft
+// timing every node in this harness runs with, at every cluster size: a 1 ms
+// tick, a 10-tick election timeout (etcd/raft randomizes it in [10, 20)), and
+// a 1-tick heartbeat. They match QuicRaft's and Dragonboat's RTTMillisecond 1,
+// ElectionRTT 10, HeartbeatRTT 1.
+const (
+	benchElectionTick  = 10
+	benchHeartbeatTick = 1
+	benchTickInterval  = 1 * time.Millisecond
+)
 
-	storage := raft.NewMemoryStorage()
+// readIndexTimeout bounds one ReadIndex attempt. A request dropped by an
+// election is never answered, so a retry, not a long wait, recovers it.
+const readIndexTimeout = 2 * time.Second
 
-	cfg := &raft.Config{
-		ID:              1,
-		ElectionTick:    10,
-		HeartbeatTick:   1,
+// setupWarmupProposals is the number of proposals every harness's setup
+// warmup runs, before its one linearizable read, ahead of any timer.
+const setupWarmupProposals = 10
+
+// benchRaftConfig returns the raft.Config of node id. Every node in this
+// harness, single-node or clustered, WAL or memory, uses it, so the timing,
+// CheckQuorum and PreVote are pinned in one place.
+func benchRaftConfig(id uint64, storage *raft.MemoryStorage) *raft.Config {
+	return &raft.Config{
+		ID:              id,
+		ElectionTick:    benchElectionTick,
+		HeartbeatTick:   benchHeartbeatTick,
 		Storage:         storage,
 		MaxSizePerMsg:   1024 * 1024,
 		MaxInflightMsgs: 256,
 		CheckQuorum:     true,
 		PreVote:         true,
 	}
+}
 
-	peers := []raft.Peer{{ID: 1}}
-	node := raft.StartNode(cfg, peers)
+// runTicker calls node.Tick every benchTickInterval until stopCh closes, then
+// closes done.
+func runTicker(node raft.Node, stopCh <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(benchTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			node.Tick()
+		case <-stopCh:
+			return
+		}
+	}
+}
 
-	walDir := b.TempDir()
-	wal, err := newWALWriter(walDir)
+// linearizableRead performs an etcd/raft ReadIndex read of key: it requests a
+// read index, waits for the matching ReadState, waits until the node has
+// applied through that index, and then reads the state machine.
+func linearizableRead(node raft.Node, reads *waiters, applied *atomic.Uint64, sm *benchStateMachineEtcd, key []byte, timeout time.Duration) ([]byte, error) {
+	id := nextRequestID.Add(1)
+	var rctx [8]byte
+	binary.BigEndian.PutUint64(rctx[:], id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	done := reads.register(id)
+	if err := node.ReadIndex(ctx, rctx[:]); err != nil {
+		reads.cancel(id)
+		return nil, err
+	}
+	var index uint64
+	select {
+	case index = <-done:
+	case <-ctx.Done():
+		reads.cancel(id)
+		return nil, ctx.Err()
+	}
+
+	ticker := time.NewTicker(50 * time.Microsecond)
+	defer ticker.Stop()
+	for applied.Load() < index {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	return sm.get(key), nil
+}
+
+// setupWarmup is the setup warmup every harness runs before any timer:
+// exactly setupWarmupProposals proposals, each waiting for its own entry to
+// apply on the shared warmup retry budget, then one linearizable read.
+func setupWarmup(node raft.Node, proposals, reads *waiters, applied *atomic.Uint64, sm *benchStateMachineEtcd) error {
+	for i := 0; i < setupWarmupProposals; i++ {
+		key := []byte(fmt.Sprintf("warmup-%d", i))
+		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+			id, cmd := newRequest(key)
+			return proposeAndWait(node, proposals, id, cmd, proposalApplyTimeout)
+		})
+		if err != nil {
+			return fmt.Errorf("warmup proposal %d: %w", i, err)
+		}
+	}
+	// A ReadIndex request lost to a leadership change is dropped without an
+	// error, so the read gets the same retry budget as the proposals.
+	err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
+		_, rerr := linearizableRead(node, reads, applied, sm, []byte("warmup-0"), readIndexTimeout)
+		return rerr
+	})
 	if err != nil {
-		node.Stop()
+		return fmt.Errorf("warmup linearizable read: %w", err)
+	}
+	return nil
+}
+
+// setupEtcdRaftNode creates a single-node etcd/raft cluster with both
+// in-memory storage (for raft internals) and a file-based WAL (for I/O
+// parity with QuicRaft). See newEtcdRaftTestNode.
+func setupEtcdRaftNode(b *testing.B) *etcdRaftTestNode {
+	b.Helper()
+	wal, err := newWALWriter(b.TempDir())
+	if err != nil {
 		b.Fatalf("newWALWriter failed: %v", err)
 	}
+	return newEtcdRaftTestNode(b, wal)
+}
+
+// setupEtcdRaftNodeMemory creates a single-node etcd/raft cluster with
+// in-memory storage only (no WAL file). This benchmarks pure algorithm
+// performance without disk I/O overhead. See newEtcdRaftTestNode.
+func setupEtcdRaftNodeMemory(b *testing.B) *etcdRaftTestNode {
+	b.Helper()
+	return newEtcdRaftTestNode(b, nil)
+}
+
+// newEtcdRaftTestNode starts a single-node etcd/raft cluster persisting to
+// wal (nil for memory mode). It starts the event-loop goroutine that persists
+// entries, applies committed entries through a state machine and advances the
+// raft node, and the 1 ms ticker. Leadership comes from the randomized
+// election timeout, as in every harness (no Campaign shortcut). It then runs
+// the setup warmup. The node is stopped by b.Cleanup.
+func newEtcdRaftTestNode(b *testing.B, wal *walWriter) *etcdRaftTestNode {
+	b.Helper()
+
+	storage := raft.NewMemoryStorage()
+	node := raft.StartNode(benchRaftConfig(1, storage), []raft.Peer{{ID: 1}})
 
 	tn := &etcdRaftTestNode{
 		node:        node,
@@ -355,58 +563,39 @@ func setupEtcdRaftNode(b *testing.B) *etcdRaftTestNode {
 		sm:          newBenchStateMachineEtcd(),
 		confTracker: newConfChangeTracker(),
 		stopCh:      make(chan struct{}),
+		tickDone:    make(chan struct{}),
+		proposals:   newWaiters(),
+		reads:       newWaiters(),
 	}
 
-	// Start the event loop that persists, commits, and applies.
 	tn.loopDone.Add(1)
 	go func() {
 		defer tn.loopDone.Done()
 		tn.eventLoop()
 	}()
+	go runTicker(node, tn.stopCh, tn.tickDone)
 
-	// Wait for the initial ConfChange to be applied before calling
-	// Campaign. The ConfChange is generated by StartNode for the
-	// bootstrap peer. Without waiting for it, Campaign will fail with
-	// "cannot campaign: pending configuration changes".
+	b.Cleanup(tn.stop)
+
 	if !tn.waitForConfChange(5 * time.Second) {
-		tn.stop()
 		b.Fatalf("etcd/raft: initial ConfChange not processed within timeout")
 	}
 
-	// Trigger election. In a single-node cluster the node immediately
-	// becomes leader once the bootstrap config change is applied.
-	node.Campaign(context.Background())
-
-	// Wait for the node to become leader.
 	leaderTicker := time.NewTicker(1 * time.Millisecond)
+	defer leaderTicker.Stop()
 	leaderDeadline := time.NewTimer(10 * time.Second)
-	for {
-		status := node.Status()
-		if status.Lead == 1 {
-			leaderTicker.Stop()
-			leaderDeadline.Stop()
-			break
-		}
+	defer leaderDeadline.Stop()
+	for node.Status().Lead != 1 {
 		select {
 		case <-leaderDeadline.C:
-			leaderTicker.Stop()
-			leaderDeadline.Stop()
-			goto checkLeaderStatus
+			b.Fatalf("etcd/raft single-node failed to elect leader: lead=%d", node.Status().Lead)
 		case <-leaderTicker.C:
 		}
 	}
-checkLeaderStatus:
 
-	status := node.Status()
-	if status.Lead != 1 {
-		tn.stop()
-		b.Fatalf("etcd/raft single-node failed to elect leader: lead=%d", status.Lead)
+	if err := setupWarmup(node, tn.proposals, tn.reads, &tn.appliedIndex, tn.sm); err != nil {
+		b.Fatalf("etcd/raft single-node setup warmup failed: %v", err)
 	}
-
-	b.Cleanup(func() {
-		tn.stop()
-	})
-
 	return tn
 }
 
@@ -475,7 +664,7 @@ func (tn *etcdRaftTestNode) waitForConfChange(timeout time.Duration) bool {
 //  1. Persists entries and hard state to WAL with single fsync -- skipped when wal is nil
 //  2. Appends entries to MemoryStorage (raft internal requirement)
 //  3. Applies committed entries through the state machine
-//  4. Increments totalApplied atomic counter for waiters
+//  4. Signals the waiter of each proposal whose entry was applied
 //  5. Advances the raft node
 //
 // When wal is nil (memory mode), step 1 is skipped to benchmark
@@ -511,30 +700,27 @@ func (tn *etcdRaftTestNode) eventLoop() {
 
 			// Step 3: Apply committed entries through the state machine.
 			if len(rd.CommittedEntries) > 0 {
-				applied := int64(0)
 				for _, entry := range rd.CommittedEntries {
-					switch entry.GetType() {
-					case raftpb.EntryConfChange:
+					if entry.GetType() == raftpb.EntryConfChange {
 						var cc raftpb.ConfChange
 						if err := proto.Unmarshal(entry.Data, &cc); err == nil {
 							tn.node.ApplyConfChange(&cc)
 						}
 						tn.confTracker.signal()
-					case raftpb.EntryNormal:
-						if len(entry.Data) > 0 {
-							applied++
-						}
 					}
 				}
 
 				// Batch-apply all normal entries through state machine.
 				tn.sm.apply(rd.CommittedEntries)
 
-				// Step 4: Atomic counter increment (no channel signals).
-				if applied > 0 {
-					tn.totalApplied.Add(applied)
-				}
+				tn.appliedIndex.Store(rd.CommittedEntries[len(rd.CommittedEntries)-1].GetIndex())
+
+				// Step 4: Wake each proposer whose own entry just applied.
+				tn.proposals.completeEntries(rd.CommittedEntries)
 			}
+
+			// Hand each ReadIndex result to its reader.
+			tn.reads.completeReadStates(rd.ReadStates)
 
 			// Step 5: Advance the raft node.
 			tn.node.Advance()
@@ -555,90 +741,48 @@ func (tn *etcdRaftTestNode) stop() {
 	tn.node.Stop()
 	close(tn.stopCh)
 	tn.loopDone.Wait()
+	<-tn.tickDone
 	if tn.wal != nil {
 		tn.wal.close()
 	}
 }
 
-// waitForApplied polls the atomic totalApplied counter until it reaches
-// or exceeds the target count, or the timeout expires. Returns true if
-// the target was reached. Uses tight polling to avoid channel signal
-// drops under sustained load.
-func (tn *etcdRaftTestNode) waitForApplied(target int64, timeout time.Duration) bool {
-	ticker := time.NewTicker(50 * time.Microsecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		if tn.totalApplied.Load() >= target {
-			return true
-		}
-		select {
-		case <-deadline.C:
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
 // benchEtcdRaftPropose runs sequential proposals through etcd/raft,
 // recording per-operation latency. Each proposal is timed from the
-// Propose call through WAL persistence, commit, and state machine
-// application.
+// Propose call until its own entry has been persisted, committed and
+// applied through the state machine.
 func benchEtcdRaftPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// Every command is proposalBytes (128B), identical in size and layout to
+	// the commands proposed by the other engines. payloadSize is retained in
+	// the signature for call-site symmetry; the shared proposalBytes constant
+	// governs the actual entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
-
-	ctx := context.Background()
-
-	// Reset applied counter for measurement.
-	tn.totalApplied.Store(0)
+	key := []byte("bench-key")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		id, cmd := newRequest(key)
 		start := time.Now()
-		targetApplied := int64(i + 1)
-
-		if err := tn.node.Propose(ctx, payload); err != nil {
-			b.Fatalf("etcd Propose failed at iteration %d: %v", i, err)
+		if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
+			b.Fatalf("etcd propose failed at iteration %d: %v", i, err)
 		}
-
-		// Wait for this entry to be fully applied (WAL + commit + SM).
-		if !tn.waitForApplied(targetApplied, 10*time.Second) {
-			b.Fatalf("etcd apply did not complete within timeout at iteration %d (applied=%d, target=%d)",
-				i, tn.totalApplied.Load(), targetApplied)
-		}
-
-		elapsed := time.Since(start)
-		rec.Record(elapsed)
+		rec.Record(time.Since(start))
 	}
 	b.StopTimer()
 }
 
 // benchEtcdRaftConcurrentPropose runs concurrent proposals from multiple
-// goroutines, recording aggregate latency. Each goroutine waits for its
-// proposal to be fully applied (WAL persist + commit + state machine)
-// before recording the latency sample.
+// goroutines, recording aggregate latency. Each goroutine proposes under its
+// own key (key-%d, by writer index) and waits for its own entry to be fully
+// applied (WAL persist + commit + state machine) before recording the
+// latency sample.
 func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// See benchEtcdRaftPropose: proposalBytes governs the entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
-
-	ctx := context.Background()
-
-	// Reset applied counter.
-	tn.totalApplied.Store(0)
 
 	b.ResetTimer()
 
@@ -646,11 +790,6 @@ func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadS
 	opsPerGoroutine := b.N / numGoroutines
 	remainder := b.N % numGoroutines
 	var errCount atomic.Int64
-
-	// proposalCounter assigns a monotonically increasing target to each
-	// proposal so each goroutine can wait for its specific entry to be
-	// applied through the full pipeline.
-	var proposalCounter atomic.Int64
 
 	for g := 0; g < numGoroutines; g++ {
 		ops := opsPerGoroutine
@@ -662,30 +801,19 @@ func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadS
 		}
 
 		wg.Add(1)
-		go func(n int) {
+		go func(writer, n int) {
 			defer wg.Done()
+			key := []byte(fmt.Sprintf("key-%d", writer))
 			for i := 0; i < n; i++ {
+				id, cmd := newRequest(key)
 				start := time.Now()
-
-				// Reserve a target applied index before proposing.
-				target := proposalCounter.Add(1)
-
-				if err := tn.node.Propose(ctx, payload); err != nil {
+				if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
 					errCount.Add(1)
 					continue
 				}
-
-				// Wait for this specific proposal to be applied through
-				// the full pipeline (WAL -> commit -> state machine).
-				if !tn.waitForApplied(target, 10*time.Second) {
-					errCount.Add(1)
-					continue
-				}
-
-				elapsed := time.Since(start)
-				rec.Record(elapsed)
+				rec.Record(time.Since(start))
 			}
-		}(ops)
+		}(g, ops)
 	}
 	wg.Wait()
 	b.StopTimer()
@@ -697,50 +825,38 @@ func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadS
 
 // benchEtcdRaftElection measures the time from node creation to leader
 // election via natural randomized election timeout (no Campaign shortcut).
-// Each iteration creates a WAL file in a temp directory to match the I/O
-// overhead that QuicRaft incurs during startup and election (WAL directory
-// creation, initial segment allocation). A ticker goroutine drives
-// node.Tick() at 1ms intervals matching QuicRaft's RTTMillisecond.
+// Each iteration opens a fresh WAL file before the timer starts; the timer
+// covers StartNode, the durable writes of the election itself, and the wait
+// for a leader. A ticker goroutine drives node.Tick() at 1ms intervals
+// matching QuicRaft's RTTMillisecond.
 func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
 	for i := 0; i < b.N; i++ {
 		storage := raft.NewMemoryStorage()
 
-		cfg := &raft.Config{
-			ID:              1,
-			ElectionTick:    10,
-			HeartbeatTick:   1,
-			Storage:         storage,
-			MaxSizePerMsg:   1024 * 1024,
-			MaxInflightMsgs: 256,
-			CheckQuorum:     true,
-			PreVote:         true,
-		}
+		cfg := benchRaftConfig(1, storage)
 
 		peers := []raft.Peer{{ID: 1}}
 
-		walDir := b.TempDir()
-
-		// Initialize TLS transport outside the timed region. QuicRaft and
-		// Dragonboat create their transport infrastructure (cert generation,
-		// listener binding) outside their election timers, so etcd must too to
-		// keep the election-time measurement apples-to-apples.
+		// Initialize TLS transport and open the WAL file outside the timed
+		// region. QuicRaft and Dragonboat create their transport
+		// infrastructure (cert generation, listener binding) and storage
+		// directories outside their election timers and time only the replica
+		// start plus the wait for a leader, so etcd must too.
 		ts, tlsErr := setupTLSTransport()
 		if tlsErr != nil {
 			b.Fatalf("setupTLSTransport failed: %v", tlsErr)
+		}
+		wal, err := newWALWriter(b.TempDir())
+		if err != nil {
+			ts.close()
+			b.Fatalf("newWALWriter failed in election bench: %v", err)
 		}
 
 		start := time.Now()
 
 		node := raft.StartNode(cfg, peers)
-
-		wal, err := newWALWriter(walDir)
-		if err != nil {
-			ts.close()
-			node.Stop()
-			b.Fatalf("newWALWriter failed in election bench: %v", err)
-		}
 
 		// Start event loop that processes ConfChange entries and persists
 		// to WAL.
@@ -752,16 +868,14 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 			for {
 				select {
 				case rd := <-node.Ready():
-					// Persist entries to WAL with fsync.
-					if len(rd.Entries) > 0 {
-						if walErr := wal.persistEntries(rd.Entries); walErr != nil {
+					// Persist entries and hard state with one fsync, the
+					// same durable path as the steady-state event loops.
+					if len(rd.Entries) > 0 || !raft.IsEmptyHardState(rd.HardState) {
+						if walErr := wal.persistReady(rd.Entries, rd.HardState); walErr != nil {
 							return
 						}
 					}
 					if !raft.IsEmptyHardState(rd.HardState) {
-						if walErr := wal.persistHardState(rd.HardState); walErr != nil {
-							return
-						}
 						storage.SetHardState(rd.HardState)
 					}
 					if len(rd.Entries) > 0 {
@@ -788,22 +902,10 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		// using the explicit Campaign() shortcut, giving a fair
 		// apples-to-apples election time comparison.
 		tickDone := make(chan struct{})
-		go func() {
-			defer close(tickDone)
-			ticker := time.NewTicker(1 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					node.Tick()
-				case <-stopCh:
-					return
-				}
-			}
-		}()
+		go runTicker(node, stopCh, tickDone)
 
 		// Wait for leader via natural election timeout (no Campaign).
-		electionTicker := time.NewTicker(100 * time.Microsecond)
+		electionTicker := time.NewTicker(1 * time.Millisecond)
 		electionDeadline := time.NewTimer(10 * time.Second)
 		elected := false
 	electionPoll:
@@ -842,54 +944,37 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 }
 
 // benchEtcdRaftCommitLatency measures per-proposal commit latency
-// (propose to fully applied through WAL + state machine). This is
+// (propose to its own entry applied through WAL + state machine). This is
 // equivalent to QuicRaft's SyncPropose latency which includes WAL
 // persistence, raft commit, and state machine application.
 func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// See benchEtcdRaftPropose: proposalBytes governs the entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
-
-	ctx := context.Background()
+	key := []byte("commit-key")
 
 	// Warm up: prime the pipeline and WAL file. The same retry budget as
-	// all engines tolerates transient startup errors.
-	tn.totalApplied.Store(0)
+	// all engines tolerates transient startup errors; each attempt waits for
+	// its own entry to apply, so a failed attempt is retried.
 	for w := 0; w < commitLatencyWarmup; w++ {
 		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
-			return tn.node.Propose(ctx, payload)
+			id, cmd := newRequest(key)
+			return proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout)
 		})
 		if err != nil {
 			b.Fatalf("warmup propose failed: %v", err)
 		}
 	}
-	if !tn.waitForApplied(commitLatencyWarmup, 10*time.Second) {
-		b.Fatalf("warmup applies did not complete")
-	}
-
-	// Reset for measurement.
-	tn.totalApplied.Store(0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		id, cmd := newRequest(key)
 		start := time.Now()
-		targetApplied := int64(i + 1)
-
-		if err := tn.node.Propose(ctx, payload); err != nil {
-			b.Fatalf("etcd Propose commit latency failed at iteration %d: %v", i, err)
+		if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
+			b.Fatalf("etcd commit latency propose failed at iteration %d: %v", i, err)
 		}
-
-		if !tn.waitForApplied(targetApplied, 10*time.Second) {
-			b.Fatalf("etcd commit latency: apply did not complete at iteration %d", i)
-		}
-
-		elapsed := time.Since(start)
-		rec.Record(elapsed)
+		rec.Record(time.Since(start))
 	}
 	b.StopTimer()
 
@@ -904,93 +989,78 @@ func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize 
 // Multi-Node Cluster Benchmark Functions
 // ---------------------------------------------------------------------------
 
-// benchEtcdRaftElectionCluster measures multi-node election time including
-// TLS transport initialization, WAL setup, and natural leader election
-// across all cluster nodes. Each iteration creates and tears down a
-// complete cluster.
+// benchEtcdRaftElectionCluster measures multi-node election time. The
+// cluster infrastructure (TLS material, reserved addresses, transport
+// listeners) is created once outside the timed loop, as QuicRaft and
+// Dragonboat create their hosts once. Each iteration prepares a fresh set
+// of nodes (storage, WAL files) outside the timer, then times only starting
+// every node and waiting until a leader is known, then stops the nodes.
+// Each round uses new raft ids so traffic left over from the previous round
+// is dropped by the transport instead of reaching the new nodes, the way
+// Dragonboat gives each round its own shard ID.
 func benchEtcdRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
+
+	infra := newEtcdClusterInfra(b, numNodes)
+	defer infra.close()
+
 	for i := 0; i < b.N; i++ {
+		cluster := newEtcdCluster(b, infra, uint64(i*numNodes))
+
 		start := time.Now()
-		cluster := SetupEtcdCluster(b, numNodes)
+		cluster.start()
+		_, err := cluster.waitForLeader(clusterLeaderTimeout)
 		elapsed := time.Since(start)
+
+		cluster.stopNodes()
+		if err != nil {
+			b.Fatalf("cluster leader election failed at iteration %d: %v", i, err)
+		}
 		rec.Record(elapsed)
-		cluster.Close()
 	}
 }
 
 // benchEtcdRaftProposeCluster measures sequential proposal throughput
 // through the cluster leader with TCP+TLS transport and WAL persistence.
-// Each proposal is timed from Propose through quorum replication,
-// commit, and state machine application on the leader node. The leader
-// is re-discovered dynamically on each proposal failure to handle
-// leadership changes during the benchmark.
+// Each proposal is timed from Propose through quorum replication, commit,
+// and application of its own entry on the leader node. The leader is
+// re-discovered when raft rejects a proposal.
 func benchEtcdRaftProposeCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// See benchEtcdRaftPropose: proposalBytes governs the entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
+	key := []byte("bench-key")
 
-	ctx := context.Background()
 	leader, findErr := cluster.CurrentLeaderNode()
 	if findErr != nil {
 		b.Fatalf("no leader at benchmark start: %v", findErr)
 	}
 
-	// Reset applied counter for measurement.
-	leader.totalApplied.Store(0)
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		id, cmd := newRequest(key)
 		start := time.Now()
-		targetApplied := int64(i + 1)
-
-		if err := leader.node.Propose(ctx, payload); err != nil {
-			// Re-discover leader on proposal failure.
-			newLeader, reErr := cluster.waitForLeader(5 * time.Second)
-			if reErr != nil {
-				b.Fatalf("cluster propose failed at iteration %d and no leader available: %v", i, err)
-			}
-			// Transfer applied count to new leader so target tracking
-			// stays consistent.
-			newLeader.totalApplied.Store(leader.totalApplied.Load())
-			leader = newLeader
-			// Retry on new leader.
-			if retryErr := leader.node.Propose(ctx, payload); retryErr != nil {
-				b.Fatalf("cluster propose retry failed at iteration %d: %v", i, retryErr)
-			}
+		var err error
+		leader, err = cluster.proposeAndWait(leader, id, cmd)
+		if err != nil {
+			b.Fatalf("cluster propose failed at iteration %d: %v", i, err)
 		}
-
-		if !leader.waitForApplied(targetApplied, 10*time.Second) {
-			b.Fatalf("cluster apply did not complete at iteration %d (applied=%d, target=%d)",
-				i, leader.totalApplied.Load(), targetApplied)
-		}
-
 		rec.Record(time.Since(start))
 	}
 	b.StopTimer()
 }
 
 // benchEtcdRaftConcurrentProposeCluster runs concurrent proposals from
-// multiple goroutines through the cluster leader. Each goroutine waits
-// for its proposal to be fully committed and applied before recording
-// the latency sample. The leader is re-discovered dynamically when a
-// proposal fails due to leadership change.
+// multiple goroutines through the cluster leader. Each goroutine proposes
+// under its own key (key-%d, by writer index) and waits for its own entry
+// to be committed and applied before recording the latency sample. The
+// leader is re-discovered when raft rejects a proposal.
 func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, numGoroutines int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// See benchEtcdRaftPropose: proposalBytes governs the entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
-
-	ctx := context.Background()
 
 	// leaderRef is an atomically-swapped pointer to the current leader.
 	// All goroutines read from this and update it on leadership change.
@@ -1001,16 +1071,12 @@ func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, p
 	}
 	leaderRef.Store(initialLeader)
 
-	// Reset applied counter.
-	initialLeader.totalApplied.Store(0)
-
 	b.ResetTimer()
 
 	var wg sync.WaitGroup
 	opsPerGoroutine := b.N / numGoroutines
 	remainder := b.N % numGoroutines
 	var errCount atomic.Int64
-	var proposalCounter atomic.Int64
 
 	for g := 0; g < numGoroutines; g++ {
 		ops := opsPerGoroutine
@@ -1022,47 +1088,24 @@ func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, p
 		}
 
 		wg.Add(1)
-		go func(n int) {
+		go func(writer, n int) {
 			defer wg.Done()
+			key := []byte(fmt.Sprintf("key-%d", writer))
 			for i := 0; i < n; i++ {
+				id, cmd := newRequest(key)
 				start := time.Now()
-
-				target := proposalCounter.Add(1)
-				currentLeader := leaderRef.Load()
-
-				if err := currentLeader.node.Propose(ctx, payload); err != nil {
-					// Re-discover leader on proposal failure.
-					newLeader, reErr := cluster.waitForLeader(5 * time.Second)
-					if reErr != nil {
-						errCount.Add(1)
-						continue
-					}
-					// Transfer the applied count to the new leader before
-					// publishing it (matching the sequential variant): every
-					// node applies all committed entries, so a follower's
-					// counter includes pre-reset history and is LARGER than
-					// the old leader's. Without the transfer, waitForApplied
-					// on the new leader returns immediately and records
-					// near-zero latencies for the rest of the run.
-					if leaderRef.CompareAndSwap(currentLeader, newLeader) {
-						newLeader.totalApplied.Store(currentLeader.totalApplied.Load())
-					}
-					currentLeader = leaderRef.Load()
-					// Retry on new leader.
-					if retryErr := currentLeader.node.Propose(ctx, payload); retryErr != nil {
-						errCount.Add(1)
-						continue
-					}
+				current := leaderRef.Load()
+				used, err := cluster.proposeAndWait(current, id, cmd)
+				if used != current {
+					leaderRef.CompareAndSwap(current, used)
 				}
-
-				if !currentLeader.waitForApplied(target, 10*time.Second) {
+				if err != nil {
 					errCount.Add(1)
 					continue
 				}
-
 				rec.Record(time.Since(start))
 			}
-		}(ops)
+		}(g, ops)
 	}
 	wg.Wait()
 	b.StopTimer()
@@ -1073,65 +1116,44 @@ func benchEtcdRaftConcurrentProposeCluster(b *testing.B, cluster *EtcdCluster, p
 }
 
 // benchEtcdRaftCommitLatencyCluster measures per-proposal commit latency
-// through the cluster leader. A warmup phase primes the TLS connections
-// and WAL before measurement begins. The leader is re-discovered
-// dynamically on proposal failure.
+// through the cluster leader. A 100-proposal warmup primes the TLS
+// connections and WAL before measurement begins. The leader is
+// re-discovered when raft rejects a proposal.
 func benchEtcdRaftCommitLatencyCluster(b *testing.B, cluster *EtcdCluster, payloadSize int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// Build a KV command whose total wire size matches proposalBytes (128B),
-	// identical to the commands proposed by the other engines. payloadSize is
-	// retained in the signature for call-site symmetry; the shared
-	// proposalBytes constant governs the actual entry size.
+	// See benchEtcdRaftPropose: proposalBytes governs the entry size.
 	_ = payloadSize
-	payload := makeKVCmd([]byte("bench-key"))
+	key := []byte("commit-key")
 
-	ctx := context.Background()
 	leader, findErr := cluster.CurrentLeaderNode()
 	if findErr != nil {
 		b.Fatalf("no leader at benchmark start: %v", findErr)
 	}
 
-	// Warm up: prime the pipeline and TLS connections. The same retry
-	// budget as all engines tolerates transient startup errors.
-	leader.totalApplied.Store(0)
+	// Warm up on the same retry budget as all engines; each attempt waits
+	// for its own entry to apply, so a failed attempt is retried.
 	for w := 0; w < commitLatencyWarmup; w++ {
 		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
-			return leader.node.Propose(ctx, payload)
+			id, cmd := newRequest(key)
+			var perr error
+			leader, perr = cluster.proposeAndWait(leader, id, cmd)
+			return perr
 		})
 		if err != nil {
 			b.Fatalf("cluster warmup propose failed: %v", err)
 		}
 	}
-	if !leader.waitForApplied(commitLatencyWarmup, 10*time.Second) {
-		b.Fatalf("cluster warmup applies did not complete")
-	}
-
-	// Reset for measurement.
-	leader.totalApplied.Store(0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		id, cmd := newRequest(key)
 		start := time.Now()
-		targetApplied := int64(i + 1)
-
-		if err := leader.node.Propose(ctx, payload); err != nil {
-			// Re-discover leader on proposal failure.
-			newLeader, reErr := cluster.waitForLeader(5 * time.Second)
-			if reErr != nil {
-				b.Fatalf("cluster commit propose failed at iteration %d and no leader: %v", i, err)
-			}
-			newLeader.totalApplied.Store(leader.totalApplied.Load())
-			leader = newLeader
-			if retryErr := leader.node.Propose(ctx, payload); retryErr != nil {
-				b.Fatalf("cluster commit propose retry failed at iteration %d: %v", i, retryErr)
-			}
+		var err error
+		leader, err = cluster.proposeAndWait(leader, id, cmd)
+		if err != nil {
+			b.Fatalf("cluster commit latency propose failed at iteration %d: %v", i, err)
 		}
-
-		if !leader.waitForApplied(targetApplied, 10*time.Second) {
-			b.Fatalf("cluster commit latency: apply did not complete at iteration %d", i)
-		}
-
 		rec.Record(time.Since(start))
 	}
 	b.StopTimer()
@@ -1141,90 +1163,6 @@ func benchEtcdRaftCommitLatencyCluster(b *testing.B, cluster *EtcdCluster, paylo
 			perfresult.FormatDuration(rec.P50()), perfresult.FormatDuration(rec.P90()),
 			perfresult.FormatDuration(rec.P99()), perfresult.FormatDuration(rec.Mean()), rec.Count())
 	}
-}
-
-// setupEtcdRaftNodeMemory creates a single-node etcd/raft cluster with
-// in-memory storage only (no WAL file). This benchmarks pure algorithm
-// performance without disk I/O overhead. The event loop skips WAL
-// persistence steps when tn.wal is nil.
-func setupEtcdRaftNodeMemory(b *testing.B) *etcdRaftTestNode {
-	b.Helper()
-
-	storage := raft.NewMemoryStorage()
-
-	cfg := &raft.Config{
-		ID:              1,
-		ElectionTick:    10,
-		HeartbeatTick:   1,
-		Storage:         storage,
-		MaxSizePerMsg:   1024 * 1024,
-		MaxInflightMsgs: 256,
-		CheckQuorum:     true,
-		PreVote:         true,
-	}
-
-	peers := []raft.Peer{{ID: 1}}
-	node := raft.StartNode(cfg, peers)
-
-	tn := &etcdRaftTestNode{
-		node:        node,
-		storage:     storage,
-		wal:         nil, // Memory mode: no WAL writer.
-		sm:          newBenchStateMachineEtcd(),
-		confTracker: newConfChangeTracker(),
-		stopCh:      make(chan struct{}),
-	}
-
-	// Start the event loop that commits and applies (no WAL persistence).
-	tn.loopDone.Add(1)
-	go func() {
-		defer tn.loopDone.Done()
-		tn.eventLoop()
-	}()
-
-	// Wait for the initial ConfChange to be applied before calling
-	// Campaign. The ConfChange is generated by StartNode for the
-	// bootstrap peer.
-	if !tn.waitForConfChange(5 * time.Second) {
-		tn.stop()
-		b.Fatalf("etcd/raft (memory): initial ConfChange not processed within timeout")
-	}
-
-	// Trigger election. In a single-node cluster the node immediately
-	// becomes leader once the bootstrap config change is applied.
-	node.Campaign(context.Background())
-
-	// Wait for the node to become leader.
-	memLeaderTicker := time.NewTicker(1 * time.Millisecond)
-	memLeaderDeadline := time.NewTimer(10 * time.Second)
-	for {
-		status := node.Status()
-		if status.Lead == 1 {
-			memLeaderTicker.Stop()
-			memLeaderDeadline.Stop()
-			break
-		}
-		select {
-		case <-memLeaderDeadline.C:
-			memLeaderTicker.Stop()
-			memLeaderDeadline.Stop()
-			goto checkMemLeaderStatus
-		case <-memLeaderTicker.C:
-		}
-	}
-checkMemLeaderStatus:
-
-	status := node.Status()
-	if status.Lead != 1 {
-		tn.stop()
-		b.Fatalf("etcd/raft (memory) single-node failed to elect leader: lead=%d", status.Lead)
-	}
-
-	b.Cleanup(func() {
-		tn.stop()
-	})
-
-	return tn
 }
 
 // benchEtcdRaftElectionMemory measures the time from node creation to
@@ -1237,16 +1175,7 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 	for i := 0; i < b.N; i++ {
 		storage := raft.NewMemoryStorage()
 
-		cfg := &raft.Config{
-			ID:              1,
-			ElectionTick:    10,
-			HeartbeatTick:   1,
-			Storage:         storage,
-			MaxSizePerMsg:   1024 * 1024,
-			MaxInflightMsgs: 256,
-			CheckQuorum:     true,
-			PreVote:         true,
-		}
+		cfg := benchRaftConfig(1, storage)
 
 		peers := []raft.Peer{{ID: 1}}
 
@@ -1297,22 +1226,10 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 		// intervals, matching QuicRaft's RTTMillisecond. This allows
 		// etcd/raft to trigger its natural randomized election timeout.
 		tickDone := make(chan struct{})
-		go func() {
-			defer close(tickDone)
-			ticker := time.NewTicker(1 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					node.Tick()
-				case <-stopCh:
-					return
-				}
-			}
-		}()
+		go runTicker(node, stopCh, tickDone)
 
 		// Wait for leader via natural election timeout (no Campaign).
-		memElectionTicker := time.NewTicker(100 * time.Microsecond)
+		memElectionTicker := time.NewTicker(1 * time.Millisecond)
 		memElectionDeadline := time.NewTimer(10 * time.Second)
 		elected := false
 	memElectionPoll:

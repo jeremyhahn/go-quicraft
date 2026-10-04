@@ -222,7 +222,13 @@ impl RaftLogStorage<C> for ShardedDiskLogStore {
             sync_files.push(guard.wal.try_clone().expect("File::try_clone"));
         }
 
-        // Parallel fdatasync across all touched shards.
+        // Parallel fdatasync across all touched shards. `sync_data()` is
+        // fdatasync(2) on Linux (the Go etcd harness's `Sync()` is fsync(2)).
+        //
+        // CAVEAT: this WAL is write-only. Entries are served from the
+        // in-memory per-shard BTreeMap; truncate and purge mutate only that
+        // map, and nothing ever reads wal.bin back, so it reproduces the
+        // write+fdatasync cost of a durable log but is not a recoverable one.
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(sync_files.len());
             for file in &sync_files {
@@ -278,6 +284,29 @@ impl RaftLogStorage<C> for ShardedDiskLogStore {
 
     async fn read_committed(&mut self) -> StorageResult<Option<LogId<NodeId>>> {
         Ok(self.global.lock().unwrap().committed)
+    }
+}
+
+// ── bootstrap seeding ─────────────────────────────────────────────────────────
+
+impl ShardedDiskLogStore {
+    /// Durably writes `entry` as the store's first log entry before the store
+    /// is handed to `Raft::new`.
+    ///
+    /// The cluster harness seeds every node with the same membership entry
+    /// openraft's `Raft::initialize` would write (log id `(0,0)-0`), so all
+    /// nodes start as followers with a known membership and the first leader
+    /// is chosen by a natural randomized election timeout. `initialize` would
+    /// instead make the calling node campaign at once, which is the
+    /// `Campaign()` shortcut the other engines' harnesses do not take.
+    pub fn seed(&self, entry: Entry<C>) {
+        let mut guard = self.shards[shard_idx(entry.log_id.index)].lock().unwrap();
+        let data = bincode::serialize(&entry).expect("bincode serialize");
+        let len = (data.len() as u32).to_le_bytes();
+        guard.wal.write_all(&len).expect("WAL write length");
+        guard.wal.write_all(&data).expect("WAL write payload");
+        guard.wal.sync_data().expect("shard fdatasync");
+        guard.log.insert(entry.log_id.index, entry);
     }
 }
 

@@ -19,6 +19,10 @@ use result::BenchmarkSuite;
 const PAYLOAD_SIZE: usize = 128;
 const CONCURRENCY: usize = 8;
 
+/// Number of scenarios this binary runs (16 minus the two single-node
+/// election scenarios OpenRaft cannot express).
+const SCENARIO_COUNT: usize = 14;
+
 /// Default benchmark duration per scenario when no --benchtime is provided.
 const DEFAULT_BENCHTIME: Duration = Duration::from_secs(30);
 
@@ -69,8 +73,8 @@ fn main() {
     eprintln!(
         "[openraft-bench] benchtime={:.1}s per scenario ({} scenarios = ~{:.0}s total)",
         benchtime.as_secs_f64(),
-        16,
-        benchtime.as_secs_f64() * 16.0,
+        SCENARIO_COUNT,
+        benchtime.as_secs_f64() * SCENARIO_COUNT as f64,
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -82,14 +86,11 @@ fn main() {
 
     rt.block_on(async {
         // ── single-node (memory-only) scenarios ─────────────────────────────
-
-        eprintln!("[openraft-bench] election_memory ({:.0}s)", benchtime.as_secs_f64());
-        let r = scenarios::bench_election(benchtime).await;
-        eprintln!(
-            "[openraft-bench] election_memory: {} ops, {:.0} ops/sec  p99={}us",
-            r.ops, r.ops_per_sec, r.latency.p99_ns / 1_000,
-        );
-        results.insert("election_memory".to_string(), r);
+        //
+        // election_memory and election_wal are deliberately absent: OpenRaft
+        // cannot hold a timeout-driven single-node election, so the result
+        // is reported as not comparable (N/A) rather than measured
+        // differently. See the scenarios module docs.
 
         eprintln!("[openraft-bench] propose_seq_memory ({:.0}s)", benchtime.as_secs_f64());
         let r = scenarios::bench_propose_sequential(benchtime, PAYLOAD_SIZE).await;
@@ -119,14 +120,6 @@ fn main() {
         results.insert("commit_latency_memory".to_string(), r);
 
         // ── single-node WAL (16-shard WAL with parallel fsync) ──────────────
-
-        eprintln!("[openraft-bench] election_wal ({:.0}s)", benchtime.as_secs_f64());
-        let r = scenarios::bench_election_wal(benchtime).await;
-        eprintln!(
-            "[openraft-bench] election_wal: {} ops, {:.0} ops/sec  p99={}us",
-            r.ops, r.ops_per_sec, r.latency.p99_ns / 1_000,
-        );
-        results.insert("election_wal".to_string(), r);
 
         eprintln!("[openraft-bench] propose_seq_wal ({:.0}s)", benchtime.as_secs_f64());
         let r = scenarios::bench_propose_sequential_wal(benchtime, PAYLOAD_SIZE).await;

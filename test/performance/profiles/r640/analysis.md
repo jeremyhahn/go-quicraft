@@ -330,6 +330,10 @@ See individual comparison documents for detailed analysis:
 
 ## Fairness and comparability
 
+> This section describes the harnesses as they were when this profile was
+> measured (2026-08). The current harnesses follow the rules in
+> [Fairness](../../README.md#fairness).
+
 This section was rewritten on 2026-08-17 after auditing the four harnesses
 against their source. The previous version overstated parity in three places and
 was wrong in one. Everything below was read from the harness code, not inferred

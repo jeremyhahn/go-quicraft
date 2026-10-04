@@ -50,6 +50,7 @@ use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::version::TLS13;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::ServerConfig;
@@ -127,13 +128,16 @@ pub fn generate_tls_material() -> TlsMaterial {
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store.clone()))
         .build()
         .expect("client cert verifier build failed");
-    let server_config = ServerConfig::builder()
+    // TLS 1.3 is the minimum (and, in rustls, the only version above it), as
+    // in every other engine's harness. The crate is also built without the
+    // rustls `tls12` feature, so 1.2 cannot be negotiated at all.
+    let server_config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key())
         .expect("server TLS config failed");
 
     // ── client TLS config (present cert for mutual auth) ────────────────────
-    let client_config = ClientConfig::builder()
+    let client_config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .with_root_certificates(root_store)
         .with_client_auth_cert(vec![cert_der], key_der)
         .expect("client TLS config with cert failed");
@@ -264,6 +268,16 @@ impl TlsNetworkConnection {
     }
 
     /// Send `msg` over the cached connection, reconnecting once on failure.
+    ///
+    /// Cancellation-safe: the stream is taken out of the cache for the whole
+    /// request/response exchange and put back only after a complete response
+    /// has been read. OpenRaft drops an RPC future when its timeout (the
+    /// `heartbeat_interval`) expires; if the cached stream survived that, the
+    /// abandoned response would still be in flight and the NEXT call on this
+    /// connection would read it as its own reply. A plain
+    /// `AppendEntriesResponse::Success` carries no log id, so the leader
+    /// would count an acknowledgement for entries the follower never
+    /// received. Dropping the stream closes the connection instead.
     async fn rpc_call(&mut self, msg: &RpcMessage) -> Result<RpcResponse, WireError> {
         // Ensure we have a connection.
         if self.stream.is_none() {
@@ -271,19 +285,19 @@ impl TlsNetworkConnection {
         }
 
         // First attempt on the cached stream.
-        let tls = self.stream.as_mut().expect("stream was just established");
-        match Self::send_recv(tls, msg).await {
-            Ok(resp) => return Ok(resp),
-            Err(_) => {
-                // Connection is broken; drop it and retry once.
-                self.stream = None;
-            }
+        let mut tls = self.stream.take().expect("stream was just established");
+        if let Ok(resp) = Self::send_recv(&mut tls, msg).await {
+            self.stream = Some(tls);
+            return Ok(resp);
         }
+        // Connection is broken; it is dropped here. Reconnect and retry once.
+        drop(tls);
 
-        // Reconnect and retry.
         self.connect().await?;
-        let tls = self.stream.as_mut().expect("stream was just established");
-        Self::send_recv(tls, msg).await
+        let mut tls = self.stream.take().expect("stream was just established");
+        let resp = Self::send_recv(&mut tls, msg).await?;
+        self.stream = Some(tls);
+        Ok(resp)
     }
 
     /// Map a `WireError` to an `RPCError::Unreachable`.

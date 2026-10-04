@@ -10,21 +10,21 @@
   <rect x="0" y="122" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="141" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election (WAL)</text>
   <text x="188" y="167" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="149" width="532" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="167" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">52.3 ops/s</text>
-  <text x="894" y="167" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">19.06ms</text>
+  <rect x="200" y="149" width="506" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="167" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">55.0 ops/s</text>
+  <text x="894" y="167" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.00ms</text>
   <text x="188" y="197" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <rect x="200" y="179" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">54.0 ops/s</text>
-  <text x="894" y="197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.40ms</text>
+  <text x="764" y="197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">59.8 ops/s</text>
+  <text x="894" y="197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">16.72ms</text>
   <text x="964" y="197" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <line x1="20" y1="216" x2="1080" y2="216" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="225" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="244" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election (Memory)</text>
   <text x="188" y="270" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="252" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="270" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">53.8 ops/s</text>
-  <text x="894" y="270" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.61ms</text>
+  <text x="764" y="270" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">57.8 ops/s</text>
+  <text x="894" y="270" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.12ms</text>
   <text x="964" y="270" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="300" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="300" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -33,21 +33,21 @@
   <text x="14" y="347" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential (WAL)</text>
   <text x="188" y="373" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="355" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="373" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.24K ops/s</text>
-  <text x="894" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">730.3us</text>
+  <text x="764" y="373" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.21K ops/s</text>
+  <text x="894" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">738.4us</text>
   <text x="964" y="373" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.66x)</text>
+  <text x="980" y="373" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.70x)</text>
   <text x="188" y="403" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="385" width="331" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">746.3 ops/s</text>
-  <text x="894" y="403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.32ms</text>
+  <rect x="200" y="385" width="323" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">711.7 ops/s</text>
+  <text x="894" y="403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.37ms</text>
   <line x1="20" y1="422" x2="1080" y2="422" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="431" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="450" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential (Memory)</text>
   <text x="188" y="476" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="458" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="476" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">46.22K ops/s</text>
-  <text x="894" y="476" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">17.1us</text>
+  <text x="764" y="476" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">36.48K ops/s</text>
+  <text x="894" y="476" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">21.5us</text>
   <text x="964" y="476" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="506" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="506" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -55,22 +55,22 @@
   <rect x="0" y="534" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="553" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 (WAL)</text>
   <text x="188" y="579" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="561" width="426" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="579" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.60K ops/s</text>
-  <text x="894" y="579" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.67ms</text>
+  <rect x="200" y="561" width="430" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="579" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.35K ops/s</text>
+  <text x="894" y="579" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.74ms</text>
   <text x="188" y="609" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <rect x="200" y="591" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.94K ops/s</text>
-  <text x="894" y="609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.33ms</text>
+  <text x="764" y="609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.56K ops/s</text>
+  <text x="894" y="609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.41ms</text>
   <text x="964" y="609" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="609" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.29x)</text>
+  <text x="980" y="609" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.28x)</text>
   <line x1="20" y1="628" x2="1080" y2="628" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="637" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="656" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 (Memory)</text>
   <text x="188" y="682" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="664" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="682" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">97.92K ops/s</text>
-  <text x="894" y="682" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">75.8us</text>
+  <text x="764" y="682" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">89.35K ops/s</text>
+  <text x="894" y="682" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">82.9us</text>
   <text x="964" y="682" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="712" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="712" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -79,21 +79,21 @@
   <text x="14" y="759" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency (WAL)</text>
   <text x="188" y="785" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="767" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="785" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.28K ops/s</text>
-  <text x="894" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">701.1us</text>
+  <text x="764" y="785" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.21K ops/s</text>
+  <text x="894" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">740.1us</text>
   <text x="964" y="785" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.72x)</text>
+  <text x="980" y="785" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.65x)</text>
   <text x="188" y="815" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="797" width="320" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">744.6 ops/s</text>
-  <text x="894" y="815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.32ms</text>
+  <rect x="200" y="797" width="333" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">730.5 ops/s</text>
+  <text x="894" y="815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.35ms</text>
   <line x1="20" y1="834" x2="1080" y2="834" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="843" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="862" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency (Memory)</text>
   <text x="188" y="888" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="870" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="888" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">49.94K ops/s</text>
-  <text x="894" y="888" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">14.9us</text>
+  <text x="764" y="888" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">38.25K ops/s</text>
+  <text x="894" y="888" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">20.4us</text>
   <text x="964" y="888" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="918" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="918" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -102,21 +102,21 @@
   <text x="14" y="965" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read (WAL)</text>
   <text x="188" y="991" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="973" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="991" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">224.45K ops/s</text>
-  <text x="894" y="991" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.4us</text>
+  <text x="764" y="991" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">189.50K ops/s</text>
+  <text x="894" y="991" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.5us</text>
   <text x="964" y="991" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="991" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.79x)</text>
+  <text x="980" y="991" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.90x)</text>
   <text x="188" y="1021" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1003" width="308" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1021" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">125.69K ops/s</text>
-  <text x="894" y="1021" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">6.4us</text>
+  <rect x="200" y="1003" width="289" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1021" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">99.73K ops/s</text>
+  <text x="894" y="1021" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">7.8us</text>
   <line x1="20" y1="1040" x2="1080" y2="1040" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1049" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="1068" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read (Memory)</text>
   <text x="188" y="1094" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1076" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1094" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">223.52K ops/s</text>
-  <text x="894" y="1094" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.4us</text>
+  <text x="764" y="1094" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">199.66K ops/s</text>
+  <text x="894" y="1094" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.1us</text>
   <text x="964" y="1094" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="1124" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="1124" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -125,20 +125,21 @@
   <text x="14" y="1171" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read (WAL)</text>
   <text x="188" y="1197" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1179" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.08M ops/s</text>
-  <text x="894" y="1197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">122ns</text>
+  <text x="764" y="1197" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.54M ops/s</text>
+  <text x="894" y="1197" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">118ns</text>
   <text x="964" y="1197" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1197" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.25x)</text>
   <text x="188" y="1227" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1209" width="510" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1227" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.71M ops/s</text>
-  <text x="894" y="1227" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">143ns</text>
+  <rect x="200" y="1209" width="442" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1227" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.45M ops/s</text>
+  <text x="894" y="1227" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">142ns</text>
   <line x1="20" y1="1246" x2="1080" y2="1246" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1255" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="1274" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read (Memory)</text>
   <text x="188" y="1300" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1282" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1300" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.77M ops/s</text>
-  <text x="894" y="1300" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">132ns</text>
+  <text x="764" y="1300" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.54M ops/s</text>
+  <text x="894" y="1300" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">118ns</text>
   <text x="964" y="1300" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="1330" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="1330" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -147,73 +148,73 @@
   <text x="14" y="1377" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election 3N (WAL)</text>
   <text x="188" y="1403" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1385" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">51.5 ops/s</text>
-  <text x="894" y="1403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.67ms</text>
+  <text x="764" y="1403" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">53.2 ops/s</text>
+  <text x="894" y="1403" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.46ms</text>
   <text x="964" y="1403" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="1403" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.16x)</text>
   <text x="188" y="1433" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1415" width="474" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">44.3 ops/s</text>
-  <text x="894" y="1433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">19.77ms</text>
+  <rect x="200" y="1415" width="526" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">50.8 ops/s</text>
+  <text x="894" y="1433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.44ms</text>
+  <text x="964" y="1433" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <line x1="20" y1="1452" x2="1080" y2="1452" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1461" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="1480" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential 3N (WAL)</text>
   <text x="188" y="1506" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1488" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1506" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">474.6 ops/s</text>
-  <text x="894" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.93ms</text>
+  <text x="764" y="1506" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">554.5 ops/s</text>
+  <text x="894" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.66ms</text>
   <text x="964" y="1506" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.84x)</text>
+  <text x="980" y="1506" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.54x)</text>
   <text x="188" y="1536" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1518" width="299" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">257.8 ops/s</text>
-  <text x="894" y="1536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.75ms</text>
+  <rect x="200" y="1518" width="356" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">359.3 ops/s</text>
+  <text x="894" y="1536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.74ms</text>
   <line x1="20" y1="1555" x2="1080" y2="1555" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1564" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="1583" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 3N (WAL)</text>
   <text x="188" y="1609" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="1591" width="388" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.07K ops/s</text>
-  <text x="894" y="1609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.39ms</text>
+  <rect x="200" y="1591" width="493" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1609" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.43K ops/s</text>
+  <text x="894" y="1609" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.23ms</text>
   <text x="188" y="1639" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <rect x="200" y="1621" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.94K ops/s</text>
-  <text x="894" y="1639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.71ms</text>
+  <text x="764" y="1639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.71K ops/s</text>
+  <text x="894" y="1639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.90ms</text>
   <text x="964" y="1639" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="1639" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.42x)</text>
+  <text x="980" y="1639" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.12x)</text>
   <line x1="20" y1="1658" x2="1080" y2="1658" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1667" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="1686" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency 3N (WAL)</text>
   <text x="188" y="1712" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1694" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1712" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">557.0 ops/s</text>
-  <text x="894" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.67ms</text>
+  <text x="764" y="1712" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">498.5 ops/s</text>
+  <text x="894" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">1.80ms</text>
   <text x="964" y="1712" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(3.01x)</text>
+  <text x="980" y="1712" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.12x)</text>
   <text x="188" y="1742" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1724" width="183" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">185.3 ops/s</text>
-  <text x="894" y="1742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.45ms</text>
+  <rect x="200" y="1724" width="259" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">235.1 ops/s</text>
+  <text x="894" y="1742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.47ms</text>
   <line x1="20" y1="1761" x2="1080" y2="1761" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1770" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="1789" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 3N (WAL)</text>
   <text x="188" y="1815" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="1797" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">7.16K ops/s</text>
-  <text x="894" y="1815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">126.7us</text>
-  <text x="964" y="1815" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="1815" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.84x)</text>
+  <rect x="200" y="1797" width="462" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="1815" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">7.01K ops/s</text>
+  <text x="894" y="1815" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">127.0us</text>
   <text x="188" y="1845" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="1827" width="299" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="1845" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">3.89K ops/s</text>
-  <text x="894" y="1845" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">198.3us</text>
+  <rect x="200" y="1827" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="1845" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">8.34K ops/s</text>
+  <text x="894" y="1845" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">115.0us</text>
+  <text x="964" y="1845" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="1845" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.19x)</text>
   <line x1="20" y1="1864" x2="1080" y2="1864" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="1873" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="1892" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 3N (WAL+LeaseRead)</text>
   <text x="188" y="1918" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="1900" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="1918" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">146.60K ops/s</text>
-  <text x="894" y="1918" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.2us</text>
+  <text x="764" y="1918" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">121.62K ops/s</text>
+  <text x="894" y="1918" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">5.3us</text>
   <text x="964" y="1918" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="1948" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="1948" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -222,84 +223,85 @@
   <text x="14" y="1995" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read 3N (WAL)</text>
   <text x="188" y="2021" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2003" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2021" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.63M ops/s</text>
-  <text x="894" y="2021" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">133ns</text>
+  <text x="764" y="2021" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.32M ops/s</text>
+  <text x="894" y="2021" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">122ns</text>
   <text x="964" y="2021" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2021" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.22x)</text>
   <text x="188" y="2051" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2033" width="527" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2051" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.43M ops/s</text>
-  <text x="894" y="2051" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">147ns</text>
+  <rect x="200" y="2033" width="451" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2051" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.37M ops/s</text>
+  <text x="894" y="2051" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">145ns</text>
   <line x1="20" y1="2070" x2="1080" y2="2070" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2079" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="2098" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Election 5N (WAL)</text>
   <text x="188" y="2124" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2106" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2124" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">51.7 ops/s</text>
-  <text x="894" y="2124" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">19.30ms</text>
+  <text x="764" y="2124" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">53.1 ops/s</text>
+  <text x="894" y="2124" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.48ms</text>
   <text x="964" y="2124" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="2154" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2136" width="518" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2154" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">48.7 ops/s</text>
-  <text x="894" y="2154" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">19.79ms</text>
+  <rect x="200" y="2136" width="513" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2154" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">49.5 ops/s</text>
+  <text x="894" y="2154" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">18.87ms</text>
   <line x1="20" y1="2173" x2="1080" y2="2173" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2182" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="2201" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Sequential 5N (WAL)</text>
   <text x="188" y="2227" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2209" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2227" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">378.0 ops/s</text>
-  <text x="894" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.49ms</text>
+  <text x="764" y="2227" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">339.5 ops/s</text>
+  <text x="894" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.87ms</text>
   <text x="964" y="2227" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.17x)</text>
+  <text x="980" y="2227" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.42x)</text>
   <text x="188" y="2257" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2239" width="254" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2257" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">174.4 ops/s</text>
-  <text x="894" y="2257" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.69ms</text>
+  <rect x="200" y="2239" width="227" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2257" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">140.2 ops/s</text>
+  <text x="894" y="2257" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.09ms</text>
   <line x1="20" y1="2276" x2="1080" y2="2276" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2285" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="2304" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Propose Concurrent/8 5N (WAL)</text>
   <text x="188" y="2330" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="2312" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2330" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.45K ops/s</text>
-  <text x="894" y="2330" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">5.00ms</text>
-  <text x="964" y="2330" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <rect x="200" y="2312" width="410" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2330" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.70K ops/s</text>
+  <text x="894" y="2330" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.63ms</text>
   <text x="188" y="2360" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2342" width="512" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2360" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">1.35K ops/s</text>
-  <text x="894" y="2360" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.43ms</text>
+  <rect x="200" y="2342" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2360" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">2.28K ops/s</text>
+  <text x="894" y="2360" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.50ms</text>
   <text x="964" y="2360" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2360" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.34x)</text>
   <line x1="20" y1="2379" x2="1080" y2="2379" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2388" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="2407" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Commit Latency 5N (WAL)</text>
   <text x="188" y="2433" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2415" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">366.8 ops/s</text>
-  <text x="894" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.62ms</text>
+  <text x="764" y="2433" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">378.5 ops/s</text>
+  <text x="894" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">2.53ms</text>
   <text x="964" y="2433" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(2.95x)</text>
+  <text x="980" y="2433" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.83x)</text>
   <text x="188" y="2463" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2445" width="186" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2463" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">124.2 ops/s</text>
-  <text x="894" y="2463" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.98ms</text>
+  <rect x="200" y="2445" width="300" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2463" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">206.7 ops/s</text>
+  <text x="894" y="2463" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">3.83ms</text>
   <line x1="20" y1="2482" x2="1080" y2="2482" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2491" width="1100" height="103" fill="#f8f9fa"/>
   <text x="14" y="2510" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 5N (WAL)</text>
   <text x="188" y="2536" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
-  <rect x="200" y="2518" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.74K ops/s</text>
-  <text x="894" y="2536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">149.5us</text>
+  <rect x="200" y="2518" width="506" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
+  <text x="764" y="2536" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.24K ops/s</text>
+  <text x="894" y="2536" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">155.4us</text>
   <text x="964" y="2536" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
-  <text x="980" y="2536" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.14x)</text>
   <text x="188" y="2566" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2548" width="482" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2566" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.03K ops/s</text>
-  <text x="894" y="2566" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">180.1us</text>
+  <rect x="200" y="2548" width="550" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2566" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.70K ops/s</text>
+  <text x="894" y="2566" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">168.3us</text>
+  <text x="964" y="2566" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <line x1="20" y1="2585" x2="1080" y2="2585" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2594" width="1100" height="103" fill="#ffffff"/>
   <text x="14" y="2613" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Sync Read 5N (WAL+LeaseRead)</text>
   <text x="188" y="2639" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2621" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">122.82K ops/s</text>
-  <text x="894" y="2639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">4.9us</text>
+  <text x="764" y="2639" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">91.74K ops/s</text>
+  <text x="894" y="2639" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">6.8us</text>
   <text x="964" y="2639" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
   <text x="188" y="2669" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
   <text x="208" y="2669" font-size="13" font-weight="normal" text-anchor="start" fill="#aaaaaa">N/A</text>
@@ -308,13 +310,14 @@
   <text x="14" y="2716" font-size="15" font-weight="bold" text-anchor="start" fill="#333333">Stale Read 5N (WAL)</text>
   <text x="188" y="2742" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">quicraft</text>
   <rect x="200" y="2724" width="550" height="24" rx="3" fill="#2196F3" opacity="0.9"/>
-  <text x="764" y="2742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.48M ops/s</text>
-  <text x="894" y="2742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">134ns</text>
+  <text x="764" y="2742" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">5.12M ops/s</text>
+  <text x="894" y="2742" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">125ns</text>
   <text x="964" y="2742" font-size="13" font-weight="bold" text-anchor="start" fill="#FFC107">★</text>
+  <text x="980" y="2742" font-size="11" font-weight="normal" text-anchor="start" fill="#FFC107">(1.17x)</text>
   <text x="188" y="2772" font-size="13" font-weight="normal" text-anchor="end" fill="#555555">dragonboat</text>
-  <rect x="200" y="2754" width="540" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
-  <text x="764" y="2772" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.39M ops/s</text>
-  <text x="894" y="2772" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">147ns</text>
+  <rect x="200" y="2754" width="468" height="24" rx="3" fill="#FF9800" opacity="0.9"/>
+  <text x="764" y="2772" font-size="13" font-weight="bold" text-anchor="start" fill="#444444">4.36M ops/s</text>
+  <text x="894" y="2772" font-size="11" font-weight="normal" text-anchor="start" fill="#777777">143ns</text>
   <line x1="20" y1="2791" x2="1080" y2="2791" stroke="#dee2e6" stroke-width="1"/>
   <rect x="0" y="2824" width="1100" height="60" fill="#f8f9fa"/>
   <line x1="0" y1="2824" x2="1100" y2="2824" stroke="#dee2e6" stroke-width="1"/>

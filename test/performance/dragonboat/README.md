@@ -1,7 +1,7 @@
 # QuicRaft vs Dragonboat benchmark
 
 > **Status: REFERENCE** · Scope: the Dragonboat harness in
-> `test/performance/dragonboat` · Last verified: 2026-10-02
+> `test/performance/dragonboat` · Last verified: 2026-10-03
 
 This harness runs the shared benchmark scenarios against Dragonboat v4 so they
 can be compared with QuicRaft's. It covers single-node and 3- and 5-node
@@ -17,7 +17,23 @@ Both engines run with the same Raft timing:
 | `ElectionRTT` | 10 ticks | 10 ticks |
 | `HeartbeatRTT` | 1 tick | 1 tick |
 | `CheckQuorum` | on (default) | on |
-| `PreVote` | on (default) | off (Dragonboat default; the harness does not set it) |
+| `PreVote` | on (default) | on (off by Dragonboat default; `raftConfig` sets it) |
+
+Every `dbconfig.Config` comes from `raftConfig` in `dragonboat_bench.go`, and
+`TestRaftConfigMatchesCommonConfiguration` pins those values. Both setup helpers
+run `warmupShard` (10 proposals, then one linearizable read) before any timer
+starts; commit-latency scenarios add their own 100-proposal warmup on top.
+The election benchmarks first run one untimed cycle per shard ID in their
+16-ID ring (`primeElectionRing`), so every timed iteration restarts an existing
+group, and leader waits poll every 1 ms.
+
+Every NodeHost uses Dragonboat's TCP transport with `MutualTLS: true`.
+Dragonboat sets no TLS `MinVersion` on either side, so Go's defaults apply:
+TLS 1.3 is negotiated between peers (`TestTransportNegotiatesTLS13` checks
+this), but a TLS 1.2 peer would still be accepted. The transport is in an
+internal package, so the harness cannot raise the floor without replacing it.
+Durability is Tan's: each log write is followed by `fsync(2)` (`os.File.Sync`)
+on the log file before the update is acknowledged.
 
 Storage differs by design. QuicRaft uses its own 16-shard WAL
 (`pkg/logdb/waldb`). The Dragonboat harness builds every NodeHost through
@@ -32,7 +48,7 @@ The engine under test is the fork `github.com/jeremyhahn/dragonboat/v4`
 fix. It is an ordinary versioned dependency, so nothing needs to be checked out
 beforehand.
 
-Read the [fairness audit](../profiles/r640/analysis.md#fairness-and-comparability)
+Read the [fairness rules](../README.md#fairness)
 before drawing conclusions. Some rows, elections in particular, do not measure
 the same thing in both columns.
 
@@ -41,7 +57,7 @@ the same thing in both columns.
 Results are stored per machine under [`../profiles/`](../profiles/). The most
 recent full comparison is
 [`profiles/ci-node-2/dragonboat.md`](../profiles/ci-node-2/dragonboat.md), <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
-measured 2026-10-02. Numbers from different profiles are not comparable.
+measured 2026-10-04. Numbers from different profiles are not comparable.
 
 ## Running
 
