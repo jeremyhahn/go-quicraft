@@ -170,8 +170,9 @@ func (t *QUICTransport) acceptLoop(sem chan struct{}, ipTracker *ipConnTracker) 
 // startAcceptLoop starts acceptLoop under supervise.Supervise. The caller has
 // already counted it in t.acceptWG.
 func (t *QUICTransport) startAcceptLoop() {
-	sem := make(chan struct{}, t.cfg.MaxIncomingConnections)
-	ipTracker := newIPConnTracker(t.cfg.MaxConnectionsPerIP)
+	t.acceptSem = make(chan struct{}, t.cfg.MaxIncomingConnections)
+	t.acceptIPs = newIPConnTracker(t.cfg.MaxConnectionsPerIP)
+	sem, ipTracker := t.acceptSem, t.acceptIPs
 	supervise.Supervise(&t.wg, t.stopC, func() { t.acceptLoop(sem, ipTracker) }, t.acceptWG.Done)
 }
 
@@ -210,25 +211,60 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 			return
 		}
 		// Transient error, log and continue.
-		slog.Warn("transport accept error", "error", err)
+		supervise.LogContained(func() { slog.Warn("transport accept error", "error", err) })
 		return
 	}
 
-	// Check per-IP connection limit.
+	// From here until a handler goroutine takes them over, this goroutine
+	// owns the accepted connection and every admission slot it acquires. The
+	// deferred settlement gives the slots back and closes the connection on
+	// every exit that does not hand them over — a refusal, and an abnormal
+	// exit alike — and only then emits the refusal's diagnostic, contained:
+	// a log handler is user code and must not stand between a refusal and
+	// its cleanup. An abnormal exit before any verdict closes the connection
+	// as a refused admission (QUICErrConnLimitReached), which the peer
+	// retries.
 	ip := extractIP(conn.RemoteAddr())
+	var (
+		owned       = true
+		ipHeld      bool
+		semHeld     bool
+		closeCode   = QUICErrConnLimitReached
+		closeReason = "connection limit reached"
+		refusal     func()
+	)
+	defer func() {
+		if semHeld {
+			<-sem
+		}
+		if ipHeld {
+			ipTracker.release(ip)
+		}
+		if !owned {
+			return
+		}
+		closeErr := conn.CloseWithError(closeCode, closeReason)
+		supervise.LogContained(func() {
+			if refusal != nil {
+				refusal()
+			}
+			if closeErr != nil {
+				slog.Debug("transport: connection close failed after an admission refusal",
+					"ip", ip, "error", closeErr)
+			}
+		})
+	}()
+
+	// Check per-IP connection limit.
 	if !ipTracker.tryAcquire(ip) {
-		slog.Warn("per-IP connection limit reached",
-			"ip", ip,
-			"limit", t.cfg.MaxConnectionsPerIP,
-		)
-		if closeErr := conn.CloseWithError(QUICErrIPLimitReached, "per-IP connection limit reached"); closeErr != nil {
-			slog.Debug("transport: connection close failed after IP limit reached",
-				"ip", ip,
-				"error", closeErr,
-			)
+		closeCode, closeReason = QUICErrIPLimitReached, "per-IP connection limit reached"
+		limit := t.cfg.MaxConnectionsPerIP
+		refusal = func() {
+			slog.Warn("per-IP connection limit reached", "ip", ip, "limit", limit)
 		}
 		return
 	}
+	ipHeld = true
 
 	// Refuse a peer whose certificate ALSO covers this node's host, before the
 	// connection is allowed to occupy a global slot or open a single stream.
@@ -244,66 +280,64 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 	// certificate is verified and present here, and this runs on RESUMED
 	// sessions too — Accept yields every inbound connection regardless of
 	// whether its TLS session was resumed.
-	if err := t.refuseInboundPromiscuousCert(conn); err != nil {
-		// The precise verdict is logged HERE and kept out of the
-		// CONNECTION_CLOSE reason phrase, which travels to the peer verbatim.
-		// See closeReasonRedacted.
-		slog.Warn("refusing inbound connection: peer certificate is not exclusive",
-			"remote", conn.RemoteAddr().String(),
-			"error", err,
-		)
-		ipTracker.release(ip)
-		if closeErr := conn.CloseWithError(QUICErrPromiscuousCert, closeReasonRedacted); closeErr != nil {
-			slog.Debug("transport: connection close failed after promiscuous-certificate refusal",
-				"ip", ip,
-				"error", closeErr,
-			)
+	refuse := t.refuseInboundPromiscuousCert
+	if t.inboundRefusalForTest != nil {
+		refuse = t.inboundRefusalForTest
+	}
+	if err := refuse(conn); err != nil {
+		// The precise verdict is logged (after the cleanup) and kept out of
+		// the CONNECTION_CLOSE reason phrase, which travels to the peer
+		// verbatim. See closeReasonRedacted.
+		closeCode, closeReason = QUICErrPromiscuousCert, closeReasonRedacted
+		remote := conn.RemoteAddr().String()
+		refusal = func() {
+			slog.Warn("refusing inbound connection: peer certificate is not exclusive",
+				"remote", remote, "error", err)
 		}
 		return
 	}
 
-	// Try to acquire global semaphore without blocking.
+	// Try to acquire global semaphore without blocking. At the global
+	// connection limit the deferred settlement releases the per-IP slot and
+	// closes the connection with QUICErrConnLimitReached.
 	select {
 	case sem <- struct{}{}:
-		// Publish SYNCHRONOUSLY, on this goroutine, before the handler is
-		// launched. Publishing inside handleConnection would leave every
-		// admitted connection invisible for as long as its goroutine took to
-		// be scheduled — and stop()'s inbound sweep walks exactly that map. A
-		// connection admitted just before a shutdown could then be missed by
-		// the sweep, have quicTr.Close() destroy it locally, and only then
-		// reach publication, by which point announcing anything on it is a
-		// no-op: the peer is left holding a dead connection, which is exactly
-		// what this path exists to prevent.
-		//
-		// Publishing here is what lets stop() close that off for good, because
-		// it makes "the accept loop has returned" mean "every connection it
-		// admitted is in the map". See acceptWG.
-		//
-		// It is inside the semaphore branch and not above it deliberately: the
-		// limit-rejection paths close the connection without ever running a
-		// handler, and an entry published for one of them would have nothing
-		// left to call forgetInboundConnState and would pin the *quic.Conn for
-		// the process lifetime.
-		activity := t.publishInboundConn(conn)
-		t.wg.Add(1)
-		go func() {
-			defer func() {
-				<-sem
-				ipTracker.release(ip)
-			}()
-			defer t.wg.Done()
-			t.handleConnection(conn, activity)
-		}()
+		semHeld = true
 	default:
-		// At global connection limit, reject and release IP slot.
-		ipTracker.release(ip)
-		if closeErr := conn.CloseWithError(QUICErrConnLimitReached, "connection limit reached"); closeErr != nil {
-			slog.Debug("transport: connection close failed after global limit reached",
-				"ip", ip,
-				"error", closeErr,
-			)
-		}
+		return
 	}
+
+	// Publish SYNCHRONOUSLY, on this goroutine, before the handler is
+	// launched. Publishing inside handleConnection would leave every
+	// admitted connection invisible for as long as its goroutine took to
+	// be scheduled — and stop()'s inbound sweep walks exactly that map. A
+	// connection admitted just before a shutdown could then be missed by
+	// the sweep, have quicTr.Close() destroy it locally, and only then
+	// reach publication, by which point announcing anything on it is a
+	// no-op: the peer is left holding a dead connection, which is exactly
+	// what this path exists to prevent.
+	//
+	// Publishing here is what lets stop() close that off for good, because
+	// it makes "the accept loop has returned" mean "every connection it
+	// admitted is in the map". See acceptWG.
+	//
+	// It is after every refusal deliberately: the refusal paths close the
+	// connection without ever running a handler, and an entry published for
+	// one of them would have nothing left to call forgetInboundConnState and
+	// would pin the *quic.Conn for the process lifetime.
+	activity := t.publishInboundConn(conn)
+	t.wg.Add(1)
+	// Ownership passes to the handler goroutine: it releases both slots and
+	// the connection's state when handleConnection returns.
+	owned, ipHeld, semHeld = false, false, false
+	go func() {
+		defer func() {
+			<-sem
+			ipTracker.release(ip)
+		}()
+		defer t.wg.Done()
+		t.handleConnection(conn, activity)
+	}()
 	return
 }
 
@@ -395,10 +429,11 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn, activity *inboundConnS
 		case streamSem <- struct{}{}:
 		case <-connCtx.Done():
 			if closeErr := stream.Close(); closeErr != nil {
-				slog.Debug("transport: stream close failed after connection context cancelled",
-					"remote", conn.RemoteAddr().String(),
-					"error", closeErr,
-				)
+				remote := conn.RemoteAddr().String()
+				supervise.LogContained(func() {
+					slog.Debug("transport: stream close failed after connection context cancelled",
+						"remote", remote, "error", closeErr)
+				})
 			}
 			return
 		}
@@ -463,10 +498,14 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		// is a no-op.
 		stream.CancelRead(cancelCode)
 		if closeErr := stream.Close(); closeErr != nil {
-			slog.Debug("transport: stream close failed after handleStream",
-				"remote", inboundConn.RemoteAddr().String(),
-				"error", closeErr,
-			)
+			// Contained: this deferred cleanup runs after the recover below
+			// has, so a panicking log handler here would escape it, and
+			// every cleanup deferred before this one still has to run.
+			remote := remoteAddrOf(inboundConn)
+			supervise.LogContained(func() {
+				slog.Debug("transport: stream close failed after handleStream",
+					"remote", remote, "error", closeErr)
+			})
 		}
 	}()
 	defer func() {
@@ -524,8 +563,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			// budget for the (potentially slow) transfer. The handoff releases
 			// the streamSem slot first so it is not held for the transfer's
 			// duration, then tries to acquire a snapSem slot.
-			acquired := t.handoffToSnapSem(streamSem, snapSem, inboundConn)
-			streamSemHeld = false
+			acquired := t.handoffToSnapSem(streamSem, snapSem, inboundConn, &streamSemHeld)
 			if !acquired {
 				// Snapshot budget exhausted or connection closing: streamSem is
 				// already released by handoffToSnapSem, so drop the snapshot
@@ -557,7 +595,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 		// handshake decision.
 		//
 		// 0-RTT is default-off, and this node never SENDS early data
-		// (dialConnection uses Dial, not DialEarly), so enabling it today buys
+		// (dialAndPool uses Dial, not DialEarly), so enabling it today buys
 		// latency only for non-quicraft clients — all risk, no benefit.
 		if inboundConn != nil && inboundConn.ConnectionState().Used0RTT {
 			cnt := t.zeroRTTRefusals.Add(1)
@@ -754,8 +792,17 @@ func (t *QUICTransport) readFrameHeaderResilient(conn *quic.Conn, stream *quic.S
 // snapshot. Either way the streamSem slot is released exactly once, so across
 // the handoff exactly one of streamSem/snapSem transitions and neither is
 // leaked.
-func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inboundConn *quic.Conn) bool {
+//
+// streamSemHeld is the caller's ownership flag for the streamSem slot, which
+// its deferred cleanup releases while set. It is cleared together with the
+// release, before anything else runs: the refusal below logs, and a log
+// handler that panicked or called runtime.Goexit between the release and the
+// caller clearing the flag made that cleanup release the slot a second time —
+// stealing another stream's slot, or blocking forever on an empty semaphore.
+// The refusal's diagnostic is contained for the same reason.
+func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inboundConn *quic.Conn, streamSemHeld *bool) bool {
 	<-streamSem
+	*streamSemHeld = false
 	// Check shutdown explicitly before trying the snapshot budget: in a
 	// combined select with a default case, a closed stopC/connection context
 	// only wins by random choice against an available snapSem slot, so a
@@ -774,11 +821,11 @@ func (t *QUICTransport) handoffToSnapSem(streamSem, snapSem chan struct{}, inbou
 	default:
 		n := t.snapshotStreamDrops.Add(1)
 		if LogSampled(&t.lastSnapshotRejectLog, protocolViolationLogInterval) {
-			slog.Warn("snapshot stream dropped: per-connection snapshot limit reached",
-				"remote", inboundConn.RemoteAddr().String(),
-				"limit", t.cfg.MaxConcurrentSnapshotRecv,
-				"total", n,
-			)
+			remote, limit := remoteAddrOf(inboundConn), t.cfg.MaxConcurrentSnapshotRecv
+			supervise.LogContained(func() {
+				slog.Warn("snapshot stream dropped: per-connection snapshot limit reached",
+					"remote", remote, "limit", limit, "total", n)
+			})
 		}
 		return false
 	}
@@ -819,12 +866,11 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	if !t.reserveConnMsgRecvBudget(inboundConn, charge) {
 		n := t.recvBudgetDrops.Add(1)
 		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-			slog.Warn("message frame dropped: per-connection receive memory budget exhausted",
-				"remote", remoteAddrOf(inboundConn),
-				"length", length,
-				"per_conn_limit", t.maxConnMsgRecv,
-				"total", n,
-			)
+			remote, limit := remoteAddrOf(inboundConn), t.maxConnMsgRecv
+			supervise.LogContained(func() {
+				slog.Warn("message frame dropped: per-connection receive memory budget exhausted",
+					"remote", remote, "length", length, "per_conn_limit", limit, "total", n)
+			})
 		}
 		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
 	}
@@ -832,11 +878,11 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		t.releaseConnMsgRecvBudget(inboundConn, charge)
 		n := t.recvBudgetDrops.Add(1)
 		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-			slog.Warn("message frame dropped: receive memory budget exhausted",
-				"remote", remoteAddrOf(inboundConn),
-				"length", length,
-				"total", n,
-			)
+			remote := remoteAddrOf(inboundConn)
+			supervise.LogContained(func() {
+				slog.Warn("message frame dropped: receive memory budget exhausted",
+					"remote", remote, "length", length, "total", n)
+			})
 		}
 		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
 	}
@@ -887,13 +933,12 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
 				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-					slog.Warn("compressed message frame dropped: per-connection receive memory budget exhausted",
-						"remote", remoteAddrOf(inboundConn),
-						"compressed_length", length,
-						"declared_decompressed_length", declaredLen,
-						"per_conn_limit", t.maxConnMsgRecv,
-						"total", n,
-					)
+					remote, limit := remoteAddrOf(inboundConn), t.maxConnMsgRecv
+					supervise.LogContained(func() {
+						slog.Warn("compressed message frame dropped: per-connection receive memory budget exhausted",
+							"remote", remote, "compressed_length", length,
+							"declared_decompressed_length", declaredLen, "per_conn_limit", limit, "total", n)
+					})
 				}
 				return ErrMessageRecvMemoryBudgetExceeded
 			}
@@ -902,12 +947,12 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
 				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-					slog.Warn("compressed message frame dropped: receive memory budget exhausted",
-						"remote", remoteAddrOf(inboundConn),
-						"compressed_length", length,
-						"declared_decompressed_length", declaredLen,
-						"total", n,
-					)
+					remote := remoteAddrOf(inboundConn)
+					supervise.LogContained(func() {
+						slog.Warn("compressed message frame dropped: receive memory budget exhausted",
+							"remote", remote, "compressed_length", length,
+							"declared_decompressed_length", declaredLen, "total", n)
+					})
 				}
 				return ErrMessageRecvMemoryBudgetExceeded
 			}
@@ -968,20 +1013,19 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	for i := range batch.Requests {
 		if batch.Requests[i].ShardID == 0 {
 			n := t.zeroShardDrops.Add(1)
-			if LogSampled(&t.lastZeroShardLog, protocolViolationLogInterval) {
-				slog.Warn("dropping message with ShardID=0",
-					"from", batch.Requests[i].From,
-					"type", proto.MessageTypeName(batch.Requests[i].Type),
-					"source", batch.SourceAddress,
-					"total", n,
-				)
-			}
+			from, msgType, source := batch.Requests[i].From, batch.Requests[i].Type, batch.SourceAddress
 			batch.Reset()
 			batchPool.Put(batch)
 			if buf != nil {
 				t.putRecvBuf(buf)
 			}
 			returnSnappyBuf()
+			if LogSampled(&t.lastZeroShardLog, protocolViolationLogInterval) {
+				supervise.LogContained(func() {
+					slog.Warn("dropping message with ShardID=0",
+						"from", from, "type", proto.MessageTypeName(msgType), "source", source, "total", n)
+				})
+			}
 			return nil
 		}
 	}
@@ -1014,11 +1058,11 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	if batch.SourceAddress != "" && !t.inboundAuthorizedForCached(inboundConn, batch.SourceAddress) {
 		n := t.spoofedSourceClears.Add(1)
 		if LogSampled(&t.lastSpoofedSourceLog, protocolViolationLogInterval) {
-			slog.Warn("clearing spoofed source address: not covered by peer certificate",
-				"claimed_source", batch.SourceAddress,
-				"remote", remoteAddrOf(inboundConn),
-				"total", n,
-			)
+			claimed, remote := batch.SourceAddress, remoteAddrOf(inboundConn)
+			supervise.LogContained(func() {
+				slog.Warn("clearing spoofed source address: not covered by peer certificate",
+					"claimed_source", claimed, "remote", remote, "total", n)
+			})
 		}
 		batch.SourceAddress = ""
 	}
@@ -1097,19 +1141,6 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 			break
 		}
 	}
-	// Record message received metrics before delivery. The batch is about
-	// to be consumed by the engine so we measure it here while we still
-	// own the batch reference.
-	if t.metrics != nil {
-		for i := range batch.Requests {
-			t.metrics.IncMessagesReceived(
-				batch.Requests[i].ShardID,
-				batch.Requests[i].From,
-				batch.Requests[i].Type,
-			)
-		}
-	}
-
 	// Bind the batch's in-band claims to the connection that carried them: the
 	// peer's authenticated NODE IDENTITY (which msg.From is checked against
 	// wherever committed membership records one) and the certificate's address
@@ -1122,6 +1153,20 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		},
 	}
 	handleErr := t.handler.HandleMessage(*batch, peer)
+	// Received-message metrics are recorded after the hand-off they
+	// describe: the MetricsCollector is user code, and one that panicked or
+	// called runtime.Goexit before HandleMessage lost the whole batch. The
+	// handler copies what it keeps (see MessageHandler), so the batch's
+	// Requests are still this frame's to read until the Reset below.
+	if t.metrics != nil {
+		for i := range batch.Requests {
+			t.metrics.IncMessagesReceived(
+				batch.Requests[i].ShardID,
+				batch.Requests[i].From,
+				batch.Requests[i].Type,
+			)
+		}
+	}
 	if !recvStart.IsZero() && len(batch.Requests) > 0 {
 		slog.Debug("message batch received",
 			"source", batch.SourceAddress,

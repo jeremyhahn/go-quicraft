@@ -375,7 +375,7 @@ func TestDialConnection_RefusesInsertAfterStop(t *testing.T) {
 	// itself succeeds and the post-dial guard is the branch under test.
 	t1.stopped.Store(true)
 
-	conn, err := t1.dialConnection(target, "")
+	conn, err := t1.dialForTest(target)
 	if !errors.Is(err, ErrStreamClosed) {
 		t.Fatalf("dialConnection after stop = (%v, %v), want ErrStreamClosed", conn, err)
 	}

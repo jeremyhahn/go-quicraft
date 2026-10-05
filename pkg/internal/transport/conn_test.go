@@ -1615,7 +1615,7 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := tr.dialConnection(target, "")
+		_, err := tr.dialForTest(target)
 		done <- err
 	}()
 
@@ -1659,7 +1659,7 @@ func TestDialConnectionReturnsErrorOnShutdown(t *testing.T) {
 	}
 	tr.Stop()
 
-	_, err = tr.dialConnection("127.0.0.1:12345", "")
+	_, err = tr.dialForTest("127.0.0.1:12345")
 	if err == nil {
 		t.Fatal("expected error from dialConnection after stop, got nil")
 	}
@@ -2105,7 +2105,7 @@ func TestDialConnection_InvalidTarget(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	_, err = tr.dialConnection("not-valid", "")
+	_, err = tr.dialForTest("not-valid")
 	if err == nil {
 		t.Fatal("expected error for invalid target")
 	}
@@ -2122,7 +2122,7 @@ func TestDialConnection_EmptyHost(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Verify connection works with normal target.
-	conn, err := t1.dialConnection(target, "")
+	conn, err := t1.dialForTest(target)
 	if err != nil {
 		t.Fatalf("dialConnection failed: %v", err)
 	}
@@ -2252,7 +2252,7 @@ func TestDialConnection_WithEventListener(t *testing.T) {
 	}
 	defer t2.Stop()
 
-	_, dialErr := tr.dialConnection(t2.Addr().String(), "")
+	_, dialErr := tr.dialForTest(t2.Addr().String())
 	if dialErr != nil {
 		t.Fatalf("dialConnection failed: %v", dialErr)
 	}
@@ -2714,7 +2714,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	t1.connMu.Lock()
 	delete(t1.conns, t2Addr)
 	t1.connMu.Unlock()
-	conn2, dialErr := t1.dialConnection(t2Addr, "")
+	conn2, dialErr := t1.dialForTest(t2Addr)
 	if dialErr != nil {
 		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
 		return
@@ -2814,7 +2814,7 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	// Open a second connection and simulate a recv on that new *quic.Conn —
 	// i.e. "the peer dialled us from a fresh connection" — but with the SAME
 	// boot epoch (7): a benign re-dial, NOT a restart.
-	conn2, dialErr := t1.dialConnection(t2Addr, "")
+	conn2, dialErr := t1.dialForTest(t2Addr)
 	if dialErr != nil {
 		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
 	}
@@ -2880,11 +2880,11 @@ func TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored(t *testing.T) {
 
 	// Two live, fully-handshaked connections to t2. Both present t2's
 	// certificate, which covers loopback/:: but NOT the spoofed host below.
-	cachedConn, dialErr := t1.dialConnection(t2.Addr().String(), "")
+	cachedConn, dialErr := t1.dialForTest(t2.Addr().String())
 	if dialErr != nil {
 		t.Fatalf("dialConnection(cached) failed: %v", dialErr)
 	}
-	inboundConn, dialErr := t1.dialConnection(t2.Addr().String(), "")
+	inboundConn, dialErr := t1.dialForTest(t2.Addr().String())
 	if dialErr != nil {
 		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
 	}
@@ -3146,7 +3146,7 @@ func TestDialConnection_OnConnectionFailedEvent(t *testing.T) {
 	defer tr.Stop()
 
 	// Dial a non-existent address to trigger failure.
-	_, err = tr.dialConnection("127.0.0.1:1", "")
+	_, err = tr.dialForTest("127.0.0.1:1")
 	if err == nil {
 		t.Fatal("expected dial to fail")
 	}
@@ -3182,7 +3182,7 @@ func TestDialConnection_EmptyHostRejected(t *testing.T) {
 	// ":12345" has an empty host. Rather than silently verifying the peer
 	// certificate against a hardcoded "localhost" ServerName (masking a
 	// misconfiguration), dialConnection must reject it with ErrEmptyDialHost.
-	_, err = tr.dialConnection(":12345", "")
+	_, err = tr.dialForTest(":12345")
 	if !errors.Is(err, ErrEmptyDialHost) {
 		t.Fatalf("expected ErrEmptyDialHost for empty-host target, got %v", err)
 	}
@@ -3720,7 +3720,7 @@ func TestDialConnection_ShutdownContextCanceled(t *testing.T) {
 	tr.shutdownCancel()
 
 	// dialConnection should fail because the context is canceled.
-	_, err = tr.dialConnection("127.0.0.1:39999", "")
+	_, err = tr.dialForTest("127.0.0.1:39999")
 	if err == nil {
 		t.Fatal("expected error from dialConnection with canceled context")
 	}
@@ -3759,7 +3759,7 @@ func TestDialConnection_ReusesCachedWinner(t *testing.T) {
 
 	// A direct dial simulates the loser of the race: the cache already
 	// holds a live connection when its insert runs.
-	got, err := t1.dialConnection(t2Addr, "")
+	got, err := t1.dialForTest(t2Addr)
 	if err != nil {
 		t.Fatalf("dialConnection failed: %v", err)
 	}

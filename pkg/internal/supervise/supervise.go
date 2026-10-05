@@ -28,7 +28,9 @@
 //     goroutine when a Goexit ends it, with the caller's WaitGroup accounting
 //     and the restart wait (AwaitRestart, RestartDelay) a panic restart takes.
 //   - RunResilient runs a shutdown or cleanup path to completion on helper
-//     goroutines, so no abnormal exit inside it can leave its caller waiting.
+//     goroutines, so no abnormal exit inside it can leave its caller waiting;
+//     RunEach runs a sequence of callbacks the same way, each one isolated
+//     from the others and from the caller.
 //   - LogContained emits a diagnostic on a goroutine of its own.
 //
 // The rule they serve is settle first, log last: a recovery settles
@@ -146,8 +148,9 @@ func Supervise(wg *sync.WaitGroup, stopC <-chan struct{}, loop, stopped func()) 
 // and returns once fn has returned normally. The calling goroutine never runs
 // fn itself, so no user code can end it. fn must consume what it has handled
 // before running user code on it, so that a rerun resumes where the last run
-// stopped instead of repeating it. It is for shutdown and cleanup paths that
-// must finish — a drain whose callers then close a done channel.
+// stopped instead of repeating it. It is for paths that must finish — a
+// shutdown drain whose callers then close a done channel, or a sequence of
+// callbacks every one of which must run (RunEach).
 func RunResilient(fn func()) {
 	for {
 		normal := make(chan bool, 1)
@@ -160,7 +163,7 @@ func RunResilient(fn func()) {
 				normal <- ok
 				if r != nil {
 					LogContained(func() {
-						slog.Error("panic recovered in a shutdown drain; resuming it",
+						slog.Error("panic recovered in a resilient run; resuming it",
 							"panic", fmt.Sprint(r))
 					})
 				}
@@ -172,6 +175,31 @@ func RunResilient(fn func()) {
 			return
 		}
 	}
+}
+
+// RunEach makes the calls call(0) … call(n-1), in order and synchronously:
+// it returns once every call has ended. Each call is user code — a listener
+// callback, a revocation notification — and is consumed before it runs, so a
+// call that panics or calls runtime.Goexit ends only itself: the calls after
+// it still run, none runs twice, and the caller is never ended (RunResilient).
+// A panic's diagnostic is contained (LogContained).
+//
+// The calls run on a helper goroutine while the caller waits, so a callback
+// documented to run synchronously, in order, on the goroutine of the
+// operation that produced it keeps that contract in every respect but the
+// goroutine's identity.
+func RunEach(n int, call func(i int)) {
+	if n <= 0 {
+		return
+	}
+	next := 0
+	RunResilient(func() {
+		for next < n {
+			i := next
+			next++
+			call(i)
+		}
+	})
 }
 
 // LogContained emits a diagnostic on a goroutine of its own, so the slog

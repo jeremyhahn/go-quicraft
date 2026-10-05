@@ -51,7 +51,11 @@ func TestHandoffToSnapSem_NormalPath(t *testing.T) {
 	// Caller holds one streamSem slot on entry, as handleConnection guarantees.
 	streamSem <- struct{}{}
 
-	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn)
+	held := true
+	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn, &held)
+	if held {
+		t.Fatal("handoffToSnapSem left the data-stream slot marked held after releasing it")
+	}
 	if !acquired {
 		t.Fatal("normal path: handoff should acquire a snapSem slot")
 	}
@@ -84,7 +88,11 @@ func TestHandoffToSnapSem_SnapSemFull(t *testing.T) {
 	// Snapshot budget is already fully consumed by another in-flight transfer.
 	snapSem <- struct{}{}
 
-	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn)
+	held := true
+	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn, &held)
+	if held {
+		t.Fatal("handoffToSnapSem left the data-stream slot marked held after releasing it")
+	}
 	if acquired {
 		t.Fatal("snapSem-full path: handoff must not acquire a slot when budget is exhausted")
 	}
@@ -118,7 +126,11 @@ func TestHandoffToSnapSem_ConnContextCancelled(t *testing.T) {
 	waitForChan(t, conn.Context().Done(), 5*time.Second,
 		"connection context not cancelled after CloseWithError")
 
-	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn)
+	held := true
+	acquired := tr.handoffToSnapSem(streamSem, snapSem, conn, &held)
+	if held {
+		t.Fatal("handoffToSnapSem left the data-stream slot marked held after releasing it")
+	}
 	if acquired {
 		t.Fatal("cancelled path: handoff must not acquire a slot when connection is closing")
 	}

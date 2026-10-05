@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `EventListener.OnSnapshotRejected` is delivered on the listener dispatcher
   whatever produced it, the snapshot pool or the snapshot receiver, so a
   listener may call `StopShard` from it.
+- The transport's connection and snapshot-transfer events
+  (`OnConnectionEstablished`, `OnConnectionFailed`, `OnSnapshotSendStarted`,
+  `OnSnapshotSent`, `OnSnapshotSendAborted`, `OnSnapshotReceived`) and the
+  revocation `OnCertRevoked` notification still run synchronously and in
+  order, but on a helper goroutine that the transport waits for. A callback
+  that panics or calls `runtime.Goexit` now stops only itself, not the
+  transport operation that fired it or the callbacks after it.
 - A snapshot recovery that fails or panics before the state machine's
   `RecoverFromSnapshot` is invoked (reading the snapshot record, verifying,
   decrypting or decompressing the artifact, resolving the barrier, or the Raft
@@ -260,6 +267,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sweeping and a peer's send queue stopped draining for good; and none of its
   recoveries can be crashed by a log handler that panics. A panic in the
   connection cleanup sweep no longer leaves the connection pool locked.
+- The QUIC transport no longer runs user code (a log handler, an
+  `EventListener` callback, the revocation `OnCertRevoked` notification, a
+  `MetricsCollector`) between a state change and the cleanup that goes with it.
+  A callback or handler that panicked or called `runtime.Goexit` at the wrong
+  moment caused these failures, now fixed:
+  - an inbound connection refused for the per-IP limit stayed open, outside
+    `MaxIncomingConnections`;
+  - a connection refused for a promiscuous certificate permanently used up its
+    address's per-IP quota;
+  - a refused snapshot stream released its data-stream slot twice, which could
+    hang `Stop`;
+  - a dead peer's pooled streams were left in place and their
+    `OnConnectionFailed` callbacks were never delivered;
+  - a revoked, idle or removed peer's connection was not closed, and a stale
+    outbound connection was not evicted;
+  - a dead connection stayed pooled after a failed write;
+  - a delivered snapshot was reported as failed;
+  - `Stop` left locks held and sockets bound;
+  - a failed CRL read did not mark the revocation set stale (revocation failed
+    open), a reloaded CRL was not committed, or the CRL reload loop never
+    started.
+
+  Callbacks now run only after that cleanup, and each runs isolated from the
+  others. `OnConnectionEstablished` and `OnConnectionFailed` fire after the
+  dial completes, never inside the dial that concurrent sends share. Inbound
+  message metrics are recorded after the batch is handed to the host.
 - The host completes callers before it calls the `MetricsCollector` and holds
   no lock while it does: a collector that called `runtime.Goexit` (or, when
   installed unwrapped, panicked) could leave a ReadIndex confirmation holding

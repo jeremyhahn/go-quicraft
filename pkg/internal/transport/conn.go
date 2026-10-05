@@ -126,12 +126,13 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 		select {
 		case <-conn.Context().Done():
 			// Connection is dead, remove it and evict all associated
-			// streams so callers don't get stale stream handles.
+			// streams so callers don't get stale stream handles. The
+			// diagnostic follows the eviction it reports.
+			t.removeConnection(target)
+			t.evictStreamsForTarget(target)
 			slog.Debug("stale connection detected, reconnecting",
 				"target", target,
 			)
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
 		default:
 			if t.serves(presented, want) {
 				return conn, nil
@@ -164,9 +165,19 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 	slog.Debug("initiating connection dial",
 		"target", target,
 	)
+	// The coalesced dial runs no user code: the connection event is reported
+	// by the goroutine that ran the dial, after Do has released every sender
+	// waiting on it (see dialAndPool). report stays nil on a goroutine whose
+	// Do only waited for another's dial.
+	var report func()
 	result, err, _ := t.dialGroup.Do(dialKey, func() (any, error) {
-		return t.dialConnection(target, want)
+		conn, r, err := t.dialAndPool(target, want)
+		report = r
+		return conn, err
 	})
+	if report != nil {
+		report()
+	}
 	if err != nil {
 		if _, refused := errors.AsType[*DialIdentityError](err); refused {
 			t.dialRefusals.Store(refusalKey, dialRefusal{at: time.Now(), err: err})
@@ -262,24 +273,36 @@ func (t *QUICTransport) forgetDialRefusals(address string) {
 	})
 }
 
-// dialConnection establishes a new QUIC connection to the target address. When
-// want is not "", the peer must present exactly that node identity or the
-// connection is closed and refused before it is pooled (see getConnection).
-func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) {
+// dialAndPool establishes a new QUIC connection to the target address and
+// pools it. When want is not "", the peer must present exactly that node
+// identity or the connection is closed and refused before it is pooled (see
+// getConnection).
+//
+// It returns report, which delivers the connection event
+// (OnConnectionEstablished or OnConnectionFailed) and its diagnostics.
+// report runs no part of the dial, which has settled — the
+// connection pooled or closed — before it returns, so it is called after the
+// dial and outside the singleflight that coalesces it (getConnection): a
+// listener or log handler that panicked or called runtime.Goexit inside the
+// coalesced dial re-raised it in every sender waiting on that dial. The
+// listener runs through deliverEvent and the diagnostics are contained, so
+// report cannot end its caller either. report is never nil.
+func (t *QUICTransport) dialAndPool(target, want string) (*quic.Conn, func(), error) {
+	noEvent := func() {}
 	udpAddr, err := net.ResolveUDPAddr("udp", target)
 	if err != nil {
-		return nil, err
+		return nil, noEvent, err
 	}
 
 	host, _, err := net.SplitHostPort(target)
 	if err != nil {
-		return nil, &DialError{Target: target, Err: err}
+		return nil, noEvent, &DialError{Target: target, Err: err}
 	}
 	if host == "" {
 		// An empty host would silently verify the peer cert against
 		// "localhost", masking a misconfigured target and failing SAN
 		// matching against real-hostname/IP certs. Fail loudly instead.
-		return nil, &DialError{Target: target, Err: ErrEmptyDialHost}
+		return nil, noEvent, &DialError{Target: target, Err: ErrEmptyDialHost}
 	}
 
 	// Capture the peer incarnation this dial is being made under BEFORE the
@@ -307,11 +330,7 @@ func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) 
 		}
 	}
 	if err != nil {
-		slog.Info("peer connection failed", "target", target, "error", err)
-		if t.eventListener != nil && t.eventListener.OnConnectionFailed != nil {
-			t.eventListener.OnConnectionFailed(config.ConnectionInfo{Address: target, Err: err})
-		}
-		return nil, err
+		return nil, t.connectionEvent(target, nil, err), err
 	}
 
 	// Insert under connMu guarded by the stopped flag. Stop() sets stopped=true
@@ -323,7 +342,7 @@ func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) 
 	if t.stopped.Load() {
 		t.connMu.Unlock()
 		_ = conn.CloseWithError(QUICErrShutdown, "transport stopped during dial")
-		return nil, ErrStreamClosed
+		return nil, noEvent, ErrStreamClosed
 	}
 	// Re-check the cache under the lock: singleflight only coalesces
 	// OVERLAPPING dials, so a dial started after another completed (fast-path
@@ -340,13 +359,17 @@ func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) 
 			existingPeer := t.connPeer[existing]
 			t.connMu.Unlock()
 			_ = conn.CloseWithError(QUICErrDuplicateDial, "duplicate dial: reusing cached connection")
-			slog.Debug("dial race lost, reusing cached connection", "target", target)
+			lost := func() {
+				supervise.LogContained(func() {
+					slog.Debug("dial race lost, reusing cached connection", "target", target)
+				})
+			}
 			if want != "" && existingPeer != want {
 				// The winner reached another peer; the caller's destination
 				// is not reachable over it (see replaceUnboundPeer).
-				return nil, &DialError{Target: target, Err: &DialIdentityError{Presented: existingPeer}}
+				return nil, lost, &DialError{Target: target, Err: &DialIdentityError{Presented: existingPeer}}
 			}
-			return existing, nil
+			return existing, lost, nil
 		}
 	}
 	t.conns[target] = conn
@@ -362,19 +385,40 @@ func (t *QUICTransport) dialConnection(target, want string) (*quic.Conn, error) 
 	t.wg.Add(1)
 	go t.preOpenHeartbeatStream(target, conn)
 
-	// Log connection establishment at Debug level.
-	slog.Debug("connection established",
-		"target", target,
-		"local_addr", conn.LocalAddr().String(),
-		"remote_addr", conn.RemoteAddr().String(),
-	)
+	return conn, t.connectionEvent(target, conn, nil), nil
+}
 
-	slog.Info("peer connected", "target", target)
-	if t.eventListener != nil && t.eventListener.OnConnectionEstablished != nil {
-		t.eventListener.OnConnectionEstablished(config.ConnectionInfo{Address: target})
+// connectionEvent returns the report of a dial to target that settled with
+// conn (pooled) or err: its diagnostics, contained, and then
+// OnConnectionFailed (err != nil) or OnConnectionEstablished, isolated
+// (deliverEvent).
+func (t *QUICTransport) connectionEvent(target string, conn *quic.Conn, err error) func() {
+	return func() {
+		supervise.LogContained(func() {
+			if err != nil {
+				slog.Info("peer connection failed", "target", target, "error", err)
+				return
+			}
+			slog.Debug("connection established",
+				"target", target,
+				"local_addr", conn.LocalAddr().String(),
+				"remote_addr", conn.RemoteAddr().String(),
+			)
+			slog.Info("peer connected", "target", target)
+		})
+		if t.eventListener == nil {
+			return
+		}
+		if err != nil {
+			if cb := t.eventListener.OnConnectionFailed; cb != nil {
+				deliverEvent(func() { cb(config.ConnectionInfo{Address: target, Err: err}) })
+			}
+			return
+		}
+		if cb := t.eventListener.OnConnectionEstablished; cb != nil {
+			deliverEvent(func() { cb(config.ConnectionInfo{Address: target}) })
+		}
 	}
-
-	return conn, nil
 }
 
 // boundIdentitiesAt returns the node identities membership binds to the
@@ -438,7 +482,7 @@ func (t *QUICTransport) dropIdentityMismatch(target string, msg *proto.Message) 
 
 // preOpenHeartbeatStream proactively opens a QUIC stream and stores it in the
 // stream pool at index 0 (the heartbeat stream slot). This runs asynchronously
-// after dialConnection so the dial path is not blocked. If the stream open
+// after dialAndPool so the dial path is not blocked. If the stream open
 // fails (e.g., connection closed before completion), the failure is non-fatal:
 // the heartbeat send path will lazily open the stream on its first use.
 func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
@@ -518,7 +562,7 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 //
 // The peerEpoch record is deliberately NOT dropped here. Removing a connection
 // is the FIRST half of a re-dial, and the epoch is what the re-dial stamps the
-// replacement with (see dialConnection). Forgetting it would stamp the fresh
+// replacement with (see dialAndPool). Forgetting it would stamp the fresh
 // outbound with "unknown", the next batch from the peer would find a stamp
 // mismatch and evict again, and the eviction would forget again -- an endless
 // evict/re-dial cascade. A dead connection is no different: it is re-dialed
@@ -770,10 +814,12 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) b
 
 	if ok && conn != nil {
 		if closeErr := conn.CloseWithError(0, reason); closeErr != nil {
-			slog.Debug("transport: connection close failed during removeAndClose",
-				"target", target,
-				"error", closeErr,
-			)
+			// Contained: every caller has teardown still to do after this
+			// (stream eviction, the send queue, the incarnation record).
+			supervise.LogContained(func() {
+				slog.Debug("transport: connection close failed during removeAndClose",
+					"target", target, "error", closeErr)
+			})
 		}
 	}
 	return ok
@@ -993,9 +1039,15 @@ func ownerIsLivePooled(owner, pooled *quic.Conn, pooledOK bool) bool {
 
 // closeStreamQuietly closes a stream getStream is discarding; a close error is
 // diagnostic only.
+//
+// The diagnostic is contained: getStream closes two streams back to back on
+// one path, and a log handler ending the first close's goroutine left the
+// second open, holding a stream credit for good.
 func closeStreamQuietly(stream *quic.Stream, msg, target string, shardID uint64) {
 	if err := stream.Close(); err != nil {
-		slog.Debug(msg, "target", target, "shard_id", shardID, "error", err)
+		supervise.LogContained(func() {
+			slog.Debug(msg, "target", target, "shard_id", shardID, "error", err)
+		})
 	}
 }
 
@@ -1219,14 +1271,16 @@ func (t *QUICTransport) revokeCheckConnections() {
 		// connected.
 		// The precise verdict is logged HERE and is deliberately not put in the
 		// CONNECTION_CLOSE reason phrase, which travels to the peer verbatim.
-		// See closeReasonRedacted.
-		slog.Warn("closing connection: peer certificate is no longer admissible",
-			"remote", conn.RemoteAddr().String(),
-			"serial", leaf.SerialNumber.Text(16),
-			"revoked", revoked,
-			"error", err,
-		)
+		// See closeReasonRedacted. The close comes first and the warning is
+		// contained: a log handler that panicked or called runtime.Goexit
+		// before the close left a revoked peer connected, and every
+		// connection after it unchecked.
 		_ = conn.CloseWithError(QUICErrRevoked, closeReasonRedacted)
+		remote, serial := conn.RemoteAddr().String(), leaf.SerialNumber.Text(16)
+		supervise.LogContained(func() {
+			slog.Warn("closing connection: peer certificate is no longer admissible",
+				"remote", remote, "serial", serial, "revoked", revoked, "error", err)
+		})
 	}
 
 	t.inboundConns.Range(func(k, _ any) bool {
@@ -1308,12 +1362,13 @@ func (t *QUICTransport) reapIdleInboundConns(now time.Time) {
 		if state.lastActive.Load() > cutoff {
 			return true
 		}
-		slog.Info("reclaiming idle inbound connection",
-			"remote", conn.RemoteAddr().String(),
-			"idle_for", now.Sub(time.Unix(0, state.lastActive.Load())).String(),
-			"limit", inboundIdleRetention.String(),
-		)
+		idleFor := now.Sub(time.Unix(0, state.lastActive.Load()))
 		_ = conn.CloseWithError(QUICErrInboundIdle, closeReasonRedacted)
+		remote := conn.RemoteAddr().String()
+		supervise.LogContained(func() {
+			slog.Info("reclaiming idle inbound connection",
+				"remote", remote, "idle_for", idleFor.String(), "limit", inboundIdleRetention.String())
+		})
 		return true
 	})
 }
@@ -1358,13 +1413,14 @@ func (t *QUICTransport) closeInboundFromPeer(address string) int {
 		if !t.inboundAuthorizedFor(conn, address) {
 			return true
 		}
-		// The membership verdict is logged HERE; the reason phrase travels to
-		// the peer verbatim, so it carries none of it. See closeReasonRedacted.
-		slog.Info("closing inbound connection from removed peer",
-			"target", address,
-			"remote", conn.RemoteAddr().String(),
-		)
+		// The membership verdict is logged HERE, after the close and
+		// contained; the reason phrase travels to the peer verbatim, so it
+		// carries none of it. See closeReasonRedacted.
 		_ = conn.CloseWithError(QUICErrPeerRemoved, closeReasonRedacted)
+		remote := conn.RemoteAddr().String()
+		supervise.LogContained(func() {
+			slog.Info("closing inbound connection from removed peer", "target", address, "remote", remote)
+		})
 		closed++
 		return true
 	})
@@ -1402,10 +1458,10 @@ func (t *QUICTransport) closeInboundOnShutdown() int {
 			return true
 		}
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
-			slog.Debug("QUIC inbound connection close failed",
-				"remote", conn.RemoteAddr().String(),
-				"error", err,
-			)
+			remote := conn.RemoteAddr().String()
+			supervise.LogContained(func() {
+				slog.Debug("QUIC inbound connection close failed", "remote", remote, "error", err)
+			})
 		}
 		closed++
 		return true
@@ -1428,7 +1484,7 @@ func (t *QUICTransport) closeInboundOnShutdown() int {
 // out elections on shards that have nothing to do with the dead peer, and a
 // listener that re-entered transport teardown (Stop, CloseTarget) deadlocked
 // outright, since sync.RWMutex is not reentrant. The dial path has always
-// fired the same callback outside any lock (see dialConnection).
+// fired the same callback outside any lock (see dialAndPool).
 func (t *QUICTransport) cleanStaleConnections() {
 	// The scan releases connMu by defer: a panic in it must not leave the
 	// pool locked for the sweep the cleanup loop restarts, and for every
@@ -1450,9 +1506,18 @@ func (t *QUICTransport) cleanStaleConnections() {
 		return dead
 	}()
 
-	// Evict all pooled streams belonging to dead connections, and notify the
-	// listener. This must happen outside connMu to avoid lock ordering issues
-	// with shard locks and to keep user callbacks off the send path's lock.
+	// Evict all pooled streams belonging to dead connections, then notify.
+	// This must happen outside connMu to avoid lock ordering issues with
+	// shard locks and to keep user callbacks off the send path's lock.
+	//
+	// The structural eviction runs for EVERY dead target before any user
+	// code: the targets are already out of the pool, so no later sweep finds
+	// them again, and a log handler or listener that panicked or called
+	// runtime.Goexit between two targets used to leave the rest with their
+	// streams pooled and their callbacks undelivered. Then the diagnostics,
+	// contained, and then the callbacks, each isolated from the others and
+	// from this goroutine (deliverEvent) but still delivered synchronously
+	// and in order on the sweep, as the EventListener contract describes.
 	//
 	// The dead targets' incarnation records are deliberately NOT dropped here:
 	// a connection found dead is re-dialed, and the re-dial is stamped from
@@ -1460,14 +1525,25 @@ func (t *QUICTransport) cleanStaleConnections() {
 	// reapPeerIncarnations instead, which only forgets an address that has
 	// been both disconnected and silent for a long window.
 	for _, target := range deadTargets {
-		slog.Info("peer disconnected", "target", target)
 		t.evictStreamsForTarget(target)
-		if t.eventListener != nil && t.eventListener.OnConnectionFailed != nil {
-			t.eventListener.OnConnectionFailed(config.ConnectionInfo{Address: target})
-		}
 	}
-
 	t.reapPeerIncarnations(time.Now())
+
+	if len(deadTargets) == 0 {
+		return
+	}
+	supervise.LogContained(func() {
+		for _, target := range deadTargets {
+			slog.Info("peer disconnected", "target", target)
+		}
+	})
+	if t.eventListener == nil || t.eventListener.OnConnectionFailed == nil {
+		return
+	}
+	onFailed := t.eventListener.OnConnectionFailed
+	supervise.RunEach(len(deadTargets), func(i int) {
+		onFailed(config.ConnectionInfo{Address: deadTargets[i]})
+	})
 }
 
 // evictStreamsForTarget removes and closes all pooled streams whose
@@ -1490,15 +1566,24 @@ func (t *QUICTransport) evictStreamsForTarget(target string) {
 		}
 		shard.mu.Unlock()
 
+		// Every dropped stream is closed before any diagnostic: they are out
+		// of the pool, so one left open by a log handler that panicked or
+		// called runtime.Goexit would hold its stream credit for good.
+		var closeErrs []error
 		for _, s := range toClose {
 			if s != nil {
 				if closeErr := s.Close(); closeErr != nil {
-					slog.Debug("transport: stream close failed during eviction",
-						"target", target,
-						"error", closeErr,
-					)
+					closeErrs = append(closeErrs, closeErr)
 				}
 			}
+		}
+		if len(closeErrs) > 0 {
+			supervise.LogContained(func() {
+				for _, closeErr := range closeErrs {
+					slog.Debug("transport: stream close failed during eviction",
+						"target", target, "error", closeErr)
+				}
+			})
 		}
 	}
 }
@@ -1596,19 +1681,28 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 		// sender may SPEAK for this address; it does not bound how much work it
 		// may ask for.
 		if !t.allowEviction(target, time.Now()) {
-			slog.Warn("epoch-driven eviction budget exhausted for peer; ignoring restart hint",
-				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp,
-				"budget", evictionBudget, "window", evictionWindow)
+			supervise.LogContained(func() {
+				slog.Warn("epoch-driven eviction budget exhausted for peer; ignoring restart hint",
+					"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp,
+					"budget", evictionBudget, "window", evictionWindow)
+			})
 			return
 		}
-		slog.Info("evicting outbound not attributable to the sending peer incarnation",
-			"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp)
-		if closeErr := outbound.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation"); closeErr != nil {
-			slog.Debug("transport: connection close failed during stale eviction",
-				"target", target, "error", closeErr)
-		}
+		// The eviction comes first and its diagnostics after, contained: a
+		// log handler that panicked or called runtime.Goexit before the close
+		// left the black-holed outbound pooled, which is the stall this
+		// eviction exists to end.
+		closeErr := outbound.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation")
 		t.removeConnection(target)
 		t.evictStreamsForTarget(target)
+		supervise.LogContained(func() {
+			slog.Info("evicting outbound not attributable to the sending peer incarnation",
+				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp)
+			if closeErr != nil {
+				slog.Debug("transport: connection close failed during stale eviction",
+					"target", target, "error", closeErr)
+			}
+		})
 	}
 }
 
@@ -1883,14 +1977,19 @@ func (t *QUICTransport) reportPromiscuousCertCoverage() {
 	if !unnameableCertSelfHost(selfHost) {
 		return
 	}
-	slog.Warn("promiscuous-certificate refusal is INERT: this node has no "+
-		"advertised host a certificate can be matched against, so an inbound "+
-		"peer whose certificate also covers this node cannot be detected; set "+
-		"AdvertiseAddress to this node's reachable hostname or IP",
-		"listen_address", t.cfg.ListenAddress,
-		"advertise_address", t.cfg.AdvertiseAddress,
-		"resolved_host", selfHost,
-	)
+	// Contained: Start calls this with the listener bound and its loops not
+	// yet started, and a log handler must not be able to leave it there.
+	listen, advertise := t.cfg.ListenAddress, t.cfg.AdvertiseAddress
+	supervise.LogContained(func() {
+		slog.Warn("promiscuous-certificate refusal is INERT: this node has no "+
+			"advertised host a certificate can be matched against, so an inbound "+
+			"peer whose certificate also covers this node cannot be detected; set "+
+			"AdvertiseAddress to this node's reachable hostname or IP",
+			"listen_address", listen,
+			"advertise_address", advertise,
+			"resolved_host", selfHost,
+		)
+	})
 }
 
 // inboundAuthorizedForCached is the per-connection-cached form of
@@ -2167,11 +2266,10 @@ func (t *QUICTransport) evictStream(target string, shardID uint64, isHeartbeat b
 	shard.mu.Unlock()
 
 	if closeErr := stream.Close(); closeErr != nil {
-		slog.Debug("transport: stream close failed during single-stream eviction",
-			"target", target,
-			"shard_id", shardID,
-			"error", closeErr,
-		)
+		supervise.LogContained(func() {
+			slog.Debug("transport: stream close failed during single-stream eviction",
+				"target", target, "shard_id", shardID, "error", closeErr)
+		})
 	}
 }
 

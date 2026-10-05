@@ -27,6 +27,7 @@ import (
 	"unsafe"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/quic-go/quic-go"
 )
@@ -819,44 +820,53 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	// (0 != 0) is false, so an empty transfer would otherwise fall through to
 	// a silent return with no log and no listener callback.
 	if truncated || hdr.ChunkCount == 0 || uint64(len(chunks)) != hdr.ChunkCount {
-		slog.Warn("snapshot receive incomplete, discarding partial transfer",
-			"shard", hdr.ShardID,
-			"replica", hdr.ReplicaID,
-			"index", hdr.Index,
-			"received_chunks", len(chunks),
-			"expected_chunks", hdr.ChunkCount,
-		)
+		// The rejection is reported before its diagnostic, which is
+		// contained (see rejectStream).
 		sr.notifyRejected(config.SnapshotInfo{
 			ShardID:   hdr.ShardID,
 			ReplicaID: hdr.ReplicaID,
 			Index:     hdr.Index,
+		})
+		received := len(chunks)
+		supervise.LogContained(func() {
+			slog.Warn("snapshot receive incomplete, discarding partial transfer",
+				"shard", hdr.ShardID,
+				"replica", hdr.ReplicaID,
+				"index", hdr.Index,
+				"received_chunks", received,
+				"expected_chunks", hdr.ChunkCount,
+			)
 		})
 		return
 	}
 
 	if len(chunks) > 0 {
 		if err := sr.handler.HandleSnapshot(chunks, peer); err != nil {
-			slog.Warn("snapshot handler failed",
-				"shard", hdr.ShardID,
-				"replica", hdr.ReplicaID,
-				"chunks", len(chunks),
-				"error", err)
+			n := len(chunks)
+			supervise.LogContained(func() {
+				slog.Warn("snapshot handler failed",
+					"shard", hdr.ShardID, "replica", hdr.ReplicaID, "chunks", n, "error", err)
+			})
 		} else {
-			slog.Info("snapshot received",
-				"shard", hdr.ShardID,
-				"replica", hdr.ReplicaID,
-				"index", hdr.Index,
-				"chunks", len(chunks))
-			if sr.listener != nil && sr.listener.OnSnapshotReceived != nil {
-				sr.listener.OnSnapshotReceived(config.SnapshotInfo{
-					ShardID:   hdr.ShardID,
-					ReplicaID: hdr.ReplicaID,
-					Index:     hdr.Index,
-				})
+			// The snapshot is handed off; its report is diagnostics,
+			// contained, then OnSnapshotReceived and the metric, each
+			// isolated so neither can end this receive goroutine.
+			n := len(chunks)
+			supervise.LogContained(func() {
+				slog.Info("snapshot received",
+					"shard", hdr.ShardID, "replica", hdr.ReplicaID, "index", hdr.Index, "chunks", n)
+			})
+			info := config.SnapshotInfo{ShardID: hdr.ShardID, ReplicaID: hdr.ReplicaID, Index: hdr.Index}
+			var notify, observe func()
+			if l := sr.listener; l != nil && l.OnSnapshotReceived != nil {
+				cb := l.OnSnapshotReceived
+				notify = func() { cb(info) }
 			}
-			if sr.metrics != nil {
-				sr.metrics.IncSnapshotsReceived(hdr.ShardID, totalBytes, time.Since(recvStart))
+			if m := sr.metrics; m != nil {
+				elapsed := time.Since(recvStart)
+				observe = func() { m.IncSnapshotsReceived(hdr.ShardID, totalBytes, elapsed) }
 			}
+			deliverEvent(notify, observe)
 		}
 	}
 }
@@ -867,26 +877,33 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 // OnSnapshotRejected listener — the same failure signal the truncated-transfer
 // path fires — so a dropped receive is observable instead of silently timing
 // out the sender's ack wait.
+//
+// The rejection is reported first (notifyRejected, which hands it to the
+// listener dispatcher), then the diagnostic, contained, then the metric:
+// user code may not stand between a rejection and its report.
 func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotRejectReason, detail string, receivedBytes int64, err error) {
-	slog.Warn("snapshot receive rejected, discarding transfer",
-		"reason", reason,
-		"detail", detail,
-		"shard", hdr.ShardID,
-		"replica", hdr.ReplicaID,
-		"index", hdr.Index,
-		"received_bytes", receivedBytes,
-		"expected_chunks", hdr.ChunkCount,
-		"error", err,
-	)
-	if sr.metrics != nil {
-		sr.metrics.IncSnapshotsRejected(hdr.ShardID, string(reason))
-	}
 	sr.notifyRejected(config.SnapshotInfo{
 		ShardID:   hdr.ShardID,
 		ReplicaID: hdr.ReplicaID,
 		Index:     hdr.Index,
 		Err:       err,
 	})
+	shardID, replicaID, index, chunkCount := hdr.ShardID, hdr.ReplicaID, hdr.Index, hdr.ChunkCount
+	supervise.LogContained(func() {
+		slog.Warn("snapshot receive rejected, discarding transfer",
+			"reason", reason,
+			"detail", detail,
+			"shard", shardID,
+			"replica", replicaID,
+			"index", index,
+			"received_bytes", receivedBytes,
+			"expected_chunks", chunkCount,
+			"error", err,
+		)
+	})
+	if sr.metrics != nil {
+		sr.metrics.IncSnapshotsRejected(shardID, string(reason))
+	}
 }
 
 // rejectSnapshotStream records a snapshot transfer discarded before any chunk
@@ -920,18 +937,22 @@ func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail str
 	if hdr != nil {
 		info.ShardID, info.ReplicaID, info.Index = hdr.ShardID, hdr.ReplicaID, hdr.Index
 	}
-	slog.Log(context.Background(), level, "snapshot stream rejected, discarding transfer",
-		"reason", reason,
-		"detail", detail,
-		"shard", info.ShardID,
-		"replica", info.ReplicaID,
-		"index", info.Index,
-		"error", err,
-	)
+	// Reported first, then the diagnostic (contained) and the metric: see
+	// rejectSnapshot.
+	sr.notifyRejected(info)
+	supervise.LogContained(func() {
+		slog.Log(context.Background(), level, "snapshot stream rejected, discarding transfer",
+			"reason", reason,
+			"detail", detail,
+			"shard", info.ShardID,
+			"replica", info.ReplicaID,
+			"index", info.Index,
+			"error", err,
+		)
+	})
 	if sr.metrics != nil {
 		sr.metrics.IncSnapshotsRejected(countedShard, string(reason))
 	}
-	sr.notifyRejected(info)
 }
 
 // notifyRejected delivers OnSnapshotRejected on the host's listener
@@ -949,16 +970,18 @@ func (sr *snapshotReceiver) notifyRejected(info config.SnapshotInfo) {
 	onRejected := sr.listener.OnSnapshotRejected
 	deliver := func() { onRejected(info) }
 	if sr.dispatchListener == nil {
-		deliver()
+		deliverEvent(deliver)
 		return
 	}
 	if !sr.dispatchListener(deliver) {
 		// Dropped on a full queue, as the engine drops its own notifications
 		// (counted in ListenerNotificationsDropped); named so an operator can
 		// tell which event a shard never delivered.
-		slog.Error("listener notification dropped: the EventListener is not consuming",
-			"event", "OnSnapshotRejected",
-			"shard_id", info.ShardID)
+		supervise.LogContained(func() {
+			slog.Error("listener notification dropped: the EventListener is not consuming",
+				"event", "OnSnapshotRejected",
+				"shard_id", info.ShardID)
+		})
 	}
 }
 

@@ -278,6 +278,20 @@ type QUICTransport struct {
 	// longer miss one and let quicTr.Close() destroy it unannounced.
 	acceptWG sync.WaitGroup
 
+	// acceptSem and acceptIPs are the accept loop's admission accounting:
+	// the global connection semaphore (MaxIncomingConnections) and the per-IP
+	// tracker (MaxConnectionsPerIP). They are created once, by
+	// startAcceptLoop, so a supervised restart of the loop keeps the counts
+	// of the connections already admitted.
+	acceptSem chan struct{}
+	acceptIPs *ipConnTracker
+
+	// inboundRefusalForTest, when set, replaces refuseInboundPromiscuousCert
+	// in admission. The co-location exemption makes that refusal unreachable
+	// between two loopback transports, so tests of its rejection branch need
+	// a seam.
+	inboundRefusalForTest func(conn *quic.Conn) error
+
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	wg              sync.WaitGroup
@@ -789,9 +803,14 @@ func (t *QUICTransport) stop() {
 	// snapshot operations can begin.
 	t.snapshotTracker.ShutdownAndWait()
 
+	// Every diagnostic below is contained (supervise.LogContained): stop is
+	// a sequence of teardown steps, several under locks, and a log handler
+	// that panicked or called runtime.Goexit in one of them left the rest
+	// undone — connMu or a stream shard lock held for good, the listener
+	// socket bound, the goroutines unjoined.
 	if t.listener != nil {
 		if err := t.listener.Close(); err != nil {
-			slog.Debug("QUIC listener close failed", "error", err)
+			supervise.LogContained(func() { slog.Debug("QUIC listener close failed", "error", err) })
 		}
 	}
 
@@ -815,7 +834,7 @@ func (t *QUICTransport) stop() {
 	t.connMu.Lock()
 	for addr, conn := range t.conns {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
-			slog.Debug("QUIC connection close failed", "addr", addr, "error", err)
+			supervise.LogContained(func() { slog.Debug("QUIC connection close failed", "addr", addr, "error", err) })
 		}
 		delete(t.connPeer, conn)
 		delete(t.conns, addr)
@@ -843,7 +862,7 @@ func (t *QUICTransport) stop() {
 	// above: no connection can be admitted after it, and every one that was is
 	// already in the map.
 	if n := t.closeInboundOnShutdown(); n > 0 {
-		slog.Debug("announced shutdown on inbound connections", "connections", n)
+		supervise.LogContained(func() { slog.Debug("announced shutdown on inbound connections", "connections", n) })
 	}
 
 	t.peerEpochMu.Lock()
@@ -856,7 +875,10 @@ func (t *QUICTransport) stop() {
 		shard.mu.Lock()
 		for k, s := range shard.streams {
 			if err := s.Close(); err != nil {
-				slog.Debug("QUIC stream close failed", "target", k.target, "idx", k.idx, "error", err)
+				target, idx := k.target, k.idx
+				supervise.LogContained(func() {
+					slog.Debug("QUIC stream close failed", "target", target, "idx", idx, "error", err)
+				})
 			}
 			shard.drop(k)
 		}
@@ -865,7 +887,7 @@ func (t *QUICTransport) stop() {
 
 	if t.quicTr != nil {
 		if err := t.quicTr.Close(); err != nil {
-			slog.Debug("QUIC transport close failed", "error", err)
+			supervise.LogContained(func() { slog.Debug("QUIC transport close failed", "error", err) })
 		}
 	}
 
@@ -877,7 +899,7 @@ func (t *QUICTransport) stop() {
 	// EADDRINUSE.
 	if t.udpConn != nil {
 		if err := t.udpConn.Close(); err != nil {
-			slog.Debug("UDP listener close failed", "error", err)
+			supervise.LogContained(func() { slog.Debug("UDP listener close failed", "error", err) })
 		}
 	}
 }
@@ -1531,13 +1553,13 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 	if err != nil {
 		// A marshal failure indicates an internal sizing bug; surface it
 		// loudly rather than dropping the batch silently.
+		t.putBuf(bufPtr)
 		slog.Error("transport: dropping batch that failed to marshal",
 			"target", target,
 			"batch_size", len(msgs),
 			"error", err,
 		)
 		t.incBatchDropped(msgs, dropReasonMarshalFailed)
-		t.putBuf(bufPtr)
 		return
 	}
 
@@ -1622,6 +1644,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		// Dropping (rather than writing an unacceptable frame) is still the
 		// correct response: retrying it unchanged can never succeed, and
 		// emitting it would cost the connection.
+		t.putBuf(bufPtr)
 		slog.Error("transport: dropping frame that failed to marshal despite passing the pre-write size check",
 			"target", target,
 			"shard", shardID,
@@ -1632,14 +1655,20 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 			"error", err,
 		)
 		t.incBatchDropped(msgs, dropReasonMarshalFailed)
-		t.putBuf(bufPtr)
 		return
 	}
 
 	frameSize := totalSize
 
+	// Every failure branch below settles first — the frame buffer returned,
+	// a dead connection and its streams evicted — and only then runs user
+	// code (the drop metrics and diagnostics): a MetricsCollector or log
+	// handler that panicked or called runtime.Goexit before the eviction
+	// left the dead connection pooled, so every later send hung on it for
+	// the full write deadline.
 	stream, err := t.getStream(target, shardID, isHeartbeat, want)
 	if err != nil {
+		t.putBuf(bufPtr)
 		// Debug level: repeats for every batch while a peer is unreachable;
 		// Raft retransmits once the peer returns.
 		if debugOn {
@@ -1650,16 +1679,15 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 			)
 		}
 		t.incBatchDropped(msgs, streamDropReason(err))
-		t.putBuf(bufPtr)
 		return
 	}
 
 	err = stream.SetWriteDeadline(time.Now().Add(sendWriteDeadline))
 	if err != nil {
-		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.putBuf(bufPtr)
 		t.removeAndCloseConnection(target, "write deadline failure")
 		t.evictStreamsForTarget(target)
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		return
 	}
 
@@ -1674,9 +1702,9 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		// re-send the same batch, repeat. Drop the batch and replace only the
 		// stream; the connection, and every other stream on it, survives.
 		if isPeerFrameRejection(err) {
+			t.evictStream(target, shardID, isHeartbeat, stream)
 			t.incBatchDropped(msgs, dropReasonPeerRejected)
 			t.recordPeerFrameRejection(target, shardID, len(msgs), err)
-			t.evictStream(target, shardID, isHeartbeat, stream)
 			return
 		}
 		// Stream write failed — likely a dead connection. Close and evict
@@ -1684,6 +1712,8 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		// fresh. Without this, other cached streams on the same dead
 		// connection would each hang for the full write deadline before
 		// failing, compounding latency on every message type.
+		t.removeAndCloseConnection(target, "stream write failure")
+		t.evictStreamsForTarget(target)
 		// Debug level: a dead peer fails every in-flight batch until eviction
 		// completes; Raft retransmits the dropped messages.
 		if debugOn {
@@ -1694,8 +1724,6 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 			)
 		}
 		t.incBatchDropped(msgs, dropReasonWriteFailed)
-		t.removeAndCloseConnection(target, "stream write failure")
-		t.evictStreamsForTarget(target)
 		return
 	}
 	sendElapsed := time.Since(sendStart)
@@ -1810,14 +1838,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if closeErr := stream.Close(); closeErr != nil {
-			slog.Debug("snapshot stream close failed",
-				"shard", first.ShardID,
-				"replica", first.ReplicaID,
-				"error", closeErr)
-		}
-	}()
+	defer t.closeSnapshotStream(stream, first.ShardID, first.ReplicaID)
 
 	if err := writeSnapshotHeader(stream, first); err != nil {
 		return err
@@ -1825,24 +1846,22 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 
 	// Fire OnSnapshotSendStarted after the header is written successfully.
 	// If the send fails after this point, OnSnapshotSendAborted is fired
-	// via the deferred closure below.
+	// via the deferred closure below, which is in place before Started
+	// runs. Every listener call is isolated (deliverEvent): one that
+	// panicked or called runtime.Goexit used to end the send, or turn a
+	// delivered snapshot into a failed one.
 	snapInfo := config.SnapshotInfo{
 		ShardID:   first.ShardID,
 		ReplicaID: first.ReplicaID,
 		Index:     first.Index,
 	}
-	if t.eventListener != nil && t.eventListener.OnSnapshotSendStarted != nil {
-		t.eventListener.OnSnapshotSendStarted(snapInfo)
-	}
-
-	// Track whether the send completed successfully so the deferred
-	// closure can fire OnSnapshotSendAborted on failure.
 	sendOK := false
 	defer func() {
-		if !sendOK && t.eventListener != nil && t.eventListener.OnSnapshotSendAborted != nil {
-			t.eventListener.OnSnapshotSendAborted(snapInfo)
+		if !sendOK {
+			deliverEvent(t.snapshotEvent(onSnapshotSendAborted, snapInfo))
 		}
 	}()
+	deliverEvent(t.snapshotEvent(onSnapshotSendStarted, snapInfo))
 
 	// Write each chunk as a framed payload. Stamp the deployment ID on
 	// each chunk so the receiver can validate it matches (analogous to
@@ -1905,20 +1924,22 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 
 	// Mark send as successful before firing completion events.
 	sendOK = true
-
-	slog.Info("snapshot sent",
-		"shard", first.ShardID,
-		"replica", first.ReplicaID,
-		"index", first.Index,
-		"chunks", len(chunks))
-	if t.eventListener != nil && t.eventListener.OnSnapshotSent != nil {
-		t.eventListener.OnSnapshotSent(snapInfo)
-	}
-	if t.metrics != nil {
-		t.metrics.IncSnapshotsSent(first.ShardID, snapBytes, time.Since(snapStart))
-	}
-
+	t.reportSnapshotSent(snapInfo, uint64(len(chunks)), snapBytes, time.Since(snapStart))
 	return nil
+}
+
+// closeSnapshotStream closes an outbound snapshot stream when its send
+// returns. A close failure's diagnostic is contained: this runs from a defer
+// of a send whose result is already settled, and a log handler must not
+// replace that result with a panic or end the goroutine before the send's
+// remaining defers (the snapshot tracker) run.
+func (t *QUICTransport) closeSnapshotStream(stream *quic.Stream, shardID, replicaID uint64) {
+	if closeErr := stream.Close(); closeErr != nil {
+		supervise.LogContained(func() {
+			slog.Debug("snapshot stream close failed",
+				"shard", shardID, "replica", replicaID, "error", closeErr)
+		})
+	}
 }
 
 // cancelSnapshotWriteOnStop arms a watcher that resets the snapshot stream's
@@ -2021,14 +2042,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if closeErr := stream.Close(); closeErr != nil {
-			slog.Debug("snapshot stream close failed",
-				"shard", meta.ShardID,
-				"replica", meta.ReplicaID,
-				"error", closeErr)
-		}
-	}()
+	defer t.closeSnapshotStream(stream, meta.ShardID, meta.ReplicaID)
 
 	// Write snapshot header first.
 	if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
@@ -2043,23 +2057,20 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	}
 
 	// Fire OnSnapshotSendStarted after the header is written successfully.
+	// The Aborted report is in place before Started runs, and every listener
+	// call is isolated (see SendSnapshot).
 	snapInfo := config.SnapshotInfo{
 		ShardID:   meta.ShardID,
 		ReplicaID: meta.ReplicaID,
 		Index:     meta.Index,
 	}
-	if t.eventListener != nil && t.eventListener.OnSnapshotSendStarted != nil {
-		t.eventListener.OnSnapshotSendStarted(snapInfo)
-	}
-
-	// Track whether the send completed successfully so the deferred
-	// closure can fire OnSnapshotSendAborted on failure.
 	sendOK := false
 	defer func() {
-		if !sendOK && t.eventListener != nil && t.eventListener.OnSnapshotSendAborted != nil {
-			t.eventListener.OnSnapshotSendAborted(snapInfo)
+		if !sendOK {
+			deliverEvent(t.snapshotEvent(onSnapshotSendAborted, snapInfo))
 		}
 	}()
+	deliverEvent(t.snapshotEvent(onSnapshotSendStarted, snapInfo))
 
 	// Stream chunks from the producer. Each chunk is serialized and
 	// written to the wire immediately, then its data buffer can be GC'd
@@ -2113,19 +2124,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 
 	// Mark send as successful before firing completion events.
 	sendOK = true
-
-	slog.Info("snapshot sent",
-		"shard", meta.ShardID,
-		"replica", meta.ReplicaID,
-		"index", meta.Index,
-		"chunks", chunkIdx)
-	if t.eventListener != nil && t.eventListener.OnSnapshotSent != nil {
-		t.eventListener.OnSnapshotSent(snapInfo)
-	}
-	if t.metrics != nil {
-		t.metrics.IncSnapshotsSent(meta.ShardID, snapBytes, time.Since(snapStart))
-	}
-
+	t.reportSnapshotSent(snapInfo, chunkIdx, snapBytes, time.Since(snapStart))
 	return nil
 }
 

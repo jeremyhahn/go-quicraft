@@ -98,6 +98,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 			// marshal failure means a non-fixed-size message slipped past
 			// isHeartbeatBatch — an internal routing bug. Surface it loudly:
 			// silently dropping the whole batch would stall liveness.
+			t.putBuf(bufPtr)
 			slog.Warn("transport: dropping heartbeat batch: message failed fixed-size marshal",
 				"target", target,
 				"batch_size", msgCount,
@@ -105,7 +106,6 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 				"error", err,
 			)
 			t.incBatchDropped(msgs, dropReasonMarshalFailed)
-			t.putBuf(bufPtr)
 			return
 		}
 		offset += n
@@ -118,8 +118,11 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 		shardID = msgs[0].ShardID
 	}
 
+	// Every failure branch below settles first and runs user code (drop
+	// metrics, diagnostics) last; see sendFrame.
 	stream, err := t.getStream(target, shardID, true, want)
 	if err != nil {
+		t.putBuf(bufPtr)
 		// Debug level: repeats every heartbeat tick while a peer is
 		// unreachable; the next tick retries. Gated so the variadic slog form
 		// does not build and box its []any on every tick when Debug is off.
@@ -131,15 +134,14 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 			)
 		}
 		t.incBatchDropped(msgs, streamDropReason(err))
-		t.putBuf(bufPtr)
 		return
 	}
 
 	if err := stream.SetWriteDeadline(time.Now().Add(heartbeatWriteDeadline)); err != nil {
-		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		t.putBuf(bufPtr)
 		t.removeAndCloseConnection(target, "heartbeat write deadline failure")
 		t.evictStreamsForTarget(target)
+		t.incBatchDropped(msgs, dropReasonWriteFailed)
 		return
 	}
 
@@ -152,11 +154,13 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 		// mismatch — would otherwise turn each heartbeat tick into a
 		// connection teardown and re-dial.
 		if isPeerFrameRejection(err) {
+			t.evictStream(target, shardID, true, stream)
 			t.incBatchDropped(msgs, dropReasonPeerRejected)
 			t.recordPeerFrameRejection(target, shardID, msgCount, err)
-			t.evictStream(target, shardID, true, stream)
 			return
 		}
+		t.removeAndCloseConnection(target, "heartbeat stream write failure")
+		t.evictStreamsForTarget(target)
 		// Debug level: a dead peer fails every heartbeat until eviction
 		// completes; the next tick retries on a fresh connection.
 		if debugEnabled() {
@@ -167,8 +171,6 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 			)
 		}
 		t.incBatchDropped(msgs, dropReasonWriteFailed)
-		t.removeAndCloseConnection(target, "heartbeat stream write failure")
-		t.evictStreamsForTarget(target)
 	}
 }
 

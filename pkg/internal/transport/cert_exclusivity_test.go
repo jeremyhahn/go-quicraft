@@ -148,7 +148,7 @@ func TestInboundAuthorizedFor_WildcardCertCoversEveryPeer(t *testing.T) {
 	}
 	defer t2.Stop()
 
-	conn, dialErr := t1.dialConnection(t2.Addr().String(), "")
+	conn, dialErr := t1.dialForTest(t2.Addr().String())
 	if dialErr != nil {
 		t.Fatalf("dialConnection failed: %v", dialErr)
 	}
@@ -473,7 +473,7 @@ func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 	// The inbound the "peer" speaks on. Loopback IS covered by the shared test
 	// certificate, so every claim below is authorized: the budget is the ONLY
 	// thing standing between the peer and unbounded teardown work.
-	inbound, dialErr := t1.dialConnection(target, "")
+	inbound, dialErr := t1.dialForTest(target)
 	if dialErr != nil {
 		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
 	}
@@ -490,7 +490,7 @@ func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 		delete(t1.conns, target)
 		t1.connMu.Unlock()
 
-		conn, err := t1.dialConnection(target, "")
+		conn, err := t1.dialForTest(target)
 		if err != nil {
 			t.Fatalf("dialConnection(cached %d) failed: %v", i, err)
 		}

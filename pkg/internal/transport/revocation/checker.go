@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ocsp"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
 // Mode determines which revocation checking methods to use.
@@ -397,10 +399,15 @@ func (c *Checker) Start() {
 	if !c.started.CompareAndSwap(false, true) {
 		return
 	}
-	if err := c.ReloadCRLs(); err != nil {
-		slog.Warn("initial CRL reload failed", "error", err)
-	}
+	err := c.ReloadCRLs()
+	// The reload loop is started before the diagnostic, which is contained:
+	// a log handler that panicked or called runtime.Goexit here left the
+	// loop unstarted, so the CRL was never loaded and a set loaded earlier
+	// never went stale.
 	go c.reloadLoop()
+	if err != nil {
+		supervise.LogContained(func() { slog.Warn("initial CRL reload failed", "error", err) })
+	}
 }
 
 // Stop terminates the CRL reload goroutine and cancels any in-flight OCSP
@@ -425,7 +432,10 @@ func (c *Checker) reloadLoop() {
 			return
 		case <-ticker.C:
 			if err := c.ReloadCRLs(); err != nil {
-				slog.Warn("CRL reload failed", "error", err)
+				// Contained: the loop must outlive any log handler, or the
+				// revocation set is never refreshed — nor marked stale —
+				// again.
+				supervise.LogContained(func() { slog.Warn("CRL reload failed", "error", err) })
 			}
 		}
 	}
@@ -455,13 +465,19 @@ func (c *Checker) ReloadCRLs() error {
 	newSet := make(map[string]struct{})
 	newHashes := make(map[string][32]byte)
 	now := time.Now()
+	var reloaded []reloadedCRL
 
 	for _, path := range c.cfg.CRLPaths {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			slog.Warn("CRL file read failed; keeping previous revocation set",
-				"path", path, "error", err)
+			// Stale first, then the diagnostic, contained: a log handler
+			// that panicked or called runtime.Goexit before the mark left
+			// the set current — revocation fail-open.
 			c.markCRLStale()
+			supervise.LogContained(func() {
+				slog.Warn("CRL file read failed; keeping previous revocation set",
+					"path", path, "error", err)
+			})
 			return &CRLReadError{Path: path, Err: err}
 		}
 
@@ -526,12 +542,15 @@ func (c *Checker) ReloadCRLs() error {
 			}
 		}
 
-		// Log only when content changed.
+		// Log only when content changed, and only once the new set is
+		// committed below: a log handler that panicked or called
+		// runtime.Goexit here used to keep the reloaded CRL from ever
+		// taking effect.
 		c.mu.RLock()
 		oldHash, existed := c.crlHashes[path]
 		c.mu.RUnlock()
 		if !existed || oldHash != hash {
-			slog.Info("CRL reloaded", "path", path, "revoked_serials", serialCount)
+			reloaded = append(reloaded, reloadedCRL{path: path, serials: serialCount})
 		}
 	}
 
@@ -541,7 +560,21 @@ func (c *Checker) ReloadCRLs() error {
 	c.crlCurrent = true
 	c.mu.Unlock()
 
+	if len(reloaded) > 0 {
+		supervise.LogContained(func() {
+			for _, r := range reloaded {
+				slog.Info("CRL reloaded", "path", r.path, "revoked_serials", r.serials)
+			}
+		})
+	}
 	return nil
+}
+
+// reloadedCRL names a CRL file whose content a reload found changed, for the
+// diagnostic emitted once the reload has committed.
+type reloadedCRL struct {
+	path    string
+	serials int
 }
 
 // markCRLStale records that the revoked set no longer reflects a
@@ -975,7 +1008,9 @@ func (c *Checker) queryOCSP(cert, issuerCert *x509.Certificate) (bool, time.Time
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			slog.Debug("failed to close OCSP response body", "error", closeErr)
+			// Contained: this runs inside a TLS handshake's revocation check
+			// and inside the transport's cleanup sweep.
+			supervise.LogContained(func() { slog.Debug("failed to close OCSP response body", "error", closeErr) })
 		}
 	}()
 

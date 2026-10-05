@@ -146,11 +146,11 @@ func TestSnapshotFairnessKey_IndependentOfPeerAddress(t *testing.T) {
 	t3 := newTransport("t3")
 	defer func() { _ = t3.Stop() }()
 
-	connA, err := t1.dialConnection(t2.Addr().String(), "")
+	connA, err := t1.dialForTest(t2.Addr().String())
 	if err != nil {
 		t.Fatalf("dialConnection(t2): %v", err)
 	}
-	connB, err := t1.dialConnection(t3.Addr().String(), "")
+	connB, err := t1.dialForTest(t3.Addr().String())
 	if err != nil {
 		t.Fatalf("dialConnection(t3): %v", err)
 	}

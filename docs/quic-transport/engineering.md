@@ -105,7 +105,7 @@ getConnection(target, want)
     |-- RLock: check conns[target]
     |   |-- alive? return
     |   |-- dead? removeConnection + evictStreamsForTarget
-    |-- dialGroup.Do(target+want, dialConnection)
+    |-- dialGroup.Do(target+want, dialAndPool)   // runs no user code
     |   |-- net.ResolveUDPAddr
     |   |-- net.SplitHostPort(target) -> host   (empty host => ErrEmptyDialHost)
     |   |-- dialEpoch = knownPeerEpoch(target)  // captured BEFORE the dial
@@ -115,10 +115,17 @@ getConnection(target, want)
     |   |-- Lock: re-check cache, then conns[target] = conn
     |   |             connEpoch[target] = dialEpoch
     |   |-- go preOpenHeartbeatStream(target, conn)
+    |-- report()   // the dialing goroutine only: log (contained), then
+    |              // OnConnectionEstablished / OnConnectionFailed (isolated)
     |-- return conn
 ```
 
-**Server name and the empty-host rule.** `dialConnection` extracts the host with
+The connection event is reported after `Do` has released every sender
+coalesced on the dial, and only by the goroutine that ran it. Inside the
+singleflight, a listener or log handler that panicked or called
+`runtime.Goexit` was re-raised in every waiting sender.
+
+**Server name and the empty-host rule.** `dialAndPool` extracts the host with
 `net.SplitHostPort(target)` and sets `clientTLS.ServerName = host`, which is what
 makes the peer's SANs load bearing. A malformed target returns a `DialError`.
 An *empty* host is refused with `ErrEmptyDialHost` rather than defaulted:
@@ -139,7 +146,7 @@ travels with the send down to the point it takes a connection:
   as `identity_mismatch`, messages for a replica nothing binds.
 - `getStream` hands out a pooled stream only when its connection's peer
   presented that identity (`connServes`); `getConnection` hands out the pooled
-  connection only on the same condition; and `dialConnection` keeps a dial only
+  connection only on the same condition; and `dialAndPool` keeps a dial only
   when the peer presents **exactly** that identity, closing it otherwise
   (`QUICErrDialIdentity`, `DialIdentityError`). Every re-dial and retry on the
   write path goes through these, so no write can reach an unchecked peer.
@@ -166,7 +173,7 @@ connection rather than an unpinned one.
 
 **Dial race.** `singleflight` coalesces only overlapping dials. A dial that
 starts just after another completed reaches the insert with the cache already
-populated, so `dialConnection` re-checks under `connMu` and keeps the live
+populated, so `dialAndPool` re-checks under `connMu` and keeps the live
 winner, closing the loser with `QUICErrDuplicateDial`. Overwriting would leak
 the cached connection, which keep-alives would then hold open forever with its
 pre-opened streams diverging from the pool's bookkeeping.
@@ -177,7 +184,11 @@ pre-opened streams diverging from the pool's bookkeeping.
 - `cleanStaleConnections` drops pooled outbounds whose `Context()` is done,
   evicts their streams, and fires `OnConnectionFailed`, all outside `connMu`,
   because that lock is on every shard's send path and the listener callback is
-  user code of unbounded duration.
+  user code of unbounded duration. Every dead target's streams are evicted
+  before any user code runs; then the diagnostics (contained) and the
+  callbacks, one per target, in order, each isolated (`supervise.RunEach`), so
+  a callback that panics or calls `runtime.Goexit` skips neither the others nor
+  any eviction.
 - `reapPeerIncarnations` forgets a peer's incarnation record once the address has
   had neither a cached outbound nor traffic for `peerIncarnationRetention`
   (10 × the interval, so 5 minutes).
@@ -696,6 +707,46 @@ panic value's `String`/`Error` method that panics or calls `runtime.Goexit`
 cannot crash the process or end the goroutine it is reporting on. The cleanup
 sweep releases the connection-pool lock by `defer`, so a panic in it cannot
 leave the pool locked for the restarted sweep and every sender.
+
+**Critical windows.** The transport runs user code at three kinds of point:
+a slog handler (any log call), an `EventListener` callback or the revocation
+`OnCertRevoked` notification, and a `MetricsCollector`. None of it runs between
+a state change and the cleanup or hand-off that settles it. Inside a window
+like that, a panic or `runtime.Goexit` would skip the settlement. Each window
+is closed one of three ways:
+
+- **Settle first.** All structural work is done, or owned by a defer that user
+  code cannot skip, before any user code runs.
+- **Contain diagnostics.** A log call on a path with work still to do goes
+  through `supervise.LogContained`.
+- **Isolate callbacks.** A callback runs through `deliverEvent`
+  (`supervise.RunEach`): synchronously and in order, on a helper goroutine
+  that the transport waits for.
+
+| Window | Settled by |
+|---|---|
+| connection accepted, per-IP slot and semaphore taken, before the handler owns them | a deferred rollback releases every slot and closes the connection on any exit that does not hand them over; the refusal is logged afterwards |
+| data-stream slot released at snapshot hand-off, before the stream's ownership flag is cleared | the flag is cleared together with the release; the refusal log is contained |
+| frame budget refused, before the body is drained | the warning is contained, so the stream survives at a clean boundary |
+| inbound batch delivered | receive metrics are recorded after `HandleMessage` |
+| dead connections removed from the pool, before their streams are evicted and `OnConnectionFailed` delivered | every eviction runs first; then the logs (contained), then one isolated callback per target |
+| revoked, idle, removed or shutting-down connection found | closed before its log, which is contained |
+| stale outbound found on the receive path | closed, unpooled and its streams evicted before the log |
+| write failure on the send or heartbeat path | buffer returned and connection or stream evicted before the drop metric and log |
+| stream dropped from the pool, before it is closed | every dropped stream is closed before any log |
+| dial complete, before senders coalesced on it are released | the connection event is reported after `singleflight.Do` returns, by the dialing goroutine only |
+| snapshot fully sent | `sendOK` is recorded first; the log, `OnSnapshotSent` and the metric are isolated, and `OnSnapshotSendAborted` is armed before `OnSnapshotSendStarted` runs |
+| snapshot rejected or received | the rejection is handed to the dispatcher first; logs are contained and callbacks isolated |
+| teardown in `stop()` | every diagnostic is contained, so no log can leave a lock held or a step undone |
+| revocation: failed CRL read, changed CRL, initial load | the set is marked stale, or the new set committed, or the reload loop started, before the log, which is contained |
+| revoked certificate found in the TLS handshake | `OnCertRevoked` is isolated from the handshake goroutine |
+
+What remains, and why it is safe: a log, metric or identity resolver on a path
+that drops messages (an unresolved target, a full queue, an unsendable
+message, an identity mismatch) holds nothing, so an abnormal exit there loses
+only messages that Raft retransmits. A log on a stream-teardown path
+(protocol violation, 0-RTT refusal, drain failure) runs while every stream
+resource is still owned by a defer.
 
 ### Stream isolation (data vs snapshot)
 

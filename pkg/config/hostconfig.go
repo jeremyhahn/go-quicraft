@@ -145,10 +145,13 @@ type MetricsConfig struct {
 // is re-published on the next tick, and any other refused notification is
 // dropped and logged.
 //
-// Every other callback runs inline on the goroutine that produced the event
-// and must not block: connection events and the other snapshot-transfer
-// events (OnSnapshotReceived, OnSnapshotSendStarted and its siblings) on
-// transport goroutines, disk events on the WAL write path,
+// Every other callback runs synchronously with the operation that produced the
+// event, in order, and must not block: connection events and the other
+// snapshot-transfer events (OnSnapshotReceived, OnSnapshotSendStarted and its
+// siblings) for the transport — each on a helper goroutine the transport waits
+// for, so a callback that panics or calls runtime.Goexit ends only itself,
+// never the transport operation or the callbacks after it — disk events on
+// the WAL write path,
 // OnMembershipChanged on the apply path, and OnNodeReady, OnNodeUnloaded,
 // OnNodeDeleted, OnProposalDropped, OnReadIndexDropped and
 // OnNodeHostShuttingDown on the goroutine calling the Host method that caused

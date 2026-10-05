@@ -186,7 +186,13 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			if revoked {
 				serial := leaf.SerialNumber.Text(16)
 				if onRevoked != nil {
-					onRevoked(serial)
+					// The notification is user code running inside the TLS
+					// handshake, between the verdict and the rejection it
+					// returns: isolated (deliverEvent) so a panic or
+					// runtime.Goexit in it can neither reach the handshake
+					// goroutine nor keep the revoked peer from being
+					// refused.
+					deliverEvent(func() { onRevoked(serial) })
 				}
 				return &revocation.CertificateRevokedError{Serial: serial}
 			}

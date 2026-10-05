@@ -169,6 +169,31 @@ func TestRunResilient_ResumesAfterGoexit(t *testing.T) {
 	}
 }
 
+// TestRunEach_IsolatesEveryCall: a call that panics or calls runtime.Goexit
+// ends only itself — every other call runs, in order, exactly once — and the
+// caller is not ended.
+func TestRunEach_IsolatesEveryCall(t *testing.T) {
+	for exitName, exit := range hostileExits {
+		t.Run(exitName, func(t *testing.T) {
+			var order []int
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				RunEach(4, func(i int) {
+					order = append(order, i)
+					if i == 0 || i == 2 {
+						exit()
+					}
+				})
+			}()
+			await(t, done, "RunEach never returned")
+			if len(order) != 4 || order[0] != 0 || order[1] != 1 || order[2] != 2 || order[3] != 3 {
+				t.Fatalf("calls ran as %v, want [0 1 2 3]", order)
+			}
+		})
+	}
+}
+
 // TestLogContained_HostileHandler: a handler that panics or Goexits ends only
 // the diagnostic's own goroutine.
 func TestLogContained_HostileHandler(t *testing.T) {

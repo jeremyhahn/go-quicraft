@@ -724,7 +724,7 @@ and rotation is between the other two from then on.
   each batch, and splits an oversized batch across frames. Sends to different
   peers proceed in parallel. A worker exits after `sendQueueIdleTimeout` (60 s)
   idle. See [quic-transport](../quic-transport/engineering.md#send-path).
-- **Persistent heartbeat stream.** `dialConnection()` starts
+- **Persistent heartbeat stream.** `dialAndPool()` starts
   `preOpenHeartbeatStream()` after connecting, so the first heartbeat skips a
   stream-open round trip.
 

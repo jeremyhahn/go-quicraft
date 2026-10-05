@@ -329,7 +329,7 @@ func TestDialConnectionResolveFailure(t *testing.T) {
 	defer tr.Stop()
 
 	// Invalid address should fail at resolution.
-	_, err = tr.dialConnection("not-a-valid-address::::", "")
+	_, err = tr.dialForTest("not-a-valid-address::::")
 	if err == nil {
 		t.Fatal("expected error for invalid address")
 	}
