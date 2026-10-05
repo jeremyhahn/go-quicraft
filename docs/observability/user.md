@@ -151,7 +151,8 @@ status := host.HealthCheck() // *HealthStatus
 ```
 
 The library returns a value and serves nothing. Wire it into your own readiness
-endpoint. For incident response, `host.GetShardInfo`, `host.GetNodeHostInfo`
+endpoint. `status.DiagnosticsDropped` counts library log records dropped
+because your `slog` handler was not taking them; alert on it rising. For incident response, `host.GetShardInfo`, `host.GetNodeHostInfo`
 and `host.DiagRaftState` give per-shard detail; see
 [`../raft-consensus/cli.md`](../raft-consensus/cli.md).
 

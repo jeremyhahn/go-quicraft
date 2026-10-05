@@ -23,6 +23,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -166,18 +167,40 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 		"target", target,
 	)
 	// The coalesced dial runs no user code: the connection event is reported
-	// by the goroutine that ran the dial, after Do has released every sender
-	// waiting on it (see dialAndPool). report stays nil on a goroutine whose
-	// Do only waited for another's dial.
-	var report func()
-	result, err, _ := t.dialGroup.Do(dialKey, func() (any, error) {
+	// by the goroutine that ran the dial, after Do has returned, so a listener
+	// that re-enters the transport finds no singleflight entry held (see
+	// dialAndPool). report stays nil on a goroutine whose Do only waited for
+	// another's dial; that goroutine waits on reported, which the dialing
+	// goroutine closes once report has returned.
+	//
+	// Do drops the flight before it returns, so the next dial to the same
+	// destination can start, finish and report while this one has not yet
+	// reported. Each dial therefore takes its turn in the destination's report
+	// order when its flight starts, and reports only after the dial before it
+	// has: events are delivered in the order the dials started. The turn is
+	// released by defer as well, so a dial that ends in a panic or
+	// runtime.Goexit before reporting does not hold back the dials after it.
+	var (
+		report func()
+		turn   reportTurn
+	)
+	defer t.dialReports.release(dialKey, &turn)
+	v, err, _ := t.dialGroup.Do(dialKey, func() (any, error) {
+		turn = t.dialReports.take(dialKey)
 		conn, r, err := t.dialAndPool(target, want)
 		report = r
-		return conn, err
+		return &dialOutcome{conn: conn, reported: make(chan struct{})}, err
 	})
+	outcome := v.(*dialOutcome)
 	if report != nil {
-		report()
+		func() {
+			defer close(outcome.reported)
+			defer t.dialReports.release(dialKey, &turn)
+			turn.await()
+			report()
+		}()
 	}
+	<-outcome.reported
 	if err != nil {
 		if _, refused := errors.AsType[*DialIdentityError](err); refused {
 			t.dialRefusals.Store(refusalKey, dialRefusal{at: time.Now(), err: err})
@@ -188,7 +211,80 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 		)
 		return nil, err
 	}
-	return result.(*quic.Conn), nil
+	return outcome.conn, nil
+}
+
+// dialOutcome is the result of one coalesced dial, shared by every sender
+// that joined it: the connection (nil when the dial failed) and reported,
+// closed once the dialing sender has delivered the dial's connection event.
+type dialOutcome struct {
+	conn     *quic.Conn
+	reported chan struct{}
+}
+
+// dialReportSequencer orders the connection events of consecutive dials to
+// one destination (a dial key: the target and the identity wanted there). It
+// holds, per destination, the turn of the latest dial whose report has not
+// run, and forgets the destination once that turn is released, so it holds
+// entries only for destinations with a dial in progress. Only the dial path
+// uses it; a send served from the connection pool never reaches it.
+type dialReportSequencer struct {
+	mu    sync.Mutex
+	tails map[string]chan struct{}
+}
+
+// reportTurn is one dial's place in its destination's report order.
+type reportTurn struct {
+	// prev is closed once the previous dial to the destination has reported;
+	// nil when none was pending.
+	prev <-chan struct{}
+	// done is closed once this dial has reported, or ended without
+	// reporting; nil once released, or for a goroutine that only waited for
+	// another's dial.
+	done chan struct{}
+}
+
+// take appends a dial to key's report order and returns its turn.
+func (s *dialReportSequencer) take(key string) reportTurn {
+	done := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tails == nil {
+		s.tails = make(map[string]chan struct{})
+	}
+	prev, pending := s.tails[key]
+	s.tails[key] = done
+	if !pending {
+		return reportTurn{done: done}
+	}
+	return reportTurn{prev: prev, done: done}
+}
+
+// await waits until every dial to the destination before this one has
+// reported.
+func (r *reportTurn) await() {
+	if r.prev != nil {
+		<-r.prev
+	}
+}
+
+// release ends turn, letting the next dial to key report, and forgets key
+// when no later dial is pending. It waits for the dials before this one
+// first, so a turn released without reporting — its dial ended in a panic or
+// runtime.Goexit — still lets no later report overtake an earlier one. It is
+// a no-op for a turn already released, or never taken.
+func (s *dialReportSequencer) release(key string, turn *reportTurn) {
+	if turn.done == nil {
+		return
+	}
+	turn.await()
+	close(turn.done)
+	s.mu.Lock()
+	if s.tails[key] == turn.done {
+		delete(s.tails, key)
+	}
+	s.mu.Unlock()
+	turn.done = nil
 }
 
 // replaceUnboundPeer handles a live pooled connection to target whose peer

@@ -106,6 +106,7 @@ getConnection(target, want)
     |   |-- alive? return
     |   |-- dead? removeConnection + evictStreamsForTarget
     |-- dialGroup.Do(target+want, dialAndPool)   // runs no user code
+    |   |-- turn = dialReports.take(target+want)  // place in report order
     |   |-- net.ResolveUDPAddr
     |   |-- net.SplitHostPort(target) -> host   (empty host => ErrEmptyDialHost)
     |   |-- dialEpoch = knownPeerEpoch(target)  // captured BEFORE the dial
@@ -115,15 +116,37 @@ getConnection(target, want)
     |   |-- Lock: re-check cache, then conns[target] = conn
     |   |             connEpoch[target] = dialEpoch
     |   |-- go preOpenHeartbeatStream(target, conn)
-    |-- report()   // the dialing goroutine only: log (contained), then
-    |              // OnConnectionEstablished / OnConnectionFailed (isolated)
+    |-- turn.await(); report()   // the dialing goroutine only: log
+    |              // (contained), then OnConnectionEstablished /
+    |              // OnConnectionFailed (isolated); then release the turn
+    |              // and close(outcome.reported)
+    |-- <-outcome.reported   // every coalesced sender
     |-- return conn
 ```
 
-The connection event is reported after `Do` has released every sender
-coalesced on the dial, and only by the goroutine that ran it. Inside the
-singleflight, a listener or log handler that panicked or called
-`runtime.Goexit` was re-raised in every waiting sender.
+The connection event is reported after `Do` has returned, and only by the
+goroutine that ran the dial. Inside the singleflight, a listener or log handler
+that panicked or called `runtime.Goexit` was re-raised in every waiting sender,
+and a listener that re-entered the transport would find the dial's entry still
+held. The coalesced senders share a `dialOutcome` — the connection and a
+`reported` channel — and wait on `reported`, which the dialing goroutine closes
+once the report has returned, so no sender returns before its dial's event is
+delivered.
+
+That orders the senders of one flight, not consecutive flights: `Do` drops a
+flight before it returns, so a dial to the same destination can start, finish
+and report while the previous one's goroutine has not yet reported. A
+per-destination report sequencer (`dialReports`) closes that gap. Each dial
+takes a turn when its flight starts and reports only after the dial before it
+has, so events are delivered in the order the dials started: a failed dial's
+`OnConnectionFailed` can no longer arrive after the `OnConnectionEstablished`
+of the retry that followed it. A turn is also released by `defer`, after its
+predecessors, so a dial ended by a panic or `runtime.Goexit` before reporting
+does not hold back the dials after it. The sequencer keeps an entry only while
+a dial to that destination is pending, and a send served from the connection
+pool never touches it. A connection-event callback that blocked on another
+dial to the same destination would wait on itself; the callbacks' contract
+already requires them to return quickly.
 
 **Server name and the empty-host rule.** `dialAndPool` extracts the host with
 `net.SplitHostPort(target)` and sets `clientTLS.ServerName = host`, which is what
@@ -702,9 +725,14 @@ exactly once: on the loop's normal return, or by the supervisor when a Goexit
 ends it during shutdown. Every transport recovery — these three, and the
 one-shot `handleConnection`, `handleStream` and `preOpenHeartbeatStream` —
 settles first and logs last: the diagnostic goes through
-`supervise.LogContained`, on a goroutine of its own, so a slog handler or a
-panic value's `String`/`Error` method that panics or calls `runtime.Goexit`
-cannot crash the process or end the goroutine it is reporting on. The cleanup
+`supervise.LogContained`, off the goroutine it reports on, so a slog handler
+or a panic value's `String`/`Error` method that panics or calls
+`runtime.Goexit` cannot crash the process or end the goroutine it is reporting
+on. `LogContained` never blocks its caller: it queues the record for the one
+contained-diagnostics worker (see `docs/raft-consensus/engineering.md`), and a
+slog handler that blocks costs that worker and a bounded queue, not a
+goroutine per record — a peer that keeps sending snapshot streams the receiver
+rejects cannot grow the goroutine count through their diagnostics. The cleanup
 sweep releases the connection-pool lock by `defer`, so a panic in it cannot
 leave the pool locked for the restarted sweep and every sender.
 

@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -162,15 +163,41 @@ func TestFailShardOnCorruptConfig_ReportsATypedError(t *testing.T) {
 	}
 }
 
+// awaitContainedDiagnostics waits until every library diagnostic submitted so
+// far has been emitted. Diagnostics are emitted in submission order on one
+// contained worker (supervise.LogContained), so a test that counts log
+// records can otherwise receive one an earlier test submitted; once a
+// sentinel submitted now has run, nothing submitted before it is pending.
+func awaitContainedDiagnostics(t *testing.T) {
+	t.Helper()
+	drained := make(chan struct{})
+	supervise.LogContained(func() { close(drained) })
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the contained-diagnostics queue did not drain")
+	}
+}
+
 // haltCountingHandler counts the host's "shard halted" log line — written once
-// per OnShardFailed fan-out — and discards everything else.
+// per OnShardFailed fan-out — for a corrupt configuration entry, and discards
+// everything else.
 type haltCountingHandler struct{ halts *atomic.Int64 }
 
 func (h haltCountingHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h haltCountingHandler) Handle(_ context.Context, r slog.Record) error {
-	if strings.HasPrefix(r.Message, "shard halted") {
-		h.halts.Add(1)
+	if !strings.HasPrefix(r.Message, "shard halted") {
+		return nil
 	}
+	r.Attrs(func(a slog.Attr) bool {
+		if err, ok := a.Value.Any().(error); ok && a.Key == "error" {
+			if _, corrupt := errors.AsType[*CorruptConfigEntryError](err); corrupt {
+				h.halts.Add(1)
+			}
+			return false
+		}
+		return true
+	})
 	return nil
 }
 func (h haltCountingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
@@ -190,12 +217,13 @@ func TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain(t *testin
 	if engNode == nil {
 		t.Fatal("shard 1 has no engine node")
 	}
+	awaitContainedDiagnostics(t)
 	var halts atomic.Int64
 	prev := slog.Default()
 	slog.SetDefault(slog.New(haltCountingHandler{halts: &halts}))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	// The halt line is emitted contained, on a goroutine of its own, after
+	// The halt line is emitted contained, on the diagnostics worker, after
 	// the pending requests are failed; it is awaited rather than read back
 	// synchronously.
 	// haltsWithin returns the halt count once it reaches want or d elapses.

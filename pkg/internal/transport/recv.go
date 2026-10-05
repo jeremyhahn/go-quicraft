@@ -181,8 +181,8 @@ func (t *QUICTransport) startAcceptLoop() {
 // captured by the caller on the recovering goroutine. The record is emitted
 // through supervise.LogContained, after the caller's settlement: the slog
 // handler and the panic value's String or Error method are user code, and a
-// panic or Goexit in either must end only the diagnostic's own goroutine,
-// never the recovery that called it.
+// panic or Goexit in either must stay on the contained-diagnostics worker,
+// never reach the recovery that called it.
 func logRecovered(msg string, recovered any, stack []byte, attrs ...any) {
 	supervise.LogContained(func() {
 		slog.Error(msg, append(attrs, "panic", fmt.Sprint(recovered), "stack", string(stack))...)

@@ -197,6 +197,10 @@ type QUICTransport struct {
 
 	dialGroup singleflight.Group
 
+	// dialReports orders the connection events of consecutive dials to one
+	// destination (see getConnection).
+	dialReports dialReportSequencer
+
 	// bootEpoch is this process's per-start identity, stamped into every
 	// outgoing MessageBatch (SourceEpoch). It changes only when this node
 	// restarts.

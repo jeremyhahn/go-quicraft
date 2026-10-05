@@ -194,8 +194,8 @@ func TestRunEach_IsolatesEveryCall(t *testing.T) {
 	}
 }
 
-// TestLogContained_HostileHandler: a handler that panics or Goexits ends only
-// the diagnostic's own goroutine.
+// TestLogContained_HostileHandler: a handler that panics or Goexits never
+// reaches the caller, and the diagnostic still runs.
 func TestLogContained_HostileHandler(t *testing.T) {
 	for exitName, exit := range hostileExits {
 		t.Run(exitName, func(t *testing.T) {

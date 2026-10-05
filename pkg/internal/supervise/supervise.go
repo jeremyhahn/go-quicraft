@@ -31,7 +31,8 @@
 //     goroutines, so no abnormal exit inside it can leave its caller waiting;
 //     RunEach runs a sequence of callbacks the same way, each one isolated
 //     from the others and from the caller.
-//   - LogContained emits a diagnostic on a goroutine of its own.
+//   - LogContained emits a diagnostic on the contained-diagnostics worker,
+//     a single goroutine behind a bounded queue, never on the caller's.
 //
 // The rule they serve is settle first, log last: a recovery settles
 // everything structural, and publishes every completion signal, from defers
@@ -48,6 +49,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,7 +115,8 @@ func ClassifyExit(recovered any, normalReturn bool) (value any, abnormal bool) {
 // the engine's apply, commit and step workers, each per-shard apply
 // goroutine, the snapshot pool workers and the listener dispatcher, the
 // host's key-rotation loop, and the transport's send-queue workers,
-// connection cleanup and accept loop.
+// connection cleanup and accept loop, and the contained-diagnostics worker
+// (LogContained).
 func Supervise(wg *sync.WaitGroup, stopC <-chan struct{}, loop, stopped func()) {
 	add, done := func() {}, func() {}
 	if wg != nil {
@@ -202,18 +205,99 @@ func RunEach(n int, call func(i int)) {
 	})
 }
 
-// LogContained emits a diagnostic on a goroutine of its own, so the slog
+// DiagnosticQueueCapacity is how many contained diagnostics may wait for the
+// slog handler at once (LogContained). A record submitted while the queue is
+// full is dropped and counted in DiagnosticsDropped.
+const DiagnosticQueueCapacity = 256
+
+// contained is the process's contained-diagnostics worker. It is
+// process-wide because what it guards is: the slog default handler is one per
+// process, shared by every host, engine and transport in it, so a handler that
+// blocks stalls them all alike, and one bounded queue in front of it is the
+// whole bound.
+var contained = newDiagnosticWorker(DiagnosticQueueCapacity)
+
+// LogContained emits a diagnostic off the calling goroutine, so the slog
 // handler — user code, through slog.SetDefault — and the String or Error
-// method of a recovered panic value cannot reach the caller: a panic is
-// recovered there, and a runtime.Goexit ends only that goroutine. It is
-// fire-and-forget, never delaying or blocking its caller.
+// method of a recovered panic value cannot reach the caller. It never blocks
+// and never delays its caller: emit is queued for the contained-diagnostics
+// worker, or dropped and counted in DiagnosticsDropped when the queue is full.
+// emit must capture everything it logs — a stack, the attributes — before it
+// is submitted; it runs later, on the worker.
+//
+// The worker runs one record at a time, in submission order. A record whose
+// handler panics is recovered and the worker goes on; one whose handler calls
+// runtime.Goexit ends the worker, which Supervise restarts. A handler that
+// never returns holds the worker and one record, and nothing more: the queue
+// is bounded, and no goroutine is started per record. The worker exits when
+// its queue is empty and the next submission starts it again, so it holds no
+// goroutine while there is nothing to log and needs no shutdown.
 //
 // Every recovery and supervision path uses it, and only after it has settled
 // everything structural and published every completion signal: logging is
 // never allowed to stand between an abnormal exit and its settlement.
 func LogContained(emit func()) {
-	go func() {
-		defer func() { _ = recover() }()
-		emit()
-	}()
+	contained.submit(emit)
+}
+
+// DiagnosticsDropped returns the number of contained diagnostics dropped since
+// the process started because DiagnosticQueueCapacity records were already
+// waiting for the slog handler (LogContained). A count that keeps rising means
+// the handler installed through slog.SetDefault is blocking or far slower than
+// the process logs.
+func DiagnosticsDropped() uint64 {
+	return contained.dropped.Load()
+}
+
+// diagnosticWorker runs contained diagnostics on at most one goroutine, which
+// exists only while its queue is not empty.
+type diagnosticWorker struct {
+	queue   chan func()
+	running atomic.Bool
+	dropped atomic.Uint64
+}
+
+// newDiagnosticWorker returns an idle worker whose queue holds capacity
+// records.
+func newDiagnosticWorker(capacity int) *diagnosticWorker {
+	return &diagnosticWorker{queue: make(chan func(), capacity)}
+}
+
+// submit queues emit without blocking, dropping and counting it when the
+// queue is full, and makes sure a worker goroutine will run what is queued.
+func (w *diagnosticWorker) submit(emit func()) {
+	select {
+	case w.queue <- emit:
+	default:
+		w.dropped.Add(1)
+	}
+	if w.running.CompareAndSwap(false, true) {
+		Supervise(nil, nil, w.drain, nil)
+	}
+}
+
+// drain runs queued records until the queue is empty and then gives up the
+// worker. A record queued between the empty receive and the hand-back saw the
+// worker still running and started none, so drain takes the worker back for
+// it unless that record's own submit already has.
+func (w *diagnosticWorker) drain() {
+	for {
+		select {
+		case emit := <-w.queue:
+			runContained(emit)
+		default:
+			w.running.Store(false)
+			if len(w.queue) == 0 || !w.running.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	}
+}
+
+// runContained runs emit, recovering a panic in it so the worker goes on with
+// the next record. A runtime.Goexit cannot be recovered; it ends the worker
+// goroutine, and Supervise starts a fresh one.
+func runContained(emit func()) {
+	defer func() { _ = recover() }()
+	emit()
 }

@@ -142,6 +142,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `slog` handler that blocks no longer costs a goroutine per library log
+  record. Diagnostics went out on a goroutine each, so an authenticated peer
+  that kept sending snapshot streams the receiver rejected, against a blocked
+  handler, grew the goroutine count without bound. They now go through one
+  contained worker behind a bounded queue: the code that logs never blocks, a
+  record that finds the queue full is dropped and counted in the new
+  `HealthStatus.DiagnosticsDropped`, and a handler that panics or calls
+  `runtime.Goexit` no longer loses the records behind it.
+- Connection events are delivered in the order their dials started. Senders
+  coalesced onto one QUIC dial no longer return before the dialing sender has
+  delivered its `OnConnectionEstablished` or `OnConnectionFailed`, and a dial
+  to the same peer that starts after it reports only once it has, so a failed
+  dial's `OnConnectionFailed` can no longer arrive after the
+  `OnConnectionEstablished` of the retry that followed it.
 - `Host.Close` seals every barrier the `WithShardBarriers` resolver returned,
   not only the `WithBarrier` barrier, once each, joining any seal failure into
   `Close`'s error. Strategies remain the caller's to close.

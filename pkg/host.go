@@ -1897,7 +1897,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 					c.h.completePendingOp()
 				}
 
-				// Logging last, and contained on its own goroutine:
+				// Logging last, and contained off this goroutine:
 				// everything that must happen for correctness already has,
 				// and neither fmt.Sprint(r) nor a slog handler that panics
 				// or calls runtime.Goexit can replace the panic this
@@ -9787,7 +9787,8 @@ func (h *Host) ShardCount() int {
 
 // HealthCheck returns a point-in-time health assessment of the host.
 // The returned HealthStatus includes barrier state, disk condition,
-// shard count, and per-shard health information.
+// shard count, per-shard health information, and the process-wide count of
+// library log records dropped because the slog handler was not taking them.
 //
 // Status values:
 //   - "sealed"    if a barrier is configured and sealed (HTTP 503)
@@ -9815,10 +9816,11 @@ func (h *Host) HealthCheck() *HealthStatus {
 	})
 
 	status := &HealthStatus{
-		BarrierSealed: sealed,
-		DiskOK:        diskOK,
-		ShardCount:    len(shards),
-		Shards:        shards,
+		BarrierSealed:      sealed,
+		DiskOK:             diskOK,
+		ShardCount:         len(shards),
+		Shards:             shards,
+		DiagnosticsDropped: supervise.DiagnosticsDropped(),
 	}
 
 	switch {

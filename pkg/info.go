@@ -231,6 +231,16 @@ type HealthStatus struct {
 
 	// Shards contains per-shard health information. Omitted when empty.
 	Shards []ShardInfo `json:"shards,omitempty"`
+
+	// DiagnosticsDropped is the number of library log records dropped since
+	// the process started because the handler installed through
+	// slog.SetDefault was not taking them: the library emits its diagnostics
+	// through one bounded queue, never blocking the goroutine that produced
+	// them, and drops a record when that queue is full. A rising count means
+	// the handler is blocking or far slower than the process logs. The count
+	// is process-wide, as the default handler is, so every Host in a process
+	// reports the same value. It does not affect Status.
+	DiagnosticsDropped uint64 `json:"diagnostics_dropped"`
 }
 
 // NodeHostInfoOption controls what information GetNodeHostInfo returns.

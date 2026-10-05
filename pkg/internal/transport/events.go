@@ -35,7 +35,7 @@ import (
 //   - settle first: everything structural is done, or owned by a defer that
 //     user code cannot skip, before any user code runs;
 //   - log last and contained: a diagnostic on a path that still has work to do
-//     goes through supervise.LogContained, on a goroutine of its own;
+//     goes through supervise.LogContained, off the calling goroutine;
 //   - isolate callbacks: an EventListener callback or revocation notification
 //     runs through deliverEvent (supervise.RunEach), synchronously but on a
 //     helper goroutine, so its abnormal exit can end neither the transport

@@ -40,7 +40,7 @@ func captureLogOutput(t *testing.T) (*logCapture, func()) {
 }
 
 // logCapture is a log sink safe for concurrent use. Recovery diagnostics are
-// emitted on goroutines of their own (supervise.LogContained), so a test reads them
+// emitted on the contained-diagnostics worker (supervise.LogContained), so a test reads them
 // with Await rather than expecting them by the time the recovery returns.
 type logCapture struct {
 	mu  sync.Mutex

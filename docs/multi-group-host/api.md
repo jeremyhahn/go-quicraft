@@ -784,6 +784,8 @@ type HealthStatus struct {
     DiskOK        bool        `json:"disk_ok"`
     ShardCount    int         `json:"shard_count"`
     Shards        []ShardInfo `json:"shards,omitempty"`
+
+    DiagnosticsDropped uint64 `json:"diagnostics_dropped"` // process-wide
 }
 ```
 
@@ -801,6 +803,14 @@ Only `ShardError` degrades the aggregate. A shard in `ShardNoLeader`,
 `ShardLagging`, `ShardRecovering` or `ShardSnapshotting` leaves the host
 `"ok"`; inspect `Shards` to alert on those. `DiskOK` is reported but does not
 affect `Status`.
+
+`DiagnosticsDropped` counts the library's log records dropped since the
+process started because the handler installed through `slog.SetDefault` was
+not taking them. The library never blocks on its own diagnostics: they go
+through one bounded queue, and a record that finds it full is dropped. The
+count is process-wide, as the default handler is, so every `Host` in a process
+reports the same value. It does not affect `Status`; a count that keeps rising
+means the handler is blocking or far slower than the process logs.
 
 ### Encryption and the barrier
 
