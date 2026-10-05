@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-05
+
+Release candidate. **Breaking API change, no format change:**
+`DefaultMaxMessageReceiveMemory` is removed (the receive budget is derived
+from the frame size), and the release recipe takes `RELEASE_GIT`. Callers see
+a different error classification: every proposal failure after the Raft
+hand-off now reports `MaybeApplied` (see Changed). Every on-disk and wire
+format is unchanged, so 0.17.0 data directories open as they are.
+
 ### Added
 
 - Errors the engine, Raft and transport layers hand to embedders are public:
