@@ -363,7 +363,17 @@ raised until `RecoverFromSnapshot` returns, so `UnloadNode`, which waits out
 every lease before the host closes the state machine, cannot complete under a
 running restore; the restore is handed the node's stop channel and should
 return promptly once it closes. A node that has already stopped refuses the
-lease, and its recovery never touches the state machine. The bound matters because a replica holding entries
+lease, and its recovery never touches the state machine.
+
+A save takes no lease, so `UnloadNode` does not wait for a snapshot save to
+finish. That is deliberate. A save only reads the state machine, and it can
+stream for a long time after its capture point, so it should not hold up a
+shard stop. The state machine adapter covers the save instead: the stream
+holds `streamGuard` until it ends, so `Close` waits for it, and a save that
+starts after `Close` returns `ErrClosed` (see
+[state-machines/engineering.md](../state-machines/engineering.md)).
+
+The re-drive bound matters because a replica holding entries
 still votes and can win an election, and as leader it commits entries it
 does not apply: the window in which it can do so is the backoff schedule
 (100 + 200 + 400 + 800 ms) plus the five attempts themselves, after which the
