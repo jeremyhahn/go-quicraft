@@ -1,8 +1,15 @@
-# Staged fail-fast pipeline: a fast tier (lint, build) gates the expensive tier
-# (security, tests, tagged suites, module builds), and ci-gate reports the result.
+# ci-template: v1.15 (customized)
 #
-# The integration, netfault and contrib-dragonboat jobs also wait on each other:
-# multi-node QUIC suites under -race starve a shared runner when they overlap.
+# Every job starts at once (ci-template v1.14, automatethethings#207/#209), so a
+# run takes as long as its slowest job; ci-gate, the one required check, needs
+# every job and fails closed on any result but success. push runs on main only:
+# automerge.yml's merge trains are PRs from merge-train/* and get their CI from
+# pull_request (v1.15).
+#
+# The one ordering kept is isolation, not staging: integration waits on test,
+# and netfault and contrib-dragonboat wait on integration, because multi-node
+# QUIC suites under -race starve a shared runner when they overlap (4dc5bfd,
+# run 418). None of those jobs consumes another's output.
 
 name: CI
 
@@ -109,9 +116,7 @@ jobs:
   security:
     name: Security
     runs-on: ubuntu-latest
-    # Gated on the fast tier: a push that cannot lint or build should not
-    # spend a gosec/govulncheck pass.
-    needs: [lint, build]
+    # No `needs` (v1.14): starts with lint and build, not after them.
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -221,7 +226,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [lint, build]
+    # No `needs` (v1.14): every job starts at once.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -336,7 +341,7 @@ jobs:
     # Overlapping multi-node QUIC suites under -race starve each other and
     # expire 30s snapshot and rolling-restart waits. The short jobs (errfs,
     # fuzz seeds) stay parallel.
-    needs: [lint, build, test]
+    needs: [test]
     # The suite is ~9 min on a quiet machine but runs under -race with -p 1.
     # -timeout=1800s below is the real budget; this is the outer backstop.
     timeout-minutes: 45
@@ -361,7 +366,7 @@ jobs:
     runs-on: ubuntu-latest
     # Serialised behind the heavy jobs for the same reason as `integration`:
     # 3-to-5-node QUIC clusters under -race wait on election timeouts.
-    needs: [lint, build, test, integration]
+    needs: [test, integration]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -382,7 +387,6 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs]
     runs-on: ubuntu-latest
-    needs: [lint, build]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -400,7 +404,6 @@ jobs:
   zero-rtt:
     name: 0-RTT replay policy [no -race]
     runs-on: ubuntu-latest
-    needs: [lint, build]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -421,7 +424,6 @@ jobs:
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz]
     runs-on: ubuntu-latest
-    needs: [lint, build]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -462,8 +464,6 @@ jobs:
   cross-arch:
     name: Cross-architecture build (${{ matrix.goarch }})
     runs-on: ubuntu-latest
-    # A push that cannot build for the host says nothing about another arch.
-    needs: [lint, build]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -580,7 +580,7 @@ jobs:
     name: contrib/dragonboat [unit + integration]
     runs-on: ubuntu-latest
     # Last of the three heavy jobs; see the note on `integration`.
-    needs: [lint, build, integration]
+    needs: [integration]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
