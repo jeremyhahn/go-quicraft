@@ -568,6 +568,81 @@ func TestEntryQueue_AddOneAfterSwap(t *testing.T) {
 	}
 }
 
+// TestEntryQueue_TakenTracksTheSwapThatTookTheItems: AddTracked records where
+// items entered the queue, and Taken reports them taken exactly once a Swap
+// has taken them; a never-added item is never taken.
+func TestEntryQueue_TakenTracksTheSwapThatTookTheItems(t *testing.T) {
+	q := NewEntryQueue[int](4, 16)
+	var first, second, never uint64
+	if !q.AddTracked([]int{1}, &first) || first == 0 {
+		t.Fatalf("AddTracked recorded %d, want a non-zero batch id", first)
+	}
+	if taken, closed := q.Taken(&first); taken || closed {
+		t.Fatalf("queued item: taken=%v closed=%v, want neither", taken, closed)
+	}
+	_, id := q.SwapBatch(nil)
+	if id != first {
+		t.Fatalf("SwapBatch took batch %d, want %d", id, first)
+	}
+	if taken, _ := q.Taken(&first); taken {
+		t.Fatal("an item swapped out but not yet handed off is reported taken")
+	}
+	if !q.HandOff(id) {
+		t.Fatal("HandOff refused on an open queue")
+	}
+	if taken, _ := q.Taken(&first); !taken {
+		t.Fatal("an item whose batch was handed off is not reported taken")
+	}
+	if !q.AddTracked([]int{2}, &second) {
+		t.Fatal("AddTracked refused")
+	}
+	if taken, _ := q.Taken(&second); taken {
+		t.Fatal("an item added after the hand-off is reported taken")
+	}
+	if taken, _ := q.Taken(&never); taken {
+		t.Fatal("an item never added is reported taken")
+	}
+}
+
+// TestEntryQueue_CloseIsFinal: after Close nothing is added or taken, so an
+// item still queued is never taken and Taken's answer is final.
+func TestEntryQueue_CloseIsFinal(t *testing.T) {
+	q := NewEntryQueue[int](4, 16)
+	var queued, late uint64
+	q.AddTracked([]int{1}, &queued)
+	q.Close()
+	if got := q.Swap(nil); len(got) != 0 {
+		t.Fatalf("Swap after Close took %v, want nothing", got)
+	}
+	taken, closed := q.Taken(&queued)
+	if taken || !closed {
+		t.Fatalf("queued item after Close: taken=%v closed=%v, want untaken and closed", taken, closed)
+	}
+	if q.AddTracked([]int{2}, &late) || q.Add([]int{3}) || q.AddOne(4) {
+		t.Fatal("an add after Close was accepted")
+	}
+	if late != 0 {
+		t.Fatalf("a refused AddTracked recorded %d, want it untouched", late)
+	}
+}
+
+// TestEntryQueue_HandOffAfterCloseIsRefused: a batch taken before Close but
+// not yet handed off can no longer be handed off, so Taken's final answer for
+// it — untaken — stays true.
+func TestEntryQueue_HandOffAfterCloseIsRefused(t *testing.T) {
+	q := NewEntryQueue[int](4, 16)
+	var at uint64
+	q.AddTracked([]int{1}, &at)
+	_, id := q.SwapBatch(nil)
+	q.Close()
+	if q.HandOff(id) {
+		t.Fatal("HandOff succeeded on a closed queue")
+	}
+	if taken, closed := q.Taken(&at); taken || !closed {
+		t.Fatalf("taken=%v closed=%v, want final and untaken", taken, closed)
+	}
+}
+
 // --- Benchmarks ---
 
 func BenchmarkEntryQueue_Add(b *testing.B) {

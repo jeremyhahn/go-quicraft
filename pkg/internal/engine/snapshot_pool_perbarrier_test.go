@@ -819,3 +819,60 @@ func TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier(t *test
 			"epoch-2 snapshot must hold B's floor", floorB, ok)
 	}
 }
+
+// valueTenantBarrier is a valid SnapshotBarrier whose dynamic value is NOT
+// comparable (a struct holding a slice); its methods are promoted from the
+// embedded pointer, so every copy shares one keyring. Comparing two of them
+// with == panics at run time.
+type valueTenantBarrier struct {
+	*tenantBarrier
+	labels []string
+}
+
+// TestSnapshotPool_PerBarrier_NonComparableBarrierDeclinesPurge verifies the
+// per-barrier purge never compares barrier interface values. A barrier without
+// pointer identity cannot be matched to the shards that share its keyring, so
+// whether it is the purge target or another shard's barrier, the floor is
+// unprovable and the purge is declined: no panic, and no DEK purged that a
+// shard holding a copy of the barrier still needs (shard 2's epoch-2 snapshot
+// here).
+func TestSnapshotPool_PerBarrier_NonComparableBarrierDeclinesPurge(t *testing.T) {
+	keyring := newTenantBarrier(1, 10)
+	copyOf := valueTenantBarrier{tenantBarrier: keyring, labels: []string{"tenant"}}
+	cases := []struct {
+		name   string
+		target SnapshotBarrier
+		shard2 SnapshotBarrier
+	}{
+		{name: "target without identity", target: copyOf, shard2: copyOf},
+		{name: "other shard without identity", target: keyring, shard2: copyOf},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			ldb := newPerBarrierTestLogDB()
+			ldb.floors[keyring] = 9
+
+			stopC := make(chan struct{})
+			defer close(stopC)
+			p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
+			p.shardBarriers = func(shardID uint64) SnapshotBarrier {
+				if shardID == 2 {
+					return tc.shard2
+				}
+				return tc.target
+			}
+			writeShardSnapshot(t, baseDir, 1, 1, 100, 8)
+			writeShardSnapshot(t, baseDir, 2, 1, 100, 2)
+			wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1), snapshotDirNode(baseDir, 2, 1))
+
+			if floor, ok := p.perBarrierSafePurgeFloor(tc.target); ok {
+				t.Fatalf("floor = (%d, true), want fail-safe (_, false)", floor)
+			}
+			p.purgeOldEpochs(baseDir, 1, 1)
+			if got := keyring.PurgeCallCount(); got != 0 {
+				t.Fatalf("purge calls = %d, want 0", got)
+			}
+		})
+	}
+}

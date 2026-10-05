@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -89,6 +90,11 @@ type stepWorker struct {
 	// goroutine that holds no engine lock. See listenerDispatcher.
 	listeners *listenerDispatcher
 
+	// snapshots is the engine's snapshot pool, through which redriveRecovery
+	// re-queues a rejected snapshot recovery. Nil in tests that build a step
+	// worker alone, which then re-drives nothing.
+	snapshots *snapshotPool
+
 	// enqueuingNode records the node currently being handed off to the commit
 	// pipeline (mid enqueueForCommit or commitMemoryMode): its commitPending is
 	// set but its item has not yet reached commitC/applyC, so nothing else owns
@@ -100,6 +106,24 @@ type stepWorker struct {
 	// the step-worker goroutine (recovery runs on it during the panic unwind),
 	// so no synchronization is required.
 	enqueuingNode *Node
+
+	// inFlight is what this worker has taken out of a node and not yet handed
+	// on: a proposal batch from its queue (until Peer.Handle has it),
+	// ReadIndex keys (until Peer.Handle has them), and read states taken from
+	// its Peer (until OnReadyToRead has delivered them). Any of them exists
+	// nowhere else in that window, and user code — a metrics collector, a
+	// callback, a logger — runs inside it, so recoverAbnormalExit settles
+	// whatever is left (settleInFlight). Same goroutine discipline as
+	// enqueuingNode.
+	inFlight stepInFlight
+
+	// memCommitted is the node, and memCommittedUpdate the update, whose
+	// Peer.Commit in memory mode has advanced raft's processed marker but
+	// whose committed entries have not yet reached applyC. Settled by
+	// recoverAbnormalExit: the entries exist nowhere else, so the shard is
+	// failed. Same goroutine discipline as enqueuingNode.
+	memCommitted       *Node
+	memCommittedUpdate proto.Update
 
 	// extractedNode records the node whose update has been pulled out of the
 	// Peer by GetUpdate but has not yet reached a path that persists it. It is
@@ -134,11 +158,14 @@ type stepWorker struct {
 	// still reading — a data race that corrupts forwarded proposals. Using a
 	// distinct buffer defers recycling to the NEXT iteration's first drain, by
 	// which point sendMessages has already copied.
-	commitProposeBuf  []proto.Entry
-	readKeyBuf        []uint64                   // reusable buffer for draining ReadIndex keys
-	heartbeatRespBuf  []proto.Message            // reusable buffer for HeartbeatResp separation
-	otherMsgBuf       []proto.Message            // reusable buffer for non-HeartbeatResp messages
-	deferredSnapshots map[uint64][]proto.Message // per-shard deferred InstallSnapshot messages
+	commitProposeBuf []proto.Entry
+	// commitProposeBatch is the proposal-queue batch id of commitProposeBuf,
+	// for HandOffProposals.
+	commitProposeBatch uint64
+	readKeyBuf         []uint64                   // reusable buffer for draining ReadIndex keys
+	heartbeatRespBuf   []proto.Message            // reusable buffer for HeartbeatResp separation
+	otherMsgBuf        []proto.Message            // reusable buffer for non-HeartbeatResp messages
+	deferredSnapshots  map[uint64][]proto.Message // per-shard deferred InstallSnapshot messages
 
 	// freeOrderBuf and orderedMsgBuf are pre-allocated buffers for
 	// splitting messages by persistence ordering in enqueueForCommit
@@ -432,6 +459,8 @@ func (w *stepWorker) processReady() {
 			}
 			w.drainAndHandleInbox(shardID, node, node.IsRecovering())
 			node.peer.FlushReadIndex()
+			// After the inbox, so an install it just adopted is seen.
+			w.redriveRecovery(node)
 		}
 		// Output-channel backpressure guard. This worker is the ONLY producer
 		// for its output channel — commitC in WAL mode, applyC in memory mode —
@@ -467,8 +496,8 @@ func (w *stepWorker) processReady() {
 			// OnCampaignLaunched/IncElection.
 			if node.peer != nil {
 				if msgs := node.peer.DrainFreeOrderMessages(); len(msgs) > 0 {
-					w.reportFreeOrderCampaign(shardID, node, msgs)
 					w.sendMessages(msgs)
+					w.reportFreeOrderCampaign(shardID, node, msgs)
 				}
 			}
 			continue
@@ -497,7 +526,16 @@ func (w *stepWorker) processReady() {
 		holdEntries := node.IsRecovering() || node.snapshotAdoptionPending()
 		update, err := node.peer.GetUpdate(!holdEntries, lastApplied)
 		if err != nil {
-			node.handleError(err)
+			// GetUpdate fails only when the raft log cannot read committed
+			// entries it owes the state machine (logdb.ErrCompacted,
+			// ErrUnavailable, or a LogDB read error). Nothing was extracted,
+			// but the shard cannot apply past the hole, and the engine cannot
+			// tell a lost entry from a transient read failure, so it fails
+			// closed exactly like an apply or recovery failure: latched,
+			// reported once, skipped by every later cycle.
+			slog.Error("raft GetUpdate failed; failing the shard",
+				"shard_id", shardID, "replica_id", node.replicaID, "error", err)
+			failShard(node, w.callback, err, nil)
 			continue
 		}
 		// Propagate the log markers so FollowerRead can wait for
@@ -513,6 +551,11 @@ func (w *stepWorker) processReady() {
 		// goroutine unwinds in between, discardExtractedUpdate takes that
 		// claim back. See Peer.InvalidatePersistedState.
 		w.extractedNode = node
+		// The read states GetUpdate took from the Peer exist nowhere else
+		// until OnReadyToRead delivers them (processCallbacks clears this).
+		if len(update.ReadyToRead) > 0 {
+			w.inFlight = stepInFlight{node: node, readStates: update.ReadyToRead}
+		}
 		// Detect leader change, ReadyToRead, and campaign launch.
 		w.processCallbacks(shardID, node, update)
 		// Read-only updates (e.g., ReadIndex confirmations) carry no
@@ -756,8 +799,11 @@ func (w *stepWorker) answerDroppedInstalls(cause error) {
 	w.inboxNode = nil
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("answering dropped snapshot installs panicked",
-				"shard_id", node.shardID, "panic", fmt.Sprint(r))
+			shardID := node.shardID
+			supervise.LogContained(func() {
+				slog.Error("answering dropped snapshot installs panicked",
+					"shard_id", shardID, "panic", fmt.Sprint(r))
+			})
 		}
 	}()
 	if w.inboxStep >= len(w.inboxBuf) {
@@ -794,13 +840,13 @@ func (w *stepWorker) answerDroppedInstalls(cause error) {
 		return
 	}
 	defer node.ReleaseWriteLease()
-	slog.Error("step worker panicked inside a snapshot install; failing the shard",
-		"shard_id", node.shardID, "replica_id", node.replicaID,
-		"snapshot_index", index, "error", cause)
-	node.Fail(cause)
-	if w.callback != nil {
-		w.callback.OnShardFailed(node.shardID, cause)
-	}
+	failShard(node, w.callback, cause, nil)
+	shardID, replicaID := node.shardID, node.replicaID
+	supervise.LogContained(func() {
+		slog.Error("step worker panicked inside a snapshot install; failed the shard",
+			"shard_id", shardID, "replica_id", replicaID,
+			"snapshot_index", index, "error", cause)
+	})
 }
 
 // committedReached reports whether raft's committed index is at or past index,
@@ -883,35 +929,57 @@ func (w *stepWorker) enqueueForCommit(shardID uint64, node *Node, update proto.U
 // We swap once and handle them as a single batched Propose message, producing
 // one log append and one broadcastAppend instead of N separate ones.
 func (w *stepWorker) drainAndHandleProposals(shardID uint64, node *Node) {
-	w.proposeBuf = node.DrainProposals(w.proposeBuf)
-	if len(w.proposeBuf) > 0 {
-		if w.metrics != nil {
-			w.metrics.ObserveProposalBatchSize(shardID, len(w.proposeBuf))
+	batch, id := node.DrainProposalBatch(w.proposeBuf)
+	w.proposeBuf = batch
+	if len(batch) == 0 {
+		return
+	}
+	// From here until Peer.Handle has the batch it exists nowhere else; it is
+	// tracked so an abnormal exit settles it (settleInFlight).
+	w.inFlight = stepInFlight{node: node, proposals: batch}
+	// Declared handed to raft only as Peer.Handle is entered. A closed queue
+	// refuses: the node failed or stopped, and the host has already reported
+	// these proposals never taken, so they are refused definitely here too.
+	if !node.HandOffProposals(id) {
+		w.inFlight = stepInFlight{}
+		if w.callback != nil {
+			w.callback.OnProposalRejected(shardID, batch, handOffRefusal(node))
 		}
-		slog.Debug("proposal batch processing",
-			"shard", shardID,
-			"replica", node.ReplicaID(),
-			"batch_size", len(w.proposeBuf),
+		return
+	}
+	w.inFlight.handed = true
+	err := node.peer.Handle(proto.Message{
+		Type:    proto.Propose,
+		Entries: batch,
+		Origin:  proto.OriginLocal,
+	})
+	if err != nil {
+		// Raft validates the whole batch before appending any of it, so
+		// the refusal is definite. Notify the host so it can complete
+		// pending proposals with the error instead of leaving callers
+		// blocked until their context deadline.
+		w.inFlight.handed = false
+		slog.Warn("batched proposal failed",
+			"shard_id", shardID,
+			"replica_id", node.ReplicaID(),
+			"num_entries", len(batch),
+			"error", err,
 		)
-		if err := node.peer.Handle(proto.Message{
-			Type:    proto.Propose,
-			Entries: w.proposeBuf,
-			Origin:  proto.OriginLocal,
-		}); err != nil {
-			slog.Warn("batched proposal failed",
-				"shard_id", shardID,
-				"replica_id", node.ReplicaID(),
-				"num_entries", len(w.proposeBuf),
-				"error", err,
-			)
-			// Notify the host so it can complete pending proposals
-			// with the error instead of leaving callers blocked
-			// until context deadline timeout.
-			if w.callback != nil {
-				w.callback.OnProposalFailed(shardID, w.proposeBuf, err)
-			}
+		if w.callback != nil {
+			w.callback.OnProposalRejected(shardID, batch, err)
 		}
 	}
+	w.inFlight = stepInFlight{}
+	// Observability last, outside the window: user code that exits
+	// abnormally here loses nothing.
+	if w.metrics != nil {
+		w.metrics.ObserveProposalBatchSize(shardID, len(batch))
+	}
+	slog.Debug("proposal batch processed",
+		"shard", shardID,
+		"replica", node.ReplicaID(),
+		"batch_size", len(batch),
+	)
 }
 
 // drainAndHandleReadIndex drains batched ReadIndex requests from the MPSC
@@ -925,6 +993,9 @@ func (w *stepWorker) drainAndHandleProposals(shardID uint64, node *Node) {
 func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 	w.readKeyBuf = node.DrainReadIndex(w.readKeyBuf)
 	if len(w.readKeyBuf) > 0 {
+		// The drained keys exist nowhere else until Peer.Handle has them;
+		// they are tracked so an abnormal exit fails them (settleInFlight).
+		w.inFlight = stepInFlight{node: node, readKeys: w.readKeyBuf}
 		batchKey := w.readKeyBuf[0]
 		// Register batch aliases BEFORE submitting the ReadIndex
 		// to raft. In single-node clusters, Handle(ReadIndex)
@@ -937,12 +1008,13 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 		if len(w.readKeyBuf) > 1 && w.callback != nil {
 			w.callback.OnReadIndexBatched(shardID, batchKey, w.readKeyBuf[1:])
 		}
-		if err := node.peer.Handle(proto.Message{
+		err := node.peer.Handle(proto.Message{
 			Type:   proto.ReadIndex,
 			From:   node.ReplicaID(),
 			Hint:   batchKey,
 			Origin: proto.OriginLocal,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("batched ReadIndex failed",
 				"shard_id", shardID,
 				"replica_id", node.ReplicaID(),
@@ -959,6 +1031,7 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 				w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, err)
 			}
 		}
+		w.inFlight = stepInFlight{}
 	}
 }
 
@@ -1037,15 +1110,13 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 // plumbing that completes registered ReadIndex requests, and queueing it behind
 // user code would delay every linearizable read by the depth of that queue.
 //
-// A panic in the inline OnReadyToRead still loses the Update that GetUpdate
-// already extracted, with the node neither failed nor notified. That is largely
-// self-healing — update.State carries the full current HardState rather than a
-// diff, so the next cycle re-derives it — except for the readStates, which
-// GetUpdate drained out of the peer and which are gone: those ReadIndex callers
-// wait for the host's sweeper. It is left as-is deliberately: the remaining
-// panic surface here is engine-owned plumbing rather than user code (user
-// callbacks run on the dispatcher, under its own recover), so a panic in it is an engine bug that the step worker's
-// restart-on-panic must surface, not an expected condition to be absorbed.
+// A panic or runtime.Goexit before the read states are delivered loses the
+// Update that GetUpdate already extracted. That is self-healing for the hard
+// state — update.State carries the full current HardState rather than a diff,
+// and discardExtractedUpdate takes back the durability claim — and the read
+// states, which GetUpdate drained out of the peer, are tracked in w.inFlight
+// until OnReadyToRead returns, so the recovery fails their reads instead of
+// leaving them to the host's sweeper.
 func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.Update) {
 	// Detect leader change and notify callback.
 	if w.callback != nil {
@@ -1054,6 +1125,10 @@ func (w *stepWorker) processCallbacks(shardID uint64, node *Node, update proto.U
 		if len(update.ReadyToRead) > 0 {
 			w.callback.OnReadyToRead(shardID, update.ReadyToRead)
 		}
+	}
+	// Delivered (or no callback to deliver to): nothing is in flight.
+	w.inFlight = stepInFlight{}
+	if w.callback != nil {
 		// Detect campaign launch. Outbound RequestVote or
 		// RequestPreVote messages indicate this node started an
 		// election. The term is taken from the vote message itself
@@ -1168,6 +1243,9 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 		failCommit(node, w.callback, update, err)
 		return false
 	}
+	// From here until applyC has the entries they exist nowhere else: an
+	// abnormal exit fails the shard (settleMemCommitted).
+	w.memCommitted, w.memCommittedUpdate = node, update
 	// Send ordered messages after successful Commit.
 	if len(w.orderedMsgBuf) > 0 {
 		w.sendMessages(w.orderedMsgBuf)
@@ -1187,6 +1265,7 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	select {
 	case w.applyC <- ai:
 		w.enqueuingNode = nil
+		w.memCommitted, w.memCommittedUpdate = nil, proto.Update{}
 		return false
 	default:
 	}
@@ -1194,8 +1273,11 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	case w.applyC <- ai:
 		// Successfully queued for apply.
 		w.enqueuingNode = nil
+		w.memCommitted, w.memCommittedUpdate = nil, proto.Update{}
 		return false
 	case <-w.stopC:
+		// Shutdown drop: the entries are released here, not by a recovery.
+		w.memCommitted, w.memCommittedUpdate = nil, proto.Update{}
 		node.commitPending.Store(false)
 		// Return the pooled committed-entries slice BEFORE the item:
 		// releaseApplyItem clears the update with a plain struct assignment, so
@@ -1276,12 +1358,17 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// ErrSystemBusy, which is the honest reply from a replica that cannot serve
 	// them yet. Raft protocol traffic (the inbox) MUST keep flowing regardless.
 	if !node.IsRecovering() {
-		w.commitProposeBuf = node.DrainProposals(w.commitProposeBuf)
+		w.commitProposeBuf, w.commitProposeBatch = node.DrainProposalBatch(w.commitProposeBuf)
 		w.readKeyBuf = node.DrainReadIndex(w.readKeyBuf)
 	} else {
 		w.commitProposeBuf = w.commitProposeBuf[:0]
 		w.readKeyBuf = w.readKeyBuf[:0]
 	}
+	// The drained proposals and ReadIndex keys exist nowhere else until
+	// Peer.Handle has them — phase 1 for the keys, phase 2 for the proposals,
+	// with user callbacks between — so they are tracked for an abnormal exit
+	// to settle (settleInFlight).
+	w.inFlight = stepInFlight{node: node, proposals: w.commitProposeBuf, readKeys: w.readKeyBuf}
 	w.inboxBuf = node.DrainInbox(w.inboxBuf)
 	if len(w.inboxBuf) == 0 && len(w.readKeyBuf) == 0 && len(w.commitProposeBuf) == 0 {
 		return
@@ -1353,6 +1440,10 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	if readIndexErr != nil && w.callback != nil {
 		w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, readIndexErr)
 	}
+	// Raft has the keys now, or they have been failed: no longer in flight.
+	// The read states phase 1 took from the Peer are, until delivered below.
+	w.inFlight.readKeys = nil
+	w.inFlight.readStates = readStates
 
 	// Publish OUTSIDE raftMu. OnLeaderUpdated runs arbitrary user listener code
 	// (and the Host's failPendingRequests); running it under the lock stalls the
@@ -1366,8 +1457,8 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// among them is reported so a campaign launched under commitPending stays
 	// visible to OnCampaignLaunched/IncElection.
 	if len(phase1FreeOrder) > 0 {
-		w.reportFreeOrderCampaign(shardID, node, phase1FreeOrder)
 		w.sendMessages(phase1FreeOrder)
+		w.reportFreeOrderCampaign(shardID, node, phase1FreeOrder)
 	}
 
 	// Deliver ReadIndex completion callbacks immediately, before
@@ -1375,33 +1466,51 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	if w.callback != nil && len(readStates) > 0 {
 		w.callback.OnReadyToRead(shardID, readStates)
 	}
+	w.inFlight.readStates = nil
 
 	// Phase 2: Process proposals and remaining inbox messages.
 	// These can proceed at lower priority since reads are done.
 	if len(w.commitProposeBuf) == 0 && len(otherMsgs) == 0 {
+		w.inFlight = stepInFlight{}
 		return
 	}
 
+	w.runCommitPendingPhase2(shardID, node, otherMsgs)
+}
+
+// runCommitPendingPhase2 is processCommitPendingInbox's phase 2: it hands
+// the drained proposals and the remaining inbox to raft under node.raftMu
+// (commitPendingPhase2Locked), then, outside the lock, settles a refused
+// batch, sends the free-order messages, delivers further read states and
+// publishes a leadership change — tracking what is still in flight
+// (w.inFlight) until it is handed on.
+func (w *stepWorker) runCommitPendingPhase2(shardID uint64, node *Node, otherMsgs []proto.Message) {
 	freeOrderMsgs, additionalReadStates, proposeErr := w.commitPendingPhase2Locked(shardID, node, otherMsgs)
 
 	// Notify the host so it can complete pending proposals with the error
 	// instead of leaving callers blocked. Fired first among the post-unlock
-	// callbacks, preserving the order the locked version had.
+	// callbacks, preserving the order the locked version had. The refusal is
+	// definite: raft refused the batch before appending it, or the closed
+	// queue refused the hand-off.
 	if proposeErr != nil && w.callback != nil {
-		w.callback.OnProposalFailed(shardID, w.commitProposeBuf, proposeErr)
+		w.callback.OnProposalRejected(shardID, w.commitProposeBuf, proposeErr)
 	}
+	// The proposals are raft's, or refused; the further read states are in
+	// flight until delivered below.
+	w.inFlight = stepInFlight{node: node, readStates: additionalReadStates}
 
 	// Send free-order messages outside the lock. A pre-vote campaign among them
 	// is reported so it stays visible to OnCampaignLaunched/IncElection.
 	if len(freeOrderMsgs) > 0 {
-		w.reportFreeOrderCampaign(shardID, node, freeOrderMsgs)
 		w.sendMessages(freeOrderMsgs)
+		w.reportFreeOrderCampaign(shardID, node, freeOrderMsgs)
 	}
 
 	// Deliver any additional ReadIndex completions from phase 2.
 	if w.callback != nil && len(additionalReadStates) > 0 {
 		w.callback.OnReadyToRead(shardID, additionalReadStates)
 	}
+	w.inFlight = stepInFlight{}
 
 	// Publish again after Phase 2, still outside the lock. This is the phase
 	// that can actually make this node a leader: RequestVoteResp is not a
@@ -1410,6 +1519,11 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	// response delivered while commitPending was set would otherwise be reported
 	// as a follower by GetShardInfo until some later cycle happened to publish.
 	w.publishLeaderChange(shardID, node)
+
+	// Observability last, outside every window above.
+	if w.metrics != nil && len(w.commitProposeBuf) > 0 {
+		w.metrics.ObserveProposalBatchSize(shardID, len(w.commitProposeBuf))
+	}
 }
 
 // commitPendingPhase1Locked steps the batched ReadIndex and the HeartbeatResp
@@ -1531,21 +1645,29 @@ func (w *stepWorker) commitPendingPhase2Locked(
 	// This reduces latency by eliminating the blocking window where
 	// proposals sit in the MPSC queue waiting for commit to complete.
 	if len(w.commitProposeBuf) > 0 {
-		if w.metrics != nil {
-			w.metrics.ObserveProposalBatchSize(shardID, len(w.commitProposeBuf))
-		}
-		if err := node.peer.Handle(proto.Message{
-			Type:    proto.Propose,
-			Entries: w.commitProposeBuf,
-			Origin:  proto.OriginLocal,
-		}); err != nil {
-			slog.Warn("batched proposal failed (commitPending)",
-				"shard_id", shardID,
-				"replica_id", node.ReplicaID(),
-				"num_entries", len(w.commitProposeBuf),
-				"error", err,
-			)
-			proposeErr = err
+		// Declared handed to raft only as Peer.Handle is entered; a closed
+		// queue (the node failed or stopped) refuses, and the batch is
+		// refused definitely by the caller.
+		if !node.HandOffProposals(w.commitProposeBatch) {
+			proposeErr = handOffRefusal(node)
+		} else {
+			w.inFlight.handed = true
+			if err := node.peer.Handle(proto.Message{
+				Type:    proto.Propose,
+				Entries: w.commitProposeBuf,
+				Origin:  proto.OriginLocal,
+			}); err != nil {
+				// Raft validates the whole batch before appending any of
+				// it, so the refusal is definite.
+				w.inFlight.handed = false
+				slog.Warn("batched proposal failed (commitPending)",
+					"shard_id", shardID,
+					"replica_id", node.ReplicaID(),
+					"num_entries", len(w.commitProposeBuf),
+					"error", err,
+				)
+				proposeErr = err
+			}
 		}
 		// Update rate limiter cache after proposals are appended.
 		node.peer.RateLimited()
@@ -1650,6 +1772,109 @@ func (w *stepWorker) sendMessages(msgs []proto.Message) {
 //
 // Runs on the step-worker goroutine during the panic unwind, the same goroutine
 // that writes enqueuingNode, so no locking is required.
+// recoverAbnormalExit settles what a panic or runtime.Goexit cut short on
+// this worker, before it is restarted. cause is the *WorkerPanicError the
+// recovery built. It runs on the unwinding step-worker goroutine.
+//
+// commitC is deliberately NOT drained. A queued item cannot let the restarted
+// worker reuse the shard's commitItem slot and enqueue the same pointer twice:
+// getCommitSlot has exactly one caller (enqueueForCommit), reachable only when
+// commitPending is false; commitPending is set BEFORE the commitC send and is
+// cleared only by paths that have already RECEIVED the item from the channel.
+// Draining would race the commit worker consuming the same channel and fail
+// every unrelated healthy shard whose item it happened to win.
+// stepInFlight is what a step worker holds between taking it out of a node
+// and handing it on. See stepWorker.inFlight.
+type stepInFlight struct {
+	node *Node
+	// proposals is the batch taken from the proposal queue; handed reports
+	// whether Peer.Handle was entered with it (HandOffProposals succeeded).
+	proposals []proto.Entry
+	handed    bool
+	// readKeys are ReadIndex keys drained and not yet given to Peer.Handle.
+	readKeys []uint64
+	// readStates were taken from the Peer and not yet delivered.
+	readStates []proto.ReadyToRead
+}
+
+// settleInFlight resolves what an abnormal exit left in w.inFlight, so none
+// of it is lost silently. A proposal batch Peer.Handle never received is
+// refused definitely (OnProposalRejected): it is not marked handed off, so
+// the host's drains agree. One Peer.Handle had begun may have been appended,
+// so it is failed maybe-applied with cause (OnProposalFailed). ReadIndex keys and read
+// states are failed: a read has no side effect, and its caller may retry.
+// handOffRefusal is the definite refusal for a drained proposal batch whose
+// hand-off a closed queue refused: the shard halted (ErrShardFailed, the same
+// answer the host's halt drain gives) or the node stopped (ErrStopped).
+// ErrDropped is reserved for a batch lost to user code on a live shard.
+func handOffRefusal(node *Node) error {
+	if node.IsFailed() {
+		return ErrShardFailed
+	}
+	return ErrStopped
+}
+
+func (w *stepWorker) settleInFlight(cause error) {
+	f := w.inFlight
+	w.inFlight = stepInFlight{}
+	if f.node == nil || w.callback == nil {
+		return
+	}
+	shardID := f.node.shardID
+	if len(f.proposals) > 0 {
+		if f.handed {
+			w.callback.OnProposalFailed(shardID, f.proposals, cause)
+		} else {
+			w.callback.OnProposalRejected(shardID, f.proposals, ErrDropped)
+		}
+	}
+	keys := make([]uint64, 0, len(f.readKeys)+len(f.readStates))
+	keys = append(keys, f.readKeys...)
+	for i := range f.readStates {
+		keys = append(keys, f.readStates[i].Key)
+	}
+	if len(keys) > 0 {
+		w.callback.OnReadIndexFailed(shardID, keys, ErrDropped)
+	}
+}
+
+// settleMemCommitted fails the shard whose memory-mode commit advanced raft's
+// processed marker without its committed entries reaching applyC: they can
+// never be re-offered, so the state machine is missing committed entries.
+// Their proposals are failed maybe-applied.
+func (w *stepWorker) settleMemCommitted(cause error) {
+	node, u := w.memCommitted, w.memCommittedUpdate
+	w.memCommitted, w.memCommittedUpdate = nil, proto.Update{}
+	if node == nil {
+		return
+	}
+	err := &CommitError{ShardID: u.ShardID, ReplicaID: u.ReplicaID, Err: cause}
+	failShard(node, w.callback, err, func() {
+		if w.callback != nil && len(u.CommittedEntries) > 0 {
+			w.callback.OnProposalFailed(u.ShardID, u.CommittedEntries, err)
+		}
+	})
+	u.ReleaseCommittedEntries()
+}
+
+func (w *stepWorker) recoverAbnormalExit(cause error) {
+	// Whatever was taken out of a node and not yet handed on is resolved
+	// first, so nothing the exit interrupted is lost silently.
+	w.settleMemCommitted(cause)
+	w.settleInFlight(cause)
+	// The ONE node that was mid hand-off (enqueueForCommit or
+	// commitMemoryMode): its item never reached commitC/applyC.
+	w.clearStepCommitPending()
+	// An update extracted from the Peer but destroyed by the exit took a
+	// durability claim with it: GetUpdate advanced prevState at extraction,
+	// so without this the hard state it carried is never written and the
+	// next update is classified ReadOnly and skips the WAL too.
+	w.discardExtractedUpdate()
+	// A receive waiting on a local install the exit dropped from the inbox is
+	// answered rather than left waiting for the shard to stop.
+	w.answerDroppedInstalls(cause)
+}
+
 func (w *stepWorker) clearStepCommitPending() {
 	node := w.enqueuingNode
 	if node == nil {

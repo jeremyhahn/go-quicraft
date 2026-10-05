@@ -15,7 +15,7 @@
 package quicraft
 
 import (
-	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -28,8 +28,8 @@ import (
 // invoked INLINE on a snapshot-pool worker, and a recovery reports while
 // holding its node's write lease, which UnloadNode waits out. Calling the
 // user's EventListener from them directly would make a listener doing the
-// natural thing — StopShard on a failed recovery — wait on its own lease
-// forever. The fan-out is dispatched: the callback returns while the listener
+// natural thing — StopShard once a recovery has finished — wait on its own
+// lease forever. The fan-out is dispatched: the callback returns while the listener
 // is still running.
 func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 	cfg := config.HostConfig{
@@ -52,10 +52,11 @@ func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 		<-release
 	}
 	cfg.EventListener = &config.EventListener{
-		OnShardFailed:  func(config.ShardFailedInfo) { block("OnShardFailed") },
-		OnLogCompacted: func(config.EventShardInfo) { block("OnLogCompacted") },
+		OnSnapshotRecovered: func(config.SnapshotInfo) { block("OnSnapshotRecovered") },
+		OnLogCompacted:      func(config.EventShardInfo) { block("OnLogCompacted") },
+		OnSnapshotRejected:  func(config.SnapshotInfo) { block("OnSnapshotRejected") },
 	}
-	h := &Host{cfg: cfg, engine: eng}
+	h := &Host{cfg: cfg, engine: eng, logger: slog.Default()}
 	h.nodes.Store(uint64(7), &nodeState{replicaID: 1, pendingSnapshots: map[uint64]*RequestState{}})
 	cb := &hostEngineCallback{h: h}
 
@@ -63,10 +64,14 @@ func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 		name string
 		call func()
 	}{
-		{"OnShardFailed", func() { cb.OnSnapshotCompleted(7, 0, errors.New("recovery failed")) }},
+		{"OnSnapshotRecovered", func() { cb.OnSnapshotCompleted(7, 0, engine.SnapshotRecover, nil) }},
 		{"OnLogCompacted", func() {
 			cb.OnLogCompacted(7, 1, engine.LogCompaction{Index: 100, Reader: true})
 		}},
+		// The pool rejects INLINE on its worker (a panicked save, a stopping
+		// pool) and on the requesting goroutine (a full queue, a duplicate);
+		// a listener calling StopShard from either must not stall that path.
+		{"OnSnapshotRejected", func() { cb.OnSnapshotRejected(7, 1, nil) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			returned := make(chan struct{})

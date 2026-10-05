@@ -236,12 +236,13 @@ variables from the environment that invoked it:
 ```
 GOPRIVATE=github.com/jeremyhahn/*
 GIT_CONFIG_COUNT=1
-GIT_CONFIG_KEY_0=url.https://<user>:<read-only token>@forge.example/jeremyhahn/.insteadOf
+GIT_CONFIG_KEY_0=url.https://<user>:<access token>@forge.example/jeremyhahn/.insteadOf
 GIT_CONFIG_VALUE_0=https://github.com/jeremyhahn/
 ```
 
-On a workstation, put that block in `.devcontainer/.env` and every `perf-*`
-target reads it. That file is ignored by git, excluded from every Docker build
+On a workstation, put that block in `.devcontainer/.env` (template:
+`.devcontainer/.env.example`) and every `perf-*` target reads it, as do the
+devcontainer builds. That file is ignored by git, excluded from every Docker build
 context by `.dockerignore`, and excluded from the tree `run-remote.sh` stages
 onto a remote host; `test/buildgates` checks all three. `perfcompare` passes
 the variables to `docker build` as a BuildKit secret mounted only for the

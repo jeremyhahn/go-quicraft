@@ -19,7 +19,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"runtime/debug"
@@ -31,6 +30,7 @@ import (
 	"github.com/golang/snappy"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/quic-go/quic-go"
@@ -76,12 +76,6 @@ const snapshotChunkWriteDeadline = 30 * time.Second
 // traffic from multiple shards targeting the same host without dropping
 // Replicate/ReplicateResp messages that are critical for commit progress.
 const defaultSendQueueLen = 2048
-
-// workerPanicRestartDelay is the delay before restarting a panicked
-// transport background worker. This prevents tight panic-restart loops
-// from consuming CPU and flooding logs when a worker hits a persistent
-// panic trigger.
-const workerPanicRestartDelay = 100 * time.Millisecond
 
 // streamShard is a bucket in the sharded stream pool. Each shard has its
 // own mutex to reduce contention across concurrent senders.
@@ -234,7 +228,7 @@ type QUICTransport struct {
 
 	// msgRecvBudget is the remaining aggregate memory budget (bytes) for inbound
 	// message-frame payload buffers across all connections/streams. A frame
-	// reserves its declared length here BEFORE allocating its receive buffer and
+	// reserves its decode charge here BEFORE allocating its receive buffer and
 	// releases it once dispatched, bounding total in-flight message memory to
 	// MaxMessageReceiveMemory. Mirrors snapshotReceiver.memoryBudget for the
 	// regular message path, which otherwise has no aggregate cap (OOM DoS).
@@ -377,8 +371,9 @@ type QUICTransport struct {
 	// closes.
 	connMsgBudget sync.Map
 
-	// maxConnMsgRecv is the per-inbound-connection ceiling on in-flight
-	// message-frame memory, derived from MaxMessageReceiveMemory.
+	// maxConnMsgRecv is the per-peer ceiling on in-flight message-frame
+	// memory, in proto.DecodeCharge units like msgRecvBudget, derived from
+	// MaxMessageReceiveMemory.
 	maxConnMsgRecv int64
 
 	// lastProtocolViolationLog is the Unix-nanosecond timestamp of the most
@@ -423,8 +418,10 @@ type QUICTransport struct {
 	// lastIdentityMismatchLog rate-limits dropIdentityMismatch's warning.
 	lastIdentityMismatchLog atomic.Int64
 
-	// dialRefusals holds, per target, the last dial refused by the identity
-	// pin (dialRefusal), so it is not re-dialed within dialRefusalCooldown.
+	// dialRefusals holds, per dialRefusalKey, the last dial refused by the
+	// identity pin (dialRefusal), so it is not re-dialed within
+	// dialRefusalCooldown. Expired entries are swept on the cleanup tick
+	// (sweepDialRefusals) and an address's entries are dropped by CloseTarget.
 	dialRefusals sync.Map
 }
 
@@ -623,13 +620,13 @@ func NewQUICTransport(
 	)
 	t.snapshotRecv.SetSnapshotTracker(&t.snapshotTracker)
 	t.msgRecvBudget.Store(cfg.MaxMessageReceiveMemory)
-	// Cap any single connection at a quarter of the aggregate budget, but
-	// never below one maximum-size frame plus its decompression delta, so a
-	// legitimate peer's largest legal frame always fits.
-	t.maxConnMsgRecv = cfg.MaxMessageReceiveMemory / 4
-	if minPerConn := int64(cfg.MaxDecompressedSize) + int64(MaxFrameSize); t.maxConnMsgRecv < minPerConn {
-		t.maxConnMsgRecv = minPerConn
-	}
+	// Cap any single peer at a quarter of the aggregate budget, but never
+	// below one maximum-size frame's charge, so a legitimate peer's largest
+	// legal frame always fits. The cap is in the aggregate's unit
+	// (proto.DecodeCharge): a cap counted in wire bytes against an aggregate
+	// counted at the decode factor bounded one peer at twice the aggregate,
+	// which bounded nothing.
+	t.maxConnMsgRecv = max(cfg.MaxMessageReceiveMemory/4, maxFrameCharge(cfg.MaxDecompressedSize))
 
 	t.eventListener = cfg.EventListener
 	t.metrics = cfg.Metrics
@@ -648,21 +645,7 @@ func (t *QUICTransport) Start() error {
 	lc := net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-					slog.Debug("SO_REUSEADDR setsockopt failed", "fd", fd, "error", err)
-				}
-				if recvBuf > 0 {
-					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, recvBuf); err != nil {
-						slog.Warn("SO_RCVBUF setsockopt failed; increase net.core.rmem_max",
-							"requested", recvBuf, "error", err)
-					}
-				}
-				if sendBuf > 0 {
-					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, sendBuf); err != nil {
-						slog.Warn("SO_SNDBUF setsockopt failed; increase net.core.wmem_max",
-							"requested", sendBuf, "error", err)
-					}
-				}
+				setListenerSockopts(fd, recvBuf, sendBuf)
 			})
 		},
 	}
@@ -716,12 +699,10 @@ func (t *QUICTransport) Start() error {
 		t.revocationChecker.Start()
 	}
 
-	t.wg.Add(1)
 	t.acceptWG.Add(1)
-	go t.acceptLoop()
+	t.startAcceptLoop()
 
-	t.wg.Add(1)
-	go t.connectionCleanup()
+	supervise.Supervise(&t.wg, t.stopC, t.connectionCleanup, nil)
 
 	return nil
 }
@@ -742,6 +723,20 @@ func (t *QUICTransport) SetEpochTracker(tracker EpochTracker) {
 // precedence. Must be called before Start.
 func (t *QUICTransport) SetShardEpochTrackers(fn func(shardID uint64) EpochTracker) {
 	t.snapshotRecv.SetShardEpochTrackers(fn)
+}
+
+// SetListenerDispatcher installs the host's listener dispatcher, which
+// delivers OnSnapshotRejected for a transfer the snapshot receiver rejected off
+// the receive goroutine, the same way the engine delivers that event, so a
+// listener may call any Host API from it, including StopShard. dispatch
+// reports whether it accepted fn; a refused notification is dropped and logged.
+// Every other EventListener callback the transport fires stays inline.
+//
+// The host calls it before Start whenever it builds a transport. Leaving it
+// unset is supported only for a transport built standalone by this package's
+// tests, where the listener then runs inline.
+func (t *QUICTransport) SetListenerDispatcher(dispatch func(fn func()) bool) {
+	t.snapshotRecv.setListenerDispatcher(dispatch)
 }
 
 // Stop gracefully shuts down the transport. It signals all per-target
@@ -875,6 +870,16 @@ func (t *QUICTransport) stop() {
 	}
 
 	t.wg.Wait()
+
+	// quic.Transport closes only a socket it created itself, never the Conn
+	// it was handed, so the listener socket is closed here. Without this the
+	// address stays bound after Stop and a restart on it fails with
+	// EADDRINUSE.
+	if t.udpConn != nil {
+		if err := t.udpConn.Close(); err != nil {
+			slog.Debug("UDP listener close failed", "error", err)
+		}
+	}
 }
 
 // Addr returns the local address the transport is listening on.
@@ -1131,8 +1136,7 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 		hbCh: make(chan proto.Message, 64),
 	}
 	t.sendQueues[target] = sq
-	t.wg.Add(1)
-	go t.sendQueueWorker(target, sq)
+	supervise.Supervise(&t.wg, t.stopC, func() { t.sendQueueWorker(target, sq) }, nil)
 	t.sendQueuesMu.Unlock()
 	return sq
 }
@@ -1173,26 +1177,13 @@ func (t *QUICTransport) retireSendQueue(target string) {
 // buffered messages (up to 256 for data, 16 for heartbeats) into a batch
 // before sending. This amortizes QUIC frame overhead and reduces the number
 // of stream writes per batch.
+//
+// It runs under supervise.Supervise, which counts it in t.wg and starts it
+// again on a fresh goroutine if a runtime.Goexit ends it.
 func (t *QUICTransport) sendQueueWorker(target string, sq *sendQueue) {
-	defer t.wg.Done()
-
-	for {
-		panicked := t.sendQueueWorkerOnce(target, sq)
-		if !panicked {
+	for t.sendQueueWorkerOnce(target, sq) {
+		if !supervise.AwaitRestart(t.stopC) {
 			return
-		}
-		// Check for shutdown before restarting.
-		select {
-		case <-t.stopC:
-			return
-		default:
-		}
-		timer := time.NewTimer(workerPanicRestartDelay)
-		select {
-		case <-t.stopC:
-			timer.Stop()
-			return
-		case <-timer.C:
 		}
 	}
 }
@@ -1201,25 +1192,24 @@ func (t *QUICTransport) sendQueueWorker(target string, sq *sendQueue) {
 // and recovers from panics. Returns true if the worker panicked, false
 // if it returned normally (via stop signal or idle timeout).
 func (t *QUICTransport) sendQueueWorkerOnce(target string, sq *sendQueue) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
 			stack := debug.Stack()
-			panicErr := &WorkerPanicError{
-				WorkerName: "sendQueueWorker",
-				Target:     target,
-				Value:      r,
-				Stack:      stack,
-			}
-			slog.Error("sendQueueWorker panic recovered, restarting",
+			logRecovered("sendQueueWorker panic recovered, restarting", r, stack,
 				"target", target,
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
+				"error", &WorkerPanicError{WorkerName: "sendQueueWorker", Target: target, Value: r, Stack: stack})
 		}
 	}()
+	t.drainSendQueue(target, sq)
+	normalReturn = true
+	return false
+}
 
+// drainSendQueue is the send queue worker's body: it sends what sq holds to
+// target until the transport stops or the queue is pruned idle.
+func (t *QUICTransport) drainSendQueue(target string, sq *sendQueue) {
 	// Pre-size to the drain cap (1 initial + up to 255 more = 256) so a full
 	// burst does not force a slice re-grow on the send path.
 	batch := make([]proto.Message, 0, 256)

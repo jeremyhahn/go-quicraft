@@ -1422,8 +1422,8 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	// file that may be short. The entries are then gone and the snapshot cannot
 	// replace them. Returning here lands on the deferred RemoveAll (committed is
 	// still false), so the partial directory is torn down and the leader re-sends
-	// after its ack timeout. This is the same sync-then-close idiom syncDir and
-	// snapshot_reencrypt.go use.
+	// after its ack timeout. This is the same sync-then-close idiom
+	// fsutil.SyncDirWith and snapshot_reencrypt.go use.
 	if closeErr := f.Close(); closeErr != nil {
 		return &SnapshotReceiveError{
 			ShardID:   shardID,
@@ -1794,7 +1794,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 			// entries below the snapshot are still in place.
 			if saveErr := h.host.logdb.SaveSnapshot(shardID, replicaID, logdbSnap); saveErr != nil &&
 				!errors.Is(saveErr, logdb.ErrSnapshotOutOfDate) {
-				node.Fail(saveErr)
+				h.host.engine.FailShard(node, saveErr)
 				return &SnapshotReceiveError{
 					ShardID:   shardID,
 					ReplicaID: replicaID,
@@ -2199,7 +2199,7 @@ func writeReceivedSnapshotMetadata(fsys snapshotFS, dir string, index, term, sha
 	// needs, so a silently truncated one suppresses key purging for the whole
 	// barrier. The old deferred Close discarded that error by construction. The
 	// close still runs on every path, exactly as the defer arranged; the ordering
-	// is what changed. Mirrors fsys.go syncDir and snapshot_reencrypt.go.
+	// is what changed. Mirrors fsutil.SyncDirWith and snapshot_reencrypt.go.
 	_, writeErr := f.Write(buf)
 	if writeErr == nil {
 		writeErr = f.Sync()

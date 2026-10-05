@@ -539,6 +539,26 @@ var ErrSnapshotMemoryBudgetExceeded = errors.New("transport: snapshot memory bud
 // streams that each declare a large frame length and withhold the body.
 var ErrMessageRecvMemoryBudgetExceeded = errors.New("transport: message receive memory budget exceeded")
 
+// MaxMessageReceiveMemoryTooSmallError is returned by Config.Validate when
+// MaxMessageReceiveMemory cannot hold one maximum-size frame. Minimum is that
+// frame's receive charge (maxFrameCharge).
+type MaxMessageReceiveMemoryTooSmallError struct {
+	Configured int64
+	Minimum    int64
+}
+
+// Error returns a human-readable description of the violation.
+func (e *MaxMessageReceiveMemoryTooSmallError) Error() string {
+	return fmt.Sprintf(
+		"transport: max message receive memory %d is below minimum %d (one maximum-size frame)",
+		e.Configured, e.Minimum)
+}
+
+// Is reports whether target matches the sentinel ErrInvalidMaxMessageReceiveMemory.
+func (e *MaxMessageReceiveMemoryTooSmallError) Is(target error) bool {
+	return target == ErrInvalidMaxMessageReceiveMemory
+}
+
 // ErrFrameDrainIncomplete is returned when a dropped frame's body could not be
 // fully discarded. Unlike the budget error it is NOT retryable: the stream is
 // desynchronised mid-frame, so the next "header" would be parsed out of

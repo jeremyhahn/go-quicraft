@@ -19,12 +19,17 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -519,6 +524,12 @@ func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
 	if !errors.Is(got.err, ErrShardFailed) {
 		t.Fatalf("a read pending across the halt = %v (%T), want ErrShardFailed", got.err, got.err)
 	}
+	// A read appends nothing to the log, so there is nothing that may still
+	// apply: MaybeApplied is a proposal's classification, not a read's.
+	if MaybeApplied(got.err) {
+		t.Fatalf("a read pending across the halt = %v reports MaybeApplied; a read "+
+			"has no entry that could commit", got.err)
+	}
 	// Prompt means measured from the halt, not from when the read began: the
 	// read spent 300ms deliberately pending before the release.
 	if sinceHalt > budget/10 {
@@ -716,5 +727,917 @@ func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 	}
 	if elapsed > budget/10 {
 		t.Fatalf("follower read after the halt took %v; it should be refused before entering the wait", elapsed)
+	}
+}
+
+// pendingProposalCount reports how many proposals ns holds in its pending map.
+func pendingProposalCount(ns *nodeState) int {
+	n := 0
+	ns.pendingProposals.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// TestProposalRetriedFromItsFailureIsRefusedAtAdmission: the proposal whose
+// apply trips the latch is failed only once the latch has tripped, so a retry
+// issued the instant it is failed — here from inside its own completion, on
+// the apply goroutine — is refused at admission with ErrShardFailed. It is
+// never registered: a halted shard answers nothing it registers, so a
+// registered retry would wait out the pending sweep and report a timeout.
+func TestProposalRetriedFromItsFailureIsRefusedAtAdmission(t *testing.T) {
+	h, machine, failed := newLatchableHost(t)
+	releasePoison := parkPoison(t, machine)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rs, err := h.Propose(ctx, 1, poisonCmd)
+	if err != nil {
+		t.Fatalf("Propose of the poisoned command: %v", err)
+	}
+	defer rs.Release()
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked")
+	}
+
+	// Retry from inside the poisoned proposal's failure, before anything else
+	// can run: the completion site claims the entry and runs onFailure.
+	ns := testLoadNode(h, 1)
+	var (
+		retryRS  *RequestState
+		retryErr error
+	)
+	retried := make(chan struct{})
+	installed := 0
+	ns.pendingProposals.Range(func(key, value any) bool {
+		pp := value.(*pendingProposal)
+		ns.pendingProposals.Store(key, &pendingProposal{
+			rs:       pp.rs,
+			deadline: pp.deadline,
+			floor:    pp.floor,
+			onFailure: func() {
+				retryRS, retryErr = h.Propose(ctx, 1, []byte("retry"))
+				close(retried)
+			},
+		})
+		installed++
+		return true
+	})
+	if installed != 1 {
+		t.Fatalf("fixture: %d pending proposals, want the poisoned one only", installed)
+	}
+
+	releasePoison()
+	select {
+	case <-retried:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poisoned proposal was never failed")
+	}
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+	if retryRS != nil {
+		retryRS.Release()
+		t.Fatal("a proposal retried from its predecessor's failure was admitted: the " +
+			"latch had not tripped when the failure woke the caller")
+	}
+	if !errors.Is(retryErr, ErrShardFailed) {
+		t.Fatalf("retried Propose = %v, want ErrShardFailed", retryErr)
+	}
+	if n := pendingProposalCount(ns); n != 0 {
+		t.Fatalf("%d proposals left pending on the halted shard, want 0", n)
+	}
+}
+
+// TestProposalsAdmittedBeforeTheLatchAreFailedPromptly: a proposal that passed
+// admission and registered before the latch tripped — queued behind the
+// apply that trips it — is answered ErrShardFailed when the shard halts, not
+// left for the pending sweep to time out.
+func TestProposalsAdmittedBeforeTheLatchAreFailedPromptly(t *testing.T) {
+	h, machine, failed := newLatchableHost(t)
+	releasePoison := parkPoison(t, machine)
+	const budget = 5 * time.Second
+	trip, cancelTrip := context.WithTimeout(context.Background(), budget)
+	defer cancelTrip()
+	go func() { _, _ = h.SyncPropose(trip, 1, poisonCmd) }()
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	rs, err := h.Propose(ctx, 1, []byte("ordinary-command"))
+	if err != nil {
+		t.Fatalf("Propose before the latch: %v", err)
+	}
+	defer rs.Release()
+
+	releasePoison()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+	select {
+	case res := <-rs.ResultC():
+		if !errors.Is(res.Err, ErrShardFailed) {
+			t.Fatalf("proposal admitted before the latch completed with %v, want ErrShardFailed", res.Err)
+		}
+	case <-time.After(budget / 2):
+		t.Fatal("a proposal admitted before the latch was never answered: the halt " +
+			"drained reads only, and the halted shard never applies it")
+	}
+	if n := pendingProposalCount(testLoadNode(h, 1)); n != 0 {
+		t.Fatalf("%d proposals left pending on the halted shard, want 0", n)
+	}
+}
+
+// TestProposalRegisteredAfterTheLatchIsRolledBack covers the last window: the
+// admission check passed, then the latch tripped and the halt drained the
+// pending map, and only then did the registration land. The registration
+// re-checks the latch after storing, so it rolls itself back and refuses with
+// ErrShardFailed instead of leaving an entry nothing will drain.
+func TestProposalRegisteredAfterTheLatchIsRolledBack(t *testing.T) {
+	h, _, failed := newLatchableHost(t)
+	ns := testLoadNode(h, 1)
+	engNode := h.engine.GetNode(1)
+	// The latch trips, and the halt drains, between the admission check and
+	// the registration.
+	h.engine.FailShard(engNode, errors.New("latched between the check and the registration"))
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+
+	before := h.pendingOps.Load()
+	rs := newRequestState(ns.requestPool, nextRequestKey(), time.Now().Add(time.Minute), false)
+	err := h.registerPendingProposal(ns, engNode, rs.key, &pendingProposal{rs: rs, deadline: time.Now().Add(time.Minute)})
+	if !errors.Is(err, ErrShardFailed) {
+		t.Fatalf("registration after the latch = %v, want ErrShardFailed", err)
+	}
+	if MaybeApplied(err) {
+		t.Fatal("a registration rolled back at admission reports MaybeApplied: it never " +
+			"reached raft, so the refusal is definite and a retry is safe")
+	}
+	if n := pendingProposalCount(ns); n != 0 {
+		t.Fatalf("%d proposals left pending after a rolled-back registration, want 0", n)
+	}
+	if after := h.pendingOps.Load(); after != before {
+		t.Fatalf("pending ops %d after the rollback, was %d", after, before)
+	}
+}
+
+// heldCmd is a command heldApplySM parks on, applies, and counts.
+var heldCmd = []byte("held-command")
+
+// heldApplySM is poisonApplySM with one more command: heldCmd is applied
+// normally, but its apply can be parked first, so a test can hold an entry
+// that is committed and not yet applied.
+type heldApplySM struct {
+	*poisonApplySM
+	// hold, when non-nil, parks the apply of heldCmd until it is closed;
+	// held is closed the moment it parks.
+	hold chan struct{}
+	held chan struct{}
+	// heldApplies counts the applies of heldCmd on this instance.
+	heldApplies atomic.Int64
+}
+
+func (s *heldApplySM) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
+	for i := range entries {
+		if !bytes.Equal(entries[i].Cmd, heldCmd) {
+			continue
+		}
+		if s.hold != nil {
+			close(s.held)
+			<-s.hold
+		}
+		s.heldApplies.Add(1)
+	}
+	return s.poisonApplySM.Update(ctx, entries, results)
+}
+
+// TestProposalDrainedByTheHaltReportsMaybeApplied: a proposal still pending
+// when the shard halts may already be committed — here its entry is committed
+// and mid-apply when the latch trips — and a reload replays and applies it.
+// Its caller must therefore be told the outcome is unknown: the error still
+// matches ErrShardFailed, and MaybeApplied reports true, so an unsessioned
+// caller does not retry a mutation that is going to take effect.
+func TestProposalDrainedByTheHaltReportsMaybeApplied(t *testing.T) {
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	first := &heldApplySM{poisonApplySM: &poisonApplySM{}, hold: make(chan struct{}), held: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(first.hold) })
+	t.Cleanup(release)
+	reloaded := &heldApplySM{poisonApplySM: &poisonApplySM{}}
+	machines := []*heldApplySM{first, reloaded}
+	var started atomic.Int64
+	create := func(shardID, replicaID uint64) interface{} {
+		return machines[started.Add(1)-1]
+	}
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rs, err := h.Propose(ctx, 1, heldCmd)
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	defer rs.Release()
+	select {
+	case <-first.held:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the entry never reached apply")
+	}
+
+	// The entry is committed and not yet applied when the shard halts.
+	h.engine.FailShard(h.engine.GetNode(1), errors.New("halted with a committed entry pending"))
+	select {
+	case res := <-rs.ResultC():
+		if !errors.Is(res.Err, ErrShardFailed) {
+			t.Fatalf("drained proposal = %v, want it to match ErrShardFailed", res.Err)
+		}
+		if !MaybeApplied(res.Err) {
+			t.Fatalf("drained proposal = %v reports MaybeApplied false: its entry is committed, "+
+				"and a caller told it was not applied would retry a mutation a reload applies", res.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the halt never answered the pending proposal")
+	}
+
+	// Reload: the replay applies the entry the caller was told may apply.
+	release()
+	if err := h.StopShard(1); err != nil {
+		t.Fatalf("StopShard: %v", err)
+	}
+	if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard after the halt: %v", err)
+	}
+	waitForLeader(t, h, 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for reloaded.heldApplies.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the reloaded shard never applied the committed entry")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// registerTestProposal registers a proposal on shard 1 of h exactly as the
+// admission path does, deadline included, and returns its RequestState.
+func registerTestProposal(t *testing.T, h *Host, deadline time.Time) *RequestState {
+	t.Helper()
+	ns := testLoadNode(h, 1)
+	key := nextRequestKey()
+	rs := newRequestState(ns.requestPool, key, deadline, false)
+	if err := h.registerPendingProposal(ns, h.engine.GetNode(1), key, &pendingProposal{rs: rs, deadline: deadline}); err != nil {
+		t.Fatalf("registerPendingProposal: %v", err)
+	}
+	return rs
+}
+
+// awaitProposalErr waits for rs to complete and returns its error.
+func awaitProposalErr(t *testing.T, rs *RequestState) error {
+	t.Helper()
+	select {
+	case res := <-rs.ResultC():
+		return res.Err
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proposal was never completed")
+		return nil
+	}
+}
+
+// TestProposalFailuresAfterHandOffReportMaybeApplied: every failure delivered
+// to a proposal once it was handed to raft reports MaybeApplied, and still
+// matches its own error and sentinel. A committed entry whose apply or commit
+// failed is replayed by a reload; an entry the leader could not persist may
+// already be on a follower quorum (Replicate is sent before the local
+// persist); a proposal that lost its wait, or that its shard's halt or
+// teardown drained, may have reached the log.
+func TestProposalFailuresAfterHandOffReportMaybeApplied(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fail  func(h *Host, rs *RequestState)
+		match func(err error) bool
+	}{
+		"ApplyError": {
+			fail: func(h *Host, rs *RequestState) {
+				(&hostEngineCallback{h: h}).OnProposalFailed(1, []proto.Entry{{Key: rs.key}},
+					&engine.ApplyError{ShardID: 1, ReplicaID: 1, Err: errPoisonedApply})
+			},
+			match: func(err error) bool {
+				var ae *ApplyError
+				return errors.As(err, &ae) && errors.Is(err, errPoisonedApply)
+			},
+		},
+		"CommitError": {
+			fail: func(h *Host, rs *RequestState) {
+				(&hostEngineCallback{h: h}).OnProposalFailed(1, []proto.Entry{{Key: rs.key}},
+					&engine.CommitError{ShardID: 1, ReplicaID: 1, Err: errPoisonedApply})
+			},
+			match: func(err error) bool {
+				var ce *CommitError
+				return errors.As(err, &ce)
+			},
+		},
+		"SaveStateError": {
+			fail: func(h *Host, rs *RequestState) {
+				(&hostEngineCallback{h: h}).OnProposalFailed(1, []proto.Entry{{Key: rs.key}},
+					&engine.SaveStateError{ShardID: 1, ReplicaID: 1, Err: errPoisonedApply})
+			},
+			match: func(err error) bool {
+				var se *SaveStateError
+				return errors.As(err, &se)
+			},
+		},
+		"deadline sweep": {
+			fail: func(h *Host, _ *RequestState) {
+				h.sweepPendingProposals(testLoadNode(h, 1), time.Now().Add(time.Hour))
+			},
+			match: func(err error) bool { return errors.Is(err, ErrTimeout) },
+		},
+		"teardown": {
+			fail: func(h *Host, _ *RequestState) {
+				h.failPendingRequests(testLoadNode(h, 1), ErrAborted)
+			},
+			match: func(err error) bool { return errors.Is(err, ErrAborted) },
+		},
+		"leadership change": {
+			fail: func(h *Host, _ *RequestState) {
+				h.failPendingClientRequests(testLoadNode(h, 1), &NotLeaderError{ShardID: 1, LeaderID: 2})
+			},
+			match: func(err error) bool { return errors.Is(err, ErrNotLeader) },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, _, _ := newLatchableHost(t)
+			rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+			defer rs.Release()
+			tc.fail(h, rs)
+			err := awaitProposalErr(t, rs)
+			if !tc.match(err) {
+				t.Fatalf("failure = %v (%T): it no longer matches its own error", err, err)
+			}
+			if !MaybeApplied(err) {
+				t.Fatalf("failure = %v reports MaybeApplied false, but the proposal had been "+
+					"handed to raft and may still commit", err)
+			}
+			var m *MaybeAppliedError
+			if errors.As(err, &m) && errors.As(m.Err, new(*MaybeAppliedError)) {
+				t.Fatalf("failure = %v is wrapped as maybe-applied twice", err)
+			}
+		})
+	}
+}
+
+// TestProposalRejectedBeforeTheLogIsDefinite: a proposal raft refused before
+// appending it never reached the log, so the refusal is definite — MaybeApplied
+// is false and a retry is safe.
+func TestProposalRejectedBeforeTheLogIsDefinite(t *testing.T) {
+	h, _, _ := newLatchableHost(t)
+	rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+	defer rs.Release()
+	(&hostEngineCallback{h: h}).OnProposalRejected(1, []proto.Entry{{Key: rs.key}},
+		&raft.NotLeaderError{LeaderID: 2})
+	err := awaitProposalErr(t, rs)
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("rejection = %v, want it to match ErrNotLeader", err)
+	}
+	if MaybeApplied(err) {
+		t.Fatalf("rejection = %v reports MaybeApplied: raft refused the entry before "+
+			"appending it, so nothing can commit", err)
+	}
+}
+
+// TestProposalFailedByItsApplyReportsMaybeApplied is the end-to-end form: a
+// proposal whose committed entry failed to apply — returned error or panic —
+// reports MaybeApplied, since a reload replays the committed entry.
+func TestProposalFailedByItsApplyReportsMaybeApplied(t *testing.T) {
+	for name, panics := range map[string]bool{"returned error": false, "panic": true} {
+		t.Run(name, func(t *testing.T) {
+			h, machine, _ := newLatchableHost(t)
+			machine.panicOnPoison = panics
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_, err := h.SyncPropose(ctx, 1, poisonCmd)
+			if err == nil {
+				t.Fatal("the poisoned proposal succeeded")
+			}
+			if !MaybeApplied(err) {
+				t.Fatalf("apply failure = %v reports MaybeApplied false: the entry is committed "+
+					"and a reload replays it", err)
+			}
+			if panics && !errors.Is(err, ErrShardFailed) {
+				t.Fatalf("apply panic = %v no longer matches ErrShardFailed", err)
+			}
+			var smPanic *SMPanicError
+			if panics && (!errors.As(err, &smPanic) || smPanic.Value != errPoisonedApply) {
+				t.Fatalf("apply panic = %v (%T): errors.As does not reach the *SMPanicError "+
+					"carrying the panic value", err, err)
+			}
+			if !panics && !errors.Is(err, errPoisonedApply) {
+				t.Fatalf("apply error = %v no longer carries the state machine's error", err)
+			}
+		})
+	}
+}
+
+// TestProposalWhoseWaitEndsReportsMaybeApplied: a caller whose own wait for a
+// proposal ends — its context's deadline, its cancellation, or the request's
+// own deadline in RequestState.Result — after the proposal was handed to raft
+// is told the outcome is unknown, since the entry may still commit.
+func TestProposalWhoseWaitEndsReportsMaybeApplied(t *testing.T) {
+	t.Run("SyncPropose deadline", func(t *testing.T) {
+		h, machine, _ := newLatchableHost(t)
+		parkPoison(t, machine)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, err := h.SyncPropose(ctx, 1, poisonCmd)
+		if !errors.Is(err, ErrTimeout) || !MaybeApplied(err) {
+			t.Fatalf("SyncPropose whose deadline passed with its entry committed = %v, "+
+				"want ErrTimeout reporting MaybeApplied", err)
+		}
+	})
+	t.Run("SyncPropose canceled", func(t *testing.T) {
+		h, machine, _ := newLatchableHost(t)
+		parkPoison(t, machine)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-machine.poisonHeld
+			cancel()
+		}()
+		_, err := h.SyncPropose(ctx, 1, poisonCmd)
+		if !errors.Is(err, ErrCanceled) || !MaybeApplied(err) {
+			t.Fatalf("SyncPropose canceled with its entry committed = %v, "+
+				"want ErrCanceled reporting MaybeApplied", err)
+		}
+	})
+	t.Run("RequestState.Result deadline", func(t *testing.T) {
+		h, _, _ := newLatchableHost(t)
+		rs := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
+		defer rs.Release()
+		_, err := rs.Result()
+		if !errors.Is(err, ErrTimeout) || !MaybeApplied(err) {
+			t.Fatalf("Result of a registered proposal past its deadline = %v, "+
+				"want ErrTimeout reporting MaybeApplied", err)
+		}
+	})
+}
+
+// TestProposalWaitOnAClosedQueueIsDefinite: the caller's own wait is
+// classified by the same rule as the drains. A proposal provably never taken
+// from its node's queue, which is now closed, never reached raft, so a wait
+// that ends on it is a definite failure; while the queue is open the step
+// worker could still take it, so the failure stays maybe-applied.
+func TestProposalWaitOnAClosedQueueIsDefinite(t *testing.T) {
+	h, _, _ := newLatchableHost(t)
+	open := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
+	defer open.Release()
+	if _, err := open.Result(); !errors.Is(err, ErrTimeout) || !MaybeApplied(err) {
+		t.Fatalf("wait on a queued proposal with the queue open = %v, want maybe-applied ErrTimeout", err)
+	}
+
+	closed := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
+	defer closed.Release()
+	// The node stops — its queue closes — without the host draining.
+	h.engine.GetNode(1).Stop()
+	_, err := closed.Result()
+	if !errors.Is(err, ErrTimeout) || MaybeApplied(err) {
+		t.Fatalf("wait on a proposal never taken from a closed queue = %v, want a definite ErrTimeout", err)
+	}
+}
+
+// exitingReadMetrics is a metrics collector whose read-latency observation
+// exits abnormally.
+type exitingReadMetrics struct {
+	NoOpMetricsCollector
+	exit func()
+}
+
+func (m exitingReadMetrics) ObserveReadIndexLatency(uint64, time.Duration) { m.exit() }
+
+// TestOnReadyToReadNeverHoldsItsLockAcrossUserCode: the host's OnReadyToRead
+// completes reads under pendingReadsMu. It used to call the metrics collector
+// with the lock held and release it explicitly, so a collector that panicked
+// or called runtime.Goexit left the lock held, and the step worker's recovery
+// — failing the same reads through OnReadIndexFailed — deadlocked on it. The
+// read is completed, and the lock released, whatever the collector does.
+func TestOnReadyToReadNeverHoldsItsLockAcrossUserCode(t *testing.T) {
+	for exitName, exit := range map[string]func(){
+		"panic":  func() { panic("metrics panicked") },
+		"Goexit": runtime.Goexit,
+	} {
+		t.Run(exitName, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption(),
+				WithMetrics(exitingReadMetrics{exit: exit}))
+			if err != nil {
+				t.Fatalf("NewHost: %v", err)
+			}
+			t.Cleanup(func() { h.Close() })
+			if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+				func(uint64, uint64) interface{} { return &poisonApplySM{} }, testShardConfig(1, 1)); err != nil {
+				t.Fatalf("StartShard: %v", err)
+			}
+			waitForLeader(t, h, 1)
+
+			ns := testLoadNode(h, 1)
+			key := nextRequestKey()
+			rs := newRequestState(ns.requestPool, key, time.Now().Add(time.Minute), true)
+			defer rs.Release()
+			h.addPendingOp()
+			rs.acquireRef()
+			ns.pendingReadsMu.Lock()
+			ns.pendingReads[key] = &pendingRead{rs: rs}
+			ns.pendingReadsMu.Unlock()
+
+			cb := &hostEngineCallback{h: h}
+			index := ns.lastApplied.Load()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() { _ = recover() }()
+				cb.OnReadyToRead(1, []proto.ReadyToRead{{Key: key, Index: index}})
+			}()
+			<-done
+
+			if !ns.pendingReadsMu.TryLock() {
+				t.Fatal("pendingReadsMu is still held after the collector exited abnormally")
+			}
+			ns.pendingReadsMu.Unlock()
+			select {
+			case res := <-rs.ResultC():
+				if res.Err != nil || res.Value != index {
+					t.Fatalf("read completed with %+v, want value %d", res, index)
+				}
+			default:
+				t.Fatal("the confirmed read was not completed")
+			}
+			failed := make(chan struct{})
+			go func() {
+				cb.OnReadIndexFailed(1, []uint64{key}, errors.New("recovery"))
+				close(failed)
+			}()
+			select {
+			case <-failed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("OnReadIndexFailed deadlocked on pendingReadsMu")
+			}
+		})
+	}
+}
+
+// exitingProposalMetrics is a metrics collector whose proposal-latency
+// observation exits abnormally.
+type exitingProposalMetrics struct {
+	NoOpMetricsCollector
+	exit func()
+}
+
+func (m exitingProposalMetrics) ObserveProposalLatency(uint64, time.Duration) { m.exit() }
+
+// TestAppliedProposalsAreAnsweredWhateverTheCollectorDoes: OnApplied claims
+// an applied proposal out of pendingProposals and then completes it. The
+// proposal latency used to be observed between the two, so a collector that
+// called runtime.Goexit left a claimed proposal that no path would ever
+// complete — the apply worker's recovery fails only proposals still pending,
+// and the membership branch's own recovery recognised only a panic. Every
+// claimed caller is now answered before any latency is observed, and a
+// Goexit in the membership branch completes its unanswered tail too.
+func TestAppliedProposalsAreAnsweredWhateverTheCollectorDoes(t *testing.T) {
+	cc := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "127.0.0.1:6000"}
+	ccBuf := make([]byte, cc.Size())
+	n, err := cc.MarshalTo(ccBuf)
+	if err != nil {
+		t.Fatalf("ConfigChange.MarshalTo: %v", err)
+	}
+	const keyA, keyB uint64 = 1, 2
+	batches := map[string][]proto.Entry{
+		"ordinary": {
+			{Index: 5, Term: 1, Key: keyA, Type: proto.EntryNormal},
+			{Index: 6, Term: 1, Key: keyB, Type: proto.EntryNormal},
+		},
+		"membership": {
+			{Index: 5, Term: 1, Key: keyA, Type: proto.EntryNormal},
+			{Index: 6, Term: 1, Key: keyB, Type: proto.EntryConfigChange, Cmd: ccBuf[:n]},
+		},
+	}
+	for batchName, entries := range batches {
+		for exitName, exit := range map[string]func(){
+			"panic":  func() { panic("metrics panicked") },
+			"Goexit": runtime.Goexit,
+		} {
+			t.Run(batchName+"/"+exitName, func(t *testing.T) {
+				h := newTestHost(t)
+				// A raw, unwrapped collector: the Goexit is what no wrapper
+				// can contain, and the panic exercises the same ordering.
+				h.metrics = exitingProposalMetrics{exit: exit}
+				ns := &nodeState{
+					shardID:      1,
+					replicaID:    1,
+					nodes:        map[uint64]string{1: "127.0.0.1:5000"},
+					pendingReads: make(map[uint64]*pendingRead),
+					requestPool:  NewRequestStatePool(),
+					openStopper:  make(chan struct{}),
+				}
+				ns.health.Store(uint32(ShardHealthy))
+				h.nodes.Store(uint64(1), ns)
+				h.activeNodes.Add(1)
+
+				register := func(key uint64) *RequestState {
+					rs := newRequestState(ns.requestPool, key, time.Now().Add(time.Hour), true)
+					h.addPendingOp()
+					rs.acquireRef()
+					ns.pendingProposals.Store(key, &pendingProposal{rs: rs})
+					return rs
+				}
+				rsA, rsB := register(keyA), register(keyB)
+
+				cb := &hostEngineCallback{h: h}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					defer func() { _ = recover() }()
+					cb.OnApplied(1, entries, []sm.Result{{Value: 7}, {Value: 8}})
+				}()
+				<-done
+
+				// A was claimed and completed with its applied result before
+				// the collector ran.
+				select {
+				case res := <-rsA.ResultC():
+					if res.Err != nil || res.Value != 7 {
+						t.Fatalf("proposal A completed with %+v, want value 7", res)
+					}
+				default:
+					t.Fatal("proposal A was claimed but never completed")
+				}
+				if outstanding := rsA.outstanding.Load(); outstanding != 0 {
+					t.Fatalf("rsA.outstanding = %d, want exactly 0", outstanding)
+				}
+				// B is still pending on the ordinary path — the apply
+				// worker's recovery fails it — or, claimed on the membership
+				// path, was answered by that branch's recovery.
+				if _, pending := ns.pendingProposals.Load(keyB); pending {
+					return
+				}
+				select {
+				case res := <-rsB.ResultC():
+					if res.Err == nil {
+						t.Fatalf("proposal B completed with %+v; the branch exited before "+
+							"answering it, so its recovery must report an error", res)
+					}
+				default:
+					t.Fatal("proposal B was claimed but never completed")
+				}
+			})
+		}
+	}
+}
+
+// exitingLogHandler is a default slog handler that exits abnormally on every
+// record.
+type exitingLogHandler struct{ exit func() }
+
+func (h exitingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h exitingLogHandler) Handle(context.Context, slog.Record) error {
+	h.exit()
+	return nil
+}
+func (h exitingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h exitingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestShardHaltFailsPendingRequestsBeforeLogging: OnShardFailed logged the
+// halt before failing the shard's pending requests, so a default slog
+// handler that panicked or called runtime.Goexit stranded every one of them.
+// The requests are failed first; the diagnostic follows, contained.
+func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
+	for exitName, exit := range map[string]func(){
+		"panic":  func() { panic("slog handler panicked") },
+		"Goexit": runtime.Goexit,
+	} {
+		t.Run(exitName, func(t *testing.T) {
+			h := newTestHost(t)
+			ns := &nodeState{
+				shardID:      1,
+				replicaID:    1,
+				nodes:        map[uint64]string{1: "127.0.0.1:5000"},
+				pendingReads: make(map[uint64]*pendingRead),
+				requestPool:  NewRequestStatePool(),
+				openStopper:  make(chan struct{}),
+			}
+			ns.health.Store(uint32(ShardHealthy))
+			h.nodes.Store(uint64(1), ns)
+			h.activeNodes.Add(1)
+			key := nextRequestKey()
+			rs := newRequestState(ns.requestPool, key, time.Now().Add(time.Hour), true)
+			h.addPendingOp()
+			rs.acquireRef()
+			ns.pendingReadsMu.Lock()
+			ns.pendingReads[key] = &pendingRead{rs: rs}
+			ns.pendingReadsMu.Unlock()
+
+			prev := slog.Default()
+			slog.SetDefault(slog.New(exitingLogHandler{exit: exit}))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			cb := &hostEngineCallback{h: h}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() { _ = recover() }()
+				cb.OnShardFailed(1, errors.New("halted"))
+			}()
+			<-done
+			select {
+			case res := <-rs.ResultC():
+				if !errors.Is(res.Err, ErrShardFailed) {
+					t.Fatalf("pending read failed with %v, want ErrShardFailed", res.Err)
+				}
+			default:
+				t.Fatal("the pending read was stranded by the halt's log line")
+			}
+		})
+	}
+}
+
+// asPanicsError is a user error whose As method panics when asked for a
+// *MaybeAppliedError, standing in for a buggy state machine error type.
+type asPanicsError struct{}
+
+func (asPanicsError) Error() string { return "quicraft_test: As panics" }
+
+func (asPanicsError) As(target any) bool {
+	if _, ok := target.(**MaybeAppliedError); ok {
+		panic("quicraft_test: As panicked")
+	}
+	return false
+}
+
+// TestProposalFailedWithAPanickingErrorIsStillCompleted: classifying a
+// failure must not run user code once the proposal has been claimed. A user
+// error whose As panics would otherwise strand the claimed proposal: never
+// completed, its reference never released, and pendingOps never decremented,
+// so every later Drain waits out its full timeout.
+func TestProposalFailedWithAPanickingErrorIsStillCompleted(t *testing.T) {
+	h, _, _ := newLatchableHost(t)
+	rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+	defer rs.Release()
+
+	func() {
+		defer func() { _ = recover() }()
+		(&hostEngineCallback{h: h}).OnProposalFailed(1, []proto.Entry{{Key: rs.key}},
+			&engine.ApplyError{ShardID: 1, ReplicaID: 1, Err: asPanicsError{}})
+	}()
+
+	select {
+	case res := <-rs.ResultC():
+		var ae *ApplyError
+		if res.Err == nil || (!errors.As(res.Err, &ae) && res.Err.Error() == "") {
+			t.Fatalf("proposal completed with %v, want its ApplyError", res.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the claimed proposal was never completed: classifying its error panicked " +
+			"after the claim")
+	}
+	if got := rs.outstanding.Load(); got != 0 {
+		t.Fatalf("the proposal holds %d pending-map references, want 0", got)
+	}
+	if got := h.pendingOps.Load(); got != 0 {
+		t.Fatalf("pendingOps = %d after the proposal completed, want 0: Drain would wait it out", got)
+	}
+}
+
+// TestLeaderChangeLeavesUnhandedProposalsToTheStepWorker: a leadership change
+// fails only the proposals the step worker has already taken from the queue
+// (handed to raft, so maybe-applied). One registered after the leaderless
+// drain and before the new leader is known has not reached raft; the drain
+// leaves it pending, and the step worker resolves it — forwarded to the new
+// leader, or refused definitely through OnProposalRejected — so it never gets
+// a maybe-applied result it does not deserve.
+func TestLeaderChangeLeavesUnhandedProposalsToTheStepWorker(t *testing.T) {
+	h, _, _ := newLatchableHost(t)
+	cb := &hostEngineCallback{h: h}
+	ns := testLoadNode(h, 1)
+	term := ns.term.Load()
+
+	// The leader is lost: the leaderless drain runs.
+	cb.OnLeaderUpdated(1, 0, term)
+	// A proposal registers in the leaderless window.
+	rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+	defer rs.Release()
+	// The new leader is observed: the leader-change drain runs again.
+	cb.OnLeaderUpdated(1, 2, term+1)
+
+	select {
+	case res := <-rs.ResultC():
+		t.Fatalf("the leader-change drain completed a proposal raft never received, with %v", res.Err)
+	default:
+	}
+	if n := pendingProposalCount(ns); n != 1 {
+		t.Fatalf("%d proposals pending after the drain, want the unhanded one", n)
+	}
+
+	// The step worker refuses it (no leader it can forward to): definite.
+	cb.OnProposalRejected(1, []proto.Entry{{Key: rs.key}}, &raft.NotLeaderError{LeaderID: 0})
+	err := awaitProposalErr(t, rs)
+	if !errors.Is(err, ErrNotLeader) || MaybeApplied(err) {
+		t.Fatalf("refused proposal = %v, want a definite NotLeader refusal", err)
+	}
+}
+
+// TestLeaderChangeFailsHandedOffProposalsAsMaybeApplied: a proposal the step
+// worker has taken from the queue reached raft, so a leadership change fails
+// it maybe-applied.
+func TestLeaderChangeFailsHandedOffProposalsAsMaybeApplied(t *testing.T) {
+	h, machine, _ := newLatchableHost(t)
+	parkPoison(t, machine)
+	trip, cancelTrip := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTrip()
+	go func() { _, _ = h.SyncPropose(trip, 1, poisonCmd) }()
+	select {
+	case <-machine.poisonHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison apply never parked")
+	}
+
+	rs, err := h.Propose(trip, 1, []byte("handed-off"))
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	defer rs.Release()
+	ns := testLoadNode(h, 1)
+	v, ok := ns.pendingProposals.Load(rs.key)
+	if !ok {
+		t.Fatal("fixture: the proposal is not pending")
+	}
+	pp := v.(*pendingProposal)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if taken, _ := pp.node.ProposalTaken(&pp.enqueuedAt); taken {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fixture: the step worker never took the proposal from the queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	(&hostEngineCallback{h: h}).OnLeaderUpdated(1, 0, ns.term.Load())
+	err = awaitProposalErr(t, rs)
+	if !errors.Is(err, ErrNotLeader) || !MaybeApplied(err) {
+		t.Fatalf("handed-off proposal at a leadership change = %v, want NotLeader reporting MaybeApplied", err)
+	}
+}
+
+// TestHaltedProposalNeverQueuedIsDefinite: a proposal still outside the step
+// worker's reach when the shard halts — registered, but never taken from the
+// queue, which the halt closes — can never reach raft, so its failure is
+// definite. The halt fences the queue before it drains.
+func TestHaltedProposalNeverQueuedIsDefinite(t *testing.T) {
+	h, _, failed := newLatchableHost(t)
+	rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+	defer rs.Release()
+	h.engine.FailShard(h.engine.GetNode(1), errors.New("halted"))
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnShardFailed never fired")
+	}
+	err := awaitProposalErr(t, rs)
+	if !errors.Is(err, ErrShardFailed) || MaybeApplied(err) {
+		t.Fatalf("never-queued proposal on a halted shard = %v, want a definite ErrShardFailed", err)
+	}
+}
+
+// TestStoppedProposalNeverQueuedIsDefinite: the same for teardown — StopShard
+// stops the node, which closes its proposal queue before pending requests are
+// failed, so a proposal that was never taken from it gets a definite result.
+func TestStoppedProposalNeverQueuedIsDefinite(t *testing.T) {
+	h, _, _ := newLatchableHost(t)
+	rs := registerTestProposal(t, h, time.Now().Add(time.Minute))
+	defer rs.Release()
+	if err := h.StopShard(1); err != nil {
+		t.Fatalf("StopShard: %v", err)
+	}
+	err := awaitProposalErr(t, rs)
+	if !errors.Is(err, ErrAborted) || MaybeApplied(err) {
+		t.Fatalf("never-queued proposal on a stopped shard = %v, want a definite ErrAborted", err)
 	}
 }

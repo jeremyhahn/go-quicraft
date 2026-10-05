@@ -48,6 +48,15 @@ GOLANGCI_BIN   = $(shell if [ -x '$(TOOLS_BIN)/golangci-lint' ]; then \
 # The module's `go` directive, derived from go.mod (hence `override`). The
 # analyser's build toolchain is checked against it.
 override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod)
+# Every Go module in the tree: each directory holding a go.mod, skipping what
+# the go command ignores (names starting with `.` or `_`, and testdata).
+# `git ls-files` is not used because remote-% ships the tree without .git.
+# The same discovery as the CI jobs that loop over modules. Recursive (`=`) so
+# only the targets that use it pay for the walk.
+MODULE_DIRS    = $(shell find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune \
+			-o -name go.mod -printf '%h\n' | sort)
+# The platforms the cross-arch CI job builds and vets every module for.
+CROSS_PLATFORMS := linux/arm64 linux/386 windows/amd64 darwin/arm64 freebsd/amd64
 GOSEC         := gosec
 GOVULNCHECK   := govulncheck
 
@@ -75,7 +84,14 @@ COVER_MIN     := 91
 
 # Docker
 DOCKER_IMAGE  := go-quicraft-dev
-DOCKER_TAG    := latest
+DOCKER_INT_IMAGE := go-quicraft-integration
+# The docker-* images are tagged per checkout (host and directory), so two
+# checkouts sharing a daemon -- including a remote one reached through
+# DOCKER_HOST -- never build over each other's images. Derived, hence override.
+override DOCKER_TAG := checkout-$(shell printf '%s:%s' "$$(uname -n)" "$$(pwd)" | cksum | cut -d' ' -f1)
+# The one file that holds module credentials for the project forge (format:
+# .devcontainer/.env.example). Gitignored and excluded from every build context.
+MODULE_ENV_FILE := $(CURDIR)/$(DOCKER_DIR)/.env
 COMPOSE_FILE  := $(DOCKER_DIR)/docker-compose.yml
 INT_COMPOSE   := $(DOCKER_DIR)/docker-compose.integration.yml
 
@@ -618,8 +634,8 @@ PERF_FLAGS = --benchtime=$(BENCHTIME) --timeout=$(PERF_TIMEOUT) $(PERF_EXTRA)
 # perfcompare passes them as a BuildKit secret and run-remote.sh sends them over
 # stdin, so the token never appears on a command line or in an image. Without
 # them, modules resolve from the public proxy only.
-MODULE_AUTH_ENV = if [ -z "$${GIT_CONFIG_KEY_0:-}" ] && [ -f $(CURDIR)/.devcontainer/.env ]; then \
-	set -a; . $(CURDIR)/.devcontainer/.env; set +a; fi;
+MODULE_AUTH_ENV = if [ -z "$${GIT_CONFIG_KEY_0:-}" ] && [ -f $(MODULE_ENV_FILE) ]; then \
+	set -a; . $(MODULE_ENV_FILE); set +a; fi;
 # Internal: every local perfcompare invocation, credentials staged.
 PERFCOMPARE = cd $(PERF_DIR) && $(MODULE_AUTH_ENV) ./perfcompare
 
@@ -1000,9 +1016,9 @@ check-lint-toolchain:
 # ============================================================================
 
 .PHONY: ci-full
-ci-full: ci ci-modules ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci-netfault \
+ci-full: ci ci-modules ci-cross ci-errfs ci-fuzz-seeds ci-fuzz-mutation ci-integration ci-netfault \
         build-fips verify-fips verify-fips-exempt
-	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + fuzz mutation + all modules + FIPS)"
+	@echo "Full CI pipeline passed (untagged + integration + netfault + errfs + fuzz seeds + fuzz mutation + all modules on every platform + FIPS)"
 
 # ============================================================================
 # Heavyweight test offload to a remote build host
@@ -1096,10 +1112,9 @@ remote-tools:
 #
 # contrib/dragonboat and the harnesses under test/performance/ are separate
 # modules that require or replace the root, so a root change can break them.
-# Every go.mod is discovered from the tree, skipping what the go command ignores
-# (names starting with `.` or `_`, and testdata). `git ls-files` is not used
-# because remote-% ships the tree without .git. Mirrors the `modules` job in
-# .github/workflows/ci.yml.
+# Every go.mod is discovered from the tree (MODULE_DIRS). ci-modules mirrors the
+# `modules` job in .github/workflows/ci.yml; ci-cross mirrors the `cross-arch`
+# job, building and vetting every module for each of CROSS_PLATFORMS.
 #
 # GOWORK=off (exported below) matters: in a workspace the modules would resolve
 # the root through it rather than their own require/replace directives.
@@ -1110,8 +1125,7 @@ remote-tools:
 .PHONY: ci-modules
 ci-modules:
 	@rc=0; \
-	for dir in $$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune \
-			-o -name go.mod -printf '%h\n' | sort); do \
+	for dir in $(MODULE_DIRS); do \
 		echo "==> $$dir"; \
 		if ! ( cd "$$dir" && $(GO) build ./... && $(GOVET) ./... ); then \
 			echo "    FAIL: $$dir"; rc=1; \
@@ -1124,15 +1138,46 @@ ci-modules:
 	fi; \
 	exit $$rc
 
+.PHONY: ci-cross
+ci-cross:
+	@rc=0; \
+	for platform in $(CROSS_PLATFORMS); do \
+		goos=$${platform%/*}; goarch=$${platform#*/}; \
+		for dir in $(MODULE_DIRS); do \
+			echo "==> $$platform $$dir"; \
+			if ! ( cd "$$dir" && GOOS=$$goos GOARCH=$$goarch $(GO) build ./... \
+					&& GOOS=$$goos GOARCH=$$goarch $(GOVET) ./... ); then \
+				echo "    FAIL: $$platform $$dir"; rc=1; \
+			fi; \
+		done; \
+	done; \
+	if [ $$rc -ne 0 ]; then \
+		echo "ci-cross: one or more modules failed to build or vet for another platform"; \
+	else \
+		echo "All modules build and vet clean for: $(CROSS_PLATFORMS)"; \
+	fi; \
+	exit $$rc
+
 # ============================================================================
 # Linting and static analysis
 # ============================================================================
 
-# Runs the analyser resolved by GOLANGCI_BIN, after check-lint-toolchain has
-# confirmed it can analyse this module.
+# Runs the analyser resolved by GOLANGCI_BIN in every module (MODULE_DIRS),
+# after check-lint-toolchain has confirmed it can analyse this module. Nested
+# modules share the root's .golangci.yml, and -tags=benchmark brings in the
+# harness entry points under test/performance (the tag selects nothing in the
+# root), without which their helpers read as unused. Every module is attempted
+# even after a failure. Mirrors the golangci-lint step in
+# .github/workflows/ci.yml.
 .PHONY: lint
 lint: check-lint-toolchain
-	$(GOLANGCI_BIN) run --timeout=5m ./...
+	@rc=0; \
+	for dir in $(MODULE_DIRS); do \
+		echo "==> $$dir"; \
+		( cd "$$dir" && '$(GOLANGCI_BIN)' run --timeout=5m --config '$(CURDIR)/.golangci.yml' \
+			--build-tags benchmark ./... ) || rc=1; \
+	done; \
+	exit $$rc
 
 .PHONY: vet
 vet:
@@ -1297,13 +1342,52 @@ install-lint:
 # Docker
 # ============================================================================
 
+# Every docker target works against a remote daemon through the standard
+# DOCKER_HOST variable (e.g. DOCKER_HOST=ssh://user@bench-host.example): the
+# images COPY the source, nothing is bind-mounted, and the credential file is
+# read by the local docker CLI.
+#
+# Internal: MODULE_ENV_FILE, when present, as the gomodauth BuildKit secret the
+# Dockerfiles source for `go mod download` (never a layer or a command line).
+# Absent, modules resolve from the public proxy and a forge-only module fails
+# the build.
+comma := ,
+DOCKER_SECRET_ARGS = $(if $(wildcard $(MODULE_ENV_FILE)),--secret id=gomodauth$(comma)src=$(MODULE_ENV_FILE))
+# Internal: the same file as the container's run-time environment.
+DOCKER_ENV_ARGS = $(if $(wildcard $(MODULE_ENV_FILE)),--env-file $(MODULE_ENV_FILE))
+# Internal: the secret mount needs BuildKit; the legacy builder rejects it.
+REQUIRE_BUILDX = @docker buildx version >/dev/null 2>&1 || { \
+	echo "docker buildx is required: the devcontainer Dockerfiles mount module"; \
+	echo "credentials as a BuildKit secret. Install the docker-buildx plugin."; \
+	exit 1; }
+
+# The make target docker-make runs inside the dev image.
+DOCKER_MAKE_TARGET ?= ci
+
 .PHONY: docker-build
 docker-build:
-	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile.dev .
+	$(REQUIRE_BUILDX)
+	docker buildx build --load $(DOCKER_SECRET_ARGS) -t $(DOCKER_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile.dev .
 
 .PHONY: docker-build-integration
 docker-build-integration:
-	docker build -t go-quicraft-integration:$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile .
+	$(REQUIRE_BUILDX)
+	docker buildx build --load $(DOCKER_SECRET_ARGS) -t $(DOCKER_INT_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile .
+
+# Runs `make $(DOCKER_MAKE_TARGET)` in a freshly built dev image:
+#   make docker-make DOCKER_MAKE_TARGET=test
+#   DOCKER_HOST=ssh://user@bench-host.example make docker-make
+.PHONY: docker-make
+docker-make: docker-build
+	docker run --rm --network host --cap-add NET_ADMIN $(DOCKER_ENV_ARGS) $(DOCKER_IMAGE):$(DOCKER_TAG) make $(DOCKER_MAKE_TARGET)
+
+# Removes the images docker-build and docker-build-integration made for this
+# checkout.
+.PHONY: docker-clean
+docker-clean:
+	@for image in $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_INT_IMAGE):$(DOCKER_TAG); do \
+		if docker image inspect "$$image" >/dev/null 2>&1; then docker image rm "$$image"; fi; \
+	done
 
 .PHONY: docker-run
 docker-run:
@@ -1412,6 +1496,7 @@ help:
 	@echo "  ci-errfs               ErrorFS fault injection (-tags=quicraft_errfs)"
 	@echo "  ci-fuzz-seeds          Every fuzz target vs its seeds + committed corpus"
 	@echo "  ci-modules             Build and vet every go.mod in the tree"
+	@echo "  ci-cross               Build and vet every module for each of CROSS_PLATFORMS"
 	@echo ""
 	@echo "FIPS:"
 	@echo "  build-fips             Compile check: GOFIPS140=v1.0.0, untagged and -tags fips"
@@ -1422,7 +1507,7 @@ help:
 	@echo "                         (OCSP CertID SHA-1; the exemption is documented)"
 	@echo ""
 	@echo "Linting:"
-	@echo "  lint                   Run golangci-lint (the one from install-lint, not PATH)"
+	@echo "  lint                   Run golangci-lint in every module (install-lint's build, not PATH)"
 	@echo "  check-tool-versions    Assert every golangci-lint pin matches GOLANGCI_VERSION"
 	@echo "  check-lint-toolchain   Assert the installed analyser can analyse this module"
 	@echo "  vet                    Run go vet"
@@ -1448,8 +1533,11 @@ help:
 	@echo "  install-trivy          Install Trivy"
 	@echo ""
 	@echo "Docker:"
-	@echo "  docker-build                   Build devcontainer image"
+	@echo "  docker-build                   Build devcontainer image (this checkout's tag)"
 	@echo "  docker-build-integration       Build integration test image"
+	@echo "  docker-make                    Run make DOCKER_MAKE_TARGET (default ci) in a fresh"
+	@echo "                                 dev image; honours DOCKER_HOST for a remote daemon"
+	@echo "  docker-clean                   Remove this checkout's docker-build images"
 	@echo "  docker-run                     Run devcontainer shell"
 	@echo "  docker-test                    Run unit tests in devcontainer"
 	@echo "  docker-integration-down        Stop and clean integration containers"
@@ -1462,22 +1550,40 @@ export GOWORK=off
 #
 # `make release-alpha VERSION=vX.Y.Z-alpha` or `make release VERSION=vX.Y.Z`.
 # The version is explicit; the recipe never guesses. Every git write goes
-# through AGENT_GIT for identity and SSH signing, the tag is annotated, only the
-# release commit and its tags are pushed (atomically), and any failing step
-# aborts before anything is pushed.
+# through RELEASE_GIT, the tag is annotated, only the release commit and its
+# tags are pushed (atomically, by object ID), any failing step aborts before
+# anything is pushed, and the push is read back from the remote before the
+# release is reported.
 # ---------------------------------------------------------------------------
 
-# AGENT_GIT is the signing git wrapper and stays settable because its path
-# varies by host. It is not trusted: before pushing, the recipe checks that the
-# release commit is authored by agent-<repo> and that the commit and tag
-# signatures verify against RELEASE_SIGNERS. REPO_NAME is `override` and
-# literal, never derived from the checkout directory.
-AGENT_GIT      ?= /usr/local/bin/agent-git.sh
-override REPO_NAME := go-quicraft
+# RELEASE_GIT is the git command every write runs through. The default is plain
+# git, which signs per the releaser's own configuration (gpg.format=ssh,
+# user.signingkey, commit.gpgsign, tag.gpgsign). A signing wrapper is named with
+# any leading arguments it takes, e.g. RELEASE_GIT='/path/to/wrapper project';
+# the value is split on whitespace into a command and its arguments.
+#
+# Trust model. RELEASE_GIT is trusted to authenticate and nothing else; in the
+# company flow it is the wrapper that carries the push credentials, so the push
+# has to run through it. Every read is plain git. After the writes, plain git
+# resolves the release commit and both tag objects to object IDs, checks that
+# the commit is exactly the VERSION bump on top of the main it started from and
+# that each tag object targets it under its own name, and verifies all three
+# signatures against RELEASE_ALLOWED_SIGNERS. The push names those object IDs,
+# never a ref a helper could move. A helper can still ignore what it is asked
+# to push, so afterwards plain git reads the remote back, at the URL resolved
+# before RELEASE_GIT first ran, and the release fails unless the branch and both
+# tags name exactly the verified objects. The read-back uses the releaser's own
+# transport, which the duplicate-tag check already requires. A helper that
+# rewrites the releaser's git configuration or binaries is outside what any
+# recipe can check.
+RELEASE_GIT ?= git
 
-# The in-repo trust anchor for signature verification. `override` so it cannot
-# come from anything the wrapper being checked controls.
-override RELEASE_SIGNERS := $(CURDIR)/.release-allowed-signers
+# RELEASE_ALLOWED_SIGNERS is the trust anchor, a git allowed-signers file
+# (gpg.ssh.allowedSignersFile format), relative to the checkout root. The
+# release commit's author e-mail must be a principal in it, and the commit and
+# both tags must carry SSH signatures that verify against a key it lists for
+# that principal. A missing file fails the release before anything is written.
+RELEASE_ALLOWED_SIGNERS ?= .release-allowed-signers
 
 # The git remote the release commit and tags are pushed to. Its existence is
 # checked before anything is written.
@@ -1497,12 +1603,21 @@ RELEASE_REMOTE ?= dev
 # release-body is shared by release-alpha (vX.Y.Z-alpha) and release (vX.Y.Z);
 # they differ only in REL_PATTERN / REL_FORM, so every guard applies to both.
 # release.yml publishes a tag with no alpha/beta/rc suffix as a full release.
+#
+# The write, verify, push and read-back steps run as one shell, so the object
+# IDs resolved after the writes are the ones verified, pushed and compared.
+#
+# Verification runs with an allowed-signers file holding only the lines that
+# name the commit's author, so a key the anchor lists for someone else does not
+# verify. The gpg.*program settings disable OpenPGP and X.509 verification: only
+# an SSH signature checked against the anchor can pass, never a key that merely
+# happens to be trusted in a local keyring.
 define release-body
 @test -n "$$REL_VERSION" || { echo "ERROR: state the version explicitly: make $$REL_TARGET VERSION=$$REL_FORM (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)"; exit 1; }
 @printf '%s' "$$REL_VERSION" | grep -Eq "$$REL_PATTERN" || { echo "ERROR: VERSION is not of the form $$REL_FORM (no leading zeroes): $$REL_VERSION"; exit 1; }
 @test "$$(git rev-parse --abbrev-ref HEAD)" = main || { echo "ERROR: releases are cut from main; you are on $$(git rev-parse --abbrev-ref HEAD). 'push $$REL_REMOTE HEAD' would publish this branch."; exit 1; }
-@test -n "$$REL_REPO" || { echo 'ERROR: REPO_NAME is empty -- set it to the literal repo name in the Makefile, never $$(notdir $$(CURDIR))'; exit 1; }
-@test -x "$$REL_AGENT_GIT" || { echo 'ERROR: AGENT_GIT does not point at an executable agent-git.sh -- every git write in this recipe signs through it, and a bad path must fail before VERSION is written'; exit 1; }
+@set -- $$REL_GIT; test $$# -gt 0 && command -v "$$1" >/dev/null 2>&1 || { echo 'ERROR: RELEASE_GIT does not name an executable command -- every git write in this recipe runs through it, and a bad command must fail before VERSION is written'; exit 1; }
+@test -f "$$REL_SIGNERS" && test -r "$$REL_SIGNERS" || { echo "ERROR: the allowed-signers file $$REL_SIGNERS is missing or unreadable. It is the trust anchor the release is verified against; set RELEASE_ALLOWED_SIGNERS to a git allowed-signers file listing your signing key. Nothing has been written."; exit 1; }
 @test -n "$$REL_REMOTE" || { echo 'ERROR: RELEASE_REMOTE is empty -- set it to the remote the release tag is pushed to'; exit 1; }
 @git remote get-url "$$REL_REMOTE" >/dev/null 2>&1 || { echo "ERROR: no git remote named $$REL_REMOTE. Set RELEASE_REMOTE to the remote the release tag is pushed to; the duplicate-tag check below cannot answer against a remote that does not resolve"; exit 1; }
 @! git rev-parse -q --verify "refs/tags/$$REL_VERSION" >/dev/null || { echo "ERROR: tag $$REL_VERSION already exists locally"; exit 1; }
@@ -1514,41 +1629,67 @@ case "$$rc" in \
 esac
 @test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
 @ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
-@printf '%s\n' "$${REL_VERSION#v}" > VERSION
-"$$REL_AGENT_GIT" "$$REL_REPO" add VERSION
-"$$REL_AGENT_GIT" "$$REL_REPO" commit -m "chore(release): $$REL_VERSION"
-"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "$$REL_VERSION" -m "$$REL_VERSION"
-"$$REL_AGENT_GIT" "$$REL_REPO" tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)"
-@want="agent-$$REL_REPO"; got="$$(git log -1 --format='%an')"; \
-test "$$got" = "$$want" || { echo "ERROR: the release commit is authored by '$$got', not '$$want'. AGENT_GIT did not write as this repo's agent; nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; exit 1; }
-@test "$$(git cat-file -t "$$REL_VERSION")" = tag || { echo "ERROR: $$REL_VERSION is a lightweight tag; releases are annotated and signed. Nothing has been pushed."; exit 1; }
-@test -f "$(RELEASE_SIGNERS)" || { echo 'ERROR: $(RELEASE_SIGNERS) is missing. It is the trust anchor for release signature verification; without it a signature can only be observed, not TRUSTED. Nothing has been pushed.'; exit 1; }
-@rc=0; \
-git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-commit HEAD >/dev/null 2>&1 || { echo "ERROR: the release commit's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
-git -c gpg.ssh.allowedSignersFile="$(RELEASE_SIGNERS)" verify-tag "$$REL_VERSION" >/dev/null 2>&1 || { echo "ERROR: tag $$REL_VERSION's signature does not verify against the key pinned in $(RELEASE_SIGNERS). Nothing has been pushed. Reset with: git reset --hard HEAD~1 && git tag -d $$REL_VERSION"; rc=1; }; \
-exit $$rc
-"$$REL_AGENT_GIT" "$$REL_REPO" push --atomic "$$REL_REMOTE" HEAD "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION"
-@echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically)"
+@url="$$(git remote get-url "$$REL_REMOTE")" && base="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" || { echo "ERROR: could not resolve $$REL_REMOTE's URL or main before writing anything"; exit 1; }; \
+relgit() { printf '%s\n' "$$REL_GIT $$*"; $$REL_GIT "$$@"; }; \
+printf '%s\n' "$${REL_VERSION#v}" > VERSION || exit 1; \
+relgit add VERSION || exit 1; \
+relgit commit -m "chore(release): $$REL_VERSION" || exit 1; \
+relgit tag -a "$$REL_VERSION" -m "$$REL_VERSION" || exit 1; \
+relgit tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)" || exit 1; \
+reset="git reset --hard $$base && git tag -d $$REL_VERSION test/performance/$$REL_VERSION"; \
+commit="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" && \
+tag="$$(git rev-parse --verify -q "refs/tags/$$REL_VERSION")" && \
+ptag="$$(git rev-parse --verify -q "refs/tags/test/performance/$$REL_VERSION")" || { echo "ERROR: the release commit or one of its tags does not resolve. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+for t in "$$tag" "$$ptag"; do \
+  test "$$(git cat-file -t "$$t")" = tag || { echo "ERROR: $$t is not a tag object -- a lightweight tag; releases are annotated and signed. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+done; \
+test "$$(git rev-list --parents -n 1 "$$commit")" = "$$commit $$base" || { echo "ERROR: the release commit $$commit is not a single commit on top of main $$base. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+test "$$(git diff-tree -r --no-commit-id --name-only "$$base" "$$commit")" = VERSION && test "$$(git cat-file blob "$$commit:VERSION")" = "$${REL_VERSION#v}" || { echo "ERROR: the release commit $$commit changes more than VERSION, or VERSION does not read $${REL_VERSION#v}. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION"; do \
+  set -- $$pair; \
+  git cat-file tag "$$1" | awk -v o="object $$commit" -v n="tag $$2" 'NR == 1 { a = ($$0 == o) } NR == 2 { b = ($$0 == "type commit") } NR == 3 { c = ($$0 == n) } END { exit !(a && b && c) }' || { echo "ERROR: tag object $$1 does not point at the release commit $$commit under the name $$2. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+done; \
+author="$$(git log -1 --format='%ae' "$$commit")"; \
+pinned="$$(mktemp)" || exit 1; trap 'rm -f "$$pinned"' EXIT; \
+awk -v who="$$author" '/^[[:space:]]*(#|$$)/ { next } { n = split($$1, p, ","); for (i = 1; i <= n; i++) if (p[i] == who) { print; next } }' "$$REL_SIGNERS" > "$$pinned" || exit 1; \
+test -s "$$pinned" || { echo "ERROR: the release commit's author <$$author> is not a principal in $$REL_SIGNERS. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+verify() { git -c gpg.program=false -c gpg.openpgp.program=false -c gpg.x509.program=false -c gpg.ssh.allowedSignersFile="$$pinned" "$$@" >/dev/null 2>&1; }; \
+rc=0; \
+verify verify-commit "$$commit" || { echo "ERROR: the release commit's signature does not verify against a key $$REL_SIGNERS lists for <$$author>. Nothing has been pushed. Reset with: $$reset"; rc=1; }; \
+for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION"; do \
+  set -- $$pair; \
+  verify verify-tag "$$1" || { echo "ERROR: tag $$2's signature does not verify against a key $$REL_SIGNERS lists for <$$author>. Nothing has been pushed. Reset with: $$reset"; rc=1; }; \
+done; \
+test $$rc -eq 0 || exit 1; \
+relgit push --atomic "$$REL_REMOTE" "$$commit:refs/heads/main" "$$tag:refs/tags/$$REL_VERSION" "$$ptag:refs/tags/test/performance/$$REL_VERSION" || { echo "ERROR: the push through RELEASE_GIT failed. An atomic push publishes nothing on failure, but RELEASE_GIT is not trusted to have been atomic: inspect $$url before running the release again."; exit 1; }; \
+published="$$(git ls-remote "$$url" refs/heads/main "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION")" || { echo "ERROR: RELEASE_GIT reported a successful push, but $$url could not be read back, so it does not hold the verified release as far as this recipe can tell. Inspect it before announcing anything."; exit 1; }; \
+for pair in "refs/heads/main $$commit" "refs/tags/$$REL_VERSION $$tag" "refs/tags/test/performance/$$REL_VERSION $$ptag"; do \
+  set -- $$pair; \
+  got="$$(printf '%s\n' "$$published" | awk -v r="$$1" '$$2 == r { print $$1 }')"; \
+  test "$$got" = "$$2" || { echo "ERROR: $$url has $$1 at $${got:-nothing}; the verified release has it at $$2."; rc=1; }; \
+done; \
+test $$rc -eq 0 || { echo "ERROR: RELEASE_GIT reported a successful push, but $$url does not hold the verified release. Do not announce it; inspect the remote."; exit 1; }; \
+echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically and read back from $$url)"
 endef
 
-release-alpha: export override REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
-release-alpha: export override REL_REMOTE    := $(value RELEASE_REMOTE)
-release-alpha: export override REL_REPO      := $(value REPO_NAME)
-release-alpha: export override REL_AGENT_GIT := $(value AGENT_GIT)
-release-alpha: export override REL_TARGET    := release-alpha
-release-alpha: export override REL_FORM      := vX.Y.Z-alpha
-release-alpha: export override REL_PATTERN   := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$
+release-alpha: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release-alpha: export override REL_REMOTE  := $(value RELEASE_REMOTE)
+release-alpha: export override REL_GIT     := $(value RELEASE_GIT)
+release-alpha: export override REL_SIGNERS := $(value RELEASE_ALLOWED_SIGNERS)
+release-alpha: export override REL_TARGET  := release-alpha
+release-alpha: export override REL_FORM    := vX.Y.Z-alpha
+release-alpha: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$$
 release-alpha:
 	$(release-body)
 
 # release cuts a stable version (no -alpha suffix).
-release: export override REL_VERSION   := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
-release: export override REL_REMOTE    := $(value RELEASE_REMOTE)
-release: export override REL_REPO      := $(value REPO_NAME)
-release: export override REL_AGENT_GIT := $(value AGENT_GIT)
-release: export override REL_TARGET    := release
-release: export override REL_FORM      := vX.Y.Z
-release: export override REL_PATTERN   := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
+release: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release: export override REL_REMOTE  := $(value RELEASE_REMOTE)
+release: export override REL_GIT     := $(value RELEASE_GIT)
+release: export override REL_SIGNERS := $(value RELEASE_ALLOWED_SIGNERS)
+release: export override REL_TARGET  := release
+release: export override REL_FORM    := vX.Y.Z
+release: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
 release:
 	$(release-body)
 

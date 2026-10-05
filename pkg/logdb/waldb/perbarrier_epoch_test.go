@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
 // TestMinLiveEpochForBarrier_IdentityMatch verifies that a single-barrier
@@ -124,3 +125,35 @@ func TestMinLiveEpochForBarrier_ClosedDB(t *testing.T) {
 // Compile-time assertion that the concrete DB satisfies the per-barrier
 // interface used by the snapshot pool.
 var _ logdb.PerBarrierEpochAwareLogDB = (*DB)(nil)
+
+// valueWALBarrier is a valid WAL barrier whose dynamic value is NOT comparable
+// (a struct holding a slice). Its methods are promoted from the embedded
+// *seal.Barrier, so every copy encrypts under the same keyring. Comparing two
+// of them with == panics at run time.
+type valueWALBarrier struct {
+	*seal.Barrier
+	labels []string
+}
+
+// TestMinLiveEpochForBarrier_NonComparableBarrier verifies the per-barrier
+// query never compares barrier handles with ==. A handle without pointer
+// identity cannot be proven to be this DB's barrier, so the answer is
+// known=false (fail safe), even for a copy of the barrier the DB was opened
+// with, and the call does not panic.
+func TestMinLiveEpochForBarrier_NonComparableBarrier(t *testing.T) {
+	own := valueWALBarrier{Barrier: newTestBarrier(t), labels: []string{"tenant"}}
+	db := openEncryptedTestDB(t, own)
+	if err := db.SaveEntries(1, 1, makeEntries(1, 3, 1)); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	for name, handle := range map[string]any{"same copy": own, "underlying pointer": own.Barrier} {
+		got, known, err := db.MinLiveEpochForBarrier(handle)
+		if err != nil {
+			t.Fatalf("MinLiveEpochForBarrier(%s): %v", name, err)
+		}
+		if known || got != 0 {
+			t.Fatalf("MinLiveEpochForBarrier(%s) = (%d, %v), want (0, false)", name, got, known)
+		}
+	}
+}

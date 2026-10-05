@@ -83,8 +83,18 @@ var ScenarioLabels = map[string]string{
 	ScenarioKVQUICDeleteSEQ: "QUIC DELETE Sequential (1N)", ScenarioKVQUICDeleteConc8: "QUIC DELETE Concurrent/8 (1N)",
 }
 
-// PrintTerminal writes a formatted comparison report to the writer.
-func (cr *ComparisonReport) PrintTerminal(w io.Writer) {
+// PrintTerminal writes a formatted comparison report to w. The report is
+// rendered in memory and written in one call, so the only error is that
+// write's.
+func (cr *ComparisonReport) PrintTerminal(w io.Writer) error {
+	var b strings.Builder
+	cr.renderTerminal(&b)
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// renderTerminal renders the report PrintTerminal writes.
+func (cr *ComparisonReport) renderTerminal(w *strings.Builder) {
 	if len(cr.Scenarios) == 0 {
 		fmt.Fprintln(w, "No benchmark results to report.")
 		return

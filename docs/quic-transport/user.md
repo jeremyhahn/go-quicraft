@@ -117,7 +117,7 @@ The defaults suit an ordinary cluster. The ones worth revisiting:
 ```go
 cfg.TransportConfig.UDPRecvBufSize = 7 << 20 // 0 uses the OS default, usually far smaller
 cfg.TransportConfig.UDPSendBufSize = 7 << 20
-cfg.TransportConfig.MaxMessageReceiveMemory = 256 << 20
+cfg.TransportConfig.MessageReceiveBudgetFrames = 4 // or set MaxMessageReceiveMemory outright
 cfg.TransportConfig.MaxSnapshotReceiveRate = 256 << 20
 ```
 
@@ -125,11 +125,17 @@ Two things people get wrong:
 
 - **`MaxMessageReceiveMemory` is a heap budget, and each frame is charged
   eight times its wire size.** That factor is the measured ceiling on how much
-  larger a decoded frame is than its bytes. So the default 256 MB admits at
-  most 32 MB of frames in flight; raise it if many peers send large batches at
-  once. It also sets each connection's QUIC receive window (budget divided by
-  `MaxIncomingConnections`, between 8 MB and 32 MB). On long fat links,
-  10 GbE beyond about 7 ms RTT, raise it or lower `MaxIncomingConnections`.
+  larger a decoded frame is than its bytes, so one maximum-size 16 MB frame is
+  charged 128 MB. The default is derived in that unit:
+  `MessageReceiveBudgetFrames` (4) maximum-size frames, 512 MB, which admits at
+  most 64 MB of frames in flight. Raise the frame count, or set the budget
+  outright, if many peers send large batches at once; a budget below 128 MB is
+  rejected at startup, because it could never admit a maximum-size frame. One
+  peer may hold at most a quarter of the budget, never less than one
+  maximum-size frame. The budget also sets each connection's QUIC receive
+  window (budget divided by `MaxIncomingConnections`, between 8 MB and 32 MB).
+  On long fat links, 10 GbE beyond about 7 ms RTT, raise it or lower
+  `MaxIncomingConnections`.
 - **Raising `UDPRecvBufSize` above the kernel maximum silently clamps.** On
   Linux, check `net.core.rmem_max` and `net.core.wmem_max`; a refused
   `setsockopt` is logged at WARN and the OS default is used.

@@ -153,7 +153,9 @@ travels with the send down to the point it takes a connection:
   the connection is closed (compare-and-remove) and the send dials whoever is
   bound now.
 - A refusal is remembered per (address, identity) for `dialRefusalCooldown`, so
-  it costs no handshake, and no registry scan, per send.
+  it costs no handshake, and no registry scan, per send. Expired refusals are
+  swept on the connection-cleanup tick and `CloseTarget` drops an address's
+  refusals, so the set holds only recent refusals, not every pair ever refused.
 
 The peer identity of each pooled connection is recorded at dial (`connPeer`,
 under `connMu` with `conns`), so the pin costs no TLS-state copy or hash per
@@ -335,7 +337,7 @@ deadline wider than this could never be reached.
 floored at the 8 MB per-stream window and capped at 32 MB. quic-go buffers bytes
 before the application reads them, so a window fixed independently of the
 application budget multiplies by `MaxIncomingConnections` into memory that
-budget does not cover: 32 MB × 256 connections is 8 GB against a 256 MB budget.
+budget does not cover: 32 MB × 256 connections is 8 GB against a 512 MB budget.
 The floor means the QUIC-level footprint is not strictly inside the budget for
 small budgets; it is bounded and documented rather than silently unbounded.
 
@@ -345,13 +347,20 @@ RTT but caps a 10 Gbps path beyond about 6.7 ms RTT. Cross-region deployments on
 10 GbE or faster should raise `MaxMessageReceiveMemory` (or lower
 `MaxIncomingConnections`) to widen the window.
 
-**UDP buffer tuning.** `Start` sets `SO_REUSEADDR`, `SO_RCVBUF`
-(`UDPRecvBufSize`, default 7 MB) and `SO_SNDBUF` (`UDPSendBufSize`, default
-7 MB) on the listening socket through a `net.ListenConfig` control function. A
-`setsockopt` failure is logged at WARN naming `net.core.rmem_max` /
-`net.core.wmem_max` rather than failing startup, so a host with tight sysctls
-runs with the OS default instead of refusing to boot. Setting either to 0 skips
-the call.
+**UDP buffer tuning.** `Start` sets `SO_RCVBUF` (`UDPRecvBufSize`, default
+7 MB) and `SO_SNDBUF` (`UDPSendBufSize`, default 7 MB) on the listening socket
+through a `net.ListenConfig` control function (`setListenerSockopts`, in
+`sockopt_unix.go` and `sockopt_windows.go`). It sets no `SO_REUSEADDR` on any
+platform, so the listener holds its address exclusively and a second bind of
+it, by another transport or any other socket, fails with `EADDRINUSE`. `Stop`
+closes the socket (quic-go never closes a socket it was handed), and UDP has
+no `TIME_WAIT`, so a restart binds the same address as soon as `Stop` returns
+without any reuse option. On Linux the option would let two sockets that both
+set it share the address and silently split its datagrams; on Windows it
+would let a socket bind over the live listener. A `setsockopt` failure is logged at WARN (on Unix, naming
+`net.core.rmem_max` / `net.core.wmem_max`) rather than failing startup, so a
+host with tight sysctls runs with the OS default instead of refusing to boot.
+Setting either buffer to 0 skips that call.
 
 ## Send path
 
@@ -596,8 +605,9 @@ handleStream(...)
     |   |-- handleMessageFrame(conn, stream, length, flags)
     v
 handleMessageFrame(...)
-    |-- reserveMsgRecvBudget(decodeCharge(length))  // aggregate, length x MaxDecodeMemoryFactor
-    |-- reserveConnMsgRecvBudget(conn, length)  // per-peer sub-budget, wire bytes
+    |-- charge = proto.DecodeCharge(length)  // length x MaxDecodeMemoryFactor
+    |-- reserveConnMsgRecvBudget(conn, charge)  // per-peer sub-budget, first
+    |-- reserveMsgRecvBudget(charge)         // aggregate; on refusal hand the per-peer charge back, then drain
     |-- buf = getRecvBuf(length)             // sync.Pool
     |-- io.ReadFull(stream, payload)
     |-- if FlagCompressed: bound declared size, charge the delta, Snappy decode
@@ -664,10 +674,28 @@ in-process multi-node deployments.
 **Accept-loop resilience:** Each accept iteration runs inside a deferred panic
 recovery boundary (`acceptLoopIteration`). A recovered panic is logged with a
 full stack trace and, before re-entering, the loop applies a
-`workerPanicRestartDelay` (100 ms) backoff so a persistent panic trigger cannot
+`supervise.RestartDelay` (100 ms) backoff so a persistent panic trigger cannot
 spin the CPU or flood logs. A normal (non-panicking) iteration re-enters
 immediately, so accept latency is unaffected. This mirrors the backoff applied
 to `sendQueueWorker` and `connectionCleanup`.
+
+**Goexit and hostile log handlers:** the accept loop, the connection cleanup
+loop and every send-queue worker run under `supervise.Supervise`
+(`pkg/internal/supervise`), which starts the loop again on a fresh goroutine,
+after the same delay and with the same `wg` accounting, when a
+`runtime.Goexit` in code it runs (a slog handler, an identity resolver, an
+event listener) ends it. The accept loop's semaphore and per-IP tracker are
+created once, outside the restarted loop, so a restart keeps the admission
+accounting of the connections already running, and `acceptWG` is released
+exactly once: on the loop's normal return, or by the supervisor when a Goexit
+ends it during shutdown. Every transport recovery — these three, and the
+one-shot `handleConnection`, `handleStream` and `preOpenHeartbeatStream` —
+settles first and logs last: the diagnostic goes through
+`supervise.LogContained`, on a goroutine of its own, so a slog handler or a
+panic value's `String`/`Error` method that panics or calls `runtime.Goexit`
+cannot crash the process or end the goroutine it is reporting on. The cleanup
+sweep releases the connection-pool lock by `defer`, so a panic in it cannot
+leave the pool locked for the restarted sweep and every sender.
 
 ### Stream isolation (data vs snapshot)
 
@@ -704,16 +732,33 @@ read, so without an aggregate cap an authenticated peer can open many streams
 that each declare `MaxFrameSize` and withhold the body, pinning 16 MB per stream
 until the read deadline. Two budgets bound that:
 
-- **`msgRecvBudget`** is the host-wide `MaxMessageReceiveMemory` (default
-  256 MB). A frame reserves `decodeCharge(length)`, its declared length times
+- **`msgRecvBudget`** is the host-wide `MaxMessageReceiveMemory`. A frame
+  reserves `proto.DecodeCharge(length)`, its declared length times
   `proto.MaxDecodeMemoryFactor` (8), before allocating, and releases on
-  dispatch. The factor is the measured ceiling on heap per wire byte, so the
-  budget bounds the heap decoded frames can occupy, not just the bytes read.
-  The multiplication saturates rather than wraps.
+  dispatch; a compressed frame later reserves the decode charge of its
+  decompression delta too. The factor is the measured ceiling on heap per wire
+  byte, so the budget bounds the heap decoded frames can occupy, not just the
+  bytes read. The arithmetic saturates rather than wraps.
 - **`connMsgBudget`** is a per-peer sub-budget capped at `maxConnMsgRecv`
-  (`MaxMessageReceiveMemory / 4`, floored at one maximum frame plus its
-  decompression delta so a legal frame always fits). It is charged in wire
-  bytes.
+  (`MaxMessageReceiveMemory / 4`, floored at `maxFrameCharge` so a legal frame
+  always fits). It is charged in the same decode-charge unit as
+  `msgRecvBudget`; charged in wire bytes against an aggregate charged at 8x, the
+  cap was twice the aggregate and bounded nothing.
+
+The per-peer sub-budget is reserved first. A frame refused by either budget
+holds nothing while its body drains: a refused frame that kept its aggregate
+reservation through the drain would let a peer that withholds its bodies hold
+the aggregate whatever its cap.
+
+The default budget is derived, not fixed. `maxFrameCharge` is
+`proto.FrameDecodeCharge(MaxFrameSize, MaxDecompressedSize)`, the most one frame
+can reserve under the two reservations above, 128 MB at today's constants. The
+default is `config.DefaultMessageReceiveBudgetFrames` (4) of those, 512 MB, and
+`Validate` rejects a budget below one with `*MaxMessageReceiveMemoryTooSmallError`.
+Because the default and the receive path both build on `proto.DecodeCharge`, a
+change to the frame size or the decode factor moves both together. A fixed
+256 MB held two maximum-size frames, and the wire-byte per-peer cap let one
+peer hold both.
 
 The sub-budget is keyed on the peer's authenticated node identity, not on
 `*quic.Conn`. A per-connection key bounds nothing: `MaxConnectionsPerIP` is 16,
@@ -858,8 +903,9 @@ close that:
 | `maxConsecutiveZeroLengthFrames` | 8 | A legitimate sender emits none, so a run of them is a peer burning the declared `ChunkCount` |
 
 Every rejection routes through `rejectSnapshotStream`, which fires
-`OnSnapshotRejected` and increments `IncSnapshotsRejected` with a reason from a
-closed label set (`shutdown`, `concurrency_limit`, `memory_budget`, `liveness`,
+`OnSnapshotRejected` (delivered on the host's listener dispatcher, installed
+with `SetListenerDispatcher`) and increments `IncSnapshotsRejected` with a
+reason from a closed label set (`shutdown`, `concurrency_limit`, `memory_budget`, `liveness`,
 `malformed`, `io_error`, `policy`, `unauthorized`, `not_accepting`). The set is
 closed deliberately: the label
 feeds Prometheus, and a per-transfer string would create unbounded child series.
@@ -1323,7 +1369,8 @@ is dropped at Debug level and counted as `unresolved_target`.
 | `MaxSnapshotReceiveRate`        | int64         | 256 MB/s       | Inbound snapshot bandwidth; non-zero values below 64 KB/s are rejected |
 | `MaxConcurrentSnapshotReceives` | int           | 4              | Parallel inbound snapshot transfers  |
 | `MaxSnapshotReceiveMemory`      | int64         | 1 GB           | Total in-flight snapshot chunk budget |
-| `MaxMessageReceiveMemory`       | int64         | 256 MB         | Aggregate in-flight message-frame heap budget (each frame charged at 8x its wire length); also derives the QUIC per-connection receive window |
+| `MaxMessageReceiveMemory`       | int64         | 512 MB (derived) | Aggregate in-flight message-frame heap budget (each frame charged at 8x its wire length plus decompression delta); zero derives `MessageReceiveBudgetFrames` x 128 MB; below 128 MB is rejected; also derives the QUIC per-connection receive window |
+| `MessageReceiveBudgetFrames`    | int           | 4              | Maximum-size frames the derived `MaxMessageReceiveMemory` default admits; ignored when the budget is set |
 | `MaxDecompressedSize`           | uint32        | 16 MB (pinned) | Decompression size limit; must equal `MaxFrameSize` |
 | `MaxConnectionsPerIP`           | int           | 16             | Concurrent inbound connections per source IP |
 | `MaxIncomingConnections`        | int           | 256            | Total inbound connection limit       |

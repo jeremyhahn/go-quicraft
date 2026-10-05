@@ -146,11 +146,26 @@ optional callback; nil fields are skipped.
 `OnCampaignSkipped` is never invoked. Detect a leaderless shard with
 `Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
 
+`ShardFailedInfo.Err` is one of the public error types `quicraft.ApplyError`,
+`SMPanicError`, `SaveStateError`, `CommitError`, `WorkerPanicError`,
+`SnapshotError`, `SnapshotRecoveryExhaustedError` or `CorruptConfigEntryError`;
+match it with `errors.As`.
+
+`SnapshotInfo.Err` is set only on `OnSnapshotRejected`, to the rejection's
+cause when one exists: the snapshot pool's refusal (`*SnapshotDuplicateError`,
+`*SnapshotPoolBusyError`), an abandonment (`ErrStopped`, a save's
+`*SnapshotSavePanicError`), the error or `*SnapshotRecoveryPanicError` that
+rejected a recovery before the state machine restore began, or the error
+behind an inbound transfer the receiver refused. It is nil on every other
+event and on a rejection with no underlying error (an incomplete transfer, a
+shutdown or policy refusal). The full list, with causes, is in the
+[host API errors](../multi-group-host/api.md#errors).
+
 Delivery comes in two classes:
 
 | Class | Callbacks | Runs on | You may |
 |---|---|---|---|
-| dispatched | `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted` | one dispatcher goroutine holding no engine lock, FIFO | call any `Host` API, including `StopShard` |
+| dispatched | `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected` | one dispatcher goroutine holding no engine lock, FIFO | call any `Host` API, including `StopShard` |
 | inline | every other callback | the goroutine that produced the event | return quickly; do not call a synchronous `Host` API that stops or unloads a shard |
 
 There is no ordering guarantee between the two classes.

@@ -36,14 +36,21 @@ import (
 //
 // The connection receive window is varied through the PRODUCTION derivation in
 // connectionReceiveWindow(MaxMessageReceiveMemory, MaxIncomingConnections)
-// rather than through a test-only seam. MaxMessageReceiveMemory is held at the
-// 256 MB default (so the application-level receive budget, and the per-
-// connection quarter-budget cap derived from it, are identical in every
-// variant) and MaxIncomingConnections alone selects the window:
+// rather than through a test-only seam. MaxMessageReceiveMemory is held at
+// benchRecvBudget (so the application-level receive budget, and the per-peer
+// quarter-budget cap derived from it, are identical in every variant) and
+// MaxIncomingConnections alone selects the window:
 //
-//	256 MB / 32 conns =  8 MB  (the floor, and today's default outcome)
-//	256 MB / 16 conns = 16 MB
-//	256 MB /  8 conns = 32 MB  (maxConnectionReceiveWindowCeiling)
+//	1 GB / 128 conns =  8 MB  (the floor, and the default outcome)
+//	1 GB /  64 conns = 16 MB
+//	1 GB /  32 conns = 32 MB  (maxConnectionReceiveWindowCeiling)
+//
+// The budget is twice the 512 MB default because this benchmark keeps up to 16
+// ~1 MB frames from ONE peer in flight, and each is charged at
+// proto.MaxDecodeMemoryFactor: 16 x 8 MB fills the default per-peer quarter
+// exactly, and the frame overhead tips it over, so the default would measure
+// receive-budget drops instead of flow control. Production pools carry at most
+// 15 data streams (StreamPoolSize 16).
 //
 // MaxIncomingConnections otherwise only sizes the accept semaphore, and the
 // benchmark uses a single connection, so it has no other effect here.
@@ -100,17 +107,21 @@ const (
 	benchDrainTimeout = 60 * time.Second
 )
 
+// benchRecvBudget is the MaxMessageReceiveMemory every variant runs with; see
+// the file comment for why it is not the default.
+const benchRecvBudget int64 = 1 << 30
+
 // throughputWindows enumerates the per-connection receive windows under test
-// and the MaxIncomingConnections value that produces each one from the default
-// 256 MB MaxMessageReceiveMemory.
+// and the MaxIncomingConnections value that produces each one from
+// benchRecvBudget.
 var throughputWindows = []struct {
 	name           string
 	incomingConns  int
 	wantWindowByte uint64
 }{
-	{"win8MB", 32, 8 << 20},
-	{"win16MB", 16, 16 << 20},
-	{"win32MB", 8, 32 << 20},
+	{"win8MB", 128, 8 << 20},
+	{"win16MB", 64, 16 << 20},
+	{"win32MB", 32, 32 << 20},
 }
 
 // throughputStreams enumerates the concurrent-stream counts under test.
@@ -196,15 +207,15 @@ func benchmarkThroughput(b *testing.B, incomingConns int, wantWindow uint64, str
 	}
 	// Fail loudly if the config-driven derivation stops producing the window
 	// this sub-benchmark claims to measure.
-	if got := connectionReceiveWindow(defaultMaxMessageRecvMemory, incomingConns); got != wantWindow {
+	if got := connectionReceiveWindow(benchRecvBudget, incomingConns); got != wantWindow {
 		b.Fatalf("connectionReceiveWindow(%d, %d) = %d, want %d",
-			int64(defaultMaxMessageRecvMemory), incomingConns, got, wantWindow)
+			benchRecvBudget, incomingConns, got, wantWindow)
 	}
 
 	sink := newBenchSink()
 	sender, receiver, cleanup := transportPairWith(b, benchDeploymentID, newBenchSink(), sink,
 		func(c *Config) {
-			c.MaxMessageReceiveMemory = defaultMaxMessageRecvMemory
+			c.MaxMessageReceiveMemory = benchRecvBudget
 			c.MaxIncomingConnections = incomingConns
 			c.StreamPoolSize = benchStreamPoolSize
 			// Snappy is disabled so the reported MB/s is wire bytes rather

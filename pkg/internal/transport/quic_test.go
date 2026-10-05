@@ -2758,7 +2758,6 @@ func TestSendQueueWorker_PanicRestartThenStop(t *testing.T) {
 	sq := &sendQueue{ch: make(chan proto.Message, 8), hbCh: make(chan proto.Message, 8)}
 
 	done := make(chan struct{})
-	tr.wg.Add(1)
 	go func() {
 		defer close(done)
 		tr.sendQueueWorker("restart-target", sq)
@@ -2942,7 +2941,6 @@ func TestSendQueueWorker_PanicRestartsAndExitsOnStop(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	tr.wg.Add(1)
 	go func() {
 		defer close(done)
 		tr.sendQueueWorker("127.0.0.1:9999", sq)

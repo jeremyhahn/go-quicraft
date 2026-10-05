@@ -28,6 +28,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/queue"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -327,6 +328,12 @@ type Node struct {
 	// produce a result until applies resume.
 	recovering atomic.Bool
 
+	// redrive tracks snapshot recoveries rejected before the state machine
+	// restore began, so the step worker re-queues them with backoff and the
+	// snapshot pool fails the shard once they are exhausted. See
+	// recoveryRedrive.
+	redrive recoveryRedrive
+
 	// saving is set to true while the snapshot pool captures a consistent
 	// point-in-time for SaveSnapshot, and cleared once the capture completes
 	// (the gate is released before the potentially-long streaming of an
@@ -467,6 +474,42 @@ func (n *Node) SetNotifyCommit(enabled bool) {
 // (Host.Propose, Host.proposeSession, config change goroutines).
 func (n *Node) DeliverProposal(entries []proto.Entry) bool {
 	return n.proposalQ.Add(entries)
+}
+
+// DeliverTrackedProposal is DeliverProposal that also records, in *at, where
+// the entries entered the proposal queue, so ProposalTaken can later tell
+// whether the step worker has taken them — the moment a proposal is handed to
+// raft. The host uses it for every proposal it registers. *at is written under
+// the queue's lock and must only be read through ProposalTaken.
+func (n *Node) DeliverTrackedProposal(entries []proto.Entry, at *uint64) bool {
+	return n.proposalQ.AddTracked(entries, at)
+}
+
+// ProposalTaken reports whether the proposal DeliverTrackedProposal recorded
+// in *at has been handed to raft, and whether that answer is final. The step
+// worker declares a batch handed off (HandOffProposals) only as it enters
+// Peer.Handle, which appends it or forwards it to the leader, or refuses all
+// of it (OnProposalRejected); a batch it took from the queue but never
+// brought that far is not handed off. The answer is final once the queue is
+// closed — when the node fails or stops — since nothing is handed off after
+// that; until then an untaken proposal may still be taken. A proposal that
+// was never delivered (*at is zero) is not taken.
+func (n *Node) ProposalTaken(at *uint64) (taken, final bool) {
+	return n.proposalQ.Taken(at)
+}
+
+// DrainProposalBatch is DrainProposals that also returns the id of the batch
+// it took, for HandOffProposals; 0 when it took nothing.
+func (n *Node) DrainProposalBatch(buf []proto.Entry) ([]proto.Entry, uint64) {
+	return n.proposalQ.SwapBatch(buf)
+}
+
+// HandOffProposals declares the batch DrainProposalBatch returned as id handed
+// to raft. The step worker calls it immediately before Peer.Handle and must
+// not call Peer.Handle when it reports false: the node failed or stopped, its
+// queue is closed, and the batch's proposals have been reported never taken.
+func (n *Node) HandOffProposals(id uint64) bool {
+	return n.proposalQ.HandOff(id)
 }
 
 // DrainProposals swaps the proposal queue and returns all accumulated
@@ -653,35 +696,123 @@ func (n *Node) IsFailed() bool {
 	return n.failed.Load()
 }
 
-// Fail trips the shard-failure latch for this shard and reports err through the
-// node's error handler, exactly as failApply and failCommit do for a terminal
-// apply or commit error. The shard stays offline until it is reloaded or
-// recovered from a snapshot; there is no automatic reset, deliberately.
+// failShard is the one latch-and-report path for a shard failure, in this
+// order:
 //
-// It exists so that a fault detected OUTSIDE the engine's own workers — the
-// Host's routing mirror of the committed membership fold, which decodes the same
-// entries a second time — can reach the same terminal state instead of logging
-// and carrying on. Runtime failing open where recovery fails closed, over the
-// identical bytes, is a divergence generator: the replica keeps serving with a
-// routing table that disagrees with the membership raft holds, and persists that
-// disagreement with the next snapshot.
+//  1. Trip node's failure latch.
+//  2. Run failBatch, when it is not nil: the caller's own batch of requests,
+//     failed with their specific error (a SaveStateError, an ApplyError).
+//     It runs whether or not this call won the latch — the batch is the
+//     caller's, and no other path will answer it.
+//  3. If this call tripped the latch, report err once on each outward
+//     channel: the node's EventListener.OnShardFailed (handleError) and the
+//     engine Callback.OnShardFailed, with which the host fails every request
+//     still pending on the shard with ErrShardFailed.
 //
-// Idempotent, and safe from any goroutine.
-func (n *Node) Fail(err error) {
-	n.markFailed()
-	n.handleError(err)
+// The latch comes first because failing a request wakes its caller, and a
+// caller that retried before the latch tripped would pass the host's
+// admission check and register a request the halted shard never answers. The
+// reports come last so the batch keeps its specific error rather than the
+// halt's generic one.
+//
+// It serves every failure: the apply and commit workers' batch failures, a
+// step-worker GetUpdate error or install panic, a failed or panicking
+// snapshot recovery, and, through Engine.FailShard, the host's own
+// detections. A shard another path failed first has been reported by that
+// path, and is not reported again; the winner always performs both reports,
+// even when failBatch panics, and a panic in one report cannot suppress the
+// other. A panic from failBatch or a report is re-raised once both reports
+// have been made, so the worker's own recovery still sees it. It reports
+// whether this call tripped the latch.
+func failShard(node *Node, cb Callback, err error, failBatch func()) bool {
+	if !node.markFailed() {
+		if failBatch != nil {
+			failBatch()
+		}
+		return false
+	}
+	// This call won the latch, so it alone owes the reports, and no other
+	// path will make them: a worker's panic recovery that fails the shard
+	// again loses the latch. They are therefore made from a deferred call,
+	// which runs even when failBatch panics; that panic then continues to
+	// the worker's recovery with its own stack once they are made.
+	batchDone := false
+	defer func() {
+		if p := reportShardFailure(node, cb, err); p != nil {
+			if !batchDone {
+				// The batch's panic is already unwinding and is the one the
+				// worker's recovery must see; this one is only logged.
+				shardID, replicaID := node.shardID, node.replicaID
+				supervise.LogContained(func() {
+					slog.Error("shard failure report panicked while a failed batch was panicking",
+						"shard", shardID,
+						"replica", replicaID,
+						"panic", p,
+					)
+				})
+				return
+			}
+			panic(p)
+		}
+	}()
+	if failBatch != nil {
+		failBatch()
+	}
+	batchDone = true
+	return true
 }
 
-// markFailed is the ONE way a node becomes failed. A failed node's step worker
-// never steps another message, so every install waiting on a verdict is
-// answered InstallAbandoned here; setting the flag anywhere else would leave
-// a snapshot receive blocked holding a transport receive slot until the shard
-// was reloaded. The flag is stored before the abandon takes installMu, so an
-// AwaitInstallVerdict that takes installMu afterwards sees it and answers at
-// once.
-func (n *Node) markFailed() {
-	n.failed.Store(true)
+// reportShardFailure makes failShard's two reports — the node's
+// EventListener.OnShardFailed (handleError) and the engine
+// Callback.OnShardFailed — each isolated from the other, so a panic or a
+// runtime.Goexit in one cannot suppress the other. It returns the first report's panic, if any, for
+// the caller to re-raise once both have run.
+func reportShardFailure(node *Node, cb Callback, err error) (panicked any) {
+	report := func(fn func()) {
+		defer func() {
+			if r := recover(); r != nil && panicked == nil {
+				panicked = r
+			}
+		}()
+		fn()
+	}
+	// The engine callback is a deferred call of its own, not a statement after
+	// the listener report: recover returns nil for runtime.Goexit, so a
+	// listener that Goexits cannot be caught, and only a deferred call still
+	// runs as the goroutine exits. The callback is what drains the shard's
+	// pending requests on the host.
+	if cb != nil {
+		defer report(func() { cb.OnShardFailed(node.shardID, err) })
+	}
+	report(func() { node.handleError(err) })
+	return panicked
+}
+
+// markFailed is the ONE way a node becomes failed, and reports whether this
+// call is the one that failed it. The latch is a compare-and-swap so that,
+// when failures race — a SaveState failure on the commit worker and a recovery
+// exhausting its attempts, say — exactly one caller wins, and the winner alone
+// emits the terminal OnShardFailed reports. Its only caller is failShard, so
+// the winner always performs both.
+//
+// A failed node's step worker never steps another message, so every install
+// waiting on a verdict is answered InstallAbandoned here; setting the flag
+// anywhere else would leave a snapshot receive blocked holding a transport
+// receive slot until the shard was reloaded. The flag is set before the abandon
+// takes installMu, so an AwaitInstallVerdict that takes installMu afterwards
+// sees it and answers at once. Only the winner abandons: a loser found the
+// flag already set by a winner that abandons after setting it.
+func (n *Node) markFailed() bool {
+	if !n.failed.CompareAndSwap(false, true) {
+		return false
+	}
+	// A failed node hands nothing further to raft: closing the proposal queue
+	// fences the step worker from taking anything still queued, which makes a
+	// queued proposal's fate final (ProposalTaken) before the failure is
+	// reported and the host fails what is pending.
+	n.proposalQ.Close()
 	n.abandonInstallVerdicts()
+	return true
 }
 
 // AcquireWriteLease admits one durable write made on this incarnation's
@@ -1011,7 +1142,11 @@ func (n *Node) SetSaving(v bool) {
 // machine, and this drains the at-most-one apply that may have passed the gate
 // before the flag was set. Together they guarantee RecoverFromSnapshot (or the
 // consistent-capture phase of SaveSnapshot) has exclusive access to the state
-// machine. Returns false if it stopped early due to stopC.
+// machine. Returns false if stopC is closed, whether or not an apply was in
+// flight: a stopping node's state machine is about to be closed, so the
+// caller must not begin an operation on it. The check after the drain is not
+// a fence on its own — Stop can land a moment later — which is why a recovery
+// also holds the node's write lease across the restore (runRecovery).
 func (n *Node) WaitForApplyDrain(stopC <-chan struct{}) bool {
 	for n.applyInFlight.Load() > 0 {
 		select {
@@ -1023,7 +1158,12 @@ func (n *Node) WaitForApplyDrain(stopC <-chan struct{}) bool {
 		// brief yield avoids a hot spin while the in-flight apply completes.
 		time.Sleep(50 * time.Microsecond)
 	}
-	return true
+	select {
+	case <-stopC:
+		return false
+	default:
+		return true
+	}
 }
 
 // StopC returns a read-only channel that is closed when the node stops.
@@ -1280,6 +1420,8 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		close(n.stopC)
 	})
+	// A stopped node hands nothing further to raft (see markFailed).
+	n.proposalQ.Close()
 	n.abandonInstallVerdicts()
 }
 

@@ -93,7 +93,7 @@ func newEtcdClusterInfra(b *testing.B, numNodes int) *etcdClusterInfra {
 			infra.deliver(slot, msg)
 		})
 		if err != nil {
-			infra.close()
+			reportClose(b, "cluster infrastructure", infra.close())
 			b.Fatalf("newRaftTransport for slot %d: %v", slot, err)
 		}
 		infra.transports = append(infra.transports, t)
@@ -110,15 +110,19 @@ func (infra *etcdClusterInfra) deliver(slot int, msg *raftpb.Message) {
 	if cn == nil || msg.GetTo() != cn.id {
 		return
 	}
-	// Errors from Step are expected during shutdown.
-	cn.node.Step(context.Background(), msg)
+	// Step fails only once the node is stopping (raft.ErrStopped). The
+	// message is then dropped like any other that reaches a replica that is
+	// not running, so there is nothing to act on.
+	_ = cn.node.Step(context.Background(), msg)
 }
 
-// close closes every transport.
-func (infra *etcdClusterInfra) close() {
+// close closes every transport and returns their close errors, joined.
+func (infra *etcdClusterInfra) close() error {
+	var errs []error
 	for _, t := range infra.transports {
-		t.close()
+		errs = append(errs, t.close())
 	}
+	return errors.Join(errs...)
 }
 
 // EtcdCluster holds a multi-node etcd/raft cluster for benchmarks.
@@ -175,7 +179,7 @@ func (c *EtcdCluster) waitForLeader(timeout time.Duration) (*etcdClusterNode, er
 // the proposal is retried on it once. It returns the node the proposal
 // finally went to.
 func (c *EtcdCluster) proposeAndWait(leader *etcdClusterNode, id uint64, cmd []byte) (*etcdClusterNode, error) {
-	err := proposeAndWait(leader.node, leader.proposals, id, cmd, proposalApplyTimeout)
+	err := proposeAndWait(leader.node, leader.proposals, id, cmd)
 	if err == nil || errors.Is(err, errApplyTimeout) {
 		return leader, err
 	}
@@ -183,7 +187,7 @@ func (c *EtcdCluster) proposeAndWait(leader *etcdClusterNode, id uint64, cmd []b
 	if reErr != nil {
 		return leader, err
 	}
-	return newLeader, proposeAndWait(newLeader.node, newLeader.proposals, id, cmd, proposalApplyTimeout)
+	return newLeader, proposeAndWait(newLeader.node, newLeader.proposals, id, cmd)
 }
 
 // freeTCPPort reserves a loopback address for a cluster node's transport
@@ -216,7 +220,7 @@ func newEtcdCluster(b *testing.B, infra *etcdClusterInfra, firstID uint64) *Etcd
 		wal, err := newWALWriter(b.TempDir())
 		if err != nil {
 			for _, cn := range nodes[:slot] {
-				cn.wal.close()
+				reportClose(b, "WAL", cn.wal.close())
 			}
 			b.Fatalf("newWALWriter for node %d: %v", nodeID, err)
 		}
@@ -275,19 +279,19 @@ func SetupEtcdCluster(b *testing.B, numNodes int) *EtcdCluster {
 
 	for _, cn := range cluster.Nodes {
 		if !cn.confDone.wait(clusterConfChangeTimeout) {
-			cluster.Close()
+			reportClose(b, "cluster", cluster.Close())
 			b.Fatalf("initial ConfChange not applied for node %d", cn.id)
 		}
 	}
 
 	leader, err := cluster.waitForLeader(clusterLeaderTimeout)
 	if err != nil {
-		cluster.Close()
+		reportClose(b, "cluster", cluster.Close())
 		b.Fatalf("cluster leader election failed: %v", err)
 	}
 
 	if err := setupWarmup(leader.node, leader.proposals, leader.reads, &leader.appliedIndex, leader.sm); err != nil {
-		cluster.Close()
+		reportClose(b, "cluster", cluster.Close())
 		b.Fatalf("cluster setup warmup failed: %v", err)
 	}
 
@@ -311,7 +315,7 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 			// SoftState is non-nil only when it changed; it reflects this
 			// Ready, so a leader that steps down in it is not a leader here.
 			if rd.SoftState != nil {
-				isLeader = rd.SoftState.RaftState == raft.StateLeader
+				isLeader = rd.RaftState == raft.StateLeader
 			}
 
 			// A leader sends its messages in parallel with persisting, as
@@ -346,14 +350,11 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 				}
 			}
 
-			// Persist hard state to MemoryStorage.
-			if hasHardState {
-				cn.storage.SetHardState(rd.HardState)
-			}
-
-			// Append entries to MemoryStorage for raft internals.
-			if hasEntries {
-				cn.storage.Append(rd.Entries)
+			// Record hard state and entries in MemoryStorage for raft
+			// internals.
+			if err := saveToStorage(cn.storage, rd.HardState, rd.Entries); err != nil {
+				leaderSend.Wait()
+				return
 			}
 
 			// A follower sends only now that its state is durable.
@@ -396,10 +397,11 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 // stop shuts down the cluster node: detaches it from its slot's transport,
 // stops the raft node, signals the event loop and ticker to exit, waits for
 // goroutine cleanup, and closes the WAL file. The transport itself belongs
-// to the cluster infrastructure and stays open.
-func (cn *etcdClusterNode) stop(slot *atomic.Pointer[etcdClusterNode]) {
+// to the cluster infrastructure and stays open. It returns the WAL's close
+// error.
+func (cn *etcdClusterNode) stop(slot *atomic.Pointer[etcdClusterNode]) error {
 	if !cn.stopped.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
 	slot.CompareAndSwap(cn, nil)
 	if cn.node != nil {
@@ -411,21 +413,24 @@ func (cn *etcdClusterNode) stop(slot *atomic.Pointer[etcdClusterNode]) {
 		<-cn.tickDone
 	}
 	if cn.wal != nil {
-		cn.wal.close()
+		return cn.wal.close()
 	}
+	return nil
 }
 
 // stopNodes stops every node and leaves the infrastructure running, so an
 // election benchmark can start the next round's nodes on the same
-// transports.
-func (c *EtcdCluster) stopNodes() {
+// transports. It returns every node's stop error, joined.
+func (c *EtcdCluster) stopNodes() error {
+	var errs []error
 	for slot, cn := range c.Nodes {
-		cn.stop(&c.infra.current[slot])
+		errs = append(errs, cn.stop(&c.infra.current[slot]))
 	}
+	return errors.Join(errs...)
 }
 
-// Close shuts down all nodes in the cluster and its infrastructure.
-func (c *EtcdCluster) Close() {
-	c.stopNodes()
-	c.infra.close()
+// Close shuts down all nodes in the cluster and its infrastructure, and
+// returns every shutdown error, joined.
+func (c *EtcdCluster) Close() error {
+	return errors.Join(c.stopNodes(), c.infra.close())
 }

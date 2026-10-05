@@ -402,8 +402,10 @@ order on one goroutine, and a handler may call back into the host, even
 `StopShard`. Every callback must return quickly. The full list is in
 [api.md](api.md#event-listener).
 
-`OnShardFailed` also fires for some failures that do not take the shard offline;
-check `GetShardInfo` before acting. `OnCampaignSkipped` never fires: to detect a
+`OnShardFailed` fires once each time a shard's failure latch trips, and the
+shard stays offline until it is reloaded. A failed snapshot save does not fire
+it: the shard keeps running, the host logs the failure, and
+`RequestSnapshot` returns it. `OnCampaignSkipped` never fires: to detect a
 leaderless shard, watch for `ShardNoLeader` health with no election activity.
 
 ## Manage disk

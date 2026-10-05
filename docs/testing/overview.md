@@ -275,8 +275,9 @@ meet the per-package coverage floor. `make coverage` measures
 | Target | Runs |
 |---|---|
 | `ci` | `fmt`, `no-mutants`, `check-tool-versions`, `vet`, `lint`, `security`, `build`, `test`. Untagged suites only; the fast inner loop. |
-| `ci-full` | `ci`, then `ci-modules`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`, `build-fips`, `verify-fips`, `verify-fips-exempt`. Run it before opening a pull request. |
+| `ci-full` | `ci`, then `ci-modules`, `ci-cross`, `ci-errfs`, `ci-fuzz-seeds`, `ci-fuzz-mutation`, `ci-integration`, `ci-netfault`, `build-fips`, `verify-fips`, `verify-fips-exempt`. Run it before opening a pull request. |
 | `ci-modules` | `go build` and `go vet` in every `go.mod` directory, with `GOWORK=off` |
+| `ci-cross` | the same for each of `CROSS_PLATFORMS`: linux/arm64, linux/386, windows/amd64, darwin/arm64, freebsd/amd64 |
 | `remote-<target>` | `<target>` on `REMOTE_HOST` |
 | `remote-tools` | installs the remote host's scanners |
 
@@ -286,7 +287,7 @@ meet the per-package coverage floor. `make coverage` measures
 |---|---|
 | `fmt` | fails if `gofmt -l .` lists anything |
 | `vet` | `go vet ./...` |
-| `lint` | `golangci-lint run --timeout=5m ./...`, after `check-lint-toolchain` |
+| `lint` | `golangci-lint run --build-tags benchmark ./...` in every `go.mod` directory with the root's config, after `check-lint-toolchain` |
 | `no-mutants` | fails if `if false {`, `MUTANT` or `MUTATION` appears in non-test Go under `pkg/`, `test/`, `contrib/` |
 | `security` | `gosec`, `vuln` (govulncheck), `modverify` (`go mod verify`), `trivy` (filesystem scan) |
 | `trivy-image`, `nancy`, `security-sarif` | opt-in scans outside `ci` |
@@ -296,11 +297,18 @@ meet the per-package coverage floor. `make coverage` measures
 
 | Target | Runs |
 |---|---|
-| `docker-build` | builds the devcontainer image (`Dockerfile.dev`) |
+| `docker-build` | builds the devcontainer image (`Dockerfile.dev`), tagged for this checkout |
 | `docker-build-integration` | builds the integration image |
+| `docker-make` | `make $(DOCKER_MAKE_TARGET)` (default `ci`) in a fresh dev image; nothing is bind-mounted, so it honours `DOCKER_HOST` |
+| `docker-clean` | removes this checkout's `docker-build` images |
 | `docker-run` | a devcontainer shell |
 | `docker-test` | `make test` in the devcontainer |
 | `docker-integration-down` | stops and removes the integration compose stack |
+
+Module credentials for the forge come from `.devcontainer/.env` (format:
+`.devcontainer/.env.example`): the builds mount it as the `gomodauth` BuildKit
+secret, and `docker-make` and the compose services load it as the container
+environment. See [Contributing](../../CONTRIBUTING.md#running-the-suites-in-the-dev-container).
 
 ## Cross-references
 

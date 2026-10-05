@@ -18,6 +18,7 @@ import (
 	"io/fs"
 	"os"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
@@ -141,45 +142,14 @@ func (s *transportSender) snapshotFsys() snapshotFS {
 // syncDir fsyncs a directory through fsys so its entry changes (file creates,
 // renames, removals) become durable.
 func syncDir(fsys snapshotFS, dir string) error {
-	d, err := fsys.Open(dir)
-	if err != nil {
-		return err
-	}
-	syncErr := d.Sync()
-	closeErr := d.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+	return fsutil.SyncDirWith(fsys.Open, dir)
 }
 
 // syncDirChain fsyncs leaf and every ancestor up to and including stopAt
-// through fsys, applying engine.SyncDirChain's walk to the injected
-// filesystem.
+// through fsys. stopAt is the fsutil.DeepestExistingAncestorWith(fsys.Stat, ...)
+// recorded before the MkdirAll that created leaf.
 func syncDirChain(fsys snapshotFS, leaf, stopAt string) error {
-	return engine.SyncDirChainWith(func(dir string) error {
+	return fsutil.SyncDirChainWith(func(dir string) error {
 		return syncDir(fsys, dir)
 	}, leaf, stopAt)
-}
-
-// deepestExistingAncestor returns the deepest ancestor of path that already
-// exists on fsys (path itself when it exists). Recorded BEFORE a MkdirAll, it
-// is the stopAt the following syncDirChain must use: the fsync has to cover
-// every directory the MkdirAll creates and no directory above them. It applies
-// engine.DeepestExistingAncestor's walk to the injected filesystem.
-func deepestExistingAncestor(fsys snapshotFS, path string) string {
-	return engine.DeepestExistingAncestorWith(fsys.Stat, path)
-}
-
-// mkdirAllSynced creates dir and any missing parents, then fsyncs the whole
-// created chain so the new directory entries are durable. A directory that
-// holds durably-written files is itself only durable once its parent's entry
-// is fsynced; without this a crash can lose the directory the WAL lives in.
-func mkdirAllSynced(dir string) error {
-	fsys := osSnapshotFS{}
-	syncRoot := deepestExistingAncestor(fsys, dir)
-	if err := fsys.MkdirAll(dir, 0o750); err != nil {
-		return err
-	}
-	return syncDirChain(fsys, dir, syncRoot)
 }

@@ -4035,9 +4035,14 @@ func TestDrainAndHandleProposals_ErrorCallback(t *testing.T) {
 
 	sw.drainAndHandleProposals(1, node)
 
-	// The OnProposalFailed callback should have been invoked.
-	if cb.proposalFailedCount.Load() == 0 {
-		t.Fatal("expected OnProposalFailed to be called for follower rejection")
+	// Raft refused the batch before appending it: a definite rejection,
+	// reported through OnProposalRejected and never as a post-hand-off failure.
+	if cb.proposalRejectedCount.Load() == 0 {
+		t.Fatal("expected OnProposalRejected to be called for follower rejection")
+	}
+	if got := cb.proposalFailedCount.Load(); got != 0 {
+		t.Fatalf("OnProposalFailed fired %d times for a batch raft never appended; "+
+			"its callers would be told the outcome is unknown", got)
 	}
 }
 

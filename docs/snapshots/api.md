@@ -33,7 +33,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 |---|---|
 | Request | the shard and a `SnapshotOption`; `DefaultSnapshotOption` (the zero value) uses the shard's defaults |
 | Response | a `*RequestState` whose result carries the snapshot index, or the index directly from the sync form |
-| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`. From the save: `*SnapshotFailedError`, `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`. The sync form also returns `ErrTimeout` or `ErrCanceled`. |
+| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`. From the save: `*SnapshotFailedError` (wrapping `*SnapshotSavePanicError` when `SaveSnapshot` panicked), `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`. The sync form also returns `ErrTimeout` or `ErrCanceled`. |
 | Permission | none; in-process call |
 
 ```go

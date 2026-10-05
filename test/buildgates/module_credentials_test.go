@@ -15,7 +15,9 @@
 package buildgates
 
 import (
+	"io/fs"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -66,4 +68,89 @@ func containsLine(body, want string) bool {
 		}
 	}
 	return false
+}
+
+// devImageIgnoreFile is the per-Dockerfile ignore file BuildKit reads in place
+// of the root .dockerignore for the dev image. It differs from the root file
+// by exactly one entry, .git/: the dev image runs `make ci`, and the
+// releasability gate inside it reads the git index.
+const devImageIgnoreFile = ".devcontainer/Dockerfile.dev.dockerignore"
+
+// gitMetadataEntry is the one root .dockerignore entry the dev image omits.
+const gitMetadataEntry = ".git/"
+
+// ignoreEntries returns the patterns of a .dockerignore-format file: every
+// non-blank line that is not a comment, trimmed.
+func ignoreEntries(body string) []string {
+	var entries []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		entries = append(entries, line)
+	}
+	return entries
+}
+
+// TestTheDevImageIgnoreFileRepeatsTheRootList stops the two ignore files from
+// drifting. BuildKit uses the per-Dockerfile file INSTEAD of the root one, so
+// an entry added only at the root -- a new credential, a private workflow
+// file -- would silently enter the dev image.
+func TestTheDevImageIgnoreFileRepeatsTheRootList(t *testing.T) {
+	root := filepath.Join("..", "..")
+	have := make(map[string]bool)
+	for _, e := range ignoreEntries(readRepoFile(t, filepath.Join(root, devImageIgnoreFile))) {
+		have[e] = true
+	}
+	rootEntries := ignoreEntries(readRepoFile(t, filepath.Join(root, ".dockerignore")))
+	if len(rootEntries) == 0 {
+		t.Fatal("the root .dockerignore has no entries; the comparison proves nothing")
+	}
+	for _, e := range rootEntries {
+		if e == gitMetadataEntry {
+			continue
+		}
+		if !have[e] {
+			t.Errorf("%s lacks the root .dockerignore entry %q; BuildKit reads it "+
+				"instead of the root file, so that path would enter the dev image",
+				devImageIgnoreFile, e)
+		}
+	}
+}
+
+// TestTheCredentialFileIsInEveryDockerIgnore keeps the token out of every
+// image, whichever ignore file its build reads.
+func TestTheCredentialFileIsInEveryDockerIgnore(t *testing.T) {
+	root := filepath.Join("..", "..")
+	var files []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".claude", ".serena", "target":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".dockerignore") {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	if len(files) < 2 {
+		t.Fatalf("found %d ignore file(s), want the root .dockerignore and %s at least",
+			len(files), devImageIgnoreFile)
+	}
+	for _, f := range files {
+		if !slices.Contains(ignoreEntries(readRepoFile(t, f)), moduleCredentialFile) {
+			t.Errorf("%s does not exclude %s; a build reading it would COPY the token into a layer",
+				f, moduleCredentialFile)
+		}
+	}
 }

@@ -18,12 +18,17 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
 func newTestHostConfig() config.HostConfig {
@@ -1004,7 +1009,7 @@ func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
 	}
 
 	// Verify panic was logged.
-	logOutput := logBuf.String()
+	logOutput := logBuf.Await("commit worker panic recovered")
 	if !contains(logOutput, "commit worker panic recovered") {
 		t.Fatalf("expected panic log message, got: %s", logOutput)
 	}
@@ -1058,7 +1063,7 @@ func TestEngine_RunStepWorkerOnce_PanicPath(t *testing.T) {
 	}
 
 	// Verify panic was logged.
-	logOutput := logBuf.String()
+	logOutput := logBuf.Await("step worker panic recovered")
 	if !contains(logOutput, "step worker panic recovered") {
 		t.Fatalf("expected step worker panic log, got: %s", logOutput)
 	}
@@ -1153,6 +1158,271 @@ func TestEngine_RunStepWorkerLoop_PanicAndShutdown(t *testing.T) {
 		// Expected: panic recovered, stopC closed, loop exits.
 	case <-time.After(5 * time.Second):
 		t.Fatal("runStepWorkerLoop did not exit after panic + stopC close")
+	}
+}
+
+// goexitOnceCallback calls runtime.Goexit from the first OnReadyToRead, on the
+// step worker goroutine that delivers it.
+type goexitOnceCallback struct {
+	*testCallback
+	goexited atomic.Bool
+}
+
+func (c *goexitOnceCallback) OnReadyToRead(shardID uint64, readyToRead []proto.ReadyToRead) {
+	c.testCallback.OnReadyToRead(shardID, readyToRead)
+	if c.goexited.CompareAndSwap(false, true) {
+		runtime.Goexit()
+	}
+}
+
+// TestEngine_StepWorkerSurvivesGoexitInACallback: recover returns nil for
+// runtime.Goexit, so a callback that Goexits on a worker ended the worker's
+// goroutine and its panic-restart loop with it, and every shard the worker
+// owned stopped making progress for good. The supervisor restarts the loop on
+// a fresh goroutine, and the worker keeps processing.
+func TestEngine_StepWorkerSurvivesGoexitInACallback(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+	cfg := newTestHostConfig()
+	cfg.NumWorkers = 1
+	cb := &goexitOnceCallback{testCallback: newTestCallback()}
+	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, cb, nil)
+	e.Start()
+	defer e.Stop()
+
+	peer, lr := newTestPeer(t, 1, 1)
+	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
+	nodeCfg.SetDefaults()
+	node := NewNode(peer, newTestApplier(newTestSM()), lr, nodeCfg, nil, "", nil)
+	e.LoadNode(node)
+
+	key := uint64(1000)
+	deadline := time.Now().Add(15 * time.Second)
+	for cb.readyCount.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("ReadIndex confirmations = %d (goexited=%v), want a second one after "+
+				"the callback Goexited: the step worker did not survive it",
+				cb.readyCount.Load(), cb.goexited.Load())
+		}
+		key++
+		node.DeliverReadIndex(key)
+		e.NotifyWork(1)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !cb.goexited.Load() {
+		t.Fatal("fixture: the callback never Goexited")
+	}
+}
+
+// goexitApplier calls runtime.Goexit from its first Apply.
+type goexitApplier struct{ calls atomic.Int64 }
+
+func (a *goexitApplier) Apply(entries []proto.Entry, results []sm.Result) error {
+	if a.calls.Add(1) == 1 {
+		runtime.Goexit()
+	}
+	for i := range entries {
+		results[i] = sm.Result{}
+	}
+	return nil
+}
+
+// TestEngine_ShardApplyGoexitFailsTheShard: a state machine whose Apply calls
+// runtime.Goexit leaves the batch's outcome unknown, exactly as a panic does,
+// so the shard is failed with an *SMPanicError and the batch's proposals are
+// failed. Before, recover saw nothing, the batch vanished and the shard's
+// apply goroutine was gone. The goroutine is restarted, so the unload's join
+// still completes.
+func TestEngine_ShardApplyGoexitFailsTheShard(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+	cfg := newTestHostConfig()
+	cfg.NumWorkers = 1
+	cb := newTestCallback()
+	e := NewEngine(cfg, nil, newTestSender(), nil, cb, nil)
+	e.Start()
+	defer e.Stop()
+
+	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
+	nodeCfg.SetDefaults()
+	node := NewNode(nil, &goexitApplier{}, nil, nodeCfg, nil, "", nil)
+	e.LoadNode(node)
+	node.commitPending.Store(true)
+	item := e.applyPool.Get().(*applyItem)
+	item.update = proto.Update{
+		ShardID:          7,
+		ReplicaID:        1,
+		CommittedEntries: []proto.Entry{{Index: 1, Term: 1, Key: 9, Cmd: []byte("x")}},
+	}
+	item.node = node
+	e.applyCs[int(node.shardID%uint64(e.NumWorkers()))] <- item
+
+	deadline := time.Now().Add(5 * time.Second)
+	for cb.shardFailedCount.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a Goexit in SM.Apply never failed the shard")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cb.mu.Lock()
+	failErr := cb.shardFailedCalls[0].err
+	cb.mu.Unlock()
+	var smPanic *SMPanicError
+	if !errors.As(failErr, &smPanic) || smPanic.Value != supervise.ErrGoexit {
+		t.Fatalf("shard failure = %v, want an *SMPanicError carrying supervise.ErrGoexit", failErr)
+	}
+	if cb.proposalFailedCount.Load() == 0 {
+		t.Fatal("the batch's proposals were not failed")
+	}
+	unloaded := make(chan struct{})
+	go func() {
+		e.UnloadNode(7)
+		close(unloaded)
+	}()
+	select {
+	case <-unloaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UnloadNode never joined the shard's apply goroutine")
+	}
+}
+
+// TestListenerDispatcher_SurvivesGoexitInAListener: a listener that calls
+// runtime.Goexit ended the dispatcher goroutine, and every later notification
+// sat in the queue undelivered. The dispatcher is restarted.
+func TestListenerDispatcher_SurvivesGoexitInAListener(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+	var wg sync.WaitGroup
+	d := newListenerDispatcher()
+	d.start(&wg)
+	defer func() {
+		d.stop()
+		wg.Wait()
+	}()
+	d.dispatch(func() { runtime.Goexit() })
+	delivered := make(chan struct{})
+	d.dispatch(func() { close(delivered) })
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a notification queued after a listener Goexited was never delivered")
+	}
+}
+
+// TestListenerDispatcher_StopSurvivesGoexitsInItsFinalDrain: once stop has
+// begun, a listener that Goexits sends the dispatcher down its stopped path,
+// whose drain runs user code too. A second Goexit there skipped the close of
+// doneC, and Engine.Stop — and with it Host.Close — waited forever.
+func TestListenerDispatcher_StopSurvivesGoexitsInItsFinalDrain(t *testing.T) {
+	_, restore := captureLogOutput(t)
+	defer restore()
+	var wg sync.WaitGroup
+	d := newListenerDispatcher()
+	d.start(&wg)
+	gate := make(chan struct{})
+	var delivered atomic.Bool
+	d.dispatch(func() {
+		<-gate
+		runtime.Goexit()
+	})
+	d.dispatch(func() { runtime.Goexit() })
+	d.dispatch(func() { runtime.Goexit() })
+	d.dispatch(func() { delivered.Store(true) })
+
+	stopped := make(chan struct{})
+	go func() {
+		d.stop()
+		wg.Wait()
+		close(stopped)
+	}()
+	// stop has closed stopC once running is false; only then release the
+	// first listener, so its Goexit lands on the stopped path.
+	for d.running.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop never returned after listeners Goexited in the final drain")
+	}
+	if !delivered.Load() {
+		t.Fatal("a notification queued behind the Goexiting listeners was never delivered")
+	}
+}
+
+// hostileHandler is a slog handler — user-configurable through slog.SetDefault
+// — that runs act on every record: a panic or runtime.Goexit.
+type hostileHandler struct{ act func() }
+
+func (h hostileHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h hostileHandler) Handle(context.Context, slog.Record) error {
+	h.act()
+	return nil
+}
+func (h hostileHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h hostileHandler) WithGroup(string) slog.Handler      { return h }
+
+// installHostileLogger makes the default slog handler run act until the test
+// ends.
+func installHostileLogger(t *testing.T, act func()) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(hostileHandler{act: act}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+}
+
+// hostileExits are the two ways a slog handler can leave its caller.
+var hostileExits = map[string]func(){
+	"panic":  func() { panic("slog handler panicked") },
+	"Goexit": runtime.Goexit,
+}
+
+// TestEngine_CommitRecoverySettlesBeforeLogging: a worker's recovery must
+// settle everything structural before it runs any user code, logging
+// included. A commit worker that logged first and whose slog handler then
+// Goexited skipped its settlement: the batch's hard-state claim, commitPending
+// and buffered ordered messages survived, and the next batch's save could
+// release a vote response for a vote never persisted. A handler panic escaped
+// the recovery altogether.
+func TestEngine_CommitRecoverySettlesBeforeLogging(t *testing.T) {
+	for exitName, exit := range hostileExits {
+		t.Run(exitName, func(t *testing.T) {
+			cfg := newTestHostConfig()
+			cfg.NumWorkers = 1
+			ldb := newTestLogDB()
+			e := NewEngine(cfg, ldb, newTestSender(), nil, nil, nil)
+			cw := e.CommitWorker(0)
+			peer, lr := newTestVoterPeer(t, 1, 1, 3)
+			nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
+			nodeCfg.SetDefaults()
+			node := NewNode(peer, nil, lr, nodeCfg, nil, "", nil)
+			if err := peer.Handle(proto.Message{Type: proto.RequestVote, From: 2, To: 1, Term: 5}); err != nil {
+				t.Fatalf("Handle(RequestVote): %v", err)
+			}
+			update, err := peer.GetUpdate(true, 0)
+			if err != nil || update.ReadOnly {
+				t.Fatalf("fixture: %v", err)
+			}
+			node.commitPending.Store(true)
+			cw.commitC <- &commitItem{node: node, update: update}
+			ldb.setSaveError(errors.New("disk error"))
+			cw.retryHookForTest = func(int) { panic("injected commit worker panic") }
+			installHostileLogger(t, exit)
+
+			runToAbnormalEnd(func() { e.runCommitWorkerOnce(cw) })
+
+			if node.commitPending.Load() {
+				t.Fatal("the recovery's settlement was skipped: commitPending still set")
+			}
+			next, err := peer.GetUpdate(true, 0)
+			if err != nil {
+				t.Fatalf("GetUpdate: %v", err)
+			}
+			if next.ReadOnly {
+				t.Fatal("the recovery's settlement was skipped: the hard-state claim stands")
+			}
+		})
 	}
 }
 

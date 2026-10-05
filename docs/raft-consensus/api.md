@@ -143,6 +143,11 @@ func MaybeApplied(err error) bool
 or may not have been applied. A caller that treats it as "failed" and retries a
 non-idempotent command applies it twice; sessions
 ([`../client-sessions/`](../client-sessions/user.md)) make that retry safe.
+Every failure delivered after the proposal was handed to Raft reports it:
+a timeout, a leadership change, a stopped, closed or halted shard, and a
+persist, commit or apply failure. Only a refusal before the hand-off is
+definite; the full list is in
+[`../multi-group-host/api.md`](../multi-group-host/api.md#classification-helpers).
 
 ### Error vocabulary
 
@@ -174,7 +179,9 @@ ordering guarantee between the two groups.
 `GetLeaderID` or `ShardInfo.Health`.
 
 Payload types: `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`,
-`ConnectionInfo`, `DiskInfo`, `EventShardInfo`.
+`ConnectionInfo`, `DiskInfo`, `EventShardInfo`. `ShardFailedInfo.Err` is a
+public error type such as `quicraft.ApplyError` or `quicraft.SMPanicError`; see
+the [host API errors](../multi-group-host/api.md#errors).
 
 ## Configuration
 

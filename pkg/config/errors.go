@@ -143,6 +143,24 @@ func (e *SessionExpiryEntriesTooSmallError) Error() string {
 	)
 }
 
+// MaxMessageReceiveMemoryTooSmallError is returned when an explicit
+// TransportConfig.MaxMessageReceiveMemory cannot hold one maximum-size frame.
+// Such a budget drops every peer's largest legal frame on arrival, so the
+// value is rejected at startup instead. Minimum is the receive charge of one
+// maximum-size frame.
+type MaxMessageReceiveMemoryTooSmallError struct {
+	Configured int64
+	Minimum    int64
+}
+
+// Error returns a formatted error message describing the violation.
+func (e *MaxMessageReceiveMemoryTooSmallError) Error() string {
+	return fmt.Sprintf(
+		"config: TransportConfig.MaxMessageReceiveMemory %d is below minimum %d (one maximum-size frame)",
+		e.Configured, e.Minimum,
+	)
+}
+
 // ErrMTLSConfigRequired is the sentinel for MTLSConfigRequiredError.
 // Use errors.Is to match.
 var ErrMTLSConfigRequired = &MTLSConfigRequiredError{}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/invariant"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -159,18 +160,18 @@ func (im *inMemory) checkMarkerIndex() {
 
 // getEntries returns entries in the range [low, high). Both low and high
 // must fall within the valid range [markerIndex, markerIndex+len(entries)).
-// Returns ErrCompacted if low < markerIndex, ErrUnavailable if high exceeds
-// the upper bound.
+// Returns logdb.ErrCompacted if low < markerIndex, logdb.ErrUnavailable if
+// high exceeds the upper bound.
 func (im *inMemory) getEntries(low, high uint64) ([]proto.Entry, error) {
 	upperBound := im.markerIndex + uint64(len(im.entries))
 	if low < im.markerIndex {
-		return nil, ErrCompacted
+		return nil, logdb.ErrCompacted
 	}
 	if high > upperBound {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if low > high {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if low == high {
 		return nil, nil

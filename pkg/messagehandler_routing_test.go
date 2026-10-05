@@ -51,7 +51,7 @@ func newRoutingHandlerFixture(t *testing.T) (*engine.Engine, *Host, *hostMessage
 	eng.Start()
 	t.Cleanup(eng.Stop)
 
-	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
+	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry(), engine: eng}
 	handler := &hostMessageHandler{engine: eng, host: h}
 	return eng, h, handler
 }

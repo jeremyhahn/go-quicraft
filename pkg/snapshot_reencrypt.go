@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 )
 
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
@@ -180,7 +182,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// MkdirAll creates, or a crash could lose the new directories' entries
 	// even though the renamed file's data was fsynced.
 	dstDir := filepath.Dir(dstPath)
-	syncRoot := deepestExistingAncestor(fsys, dstDir)
+	syncRoot := fsutil.DeepestExistingAncestorWith(fsys.Stat, dstDir)
 	if err := fsys.MkdirAll(dstDir, 0o750); err != nil {
 		return 0, err
 	}

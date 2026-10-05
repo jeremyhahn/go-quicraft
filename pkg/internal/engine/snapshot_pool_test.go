@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -803,11 +804,11 @@ type orderedCallback struct {
 	order []string
 }
 
-func (c *orderedCallback) OnSnapshotCompleted(shardID uint64, index uint64, err error) {
+func (c *orderedCallback) OnSnapshotCompleted(shardID uint64, index uint64, op SnapshotOperation, err error) {
 	c.mu.Lock()
 	c.order = append(c.order, "completed")
 	c.mu.Unlock()
-	c.testCallback.OnSnapshotCompleted(shardID, index, err)
+	c.testCallback.OnSnapshotCompleted(shardID, index, op, err)
 }
 
 func (c *orderedCallback) OnLogCompacted(shardID, replicaID uint64, compaction LogCompaction) {
@@ -2920,7 +2921,7 @@ func TestSnapshotPool_InFlightEpochTracking(t *testing.T) {
 
 func TestSnapshotEncryptError_Error(t *testing.T) {
 	err := &SnapshotEncryptError{Op: "encrypt", Err: ErrSnapshotCorrupt}
-	want := "engine: snapshot encrypt failed: engine: snapshot data corrupt"
+	want := "engine: snapshot encrypt failed: quicraft: snapshot frame corrupt"
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
 	}
@@ -4657,11 +4658,11 @@ type panicOnCompletedCallback struct {
 	rejected atomic.Int64
 }
 
-func (c *panicOnCompletedCallback) OnSnapshotCompleted(_ uint64, _ uint64, _ error) {
+func (c *panicOnCompletedCallback) OnSnapshotCompleted(_ uint64, _ uint64, _ SnapshotOperation, _ error) {
 	panic("listener boom")
 }
 
-func (c *panicOnCompletedCallback) OnSnapshotRejected(_, _ uint64) {
+func (c *panicOnCompletedCallback) OnSnapshotRejected(_, _ uint64, _ error) {
 	c.rejected.Add(1)
 }
 
@@ -4685,7 +4686,7 @@ func TestHandleRequest_PanicRecovery_PostCompletionCallback(t *testing.T) {
 	// completes and the panic can only come from the completion callback.
 	node := NewNode(nil, nil, nil, cfg, nil, t.TempDir(), nil)
 	node.snapshotting.Store(true)
-	pool.inFlight.Store(uint64(1), struct{}{})
+	pool.inFlight.Store(uint64(1), node)
 
 	// Must not panic out of handleRequest.
 	pool.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: true})
@@ -4698,6 +4699,76 @@ func TestHandleRequest_PanicRecovery_PostCompletionCallback(t *testing.T) {
 	}
 	if cb.rejected.Load() != 0 {
 		t.Fatal("OnSnapshotRejected must not fire for a snapshot that completed")
+	}
+}
+
+// TestHandleRequest_CompletionNamesItsOperation: a save that wrote nothing and
+// a recovery both complete at index 0 without error, so the index cannot say
+// which happened. The completion carries the operation so the host fires
+// OnSnapshotRecovered only for a recovery.
+func TestHandleRequest_CompletionNamesItsOperation(t *testing.T) {
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cb := newTestCallback()
+	pool := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	// Nothing applied: the save is a no-op. No LogDB: the recovery has no
+	// record to restore and completes without touching the state machine.
+	node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(0), t.TempDir(), nil)
+
+	for _, save := range []bool{true, false} {
+		node.snapshotting.Store(true)
+		pool.inFlight.Store(uint64(1), node)
+		pool.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: save})
+	}
+
+	calls := cb.getSnapshotCalls()
+	if len(calls) != 2 {
+		t.Fatalf("OnSnapshotCompleted called %d times, want 2", len(calls))
+	}
+	if c := calls[0]; c.op != SnapshotSave || c.index != 0 || c.err != nil {
+		t.Fatalf("no-op save completed as %+v, want SnapshotSave at index 0 without error", c)
+	}
+	if c := calls[1]; c.op != SnapshotRecover || c.err != nil {
+		t.Fatalf("recovery completed as %+v, want SnapshotRecover without error", c)
+	}
+}
+
+// TestHandleRequest_FailedSaveIsLoggedNotLatched: a failed save only READ the
+// state machine, so it must not trip the failure latch or report a shard
+// failure. It must still be reported: an automatic save has no requester to
+// hand the error to, so the pool's log line is its only report.
+func TestHandleRequest_FailedSaveIsLoggedNotLatched(t *testing.T) {
+	buf, restore := captureWarnOutput(t)
+	defer restore()
+
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cb := newTestCallback()
+	pool := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	// No snapshotter: the save fails without touching anything.
+	node := NewNode(nil, nil, nil, cfg, nil, t.TempDir(), nil)
+	node.snapshotting.Store(true)
+	pool.inFlight.Store(uint64(1), node)
+
+	pool.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: true})
+
+	if node.IsFailed() {
+		t.Fatal("a failed save tripped the shard's failure latch")
+	}
+	if n := cb.shardFailedCount.Load(); n != 0 {
+		t.Fatalf("OnShardFailed called %d times for a failed save, want 0", n)
+	}
+	if n := cb.snapshotCallCount.Load(); n != 1 {
+		t.Fatalf("OnSnapshotCompleted called %d times, want 1: the requester must get the error", n)
+	}
+	if !strings.Contains(buf.String(), "snapshot save failed") {
+		t.Fatalf("the failed save was not logged; log output: %q", buf.String())
 	}
 }
 

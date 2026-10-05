@@ -224,6 +224,11 @@ type snapshotReceiver struct {
 	// listener holds optional event callbacks. May be nil.
 	listener *config.EventListener
 
+	// dispatchListener delivers OnSnapshotRejected on the host's listener
+	// dispatcher (see setListenerDispatcher). Nil only for a receiver built
+	// standalone by this package's tests.
+	dispatchListener func(fn func()) bool
+
 	// metrics collects transport-level metrics. Nil when disabled.
 	metrics Metrics
 }
@@ -821,13 +826,11 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			"received_chunks", len(chunks),
 			"expected_chunks", hdr.ChunkCount,
 		)
-		if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
-			sr.listener.OnSnapshotRejected(config.SnapshotInfo{
-				ShardID:   hdr.ShardID,
-				ReplicaID: hdr.ReplicaID,
-				Index:     hdr.Index,
-			})
-		}
+		sr.notifyRejected(config.SnapshotInfo{
+			ShardID:   hdr.ShardID,
+			ReplicaID: hdr.ReplicaID,
+			Index:     hdr.Index,
+		})
 		return
 	}
 
@@ -878,13 +881,12 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotR
 	if sr.metrics != nil {
 		sr.metrics.IncSnapshotsRejected(hdr.ShardID, string(reason))
 	}
-	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
-		sr.listener.OnSnapshotRejected(config.SnapshotInfo{
-			ShardID:   hdr.ShardID,
-			ReplicaID: hdr.ReplicaID,
-			Index:     hdr.Index,
-		})
-	}
+	sr.notifyRejected(config.SnapshotInfo{
+		ShardID:   hdr.ShardID,
+		ReplicaID: hdr.ReplicaID,
+		Index:     hdr.Index,
+		Err:       err,
+	})
 }
 
 // rejectSnapshotStream records a snapshot transfer discarded before any chunk
@@ -914,13 +916,9 @@ func (sr *snapshotReceiver) rejectAuthorizedStream(reason snapshotRejectReason, 
 // rejectStream records a stream-level rejection, counting it under
 // countedShard and logging it at level.
 func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, countedShard uint64, err error, level slog.Level) {
-	var info config.SnapshotInfo
+	info := config.SnapshotInfo{Err: err}
 	if hdr != nil {
-		info = config.SnapshotInfo{
-			ShardID:   hdr.ShardID,
-			ReplicaID: hdr.ReplicaID,
-			Index:     hdr.Index,
-		}
+		info.ShardID, info.ReplicaID, info.Index = hdr.ShardID, hdr.ReplicaID, hdr.Index
 	}
 	slog.Log(context.Background(), level, "snapshot stream rejected, discarding transfer",
 		"reason", reason,
@@ -933,9 +931,41 @@ func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail str
 	if sr.metrics != nil {
 		sr.metrics.IncSnapshotsRejected(countedShard, string(reason))
 	}
-	if sr.listener != nil && sr.listener.OnSnapshotRejected != nil {
-		sr.listener.OnSnapshotRejected(info)
+	sr.notifyRejected(info)
+}
+
+// notifyRejected delivers OnSnapshotRejected on the host's listener
+// dispatcher, the same delivery every other source of that event uses, so a
+// listener may call any Host API from it, including StopShard, and a slow one
+// does not hold this receive goroutine.
+//
+// The host always installs the dispatcher before the transport starts. Only a
+// receiver built standalone by this package's tests has none, and there the
+// listener runs inline: no engine exists for it to be reentrant against.
+func (sr *snapshotReceiver) notifyRejected(info config.SnapshotInfo) {
+	if sr.listener == nil || sr.listener.OnSnapshotRejected == nil {
+		return
 	}
+	onRejected := sr.listener.OnSnapshotRejected
+	deliver := func() { onRejected(info) }
+	if sr.dispatchListener == nil {
+		deliver()
+		return
+	}
+	if !sr.dispatchListener(deliver) {
+		// Dropped on a full queue, as the engine drops its own notifications
+		// (counted in ListenerNotificationsDropped); named so an operator can
+		// tell which event a shard never delivered.
+		slog.Error("listener notification dropped: the EventListener is not consuming",
+			"event", "OnSnapshotRejected",
+			"shard_id", info.ShardID)
+	}
+}
+
+// setListenerDispatcher installs the function that delivers OnSnapshotRejected
+// off the receive goroutine. Must be called before any snapshot receives begin.
+func (sr *snapshotReceiver) setListenerDispatcher(dispatch func(fn func()) bool) {
+	sr.dispatchListener = dispatch
 }
 
 // SetEpochTracker sets the epoch tracker for in-flight epoch protection.

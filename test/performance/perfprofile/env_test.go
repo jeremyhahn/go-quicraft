@@ -200,7 +200,7 @@ func TestCaptureEnvScriptOutputParses(t *testing.T) {
 		t.Skipf("bash unavailable: %v", err)
 	}
 
-	out, err := exec.Command(bash, script, "unit-test-profile").Output()
+	out, err := exec.CommandContext(t.Context(), bash, script, "unit-test-profile").Output()
 	if err != nil {
 		t.Fatalf("capture-env.sh failed: %v", err)
 	}

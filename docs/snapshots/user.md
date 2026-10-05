@@ -52,7 +52,8 @@ index, err := host.SyncRequestSnapshot(ctx, shardID, quicraft.DefaultSnapshotOpt
 
 `RequestSnapshot` is the asynchronous form and returns a `*RequestState`. Only
 one snapshot per shard runs at a time; a second request gets
-`ErrSnapshotInProgress`.
+`ErrSnapshotInProgress`. A request issued after the previous one has returned
+is always admitted.
 
 To keep a different amount of log for this one snapshot:
 

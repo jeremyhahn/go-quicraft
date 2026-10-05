@@ -37,6 +37,7 @@ import (
 	mathrand "math/rand"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -260,10 +261,10 @@ func checkProbeAcknowledgements(tb testing.TB, c logRecoveryCase, lr *testLogRea
 					tb.Fatalf("%s: probe(index=%d term=%d) acknowledged index %d beyond lastIndex %d",
 						c, probe, logTerm, m.LogIndex, r.log.lastIndex())
 				}
-				// ErrCompacted means the entry was captured by a snapshot and
-				// is therefore held; ErrUnavailable means it is not there at
+				// logdb.ErrCompacted means the entry was captured by a snapshot and
+				// is therefore held; logdb.ErrUnavailable means it is not there at
 				// all, which is the phantom acknowledgement.
-				if _, err := r.log.term(m.LogIndex); errors.Is(err, ErrUnavailable) {
+				if _, err := r.log.term(m.LogIndex); errors.Is(err, logdb.ErrUnavailable) {
 					tb.Fatalf("%s: probe(index=%d term=%d) acknowledged index %d the log does not hold",
 						c, probe, logTerm, m.LogIndex)
 				}

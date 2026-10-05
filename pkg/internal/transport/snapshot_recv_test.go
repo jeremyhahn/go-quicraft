@@ -2575,6 +2575,10 @@ func TestReceiveChunks_ChunkHeaderMismatchRejected(t *testing.T) {
 		if info.ShardID != 1 || info.Index != 50 {
 			t.Fatalf("unexpected rejection info: %+v", info)
 		}
+		var mismatch *ChunkHeaderMismatchError
+		if !errors.As(info.Err, &mismatch) {
+			t.Fatalf("rejection Err = %v, want the *ChunkHeaderMismatchError that caused it", info.Err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("OnSnapshotRejected was not fired for header-mismatch discard")
 	}
@@ -3178,5 +3182,72 @@ func TestSnapshotPerPeerMemoryCapAppliesEndToEnd(t *testing.T) {
 	if avail := t2.snapshotRecv.AvailableMemory(); avail != t2.snapshotRecv.maxMemory {
 		t.Fatalf("global budget = %d after a per-peer rejection, want the full %d",
 			avail, t2.snapshotRecv.maxMemory)
+	}
+}
+
+// TestSnapshotReceiverRejectionDispatched verifies a receiver-side rejection
+// reaches OnSnapshotRejected through the listener dispatcher the host installs,
+// not inline on the receive goroutine. The listener blocks until released: run
+// inline it would hold the stream handler for as long as the listener chose,
+// and a listener calling StopShard from it would lack the no-engine-lock
+// guarantee every other delivery of that event has.
+func TestSnapshotReceiverRejectionDispatched(t *testing.T) {
+	handler := newTestHandler()
+	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
+
+	entered := make(chan config.SnapshotInfo, 1)
+	release := make(chan struct{})
+	sr.listener = &config.EventListener{
+		OnSnapshotRejected: func(info config.SnapshotInfo) {
+			entered <- info
+			<-release
+		},
+	}
+
+	queue := make(chan func(), 1)
+	dispatcherDone := make(chan struct{})
+	go func() {
+		defer close(dispatcherDone)
+		for fn := range queue {
+			fn()
+		}
+	}()
+	t.Cleanup(func() {
+		close(release)
+		close(queue)
+		<-dispatcherDone
+	})
+	sr.setListenerDispatcher(func(fn func()) bool {
+		select {
+		case queue <- fn:
+			return true
+		default:
+			return false
+		}
+	})
+
+	stopC := make(chan struct{})
+	close(stopC)
+	hdr := &SnapshotHeader{ShardID: 4, ReplicaID: 2, Index: 11, ChunkCount: 3}
+
+	returned := make(chan struct{})
+	go func() {
+		sr.receiveSnapshot(nil, hdr, "10.0.0.8:5000", PeerAuth{}, stopC)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("receiveSnapshot ran the OnSnapshotRejected listener inline: " +
+			"a blocking listener stalled the receive path")
+	}
+
+	select {
+	case info := <-entered:
+		if info.ShardID != 4 || info.ReplicaID != 2 || info.Index != 11 {
+			t.Fatalf("OnSnapshotRejected info = %+v, want shard 4 replica 2 index 11", info)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dispatched OnSnapshotRejected was never delivered")
 	}
 }

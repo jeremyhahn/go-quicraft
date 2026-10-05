@@ -682,7 +682,6 @@ func TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping(t *testing.T)
 		t.Fatal("errorMappings is empty; this test would verify nothing")
 	}
 	for _, m := range errorMappings {
-		m := m
 		t.Run(m.quicraftErr.Error(), func(t *testing.T) {
 			wrapped := translateError(&quicraft.MaybeAppliedError{Err: m.quicraftErr})
 			if !errors.Is(wrapped, m.dragonboatErr) {

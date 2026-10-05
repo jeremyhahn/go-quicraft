@@ -52,7 +52,8 @@ import (
 //   - Invoked INLINE on the producing worker: OnApplied, OnCommitted,
 //     OnReadyToRead, OnProposalFailed, OnReadIndexBatched, OnReadIndexFailed,
 //     OnShardFailed,
-//     OnSnapshotCompleted, OnSnapshotRejected, and OnCampaignSkipped were it
+//     OnSnapshotCompleted, OnSnapshotRequestCompleted, OnSnapshotRejected,
+//     and OnCampaignSkipped were it
 //     ever invoked (it is not — see its declaration). These resolve
 //     registered client requests and carry happens-before requirements with
 //     raft.Peer.Handle (see OnReadIndexBatched), so they cannot be queued behind
@@ -90,9 +91,24 @@ type Callback interface {
 	OnReadyToRead(shardID uint64, readyToRead []proto.ReadyToRead)
 
 	// OnSnapshotCompleted is called by the snapshot pool worker after a
-	// snapshot save or recover operation completes. The index is the
-	// snapshot log index on success, or 0 on error. MUST be non-blocking.
-	OnSnapshotCompleted(shardID uint64, index uint64, err error)
+	// snapshot save or recover operation completes; op says which. For a save
+	// the index is the snapshot log index, or 0 when the save wrote no
+	// snapshot (nothing applied yet, or no progress since the last one) or
+	// failed. For a recovery it is always 0. It is delivered while the shard's
+	// snapshot slots are still held, so a shard's completions arrive in the
+	// order its snapshots ran. It does NOT resolve the requester; see
+	// OnSnapshotRequestCompleted. MUST be non-blocking.
+	OnSnapshotCompleted(shardID uint64, index uint64, op SnapshotOperation, err error)
+
+	// OnSnapshotRequestCompleted is called by the snapshot pool worker after
+	// OnSnapshotCompleted (and OnLogCompacted) for a save that carried a
+	// non-zero SnapshotRequestOption.RequestKey, with that key and the same
+	// index and error. It is delivered AFTER the shard's snapshot slots are
+	// released, so a requester resolved here can issue its next request at
+	// once and have it admitted. It resolves only the request with that key,
+	// so a request admitted after the release is never handed this result.
+	// MUST be non-blocking.
+	OnSnapshotRequestCompleted(shardID, requestKey, index uint64, err error)
 
 	// OnLogCompacted is called by the snapshot pool worker, immediately after
 	// OnSnapshotCompleted, when a snapshot save compacted the log. It is NOT
@@ -132,10 +148,12 @@ type Callback interface {
 	// COLD path and MUST be non-blocking.
 	OnCampaignSkipped(shardID, replicaID, term uint64)
 
-	// OnSnapshotRejected is called when a snapshot request is rejected by
-	// the snapshot pool (duplicate in-flight or pool full).
+	// OnSnapshotRejected is called when the snapshot pool refuses a request
+	// (duplicate in-flight or pool full), abandons an accepted one (the pool
+	// stopping, a save that panicked), or rejects a recovery that failed
+	// before the state machine restore began. err is the cause.
 	// MUST be non-blocking.
-	OnSnapshotRejected(shardID, replicaID uint64)
+	OnSnapshotRejected(shardID, replicaID uint64, err error)
 
 	// OnReadIndexBatched registers alias keys that should complete when the
 	// batchKey's ReadIndex is confirmed. This enables multiple concurrent
@@ -152,11 +170,26 @@ type Callback interface {
 	// are attached, orphaning alias callers until context deadline.
 	OnReadIndexBatched(shardID uint64, batchKey uint64, aliasKeys []uint64)
 
-	// OnProposalFailed is called by the step worker when a batched proposal
-	// is rejected by the Raft peer (e.g., NotLeaderError when the leader is
-	// unknown, or ErrTransferInProgress). The entries slice contains the
-	// failed proposals whose pendingProposals entries should be completed
-	// with the given error. MUST be non-blocking.
+	// OnProposalRejected is called by the step worker when the Raft peer
+	// refuses a batch of proposals BEFORE appending any of it to the log
+	// (e.g. NotLeaderError when the leader is unknown, ErrTransferInProgress,
+	// ErrPendingConfigChange): raft validates the whole batch before it
+	// mutates anything, so none of these entries can ever commit. The
+	// refusal is definite. The entries slice contains the proposals whose
+	// pendingProposals entries should be completed with the given error.
+	// MUST be non-blocking.
+	OnProposalRejected(shardID uint64, entries []proto.Entry, err error)
+
+	// OnProposalFailed is called when proposals that were already handed to
+	// raft fail: a SaveState failure (entries the leader could not persist,
+	// which it may already have replicated — Replicate is a free-order
+	// message, sent before the local persist), a Peer.Commit or apply
+	// failure of committed entries, or a committed batch discarded unapplied.
+	// Every such entry may still commit and apply, here after a reload or on
+	// the rest of the shard, so the outcome reported to its caller is
+	// ambiguous. The entries slice contains the proposals whose
+	// pendingProposals entries should be completed with the given error.
+	// MUST be non-blocking.
 	OnProposalFailed(shardID uint64, entries []proto.Entry, err error)
 
 	// OnReadIndexFailed is called by the step worker when a batched ReadIndex
@@ -168,9 +201,11 @@ type Callback interface {
 	OnReadIndexFailed(shardID uint64, keys []uint64, err error)
 
 	// OnShardFailed is called at the moment a shard's failure latch trips —
-	// an SM.Apply error, a state-machine panic, or an apply dispatcher panic
-	// — with the error that tripped it. It fires once per halt, after
-	// OnProposalFailed has completed the batch that caused it.
+	// an SM.Apply error, a state-machine panic, an apply dispatcher panic, a
+	// commit or save-state failure, a step-worker GetUpdate error, or a
+	// snapshot recovery that failed or panicked — with the error that
+	// tripped it. It fires once per halt, after OnProposalFailed has
+	// completed the batch that caused it, when there was one.
 	//
 	// It exists for the requests the batch does not account for. A pending
 	// linearizable read completes only when lastApplied reaches its read
@@ -180,6 +215,18 @@ type Callback interface {
 	// lost leader, none of which was the cause. MUST be non-blocking.
 	OnShardFailed(shardID uint64, err error)
 }
+
+// SnapshotOperation identifies the snapshot pool operation a completion
+// reports. The zero value is deliberately not an operation, so a completion
+// that forgot to say which cannot pass for either.
+type SnapshotOperation uint8
+
+const (
+	// SnapshotSave captured the state machine to a snapshot.
+	SnapshotSave SnapshotOperation = iota + 1
+	// SnapshotRecover restored the state machine from a snapshot.
+	SnapshotRecover
+)
 
 // LogCompaction reports what a snapshot save's log compaction actually did.
 type LogCompaction struct {

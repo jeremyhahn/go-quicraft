@@ -29,6 +29,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -93,7 +94,7 @@ func main() {
 	if os.Args[1] == "generate" {
 		err = runGenerate(os.Args[2:])
 	} else {
-		err = runBenchmarks(os.Args[1:])
+		err = runBenchmarks(context.Background(), os.Args[1:])
 	}
 	if err != nil {
 		log.Printf("FAILED: %v", err)
@@ -105,13 +106,15 @@ func main() {
 // systems. A system that produces no results fails the whole run: a comparison
 // that quietly drops an engine is not a comparison, and an orchestrator that
 // prints ERROR and exits 0 is a gate that cannot fail.
-func runBenchmarks(args []string) error {
+func runBenchmarks(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	benchtime := fs.String("benchtime", "30s", "Duration for each benchmark (go test -benchtime)")
 	timeout := fs.String("timeout", "3600s", "Timeout for the entire benchmark run")
 	profileDir := fs.String("profile", "", "Profile directory to store results in (e.g. profiles/<name>)")
 	noBuild := fs.Bool("no-build", false, "Skip Docker image rebuild")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	systems, err := resolveSystems(fs.Args())
 	if err != nil {
@@ -149,7 +152,7 @@ func runBenchmarks(args []string) error {
 	fmt.Printf("Running benchmarks: %s\n", strings.Join(systems, ", "))
 	fmt.Printf("  benchtime=%s  timeout=%s  logs=%s\n\n", *benchtime, *timeout, cfg.logDir)
 
-	if err := prepareHost(); err != nil {
+	if err := prepareHost(ctx); err != nil {
 		return err
 	}
 
@@ -160,7 +163,7 @@ func runBenchmarks(args []string) error {
 		fmt.Printf("=== %s ===\n", sys)
 		start := time.Now()
 
-		suite, err := runSystem(sys, cfg)
+		suite, err := runSystem(ctx, sys, cfg)
 		if err != nil {
 			log.Printf("ERROR [%s]: %v", sys, err)
 			failed = append(failed, sys)
@@ -187,18 +190,24 @@ func runBenchmarks(args []string) error {
 
 	// Report whatever did run before failing, so a partial run is still
 	// diagnostic — but never let the exit status call it a success.
+	var printErr error
 	if len(table.Suites) > 0 {
-		report := table.Compare()
-		report.PrintTerminal(os.Stdout)
+		if err := table.Compare().PrintTerminal(os.Stdout); err != nil {
+			printErr = fmt.Errorf("print report: %w", err)
+		}
 	}
 
 	if len(failed) > 0 {
-		return &SystemsFailedError{Requested: systems, Failed: failed}
+		var err error = &SystemsFailedError{Requested: systems, Failed: failed}
+		if printErr != nil {
+			err = errors.Join(err, printErr)
+		}
+		return err
 	}
 	if len(table.Suites) == 0 {
 		return &NoResultsError{Requested: systems}
 	}
-	return nil
+	return printErr
 }
 
 // runGenerate turns one profile's stored results into charts and comparison
@@ -215,7 +224,9 @@ func runGenerate(args []string) error {
 	fs := flag.NewFlagSet("generate", flag.ExitOnError)
 	profileDir := fs.String("profile", "", "Profile directory to generate (e.g. profiles/<name>)")
 	systemsFlag := fs.String("systems", "all", "Comma-separated systems the generated documents must cover")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if *profileDir == "" {
 		return &NoProfileError{}
@@ -295,12 +306,12 @@ func resolveSystems(args []string) ([]string, error) {
 }
 
 // runSystem executes the benchmark for a single system and returns the parsed suite.
-func runSystem(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
+func runSystem(ctx context.Context, system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	if _, ok := dockerGoSystems[system]; ok {
-		return runGoDocker(system, cfg)
+		return runGoDocker(ctx, system, cfg)
 	}
 	if system == "openraft" {
-		return runOpenraft(cfg)
+		return runOpenraft(ctx, cfg)
 	}
 	return nil, fmt.Errorf("unknown system: %s", system)
 }
@@ -309,7 +320,7 @@ func runSystem(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error)
 // a Docker container, then parses the sentinel-delimited JSON from stdout.
 // Every engine runs with the same container flags (goRunArgs); host socket
 // buffer limits are set once for all engines by prepareHostNetwork.
-func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
+func runGoDocker(ctx context.Context, system string, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	docker := dockerGoSystems[system]
 
 	repoRoot, err := findRepoRoot()
@@ -318,7 +329,7 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 	}
 
 	if !cfg.noBuild {
-		if err := buildImage(docker.image, docker.dockerfile, repoRoot); err != nil {
+		if err := buildImage(ctx, docker.image, docker.dockerfile, repoRoot); err != nil {
 			return nil, err
 		}
 	}
@@ -328,7 +339,7 @@ func runGoDocker(system string, cfg runConfig) (*perfresult.BenchmarkSuite, erro
 		"-test.benchtime="+cfg.benchtime, "-test.timeout="+cfg.timeout, "-test.v")
 
 	fmt.Printf("  docker %s\n", strings.Join(runArgs, " "))
-	runCmd := exec.Command("docker", runArgs...)
+	runCmd := exec.CommandContext(ctx, "docker", runArgs...)
 
 	logPath := filepath.Join(cfg.logDir, system+".log")
 	fmt.Printf("  container console: %s\n", logPath)
@@ -387,10 +398,10 @@ var prepareHost = prepareHostNetwork
 // prepareHostNetwork raises the bench host's socket buffer limits before any
 // engine runs. It fails the run rather than continuing on defaults, because a
 // run where the limits differ between engines is not a fair comparison.
-func prepareHostNetwork() error {
+func prepareHostNetwork(ctx context.Context) error {
 	args := hostNetworkArgs()
 	fmt.Printf("Host network: net.core.{r,w}mem_{max,default} = %s\n", hostSocketBufferBytes)
-	out, err := exec.Command("docker", args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("set host socket buffer limits: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -441,7 +452,7 @@ func moduleAuth(getenv func(string) string) string {
 // same way. Which way was taken is printed, because a build that resolved
 // from the proxy when it needed Gitea fails later with an error that reads
 // like a missing repository.
-func buildImage(image, dockerfile, root string) error {
+func buildImage(ctx context.Context, image, dockerfile, root string) error {
 	fmt.Printf("  building Docker image %s...\n", image)
 	args := []string{"build", "-t", image, "-f", dockerfile}
 	env := os.Environ()
@@ -452,7 +463,7 @@ func buildImage(image, dockerfile, root string) error {
 	} else {
 		fmt.Println("  module credentials: none; github.com/jeremyhahn/* resolves from the public proxy only")
 	}
-	cmd := exec.Command("docker", append(args, root)...)
+	cmd := exec.CommandContext(ctx, "docker", append(args, root)...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -481,14 +492,14 @@ func benchTmpMount() []string {
 const openraftImage = "quicraft-openraft-bench"
 
 // runOpenraft builds (unless --no-build) and runs the OpenRaft Docker benchmark.
-func runOpenraft(cfg runConfig) (*perfresult.BenchmarkSuite, error) {
+func runOpenraft(ctx context.Context, cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 	repoRoot, err := findRepoRoot()
 	if err != nil {
 		return nil, fmt.Errorf("cannot find repo root: %w", err)
 	}
 
 	if !cfg.noBuild {
-		if err := buildImage(openraftImage, "openraft/Dockerfile", repoRoot); err != nil {
+		if err := buildImage(ctx, openraftImage, "openraft/Dockerfile", repoRoot); err != nil {
 			return nil, err
 		}
 	}
@@ -502,7 +513,7 @@ func runOpenraft(cfg runConfig) (*perfresult.BenchmarkSuite, error) {
 		"--benchtime="+cfg.benchtime,
 		"--timeout="+cfg.timeout,
 	)
-	runCmd := exec.Command("docker", runArgs...)
+	runCmd := exec.CommandContext(ctx, "docker", runArgs...)
 
 	logPath := filepath.Join(cfg.logDir, "openraft.log")
 	fmt.Printf("  container console: %s\n", logPath)

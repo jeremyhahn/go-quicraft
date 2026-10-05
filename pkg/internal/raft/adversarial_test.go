@@ -50,6 +50,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -813,7 +814,7 @@ func (inv *raftInvariants) checkOutbound(tb testing.TB, r *raft, label string) {
 				tb.Fatalf("%s: acknowledged index %d beyond last index %d",
 					label, m.LogIndex, r.log.lastIndex())
 			}
-			if _, err := r.log.term(m.LogIndex); errors.Is(err, ErrUnavailable) {
+			if _, err := r.log.term(m.LogIndex); errors.Is(err, logdb.ErrUnavailable) {
 				tb.Fatalf("%s: non-rejecting ReplicateResp acknowledges index %d the log does not hold",
 					label, m.LogIndex)
 			}

@@ -727,8 +727,9 @@ func (p panicOnSecondObserveProposalLatency) ObserveProposalLatency(uint64, time
 //
 // Two claimed proposals, an ordinary one (index 0) and a membership one
 // (index 1): the collector panics on the second ObserveProposalLatency
-// call, i.e. while completing index 1, after index 0 has already completed
-// and released successfully. Asserts index 0's RequestState was not
+// call, i.e. after index 1 has been completed (each caller is answered
+// before its latency is observed), and after index 0 has already completed
+// and released successfully. Neither may be completed or released again. Asserts index 0's RequestState was not
 // recycled/reused (via its pool) as a side effect of the recovery handler
 // touching it again, and that both proposals' pendingOps are accounted for
 // exactly once (Drain balances).
@@ -797,14 +798,21 @@ func TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims(t *testing
 	}
 
 	// B failed with the panic, via the recovery path.
+	// B was applied and completed with its real result before its latency
+	// was observed — the collector is user code and runs only after the
+	// caller is answered — and the recovery did not touch it again.
 	select {
 	case result := <-rsB.ResultC():
-		var panicErr *LoopPanicError
-		if !errors.As(result.Err, &panicErr) {
-			t.Fatalf("proposal B result.Err = %T (%v), want a *LoopPanicError", result.Err, result.Err)
+		if result.Err != nil {
+			t.Fatalf("proposal B result.Err = %T (%v), want nil: it was completed before "+
+				"the collector panicked", result.Err, result.Err)
 		}
 	default:
-		t.Fatal("proposal B was never completed by the recovery path")
+		t.Fatal("proposal B was never completed")
+	}
+	if outstanding := rsB.outstanding.Load(); outstanding != 0 {
+		t.Fatalf("rsB.outstanding = %d, want exactly 0 — the recovery handler released proposal B's "+
+			"RequestState a second time after its normal completion had already done so", outstanding)
 	}
 
 	// h.pendingOps is NOT the right place to look for a double-release:
@@ -829,7 +837,7 @@ func TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims(t *testing
 }
 
 // ---------------------------------------------------------------------------
-// waitResultCtx
+// awaitResult
 // ---------------------------------------------------------------------------
 
 // TestWaitResultCtx verifies the bridge used by the session APIs: a resolved
@@ -844,9 +852,9 @@ func TestWaitResultCtx(t *testing.T) {
 		defer rs.Release()
 		rs.complete(RequestResult{Value: 42})
 
-		result, err := waitResultCtx(context.Background(), rs)
+		result, err := awaitResult(context.Background(), rs)
 		if err != nil {
-			t.Fatalf("waitResultCtx error = %v, want nil", err)
+			t.Fatalf("awaitResult error = %v, want nil", err)
 		}
 		if result.Value != 42 {
 			t.Fatalf("result.Value = %d, want 42", result.Value)
@@ -858,9 +866,9 @@ func TestWaitResultCtx(t *testing.T) {
 		defer rs.Release()
 		rs.complete(RequestResult{Err: ErrNotLeader})
 
-		result, err := waitResultCtx(context.Background(), rs)
+		result, err := awaitResult(context.Background(), rs)
 		if !errors.Is(err, ErrNotLeader) {
-			t.Fatalf("waitResultCtx error = %v, want ErrNotLeader", err)
+			t.Fatalf("awaitResult error = %v, want ErrNotLeader", err)
 		}
 		if !errors.Is(result.Err, ErrNotLeader) {
 			t.Fatalf("result.Err = %v, want ErrNotLeader", result.Err)
@@ -874,9 +882,9 @@ func TestWaitResultCtx(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		result, err := waitResultCtx(ctx, rs)
+		result, err := awaitResult(ctx, rs)
 		if !errors.Is(err, ErrCanceled) {
-			t.Fatalf("waitResultCtx error = %v, want ErrCanceled", err)
+			t.Fatalf("awaitResult error = %v, want ErrCanceled", err)
 		}
 		if result.Value != 0 || result.Data != nil || result.Err != nil {
 			t.Fatalf("result = %+v, want the zero value on cancellation", result)
@@ -890,9 +898,9 @@ func TestWaitResultCtx(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 		defer cancel()
 
-		result, err := waitResultCtx(ctx, rs)
+		result, err := awaitResult(ctx, rs)
 		if !errors.Is(err, ErrTimeout) {
-			t.Fatalf("waitResultCtx error = %v, want ErrTimeout", err)
+			t.Fatalf("awaitResult error = %v, want ErrTimeout", err)
 		}
 		if result.Value != 0 || result.Data != nil || result.Err != nil {
 			t.Fatalf("result = %+v, want the zero value on timeout", result)

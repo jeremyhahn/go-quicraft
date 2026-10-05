@@ -1179,9 +1179,10 @@ materially larger than the frame: a 100-byte heartbeat becomes a 320-byte
 `Message` in a slice, and a membership map entry costs 12 bytes on the wire
 and roughly 57 in a Go map. The transport therefore reserves the frame
 length times this factor against `MaxMessageReceiveMemory` before reading the
-body (`decodeCharge`), so that budget bounds the heap decoded frames can
-occupy rather than the bytes read: 256 MB admits at most 32 MB of frames in
-flight.
+body (`proto.DecodeCharge`, and `proto.FrameDecodeCharge` for a frame plus its
+decompression delta), so that budget bounds the heap decoded frames can occupy
+rather than the bytes read. The default budget is four maximum-size frames at
+that charge, 512 MB, which admits at most 64 MB of frames in flight.
 
 The bound is measured rather than derived. `TestDecodeMemoryAmplification`
 builds the densest frames the format admits and fails if any exceeds it; the
@@ -1566,7 +1567,7 @@ naming so they are not mistaken for wire fields:
 | Setting | Owner | Relationship |
 |---|---|---|
 | `config.Config.MaxEntrySize` | per-shard config | may not exceed `proto.MaxEntrySize`; the effective proposal cap is `min(MaxProposalPayloadSize, MaxEntrySize)` |
-| `config.TransportConfig.MaxMessageReceiveMemory` | transport | a **wire-byte** budget. Multiply by `MaxDecodeMemoryFactor` to get the heap the process may actually hold. |
+| `config.TransportConfig.MaxMessageReceiveMemory` | transport | a **heap** budget: each frame is charged `MaxDecodeMemoryFactor` times its wire length plus decompression delta (`FrameDecodeCharge`). The default is `MessageReceiveBudgetFrames` maximum-size frame charges; a budget below one is rejected. |
 | `config.Config.EntryCompressionType` | per-shard config | a `config.CompressionType` selecting the algorithm behind `EntryCompressFlag`, which records only *that* `Cmd` is compressed. The algorithm is never carried on an `Entry`. |
 
 ## Test strategy

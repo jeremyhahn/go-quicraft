@@ -1911,7 +1911,6 @@ func TestConnectionCleanup_ExitsOnStopAfterNormalReturn(t *testing.T) {
 	tr.stopC = testStopC
 
 	done := make(chan struct{})
-	tr.wg.Add(1)
 	go func() {
 		defer close(done)
 		tr.connectionCleanup()
@@ -2295,13 +2294,12 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 	tr.connMu.Unlock()
 
 	done := make(chan struct{})
-	tr.wg.Add(1)
 	go func() {
 		defer close(done)
 		tr.connectionCleanup()
 	}()
 
-	// Let the panic-restart happen (workerPanicRestartDelay is 100ms).
+	// Let the panic-restart happen (supervise.RestartDelay is 100ms).
 	time.Sleep(300 * time.Millisecond)
 
 	// Close stopC to exit the loop.

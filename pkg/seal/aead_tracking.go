@@ -249,13 +249,17 @@ func (ic *InMemoryInvocationCounter) Close() error {
 // An atomic counter provides O(1) Count(). Memory grows linearly with the number
 // of encryption operations; plan for key rotation to bound memory usage.
 //
-// Clear() uses an atomic pointer swap to replace the nonce map, eliminating the
-// TOCTOU race that would exist with Range+Delete. Concurrent CheckAndRecordNonce
-// calls either complete against the old map (their nonces are discarded with it)
-// or operate on the new map (their nonces are correctly tracked).
+// The nonce set, its count and its saturation flag form one nonceEpoch, and
+// Clear replaces the whole epoch with a single atomic pointer swap. Every
+// CheckAndRecordNonce loads the epoch once and does all of its work against
+// that one value, so a call racing Clear either completes entirely against the
+// old epoch (and is discarded with it) or entirely against the new one. It can
+// never insert into the new set while counting against the old, or saturate a
+// fresh epoch with a ceiling crossing from the one it replaced.
 //
-// Thread-safe: reads use sync.Map's lock-free fast path; writes use
-// sync.Map's internal sharding. The enabled flag is protected by atomic operations.
+// Thread-safe and lock-free: reads use sync.Map's lock-free fast path; writes
+// use sync.Map's internal sharding. The enabled flag is protected by atomic
+// operations.
 //
 // COVERAGE IS A PREFIX, NOT AN EPOCH. Memory is bounded by maxTracked, and
 // entries are released only by Clear, which is reached only through a successful
@@ -270,12 +274,19 @@ func (ic *InMemoryInvocationCounter) Close() error {
 // epoch starts with no history to retain.
 type InMemoryNonceTracker struct {
 	enabled atomic.Bool
-	nonces  atomic.Pointer[sync.Map]
-	count   atomic.Int64
+	epoch   atomic.Pointer[nonceEpoch]
 
 	// maxTracked is the ceiling on tracked nonces. Zero or negative disables
 	// the ceiling.
 	maxTracked atomic.Int64
+}
+
+// nonceEpoch is the tracker state that Clear must reset as one unit. Splitting
+// it across independent atomics let a CheckAndRecordNonce racing Clear count
+// against one epoch while inserting into another.
+type nonceEpoch struct {
+	nonces sync.Map
+	count  atomic.Int64
 
 	// saturated records that the ceiling was reached, so the error is logged
 	// once per epoch, no further nonces are admitted, and Clear knows to lift
@@ -292,7 +303,7 @@ type InMemoryNonceTracker struct {
 func NewNonceTracker(enabled bool) *InMemoryNonceTracker {
 	nt := &InMemoryNonceTracker{}
 	nt.enabled.Store(enabled)
-	nt.nonces.Store(&sync.Map{})
+	nt.epoch.Store(&nonceEpoch{})
 	nt.maxTracked.Store(DefaultMaxTrackedNonces)
 	return nt
 }
@@ -341,12 +352,14 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 	}
 
 	key := nonceKey(nonce)
-	nonces := nt.nonces.Load()
+	// One epoch for the whole call: a concurrent Clear replaces the epoch, never
+	// the fields of the one this call is working against.
+	e := nt.epoch.Load()
 
 	// Saturated: check only. A new nonce is accepted unverified — it is outside
 	// the covered prefix — but a repeat of a retained one is still caught.
-	if nt.saturated.Load() {
-		if _, exists := nonces.Load(key); exists {
+	if e.saturated.Load() {
+		if _, exists := e.nonces.Load(key); exists {
 			return ErrNonceReuse
 		}
 		return nil
@@ -354,18 +367,18 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 
 	// The reuse check runs FIRST so a repeat of an already-recorded nonce is
 	// still caught at the ceiling: it costs no additional memory.
-	if _, loaded := nonces.LoadOrStore(key, struct{}{}); loaded {
+	if _, loaded := e.nonces.LoadOrStore(key, struct{}{}); loaded {
 		return ErrNonceReuse
 	}
 
 	// This nonce is new. Admitting it past the ceiling is what would grow the
 	// tracker without limit, so the entry that crosses the ceiling is rolled
 	// back and the tracker saturates instead.
-	n := nt.count.Add(1)
+	n := e.count.Add(1)
 	if max := nt.maxTracked.Load(); max > 0 && n > max {
-		nonces.Delete(key)
-		nt.count.Add(-1)
-		nt.saturateAtCeiling(max)
+		e.nonces.Delete(key)
+		e.count.Add(-1)
+		e.saturateAtCeiling(max)
 	}
 	return nil
 }
@@ -374,12 +387,12 @@ func (nt *InMemoryNonceTracker) CheckAndRecordNonce(nonce []byte) error {
 // once, at error level. Continuing to admit would exhaust memory; the retained
 // set stays checkable, so detection degrades to the covered prefix rather than
 // vanishing. Rotating the epoch (Clear) lifts it.
-func (nt *InMemoryNonceTracker) saturateAtCeiling(max int64) {
-	if !nt.saturated.CompareAndSwap(false, true) {
+func (e *nonceEpoch) saturateAtCeiling(max int64) {
+	if !e.saturated.CompareAndSwap(false, true) {
 		return
 	}
 	slog.Error("quicraft/seal: nonce tracker ceiling reached; reuse detection now covers only the nonces already tracked",
-		"tracked", nt.count.Load(),
+		"tracked", e.count.Load(),
 		"max_tracked", max,
 		"remedy", "rotate the epoch (requires a StatePersister), raise SetMaxTrackedNonces, or disable NonceTracking",
 	)
@@ -395,7 +408,8 @@ func (nt *InMemoryNonceTracker) saturateAtCeiling(max int64) {
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Saturated() bool {
-	return nt.saturated.Load()
+	e := nt.epoch.Load()
+	return e != nil && e.saturated.Load()
 }
 
 // Contains reports whether nonce is present in the tracked set, without
@@ -409,14 +423,14 @@ func (nt *InMemoryNonceTracker) Saturated() bool {
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Contains(nonce []byte) bool {
-	// A zero-value tracker (one not built by NewNonceTracker) has no map. It
+	// A zero-value tracker (one not built by NewNonceTracker) has no epoch. It
 	// holds nothing, so the answer is false — and reaching through the nil
 	// pointer to say so would panic.
-	nonces := nt.nonces.Load()
-	if nonces == nil {
+	e := nt.epoch.Load()
+	if e == nil {
 		return false
 	}
-	_, exists := nonces.Load(nonceKey(nonce))
+	_, exists := e.nonces.Load(nonceKey(nonce))
 	return exists
 }
 
@@ -430,34 +444,43 @@ func (nt *InMemoryNonceTracker) Contains(nonce []byte) bool {
 //
 // Thread-safe (O(1) via atomic counter).
 func (nt *InMemoryNonceTracker) Count() int {
-	return int(nt.count.Load())
+	e := nt.epoch.Load()
+	if e == nil {
+		return 0
+	}
+	return int(e.count.Load())
 }
 
-// Clear removes all tracked nonces by atomically swapping the internal map with
-// a fresh empty one, letting the old map be garbage collected. This must only be
-// called after rotating to a new key — clearing nonce history without changing
-// the key eliminates the protection this tracker provides.
+// Clear removes all tracked nonces by atomically swapping in a fresh, empty
+// epoch — nonce set, count and saturation flag together — letting the old one
+// be garbage collected. This must only be called after rotating to a new key —
+// clearing nonce history without changing the key eliminates the protection
+// this tracker provides.
 //
-// The atomic pointer swap eliminates the TOCTOU race that would exist with
-// Range+Delete: concurrent CheckAndRecordNonce calls either complete against the
-// old map (their nonces are discarded with it) or operate on the new map (their
-// nonces are correctly tracked in the new epoch).
+// The single pointer swap is what makes the reset atomic: concurrent
+// CheckAndRecordNonce calls either complete entirely against the old epoch
+// (their nonces, count and any saturation are discarded with it) or entirely
+// against the new one (their nonces are correctly tracked in the new epoch).
+// Swapping the fields one at a time instead lets a racing call count against
+// one epoch while inserting into the other, and lets a ceiling crossing from
+// the old epoch saturate the new one.
 //
-// Is a no-op when tracking is disabled.
-// Always returns nil for the in-memory implementation.
+// When tracking is disabled, Clear keeps the recorded history and only lifts
+// saturation. Always returns nil for the in-memory implementation.
 //
 // Thread-safe.
 func (nt *InMemoryNonceTracker) Clear() error {
 	// A saturated tracker regains full coverage here: the epoch has changed, so
 	// there is no history left to retain and admission can resume from empty. A
 	// tracker disabled explicitly via SetEnabled stays disabled.
-	nt.saturated.Store(false)
 	if !nt.enabled.Load() {
+		if e := nt.epoch.Load(); e != nil {
+			e.saturated.Store(false)
+		}
 		return nil
 	}
 
-	nt.nonces.Store(&sync.Map{})
-	nt.count.Store(0)
+	nt.epoch.Store(&nonceEpoch{})
 	return nil
 }
 

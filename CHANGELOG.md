@@ -7,7 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Errors the engine, Raft and transport layers hand to embedders are public:
+  `ApplyError`, `SMPanicError`, `SaveStateError`, `CommitError`,
+  `WorkerPanicError`, `SnapshotError`, `SnapshotRecoveryBehindError`,
+  `SnapshotEncryptError`, `SnapshotMetaInvalidError`, `ScratchUnlinkError`,
+  `DecompressError`, `CACertificateParseError`, and the sentinels
+  `ErrApplyGap`, `ErrSnapshotMetaCorrupt`, `ErrScratchNotUnlinked`,
+  `ErrUnsupportedSnapshotCompression`, `ErrCorruptConfigEntry`,
+  `ErrEntropyUnavailable`, `ErrCACertificateParse`, `ErrInvalidCertKeyPair`.
+  Each is the value the library returns, so `errors.Is`/`errors.As` match a
+  failed proposal, `ShardFailedInfo.Err` and the cause inside `HostInitError`.
+- `SnapshotSavePanicError` reports a state machine whose `SaveSnapshot`
+  panicked. It does not match `ErrShardFailed`, because a panicking save leaves
+  the shard running.
+- `TransportConfig.MessageReceiveBudgetFrames` (default 4) and
+  `*MaxMessageReceiveMemoryTooSmallError`; `proto.DecodeCharge` and
+  `proto.FrameDecodeCharge` expose the receive-budget charge for one frame.
+- `pkg/fsutil`: durable directory operations (`SyncDir`, `SyncDirChain`,
+  `DeepestExistingAncestor`, `MkdirAllSynced`), each with a `...With` form
+  that runs through a caller-supplied filesystem. Every directory fsync in the
+  engine, host, WAL and Dragonboat adapter goes through it;
+  `waldb.FileMetadataSyncer` is now an alias of `fsutil.MetadataSyncer`.
+- CI and `make ci-cross` build and vet every module for windows/amd64,
+  darwin/arm64 and freebsd/amd64 alongside linux/arm64 and linux/386; `make
+  lint` and the CI lint step run golangci-lint in every module, including
+  contrib/dragonboat and the test/performance harnesses.
+- `make docker-make` runs any make target (default `ci`) in a freshly built
+  dev image, locally or on a remote daemon via `DOCKER_HOST`; `make
+  docker-clean` removes this checkout's images. `.devcontainer/.env.example`
+  documents the module-credential file the images and compose services use.
+- `logdb.SameBarrier(a, b any) bool`, the one identity rule for barrier
+  handles: identity is pointer identity, and a nil or non-pointer barrier
+  matches nothing, not even a copy of itself. Implementations of
+  `PerBarrierEpochAwareLogDB` and `BarrierShardEnumerator` should match their
+  barrier argument with it.
+- `config.SnapshotInfo.Err`: the cause of an `OnSnapshotRejected` event when
+  one exists (the snapshot pool's refusal or abandonment, the error or panic
+  that rejected a recovery before the state machine restore, or the error
+  behind a refused inbound transfer); nil otherwise.
+- `SnapshotRecoveryPanicError` and `SnapshotRecoveryExhaustedError`.
+
 ### Changed
+
+- **BREAKING:** `DefaultMaxMessageReceiveMemory` is removed. The default
+  `TransportConfig.MaxMessageReceiveMemory` is derived from the frame size:
+  `MessageReceiveBudgetFrames` maximum-size frame charges, 512 MiB at the
+  defaults (was a fixed 256 MiB). An explicit budget still wins; `Validate`
+  rejects one below a single frame's charge.
+- **Callers see a different error classification.** Every failure delivered to
+  a proposal, config change or session operation after it was handed to Raft
+  now reports `MaybeApplied(err) == true`, wrapped in `*MaybeAppliedError`;
+  `errors.Is`, `errors.As`, `Temporary` and `NotLeader` still match the
+  underlying error. This covers `ErrTimeout` and `ErrCanceled` when the
+  caller's wait ends (a `Sync*` context's deadline or cancellation,
+  `RequestState.Result`'s deadline, the host's deadline sweep), `ErrAborted`
+  (the shard was stopped) and `ErrClosed` (the host closed) for a pending
+  proposal, a halted shard's pending proposals (`ErrShardFailed`), and
+  the failed batch's own `*SaveStateError` (the leader may already have
+  replicated the entries), `*CommitError` and `*ApplyError` or apply panic
+  (the entries are committed, and a reload replays them). Before, all of these
+  reported `MaybeApplied` false, so an unsessioned caller that retried could
+  apply its command twice. Refusals before the hand-off are unchanged and
+  definite: admission checks, a full proposal queue, a proposal still queued
+  when its shard halts or stops, and a batch Raft refused before appending it
+  (no known leader, a transfer in progress, a config change already pending).
+  A proposal is handed to Raft when the step worker takes it from the queue,
+  and a caller's own wait is classified by the same rule: one that ends on a
+  proposal never taken from a closed queue is definite. Pending reads failed by a leadership change or a
+  halt now get the bare error rather than one wrapped in `*MaybeAppliedError`:
+  a read appends nothing that could commit.
+- A proposal whose apply panicked receives the `*SMPanicError` itself
+  (wrapped in `*MaybeAppliedError`), so `errors.As` reaches the panic value
+  and stack; `errors.Is(err, ErrShardFailed)` still holds. It received the
+  bare `ErrShardFailed` sentinel before.
+- `ErrDropped` is also returned for a proposal or read an engine worker took
+  out of a shard and could not hand on because user code it ran panicked or
+  called `runtime.Goexit`. It is still `Temporary` and never `MaybeApplied`.
+- **BREAKING (release tooling):** `make release` / `make release-alpha` take
+  `RELEASE_GIT` (default `git`; a wrapper may carry leading arguments)
+  instead of `AGENT_GIT`. Before pushing, the release commit's author must be
+  a principal in `RELEASE_ALLOWED_SIGNERS` (default
+  `.release-allowed-signers`) and the commit and both tags must carry SSH
+  signatures that verify against that principal's key.
+- The QUIC transport no longer sets `SO_REUSEADDR` on its UDP listener on any
+  platform. UDP has no `TIME_WAIT`, so the option bought nothing on restart,
+  and on Linux it let two processes bind the same port and silently split its
+  datagrams. A second bind of a live listener's address now fails with
+  `EADDRINUSE`.
+- The Raft log's compacted and unavailable errors are `logdb.ErrCompacted`
+  and `logdb.ErrUnavailable` themselves, so the value in a
+  `ShardFailedInfo.Err` or `CommitError` matches the public names. The error
+  text changes from `raft: entry ...` to `logdb: entry ...`.
+- `EventListener.OnSnapshotRejected` is delivered on the listener dispatcher
+  whatever produced it, the snapshot pool or the snapshot receiver, so a
+  listener may call `StopShard` from it.
+- A snapshot recovery that fails or panics before the state machine's
+  `RecoverFromSnapshot` is invoked (reading the snapshot record, verifying,
+  decrypting or decompressing the artifact, resolving the barrier, or the Raft
+  log never reaching the snapshot index) no longer fails the shard at once. It
+  is rejected (`OnSnapshotRejected`, with the cause in `SnapshotInfo.Err`) and
+  the engine re-drives it with exponential backoff (100 ms doubling, capped at
+  5 s) while the replica is holding entries above the snapshot. After five
+  consecutive rejections over one continuous period of holding entries,
+  whatever snapshot each attempt was made against (a newer snapshot adopted
+  meanwhile does not restart the count), the shard is failed and
+  `OnShardFailed` fires once with a `*SnapshotRecoveryExhaustedError` wrapping
+  the last cause and naming the last attempt's snapshot index. A re-drive the
+  snapshot pool is too busy to admit is retried after the same backoff; it is
+  not an attempt and fires no `OnSnapshotRejected`, so each rejection event is
+  one real attempt. A recovery that fails once the restore has begun still
+  fails the shard immediately. `StartShard` is unchanged and still returns
+  integrity failures as `*HostInitError`.
+- `EventListener.OnShardFailed` no longer reports a
+  `SnapshotRecoveryBehindError` directly; it can only appear as the cause
+  inside a `*SnapshotRecoveryExhaustedError`.
 
 - The four benchmark harnesses run one common configuration: 1 ms tick,
   10-tick election timeout at every cluster size, PreVote and CheckQuorum where
@@ -17,6 +132,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container runs privileged. Where an engine cannot match a setting it is
   listed in `test/performance/README.md`. The `ci-node-2` profile is
   re-measured on 2026-10-04.
+
+### Fixed
+
+- `Host.Close` seals every barrier the `WithShardBarriers` resolver returned,
+  not only the `WithBarrier` barrier, once each, joining any seal failure into
+  `Close`'s error. Strategies remain the caller's to close.
+- `ErrShardFailed`, `ErrSnapshotCorrupt`, `ErrSnapshotSizeMismatch` and
+  `ErrDecompressionBomb` match the errors the engine produces, not only the
+  library's own translated returns.
+- `EventListener.OnShardFailed` fires exactly once per shard instance, from
+  the failure latch, for the failure that tripped it; failures racing it (a
+  save-state failure alongside a recovery exhausting its attempts, say) are
+  not reported again, and the report is made even when failing the batch
+  that tripped it panics. Whichever failure trips it also fails every
+  proposal and read still pending on the shard with `ErrShardFailed` (a
+  proposal's reporting `MaybeApplied`, since it reached Raft and may already
+  be committed, to be applied when the shard is reloaded); before, only reads
+  were failed (and not at all when a snapshot receive could not record an
+  adopted snapshot), so a proposal queued behind the failure waited out the
+  pending sweep and reported a timeout. The latch trips before the failed
+  batch's own proposals are completed, so a caller that retries at once is
+  refused with `ErrShardFailed` instead of being registered on a shard that
+  never answers, and a proposal or config change whose registration races the
+  halt rolls itself back. A failed snapshot recovery was reported twice,
+  and a failed snapshot save, which does not fail the shard, was reported as
+  a failure; a failed save is now logged at WARN and returned to
+  `RequestSnapshot` as a `*SnapshotFailedError`.
+- One peer could hold the whole message-receive budget and stall every other
+  peer: the per-peer sub-budget was charged in wire bytes against an aggregate
+  charged at the decode factor, and a refused frame kept its aggregate
+  reservation while its body drained. Both budgets use the same unit and a
+  refused frame holds nothing.
+- `InMemoryNonceTracker.Clear` resets the nonce set, count and saturation flag
+  as one atomic unit; a racing `CheckAndRecordNonce` could leave `Count()` out
+  of step, exceed the ceiling, or carry saturation into the fresh epoch.
+- A long-lived host no longer keeps an import-lock record for every shard ID
+  it has ever started, imported or removed.
+- The transport sweeps expired dial refusals on its cleanup tick, and
+  `CloseTarget` clears an address's refusals.
+- Dragonboat adapter: `RemoveData`/`SyncRemoveData` fsync `NodeHostDir` after
+  creating the removed-replica marker directory, so a power loss cannot drop
+  it and let a retired replica ID restart; a missing `NodeHostDir` is reported
+  as a `RemovalMarkerError`. Every timeout-taking request rejects zero,
+  negative and sub-RTT timeouts with `ErrTimeoutTooSmall`, including the
+  membership requests, which did not check before.
+- The WAL root's directory-chain fsync no longer skips the parent
+  directories when nothing above the WAL root exists but the filesystem root,
+  so a crash cannot lose a freshly created WAL tree; a directory whose
+  existence cannot be determined is fsynced rather than ending the chain.
+- A step-worker raft `GetUpdate` failure (the log cannot read committed
+  entries it owes the state machine) trips the shard's failure latch like an
+  apply or recovery failure: `OnShardFailed` fires once and the shard refuses
+  proposals and reads with `ErrShardFailed`. Previously it reported
+  `OnShardFailed` without taking the shard offline.
+- A panic inside the state machine's `RecoverFromSnapshot` fails the shard and
+  reports `OnShardFailed` once with an `*SMPanicError`, instead of firing
+  `OnSnapshotRejected` and resuming applies on a possibly half-restored state
+  machine. A panic in `SaveSnapshot` still leaves the shard running.
+- A snapshot save that had nothing new to capture no longer fires
+  `OnSnapshotRecovered`; it fires no snapshot event.
+- A snapshot save no longer rewrites the host's routing table from the Raft
+  membership; only a snapshot recovery reconciles it.
+- The QUIC transport builds on Windows: listener socket options are set per
+  platform.
+- Stopping the QUIC transport closes its UDP listener socket. quic-go does not
+  close a socket it was handed, so the address stayed bound after `Stop` and
+  the descriptor leaked.
+- contrib/dragonboat: the on-disk session check reports a failed shard lookup
+  instead of treating it as acceptable.
+- `SyncRequestSnapshot` (and a `RequestSnapshot` caller resolved by its
+  `RequestState`) could have the very next snapshot request refused with
+  `ErrSnapshotInProgress`, because the caller was resolved before the shard's
+  snapshot slot was released. The caller is resolved only after the slot is
+  free, and each completion resolves only the request it served.
+- A `SaveSnapshot` panic left its `SyncRequestSnapshot` caller waiting until its
+  context or the snapshot timeout expired; it now gets a
+  `*SnapshotFailedError` wrapping a `*SnapshotSavePanicError` at once, and the
+  shard keeps running.
+- A snapshot request abandoned by a stopped shard instance could make a
+  restarted instance of the same shard refuse snapshots, or clear its claim on
+  the slot; the slot now belongs to a specific node instance.
+- A `Barrier` whose value is not comparable (for example a struct holding a
+  slice) no longer panics `StartShard`, `Host.Close`, the snapshot pool's
+  per-barrier key purge or `waldb.DB.MinLiveEpochForBarrier`. Barriers are
+  matched by pointer identity: a non-pointer barrier is distinct for every
+  shard, `Close` seals it per shard, per-barrier key purges that cannot be
+  proven safe are declined, and `StartShard` with no `WithBarrier` refuses it
+  with `ErrShardBarrierLogDBMismatch`.
+- A `runtime.Goexit` in user code or a callback no longer ends a long-lived
+  goroutine for good: the apply, commit and step workers, each shard's apply
+  goroutine, the snapshot pool workers, the listener dispatcher and the
+  host's key-rotation loop are restarted on a fresh goroutine, as after a
+  panic. A `Goexit` in a state machine's `Apply`, or in its
+  `RecoverFromSnapshot`, fails the shard as a panic there does (an
+  `*SMPanicError` carrying `ErrGoexit`). A `Goexit` in one shard-failure
+  report no longer suppresses the other, so the host still fails the shard's
+  pending requests.
+- User code an engine worker runs between taking state out of a shard and
+  handing it on — a metrics collector, a callback, a logger, a user LogDB —
+  no longer loses that state when it panics or calls `runtime.Goexit`.
+  Committed entries whose `Peer.Commit` had run but which had not reached
+  the apply worker were dropped while the shard stayed live (a panic lost
+  them too); the shard is now failed with a `*CommitError` and their
+  proposals reported maybe-applied. A proposal batch taken from the queue
+  but not yet given to Raft was lost while reported handed off; it is now
+  marked handed off only as Raft receives it, and otherwise refused with
+  `ErrDropped` on a live shard, or with `ErrShardFailed` (`ErrStopped`) when
+  the shard has halted (is stopping). Drained ReadIndex requests and undelivered read results are
+  failed with `ErrDropped` instead of waiting for the sweep, and a commit
+  batch whose `SaveState` did not complete has its hard state written
+  again. Metrics are recorded after the hand-off they describe.
+- An update in a commit batch that had already reached the apply worker was
+  persisted, committed and applied a second time when a later update in the
+  same batch, or the batch's metrics, panicked or called `runtime.Goexit`.
+  Each update leaves the batch as it is handed on.
+- Every worker and goroutine recovery settles what an abnormal exit left
+  behind, and signals completion, before it logs; the diagnostic is emitted
+  on a goroutine of its own. A default `slog` handler, a host logger or a
+  panic value's `String`/`Error` method that panicked or called
+  `runtime.Goexit` could skip the settlement (leaving a commit batch's
+  durability claims standing), crash the process, or hang a shutdown drain.
+  The QUIC transport follows the same rule: its accept loop, connection
+  cleanup and send-queue workers are restarted when a `runtime.Goexit` (in a
+  log handler, an identity resolver or an event listener) ends them, where
+  before the accept loop stopped admitting connections, the cleanup stopped
+  sweeping and a peer's send queue stopped draining for good; and none of its
+  recoveries can be crashed by a log handler that panics. A panic in the
+  connection cleanup sweep no longer leaves the connection pool locked.
+- The host completes callers before it calls the `MetricsCollector` and holds
+  no lock while it does: a collector that called `runtime.Goexit` (or, when
+  installed unwrapped, panicked) could leave a ReadIndex confirmation holding
+  the shard's pending-reads lock, deadlocking the recovery that fails those
+  reads, or leave an applied proposal claimed and never answered. A halted
+  shard's pending requests are failed before the halt is logged, and a
+  snapshot send ended by `runtime.Goexit` reports the snapshot rejected as a
+  panic does.
+- `Engine.Stop` and `Host.Close` no longer hang when a listener calls
+  `runtime.Goexit` during the dispatcher's final drain, and the snapshot
+  pool's shutdown drain releases every queued request even when the
+  rejection callback exits abnormally.
+- A proposal failed with a state-machine error whose `As` method panics is
+  still completed and released; it was left pending, and `Drain` waited out
+  its timeout.
+- A leadership change no longer fails a proposal the step worker has not yet
+  taken from the queue. It reached no leader, so it is left pending and is
+  forwarded under the new leader or refused definitely; before, it could get
+  a `MaybeApplied` result or a definite one depending on a race. A proposal
+  still queued when its shard halts or stops is failed definitely.
+- A snapshot recovery that reaches a shard already stopping no longer starts
+  the state machine restore, and `StopShard` waits for a restore already
+  running before it tears the shard down, rather than relying on the state
+  machine's `Close` to wait for it.
+- A panic while reading the snapshot record during recovery no longer leaves
+  the shard's snapshot-directory lock held, which deadlocked every later
+  recovery, save and receive of that shard.
+- The devcontainer images mount module credentials from `.devcontainer/.env`
+  as the same `gomodauth` BuildKit secret the benchmark images use, and fail
+  loudly when a forge-only module cannot be fetched, instead of ignoring the
+  failed download.
+
+### Security
+
+- The release recipe no longer trusts the signing helper for what it
+  publishes: the release commit and tags are resolved to object IDs with plain
+  git, checked to be exactly the VERSION change on top of main with each tag
+  targeting it, verified on those IDs, pushed atomically by object ID through
+  the helper, and read back from the remote with plain git; the release fails
+  unless the remote branch and both tags name exactly the verified objects.
 
 ## [0.17.0] - 2026-10-02
 

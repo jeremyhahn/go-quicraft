@@ -243,7 +243,7 @@ func BenchmarkElection_5N_WAL(b *testing.B) {
 
 func BenchmarkPropose_SEQ_3N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftProposeCluster(b, cluster, rec)
@@ -257,7 +257,7 @@ func BenchmarkPropose_SEQ_3N_WAL(b *testing.B) {
 
 func BenchmarkPropose_SEQ_5N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftProposeCluster(b, cluster, rec)
@@ -271,7 +271,7 @@ func BenchmarkPropose_SEQ_5N_WAL(b *testing.B) {
 
 func BenchmarkPropose_Conc8_3N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftConcurrentProposeFixedCluster(b, cluster, concurrentGoroutines, rec)
@@ -287,7 +287,7 @@ func BenchmarkPropose_Conc8_3N_WAL(b *testing.B) {
 
 func BenchmarkPropose_Conc8_5N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftConcurrentProposeFixedCluster(b, cluster, concurrentGoroutines, rec)
@@ -303,7 +303,7 @@ func BenchmarkPropose_Conc8_5N_WAL(b *testing.B) {
 
 func BenchmarkCommitLatency_3N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftCommitLatencyCluster(b, cluster, rec)
@@ -317,7 +317,7 @@ func BenchmarkCommitLatency_3N_WAL(b *testing.B) {
 
 func BenchmarkCommitLatency_5N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftCommitLatencyCluster(b, cluster, rec)
@@ -331,7 +331,7 @@ func BenchmarkCommitLatency_5N_WAL(b *testing.B) {
 
 func BenchmarkSyncRead_3N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftSyncReadCluster(b, cluster, rec)
@@ -345,7 +345,7 @@ func BenchmarkSyncRead_3N_WAL(b *testing.B) {
 
 func BenchmarkSyncRead_5N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftSyncReadCluster(b, cluster, rec)
@@ -359,7 +359,7 @@ func BenchmarkSyncRead_5N_WAL(b *testing.B) {
 
 func BenchmarkStaleRead_3N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftStaleReadCluster(b, cluster, rec)
@@ -373,7 +373,7 @@ func BenchmarkStaleRead_3N_WAL(b *testing.B) {
 
 func BenchmarkStaleRead_5N_WAL(b *testing.B) {
 	cluster := perf.SetupQuicRaftCluster(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftStaleReadCluster(b, cluster, rec)
@@ -387,7 +387,7 @@ func BenchmarkStaleRead_5N_WAL(b *testing.B) {
 
 func BenchmarkSyncRead_3N_WAL_LeaseRead(b *testing.B) {
 	cluster := perf.SetupQuicRaftClusterLeaseRead(b, 3)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftSyncReadCluster(b, cluster, rec)
@@ -401,7 +401,7 @@ func BenchmarkSyncRead_3N_WAL_LeaseRead(b *testing.B) {
 
 func BenchmarkSyncRead_5N_WAL_LeaseRead(b *testing.B) {
 	cluster := perf.SetupQuicRaftClusterLeaseRead(b, 5)
-	defer cluster.Close()
+	defer closeCluster(b, cluster)
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 	perf.BenchQuicRaftSyncReadCluster(b, cluster, rec)
@@ -422,4 +422,12 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(exitCode)
+}
+
+// closeCluster closes cluster and reports a Close error on b.
+func closeCluster(b *testing.B, cluster *perf.BenchCluster) {
+	b.Helper()
+	if err := cluster.Close(); err != nil {
+		b.Errorf("close cluster: %v", err)
+	}
 }

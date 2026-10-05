@@ -179,7 +179,7 @@ type AEADProvider interface {
 // Implementations must be safe for concurrent use.
 //
 // The default in-memory implementation (InMemoryNonceTracker) uses sync.Map
-// with full [12]byte nonce keys for lock-free reads. Consumers may inject
+// keyed by the full nonce, whatever its length, for lock-free reads. Consumers may inject
 // persistent or hardware-backed implementations via
 // BarrierConfig.NonceTrackerProvider.
 type NonceTrackerProvider interface {

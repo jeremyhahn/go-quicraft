@@ -96,8 +96,10 @@ measured ceiling on that ratio; the measured worst case is 5.1x.
 
 The transport charges every inbound frame at eight times its wire length
 against `TransportConfig.MaxMessageReceiveMemory`, so that setting is a heap
-budget. The default 256 MB admits at most 32 MB of frames in flight; raise it
-if many peers send large batches at once.
+budget. The default is four maximum-size frames at that charge, 512 MB, which
+admits at most 64 MB of frames in flight; raise
+`TransportConfig.MessageReceiveBudgetFrames`, or set the budget outright, if
+many peers send large batches at once.
 
 ## Task: inspect a log or a snapshot by hand
 
@@ -165,4 +167,4 @@ on. See the copy rule above.
 
 **Fewer frames are admitted than the receive budget suggests.** Each frame is
 charged at `MaxDecodeMemoryFactor` times its wire length. Raise
-`MaxMessageReceiveMemory`.
+`MessageReceiveBudgetFrames` or `MaxMessageReceiveMemory`.

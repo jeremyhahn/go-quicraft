@@ -17,6 +17,8 @@ package waldb
 import (
 	"io/fs"
 	"os"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 )
 
 // File abstracts the file I/O operations used by WAL segments. Production
@@ -47,10 +49,9 @@ type File interface {
 // Directory syncs must therefore go through SyncMetadata, never Sync.
 //
 // Implementations whose Sync already covers metadata (the non-Linux osFile, and
-// in-memory test filesystems) need not implement this.
-type FileMetadataSyncer interface {
-	SyncMetadata() error
-}
+// in-memory test filesystems) need not implement this. It is
+// fsutil.MetadataSyncer, the capability fsutil.SyncDirWith checks for.
+type FileMetadataSyncer = fsutil.MetadataSyncer
 
 // FilePreAllocator is optionally implemented by File implementations that
 // support pre-allocating disk space without changing the visible file size.

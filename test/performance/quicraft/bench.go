@@ -16,6 +16,7 @@ package quicraft_perf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -79,9 +80,13 @@ type BenchCluster struct {
 }
 
 // Close shuts down all hosts in the cluster.
-func (c *BenchCluster) Close() {
+// It returns every host's Close error, joined.
+func (c *BenchCluster) Close() error {
+	var errs []error
 	for _, h := range c.Hosts {
-		h.Close()
+		if err := h.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	// Brief pause to let QUIC listeners and UDP sockets fully release.
 	// Without this, the next benchmark's cluster setup may hit port conflicts
@@ -89,6 +94,19 @@ func (c *BenchCluster) Close() {
 	drainTimer := time.NewTimer(500 * time.Millisecond)
 	<-drainTimer.C
 	drainTimer.Stop()
+	return errors.Join(errs...)
+}
+
+// closeHosts closes every host and reports each Close error on tb. A host
+// that fails to shut down can leave state the next benchmark trips on, so the
+// failure is surfaced rather than dropped.
+func closeHosts(tb testing.TB, hosts ...*quicraft.Host) {
+	tb.Helper()
+	for _, h := range hosts {
+		if err := h.Close(); err != nil {
+			tb.Errorf("close host: %v", err)
+		}
+	}
 }
 
 // Leader returns the host that was elected leader during setup.
@@ -181,16 +199,14 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
 			// Clean up already-created hosts on failure.
-			for j := 0; j < i; j++ {
-				hosts[j].Close()
-			}
+			closeHosts(b, hosts[:i]...)
 			b.Fatalf("quicraft.NewHost[%d] failed: %v", i, err)
 		}
 		hosts[i] = h
 	}
 
 	// Start the shard on all hosts.
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -202,9 +218,7 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		shardCfg := benchShardConfig(uint64(i+1), identities)
 
 		if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
-			for _, hh := range hosts {
-				hh.Close()
-			}
+			closeHosts(b, hosts...)
 			b.Fatalf("StartShard[%d] failed: %v", i, err)
 		}
 	}
@@ -212,16 +226,14 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 	// Wait for leader election.
 	leaderIdx, err := waitForClusterLeader(hosts, quicraftShardID, quicraftClusterElectionWait)
 	if err != nil {
-		for _, h := range hosts {
-			h.Close()
-		}
+		closeHosts(b, hosts...)
 		b.Fatalf("cluster leader election timed out: %v", err)
 	}
 
 	// Verify the cluster is ready to accept proposals with retry-tolerant
 	// warmup. This establishes all peer QUIC connections and ensures the
 	// leader can process proposals before the benchmark timer starts.
-	verifyClusterReady(b, hosts, leaderIdx, quicraftShardID)
+	verifyClusterReady(b, hosts, leaderIdx)
 
 	return &BenchCluster{
 		Hosts:     hosts,
@@ -281,7 +293,8 @@ func warmupPropose(ctx context.Context, h *quicraft.Host, shardID uint64, cmd []
 // and runs in addition, inside the commit-latency scenarios.
 const setupWarmupProposals = 10
 
-// verifyClusterReady runs the setup warmup on a freshly elected group of any
+// verifyClusterReady runs the setup warmup on the benchmark shard
+// (quicraftShardID) of a freshly elected group of any
 // size (a single-node group included): setupWarmupProposals proposals, then
 // one linearizable read, each on the shared warmup retry budget. It
 // establishes the peer QUIC connections and primes the propose and ReadIndex
@@ -289,16 +302,14 @@ const setupWarmupProposals = 10
 // calls return only once their own operation has completed (applied, or the
 // read index confirmed and reached), so nothing is left in flight that would
 // need a settle delay before the timer starts.
-func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int, shardID uint64) {
+func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int) {
 	b.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	fail := func(err error) {
-		for _, h := range hosts {
-			h.Close()
-		}
+		closeHosts(b, hosts...)
 		b.Fatalf("cluster readiness verification failed: %v", err)
 	}
 
@@ -306,7 +317,7 @@ func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int, sha
 	for i := 0; i < setupWarmupProposals; i++ {
 		warmupCmd := encodeKVCmd([]byte(fmt.Sprintf("warmup-%d", i)), []byte("ok"))
 		label := fmt.Sprintf("proposal %d on node %d", i, leaderIdx)
-		if err := warmupPropose(ctx, leader, shardID, warmupCmd, label); err != nil {
+		if err := warmupPropose(ctx, leader, quicraftShardID, warmupCmd, label); err != nil {
 			fail(err)
 		}
 	}
@@ -314,7 +325,7 @@ func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int, sha
 	// One linearizable read of a key the warmup just wrote, so a failure here
 	// is the ReadIndex path itself and is fatal like a failed proposal.
 	if err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
-		_, rerr := leader.SyncRead(ctx, shardID, []byte("warmup-0"))
+		_, rerr := leader.SyncRead(ctx, quicraftShardID, []byte("warmup-0"))
 		return rerr
 	}); err != nil {
 		fail(fmt.Errorf("warmup SyncRead on node %d failed after %d attempts: %w", leaderIdx, benchutil.WarmupAttempts, err))
@@ -365,20 +376,16 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 
 		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
-			for k := 0; k < j; k++ {
-				hosts[k].Close()
-			}
+			closeHosts(b, hosts[:j]...)
 			b.Fatalf("NewHost[%d] failed: %v", j, err)
 		}
 		hosts[j] = h
 	}
 	defer func() {
-		for _, h := range hosts {
-			h.Close()
-		}
+		closeHosts(b, hosts...)
 	}()
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 	identities := make(map[uint64]string, numNodes)
@@ -665,7 +672,7 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 		b.Fatalf("quicraft.NewHost failed: %v", err)
 	}
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -676,21 +683,21 @@ func SetupQuicRaftHost(b *testing.B) (*quicraft.Host, func()) {
 	}
 
 	if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
-		h.Close()
+		closeHosts(b, h)
 		b.Fatalf("StartShard failed: %v", err)
 	}
 
 	// Wait for leader election.
-	if err := waitForQuicRaftLeader(h, quicraftShardID, quicraftElectionWait); err != nil {
-		h.Close()
+	if err := waitForQuicRaftLeader(h); err != nil {
+		closeHosts(b, h)
 		b.Fatalf("leader election timed out: %v", err)
 	}
 
 	// The same setup warmup every group size runs; it closes h on failure.
-	verifyClusterReady(b, []*quicraft.Host{h}, 0, quicraftShardID)
+	verifyClusterReady(b, []*quicraft.Host{h}, 0)
 
 	cleanup := func() {
-		h.Close()
+		closeHosts(b, h)
 	}
 	return h, cleanup
 }
@@ -723,7 +730,7 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 		b.Fatalf("quicraft.NewHost (memory) failed: %v", err)
 	}
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -734,38 +741,39 @@ func SetupQuicRaftHostMemory(b *testing.B) (*quicraft.Host, func()) {
 	}
 
 	if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
-		h.Close()
+		closeHosts(b, h)
 		b.Fatalf("StartShard (memory) failed: %v", err)
 	}
 
-	if err := waitForQuicRaftLeader(h, quicraftShardID, quicraftElectionWait); err != nil {
-		h.Close()
+	if err := waitForQuicRaftLeader(h); err != nil {
+		closeHosts(b, h)
 		b.Fatalf("leader election (memory) timed out: %v", err)
 	}
 
 	// The same setup warmup every group size runs; it closes h on failure.
-	verifyClusterReady(b, []*quicraft.Host{h}, 0, quicraftShardID)
+	verifyClusterReady(b, []*quicraft.Host{h}, 0)
 
 	cleanup := func() {
-		h.Close()
+		closeHosts(b, h)
 	}
 	return h, cleanup
 }
 
-// waitForQuicRaftLeader polls until a leader is elected or the timeout expires.
-func waitForQuicRaftLeader(h *quicraft.Host, shardID uint64, timeout time.Duration) error {
+// waitForQuicRaftLeader polls until the benchmark shard (quicraftShardID) has
+// a leader or quicraftElectionWait expires.
+func waitForQuicRaftLeader(h *quicraft.Host) error {
 	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(quicraftElectionWait)
 	defer deadline.Stop()
 	for {
-		leaderID, ok, err := h.GetLeaderID(shardID)
+		leaderID, ok, err := h.GetLeaderID(quicraftShardID)
 		if err == nil && ok && leaderID > 0 {
 			return nil
 		}
 		select {
 		case <-deadline.C:
-			return fmt.Errorf("no leader elected within %v", timeout)
+			return fmt.Errorf("no leader elected within %v", quicraftElectionWait)
 		case <-ticker.C:
 		}
 	}
@@ -915,9 +923,9 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	if err != nil {
 		b.Fatalf("NewHost failed: %v", err)
 	}
-	defer h.Close()
+	defer closeHosts(b, h)
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -937,7 +945,7 @@ func BenchQuicRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 			b.Fatalf("StartShard failed at iteration %d: %v", i, err)
 		}
 
-		if err := waitForQuicRaftLeader(h, quicraftShardID, quicraftElectionWait); err != nil {
+		if err := waitForQuicRaftLeader(h); err != nil {
 			b.Fatalf("leader election timed out at iteration %d: %v", i, err)
 		}
 
@@ -979,9 +987,9 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 	if err != nil {
 		b.Fatalf("NewHost (memory) failed: %v", err)
 	}
-	defer h.Close()
+	defer closeHosts(b, h)
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -1001,7 +1009,7 @@ func BenchQuicRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 			b.Fatalf("StartShard (memory) failed at iteration %d: %v", i, err)
 		}
 
-		if err := waitForQuicRaftLeader(h, quicraftShardID, quicraftElectionWait); err != nil {
+		if err := waitForQuicRaftLeader(h); err != nil {
 			b.Fatalf("leader election (memory) timed out at iteration %d: %v", i, err)
 		}
 
@@ -1084,15 +1092,13 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 
 		h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 		if err != nil {
-			for j := 0; j < i; j++ {
-				hosts[j].Close()
-			}
+			closeHosts(b, hosts[:i]...)
 			b.Fatalf("quicraft.NewHost[%d] failed: %v", i, err)
 		}
 		hosts[i] = h
 	}
 
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()
 	})
 
@@ -1105,25 +1111,21 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		shardCfg.LeaseRead = true
 
 		if err := h.StartShard(members, false, createFn, shardCfg); err != nil {
-			for _, hh := range hosts {
-				hh.Close()
-			}
+			closeHosts(b, hosts...)
 			b.Fatalf("StartShard[%d] failed: %v", i, err)
 		}
 	}
 
 	leaderIdx, err := waitForClusterLeader(hosts, quicraftShardID, quicraftClusterElectionWait)
 	if err != nil {
-		for _, h := range hosts {
-			h.Close()
-		}
+		closeHosts(b, hosts...)
 		b.Fatalf("cluster leader election timed out: %v", err)
 	}
 
 	// Verify the cluster is ready to accept proposals with retry-tolerant
 	// warmup. This establishes all peer QUIC connections and ensures the
 	// leader can process proposals before the benchmark timer starts.
-	verifyClusterReady(b, hosts, leaderIdx, quicraftShardID)
+	verifyClusterReady(b, hosts, leaderIdx)
 
 	return &BenchCluster{
 		Hosts:     hosts,

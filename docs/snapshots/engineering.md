@@ -330,7 +330,50 @@ Watch three things:
 **Events.** `config.EventListener` carries `OnSnapshotCreated`,
 `OnSnapshotSent`, `OnSnapshotSendAborted`, `OnSnapshotReceived`,
 `OnSnapshotRecovered` and `OnSnapshotCompacted` with `config.SnapshotInfo`
-(shard, replica, index, sender).
+(shard, replica, index, sender). A save with nothing new to capture writes no
+snapshot and fires no event. A recovery that fails or panics once the state
+machine's `RecoverFromSnapshot` has been invoked fails the shard and fires
+`OnShardFailed` once. An error or panic in a step before that (reading the
+snapshot record, artifact verification, barrier resolution, decryption, or the
+raft log never reaching the snapshot index) has not touched the state machine:
+the recovery is rejected (`OnSnapshotRejected`, with the cause as
+`SnapshotInfo.Err` and logged at ERROR), the recovering gate comes down, the
+slots are released and the shard keeps running. Entries above the snapshot stay
+held until a recovery of it succeeds, so the replica applies nothing onto the
+untouched state machine meanwhile.
+
+Nothing outside the engine retries that recovery (the leader saw the snapshot
+acknowledged), so the step worker re-drives it through the same request path a
+snapshot receive uses: after 100 ms, then doubling, capped at 5 s, while the
+node is still holding entries and no recovery is running. Five consecutive
+attempts are made over one continuous episode of holding entries, the first
+included and whatever snapshot each is made against: a newer snapshot adopted
+mid-episode does not grant fresh attempts. The fifth rejection fails the shard
+with `*SnapshotRecoveryExhaustedError`, whose `Err` is the last cause and
+`SnapshotIndex` the snapshot the last attempt was made against, and fires
+`OnShardFailed` once. The count restarts only on a successful recovery, when
+the node is no longer holding entries, and with a restarted shard. A re-drive
+the pool cannot admit (its request queue is full) is not an attempt: it is
+retried after the same backoff, counts nothing and reports nothing, so each
+`OnSnapshotRejected` is one real attempt. The re-drive uses no goroutine or
+timer of its own, so a stopped or unloaded node simply stops being re-driven.
+
+A recovery holds the node's write lease from before the recovering gate is
+raised until `RecoverFromSnapshot` returns, so `UnloadNode`, which waits out
+every lease before the host closes the state machine, cannot complete under a
+running restore; the restore is handed the node's stop channel and should
+return promptly once it closes. A node that has already stopped refuses the
+lease, and its recovery never touches the state machine. The bound matters because a replica holding entries
+still votes and can win an election, and as leader it commits entries it
+does not apply: the window in which it can do so is the backoff schedule
+(100 + 200 + 400 + 800 ms) plus the five attempts themselves, after which the
+latch takes it out of the protocol. This covers
+the snapshot pool's runtime recovery only: `StartShard` restores on its own path
+and still returns integrity failures as `*HostInitError` (`ErrSnapshotCorrupt`).
+A failed save fires no event, because the shard keeps
+running: it is logged at WARN and returned to the `RequestSnapshot` caller as a
+`*SnapshotFailedError`; for automatic saves, alert on the log line or on
+`OnSnapshotCreated` going quiet.
 
 **Logging** uses `log/slog`. Failed saves and recoveries, verification failures,
 receive verdicts (declined, abandoned, kept) and epoch purges are logged with

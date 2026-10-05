@@ -44,22 +44,22 @@ func newTestLogReader(entries []proto.Entry, state proto.State) *testLogReader {
 
 func (lr *testLogReader) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) {
 	if low > high {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if low == high {
 		return nil, nil
 	}
 	// Find entries in our stored range.
 	if len(lr.entries) == 0 {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	firstIdx := lr.entries[0].Index
 	lastIdx := lr.entries[len(lr.entries)-1].Index
 	if low < firstIdx {
-		return nil, ErrCompacted
+		return nil, logdb.ErrCompacted
 	}
 	if low > lastIdx {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if high > lastIdx+1 {
 		high = lastIdx + 1
@@ -78,15 +78,15 @@ func (lr *testLogReader) Term(index uint64) (uint64, error) {
 		return lr.markerTerm, nil
 	}
 	if len(lr.entries) == 0 {
-		return 0, ErrUnavailable
+		return 0, logdb.ErrUnavailable
 	}
 	firstIdx := lr.entries[0].Index
 	lastIdx := lr.entries[len(lr.entries)-1].Index
 	if index < firstIdx {
-		return 0, ErrCompacted
+		return 0, logdb.ErrCompacted
 	}
 	if index > lastIdx {
-		return 0, ErrUnavailable
+		return 0, logdb.ErrUnavailable
 	}
 	return lr.entries[index-firstIdx].Term, nil
 }
@@ -145,15 +145,15 @@ func (lr *testLogReader) IndexRange() (uint64, uint64) {
 
 func (lr *testLogReader) Compact(index uint64) error {
 	if len(lr.entries) == 0 {
-		return ErrCompacted
+		return logdb.ErrCompacted
 	}
 	firstIdx := lr.entries[0].Index
 	if index < firstIdx {
-		return ErrCompacted
+		return logdb.ErrCompacted
 	}
 	lastIdx := lr.entries[len(lr.entries)-1].Index
 	if index > lastIdx {
-		return ErrUnavailable
+		return logdb.ErrUnavailable
 	}
 	offset := index - firstIdx
 	lr.markerIndex = index
@@ -182,14 +182,14 @@ func (db *testLogDB) Term(index uint64) (uint64, error) {
 	if db.termFn != nil {
 		return db.termFn(index)
 	}
-	return 0, ErrUnavailable
+	return 0, logdb.ErrUnavailable
 }
 
 func (db *testLogDB) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) {
 	if db.getRangeFn != nil {
 		return db.getRangeFn(low, high, maxSize)
 	}
-	return nil, ErrUnavailable
+	return nil, logdb.ErrUnavailable
 }
 
 func (db *testLogDB) SetRange(firstIndex, length uint64) error { return nil }
@@ -288,11 +288,11 @@ func TestRaftLog_Term_InvalidIndex(t *testing.T) {
 	l := newTestRaftLog(entries)
 
 	// For an index beyond lastIndex the in-memory log reports a miss and the
-	// LogDB reports ErrUnavailable, so term() must surface that error rather
+	// LogDB reports logdb.ErrUnavailable, so term() must surface that error rather
 	// than hand back a zero term a caller could mistake for a real one.
 	term, err := l.term(10)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("term(10) error = %v, want %v", err, ErrUnavailable)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("term(10) error = %v, want %v", err, logdb.ErrUnavailable)
 	}
 	if term != 0 {
 		t.Fatalf("term(10) = %d alongside its error, want 0", term)
@@ -366,8 +366,8 @@ func TestRaftLog_Entries_LowBeyondLastIndex(t *testing.T) {
 	l := newTestRaftLog(entries)
 
 	_, err := l.entries(10, 15, 0)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable, got %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("expected logdb.ErrUnavailable, got %v", err)
 	}
 }
 
@@ -929,7 +929,7 @@ func TestRaftLog_GetConflictIndex_NewEntriesBeyondLog(t *testing.T) {
 }
 
 // TestRaftLog_GetConflictIndex_CompactedEntriesSkipped verifies that
-// getConflictIndex skips entries that return ErrCompacted from term(),
+// getConflictIndex skips entries that return logdb.ErrCompacted from term(),
 // treating them as non-conflicting (already committed and persisted).
 // This prevents false conflicts when a follower's inmem log has a gap
 // after snapshot restore but LogDB has compacted entries below.
@@ -940,7 +940,7 @@ func TestRaftLog_GetConflictIndex_CompactedEntriesSkipped(t *testing.T) {
 	if err := logdb.Compact(3); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	// Now LogDB has entries [4, 5] and returns ErrCompacted for 1-3.
+	// Now LogDB has entries [4, 5] and returns logdb.ErrCompacted for 1-3.
 	l := &raftLog{
 		logdb: logdb,
 		inmem: newInMemory(5),
@@ -950,7 +950,7 @@ func TestRaftLog_GetConflictIndex_CompactedEntriesSkipped(t *testing.T) {
 	// Add entry 4 back to inmem.
 	l.inmem.merge([]proto.Entry{{Index: 4, Term: 1}})
 
-	// Entries 2-3 are compacted in LogDB (ErrCompacted), entry 4 matches inmem.
+	// Entries 2-3 are compacted in LogDB (logdb.ErrCompacted), entry 4 matches inmem.
 	checkEntries := []proto.Entry{
 		{Index: 2, Term: 1}, // compacted → skip
 		{Index: 3, Term: 1}, // compacted → skip
@@ -1267,8 +1267,8 @@ func TestRaftLog_Entries_LowGtHigh(t *testing.T) {
 	l := newTestRaftLog(entries)
 
 	_, err := l.entries(5, 3, 0)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable for low > high, got %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("expected logdb.ErrUnavailable for low > high, got %v", err)
 	}
 }
 
@@ -1291,112 +1291,140 @@ func TestRaftLog_EntriesToApply_WithProcessedAtZero(t *testing.T) {
 	}
 }
 
-// TestRaftLog_Term_TranslatesLogDBErrCompacted verifies that when the
-// underlying LogReader returns logdb.ErrCompacted (a different sentinel
-// from raft.ErrCompacted), term() translates it to raft.ErrCompacted.
-// This is the root cause of the getConflictIndex false-conflict bug:
-// without translation, errors.Is(err, ErrCompacted) fails in
-// getConflictIndex and the compacted entry is treated as a new entry.
-func TestRaftLog_Term_TranslatesLogDBErrCompacted(t *testing.T) {
-	db := &testLogDB{
-		termFn: func(index uint64) (uint64, error) {
-			return 0, logdb.ErrCompacted
+// TestRaftLog_ErrorsAreLogDBSentinels verifies that every compacted and
+// unavailable error the raft log produces -- whether it originates in the
+// LogReader or in the raft log's own bounds checks -- is logdb.ErrCompacted or
+// logdb.ErrUnavailable. One value means one condition everywhere: an embedder
+// that finds one inside ShardFailedInfo.Err or a CommitError matches it with
+// the public logdb name, and no raft-side copy of either sentinel exists to
+// diverge from it.
+func TestRaftLog_ErrorsAreLogDBSentinels(t *testing.T) {
+	tests := []struct {
+		name string
+		call func() error
+		want error
+	}{
+		{
+			name: "term from LogReader compacted",
+			call: func() error {
+				l := &raftLog{
+					logdb: &testLogDB{
+						termFn: func(uint64) (uint64, error) { return 0, logdb.ErrCompacted },
+						// Index 5 is compacted, so the log starts above it.
+						indexRangeFn: func() (uint64, uint64) { return 6, 10 },
+					},
+					inmem: newInMemory(0),
+				}
+				_, err := l.term(5)
+				return err
+			},
+			want: logdb.ErrCompacted,
 		},
-		// Index 5 is compacted, so the log starts above it and runs to 10.
-		// term()'s LogDB fallback is bounded by lastIndex(), so the stub has
-		// to describe a log that still holds something.
-		indexRangeFn: func() (uint64, uint64) { return 6, 10 },
-	}
-	l := &raftLog{
-		logdb: db,
-		inmem: newInMemory(0),
-	}
-	_, err := l.term(5)
-	if !errors.Is(err, ErrCompacted) {
-		t.Fatalf("expected raft.ErrCompacted, got %v", err)
-	}
-	// Ensure it is NOT logdb.ErrCompacted (different sentinel).
-	if errors.Is(err, logdb.ErrCompacted) {
-		t.Fatal("expected translated error, but got raw logdb.ErrCompacted")
-	}
-}
-
-// TestRaftLog_Term_TranslatesLogDBErrUnavailable verifies that
-// logdb.ErrUnavailable from the LogReader is translated to
-// raft.ErrUnavailable by term().
-func TestRaftLog_Term_TranslatesLogDBErrUnavailable(t *testing.T) {
-	db := &testLogDB{
-		termFn: func(index uint64) (uint64, error) {
-			return 0, logdb.ErrUnavailable
+		{
+			name: "term from LogReader unavailable",
+			call: func() error {
+				l := &raftLog{
+					logdb: &testLogDB{
+						termFn: func(uint64) (uint64, error) { return 0, logdb.ErrUnavailable },
+						// Index 5 is inside the declared range, so the error
+						// comes from the LogReader, not term()'s own bound.
+						indexRangeFn: func() (uint64, uint64) { return 1, 10 },
+					},
+					inmem: newInMemory(0),
+				}
+				_, err := l.term(5)
+				return err
+			},
+			want: logdb.ErrUnavailable,
 		},
-		// Index 5 is inside the declared range, so the error under test comes
-		// from the stub's Term and not from term()'s own lastIndex bound --
-		// which would report ErrUnavailable without ever calling the stub,
-		// making the translation this test covers unreachable.
-		indexRangeFn: func() (uint64, uint64) { return 1, 10 },
-	}
-	l := &raftLog{
-		logdb: db,
-		inmem: newInMemory(0),
-	}
-	_, err := l.term(5)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected raft.ErrUnavailable, got %v", err)
-	}
-	if errors.Is(err, logdb.ErrUnavailable) {
-		t.Fatal("expected translated error, but got raw logdb.ErrUnavailable")
-	}
-}
-
-// TestRaftLog_Entries_TranslatesLogDBErrCompacted verifies that when
-// LogDB's GetRange returns logdb.ErrCompacted, entries() translates it
-// to raft.ErrCompacted for callers in the raft package.
-func TestRaftLog_Entries_TranslatesLogDBErrCompacted(t *testing.T) {
-	db := &testLogDB{
-		getRangeFn: func(low, high, maxSize uint64) ([]proto.Entry, error) {
-			return nil, logdb.ErrCompacted
+		{
+			name: "term past the end of the log",
+			call: func() error {
+				_, err := newTestRaftLog(makeEntries(1, 6, 1)).term(10)
+				return err
+			},
+			want: logdb.ErrUnavailable,
+		},
+		{
+			name: "entries from LogReader compacted",
+			call: func() error {
+				l := &raftLog{
+					logdb: &testLogDB{
+						getRangeFn: func(uint64, uint64, uint64) ([]proto.Entry, error) {
+							return nil, logdb.ErrCompacted
+						},
+					},
+					inmem: newInMemory(10), // markerIndex > low forces the LogDB path
+				}
+				_, err := l.entries(1, 5, 0)
+				return err
+			},
+			want: logdb.ErrCompacted,
+		},
+		{
+			name: "entries from LogReader unavailable",
+			call: func() error {
+				l := &raftLog{
+					logdb: &testLogDB{
+						getRangeFn: func(uint64, uint64, uint64) ([]proto.Entry, error) {
+							return nil, logdb.ErrUnavailable
+						},
+					},
+					inmem: newInMemory(10),
+				}
+				_, err := l.entries(1, 5, 0)
+				return err
+			},
+			want: logdb.ErrUnavailable,
+		},
+		{
+			name: "entries low greater than high",
+			call: func() error {
+				_, err := newTestRaftLog(makeEntries(1, 6, 1)).entries(5, 3, 0)
+				return err
+			},
+			want: logdb.ErrUnavailable,
+		},
+		{
+			name: "entries past the end of the log",
+			call: func() error {
+				_, err := newTestRaftLog(makeEntries(1, 6, 1)).entries(10, 12, 0)
+				return err
+			},
+			want: logdb.ErrUnavailable,
+		},
+		{
+			name: "in-memory entries below the marker",
+			call: func() error {
+				im := newInMemory(5)
+				_, err := im.getEntries(3, 6)
+				return err
+			},
+			want: logdb.ErrCompacted,
+		},
+		{
+			name: "in-memory entries above the upper bound",
+			call: func() error {
+				im := newInMemory(5)
+				_, err := im.getEntries(6, 8)
+				return err
+			},
+			want: logdb.ErrUnavailable,
 		},
 	}
-	l := &raftLog{
-		logdb: db,
-		inmem: newInMemory(10), // markerIndex > low forces LogDB path
-	}
-	_, err := l.entries(1, 5, 0)
-	if !errors.Is(err, ErrCompacted) {
-		t.Fatalf("expected raft.ErrCompacted, got %v", err)
-	}
-	if errors.Is(err, logdb.ErrCompacted) {
-		t.Fatal("expected translated error, but got raw logdb.ErrCompacted")
-	}
-}
-
-// TestRaftLog_Entries_TranslatesLogDBErrUnavailable verifies that when
-// LogDB's GetRange returns logdb.ErrUnavailable, entries() translates
-// it to raft.ErrUnavailable.
-func TestRaftLog_Entries_TranslatesLogDBErrUnavailable(t *testing.T) {
-	db := &testLogDB{
-		getRangeFn: func(low, high, maxSize uint64) ([]proto.Entry, error) {
-			return nil, logdb.ErrUnavailable
-		},
-	}
-	l := &raftLog{
-		logdb: db,
-		inmem: newInMemory(10),
-	}
-	_, err := l.entries(1, 5, 0)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected raft.ErrUnavailable, got %v", err)
-	}
-	if errors.Is(err, logdb.ErrUnavailable) {
-		t.Fatal("expected translated error, but got raw logdb.ErrUnavailable")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); !errors.Is(err, tt.want) {
+				t.Fatalf("error = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }
 
 // TestRaftLog_GetConflictIndex_LogDBCompactedSkipped verifies the full
 // bug-fix path: getConflictIndex receives logdb.ErrCompacted from the
-// real LogDB layer (via term()), which is translated to
-// raft.ErrCompacted, and the compacted entry is correctly skipped
-// instead of treated as a false conflict.
+// real LogDB layer (via term()), and the compacted entry is correctly
+// skipped instead of treated as a false conflict.
 func TestRaftLog_GetConflictIndex_LogDBCompactedSkipped(t *testing.T) {
 	db := &testLogDB{
 		termFn: func(index uint64) (uint64, error) {
@@ -1449,7 +1477,7 @@ func TestRaftLog_TryCommit_LogDBCompacted(t *testing.T) {
 			return 0, logdb.ErrCompacted
 		},
 		// Index 5 is compacted, so the log starts above it. Without a declared
-		// range term() reports ErrUnavailable from its lastIndex bound and
+		// range term() reports logdb.ErrUnavailable from its lastIndex bound and
 		// tryCommit takes the plain-error path instead of the compacted one
 		// this test is about.
 		indexRangeFn: func() (uint64, uint64) { return 6, 10 },
@@ -1459,7 +1487,7 @@ func TestRaftLog_TryCommit_LogDBCompacted(t *testing.T) {
 		inmem:     newInMemory(0),
 		committed: 0,
 	}
-	// tryCommit should see ErrCompacted (translated), set t=0,
+	// tryCommit should see logdb.ErrCompacted (translated), set t=0,
 	// fail the t==term check, and return false.
 	ok := l.tryCommit(5, 1)
 	if ok {

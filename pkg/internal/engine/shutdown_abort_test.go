@@ -294,7 +294,7 @@ func TestSnapshotPool_Recovery_AbortsWhenNodeStopsMidDrain(t *testing.T) {
 	node.Stop()
 
 	// Mirror requestSnapshot's bookkeeping so the abort's cleanup is observable.
-	p.inFlight.Store(uint64(1), struct{}{})
+	p.inFlight.Store(uint64(1), node)
 	node.snapshotting.Store(true)
 
 	p.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: false})
@@ -316,11 +316,22 @@ func TestSnapshotPool_Recovery_AbortsWhenNodeStopsMidDrain(t *testing.T) {
 	if _, stillInFlight := p.inFlight.Load(uint64(1)); stillInFlight {
 		t.Fatal("in-flight marker left set: no further snapshot request for this shard would be accepted")
 	}
-	// The abort is not a completion: no result and no completion callback.
+	// The abort is abandoned like any recovery whose node stopped: its only
+	// trace is the test-only result, carrying ErrStopped, and no callback
+	// reports it.
 	select {
 	case res := <-p.CompletedC():
-		t.Fatalf("aborted recovery reported a completion result: %+v", res)
+		if !errors.Is(res.err, ErrStopped) {
+			t.Fatalf("aborted recovery result = %+v, want ErrStopped", res)
+		}
 	default:
+		t.Fatal("aborted recovery left no result")
+	}
+	if n := cb.snapshotRejected.Load(); n != 0 {
+		t.Fatalf("OnSnapshotRejected fired %d times for an aborted recovery, want 0", n)
+	}
+	if n := cb.shardFailedCount.Load(); n != 0 {
+		t.Fatalf("OnShardFailed fired %d times for an aborted recovery, want 0", n)
 	}
 	if got := cb.getSnapshotCalls(); len(got) != 0 {
 		t.Fatalf("OnSnapshotCompleted fired %d times for an aborted recovery, want 0: %+v", len(got), got)

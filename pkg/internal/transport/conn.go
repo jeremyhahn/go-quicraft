@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"runtime/debug"
@@ -29,6 +28,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/quic-go/quic-go"
 )
@@ -143,18 +143,19 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 	if want != "" {
 		dialKey = target + "\x00" + want
 	}
+	refusalKey := dialRefusalKey{target: target, want: want}
 	// A destination just refused is not tried again until the cooldown
 	// passes: see dialRefusalCooldown.
-	if v, found := t.dialRefusals.Load(dialKey); found {
+	if v, found := t.dialRefusals.Load(refusalKey); found {
 		refusal := v.(dialRefusal)
 		if time.Since(refusal.at) < dialRefusalCooldown {
 			return nil, refusal.err
 		}
-		t.dialRefusals.CompareAndDelete(dialKey, v)
+		t.dialRefusals.CompareAndDelete(refusalKey, v)
 	}
 	if ok && want != "" && presented != want && conn.Context().Err() == nil {
 		if err := t.replaceUnboundPeer(target, conn, presented); err != nil {
-			t.dialRefusals.Store(dialKey, dialRefusal{at: time.Now(), err: err})
+			t.dialRefusals.Store(refusalKey, dialRefusal{at: time.Now(), err: err})
 			return nil, err
 		}
 	}
@@ -168,7 +169,7 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 	})
 	if err != nil {
 		if _, refused := errors.AsType[*DialIdentityError](err); refused {
-			t.dialRefusals.Store(dialKey, dialRefusal{at: time.Now(), err: err})
+			t.dialRefusals.Store(refusalKey, dialRefusal{at: time.Now(), err: err})
 		}
 		slog.Debug("connection dial failed",
 			"target", target,
@@ -214,11 +215,51 @@ func (t *QUICTransport) replaceUnboundPeer(target string, conn *quic.Conn, prese
 // handshake and log storm against that peer at the sender's message rate.
 const dialRefusalCooldown = time.Second
 
+// dialRefusalKey names the destination a dial refusal is remembered for: the
+// target address and the identity the dial wanted there ("" when pinning is
+// disabled).
+type dialRefusalKey struct {
+	target string
+	want   string
+}
+
 // dialRefusal records a dial refused by the identity pin, for
 // dialRefusalCooldown.
 type dialRefusal struct {
 	at  time.Time
 	err error
+}
+
+// sweepDialRefusals forgets every remembered dial refusal whose cooldown has
+// passed by now. getConnection drops an expired refusal only when the same
+// destination is dialed again, so without this a destination never dialed
+// again — a removed member, a rotated identity, a moved address — kept its
+// entry for the life of the transport.
+//
+// Run on the connection-cleanup tick, it bounds the map to the refusals made
+// within one cleanup interval plus the cooldown. Every refusal is for a
+// (target, identity) pair membership routed a send to — never a value a peer
+// chooses — and a refused pair is not dialed again inside its cooldown, so
+// that window holds at most one entry per pair the host routed to in it: the
+// bound follows membership, not uptime, and needs no separate cap.
+func (t *QUICTransport) sweepDialRefusals(now time.Time) {
+	t.dialRefusals.Range(func(k, v any) bool {
+		if refusal := v.(dialRefusal); now.Sub(refusal.at) >= dialRefusalCooldown {
+			t.dialRefusals.CompareAndDelete(k, v)
+		}
+		return true
+	})
+}
+
+// forgetDialRefusals drops every remembered dial refusal for address,
+// whatever identity it was refused for.
+func (t *QUICTransport) forgetDialRefusals(address string) {
+	t.dialRefusals.Range(func(k, _ any) bool {
+		if key := k.(dialRefusalKey); key.target == address {
+			t.dialRefusals.Delete(k)
+		}
+		return true
+	})
 }
 
 // dialConnection establishes a new QUIC connection to the target address. When
@@ -408,11 +449,8 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 	// process — matching every other transport background goroutine.
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("preOpenHeartbeatStream panic recovered",
-				"target", target,
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			logRecovered("preOpenHeartbeatStream panic recovered", r, debug.Stack(),
+				"target", target)
 		}
 	}()
 
@@ -811,6 +849,13 @@ func (t *QUICTransport) CloseTarget(address string) bool {
 	// See closeInboundFromPeer.
 	inbound := t.closeInboundFromPeer(address)
 
+	// A refusal remembered for the address describes a peer membership no
+	// longer routes there; whoever holds it next is dialed afresh. A refused
+	// dial is never pooled, so this too precedes the early return below. It is
+	// cooldown bookkeeping, not a held resource, and does not count towards
+	// the result.
+	t.forgetDialRefusals(address)
+
 	// Nothing cached: leave every other structure untouched so a call for an
 	// address this transport never dialed cannot disturb state that a live
 	// shard may still be using.
@@ -1084,26 +1129,13 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 // those whose context is done (i.e., the connection has been closed by the
 // peer or timed out). Restarts automatically on panic to prevent silent
 // connection leak accumulation.
+//
+// It runs under supervise.Supervise, which counts it in t.wg and starts it
+// again on a fresh goroutine if a runtime.Goexit ends it.
 func (t *QUICTransport) connectionCleanup() {
-	defer t.wg.Done()
-
-	for {
-		panicked := t.connectionCleanupOnce()
-		if !panicked {
+	for t.connectionCleanupOnce() {
+		if !supervise.AwaitRestart(t.stopC) {
 			return
-		}
-		// Check for shutdown before restarting.
-		select {
-		case <-t.stopC:
-			return
-		default:
-		}
-		timer := time.NewTimer(workerPanicRestartDelay)
-		select {
-		case <-t.stopC:
-			timer.Stop()
-			return
-		case <-timer.C:
 		}
 	}
 }
@@ -1112,23 +1144,24 @@ func (t *QUICTransport) connectionCleanup() {
 // and recovers from panics. Returns true if the loop panicked, false if
 // it returned normally (via stop signal).
 func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
 			stack := debug.Stack()
-			panicErr := &WorkerPanicError{
-				WorkerName: "connectionCleanup",
-				Value:      r,
-				Stack:      stack,
-			}
-			slog.Error("connectionCleanup panic recovered, restarting",
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
+			logRecovered("connectionCleanup panic recovered, restarting", r, stack,
+				"error", &WorkerPanicError{WorkerName: "connectionCleanup", Value: r, Stack: stack})
 		}
 	}()
+	t.sweepConnectionsUntilStopped()
+	normalReturn = true
+	return false
+}
 
+// sweepConnectionsUntilStopped is the connection cleanup loop's body: it
+// sweeps the pooled connections every cleanup interval until the transport
+// stops.
+func (t *QUICTransport) sweepConnectionsUntilStopped() {
 	// The field, not the constant: see QUICTransport.cleanupInterval. A zero
 	// value means the transport was built without the constructor, so fall back
 	// rather than panicking in NewTicker.
@@ -1147,6 +1180,7 @@ func (t *QUICTransport) connectionCleanupOnce() (panicked bool) {
 			t.cleanStaleConnections()
 			t.revokeCheckConnections()
 			t.reapIdleInboundConns(time.Now())
+			t.sweepDialRefusals(time.Now())
 		}
 	}
 }
@@ -1396,20 +1430,25 @@ func (t *QUICTransport) closeInboundOnShutdown() int {
 // outright, since sync.RWMutex is not reentrant. The dial path has always
 // fired the same callback outside any lock (see dialConnection).
 func (t *QUICTransport) cleanStaleConnections() {
-	var deadTargets []string
-
-	t.connMu.Lock()
-	for addr, conn := range t.conns {
-		select {
-		case <-conn.Context().Done():
-			delete(t.connPeer, conn)
-			delete(t.conns, addr)
-			delete(t.connEpoch, addr)
-			deadTargets = append(deadTargets, addr)
-		default:
+	// The scan releases connMu by defer: a panic in it must not leave the
+	// pool locked for the sweep the cleanup loop restarts, and for every
+	// sender after it.
+	deadTargets := func() []string {
+		var dead []string
+		t.connMu.Lock()
+		defer t.connMu.Unlock()
+		for addr, conn := range t.conns {
+			select {
+			case <-conn.Context().Done():
+				delete(t.connPeer, conn)
+				delete(t.conns, addr)
+				delete(t.connEpoch, addr)
+				dead = append(dead, addr)
+			default:
+			}
 		}
-	}
-	t.connMu.Unlock()
+		return dead
+	}()
 
 	// Evict all pooled streams belonging to dead connections, and notify the
 	// listener. This must happen outside connMu to avoid lock ordering issues
@@ -2020,7 +2059,8 @@ func (t *QUICTransport) releasePeerMsgBudgetKey(key string) {
 }
 
 // reserveConnMsgRecvBudget reserves n bytes against the per-PEER
-// message-receive sub-budget in addition to the aggregate budget, so a single
+// message-receive sub-budget in addition to the aggregate budget, in the same
+// unit as the aggregate (proto.DecodeCharge), so a single
 // peer cannot occupy the whole of MaxMessageReceiveMemory and force every
 // other peer's frames into the exhaustion path. A nil conn (test/unit paths)
 // is not accounted. Successful reservations must be paired with

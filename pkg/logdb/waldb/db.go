@@ -22,12 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
@@ -647,11 +647,8 @@ func createWALRoot(o dbOptions, dir string) error {
 	if o.noSync {
 		return nil
 	}
-	existing := deepestExistingDir(o.fs, dir)
-	if err := o.fs.MkdirAll(dir, 0o700); err != nil {
-		return &DBOpenError{Dir: dir, Err: err}
-	}
-	if err := syncDirChainFS(o.fs, dir, existing); err != nil {
+	syncDir := func(d string) error { return syncDirFS(o.fs, d) }
+	if err := fsutil.MkdirAllSyncedWith(o.fs, syncDir, dir, 0o700); err != nil {
 		return &DBOpenError{Dir: dir, Err: err}
 	}
 	return nil
@@ -3072,75 +3069,22 @@ func itoa(n int) string {
 
 // syncDirFS fsyncs a directory using the provided FS to make metadata
 // changes (file creates, deletes, renames) durable. Returns a DirSyncError
-// if the directory cannot be opened or synced.
+// if the directory cannot be opened, synced or closed.
 //
-// This uses SyncMetadata, NOT Sync. On Linux File.Sync is fdatasync, which is
-// specified to skip metadata not needed to retrieve the data — and for a
-// directory the metadata IS the point. A dirent removal often leaves the
-// directory size unchanged, so XFS can skip the log force that ext4 happens to
-// perform anyway, which is why no test catches the difference. The paths that
-// depend on this are rollback segment deletion, orphan discard (whose own
-// comment cites voting twice in one term) and GC — all of them Raft durability.
+// The flush is SyncMetadata, NOT Sync, whenever the File provides it (see
+// FileMetadataSyncer); fsutil.SyncDirWith makes that choice. On Linux File.Sync
+// is fdatasync, which is specified to skip metadata not needed to retrieve the
+// data — and for a directory the metadata IS the point. A dirent removal often
+// leaves the directory size unchanged, so XFS can skip the log force that ext4
+// happens to perform anyway, which is why no test catches the difference. The
+// paths that depend on this are rollback segment deletion, orphan discard
+// (whose own comment cites voting twice in one term) and GC — all of them Raft
+// durability.
 func syncDirFS(filesystem FS, dir string) error {
-	d, err := filesystem.Open(dir)
-	if err != nil {
+	if err := fsutil.SyncDirWith(filesystem.Open, dir); err != nil {
 		return &DirSyncError{Dir: dir, Err: err}
 	}
-	var syncErr error
-	if ms, ok := d.(FileMetadataSyncer); ok {
-		syncErr = ms.SyncMetadata()
-	} else {
-		syncErr = d.Sync()
-	}
-	closeErr := d.Close()
-	if syncErr != nil {
-		return &DirSyncError{Dir: dir, Err: syncErr}
-	}
-	if closeErr != nil {
-		return &DirSyncError{Dir: dir, Err: closeErr}
-	}
 	return nil
-}
-
-// deepestExistingDir returns the deepest ancestor of dir (dir itself when it
-// already exists) that is present on filesystem. Only ErrNotExist is read as
-// absence; any other Stat error stops the walk at that level, which is the
-// conservative choice because the following sync walk then covers MORE
-// directories, never fewer.
-func deepestExistingDir(filesystem FS, dir string) string {
-	for p := filepath.Clean(dir); ; {
-		if _, err := filesystem.Stat(p); err == nil || !errors.Is(err, fs.ErrNotExist) {
-			return p
-		}
-		parent := filepath.Dir(p)
-		if parent == p {
-			return p
-		}
-		p = parent
-	}
-}
-
-// syncDirChainFS fsyncs leaf and every ancestor up to and including stopAt, so
-// each directory MkdirAll created below stopAt has its own dirent made durable
-// by a sync of its parent. It is the FS-abstracted equivalent of the shared
-// engine.SyncDirChainWith walk (pkg/internal/engine/fsync.go); the walk is
-// duplicated rather than imported because waldb is the storage layer and must
-// not depend on the consensus engine package.
-func syncDirChainFS(filesystem FS, leaf, stopAt string) error {
-	leaf = filepath.Clean(leaf)
-	stopAt = filepath.Clean(stopAt)
-	sep := string(filepath.Separator)
-	if stopAt == "" || !strings.HasPrefix(leaf+sep, stopAt+sep) {
-		return syncDirFS(filesystem, leaf)
-	}
-	for dir := leaf; ; dir = filepath.Dir(dir) {
-		if err := syncDirFS(filesystem, dir); err != nil {
-			return err
-		}
-		if dir == stopAt {
-			return nil
-		}
-	}
 }
 
 // getShard returns the WAL shard for the given Raft shardID.
@@ -5057,11 +5001,12 @@ func (db *DB) MinLiveEpoch() (uint64, error) {
 // PerBarrierEpochAwareLogDB by delegating to whichever underlying DB owns the
 // requested barrier; each such DB answers via this method.
 //
-// The barrier argument is compared by interface identity. Both db.barrier and
-// the argument box the same concrete *seal.Barrier pointer, so boxing to any
-// normalizes them to (concrete type, value) and == is an exact pointer match
-// regardless of the static interface type the caller holds (SnapshotBarrier,
-// Barrier, WALBarrier).
+// The barrier argument is matched by logdb.SameBarrier (pointer identity),
+// never with ==: a barrier's dynamic value need not be comparable, and == on
+// two that are not panics. The match holds whatever static interface type the
+// caller holds (SnapshotBarrier, Barrier, WALBarrier). A barrier whose dynamic
+// value is not a pointer has no identity, so it never matches, not even a copy
+// of the barrier this DB was opened with.
 //
 // The return values follow the fail-safe contract of
 // logdb.PerBarrierEpochAwareLogDB: this DB returns known == true only when the
@@ -5077,7 +5022,7 @@ func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err
 	if db.barrier == nil || barrier == nil {
 		return 0, false, nil
 	}
-	if any(db.barrier) != barrier {
+	if !logdb.SameBarrier(db.barrier, barrier) {
 		// This DB's records are not encrypted under the requested barrier:
 		// known == false (NOT a zero-epoch non-constraint).
 		return 0, false, nil

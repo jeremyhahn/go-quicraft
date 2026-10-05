@@ -47,23 +47,28 @@
 //
 // The engine caught it only because both replicas were members of one shard.
 // Two hosts in different shards, or in different packages of a parallel `go
-// test` run, are not compared to each other by anything. They would both bind
-// successfully and silently split each other's datagrams, because the QUIC
-// transport sets SO_REUSEADDR (pkg/internal/transport/quic.go, Start) and Linux
-// lets two SO_REUSEADDR UDP sockets share one address, delivering to whichever
-// bound last. Measured on the CI host:
+// test` run, are not compared to each other by anything. What stops them
+// sharing a port is the bind itself: the QUIC transport sets no SO_REUSEADDR
+// (pkg/internal/transport/sockopt_unix.go, sockopt_windows.go), so whichever
+// host binds second fails to start with EADDRINUSE. A duplicate port is a loud
+// failure, but it lands on whichever test happened to start second, far from
+// the reservation that caused it, which is why narrowing the window was not an
+// acceptable fix.
+//
+// It was not always loud. The transport used to set SO_REUSEADDR, and Linux
+// lets two UDP sockets that both set it share one address, delivering to
+// whichever bound last. Measured on the CI host:
 //
 //	two SO_REUSEADDR binds on 127.0.0.1:39651 BOTH SUCCEEDED
 //	datagram delivered to: second
 //
-// A duplicate port is therefore not reliably a loud failure. It is sometimes a
-// silent one, which is why narrowing the window was not an acceptable fix.
+// That silent split is why the transport no longer sets it.
 //
 // # Measured
 //
 // Modelling newTestCluster — reserve five addresses, then bind all five with
-// SO_REUSEADDR — against 24 goroutines churning the ephemeral pool, 360,000
-// reservations each way on a 24-core host:
+// SO_REUSEADDR, as the transport then did — against 24 goroutines churning the
+// ephemeral pool, 360,000 reservations each way on a 24-core host:
 //
 //	old freePort : 42 duplicate addresses within a cluster, 150 EADDRINUSE binds
 //	netport      :  0                                   ,   0
@@ -103,8 +108,9 @@
 //     each process starts its scan at a PID-derived offset rather than at the
 //     bottom of the window, so concurrent packages do not march over each
 //     other from the same end, and every candidate is probe-bound with a plain
-//     socket first, which does detect a live host another process has already
-//     started (a plain bind is refused by an SO_REUSEADDR holder; measured).
+//     socket first, which detects a live host another process has already
+//     started: the probe is the same plain bind the transport makes, and a
+//     live holder refuses it.
 //     What remains is the ordinary interval between one process's probe and
 //     its own bind.
 //
@@ -148,7 +154,7 @@ const (
 const inFlightRetain = 512
 
 // probeConfig binds the candidate port. It is deliberately the zero value: see
-// probe for why it must carry no socket options.
+// probe for why it carries no socket options.
 var probeConfig net.ListenConfig
 
 // state is the process-wide reservation window and the ports already handed
@@ -280,13 +286,13 @@ func scanWindow(network string) (string, bool) {
 // socket and closes it again; the caller gets the address, not the descriptor.
 //
 // A ZERO ListenConfig, deliberately: no Control hook, so the probe carries no
-// socket options of its own and is refused by a live holder, which is how a
-// host another process already started is detected. A UDP probe that set
-// SO_REUSEADDR itself would bind straight through such a host and report the
-// port free. TCP needs no such care in the other direction — Go sets
-// SO_REUSEADDR on a TCP listener by default, and SO_REUSEADDR permits binding
-// over a socket in TIME_WAIT, never over a LIVE listener; two live listeners on
-// one address need SO_REUSEPORT, which nothing here sets.
+// socket options of its own. For UDP that is the bind the QUIC transport makes,
+// which a live holder refuses, and that refusal is how a host another process
+// already started is detected. A reuse option on the probe would only widen
+// what it can bind through (on Windows, SO_REUSEADDR binds over a live holder).
+// For TCP, Go sets SO_REUSEADDR on a listener by default, and SO_REUSEADDR
+// permits binding over a socket in TIME_WAIT, never over a LIVE listener; two
+// live listeners on one address need SO_REUSEPORT, which nothing here sets.
 //
 // A failed Close is treated as "not free" rather than ignored: the port's state
 // is then unknown, and handing out an address whose probe socket may still be

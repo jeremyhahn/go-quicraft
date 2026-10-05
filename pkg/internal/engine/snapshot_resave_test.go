@@ -648,10 +648,10 @@ type slotProbeCallback struct {
 	nodeHeld     bool
 }
 
-func (c *slotProbeCallback) OnSnapshotCompleted(shardID uint64, index uint64, err error) {
+func (c *slotProbeCallback) OnSnapshotCompleted(shardID uint64, index uint64, op SnapshotOperation, err error) {
 	_, c.inFlightHeld = c.pool.inFlight.Load(c.shardID)
 	c.nodeHeld = c.node.snapshotting.Load()
-	c.testCallback.OnSnapshotCompleted(shardID, index, err)
+	c.testCallback.OnSnapshotCompleted(shardID, index, op, err)
 }
 
 // TestHandleRequest_CompletionFiresBeforeSlotsAreReleased pins the ordering
@@ -664,7 +664,7 @@ func TestHandleRequest_CompletionFiresBeforeSlotsAreReleased(t *testing.T) {
 	probe := &slotProbeCallback{pool: f.pool, node: f.node, shardID: f.req.shardID}
 	f.pool.setCallback(probe)
 
-	f.pool.inFlight.Store(f.req.shardID, struct{}{})
+	f.pool.inFlight.Store(f.req.shardID, f.node)
 	f.node.snapshotting.Store(true)
 
 	f.pool.handleRequest(f.req)
@@ -685,5 +685,131 @@ func TestHandleRequest_CompletionFiresBeforeSlotsAreReleased(t *testing.T) {
 	}
 	if f.node.snapshotting.Load() {
 		t.Error("node.snapshotting was never cleared")
+	}
+}
+
+// requestProbeCallback records, from inside OnSnapshotRequestCompleted,
+// whether the shard's snapshot slots were still claimed and whether
+// OnSnapshotCompleted had already been delivered. claim, when set, re-claims
+// both slots before the probe returns, standing in for the next request the
+// resolved caller issues at once; panicAfter makes the probe panic afterwards.
+type requestProbeCallback struct {
+	testCallback
+	pool              *snapshotPool
+	node              *Node
+	shardID           uint64
+	inFlightHeld      bool
+	nodeHeld          bool
+	completedBefore   bool
+	claim, panicAfter bool
+}
+
+func (c *requestProbeCallback) OnSnapshotRequestCompleted(shardID, requestKey, index uint64, err error) {
+	_, c.inFlightHeld = c.pool.inFlight.Load(c.shardID)
+	c.nodeHeld = c.node.snapshotting.Load()
+	c.completedBefore = c.snapshotCallCount.Load() == 1
+	c.testCallback.OnSnapshotRequestCompleted(shardID, requestKey, index, err)
+	if c.claim {
+		if !c.node.TryStartSnapshot() {
+			panic("test: the resolved requester's next request was refused the node slot")
+		}
+		if _, loaded := c.pool.inFlight.LoadOrStore(c.shardID, c.node); loaded {
+			panic("test: the resolved requester's next request was refused the in-flight slot")
+		}
+	}
+	if c.panicAfter {
+		panic("test: OnSnapshotRequestCompleted panicked")
+	}
+}
+
+// TestHandleRequest_RequesterResolvedAfterSlotsAreReleased pins the ordering
+// that lets a caller issue its next snapshot request the moment the previous
+// one returns: the requester is resolved only after both snapshot slots are
+// released, and only after the completion event that ran inside them.
+func TestHandleRequest_RequesterResolvedAfterSlotsAreReleased(t *testing.T) {
+	f := newResaveFixture(t, 90)
+	probe := &requestProbeCallback{pool: f.pool, node: f.node, shardID: f.req.shardID, claim: true}
+	f.pool.setCallback(probe)
+	f.req.requestKey = 0xbeef
+
+	f.pool.inFlight.Store(f.req.shardID, f.node)
+	f.node.snapshotting.Store(true)
+
+	f.pool.handleRequest(f.req)
+
+	if len(probe.requestCalls) != 1 {
+		t.Fatalf("OnSnapshotRequestCompleted called %d times, want 1", len(probe.requestCalls))
+	}
+	if got := probe.requestCalls[0]; got.requestKey != 0xbeef || got.index != 90 || got.err != nil {
+		t.Fatalf("OnSnapshotRequestCompleted(key=%#x, index=%d, err=%v), want (0xbeef, 90, nil)",
+			got.requestKey, got.index, got.err)
+	}
+	if !probe.completedBefore {
+		t.Error("the requester was resolved before OnSnapshotCompleted was delivered")
+	}
+	if probe.inFlightHeld {
+		t.Error("the requester was resolved while the pool's in-flight slot was still held; " +
+			"its next request is refused as already in progress")
+	}
+	if probe.nodeHeld {
+		t.Error("the requester was resolved while node.snapshotting was still held; " +
+			"its next request is refused as already in progress")
+	}
+	// The next request's claims, made from inside the resolution, survive.
+	if _, held := f.pool.inFlight.Load(f.req.shardID); !held {
+		t.Error("the next request's in-flight claim was cleared by the previous request")
+	}
+	if !f.node.snapshotting.Load() {
+		t.Error("the next request's node.snapshotting claim was cleared by the previous request")
+	}
+}
+
+// TestHandleRequest_NoRequesterNoResolution: an automatic save or a recovery
+// carries no request key, so nobody is resolved for it.
+func TestHandleRequest_NoRequesterNoResolution(t *testing.T) {
+	f := newResaveFixture(t, 90)
+	probe := &requestProbeCallback{pool: f.pool, node: f.node, shardID: f.req.shardID}
+	f.pool.setCallback(probe)
+
+	f.pool.inFlight.Store(f.req.shardID, f.node)
+	f.node.snapshotting.Store(true)
+
+	f.pool.handleRequest(f.req)
+
+	if probe.snapshotCallCount.Load() != 1 {
+		t.Fatalf("OnSnapshotCompleted called %d times, want 1", probe.snapshotCallCount.Load())
+	}
+	if len(probe.requestCalls) != 0 {
+		t.Fatalf("OnSnapshotRequestCompleted called %d times for a save nobody requested",
+			len(probe.requestCalls))
+	}
+}
+
+// TestHandleRequest_PanicAfterReleaseLeavesSuccessorSlots: once the slots are
+// released they may belong to the next request, so a panic in the resolution
+// that follows must not clear them — that would admit a second concurrent
+// snapshot of the shard.
+func TestHandleRequest_PanicAfterReleaseLeavesSuccessorSlots(t *testing.T) {
+	f := newResaveFixture(t, 90)
+	probe := &requestProbeCallback{
+		pool: f.pool, node: f.node, shardID: f.req.shardID,
+		claim: true, panicAfter: true,
+	}
+	f.pool.setCallback(probe)
+	f.req.requestKey = 0xbeef
+
+	f.pool.inFlight.Store(f.req.shardID, f.node)
+	f.node.snapshotting.Store(true)
+
+	f.pool.handleRequest(f.req)
+
+	if _, held := f.pool.inFlight.Load(f.req.shardID); !held {
+		t.Error("a panic after the release cleared the next request's in-flight claim")
+	}
+	if !f.node.snapshotting.Load() {
+		t.Error("a panic after the release cleared the next request's node.snapshotting claim")
+	}
+	if n := probe.snapshotRejected.Load(); n != 0 {
+		t.Errorf("OnSnapshotRejected fired %d times for a save that completed", n)
 	}
 }

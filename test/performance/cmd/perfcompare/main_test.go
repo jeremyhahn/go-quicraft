@@ -205,7 +205,7 @@ func TestRunBenchmarksFailsWhenSystemProducesNoResults(t *testing.T) {
 	stubPrepareHost(t, nil)
 	profileDir := newProfileDir(t)
 
-	err := runBenchmarks([]string{"--benchtime=1x", "--no-build", "--profile=" + profileDir, "dragonboat"})
+	err := runBenchmarks(t.Context(), []string{"--benchtime=1x", "--no-build", "--profile=" + profileDir, "dragonboat"})
 	if err == nil {
 		t.Fatal("runBenchmarks returned nil after the only requested system produced no results")
 	}
@@ -241,7 +241,7 @@ echo '--- FAIL: BenchmarkProposeThroughput_5N_Dragonboat-112'
 echo 'FAIL'
 exit 1`
 
-	stdout, err := runContainer(exec.Command("sh", "-c", script), logPath)
+	stdout, err := runContainer(exec.CommandContext(t.Context(), "sh", "-c", script), logPath)
 	if err == nil {
 		t.Fatal("runContainer returned nil for a container that exited 1")
 	}
@@ -518,7 +518,7 @@ func TestRunContainerReportsAnIncompleteLog(t *testing.T) {
 		t.Skip("/dev/full not available")
 	}
 
-	cmd := exec.Command("sh", "-c", "echo '=== RUN   B'; echo '--- FAIL: B' >&2; exit 0")
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "echo '=== RUN   B'; echo '--- FAIL: B' >&2; exit 0")
 	out, err := runContainer(cmd, "/dev/full")
 	if err == nil {
 		t.Fatal("runContainer returned nil error with an unwritable log; the " +
@@ -594,7 +594,7 @@ func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {
 	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@198.51.100.50:3001/jeremyhahn/.insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/jeremyhahn/")
 
-	if err := buildImage("quicraft-bench-quicraft", "quicraft/Dockerfile", "/repo"); err != nil {
+	if err := buildImage(t.Context(), "quicraft-bench-quicraft", "quicraft/Dockerfile", "/repo"); err != nil {
 		t.Fatalf("buildImage: %v", err)
 	}
 	args, _ := os.ReadFile(argv)
@@ -613,7 +613,7 @@ func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {
 	for _, k := range moduleAuthVars {
 		t.Setenv(k, "")
 	}
-	if err := buildImage("quicraft-bench-etcd", "etcd/Dockerfile", "/repo"); err != nil {
+	if err := buildImage(t.Context(), "quicraft-bench-etcd", "etcd/Dockerfile", "/repo"); err != nil {
 		t.Fatalf("buildImage without credentials: %v", err)
 	}
 	args, _ = os.ReadFile(argv)

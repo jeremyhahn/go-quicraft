@@ -15,6 +15,7 @@
 package etcd_perf
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	crand "crypto/rand"
@@ -23,6 +24,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -241,9 +243,11 @@ func (t *raftTransport) acceptLoop() {
 // signaled, or a non-timeout read error occurs.
 func (t *raftTransport) handleConn(conn net.Conn) {
 	defer t.done.Done()
-	defer conn.Close()
+	// An inbound connection is only read from, so nothing is lost if its
+	// close fails; there is no caller to report it to.
+	defer func() { _ = conn.Close() }()
 
-	// Complete the TLS handshake under its own deadline before applying the
+	// Complete the TLS handshake under its own timeout before applying the
 	// short per-frame read deadline below. A handshake that times out leaves
 	// crypto/tls with a sticky error, and every later Read would return that
 	// timeout again: the loop would spin forever without reading, while the
@@ -251,11 +255,12 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 	// direction of the link. On failure the connection is closed instead, so
 	// the sender's next write fails and it redials.
 	if tc, ok := conn.(*tls.Conn); ok {
-		tc.SetDeadline(time.Now().Add(connDialTimeout))
-		if err := tc.Handshake(); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), connDialTimeout)
+		err := tc.HandshakeContext(ctx)
+		cancel()
+		if err != nil {
 			return
 		}
-		tc.SetDeadline(time.Time{})
 	}
 
 	lengthBuf := make([]byte, 4)
@@ -266,7 +271,9 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(connReadDeadline))
+		if err := conn.SetReadDeadline(time.Now().Add(connReadDeadline)); err != nil {
+			return
+		}
 		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -280,7 +287,9 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 		}
 
 		data := make([]byte, msgLen)
-		conn.SetReadDeadline(time.Now().Add(connWriteDeadline))
+		if err := conn.SetReadDeadline(time.Now().Add(connWriteDeadline)); err != nil {
+			return
+		}
 		if _, err := io.ReadFull(conn, data); err != nil {
 			return
 		}
@@ -354,12 +363,11 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 
 	if !ok {
 		var err error
-		conn, err = tls.DialWithDialer(
-			&net.Dialer{Timeout: connDialTimeout},
-			"tcp",
-			peerAddr,
-			t.clientCfg,
-		)
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: connDialTimeout},
+			Config:    t.clientCfg,
+		}
+		conn, err = dialer.DialContext(context.Background(), "tcp", peerAddr)
 		if err != nil {
 			return
 		}
@@ -376,7 +384,10 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 	var lengthBuf [4]byte
 	binary.BigEndian.PutUint32(lengthBuf[:], uint32(len(data)))
 
-	conn.SetWriteDeadline(time.Now().Add(connWriteDeadline))
+	if err := conn.SetWriteDeadline(time.Now().Add(connWriteDeadline)); err != nil {
+		t.removeConn(peerAddr)
+		return
+	}
 	if _, err := conn.Write(lengthBuf[:]); err != nil {
 		t.removeConn(peerAddr)
 		return
@@ -393,7 +404,9 @@ func (t *raftTransport) sendOne(msg *raftpb.Message) {
 func (t *raftTransport) removeConn(peerAddr string) {
 	t.mu.Lock()
 	if conn, ok := t.conns[peerAddr]; ok {
-		conn.Close()
+		// The send on this connection already failed and it is being
+		// discarded, so its close error carries nothing to act on.
+		_ = conn.Close()
 		delete(t.conns, peerAddr)
 	}
 	t.mu.Unlock()
@@ -401,15 +414,17 @@ func (t *raftTransport) removeConn(peerAddr string) {
 
 // close shuts down the transport: closes the listener, closes all
 // cached outbound connections, and waits for all goroutines (accept
-// loop and connection handlers) to exit.
-func (t *raftTransport) close() {
+// loop and connection handlers) to exit. It returns every close error,
+// joined.
+func (t *raftTransport) close() error {
 	close(t.stopCh)
-	t.listener.Close()
+	errs := []error{t.listener.Close()}
 	t.mu.Lock()
 	for addr, conn := range t.conns {
-		conn.Close()
+		errs = append(errs, conn.Close())
 		delete(t.conns, addr)
 	}
 	t.mu.Unlock()
 	t.done.Wait()
+	return errors.Join(errs...)
 }

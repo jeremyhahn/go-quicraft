@@ -1986,7 +1986,7 @@ var errNoLeaderObserved = errors.New("integration: no live replica reports leade
 // Two errors carry that meaning through this adapter:
 //
 //   - ErrTimeout. The adapter's Sync* methods refuse a context that has no
-//     deadline or an expired one BEFORE calling quicraft (timeoutFromContext),
+//     deadline or an expired one BEFORE calling quicraft (checkContextDeadline),
 //     and every attempt here is given a fresh context of at least
 //     minLeaderAttempt, so an ErrTimeout can only be quicraft's own: the
 //     select on ctx.Done() after RequestX returned a live RequestState, or the

@@ -15,9 +15,13 @@
 package quicraft
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -155,5 +159,66 @@ func TestFailShardOnCorruptConfig_ReportsATypedError(t *testing.T) {
 			t.Fatalf("error %q does not name %q; an operator cannot locate the "+
 				"entry without it", msg, want)
 		}
+	}
+}
+
+// haltCountingHandler counts the host's "shard halted" log line — written once
+// per OnShardFailed fan-out — and discards everything else.
+type haltCountingHandler struct{ halts *atomic.Int64 }
+
+func (h haltCountingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h haltCountingHandler) Handle(_ context.Context, r slog.Record) error {
+	if strings.HasPrefix(r.Message, "shard halted") {
+		h.halts.Add(1)
+	}
+	return nil
+}
+func (h haltCountingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h haltCountingHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain: the
+// routing mirror reports the halt only when its own Fail tripped the latch. A
+// shard another path failed first was reported, and its reads drained, by that
+// path; a second OnShardFailed fan-out would report one halt twice.
+func TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain(t *testing.T) {
+	h := newTestHost(t)
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	engNode := h.engine.GetNode(1)
+	if engNode == nil {
+		t.Fatal("shard 1 has no engine node")
+	}
+	var halts atomic.Int64
+	prev := slog.Default()
+	slog.SetDefault(slog.New(haltCountingHandler{halts: &halts}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// The halt line is emitted contained, on a goroutine of its own, after
+	// the pending requests are failed; it is awaited rather than read back
+	// synchronously.
+	// haltsWithin returns the halt count once it reaches want or d elapses.
+	haltsWithin := func(want int64, d time.Duration) int64 {
+		deadline := time.After(d)
+		for halts.Load() < want {
+			select {
+			case <-deadline:
+				return halts.Load()
+			case <-time.After(time.Millisecond):
+			}
+		}
+		return halts.Load()
+	}
+	cb := &hostEngineCallback{h: h}
+	cb.failShardOnCorruptConfig(1, 9, "config change", proto.ErrBufferTooSmall)
+	if got := haltsWithin(1, 5*time.Second); got != 1 {
+		t.Fatalf("first corrupt-config failure reported %d halts, want 1", got)
+	}
+	cb.failShardOnCorruptConfig(1, 10, "config change", proto.ErrBufferTooSmall)
+	// A second report would be emitted the same way; it is given far longer
+	// than the first one took before concluding there is none.
+	if got := haltsWithin(2, 200*time.Millisecond); got != 1 {
+		t.Fatalf("a second failure of an already-failed shard reported the halt again: %d halts, want 1", got)
 	}
 }

@@ -125,17 +125,23 @@ alerting surface.
 
 ## Two callback classes
 
-Engine-produced notifications run on a dedicated dispatcher goroutine that
+Dispatched notifications run on a dedicated dispatcher goroutine that
 holds no engine lock: `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`,
 `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`,
-`OnSnapshotRecovered`, `OnLogCompacted` and `OnLogDBCompacted`. A listener may
-call any `Host` API from them, including the synchronous `StopShard`.
+`OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted` and
+`OnSnapshotRejected`, whether the snapshot pool refused a request or rejected
+a recovery that failed before the state machine restore began, or the snapshot
+receiver rejected an inbound transfer (the host installs the
+dispatcher on the transport before starting it). A listener may call any `Host`
+API from them, including the synchronous `StopShard`.
 
 The reason is a deadlock. The step worker holds `stepWorker.nodesMu.RLock`
 while it ticks, and `Host.StopShard` takes `nodesMu.Lock()` on the same worker;
 a snapshot worker reporting a recovery holds the node's write lease, which an
-unload waits out. A handler that stopped a shard from either goroutine would
-wait on itself forever, stalling every shard on that worker and leaving
+unload waits out. The snapshot pool reports a rejection on its worker, on the
+shard's apply goroutine (which an unload joins) for an automatic snapshot, or on
+the goroutine requesting one. A handler that stopped a shard from any of them
+would wait on itself forever, stalling every shard on that worker and leaving
 `Host.Close` unable to return. Stopping a failed shard is the obvious handler to
 write.
 
@@ -146,12 +152,12 @@ next tick and is never lost; any other refused notification is dropped and
 logged at ERROR with the shard and event.
 
 The remaining callbacks run inline on the goroutine that produced the event and
-must not block: connection and snapshot-transfer events on transport
-goroutines, disk events on the WAL write path, `OnMembershipChanged` on the
-apply path, `OnSnapshotRejected` on the snapshot path, and `OnNodeReady`,
-`OnNodeUnloaded`, `OnNodeDeleted`, `OnProposalDropped`, `OnReadIndexDropped`
-and `OnNodeHostShuttingDown` on the goroutine calling the `Host` method that
-caused them.
+must not block: connection events and the other snapshot-transfer events
+(`OnSnapshotReceived`, `OnSnapshotSendStarted`, `OnSnapshotSent`,
+`OnSnapshotSendAborted`) on transport goroutines, disk events on the WAL write path, `OnMembershipChanged` on the
+apply path, and `OnNodeReady`, `OnNodeUnloaded`, `OnNodeDeleted`,
+`OnProposalDropped`, `OnReadIndexDropped` and `OnNodeHostShuttingDown` on the
+goroutine calling the `Host` method that caused them.
 
 Internally, the engine's own request-resolving callbacks (`OnApplied`,
 `OnCommitted`, `OnReadyToRead`, `OnProposalFailed`, `OnReadIndexBatched`,

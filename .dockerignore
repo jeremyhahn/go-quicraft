@@ -1,5 +1,7 @@
-# Version control. Several Dockerfiles COPY the whole build context, and no
-# build reads git metadata, so keep the history out of every image.
+# Version control. Several Dockerfiles COPY the whole build context. Only the
+# dev image reads git metadata (its releasability gate), and it has its own
+# .devcontainer/Dockerfile.dev.dockerignore, so keep history out of the rest.
+# Every entry below must also appear there (test/buildgates).
 .git/
 
 # Build artifacts

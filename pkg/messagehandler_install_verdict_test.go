@@ -153,7 +153,7 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 	authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 	handler := &hostMessageHandler{engine: eng, host: h}
-	eng.GetNode(shardID).Fail(errors.New("latched for the test"))
+	eng.FailShard(eng.GetNode(shardID), errors.New("latched for the test"))
 
 	done := make(chan error, 1)
 	go func() {
@@ -222,17 +222,17 @@ func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
 func TestHandleSnapshot_AuthorizationIsCheckedBeforeShardState(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		state func(*engine.Node)
+		state func(*engine.Engine, *engine.Node)
 	}{
-		{"failed", func(n *engine.Node) { n.Fail(errors.New("latched for the test")) }},
-		{"stopping", func(n *engine.Node) { n.Stop() }},
+		{"failed", func(e *engine.Engine, n *engine.Node) { e.FailShard(n, errors.New("latched for the test")) }},
+		{"stopping", func(_ *engine.Engine, n *engine.Node) { n.Stop() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			eng, h, _ := newRoutingHandlerFixture(t)
 			const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
 			authorizeSnapshotPath(t, eng, h, shardID, localReplicaID, fromReplicaID)
 			handler := &hostMessageHandler{engine: eng, host: h}
-			tc.state(eng.GetNode(shardID))
+			tc.state(eng, eng.GetNode(shardID))
 
 			// Addressed to a replica this host does not own.
 			err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID+7, fromReplicaID, 900), authorizeAllSenders)
@@ -304,7 +304,7 @@ func TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone(t *testing.T) {
 
 	// A shard that is merely failed is an ordinary state: marked so the
 	// transport reports it quietly, apart from unauthorized transfers.
-	eng.GetNode(shardID).Fail(errors.New("latched for the test"))
+	eng.FailShard(eng.GetNode(shardID), errors.New("latched for the test"))
 	if err := handler.AuthorizeSnapshot(shardID, localReplicaID, fromReplicaID, 900, authorizeAllSenders); !errors.Is(err, transport.ErrSnapshotNotAccepting) {
 		t.Fatalf("AuthorizeSnapshot on a failed shard = %v, want ErrSnapshotNotAccepting", err)
 	}

@@ -22,6 +22,17 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+)
+
+// config.DefaultMaxDecompressedSize is the public name for MaxFrameSize: the
+// public configuration validates MaxDecompressedSize against it and sizes the
+// default message-receive budget from it. config cannot import this package,
+// so these assertions fail the build if the two ever drift, in either
+// direction.
+const (
+	_ = uint64(MaxFrameSize) - uint64(config.DefaultMaxDecompressedSize)
+	_ = uint64(config.DefaultMaxDecompressedSize) - uint64(MaxFrameSize)
 )
 
 // Metrics is the metrics interface consumed by the transport for
@@ -139,7 +150,6 @@ const (
 	defaultMaxSnapshotReceiveRate  = 256 * 1024 * 1024 // 256 MB/s
 	defaultMaxConcurrentSnapRecv   = 4
 	defaultMaxSnapshotRecvMemory   = 1024 * 1024 * 1024 // 1 GB
-	defaultMaxMessageRecvMemory    = 256 * 1024 * 1024  // 256 MB
 	defaultSendBatchMaxSize        = 64 * 1024          // 64 KB
 	defaultMaxIncomingConnections  = 256
 	defaultMaxConnectionsPerIP     = 16
@@ -306,7 +316,14 @@ type Config struct {
 	// open many streams that each declare the max length and withhold the body,
 	// pinning MaxFrameSize per stream and exhausting host memory (OOM DoS). A
 	// reservation against this budget is taken before allocation and released
-	// once the frame is dispatched. Default: 256 MB.
+	// once the frame is dispatched.
+	//
+	// Frames are charged by proto.FrameDecodeCharge, so one maximum-size frame
+	// costs maxFrameCharge (128 MB). Default:
+	// config.DefaultMessageReceiveBudgetFrames such charges (512 MB). Validate
+	// rejects a budget below one maximum-frame charge with
+	// *MaxMessageReceiveMemoryTooSmallError. One peer may hold at most a
+	// quarter of the budget, floored at one maximum-frame charge.
 	//
 	// It bounds APPLICATION frame buffers only. QUIC also buffers received
 	// bytes before the application reads them, up to MaxIncomingConnections *
@@ -317,7 +334,7 @@ type Config struct {
 	//
 	// The derived window also sets the ceiling on replication throughput over
 	// a high-latency link, since a receive window caps a connection at
-	// window/RTT. At the defaults (256 MB over 256 connections) the derivation
+	// window/RTT. At the defaults (512 MB over 256 connections) the derivation
 	// floors at 8 MB, which sustains roughly 134 Gbps at a 0.5 ms same-AZ RTT
 	// but caps a 10 Gbps path beyond ~6.7 ms RTT and a 1 Gbps path beyond
 	// ~67 ms. Same-datacenter and same-AZ replication has ample headroom;
@@ -440,7 +457,7 @@ type Config struct {
 // the application's message-receive budget. quic-go buffers received bytes
 // before the application ever sees them, so a window fixed independently of
 // the budget multiplies by MaxIncomingConnections into memory the budget does
-// not cover (32 MB * 256 connections = 8 GB against a 256 MB budget).
+// not cover (32 MB * 256 connections = 8 GB against a 512 MB budget).
 //
 // The result is floored at maxStreamReceiveWindow — a connection window below
 // the per-stream window makes that stream window unreachable and throttles
@@ -460,6 +477,16 @@ func connectionReceiveWindow(maxMessageRecvMemory int64, maxIncomingConns int) u
 		return maxConnectionReceiveWindowCeiling
 	}
 	return window
+}
+
+// maxFrameCharge returns the most one inbound message frame can reserve
+// against the message-receive budgets: a MaxFrameSize frame whose payload
+// decodes to maxDecompressed bytes, charged by proto.FrameDecodeCharge. It is
+// the composition handleMessageFrame charges (proto.DecodeCharge of the wire
+// length, then of the decompression delta), so the budget it sizes cannot
+// drift from the reservations it bounds.
+func maxFrameCharge(maxDecompressed uint32) int64 {
+	return proto.FrameDecodeCharge(int64(MaxFrameSize), int64(maxDecompressed))
 }
 
 // SetDefaults fills zero-valued fields with production defaults.
@@ -482,14 +509,15 @@ func (c *Config) SetDefaults() {
 	if c.MaxSnapshotReceiveMemory == 0 {
 		c.MaxSnapshotReceiveMemory = defaultMaxSnapshotRecvMemory
 	}
-	if c.MaxMessageReceiveMemory == 0 {
-		c.MaxMessageReceiveMemory = defaultMaxMessageRecvMemory
-	}
 	if c.SendBatchMaxSize == 0 {
 		c.SendBatchMaxSize = defaultSendBatchMaxSize
 	}
 	if c.MaxDecompressedSize == 0 {
 		c.MaxDecompressedSize = MaxFrameSize
+	}
+	// Derived after MaxDecompressedSize, which the frame charge depends on.
+	if c.MaxMessageReceiveMemory == 0 {
+		c.MaxMessageReceiveMemory = int64(config.DefaultMessageReceiveBudgetFrames) * maxFrameCharge(c.MaxDecompressedSize)
 	}
 	if c.MaxIncomingConnections == 0 {
 		c.MaxIncomingConnections = defaultMaxIncomingConnections
@@ -543,6 +571,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxDecompressedSize != MaxFrameSize {
 		return ErrInvalidMaxDecompressedSize
+	}
+	if minimum := maxFrameCharge(c.MaxDecompressedSize); c.MaxMessageReceiveMemory < minimum {
+		return &MaxMessageReceiveMemoryTooSmallError{Configured: c.MaxMessageReceiveMemory, Minimum: minimum}
 	}
 	if c.MaxIncomingConnections < 1 {
 		return ErrInvalidMaxIncomingConnections

@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
@@ -1883,14 +1884,15 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	}
 
 	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
 	h := &Host{
 		cfg:   cfg,
 		logdb: failDB,
 	}
+	cb := &countingShardFailedCallback{hostEngineCallback: &hostEngineCallback{h: h}}
+	eng := engine.NewEngine(cfg, nil, sender, nil, cb, nil)
+	h.engine = eng
+	eng.Start()
+	defer eng.Stop()
 
 	handler := &hostMessageHandler{engine: eng, host: h}
 	authorizeSnapshotPath(t, eng, h, 5, 3, 1)
@@ -1937,6 +1939,23 @@ func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	if !node.IsFailed() {
 		t.Fatal("shard still serving after the adopted snapshot could not be recorded")
 	}
+	// The receive fails the shard through the engine's one latch-and-report
+	// path, so the host's OnShardFailed — which drains pending reads — runs.
+	if got := cb.shardFailed.Load(); got != 1 {
+		t.Fatalf("engine Callback.OnShardFailed fired %d times for the receive's failure, want 1", got)
+	}
+}
+
+// countingShardFailedCallback is the host's engine callback, counting
+// OnShardFailed.
+type countingShardFailedCallback struct {
+	*hostEngineCallback
+	shardFailed atomic.Int64
+}
+
+func (c *countingShardFailedCallback) OnShardFailed(shardID uint64, err error) {
+	c.shardFailed.Add(1)
+	c.hostEngineCallback.OnShardFailed(shardID, err)
 }
 
 // seedPersistedSnapshot writes a snapshot.dat holding data into a fresh

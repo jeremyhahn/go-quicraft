@@ -336,6 +336,15 @@ The CI `modules` job discovers modules with a shell loop and fails if it finds
 fewer than `MODULE_FLOOR=6`, so a discovery that returns nothing cannot read as
 clean. Lower the floor in the same commit that removes a module on purpose.
 
+The same discovery (`MODULE_DIRS` in the Makefile) drives two more gates.
+`make lint` and the CI lint step run golangci-lint in every module with the
+root's `.golangci.yml` and `-tags=benchmark`, which brings in the harness entry
+points under `test/performance` (without it their helpers read as unused).
+`make ci-cross` and the CI `cross-arch` job build and vet every module for
+linux/arm64, linux/386, windows/amd64, darwin/arm64 and freebsd/amd64, so a
+Unix-only syscall or a build constraint that leaves a symbol undefined on one
+OS fails before merge.
+
 ## Running heavyweight suites off-box
 
 `make remote-<target>` rsyncs the working tree to `REMOTE_HOST` (required, no

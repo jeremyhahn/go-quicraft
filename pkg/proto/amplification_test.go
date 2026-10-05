@@ -16,6 +16,7 @@ package proto
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -230,5 +231,61 @@ func TestMapAllocBytesPerEntryIsAnUpperBound(t *testing.T) {
 					"this figure", perEntry, count, mapAllocBytesPerEntry)
 			}
 		})
+	}
+}
+
+// TestDecodeChargeSaturates pins the saturating arithmetic behind every
+// receive-budget reservation. A charge that wrapped negative would reserve
+// negative budget, which is unlimited headroom, so overflow must clamp to
+// MaxInt64, not wrap.
+func TestDecodeChargeSaturates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		n    int64
+		want int64
+	}{
+		{"zero", 0, 0},
+		{"negative", -5, 0},
+		{"ordinary", 1024, 1024 * MaxDecodeMemoryFactor},
+		{"largest exact", math.MaxInt64 / MaxDecodeMemoryFactor,
+			(math.MaxInt64 / MaxDecodeMemoryFactor) * MaxDecodeMemoryFactor},
+		{"would overflow", math.MaxInt64/MaxDecodeMemoryFactor + 1, math.MaxInt64},
+		{"max", math.MaxInt64, math.MaxInt64},
+	} {
+		got := DecodeCharge(tc.n)
+		if got != tc.want {
+			t.Errorf("DecodeCharge(%s = %d) = %d, want %d", tc.name, tc.n, got, tc.want)
+		}
+		if got < 0 {
+			t.Errorf("DecodeCharge(%s) = %d: a negative charge is unlimited budget", tc.name, got)
+		}
+	}
+}
+
+// TestFrameDecodeCharge pins the per-frame charge as the sum of the two
+// reservations the receiver takes: the wire length, then the positive
+// decompression delta, each at DecodeCharge. A frame that decodes to no more
+// than its wire length pays for its wire length alone.
+func TestFrameDecodeCharge(t *testing.T) {
+	const mib = int64(1 << 20)
+	for _, tc := range []struct {
+		name          string
+		wire, decoded int64
+		want          int64
+	}{
+		{"uncompressed", 16 * mib, 0, DecodeCharge(16 * mib)},
+		{"decodes smaller than wire", 16 * mib, 8 * mib, DecodeCharge(16 * mib)},
+		{"compressed to max", 1024, 16 * mib, DecodeCharge(1024) + DecodeCharge(16*mib-1024)},
+		{"wire and decoded at max", 16 * mib, 16 * mib, DecodeCharge(16 * mib)},
+		{"decoded above wire limit", 16 * mib, 32 * mib, DecodeCharge(32 * mib)},
+		{"saturates", math.MaxInt64 / 2, math.MaxInt64, math.MaxInt64},
+	} {
+		got := FrameDecodeCharge(tc.wire, tc.decoded)
+		if got != tc.want {
+			t.Errorf("FrameDecodeCharge(%s: %d, %d) = %d, want %d", tc.name, tc.wire, tc.decoded, got, tc.want)
+		}
+		if got < 0 {
+			t.Errorf("FrameDecodeCharge(%s) = %d: a negative charge is unlimited budget", tc.name, got)
+		}
 	}
 }

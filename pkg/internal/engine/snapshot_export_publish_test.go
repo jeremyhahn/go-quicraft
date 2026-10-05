@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 )
 
 // errInjectedExport is the failure the export publication tests inject.
@@ -105,7 +107,7 @@ func TestWriteSnapshotExport_FsyncsEveryCreatedDirectory(t *testing.T) {
 		mu.Lock()
 		synced[filepath.Clean(dir)] = true
 		mu.Unlock()
-		return SyncDir(dir)
+		return fsutil.SyncDir(dir)
 	})
 
 	src, meta := exportPairSource(t, []byte("a fresh export"))
@@ -170,7 +172,7 @@ func TestWriteSnapshotExport_FailedPublishKeepsThePreviousPair(t *testing.T) {
 							return errInjectedExport
 						}
 					}
-					return SyncDir(dir)
+					return fsutil.SyncDir(dir)
 				})
 			},
 		},
@@ -304,7 +306,7 @@ func TestWriteSnapshotExport_SweepsACrashedExportsLeftovers(t *testing.T) {
 				mu.Unlock()
 			}
 		}
-		return SyncDir(dir)
+		return fsutil.SyncDir(dir)
 	})
 
 	src, meta := exportPairSource(t, []byte("the export that succeeds"))

@@ -134,9 +134,10 @@ type MetricsConfig struct {
 // EventListener holds per-type optional event callbacks. Only non-nil
 // callbacks are invoked. They fall into two classes.
 //
-// Engine-produced notifications — OnLeaderUpdated, OnLeaderLost,
+// Dispatched notifications — OnLeaderUpdated, OnLeaderLost,
 // OnCampaignLaunched, OnShardFailed, OnSnapshotCreated, OnSnapshotCompacted,
-// OnSnapshotRecovered, OnLogCompacted and OnLogDBCompacted — run on a
+// OnSnapshotRecovered, OnLogCompacted, OnLogDBCompacted and OnSnapshotRejected
+// (whether the snapshot pool or the snapshot receiver rejected) — run on a
 // dedicated dispatcher goroutine that holds no engine lock, so a listener may
 // call any Host API from them, including the synchronous StopShard. They are
 // delivered FIFO by that one goroutine and are therefore ordered per shard.
@@ -145,10 +146,11 @@ type MetricsConfig struct {
 // dropped and logged.
 //
 // Every other callback runs inline on the goroutine that produced the event
-// and must not block: connection and snapshot-transfer events on transport
-// goroutines, disk events on the WAL write path, OnMembershipChanged on the
-// apply path, OnSnapshotRejected on the snapshot path, and OnNodeReady,
-// OnNodeUnloaded, OnNodeDeleted, OnProposalDropped, OnReadIndexDropped and
+// and must not block: connection events and the other snapshot-transfer
+// events (OnSnapshotReceived, OnSnapshotSendStarted and its siblings) on
+// transport goroutines, disk events on the WAL write path,
+// OnMembershipChanged on the apply path, and OnNodeReady, OnNodeUnloaded,
+// OnNodeDeleted, OnProposalDropped, OnReadIndexDropped and
 // OnNodeHostShuttingDown on the goroutine calling the Host method that caused
 // them. There is no ordering guarantee between the two classes.
 type EventListener struct {
@@ -178,8 +180,10 @@ type EventListener struct {
 
 	// OnSnapshotRejected fires when a snapshot is refused or abandoned: a
 	// snapshot request the snapshot pool would not accept, an accepted request
-	// abandoned when the pool stops or failed by a panic mid-save, or an
-	// inbound snapshot transfer the receiver rejected.
+	// abandoned when the pool stops or failed by a panic mid-save, a recovery
+	// that failed or panicked before the state machine restore began (the
+	// engine re-drives it), or an inbound snapshot transfer the receiver
+	// rejected. info.Err is the cause when one exists, nil otherwise.
 	OnSnapshotRejected func(info SnapshotInfo)
 	// OnProposalDropped fires when a proposal could not be handed to the
 	// shard and was failed with ErrDropped.
@@ -273,6 +277,15 @@ type SnapshotInfo struct {
 	ReplicaID uint64
 	Index     uint64
 	From      uint64
+	// Err is the cause of an OnSnapshotRejected event when one is known: the
+	// snapshot pool's refusal (*SnapshotDuplicateError,
+	// *SnapshotPoolBusyError), an abandonment (ErrStopped, a save's
+	// *SnapshotSavePanicError), the error or panic that rejected a recovery
+	// before the state machine restore began, or the error behind an inbound
+	// transfer the receiver rejected. It is nil for every other event, and for
+	// a rejection without an underlying error (an incomplete transfer, a
+	// shutdown or policy refusal).
+	Err error
 }
 
 // ShardFailedInfo describes a shard failure event.

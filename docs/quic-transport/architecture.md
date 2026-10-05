@@ -208,12 +208,13 @@ within one tick.
 
 A peer must not be able to make this process allocate by asserting a size.
 
-- `MaxMessageReceiveMemory` (256 MB) is the aggregate heap budget for inbound
-  message frames. A frame reserves its declared length times
+- `MaxMessageReceiveMemory` (512 MB: four maximum-size frames) is the
+  aggregate heap budget for inbound message frames. A frame reserves its
+  declared length, plus any decompression delta, times
   `proto.MaxDecodeMemoryFactor` (8), the measured ceiling on heap per wire
   byte, before the body is read, so a peer cannot declare a huge frame and
-  withhold it. Each peer is further capped at a quarter of the budget, charged
-  in wire bytes.
+  withhold it. Each peer is further capped at a quarter of the budget, in the
+  same unit, and never below one maximum-size frame.
 - `MaxSnapshotReceiveMemory` (1 GB), `MaxConcurrentSnapshotReceives` (4) and
   `MaxSnapshotReceiveRate` (256 MB/s) bound snapshot receives independently,
   with per-peer sub-limits.

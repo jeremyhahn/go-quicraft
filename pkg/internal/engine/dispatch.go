@@ -20,6 +20,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
 // listenerQueueSize bounds the notification queue. Only COLD-PATH
@@ -117,6 +119,8 @@ type listenerDispatcher struct {
 
 	stopC chan struct{}
 	doneC chan struct{}
+	// doneOnce closes doneC once, from whichever exit path reaches it first.
+	doneOnce sync.Once
 }
 
 // newListenerDispatcher creates a dispatcher with the standard queue size. The
@@ -135,12 +139,26 @@ func newListenerDispatcher() *listenerDispatcher {
 func (d *listenerDispatcher) start(wg *sync.WaitGroup) {
 	d.started.Store(true)
 	d.running.Store(true)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(d.doneC)
-		d.run()
-	}()
+	// Supervised: a listener that calls runtime.Goexit ends the goroutine,
+	// which invoke's recover cannot prevent, and the dispatcher is restarted
+	// on a fresh one. doneC is closed only on the final exit.
+	supervise.Supervise(wg, d.stopC,
+		func() {
+			d.run()
+			d.closeDone()
+		},
+		func() {
+			// The stopped path runs user listeners too: the drain is
+			// resilient, and doneC is closed whatever they do.
+			defer d.closeDone()
+			supervise.RunResilient(d.drain)
+		})
+}
+
+// closeDone closes doneC exactly once, from whichever exit path reaches it:
+// the dispatcher's own return, or its stopped path after a Goexit.
+func (d *listenerDispatcher) closeDone() {
+	d.doneOnce.Do(func() { close(d.doneC) })
 }
 
 // run consumes notifications until stopC closes, then drains whatever the
@@ -151,7 +169,7 @@ func (d *listenerDispatcher) run() {
 		case fn := <-d.q:
 			d.invoke(fn)
 		case <-d.stopC:
-			d.drain()
+			supervise.RunResilient(d.drain)
 			return
 		}
 	}
@@ -178,10 +196,15 @@ func (d *listenerDispatcher) drain() {
 func (d *listenerDispatcher) invoke(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("event listener panic recovered",
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			stack := debug.Stack()
+			// Contained: a slog handler that panicked here would escape this
+			// recover and take down the process.
+			supervise.LogContained(func() {
+				slog.Error("event listener panic recovered",
+					"panic", fmt.Sprint(r),
+					"stack", string(stack),
+				)
+			})
 		}
 	}()
 	fn()
@@ -222,7 +245,9 @@ func (d *listenerDispatcher) stop() {
 	if d.started.Load() {
 		<-d.doneC
 	}
-	d.drain()
+	// Runs user listeners: resilient, so a listener that Goexits cannot end
+	// the goroutine stopping the engine (Engine.Stop, Host.Close).
+	supervise.RunResilient(d.drain)
 }
 
 // droppedCount returns the number of notifications refused because the queue

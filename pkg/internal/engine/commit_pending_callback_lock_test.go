@@ -59,10 +59,10 @@ func (c *raftMuProbeCallback) OnReadIndexFailed(shardID uint64, keys []uint64, e
 	c.testCallback.OnReadIndexFailed(shardID, keys, err)
 }
 
-func (c *raftMuProbeCallback) OnProposalFailed(shardID uint64, entries []proto.Entry, err error) {
+func (c *raftMuProbeCallback) OnProposalRejected(shardID uint64, entries []proto.Entry, err error) {
 	free := c.probe()
 	c.proposalFailedFree = &free
-	c.testCallback.OnProposalFailed(shardID, entries, err)
+	c.testCallback.OnProposalRejected(shardID, entries, err)
 }
 
 // TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu is the regression test
@@ -129,11 +129,11 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 	}
 
 	if cb.proposalFailedFree == nil {
-		t.Fatal("OnProposalFailed never fired; a leaderless follower must reject " +
+		t.Fatal("OnProposalRejected never fired; a leaderless follower must reject " +
 			"the batched Propose")
 	}
 	if !*cb.proposalFailedFree {
-		t.Error("OnProposalFailed ran while node.raftMu was held: this is the hot " +
+		t.Error("OnProposalRejected ran while node.raftMu was held: this is the hot " +
 			"path, driven by NotLeaderError on every leaderless follower")
 	}
 
@@ -146,8 +146,8 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 	if got := cb.readIndexFailedCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one ReadIndex failure completion, got %d", got)
 	}
-	if got := cb.proposalFailedCount.Load(); got != 1 {
-		t.Fatalf("expected exactly one proposal failure completion, got %d", got)
+	if got := cb.proposalRejectedCount.Load(); got != 1 {
+		t.Fatalf("expected exactly one proposal rejection completion, got %d", got)
 	}
 }
 

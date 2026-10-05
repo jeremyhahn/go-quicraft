@@ -30,13 +30,52 @@ import (
 // returns the buffer and a restore function that reinstates the previous
 // default logger. Tests that need to verify log output should call this
 // at the top and defer the restore.
-func captureLogOutput(t *testing.T) (*bytes.Buffer, func()) {
+func captureLogOutput(t *testing.T) (*logCapture, func()) {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &logCapture{}
 	prev := slog.Default()
-	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
+	handler := slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelError})
 	slog.SetDefault(slog.New(handler))
-	return &buf, func() { slog.SetDefault(prev) }
+	return buf, func() { slog.SetDefault(prev) }
+}
+
+// logCapture is a log sink safe for concurrent use. Recovery diagnostics are
+// emitted on goroutines of their own (supervise.LogContained), so a test reads them
+// with Await rather than expecting them by the time the recovery returns.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p to the captured output.
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+// String returns the output captured so far.
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+// Await returns the captured output once it contains want, or whatever was
+// captured when a five-second deadline passes.
+func (c *logCapture) Await(want string) string {
+	deadline := time.After(5 * time.Second)
+	for {
+		out := c.String()
+		if strings.Contains(out, want) {
+			return out
+		}
+		select {
+		case <-deadline:
+			return out
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +144,7 @@ func TestStepWorkerPanicRecovery_GoroutineExitsCleanly(t *testing.T) {
 	}
 
 	// Verify panic was logged.
-	logOutput := logBuf.String()
+	logOutput := logBuf.Await("step worker test panic")
 	if !strings.Contains(logOutput, "step worker panic recovered") {
 		t.Errorf("expected panic log message, got: %s", logOutput)
 	}
@@ -212,7 +251,7 @@ func TestCommitWorkerPanicRecovery_GoroutineExitsCleanly(t *testing.T) {
 	}
 
 	// Verify panic was logged.
-	logOutput := logBuf.String()
+	logOutput := logBuf.Await("commit worker test panic")
 	if !strings.Contains(logOutput, "commit worker panic recovered") {
 		t.Errorf("expected panic log message, got: %s", logOutput)
 	}
@@ -292,7 +331,7 @@ func TestApplyWorkerDispatcherPanicRecovery_RestartsAndLogs(t *testing.T) {
 	}
 
 	// Verify the panic was logged with the correct worker type and ID.
-	logOutput := logBuf.String()
+	logOutput := logBuf.Await("apply worker panic recovered")
 	if !strings.Contains(logOutput, "apply worker panic recovered") {
 		t.Fatalf("expected 'apply worker panic recovered' in log, got: %s", logOutput)
 	}

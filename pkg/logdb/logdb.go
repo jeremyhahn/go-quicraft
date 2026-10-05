@@ -179,12 +179,17 @@ type EpochAwareLogDB interface {
 // purging barrier B's old DEKs must use min(B's snapshots, B's WAL records)
 // and must never be lowered or raised by another barrier's records.
 //
-// The barrier argument is an opaque, comparable handle (the same concrete
-// *seal.Barrier the caller installed). Implementations compare it by
-// identity to select the matching records. A single-barrier LogDB satisfies
-// this by returning its global MinLiveEpoch when the handle matches its own
-// barrier and 0 otherwise; a multiplexing LogDB delegates to the underlying
-// store that owns the barrier.
+// The barrier argument is an opaque handle (the same barrier value the caller
+// installed, typically a *seal.Barrier). Its dynamic value is NOT guaranteed
+// to be comparable, so implementations must never compare it with == or use
+// it as a map key: either panics when the value holds a slice, map or func.
+// Implementations match it with SameBarrier, the one identity rule: identity
+// is pointer identity, and a handle that is not a non-nil pointer is the same
+// barrier as nothing, not even a copy of itself, so it must be answered
+// known == false. A single-barrier LogDB satisfies this by
+// returning its global MinLiveEpoch when the handle matches its own barrier;
+// a multiplexing LogDB delegates to the underlying store that owns the
+// barrier.
 //
 // Implementations that do not support per-barrier routing need not implement
 // this interface. Callers should use a type assertion to check for support
@@ -232,6 +237,10 @@ type PerBarrierEpochAwareLogDB interface {
 // that is the fallback for every non-dedicated shard) and for any barrier the
 // implementation does not own; in those cases the caller falls back to scanning
 // the currently-loaded shards, matching the global single-barrier behavior.
+//
+// The barrier argument follows PerBarrierEpochAwareLogDB's identity rule: it
+// is matched with SameBarrier, never with == or as a map key, and a handle
+// that is not a pointer is answered known == false.
 //
 // Implementations that cannot enumerate shards per barrier need not implement
 // this interface; callers use a type assertion to check for support.

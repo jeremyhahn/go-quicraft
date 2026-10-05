@@ -1,9 +1,20 @@
+# Module credentials for the project forge live in one place: the gitignored
+# .devcontainer/.env beside this file (format: .env.example). The image builds
+# mount it as the gomodauth BuildKit secret for `go mod download`, and the
+# services load the same variables at run time so `go` inside the container
+# can fetch github.com/jeremyhahn/* from the forge. Without the file the build
+# fails: compose cannot mount a secret it cannot find.
 services:
   devcontainer:
     build:
       context: ..
       dockerfile: .devcontainer/Dockerfile.dev
+      secrets:
+        - gomodauth
     image: go-quicraft-dev:latest
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ../:/app
     working_dir: /app
@@ -15,7 +26,12 @@ services:
     build:
       context: ..
       dockerfile: .devcontainer/Dockerfile
+      secrets:
+        - gomodauth
     image: go-quicraft-integration:latest
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ../:/app
     working_dir: /app
@@ -23,3 +39,7 @@ services:
     cap_add:
       - NET_ADMIN
     command: ["make", "_integration-test"]
+
+secrets:
+  gomodauth:
+    file: .env

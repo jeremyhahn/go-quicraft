@@ -1176,3 +1176,77 @@ func TestNonceTracker_ClearConcurrentRaceDetector(t *testing.T) {
 		t.Fatalf("post-stress fresh nonce failed: %v", err)
 	}
 }
+
+// TestNonceTracker_ClearIsAtomicWithAdmission checks the invariants an epoch
+// boundary must preserve when Clear races CheckAndRecordNonce. Every nonce is
+// presented once, so after quiescence the tracked set is exactly the presented
+// nonces Contains still reports, and:
+//
+//   - Count() equals that cardinality: the counter belongs to the same epoch
+//     as the set it counts;
+//   - Count() never exceeds the ceiling;
+//   - Saturated() implies the current epoch actually reached the ceiling, so
+//     saturation from a cleared epoch cannot leak into its successor and leave
+//     a fresh epoch accepting nonces without recording them.
+//
+// The ceiling is small so admission, rollback and saturation all run on every
+// round, inside the window a concurrent Clear can split.
+func TestNonceTracker_ClearIsAtomicWithAdmission(t *testing.T) {
+	captureLogs(t) // saturation logs once per epoch; keep it out of the output
+
+	const (
+		rounds     = 200
+		workers    = 8
+		perWorker  = 256
+		clears     = 64
+		maxTracked = 32
+	)
+	nonce := func(w, i int) []byte { return nonceN(uint64(w*perWorker + i)) }
+
+	for round := range rounds {
+		nt := NewNonceTracker(true)
+		nt.SetMaxTrackedNonces(maxTracked)
+
+		var wg sync.WaitGroup
+		wg.Add(workers + 1)
+		for w := range workers {
+			go func() {
+				defer wg.Done()
+				for i := range perWorker {
+					if err := nt.CheckAndRecordNonce(nonce(w, i)); err != nil {
+						t.Errorf("round %d: unique nonce rejected: %v", round, err)
+						return
+					}
+				}
+			}()
+		}
+		go func() {
+			defer wg.Done()
+			for range clears {
+				_ = nt.Clear()
+			}
+		}()
+		wg.Wait()
+
+		tracked := 0
+		for w := range workers {
+			for i := range perWorker {
+				if nt.Contains(nonce(w, i)) {
+					tracked++
+				}
+			}
+		}
+
+		count := nt.Count()
+		if count != tracked {
+			t.Fatalf("round %d: Count() = %d, tracked set holds %d", round, count, tracked)
+		}
+		if count > maxTracked {
+			t.Fatalf("round %d: Count() = %d exceeds ceiling %d", round, count, maxTracked)
+		}
+		if nt.Saturated() && count != maxTracked {
+			t.Fatalf("round %d: Saturated() with %d of %d tracked: saturation leaked across Clear",
+				round, count, maxTracked)
+		}
+	}
+}

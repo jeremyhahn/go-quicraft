@@ -3436,14 +3436,16 @@ func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
 // caller can simply continue.
 func TestHandleMessageFrameDrainsBodyOnBudgetExhaustion(t *testing.T) {
 	tr, err := NewQUICTransport(Config{
-		ListenAddress:           "127.0.0.1:0",
-		DeploymentID:            42,
-		MaxMessageReceiveMemory: 1024,
-		MTLSConfig:              testMTLSConfig(t),
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
 	}, newTestHandler(), registry.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
+	// Leave 1024 bytes of the aggregate budget, as other in-flight frames
+	// would; Config rejects a configured budget that small.
+	tr.msgRecvBudget.Store(1024)
 
 	body := make([]byte, 4096) // larger than the whole budget
 	marker := []byte("NEXT-FRAME-HEADER")

@@ -9,6 +9,10 @@
 # real QUIC with mTLS on loopback ports, so no cross-container topology is
 # needed. The container provides the pinned toolchain and the tuned QUIC UDP
 # buffers the entrypoint sets.
+#
+# The builder stage downloads modules with the gomodauth BuildKit secret, taken
+# from the gitignored .devcontainer/.env (format: .env.example). The runner
+# stage holds only the compiled binary, so it needs no credentials at run time.
 
 services:
 
@@ -17,6 +21,8 @@ services:
       context: ..
       dockerfile: .devcontainer/Dockerfile.integration
       target: test-runner
+      secrets:
+        - gomodauth
     image: go-quicraft-integration-runner:latest
     hostname: test-runner
     cap_add:
@@ -25,3 +31,7 @@ services:
     # starts a multi-node QUIC cluster and waits on election timeouts, so raise
     # this rather than trimming coverage if it is ever hit.
     command: ["-test.v", "-test.timeout=600s"]
+
+secrets:
+  gomodauth:
+    file: .env

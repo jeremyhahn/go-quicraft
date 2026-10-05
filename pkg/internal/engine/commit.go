@@ -93,13 +93,32 @@ type commitWorker struct {
 	commitC    chan *commitItem
 	batch      []proto.Update
 	batchNodes []*Node // parallel slice: batchNodes[i] owns batch[i]
-	logdbBuf   []logdb.Update
-	flatBuf    []logdb.Entry // single flat buffer for all entries across the batch
-	applyC     chan *applyItem
-	applyPool  *sync.Pool
-	workSignal *WorkSignal
-	callback   Callback
-	stopC      chan struct{}
+
+	// batchUnpersisted reports that the current batch holds updates whose
+	// SaveState has not completed — from the moment the batch is gathered
+	// until SaveState succeeds or failBatchSaveState settles it. Its updates
+	// are owed a durable hard-state write GetUpdate already claimed (it
+	// advanced prevState at extraction), so an abnormal exit in that window
+	// gives the claim back (recoverAbnormalExit), as the step worker's
+	// discardExtractedUpdate does. Their entries were never marked stable, so
+	// the next GetUpdate re-derives them.
+	batchUnpersisted bool
+
+	// handoffNode and handoffUpdate are the update whose Peer.Commit has
+	// advanced raft's processed marker but whose committed entries have not
+	// yet reached the apply worker. They exist nowhere else in that window,
+	// and user code — the OnCommitted callback, a logger — runs inside it, so
+	// an abnormal exit fails the shard (recoverAbnormalExit). Written and
+	// read only on the commit-worker goroutine.
+	handoffNode   *Node
+	handoffUpdate proto.Update
+	logdbBuf      []logdb.Update
+	flatBuf       []logdb.Entry // single flat buffer for all entries across the batch
+	applyC        chan *applyItem
+	applyPool     *sync.Pool
+	workSignal    *WorkSignal
+	callback      Callback
+	stopC         chan struct{}
 
 	// applyStopC is the APPLY tier's stop channel (applyStopC in the engine),
 	// distinct from this worker's own stopC (commitStopC). The forward to the
@@ -219,6 +238,7 @@ func (w *commitWorker) run() {
 		case item := <-w.commitC:
 			w.batch = w.batch[:0]
 			w.batchNodes = w.batchNodes[:0]
+			w.batchUnpersisted = true
 			w.admit(item)
 			// Yield to let other step workers produce items before
 			// draining. Under load this increases batch size; when
@@ -243,6 +263,7 @@ func (w *commitWorker) drainAndProcess() {
 		case item := <-w.commitC:
 			w.batch = w.batch[:0]
 			w.batchNodes = w.batchNodes[:0]
+			w.batchUnpersisted = true
 			w.admit(item)
 			w.drainCommitC()
 			if len(w.batch) > 0 {
@@ -419,11 +440,25 @@ func (w *commitWorker) retryWait(attempt int) (cancelled bool) {
 // processBatch converts the batch to logdb.Update format, calls
 // SaveState with retry logic, and forwards successful updates to the
 // apply worker.
-//
-//nolint:gocyclo // batch processing covers save, send, apply, and error recovery paths
 func (w *commitWorker) processBatch() {
-	if w.metrics != nil {
-		w.metrics.ObserveCommitBatchSize(len(w.batch))
+	// Observability runs on every exit, but only once the batch is settled —
+	// failed, abandoned or handed on — never inside a window in which an
+	// abnormal exit in user metrics code could lose state.
+	batchSize := len(w.batch)
+	var persistedAt time.Time
+	observe := func() {
+		if w.metrics == nil {
+			return
+		}
+		w.metrics.ObserveCommitBatchSize(batchSize)
+		if persistedAt.IsZero() {
+			return
+		}
+		for shardID, ts := range w.commitTimes {
+			if !ts.IsZero() {
+				w.metrics.ObserveCommitLatency(shardID, persistedAt.Sub(ts))
+			}
+		}
 	}
 
 	// Only convert and persist when LogDB is configured. In memory
@@ -449,6 +484,7 @@ func (w *commitWorker) processBatch() {
 					// until their context deadline and the nodes are left
 					// stuck with commitPending=true.
 					w.failBatchSaveState(saveErr)
+					observe()
 					return
 				}
 			}
@@ -457,19 +493,13 @@ func (w *commitWorker) processBatch() {
 
 	if saveErr != nil {
 		w.failBatchSaveState(saveErr)
+		observe()
 		return
 	}
-
-	// Record commit latency for each shard in the batch. The latency
-	// spans from step worker Update production to SaveState completion.
-	if w.metrics != nil {
-		now := time.Now()
-		for shardID, ts := range w.commitTimes {
-			if !ts.IsZero() {
-				w.metrics.ObserveCommitLatency(shardID, now.Sub(ts))
-			}
-		}
-	}
+	w.batchUnpersisted = false
+	// The latency spans from step worker Update production to SaveState
+	// completion; it is reported only once the batch is settled (observe).
+	persistedAt = time.Now()
 
 	// Send ordered messages now that state is persisted to stable
 	// storage. These include VoteResp, HeartbeatResp, ReplicateResp,
@@ -514,103 +544,124 @@ func (w *commitWorker) processBatch() {
 	// committed index may be lower), violating the appliedTo
 	// invariant.
 	for i, u := range w.batch {
-		node := w.batchNodes[i]
-
-		// Skip Peer.Commit for shards that have been unloaded.
-		// An in-flight commitItem may have been enqueued before the
-		// unload was processed. Calling Peer.Commit on a torn-down
-		// node would panic or corrupt state.
-		if w.unloaded.has(u.ShardID) {
-			slog.Warn("commit skipped for unloaded shard",
-				"worker", w.workerID,
-				"shard", u.ShardID,
-			)
-			u.ReleaseCommittedEntries()
-			node.commitPending.Store(false)
-			continue
-		}
-
-		// Incarnation guard, mirroring the apply dispatcher. The unloaded set is
-		// shardID-keyed and cannot distinguish a stale old-incarnation item from
-		// a fresh one after a rapid StopShard->StartShard. The node's own stopC
-		// can: an item whose node UnloadNode has begun tearing down belongs to
-		// a torn-down incarnation, and Commit on its peer would race the
-		// teardown. A node stopped only by Engine.Stop is not unloaded, so the
-		// shutdown drain keeps committing (see Node.isUnloaded).
-		if node.isUnloaded() {
-			slog.Warn("commit skipped for stopped shard incarnation",
-				"worker", w.workerID,
-				"shard", u.ShardID,
-			)
-			u.ReleaseCommittedEntries()
-			node.commitPending.Store(false)
-			continue
-		}
-
-		var piggyback proto.Update
-		status, err := commitUpdateLocked(node, &u, &piggyback)
-		switch status {
-		case commitFailed:
-			failCommit(node, w.callback, u, err)
-			continue
-		case commitRecovering:
-			// A snapshot recovery owns the state machine, so nothing was
-			// extracted for the apply worker (see commitUpdateLocked). Clear
-			// commitPending and re-notify: the entries stay in the log and are
-			// re-offered once the gate clears.
-			node.commitPending.Store(false)
-			w.workSignal.Notify(node.shardID)
-			continue
-		case commitPiggyback:
-			if err != nil || len(piggyback.CommittedEntries) == 0 {
-				// No piggyback available — original skip-apply fast path.
-				if err != nil {
-					notePiggybackFailure(u.ShardID, u.ReplicaID, err)
-				}
-				node.commitPending.Store(false)
-				w.workSignal.Notify(node.shardID)
-				continue
-			}
-
-			// Piggyback path: persist updated state, send messages, apply.
-			// It takes raftMu itself, in short bursts, and must therefore run
-			// with the lock released — which is why commitUpdateLocked returns
-			// the piggyback instead of executing it.
-			//
-			// On shutdown mid-delivery it returns false; stop processing the
-			// batch entirely rather than iterating cleared/nil batch slots
-			// (which would nil-deref node.raftMu on the next item).
-			if !w.executePiggyback(node, piggyback) {
-				node.commitPending.Store(false)
-				w.abandonBatchTail(i + 1)
-				w.clearBatch()
-				return
-			}
-			continue
-		}
-
-		// commitApply: the update carries committed entries. The forward below
-		// is a BLOCKING channel send to the apply worker and must never run
-		// under node.raftMu — the apply worker's own progress depends on the
-		// commit and step workers being able to take it.
-		ai := w.applyPool.Get().(*applyItem)
-		ai.update = u
-		ai.node = node
-		// Only if the channel is full AND the apply tier is stopping do we
-		// give up — an edge case where the engine is already tearing down
-		// (see forwardToApply).
-		if !w.forwardToApply(ai) {
-			slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
-				"shard", ai.update.ShardID)
-			ai.update.ReleaseCommittedEntries()
-			releaseApplyItem(w.applyPool, ai)
-			node.commitPending.Store(false)
+		stop := w.commitBatchItem(w.batchNodes[i], u)
+		// The item reached its terminal hand-off — the apply worker owns it,
+		// or it was failed, skipped or released — so it is retired from the
+		// batch: a later abnormal exit must not touch its node, whose
+		// commitPending may already belong to the apply worker.
+		w.batchNodes[i] = nil
+		if stop {
 			w.abandonBatchTail(i + 1)
+			observe()
 			w.clearBatch()
 			return
 		}
 	}
+	observe()
 	w.clearBatch()
+}
+
+// commitBatchItem commits one persisted batch update to its owning node and
+// hands its committed entries on, reporting stop when the worker is shutting
+// down and the rest of the batch must be abandoned. It runs every terminal
+// outcome for the item itself, so the caller can retire it.
+//
+// Each update is committed to its owning node (batchNodes[i]), NOT resolved by
+// shardID. This is critical for correctness during rapid shard stop/restart:
+// the batch may contain updates from both the old and new shard incarnation
+// for the same shardID. Using a shardID-keyed map would clobber the old node
+// pointer with the new one, causing the old update's committed entries to be
+// applied to the new Peer (whose committed index may be lower), violating the
+// appliedTo invariant.
+func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
+	// Skip Peer.Commit for shards that have been unloaded. An in-flight
+	// commitItem may have been enqueued before the unload was processed.
+	// Calling Peer.Commit on a torn-down node would panic or corrupt state.
+	if w.unloaded.has(u.ShardID) {
+		slog.Warn("commit skipped for unloaded shard",
+			"worker", w.workerID,
+			"shard", u.ShardID,
+		)
+		u.ReleaseCommittedEntries()
+		node.commitPending.Store(false)
+		return false
+	}
+
+	// Incarnation guard, mirroring the apply dispatcher. The unloaded set is
+	// shardID-keyed and cannot distinguish a stale old-incarnation item from
+	// a fresh one after a rapid StopShard->StartShard. The node's own stopC
+	// can: an item whose node UnloadNode has begun tearing down belongs to a
+	// torn-down incarnation, and Commit on its peer would race the teardown.
+	// A node stopped only by Engine.Stop is not unloaded, so the shutdown
+	// drain keeps committing (see Node.isUnloaded).
+	if node.isUnloaded() {
+		slog.Warn("commit skipped for stopped shard incarnation",
+			"worker", w.workerID,
+			"shard", u.ShardID,
+		)
+		u.ReleaseCommittedEntries()
+		node.commitPending.Store(false)
+		return false
+	}
+
+	var piggyback proto.Update
+	status, err := commitUpdateLocked(node, &u, &piggyback)
+	switch status {
+	case commitFailed:
+		failCommit(node, w.callback, u, err)
+		return false
+	case commitRecovering:
+		// A snapshot recovery owns the state machine, so nothing was
+		// extracted for the apply worker (see commitUpdateLocked). Clear
+		// commitPending and re-notify: the entries stay in the log and are
+		// re-offered once the gate clears.
+		node.commitPending.Store(false)
+		w.workSignal.Notify(node.shardID)
+		return false
+	case commitPiggyback:
+		if err != nil || len(piggyback.CommittedEntries) == 0 {
+			// No piggyback available — original skip-apply fast path.
+			if err != nil {
+				notePiggybackFailure(u.ShardID, u.ReplicaID, err)
+			}
+			node.commitPending.Store(false)
+			w.workSignal.Notify(node.shardID)
+			return false
+		}
+		// Piggyback path: persist updated state, send messages, apply. It
+		// takes raftMu itself, in short bursts, and must therefore run with
+		// the lock released — which is why commitUpdateLocked returns the
+		// piggyback instead of executing it. On shutdown mid-delivery it
+		// returns false and the rest of the batch is abandoned.
+		if !w.executePiggyback(node, piggyback) {
+			node.commitPending.Store(false)
+			return true
+		}
+		return false
+	}
+
+	// commitApply: the update carries committed entries. The forward below is
+	// a BLOCKING channel send to the apply worker and must never run under
+	// node.raftMu — the apply worker's own progress depends on the commit and
+	// step workers being able to take it.
+	w.handoffNode, w.handoffUpdate = node, u
+	ai := w.applyPool.Get().(*applyItem)
+	ai.update = u
+	ai.node = node
+	// Only if the channel is full AND the apply tier is stopping do we give up
+	// — an edge case where the engine is already tearing down (see
+	// forwardToApply).
+	forwarded := w.forwardToApply(ai)
+	w.handoffNode, w.handoffUpdate = nil, proto.Update{}
+	if !forwarded {
+		slog.Warn("commit worker shutting down, committed item not delivered to apply worker",
+			"shard", ai.update.ShardID)
+		ai.update.ReleaseCommittedEntries()
+		releaseApplyItem(w.applyPool, ai)
+		node.commitPending.Store(false)
+		return true
+	}
+	return false
 }
 
 // commitStatus classifies what commitUpdateLocked did, telling processBatch
@@ -859,18 +910,17 @@ func failBatchProposals(callback Callback, u proto.Update, err error) {
 func (w *commitWorker) failBatchSaveState(saveErr error) {
 	for i, u := range w.batch {
 		node := w.batchNodes[i]
-		node.markFailed()
-		node.commitPending.Store(false)
 		saveStateErr := &SaveStateError{
 			ShardID:   u.ShardID,
 			ReplicaID: u.ReplicaID,
 			Err:       saveErr,
 		}
-		node.handleError(saveStateErr)
-		failBatchProposals(w.callback, u, saveStateErr)
-		if w.callback != nil {
-			w.callback.OnShardFailed(u.ShardID, saveStateErr)
-		}
+		failShard(node, w.callback, saveStateErr, func() {
+			failBatchProposals(w.callback, u, saveStateErr)
+		})
+		// The latch is tripped before commitPending is cleared, so the step
+		// worker never steps the node again.
+		node.commitPending.Store(false)
 		// Return the pooled committed-entries slice after the callback (which
 		// must not retain them). clearBatch below only zeroes the slot, so
 		// without this every failed batch permanently removes a slice from
@@ -901,13 +951,12 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	}
 	slog.Warn("commit Peer.Commit failed, shard marked failed",
 		"shard", u.ShardID, "replica", u.ReplicaID, "error", err)
-	node.markFailed()
+	failShard(node, callback, commitErr, func() {
+		failBatchProposals(callback, u, commitErr)
+	})
+	// The latch is tripped before commitPending is cleared, so the step
+	// worker never steps the node again.
 	node.commitPending.Store(false)
-	node.handleError(commitErr)
-	failBatchProposals(callback, u, commitErr)
-	if callback != nil {
-		callback.OnShardFailed(u.ShardID, commitErr)
-	}
 	// Return the pooled slice only after the callback, which must not
 	// retain the entries beyond the call.
 	u.ReleaseCommittedEntries()
@@ -958,6 +1007,80 @@ func (w *commitWorker) clearBatch() {
 	}
 	clear(w.commitTimes)
 	clear(w.orderedMsgsBuf)
+}
+
+// recoverAbnormalExit settles the batch a panic or runtime.Goexit cut short,
+// before the worker is restarted. cause is the *WorkerPanicError the
+// recovery built. It runs on the unwinding worker goroutine, which owns the
+// batch.
+func (w *commitWorker) recoverAbnormalExit(cause error, workSignal *WorkSignal) {
+	// A batch whose SaveState had not completed: GetUpdate already claimed its
+	// hard state durable, so the claim is given back, and the next GetUpdate
+	// carries the hard state through SaveState again instead of classifying
+	// the update ReadOnly — a vote or term that never reached disk is never
+	// treated as persisted. Its entries were never marked stable and are
+	// re-derived. The shards keep running, as the batch's commitPending is
+	// cleared below.
+	if w.batchUnpersisted {
+		w.batchUnpersisted = false
+		for _, node := range w.batchNodes {
+			invalidatePersistedStateLocked(node)
+		}
+	}
+	// An update whose Peer.Commit advanced raft's processed marker without
+	// its committed entries reaching the apply worker: they can never be
+	// re-offered, so the shard is failed and their proposals with it
+	// (maybe-applied).
+	if node := w.handoffNode; node != nil {
+		u := w.handoffUpdate
+		w.handoffNode, w.handoffUpdate = nil, proto.Update{}
+		err := &CommitError{ShardID: u.ShardID, ReplicaID: u.ReplicaID, Err: cause}
+		failShard(node, w.callback, err, func() { failBatchProposals(w.callback, u, err) })
+		node.commitPending.Store(false)
+		u.ReleaseCommittedEntries()
+	}
+	// commitC is deliberately NOT drained here, for the same reason as the
+	// step-worker recovery: a shard has at most ONE item in flight
+	// (commitPending gates the step worker from producing a second), so no
+	// shard can have both an item in w.batch and an item in commitC. Clearing
+	// a batch node's commitPending therefore cannot hand the step worker a
+	// slot whose pointer is still queued, and the items that ARE queued
+	// belong to other shards, which the restarted worker processes normally.
+	// Draining them instead failed those unrelated healthy shards permanently.
+	//
+	// Unwedge exactly the nodes whose updates died with the batch. A blanket
+	// clear over every node this worker owns would also clear nodes the STEP
+	// worker is mid-enqueueForCommit for: that worker sets commitPending
+	// before its commitC send, so clearing it lets the very next processReady
+	// call GetUpdate again while the first update is still in flight. Raft's
+	// processed marker has not advanced yet, so the same committed entries are
+	// extracted TWICE (double Peer.Commit, double apply, double
+	// ReleaseCommittedEntries on one pooled slice), and getCommitSlot hands
+	// back the SAME *commitItem that is still queued — one pointer enqueued
+	// twice. Items in the batch have already been consumed from commitC and
+	// copied into w.batch, so clearing them is safe.
+	w.clearBatchCommitPending(workSignal)
+	// The exit may have unwound out of processBatch before clearBatch ran,
+	// leaving orderedMsgsBuf holding this batch's VoteResp/HeartbeatResp and
+	// batch/commitTimes holding its updates. The restarted worker would append
+	// the NEXT batch's messages to those survivors and send them after that
+	// unrelated batch's SaveState — sending a vote grant whose HardState was
+	// never persisted (Raft PhD 10.2.1). Safe to touch here: the worker
+	// goroutine is unwinding, so nothing else owns the batch.
+	w.clearBatch()
+}
+
+// invalidatePersistedStateLocked gives back the hard-state durability claim
+// GetUpdate took for node's extracted update, with node.raftMu held: the
+// commit worker reaches the Peer only under it. A node without a Peer has no
+// claim to give back.
+func invalidatePersistedStateLocked(node *Node) {
+	if node == nil || node.peer == nil {
+		return
+	}
+	node.raftMu.Lock()
+	defer node.raftMu.Unlock()
+	node.peer.InvalidatePersistedState()
 }
 
 // applyMembership folds one ordered unload/reload notification into the
@@ -1175,6 +1298,9 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		failCommit(node, w.callback, piggyback, pbCommitErr)
 		return true
 	}
+	// From here until the apply worker has the committed entries they exist
+	// nowhere else: an abnormal exit fails the shard (recoverAbnormalExit).
+	w.handoffNode, w.handoffUpdate = node, piggyback
 
 	// Now that the commit index is durable, it is safe to send ordered
 	// responses and fire the WAL-durable commit notification.
@@ -1185,15 +1311,18 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		w.callback.OnCommitted(piggyback.ShardID, piggyback.CommittedEntries)
 	}
 
-	if w.metrics != nil {
-		w.metrics.IncPiggybackCommit(piggyback.ShardID)
-	}
-
 	// Forward to apply worker (commitPending cleared by apply worker).
 	ai := w.applyPool.Get().(*applyItem)
 	ai.update = piggyback
 	ai.node = node
-	if !w.forwardToApply(ai) {
+	forwarded := w.forwardToApply(ai)
+	w.handoffNode, w.handoffUpdate = nil, proto.Update{}
+	// Observability after the hand-off: user code that exits abnormally
+	// here loses nothing.
+	if forwarded && w.metrics != nil {
+		w.metrics.IncPiggybackCommit(piggyback.ShardID)
+	}
+	if !forwarded {
 		slog.Warn("commit worker shutting down, piggyback item not delivered to apply worker",
 			"shard", piggyback.ShardID)
 		ai.update.ReleaseCommittedEntries()

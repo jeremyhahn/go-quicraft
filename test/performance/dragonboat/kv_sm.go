@@ -63,16 +63,6 @@ func encodeKVCmd(key, value []byte) []byte {
 	return cmd
 }
 
-// encodeKVGet builds the wire-format command for a Get query.
-func encodeKVGet(key []byte) []byte {
-	keyLen := len(key)
-	cmd := make([]byte, 1+2+keyLen)
-	cmd[0] = opGet
-	binary.BigEndian.PutUint16(cmd[1:3], uint16(keyLen))
-	copy(cmd[3:3+keyLen], key)
-	return cmd
-}
-
 // parseKVCmd decodes the wire-format command.
 func parseKVCmd(cmd []byte) (op byte, key, value []byte) {
 	if len(cmd) < 3 {

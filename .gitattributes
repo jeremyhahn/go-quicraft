@@ -12,10 +12,10 @@ AGENTS.md export-ignore
 
 # Private-forge and private-release workflow. These files drive only the
 # private forge's SDLC -- arming the forge's auto-merge (automerge) -- and the
-# private release recipe's trust anchor (.release-allowed-signers, which pins
-# the internal agent principal `make release-alpha` verifies against). Nothing a
-# public reader runs depends on them: ci.yml, release.yml, nightly.yml and
-# fuzz.yml neither call nor read them, and the Makefile reads the signers file
-# from the checkout, which export-ignore does not touch.
+# private repository's release trust anchor (.release-allowed-signers, which
+# pins the internal principal `make release-alpha` verifies against by
+# default). Nothing a public reader runs depends on them: ci.yml, release.yml,
+# nightly.yml and fuzz.yml neither call nor read them, and a public maintainer
+# names their own signers file with RELEASE_ALLOWED_SIGNERS.
 .github/workflows/automerge.yml export-ignore
 /.release-allowed-signers export-ignore

@@ -36,11 +36,13 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -245,6 +247,20 @@ func WithBarrier(b Barrier) HostOption {
 // caller supplies a multiplexing LogDB via WithLogDB that implements
 // logdb.PerBarrierEpochAwareLogDB (one dedicated single-barrier WAL per
 // tenant). All barriers must be initialized and unsealed.
+//
+// A barrier's dynamic value need not be comparable; the host never compares
+// two barriers with == or uses one as a map key. Two shards share a barrier
+// when the resolver returns the same pointer for both. A barrier that is not a
+// pointer is distinct for every shard that resolves to it: its shards are not
+// grouped, the snapshot pool declines per-barrier DEK purges it cannot prove
+// safe, and a per-barrier LogDB answers that it does not own it.
+//
+// Host.Close seals every barrier the resolver returned during the host's
+// lifetime, after the shards and the LogDB using them have stopped. A pointer
+// barrier shared by several shards, or the WithBarrier barrier itself, is
+// sealed once; a non-pointer barrier is sealed per shard, and an
+// ErrBarrierSealed from a barrier already sealed is not a Close error. Closing
+// the SealingStrategy behind each barrier remains the caller's job.
 func WithShardBarriers(fn func(shardID uint64) Barrier) HostOption {
 	return func(o *hostOptions) {
 		o.shardBarriers = fn
@@ -397,6 +413,89 @@ func (s *transportSender) barrierFor(shardID uint64) Barrier {
 	return s.barrier
 }
 
+// givenBarriers records every barrier a WithShardBarriers resolver has handed
+// the host, so Host.Close can seal each one. The resolver is a function rather
+// than a set, so the host only learns which barriers it was given by watching
+// what the resolver returns.
+//
+// The Barrier interface does not require a comparable dynamic value, so the
+// record never keys on or compares a Barrier: either panics for a value that
+// holds a slice or map. A barrier with pointer identity (logdb.SameBarrier) is
+// recorded once however many shards resolve to it; one without is recorded
+// per shard, as the latest value the resolver returned for that shard. Close
+// treats an already-sealed result as benign, so copies of one value-type
+// barrier recorded under several shards are sealed once in effect. The zero
+// value is ready to use.
+type givenBarriers struct {
+	mu sync.Mutex
+	// identified holds each distinct pointer barrier once.
+	identified []Barrier
+	// lastIdentified is the pointer barrier last recorded for each shard. A
+	// resolution that repeats it, the common case, is recorded without
+	// scanning identified.
+	lastIdentified map[uint64]Barrier
+	// unidentified is the latest non-pointer barrier recorded for each shard.
+	unidentified map[uint64]Barrier
+}
+
+// recording wraps resolve so that every non-nil barrier it returns is
+// recorded. Every consumer of the resolver (snapshot pool, transport epoch
+// tracking, snapshot sends and the host's own barrierForShard) is handed the
+// wrapped function, so no path can use a barrier Close would not seal.
+func (g *givenBarriers) recording(resolve func(shardID uint64) Barrier) func(shardID uint64) Barrier {
+	return func(shardID uint64) Barrier {
+		b := resolve(shardID)
+		if b != nil {
+			g.record(shardID, b)
+		}
+		return b
+	}
+}
+
+// record adds b, resolved for shardID, to the set.
+func (g *givenBarriers) record(shardID uint64, b Barrier) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !logdb.SameBarrier(b, b) {
+		if g.unidentified == nil {
+			g.unidentified = make(map[uint64]Barrier)
+		}
+		g.unidentified[shardID] = b
+		return
+	}
+	if logdb.SameBarrier(g.lastIdentified[shardID], b) {
+		return
+	}
+	if g.lastIdentified == nil {
+		g.lastIdentified = make(map[uint64]Barrier)
+	}
+	g.lastIdentified[shardID] = b
+	for _, known := range g.identified {
+		if logdb.SameBarrier(known, b) {
+			return
+		}
+	}
+	g.identified = append(g.identified, b)
+}
+
+// each calls fn once for every recorded barrier, outside the set's lock. A nil
+// set records nothing.
+func (g *givenBarriers) each(fn func(Barrier)) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	recorded := make([]Barrier, 0, len(g.identified)+len(g.unidentified))
+	recorded = append(recorded, g.identified...)
+	for _, b := range g.unidentified {
+		recorded = append(recorded, b)
+	}
+	g.mu.Unlock()
+	for _, b := range recorded {
+		fn(b)
+	}
+}
+
 // logDBAtRestProtection reports a LogDB's declared at-rest guarantee. A LogDB
 // that does not implement logdb.AtRestProtectedLogDB declares nothing, and a
 // nil LogDB is not a store at all; both read as UNPROTECTED so every caller
@@ -491,10 +590,12 @@ func (h *Host) warnBarrierFallback(shardID uint64) {
 // construction) and the per-shard barriers cover snapshots only, so demanding
 // per-shard WAL ownership would refuse a supported configuration.
 //
-// logdb.PerBarrierEpochAwareLogDB answers by barrier IDENTITY: known == true
-// means "my records for this barrier are these", which for waldb.DB is decided
-// by the barrier it was opened with. A LogDB that cannot answer cannot prove
-// isolation, so it is refused rather than trusted.
+// logdb.PerBarrierEpochAwareLogDB answers by barrier IDENTITY, which is pointer
+// identity: known == true means "my records for this barrier are these", which
+// for waldb.DB is decided by the barrier it was opened with. A LogDB that
+// cannot answer cannot prove isolation, so it is refused rather than trusted;
+// a barrier that is not a pointer has no identity to answer for, so its shard
+// is refused too.
 func (h *Host) verifyShardLogDBBarrier(shardID uint64, barrier Barrier) error {
 	if h.shardBarriers == nil || h.barrier != nil || h.logdb == nil {
 		return nil
@@ -509,6 +610,13 @@ func (h *Host) verifyShardLogDBBarrier(shardID uint64, barrier Barrier) error {
 		h.logger.Error("refusing to start shard: the supplied LogDB cannot "+
 			"attribute its records to a barrier, so it cannot prove this shard's "+
 			"log is stored under this shard's own key",
+			"shard_id", shardID)
+		return ErrShardBarrierLogDBMismatch
+	}
+	if !logdb.SameBarrier(barrier, barrier) {
+		h.logger.Error("refusing to start shard: the barrier the resolver "+
+			"returned for it is not a pointer, so it has no identity a LogDB "+
+			"could attribute this shard's log to",
 			"shard_id", shardID)
 		return ErrShardBarrierLogDBMismatch
 	}
@@ -587,22 +695,31 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 					"shard", msg.ShardID, "path", msg.Snapshot.Filepath, "error", err)
 			}
 		}()
+		// normalReturn tells a runtime.Goexit in user code apart from a
+		// normal return; both leave recover() nil.
+		normalReturn := false
 		defer func() {
-			if r := recover(); r != nil {
-				s.logger.Error("panic recovered in doSendSnapshot",
-					"shard", msg.ShardID,
-					"from", msg.From,
-					"to", msg.To,
-					"panic", fmt.Sprint(r),
-					"stack", string(debug.Stack()),
-				)
+			if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 				// Notify the raft layer that the snapshot was rejected so
 				// the leader transitions the remote out of snapshot state.
-				// Without this, the follower is permanently stuck.
+				// Without this, the follower is permanently stuck. It comes
+				// before the diagnostic, which is contained: the logger is
+				// user code and must not be able to skip the notification.
 				s.safeNotifySnapshotRejected(msg.ShardID, msg.From, msg.To, msg.Hint)
+				stack := debug.Stack()
+				supervise.LogContained(func() {
+					s.logger.Error("panic recovered in doSendSnapshot",
+						"shard", msg.ShardID,
+						"from", msg.From,
+						"to", msg.To,
+						"panic", fmt.Sprint(r),
+						"stack", string(stack),
+					)
+				})
 			}
 		}()
 		s.doSendSnapshot(msg, src, openErr)
+		normalReturn = true
 	}()
 }
 
@@ -613,12 +730,14 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 func (s *transportSender) safeNotifySnapshotRejected(shardID, from, to, transferSeq uint64) {
 	defer func() {
 		if r := recover(); r != nil {
-			s.logger.Error("panic in snapshot rejection notification",
-				"shard", shardID,
-				"from", from,
-				"to", to,
-				"panic", fmt.Sprint(r),
-			)
+			supervise.LogContained(func() {
+				s.logger.Error("panic in snapshot rejection notification",
+					"shard", shardID,
+					"from", from,
+					"to", to,
+					"panic", fmt.Sprint(r),
+				)
+			})
 		}
 	}()
 	s.notifySnapshotStatus(shardID, from, to, transferSeq, true)
@@ -1445,6 +1564,44 @@ type pendingProposal struct {
 	// pre-registration for an entry that was appended but never committed
 	// (leader deposed, log truncated). Nil for ordinary proposals.
 	onFailure func()
+
+	// node is the engine node the proposal was registered on, and enqueuedAt
+	// where it entered that node's proposal queue (engine.Node.
+	// DeliverTrackedProposal; zero until it is delivered). Together they tell
+	// a drain whether the proposal has been handed to raft — the step worker
+	// took it from the queue — and so whether a failure is maybe-applied or
+	// definite (proposalMayReachRaft). enqueuedAt is written under the queue's
+	// lock and read only through node.ProposalTaken.
+	node       *engine.Node
+	enqueuedAt uint64
+}
+
+// proposalMayReachRaft reports whether pp has been handed to raft, or may
+// still be: the step worker has taken it from its node's proposal queue, or
+// the queue is still open and may yet hand it off. Only a proposal its node
+// can no longer hand off — never taken, and the queue closed by a failure or
+// a stop — is provably outside raft. A proposal without a node is treated as
+// handed off, the safe direction.
+func proposalMayReachRaft(pp *pendingProposal) bool {
+	if pp.node == nil {
+		return true
+	}
+	taken, final := pp.node.ProposalTaken(&pp.enqueuedAt)
+	return taken || !final
+}
+
+// closedQueueRefusal returns the definite refusal for a proposal whose
+// delivery was refused because engNode's proposal queue is closed — the node
+// failed (ErrShardFailed) or stopped (ErrClosed) — or nil when the node is
+// running and the refusal was an overflow.
+func closedQueueRefusal(engNode *engine.Node) error {
+	if engNode.IsFailed() {
+		return ErrShardFailed
+	}
+	if engNode.IsStopped() {
+		return ErrClosed
+	}
+	return nil
 }
 
 // failed runs the entry's failure hook. Safe when no hook is set.
@@ -1473,11 +1630,20 @@ func (pp *pendingProposal) owns(entry proto.Entry) bool {
 // zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
 // OnApplied's proposal completion so they cannot drift apart.
 func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
+	createdAt := deliverProposal(h, shardID, entry, pp, result)
+	observeProposalLatency(h, shardID, createdAt)
+}
+
+// deliverProposal is completeProposal without the latency observation: it
+// completes and releases pp's caller, runs no user code, and returns the
+// request's creation time for observeProposalLatency. A caller that tracks
+// which proposals it has completed records the completion between the two,
+// so a MetricsCollector that ends the goroutine cannot have a completed
+// proposal completed — and released — a second time by its recovery.
+func deliverProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) time.Time {
 	rs := pp.rs
-	// Record end-to-end proposal latency (Propose -> OnApplied).
-	if h.metrics != nil && !rs.createdAt.IsZero() {
-		h.metrics.ObserveProposalLatency(shardID, time.Since(rs.createdAt))
-	}
+	// createdAt is read before the release, after which rs may be recycled.
+	createdAt := rs.createdAt
 	if result.Value == sm.ResultSessionExpired {
 		rs.complete(RequestResult{Err: &SessionExpiredError{
 			ShardID:  shardID,
@@ -1488,6 +1654,17 @@ func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingPro
 	}
 	rs.releaseRef()
 	h.completePendingOp()
+	return createdAt
+}
+
+// observeProposalLatency records the end-to-end proposal latency (Propose ->
+// OnApplied) for a request created at createdAt. It runs only after the
+// caller has been completed: the MetricsCollector is user code, and nothing
+// it does may stand between an applied entry and the caller waiting on it.
+func observeProposalLatency(h *Host, shardID uint64, createdAt time.Time) {
+	if h.metrics != nil && !createdAt.IsZero() {
+		h.metrics.ObserveProposalLatency(shardID, time.Since(createdAt))
+	}
 }
 
 // OnApplied completes pending proposals whose entries have been
@@ -1650,8 +1827,12 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		// recover for why a panic handler needs this rather than ranging
 		// over all of claimed unconditionally.
 		completedClaims := 0
+		// normalReturn distinguishes a runtime.Goexit in user code (a
+		// MetricsCollector, the logger) from a normal return: both leave
+		// recover() nil, and the tail must be completed for either exit.
+		normalReturn := false
 		defer func() {
-			if r := recover(); r != nil {
+			if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 				// Capturing the stack and constructing the typed error are
 				// both safe: debug.Stack() is pure runtime introspection,
 				// and storing r in a struct field does not call any method
@@ -1708,28 +1889,34 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// shard failing after this recovers will re-derive ns.nodes
 				// and the registry from the persisted log on reload
 				// regardless.
+				// The entries were committed and applied, so the panic is
+				// reported as maybe-applied (proposalOutcomeUnknown).
 				for _, cp := range claimed[completedClaims:] {
-					cp.pp.rs.complete(RequestResult{Err: panicErr})
+					cp.pp.rs.complete(RequestResult{Err: proposalOutcomeUnknown(panicErr)})
 					cp.pp.rs.releaseRef()
 					c.h.completePendingOp()
 				}
 
-				// Logging last, and self-contained: everything that must
-				// happen for correctness already has. If fmt.Sprint(r) or
-				// the default slog Handler panics here, this inner recover
-				// drops the log line rather than let that panic replace
-				// the one this whole function exists to report, or skip
-				// the re-panic below that fails the shard.
-				func() {
-					defer func() { _ = recover() }()
+				// Logging last, and contained on its own goroutine:
+				// everything that must happen for correctness already has,
+				// and neither fmt.Sprint(r) nor a slog handler that panics
+				// or calls runtime.Goexit can replace the panic this
+				// function exists to report, or skip the re-panic below
+				// that fails the shard.
+				supervise.LogContained(func() {
 					slog.Error("panic recovered completing a membership-changing batch; "+
 						"claimed proposals already completed and released",
 						"shard_id", shardID,
 						"panic", fmt.Sprint(r),
 						"stack", string(stack),
 					)
-				}()
+				})
 
+				if r == supervise.ErrGoexit {
+					// A runtime.Goexit keeps unwinding on its own; the apply
+					// worker's recovery classifies it and fails the shard.
+					return
+				}
 				panic(r)
 			}
 		}()
@@ -1754,33 +1941,18 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		// lastApplied; this scan ran before the read was confirmed) and
 		// would hang until its deadline.
 		//
-		// The unlock is deferred, not explicit-at-the-end: the loop calls
-		// c.h.metrics.ObserveReadIndexLatency, user-supplied code that can
-		// panic. An explicit Unlock() after the loop is skipped entirely if
-		// the loop panics, leaving pendingReadsMu locked forever — every
+		// The unlock is deferred, not explicit-at-the-end, and no user code
+		// runs under the lock: ObserveReadIndexLatency, user-supplied code
+		// that can panic or call runtime.Goexit, runs after it is released.
+		// An explicit Unlock() after the loop is skipped entirely if the
+		// loop exits abnormally, leaving pendingReadsMu locked forever — every
 		// future ReadIndex registration and every future sweepPendingReads
 		// call (which sweeps every shard's nodeState from one loop) would
 		// then hang acquiring it, well beyond just this shard. Scoped to
 		// its own closure so the lock is not held across routing below,
 		// which does not need it.
 		if len(entries) > 0 {
-			func() {
-				newLastApplied := entries[len(entries)-1].Index
-				ns.pendingReadsMu.Lock()
-				defer ns.pendingReadsMu.Unlock()
-				ns.lastApplied.Store(newLastApplied)
-				for key, pr := range ns.pendingReads {
-					if pr.confirmed && newLastApplied >= pr.readIndex {
-						if c.h.metrics != nil && !pr.rs.createdAt.IsZero() {
-							c.h.metrics.ObserveReadIndexLatency(shardID, time.Since(pr.rs.createdAt))
-						}
-						pr.rs.complete(RequestResult{Value: pr.readIndex})
-						delete(ns.pendingReads, key)
-						pr.rs.releaseRef()
-						c.h.completePendingOp()
-					}
-				}
-			}()
+			c.completeAppliedReads(ns, shardID, entries[len(entries)-1].Index)
 		}
 
 		if hasMembershipChange {
@@ -1819,10 +1991,12 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			c.applyMembershipRouting(ns, shardID, entries)
 
 			for i, cp := range claimed {
-				completeProposal(c.h, shardID, cp.entry, cp.pp, cp.result)
+				createdAt := deliverProposal(c.h, shardID, cp.entry, cp.pp, cp.result)
 				completedClaims = i + 1
+				observeProposalLatency(c.h, shardID, createdAt)
 			}
 		}
+		normalReturn = true
 	}()
 
 	// Fire OnMembershipChanged last, after every pending proposal and read in
@@ -1838,6 +2012,41 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// as an error.
 	if hasMembershipChange {
 		c.fireMembershipChanged(ns, shardID)
+	}
+}
+
+// completeAppliedReads stores newLastApplied as ns's applied index and
+// completes every confirmed pending read it satisfies, both under
+// pendingReadsMu (see OnApplied for why the store and the scan share the
+// lock). The completed reads' latencies are observed after the lock is
+// released, each after its read was completed: the MetricsCollector is user
+// code and must neither run under pendingReadsMu nor stand between a
+// confirmed read and its caller.
+func (c *hostEngineCallback) completeAppliedReads(ns *nodeState, shardID, newLastApplied uint64) {
+	var latencyBuf [8]time.Duration
+	latencies := func() []time.Duration {
+		latencies := latencyBuf[:0]
+		observe := c.h.metrics != nil
+		ns.pendingReadsMu.Lock()
+		defer ns.pendingReadsMu.Unlock()
+		ns.lastApplied.Store(newLastApplied)
+		for key, pr := range ns.pendingReads {
+			if pr.confirmed && newLastApplied >= pr.readIndex {
+				// Read before the release, after which rs may be recycled.
+				createdAt := pr.rs.createdAt
+				pr.rs.complete(RequestResult{Value: pr.readIndex})
+				delete(ns.pendingReads, key)
+				pr.rs.releaseRef()
+				c.h.completePendingOp()
+				if observe && !createdAt.IsZero() {
+					latencies = append(latencies, time.Since(createdAt))
+				}
+			}
+		}
+		return latencies
+	}()
+	for _, d := range latencies {
+		c.h.metrics.ObserveReadIndexLatency(shardID, d)
 	}
 }
 
@@ -1966,12 +2175,10 @@ func (c *hostEngineCallback) failShardOnCorruptConfig(shardID, index uint64, kin
 	)
 	if node := c.h.engine.GetNode(shardID); node != nil {
 		corrupt := &CorruptConfigEntryError{ShardID: shardID, Index: index, Kind: kind, Err: err}
-		node.Fail(corrupt)
-		// Node.Fail reports to the event listener only; the engine's
-		// OnShardFailed fan-out runs at the engine's own latch sites and does
-		// not see this one. Drain the reads here, or a read pending across
-		// this halt waits for its deadline (see OnShardFailed).
-		c.OnShardFailed(shardID, corrupt)
+		// The engine's one latch-and-report path: whichever failure wins the
+		// latch fires both EventListener.OnShardFailed and this callback's
+		// OnShardFailed, which drains the reads pending across the halt.
+		c.h.engine.FailShard(node, corrupt)
 	}
 }
 
@@ -2026,7 +2233,42 @@ func (c *hostEngineCallback) OnReadyToRead(shardID uint64, readyToRead []proto.R
 			})
 		return
 	}
+	// Reads are completed under pendingReadsMu and their latencies observed
+	// only after it is released: the MetricsCollector is user code, and a
+	// collector that panicked or called runtime.Goexit while the lock was
+	// held would leave it held for the recovery's OnReadIndexFailed. Each
+	// completion comes before its observation, so nothing the collector
+	// does can strand a caller.
+	var latencyBuf [8]time.Duration
+	latencies := c.confirmReadyReads(ns, readyToRead, latencyBuf[:0])
+	if c.h.metrics == nil {
+		return
+	}
+	for _, d := range latencies {
+		c.h.metrics.ObserveReadIndexLatency(shardID, d)
+	}
+}
+
+// confirmReadyReads applies the ReadIndex confirmations in readyToRead to
+// ns's pending reads under pendingReadsMu, completing each read whose index
+// the state machine has already applied, and returns the completed reads'
+// latencies appended to latencies. It runs no user code, and the lock is
+// released by defer.
+func (c *hostEngineCallback) confirmReadyReads(ns *nodeState, readyToRead []proto.ReadyToRead, latencies []time.Duration) []time.Duration {
 	ns.pendingReadsMu.Lock()
+	defer ns.pendingReadsMu.Unlock()
+	observe := c.h.metrics != nil
+	complete := func(key uint64, pr *pendingRead, index uint64) {
+		// Read before the release: the RequestState may be recycled after it.
+		createdAt := pr.rs.createdAt
+		pr.rs.complete(RequestResult{Value: index})
+		delete(ns.pendingReads, key)
+		pr.rs.releaseRef()
+		c.h.completePendingOp()
+		if observe && !createdAt.IsZero() {
+			latencies = append(latencies, time.Since(createdAt))
+		}
+	}
 	// Load lastApplied under pendingReadsMu so it is consistent with
 	// OnApplied's store (which also happens under this lock). Loading it
 	// before the lock would risk seeing a value older than an OnApplied that
@@ -2041,37 +2283,25 @@ func (c *hostEngineCallback) OnReadyToRead(shardID uint64, readyToRead []proto.R
 		pr.readIndex = rtr.Index
 		pr.confirmed = true
 		if lastApplied >= rtr.Index {
-			if c.h.metrics != nil && !pr.rs.createdAt.IsZero() {
-				c.h.metrics.ObserveReadIndexLatency(shardID, time.Since(pr.rs.createdAt))
-			}
-			pr.rs.complete(RequestResult{Value: rtr.Index})
-			delete(ns.pendingReads, rtr.Key)
-			pr.rs.releaseRef()
-			c.h.completePendingOp()
+			complete(rtr.Key, pr, rtr.Index)
 			// Complete all alias keys that share this batch's ReadIndex.
 			for _, aliasKey := range pr.aliases {
 				if aliasPR, aliasOK := ns.pendingReads[aliasKey]; aliasOK {
-					if c.h.metrics != nil && !aliasPR.rs.createdAt.IsZero() {
-						c.h.metrics.ObserveReadIndexLatency(shardID, time.Since(aliasPR.rs.createdAt))
-					}
-					aliasPR.rs.complete(RequestResult{Value: rtr.Index})
-					delete(ns.pendingReads, aliasKey)
-					aliasPR.rs.releaseRef()
-					c.h.completePendingOp()
+					complete(aliasKey, aliasPR, rtr.Index)
 				}
 			}
-		} else {
-			// SM has not caught up yet. Mark all alias keys as confirmed
-			// so OnApplied resolves them when lastApplied advances.
-			for _, aliasKey := range pr.aliases {
-				if aliasPR, aliasOK := ns.pendingReads[aliasKey]; aliasOK {
-					aliasPR.readIndex = rtr.Index
-					aliasPR.confirmed = true
-				}
+			continue
+		}
+		// SM has not caught up yet. Mark all alias keys as confirmed
+		// so OnApplied resolves them when lastApplied advances.
+		for _, aliasKey := range pr.aliases {
+			if aliasPR, aliasOK := ns.pendingReads[aliasKey]; aliasOK {
+				aliasPR.readIndex = rtr.Index
+				aliasPR.confirmed = true
 			}
 		}
 	}
-	ns.pendingReadsMu.Unlock()
+	return latencies
 }
 
 // OnReadIndexBatched registers alias keys that should complete when the
@@ -2192,20 +2422,16 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 			"new_leader", leaderID,
 			"term", term,
 		)
-		// Wrapped in MaybeAppliedError because every request this fails was
-		// ALREADY delivered to raft: pendingProposals is rolled back when
-		// DeliverProposal fails, so anything still in it at a leadership change
-		// is in the log and can still commit under the new leader (Leader
-		// Completeness guarantees it if it reached a quorum). The bare
-		// *NotLeaderError is also produced as a pre-flight refusal where
-		// nothing was submitted; the two are otherwise indistinguishable to a
-		// caller, and NotLeader's own doc invites a retry loop. Wrapping keeps
-		// errors.Is / Temporary / NotLeader behaviour identical and gives a
-		// caller that checks MaybeApplied the one bit it needs to retry safely.
-		notLeaderErr := &MaybeAppliedError{
-			Err: &NotLeaderError{ShardID: shardID, LeaderID: leaderID},
-		}
-		c.h.failPendingClientRequests(ns, notLeaderErr)
+		// failLeaderChangeRequests fails only the proposals already handed
+		// to raft, which can still commit under the new leader (Leader
+		// Completeness guarantees it if it reached a quorum), so it reports
+		// them maybe-applied (proposalOutcomeUnknown); proposals the step
+		// worker has not taken yet are left to it. The bare *NotLeaderError is
+		// also produced as a pre-flight refusal where nothing was submitted;
+		// the wrapper is the one bit that tells the two apart, while
+		// errors.Is / Temporary / NotLeader behave identically. A pending read
+		// gets the bare error: it appended nothing that could commit.
+		c.h.failLeaderChangeRequests(ns, &NotLeaderError{ShardID: shardID, LeaderID: leaderID})
 	}
 
 	// Fail forwarded proposals on followers when the leader changes.
@@ -2235,20 +2461,16 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 			"new_leader", leaderID,
 			"term", term,
 		)
-		// Wrapped in MaybeAppliedError because every request this fails was
-		// ALREADY delivered to raft: pendingProposals is rolled back when
-		// DeliverProposal fails, so anything still in it at a leadership change
-		// is in the log and can still commit under the new leader (Leader
-		// Completeness guarantees it if it reached a quorum). The bare
-		// *NotLeaderError is also produced as a pre-flight refusal where
-		// nothing was submitted; the two are otherwise indistinguishable to a
-		// caller, and NotLeader's own doc invites a retry loop. Wrapping keeps
-		// errors.Is / Temporary / NotLeader behaviour identical and gives a
-		// caller that checks MaybeApplied the one bit it needs to retry safely.
-		notLeaderErr := &MaybeAppliedError{
-			Err: &NotLeaderError{ShardID: shardID, LeaderID: leaderID},
-		}
-		c.h.failPendingClientRequests(ns, notLeaderErr)
+		// failLeaderChangeRequests fails only the proposals already handed
+		// to raft, which can still commit under the new leader (Leader
+		// Completeness guarantees it if it reached a quorum), so it reports
+		// them maybe-applied (proposalOutcomeUnknown); proposals the step
+		// worker has not taken yet are left to it. The bare *NotLeaderError is
+		// also produced as a pre-flight refusal where nothing was submitted;
+		// the wrapper is the one bit that tells the two apart, while
+		// errors.Is / Temporary / NotLeader behave identically. A pending read
+		// gets the bare error: it appended nothing that could commit.
+		c.h.failLeaderChangeRequests(ns, &NotLeaderError{ShardID: shardID, LeaderID: leaderID})
 	}
 }
 
@@ -2299,9 +2521,10 @@ func (c *hostEngineCallback) dispatchListener(event string, shardID uint64, fn f
 }
 
 // OnSnapshotCompleted processes snapshot completion callbacks from the
-// engine snapshot pool. It completes any pending snapshot RequestState
-// and fires the OnSnapshotCreated event listener if configured.
-func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, err error) {
+// engine snapshot pool. It reconciles membership after a recovery and fires
+// the snapshot event listeners for op if configured. The requester, if any,
+// is resolved separately by OnSnapshotRequestCompleted.
+func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, op engine.SnapshotOperation, err error) {
 	v, exists := c.h.nodes.Load(shardID)
 	if !exists {
 		return
@@ -2318,24 +2541,6 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 		return
 	}
 
-	// Complete pending snapshot RequestStates. The engine's error is
-	// translated once, outside the loop, so every waiter on this shard is
-	// handed the SAME public identity for the one failure.
-	apiErr := translateSnapshotError(err)
-
-	ns.pendingSnapshotsMu.Lock()
-	for key, rs := range ns.pendingSnapshots {
-		if err != nil {
-			rs.complete(RequestResult{Err: apiErr})
-		} else {
-			rs.complete(RequestResult{Value: index})
-		}
-		delete(ns.pendingSnapshots, key)
-		rs.releaseRef()
-		c.h.completePendingOp()
-	}
-	ns.pendingSnapshotsMu.Unlock()
-
 	// Reconcile nodeState.nodes from the snapshot membership on
 	// successful snapshot recovery. The Raft Peer already applied
 	// the snapshot membership to its internal state; we mirror it
@@ -2343,7 +2548,11 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 	// in sync. This handles the case where config changes were
 	// compacted into the snapshot and never individually observed
 	// by OnApplied.
-	if err == nil {
+	//
+	// A save needs none of this: every entry at or below its index was
+	// applied first, and OnApplied updated the routing table from those
+	// entries in hand, so compacting them afterwards loses nothing.
+	if err == nil && op == engine.SnapshotRecover {
 		c.reconcileMembershipFromPeer(shardID, ns)
 	}
 
@@ -2351,15 +2560,74 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, e
 	// dispatchListener.
 	if el := c.h.cfg.EventListener; el != nil {
 		replicaID := ns.replicaID
-		c.dispatchListener("OnSnapshotCompleted", shardID, func() { fireSnapshotListeners(el, shardID, replicaID, index, err) })
+		c.dispatchListener("OnSnapshotCompleted", shardID, func() { fireSnapshotListeners(el, shardID, replicaID, index, op, err) })
 	}
+}
+
+// OnSnapshotRequestCompleted resolves the snapshot RequestState registered
+// under requestKey with the snapshot's index or translated error. The pool
+// delivers it after releasing the shard's snapshot slots, so the caller can
+// issue its next request the moment it is resolved. A key no longer present
+// was already claimed by the deadline sweep or by teardown.
+func (c *hostEngineCallback) OnSnapshotRequestCompleted(shardID, requestKey, index uint64, err error) {
+	v, exists := c.h.nodes.Load(shardID)
+	if !exists {
+		return
+	}
+	ns, ok := v.(*nodeState)
+	if !ok {
+		slog.Error("OnSnapshotRequestCompleted: nodeState type assertion failed",
+			"shard_id", shardID,
+			"error", &TypeAssertionError{
+				Context:      "OnSnapshotRequestCompleted nodeState lookup",
+				ExpectedType: "*nodeState",
+				ActualValue:  v,
+			})
+		return
+	}
+	ns.pendingSnapshotsMu.Lock()
+	rs, present := ns.pendingSnapshots[requestKey]
+	if present {
+		delete(ns.pendingSnapshots, requestKey)
+	}
+	ns.pendingSnapshotsMu.Unlock()
+	if !present {
+		return
+	}
+	if err != nil {
+		rs.complete(RequestResult{Err: translateSnapshotError(err)})
+	} else {
+		rs.complete(RequestResult{Value: index})
+	}
+	rs.releaseRef()
+	c.h.completePendingOp()
 }
 
 // fireSnapshotListeners delivers a snapshot completion to the user's
 // EventListener. It runs on the listener dispatcher (see dispatchListener).
-func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index uint64, err error) {
-	if err == nil && index > 0 {
-		// Successful snapshot save.
+//
+// A failed completion fires nothing here. OnShardFailed reports a shard whose
+// failure latch has tripped, exactly once, and the only snapshot outcome that
+// trips it — a failed recovery — is reported by the latch itself
+// (the engine's latch-and-report path, called from the snapshot pool). Reporting it again here
+// counted one failure twice. A failed save does not latch: the replica keeps
+// applying and serving and the next save is attempted as usual, so it is
+// reported where it happened — the pool logs it, and the caller of
+// RequestSnapshot receives it as a *SnapshotFailedError. A recovery the engine
+// DECLINED as stale is neither a failure nor a recovery and fires nothing.
+//
+// A save that wrote no snapshot — nothing applied yet, or no progress since
+// the last one — completes without error at index 0 and fires nothing either:
+// no snapshot was created, and it was never a recovery.
+func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index uint64, op engine.SnapshotOperation, err error) {
+	if err != nil {
+		return
+	}
+	switch op {
+	case engine.SnapshotSave:
+		if index == 0 {
+			return
+		}
 		if el.OnSnapshotCreated != nil {
 			el.OnSnapshotCreated(config.SnapshotInfo{
 				ShardID:   shardID,
@@ -2374,9 +2642,7 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 				Index:     index,
 			})
 		}
-	}
-	if err == nil && index == 0 {
-		// Successful snapshot recovery (index is 0 for recovers).
+	case engine.SnapshotRecover:
 		if el.OnSnapshotRecovered != nil {
 			el.OnSnapshotRecovered(config.SnapshotInfo{
 				ShardID:   shardID,
@@ -2384,45 +2650,6 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 			})
 		}
 	}
-	// A DECLINED stale recovery is NOT a failed shard.
-	//
-	// The engine refuses a recovery whose snapshot is not ahead of the
-	// apply frontier, and it DECLINES that refusal rather than failing the
-	// node: recoveryBlockedByLog produces it before the
-	// recovering gate is raised and before RecoverFromSnapshot runs, so the
-	// state machine is untouched and already at or past the snapshot index.
-	// engine.Node.Fail is never called and the replica keeps serving.
-	//
-	// The pool still reports the refusal as the completion's error, and
-	// must: a declined recovery is not a SUCCESSFUL one either, and
-	// treating it as success would fire OnSnapshotRecovered and reconcile
-	// membership from a snapshot nothing ever restored. What must not
-	// happen is handing that same error to OnShardFailed, which is the only
-	// outward report that a replica makes no further progress without an
-	// operator StopShard/StartShard. A false one is not cosmetic: an
-	// operator acts on it, and a harness that fast-fails on it aborts a
-	// healthy run.
-	if err != nil && el.OnShardFailed != nil && !declinedStaleRecovery(err) {
-		el.OnShardFailed(config.ShardFailedInfo{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Err:       err,
-		})
-	}
-}
-
-// declinedStaleRecovery reports whether a snapshot-pool completion error is a
-// stale state-machine recovery the engine DECLINED, as opposed to a fault that
-// finished the shard.
-//
-// It is deliberately the same match the engine makes before choosing not to
-// call Node.Fail, so the host's outward report cannot drift from the engine's
-// decision about whether the replica is alive. Every other error out of the
-// pool — including a failed RecoverFromSnapshot, which IS terminal — is
-// reported unchanged.
-func declinedStaleRecovery(err error) bool {
-	var stale *engine.SnapshotRecoveryStaleError
-	return errors.As(err, &stale)
 }
 
 // reconcileMembershipFromPeer reads the committed membership from the
@@ -2542,18 +2769,22 @@ func (c *hostEngineCallback) OnCampaignSkipped(shardID, replicaID, term uint64) 
 	)
 }
 
-// OnSnapshotRejected is called when a snapshot request is rejected by
-// the snapshot pool (duplicate in-flight or pool full).
-func (c *hostEngineCallback) OnSnapshotRejected(shardID, replicaID uint64) {
+// OnSnapshotRejected is called when the snapshot pool refuses a request
+// (duplicate in-flight or pool full), abandons an accepted one (the pool
+// stopping, or a save that panicked), or rejects a recovery that failed before
+// the state machine restore began; err is the cause, delivered as
+// SnapshotInfo.Err. The pool reports it inline, on its worker or on the
+// requesting goroutine, so the user listener is delivered by the listener
+// dispatcher (see dispatchListener) rather than run here.
+func (c *hostEngineCallback) OnSnapshotRejected(shardID, replicaID uint64, err error) {
 	if el := c.h.cfg.EventListener; el != nil && el.OnSnapshotRejected != nil {
-		el.OnSnapshotRejected(config.SnapshotInfo{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-		})
+		info := config.SnapshotInfo{ShardID: shardID, ReplicaID: replicaID, Err: err}
+		c.dispatchListener("OnSnapshotRejected", shardID, func() { el.OnSnapshotRejected(info) })
 	}
 	c.h.logger.Info("snapshot rejected",
 		"shard", shardID,
 		"replica", replicaID,
+		"error", err,
 	)
 }
 
@@ -2636,10 +2867,28 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 	}
 }
 
-// OnProposalFailed completes pending proposals that the Raft peer rejected
-// (e.g., no known leader, transfer in progress). This ensures callers of
-// Host.Propose/SyncPropose get a fast error instead of waiting for timeout.
+// OnProposalFailed completes pending proposals that failed after they were
+// handed to raft: entries the leader could not persist (which it may already
+// have replicated), committed entries whose commit or apply failed, or a
+// committed batch discarded unapplied. Every one of them may still commit and
+// apply, so the caller is told the outcome is unknown: the error reports
+// MaybeApplied and still matches its own type and sentinel.
 func (c *hostEngineCallback) OnProposalFailed(shardID uint64, entries []proto.Entry, err error) {
+	c.failProposals(shardID, entries, err, true)
+}
+
+// OnProposalRejected completes pending proposals raft refused before
+// appending them (no known leader, a transfer in progress, a config change
+// already pending). None of them can ever commit, so the refusal is definite.
+func (c *hostEngineCallback) OnProposalRejected(shardID uint64, entries []proto.Entry, err error) {
+	c.failProposals(shardID, entries, err, false)
+}
+
+// failProposals completes the pending proposals for entries with err,
+// translated to the public API, and classified by whether they had been
+// handed to raft (see failClaimedProposal). Callers of Host.Propose and
+// SyncPropose get a prompt error instead of waiting for their deadline.
+func (c *hostEngineCallback) failProposals(shardID uint64, entries []proto.Entry, err error, handedOff bool) {
 	v, exists := c.h.nodes.Load(shardID)
 	if !exists {
 		return
@@ -2661,25 +2910,59 @@ func (c *hostEngineCallback) OnProposalFailed(shardID uint64, entries []proto.En
 
 	for _, entry := range entries {
 		v, ok := ns.pendingProposals.LoadAndDelete(entry.Key)
-		if ok {
-			pp, ppOK := v.(*pendingProposal)
-			if !ppOK {
-				slog.Error("OnProposalFailed: pendingProposal type assertion failed",
-					"shard_id", shardID,
-					"entry_key", entry.Key,
-					"error", &TypeAssertionError{
-						Context:      "OnProposalFailed pendingProposal lookup",
-						ExpectedType: "*pendingProposal",
-						ActualValue:  v,
-					})
-				continue
-			}
-			pp.failed()
-			pp.rs.complete(RequestResult{Err: apiErr})
-			pp.rs.releaseRef()
-			c.h.completePendingOp()
+		if !ok {
+			continue
 		}
+		pp, ppOK := v.(*pendingProposal)
+		if !ppOK {
+			slog.Error("OnProposalFailed: pendingProposal type assertion failed",
+				"shard_id", shardID,
+				"entry_key", entry.Key,
+				"error", &TypeAssertionError{
+					Context:      "OnProposalFailed pendingProposal lookup",
+					ExpectedType: "*pendingProposal",
+					ActualValue:  v,
+				})
+			continue
+		}
+		c.h.failClaimedProposal(pp, apiErr, handedOff)
 	}
+}
+
+// proposalOutcomeUnknown is the one classification point for a failure
+// delivered to a proposal, config change or session operation AFTER it was
+// handed to raft: the entry may still commit and apply, so the failure is
+// wrapped in a MaybeAppliedError — unless it already is one, which is never
+// wrapped twice. errors.Is and errors.As still reach the failure's own type
+// and sentinel through the wrapper. It runs no user code and cannot panic.
+func proposalOutcomeUnknown(err error) error {
+	// A type assertion, not MaybeApplied: errors.As would walk the error's
+	// chain, calling user code — a state machine error's own As or Unwrap —
+	// that can panic, and this runs after the proposal has been claimed, where
+	// a panic strands it. Only the host's own wrapper is recognized, at the
+	// top: a user error that wraps one deeper is wrapped again, which costs a
+	// redundant layer and nothing else.
+	if _, ok := err.(*MaybeAppliedError); ok {
+		return err
+	}
+	return &MaybeAppliedError{Err: err}
+}
+
+// failClaimedProposal completes pp, already claimed out of pendingProposals by
+// the caller, with err. handedOff reports whether the proposal may have
+// reached raft, which the caller decides before the claim: false when raft
+// refused it before appending (OnProposalRejected) or when its node provably
+// never handed it off (proposalMayReachRaft). A handed-off failure is
+// classified by proposalOutcomeUnknown. Nothing here runs user code or can
+// panic, so a claimed proposal is always completed and released.
+func (h *Host) failClaimedProposal(pp *pendingProposal, err error, handedOff bool) {
+	if handedOff {
+		err = proposalOutcomeUnknown(err)
+	}
+	pp.failed()
+	pp.rs.complete(RequestResult{Err: err})
+	pp.rs.releaseRef()
+	h.completePendingOp()
 }
 
 // OnReadIndexFailed completes pending read requests whose ReadIndex
@@ -2719,21 +3002,34 @@ func (c *hostEngineCallback) OnReadIndexFailed(shardID uint64, keys []uint64, er
 	ns.pendingReadsMu.Unlock()
 }
 
-// OnShardFailed fails every read still pending on a shard whose failure latch
-// has just tripped.
+// OnShardFailed fails every proposal and read still pending on a shard whose
+// failure latch has just tripped with ErrShardFailed — a proposal's wrapped in
+// a MaybeAppliedError, a read's bare.
 //
-// OnProposalFailed completes the proposals in the batch that caused the halt,
-// but a pending read is not in any batch: it completes only when the OnApplied
-// scan sees lastApplied reach its read index, and a halted shard never applies
-// again. So every read registered before the halt — confirmed by a leader that
-// is still healthy, waiting on an apply that cannot come — would otherwise sit
-// until sweepPendingReads expired it at its deadline with ErrTimeout.
+// The engine fails the batch that caused the halt, with its own error, before
+// it reports the halt. Everything else registered before the halt is stranded
+// without this drain: a halted shard never steps, commits or applies again, so
+// a proposal still queued behind the failed batch, or a read waiting for the
+// OnApplied scan to reach its read index, would sit until the pending sweep
+// expired it with ErrTimeout — pointing at consensus or the network, not at the
+// failure. Snapshot requests are not drained: the snapshot pool answers each
+// one it admitted whether or not the shard has failed.
 //
-// The gate in ReadIndex handles reads that arrive AFTER the latch; this is the
-// other half, for the ones already inside. The error is the sentinel rather
-// than the halt's own error for the same reason the propose gate returns it: a
-// caller can match ErrShardFailed and know the shard is offline until reloaded,
-// where the raw *ApplyError would need string-matching to classify.
+// The admission gates handle requests that arrive AFTER the latch, and
+// re-check it after registering (registerPendingProposal, ReadIndex) so that a
+// registration racing this drain rolls itself back; this is the other half,
+// for the requests already inside. The error is the sentinel rather than the
+// halt's own error for the same reason the gates return it: a caller can match
+// ErrShardFailed and know the shard is offline until reloaded, where the raw
+// *ApplyError would need string-matching to classify.
+//
+// A proposal drained here was handed to raft, and its entry may already be
+// committed: a recovery, for one, keeps the raft protocol running while it
+// withholds applies, so entries commit behind it, and a reload replays and
+// applies them. Its outcome is unknown, so the error reports MaybeApplied true
+// — an unsessioned caller must not retry it blindly — while still matching
+// ErrShardFailed. A read appends nothing, and a request refused at admission
+// never reached raft; both get the bare ErrShardFailed.
 func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
 	v, exists := c.h.nodes.Load(shardID)
 	if !exists {
@@ -2751,24 +3047,26 @@ func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
 		return
 	}
 
-	// One log line at the moment of the halt, naming shard and replica and
-	// carrying the state machine's own error, so the read failures that
-	// follow have something to correlate against. The halt's cause reaches
-	// the operator here; the reads carry only the sentinel.
-	slog.Error("shard halted: state machine failed, refusing reads and proposals until the shard is reloaded",
-		"shard_id", shardID,
-		"replica_id", ns.replicaID,
-		"error", err,
-	)
+	// Every proposal still pending had been handed to raft and may already be
+	// committed, which a reload replays and applies, so
+	// failPendingClientRequests reports it maybe-applied; reads get the bare
+	// sentinel.
+	c.h.failPendingClientRequests(ns, ErrShardFailed)
 
-	ns.pendingReadsMu.Lock()
-	defer ns.pendingReadsMu.Unlock()
-	for key, pr := range ns.pendingReads {
-		pr.rs.complete(RequestResult{Err: ErrShardFailed})
-		delete(ns.pendingReads, key)
-		pr.rs.releaseRef()
-		c.h.completePendingOp()
-	}
+	// One log line at the moment of the halt, naming shard and replica and
+	// carrying the error that tripped the latch, so the read failures that
+	// follow have something to correlate against. The halt's cause reaches
+	// the operator here; the requests carry only the sentinel. It comes
+	// after every pending request has been failed, and contained: the slog
+	// handler is user code and must not be able to strand them.
+	replicaID := ns.replicaID
+	supervise.LogContained(func() {
+		slog.Error("shard halted: failure latch tripped, refusing reads and proposals until the shard is reloaded",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"error", err,
+		)
+	})
 }
 
 // translateProposalError converts internal Raft errors to public API errors.
@@ -2795,20 +3093,20 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		// the raft-internal one is unmatchable from outside the module.
 		return ErrDecompressionBomb
 	}
-	if errors.Is(err, engine.ErrShardFailed) {
-		// The shard-failure latch tripped. The two errors the apply path
-		// produces for it are *engine.SMPanicError (a state machine that
-		// panicked) and *engine.ApplyError (a state machine that returned an
-		// error, or a decompression failure); of those only *engine.SMPanicError
-		// carries an Is method matching this sentinel, so only a panic arrives
-		// here. *engine.ApplyError reaches the caller as itself, wrapping the
-		// state machine's own error, which is the more specific answer.
-		//
-		// The shard is offline until it is reloaded or recovered, which is
-		// exactly what the public ErrShardFailed tells the caller; leaving the
-		// engine error to escape meant no caller could tell a latched shard from
-		// a transient refusal.
-		return ErrShardFailed
+	// A shard-failure error is NOT translated. The public ErrShardFailed IS
+	// engine.ErrShardFailed, and the errors the apply path produces for a
+	// halted shard are public too: an *ApplyError (a state machine that
+	// returned an error, or a decompression failure) wraps the state machine's
+	// own error, and an *SMPanicError (a state machine that panicked) matches
+	// ErrShardFailed through its own Is method. Passed through as themselves,
+	// both reach the caller with errors.Is(err, ErrShardFailed) where it
+	// applies and errors.As to the typed error and its detail — the panic
+	// value and stack — which a translation to the bare sentinel discarded.
+	if errors.Is(err, engine.ErrStopped) {
+		// A proposal batch the step worker drained but could not hand to
+		// raft because its node stopped first: definite, and the engine's
+		// sentinel is internal, so it is mapped to the public one.
+		return ErrStopped
 	}
 	if errors.Is(err, raft.ErrPendingConfigChange) {
 		// A config change proposed while another is still uncommitted, or
@@ -2915,6 +3213,9 @@ type Host struct {
 	logdb         logdb.LogDB
 	barrier       Barrier
 	shardBarriers func(shardID uint64) Barrier // per-shard at-rest barrier resolver; nil when WithShardBarriers unused
+	// shardBarriersGiven records every barrier shardBarriers has returned, so
+	// Close seals them. Nil when WithShardBarriers is unused.
+	shardBarriersGiven *givenBarriers
 	// barrierFallbackWarned records the shards already warned about falling
 	// back from an unresolved per-shard barrier to the host-wide one, so the
 	// warning fires once per shard instead of once per snapshot operation.
@@ -2966,8 +3267,9 @@ type Host struct {
 	// Set at StartShard and removed with the shard.
 	anchors sync.Map
 
-	// importLocks serialises ImportSnapshot per shard
-	// (map[uint64]chan struct{}, each of capacity one).
+	// importLocks serialises ImportSnapshot per shard. A shard's record
+	// exists only while its lock is held or waited on, so the set does not
+	// grow with every shard ID the host has seen.
 	//
 	// Nothing else serialises imports, and two concurrent imports of the same
 	// shard race over the SAME on-disk directory: the artifact index names it,
@@ -2975,7 +3277,7 @@ type Host struct {
 	// staleness check and the destination-exists check below would otherwise be
 	// evaluated against a tree the other call is midway through changing. The
 	// lock makes the check-then-write sequence atomic per shard.
-	importLocks sync.Map
+	importLocks shardLocks
 
 	// startingShards holds the shard IDs a StartShard is between its early
 	// duplicate check and its return (map[uint64]struct{}). StartShard holds
@@ -2989,27 +3291,11 @@ type Host struct {
 // acquireImportLock takes the shard's exclusive import lock, waiting until it
 // is free or ctx is done. The returned function releases it.
 //
-// The channel is the lock: a buffered channel of capacity one admits exactly
-// one holder and, unlike a sync.Mutex, lets a caller abandon the wait when its
-// context is cancelled — an import can run for as long as it takes to write a
-// multi-gigabyte artifact, so blocking uninterruptibly behind one is not an
-// acceptable answer to a cancelled request.
+// The wait is cancellable because an import can run for as long as it takes
+// to write a multi-gigabyte artifact, so blocking uninterruptibly behind one
+// is not an acceptable answer to a cancelled request.
 func (h *Host) acquireImportLock(ctx context.Context, shardID uint64) (func(), error) {
-	v, _ := h.importLocks.LoadOrStore(shardID, make(chan struct{}, 1))
-	lock, ok := v.(chan struct{})
-	if !ok {
-		return nil, &TypeAssertionError{
-			Context:      "acquireImportLock importLocks lookup",
-			ExpectedType: "chan struct{}",
-			ActualValue:  v,
-		}
-	}
-	select {
-	case lock <- struct{}{}:
-		return func() { <-lock }, nil
-	case <-ctx.Done():
-		return nil, mapContextError(ctx.Err())
-	}
+	return h.importLocks.acquire(ctx, shardID)
 }
 
 // tryAcquireImportLock takes the shard's exclusive import lock if it is free,
@@ -3022,17 +3308,7 @@ func (h *Host) acquireImportLock(ctx context.Context, shardID uint64) (func(), e
 // lock" is itself the answer: whatever the sweep would have found belongs to
 // that import.
 func (h *Host) tryAcquireImportLock(shardID uint64) (func(), bool) {
-	v, _ := h.importLocks.LoadOrStore(shardID, make(chan struct{}, 1))
-	lock, ok := v.(chan struct{})
-	if !ok {
-		return nil, false
-	}
-	select {
-	case lock <- struct{}{}:
-		return func() { <-lock }, true
-	default:
-		return nil, false
-	}
+	return h.importLocks.tryAcquire(shardID)
 }
 
 // lockStoppedShardForImport takes the shard's import lock and then re-checks,
@@ -3363,6 +3639,15 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		return nil, ErrAtRestEncryptionUnspecified
 	}
 
+	// Record every barrier the per-shard resolver hands out, so Close can seal
+	// them. The wrapped resolver replaces the caller's before any consumer is
+	// wired, so every path below resolves through it.
+	var shardBarriersGiven *givenBarriers
+	if options.shardBarriers != nil {
+		shardBarriersGiven = &givenBarriers{}
+		options.shardBarriers = shardBarriersGiven.recording(options.shardBarriers)
+	}
+
 	// Propagate transport disabled state to the config before validation
 	// so that MTLSConfig is only required when transport is enabled.
 	if options.disableTransport {
@@ -3397,10 +3682,10 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// created chain is fsynced; without this a crash can lose the directory a
 	// durably-written WAL lives in, which is the identical defect the WAL
 	// layer closes one level down for its own subdirectories.
-	if err := mkdirAllSynced(cfg.NodeHostDir); err != nil {
+	if err := fsutil.MkdirAllSynced(cfg.NodeHostDir, 0o750); err != nil {
 		return nil, &HostInitError{Field: "NodeHostDir", Err: err}
 	}
-	if err := mkdirAllSynced(cfg.WALDir); err != nil {
+	if err := fsutil.MkdirAllSynced(cfg.WALDir, 0o750); err != nil {
 		return nil, &HostInitError{Field: "WALDir", Err: err}
 	}
 
@@ -3568,6 +3853,10 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// the correct tenant barrier; otherwise the single host-wide barrier is
 	// used (unchanged behavior).
 	if tr != nil {
+		// Receiver-side snapshot rejections reach OnSnapshotRejected through the
+		// engine's listener dispatcher, as the snapshot pool's do, so the event
+		// has one delivery class whatever produced it.
+		tr.SetListenerDispatcher(eng.DispatchListener)
 		if options.shardBarriers != nil {
 			shardFn := options.shardBarriers
 			tr.SetShardEpochTrackers(func(shardID uint64) transport.EpochTracker {
@@ -3586,23 +3875,24 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	}
 
 	h := &Host{
-		cfg:           cfg,
-		logger:        logger,
-		logdb:         options.logdb,
-		barrier:       options.barrier,
-		shardBarriers: options.shardBarriers,
-		metrics:       options.metrics,
-		engine:        eng,
-		registry:      reg,
-		sender:        sender,
-		transport:     tr,
-		diskFull:      &diskFullFlag,
-		id:            hostID,
-		keyRotStopC:   make(chan struct{}),
-		keyRotDone:    make(chan struct{}),
-		sweepStopC:    make(chan struct{}),
-		sweepDone:     make(chan struct{}),
-		fsys:          options.fsys,
+		cfg:                cfg,
+		logger:             logger,
+		logdb:              options.logdb,
+		barrier:            options.barrier,
+		shardBarriers:      options.shardBarriers,
+		metrics:            options.metrics,
+		shardBarriersGiven: shardBarriersGiven,
+		engine:             eng,
+		registry:           reg,
+		sender:             sender,
+		transport:          tr,
+		diskFull:           &diskFullFlag,
+		id:                 hostID,
+		keyRotStopC:        make(chan struct{}),
+		keyRotDone:         make(chan struct{}),
+		sweepStopC:         make(chan struct{}),
+		sweepDone:          make(chan struct{}),
+		fsys:               options.fsys,
 	}
 
 	// Wire the host into the message handler so HandleSnapshot can
@@ -3644,7 +3934,17 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// (including the pessimistic post-restart seeding done by Unseal).
 	// The goroutine exits when keyRotStopC is closed.
 	if options.barrier != nil {
-		go h.keyRotationLoop(cfg.KeyRotationInterval)
+		// Supervised: a runtime.Goexit in the barrier's own code ends the
+		// goroutine, which the loop's panic recovery cannot see, and it is
+		// restarted on a fresh one. keyRotDone closes only on the final exit.
+		interval := cfg.KeyRotationInterval
+		closeDone := sync.OnceFunc(func() { close(h.keyRotDone) })
+		supervise.Supervise(nil, h.keyRotStopC,
+			func() {
+				h.keyRotationLoop(interval)
+				closeDone()
+			},
+			closeDone)
 	} else {
 		close(h.keyRotDone)
 	}
@@ -4639,7 +4939,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// aborts this same call (reconstructShardMembership). Nothing has been
 		// published yet — the nodeState is not in h.nodes and the engine node does
 		// not exist — so returning here leaves no half-started shard behind, which
-		// is why it is an abort and not a Node.Fail.
+		// is why it is an abort and not an Engine.FailShard.
 		var setErr error
 		recoveredIndex, setErr = peer.SetProcessedIndex(recoveredIndex)
 		if setErr != nil {
@@ -5019,20 +5319,13 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 	}
 	defer rs.Release()
 
-	// Use ctx.Done() directly instead of rs.Result() to avoid allocating
-	// a time.NewTimer per SyncPropose call.
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return sm.Result{}, result.Err
-		}
-		return sm.Result{Value: result.Value, Data: result.Data}, nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return sm.Result{}, ErrTimeout
-		}
-		return sm.Result{}, ErrCanceled
+	// awaitResult selects on ctx.Done() directly instead of rs.Result(), so
+	// no time.NewTimer is allocated per SyncPropose call.
+	result, err := awaitResult(ctx, rs)
+	if err != nil {
+		return sm.Result{}, err
 	}
+	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
 // SyncRead performs a linearizable read in a single call. It confirms
@@ -5428,19 +5721,12 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return sm.Result{}, result.Err
-		}
-		session.ProposalCompleted()
-		return sm.Result{Value: result.Value, Data: result.Data}, nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return sm.Result{}, ErrTimeout
-		}
-		return sm.Result{}, ErrCanceled
+	result, err := awaitResult(ctx, rs)
+	if err != nil {
+		return sm.Result{}, err
 	}
+	session.ProposalCompleted()
+	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
 // proposeEntry is the shared proposal pipeline used by Propose,
@@ -5528,7 +5814,7 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	//
 	// The latch is terminal: an SM.Apply error or a state-machine panic takes
 	// the node offline and the step worker skips it from then on (see
-	// engine.Node.Fail / IsFailed). Without this gate the proposal is accepted,
+	// engine.Engine.FailShard / Node.IsFailed). Without this gate the proposal is accepted,
 	// registered in the pending map, delivered to an inbox nothing drains, and
 	// answered only when the sweeper reclaims it at its deadline -- so every
 	// call after the failure blocks for its full timeout and reports what looks
@@ -5575,39 +5861,17 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 		bound = true
 	}
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
-
 	// Register the proposal in the pending map BEFORE delivering the
 	// message to the inbox. This ensures that if the step worker
 	// processes and applies the entry extremely fast, the OnApplied
-	// callback will find the RS. acquireRef pins the RS so it is not
-	// recycled to the pool until this map entry is removed, even if the
-	// caller releases first (e.g., Sync* timeout).
-	rs.acquireRef()
-	ns.pendingProposals.Store(proposalKey, &pendingProposal{
+	// callback will find the RS.
+	pp := &pendingProposal{
 		rs:       rs,
 		deadline: deadline,
 		floor:    engNode.CommittedIndex(),
-	})
-
-	// Close-vs-Propose TOCTOU guard: the host may have begun closing (and run
-	// its pending-request sweeps) between the top-of-Propose closed check and
-	// this Store, which would orphan the RS in a deleted nodeState's map — a
-	// deadline-less caller would then block on rs.Result() forever. Re-check
-	// after registering and roll back if shutting down. LoadAndDelete makes the
-	// rollback exactly-once relative to a concurrent Close sweep.
-	if h.closed.Load() || ns.stopped.Load() {
-		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
-			rs.releaseRef()
-			h.completePendingOp()
-		}
-		// The caller's own reference is dropped whether or not the claim
-		// won: a sweep that beat us to the entry drops only ITS reference,
-		// so leaving Release() inside the claim would strand the object
-		// outside the pool.
-		rs.Release()
-		return nil, ErrClosed
+	}
+	if err := h.registerPendingProposal(ns, engNode, proposalKey, pp); err != nil {
+		return nil, err
 	}
 
 	// Deliver the proposal to the MPSC proposal queue. The step worker
@@ -5615,7 +5879,7 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	// proposals must be routed through the queue to respect the
 	// single-owner invariant on the Peer. Using the dedicated proposal
 	// queue avoids channel serialization under high concurrent load.
-	if !engNode.DeliverProposal([]proto.Entry{entry}) {
+	if !engNode.DeliverTrackedProposal([]proto.Entry{entry}, &pp.enqueuedAt) {
 		// Queue full — remove the RS and let the caller retry. The entry
 		// must be CLAIMED with LoadAndDelete: the sweep and
 		// failPendingRequests also remove entries with claims, and an
@@ -5631,6 +5895,11 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 			h.completePendingOp()
 		}
 		rs.Release()
+		// The queue refuses for good once the node failed or stopped (it is
+		// closed); that is not an overflow, and says so.
+		if refusal := closedQueueRefusal(engNode); refusal != nil {
+			return nil, refusal
+		}
 		if h.metrics != nil {
 			h.metrics.IncProposalDropped(shardID)
 		}
@@ -5656,6 +5925,57 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 	h.engine.NotifyWork(shardID)
 
 	return rs, nil
+}
+
+// registerPendingProposal tracks pp for drain notification and registers it
+// under key in ns's pending proposals, and then re-checks the terminal states
+// whose drain of that map may already have run. It returns nil once the
+// proposal is registered; otherwise the registration has been rolled back,
+// the caller's own reference on pp.rs dropped, and the error is the refusal
+// to return. Every request that registers in pendingProposals — proposals,
+// session operations and config changes — comes through here.
+//
+// The re-check runs AFTER the store, for the two terminal states that can land
+// between the caller's admission checks and the store and would orphan the RS
+// in a map nothing drains again — a deadline-less caller would block on
+// rs.Result() forever, and one with a deadline would wait it out:
+//
+//   - Close/stop: the host's pending-request sweeps may have run first.
+//   - The failure latch: OnShardFailed may have drained the map first, and a
+//     halted shard never completes anything it registers.
+//
+// Either the registration observes the state or the drain observes the
+// entry; there is no interleaving in which neither happens. LoadAndDelete
+// makes the rollback exactly-once relative to a concurrent drain. acquireRef
+// pins the RS until this map entry is removed, even if the caller releases
+// first (e.g. a Sync* timeout).
+func (h *Host) registerPendingProposal(ns *nodeState, engNode *engine.Node, key uint64, pp *pendingProposal) error {
+	h.addPendingOp()
+	pp.node = engNode
+	pp.rs.acquireRef()
+	// From here a completion or the caller's own wait can fail it, and both
+	// classify the failure from this entry's hand-off marker
+	// (proposalMayReachRaft, through failClaimedProposal and
+	// RequestState.lostWait). The rollback below returns its refusal directly,
+	// and that stays definite.
+	pp.rs.proposal.Store(pp)
+	ns.pendingProposals.Store(key, pp)
+	refusal := ErrClosed
+	if !h.closed.Load() && !ns.stopped.Load() {
+		if !engNode.IsFailed() {
+			return nil
+		}
+		refusal = ErrShardFailed
+	}
+	if _, removed := ns.pendingProposals.LoadAndDelete(key); removed {
+		pp.rs.releaseRef()
+		h.completePendingOp()
+	}
+	// The caller's own reference is dropped whether or not the claim won: a
+	// sweep that beat us to the entry drops only ITS reference, so leaving
+	// Release() inside the claim would strand the object outside the pool.
+	pp.rs.Release()
+	return refusal
 }
 
 // ReadIndex submits a ReadIndex request to confirm linearizability.
@@ -6074,7 +6394,7 @@ func (h *Host) GetNewSessionWithOwner(
 	// Wait for the registration to be committed and applied, respecting
 	// ctx cancellation/deadline so a cancelable-but-deadline-less context
 	// does not block forever on quorum loss.
-	result, err := waitResultCtx(ctx, rs)
+	result, err := awaitResult(ctx, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -6133,23 +6453,6 @@ func newClientID(entropy io.Reader) (uint64, error) {
 var ErrEntropyDegenerate = errors.New(
 	"quicraft: the system random source returned a degenerate value repeatedly")
 
-// waitResultCtx waits for a RequestState to complete while honoring the
-// caller's context. It bridges the gap for request states that carry no
-// deadline of their own: without this, RequestState.Result blocks
-// indefinitely and a cancelable-but-deadline-less context (common for
-// session register/unregister) cannot unblock a quorum-loss stall.
-func waitResultCtx(ctx context.Context, rs *RequestState) (RequestResult, error) {
-	select {
-	case result := <-rs.ResultC():
-		return result, result.Err
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return RequestResult{}, ErrTimeout
-		}
-		return RequestResult{}, ErrCanceled
-	}
-}
-
 // RegisterSession registers the given session through Raft consensus,
 // preserving its existing client ID. Unlike GetNewSession, which generates
 // a new random client ID, RegisterSession uses the client ID already set
@@ -6199,8 +6502,8 @@ func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session,
 	defer rs.Release()
 
 	// Wait for the registration to be committed and applied, respecting
-	// ctx cancellation/deadline (see waitResultCtx).
-	result, err := waitResultCtx(ctx, rs)
+	// ctx cancellation/deadline (see awaitResult).
+	result, err := awaitResult(ctx, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -6647,7 +6950,7 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	h.addPendingOp()
 
 	// Register the pending snapshot before submitting to avoid a race
-	// where OnSnapshotCompleted fires before the map entry exists.
+	// where OnSnapshotRequestCompleted fires before the map entry exists.
 	// acquireRef pins the RS until this map entry is removed.
 	rs.acquireRef()
 	ns.pendingSnapshotsMu.Lock()
@@ -6686,16 +6989,16 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 		CompactionOverhead: opt.CompactionOverhead,
 		OverrideCompaction: opt.OverrideCompactionOverhead,
 		Exported:           opt.IsExport(),
+		RequestKey:         snapshotKey,
 	}
 
 	// Submit the snapshot request to the engine's snapshot pool.
 	if submitErr := h.engine.RequestSnapshot(shardID, ns.replicaID, engNode, engineOpt); submitErr != nil {
 		// Snapshot pool rejected (duplicate or full) -- clean up. Claim the
-		// entry first: OnSnapshotCompleted drains the ENTIRE pendingSnapshots
-		// map on any completion for this shard, so a concurrent completion
-		// may already have completed, removed and released this entry between
-		// the Store above and this rollback. An unconditional
-		// releaseRef/completePendingOp would then double-count — outstanding
+		// entry first: the deadline sweep and teardown also claim entries from
+		// pendingSnapshots, so one may already have completed, removed and
+		// released this entry between the Store above and this rollback. An
+		// unconditional releaseRef/completePendingOp would then double-count — outstanding
 		// goes negative so tryRecycle's outstanding==0 check never holds and
 		// the object is permanently lost from the pool, and pendingOps is
 		// undercounted so Drain can close drainC with work in flight.
@@ -7853,7 +8156,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// Record the deepest pre-existing ancestor BEFORE MkdirAll: the directory
 	// fsync below must cover every directory this call creates (same
 	// bookkeeping as ReencryptSnapshotFile).
-	syncRoot := deepestExistingAncestor(fsys, snapDir)
+	syncRoot := fsutil.DeepestExistingAncestorWith(fsys.Stat, snapDir)
 	stageParent := filepath.Dir(snapDir)
 	if mkdirErr := fsys.MkdirAll(stageParent, 0o750); mkdirErr != nil {
 		return mkdirErr
@@ -8628,7 +8931,7 @@ func (h *Host) DiagRemotes(shardID uint64) (string, error) {
 // Shutdown always runs to completion; the returned error is the JOIN
 // (errors.Join, so errors.Is reaches each cause) of everything that failed
 // along the way: an incomplete Drain, each shard state machine's Close, the
-// LogDB Close and the barrier Seal. This is the last durability signal the
+// LogDB Close and the Seal of every barrier the host was given. This is the last durability signal the
 // embedding application receives — for an on-disk state machine, the Close
 // error is its backing store's final flush — so a nil return means every one
 // of those succeeded, not merely that shutdown was attempted.
@@ -8795,21 +9098,37 @@ func (h *Host) Close() error {
 			}
 		}
 
-		// Seal barrier if present.
-		if h.barrier != nil {
-			if err := h.barrier.Seal(); err != nil {
-				// Already sealed is not an error during shutdown.
-				if err != ErrBarrierSealed {
-					closeErr = errors.Join(closeErr, err)
-				}
+		// Seal every barrier the host was given: the host-wide one and each
+		// per-shard barrier the resolver returned. They are sealed last, after
+		// every shard, snapshot and the LogDB that encrypt under them have
+		// stopped. A per-shard barrier that IS the host-wide barrier (pointer
+		// identity, logdb.SameBarrier) was sealed with it; one that cannot be
+		// identified is sealed again, and its ErrBarrierSealed is benign.
+		closeErr = errors.Join(closeErr, sealOnClose(h.barrier))
+		h.shardBarriersGiven.each(func(b Barrier) {
+			if !logdb.SameBarrier(b, h.barrier) {
+				closeErr = errors.Join(closeErr, sealOnClose(b))
 			}
-		}
+		})
 
 		h.logger.Info("host closed", "id", h.id)
 		h.closeErr = closeErr
 	})
 
 	return h.closeErr
+}
+
+// sealOnClose seals b during Host.Close and returns the failure Close must
+// report. A nil barrier has nothing to seal, and one already sealed is not an
+// error during shutdown.
+func sealOnClose(b Barrier) error {
+	if b == nil {
+		return nil
+	}
+	if err := b.Seal(); err != nil && !errors.Is(err, ErrBarrierSealed) {
+		return err
+	}
+	return nil
 }
 
 // Drain transitions the host into drain mode as part of graceful shutdown.
@@ -8952,8 +9271,14 @@ func (h *Host) failPendingRequests(ns *nodeState, err error) {
 }
 
 // failPendingClientRequests completes the pending requests whose outcome
-// depends on LEADERSHIP — proposals and reads — with the provided error, and
-// leaves pending snapshots untouched.
+// depends on LEADERSHIP, or on the shard still running — proposals (session
+// operations and config changes included) and reads — with the provided error,
+// and leaves pending snapshots untouched. OnShardFailed uses it for a halted
+// shard.
+//
+// A proposal gets err reported as maybe-applied (failClaimedProposal): it was
+// registered, so it has been or will be handed to raft. A read gets err as
+// given: it appends nothing that could commit.
 //
 // Saving a snapshot is a purely LOCAL operation: it reads this replica's own
 // state machine and writes this replica's own disk, and it proceeds regardless
@@ -8965,35 +9290,70 @@ func (h *Host) failPendingRequests(ns *nodeState, err error) {
 //
 // Safe to call multiple times; RequestState.complete is CAS-guarded.
 func (h *Host) failPendingClientRequests(ns *nodeState, err error) {
-	ns.pendingProposals.Range(func(key, _ any) bool {
+	h.failPendingProposals(ns, err, false)
+	h.failPendingReads(ns, err)
+}
+
+// failLeaderChangeRequests fails the requests a leadership change strands:
+// every pending read, and every proposal already handed to raft — taken from
+// the proposal queue, so appended at the old leader or forwarded to it, where
+// it can still commit (maybe-applied). A proposal the step worker has not yet
+// taken is left pending: it has not reached raft, and the step worker resolves
+// it — appended or forwarded under the new leader, or refused definitely
+// through OnProposalRejected — so failing it here would hand it a
+// maybe-applied result it does not deserve, racing that refusal.
+func (h *Host) failLeaderChangeRequests(ns *nodeState, err error) {
+	h.failPendingProposals(ns, err, true)
+	h.failPendingReads(ns, err)
+}
+
+// failPendingProposals completes the pending proposals of ns with err. Each
+// is classified BEFORE it is claimed, by whether it may have reached raft
+// (proposalMayReachRaft): if so the failure is maybe-applied, otherwise —
+// never taken from a queue that is now closed — definite. With
+// onlyHandedOff, a proposal not yet taken from the queue is left pending.
+func (h *Host) failPendingProposals(ns *nodeState, err error, onlyHandedOff bool) {
+	ns.pendingProposals.Range(func(key, value any) bool {
+		pp, ok := value.(*pendingProposal)
+		if !ok {
+			// Claim it so the malformed entry does not linger; nothing to
+			// complete.
+			if ns.pendingProposals.CompareAndDelete(key, value) {
+				slog.Error("failPendingClientRequests: pendingProposals value type assertion failed",
+					"error", &TypeAssertionError{
+						Context:      "failPendingClientRequests pendingProposals range",
+						ExpectedType: "*pendingProposal",
+						ActualValue:  value,
+					})
+			}
+			return true
+		}
+		handedOff := true
+		if pp.node != nil {
+			taken, final := pp.node.ProposalTaken(&pp.enqueuedAt)
+			if onlyHandedOff && !taken {
+				return true
+			}
+			handedOff = taken || !final
+		}
 		// Claim the entry atomically. pendingProposals is a lock-free
 		// sync.Map shared with OnApplied/OnProposalFailed (which use
 		// LoadAndDelete). A plain Range+Delete+releaseRef would double-count
 		// the ref when a concurrent completion removes the same key first,
 		// driving outstanding negative and recycling the RequestState early.
-		// Only the goroutine whose LoadAndDelete actually removes the entry
-		// completes and releases it.
-		value, removed := ns.pendingProposals.LoadAndDelete(key)
-		if !removed {
+		// Only the goroutine whose CompareAndDelete actually removes this
+		// entry completes and releases it.
+		if !ns.pendingProposals.CompareAndDelete(key, value) {
 			return true
 		}
-		pp, ok := value.(*pendingProposal)
-		if !ok {
-			slog.Error("failPendingClientRequests: pendingProposals value type assertion failed",
-				"error", &TypeAssertionError{
-					Context:      "failPendingClientRequests pendingProposals range",
-					ExpectedType: "*pendingProposal",
-					ActualValue:  value,
-				})
-			return true // skip malformed entry
-		}
-		pp.failed()
-		pp.rs.complete(RequestResult{Err: err})
-		pp.rs.releaseRef()
-		h.completePendingOp()
+		h.failClaimedProposal(pp, err, handedOff)
 		return true
 	})
+}
 
+// failPendingReads completes every pending read of ns with err, as given: a
+// read appends nothing that could commit, so it is never maybe-applied.
+func (h *Host) failPendingReads(ns *nodeState, err error) {
 	ns.pendingReadsMu.Lock()
 	for k, pr := range ns.pendingReads {
 		pr.rs.complete(RequestResult{Err: err})
@@ -9024,7 +9384,6 @@ func (h *Host) IsDraining() bool {
 // cannot hold the host's shutdown open past the provider's own honouring of
 // the cancellation.
 func (h *Host) keyRotationLoop(interval time.Duration) {
-	defer close(h.keyRotDone)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -9059,8 +9418,9 @@ func (h *Host) keyRotationLoop(interval time.Duration) {
 // panics. Returns true if the loop panicked, false if it returned
 // normally (stop channel closed).
 func (h *Host) keyRotationLoopOnce(ctx context.Context, interval time.Duration) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
 			stack := debug.Stack()
 			panicErr := &LoopPanicError{
@@ -9068,11 +9428,13 @@ func (h *Host) keyRotationLoopOnce(ctx context.Context, interval time.Duration) 
 				Value:    r,
 				Stack:    stack,
 			}
-			slog.Error("key rotation loop panic recovered, restarting",
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
+			supervise.LogContained(func() {
+				slog.Error("key rotation loop panic recovered, restarting",
+					"panic", fmt.Sprint(r),
+					"stack", string(stack),
+					"error", panicErr,
+				)
+			})
 		}
 	}()
 
@@ -9093,6 +9455,7 @@ func (h *Host) keyRotationLoopOnce(ctx context.Context, interval time.Duration) 
 	for {
 		select {
 		case <-h.keyRotStopC:
+			normalReturn = true
 			return false
 		case <-scheduledC:
 			h.rotateBarrierKey(ctx)
@@ -9249,11 +9612,13 @@ func (h *Host) pendingSweepLoopOnce(interval time.Duration) (panicked bool) {
 				Value:    r,
 				Stack:    stack,
 			}
-			slog.Error("pending sweep loop panic recovered, restarting",
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
+			supervise.LogContained(func() {
+				slog.Error("pending sweep loop panic recovered, restarting",
+					"panic", fmt.Sprint(r),
+					"stack", string(stack),
+					"error", panicErr,
+				)
+			})
 		}
 	}()
 
@@ -9317,6 +9682,9 @@ func (h *Host) sweepPendingProposals(ns *nodeState, now time.Time) {
 		if pp.deadline.IsZero() || now.Before(pp.deadline) {
 			return true
 		}
+		// Classified before the claim: it lost its wait, and unless its node
+		// can provably no longer hand it to raft the timeout is maybe-applied.
+		handedOff := proposalMayReachRaft(pp)
 		// Claim atomically before completing/releasing: pendingProposals is a
 		// lock-free sync.Map shared with OnApplied/OnProposalFailed. Without
 		// the LoadAndDelete guard a concurrent completion of the same key
@@ -9325,10 +9693,7 @@ func (h *Host) sweepPendingProposals(ns *nodeState, now time.Time) {
 		if _, removed := ns.pendingProposals.LoadAndDelete(key); !removed {
 			return true
 		}
-		pp.failed()
-		pp.rs.complete(RequestResult{Err: ErrTimeout})
-		pp.rs.releaseRef()
-		h.completePendingOp()
+		h.failClaimedProposal(pp, ErrTimeout, handedOff)
 		return true
 	})
 }
@@ -9570,16 +9935,8 @@ func awaitConfigChange(ctx context.Context, rs *RequestState, err error) error {
 		return err
 	}
 	defer rs.Release()
-
-	select {
-	case result := <-rs.ResultC():
-		return result.Err
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+	_, err = awaitResult(ctx, rs)
+	return err
 }
 
 // RequestRemoveNode requests removing a replica from a shard via Raft
@@ -9610,23 +9967,7 @@ func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64
 // The context must carry a deadline or timeout to bound the wait.
 func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error {
 	rs, err := h.RequestRemoveNode(ctx, shardID, replicaID, configChangeIndex)
-	if err != nil {
-		return err
-	}
-	defer rs.Release()
-
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return result.Err
-		}
-		return nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestAddObserver adds a non-voting observer to a shard and blocks
@@ -9756,23 +10097,7 @@ func (h *Host) RequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, p
 // RequestUpdateWitnessPolicy.
 func (h *Host) SyncRequestUpdateWitnessPolicy(ctx context.Context, shardID uint64, policy config.WitnessConfig, configChangeIndex uint64) error {
 	rs, err := h.RequestUpdateWitnessPolicy(ctx, shardID, policy, configChangeIndex)
-	if err != nil {
-		return err
-	}
-	defer rs.Release()
-
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return result.Err
-		}
-		return nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
-	}
+	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestSnapshot requests a snapshot of the shard with the
@@ -10254,14 +10579,9 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	deadline := pendingDeadline(ctx)
 	rs := newRequestState(ns.requestPool, proposalKey, deadline, h.metrics != nil)
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
-
 	// Register pending before delivery to avoid a race where OnApplied
-	// fires before the map entry exists. acquireRef pins the RS until
-	// this map entry is removed.
-	rs.acquireRef()
-	ns.pendingProposals.Store(proposalKey, &pendingProposal{
+	// fires before the map entry exists.
+	pp := &pendingProposal{
 		rs:       rs,
 		deadline: deadline,
 		floor:    engNode.CommittedIndex(),
@@ -10269,25 +10589,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		// log truncated) must not leave a registry entry behind for a
 		// replica that never became a member.
 		onFailure: rollbackPreRegister,
-	})
-
-	// Close-vs-configchange TOCTOU guard: the host may have begun closing
-	// (and run its pending-request sweeps) between the top-of-method closed
-	// check and the Store above, which would orphan the RS in a deleted
-	// nodeState's map — a deadline-less caller would then block on
-	// rs.Result() forever. Re-check after registering and roll back if
-	// shutting down. LoadAndDelete makes the rollback exactly-once relative
-	// to a concurrent Close sweep (mirrors proposeEntry).
-	if h.closed.Load() || ns.stopped.Load() {
-		if _, removed := ns.pendingProposals.LoadAndDelete(proposalKey); removed {
-			rs.releaseRef()
-			h.completePendingOp()
-		}
-		// The caller's own reference is dropped whether or not the claim
-		// won; a sweep that beat us drops only its own.
-		rs.Release()
+	}
+	if err := h.registerPendingProposal(ns, engNode, proposalKey, pp); err != nil {
 		rollbackPreRegister()
-		return nil, ErrClosed
+		return nil, err
 	}
 
 	entry := proto.Entry{
@@ -10295,7 +10600,7 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		Key:  proposalKey,
 		Cmd:  buf,
 	}
-	if !engNode.DeliverProposal([]proto.Entry{entry}) {
+	if !engNode.DeliverTrackedProposal([]proto.Entry{entry}, &pp.enqueuedAt) {
 		// Queue full — claim the entry before rolling back. The sweep and
 		// failPendingRequests remove entries with LoadAndDelete-style
 		// claims; an unconditional Delete here could pair with a sweep that
@@ -10309,6 +10614,9 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		}
 		rs.Release()
 		rollbackPreRegister()
+		if refusal := closedQueueRefusal(engNode); refusal != nil {
+			return nil, refusal
+		}
 		return nil, ErrSystemBusy
 	}
 

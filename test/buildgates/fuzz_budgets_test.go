@@ -143,7 +143,7 @@ func TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", makefilePath, err)
 	}
-	recipe := regexp.MustCompile(`(?ms)^ci-fuzz-mutation:\n(?:\t.*\n)+`).FindString(string(raw))
+	recipe := regexp.MustCompile(`(?m)^ci-fuzz-mutation:\n(?:\t.*\n)+`).FindString(string(raw))
 	if recipe == "" {
 		t.Fatal("could not isolate the ci-fuzz-mutation recipe")
 	}

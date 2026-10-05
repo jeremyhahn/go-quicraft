@@ -213,6 +213,9 @@ Deliberately **not**, and this is stated so nobody "fixes" it:
 - `pkg/internal/queue`: `EntryQueue` (double-buffered MPSC), `SwapBuffer`.
 - `pkg/internal/server`: the global in-memory-log rate limiter.
 - `pkg/internal/invariant`: debug assertions.
+- `pkg/internal/supervise`: restart-on-Goexit supervision, exit
+  classification, resilient shutdown drains and contained diagnostics, shared
+  with the transport and the host.
 - Consumers: `pkg.Host`, the only exported surface.
 
 All are `internal/`; the embedder drives them only through `pkg.Host`.

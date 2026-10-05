@@ -47,28 +47,22 @@ func (r *shardFailedRecorder) reports() []config.ShardFailedInfo {
 	return append([]config.ShardFailedInfo(nil), r.seen...)
 }
 
-// TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure pins the
-// half of the stale-recovery contract that lives in the HOST rather than the
-// engine.
+// TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport pins the HOST half of
+// the OnShardFailed contract for snapshot completions: a failed completion
+// never fires OnShardFailed from here, whatever the error.
 //
-// # The engine half
+// OnShardFailed reports a tripped failure latch, once. The only snapshot
+// outcome that trips it — a failed RecoverFromSnapshot — is reported by the
+// latch itself (engine.Node.Fail in the snapshot pool, pinned by the engine's
+// TestHandleRequest_PostRestoreErrorLatches), so a report here
+// counts the same failure twice. A failed save does not latch at all.
 //
-// The snapshot pool does not call Node.Fail on a stale recovery: the refusal
-// is produced before the recovering gate is raised and before
-// RecoverFromSnapshot runs, so the state machine is untouched and already at or
-// past the snapshot index. The replica is alive and serving.
-//
-// The pool still reports that refusal as the completion's ERROR, and must -- a
-// declined recovery is not a successful one either, and calling it success
-// would fire OnSnapshotRecovered and reconcile membership from a snapshot
-// nothing restored. But handing every non-nil error straight to
-// EventListener.OnShardFailed is wrong: that is the only outward report that a
-// replica makes no further progress without an operator StopShard/StartShard.
-//
-// The shard would stay alive while the host announced it dead. Under load that
-// fails whole integration runs on a healthy cluster, with the engine's own
-// "snapshot recovery declined" line sitting in the same log a few microseconds
-// earlier:
+// The declined stale recovery is the case that made this visible first. The
+// engine refuses a recovery whose snapshot is not ahead of the apply frontier
+// and leaves the replica serving, yet the completion still carries that
+// refusal as its error. Reported as a shard failure it failed whole
+// integration runs on a healthy cluster, with the engine's own "snapshot
+// recovery declined" line a few microseconds earlier in the same log:
 //
 //	INFO  snapshot rejected, behind committed index shard=1 replica=4 committed=25
 //	INFO  snapshot recovery declined: the state machine is already past this
@@ -76,59 +70,55 @@ func (r *shardFailedRecorder) reports() []config.ShardFailedInfo {
 //	      snapshot_index=25 last_applied=25
 //	FAIL  shard 1 replica 4 failed: engine: snapshot recovery for shard 1
 //	      replica 4 at index 25 is not ahead of applied index 25
-//
-// # The other half
-//
-// The narrowness is the point, so the terminal case is pinned alongside it: a
-// recovery that actually failed -- RecoverFromSnapshot returning an error --
-// leaves a possibly half-restored state machine and MUST still be reported.
-// Widening this into "snapshot errors are not shard failures" would silence it.
-func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure(t *testing.T) {
+func TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		wantReport bool
-		why        string
+		name string
+		op   engine.SnapshotOperation
+		err  error
+		why  string
 	}{
 		{
 			name: "declined stale recovery",
+			op:   engine.SnapshotRecover,
 			err: &engine.SnapshotRecoveryStaleError{
 				ShardID: 1, ReplicaID: 2, SnapshotIndex: 31, LastApplied: 34,
 			},
-			wantReport: false,
-			why: "the engine declined this recovery and left the replica serving; " +
-				"reporting it through OnShardFailed tells an operator the replica " +
-				"is finished when it is not",
+			why: "the engine declined this recovery and left the replica serving",
 		},
 		{
 			name: "declined stale recovery, wrapped",
+			op:   engine.SnapshotRecover,
 			err: fmt.Errorf("delivering install snapshot: %w",
 				&engine.SnapshotRecoveryStaleError{
 					ShardID: 1, ReplicaID: 2, SnapshotIndex: 42, LastApplied: 44,
 				}),
-			wantReport: false,
-			why: "the match is on the error CHAIN, so a caller that adds context " +
-				"with %w cannot resurrect the false failure report",
+			why: "wrapping the refusal does not make it a failure",
 		},
 		{
 			name: "failed RecoverFromSnapshot",
+			op:   engine.SnapshotRecover,
 			err: &engine.SnapshotError{
 				ShardID: 1, ReplicaID: 2, Save: false,
 				Err: errors.New("user state machine refused the snapshot"),
 			},
-			wantReport: true,
-			why: "the user state machine is free to have mutated itself before " +
-				"returning an error, so applies must not resume and the shard IS " +
-				"finished",
+			why: "the latch that this failure trips has already reported it; " +
+				"a second report counts one shard failure twice",
 		},
 		{
 			name: "failed snapshot save",
+			op:   engine.SnapshotSave,
 			err: &engine.SnapshotError{
 				ShardID: 1, ReplicaID: 2, Save: true,
 				Err: errors.New("no space left on device"),
 			},
-			wantReport: true,
-			why:        "a save that cannot be made durable is the terminal state it always was",
+			why: "a failed save leaves the shard running; it is logged and " +
+				"returned to the requester instead",
+		},
+		{
+			name: "unclassified error",
+			op:   engine.SnapshotRecover,
+			err:  errors.New("disk full"),
+			why:  "only a tripped latch is a shard failure",
 		},
 	}
 
@@ -140,28 +130,11 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure(t *testing.
 			addTestNodeState(h, 1, 2)
 
 			cb := &hostEngineCallback{h: h}
-			// index 0 is what a RECOVERY completion carries; a save carries the
-			// saved index. Neither reaches the success branches here, because
-			// every case is an error.
-			cb.OnSnapshotCompleted(1, 0, tt.err)
+			cb.OnSnapshotCompleted(1, 0, tt.op, tt.err)
 			flushListeners(t, cb)
 
-			got := rec.reports()
-			if tt.wantReport && len(got) == 0 {
-				t.Fatalf("no OnShardFailed report for %v: %s", tt.err, tt.why)
-			}
-			if !tt.wantReport && len(got) != 0 {
+			if got := rec.reports(); len(got) != 0 {
 				t.Fatalf("OnShardFailed reported %q: %s", got[0].Err, tt.why)
-			}
-			if tt.wantReport {
-				if got[0].ShardID != 1 || got[0].ReplicaID != 2 {
-					t.Errorf("report named shard %d replica %d, want 1/2",
-						got[0].ShardID, got[0].ReplicaID)
-				}
-				if !errors.Is(got[0].Err, tt.err) {
-					t.Errorf("report carried %v, want the engine's own error %v",
-						got[0].Err, tt.err)
-				}
 			}
 		})
 	}
@@ -171,7 +144,7 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure(t *testing.
 // the flip side of the same completion: declining is not succeeding either.
 //
 // Suppressing the failure report by zeroing the error instead of by matching it
-// would be the obvious shortcut and is wrong. A nil error with index 0 is the
+// would be the obvious shortcut and is wrong. A nil error on a recovery is the
 // SUCCESSFUL-RECOVERY signal: it fires OnSnapshotRecovered and reconciles the
 // host's routing table from the peer's membership. Doing that for a snapshot
 // nothing ever restored would announce a recovery that did not happen.
@@ -185,7 +158,7 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered(t *te
 	addTestNodeState(h, 1, 2)
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 0, &engine.SnapshotRecoveryStaleError{
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotRecover, &engine.SnapshotRecoveryStaleError{
 		ShardID: 1, ReplicaID: 2, SnapshotIndex: 31, LastApplied: 34,
 	})
 	flushListeners(t, cb)

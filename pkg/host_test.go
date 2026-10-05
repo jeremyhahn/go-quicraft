@@ -4892,7 +4892,7 @@ func TestOnApplied_IgnoresUnconfirmedReads(t *testing.T) {
 // OnSnapshotCompleted
 // ---------------------------------------------------------------------------
 
-func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
+func TestOnSnapshotRequestCompleted_SuccessCompletesRS(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -4915,10 +4915,9 @@ func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 	ns.pendingSnapshots[42] = rs
 	ns.pendingSnapshotsMu.Unlock()
 
-	// Call OnSnapshotCompleted with success.
+	// Resolve the request with success.
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 100, nil)
-	flushListeners(t, cb)
+	cb.OnSnapshotRequestCompleted(1, 42, 100, nil)
 
 	// Verify RS completed with Value=100.
 	select {
@@ -4943,7 +4942,7 @@ func TestOnSnapshotCompleted_SuccessCompletesRS(t *testing.T) {
 	rs.Release()
 }
 
-func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
+func TestOnSnapshotRequestCompleted_ErrorFailsRS(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -4965,11 +4964,10 @@ func TestOnSnapshotCompleted_ErrorFailsRS(t *testing.T) {
 	ns.pendingSnapshots[43] = rs
 	ns.pendingSnapshotsMu.Unlock()
 
-	// Call OnSnapshotCompleted with an error.
+	// Resolve the request with an error.
 	testErr := errors.New("snapshot failed")
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 0, testErr)
-	flushListeners(t, cb)
+	cb.OnSnapshotRequestCompleted(1, 43, 0, testErr)
 
 	select {
 	case result := <-rs.ResultC():
@@ -5002,7 +5000,8 @@ func TestOnSnapshotCompleted_NonexistentShard(t *testing.T) {
 
 	// Should not panic for a shard that does not exist.
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(999, 100, nil)
+	cb.OnSnapshotCompleted(999, 100, engine.SnapshotSave, nil)
+	cb.OnSnapshotRequestCompleted(999, 42, 100, nil)
 	flushListeners(t, cb)
 }
 
@@ -5030,7 +5029,7 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCreated(t *testing.T) {
 	}
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 200, nil)
+	cb.OnSnapshotCompleted(1, 200, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 
 	if !called.Load() {
@@ -5067,7 +5066,7 @@ func TestOnSnapshotCompleted_FiresNoCompactionEvents(t *testing.T) {
 	addTestNodeState(h, 1, 1)
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 150, nil)
+	cb.OnSnapshotCompleted(1, 150, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 	if n := fired.Load(); n != 0 {
 		t.Fatalf("OnSnapshotCompleted fired %d compaction event(s); only OnLogCompacted may", n)
@@ -5119,48 +5118,6 @@ func TestOnLogCompacted_FiresWithTheCompactedIndex(t *testing.T) {
 	}
 }
 
-func TestOnSnapshotCompleted_ErrorFiresOnShardFailed(t *testing.T) {
-	cfg := testHostConfig(t)
-	var called atomic.Bool
-	var capturedInfo config.ShardFailedInfo
-	cfg.EventListener = &config.EventListener{
-		OnShardFailed: func(info config.ShardFailedInfo) {
-			capturedInfo = info
-			called.Store(true)
-		},
-	}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	snapErr := errors.New("disk full")
-	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 0, snapErr)
-	flushListeners(t, cb)
-
-	if !called.Load() {
-		t.Fatal("OnShardFailed callback was not called")
-	}
-	if capturedInfo.ShardID != 1 {
-		t.Errorf("ShardFailedInfo.ShardID = %d, want 1", capturedInfo.ShardID)
-	}
-	if capturedInfo.ReplicaID != 1 {
-		t.Errorf("ShardFailedInfo.ReplicaID = %d, want 1", capturedInfo.ReplicaID)
-	}
-	if capturedInfo.Err == nil || capturedInfo.Err.Error() != "disk full" {
-		t.Errorf("ShardFailedInfo.Err = %v, want 'disk full'", capturedInfo.Err)
-	}
-}
-
 func TestOnSnapshotCompleted_NilEventListener(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.EventListener = nil
@@ -5179,13 +5136,16 @@ func TestOnSnapshotCompleted_NilEventListener(t *testing.T) {
 
 	// Should not panic with nil EventListener.
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 100, nil)
+	cb.OnSnapshotCompleted(1, 100, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
-	cb.OnSnapshotCompleted(1, 0, errors.New("test error"))
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotSave, errors.New("test error"))
 	flushListeners(t, cb)
 }
 
-func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
+// TestOnSnapshotRequestCompleted_ResolvesOnlyItsKey: a completion is matched
+// to the request that carried its key. Every other pending entry belongs to a
+// request the completed snapshot did not serve, and is left for its own.
+func TestOnSnapshotRequestCompleted_ResolvesOnlyItsKey(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -5202,41 +5162,75 @@ func TestOnSnapshotCompleted_MultiplePendingSnapshots(t *testing.T) {
 	ns := testLoadNode(h, 1)
 
 	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 50, time.Time{}, true)
-	rs2 := newRequestState(pool, 51, time.Time{}, true)
-	rs3 := newRequestState(pool, 52, time.Time{}, true)
-
+	served := newRequestState(pool, 50, time.Time{}, true)
+	other := newRequestState(pool, 51, time.Time{}, true)
 	ns.pendingSnapshotsMu.Lock()
-	ns.pendingSnapshots[50] = rs1
-	ns.pendingSnapshots[51] = rs2
-	ns.pendingSnapshots[52] = rs3
+	ns.pendingSnapshots[50] = served
+	ns.pendingSnapshots[51] = other
 	ns.pendingSnapshotsMu.Unlock()
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 300, nil)
+	cb.OnSnapshotRequestCompleted(1, 50, 300, nil)
+
+	select {
+	case result := <-served.ResultC():
+		if result.Value != 300 || result.Err != nil {
+			t.Errorf("served request = (%d, %v), want (300, nil)", result.Value, result.Err)
+		}
+	default:
+		t.Error("the request that carried the key was not resolved")
+	}
+	select {
+	case result := <-other.ResultC():
+		t.Errorf("a request with another key was resolved with (%d, %v)", result.Value, result.Err)
+	default:
+	}
+	ns.pendingSnapshotsMu.Lock()
+	_, stillPending := ns.pendingSnapshots[51]
+	n := len(ns.pendingSnapshots)
+	ns.pendingSnapshotsMu.Unlock()
+	if !stillPending || n != 1 {
+		t.Errorf("pendingSnapshots = %d entries (key 51 present: %v), want only key 51", n, stillPending)
+	}
+	served.Release()
+	other.complete(RequestResult{Value: 1})
+	other.Release()
+}
+
+// TestOnSnapshotCompleted_LeavesRequestsPending: the completion event runs
+// while the shard's snapshot slots are still held, so it must not resolve a
+// requester — a caller resolved there could retry into a slot that is not yet
+// released. OnSnapshotRequestCompleted resolves it after the release.
+func TestOnSnapshotCompleted_LeavesRequestsPending(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		testCreateFunc, testShardConfig(1, 1)); startErr != nil {
+		t.Fatalf("StartShard failed: %v", startErr)
+	}
+	ns := testLoadNode(h, 1)
+
+	rs := newRequestState(NewRequestStatePool(), 60, time.Time{}, true)
+	ns.pendingSnapshotsMu.Lock()
+	ns.pendingSnapshots[60] = rs
+	ns.pendingSnapshotsMu.Unlock()
+
+	cb := &hostEngineCallback{h: h}
+	cb.OnSnapshotCompleted(1, 300, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 
-	// All three should be completed with Value=300.
-	for i, rs := range []*RequestState{rs1, rs2, rs3} {
-		select {
-		case result := <-rs.ResultC():
-			if result.Value != 300 {
-				t.Errorf("rs[%d]: result.Value = %d, want 300", i, result.Value)
-			}
-			if result.Err != nil {
-				t.Errorf("rs[%d]: result.Err = %v, want nil", i, result.Err)
-			}
-		default:
-			t.Errorf("rs[%d]: should have been completed", i)
-		}
-		rs.Release()
+	select {
+	case result := <-rs.ResultC():
+		t.Fatalf("OnSnapshotCompleted resolved a requester with (%d, %v)", result.Value, result.Err)
+	default:
 	}
-
-	ns.pendingSnapshotsMu.Lock()
-	if len(ns.pendingSnapshots) != 0 {
-		t.Errorf("pendingSnapshots len = %d, want 0", len(ns.pendingSnapshots))
-	}
-	ns.pendingSnapshotsMu.Unlock()
+	rs.complete(RequestResult{Value: 1})
+	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -5382,8 +5376,7 @@ func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	// simply LEAKED the entry would satisfy the check above and block the caller
 	// forever. The save must still be able to complete it normally, with the
 	// real snapshot index.
-	cb.OnSnapshotCompleted(1, 512, nil)
-	flushListeners(t, cb)
+	cb.OnSnapshotRequestCompleted(1, 70, 512, nil)
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
@@ -6202,7 +6195,7 @@ func TestOnSnapshotCompleted_SuccessDoesNotFireOnShardFailed(t *testing.T) {
 	}
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 100, nil)
+	cb.OnSnapshotCompleted(1, 100, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 
 	if shardFailedCalled.Load() {
@@ -6236,7 +6229,7 @@ func TestOnSnapshotCompleted_ErrorDoesNotFireOnSnapshotCreated(t *testing.T) {
 	}
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 0, errors.New("test error"))
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotSave, errors.New("test error"))
 	flushListeners(t, cb)
 
 	if snapshotCreatedCalled.Load() {
@@ -6263,9 +6256,9 @@ func TestOnSnapshotCompleted_NoPendingSnapshotsIsNoOp(t *testing.T) {
 
 	// No pending snapshots registered. Should not panic.
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 100, nil)
+	cb.OnSnapshotCompleted(1, 100, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
-	cb.OnSnapshotCompleted(1, 0, errors.New("error"))
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotSave, errors.New("error"))
 	flushListeners(t, cb)
 }
 
@@ -7070,6 +7063,51 @@ func TestKeyRotationLoop_RestartsAfterPanic(t *testing.T) {
 	select {
 	case <-h.keyRotDone:
 		// Expected.
+	case <-time.After(5 * time.Second):
+		t.Fatal("keyRotDone not closed after Host.Close()")
+	}
+}
+
+// goexitBarrier calls runtime.Goexit from its first Rotate.
+type goexitBarrier struct {
+	*testHostBarrier
+	goexited     atomic.Bool
+	successCount atomic.Int64
+}
+
+func (b *goexitBarrier) Rotate(ctx context.Context) (uint64, error) {
+	if b.goexited.CompareAndSwap(false, true) {
+		runtime.Goexit()
+	}
+	b.successCount.Add(1)
+	return b.testHostBarrier.Rotate(ctx)
+}
+
+var _ Barrier = (*goexitBarrier)(nil)
+
+// TestKeyRotationLoop_RestartsAfterGoexit: a barrier whose Rotate calls
+// runtime.Goexit ended the key-rotation goroutine for good — recover cannot
+// see a Goexit — so the host never rotated again. The loop is restarted, and
+// Close still finds it done.
+func TestKeyRotationLoop_RestartsAfterGoexit(t *testing.T) {
+	cfg := testHostConfig(t)
+	cfg.KeyRotationInterval = 1 * time.Second
+	barrier := &goexitBarrier{testHostBarrier: newTestHostBarrier(1)}
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	deadline := time.Now().Add(6 * time.Second)
+	for barrier.successCount.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !barrier.goexited.Load() || barrier.successCount.Load() < 1 {
+		t.Fatalf("goexited=%v successful rotations=%d, want a rotation after the Goexit",
+			barrier.goexited.Load(), barrier.successCount.Load())
+	}
+	h.Close()
+	select {
+	case <-h.keyRotDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("keyRotDone not closed after Host.Close()")
 	}
@@ -9779,54 +9817,67 @@ func TestReconcileMembershipFromPeer_NoEngine(t *testing.T) {
 	ns.nodesMu.RUnlock()
 }
 
-// TestOnSnapshotCompleted_ReconcilesMembership verifies that a successful
-// snapshot completion triggers membership reconciliation via the
-// reconcileMembershipFromPeer callback.
-func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
+// startReconcileFixture starts a single-replica shard and plants a stale
+// replica 77 in its routing table, which the Peer's membership does not hold.
+// A membership reconcile removes it; nothing else does.
+func startReconcileFixture(t *testing.T) (*Host, *nodeState) {
+	t.Helper()
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	defer h.Close()
+	t.Cleanup(func() { h.Close() })
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
+	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); startErr != nil {
 		t.Fatalf("StartShard failed: %v", startErr)
 	}
 	waitForLeader(t, h, 1)
 
 	ns := testLoadNode(h, 1)
-
-	// Add a stale node to simulate a snapshot containing different membership.
 	ns.nodesMu.Lock()
 	ns.nodes[77] = "127.0.0.1:7777"
 	ns.nodesMu.Unlock()
+	return h, ns
+}
 
-	// Register a pending snapshot so OnSnapshotCompleted has something to complete.
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 50, time.Time{}, true)
-	h.addPendingOp()
-	ns.pendingSnapshotsMu.Lock()
-	ns.pendingSnapshots[50] = rs
-	ns.pendingSnapshotsMu.Unlock()
+func hasRoutingEntry(ns *nodeState, replicaID uint64) bool {
+	ns.nodesMu.RLock()
+	defer ns.nodesMu.RUnlock()
+	_, ok := ns.nodes[replicaID]
+	return ok
+}
 
-	// Call OnSnapshotCompleted with success.
+// TestOnSnapshotCompleted_ReconcilesMembership verifies that a successful
+// snapshot RECOVERY reconciles the routing table with the Peer's membership:
+// the recovered snapshot may carry config changes OnApplied never saw.
+func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
+	h, ns := startReconcileFixture(t)
+
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 100, nil)
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotRecover, nil)
 	flushListeners(t, cb)
 
-	// Verify stale node was removed. The Peer's membership only has replica 1.
-	ns.nodesMu.RLock()
-	_, hasStale := ns.nodes[77]
-	ns.nodesMu.RUnlock()
-
-	if hasStale {
-		t.Error("stale node 77 should have been removed after snapshot completion")
+	if hasRoutingEntry(ns, 77) {
+		t.Error("stale node 77 should have been removed after snapshot recovery")
 	}
+}
 
-	rs.Release()
+// TestOnSnapshotCompleted_SaveDoesNotReconcileMembership verifies that a
+// snapshot SAVE leaves the routing table alone. Every entry a save covers was
+// applied first, and OnApplied already routed its config changes, so a save
+// has nothing to reconcile.
+func TestOnSnapshotCompleted_SaveDoesNotReconcileMembership(t *testing.T) {
+	h, ns := startReconcileFixture(t)
+
+	cb := &hostEngineCallback{h: h}
+	cb.OnSnapshotCompleted(1, 100, engine.SnapshotSave, nil)
+	flushListeners(t, cb)
+
+	if !hasRoutingEntry(ns, 77) {
+		t.Error("a snapshot save reconciled the routing table: only a recovery may")
+	}
 }
 
 // TestOnSnapshotCompleted_ErrorSkipsReconciliation verifies that membership
@@ -9862,7 +9913,7 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 
 	// Call OnSnapshotCompleted with error. Reconciliation should NOT happen.
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 0, errors.New("snapshot failed"))
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotSave, errors.New("snapshot failed"))
 	flushListeners(t, cb)
 
 	// Verify stale node was NOT removed (reconciliation skipped on error).
@@ -11568,8 +11619,10 @@ func TestHostEngineCallback_OnSnapshotRejected_WithListener(t *testing.T) {
 	}
 	defer h.Close()
 
+	cause := &engine.SnapshotPoolBusyError{ShardID: 20}
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotRejected(20, 10)
+	cb.OnSnapshotRejected(20, 10, cause)
+	flushListeners(t, cb)
 
 	if !called.Load() {
 		t.Fatal("expected OnSnapshotRejected listener to be called")
@@ -11581,6 +11634,9 @@ func TestHostEngineCallback_OnSnapshotRejected_WithListener(t *testing.T) {
 	}
 	if captured.ReplicaID != 10 {
 		t.Errorf("ReplicaID = %d, want 10", captured.ReplicaID)
+	}
+	if captured.Err != cause {
+		t.Errorf("Err = %v, want the rejection's cause %v", captured.Err, cause)
 	}
 }
 
@@ -11594,7 +11650,7 @@ func TestHostEngineCallback_OnSnapshotRejected_NilListener(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	// Should not panic with nil EventListener.
-	cb.OnSnapshotRejected(1, 1)
+	cb.OnSnapshotRejected(1, 1, nil)
 }
 
 func TestHostEngineCallback_OnSnapshotRejected_NilCallback(t *testing.T) {
@@ -11609,7 +11665,7 @@ func TestHostEngineCallback_OnSnapshotRejected_NilCallback(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	// Should not panic with nil callback function.
-	cb.OnSnapshotRejected(1, 1)
+	cb.OnSnapshotRejected(1, 1, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -18294,7 +18350,7 @@ func TestOnSnapshotCompleted_SnapshotRecovery(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 	// index=0 means recovery.
-	cb.OnSnapshotCompleted(1, 0, nil)
+	cb.OnSnapshotCompleted(1, 0, engine.SnapshotRecover, nil)
 	flushListeners(t, cb)
 
 	if !recoveryCalled {
@@ -18321,7 +18377,7 @@ func TestOnSnapshotCompleted_FiresOnSnapshotCompacted(t *testing.T) {
 	addTestNodeState(h, 1, 1)
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotCompleted(1, 42, nil)
+	cb.OnSnapshotCompleted(1, 42, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 
 	if !compactedCalled {
@@ -19607,7 +19663,8 @@ func TestOnSnapshotRejected_WithListener(t *testing.T) {
 	defer h.Close()
 
 	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotRejected(1, 1)
+	cb.OnSnapshotRejected(1, 1, nil)
+	flushListeners(t, cb)
 	if !fired.Load() {
 		t.Error("expected OnSnapshotRejected event to fire")
 	}
@@ -20313,7 +20370,7 @@ func TestOnSnapshotCompleted_BadNodeStateType(t *testing.T) {
 	h.nodes.Store(uint64(1), "bad-type")
 
 	// Should not panic, just return after logging.
-	cb.OnSnapshotCompleted(1, 100, nil)
+	cb.OnSnapshotCompleted(1, 100, engine.SnapshotSave, nil)
 	flushListeners(t, cb)
 }
 

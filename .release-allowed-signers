@@ -1,7 +1,9 @@
-# Trust anchor for release signature verification (Makefile: release-alpha).
+# Trust anchor for release signature verification (Makefile: release-alpha,
+# the default RELEASE_ALLOWED_SIGNERS).
 #
-# git allowed-signers format. This file is the ONLY trust anchor the release
-# recipe uses. It is deliberately IN-REPO and not derived from AGENT_GIT: a
+# git allowed-signers format. The release commit's author e-mail must be a
+# principal on a line here, and the commit and tags must verify against that
+# line's key. It is deliberately IN-REPO and never derived from RELEASE_GIT: a
 # caller-supplied helper could otherwise ship its own keypair and place a
 # matching public key where the recipe looked, and forge a release that
 # verified against the attacker key. Changing this file is a reviewed change,

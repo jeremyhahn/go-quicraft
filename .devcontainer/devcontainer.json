@@ -2,8 +2,10 @@
   "name": "go-quicraft",
   "build": {
     "dockerfile": "Dockerfile",
-    "context": ".."
+    "context": "..",
+    "options": ["--secret", "id=gomodauth,src=${localWorkspaceFolder}/.devcontainer/.env"]
   },
+  "runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"],
   "workspaceFolder": "/app",
   "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
   "remoteUser": "root",
@@ -21,8 +23,5 @@
     }
   },
   "postCreateCommand": "go mod download",
-  "forwardPorts": [],
-  "containerEnv": {
-    "GOFLAGS": "-race"
-  }
+  "forwardPorts": []
 }

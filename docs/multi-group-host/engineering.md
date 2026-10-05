@@ -409,7 +409,8 @@ StopShard(shardID)
   |  3. Remove from h.nodes
   |  4. engine.UnloadNode(shardID)
   |     - mark the node unloaded, then node.Stop(); awaited installs answered
-  |     - node.awaitWriteLeases(): a snapshot receive's writes finish
+  |     - node.awaitWriteLeases(): a snapshot receive's writes and a
+  |       running snapshot recovery finish
   |     - step worker drops the node
   |     - commit fence, waited on (below)
   |     - apply unload, waited on (below)
@@ -457,7 +458,12 @@ honor its stopper (the state machine's own `Close` still waits for an in-flight
 stream). Saves and receives serialize on a per-node snapshot-directory lock,
 taken after the lease, so a save never replaces a directory it did not make and a
 failed receive keeps a directory LogDB records. A save on a stopped node publishes
-nothing, and `StartShard` sweeps orphaned stages left by a crash. A recovery that
+nothing, and `StartShard` sweeps orphaned stages left by a crash. A runtime
+snapshot recovery, unlike a save, holds the lease from before applies are gated
+until `RecoverFromSnapshot` returns, so `UnloadNode` waits for the restore
+(which is handed the node's stopper) instead of leaving
+`rsm.StateMachine.Close` to; a recovery whose node has already stopped is
+refused the lease and never touches the state machine. A recovery that
 fails because its node stopped is abandoned by the snapshot pool rather than
 reported, since the callbacks resolve by shard ID and would land on the next
 incarnation.

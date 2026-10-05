@@ -105,6 +105,7 @@ Internal (not importable):
 | `pkg/internal/queue/` | `EntryQueue` (double-buffered MPSC) and `SwapBuffer` |
 | `pkg/internal/server/` | the global in-memory-log rate limiter |
 | `pkg/internal/invariant/` | debug assertions |
+| `pkg/internal/supervise/` | Goexit-resilient supervision (`Supervise`, `ClassifyExit`, `RunResilient`) and contained diagnostics (`LogContained`) for every goroutine that runs user code |
 
 `contrib/dragonboat/` is a Dragonboat API compatibility layer.
 

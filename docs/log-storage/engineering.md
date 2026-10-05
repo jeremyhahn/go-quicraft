@@ -596,7 +596,9 @@ Directory fsyncs:
 - At `Open`, the WAL root's whole created ancestor chain is fsynced. `MkdirAll`
   may create several levels, and POSIX durability needs each new directory's
   parent synced, or a crash after an acknowledged write can take the tree with
-  it and the node boots with no term and no vote.
+  it and the node boots with no term and no vote. The walk is
+  `fsutil.MkdirAllSyncedWith`, run through the database's `FS`, and it reaches
+  the filesystem root when nothing above the WAL root existed.
 - When a lazy shard creates its directory, the WAL root is fsynced.
 - After each new segment is created, the shard directory is fsynced. If that
   fails, the segment is closed and the write fails.

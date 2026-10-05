@@ -136,9 +136,13 @@ var (
 		"quicraft: the supplied LogDB does not store this shard's records under " +
 			"the barrier WithShardBarriers resolved for it")
 
-	// ErrDropped is returned when a proposal is dropped by the engine
-	// due to queue overflow or shutdown in progress.
-	ErrDropped = errors.New("quicraft: proposal dropped")
+	// ErrDropped is returned when a request is dropped by the engine before
+	// it reached Raft: a proposal queue overflow or shutdown in progress, or
+	// a proposal, ReadIndex or read result an engine worker took out of a
+	// shard and could not hand on because user code it ran (a metrics
+	// collector, a callback, a logger) panicked or called runtime.Goexit. It
+	// is Temporary, and never MaybeApplied: nothing reached the log.
+	ErrDropped = engine.ErrDropped
 
 	// ErrShardNotFound is returned when the requested shard does not
 	// exist on this host.
@@ -160,9 +164,12 @@ var (
 	// and the shard is offline until it is reloaded or recovered from a
 	// snapshot. Apply is fail-fast: the FIRST failure latches, and there is
 	// no retry count to configure. An SM.Update that returns an error instead
-	// reaches the caller wrapping the state machine's own error, which is the
-	// more specific answer.
-	ErrShardFailed = errors.New("quicraft: shard failed (SM circuit breaker tripped)")
+	// reaches the caller as a *ApplyError wrapping the state machine's own
+	// error, which is the more specific answer.
+	//
+	// It is the engine's own sentinel, so the *SMPanicError a panicking state
+	// machine produces in config.ShardFailedInfo.Err matches it.
+	ErrShardFailed = engine.ErrShardFailed
 
 	// ErrInvalidConfig is returned when a configuration value fails
 	// validation during StartShard or NewHost.
@@ -203,8 +210,12 @@ var (
 	ErrSystemBusy error = &BusyError{message: "quicraft: system busy, global rate limit exceeded"}
 
 	// ErrDecompressionBomb is returned when a decompressed payload
-	// exceeds the configured maximum size, preventing zip-bomb attacks.
-	ErrDecompressionBomb = errors.New("quicraft: decompressed size exceeds limit")
+	// exceeds the configured maximum size, preventing zip-bomb attacks. A
+	// committed entry that declares such an expansion fails its batch: the
+	// batch's proposals receive this sentinel and config.ShardFailedInfo.Err is
+	// a *ApplyError wrapping it. It is the raft package's own sentinel, so
+	// both match.
+	ErrDecompressionBomb = raft.ErrDecompressionBomb
 
 	// ErrSessionLimitExceeded is returned when the per-client or total
 	// session limit for a shard has been reached.
@@ -313,14 +324,23 @@ var (
 	ErrSessionBusy = errors.New("quicraft: session has a proposal in flight")
 
 	// ErrSnapshotSizeMismatch is returned when the snapshot file size
-	// on disk does not match the expected FileSize from the message.
-	ErrSnapshotSizeMismatch = errors.New("quicraft: snapshot file size mismatch")
+	// on disk does not match the expected FileSize from the message, or the
+	// FileSize the snapshot's LogDB record claims. The second is the cause
+	// inside a *HostInitError with Field "snapshot_integrity" from StartShard;
+	// a runtime recovery that meets it is rejected rather than failing the shard
+	// (see SnapshotError). It is the engine's own sentinel, so both match.
+	ErrSnapshotSizeMismatch = engine.ErrSnapshotSizeMismatch
 
 	// ErrSnapshotCorrupt is returned when an encrypted snapshot frame has a
 	// corrupt/oversized length prefix during decryption (send/export path),
 	// or when a snapshot's data does not match the length and hash recorded
-	// in its snapshot.meta as the send or export path reads it.
-	ErrSnapshotCorrupt = errors.New("quicraft: snapshot frame corrupt")
+	// in its snapshot.meta as the send or export path reads it. The same
+	// checks on recovery make it the cause inside a *HostInitError with Field
+	// "snapshot_integrity" or "snapshot_decrypt" from StartShard; a runtime
+	// recovery that meets it is rejected rather than failing the shard (see
+	// SnapshotError). It is the engine's own sentinel, so every one of those
+	// matches it.
+	ErrSnapshotCorrupt = engine.ErrSnapshotCorrupt
 
 	// ErrSnapshotDestinationRecorded is returned when a received snapshot's
 	// canonical directory is the directory LogDB currently records as this
@@ -517,6 +537,181 @@ var ErrSharedPeerCertificate = transport.ErrSharedPeerCertificate
 // the transport type, so errors.As into it matches the error StartShard and
 // the membership-add API return.
 type SharedPeerCertificateError = transport.SharedPeerCertificateError
+
+// Errors built inside the engine, raft and transport packages that reach a
+// caller through one of three channels: the result of a proposal whose batch
+// failed to apply or persist, config.ShardFailedInfo.Err, and the cause inside
+// a *HostInitError from NewHost or StartShard. Each is an alias of the SAME
+// value or type the internal package builds, never a copy with the same text,
+// so errors.Is and errors.As match through every layer of wrapping without any
+// translation. Errors of those packages that cannot reach a caller stay
+// internal.
+//
+// The sentinels ErrShardFailed, ErrSnapshotCorrupt, ErrSnapshotSizeMismatch
+// and ErrDecompressionBomb, declared with the others above, are aliases of the
+// same kind: the internal error and the public sentinel are one value.
+var (
+	// ErrApplyGap is the cause inside a *ApplyError when a committed batch
+	// does not start at the entry after the last one applied. The missing
+	// range can never be re-offered, so the shard is failed rather than left
+	// with a hole in its state machine. It reaches the batch's proposals and
+	// config.ShardFailedInfo.Err.
+	ErrApplyGap = engine.ErrApplyGap
+
+	// ErrSnapshotMetaCorrupt is matched, together with ErrSnapshotCorrupt, by
+	// a *SnapshotMetaInvalidError: a recorded snapshot whose snapshot.meta is
+	// missing, unreadable, foreign or lacks its integrity fields. It is the
+	// cause inside a *HostInitError with Field "snapshot_integrity" from
+	// StartShard; a runtime recovery that meets it is rejected rather than failing the shard
+	// (see SnapshotError).
+	ErrSnapshotMetaCorrupt = engine.ErrSnapshotMetaCorrupt
+
+	// ErrScratchNotUnlinked is the sentinel form of *ScratchUnlinkError: the
+	// scratch file an encrypted snapshot is decrypted into could not be
+	// unlinked the moment it was created, so no plaintext was written to it.
+	// It is the cause inside a *HostInitError with Field "snapshot_decrypt"
+	// from StartShard; a runtime recovery that meets it is rejected rather than failing the shard
+	// (see SnapshotError).
+	ErrScratchNotUnlinked = engine.ErrScratchNotUnlinked
+
+	// ErrUnsupportedSnapshotCompression is returned when a snapshot record
+	// names a compression algorithm this binary cannot decompress. It is the
+	// cause inside a *HostInitError with Field "snapshot_compression" from
+	// StartShard; a runtime recovery that meets it is rejected rather than failing the shard
+	// (see SnapshotError).
+	ErrUnsupportedSnapshotCompression = engine.ErrUnsupportedSnapshotCompression
+
+	// ErrCorruptConfigEntry is returned when a COMMITTED config change or
+	// bootstrap membership entry does not decode. Every peer can read those
+	// bytes and this replica cannot, so there is no local repair. It is the
+	// cause inside a *HostInitError with Field "config_replay" or
+	// "membership_reconstruct" from StartShard, and inside the *CommitError in
+	// config.ShardFailedInfo.Err when the commit pipeline meets the entry.
+	ErrCorruptConfigEntry = raft.ErrCorruptConfigEntry
+
+	// ErrEntropyUnavailable is the cause inside a *HostInitError with Field
+	// "peer" from StartShard when crypto/rand could not seed the Raft peer's
+	// election-timeout randomization.
+	ErrEntropyUnavailable = raft.ErrEntropyUnavailable
+
+	// ErrCACertificateParse is the sentinel form of *CACertificateParseError,
+	// the cause inside a *HostInitError with Field "transport" from NewHost.
+	ErrCACertificateParse = transport.ErrCACertificateParse
+
+	// ErrInvalidCertKeyPair is the cause inside a *HostInitError with Field
+	// "transport" from NewHost when the node's TLS leaf cannot be parsed: a
+	// pre-built TransportConfig.MTLSConfig.Certificate whose first DER block
+	// is not an X.509 certificate.
+	ErrInvalidCertKeyPair = transport.ErrInvalidCertKeyPair
+)
+
+// ApplyError reports a committed batch the state machine could not apply:
+// SM.Update returned an error, an entry failed to decompress, or the batch did
+// not continue from the last applied entry (ErrApplyGap). Err is the cause —
+// the state machine's own error, a *DecompressError, ErrDecompressionBomb or
+// ErrApplyGap. The shard is failed: every proposal in the batch receives the
+// *ApplyError, and it is config.ShardFailedInfo.Err. It does not match
+// ErrShardFailed; Err is the more specific answer.
+type ApplyError = engine.ApplyError
+
+// SMPanicError reports a state machine that panicked while applying a batch.
+// Value is the recovered panic value and Stack the goroutine stack. The shard
+// is failed: it is config.ShardFailedInfo.Err and matches ErrShardFailed. The
+// batch's proposals receive ErrShardFailed itself.
+type SMPanicError = engine.SMPanicError
+
+// SnapshotSavePanicError reports a state machine whose SaveSnapshot panicked.
+// Value is the recovered panic value and Stack the goroutine stack. The shard
+// is NOT failed — a save only reads the state machine — so it does not match
+// ErrShardFailed. RequestSnapshot's caller receives it as the Err of a
+// *SnapshotFailedError, like any other failed save.
+type SnapshotSavePanicError = engine.SnapshotSavePanicError
+
+// SaveStateError reports a batch whose Raft state and entries could not be
+// persisted to the LogDB after every retry. Err is the LogDB error. The shard
+// is failed: every proposal in the batch receives the *SaveStateError, and it
+// is config.ShardFailedInfo.Err.
+type SaveStateError = engine.SaveStateError
+
+// CommitError reports a batch the Raft peer could not commit after it was
+// persisted: the log reader refused the entries or snapshot, or a committed
+// config entry did not decode (ErrCorruptConfigEntry). Err is the cause. The
+// shard is failed: every proposal in the batch receives the *CommitError, and
+// it is config.ShardFailedInfo.Err.
+type CommitError = engine.CommitError
+
+// WorkerPanicError reports a step worker that panicked while a snapshot
+// install it had in hand was in progress, leaving raft's state unknown. The
+// shard owning that install is failed with it as config.ShardFailedInfo.Err.
+type WorkerPanicError = engine.WorkerPanicError
+
+// SnapshotError reports a snapshot save (Save true) or recovery (Save false)
+// that failed inside the engine's snapshot pool. Err is the cause, which may
+// be any of the snapshot sentinels and types in this file. It is
+// config.ShardFailedInfo.Err for a recovery that failed once the state
+// machine's RecoverFromSnapshot was invoked, which fails the shard. A recovery
+// that fails before that (reading the snapshot record, verifying, decrypting or
+// decompressing the artifact, resolving the barrier) has not touched the state
+// machine: it is rejected, logged at ERROR and reported through
+// OnSnapshotRejected with its cause as config.SnapshotInfo.Err, the shard keeps
+// running, and the engine re-drives the recovery; the last rejected attempt
+// fails the shard with a *SnapshotRecoveryExhaustedError. A failed save does not fail
+// the shard and fires no OnShardFailed: it is logged, and a SyncRequestSnapshot
+// caller receives it as a *SnapshotFailedError.
+type SnapshotError = engine.SnapshotError
+
+// SnapshotRecoveryBehindError reports a snapshot recovery abandoned because
+// the Raft log never reached the snapshot's index within the wait budget. The
+// state machine was not touched, so the recovery is rejected rather than
+// failing the shard (see SnapshotError).
+type SnapshotRecoveryBehindError = engine.SnapshotRecoveryBehindError
+
+// SnapshotRecoveryPanicError reports a snapshot recovery that panicked before
+// the state machine's RecoverFromSnapshot was invoked. Value is the recovered
+// panic value and Stack the goroutine stack. The state machine was not
+// touched, so it does not match ErrShardFailed: the recovery is rejected and
+// re-driven. It is config.SnapshotInfo.Err of that OnSnapshotRejected, and the
+// cause inside a *SnapshotRecoveryExhaustedError when it was the last attempt.
+type SnapshotRecoveryPanicError = engine.SnapshotRecoveryPanicError
+
+// SnapshotRecoveryExhaustedError reports a shard failed because every attempt
+// to recover a snapshot its Raft log adopted was rejected before the state
+// machine restore began: the engine re-drives a rejected recovery with backoff
+// and fails the shard after the last attempt of one continuous episode of
+// holding entries, whatever snapshot each attempt was made against. Attempts is
+// how many were made, SnapshotIndex the snapshot the last one was made
+// against, and Err its cause, reachable with errors.Is and errors.As. It is
+// config.ShardFailedInfo.Err.
+type SnapshotRecoveryExhaustedError = engine.SnapshotRecoveryExhaustedError
+
+// SnapshotEncryptError reports a snapshot frame that could not be encrypted
+// or decrypted; Op names the step and Err the cause (ErrSnapshotCorrupt for a
+// damaged artifact). It is the cause inside a *HostInitError with Field
+// "snapshot_decrypt" from StartShard and inside the *SnapshotFailedError a
+// failed save returns to its requester; a runtime recovery that meets it is
+// rejected rather than failing the shard (see SnapshotError).
+type SnapshotEncryptError = engine.SnapshotEncryptError
+
+// SnapshotMetaInvalidError reports a recorded snapshot whose snapshot.meta
+// cannot vouch for the data file beside it. Dir is the snapshot directory and
+// Err the underlying cause, if any. It matches ErrSnapshotCorrupt and
+// ErrSnapshotMetaCorrupt; see ErrSnapshotMetaCorrupt for where it is returned.
+type SnapshotMetaInvalidError = engine.SnapshotMetaInvalidError
+
+// ScratchUnlinkError is the error behind ErrScratchNotUnlinked. Path is the
+// scratch file and Err the refused unlink.
+type ScratchUnlinkError = engine.ScratchUnlinkError
+
+// DecompressError is the cause inside a *ApplyError when a committed entry's
+// snappy payload does not decode. Err is the decoder's error.
+type DecompressError = raft.DecompressError
+
+// CACertificateParseError is the error behind ErrCACertificateParse, returned
+// by NewHost (inside a *HostInitError with Field "transport") when
+// TransportConfig.RevocationConfig is set and the CA bundle has a block that
+// does not parse, no CERTIFICATE block, or no certificate able to act as an
+// issuer. Reason names the failure and Err the parse error, if any.
+type CACertificateParseError = transport.CACertificateParseError
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
 // It carries the current leader's identity so clients can redirect
@@ -1376,19 +1571,32 @@ func Temporary(err error) bool {
 	return false
 }
 
-// MaybeAppliedError wraps an error whose request had ALREADY been submitted
-// to Raft when it failed. The entry may still commit and apply even though
-// this caller received an error.
+// MaybeAppliedError wraps an error whose request had ALREADY been submitted to
+// Raft when it failed. The entry may still commit and apply even though this
+// caller received an error.
 //
 // It exists because Temporary() answers "is it reasonable to retry?" and says
 // nothing about "did it happen?" — and for a consensus library those are
-// different questions with different consequences. A proposal that reached the
-// log and then failed its wait (leadership moved, the deadline expired, the
-// shard was closed) is in exactly this state: retrying an UNSESSIONED proposal
-// after one of those errors can apply the command twice.
+// different questions with different consequences.
 //
-// Wrapping preserves every existing errors.Is / Temporary / NotLeader result,
-// so a caller that does not know about this type behaves exactly as before.
+// Every failure delivered to a proposal, config change or session operation
+// after it was handed to Raft is wrapped in it: leadership moved, the caller's
+// own wait ended (its context's deadline or cancellation in a Sync* call, or
+// the request's deadline in RequestState.Result), the host's deadline sweep
+// expired it, the shard was stopped, closed or halted while it was pending, the
+// leader could not persist it (it may already be replicated), or its committed
+// entry failed to commit or apply (a reload replays it). Retrying an
+// UNSESSIONED proposal after any of these can apply the command twice. A
+// proposal is handed to Raft when the step worker takes it from its shard's
+// proposal queue; a leadership change fails only proposals already taken. A
+// failure that provably happened before the hand-off is never wrapped: an
+// admission refusal, a full proposal queue, a proposal still queued when its
+// shard halted or stopped, and a batch Raft refused before appending it. Reads
+// append nothing and are never wrapped.
+//
+// Wrapping preserves every existing errors.Is / errors.As / Temporary /
+// NotLeader result, so a caller that does not know about this type behaves
+// exactly as before.
 type MaybeAppliedError struct{ Err error }
 
 // Error returns the wrapped error's message, marked as already submitted.

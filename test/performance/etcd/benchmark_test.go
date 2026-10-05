@@ -245,7 +245,7 @@ func BenchmarkElectionTime_3N_EtcdRaft(b *testing.B) {
 // throughput for etcd/raft in a 3-node cluster with TCP+TLS transport.
 func BenchmarkProposeThroughput_3N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 3)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 
@@ -264,7 +264,7 @@ func BenchmarkProposeThroughput_3N_EtcdRaft(b *testing.B) {
 // proposal throughput for etcd/raft in a 3-node cluster with 8 goroutines.
 func BenchmarkProposeThroughput_Concurrent_3N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 3)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 
@@ -287,7 +287,7 @@ func BenchmarkProposeThroughput_Concurrent_3N_EtcdRaft(b *testing.B) {
 // for etcd/raft in a 3-node cluster with TCP+TLS transport and WAL.
 func BenchmarkCommitLatency_3N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 3)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 
@@ -325,7 +325,7 @@ func BenchmarkElectionTime_5N_EtcdRaft(b *testing.B) {
 // throughput for etcd/raft in a 5-node cluster with TCP+TLS transport.
 func BenchmarkProposeThroughput_5N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 5)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 
@@ -344,7 +344,7 @@ func BenchmarkProposeThroughput_5N_EtcdRaft(b *testing.B) {
 // proposal throughput for etcd/raft in a 5-node cluster with 8 goroutines.
 func BenchmarkProposeThroughput_Concurrent_5N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 5)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 
@@ -367,7 +367,7 @@ func BenchmarkProposeThroughput_Concurrent_5N_EtcdRaft(b *testing.B) {
 // for etcd/raft in a 5-node cluster with TCP+TLS transport and WAL.
 func BenchmarkCommitLatency_5N_EtcdRaft(b *testing.B) {
 	cluster := SetupEtcdCluster(b, 5)
-	b.Cleanup(func() { cluster.Close() })
+	b.Cleanup(func() { reportClose(b, "cluster", cluster.Close()) })
 
 	rec := perfresult.NewLatencyRecorder(b.N)
 

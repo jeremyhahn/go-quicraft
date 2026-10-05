@@ -196,10 +196,9 @@ func (b *Barrier) Seal() error
 ```
 
 Drops every key reference, clears any delegated encryptor, and resets the
-context binding to `ContextBindingUnresolved`. For the host-wide barrier, prefer
-`Host.Close()`, which drains the pipeline before sealing so the engine does not
-take an `ErrBarrierSealed` storm. Per-shard barriers are sealed by the caller
-after `Close` returns.
+context binding to `ContextBindingUnresolved`. For a barrier wired into a host,
+host-wide or per-shard, prefer `Host.Close()`, which drains the pipeline before
+sealing so the engine does not take an `ErrBarrierSealed` storm.
 
 ### Introspect state and capability
 

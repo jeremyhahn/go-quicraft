@@ -681,12 +681,12 @@ func (l *raftLog) term(index uint64) (uint64, error) {
 	// handleAppend's shorter-log branch already expects, so the leader gets the
 	// lastIndex hint and backtracks instead of being falsely acknowledged.
 	if index > l.lastIndex() {
-		return 0, ErrUnavailable
+		return 0, logdb.ErrUnavailable
 	}
 	// Fall back to LogDB.
 	t, err := l.logdb.Term(index)
 	if err != nil {
-		return 0, translateLogDBError(err)
+		return 0, err
 	}
 	return t, nil
 }
@@ -695,14 +695,14 @@ func (l *raftLog) term(index uint64) (uint64, error) {
 // bytes total. Combines entries from LogDB and in-memory storage.
 func (l *raftLog) entries(low, high, maxSize uint64) ([]proto.Entry, error) {
 	if low > high {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if low == high {
 		return nil, nil
 	}
 	last := l.lastIndex()
 	if low > last+1 {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	if high > last+1 {
 		high = last + 1
@@ -717,7 +717,7 @@ func (l *raftLog) entries(low, high, maxSize uint64) ([]proto.Entry, error) {
 		}
 		dbEntries, err := l.logdb.GetRange(low, upperBound, maxSize)
 		if err != nil {
-			return nil, translateLogDBError(err)
+			return nil, err
 		}
 		// Copy entries into a caller-owned slice. GetRange returns
 		// entries from a reuse buffer (LogReader.protoEntryBuf) that
@@ -914,7 +914,7 @@ func (l *raftLog) tryAppend(prevLogIndex, prevLogTerm uint64, ents []proto.Entry
 	// conflict index points to the first entry that doesn't match.
 	// If it is at or before the current lastIndex, an existing entry
 	// has a different term and is being replaced. If it is beyond
-	// lastIndex, the "conflict" is just ErrUnavailable (new entries
+	// lastIndex, the "conflict" is just logdb.ErrUnavailable (new entries
 	// beyond the log end), which is a simple extension, not a
 	// truncation. Only real overwrites require membership rebuild.
 	isOverwrite := conflictIdx <= l.lastIndex()
@@ -954,7 +954,7 @@ func (l *raftLog) tryCommit(toCommit, term uint64) bool {
 		return false
 	}
 	t, err := l.term(toCommit)
-	if errors.Is(err, ErrCompacted) {
+	if errors.Is(err, logdb.ErrCompacted) {
 		t = 0
 	} else if err != nil {
 		return false
@@ -1127,12 +1127,12 @@ func (l *raftLog) getConflictIndex(entries []proto.Entry) (uint64, error) {
 		}
 		t, err := l.term(entries[i].Index)
 		if err != nil {
-			if errors.Is(err, ErrCompacted) {
+			if errors.Is(err, logdb.ErrCompacted) {
 				// Entry was compacted away — it was committed and
 				// persisted, so it cannot conflict. Skip it.
 				continue
 			}
-			// ErrUnavailable: entry is beyond our log. This is the
+			// logdb.ErrUnavailable: entry is beyond our log. This is the
 			// first genuinely new entry that needs to be appended.
 			// Report it as a conflict so tryAppend appends from here.
 			return entries[i].Index, nil
@@ -1157,23 +1157,6 @@ func (l *raftLog) commitUpdate(up proto.UpdateCommit) {
 			"commitUpdate: last applied exceeds processed")
 		l.inmem.appliedLogTo(up.LastApplied)
 	}
-}
-
-// translateLogDBError maps logdb-layer sentinel errors to their
-// raft-package equivalents. The LogReader (logdb.LogReader) returns
-// logdb.ErrCompacted and logdb.ErrUnavailable, but callers within the
-// raft package check for raft.ErrCompacted and raft.ErrUnavailable.
-// Without this translation, errors.Is comparisons silently fail, causing
-// getConflictIndex to treat compacted entries as new entries (false
-// conflict at committed index) and tryCommit to miss the compacted case.
-func translateLogDBError(err error) error {
-	if errors.Is(err, logdb.ErrCompacted) {
-		return ErrCompacted
-	}
-	if errors.Is(err, logdb.ErrUnavailable) {
-		return ErrUnavailable
-	}
-	return err
 }
 
 // limitEntrySize limits the total byte size of entries to maxSize.

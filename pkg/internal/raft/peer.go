@@ -24,6 +24,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -650,7 +651,7 @@ func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 			// point rather than merely stopped. Any other outcome leaves a
 			// window this replica has not read, and reporting that as complete
 			// is what would let a campaign run against a superseded voting set.
-			complete = errors.Is(err, ErrCompacted)
+			complete = errors.Is(err, logdb.ErrCompacted)
 			if complete {
 				folded = index
 			}

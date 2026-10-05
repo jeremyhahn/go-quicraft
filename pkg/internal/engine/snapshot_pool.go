@@ -34,7 +34,10 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -147,6 +150,12 @@ type snapshotRequest struct {
 
 	// exported marks this snapshot as an export operation on the metadata.
 	exported bool
+
+	// requestKey identifies the requester waiting on this save, and is
+	// reported back through Callback.OnSnapshotRequestCompleted once the
+	// shard's snapshot slots are released. Zero means nobody waits on it:
+	// an automatic save or a recovery.
+	requestKey uint64
 }
 
 // snapshotResult is the outcome of a snapshot operation, sent back
@@ -180,8 +189,14 @@ type snapshotPool struct {
 	callback   Callback
 	requestC   chan snapshotRequest
 	completedC chan snapshotResult
-	inFlight   sync.Map // shardID -> struct{} for per-shard dedup
-	stopC      chan struct{}
+	// inFlight is the per-shard single-flight slot: shardID -> the *Node
+	// whose request holds it. It is owned by node incarnation, not by shard:
+	// a request releases it only while its own node still holds it, and a
+	// slot held by a stopped incarnation is taken over by the next one (see
+	// claimInFlight), so a restarted shard is never refused because of a
+	// request its previous incarnation abandoned.
+	inFlight sync.Map
+	stopC    chan struct{}
 
 	// workSignal is used to notify the step worker after snapshot
 	// recovery completes so it re-evaluates the node immediately
@@ -312,11 +327,11 @@ func (p *snapshotPool) barrierForShard(shardID uint64) (SnapshotBarrier, error) 
 // by the provided WaitGroup so the engine can wait for clean shutdown.
 func (p *snapshotPool) start(wg *sync.WaitGroup) {
 	for range p.workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			p.worker()
-		}()
+		// Supervised: a runtime.Goexit in user code (a state machine's
+		// SaveSnapshot or RecoverFromSnapshot, a callback) ends the worker's
+		// goroutine, and it is restarted on a fresh one. The request it was
+		// running is settled by handleRequest's deferred check.
+		supervise.Supervise(wg, p.stopC, p.worker, p.drainRequests)
 	}
 }
 
@@ -326,10 +341,13 @@ func (p *snapshotPool) start(wg *sync.WaitGroup) {
 //
 // Panic recovery: if user-provided state machine code (SaveSnapshot or
 // RecoverFromSnapshot) panics, the worker recovers, cleans up all
-// per-shard state (inFlight, snapshotting, recovering flags), fires
-// OnSnapshotRejected, and continues the loop. Without recovery, the
-// goroutine would die permanently, reducing pool capacity until all
-// workers are dead and snapshot requests queue forever.
+// per-shard state (inFlight, snapshotting, recovering flags), and continues
+// the loop. A save panic fires OnSnapshotRejected. A recovery panic once the
+// state machine restore began fails the shard, as a failed recovery does; one
+// before it fires OnSnapshotRejected and leaves the shard running (see
+// recoverSnapshot and settlePanickedRequest). Without
+// recovery, the goroutine would die permanently, reducing pool capacity
+// until all workers are dead and snapshot requests queue forever.
 func (p *snapshotPool) worker() {
 	for {
 		select {
@@ -353,36 +371,97 @@ func (p *snapshotPool) worker() {
 // run from several goroutines at once: a channel receive is exclusive, so
 // each request is released exactly once.
 func (p *snapshotPool) drainRequests() {
-	for {
-		select {
-		case req := <-p.requestC:
-			p.abandonRequest(req)
-		default:
-			return
+	// Each abandoned request is reported rejected, which runs user code: the
+	// drain is resilient, so a callback that panics or Goexits cannot end it
+	// and leave the rest holding their shard's snapshot slot. A request is
+	// taken off requestC before it is reported, so a rerun resumes.
+	supervise.RunResilient(func() {
+		for {
+			select {
+			case req := <-p.requestC:
+				p.abandonRequest(req)
+			default:
+				return
+			}
 		}
+	})
+}
+
+// runRecovery runs a recovery request up to and including the state machine
+// restore, and returns the outcome settleRecovery classifies: a rejection
+// before the restore, the restore's own result, or, for a node that is
+// stopping, a *SnapshotError wrapping ErrStopped without the state machine
+// having been touched. A stopped node also refuses the lease handleRequest
+// settles under, so that outcome is abandoned, never reported.
+//
+// The order is what makes the restore safe:
+//
+//   - The raft log must reach the snapshot index BEFORE the recovering gate is
+//     raised. The step worker DEFERS InstallSnapshot while the gate is up
+//     (handling one would move the raft log's snapshot floor out from under
+//     this recovery), so the InstallSnapshot that makes the recovery
+//     admissible could not be installed once it was raised.
+//   - The node's write lease is taken before the gate is raised and held
+//     through RecoverFromSnapshot. UnloadNode waits out every lease before
+//     the host closes the state machine, so the host cannot close it under
+//     the restore; the restore is handed the node's stopC, so the wait lasts
+//     only as long as it takes to notice the stop. A node that has already
+//     stopped refuses the lease and its state machine is never touched. The
+//     release is deferred, so a panicking restore releases it on the way to
+//     handleRequest's recovery, which takes the lease itself to settle.
+//   - The gate stops NEW applies; an apply already past it could still be
+//     inside SM.Apply, so it is drained before the restore. The
+//     increment-then-check (apply) / set-then-drain (here) ordering guarantees
+//     any in-flight apply is observed by the drain. A drain that sees the node
+//     stopping aborts: an apply may still be in flight (engine Stop closes
+//     stopC before the apply workers drain), and the restore would race it.
+//     The gate is lowered when the outcome is settled.
+func (p *snapshotPool) runRecovery(req snapshotRequest) error {
+	if blocked := rejectBeforeRestore(p.awaitRecoverableLog(req)); blocked != nil {
+		return blocked
 	}
+	stopped := &SnapshotError{
+		ShardID:   req.shardID,
+		ReplicaID: req.replicaID,
+		Save:      false,
+		Err:       ErrStopped,
+	}
+	if !req.node.AcquireWriteLease() {
+		return stopped
+	}
+	defer req.node.ReleaseWriteLease()
+	req.node.SetRecovering(true)
+	if !req.node.WaitForApplyDrain(req.node.StopC()) {
+		return stopped
+	}
+	_, _, err := p.handleSnapshot(req)
+	return err
 }
 
 // abandonRequest undoes the per-shard state requestSnapshot established for
 // a request that will never run, and reports the rejection so the caller
 // does not wait for a completion that cannot come.
 func (p *snapshotPool) abandonRequest(req snapshotRequest) {
-	p.inFlight.Delete(req.shardID)
+	p.releaseInFlight(req)
 	if req.node != nil {
 		req.node.snapshotting.Store(false)
 	}
 	if p.callback != nil {
-		p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
+		p.callback.OnSnapshotRejected(req.shardID, req.replicaID, ErrStopped)
 	}
 }
 
 // settleRecovery acts on how a recovery request ended — abandoned because its
 // node stopped (the caller was refused the node's write lease), declined as
-// stale, or failed — and lowers the recovering gate. It
-// reports whether the recovery was abandoned, in which case no callback may
-// report it.
-func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bool) (abandoned bool) {
-	var stale *SnapshotRecoveryStaleError
+// stale, rejected before the state machine restore began, or failed — and
+// lowers the recovering gate. It reports whether the recovery was abandoned,
+// in which case no callback may report it, and whether it was rejected, in
+// which case it is reported as OnSnapshotRejected rather than completed.
+func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bool) (abandoned, rejected bool) {
+	var (
+		stale    *SnapshotRecoveryStaleError
+		rejectBy *recoveryRejectedError
+	)
 	switch {
 	case stopped:
 		// Its node stopped under it — whether the restore then failed or not.
@@ -429,6 +508,35 @@ func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bo
 			"snapshot_index", stale.SnapshotIndex,
 			"last_applied", stale.LastApplied,
 		)
+	case errors.As(err, &rejectBy):
+		// NOT a shard failure: the recovery stopped before the state
+		// machine's RecoverFromSnapshot was invoked (LogDB read, artifact
+		// choice and verification, barrier resolution, decryption, or the
+		// raft log never installing the snapshot), so the state machine is
+		// untouched. It is settled exactly like a panic in the same steps
+		// (settlePanickedRequest): rejected and re-driven by the step worker
+		// (redriveRecovery), with the shard left running, until the attempts
+		// of the holding episode are exhausted and settleRejectedRecovery
+		// fails it. Entries above the snapshot stay held until a
+		// recovery succeeds (Node.snapshotAdoptionPending), so the untouched
+		// state machine is never applied onto with a hole beneath it.
+		if p.settleRejectedRecovery(req, rejectBy.err) {
+			slog.Error("snapshot recovery rejected before the state machine "+
+				"restore began, and no attempts remain; failing the shard",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"attempts", maxRecoveryAttempts,
+				"error", rejectBy.err,
+			)
+			break
+		}
+		rejected = true
+		slog.Error("snapshot recovery rejected before the state machine restore "+
+			"began; the shard keeps running and the recovery is re-driven",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"error", rejectBy.err,
+		)
 	case err != nil:
 		// A FAILED restore must fail the shard, not resume applies on it.
 		//
@@ -452,16 +560,192 @@ func (p *snapshotPool) settleRecovery(req snapshotRequest, err error, stopped bo
 			"replica_id", req.replicaID,
 			"error", err,
 		)
-		req.node.Fail(err)
-		if p.callback != nil {
-			p.callback.OnShardFailed(req.shardID, err)
-		}
+		failShard(req.node, p.callback, err, nil)
+	default:
+		// The recovery completed: nothing is owed any more.
+		req.node.redrive.reset()
 	}
 	req.node.SetRecovering(false)
 	if p.workSignal != nil {
 		p.workSignal.Notify(req.shardID)
 	}
-	return abandoned
+	return abandoned, rejected
+}
+
+// rejectBeforeRestore classifies err, returned by a recovery step before the
+// state machine's RecoverFromSnapshot was invoked, as a rejection
+// (*recoveryRejectedError) that settleRecovery does not fail the shard for.
+// It is the error-path half of the recovery's one stage boundary; the panic
+// half is recoverSnapshot's restoring flag. A stale refusal keeps its own
+// meaning — the state machine is already past the snapshot, so there is
+// nothing to retry — and nil stays nil.
+func rejectBeforeRestore(err error) error {
+	var stale *SnapshotRecoveryStaleError
+	if err == nil || errors.As(err, &stale) {
+		return err
+	}
+	return &recoveryRejectedError{err: err}
+}
+
+// requestProgress is how far handleRequest got, for settlePanickedRequest.
+type requestProgress struct {
+	// completed: the snapshot operation itself finished (a later callback
+	// panicked instead); index and err are its outcome.
+	completed bool
+	index     uint64
+	err       error
+	// abandoned: the request's node stopped, so nothing reports it.
+	abandoned bool
+	// released: the shard's snapshot slots were already released, and the
+	// requester is being (or has been) resolved by the normal path.
+	released bool
+}
+
+// settlePanickedRequest undoes the per-shard state of a request whose handling
+// panicked, then reports it. Slots already released are left alone: a
+// successor request may hold them by then.
+func (p *snapshotPool) settlePanickedRequest(req snapshotRequest, value any, progress requestProgress) {
+	completed, released := progress.completed, progress.released
+	stack := debug.Stack()
+	// The diagnostic comes last and contained (deferred): nothing a slog
+	// handler or the panic value's own methods do can skip the settlement.
+	defer supervise.LogContained(func() {
+		slog.Error("snapshot worker panic recovered",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"save", req.save,
+			"completed", completed,
+			"released", released,
+			"panic", fmt.Sprint(value),
+			"stack", string(stack),
+		)
+	})
+	// A recovery panic fails the shard here only as the last of the attempts
+	// settleRejectedRecovery allows. One raised once the state
+	// machine restore began was recovered by recoverSnapshot and returned as
+	// an *SMPanicError, which handleRequest settled as a failed recovery; one
+	// that reaches here came from a step before the restore (LogDB access,
+	// the recovering gate and apply drain, artifact verification, barrier
+	// resolution), or after the recovery completed, and the state machine was
+	// not touched by it. Lower the recovering gate and signal the step worker,
+	// as the normal path does; the cleanup is idempotent, so running it after
+	// a post-completion panic is harmless and the shard is never left wedged.
+	// A recovery stopped before it completed is reported rejected below, like
+	// a save, and re-driven.
+	if !req.save {
+		req.node.SetRecovering(false)
+		if p.workSignal != nil {
+			p.workSignal.Notify(req.shardID)
+		}
+	}
+	// Clear in-flight and the node's snapshotting flag so the next request
+	// for this shard can be accepted — unless they were already released, in
+	// which case they may now belong to the next request.
+	if !released {
+		p.releaseInFlight(req)
+		req.node.snapshotting.Store(false)
+	}
+	// The panic is the cause the rejection reports.
+	var cause error = &SnapshotSavePanicError{
+		ShardID:   req.shardID,
+		ReplicaID: req.replicaID,
+		Value:     value,
+		Stack:     stack,
+	}
+	// A recovery the panic stopped before the restore is settled like one
+	// rejected with an error (settleRejectedRecovery): re-driven, or, once the
+	// attempts are exhausted, the shard is failed instead of reporting a
+	// rejection. The lease runRecovery held across the recovery, if it got
+	// that far, was released as the panic unwound past it; it is taken again
+	// here so the failure cannot land on a later incarnation.
+	// A recovery that ended in runtime.Goexit before it completed cannot have
+	// been caught where the restore runs (recoverSnapshot turns a panic in the
+	// restore into an *SMPanicError, but recover cannot see a Goexit), so
+	// whether the restore began is unknown and the state machine may be
+	// half-restored. Failing the shard is the only safe settlement; it is not
+	// re-driven or reported as a rejection.
+	if !req.save && !completed && value == supervise.ErrGoexit {
+		if req.node.AcquireWriteLease() {
+			func() {
+				defer req.node.ReleaseWriteLease()
+				failShard(req.node, p.callback, &SMPanicError{
+					ShardID:   req.shardID,
+					ReplicaID: req.replicaID,
+					Value:     value,
+					Stack:     stack,
+				}, nil)
+			}()
+		}
+		return
+	}
+	exhausted := false
+	if !req.save && !completed {
+		cause = &SnapshotRecoveryPanicError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Value:     value,
+			Stack:     stack,
+		}
+		if req.node.AcquireWriteLease() {
+			func() {
+				defer req.node.ReleaseWriteLease()
+				exhausted = p.settleRejectedRecovery(req, cause)
+			}()
+		}
+	}
+	// Report a request that the panic stopped as rejected, so the caller can
+	// retry or report. Only when the operation itself did not complete: after
+	// completion OnSnapshotCompleted has already been delivered, and a
+	// second terminal callback would misreport a snapshot that exists. The
+	// nested recover keeps a panicking listener from escaping this deferred
+	// handler.
+	if !completed && !exhausted && p.callback != nil {
+		func() {
+			defer func() {
+				if r2 := recover(); r2 != nil {
+					supervise.LogContained(func() {
+						slog.Error("OnSnapshotRejected callback panicked",
+							"shard_id", req.shardID,
+							"replica_id", req.replicaID,
+							"panic", fmt.Sprint(r2),
+						)
+					})
+				}
+			}()
+			p.callback.OnSnapshotRejected(req.shardID, req.replicaID, cause)
+		}()
+	}
+	// Resolve the requester, after the release, as handleRequest would have.
+	// A save stopped by the panic is a FAILED SAVE: the state machine was
+	// only read, so the shard is not failed and keeps applying, and the
+	// error says so — SnapshotSavePanicError, unlike SMPanicError, does not
+	// match ErrShardFailed. A save that completed before a later callback
+	// panicked resolves with its real outcome.
+	if req.save && !released && !progress.abandoned && req.requestKey != 0 && p.callback != nil {
+		index, err := progress.index, progress.err
+		if !completed {
+			index, err = 0, &SnapshotError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Save:      true,
+				Err:       cause,
+			}
+		}
+		func() {
+			defer func() {
+				if r2 := recover(); r2 != nil {
+					supervise.LogContained(func() {
+						slog.Error("OnSnapshotRequestCompleted callback panicked",
+							"shard_id", req.shardID,
+							"replica_id", req.replicaID,
+							"panic", fmt.Sprint(r2),
+						)
+					})
+				}
+			}()
+			p.callback.OnSnapshotRequestCompleted(req.shardID, req.requestKey, index, err)
+		}()
+	}
 }
 
 // handleRequest processes a single snapshot request with panic recovery.
@@ -478,108 +762,30 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// callbacks through the host. A panicking listener on a pool worker
 	// goroutine would otherwise abort the entire host process, taking every
 	// unrelated shard with it.
-	completed := false
+	// A runtime.Goexit, which recover cannot see, is settled the same way:
+	// the function did not reach its normal return (supervise.ClassifyExit).
+	var progress requestProgress
+	normalReturn := false
 	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-		stack := debug.Stack()
-		slog.Error("snapshot worker panic recovered",
-			"shard_id", req.shardID,
-			"replica_id", req.replicaID,
-			"save", req.save,
-			"completed", completed,
-			"panic", fmt.Sprint(r),
-			"stack", string(stack),
-		)
-		// Mirror the normal cleanup path: clear recovering flag
-		// for recovery requests and signal the step worker. The cleanup is
-		// idempotent, so running it again after a post-completion panic is
-		// harmless and guarantees the shard is never left wedged.
-		if !req.save {
-			req.node.SetRecovering(false)
-			if p.workSignal != nil {
-				p.workSignal.Notify(req.shardID)
-			}
-		}
-		// Clear in-flight so the next request for this shard
-		// can be accepted.
-		p.inFlight.Delete(req.shardID)
-		// Clear snapshotting flag on the node.
-		req.node.snapshotting.Store(false)
-		// Notify via callback that the snapshot was rejected due to the
-		// panic, so the caller can retry or report. Only when the snapshot
-		// itself did not complete: after completion OnSnapshotCompleted has
-		// already been delivered, and a second terminal callback would
-		// misreport a snapshot that exists. The nested recover keeps a
-		// panicking listener from escaping this deferred handler.
-		if !completed && p.callback != nil {
-			func() {
-				defer func() {
-					if r2 := recover(); r2 != nil {
-						slog.Error("OnSnapshotRejected callback panicked",
-							"shard_id", req.shardID,
-							"replica_id", req.replicaID,
-							"panic", fmt.Sprint(r2),
-						)
-					}
-				}()
-				p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
-			}()
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
+			p.settlePanickedRequest(req, r, progress)
 		}
 	}()
 
-	// Set the recovering flag BEFORE calling handleSnapshot
-	// for recovery requests. This gates the apply worker and
-	// step worker from operating on the state machine while
-	// RecoverFromSnapshot executes in this goroutine.
-	//
-	// Setting the flag stops NEW applies at the gate, but an apply that
-	// already passed the gate could still be inside SM.Apply. Drain it
-	// before RecoverFromSnapshot touches the state machine, otherwise the
-	// two would race and corrupt SM/session state. The increment-then-check
-	// (apply) / set-then-drain (here) ordering guarantees any in-flight
-	// apply is observed by the drain.
-	var blocked error
-	if !req.save {
-		// The step worker DEFERS InstallSnapshot while the recovering gate is
-		// up (handling one would move the raft log's snapshot floor out from
-		// under this recovery), so the InstallSnapshot that advances the log
-		// to the snapshot index cannot be installed once the gate is raised.
-		// Wait for the log to reach the snapshot index BEFORE raising it,
-		// otherwise the recovery would exclude the very message that makes it
-		// admissible.
-		blocked = p.awaitRecoverableLog(req)
-	}
-	if !req.save && blocked == nil {
-		req.node.SetRecovering(true)
-		// If the drain aborts because the node is stopping, do NOT touch the
-		// state machine: an apply may still be in flight (engine Stop closes
-		// stopC before the apply workers drain), and RecoverFromSnapshot would
-		// race it. Abort the recovery cleanly instead.
-		if !req.node.WaitForApplyDrain(req.node.StopC()) {
-			req.node.SetRecovering(false)
-			p.inFlight.Delete(req.shardID)
-			req.node.snapshotting.Store(false)
-			if p.workSignal != nil {
-				p.workSignal.Notify(req.shardID)
-			}
-			return
-		}
-	}
 	var (
 		index      uint64
 		compaction LogCompaction
+		err        error
 	)
-	err := blocked
-	if err == nil {
+	if req.save {
 		index, compaction, err = p.handleSnapshot(req)
+	} else {
+		err = p.runRecovery(req)
 	}
 
 	// Mark that the snapshot operation itself finished, so a later panic is
 	// reported as a post-completion panic rather than a rejected snapshot.
-	completed = true
+	progress.completed, progress.index, progress.err = true, index, err
 
 	// Clear the recovering flag AFTER recovery completes
 	// (success or error). Signal the work signal so the step
@@ -594,15 +800,32 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	// requests are failed by the teardown instead. The host dispatches every
 	// user EventListener fan-out from these callbacks, so no user code runs
 	// under the lease. The release is deferred so a panicking callback cannot
-	// leak the lease and hang the unload. A save's own lease was released
-	// when it returned, so this is never a nested acquire.
+	// leak the lease and hang the unload. The lease a save or a recovery held
+	// while it ran was released when it returned, so this is never a nested
+	// acquire. A node that stopped in between refuses it, and its outcome is
+	// abandoned: whatever the restore returned is the unload's doing.
 	leased := req.node.AcquireWriteLease()
 	if leased {
 		defer req.node.ReleaseWriteLease()
 	}
 	abandoned := !leased
+	progress.abandoned = abandoned
+	rejected := false
 	if !req.save {
-		abandoned = p.settleRecovery(req, err, !leased)
+		abandoned, rejected = p.settleRecovery(req, err, !leased)
+		progress.abandoned = abandoned
+	} else if err != nil && !abandoned {
+		// A failed save does NOT fail the shard: the state machine was only
+		// read, so the replica keeps applying and serving, and the next save
+		// is attempted as usual. It is reported here and to the requester
+		// (OnSnapshotCompleted); EventListener.OnShardFailed is reserved for a
+		// tripped failure latch. An automatic save has no requester, so this
+		// line is its only report.
+		slog.Warn("snapshot save failed; the shard keeps running",
+			"shard_id", req.shardID,
+			"replica_id", req.replicaID,
+			"error", err,
+		)
 	}
 	result := snapshotResult{
 		shardID:   req.shardID,
@@ -618,25 +841,31 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	if p.metrics != nil && err == nil && req.save {
 		p.metrics.IncSnapshot(req.shardID)
 	}
-	// Deliver the completion BEFORE the in-flight/snapshotting slots are
-	// released. The callback resolves the pending requests registered for this
-	// shard WITHOUT matching them to a specific request, so clearing the slots
-	// first opens a window in which a brand-new request registers and is then
-	// completed with THIS snapshot's index or error — an export caller would be
-	// told its backup succeeded before its export directory exists. Both slots
-	// stay claimed across the callback, so no later request can be admitted
-	// until it has drained.
-	if p.callback != nil && !abandoned {
-		p.callback.OnSnapshotCompleted(req.shardID, index, err)
-		// After the completion, so a listener sees the snapshot before the
-		// compaction it made possible, and still inside the held slots.
-		if err == nil && compaction.Reader {
-			p.callback.OnLogCompacted(req.shardID, req.replicaID, compaction)
-		}
+	// Report the completion BEFORE the in-flight/snapshotting slots are
+	// released, so no later snapshot of this shard can be admitted, run and
+	// reported ahead of it: listeners see this shard's snapshots, and the
+	// compactions they made possible, in the order they happened.
+	if p.callback != nil && !abandoned && !rejected {
+		p.reportCompleted(req, index, compaction, err)
 	}
 	// Release the slots so the next request for this shard can be accepted.
-	p.inFlight.Delete(req.shardID)
+	p.releaseInFlight(req)
 	req.node.snapshotting.Store(false)
+	progress.released = true
+	// A rejected recovery is reported once the slots are free, as an abandoned
+	// request is (abandonRequest), so a retry it prompts is admitted. err is
+	// the *recoveryRejectedError; the cause it wraps is what is reported.
+	if p.callback != nil && !abandoned && rejected {
+		p.callback.OnSnapshotRejected(req.shardID, req.replicaID, errors.Unwrap(err))
+	}
+	// Resolve the requester only now that the slots are free. Its caller may
+	// issue the next request the instant it is resolved, and that request must
+	// be admitted: the snapshot it waited for is over. The resolution is
+	// matched to this request by key, so a request admitted after the release
+	// can never be handed this snapshot's result.
+	if p.callback != nil && !abandoned && req.requestKey != 0 {
+		p.callback.OnSnapshotRequestCompleted(req.shardID, req.requestKey, index, err)
+	}
 	// Non-blocking send to completedC. The callback is the
 	// production notification path; completedC is used only
 	// by tests. A blocking send would permanently stall ALL
@@ -650,6 +879,22 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 			"replica_id", req.replicaID,
 			"index", index,
 		)
+	}
+	normalReturn = true
+}
+
+// reportCompleted delivers a finished snapshot operation to the callback:
+// OnSnapshotCompleted, then OnLogCompacted for the compaction a save made
+// possible, so a listener sees the snapshot before the compaction. The caller
+// holds the shard's snapshot slots and has checked p.callback.
+func (p *snapshotPool) reportCompleted(req snapshotRequest, index uint64, compaction LogCompaction, err error) {
+	op := SnapshotRecover
+	if req.save {
+		op = SnapshotSave
+	}
+	p.callback.OnSnapshotCompleted(req.shardID, index, op, err)
+	if err == nil && compaction.Reader {
+		p.callback.OnLogCompacted(req.shardID, req.replicaID, compaction)
 	}
 }
 
@@ -1345,7 +1590,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// exists — a multi-node cluster re-streams from the leader, but a
 	// single-node deployment would lose the snapshot and the compacted
 	// entries it covers.
-	if err := SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
+	if err := fsutil.SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
@@ -1459,7 +1704,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	dataPath = filepath.Join(saveDir, snapshotDataFile)
 	// The rename is durable only once the parent directory is fsynced, and
 	// the record below must never name a directory a crash could still undo.
-	if err := SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
+	if err := fsutil.SyncDirChain(saveDir, node.SnapshotDir()); err != nil {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
@@ -1785,8 +2030,9 @@ const (
 // are. A permanent refusal (the snapshot is behind the apply frontier) is
 // returned immediately. A transient one — the raft log has not installed the
 // snapshot yet — is retried until the budget is exhausted, then returned so
-// the transfer fails loudly instead of leaving the state machine silently
-// behind a snapshot raft already accounts for.
+// the recovery is rejected loudly (handleRequest classifies it with
+// rejectBeforeRestore) instead of leaving the state machine silently behind a
+// snapshot raft already accounts for.
 func (p *snapshotPool) awaitRecoverableLog(req snapshotRequest) error {
 	snapIndex := p.pendingRecoveryIndex(req)
 	if snapIndex == 0 {
@@ -1839,7 +2085,49 @@ func (p *snapshotPool) pendingRecoveryIndex(req snapshotRequest) uint64 {
 
 // recoverSnapshot recovers the state machine from the most recent
 // snapshot stored in LogDB. If no snapshot exists, recovery is a no-op.
-func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
+//
+// The recovery's failure classification is staged, for panics and errors
+// alike. Every step before the state machine's RecoverFromSnapshot is invoked
+// (LogDB reads, artifact choice and verification, sweeps, barrier resolution,
+// decryption) leaves the state machine untouched, so a panic in one of them
+// propagates to handleRequest, and an error from one is returned as a
+// rejection (rejectBeforeRestore); either way the recovery is rejected without
+// failing the shard. From the moment restoring is set, immediately before
+// RecoverFromSnapshot, the state machine may be partially overwritten, so a
+// returned error, or any later panic — in RecoverFromSnapshot, the marker
+// seeding after it, or a deferred cleanup — recovered here and returned as an
+// *SMPanicError, fails the shard through settleRecovery.
+//
+// The caller holds the node's write lease for the whole call (runRecovery),
+// which fences the sweeps below and keeps the state machine open under the
+// restore.
+func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
+	restoring := false
+	defer func() {
+		if !restoring {
+			// A pre-restore panic keeps unwinding to handleRequest; a
+			// pre-restore error is a rejection.
+			err = rejectBeforeRestore(err)
+			return
+		}
+		if v := recover(); v != nil {
+			stack := debug.Stack()
+			err = &SMPanicError{
+				ShardID:   req.shardID,
+				ReplicaID: req.replicaID,
+				Value:     v,
+				Stack:     stack,
+			}
+			supervise.LogContained(func() {
+				slog.Error("snapshot recovery panicked after the state machine restore began",
+					"shard_id", req.shardID,
+					"replica_id", req.replicaID,
+					"panic", fmt.Sprint(v),
+					"stack", string(stack),
+				)
+			})
+		}
+	}()
 	node := req.node
 	snapshotter := node.Snapshotter()
 	if snapshotter == nil {
@@ -1855,12 +2143,18 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// delete it while this recovery reads it by path (Node.PinSnapshotDir).
 	// The lock is held only for the choice: verification and decryption read
 	// the whole file, and receives must not queue behind them.
-	node.LockSnapshotDir()
-	logdbSnap, snapshotDir, artifactIndex, err := p.chooseRecoverySnapshot(req)
-	if err == nil && snapshotDir != "" {
-		node.PinSnapshotDir(snapshotDir)
-	}
-	node.UnlockSnapshotDir()
+	// The unlock is deferred so a panic in the LogDB read cannot leave the
+	// lock held: that panic is rejected without failing the shard, and every
+	// later receive, save and recovery of the shard takes this lock.
+	logdbSnap, snapshotDir, artifactIndex, err := func() (logdb.Snapshot, string, uint64, error) {
+		node.LockSnapshotDir()
+		defer node.UnlockSnapshotDir()
+		snap, dir, idx, chooseErr := p.chooseRecoverySnapshot(req)
+		if chooseErr == nil && dir != "" {
+			node.PinSnapshotDir(dir)
+		}
+		return snap, dir, idx, chooseErr
+	}()
 	if err != nil {
 		return err
 	}
@@ -1940,24 +2234,19 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 	// plaintext copy of the imported state machine for as long as the shard
 	// ran.
 	//
-	// Every sweep is fenced by this node's write lease. While the lease is
-	// held the shard is loaded: no import can be in flight for it (StartShard
+	// Every sweep is fenced by this node's write lease, which the caller
+	// (runRecovery) holds for the whole recovery. While the lease is held
+	// the shard is loaded: no import can be in flight for it (StartShard
 	// holds the import lock until its node is published, and an import
 	// re-checks under that lock that the shard is not running), and no next
 	// incarnation can be decrypting in the same replica directory, since
 	// UnloadNode — and so that incarnation's StartShard — waits for the lease.
-	// A stopped incarnation's late recovery gets no lease and sweeps nothing:
-	// unfenced, it could unlink the new incarnation's live recovery scratch
-	// before StartShard opened it. The release is deferred so a recovered
-	// panic in a sweep cannot leave UnloadNode waiting on the lease forever.
-	if node.AcquireWriteLease() {
-		func() {
-			defer node.ReleaseWriteLease()
-			SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
-			SweepStaleDecryptTmp(snapshotDir)
-			SweepStaleImportStageDirs(node.SnapshotDir(), req.shardID, req.replicaID)
-		}()
-	}
+	// A stopped incarnation never gets this far: it is refused the lease
+	// before the recovery begins, so it cannot unlink the new incarnation's
+	// live recovery scratch before StartShard opened it.
+	SweepStaleDecryptTmpTree(node.SnapshotDir(), req.shardID, req.replicaID)
+	SweepStaleDecryptTmp(snapshotDir)
+	SweepStaleImportStageDirs(node.SnapshotDir(), req.shardID, req.replicaID)
 
 	// An encrypted artifact with no usable barrier fails CLOSED, matching
 	// Host.StartShard on the identical predicate. Falling through would hand
@@ -2053,6 +2342,9 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
 			Err:       readerErr,
 		}
 	}
+	// The restore begins: from here on the state machine may be partially
+	// overwritten, and a panic fails the shard (see the deferred recover).
+	restoring = true
 	if err := snapshotter.RecoverFromSnapshot(ctx, r, node.stopC); err != nil {
 		return &SnapshotError{
 			ShardID:   req.shardID,
@@ -2623,7 +2915,8 @@ func minNonZero(a, b uint64) uint64 {
 // analogue of globalSafePurgeFloor and is the minimum over:
 //
 //	(a) the retained encrypted-snapshot epoch of every loaded shard whose
-//	    barrier is THIS barrier (barrierForShard(shardID) == target), and
+//	    barrier is THIS barrier (logdb.SameBarrier(barrierForShard(shardID),
+//	    target)), and
 //	(b) the WAL min-live epoch restricted to THIS barrier's records, obtained
 //	    via PerBarrierEpochAwareLogDB.MinLiveEpochForBarrier(target).
 //
@@ -2636,10 +2929,16 @@ func minNonZero(a, b uint64) uint64 {
 // globalSafePurgeFloor: false on a nil node enumerator, any snapshot-dir scan
 // error, a WAL query error, an unsupported (non-per-barrier) LogDB, or when
 // nothing encrypted is retained for this barrier. Callers MUST NOT purge when
-// ok is false.
+// ok is false. It is also false when the target or any shard's barrier has no
+// pointer identity (see shardUsesBarrier): the floor is a claim about EVERY
+// shard sharing the target's keyring, and that set cannot be proven for such a
+// barrier.
 func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64, bool) {
 	if p.nodes == nil || target == nil {
 		return 0, false
+	}
+	if !logdb.SameBarrier(target, target) {
+		return 0, false // no pointer identity
 	}
 
 	// Snapshot the currently-loaded shards mapped to the target barrier, indexed
@@ -2649,14 +2948,15 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 	allLoaded := p.nodes()
 	loadedForTarget := make(map[uint64]*Node)
 	for _, node := range allLoaded {
-		nodeBarrier, barrierErr := p.barrierForShard(node.ShardID())
+		uses, barrierErr := p.shardUsesBarrier(node.ShardID(), target)
 		if barrierErr != nil {
-			// A loaded shard whose barrier cannot be resolved may or may not
-			// belong to the target: it can neither be scanned nor excluded, so
-			// its retained epochs cannot be proven absent from this floor.
+			// A loaded shard whose barrier cannot be resolved or identified may
+			// or may not belong to the target: it can neither be scanned nor
+			// excluded, so its retained epochs cannot be proven absent from
+			// this floor.
 			return 0, false
 		}
-		if nodeBarrier != target {
+		if !uses {
 			continue // belongs to a different barrier; do not let it lower/raise this floor
 		}
 		loadedForTarget[node.ShardID()] = node
@@ -2687,11 +2987,10 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 	// Shards mapped to the target that are NOT loaded — the enumerator above
 	// is optional, and its absence cannot mean the loaded set is complete.
 	// The resolver is a function of shardID, so an unloaded shard's barrier is
-	// as resolvable as a loaded one's; one that cannot be resolved can neither
-	// be counted nor excluded, which declines the purge.
+	// as resolvable as a loaded one's; one that cannot be resolved or
+	// identified can neither be counted nor excluded, which declines the purge.
 	unloadedMin, ok := p.unloadedSnapshotFloor(allLoaded, func(shardID uint64) (bool, error) {
-		b, err := p.barrierForShard(shardID)
-		return b == target, err
+		return p.shardUsesBarrier(shardID, target)
 	})
 	if !ok {
 		return 0, false
@@ -2750,6 +3049,24 @@ func (p *snapshotPool) perBarrierSafePurgeFloor(target SnapshotBarrier) (uint64,
 		return 0, false // nothing encrypted retained for this barrier
 	}
 	return floor, true
+}
+
+// shardUsesBarrier reports whether shardID's barrier is target, by pointer
+// identity (logdb.SameBarrier), never with ==: a barrier's dynamic value need
+// not be comparable, and == on two that are not panics. A shard whose barrier
+// cannot be resolved returns the resolution error; one whose barrier has no
+// pointer identity returns errBarrierWithoutIdentity, because a copy of a
+// value-type barrier may share target's keyring and so can be neither counted
+// nor excluded.
+func (p *snapshotPool) shardUsesBarrier(shardID uint64, target SnapshotBarrier) (bool, error) {
+	b, err := p.barrierForShard(shardID)
+	if err != nil {
+		return false, err
+	}
+	if !logdb.SameBarrier(b, b) {
+		return false, errBarrierWithoutIdentity
+	}
+	return logdb.SameBarrier(b, target), nil
 }
 
 // purgeOldEpochs purges barrier DEKs for epochs strictly below the safe-purge
@@ -3323,16 +3640,28 @@ func (p *snapshotPool) setCallback(callback Callback) {
 	p.callback = callback
 }
 
-// requestSnapshot submits a snapshot request to the pool. Returns a
-// SnapshotDuplicateError if a snapshot is already in-flight for the
-// shard. Returns a SnapshotPoolBusyError if the request channel is
+// requestSnapshot submits a snapshot request to the pool, and reports a
+// request it cannot admit through OnSnapshotRejected as well as returning the
+// error. Returns a SnapshotDuplicateError if a snapshot is already in-flight
+// for the shard. Returns a SnapshotPoolBusyError if the request channel is
 // full; the caller should retry later.
 func (p *snapshotPool) requestSnapshot(req snapshotRequest) error {
+	err := p.submit(req)
+	if err != nil && p.callback != nil {
+		p.callback.OnSnapshotRejected(req.shardID, req.replicaID, err)
+	}
+	return err
+}
+
+// submit admits req to the pool, or returns why it cannot — a
+// *SnapshotDuplicateError when the shard already has a snapshot in flight, a
+// *SnapshotPoolBusyError when the request channel is full — and reports
+// nothing. It is the admission requestSnapshot reports on, and the one the
+// step worker's recovery re-drive uses directly: a refused re-drive is retried
+// on the engine's own schedule, so it is not an external rejection.
+func (p *snapshotPool) submit(req snapshotRequest) error {
 	// Per-shard dedup: only one snapshot per shard in-flight.
-	if _, loaded := p.inFlight.LoadOrStore(req.shardID, struct{}{}); loaded {
-		if p.callback != nil {
-			p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
-		}
+	if !p.claimInFlight(req) {
 		return &SnapshotDuplicateError{ShardID: req.shardID}
 	}
 	select {
@@ -3352,12 +3681,58 @@ func (p *snapshotPool) requestSnapshot(req snapshotRequest) error {
 	default:
 		// Request channel full. Clear the in-flight flag and let
 		// the caller retry.
-		p.inFlight.Delete(req.shardID)
-		if p.callback != nil {
-			p.callback.OnSnapshotRejected(req.shardID, req.replicaID)
-		}
+		p.releaseInFlight(req)
 		return &SnapshotPoolBusyError{ShardID: req.shardID}
 	}
+}
+
+// requestRecovery submits a state machine recovery request for node on behalf
+// of a snapshot receive (Engine.RequestSnapshotRecovery). The step worker's
+// re-drive of a rejected recovery submits the same request without the
+// rejection report (redriveRecovery). The caller holds the node's
+// snapshotting flag, as for requestSnapshot.
+func (p *snapshotPool) requestRecovery(shardID, replicaID uint64, node *Node) error {
+	return p.requestSnapshot(snapshotRequest{
+		shardID:   shardID,
+		replicaID: replicaID,
+		node:      node,
+		save:      false,
+	})
+}
+
+// claimInFlight claims the shard's single-flight slot for req's node. It
+// reports false when another request of a LIVE incarnation holds it — its own
+// node's, or one of a node not yet stopped.
+//
+// A slot held by a STOPPED incarnation is taken over. That request was
+// abandoned: its node refuses the write lease, so it publishes, records,
+// compacts and sweeps nothing, and UnloadNode waited for any lease it held
+// before the next incarnation could load. Its worker may still be finishing,
+// but its release is a compare-and-delete against its own node and cannot
+// clear the slot once taken over. Refusing here instead would turn the old
+// incarnation's leftover into ErrSnapshotInProgress for the new one.
+func (p *snapshotPool) claimInFlight(req snapshotRequest) bool {
+	for {
+		prev, loaded := p.inFlight.LoadOrStore(req.shardID, req.node)
+		if !loaded {
+			return true
+		}
+		owner, ok := prev.(*Node)
+		if !ok || owner == nil || owner == req.node || !owner.IsStopped() {
+			return false
+		}
+		if p.inFlight.CompareAndSwap(req.shardID, prev, req.node) {
+			return true
+		}
+		// The slot changed under us (released, or taken over by another
+		// claimant); look again.
+	}
+}
+
+// releaseInFlight releases the shard's single-flight slot if req's node still
+// holds it. A slot taken over by a later incarnation is left alone.
+func (p *snapshotPool) releaseInFlight(req snapshotRequest) {
+	p.inFlight.CompareAndDelete(req.shardID, req.node)
 }
 
 // CompletedC returns the read-only completion channel. This channel is
@@ -3680,7 +4055,7 @@ func writeSnapshotExport(srcDataPath, exportPath string, metaBytes []byte) error
 	}
 	// Recorded BEFORE the MkdirAll: the final fsync covers every directory
 	// it creates and no directory above them.
-	syncRoot := DeepestExistingAncestor(exportPath)
+	syncRoot := fsutil.DeepestExistingAncestor(exportPath)
 	if err := os.MkdirAll(exportPath, 0o750); err != nil {
 		return fail(err)
 	}
@@ -3751,7 +4126,7 @@ const exportBackupPattern = ".snapshot-export-prev-*"
 // Production code must never assign to them.
 var (
 	exportRename  = os.Rename
-	exportSyncDir = SyncDir
+	exportSyncDir = fsutil.SyncDir
 )
 
 // publishSnapshotExport renames the staged dataTmp and metaTmp onto
@@ -3813,7 +4188,7 @@ func publishSnapshotExport(exportPath, dataTmp, metaTmp, syncRoot string) (err e
 
 	// Fsync the export directory so both renames survive a crash, then every
 	// directory the export created, so the export directory itself does.
-	return SyncDirChainWith(exportSyncDir, exportPath, syncRoot)
+	return fsutil.SyncDirChainWith(exportSyncDir, exportPath, syncRoot)
 }
 
 // sweepExportOrphans removes every backup directory (exportBackupPattern) and
@@ -4069,7 +4444,7 @@ func gcSnapshotDirs(baseDir string, shardID, replicaID uint64, recorded string, 
 	// resurrect a GC'd directory after a crash, and the resurrected one is a
 	// half-deleted tree no consumer validates. waldb fsyncs after segment
 	// deletion for exactly this reason.
-	return SyncDir(snapshotBaseDir(baseDir, shardID, replicaID))
+	return fsutil.SyncDir(snapshotBaseDir(baseDir, shardID, replicaID))
 }
 
 // recordedSnapshotDir returns the cleaned path LogDB records for the node: ""

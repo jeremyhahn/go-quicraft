@@ -21,15 +21,12 @@ import (
 
 // Sentinel errors for the raft package. These are pre-allocated and
 // compared with errors.Is for zero-allocation on the hot path.
+//
+// The raft log has no compacted or unavailable sentinel of its own: it
+// returns logdb.ErrCompacted and logdb.ErrUnavailable, whether the condition
+// comes from the LogReader or from its own bounds checks, so one value means
+// one condition everywhere.
 var (
-	// ErrCompacted is returned when requested entries have been removed
-	// by log compaction and are no longer available.
-	ErrCompacted = errors.New("raft: entry compacted")
-
-	// ErrUnavailable is returned when requested entries are not yet
-	// available in the log (index beyond last entry).
-	ErrUnavailable = errors.New("raft: entry unavailable")
-
 	// ErrTransferInProgress is returned when a leadership transfer
 	// is already in progress.
 	ErrTransferInProgress = errors.New("raft: leadership transfer in progress")
@@ -85,7 +82,10 @@ var (
 
 	// ErrDecompressionBomb is returned when a decompressed entry payload
 	// exceeds the configured maximum size, preventing zip-bomb attacks.
-	ErrDecompressionBomb = errors.New("raft: decompressed size exceeds limit")
+	// The quicraft package re-exports it as its public ErrDecompressionBomb,
+	// so the cause inside an engine ApplyError matches the public sentinel;
+	// hence the public prefix.
+	ErrDecompressionBomb = errors.New("quicraft: decompressed size exceeds limit")
 
 	// ErrInflightsFull is returned when attempting to add to a full
 	// inflights buffer. Callers should check full() before calling

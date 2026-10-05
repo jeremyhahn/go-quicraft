@@ -16,11 +16,8 @@ package transport
 
 import (
 	"errors"
-	"math"
 	"strings"
 	"testing"
-
-	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // TestPeerAuthAuthorizesFailsClosed pins the helper every handler routes the
@@ -40,32 +37,6 @@ func TestPeerAuthAuthorizesFailsClosed(t *testing.T) {
 	}
 	if p.Authorizes("10.0.0.2:5000") {
 		t.Fatal("Authorizes returned true for an address the callback refused")
-	}
-}
-
-// TestDecodeChargeSaturates pins the saturating arithmetic behind the receive
-// budget. A charge that wrapped negative would reserve negative budget —
-// unlimited headroom — so overflow must clamp to MaxInt64, not wrap.
-func TestDecodeChargeSaturates(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		n    int64
-		want int64
-	}{
-		{"zero", 0, 0},
-		{"negative", -5, 0},
-		{"ordinary", 1024, 1024 * proto.MaxDecodeMemoryFactor},
-		{"largest exact", math.MaxInt64 / proto.MaxDecodeMemoryFactor,
-			(math.MaxInt64 / proto.MaxDecodeMemoryFactor) * proto.MaxDecodeMemoryFactor},
-		{"would overflow", math.MaxInt64/proto.MaxDecodeMemoryFactor + 1, math.MaxInt64},
-		{"max", math.MaxInt64, math.MaxInt64},
-	} {
-		if got := decodeCharge(tc.n); got != tc.want {
-			t.Errorf("decodeCharge(%s = %d) = %d, want %d", tc.name, tc.n, got, tc.want)
-		}
-		if got := decodeCharge(tc.n); got < 0 {
-			t.Errorf("decodeCharge(%s) = %d: a negative charge is unlimited budget", tc.name, got)
-		}
 	}
 }
 

@@ -612,7 +612,7 @@ index (Paper 5.1 guarantees committed entries match across all servers). This
 prevents falsely identifying committed entries as conflicts when the same batch
 drain advances the committed index partway through processing multiple
 `Replicate` messages. A compacted index is skipped for the same reason; only
-`ErrUnavailable` (past the end of the log) is reported as the append point.
+`logdb.ErrUnavailable` (past the end of the log) is reported as the append point.
 
 ### Replication chunking
 
@@ -1808,8 +1808,8 @@ truncations are followed by new appends.
 ### Term resolution
 
 `raftLog.term(index)` checks inmem first (O(1) index arithmetic), then falls
-back to `LogReader.Term()`, translating `logdb.ErrCompacted`/`ErrUnavailable`
-into the raft-package sentinels so `errors.Is` comparisons work. The inmem
+back to `LogReader.Term()`, whose `logdb.ErrCompacted`/`logdb.ErrUnavailable`
+it returns unchanged. The inmem
 layer also caches a single `(appliedTo, appliedToTerm)` pair for lookups at the
 truncation boundary.
 
@@ -2074,8 +2074,6 @@ the hot path returns them with no allocation. Selected errors:
 
 | Error                          | Condition                                                        |
 |--------------------------------|------------------------------------------------------------------|
-| `ErrCompacted`                 | Requested entries removed by log compaction                       |
-| `ErrUnavailable`               | Index beyond last entry                                           |
 | `ErrGappedEntryBatch`          | Append batch is not index-contiguous                              |
 | `ErrTransferInProgress`        | Proposal or ReadIndex rejected during leader transfer             |
 | `ErrPendingConfigChange`       | Second config change proposed before the first commits            |
@@ -2104,6 +2102,11 @@ the hot path returns them with no allocation. Selected errors:
 | `ErrJoiningNodeCannotCampaign` | TimeoutNow on a replica with incomplete membership                |
 | `ErrStaleConfigCannotCampaign` | Configuration tail unresolved at a TimeoutNow                     |
 | `ErrInflightsFull`             | Inflight window at capacity (defensive backstop)                  |
+
+The raft log has no compacted or unavailable sentinel of its own. Compaction
+and an index past the end of the log are reported as `logdb.ErrCompacted` and
+`logdb.ErrUnavailable`, whether the LogReader or the raft log's own bounds
+check detects them, so an embedder matches them with the public `logdb` names.
 
 `NotLeaderError` (`errors.go`) is a struct carrying `LeaderID` and
 `LeaderAddress` so a client can redirect without an extra round-trip. The Host
@@ -2255,7 +2258,25 @@ When `commitPending` is true, a `Tick()` may still produce messages that must go
 
 **Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
 
-**Batched proposal queue**: `internal/queue.EntryQueue` is MPSC with a *brief* `sync.Mutex`, not lock-free. Multiple producers take the lock only for a slice append; the single consumer takes it once per drain cycle to `Swap` the write buffer with a caller-provided read buffer, regardless of item count. That amortization (one acquisition per drain rather than per item) is what reduces step worker contention versus a shared proposals map. `maxLen` provides bounded backpressure: `Add`/`AddOne` return false at capacity and add nothing. A refused proposal surfaces as `ErrDropped` (with `IncProposalDropped` and the `OnProposalDropped` event); a refused ReadIndex surfaces as `ErrSystemBusy`. `ErrSystemBusy` is reserved for the global `MaxTotalInMemLogSize` rate limiter, so reporting it for a full per-shard proposal queue would send an operator to the wrong metric.
+**Batched proposal queue**: `internal/queue.EntryQueue` is MPSC with a *brief* `sync.Mutex`, not lock-free. Multiple producers take the lock only for a slice append; the single consumer takes it once per drain cycle to `Swap` the write buffer with a caller-provided read buffer, regardless of item count. That amortization (one acquisition per drain rather than per item) is what reduces step worker contention versus a shared proposals map. `maxLen` provides bounded backpressure: `Add`/`AddOne` return false at capacity and add nothing. A refused proposal surfaces as `ErrDropped` (with `IncProposalDropped` and the `OnProposalDropped` event); a refused ReadIndex surfaces as `ErrSystemBusy`. `ErrSystemBusy` is reserved for the global `MaxTotalInMemLogSize` rate limiter, so reporting it for a full per-shard proposal queue would send an operator to the wrong metric. `SwapBatch` returns the id of the batch it took, and the step worker declares it handed off (`HandOff`) only as it enters `Peer.Handle`; `Taken` reports a tracked proposal handed off from then on, and `Close` (a failed or stopped node) refuses every later hand-off, so a batch taken but not yet handed on is final and untaken.
+
+**Critical windows.** A worker runs user code — metrics collectors, callbacks that reach listeners, `slog` handlers, the state machine, the barrier, a user LogDB — and some of it runs after internal state has advanced but before the matching hand-off. Each such window is either free of user code (observability moved after the hand-off: the proposal batch-size, commit batch-size and latency, piggyback, apply-latency and election metrics) or tracked on the worker and settled by its recovery, for a panic and a `runtime.Goexit` alike (`supervise.ClassifyExit`):
+
+| Window | Worker | Settled on an abnormal exit by |
+|---|---|---|
+| proposal batch taken from the queue, before `Peer.Handle` | step | refused definitely (`OnProposalRejected`: `ErrDropped` on a live shard, `ErrShardFailed` or `ErrStopped` once the closed queue refuses the hand-off); if `Peer.Handle` had begun, failed maybe-applied |
+| ReadIndex keys drained, before `Peer.Handle`; read states taken by `GetUpdate` or phase 1/2, before `OnReadyToRead` | step | the reads failed (`OnReadIndexFailed`, `ErrDropped`) |
+| update extracted by `GetUpdate`, before its hand-off | step | the hard-state claim given back (`discardExtractedUpdate`) |
+| memory-mode `Peer.Commit`, before `applyC` | step | the shard failed (`CommitError`), its proposals maybe-applied |
+| batch gathered, before `SaveState` completes | commit | each node's hard-state claim given back (`InvalidatePersistedState`); entries re-derived |
+| `Peer.Commit` (batch or piggyback), before the apply hand-off | commit | the shard failed (`CommitError`), its proposals maybe-applied; an item already handed on is retired from the batch at its hand-off, so no recovery touches it again |
+| item received from `applyC`, before a per-shard goroutine has it | apply dispatcher | the shard failed (`failInFlightItem`) |
+| batch applying, before `lastApplied` records it | per-shard apply | the shard failed (`SMPanicError`) |
+| snapshot request running | snapshot pool | `settlePanickedRequest` |
+
+Every recovery settles first and logs last. All structural settlement, and every completion signal (a supervisor's restart, `supervise.RunResilient`'s outcome), happens from defers user code cannot skip before any diagnostic is emitted, and the diagnostic goes through `supervise.LogContained`, which runs it on a goroutine of its own: a `slog` handler, a host logger or a panic value's `String`/`Error` method that panics or calls `runtime.Goexit` ends only that goroutine. The host follows the same rule for its callbacks: callers are completed before the `MetricsCollector` observes their latency, and no lock is held while it does.
+
+Shutdown paths that run user code are resilient: the listener dispatcher's final drain, the snapshot pool's request drain, the apply worker's stop path and a commit worker's shutdown drain run on helper goroutines restarted until they finish (`supervise.RunResilient`), and terminal closes (`doneC`, a shard's `exited`, `keyRotDone`) go through `sync.Once` on a path no user code can skip.
 
 
 ### Commit worker
@@ -2501,12 +2522,14 @@ PER-SHARD GOROUTINE:
 Step worker re-processes shard (inner loop)
 ```
 
-**Error paths**:
-- SaveState exhausts retries OR shutdown cancels mid-backoff: `failBatchSaveState` marks node failed, clears commitPending, reports SaveStateError to handleError, fails pending proposals (OnProposalFailed)
-- Peer.Commit fails (log gap): `failCommit` marks node failed, clears commitPending, reports CommitError to handleError, fails pending proposals and drains pending reads (OnProposalFailed, OnShardFailed)
-- DecompressEntries fails: fail-fast. `failApply` marks node failed, reports ApplyError, fails pending proposals; lastApplied NOT advanced; step worker skips shard until operator intervention
+**Error paths**: every one goes through `failShard`, which trips the latch first, then fails the caller's own batch of proposals with its specific error (OnProposalFailed), then, once per shard, reports (handleError, OnShardFailed, with which the host fails every other pending proposal with `ErrShardFailed` wrapped as maybe-applied, and every pending read with the bare sentinel). Once a path wins the latch its reports are made from a deferred call, each isolated from the other, so a panic in the batch or in one report cannot suppress them; the panic is re-raised afterwards for the worker's recovery. Latch first, because failing a proposal wakes its caller, and a retry admitted before the latch would wait on a shard that never answers. The latch also closes the node's proposal queue (as `Node.Stop` does), so nothing still queued is handed to raft afterwards and a queued proposal's fate is final when the host drains it: taken from the queue means handed off (maybe-applied), never taken means definite. Each report is its own deferred call, so a `runtime.Goexit` in one, which `recover` cannot see, still lets the other run. Every long-lived goroutine that runs user code or callbacks — the apply, commit and step worker loops, each per-shard apply goroutine, the snapshot pool workers, the listener dispatcher, and the host's key-rotation loop, as well as the transport's accept loop, connection cleanup and send-queue workers — runs under `supervise.Supervise` (`pkg/internal/supervise`, the standard-library-only package the engine, transport and host share), which restarts it on a fresh goroutine, after the panic-restart delay and with the same wait-group accounting, when a `runtime.Goexit` ends it. Each one's own recovery treats a run that neither returned nor panicked as such an exit (`supervise.ClassifyExit`, value `supervise.ErrGoexit`) and settles it as a panic: a per-shard apply fails the shard, and a snapshot recovery fails the shard too, since whether its restore began is unknown. The host's pending sweep runs no user code and is not supervised.
+- SaveState exhausts retries OR shutdown cancels mid-backoff: `failBatchSaveState` fails the shard with SaveStateError, then clears commitPending
+- Peer.Commit fails (log gap): `failCommit` fails the shard with CommitError, then clears commitPending
+- DecompressEntries fails: fail-fast. `failApply` fails the shard with ApplyError; lastApplied NOT advanced; step worker skips shard until operator intervention
 - SM.Apply fails: fail-fast, the same `failApply` path as decompression (shard offline on first error, no retry counting)
 - SM.Apply panics: recovered, node failed, SMPanicError to handleError, step worker skips node
+- Peer.GetUpdate fails (the raft log cannot read committed entries it owes the state machine): node failed through `failShard`, the log's error reported once (handleError, OnShardFailed), step worker skips node
+- Snapshot recovery fails or panics: node failed through `failShard` (a panic as an `SMPanicError`), since the state machine may be half-restored; a save that fails or panics only read the state machine and leaves the node running
 
 
 ### Error types
@@ -2516,7 +2539,8 @@ Step worker re-processes shard (inner loop)
 | `SaveStateError`          | SaveState retries exhausted / shutdown  | node.failed = true        |
 | `CommitError`             | Peer.Commit() fails (log gap)           | node.failed = true        |
 | `ApplyError`              | SM.Apply or decompression fails         | node.failed = true        |
-| `SMPanicError`            | SM.Apply panics (recovered)             | node.failed = true        |
+| `SMPanicError`            | SM.Apply or RecoverFromSnapshot panics  | node.failed = true        |
+| `SnapshotSavePanicError`  | SaveSnapshot panics                     | Save failed; node runs    |
 | `SnapshotDuplicateError`  | Snapshot already in-flight for shard    | Request rejected          |
 | `SnapshotPoolBusyError`   | Snapshot pool request channel full      | Request rejected (retry)  |
 | `SnapshotError`           | Snapshot save/recover fails             | Reported via callback     |
@@ -2525,7 +2549,7 @@ Step worker re-processes shard (inner loop)
 
 Sentinels: `ErrShardFailed` (shard taken offline; `SMPanicError` matches it via `errors.Is`. `ApplyError`, `SaveStateError` and `CommitError` also set `node.failed` but are distinct typed errors), `ErrStopped` (stopped), `ErrSnapshotCorrupt` (corrupt frame).
 
-Two different things reach a caller as the public `ErrShardFailed`. The proposal or read that was in flight when the latch tripped is completed with the error that tripped it: `SMPanicError` matches `ErrShardFailed`, while a *returned* `SM.Apply` error produces an `ApplyError`, which carries no `Is` method and reaches the caller wrapping the state machine's own error: the more specific answer. Every request that arrives AFTER the latch tripped, whatever tripped it, is refused with the bare `ErrShardFailed` sentinel at the gate: `Propose`, `ReadIndex` (so `SyncRead`/`SyncReadBuf`) and `FollowerRead` all check `Node.IsFailed` first. All failures latch identically; only the error the in-flight request sees differs.
+Two different things reach a caller as the public `ErrShardFailed`. The proposal that was in flight when the latch tripped is completed with the error that tripped it: `SMPanicError` matches `ErrShardFailed`, while a *returned* `SM.Apply` error produces an `ApplyError`, which carries no `Is` method and reaches the caller wrapping the state machine's own error: the more specific answer. Its entry is committed and a reload replays it, so the error is wrapped in `*MaybeAppliedError` too, as is every failure delivered to a proposal after it was handed to raft (`OnProposalFailed`); a batch raft refused before appending it is reported through `OnProposalRejected` and stays definite. Every other proposal pending when the latch tripped is failed by the host's `OnShardFailed` with `ErrShardFailed` wrapped in `*MaybeAppliedError`: it reached raft and may already be committed (a recovery keeps the protocol running while it withholds applies), and a reload replays and applies it, so `MaybeApplied` reports true while `errors.Is(err, ErrShardFailed)` still holds. A pending read gets the bare sentinel, since it appended nothing. Every request that arrives AFTER the latch, whatever tripped it, is refused with the bare sentinel at the gate, since it never reached raft: `Propose` (and the session and config-change paths), `ReadIndex` (so `SyncRead`/`SyncReadBuf`) and `FollowerRead` all check `Node.IsFailed` first, and the registering paths check it again after registering, so a request racing the halt's drain rolls itself back. All failures latch identically; only the error the in-flight request sees differs.
 
 ### Interfaces
 
@@ -2543,18 +2567,46 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 | `OnReadIndexBatched(shardID, batchKey, aliasKeys)` | step worker, BEFORE `Peer.Handle` |
 | `OnReadIndexFailed(shardID, keys, err)` | step worker |
 | `OnProposalFailed(shardID, entries, err)` | step worker |
-| `OnSnapshotCompleted(shardID, index, err)` | snapshot pool worker |
+| `OnSnapshotCompleted(shardID, index, op, err)` | snapshot pool worker, while the shard's snapshot slots are held; `op` is `SnapshotSave` or `SnapshotRecover` |
 | `OnLogCompacted(shardID, replicaID, compaction)` | snapshot pool worker, after a save that compacted the log |
-| `OnSnapshotRejected(shardID, replicaID)` | snapshot pool worker |
+| `OnSnapshotRequestCompleted(shardID, requestKey, index, err)` | snapshot pool worker, after the slots are released, for a save `RequestSnapshot` keyed, including one whose `SaveSnapshot` panicked |
+| `OnSnapshotRejected(shardID, replicaID)` | snapshot pool worker, the per-shard apply goroutine (automatic snapshot), or the `RequestSnapshot` caller |
 | `OnShardFailed(shardID, err)` | the worker that latched the failure |
 | `OnCampaignSkipped(shardID, replicaID, term)` | step worker; **not emitted** (see below) |
 
 The producer column is the goroutine that calls the engine callback. The
 host's snapshot and log-compaction callbacks do not run user code there: they
 queue the matching `EventListener` events (`OnSnapshotCreated`,
-`OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnShardFailed`, `OnLogCompacted`,
-`OnLogDBCompacted`) on the listener dispatcher, so a listener may call
-`StopShard` from them. `OnSnapshotRejected` is the exception and runs inline.
+`OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`,
+`OnLogDBCompacted`, `OnSnapshotRejected`) on the listener dispatcher, so a
+listener may call `StopShard` from them. The completion's `op`, not its index,
+decides between `OnSnapshotCreated` and `OnSnapshotRecovered`: a save that
+wrote nothing (nothing applied, or no progress since the last snapshot)
+completes at index 0 like a recovery, and queues no event. A failed completion
+queues no event:
+a recovery that failed once `RecoverFromSnapshot` was invoked latches the node,
+and the latch's one report path fires `EventListener.OnShardFailed` once; one that
+failed before it is rejected through `OnSnapshotRejected` without latching and
+re-driven by the step worker, latching only once the attempts are exhausted
+(`*SnapshotRecoveryExhaustedError`); a
+failed save does not latch, and the pool
+logs it at WARN (`snapshot save failed; the shard keeps running`) and hands it
+to the `RequestSnapshot` caller.
+
+The completion events run while the shard's single-flight snapshot slots
+(`Node.snapshotting` and the pool's per-shard in-flight entry) are held, so no
+later snapshot of the shard can be reported ahead of them. The
+`RequestSnapshot` caller is resolved afterwards by
+`OnSnapshotRequestCompleted`, matched by the request's key, once both slots are
+released: a caller can issue its next request the moment the previous one
+returns without being refused `ErrSnapshotInProgress`, and a request admitted
+after the release is never handed the earlier snapshot's result.
+
+The pool's in-flight slot is owned by node incarnation: a request releases it
+only while its own node still holds it, and a slot held by a stopped
+incarnation is taken over by the next one. A request abandoned because its node
+stopped is fenced from shared state by the write lease, so it can neither
+refuse the restarted shard nor clear the restarted shard's claim.
 
 `OnCampaignSkipped` is declared on the interface and its doc comment names the step worker as the producer, but nothing in `pkg/internal/engine` calls it: every campaign-refusal branch in `startElection` and `handleTimeoutNow` logs and returns without notifying the engine, so `selfRemoved`, `roleMismatch`, `joining`, an unresolved stale config tail and an unreadable own-log term all produce no event. The Host-side plumbing down to `EventListener.OnCampaignSkipped` is wired and works if the hook is ever called, so implement against it if you like, but do not build monitoring that depends on receiving these events today.
 

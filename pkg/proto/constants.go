@@ -152,8 +152,10 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 // frames can occupy up to 2 GB of heap. The QUIC transport therefore reserves
 // each frame's length MULTIPLIED by this factor against its aggregate
 // message-receive budget (MaxMessageReceiveMemory) before reading the body, so
-// that budget bounds decoded heap, not wire bytes. A receiver built on this
-// package without that transport must apply the factor itself.
+// that budget bounds decoded heap, not wire bytes. DecodeCharge computes that
+// charge, and FrameDecodeCharge the charge of a frame plus its decompression
+// delta; a receiver built on this package without that transport must apply
+// them itself.
 //
 // The bound is MEASURED, not derived — TestDecodeMemoryAmplification builds the
 // densest frames this format admits and fails if any exceeds it — and the

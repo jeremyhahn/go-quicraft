@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,6 +155,14 @@ type RequestState struct {
 	// newRequestState.
 	session       atomic.Pointer[Session]
 	sessionSeries atomic.Uint64
+
+	// proposal is the pending entry under which the request is registered as
+	// a proposal — a client proposal, config change or session operation —
+	// and nil for any other request. A failure of the caller's own wait for
+	// it is classified from that entry's hand-off marker by lostWait, by the
+	// same rule the drains use (proposalMayReachRaft). Reset by
+	// newRequestState.
+	proposal atomic.Pointer[pendingProposal]
 }
 
 // NewRequestStatePool creates a sync.Pool that produces RequestState objects
@@ -194,6 +203,7 @@ func newRequestState(pool *sync.Pool, key uint64, deadline time.Time, trackLaten
 	rs.committedDone.Store(false)
 	rs.session.Store(nil)
 	rs.sessionSeries.Store(0)
+	rs.proposal.Store(nil)
 	// Drain any stale result from a previous use.
 	select {
 	case <-rs.completedC:
@@ -228,7 +238,7 @@ func (rs *RequestState) Result() (RequestResult, error) {
 	timeout := time.Until(deadline)
 	if timeout <= 0 {
 		// Already expired.
-		return RequestResult{}, ErrTimeout
+		return RequestResult{}, rs.lostWait(ErrTimeout)
 	}
 
 	timer := acquireTimer(timeout)
@@ -238,7 +248,37 @@ func (rs *RequestState) Result() (RequestResult, error) {
 	case result := <-rs.completedC:
 		return result, result.Err
 	case <-timer.C:
-		return RequestResult{}, ErrTimeout
+		return RequestResult{}, rs.lostWait(ErrTimeout)
+	}
+}
+
+// lostWait classifies err, a failure of the caller's own wait for this
+// request (its deadline passed, or its context ended) rather than a result the
+// request completed with. A proposal that may have reached raft — taken from
+// its node's queue, or still queued while the queue is open — may still
+// commit, so for one the failure is reported maybe-applied
+// (proposalOutcomeUnknown); a proposal provably never taken from a closed
+// queue, and any other request, gets err as given.
+func (rs *RequestState) lostWait(err error) error {
+	if pp := rs.proposal.Load(); pp != nil && proposalMayReachRaft(pp) {
+		return proposalOutcomeUnknown(err)
+	}
+	return err
+}
+
+// awaitResult waits for rs to complete or ctx to end, whichever is first. A
+// context that ends first is reported as ErrTimeout (deadline) or ErrCanceled,
+// classified by lostWait. It is the one wait every synchronous proposal path
+// uses.
+func awaitResult(ctx context.Context, rs *RequestState) (RequestResult, error) {
+	select {
+	case result := <-rs.ResultC():
+		return result, result.Err
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			return RequestResult{}, rs.lostWait(ErrTimeout)
+		}
+		return RequestResult{}, rs.lostWait(ErrCanceled)
 	}
 }
 

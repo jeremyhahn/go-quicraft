@@ -237,8 +237,9 @@ func TestSweepStaleDecryptTmpTree_ReclaimsASendScratchInTheBaseDir(t *testing.T)
 // only logs a failure, so a recovery retries — under the loaded node's write
 // lease, which proves no import is in flight, rather than the shard's import
 // lock, which a stopped incarnation's late recovery held while the next
-// StartShard failed with ErrImportInProgress. A stopped node grants no lease,
-// so its recovery leaves the stage to the next StartShard.
+// StartShard failed with ErrImportInProgress. The recovery request holds the
+// lease for its whole run (handleRequest); a stopped node grants none, so its
+// recovery never runs and leaves the stage to the next StartShard.
 func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -295,7 +296,10 @@ func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
 			if tc.stopped {
 				node.Stop()
 			}
-			_ = p.recoverSnapshot(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node})
+			if !node.TryStartSnapshot() {
+				t.Fatal("snapshot slot busy")
+			}
+			p.handleRequest(snapshotRequest{shardID: shardID, replicaID: replicaID, node: node})
 
 			_, statErr := os.Stat(stagedArtifact)
 			switch {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/server"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -195,6 +196,7 @@ func NewEngine(cfg config.HostConfig, ldb logdb.LogDB, sender MessageSender, bar
 	for i := range numWorkers {
 		sw := newStepWorker(i, tickInterval, sender, workSignal, commitCs[i], callback, stepStopC, metrics)
 		sw.listeners = listeners
+		sw.snapshots = snapshots
 		if memoryMode {
 			sw.memoryMode = true
 			sw.applyC = applyCs[i]
@@ -302,12 +304,15 @@ func (e *Engine) Start() {
 	// shards assigned to that worker would stop making progress without
 	// restart logic. The restart loop re-enters the dispatcher after a
 	// brief delay to avoid tight panic loops.
+	//
+	// Every tier runs under supervise.Supervise, which also restarts a worker
+	// whose goroutine a runtime.Goexit ended (recover cannot catch one).
 	for _, aw := range e.applyWorkers {
-		e.applyWg.Add(1)
-		go func() {
-			defer e.applyWg.Done()
-			e.runApplyWorkerLoop(aw)
-		}()
+		// The stopped path runs the dispatcher's stop path, user code
+		// included, so it is resilient (supervise.RunResilient).
+		supervise.Supervise(&e.applyWg, aw.stopC,
+			func() { e.runApplyWorkerLoop(aw) },
+			func() { supervise.RunResilient(func() { e.finishStoppedApplyWorker(aw) }) })
 	}
 
 	// Start commit workers with restart-on-panic. If a commit worker
@@ -316,22 +321,27 @@ func (e *Engine) Start() {
 	// owned by this worker to unblock them, then restarts after a brief
 	// delay to avoid tight panic loops.
 	for _, cw := range e.commitWorkers {
-		e.commitWg.Add(1)
-		go func() {
-			defer e.commitWg.Done()
-			e.runCommitWorkerLoop(cw)
-		}()
+		// A worker that exited abnormally once the engine is stopping still
+		// owes its shutdown drain: persisting and forwarding what is queued
+		// in commitC. It runs resiliently, each run under the same recovery
+		// as the worker's own (runCommitWorkerOnce returns true after a
+		// recovered panic, and its recovery settles a Goexit before the
+		// helper exits).
+		supervise.Supervise(&e.commitWg, cw.stopC,
+			func() { e.runCommitWorkerLoop(cw) },
+			func() {
+				supervise.RunResilient(func() {
+					for e.runCommitWorkerOnce(cw) {
+					}
+				})
+			})
 	}
 
 	// Start step workers with restart-on-panic. On panic the recovery clears
 	// commitPending for the single node that was mid-enqueue, then restarts
 	// after a brief delay.
 	for _, sw := range e.stepWorkers {
-		e.stepWg.Add(1)
-		go func() {
-			defer e.stepWg.Done()
-			e.runStepWorkerLoop(sw)
-		}()
+		supervise.Supervise(&e.stepWg, sw.stopC, func() { e.runStepWorkerLoop(sw) }, nil)
 	}
 }
 
@@ -663,11 +673,6 @@ func (e *Engine) stop() {
 	e.listenerWg.Wait()
 }
 
-// workerPanicRestartDelay is the delay before restarting a panicked
-// worker. This prevents tight panic-restart loops from consuming CPU
-// and flooding logs when a worker hits a persistent panic trigger.
-const workerPanicRestartDelay = 100 * time.Millisecond
-
 // runApplyWorkerLoop runs an apply worker dispatcher with automatic restart
 // on panic. If the dispatcher panics (during dispatch() or drain()), the
 // loop logs the panic with a full stack trace and restarts after a brief
@@ -680,25 +685,10 @@ const workerPanicRestartDelay = 100 * time.Millisecond
 // away skipped the join — leaving per-shard goroutines running into Close and
 // joinedC open, so an UnloadNode waiting on it hung forever.
 func (e *Engine) runApplyWorkerLoop(aw *applyWorker) {
-	for {
-		panicked := e.runApplyWorkerOnce(aw)
-		if !panicked {
-			return
-		}
-		// Check for shutdown before restarting.
-		select {
-		case <-aw.stopC:
+	for e.runApplyWorkerOnce(aw) {
+		if !supervise.AwaitRestart(aw.stopC) {
 			e.finishStoppedApplyWorker(aw)
 			return
-		default:
-		}
-		t := time.NewTimer(workerPanicRestartDelay)
-		select {
-		case <-aw.stopC:
-			t.Stop()
-			e.finishStoppedApplyWorker(aw)
-			return
-		case <-t.C:
 		}
 	}
 }
@@ -723,22 +713,10 @@ func (e *Engine) finishStoppedApplyWorker(aw *applyWorker) {
 // runApplyWorkerOnce runs the apply worker dispatcher and recovers from panics.
 // Returns true if the worker panicked, false if it returned normally.
 func (e *Engine) runApplyWorkerOnce(aw *applyWorker) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
-			stack := debug.Stack()
-			panicErr := &WorkerPanicError{
-				WorkerID:   aw.workerID,
-				WorkerType: "apply",
-				Value:      r,
-				Stack:      stack,
-			}
-			slog.Error("apply worker panic recovered, restarting",
-				"worker_id", aw.workerID,
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
 			// The dispatcher panicked holding an applyItem it had received from
 			// applyC but not yet handed to a per-shard goroutine. That item's
 			// commitPending is set: dropping it silently would wedge the shard
@@ -747,13 +725,40 @@ func (e *Engine) runApplyWorkerOnce(aw *applyWorker) (panicked bool) {
 			// idiom — release its pooled entries, mark the shard failed, and
 			// report a typed error — because the committed batch is lost and the
 			// state machine would otherwise silently miss the range.
-			if item := aw.inFlight.Swap(nil); item != nil {
-				aw.failInFlightItem(item)
-			}
+			settleWorkerExit("apply", aw.workerID, r, func(error) {
+				if item := aw.inFlight.Swap(nil); item != nil {
+					aw.failInFlightItem(item)
+				}
+			})
 		}
 	}()
 	aw.run()
+	normalReturn = true
 	return false
+}
+
+// settleWorkerExit is the one shape of every worker recovery: build the
+// *WorkerPanicError for the exit (no user code: the panic value is stored, not
+// formatted), run settle with it — everything structural — and only then
+// report the exit, through supervise.LogContained, so a slog handler or the panic value's
+// own methods can neither skip the settlement nor escape the recovery.
+func settleWorkerExit(workerType string, workerID int, r any, settle func(cause error)) {
+	stack := debug.Stack()
+	panicErr := &WorkerPanicError{
+		WorkerID:   workerID,
+		WorkerType: workerType,
+		Value:      r,
+		Stack:      stack,
+	}
+	settle(panicErr)
+	supervise.LogContained(func() {
+		slog.Error(workerType+" worker panic recovered, restarting",
+			"worker_id", workerID,
+			"panic", fmt.Sprint(r),
+			"stack", string(stack),
+			"error", panicErr,
+		)
+	})
 }
 
 // runCommitWorkerLoop runs a commit worker with automatic restart on
@@ -762,23 +767,9 @@ func (e *Engine) runApplyWorkerOnce(aw *applyWorker) (panicked bool) {
 // and restarts the worker after a brief delay. The loop exits cleanly when
 // the commit stop channel is closed.
 func (e *Engine) runCommitWorkerLoop(cw *commitWorker) {
-	for {
-		panicked := e.runCommitWorkerOnce(cw)
-		if !panicked {
+	for e.runCommitWorkerOnce(cw) {
+		if !supervise.AwaitRestart(cw.stopC) {
 			return
-		}
-		// Check for shutdown before restarting.
-		select {
-		case <-cw.stopC:
-			return
-		default:
-		}
-		t := time.NewTimer(workerPanicRestartDelay)
-		select {
-		case <-cw.stopC:
-			t.Stop()
-			return
-		case <-t.C:
 		}
 	}
 }
@@ -786,59 +777,17 @@ func (e *Engine) runCommitWorkerLoop(cw *commitWorker) {
 // runCommitWorkerOnce runs the commit worker and recovers from panics.
 // Returns true if the worker panicked, false if it returned normally.
 func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
-			stack := debug.Stack()
-			panicErr := &WorkerPanicError{
-				WorkerID:   cw.workerID,
-				WorkerType: "commit",
-				Value:      r,
-				Stack:      stack,
-			}
-			slog.Error("commit worker panic recovered, restarting",
-				"worker_id", cw.workerID,
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
-			// commitC is deliberately NOT drained here either, for the same
-			// reason as the step-worker recovery: a shard has at most ONE item
-			// in flight (commitPending gates the step worker from producing a
-			// second), so no shard can have both an item in w.batch and an item
-			// in commitC. Clearing a batch node's commitPending therefore cannot
-			// hand the step worker a slot whose pointer is still queued, and the
-			// items that ARE queued belong to other shards, which the restarted
-			// worker processes normally. Draining them instead failed those
-			// unrelated healthy shards permanently.
-			//
-			// Unwedge exactly the nodes whose updates died with the batch.
-			// A blanket clear over every node this worker owns would also
-			// clear nodes the STEP worker is mid-enqueueForCommit for: that
-			// worker sets commitPending before its commitC send, so clearing
-			// it lets the very next processReady call GetUpdate again while
-			// the first update is still in flight. Raft's processed marker
-			// has not advanced yet, so the same committed entries are
-			// extracted TWICE (double Peer.Commit, double apply, double
-			// ReleaseCommittedEntries on one pooled slice), and
-			// getCommitSlot hands back the SAME *commitItem that is still
-			// queued — one pointer enqueued twice. Items in the batch have
-			// already been consumed from commitC and copied into w.batch, so
-			// clearing them is safe; items still in commitC were cleared by
-			// the drain above.
-			cw.clearBatchCommitPending(e.workSignal)
-			// The panic may have unwound out of processBatch before
-			// clearBatch ran, leaving orderedMsgsBuf holding this batch's
-			// VoteResp/HeartbeatResp and batch/commitTimes holding its
-			// updates. The restarted worker would append the NEXT batch's
-			// messages to those survivors and send them after that unrelated
-			// batch's SaveState — sending a vote grant whose HardState was
-			// never persisted (Raft PhD 10.2.1). Safe to touch here: the
-			// worker goroutine is unwinding, so nothing else owns the batch.
-			cw.clearBatch()
+			settleWorkerExit("commit", cw.workerID, r, func(cause error) {
+				cw.recoverAbnormalExit(cause, e.workSignal)
+			})
 		}
 	}()
 	cw.run()
+	normalReturn = true
 	return false
 }
 
@@ -849,23 +798,9 @@ func (e *Engine) runCommitWorkerOnce(cw *commitWorker) (panicked bool) {
 // commit worker, which owns them. The loop exits cleanly when the step stop
 // channel is closed.
 func (e *Engine) runStepWorkerLoop(sw *stepWorker) {
-	for {
-		panicked := e.runStepWorkerOnce(sw)
-		if !panicked {
+	for e.runStepWorkerOnce(sw) {
+		if !supervise.AwaitRestart(sw.stopC) {
 			return
-		}
-		// Check for shutdown before restarting.
-		select {
-		case <-sw.stopC:
-			return
-		default:
-		}
-		t := time.NewTimer(workerPanicRestartDelay)
-		select {
-		case <-sw.stopC:
-			t.Stop()
-			return
-		case <-t.C:
 		}
 	}
 }
@@ -873,61 +808,15 @@ func (e *Engine) runStepWorkerLoop(sw *stepWorker) {
 // runStepWorkerOnce runs the step worker and recovers from panics.
 // Returns true if the worker panicked, false if it returned normally.
 func (e *Engine) runStepWorkerOnce(sw *stepWorker) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
-			stack := debug.Stack()
-			panicErr := &WorkerPanicError{
-				WorkerID:   sw.workerID,
-				WorkerType: "step",
-				Value:      r,
-				Stack:      stack,
-			}
-			slog.Error("step worker panic recovered, restarting",
-				"worker_id", sw.workerID,
-				"panic", fmt.Sprint(r),
-				"stack", string(stack),
-				"error", panicErr,
-			)
-			// commitC is deliberately NOT drained here. A queued item cannot let
-			// the restarted worker reuse the shard's commitItem slot and enqueue
-			// the same pointer twice: getCommitSlot has exactly one caller
-			// (enqueueForCommit), reachable only when commitPending is false;
-			// commitPending is set BEFORE the commitC send and is cleared only by
-			// paths that have already RECEIVED the item from the channel. While a
-			// shard's item sits in commitC its slot is therefore provably
-			// unreachable.
-			//
-			// Draining would be actively harmful: commitWorkers[i] consumes the
-			// SAME channel concurrently, so a drain races the live consumer and
-			// PERMANENTLY fails every unrelated healthy shard whose item it
-			// happens to win — up to CommitCBufferSize (64 by default) of them,
-			// with no automatic reset, from one panic on one shard. The one node
-			// that genuinely needs unwedging is the one mid-enqueueForCommit, and
-			// clearStepCommitPending below handles exactly that. Items left in the
-			// channel are consumed and committed normally by the commit worker.
-			//
-			// Clear commitPending for the ONE node that was mid-enqueueForCommit
-			// (or mid-commitMemoryMode) when the panic hit — its item never
-			// reached commitC/applyC, so nothing else owns it. A blanket clear
-			// over every owned node would race the commit worker's in-flight
-			// batch, which legitimately holds commitPending across SaveState,
-			// causing a double GetUpdate extraction and double apply.
-			sw.clearStepCommitPending()
-			// An update extracted from the Peer but destroyed by this panic
-			// took a durability claim with it: GetUpdate advanced prevState at
-			// extraction, so without this the hard state it carried is never
-			// written and the next update is classified ReadOnly and skips the
-			// WAL too. Wider window than clearStepCommitPending above — a panic
-			// in processCallbacks unwinds before the hand-off even starts.
-			sw.discardExtractedUpdate()
-			// A receive waiting on a local install the panic dropped from
-			// the inbox is answered rather than left waiting for the shard
-			// to stop.
-			sw.answerDroppedInstalls(panicErr)
+			settleWorkerExit("step", sw.workerID, r, sw.recoverAbnormalExit)
 		}
 	}()
 	sw.run()
+	normalReturn = true
 	return false
 }
 
@@ -1017,6 +906,12 @@ type SnapshotRequestOption struct {
 
 	// Exported marks this snapshot as an export operation on the metadata.
 	Exported bool
+
+	// RequestKey identifies the requester waiting on this snapshot. It is
+	// handed back through Callback.OnSnapshotRequestCompleted, after the
+	// shard's snapshot slots are released, and must be non-zero for the
+	// requester to be resolved.
+	RequestKey uint64
 }
 
 // RequestSnapshot submits a snapshot save request for the given shard
@@ -1047,6 +942,7 @@ func (e *Engine) RequestSnapshot(shardID, replicaID uint64, node *Node, opt Snap
 		compactionOverhead: opt.CompactionOverhead,
 		overrideCompaction: opt.OverrideCompaction,
 		exported:           opt.Exported,
+		requestKey:         opt.RequestKey,
 	})
 }
 
@@ -1056,12 +952,28 @@ func (e *Engine) RequestSnapshot(shardID, replicaID uint64, node *Node, opt Snap
 // The snapshot pool worker will read the snapshot from disk and apply
 // it to the state machine via Snapshotter.RecoverFromSnapshot.
 func (e *Engine) RequestSnapshotRecovery(shardID, replicaID uint64, node *Node) error {
-	return e.snapshots.requestSnapshot(snapshotRequest{
-		shardID:   shardID,
-		replicaID: replicaID,
-		node:      node,
-		save:      false,
-	})
+	return e.snapshots.requestRecovery(shardID, replicaID, node)
+}
+
+// FailShard trips node's shard-failure latch for a fault detected outside the
+// engine's own workers, and reports it exactly as the engine reports its own:
+// EventListener.OnShardFailed and Callback.OnShardFailed, once, from whichever
+// failure wins the latch. The shard stays offline until it is reloaded; there
+// is no automatic reset, deliberately. It reports whether this call tripped
+// the latch.
+//
+// It is how the host fails a shard: a snapshot receive whose adopted snapshot
+// cannot be recorded, and the routing mirror of the committed membership fold,
+// which decodes the same entries a second time — runtime failing open where
+// recovery fails closed, over the identical bytes, would leave a replica
+// serving with a routing table that disagrees with the membership raft holds.
+// Going through the one latch-and-report path is what keeps a failure that
+// races an engine-side one from winning the latch without the engine callback,
+// which would leave the host's pending reads undrained.
+//
+// Idempotent, and safe from any goroutine.
+func (e *Engine) FailShard(node *Node, err error) bool {
+	return failShard(node, e.callback, err, nil)
 }
 
 // SetSender replaces the message sender on the engine, all step

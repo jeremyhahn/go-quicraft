@@ -135,7 +135,9 @@ func setupTLSTransport() (*tlsTransportState, error) {
 					continue
 				}
 			}
-			conn.Close()
+			// The connection exists only to be accepted; it carries no data,
+			// so a failed close loses nothing.
+			_ = conn.Close()
 		}
 	}()
 
@@ -143,11 +145,42 @@ func setupTLSTransport() (*tlsTransportState, error) {
 }
 
 // close shuts down the TLS transport: closes the listener, signals the
-// accept loop to exit, and waits for goroutine cleanup.
-func (s *tlsTransportState) close() {
+// accept loop to exit, and waits for goroutine cleanup. It returns the
+// listener's close error.
+func (s *tlsTransportState) close() error {
 	close(s.stopCh)
-	s.listener.Close()
+	err := s.listener.Close()
 	s.done.Wait()
+	return err
+}
+
+// reportClose reports err, returned by shutting down what, on tb. A teardown
+// that fails can leave state the next benchmark trips on, so it is surfaced
+// rather than dropped.
+func reportClose(tb testing.TB, what string, err error) {
+	tb.Helper()
+	if err != nil {
+		tb.Errorf("close %s: %v", what, err)
+	}
+}
+
+// saveToStorage records a Ready's hard state and entries in the node's
+// MemoryStorage, which raft reads its log back from. An error means raft's
+// view of its log is no longer what it persisted, so the caller's event loop
+// stops, as it does when the WAL write fails; the benchmark then fails on its
+// own proposal or election timeout.
+func saveToStorage(storage *raft.MemoryStorage, hs *raftpb.HardState, entries []*raftpb.Entry) error {
+	if !raft.IsEmptyHardState(hs) {
+		if err := storage.SetHardState(hs); err != nil {
+			return fmt.Errorf("set hard state: %w", err)
+		}
+	}
+	if len(entries) > 0 {
+		if err := storage.Append(entries); err != nil {
+			return fmt.Errorf("append entries: %w", err)
+		}
+	}
+	return nil
 }
 
 // walWriter provides a minimal file-based write-ahead log that performs
@@ -367,14 +400,14 @@ func newRequest(key []byte) (uint64, []byte) {
 // proposeAndWait proposes cmd, built by newRequest with id, on node and blocks
 // until that entry has been persisted, committed and applied on node. A
 // rejected proposal returns raft's error; an accepted proposal whose entry
-// does not apply within timeout returns errApplyTimeout.
-func proposeAndWait(node raft.Node, w *waiters, id uint64, cmd []byte, timeout time.Duration) error {
+// does not apply within proposalApplyTimeout returns errApplyTimeout.
+func proposeAndWait(node raft.Node, w *waiters, id uint64, cmd []byte) error {
 	done := w.register(id)
 	if err := node.Propose(context.Background(), cmd); err != nil {
 		w.cancel(id)
 		return err
 	}
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(proposalApplyTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
@@ -506,7 +539,7 @@ func setupWarmup(node raft.Node, proposals, reads *waiters, applied *atomic.Uint
 		key := []byte(fmt.Sprintf("warmup-%d", i))
 		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
 			id, cmd := newRequest(key)
-			return proposeAndWait(node, proposals, id, cmd, proposalApplyTimeout)
+			return proposeAndWait(node, proposals, id, cmd)
 		})
 		if err != nil {
 			return fmt.Errorf("warmup proposal %d: %w", i, err)
@@ -575,7 +608,7 @@ func newEtcdRaftTestNode(b *testing.B, wal *walWriter) *etcdRaftTestNode {
 	}()
 	go runTicker(node, tn.stopCh, tn.tickDone)
 
-	b.Cleanup(tn.stop)
+	b.Cleanup(func() { reportClose(b, "raft node", tn.stop()) })
 
 	if !tn.waitForConfChange(5 * time.Second) {
 		b.Fatalf("etcd/raft: initial ConfChange not processed within timeout")
@@ -688,14 +721,10 @@ func (tn *etcdRaftTestNode) eventLoop() {
 				}
 			}
 
-			// Persist hard state to MemoryStorage regardless of WAL mode.
-			if hasHardState {
-				tn.storage.SetHardState(rd.HardState)
-			}
-
-			// Step 2: Append entries to MemoryStorage for raft internals.
-			if hasEntries {
-				tn.storage.Append(rd.Entries)
+			// Step 2: Record hard state and entries in MemoryStorage for raft
+			// internals, regardless of WAL mode.
+			if err := saveToStorage(tn.storage, rd.HardState, rd.Entries); err != nil {
+				return
 			}
 
 			// Step 3: Apply committed entries through the state machine.
@@ -733,18 +762,20 @@ func (tn *etcdRaftTestNode) eventLoop() {
 
 // stop shuts down the raft node, waits for the event loop goroutine
 // to exit, then closes the WAL file. This ordering prevents the race
-// where the event loop writes to a closed WAL file.
-func (tn *etcdRaftTestNode) stop() {
+// where the event loop writes to a closed WAL file. It returns the WAL's
+// close error.
+func (tn *etcdRaftTestNode) stop() error {
 	if !tn.stopped.CompareAndSwap(false, true) {
-		return
+		return nil
 	}
 	tn.node.Stop()
 	close(tn.stopCh)
 	tn.loopDone.Wait()
 	<-tn.tickDone
 	if tn.wal != nil {
-		tn.wal.close()
+		return tn.wal.close()
 	}
+	return nil
 }
 
 // benchEtcdRaftPropose runs sequential proposals through etcd/raft,
@@ -765,7 +796,7 @@ func benchEtcdRaftPropose(b *testing.B, tn *etcdRaftTestNode, payloadSize int, r
 	for i := 0; i < b.N; i++ {
 		id, cmd := newRequest(key)
 		start := time.Now()
-		if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
+		if err := proposeAndWait(tn.node, tn.proposals, id, cmd); err != nil {
 			b.Fatalf("etcd propose failed at iteration %d: %v", i, err)
 		}
 		rec.Record(time.Since(start))
@@ -807,7 +838,7 @@ func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadS
 			for i := 0; i < n; i++ {
 				id, cmd := newRequest(key)
 				start := time.Now()
-				if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
+				if err := proposeAndWait(tn.node, tn.proposals, id, cmd); err != nil {
 					errCount.Add(1)
 					continue
 				}
@@ -850,7 +881,7 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		}
 		wal, err := newWALWriter(b.TempDir())
 		if err != nil {
-			ts.close()
+			reportClose(b, "TLS transport", ts.close())
 			b.Fatalf("newWALWriter failed in election bench: %v", err)
 		}
 
@@ -875,11 +906,8 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 							return
 						}
 					}
-					if !raft.IsEmptyHardState(rd.HardState) {
-						storage.SetHardState(rd.HardState)
-					}
-					if len(rd.Entries) > 0 {
-						storage.Append(rd.Entries)
+					if saveErr := saveToStorage(storage, rd.HardState, rd.Entries); saveErr != nil {
+						return
 					}
 					for _, entry := range rd.CommittedEntries {
 						if entry.GetType() == raftpb.EntryConfChange {
@@ -934,8 +962,8 @@ func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		close(stopCh)
 		loopDone.Wait()
 		<-tickDone
-		wal.close()
-		ts.close()
+		reportClose(b, "WAL", wal.close())
+		reportClose(b, "TLS transport", ts.close())
 
 		if !elected {
 			b.Fatalf("etcd/raft election did not complete within timeout (iteration %d)", i)
@@ -960,7 +988,7 @@ func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize 
 	for w := 0; w < commitLatencyWarmup; w++ {
 		err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
 			id, cmd := newRequest(key)
-			return proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout)
+			return proposeAndWait(tn.node, tn.proposals, id, cmd)
 		})
 		if err != nil {
 			b.Fatalf("warmup propose failed: %v", err)
@@ -971,7 +999,7 @@ func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize 
 	for i := 0; i < b.N; i++ {
 		id, cmd := newRequest(key)
 		start := time.Now()
-		if err := proposeAndWait(tn.node, tn.proposals, id, cmd, proposalApplyTimeout); err != nil {
+		if err := proposeAndWait(tn.node, tn.proposals, id, cmd); err != nil {
 			b.Fatalf("etcd commit latency propose failed at iteration %d: %v", i, err)
 		}
 		rec.Record(time.Since(start))
@@ -1002,7 +1030,7 @@ func benchEtcdRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 	b.Helper()
 
 	infra := newEtcdClusterInfra(b, numNodes)
-	defer infra.close()
+	defer func() { reportClose(b, "cluster infrastructure", infra.close()) }()
 
 	for i := 0; i < b.N; i++ {
 		cluster := newEtcdCluster(b, infra, uint64(i*numNodes))
@@ -1012,7 +1040,7 @@ func benchEtcdRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 		_, err := cluster.waitForLeader(clusterLeaderTimeout)
 		elapsed := time.Since(start)
 
-		cluster.stopNodes()
+		reportClose(b, "cluster nodes", cluster.stopNodes())
 		if err != nil {
 			b.Fatalf("cluster leader election failed at iteration %d: %v", i, err)
 		}
@@ -1201,11 +1229,8 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 				select {
 				case rd := <-node.Ready():
 					// No WAL persistence in memory mode.
-					if !raft.IsEmptyHardState(rd.HardState) {
-						storage.SetHardState(rd.HardState)
-					}
-					if len(rd.Entries) > 0 {
-						storage.Append(rd.Entries)
+					if saveErr := saveToStorage(storage, rd.HardState, rd.Entries); saveErr != nil {
+						return
 					}
 					for _, entry := range rd.CommittedEntries {
 						if entry.GetType() == raftpb.EntryConfChange {
@@ -1258,7 +1283,7 @@ func benchEtcdRaftElectionMemory(b *testing.B, rec *perfresult.LatencyRecorder) 
 		close(stopCh)
 		loopDone.Wait()
 		<-tickDone
-		ts.close()
+		reportClose(b, "TLS transport", ts.close())
 
 		if !elected {
 			b.Fatalf("etcd/raft (memory) election did not complete within timeout (iteration %d)", i)

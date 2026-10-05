@@ -34,6 +34,17 @@ type EntryQueue[T any] struct {
 	mu       sync.Mutex
 	writeBuf []T
 	maxLen   int
+	// batch is the id of the batch being filled, starting at 1. Items added
+	// while it reads b are taken by the Swap that takes batch b, which then
+	// moves it past b. AddTracked records it.
+	batch uint64
+	// handedOff is the highest batch id the consumer has declared handed on
+	// (HandOff). A tracked item is handed off once its batch id is at or
+	// below it, which is what Taken reports.
+	handedOff uint64
+	// closed is set once by Close; from then on nothing is added or taken,
+	// and nothing more is handed off.
+	closed bool
 }
 
 // NewEntryQueue creates an EntryQueue with the given initial capacity
@@ -43,6 +54,7 @@ func NewEntryQueue[T any](initCap, maxLen int) *EntryQueue[T] {
 	return &EntryQueue[T]{
 		writeBuf: make([]T, 0, initCap),
 		maxLen:   maxLen,
+		batch:    1,
 	}
 }
 
@@ -52,14 +64,61 @@ func NewEntryQueue[T any](initCap, maxLen int) *EntryQueue[T] {
 //
 // Safe for concurrent use by multiple producer goroutines.
 func (q *EntryQueue[T]) Add(items []T) bool {
+	return q.AddTracked(items, nil)
+}
+
+// AddTracked is Add that also records, in *at, the generation the items were
+// added under (a non-zero value; *at is left untouched when the add is
+// refused). The write happens under the queue's lock, so Taken can never
+// observe the items taken before *at is set. at may be nil.
+func (q *EntryQueue[T]) AddTracked(items []T, at *uint64) bool {
 	q.mu.Lock()
-	if len(q.writeBuf)+len(items) > q.maxLen {
+	if q.closed || len(q.writeBuf)+len(items) > q.maxLen {
 		q.mu.Unlock()
 		return false
 	}
 	q.writeBuf = append(q.writeBuf, items...)
+	if at != nil {
+		*at = q.batch
+	}
 	q.mu.Unlock()
 	return true
+}
+
+// Taken reports whether the items whose batch AddTracked recorded in *at have
+// been handed off — taken by SwapBatch AND declared handed on by HandOff —
+// and whether the queue is closed. A zero *at (never added) is not taken.
+// Once closed is true the answer is final: nothing is handed off after Close.
+func (q *EntryQueue[T]) Taken(at *uint64) (taken, closed bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return *at != 0 && *at <= q.handedOff, q.closed
+}
+
+// HandOff declares the batch SwapBatch returned as id handed on by the
+// consumer — the moment it is given to its destination — and reports true. It
+// reports false, declaring nothing, once the queue is closed: the consumer
+// must then not hand the batch on, since Taken has already reported its items
+// final and untaken. A batch that is taken but never handed off stays
+// untaken.
+func (q *EntryQueue[T]) HandOff(id uint64) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return false
+	}
+	if id > q.handedOff {
+		q.handedOff = id
+	}
+	return true
+}
+
+// Close stops the queue: every later Add is refused and every later Swap
+// takes nothing. Items still queued are never taken. Idempotent.
+func (q *EntryQueue[T]) Close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
 }
 
 // AddOne appends a single item to the write buffer. Returns true if the
@@ -70,7 +129,7 @@ func (q *EntryQueue[T]) Add(items []T) bool {
 // Safe for concurrent use by multiple producer goroutines.
 func (q *EntryQueue[T]) AddOne(item T) bool {
 	q.mu.Lock()
-	if len(q.writeBuf) >= q.maxLen {
+	if q.closed || len(q.writeBuf) >= q.maxLen {
 		q.mu.Unlock()
 		return false
 	}
@@ -87,11 +146,20 @@ func (q *EntryQueue[T]) AddOne(item T) bool {
 //
 // Must only be called by the single consumer (step worker).
 func (q *EntryQueue[T]) Swap(buf []T) []T {
+	items, _ := q.SwapBatch(buf)
+	return items
+}
+
+// SwapBatch is Swap that also returns the id of the batch it took, for
+// HandOff; 0 when it took nothing.
+func (q *EntryQueue[T]) SwapBatch(buf []T) ([]T, uint64) {
 	q.mu.Lock()
-	if len(q.writeBuf) == 0 {
+	if q.closed || len(q.writeBuf) == 0 {
 		q.mu.Unlock()
-		return buf[:0]
+		return buf[:0], 0
 	}
+	id := q.batch
+	q.batch++
 	result := q.writeBuf
 	// Reuse the caller's buffer as the new write buffer. Reset length
 	// to 0 but keep the backing array to avoid allocation. Zero the
@@ -109,7 +177,7 @@ func (q *EntryQueue[T]) Swap(buf []T) []T {
 		q.writeBuf = make([]T, 0, cap(result))
 	}
 	q.mu.Unlock()
-	return result
+	return result, id
 }
 
 // Len returns the number of items currently in the write buffer.

@@ -515,8 +515,9 @@ func TestMsgRecvBudget_PerConnectionCompressedDeltaRejected(t *testing.T) {
 	tr, conn := liveConn(t)
 
 	// Leave only a small slice of this connection's sub-budget available, as
-	// concurrent in-flight frames from the same peer would.
-	const headroom = int64(16 * 1024)
+	// concurrent in-flight frames from the same peer would. The sub-budget is
+	// charged in proto.DecodeCharge units, so the slice is too.
+	headroom := proto.DecodeCharge(16 * 1024)
 	preReserve := tr.maxConnMsgRecv - headroom
 	if preReserve <= 0 {
 		t.Fatalf("test setup: per-connection budget %d is too small", tr.maxConnMsgRecv)
@@ -529,8 +530,8 @@ func TestMsgRecvBudget_PerConnectionCompressedDeltaRejected(t *testing.T) {
 	// the declared decompressed size does not.
 	raw := make([]byte, 64*1024)
 	compressed := snappyEncode(nil, raw)
-	if int64(len(compressed)) >= headroom {
-		t.Fatalf("test setup: compressed length %d must fit the headroom %d", len(compressed), headroom)
+	if charge := proto.DecodeCharge(int64(len(compressed))); charge >= headroom {
+		t.Fatalf("test setup: compressed frame charge %d must fit the headroom %d", charge, headroom)
 	}
 
 	aggregateBefore := tr.msgRecvBudget.Load()

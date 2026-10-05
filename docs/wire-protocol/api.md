@@ -152,8 +152,11 @@ rejection is indistinguishable from a broken connection at the sender.
 `MaxDecodeMemoryFactor` is not checked by the codec. It is the measured
 heap-per-wire-byte ceiling of a decode, and the transport charges every inbound
 frame at that multiple against `TransportConfig.MaxMessageReceiveMemory`, so
-the budget bounds decoded heap: 256 MB admits at most 32 MB of frames in
-flight.
+the budget bounds decoded heap. `DecodeCharge(n)` is that charge for `n` wire
+bytes, saturating at `MaxInt64`, and `FrameDecodeCharge(wireLen, decodedLen)` is
+the charge for one frame including its decompression delta. The default budget
+is four maximum-size frame charges, 512 MB, which admits at most 64 MB of
+frames in flight.
 
 ### Entry types and masks
 

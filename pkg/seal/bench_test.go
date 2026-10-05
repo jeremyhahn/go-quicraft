@@ -17,8 +17,10 @@ package seal
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 )
 
@@ -61,6 +63,78 @@ func BenchmarkBarrier_Encrypt_64B(b *testing.B) {
 	for b.Loop() {
 		_, _ = barrier.Encrypt(nil, plaintext)
 	}
+}
+
+// BenchmarkBarrier_Encrypt_64B_Parallel measures Encrypt under contention,
+// where every call admits its nonce into the shared nonce tracker. Run it with
+// a fixed -benchtime=Nx below DefaultMaxTrackedNonces: past the ceiling the
+// tracker saturates and takes the cheaper check-only path.
+func BenchmarkBarrier_Encrypt_64B_Parallel(b *testing.B) {
+	barrier := benchBarrier(b)
+	plaintext := make([]byte, 64)
+	rand.Read(plaintext)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(64)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = barrier.Encrypt(nil, plaintext)
+		}
+	})
+}
+
+// benchTrackerClearEvery bounds tracker memory in the tracker benchmarks:
+// each goroutine clears after this many admissions, so the measured path is
+// always admission and never the saturated check-only path.
+const benchTrackerClearEvery = 1 << 18
+
+// BenchmarkNonceTracker_CheckAndRecordNonce measures the uncontended
+// admission path that every Encrypt takes.
+func BenchmarkNonceTracker_CheckAndRecordNonce(b *testing.B) {
+	nt := NewNonceTracker(true)
+	nt.SetMaxTrackedNonces(0)
+	var nonce [NonceSize]byte
+
+	b.ReportAllocs()
+	var i uint64
+	for b.Loop() {
+		i++
+		binary.LittleEndian.PutUint64(nonce[:8], i)
+		if err := nt.CheckAndRecordNonce(nonce[:]); err != nil {
+			b.Fatal(err)
+		}
+		if i%benchTrackerClearEvery == 0 {
+			_ = nt.Clear()
+		}
+	}
+}
+
+// BenchmarkNonceTracker_CheckAndRecordNonce_Parallel measures admission under
+// contention, with concurrent Clears at the epoch boundaries.
+func BenchmarkNonceTracker_CheckAndRecordNonce_Parallel(b *testing.B) {
+	nt := NewNonceTracker(true)
+	nt.SetMaxTrackedNonces(0)
+	var goroutine atomic.Uint32
+
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		var nonce [NonceSize]byte
+		binary.LittleEndian.PutUint32(nonce[8:], goroutine.Add(1))
+		var i uint64
+		for pb.Next() {
+			i++
+			binary.LittleEndian.PutUint64(nonce[:8], i)
+			// Every nonce is unique, so any error is a defect.
+			if err := nt.CheckAndRecordNonce(nonce[:]); err != nil {
+				b.Error(err)
+				return
+			}
+			if i%benchTrackerClearEvery == 0 {
+				_ = nt.Clear()
+			}
+		}
+	})
 }
 
 func BenchmarkBarrier_Encrypt_1KB(b *testing.B) {

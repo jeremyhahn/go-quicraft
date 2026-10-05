@@ -48,7 +48,6 @@ func TestSendQueueWorkerPanicRecovery(t *testing.T) {
 
 	panicTarget := "panic-target"
 	done := make(chan struct{})
-	tr.wg.Add(1) // balance the defer wg.Done() inside sendQueueWorker
 	go func() {
 		defer close(done)
 		// Call the recovery-protected worker. The worker will try to
@@ -358,7 +357,6 @@ func TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	tr.wg.Add(1) // balance the defer wg.Done() inside sendQueueWorker
 	go func() {
 		defer close(done)
 		tr.sendQueueWorker("resume-target", sq)
@@ -433,7 +431,6 @@ func TestConnectionCleanupRestartsAfterPanic(t *testing.T) {
 	tr.stopC = testStopC
 
 	done := make(chan struct{})
-	tr.wg.Add(1) // balance the defer wg.Done() inside connectionCleanup
 	go func() {
 		defer close(done)
 		tr.connectionCleanup()
@@ -507,7 +504,6 @@ func TestSendQueueWorkerExitsCleanlyOnStopSignal(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	tr.wg.Add(1) // balance the defer wg.Done() inside sendQueueWorker
 	go func() {
 		defer close(done)
 		tr.sendQueueWorker("clean-exit-target", sq)

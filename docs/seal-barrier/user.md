@@ -226,8 +226,10 @@ rotation**: the host-wide rotation loop only rotates the `WithBarrier` barrier.
 All barriers must be initialized and unsealed before use.
 
 Shut down through `Host.Close()`, which drains the pipeline, closes the LogDB and
-then seals the `WithBarrier` barrier. Per-shard barriers and every strategy are
-yours to seal and close after `Close` returns. Calling `Barrier.Seal()` directly
+then seals the `WithBarrier` barrier and every barrier the `WithShardBarriers`
+resolver returned, once even when shards share it (sharing is pointer identity:
+return the same `*seal.Barrier` for every shard of a tenant). Every strategy is yours
+to close after `Close` returns. Calling `Barrier.Seal()` directly
 on a running host gives the engine an `ErrBarrierSealed` storm.
 
 ## Set `MinEpoch`

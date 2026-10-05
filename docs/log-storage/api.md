@@ -91,6 +91,11 @@ snapshot silently.
 | `ErrEntriesBelowCompactionFloor` (`*EntriesBelowCompactionFloorError`) | an `Update` whose first entry is at or below the floor. The whole batch is refused and nothing is stored: those indexes are already deleted, so writing them would replace the live suffix above the floor with entries nothing can serve. |
 | `ErrReplicaRetired` | a write names a node `RemoveNodeData` removed |
 
+`ErrCompacted` and `ErrUnavailable` are also the Raft log's own errors for a
+compacted index and an index past the end of the log; it has no separate
+sentinel. Match them with `errors.Is` wherever they surface, including in a
+`ShardFailedInfo.Err` or a `CommitError`.
+
 [engineering.md](engineering.md#recovery-error-reference) covers `waldb`'s
 errors and which paths fail closed.
 
@@ -105,6 +110,14 @@ each one enables a capability without changing a contract.
 | `EpochAwareLogDB` | `MinLiveEpoch() (uint64, error)` | the safe-purge floor for barrier DEKs. `0` with a nil error means no encrypted records, or no barrier. |
 | `PerBarrierEpochAwareLogDB` | `MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)` | the same floor, restricted to one barrier's records |
 | `BarrierShardEnumerator` | `ShardsForBarrier(barrier any) (shards []uint64, known bool)` | the complete shard set behind a barrier, when that set is fixed |
+
+The `barrier` handle in the last two is matched with `logdb.SameBarrier(a, b any)
+bool`, the one identity rule the host, the snapshot pool and `waldb` also use:
+identity is pointer identity, and a nil or non-pointer handle matches nothing,
+not even a copy of itself. The handle's dynamic value need not be comparable,
+so an implementation must never compare it with `==` or use it as a map key
+(either panics on a value holding a slice or map), and must answer
+`known == false` for a handle that is not a pointer.
 
 `waldb.DB` implements the first three; `memdb.MemDB` implements
 `AtRestProtectedLogDB` (reporting `AtRestNonDurable`). Nothing in this
@@ -122,9 +135,7 @@ purging any DEK:
 | `known == true, epoch > 0` | the oldest live record under this barrier is at `epoch` | not below `epoch` |
 
 With two return values, "unknown barrier" and "zero live records" look the
-same, and reading the first as the second over-purges. The `barrier` argument
-is an opaque, comparable handle (the value the caller installed), compared by
-identity.
+same, and reading the first as the second over-purges.
 
 ### Types
 
@@ -236,6 +247,9 @@ func DefaultFS() FS
 `File` is `Read`, `ReadAt`, `Write`, `WriteAt`, `Seek`, `Stat`, `Truncate`,
 `Sync` and `Close`. `FileMetadataSyncer` (`SyncMetadata`) and
 `FilePreAllocator` (`PreAllocate`) are optional and found by type assertion.
+`FileMetadataSyncer` is an alias of `fsutil.MetadataSyncer`: every directory
+fsync goes through `fsutil.SyncDirWith`, which uses `SyncMetadata` when the
+handle has it.
 `Rename` is required: an embedder's own `FS` must provide it.
 
 ### The barrier seam

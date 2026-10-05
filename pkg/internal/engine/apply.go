@@ -25,6 +25,7 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
@@ -421,12 +422,17 @@ func (w *applyWorker) dispatch(item *applyItem) {
 		// SM.Apply is in flight after the unload completes.
 		exited := make(chan struct{})
 		w.shardExits[shardID] = exited
-		w.wg.Add(1)
-		go func() {
-			defer close(exited)
-			defer w.wg.Done()
-			w.runShardApply(ch)
-		}()
+		// Supervised: a runtime.Goexit in user code (SM.Apply, a callback)
+		// ends the goroutine, which recover cannot prevent; the batch is
+		// settled by runShardApply's deferred check and the goroutine is
+		// restarted on a fresh one. exited closes only on the final exit.
+		closeExited := sync.OnceFunc(func() { close(exited) })
+		supervise.Supervise(w.wg, w.stopC,
+			func() {
+				w.runShardApply(ch)
+				closeExited()
+			},
+			closeExited)
 	}
 	// Send to the per-shard channel with backpressure monitoring.
 	// If the shard's channel is full (slow state machine Apply),
@@ -500,16 +506,14 @@ func (w *applyWorker) failInFlightItem(item *applyItem) {
 			ReplicaID: node.replicaID,
 			Err:       errApplyDispatcherPanic,
 		}
-		// Report proposals before releasing the pooled entries below.
-		if w.callback != nil {
-			w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries, applyErr)
-		}
-		node.markFailed()
-		if w.callback != nil {
-			w.callback.OnShardFailed(node.shardID, applyErr)
-		}
+		// The batch's proposals are failed before the pooled entries are
+		// released below.
+		failShard(node, w.callback, applyErr, func() {
+			if w.callback != nil {
+				w.callback.OnProposalFailed(node.shardID, item.update.CommittedEntries, applyErr)
+			}
+		})
 		node.commitPending.Store(false)
-		node.handleError(applyErr)
 	}
 	item.update.ReleaseCommittedEntries()
 	// applyPool is always set in production; guard only so the panic-recovery
@@ -609,16 +613,25 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			// decompression, etc). A panicking SM must not crash the
 			// entire host process. The shard is marked as failed via
 			// the circuit breaker so it becomes unavailable, but all
-			// other shards continue operating normally.
+			// other shards continue operating normally. A runtime.Goexit,
+			// which recover cannot see, leaves the batch's outcome just as
+			// unknown and is settled the same way: the body below did not
+			// reach its normal return (supervise.ClassifyExit).
+			normalReturn := false
 			defer func() {
-				if r := recover(); r != nil {
+				if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 					stack := debug.Stack()
-					slog.Error("state machine panic recovered",
-						"shard", node.shardID,
-						"replica", node.replicaID,
-						"panic", fmt.Sprint(r),
-						"stack", string(stack),
-					)
+					// Settled first (below); the diagnostic is emitted last and
+					// contained, so neither a slog handler nor the panic value's own
+					// methods can skip the settlement.
+					defer supervise.LogContained(func() {
+						slog.Error("state machine panic recovered",
+							"shard", node.shardID,
+							"replica", node.replicaID,
+							"panic", fmt.Sprint(r),
+							"stack", string(stack),
+						)
+					})
 					panicErr := &SMPanicError{
 						ShardID:   node.shardID,
 						ReplicaID: node.replicaID,
@@ -632,210 +645,214 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 					// StopShard/Close and the host's pendingOps never drops, so
 					// Drain always times out. failApply and failInFlightItem
 					// handle their own terminal batches the same way.
-					if w.callback != nil {
-						w.callback.OnProposalFailed(node.shardID, entries, panicErr)
-					}
-					node.markFailed()
-					if w.callback != nil {
-						w.callback.OnShardFailed(node.shardID, panicErr)
-					}
-					node.handleError(panicErr)
+					failShard(node, w.callback, panicErr, func() {
+						if w.callback != nil {
+							w.callback.OnProposalFailed(node.shardID, entries, panicErr)
+						}
+					})
 				}
 			}()
 
-			// An empty batch never touches the state machine, so it must
-			// NOT wait on the recovering/saving gate below: parking it
-			// would hold commitPending — and with it the shard's whole
-			// pipeline — for the entire, unbounded duration of user
-			// RecoverFromSnapshot/SaveSnapshot code, for a batch that has
-			// nothing to apply. Memory mode forwards such batches (a hard
-			// state change with no committed entries) on every update.
-			if len(entries) == 0 {
-				return
-			}
-
-			// If a snapshot recovery OR a snapshot-save capture is in
-			// progress, WAIT for the gate to clear rather than dropping the
-			// batch. Raft's processed marker already advanced past these
-			// entries in Peer.Commit, so a dropped batch is never
-			// re-delivered and the state machine would silently diverge.
-			// The gate exists to avoid concurrent state machine access
-			// between the snapshot-pool goroutine and this apply goroutine:
-			// recovery replaces SM state; the save capture reads shared
-			// in-memory state (the session manager, which is not safe for
-			// concurrent use, and a regular in-memory SM).
-			//
-			// The Add(-1)/recheck/Add(+1) handshake pairs with the snapshot
-			// worker's set-flag-then-drain protocol: either this apply's
-			// in-flight registration is visible to WaitForApplyDrain, or
-			// the flag is visible here and we back off, releasing the slot
-			// so the drain can complete.
-			for node.IsRecovering() || node.IsSaving() {
-				node.applyInFlight.Add(-1)
-				stopped := false
-				select {
-				case <-node.StopC():
-					stopped = true
-				default:
-					time.Sleep(50 * time.Microsecond)
-				}
-				node.applyInFlight.Add(1)
-				if stopped {
-					// Shard is stopping. The entries are durable in the
-					// WAL; restart re-derives the apply frontier from
-					// LogDB state, so abandoning them here is safe.
+			func() {
+				// An empty batch never touches the state machine, so it must
+				// NOT wait on the recovering/saving gate below: parking it
+				// would hold commitPending — and with it the shard's whole
+				// pipeline — for the entire, unbounded duration of user
+				// RecoverFromSnapshot/SaveSnapshot code, for a batch that has
+				// nothing to apply. Memory mode forwards such batches (a hard
+				// state change with no committed entries) on every update.
+				if len(entries) == 0 {
 					return
 				}
-			}
 
-			// A completed recovery replaced SM state with a snapshot that
-			// may already cover a prefix (or all) of this batch. Skip
-			// covered entries: they are represented in the recovered state
-			// and re-applying them would double-apply. The save gate never
-			// moves lastApplied, so this filter is a no-op for it — and in
-			// normal operation entries[0].Index == lastApplied+1.
-			la := node.lastApplied.Load()
-			if len(entries) > 0 && entries[0].Index <= la {
-				skip := 0
-				for skip < len(entries) && entries[skip].Index <= la {
-					skip++
+				// If a snapshot recovery OR a snapshot-save capture is in
+				// progress, WAIT for the gate to clear rather than dropping the
+				// batch. Raft's processed marker already advanced past these
+				// entries in Peer.Commit, so a dropped batch is never
+				// re-delivered and the state machine would silently diverge.
+				// The gate exists to avoid concurrent state machine access
+				// between the snapshot-pool goroutine and this apply goroutine:
+				// recovery replaces SM state; the save capture reads shared
+				// in-memory state (the session manager, which is not safe for
+				// concurrent use, and a regular in-memory SM).
+				//
+				// The Add(-1)/recheck/Add(+1) handshake pairs with the snapshot
+				// worker's set-flag-then-drain protocol: either this apply's
+				// in-flight registration is visible to WaitForApplyDrain, or
+				// the flag is visible here and we back off, releasing the slot
+				// so the drain can complete.
+				for node.IsRecovering() || node.IsSaving() {
+					node.applyInFlight.Add(-1)
+					stopped := false
+					select {
+					case <-node.StopC():
+						stopped = true
+					default:
+						time.Sleep(50 * time.Microsecond)
+					}
+					node.applyInFlight.Add(1)
+					if stopped {
+						// Shard is stopping. The entries are durable in the
+						// WAL; restart re-derives the apply frontier from
+						// LogDB state, so abandoning them here is safe.
+						return
+					}
 				}
-				entries = entries[skip:]
-			}
 
-			if len(entries) == 0 {
-				return
-			}
+				// A completed recovery replaced SM state with a snapshot that
+				// may already cover a prefix (or all) of this batch. Skip
+				// covered entries: they are represented in the recovered state
+				// and re-applying them would double-apply. The save gate never
+				// moves lastApplied, so this filter is a no-op for it — and in
+				// normal operation entries[0].Index == lastApplied+1.
+				la := node.lastApplied.Load()
+				if len(entries) > 0 && entries[0].Index <= la {
+					skip := 0
+					for skip < len(entries) && entries[skip].Index <= la {
+						skip++
+					}
+					entries = entries[skip:]
+				}
 
-			// The batch must continue exactly where the last one stopped.
-			// A higher first index means an earlier batch was dropped (an
-			// unloaded-shard skip, a shutdown drop, a failed Peer.Commit).
-			// The missing range can never be re-offered, so applying this
-			// batch would silently skip committed entries and keep the shard
-			// serving reads from a divergent state machine. Fail the shard
-			// instead.
-			//
-			// The check covers la == 0 as well. A zero applied marker is not
-			// an "unknown frontier" that has to be trusted: node.lastApplied
-			// is seeded to raft's processed marker before the node enters the
-			// pipeline (Host.StartShard: SetProcessedIndex then
-			// SeedLastApplied) and to the snapshot index by snapshot recovery,
-			// so la == 0 means raft.processed == 0 and raft offers batches
-			// starting at index 1. A first batch above index 1 with la == 0
-			// therefore means entries were lost — exactly the drop this guard
-			// exists to catch, and the only window the three drop paths
-			// (unloaded skip, shutdown drop, failed Peer.Commit) were not
-			// covered in.
-			if entries[0].Index != la+1 {
-				slog.Error("committed entry gap before apply",
-					"shard", node.shardID,
-					"replica", node.replicaID,
-					"last_applied", la,
-					"batch_first_index", entries[0].Index,
-				)
-				w.failApply(node, entries, ErrApplyGap)
-				return
-			}
-			// Grow pre-allocated results slice if needed.
-			if cap(results) < len(entries) {
-				results = make([]sm.Result, len(entries))
-			}
-			results = results[:len(entries)]
+				if len(entries) == 0 {
+					return
+				}
 
-			// Decompress entry payloads before applying to the state
-			// machine. The maxSize limit prevents decompression bomb
-			// attacks from malicious entries in the log.
-			maxDecompressSize := int(node.cfg.MaxEntrySize)
-			err := checkDecompressedSize(entries, maxDecompressSize)
-			if err == nil {
-				err = raft.DecompressEntries(entries, maxDecompressSize)
-			}
-			if err != nil {
-				// Fail-fast: a decompression error means these committed
-				// entries cannot be applied. Skipping them while advancing
-				// lastApplied would silently diverge this state machine
-				// from its peers, violating Raft's state-machine safety
-				// property. Instead, fail pending proposals, mark the shard
-				// failed (lastApplied is NOT advanced), and take it offline
-				// until reload/snapshot recovery — mirroring the SM-panic
-				// recovery path above.
-				w.failApply(node, entries, err)
-				return
-			}
+				// The batch must continue exactly where the last one stopped.
+				// A higher first index means an earlier batch was dropped (an
+				// unloaded-shard skip, a shutdown drop, a failed Peer.Commit).
+				// The missing range can never be re-offered, so applying this
+				// batch would silently skip committed entries and keep the shard
+				// serving reads from a divergent state machine. Fail the shard
+				// instead.
+				//
+				// The check covers la == 0 as well. A zero applied marker is not
+				// an "unknown frontier" that has to be trusted: node.lastApplied
+				// is seeded to raft's processed marker before the node enters the
+				// pipeline (Host.StartShard: SetProcessedIndex then
+				// SeedLastApplied) and to the snapshot index by snapshot recovery,
+				// so la == 0 means raft.processed == 0 and raft offers batches
+				// starting at index 1. A first batch above index 1 with la == 0
+				// therefore means entries were lost — exactly the drop this guard
+				// exists to catch, and the only window the three drop paths
+				// (unloaded skip, shutdown drop, failed Peer.Commit) were not
+				// covered in.
+				if entries[0].Index != la+1 {
+					slog.Error("committed entry gap before apply",
+						"shard", node.shardID,
+						"replica", node.replicaID,
+						"last_applied", la,
+						"batch_first_index", entries[0].Index,
+					)
+					w.failApply(node, entries, ErrApplyGap)
+					return
+				}
+				// Grow pre-allocated results slice if needed.
+				if cap(results) < len(entries) {
+					results = make([]sm.Result, len(entries))
+				}
+				results = results[:len(entries)]
 
-			// Acquire the semaphore to limit concurrent Apply calls and
-			// release it via defer relative to the Apply call, so a
-			// panicking user SM.Apply (recovered above) cannot leak the
-			// slot. Leaking enough slots across distinct panicking shards
-			// would deadlock all applies.
-			func() {
-				w.sem <- struct{}{}
-				defer func() { <-w.sem }()
-				applyStart := time.Now()
-				err = node.sm.Apply(entries, results)
-				applyElapsed := time.Since(applyStart)
+				// Decompress entry payloads before applying to the state
+				// machine. The maxSize limit prevents decompression bomb
+				// attacks from malicious entries in the log.
+				maxDecompressSize := int(node.cfg.MaxEntrySize)
+				err := checkDecompressedSize(entries, maxDecompressSize)
+				if err == nil {
+					err = raft.DecompressEntries(entries, maxDecompressSize)
+				}
+				if err != nil {
+					// Fail-fast: a decompression error means these committed
+					// entries cannot be applied. Skipping them while advancing
+					// lastApplied would silently diverge this state machine
+					// from its peers, violating Raft's state-machine safety
+					// property. Instead, fail pending proposals, mark the shard
+					// failed (lastApplied is NOT advanced), and take it offline
+					// until reload/snapshot recovery — mirroring the SM-panic
+					// recovery path above.
+					w.failApply(node, entries, err)
+					return
+				}
+
+				// applyElapsed is reported once the batch is applied and
+				// recorded (below), outside the window in which the state
+				// machine has applied it but lastApplied does not show it.
+				var applyElapsed time.Duration
+				// Acquire the semaphore to limit concurrent Apply calls and
+				// release it via defer relative to the Apply call, so a
+				// panicking user SM.Apply (recovered above) cannot leak the
+				// slot. Leaking enough slots across distinct panicking shards
+				// would deadlock all applies.
+				func() {
+					w.sem <- struct{}{}
+					defer func() { <-w.sem }()
+					applyStart := time.Now()
+					err = node.sm.Apply(entries, results)
+					applyElapsed = time.Since(applyStart)
+					slog.Debug("state machine apply completed",
+						"shard", node.shardID,
+						"replica", node.replicaID,
+						"entries", len(entries),
+						"apply_ns", applyElapsed.Nanoseconds(),
+					)
+				}()
+
+				if err != nil {
+					// Fail-fast: an SM.Apply error is terminal. See the
+					// decompression path above for the safety rationale.
+					w.failApply(node, entries, err)
+					return
+				}
+				// Notify callback before resetting circuit breaker state.
+				// This allows the Host to complete pending proposals with
+				// the apply results before any other state changes.
+				if w.callback != nil {
+					w.callback.OnApplied(node.shardID, entries, results[:len(entries)])
+				}
+				// Update lastApplied (and its term) to the highest index in the
+				// batch. The term is stored together with the index so the snapshot
+				// pool can read a consistent (index, term) pair for the snapshot
+				// point while applies are quiesced.
+				lastEntry := &entries[len(entries)-1]
+				lastIdx := lastEntry.Index
+				node.lastApplied.Store(lastIdx)
+				node.lastAppliedTerm.Store(lastEntry.Term)
 				if w.metrics != nil {
 					w.metrics.ObserveApplyLatency(node.shardID, applyElapsed)
 				}
-				slog.Debug("state machine apply completed",
-					"shard", node.shardID,
-					"replica", node.replicaID,
-					"entries", len(entries),
-					"apply_ns", applyElapsed.Nanoseconds(),
-				)
-			}()
 
-			if err != nil {
-				// Fail-fast: an SM.Apply error is terminal. See the
-				// decompression path above for the safety rationale.
-				w.failApply(node, entries, err)
-				return
-			}
-			// Notify callback before resetting circuit breaker state.
-			// This allows the Host to complete pending proposals with
-			// the apply results before any other state changes.
-			if w.callback != nil {
-				w.callback.OnApplied(node.shardID, entries, results[:len(entries)])
-			}
-			// Update lastApplied (and its term) to the highest index in the
-			// batch. The term is stored together with the index so the snapshot
-			// pool can read a consistent (index, term) pair for the snapshot
-			// point while applies are quiesced.
-			lastEntry := &entries[len(entries)-1]
-			lastIdx := lastEntry.Index
-			node.lastApplied.Store(lastIdx)
-			node.lastAppliedTerm.Store(lastEntry.Term)
-
-			// Auto-snapshot trigger: if SnapshotEntries is configured and
-			// enough entries have been applied since the last snapshot,
-			// submit a snapshot request to the pool.
-			if w.snapshotPool != nil && node.cfg.SnapshotEntries > 0 {
-				lastSnap := node.lastSnapshotIndex.Load()
-				if lastIdx-lastSnap >= node.cfg.SnapshotEntries {
-					if node.snapshotting.CompareAndSwap(false, true) {
-						// Capture appliedToTerm before dispatching to the
-						// pool. commitPending is still true here (cleared
-						// in the deferred function above), so the step
-						// worker cannot be writing inMemory.appliedToTerm
-						// concurrently. Reading it here is race-free.
-						var term uint64
-						if peer := node.Peer(); peer != nil {
-							term = peer.AppliedToTerm()
-						}
-						if err := w.snapshotPool.requestSnapshot(snapshotRequest{
-							shardID:       node.shardID,
-							replicaID:     node.replicaID,
-							node:          node,
-							appliedToTerm: term,
-							save:          true,
-						}); err != nil {
-							// Request rejected (pool full or duplicate).
-							// Clear the flag so future triggers can retry.
-							node.snapshotting.Store(false)
+				// Auto-snapshot trigger: if SnapshotEntries is configured and
+				// enough entries have been applied since the last snapshot,
+				// submit a snapshot request to the pool.
+				if w.snapshotPool != nil && node.cfg.SnapshotEntries > 0 {
+					lastSnap := node.lastSnapshotIndex.Load()
+					if lastIdx-lastSnap >= node.cfg.SnapshotEntries {
+						if node.snapshotting.CompareAndSwap(false, true) {
+							// Capture appliedToTerm before dispatching to the
+							// pool. commitPending is still true here (cleared
+							// in the deferred function above), so the step
+							// worker cannot be writing inMemory.appliedToTerm
+							// concurrently. Reading it here is race-free.
+							var term uint64
+							if peer := node.Peer(); peer != nil {
+								term = peer.AppliedToTerm()
+							}
+							if err := w.snapshotPool.requestSnapshot(snapshotRequest{
+								shardID:       node.shardID,
+								replicaID:     node.replicaID,
+								node:          node,
+								appliedToTerm: term,
+								save:          true,
+							}); err != nil {
+								// Request rejected (pool full or duplicate).
+								// Clear the flag so future triggers can retry.
+								node.snapshotting.Store(false)
+							}
 						}
 					}
 				}
-			}
+			}()
+			normalReturn = true
 		}()
 	}
 }
@@ -880,14 +897,11 @@ func (w *applyWorker) failApply(node *Node, entries []proto.Entry, err error) {
 		ReplicaID: node.replicaID,
 		Err:       err,
 	}
-	if w.callback != nil {
-		w.callback.OnProposalFailed(node.shardID, entries, applyErr)
-	}
-	node.markFailed()
-	if w.callback != nil {
-		w.callback.OnShardFailed(node.shardID, applyErr)
-	}
-	node.handleError(applyErr)
+	failShard(node, w.callback, applyErr, func() {
+		if w.callback != nil {
+			w.callback.OnProposalFailed(node.shardID, entries, applyErr)
+		}
+	})
 }
 
 // requestUnload sends a shard removal request to the dispatcher goroutine

@@ -125,12 +125,7 @@ func generateTLSCerts(b testing.TB, dir string, numNodes int) []tlsCertBundle {
 // writePEM encodes the given DER data as a PEM block and writes it to path.
 func writePEM(b testing.TB, path, blockType string, data []byte) {
 	b.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		b.Fatalf("create %s: %v", path, err)
-	}
-	defer f.Close()
-	if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: data}); err != nil {
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: data}), 0o600); err != nil {
 		b.Fatalf("write PEM %s: %v", path, err)
 	}
 }

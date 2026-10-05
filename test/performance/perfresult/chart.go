@@ -186,7 +186,7 @@ func GenerateSystemChart(suite *BenchmarkSuite, outPath string) error {
 
 		// Section separator.
 		sepY := y + chartBarHeight + chartBarGap + chartScenarioGap - chartSectionBorder
-		writeLine(&sb, 20, sepY, chartTotalWidth-20, sepY, colorSeparator, 1)
+		writeSeparator(&sb, 20, chartTotalWidth-20, sepY)
 
 		y += rowH
 	}
@@ -194,7 +194,7 @@ func GenerateSystemChart(suite *BenchmarkSuite, outPath string) error {
 	// Footer.
 	footerY := contentH - chartFooterH
 	writeRect(&sb, 0, footerY, chartTotalWidth, chartFooterH, colorFooterBg, 0)
-	writeLine(&sb, 0, footerY, chartTotalWidth, footerY, colorSeparator, 1)
+	writeSeparator(&sb, 0, chartTotalWidth, footerY)
 
 	// Legend swatch.
 	legendY := footerY + 22
@@ -341,14 +341,14 @@ func GenerateComparisonChart(suites map[string]*BenchmarkSuite, outPath string) 
 
 		// Section separator line.
 		sepY := y + chartGroupPadBot - chartSectionBorder
-		writeLine(&sb, 20, sepY, chartTotalWidth-20, sepY, colorSeparator, 1)
+		writeSeparator(&sb, 20, chartTotalWidth-20, sepY)
 		y += chartGroupPadBot + chartScenarioGap
 	}
 
 	// Footer with legend.
 	footerY := contentH - chartFooterH
 	writeRect(&sb, 0, footerY, chartTotalWidth, chartFooterH, colorFooterBg, 0)
-	writeLine(&sb, 0, footerY, chartTotalWidth, footerY, colorSeparator, 1)
+	writeSeparator(&sb, 0, chartTotalWidth, footerY)
 
 	legendY := footerY + 22
 	legendX := chartMarginLeft
@@ -624,21 +624,20 @@ func writeText(sb *strings.Builder, x, y, fontSize int, fontWeight, anchor, fill
 	sb.WriteString("</text>\n")
 }
 
-// writeLine writes an SVG line element.
-func writeLine(sb *strings.Builder, x1, y1, x2, y2 int, stroke string, width int) {
+// writeSeparator writes a horizontal one-pixel SVG separator line from x1 to
+// x2 at height y.
+func writeSeparator(sb *strings.Builder, x1, x2, y int) {
 	sb.WriteString(`  <line x1="`)
 	sb.WriteString(itoa(x1))
 	sb.WriteString(`" y1="`)
-	sb.WriteString(itoa(y1))
+	sb.WriteString(itoa(y))
 	sb.WriteString(`" x2="`)
 	sb.WriteString(itoa(x2))
 	sb.WriteString(`" y2="`)
-	sb.WriteString(itoa(y2))
+	sb.WriteString(itoa(y))
 	sb.WriteString(`" stroke="`)
-	sb.WriteString(stroke)
-	sb.WriteString(`" stroke-width="`)
-	sb.WriteString(itoa(width))
-	sb.WriteString(`"/>` + "\n")
+	sb.WriteString(colorSeparator)
+	sb.WriteString(`" stroke-width="1"/>` + "\n")
 }
 
 // writeDashedLine writes an SVG dashed line element.

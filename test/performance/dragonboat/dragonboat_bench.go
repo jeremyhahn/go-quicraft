@@ -72,6 +72,10 @@ const (
 	// bounds how late an election benchmark can notice a leader, so every
 	// engine's harness polls at the same 1 ms.
 	leaderPollInterval = time.Millisecond
+
+	// clusterLeaderTimeout bounds how long a multi-node setup or election
+	// iteration waits for a leader before failing.
+	clusterLeaderTimeout = 30 * time.Second
 )
 
 // raftConfig returns the Raft configuration every benchmark replica uses. The
@@ -151,7 +155,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 		dbReplicaID: addr,
 	}
 
-	createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
+	createFn := func(_, _ uint64) dbsm.IStateMachine {
 		return newDragonboatKVSM()
 	}
 
@@ -181,7 +185,7 @@ func SetupDragonboatHost(b *testing.B) (*dragonboat.NodeHost, func()) {
 func waitForDragonboatLeader(nh *dragonboat.NodeHost, shardID uint64, timeout time.Duration) error {
 	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(clusterLeaderTimeout)
 	defer deadline.Stop()
 	for {
 		leaderID, _, ok, err := nh.GetLeaderID(shardID)
@@ -387,7 +391,7 @@ func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 		dbReplicaID: addr,
 	}
 
-	createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
+	createFn := func(_, _ uint64) dbsm.IStateMachine {
 		return newDragonboatKVSM()
 	}
 
@@ -532,7 +536,7 @@ func (c *BenchCluster) seed(b *testing.B, key []byte) {
 	b.Helper()
 	cmd := makeKVCmd(key)
 	err := benchutil.Retry(benchutil.WarmupAttempts, benchutil.WarmupBackoff, func() error {
-		idx, err := waitForDragonboatClusterLeader(c.Hosts, dbShardID, 30*time.Second)
+		idx, err := waitForDragonboatClusterLeader(c.Hosts, dbShardID)
 		if err != nil {
 			return err
 		}
@@ -628,7 +632,7 @@ func primeElectionRing(b *testing.B, hosts []*dragonboat.NodeHost,
 				time.Sleep(leaderPollInterval)
 			}
 		}
-		if _, err := waitForDragonboatClusterLeader(hosts, shardID, 30*time.Second); err != nil {
+		if _, err := waitForDragonboatClusterLeader(hosts, shardID); err != nil {
 			b.Fatalf("priming shard %d: %v", shardID, err)
 		}
 		for j, nh := range hosts {
@@ -686,7 +690,7 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	// Start replicas on all hosts.
 	for i, nh := range hosts {
 		raftCfg := raftConfig(dbShardID, uint64(i+1))
-		createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
+		createFn := func(_, _ uint64) dbsm.IStateMachine {
 			return newDragonboatKVSM()
 		}
 		if err := nh.StartReplica(members, false, createFn, raftCfg); err != nil {
@@ -698,7 +702,7 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 	}
 
 	// Wait for a leader to be elected and identified.
-	leaderIdx, err := waitForDragonboatClusterLeader(hosts, dbShardID, 30*time.Second)
+	leaderIdx, err := waitForDragonboatClusterLeader(hosts, dbShardID)
 	if err != nil {
 		for _, h := range hosts {
 			h.Close()
@@ -727,11 +731,12 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 }
 
 // waitForDragonboatClusterLeader polls all hosts until one reports itself
-// as the leader. Returns the host index of the leader.
-func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64, timeout time.Duration) (int, error) {
+// as the leader, for at most clusterLeaderTimeout. Returns the host index of
+// the leader.
+func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64) (int, error) {
 	ticker := time.NewTicker(leaderPollInterval)
 	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(clusterLeaderTimeout)
 	defer deadline.Stop()
 	for {
 		for i, nh := range hosts {
@@ -742,7 +747,7 @@ func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64
 		}
 		select {
 		case <-deadline.C:
-			return -1, &LeaderElectionTimeoutError{Timeout: timeout}
+			return -1, &LeaderElectionTimeoutError{Timeout: clusterLeaderTimeout}
 		case <-ticker.C:
 		}
 	}
@@ -800,7 +805,7 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 		members[uint64(j+1)] = addr
 	}
 
-	createFn := func(shardID, replicaID uint64) dbsm.IStateMachine {
+	createFn := func(_, _ uint64) dbsm.IStateMachine {
 		return newDragonboatKVSM()
 	}
 
@@ -823,7 +828,7 @@ func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.
 		}
 
 		// Wait for a leader to be elected.
-		leaderIdx, err := waitForDragonboatClusterLeader(hosts, iterShardID, 30*time.Second)
+		leaderIdx, err := waitForDragonboatClusterLeader(hosts, iterShardID)
 		if err != nil {
 			b.Fatalf("leader election failed at iteration %d: %v", i, err)
 		}

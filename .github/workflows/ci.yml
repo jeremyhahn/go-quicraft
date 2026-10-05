@@ -110,8 +110,37 @@ jobs:
           set -euo pipefail
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 
-      - name: golangci-lint
-        run: golangci-lint run --timeout=5m ./...
+      # Every module, not only the root: contrib/ and test/performance/ are
+      # separate modules that `./...` from the root never enters. They share
+      # the root's config. -tags=benchmark brings in the harness entry points
+      # under test/performance (the tag selects nothing in the root), without
+      # which their helpers read as unused. Same discovery loop and floor as
+      # the modules job; mirrors `make lint`.
+      - name: golangci-lint (every module)
+        run: |
+          set -uo pipefail
+          MODULE_FLOOR=6
+          MODULES="$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \) -prune -o -name go.mod -printf '%h\n' | sort)"
+          COUNT="$(printf '%s\n' "${MODULES}" | grep -c . || true)"
+          echo "Discovered ${COUNT} module(s):"
+          printf '%s\n' "${MODULES}"
+          if [ "${COUNT}" -lt "${MODULE_FLOOR}" ]; then
+            echo "FAIL: discovered ${COUNT} modules but expected at least ${MODULE_FLOOR}."
+            echo "If a module was removed on purpose, lower MODULE_FLOOR in the same commit."
+            echo "Otherwise discovery has broken and this gate is verifying nothing."
+            exit 1
+          fi
+          CONFIG="${PWD}/.golangci.yml"
+          FAILED=""
+          for dir in ${MODULES}; do
+            echo "::group::${dir}"
+            ( cd "${dir}" && golangci-lint run --timeout=5m --config "${CONFIG}" --build-tags benchmark ./... ) || FAILED="${FAILED} ${dir}"
+            echo "::endgroup::"
+          done
+          if [ -n "${FAILED}" ]; then
+            echo "FAIL: golangci-lint reported issues in:${FAILED}"
+            exit 1
+          fi
 
   security:
     name: Security
@@ -451,27 +480,35 @@ jobs:
   # ==========================================================================
   # Cross-architecture build
   #
-  # Every other job runs on amd64. This catches what fails to compile or vet
-  # on another architecture: arch-specific build tags, assembly, assumed type
-  # sizes, non-portable syscalls. It does not catch a runtime value that
-  # differs by architecture (such as page size); test those against the
+  # Every other job runs on linux/amd64. This catches what fails to compile or
+  # vet on another architecture or OS: arch- and OS-specific build tags,
+  # assembly, assumed type sizes, non-portable syscalls (a socket handle is an
+  # int on Unix and a Handle on Windows). It does not catch a runtime value
+  # that differs by platform (such as page size); test those against the
   # parameter, as shamir's budget test does for 4, 16 and 64 KiB pages.
   #
-  # Cross-compiled because no arm64 runner is available and QEMU would
-  # multiply every test's wall clock.
+  # Cross-compiled because no arm64, macOS, Windows or FreeBSD runner is
+  # available and QEMU would multiply every test's wall clock.
   # ==========================================================================
 
   cross-arch:
-    name: Cross-architecture build (${{ matrix.goarch }})
+    name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        # arm64 is the second 64-bit production target. 386 catches untyped
-        # constants that overflow int on 32-bit, which often hide in test
-        # files, so this vets as well as builds.
-        goarch: [arm64, "386"]
+        # linux/arm64 is the second 64-bit production target. linux/386
+        # catches untyped constants that overflow int on 32-bit, which often
+        # hide in test files, so this vets as well as builds. windows, darwin
+        # and freebsd catch Unix-only syscalls and build constraints that
+        # leave a symbol undefined on one OS.
+        include:
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: "386" }
+          - { goos: windows, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -480,9 +517,9 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
 
       # Same discovery loop and floor as the modules job.
-      - name: Build and vet every module for linux/${{ matrix.goarch }}
+      - name: Build and vet every module for ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           set -uo pipefail

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -29,7 +30,7 @@ func getEntryForTest(im *inMemory, index uint64) (*proto.Entry, error) {
 		return nil, err
 	}
 	if len(entries) == 0 {
-		return nil, ErrUnavailable
+		return nil, logdb.ErrUnavailable
 	}
 	return &entries[0], nil
 }
@@ -96,8 +97,8 @@ func TestInMemory_GetEntries_ReturnsErrCompacted(t *testing.T) {
 	im.merge(makeEntries(11, 15, 1))
 
 	_, err := im.getEntries(5, 12)
-	if !errors.Is(err, ErrCompacted) {
-		t.Fatalf("expected ErrCompacted, got %v", err)
+	if !errors.Is(err, logdb.ErrCompacted) {
+		t.Fatalf("expected logdb.ErrCompacted, got %v", err)
 	}
 }
 
@@ -106,8 +107,8 @@ func TestInMemory_GetEntries_ReturnsErrUnavailable(t *testing.T) {
 	im.merge(makeEntries(5, 10, 1))
 
 	_, err := im.getEntries(5, 15)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable, got %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("expected logdb.ErrUnavailable, got %v", err)
 	}
 }
 
@@ -116,8 +117,8 @@ func TestInMemory_GetEntries_LowGreaterThanHigh(t *testing.T) {
 	im.merge(makeEntries(5, 10, 1))
 
 	_, err := im.getEntries(8, 6)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable, got %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("expected logdb.ErrUnavailable, got %v", err)
 	}
 }
 
@@ -152,8 +153,8 @@ func TestInMemory_GetEntry_Compacted(t *testing.T) {
 	im.merge(makeEntries(11, 15, 1))
 
 	_, err := getEntryForTest(&im, 5)
-	if !errors.Is(err, ErrCompacted) {
-		t.Fatalf("expected ErrCompacted, got %v", err)
+	if !errors.Is(err, logdb.ErrCompacted) {
+		t.Fatalf("expected logdb.ErrCompacted, got %v", err)
 	}
 }
 
@@ -162,8 +163,8 @@ func TestInMemory_GetEntry_Unavailable(t *testing.T) {
 	im.merge(makeEntries(5, 10, 1))
 
 	_, err := getEntryForTest(&im, 20)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("expected ErrUnavailable, got %v", err)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Fatalf("expected logdb.ErrUnavailable, got %v", err)
 	}
 }
 

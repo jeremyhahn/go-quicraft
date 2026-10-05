@@ -22,23 +22,8 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"syscall"
 	"testing"
 )
-
-// reuseAddrListen binds addr the way the QUIC transport binds its listener
-// (pkg/internal/transport/quic.go, Start), so a test can stand in for a live
-// host holding a port.
-func reuseAddrListen(addr string) (net.PacketConn, error) {
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-			})
-		},
-	}
-	return lc.ListenPacket(context.Background(), "udp", addr)
-}
 
 // plainListen binds a TCP listener with no socket options of its own, which is
 // how the harnesses in test/performance bind and the strongest holder TCP has:
@@ -50,6 +35,15 @@ func reuseAddrListen(addr string) (net.PacketConn, error) {
 func plainListen(addr string) (net.Listener, error) {
 	var lc net.ListenConfig
 	return lc.Listen(context.Background(), "tcp", addr)
+}
+
+// plainListenPacket binds a UDP socket with no socket options of its own,
+// which is how the QUIC transport binds its listener on every platform
+// (pkg/internal/transport/sockopt_unix.go, sockopt_windows.go), so a test can
+// stand in for a live host holding a port.
+func plainListenPacket(addr string) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	return lc.ListenPacket(context.Background(), "udp", addr)
 }
 
 // forget drops one port from the in-process reservation record, so a test can
@@ -179,8 +173,7 @@ func TestReserveUDPNeverRepeatsAPort(t *testing.T) {
 		if n > 1 {
 			t.Fatalf("%s was handed out %d times; two hosts given one address "+
 				"either fail shard membership validation or, in different shards, "+
-				"bind the same port with SO_REUSEADDR and silently split each "+
-				"other's datagrams", addr, n)
+				"the second fails to start with EADDRINUSE", addr, n)
 		}
 	}
 	if want := goroutines * perGoroutine; len(seen) != want {
@@ -192,18 +185,16 @@ func TestReserveUDPNeverRepeatsAPort(t *testing.T) {
 // another test binary's host already holds a port in the window, and the probe
 // must refuse it.
 //
-// The listener here is bound the way the QUIC transport binds
-// (pkg/internal/transport/quic.go sets SO_REUSEADDR), because a probe that set
-// SO_REUSEADDR itself would bind straight through such a holder and report the
-// port free. The probe in scanWindow is deliberately a plain ListenPacket for
-// that reason, and this is the test that says so.
+// The listener here is bound the way the QUIC transport binds, with a plain
+// UDP socket (see plainListenPacket); the probe in scanWindow makes the same
+// plain bind, and this is the test that says a live holder refuses it.
 func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 	held, err := ReserveUDP()
 	if err != nil {
 		t.Fatalf("reserve address to hold: %v", err)
 	}
 	heldPort := portOf(t, held)
-	pc, err := reuseAddrListen(held)
+	pc, err := plainListenPacket(held)
 	if err != nil {
 		t.Fatalf("bind held address %s: %v", held, err)
 	}
@@ -225,7 +216,7 @@ func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 			t.Fatalf("reservation %d: %v", i, err)
 		}
 		if addr == held {
-			t.Fatalf("reservation %d returned %s while a live SO_REUSEADDR "+
+			t.Fatalf("reservation %d returned %s while a live UDP "+
 				"listener holds it; the probe bind failed to detect the holder",
 				i, addr)
 		}
@@ -518,10 +509,11 @@ func withWindow(t *testing.T, lo, hi int) {
 	state.err = nil
 }
 
-// holdAllBut fills the installed window with live SO_REUSEADDR listeners,
-// leaving at most free ports unheld, and reports how many it left. It stands in
-// for the condition duplicate ports appear under: a loaded host where most of the
-// window is already bound by other test binaries' nodes.
+// holdAllBut fills the installed window with live UDP listeners bound as the
+// transport binds them, leaving at most free ports unheld, and reports how many
+// it left. It stands in for the condition duplicate ports appear under: a
+// loaded host where most of the window is already bound by other test
+// binaries' nodes.
 //
 // The ports are discovered by binding rather than assumed free, so a port some
 // unrelated process on the host already holds simply counts towards the held
@@ -538,7 +530,7 @@ func holdAllBut(t *testing.T, lo, hi, free int) int {
 
 	var bindable []int
 	for p := lo; p <= hi; p++ {
-		pc, err := reuseAddrListen("127.0.0.1:" + strconv.Itoa(p))
+		pc, err := plainListenPacket("127.0.0.1:" + strconv.Itoa(p))
 		if err != nil {
 			continue // already held by something outside this test
 		}
@@ -579,10 +571,11 @@ func holdAllBut(t *testing.T, lo, hi, free int) int {
 // the number of free ports, and the only thing standing between the caller and
 // a duplicate is the record of what is still in flight.
 //
-// The contract in that state is to fail loudly. An address that two hosts share
-// is sometimes a silent fault (see the package comment: two SO_REUSEADDR binds
-// on one port both succeed and split each other's datagrams), so a test that
-// cannot get a distinct port must be told, not quietly handed a used one.
+// The contract in that state is to fail loudly here. A reissued address fails
+// too, but later and elsewhere: the second host to bind it fails to start with
+// EADDRINUSE (see the package comment), in whichever test happened to start
+// second. A test that cannot get a distinct port must be told at the
+// reservation, not handed a used one.
 func TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort(t *testing.T) {
 	// Small enough to saturate quickly, and free (8) well below the retain
 	// horizon (span/2 = 32) so exhaustion is reached while every reservation

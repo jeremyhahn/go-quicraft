@@ -27,7 +27,9 @@ func TestPrintTerminalEmptyReport(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 
 	output := buf.String()
 	if !strings.Contains(output, "No benchmark results to report.") {
@@ -39,7 +41,9 @@ func TestPrintTerminalContainsSystemNames(t *testing.T) {
 	report := buildSampleReport()
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	if !strings.Contains(output, "quicraft") {
@@ -54,7 +58,9 @@ func TestPrintTerminalContainsScenarioLabel(t *testing.T) {
 	report := buildSampleReport()
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	// scenarioLabels maps ScenarioProposeSEQWAL to "Propose Sequential (WAL)".
@@ -67,7 +73,9 @@ func TestPrintTerminalContainsHeaderRow(t *testing.T) {
 	report := buildSampleReport()
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	if !strings.Contains(output, "Ops/sec") {
@@ -88,7 +96,9 @@ func TestPrintTerminalContainsWinner(t *testing.T) {
 	report := buildSampleReport()
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	if !strings.Contains(output, "WINNER") {
@@ -112,7 +122,9 @@ func TestPrintTerminalMissingSystemShowsNA(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	// etcd row should show N/A for all values (7 columns: Ops/sec, P50, P90, P95, P99, P99.9, Mean).
@@ -146,7 +158,9 @@ func TestPrintTerminalSpeedupRow(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	if !strings.Contains(output, "speedup") {
@@ -171,7 +185,9 @@ func TestPrintTerminalSingleSystemNoWinnerRow(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	// When there's only one system and no winners, the WINNER row should be suppressed.
@@ -200,7 +216,9 @@ func TestPrintTerminalUnknownScenarioKeyUsedAsLabel(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	report.PrintTerminal(&buf)
+	if err := report.PrintTerminal(&buf); err != nil {
+		t.Fatalf("PrintTerminal: %v", err)
+	}
 	output := buf.String()
 
 	// Unknown scenario key should be used directly as label.

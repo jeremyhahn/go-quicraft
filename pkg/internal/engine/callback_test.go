@@ -44,6 +44,7 @@ type testCallback struct {
 	readyCount           atomic.Int64
 	snapshotCalls        []snapshotCall
 	compactionCalls      []compactionCall
+	requestCalls         []requestCall
 	snapshotCallCount    atomic.Int64
 	campaignCalls        []campaignCall
 	campaignCount        atomic.Int64
@@ -53,9 +54,14 @@ type testCallback struct {
 	batchCount           atomic.Int64
 	proposalFailedCalls  []proposalFailedCall
 	proposalFailedCount  atomic.Int64
-	readIndexFailedCalls []readIndexFailedCall
-	readIndexFailedCount atomic.Int64
-	snapshotRejected     atomic.Int64
+	// proposalRejectedCalls records OnProposalRejected: proposals raft refused
+	// before appending them.
+	proposalRejectedCalls []proposalFailedCall
+	proposalRejectedCount atomic.Int64
+	readIndexFailedCalls  []readIndexFailedCall
+	readIndexFailedCount  atomic.Int64
+	snapshotRejected      atomic.Int64
+	rejectedCauses        []error // guarded by mu
 
 	// panicOnReadyToRead makes OnReadyToRead panic, standing in for a bug in
 	// the engine-to-Host plumbing that runs inline on the step worker. Set
@@ -94,6 +100,7 @@ type leaderCall struct {
 type snapshotCall struct {
 	shardID uint64
 	index   uint64
+	op      SnapshotOperation
 	err     error
 }
 
@@ -177,13 +184,33 @@ func (c *testCallback) OnReadyToRead(shardID uint64, readyToRead []proto.ReadyTo
 	c.mu.Unlock()
 }
 
-func (c *testCallback) OnSnapshotCompleted(shardID uint64, index uint64, err error) {
+func (c *testCallback) OnSnapshotCompleted(shardID uint64, index uint64, op SnapshotOperation, err error) {
 	c.snapshotCallCount.Add(1)
 	c.mu.Lock()
 	c.snapshotCalls = append(c.snapshotCalls, snapshotCall{
 		shardID: shardID,
 		index:   index,
+		op:      op,
 		err:     err,
+	})
+	c.mu.Unlock()
+}
+
+// requestCall records one OnSnapshotRequestCompleted delivery.
+type requestCall struct {
+	shardID    uint64
+	requestKey uint64
+	index      uint64
+	err        error
+}
+
+func (c *testCallback) OnSnapshotRequestCompleted(shardID, requestKey, index uint64, err error) {
+	c.mu.Lock()
+	c.requestCalls = append(c.requestCalls, requestCall{
+		shardID:    shardID,
+		requestKey: requestKey,
+		index:      index,
+		err:        err,
 	})
 	c.mu.Unlock()
 }
@@ -242,7 +269,10 @@ func (c *testCallback) OnCampaignSkipped(shardID, replicaID, term uint64) {
 	c.mu.Unlock()
 }
 
-func (c *testCallback) OnSnapshotRejected(_, _ uint64) {
+func (c *testCallback) OnSnapshotRejected(_, _ uint64, err error) {
+	c.mu.Lock()
+	c.rejectedCauses = append(c.rejectedCauses, err)
+	c.mu.Unlock()
 	c.snapshotRejected.Add(1)
 }
 
@@ -265,6 +295,19 @@ func (c *testCallback) OnProposalFailed(shardID uint64, entries []proto.Entry, e
 	copy(entriesCopy, entries)
 	c.mu.Lock()
 	c.proposalFailedCalls = append(c.proposalFailedCalls, proposalFailedCall{
+		shardID: shardID,
+		entries: entriesCopy,
+		err:     err,
+	})
+	c.mu.Unlock()
+}
+
+func (c *testCallback) OnProposalRejected(shardID uint64, entries []proto.Entry, err error) {
+	c.proposalRejectedCount.Add(1)
+	entriesCopy := make([]proto.Entry, len(entries))
+	copy(entriesCopy, entries)
+	c.mu.Lock()
+	c.proposalRejectedCalls = append(c.proposalRejectedCalls, proposalFailedCall{
 		shardID: shardID,
 		entries: entriesCopy,
 		err:     err,

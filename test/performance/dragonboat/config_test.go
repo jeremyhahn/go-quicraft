@@ -95,16 +95,20 @@ func TestTransportNegotiatesTLS13(t *testing.T) {
 	}
 
 	// The same client configuration Dragonboat's dialer builds.
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-		ServerName:   host,
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      roots,
-	})
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config: &tls.Config{
+			ServerName:   host,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      roots,
+		},
+	}
+	nc, err := dialer.DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("mutual-TLS handshake with the NodeHost transport: %v", err)
 	}
-	defer conn.Close()
+	defer nc.Close()
+	conn := nc.(*tls.Conn)
 	if v := conn.ConnectionState().Version; v != tls.VersionTLS13 {
 		t.Fatalf("negotiated %s, want TLS 1.3", tls.VersionName(v))
 	}

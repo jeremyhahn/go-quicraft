@@ -1200,8 +1200,8 @@ type completionProbeCallback struct {
 	fenced    chan struct{}
 }
 
-func (c *completionProbeCallback) OnSnapshotCompleted(shardID, index uint64, err error) {
-	c.testCallback.OnSnapshotCompleted(shardID, index, err)
+func (c *completionProbeCallback) OnSnapshotCompleted(shardID, index uint64, op SnapshotOperation, err error) {
+	c.testCallback.OnSnapshotCompleted(shardID, index, op, err)
 	fenced := c.fenced
 	go func() {
 		c.node.Stop()

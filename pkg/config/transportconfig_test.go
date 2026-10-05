@@ -23,9 +23,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"math"
 	"math/big"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // testMTLSMaterial generates a valid self-signed CA/cert/key PEM triple for
@@ -683,8 +688,110 @@ func TestTransportConfig_Validate_MaxMessageReceiveMemory(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxMessageReceiveMemory = 0
 		if err := tc.Validate(); err != nil {
-			t.Fatalf("Validate() = %v, want nil (0 means unlimited)", err)
+			t.Fatalf("Validate() = %v, want nil (0 selects the derived default)", err)
 		}
+	})
+
+	// A budget below one maximum-size frame's charge can never admit that
+	// frame: every peer's largest legal frame is dropped forever, and a peer
+	// sending one holds the whole budget against every other peer while it
+	// drains. The error names the minimum so the operator can size the value.
+	t.Run("below one maximum frame rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		minimum := proto.FrameDecodeCharge(int64(DefaultMaxDecompressedSize), int64(DefaultMaxDecompressedSize))
+		tc.MaxMessageReceiveMemory = minimum - 1
+		err := tc.Validate()
+		var tooSmall *MaxMessageReceiveMemoryTooSmallError
+		if !errors.As(err, &tooSmall) {
+			t.Fatalf("Validate() = %v, want *MaxMessageReceiveMemoryTooSmallError", err)
+		}
+		if tooSmall.Configured != minimum-1 || tooSmall.Minimum != minimum {
+			t.Fatalf("error = %+v, want Configured=%d Minimum=%d", tooSmall, minimum-1, minimum)
+		}
+		if !strings.Contains(err.Error(), strconv.FormatInt(minimum, 10)) {
+			t.Fatalf("error %q does not name the minimum %d", err, minimum)
+		}
+	})
+
+	t.Run("exactly one maximum frame accepted", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MaxMessageReceiveMemory = proto.FrameDecodeCharge(int64(DefaultMaxDecompressedSize), int64(DefaultMaxDecompressedSize))
+		if err := tc.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil", err)
+		}
+	})
+}
+
+// TestTransportConfig_MessageReceiveMemoryDerivedDefault pins the default
+// receive budget to the frame it must admit: MessageReceiveBudgetFrames
+// maximum-size frames, each charged exactly as the receive path charges it.
+// A fixed byte default drifts from the frame size and the decode factor, and
+// at 256 MB it admitted only two maximum-size frames host-wide.
+func TestTransportConfig_MessageReceiveMemoryDerivedDefault(t *testing.T) {
+	maxFrame := func(decompressed uint32) int64 {
+		return proto.FrameDecodeCharge(int64(DefaultMaxDecompressedSize), int64(decompressed))
+	}
+
+	t.Run("default is N maximum-frame charges", func(t *testing.T) {
+		tc := TransportConfig{TransportDisabled: true}
+		tc.SetDefaults()
+		if tc.MessageReceiveBudgetFrames != DefaultMessageReceiveBudgetFrames {
+			t.Fatalf("MessageReceiveBudgetFrames = %d, want %d",
+				tc.MessageReceiveBudgetFrames, DefaultMessageReceiveBudgetFrames)
+		}
+		want := int64(DefaultMessageReceiveBudgetFrames) * maxFrame(DefaultMaxDecompressedSize)
+		if tc.MaxMessageReceiveMemory != want {
+			t.Fatalf("MaxMessageReceiveMemory = %d, want %d", tc.MaxMessageReceiveMemory, want)
+		}
+		// 4 frames x 16 MiB x MaxDecodeMemoryFactor (8).
+		if want != 512<<20 {
+			t.Fatalf("derived default = %d, want 512 MiB at today's constants", want)
+		}
+		if err := tc.Validate(); err != nil {
+			t.Fatalf("Validate() of the defaults = %v", err)
+		}
+	})
+
+	t.Run("frames knob scales the default", func(t *testing.T) {
+		tc := TransportConfig{MessageReceiveBudgetFrames: 2}
+		tc.SetDefaults()
+		if want := 2 * maxFrame(DefaultMaxDecompressedSize); tc.MaxMessageReceiveMemory != want {
+			t.Fatalf("MaxMessageReceiveMemory = %d, want %d", tc.MaxMessageReceiveMemory, want)
+		}
+	})
+
+	t.Run("MaxDecompressedSize changes the default", func(t *testing.T) {
+		tc := TransportConfig{MaxDecompressedSize: 2 * DefaultMaxDecompressedSize}
+		tc.SetDefaults()
+		want := int64(DefaultMessageReceiveBudgetFrames) * maxFrame(2*DefaultMaxDecompressedSize)
+		if tc.MaxMessageReceiveMemory != want {
+			t.Fatalf("MaxMessageReceiveMemory = %d, want %d", tc.MaxMessageReceiveMemory, want)
+		}
+		var base TransportConfig
+		base.SetDefaults()
+		if tc.MaxMessageReceiveMemory == base.MaxMessageReceiveMemory {
+			t.Fatal("a larger MaxDecompressedSize left the derived default unchanged")
+		}
+	})
+
+	t.Run("explicit budget wins", func(t *testing.T) {
+		tc := TransportConfig{MaxMessageReceiveMemory: 1 << 30, MessageReceiveBudgetFrames: 2}
+		tc.SetDefaults()
+		if tc.MaxMessageReceiveMemory != 1<<30 {
+			t.Fatalf("MaxMessageReceiveMemory = %d, want the explicit 1 GiB", tc.MaxMessageReceiveMemory)
+		}
+	})
+
+	t.Run("negative frames rejected", func(t *testing.T) {
+		tc := validTransportConfig()
+		tc.MessageReceiveBudgetFrames = -1
+		assertValidationError(t, tc.Validate(), "TransportConfig.MessageReceiveBudgetFrames")
+	})
+
+	t.Run("overflowing frames rejected", func(t *testing.T) {
+		tc := TransportConfig{MessageReceiveBudgetFrames: math.MaxInt, TransportDisabled: true}
+		tc.SetDefaults()
+		assertValidationError(t, tc.Validate(), "TransportConfig.MessageReceiveBudgetFrames")
 	})
 }
 

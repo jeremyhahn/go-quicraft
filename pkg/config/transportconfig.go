@@ -18,25 +18,28 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"math"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // Default values for TransportConfig fields.
 const (
-	DefaultStreamPoolSize            int    = 16
-	DefaultMaxStreamPoolSize         int    = 256
-	DefaultMaxSnapshotReceiveRate    int64  = 256 * 1024 * 1024 // 256 MB/s
-	DefaultMaxConcurrentSnapshotRecv int    = 4
-	DefaultMaxSnapshotReceiveMemory  int64  = 1024 * 1024 * 1024 // 1 GB
-	DefaultMaxMessageReceiveMemory   int64  = 256 * 1024 * 1024  // 256 MB
-	DefaultMaxDecompressedSize       uint32 = 16 * 1024 * 1024   // 16 MB (transport.MaxFrameSize)
-	DefaultMaxConnectionsPerIP       int    = 16
-	DefaultMaxIncomingConnections    int    = 256
-	DefaultSendBatchMaxSize          int    = 64 * 1024       // 64 KB
-	DefaultUDPRecvBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical rmem_max)
-	DefaultUDPSendBufSize            int    = 7 * 1024 * 1024 // 7 MB (within typical wmem_max)
-	DefaultMaxStreamsPerConnection   int    = 256
-	DefaultStreamReadIdleTimeout            = 30 * time.Second
+	DefaultStreamPoolSize             int    = 16
+	DefaultMaxStreamPoolSize          int    = 256
+	DefaultMaxSnapshotReceiveRate     int64  = 256 * 1024 * 1024 // 256 MB/s
+	DefaultMaxConcurrentSnapshotRecv  int    = 4
+	DefaultMaxSnapshotReceiveMemory   int64  = 1024 * 1024 * 1024 // 1 GB
+	DefaultMaxDecompressedSize        uint32 = 16 * 1024 * 1024   // 16 MB (transport.MaxFrameSize)
+	DefaultMessageReceiveBudgetFrames int    = 4
+	DefaultMaxConnectionsPerIP        int    = 16
+	DefaultMaxIncomingConnections     int    = 256
+	DefaultSendBatchMaxSize           int    = 64 * 1024       // 64 KB
+	DefaultUDPRecvBufSize             int    = 7 * 1024 * 1024 // 7 MB (within typical rmem_max)
+	DefaultUDPSendBufSize             int    = 7 * 1024 * 1024 // 7 MB (within typical wmem_max)
+	DefaultMaxStreamsPerConnection    int    = 256
+	DefaultStreamReadIdleTimeout             = 30 * time.Second
 
 	// MinMaxSnapshotReceiveRate is the smallest accepted non-zero value for
 	// MaxSnapshotReceiveRate. Rates below this floor are rejected by Validate
@@ -167,7 +170,16 @@ type TransportConfig struct {
 	// MaxMessageReceiveMemory is the total bytes allowed for in-flight inbound
 	// message-frame payload buffers across all connections and streams. It
 	// bounds an OOM DoS where a peer opens many streams that each declare a
-	// large frame length and withhold the body. Default: 256 MB.
+	// large frame length and withhold the body.
+	//
+	// Each frame is charged at proto.MaxDecodeMemoryFactor times its wire
+	// length plus its decompression delta (proto.FrameDecodeCharge), so the
+	// budget bounds decoded heap. One maximum-size frame is charged 128 MB
+	// (16 MB x 8). Zero selects the default, MessageReceiveBudgetFrames such
+	// charges: 512 MB at the defaults. An explicit value wins over the
+	// derivation, and Validate rejects one below a single maximum-size frame's
+	// charge with *MaxMessageReceiveMemoryTooSmallError. One peer may hold at
+	// most a quarter of the budget, and never less than one maximum-size frame.
 	//
 	// It bounds APPLICATION frame buffers only. QUIC additionally buffers
 	// received bytes before the application reads them, up to
@@ -175,6 +187,13 @@ type TransportConfig struct {
 	// window is derived from this value, so the total inbound receive
 	// footprint is this budget PLUS the QUIC-level windows.
 	MaxMessageReceiveMemory int64
+
+	// MessageReceiveBudgetFrames is the number of maximum-size frames the
+	// default MaxMessageReceiveMemory admits at once. It sizes the default in
+	// the unit the receive path charges, so the default follows the frame size
+	// and the decode factor instead of drifting from them. Ignored when
+	// MaxMessageReceiveMemory is set. Default: 4.
+	MessageReceiveBudgetFrames int
 
 	// MaxDecompressedSize is the maximum allowed size after Snappy
 	// decompression. It must equal DefaultMaxDecompressedSize, which is the
@@ -290,11 +309,16 @@ func (tc *TransportConfig) SetDefaults() {
 	if tc.MaxSnapshotReceiveMemory == 0 {
 		tc.MaxSnapshotReceiveMemory = DefaultMaxSnapshotReceiveMemory
 	}
-	if tc.MaxMessageReceiveMemory == 0 {
-		tc.MaxMessageReceiveMemory = DefaultMaxMessageReceiveMemory
-	}
 	if tc.MaxDecompressedSize == 0 {
 		tc.MaxDecompressedSize = DefaultMaxDecompressedSize
+	}
+	if tc.MessageReceiveBudgetFrames == 0 {
+		tc.MessageReceiveBudgetFrames = DefaultMessageReceiveBudgetFrames
+	}
+	// Derived after MaxDecompressedSize, which the frame charge depends on. A
+	// frame count the budget cannot represent is left for Validate to report.
+	if tc.MaxMessageReceiveMemory == 0 && tc.messageReceiveBudgetFramesFit() {
+		tc.MaxMessageReceiveMemory = int64(tc.MessageReceiveBudgetFrames) * tc.maxFrameReceiveCharge()
 	}
 	if tc.MaxConnectionsPerIP == 0 {
 		tc.MaxConnectionsPerIP = DefaultMaxConnectionsPerIP
@@ -364,16 +388,15 @@ func (tc *TransportConfig) validateLimits() error {
 		return newValidationError("TransportConfig.MaxSnapshotReceiveMemory",
 			"must be >= 0")
 	}
-	if tc.MaxMessageReceiveMemory < 0 {
-		return newValidationError("TransportConfig.MaxMessageReceiveMemory",
-			"must be >= 0")
-	}
 	if tc.MaxDecompressedSize != DefaultMaxDecompressedSize {
 		return newValidationError("TransportConfig.MaxDecompressedSize",
 			"must equal DefaultMaxDecompressedSize (the transport frame size): "+
 				"the send path admits frames against that constant, so a lower "+
 				"value silently rejects frames every peer considers valid and "+
 				"stops replication to this node")
+	}
+	if err := tc.validateMessageReceiveBudget(); err != nil {
+		return err
 	}
 	if tc.MaxConnectionsPerIP < 1 {
 		return newValidationError("TransportConfig.MaxConnectionsPerIP",
@@ -394,6 +417,44 @@ func (tc *TransportConfig) validateLimits() error {
 	if tc.StreamReadIdleTimeout < 0 {
 		return newValidationError("TransportConfig.StreamReadIdleTimeout",
 			"must be >= 0 (0 uses the default)")
+	}
+	return nil
+}
+
+// maxFrameReceiveCharge returns what one maximum-size frame reserves against
+// the message-receive budget: proto.FrameDecodeCharge at the transport frame
+// size and MaxDecompressedSize, the same composition the receive path charges
+// a frame. DefaultMaxDecompressedSize is the transport frame size; the
+// transport package asserts the two equal at compile time.
+func (tc *TransportConfig) maxFrameReceiveCharge() int64 {
+	return proto.FrameDecodeCharge(int64(DefaultMaxDecompressedSize), int64(tc.MaxDecompressedSize))
+}
+
+// messageReceiveBudgetFramesFit reports whether MessageReceiveBudgetFrames
+// maximum-frame charges are representable as a budget.
+func (tc *TransportConfig) messageReceiveBudgetFramesFit() bool {
+	return tc.MessageReceiveBudgetFrames >= 0 &&
+		int64(tc.MessageReceiveBudgetFrames) <= math.MaxInt64/tc.maxFrameReceiveCharge()
+}
+
+// validateMessageReceiveBudget checks the message-receive budget and the
+// frame count its default is derived from. Zero for either is accepted:
+// SetDefaults supplies it.
+func (tc *TransportConfig) validateMessageReceiveBudget() error {
+	if !tc.messageReceiveBudgetFramesFit() {
+		return newValidationError("TransportConfig.MessageReceiveBudgetFrames",
+			"must be >= 0 (0 uses the default) and small enough that that many "+
+				"maximum-size frame charges fit in an int64 budget")
+	}
+	if tc.MaxMessageReceiveMemory < 0 {
+		return newValidationError("TransportConfig.MaxMessageReceiveMemory",
+			"must be >= 0")
+	}
+	if minimum := tc.maxFrameReceiveCharge(); tc.MaxMessageReceiveMemory > 0 && tc.MaxMessageReceiveMemory < minimum {
+		return &MaxMessageReceiveMemoryTooSmallError{
+			Configured: tc.MaxMessageReceiveMemory,
+			Minimum:    minimum,
+		}
 	}
 	return nil
 }

@@ -141,6 +141,22 @@ func sentinelTable() []sentinelClassification {
 		{"ErrImportDataDirMismatch", ErrImportDataDirMismatch, false},
 		{"ErrImportSnapshotDirExists", ErrImportSnapshotDirExists, false},
 
+		// Re-exported from the engine, raft and transport packages because they
+		// reach a caller inside a failed proposal, config.ShardFailedInfo.Err or
+		// a *HostInitError. Every one describes damaged durable state, a failed
+		// shard or unusable configuration: the identical request fails until an
+		// operator repairs the data, reloads the shard or fixes the config.
+		{"ErrApplyGap", ErrApplyGap, false},
+		{"ErrSnapshotMetaCorrupt", ErrSnapshotMetaCorrupt, false},
+		{"ErrScratchNotUnlinked", ErrScratchNotUnlinked, false},
+		{"ErrUnsupportedSnapshotCompression", ErrUnsupportedSnapshotCompression, false},
+		{"ErrCorruptConfigEntry", ErrCorruptConfigEntry, false},
+		// The system CSPRNG failing is not a condition a retry loop should
+		// paper over, for the reason ErrEntropyDegenerate is permanent.
+		{"ErrEntropyUnavailable", ErrEntropyUnavailable, false},
+		{"ErrCACertificateParse", ErrCACertificateParse, false},
+		{"ErrInvalidCertKeyPair", ErrInvalidCertKeyPair, false},
+
 		// Declared outside errors.go. These were invisible to the
 		// exhaustiveness check for as long as it parsed only errors.go, so
 		// nobody had ever decided whether they were retryable.

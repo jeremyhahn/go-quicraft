@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"runtime/debug"
 	"sync"
@@ -32,6 +31,7 @@ import (
 	"time"
 
 	"github.com/golang/snappy"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/quic-go/quic-go"
 )
@@ -143,32 +143,49 @@ func extractIP(addr net.Addr) string {
 // acceptLoop accepts incoming QUIC connections up to MaxIncomingConnections.
 // A semaphore limits total concurrency, and an ipConnTracker enforces the
 // per-IP connection limit. The loop runs until the transport is stopped.
-func (t *QUICTransport) acceptLoop() {
-	defer t.wg.Done()
-	// Signalled separately from t.wg so stop() can wait for admissions to stop
-	// without waiting for the handlers, which cannot finish until their
-	// connections are closed. See QUICTransport.acceptWG.
-	defer t.acceptWG.Done()
-
-	sem := make(chan struct{}, t.cfg.MaxIncomingConnections)
-	ipTracker := newIPConnTracker(t.cfg.MaxConnectionsPerIP)
-
-	for {
-		if t.stopped.Load() {
-			return
-		}
+//
+// It runs under supervise.Supervise (startAcceptLoop), which counts it in
+// t.wg and starts it again on a fresh goroutine if a runtime.Goexit ends it;
+// sem and ipTracker are created once, by startAcceptLoop, so a restarted loop
+// keeps the admission accounting of the connections already running. The
+// loop releases t.acceptWG on its normal return only, and startAcceptLoop's
+// stopped path releases it when a Goexit ends the loop during shutdown: it is
+// released exactly once, and only once no admission can follow.
+func (t *QUICTransport) acceptLoop(sem chan struct{}, ipTracker *ipConnTracker) {
+	for !t.stopped.Load() {
 		// On a recovered panic, back off before re-entering to avoid a tight
 		// CPU loop and log flood, mirroring sendQueueWorker and
 		// connectionCleanup. A normal iteration (no panic) re-enters
 		// immediately so accept latency is unaffected.
-		if panicked := t.acceptLoopIteration(sem, ipTracker); panicked {
-			select {
-			case <-t.stopC:
-				return
-			case <-time.After(workerPanicRestartDelay):
-			}
+		if panicked := t.acceptLoopIteration(sem, ipTracker); panicked && !supervise.AwaitRestart(t.stopC) {
+			break
 		}
 	}
+	// Signalled separately from t.wg so stop() can wait for admissions to
+	// stop without waiting for the handlers, which cannot finish until their
+	// connections are closed. See QUICTransport.acceptWG.
+	t.acceptWG.Done()
+}
+
+// startAcceptLoop starts acceptLoop under supervise.Supervise. The caller has
+// already counted it in t.acceptWG.
+func (t *QUICTransport) startAcceptLoop() {
+	sem := make(chan struct{}, t.cfg.MaxIncomingConnections)
+	ipTracker := newIPConnTracker(t.cfg.MaxConnectionsPerIP)
+	supervise.Supervise(&t.wg, t.stopC, func() { t.acceptLoop(sem, ipTracker) }, t.acceptWG.Done)
+}
+
+// logRecovered emits the diagnostic for a panic, or a runtime.Goexit reported
+// as supervise.ErrGoexit, that a transport goroutine recovered from. stack is
+// captured by the caller on the recovering goroutine. The record is emitted
+// through supervise.LogContained, after the caller's settlement: the slog
+// handler and the panic value's String or Error method are user code, and a
+// panic or Goexit in either must end only the diagnostic's own goroutine,
+// never the recovery that called it.
+func logRecovered(msg string, recovered any, stack []byte, attrs ...any) {
+	supervise.LogContained(func() {
+		slog.Error(msg, append(attrs, "panic", fmt.Sprint(recovered), "stack", string(stack))...)
+	})
 }
 
 // acceptLoopIteration executes a single iteration of the accept loop.
@@ -183,10 +200,7 @@ func (t *QUICTransport) acceptLoopIteration(sem chan struct{}, ipTracker *ipConn
 	defer func() {
 		if r := recover(); r != nil {
 			panicked = true
-			slog.Error("panic recovered in acceptLoop, restarting",
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			logRecovered("panic recovered in acceptLoop, restarting", r, debug.Stack())
 		}
 	}()
 
@@ -334,11 +348,8 @@ func (t *QUICTransport) handleConnection(conn *quic.Conn, activity *inboundConnS
 
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic recovered in handleConnection",
-				"remote", conn.RemoteAddr().String(),
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			logRecovered("panic recovered in handleConnection", r, debug.Stack(),
+				"remote", conn.RemoteAddr())
 		}
 	}()
 
@@ -460,11 +471,8 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 	}()
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic recovered in handleStream",
-				"remote", inboundConn.RemoteAddr().String(),
-				"panic", fmt.Sprint(r),
-				"stack", string(debug.Stack()),
-			)
+			logRecovered("panic recovered in handleStream", r, debug.Stack(),
+				"remote", inboundConn.RemoteAddr())
 		}
 	}()
 
@@ -787,35 +795,28 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		return nil
 	}
 
-	// Reserve the frame's declared length against the aggregate message-receive
-	// budget BEFORE allocating the buffer. The buffer is allocated before the
-	// body is read (io.ReadFull below), so without an aggregate cap an
-	// authenticated peer could open up to MaxStreamsPerConnection streams that
-	// each declare MaxFrameSize and withhold the body, pinning that memory until
-	// the read deadline and OOM-ing the host. The reservation is released once
-	// the frame has been fully processed (defer), mirroring the snapshot
+	// Reserve the frame's decode charge (proto.DecodeCharge of its declared
+	// length) against the per-peer and aggregate message-receive budgets BEFORE
+	// allocating the buffer. The buffer is allocated before the body is read
+	// (io.ReadFull below), so without an aggregate cap an authenticated peer
+	// could open up to MaxStreamsPerConnection streams that each declare
+	// MaxFrameSize and withhold the body, pinning that memory until the read
+	// deadline and OOM-ing the host. The reservations are released once the
+	// frame has been fully processed (defer), mirroring the snapshot
 	// receiver's memory budget.
+	//
+	// The per-peer sub-budget is taken first and both are charged in the same
+	// unit, so one peer can never hold more of the aggregate than its cap. A
+	// frame refused by either holds NOTHING while its body drains: a refused
+	// frame that kept an aggregate reservation through the drain would let one
+	// peer that withholds its bodies hold the aggregate regardless of its cap.
 	//
 	// Exhaustion is TRANSIENT, so the frame body is drained and the stream is
 	// left at a clean boundary for the caller to continue on (see
 	// handleStream): tearing the stream down would punish every peer sharing
 	// the aggregate budget for one peer's burst.
-	if !t.reserveMsgRecvBudget(decodeCharge(int64(length))) {
-		n := t.recvBudgetDrops.Add(1)
-		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-			slog.Warn("message frame dropped: receive memory budget exhausted",
-				"remote", remoteAddrOf(inboundConn),
-				"length", length,
-				"total", n,
-			)
-		}
-		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
-	}
-	defer t.releaseMsgRecvBudget(decodeCharge(int64(length)))
-
-	// The per-connection sub-budget bounds what one peer can hold of the
-	// aggregate, so a single connection cannot starve all the others.
-	if !t.reserveConnMsgRecvBudget(inboundConn, int64(length)) {
+	charge := proto.DecodeCharge(int64(length))
+	if !t.reserveConnMsgRecvBudget(inboundConn, charge) {
 		n := t.recvBudgetDrops.Add(1)
 		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
 			slog.Warn("message frame dropped: per-connection receive memory budget exhausted",
@@ -827,7 +828,20 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		}
 		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
 	}
-	defer t.releaseConnMsgRecvBudget(inboundConn, int64(length))
+	if !t.reserveMsgRecvBudget(charge) {
+		t.releaseConnMsgRecvBudget(inboundConn, charge)
+		n := t.recvBudgetDrops.Add(1)
+		if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+			slog.Warn("message frame dropped: receive memory budget exhausted",
+				"remote", remoteAddrOf(inboundConn),
+				"length", length,
+				"total", n,
+			)
+		}
+		return t.dropFrame(stream, length, ErrMessageRecvMemoryBudgetExceeded)
+	}
+	defer t.releaseConnMsgRecvBudget(inboundConn, charge)
+	defer t.releaseMsgRecvBudget(charge)
 
 	var recvStart time.Time
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
@@ -868,21 +882,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 		// the aggregate budget. Reserve the positive delta before decoding; the
 		// deferred release keeps the accounting exactly balanced on every exit
 		// path (success and error) for the remainder of this frame's processing.
-		if delta := int64(declaredLen) - int64(length); delta > 0 {
-			if !t.reserveMsgRecvBudget(decodeCharge(delta)) {
-				t.putRecvBuf(buf)
-				n := t.recvBudgetDrops.Add(1)
-				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
-					slog.Warn("compressed message frame dropped: receive memory budget exhausted",
-						"remote", remoteAddrOf(inboundConn),
-						"compressed_length", length,
-						"declared_decompressed_length", declaredLen,
-						"total", n,
-					)
-				}
-				return ErrMessageRecvMemoryBudgetExceeded
-			}
-			defer t.releaseMsgRecvBudget(decodeCharge(delta))
+		if delta := proto.DecodeCharge(int64(declaredLen) - int64(length)); delta > 0 {
 			if !t.reserveConnMsgRecvBudget(inboundConn, delta) {
 				t.putRecvBuf(buf)
 				n := t.recvBudgetDrops.Add(1)
@@ -898,6 +898,20 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 				return ErrMessageRecvMemoryBudgetExceeded
 			}
 			defer t.releaseConnMsgRecvBudget(inboundConn, delta)
+			if !t.reserveMsgRecvBudget(delta) {
+				t.putRecvBuf(buf)
+				n := t.recvBudgetDrops.Add(1)
+				if LogSampled(&t.lastRecvBudgetLog, protocolViolationLogInterval) {
+					slog.Warn("compressed message frame dropped: receive memory budget exhausted",
+						"remote", remoteAddrOf(inboundConn),
+						"compressed_length", length,
+						"declared_decompressed_length", declaredLen,
+						"total", n,
+					)
+				}
+				return ErrMessageRecvMemoryBudgetExceeded
+			}
+			defer t.releaseMsgRecvBudget(delta)
 		}
 		snappyBuf = snappyDecPool.Get().(*[]byte)
 		// snappy.Decode sizes its destination by len(dst), not cap(dst): a
@@ -1372,34 +1386,6 @@ func (t *QUICTransport) dropFrame(r io.Reader, length uint32, transient error) e
 		return &FrameDrainError{Declared: length, Drained: drained, Err: err}
 	}
 	return transient
-}
-
-// decodeCharge converts a frame's on-the-wire length into the heap it can
-// actually occupy while being decoded.
-//
-// The wire length alone is the one number the decode is guaranteed NOT to be
-// bounded by. Decoding a membership-dense frame can occupy several times its
-// wire size, and proto.MaxDecodeMemoryFactor states the ceiling the codec holds
-// itself to.
-//
-// Charging the wire length would therefore let a 256 MB MaxMessageReceiveMemory
-// admit frames that could occupy over 1 GB of heap at once, defeating by
-// construction the aggregate bound the budget exists to enforce. Charging the
-// factor makes the configured limit mean what it says. The visible effect is
-// that fewer frames are admitted concurrently for the same configured budget;
-// that is the correct reading of the setting.
-//
-// Saturating rather than wrapping: length is already bounded by MaxFrameSize
-// well below the overflow point, but a reservation that wrapped negative would
-// hand out unlimited budget, so the arithmetic is not left to trust.
-func decodeCharge(n int64) int64 {
-	if n <= 0 {
-		return 0
-	}
-	if n > math.MaxInt64/proto.MaxDecodeMemoryFactor {
-		return math.MaxInt64
-	}
-	return n * proto.MaxDecodeMemoryFactor
 }
 
 // reserveMsgRecvBudget atomically reserves n bytes against the aggregate

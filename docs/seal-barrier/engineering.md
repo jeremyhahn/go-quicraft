@@ -278,9 +278,9 @@ stays at epoch 1 keeps it.
 will encrypt, and it usually rotates. Neither happens in delegated or
 no-encryption mode, which return earlier.
 
-`Barrier.Seal()` is exported, but for the host-wide barrier production code
-should go through `Host.Close()`, which drains the pipeline before sealing so the
-engine does not take an `ErrBarrierSealed` storm.
+`Barrier.Seal()` is exported, but for a barrier wired into a host (host-wide or
+per-shard) production code should go through `Host.Close()`, which drains the
+pipeline before sealing so the engine does not take an `ErrBarrierSealed` storm.
 
 ### Persist-then-activate (`Rotate`)
 
@@ -574,8 +574,14 @@ epoch is guaranteed to rotate well before memory matters. `NewBarrier` warns
 when tracking is on with neither a `StatePersister` nor an `InvocationCounter`,
 the combination that cannot rotate and so can never release the tracked set.
 
-`Clear()` (called by `Rotate`) swaps in a fresh map via an atomic pointer swap,
-avoiding a TOCTOU race with concurrent `CheckAndRecordNonce` calls.
+`Clear()` (called by `Rotate`) resets the tracker with one atomic pointer swap
+of a whole epoch: nonce set, count and saturation flag together. Each
+`CheckAndRecordNonce` loads the epoch once and works only against it, so a call
+racing `Clear` lands wholly in the old epoch or wholly in the new one. Resetting
+the fields separately let a racing call insert into the new set while counting
+against the old (breaking `Count()` and the ceiling), or saturate the fresh
+epoch from the old one's ceiling crossing. The tracker stays lock-free: a mutex
+over admission measured 6x slower on the contended path.
 
 ### KDF selection
 

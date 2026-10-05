@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	dbConfig "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/config"
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	qcLogDB "github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	qcSM "github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -458,32 +460,34 @@ func NewNodeHostWithOptions(nhConfig dbConfig.NodeHostConfig, opts ...quicraft.H
 	return nh, nil
 }
 
-// timeoutFromContext mirrors dragonboat's getTimeoutFromContext: the
-// context must carry a deadline and that deadline must not already have
-// passed. Checking only for the deadline's presence, as the adapter used
-// to, accepted an already-expired context and let the operation run to a
-// zero-length timeout instead of reporting the caller's bug.
-func timeoutFromContext(ctx context.Context) (time.Duration, error) {
+// checkContextDeadline mirrors the validation in dragonboat's
+// getTimeoutFromContext: the context must carry a deadline and that deadline
+// must not already have passed. Checking only for the deadline's presence, as
+// the adapter used to, accepted an already-expired context and let the
+// operation run to a zero-length timeout instead of reporting the caller's
+// bug. Dragonboat also returns the remaining time; quicraft takes the context
+// itself, so only the validation is needed.
+func checkContextDeadline(ctx context.Context) error {
 	d, ok := ctx.Deadline()
 	if !ok {
-		return 0, ErrDeadlineNotSet
+		return ErrDeadlineNotSet
 	}
-	now := time.Now()
-	if !now.Before(d) {
-		return 0, ErrInvalidDeadline
+	if !time.Now().Before(d) {
+		return ErrInvalidDeadline
 	}
-	return d.Sub(now), nil
+	return nil
 }
 
-// checkTimeout reports ErrTimeoutTooSmall when the requested timeout is
-// shorter than a single RTT. Dragonboat converts a timeout to ticks with
-// getTimeoutTick and rejects a zero tick count the same way.
+// checkTimeout reports ErrTimeoutTooSmall when the requested timeout is not
+// positive or is shorter than a single RTT. Dragonboat converts a timeout to
+// ticks with getTimeoutTick (whole milliseconds divided by the RTT) and
+// rejects a zero tick count in its propose, read-index, snapshot and
+// config-change requests; this is that check. Unlike getTimeoutTick it
+// rejects a negative timeout instead of letting it wrap through uint64 into
+// an enormous tick count. The comparison is in whole milliseconds, so it
+// cannot overflow for any RTT.
 func (nh *NodeHost) checkTimeout(timeout time.Duration) error {
-	rtt := nh.config.RTTMillisecond
-	if rtt == 0 {
-		return nil
-	}
-	if uint64(timeout.Milliseconds())/rtt == 0 {
+	if timeout <= 0 || uint64(timeout.Milliseconds()) < nh.config.RTTMillisecond {
 		return ErrTimeoutTooSmall
 	}
 	return nil
@@ -725,15 +729,27 @@ func (nh *NodeHost) isRemoved(shardID, replicaID uint64) bool {
 // so callers learn the guard is not yet durable.
 func (nh *NodeHost) markRemoved(shardID, replicaID uint64) error {
 	nh.removed.Store(removedKey{shardID, replicaID}, struct{}{})
-	return writeRemovalMarker(nh.removedMarkerDir(), nh.removedMarkerPath(shardID, replicaID))
+	return writeRemovalMarker(fsutil.SyncDir, nh.removedMarkerDir(), nh.removedMarkerPath(shardID, replicaID))
 }
 
-// writeRemovalMarker durably creates the marker file: the file itself is
-// fsynced and then its parent directory is fsynced so the new directory
-// entry survives a crash.
-func writeRemovalMarker(dir, path string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// writeRemovalMarker durably creates the marker file at path inside the
+// marker directory dir, fsyncing directories through syncDir. Every link of
+// the chain is made durable: dir's parent (NodeHostDir) so dir's own entry
+// survives a crash, the marker file, and then dir so the marker's entry
+// survives. The parent is synced even when dir already existed, because a
+// previous attempt may have created dir and failed before syncing it.
+//
+// dir is created with Mkdir, not MkdirAll: quicraft.NewHost has already
+// created NodeHostDir and synced its chain, so dir is the only directory
+// this function may create. A missing NodeHostDir is an error, not something
+// to recreate as a chain of directories nothing would sync.
+func writeRemovalMarker(syncDir func(string) error, dir, path string) error {
+	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return &RemovalMarkerError{Op: "mkdir", Path: dir, Err: err}
+	}
+	parent := filepath.Dir(dir)
+	if err := syncDir(parent); err != nil {
+		return &RemovalMarkerError{Op: "sync", Path: parent, Err: err}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -746,12 +762,7 @@ func writeRemovalMarker(dir, path string) error {
 	if err := f.Close(); err != nil {
 		return &RemovalMarkerError{Op: "close", Path: path, Err: err}
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return &RemovalMarkerError{Op: "open", Path: dir, Err: err}
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := syncDir(dir); err != nil {
 		return &RemovalMarkerError{Op: "sync", Path: dir, Err: err}
 	}
 	return nil
@@ -775,7 +786,7 @@ func (nh *NodeHost) StopReplica(shardID, replicaID uint64) error {
 // For no-op sessions, the simpler SyncPropose path is used. For tracked
 // sessions, SyncProposeWithSession handles at-most-once semantics.
 func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, cmd []byte) (dbSM.Result, error) {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return dbSM.Result{}, err
 	}
 	if err := nh.requireNoOPSessionOnDisk(session); err != nil {
@@ -827,7 +838,7 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 
 // SyncRead performs a linearizable read via ReadIndex + Lookup.
 func (nh *NodeHost) SyncRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return nil, err
 	}
 	result, err := nh.host.SyncRead(ctx, shardID, query)
@@ -857,7 +868,7 @@ func (nh *NodeHost) GetNoOPSession(shardID uint64) *dbClient.Session {
 // (proto.OnDiskStateMachine == 2), not the dragonboat-numbered
 // statemachine.OnDiskStateMachine (== 3).
 func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClient.Session, error) {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return nil, err
 	}
 	info, infoErr := nh.host.GetShardInfo(shardID)
@@ -875,7 +886,7 @@ func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClie
 // through Raft consensus. Blocks until the session is closed or the
 // context is canceled.
 func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 
@@ -910,14 +921,18 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 // The comparison is against the UNCONVERTED quicraft ShardInfo, so it uses
 // quicraft's numbering (proto.OnDiskStateMachine == 2), not the
 // dragonboat-numbered statemachine.OnDiskStateMachine (== 3).
+//
+// A failed shard lookup is returned, translated: without the shard's state
+// machine type the rule cannot be checked, and it is the same error the
+// caller's proposal would have met, reported before any work starts, as
+// dragonboat's getShard check does.
 func (nh *NodeHost) requireNoOPSessionOnDisk(session *dbClient.Session) error {
 	if session == nil || session.IsNoOPSession() {
 		return nil
 	}
 	info, err := nh.host.GetShardInfo(session.ShardID)
-	if err != nil || info == nil {
-		// Shard lookup failures are reported by the caller's own path.
-		return nil
+	if err != nil {
+		return translateError(err)
 	}
 	if info.StateMachineType == proto.OnDiskStateMachine {
 		return ErrRejected
@@ -1138,7 +1153,7 @@ func (nh *NodeHost) StaleRead(shardID uint64, query interface{}) (interface{}, e
 // SyncGetShardMembership returns the committed shard membership after
 // confirming leadership via ReadIndex.
 func (nh *NodeHost) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Membership, error) {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return nil, err
 	}
 	m, err := nh.host.SyncGetShardMembership(ctx, shardID)
@@ -1191,7 +1206,7 @@ func (nh *NodeHost) GetLeaderID(shardID uint64) (uint64, uint64, bool, error) {
 // SyncRequestAddReplica adds a voting replica to the shard and blocks
 // until the membership change is committed.
 func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaID uint64, target Target, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1206,7 +1221,7 @@ func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaI
 // identity-less form with quicraft.ErrMemberIdentityRequired, because
 // quicraft authorizes a member by its identity and by nothing else.
 func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1218,7 +1233,7 @@ func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shard
 // SyncRequestAddNonVotingWithIdentity is SyncRequestAddNonVoting carrying the
 // node identity; see SyncRequestAddReplicaWithIdentity.
 func (nh *NodeHost) SyncRequestAddNonVotingWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1230,7 +1245,7 @@ func (nh *NodeHost) SyncRequestAddNonVotingWithIdentity(ctx context.Context, sha
 // SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the node
 // identity; see SyncRequestAddReplicaWithIdentity.
 func (nh *NodeHost) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1250,7 +1265,7 @@ func (nh *NodeHost) NodeIdentity() string {
 // SyncRequestAddNonVoting adds a non-voting observer replica and blocks
 // until the membership change is committed.
 func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replicaID uint64, target Target, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1262,7 +1277,7 @@ func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replic
 // SyncRequestAddWitness adds a voting witness replica and blocks until
 // the membership change is committed.
 func (nh *NodeHost) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, target Target, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	if !dbConfig.IsValidAddress(target) {
@@ -1274,7 +1289,7 @@ func (nh *NodeHost) SyncRequestAddWitness(ctx context.Context, shardID, replicaI
 // SyncRequestDeleteReplica removes a replica from the shard and blocks
 // until the membership change is committed.
 func (nh *NodeHost) SyncRequestDeleteReplica(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
 	return translateError(nh.host.SyncRequestDeleteNode(ctx, shardID, replicaID, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
@@ -1316,6 +1331,9 @@ func (nh *NodeHost) RequestAddReplicaWithIdentity(shardID, replicaID uint64, tar
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
 	}
+	if err := nh.checkTimeout(timeout); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
@@ -1338,6 +1356,9 @@ func (nh *NodeHost) RequestAddNonVoting(shardID, replicaID uint64, target Target
 func (nh *NodeHost) RequestAddNonVotingWithIdentity(shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
+	}
+	if err := nh.checkTimeout(timeout); err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
@@ -1366,6 +1387,9 @@ func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, tar
 	if !dbConfig.IsValidAddress(target) {
 		return nil, ErrInvalidAddress
 	}
+	if err := nh.checkTimeout(timeout); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
@@ -1383,6 +1407,9 @@ func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, tar
 // nil RequestState and a non-nil error, instead of failing later through
 // RequestState.ResultC.
 func (nh *NodeHost) RequestDeleteReplica(shardID, replicaID uint64, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
+	if err := nh.checkTimeout(timeout); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	rs, err := nh.host.RequestRemoveNode(ctx, shardID, replicaID, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
@@ -1436,7 +1463,7 @@ func (nh *NodeHost) RequestCompaction(shardID, replicaID uint64) (*SysOpState, e
 // SyncRequestSnapshot requests a snapshot synchronously and returns the
 // snapshot index on success.
 func (nh *NodeHost) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (uint64, error) {
-	if _, err := timeoutFromContext(ctx); err != nil {
+	if err := checkContextDeadline(ctx); err != nil {
 		return 0, err
 	}
 	if err := opt.Validate(); err != nil {

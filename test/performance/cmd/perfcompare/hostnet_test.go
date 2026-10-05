@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -57,7 +58,7 @@ func TestNoEngineContainerRunsPrivileged(t *testing.T) {
 func stubPrepareHost(t *testing.T, err error) {
 	t.Helper()
 	orig := prepareHost
-	prepareHost = func() error { return err }
+	prepareHost = func(context.Context) error { return err }
 	t.Cleanup(func() { prepareHost = orig })
 }
 
@@ -66,7 +67,7 @@ func stubPrepareHost(t *testing.T, err error) {
 // whose engines see different host settings is not a fair comparison.
 func TestRunBenchmarksStopsWhenHostPreparationFails(t *testing.T) {
 	stubPrepareHost(t, errors.New("set host socket buffer limits: denied"))
-	err := runBenchmarks([]string{"--benchtime=1x", "--no-build", "--profile=" + newProfileDir(t), "dragonboat"})
+	err := runBenchmarks(t.Context(), []string{"--benchtime=1x", "--no-build", "--profile=" + newProfileDir(t), "dragonboat"})
 	if err == nil || !strings.Contains(err.Error(), "host socket buffer") {
 		t.Fatalf("runBenchmarks error = %v, want the host preparation failure", err)
 	}

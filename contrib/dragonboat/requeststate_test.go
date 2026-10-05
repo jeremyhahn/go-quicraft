@@ -1168,7 +1168,7 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 	if rs.ResultC() != rs.AppliedC() || rs.ResultC() != rs.CompletedC {
 		t.Fatal("resolved RequestState must hand out one shared channel")
 	}
-	if rs.ResultC() != rs.ResultC() {
+	if first, second := rs.ResultC(), rs.ResultC(); first != second {
 		t.Fatal("ResultC must return the same channel on every call")
 	}
 

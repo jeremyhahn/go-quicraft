@@ -90,7 +90,16 @@ resolver that returns `nil` for a shard falls back to the `WithBarrier` barrier;
 with no host-wide barrier the miss fails closed with
 `ErrShardBarrierUnresolved` rather than writing that tenant in plaintext. Key
 rotation for per-shard barriers is the caller's job: the host's rotation loop
-rotates only the `WithBarrier` barrier.
+rotates only the `WithBarrier` barrier. `Close` seals every barrier the resolver returned.
+
+Barriers are matched by pointer identity (`logdb.SameBarrier`), never with `==`, because a `Barrier`'s
+dynamic value need not be comparable. Two shards share a barrier when the
+resolver returns the same pointer for both; `Close` seals it once. A barrier that
+is not a pointer is distinct for every shard that resolves to it: `Close` seals
+it per shard (an already-sealed result is not an error), the snapshot pool
+declines the per-barrier DEK purges it cannot prove safe, and a per-barrier
+LogDB reports that it does not own it, so `StartShard` with no `WithBarrier`
+refuses it with `ErrShardBarrierLogDBMismatch`. Return pointers.
 
 A stated encryption choice must cover the log, so the LogDB is checked too:
 
@@ -962,7 +971,7 @@ func (h *Host) Close() error
 
 Shuts the host down. Shutdown always runs to completion. The returned error is
 the `errors.Join` of everything that failed: an incomplete drain, each state
-machine's `Close`, the LogDB `Close` and the barrier `Seal`. `errors.Is` reaches
+machine's `Close`, the LogDB `Close` and each barrier `Seal`. `errors.Is` reaches
 each cause.
 
 Treat a non-nil return as a durability signal. For an on-disk state machine its
@@ -974,7 +983,8 @@ returns the same error.
 
 Order: drain, stop key rotation, stop the pending-request sweeper, stop the
 engine, drain in-flight snapshot sends, stop the transport, fail pending
-requests with `ErrClosed`, close state machines, close LogDB, seal the barrier.
+requests with `ErrClosed`, close state machines, close LogDB, seal the host-wide
+barrier and every per-shard barrier the resolver returned (each once).
 The engine stops before the transport because its step workers are the only
 producers of snapshot sends; stopping them first means the send drain races no
 new sends while the transport is still up.
@@ -1243,14 +1253,40 @@ All three use `errors.Is` / `errors.As`, so wrapped errors classify correctly. A
 nil error is none of the three.
 
 **Check `MaybeApplied` first.** It reports whether the request had already
-reached Raft when it failed, so the entry may still commit and apply.
-`Temporary` answers "is a retry reasonable?", not "did it happen?". A proposal
-that reached the log and then lost its wait (leadership moved, the deadline
-passed, the shard closed) is in exactly this state, and retrying it without a
-client session can apply the command twice, because an unsessioned proposal
-carries client ID 0 and nothing deduplicates it. Such errors are wrapped in
-`*MaybeAppliedError`, which preserves every `errors.Is`, `Temporary` and
-`NotLeader` result.
+been handed to Raft when it failed, so the entry may still commit and apply.
+`Temporary` answers "is a retry reasonable?", not "did it happen?". Retrying
+such a request without a client session can apply the command twice, because
+an unsessioned proposal carries client ID 0 and nothing deduplicates it.
+
+Every failure delivered to a proposal, config change or session operation
+after the hand-off is wrapped in `*MaybeAppliedError`, which preserves every
+`errors.Is`, `errors.As`, `Temporary` and `NotLeader` result:
+
+- leadership moved after the step worker took it from the shard's proposal
+  queue (`*NotLeaderError`); one still queued is left pending, and the step
+  worker forwards it under the new leader or refuses it definitely;
+- the caller's wait ended: its context's deadline or cancellation in a `Sync*`
+  call (`ErrTimeout`, `ErrCanceled`), the request's own deadline in
+  `RequestState.Result` (`ErrTimeout`), or the host's deadline sweep
+  (`ErrTimeout`);
+- the shard was stopped (`ErrAborted`), the host closed (`ErrClosed`), or the
+  shard halted (`ErrShardFailed`) while it was pending;
+- the leader could not persist it (`*SaveStateError`; Replicate is sent before
+  the local persist, so followers may already hold it);
+- its committed entry failed to commit or apply (`*CommitError`,
+  `*ApplyError`, or a state-machine panic matching `ErrShardFailed`); a reload
+  replays the committed entry.
+
+A proposal is handed to Raft when the step worker takes it from the shard's
+proposal queue. The caller's own wait (`Sync*`, `RequestState.Result`) is
+classified by the same rule as every other failure. A failure that provably happened before that is definite and
+never wrapped: the admission checks (`ErrShardFailed`, `ErrClosed`, `ErrBusy`
+and the rest), a full proposal queue (`ErrDropped`), a proposal still queued
+when its shard halted or stopped (the queue is closed first, so it can never
+be taken), and a batch Raft refused before appending it (`*NotLeaderError` with no known leader,
+`ErrTransferInProgress`, `ErrRejected` for a config change while another is
+pending). Reads append nothing and
+are never wrapped.
 
 **`Temporary`** reports whether the identical request can succeed on retry once
 a transient condition clears, with no operator or caller action. It is true for
@@ -1304,8 +1340,10 @@ for {
 
 ### Sentinel errors
 
-Every sentinel declared in this package has the `"quicraft:"` prefix. Match
-with `errors.Is`.
+Match with `errors.Is`. Sentinels declared in this package have the
+`"quicraft:"` prefix; those re-exported from an internal package keep that
+package's prefix (`"raft:"`, `"engine:"`, `"transport:"`). A re-export is the
+same value the internal package returns, so it matches through any wrapping.
 
 Host and request lifecycle:
 
@@ -1326,7 +1364,7 @@ Request outcome:
 | `ErrCanceled` | the request was canceled through its context |
 | `ErrRejected` | the proposal was rejected, for example a config change already in progress |
 | `ErrAborted` | an internal transition such as a leadership change or `StopShard` |
-| `ErrDropped` | the proposal was dropped: queue overflow or shutdown |
+| `ErrDropped` | the request was dropped before it reached Raft: queue overflow or shutdown, or a proposal, ReadIndex or read result an engine worker took out of the shard and could not hand on because user code it ran (a metrics collector, a callback, a logger) panicked or called `runtime.Goexit`. Never `MaybeApplied` |
 | `ErrReleased` | `Result` or `ResultC` on a released `RequestState` |
 
 Shard state:
@@ -1340,7 +1378,7 @@ Shard state:
 | `ErrShardNotStopped` | `RemoveData` on a loaded shard |
 | `ErrReplicaRetired` | `StartShard` of a replica ID `RemoveData` retired |
 | `ErrImportInProgress` | `StartShard` while an import of the shard runs |
-| `ErrShardFailed` | the shard's failure latch tripped |
+| `ErrShardFailed` | the shard's failure latch tripped. A `*SMPanicError` matches it |
 | `ErrReplicaNotFound` | the replica ID does not match the replica on this host |
 | `ErrInvalidShardHealth` | `ShardHealth.UnmarshalJSON` got an unrecognized value |
 
@@ -1404,8 +1442,8 @@ Snapshots:
 | `ErrSnapshotInProgress` | the shard's snapshot slot is taken |
 | `ErrSnapshotRecoveryFailed` | restoring a snapshot failed. Produced as `*SnapshotFailedError` with `Recovery` set |
 | `ErrSnapshotTooLarge` | sentinel form of `*SnapshotTooLargeError` |
-| `ErrSnapshotSizeMismatch` | the file size on disk does not match the `FileSize` in the message |
-| `ErrSnapshotCorrupt` | a corrupt or oversized frame length during decryption, or data that does not match the length and hash recorded in `snapshot.meta` or the export trailer |
+| `ErrSnapshotSizeMismatch` | the file size on disk does not match the `FileSize` in the message or in the snapshot's LogDB record |
+| `ErrSnapshotCorrupt` | a corrupt or oversized frame length during decryption, or data that does not match the length and hash recorded in `snapshot.meta` or the export trailer. A `*SnapshotMetaInvalidError` matches it |
 | `ErrSnapshotDestinationRecorded` | a received snapshot's directory is the one LogDB records as this replica's live snapshot |
 | `ErrSnapshotBarrierSealed` | a snapshot could not be written because the shard's barrier is configured but sealed |
 | `ErrSnapshotEncryptedBarrierUnavailable` | an encrypted snapshot could not be read because no barrier is configured for the shard or it is sealed |
@@ -1426,7 +1464,22 @@ Encryption and storage:
 | `ErrShardBarrierUnresolved` | the per-shard resolver returned nil and there is no host-wide barrier |
 | `ErrShardBarrierLogDBMismatch` | the LogDB stores this shard under a different barrier than the resolver returned |
 | `ErrLogDBWrite` | a LogDB write failed |
-| `ErrDecompressionBomb` | a decompressed payload exceeds the configured limit |
+| `ErrDecompressionBomb` | a decompressed payload exceeds the configured limit. Proposals in the failed batch receive it; `ShardFailedInfo.Err` is a `*ApplyError` wrapping it |
+
+Engine, Raft and transport causes. These reach a caller inside a failed
+proposal's `*ApplyError` or `*CommitError`, inside `ShardFailedInfo.Err`, or
+inside a `*HostInitError`, and are re-exported so they can be matched:
+
+| Error | Returned when |
+|---|---|
+| `ErrApplyGap` | a committed batch did not start at the entry after the last applied one. Cause inside `*ApplyError` |
+| `ErrCorruptConfigEntry` | a committed config change or bootstrap membership entry does not decode. Cause inside `*CommitError`, or `HostInitError` `config_replay` / `membership_reconstruct` |
+| `ErrSnapshotMetaCorrupt` | sentinel form of `*SnapshotMetaInvalidError` (which also matches `ErrSnapshotCorrupt`). `HostInitError` `snapshot_integrity`, or a failed recovery |
+| `ErrScratchNotUnlinked` | sentinel form of `*ScratchUnlinkError`. `HostInitError` `snapshot_decrypt`, or a failed recovery |
+| `ErrUnsupportedSnapshotCompression` | the snapshot record names a compression this binary cannot read. `HostInitError` `snapshot_compression`, or a failed recovery |
+| `ErrEntropyUnavailable` | crypto/rand could not seed the Raft peer. `HostInitError` `peer` |
+| `ErrCACertificateParse` | sentinel form of `*CACertificateParseError`. `HostInitError` `transport` |
+| `ErrInvalidCertKeyPair` | a pre-built `MTLSConfig.Certificate` whose leaf does not parse. `HostInitError` `transport` |
 
 ### Structured error types
 
@@ -1444,7 +1497,7 @@ Each type below implements `error`; those with an `Err` field implement
 | `ReplicaNotFoundError` | `ShardID`, `ReplicaID` | The replica ID does not match the local replica (`StopReplica`, `RequestCompaction`) or names no member (`RequestLeaderTransfer`). Matches `ErrReplicaNotFound` |
 | `ReplicaRetiredError` | `ShardID`, `ReplicaID` | `StartShard` of a retired replica ID. Matches `ErrReplicaRetired` |
 | `StaleConfigChangeError` | `ShardID`, `Expected`, `Got` | The `configChangeIndex` guard failed. Matches `ErrStaleConfigChange`. Re-read membership; the identical request fails forever |
-| `HostInitError` | `Field`, `Err` | A component failed in `NewHost` or `StartShard` |
+| `HostInitError` | `Field`, `Err` | A component failed in `NewHost` or `StartShard`; `Field` names it. `Err` is a public value: a stdlib or `pkg/logdb`/`pkg/proto`/`pkg/config` error, the state machine's own error, or one of the re-exports in this section (for example `snapshot_integrity` carries `*SnapshotMetaInvalidError` or `ErrSnapshotSizeMismatch`, `snapshot_decrypt` a `*SnapshotEncryptError`, `transport` a `*CACertificateParseError` or `ErrInvalidCertKeyPair`) |
 | `SnapshotSendError` | `ShardID`, `ReplicaID`, `Op`, `Err` | A snapshot send failed; `Op` names the step |
 | `SnapshotReceiveError` | `ShardID`, `ReplicaID`, `Op`, `Err` | A snapshot receive failed; `Op` names the step |
 | `SnapshotChunkError` | `ChunkID`, `ChunkCount`, `Reason` | Cause inside a `SnapshotReceiveError` with `Op` "validate": the delivered chunks are not one snapshot |
@@ -1464,6 +1517,21 @@ Each type below implements `error`; those with an `Err` field implement
 | `MaybeAppliedError` | `Err` | The request reached Raft before failing; see `MaybeApplied` |
 | `BootstrapEntryMissingError` | `Index`, `EntryType` | The log holds something other than the founding configuration at the bootstrap index. The log is damaged: restore this replica's data from backup, or wipe it and re-add the replica with `join=true`. Rebuilding membership from the `members` map would drop witnesses, observers, tombstones, identities and replicated policy |
 | `CorruptConfigEntryError` | `ShardID`, `Index`, `Kind`, `Err` | A committed configuration entry failed to decode. Surfaced through the shard's failure path, not returned from a call |
+| `ApplyError` | `ShardID`, `ReplicaID`, `Err` | A batch failed to apply: the state machine's own error, a `*DecompressError`, `ErrDecompressionBomb` or `ErrApplyGap`. Returned to the batch's proposals and delivered as `ShardFailedInfo.Err`. Does not match `ErrShardFailed` |
+| `SMPanicError` | `ShardID`, `ReplicaID`, `Value`, `Stack` | The state machine panicked during apply or snapshot recovery. `ShardFailedInfo.Err`; matches `ErrShardFailed`. An apply panic's batch proposals receive it, wrapped in `*MaybeAppliedError`, so `errors.As` reaches it and `errors.Is(err, ErrShardFailed)` holds |
+| `SnapshotSavePanicError` | `ShardID`, `ReplicaID`, `Value`, `Stack` | The state machine panicked in `SaveSnapshot`. The shard is not failed (a save only reads the state machine), so it does not match `ErrShardFailed`. A `SyncRequestSnapshot` caller gets it as the `Err` of a save `*SnapshotFailedError`; `OnSnapshotRejected` fires |
+| `SaveStateError` | `ShardID`, `ReplicaID`, `Err` | A batch could not be persisted to the LogDB. Returned to the batch's proposals and delivered as `ShardFailedInfo.Err` |
+| `CommitError` | `ShardID`, `ReplicaID`, `Err` | A persisted batch could not be committed (log reader refusal, `ErrCorruptConfigEntry`). Returned to the batch's proposals and delivered as `ShardFailedInfo.Err` |
+| `WorkerPanicError` | `WorkerID`, `WorkerType`, `Value`, `Stack` | A step worker panicked during a snapshot install. `ShardFailedInfo.Err` |
+| `SnapshotError` | `ShardID`, `ReplicaID`, `Save`, `Err` | A snapshot save or recovery failed in the snapshot pool. `ShardFailedInfo.Err` for a recovery that failed once `RecoverFromSnapshot` was invoked; a recovery that failed before it is rejected (`OnSnapshotRejected`, with it as `SnapshotInfo.Err`) and re-driven, and only the last rejected attempt fails the shard, as the cause of a `*SnapshotRecoveryExhaustedError`; a failed save fires no `OnShardFailed`, and a `SyncRequestSnapshot` caller gets either failure as `*SnapshotFailedError` |
+| `SnapshotRecoveryBehindError` | `ShardID`, `ReplicaID`, `SnapshotIndex`, `Committed`, `Processed` | A recovery was abandoned because the Raft log never reached the snapshot index. The state machine was not touched, so the recovery is rejected (`OnSnapshotRejected` with it as `SnapshotInfo.Err`) and re-driven |
+| `SnapshotRecoveryPanicError` | `ShardID`, `ReplicaID`, `Value`, `Stack` | A recovery panicked before `RecoverFromSnapshot` was invoked. The state machine was not touched, so it does not match `ErrShardFailed`: the recovery is rejected (`OnSnapshotRejected` with it as `SnapshotInfo.Err`) and re-driven |
+| `SnapshotRecoveryExhaustedError` | `ShardID`, `ReplicaID`, `SnapshotIndex`, `Attempts`, `Err` | Every attempt to recover a snapshot the Raft log adopted was rejected before the restore began, over one continuous episode of holding entries, so the shard was failed. `Attempts` counts the whole episode, whatever snapshot each attempt was made against; `SnapshotIndex` is the snapshot of the last attempt, and `Err` its cause, reachable with `errors.Is`/`errors.As`. `ShardFailedInfo.Err` |
+| `SnapshotEncryptError` | `Op`, `Err` | A snapshot frame could not be encrypted or decrypted; `ErrSnapshotCorrupt` for a damaged artifact. `HostInitError` `snapshot_decrypt`, or inside `*SnapshotError` |
+| `SnapshotMetaInvalidError` | `Dir`, `Err` | A recorded snapshot's `snapshot.meta` cannot vouch for its data. Matches `ErrSnapshotCorrupt` and `ErrSnapshotMetaCorrupt` |
+| `ScratchUnlinkError` | `Path`, `Err` | A decrypt scratch file could not be unlinked. Matches `ErrScratchNotUnlinked` |
+| `DecompressError` | `Err` | A committed entry's payload does not decode. Cause inside `*ApplyError` |
+| `CACertificateParseError` | `Reason`, `Err` | With `RevocationConfig` set, the CA bundle has an unparseable block, no certificate, or no issuer. Matches `ErrCACertificateParse` |
 | `InvalidShardHealthError` | `Value` | `ShardHealth.UnmarshalJSON` got an unrecognized string. Matches `ErrInvalidShardHealth` |
 | `ImportLayoutUnknownError` | `ShardID`, `ReplicaID` | see [ImportSnapshot](#importsnapshot) |
 | `ImportDataDirMismatchError` | `ShardID`, `ReplicaID`, `Declared`, `Recorded` | see [ImportSnapshot](#importsnapshot) |
@@ -1815,7 +1883,8 @@ Source: `pkg/config/transportconfig.go`. Behaviour is documented in
 | `MaxSnapshotReceiveRate` | `int64` | `256 MB/s` | inbound snapshot bandwidth; floor `MinMaxSnapshotReceiveRate` (64 KB/s) |
 | `MaxConcurrentSnapshotReceives` | `int` | `4` | concurrent inbound snapshots |
 | `MaxSnapshotReceiveMemory` | `int64` | `1 GB` | total snapshot receive buffer |
-| `MaxMessageReceiveMemory` | `int64` | `256 MB` | total inbound message-frame buffer |
+| `MaxMessageReceiveMemory` | `int64` | `512 MB` (derived) | total inbound message-frame heap budget; zero derives `MessageReceiveBudgetFrames` maximum-size frame charges (128 MB each), and an explicit value below one charge fails validation |
+| `MessageReceiveBudgetFrames` | `int` | `4` | maximum-size frames the derived `MaxMessageReceiveMemory` default admits; ignored when the budget is set |
 | `MaxDecompressedSize` | `uint32` | `16 MB` | must equal `DefaultMaxDecompressedSize` (the frame size); any other value fails validation |
 | `MaxConnectionsPerIP` | `int` | `16` | inbound connections per source IP |
 | `MaxIncomingConnections` | `int` | `256` | total inbound connections |
@@ -2067,8 +2136,8 @@ type EventListener struct { /* 26 optional func fields */ }
 
 Set only the callbacks you need; nil callbacks are not invoked. Engine events
 (leader updates, leader loss, campaign launches, shard failure, log compaction,
-snapshot creation) are delivered in FIFO order on one dispatcher goroutine that
-holds no engine lock, so a handler may call any Host method, including
+snapshot creation, snapshot rejection) are delivered in FIFO order on one
+dispatcher goroutine that holds no engine lock, so a handler may call any Host method, including
 `StopShard`. Other callbacks run synchronously on the goroutine that produced
 them. Every callback must return promptly.
 
@@ -2080,7 +2149,7 @@ Raft events:
 | `OnLeaderLost` | `EventShardInfo` | the local replica lost leadership |
 | `OnCampaignLaunched` | `EventShardInfo` | an election campaign started |
 | `OnCampaignSkipped` | `EventShardInfo` | **never fires**; see below |
-| `OnSnapshotRejected` | `SnapshotInfo` | a snapshot was rejected |
+| `OnSnapshotRejected` | `SnapshotInfo` | a snapshot was rejected: a request refused or abandoned, a save that panicked, an inbound transfer refused, or a recovery that failed before the state machine's `RecoverFromSnapshot` was invoked (the engine re-drives it). `SnapshotInfo.Err` carries the cause when there is one |
 | `OnProposalDropped` | `EventShardInfo` | a proposal was dropped |
 | `OnReadIndexDropped` | `EventShardInfo` | a ReadIndex request was dropped |
 
@@ -2106,7 +2175,7 @@ System events:
 | `OnSnapshotSendAborted` | `SnapshotInfo` | a snapshot transfer was abandoned |
 | `OnSnapshotReceived` | `SnapshotInfo` | a snapshot transfer was received |
 | `OnSnapshotRecovered` | `SnapshotInfo` | the state machine was restored from a snapshot |
-| `OnSnapshotCreated` | `SnapshotInfo` | an on-demand or automatic snapshot completed |
+| `OnSnapshotCreated` | `SnapshotInfo` | an on-demand or automatic snapshot was written. A save with nothing new to capture writes none and fires nothing |
 | `OnSnapshotCompacted` | `SnapshotInfo` | old snapshot directories were reclaimed |
 | `OnLogCompacted` | `EventShardInfo` | log compaction completed; `Index` is the compaction point |
 | `OnLogDBCompacted` | `EventShardInfo` | LogDB compaction completed; `Index` is the compaction point |
@@ -2115,7 +2184,7 @@ Failure events:
 
 | Callback | Payload | Fired when |
 |---|---|---|
-| `OnShardFailed` | `ShardFailedInfo` | a fatal error was reported for the shard: when the failure latch trips (SM error or panic, commit or save-state failure, snapshot recovery failure, a corrupt committed config entry), and also for a failed snapshot save and a `GetUpdate` error on the step worker, which do not latch. So the event alone does not mean the shard is offline; `GetShardInfo` reports the latch. Not fired when the engine declines a stale snapshot recovery, since the shard is already past that snapshot |
+| `OnShardFailed` | `ShardFailedInfo` | the shard's failure latch tripped, once per shard incarnation, reporting the failure that tripped it; failures that race it are not reported again. Causes: SM error or panic, commit or save-state failure, a step-worker `GetUpdate` error, a snapshot recovery that failed or panicked once the state machine's `RecoverFromSnapshot` was invoked, a recovery whose every re-driven attempt was rejected before the restore (`*SnapshotRecoveryExhaustedError`), a corrupt committed config entry. The shard is offline until reloaded. Not fired for a failed snapshot save, which leaves the shard running (it is logged and returned to the `RequestSnapshot` caller), for a recovery that failed before `RecoverFromSnapshot` was invoked while attempts remain (rejected through `OnSnapshotRejected` and re-driven), nor when the engine declines a stale snapshot recovery, since the shard is already past that snapshot |
 | `OnLogDBDiskWarning` | `DiskInfo` | WAL usage crossed the warning threshold |
 | `OnLogDBDiskFull` | `DiskInfo` | WAL usage crossed the full threshold |
 
@@ -2155,6 +2224,13 @@ type ConnectionInfo struct {
 
 `LeaderInfo` and `EventShardInfo` declare the same names in a different order, so
 construct them with field names.
+
+`ShardFailedInfo.Err` is one of `*ApplyError`, `*SMPanicError` (matches
+`ErrShardFailed`), `*SaveStateError`, `*CommitError`, `*WorkerPanicError`,
+`*SnapshotError`, `*SnapshotRecoveryExhaustedError` or `*CorruptConfigEntryError`;
+match it with `errors.As`. Their causes are listed under [Errors](#errors). A
+step-worker `GetUpdate` failure delivers the Raft log's own error, such as
+`logdb.ErrCompacted` or `logdb.ErrUnavailable`; match it with `errors.Is`.
 
 ## Information types
 

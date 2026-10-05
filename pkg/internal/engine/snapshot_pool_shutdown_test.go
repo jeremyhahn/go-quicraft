@@ -59,7 +59,7 @@ func TestSnapshotPool_WorkerExitReleasesQueuedRequests(t *testing.T) {
 					config.Config{ShardID: shardID, ReplicaID: 1}, nil, "", nil)
 
 				node.snapshotting.Store(true)
-				p.inFlight.Store(shardID, struct{}{})
+				p.inFlight.Store(shardID, node)
 				p.requestC <- snapshotRequest{
 					shardID:   shardID,
 					replicaID: 1,

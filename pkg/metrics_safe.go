@@ -15,10 +15,13 @@
 package quicraft
 
 import (
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
 // safeMetricsCollector wraps a caller-supplied MetricsCollector so a panic in
@@ -80,13 +83,19 @@ func (s *safeMetricsCollector) guard(op string, fn func()) {
 		// call is on the raft receive path; an unsampled line there is its own
 		// denial of service.
 		if n&(n-1) == 0 {
-			slog.Error("quicraft: panic recovered in MetricsCollector; "+
-				"metric discarded, consensus unaffected",
-				"op", op,
-				"recovered_panics", n,
-				"panic", r,
-				"stack", string(debug.Stack()),
-			)
+			// Contained: the slog handler and the panic value's own
+			// methods are user code, and the caller is inside an engine
+			// critical section that must not be ended by either.
+			stack := debug.Stack()
+			supervise.LogContained(func() {
+				slog.Error("quicraft: panic recovered in MetricsCollector; "+
+					"metric discarded, consensus unaffected",
+					"op", op,
+					"recovered_panics", n,
+					"panic", fmt.Sprint(r),
+					"stack", string(stack),
+				)
+			})
 		}
 	}()
 	fn()

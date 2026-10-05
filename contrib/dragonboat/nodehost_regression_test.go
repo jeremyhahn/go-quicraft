@@ -17,6 +17,8 @@ package dragonboat
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -924,5 +926,233 @@ func TestNodeHost_OnDiskReplicaRejectsTrackedSession(t *testing.T) {
 	tracked.Inner().PrepareForRegister()
 	if _, err := nh.ProposeSession(tracked, time.Second); !errors.Is(err, ErrRejected) {
 		t.Errorf("ProposeSession(tracked session on on-disk SM) = %v, want ErrRejected", err)
+	}
+}
+
+// The on-disk session check must report a failed shard lookup, translated,
+// rather than answer nil: a nil there told the caller the session was
+// acceptable for a shard whose state machine type was never learned.
+func TestNodeHost_RequireNoOPSessionOnDisk_ReportsLookupFailure(t *testing.T) {
+	nh := newTestNodeHost(t)
+
+	tracked := dbClient.NewSession(99, nil)
+	if err := nh.requireNoOPSessionOnDisk(tracked); !errors.Is(err, ErrShardNotFound) {
+		t.Errorf("requireNoOPSessionOnDisk(unknown shard) = %v, want ErrShardNotFound", err)
+	}
+	if err := nh.requireNoOPSessionOnDisk(nh.GetNoOPSession(99)); err != nil {
+		t.Errorf("requireNoOPSessionOnDisk(NoOP session) = %v, want nil: a NoOP session needs no lookup", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Every timeout-taking async API rejects a timeout that is zero, negative or
+// shorter than one RTT with ErrTimeoutTooSmall, mirroring dragonboat's
+// zero-tick rejection in its propose, read, snapshot and config-change
+// requests. A negative timeout used to wrap through uint64 into an enormous
+// tick count and pass, and the membership requests never checked at all.
+// ---------------------------------------------------------------------------
+
+func TestNodeHost_CheckTimeout(t *testing.T) {
+	nh := &NodeHost{config: dbConfig.NodeHostConfig{RTTMillisecond: 100}}
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		wantErr bool
+	}{
+		{"zero", 0, true},
+		{"minus one nanosecond", -time.Nanosecond, true},
+		{"minus one hour", -time.Hour, true},
+		{"min int64", math.MinInt64, true},
+		{"below one RTT", 99 * time.Millisecond, true},
+		{"one RTT less a nanosecond", 100*time.Millisecond - time.Nanosecond, true},
+		{"exactly one RTT", 100 * time.Millisecond, false},
+		{"several RTTs", time.Second, false},
+		{"max int64", math.MaxInt64, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := nh.checkTimeout(tt.timeout)
+			if tt.wantErr && !errors.Is(err, ErrTimeoutTooSmall) {
+				t.Fatalf("checkTimeout(%v) = %v, want ErrTimeoutTooSmall", tt.timeout, err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("checkTimeout(%v) = %v, want nil", tt.timeout, err)
+			}
+		})
+	}
+}
+
+func TestNodeHost_TimeoutTakingAPIsRejectInvalidTimeout(t *testing.T) {
+	cfg := testNodeHostConfig(t.TempDir())
+	cfg.RTTMillisecond = 100
+	nh := newTestNodeHostWithConfig(t, cfg)
+	const (
+		startedShard = 1
+		missingShard = 99
+	)
+	startTestShard(t, nh, startedShard, 1)
+	target := Target("localhost:63002")
+
+	// The rejection cases target the started shard, so the rejection cannot
+	// be a shard lookup failure. The valid case targets a shard that does not
+	// exist, so an accepted timeout reaches the host and fails there without
+	// changing the running shard's membership.
+	apis := []struct {
+		name string
+		call func(shardID uint64, timeout time.Duration) (*RequestState, error)
+	}{
+		{"Propose", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.Propose(nh.GetNoOPSession(s), []byte("x"), d)
+		}},
+		{"ProposeSession", func(s uint64, d time.Duration) (*RequestState, error) {
+			session := dbClient.NewSession(s, nil)
+			session.PrepareForRegister()
+			return nh.ProposeSession(session, d)
+		}},
+		{"ReadIndex", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.ReadIndex(s, d)
+		}},
+		{"RequestSnapshot", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestSnapshot(s, SnapshotOption{}, d)
+		}},
+		{"RequestAddReplica", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddReplica(s, 2, target, 0, d)
+		}},
+		{"RequestAddReplicaWithIdentity", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddReplicaWithIdentity(s, 2, target, "id", 0, d)
+		}},
+		{"RequestAddNonVoting", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddNonVoting(s, 2, target, 0, d)
+		}},
+		{"RequestAddNonVotingWithIdentity", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddNonVotingWithIdentity(s, 2, target, "id", 0, d)
+		}},
+		{"RequestAddWitness", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddWitness(s, 2, target, 0, d)
+		}},
+		{"RequestAddWitnessWithIdentity", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestAddWitnessWithIdentity(s, 2, target, "id", 0, d)
+		}},
+		{"RequestDeleteReplica", func(s uint64, d time.Duration) (*RequestState, error) {
+			return nh.RequestDeleteReplica(s, 2, 0, d)
+		}},
+	}
+	invalid := []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"zero", 0},
+		{"negative", -time.Hour},
+		{"min int64", math.MinInt64},
+		{"below one RTT", 99 * time.Millisecond},
+	}
+	for _, api := range apis {
+		for _, tc := range invalid {
+			t.Run(api.name+"/"+tc.name, func(t *testing.T) {
+				rs, err := api.call(startedShard, tc.timeout)
+				if rs != nil {
+					rs.Release()
+				}
+				if !errors.Is(err, ErrTimeoutTooSmall) {
+					t.Fatalf("%s(%v) = %v, want ErrTimeoutTooSmall", api.name, tc.timeout, err)
+				}
+			})
+		}
+		t.Run(api.name+"/valid", func(t *testing.T) {
+			rs, err := api.call(missingShard, time.Second)
+			if rs != nil {
+				rs.Release()
+			}
+			if errors.Is(err, ErrTimeoutTooSmall) {
+				t.Fatalf("%s(1s) = %v, want the timeout accepted", api.name, err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// writeRemovalMarker makes the marker durable end to end: the marker file,
+// the marker directory's entry for it, AND NodeHostDir's entry for the marker
+// directory. Without the last fsync a power loss can drop the freshly created
+// marker directory, and with it the record that a replica ID was retired, so
+// the ID could be started again on a non-persistent LogDB. A crash cannot be
+// simulated with os.Stat, so the directory fsyncs are recorded and each one
+// checks that what it makes durable already exists.
+// ---------------------------------------------------------------------------
+
+func TestWriteRemovalMarker_SyncsParentOfMarkerDir(t *testing.T) {
+	for _, preexisting := range []bool{false, true} {
+		name := "fresh marker dir"
+		if preexisting {
+			// A previous attempt may have created the directory and crashed
+			// before its parent was synced, so the parent is synced anyway.
+			name = "existing marker dir"
+		}
+		t.Run(name, func(t *testing.T) {
+			parent := t.TempDir()
+			dir := filepath.Join(parent, removedMarkerDirName)
+			path := filepath.Join(dir, "1-1")
+			if preexisting {
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var synced []string
+			record := func(d string) error {
+				synced = append(synced, d)
+				switch d {
+				case parent:
+					if _, err := os.Stat(dir); err != nil {
+						t.Errorf("parent synced before the marker dir exists: %v", err)
+					}
+				case dir:
+					if _, err := os.Stat(path); err != nil {
+						t.Errorf("marker dir synced before the marker exists: %v", err)
+					}
+				}
+				return nil
+			}
+			if err := writeRemovalMarker(record, dir, path); err != nil {
+				t.Fatalf("writeRemovalMarker: %v", err)
+			}
+			want := []string{parent, dir}
+			if len(synced) != len(want) || synced[0] != want[0] || synced[1] != want[1] {
+				t.Fatalf("synced directories = %v, want %v", synced, want)
+			}
+		})
+	}
+}
+
+func TestWriteRemovalMarker_ParentSyncFailureIsReported(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, removedMarkerDirName)
+	errSync := errors.New("injected sync failure")
+	syncDir := func(d string) error {
+		if d == parent {
+			return errSync
+		}
+		return nil
+	}
+	err := writeRemovalMarker(syncDir, dir, filepath.Join(dir, "1-1"))
+	var rme *RemovalMarkerError
+	if !errors.As(err, &rme) || rme.Op != "sync" || rme.Path != parent || !errors.Is(err, errSync) {
+		t.Fatalf("writeRemovalMarker = %v, want RemovalMarkerError{sync %s}", err, parent)
+	}
+}
+
+// NodeHostDir is created durably by quicraft.NewHost, so the marker directory
+// is always exactly one level below an existing, synced directory. A missing
+// NodeHostDir is reported rather than recreated: recreating it would leave an
+// unsynced chain of directories above the marker.
+func TestWriteRemovalMarker_MissingNodeHostDirIsReported(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "gone")
+	dir := filepath.Join(parent, removedMarkerDirName)
+	err := writeRemovalMarker(func(string) error { return nil }, dir, filepath.Join(dir, "1-1"))
+	var rme *RemovalMarkerError
+	if !errors.As(err, &rme) || rme.Op != "mkdir" || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("writeRemovalMarker = %v, want RemovalMarkerError{mkdir} wrapping fs.ErrNotExist", err)
+	}
+	if _, statErr := os.Stat(parent); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("NodeHostDir was recreated: stat = %v", statErr)
 	}
 }

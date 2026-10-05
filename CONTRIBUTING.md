@@ -70,6 +70,36 @@ snapshot tests, and those failures look like Raft bugs. If that happens, rerun
 on an idle machine (`make remote-ci-full REMOTE_HOST=…`) before you start
 debugging.
 
+### Running the suites in the dev container
+
+`make docker-make` builds the dev image (`.devcontainer/Dockerfile.dev`, which
+copies the source in) and runs one make target inside it, `ci` unless you name
+another:
+
+```sh
+cp .devcontainer/.env.example .devcontainer/.env   # then fill in, chmod 600
+make docker-make                                   # make ci in the container
+make docker-make DOCKER_MAKE_TARGET=test
+DOCKER_HOST=ssh://user@bench-host.example make docker-make DOCKER_MAKE_TARGET=ci-full
+make docker-clean                                  # remove this checkout's images
+```
+
+`.devcontainer/.env` holds your own Gitea account and access token as the four
+`GOPRIVATE`/`GIT_CONFIG_*` variables. It is the only place they live: the image
+builds mount it as a BuildKit secret for `go mod download` (never written to a
+layer), and the container and the compose services load it as their
+environment. Without it the build fails at go-enclave, which only the forge
+serves. Building needs the `docker-buildx` plugin.
+
+The dev image also carries `.git` (its own `Dockerfile.dev.dockerignore` keeps
+it; every other image leaves it out), because the releasability gate in
+`make test` reads the git index. Run it from a regular clone: in a `git
+worktree`, `.git` is only a pointer to a path on your machine.
+
+Nothing is bind-mounted, so the same command works against a remote daemon
+through `DOCKER_HOST`. Images are tagged per checkout, so checkouts sharing a
+daemon do not overwrite each other.
+
 ## Code style
 
 Follow *Effective Go*, and run `gofmt`. Local conventions:
@@ -181,6 +211,55 @@ model.
   behaviour, a signature or a byte layout is marked BREAKING, including changes
   that compile but break at run time.
 - `make ci-full` must pass.
+
+## Releasing
+
+Maintainers cut releases with the Makefile recipe only, never with a hand-made
+tag:
+
+```bash
+make release-alpha VERSION=vX.Y.Z-alpha   # or: make release VERSION=vX.Y.Z
+```
+
+Run it on a clean `main` whose `CHANGELOG.md` has a `## [X.Y.Z-alpha]`
+heading. The recipe writes `VERSION`, commits it, creates the annotated root
+and `test/performance/` tags, verifies them, pushes the commit and both tags
+atomically, and reads the remote back. If any step before the push fails,
+nothing is pushed.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RELEASE_GIT` | `git` | The command every git write runs through. It is split on whitespace, so a signing wrapper can take leading arguments: `RELEASE_GIT='/path/to/wrapper project'` |
+| `RELEASE_ALLOWED_SIGNERS` | `.release-allowed-signers` | A git allowed-signers file (`gpg.ssh.allowedSignersFile` format), relative to the checkout root |
+| `RELEASE_REMOTE` | `dev` | The remote the release is pushed to |
+
+With plain git, signing comes from your own configuration: `gpg.format=ssh`,
+`user.signingkey`, `commit.gpgsign=true` and `tag.gpgsign=true`. Before
+pushing, the recipe requires the release commit's author e-mail to be a
+principal in the allowed-signers file (matched literally), and the commit and
+both tags to carry SSH signatures that verify against a key the file lists for
+that principal. A missing file stops the recipe before anything is written.
+The default file belongs to the private repository and is not published, so a
+public maintainer keeps their own and passes it:
+
+```bash
+echo "you@example.org $(cat ~/.ssh/id_ed25519.pub)" > ~/release-signers
+make release-alpha VERSION=vX.Y.Z-alpha RELEASE_REMOTE=origin \
+  RELEASE_ALLOWED_SIGNERS=$HOME/release-signers
+```
+
+`RELEASE_GIT` is trusted to authenticate and for nothing else. It runs the
+writes and the push, because a signing wrapper is also what carries the push
+credentials; every read is plain git. Before pushing, plain git resolves the
+commit and both tag objects to object IDs and checks that the commit is
+exactly the `VERSION` change on top of the `main` you started from and that
+each tag targets it under its own name. The signatures are verified on those
+IDs, and the push names those IDs, not refs. After the push, plain git reads
+the remote back at the URL resolved before `RELEASE_GIT` first ran, and the
+release fails unless `main` and both tags hold exactly the verified objects.
+If that read-back fails after a successful push, something was published:
+inspect the remote before announcing or re-running anything. Your plain git
+must be able to read `RELEASE_REMOTE`; the duplicate-tag check needs that too.
 
 ## Documentation
 

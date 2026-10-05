@@ -1,7 +1,7 @@
 # Public releasability
 
 > **Status: REFERENCE** · Scope: what may be published from this repository,
-> and the gate that enforces it · Last verified: 2026-10-02
+> and the gate that enforces it · Last verified: 2026-10-04
 
 This repository ships publicly: as a Go module and as release archives built
 from a tagged commit. Everything tracked here is published except the private
@@ -62,13 +62,15 @@ Two groups of tracked files are never published:
   | Path | What it is |
   |---|---|
   | `.github/workflows/automerge.yml` | Arms the private forge's auto-merge when a PR opens |
-  | `.release-allowed-signers` | The release recipe's trust anchor: the internal agent principal and its public key |
+  | `.release-allowed-signers` | The private repository's release trust anchor: the internal principal and its public key |
 
   None of them does anything for a public reader. `ci.yml`, `release.yml`,
-  `nightly.yml` and `fuzz.yml` neither call nor read them, and
-  `make release-alpha` reads the signers file from the checkout it runs in,
-  which `export-ignore` does not touch. `.github/dependabot.yml` stays
-  published: it is a github.com service file, inert on the private forge.
+  `nightly.yml` and `fuzz.yml` neither call nor read them. `make release-alpha`
+  reads `.release-allowed-signers` from the checkout it runs in by default; a
+  maintainer releasing from an export names their own allowed-signers file with
+  `RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`).
+  `.github/dependabot.yml` stays published: it is a github.com service file,
+  inert on the private forge.
 
 All of these name the private forge, its hosts or internal identities, so they
 stay in the private repository.
@@ -91,14 +93,20 @@ A new agent tool's files go in `isDevelopmentTooling`, a new private-forge file
 in `privateWorkflowFiles` (both `test/releasability/manifest_test.go`), and
 either one in `.gitattributes` and `.dockerignore` together.
 
-One build gate reads a private-forge file: `test/buildgates` drives
-`make release-alpha` against `.release-allowed-signers`. It goes through
-`requirePrivateWorkflowFile`, which skips when the file is absent *and*
-`.gitattributes` export-ignores it exactly (a published export, where there is
-no private machinery to check), and fails when it is absent for any other
-reason. `TestPrivateWorkflowFilesAreExportIgnored` pins that the file is
-export-ignored, so an export skips the gate instead of failing it. In the
-private repository the file is present and the gate runs.
+The release recipe names no identity of its own. `test/buildgates` drives
+`make release-alpha` end to end with plain git, throwaway ed25519 keys and a
+fabricated allowed-signers file, so those gates run in an export too. The
+remote is a local bare repository, which the recipe reads back with plain git
+after the push, so the gates that substitute a misbehaving `RELEASE_GIT` at the
+push need no network either. One gate
+reads a private-forge file: `TestReleaseAllowedSignersIsWellFormed` checks that
+every entry in `.release-allowed-signers` names a principal and a key
+`ssh-keygen` parses. It goes through `requirePrivateWorkflowFile`, which skips
+when the file is absent *and* `.gitattributes` export-ignores it exactly (a
+published export, where there is no private machinery to check), and fails
+when it is absent for any other reason.
+`TestPrivateWorkflowFilesAreExportIgnored` pins that the file is
+export-ignored, so an export skips the gate instead of failing it.
 
 **Not covered: the module zip and a history push.** The Go module zip
 (`proxy.golang.org`, `go mod download`) is built from the repository at the

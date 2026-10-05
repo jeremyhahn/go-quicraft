@@ -54,7 +54,8 @@ Zero-valued fields take the defaults below (`SetDefaults`).
 | `MaxIncomingConnections` | `int` | 256 | total inbound connections |
 | `MaxConnectionsPerIP` | `int` | 16 | inbound connections from one source IP |
 | `StreamReadIdleTimeout` | `time.Duration` | 30s | how long a read waits at a clean frame boundary before re-checking the connection; not a stream lifetime |
-| `MaxMessageReceiveMemory` | `int64` | 256 MB | aggregate heap budget for inbound message frames. Each frame reserves its declared length times `proto.MaxDecodeMemoryFactor` (8) before its body is read, so a peer cannot declare a huge frame and withhold it. One peer may hold at most a quarter of it. |
+| `MaxMessageReceiveMemory` | `int64` | 512 MB (derived) | aggregate heap budget for inbound message frames. Each frame reserves its declared length, plus any decompression delta, times `proto.MaxDecodeMemoryFactor` (8) before its body is read (`proto.FrameDecodeCharge`), so a peer cannot declare a huge frame and withhold it. Zero derives the default as `MessageReceiveBudgetFrames` maximum-size frame charges (128 MB each). An explicit value wins; one below a single maximum-size frame charge is rejected with `*config.MaxMessageReceiveMemoryTooSmallError`. One peer may hold at most a quarter of it, never less than one maximum-size frame. |
+| `MessageReceiveBudgetFrames` | `int` | 4 | maximum-size frames the derived `MaxMessageReceiveMemory` default admits at once; ignored when `MaxMessageReceiveMemory` is set |
 | `MaxSnapshotReceiveRate` | `int64` | 256 MB/s | inbound snapshot bandwidth; a non-zero value below 64 KB/s is rejected |
 | `MaxConcurrentSnapshotReceives` | `int` | 4 | concurrent inbound snapshot transfers |
 | `MaxSnapshotReceiveMemory` | `int64` | 1 GB | in-flight snapshot chunk memory |
