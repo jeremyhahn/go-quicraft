@@ -41,6 +41,8 @@ type testCallback struct {
 	appliedCount         atomic.Int64
 	committedCount       atomic.Int64
 	leaderCallCount      atomic.Int64
+	leaderEvents         []leaderEvent
+	leaderReadyCount     atomic.Int64
 	readyCount           atomic.Int64
 	snapshotCalls        []snapshotCall
 	compactionCalls      []compactionCall
@@ -95,6 +97,14 @@ type leaderCall struct {
 	shardID  uint64
 	leaderID uint64
 	term     uint64
+}
+
+// leaderEvent is one OnLeaderUpdated (ready false) or OnLeaderReady (ready
+// true, with the reporting replica) in delivery order.
+type leaderEvent struct {
+	leaderCall
+	ready     bool
+	replicaID uint64
 }
 
 type snapshotCall struct {
@@ -161,12 +171,35 @@ func (c *testCallback) OnCommitted(shardID uint64, entries []proto.Entry) {
 func (c *testCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, term uint64) {
 	c.leaderCallCount.Add(1)
 	c.mu.Lock()
-	c.leaderCalls = append(c.leaderCalls, leaderCall{
+	call := leaderCall{
 		shardID:  shardID,
 		leaderID: leaderID,
 		term:     term,
+	}
+	c.leaderCalls = append(c.leaderCalls, call)
+	c.leaderEvents = append(c.leaderEvents, leaderEvent{leaderCall: call})
+	c.mu.Unlock()
+}
+
+func (c *testCallback) OnLeaderReady(shardID, replicaID, leaderID, term uint64) {
+	c.leaderReadyCount.Add(1)
+	c.mu.Lock()
+	c.leaderEvents = append(c.leaderEvents, leaderEvent{
+		leaderCall: leaderCall{shardID: shardID, leaderID: leaderID, term: term},
+		ready:      true,
+		replicaID:  replicaID,
 	})
 	c.mu.Unlock()
+}
+
+// getLeaderEvents returns OnLeaderUpdated and OnLeaderReady calls in the one
+// order they were delivered.
+func (c *testCallback) getLeaderEvents() []leaderEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]leaderEvent, len(c.leaderEvents))
+	copy(result, c.leaderEvents)
+	return result
 }
 
 func (c *testCallback) OnReadyToRead(shardID uint64, readyToRead []proto.ReadyToRead) {

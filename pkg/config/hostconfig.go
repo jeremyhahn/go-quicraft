@@ -134,7 +134,7 @@ type MetricsConfig struct {
 // EventListener holds per-type optional event callbacks. Only non-nil
 // callbacks are invoked. They fall into two classes.
 //
-// Dispatched notifications — OnLeaderUpdated, OnLeaderLost,
+// Dispatched notifications — OnLeaderUpdated, OnLeaderLost, OnLeaderReady,
 // OnCampaignLaunched, OnShardFailed, OnSnapshotCreated, OnSnapshotCompacted,
 // OnSnapshotRecovered, OnLogCompacted, OnLogDBCompacted and OnSnapshotRejected
 // (whether the snapshot pool or the snapshot receiver rejected) — run on a
@@ -142,8 +142,8 @@ type MetricsConfig struct {
 // call any Host API from them, including the synchronous StopShard. They are
 // delivered FIFO by that one goroutine and are therefore ordered per shard.
 // The queue is bounded and never blocks the producer: a refused leader change
-// is re-published on the next tick, and any other refused notification is
-// dropped and logged.
+// or readiness is re-published on the next tick, and any other refused
+// notification is dropped and logged.
 //
 // Every other callback runs synchronously with the operation that produced the
 // event, in order, and must not block: connection events and the other
@@ -165,6 +165,23 @@ type EventListener struct {
 	// OnLeaderLost fires when this replica was the shard's leader and no
 	// longer is.
 	OnLeaderLost func(info EventShardInfo)
+	// OnLeaderReady fires when the shard's leader for info.Term, as this
+	// replica knows it, has committed an entry of that term — the condition
+	// Raft requires before a leader may serve ReadIndex (§6.4 of the Raft
+	// thesis). From then until the next OnLeaderUpdated for the shard, a
+	// ReadIndex issued on this replica is not refused with
+	// ErrReadIndexNotReady: on the leader it is served, and on a follower or
+	// observer it is forwarded to a leader that will serve it.
+	//
+	// It is delivered after the OnLeaderUpdated carrying the same LeaderID and
+	// Term, with no other OnLeaderUpdated for the shard in between, and at most
+	// once per such announcement. Readiness ends with the next OnLeaderUpdated
+	// for the shard, which always names a different (LeaderID, Term) pair —
+	// a new leader, no leader, or the same leader re-elected at a higher term,
+	// which OnLeaderLost does not report — and with OnShardFailed or the
+	// replica being unloaded. Witnesses cannot serve reads and never receive
+	// it. Host.ShardReadReady answers the same question synchronously.
+	OnLeaderReady func(info LeaderInfo)
 	// OnCampaignLaunched fires when this replica starts an election.
 	OnCampaignLaunched func(info EventShardInfo)
 
@@ -254,7 +271,8 @@ type EventListener struct {
 	OnLogDBDiskFull func(info DiskInfo)
 }
 
-// LeaderInfo describes a leader change event.
+// LeaderInfo describes a leader change event (OnLeaderUpdated) or a leader's
+// read readiness (OnLeaderReady). ReplicaID is the local replica reporting it.
 type LeaderInfo struct {
 	ShardID   uint64
 	ReplicaID uint64

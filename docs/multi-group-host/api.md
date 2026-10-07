@@ -741,6 +741,7 @@ func (h *Host) NodeIdentity() string
 func (h *Host) ShardCount() int
 func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
 func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
+func (h *Host) ShardReadReady(shardID uint64) (leaderID, term uint64, ready bool, err error)
 func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
 func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
 func (h *Host) IsShardJoining(shardID uint64) bool
@@ -749,6 +750,18 @@ func (h *Host) StateMachineHash(shardID uint64) (hash uint64, appliedIndex uint6
 
 `GetLeaderID` returns `(leaderID, known, err)` and `GetLeaderIDAndTerm`
 `(leaderID, term, known, err)`. Both read local atomic state and may be stale.
+
+`ShardReadReady` is the synchronous form of `OnLeaderReady`: `ready` is true
+when the shard's leader for `term`, as this replica knows it, has committed an
+entry of that term, which is the condition Raft requires before ReadIndex is
+served (Raft thesis §6.4). It is the readiness most recently delivered to the
+listener, never ahead of it, and it never blocks. A `ReadIndex` issued on the
+replica while it reports ready is not refused with `ErrReadIndexNotReady` for
+that term; a later leader change can still make it fail in the ordinary ways.
+It refuses as `ReadIndex` does before reaching Raft: `ErrClosed`, `ErrDraining`,
+`ErrShardNotFound`, `ErrInvalidOperation` on a witness, `ErrShardNotReady`
+before the shard is in the engine, and `ErrShardFailed` once the failure latch
+has tripped.
 `GetNodeHostInfo` returns a snapshot of all loaded shards; pass
 `NodeHostInfoOption{SkipLogInfo: true}` to skip the per-shard log info, which is
 the expensive part.
@@ -2141,11 +2154,11 @@ than `(nil, nil)`, which would look like an empty value or a missing key.
 Source: `pkg/config/hostconfig.go`.
 
 ```go
-type EventListener struct { /* 26 optional func fields */ }
+type EventListener struct { /* 27 optional func fields */ }
 ```
 
 Set only the callbacks you need; nil callbacks are not invoked. Engine events
-(leader updates, leader loss, campaign launches, shard failure, log compaction,
+(leader updates, leader read readiness, leader loss, campaign launches, shard failure, log compaction,
 snapshot creation, snapshot rejection) are delivered in FIFO order on one
 dispatcher goroutine that holds no engine lock, so a handler may call any Host method, including
 `StopShard`. Other callbacks run synchronously on the goroutine that produced
@@ -2157,11 +2170,35 @@ Raft events:
 |---|---|---|
 | `OnLeaderUpdated` | `LeaderInfo` | a leader change is detected |
 | `OnLeaderLost` | `EventShardInfo` | the local replica lost leadership |
+| `OnLeaderReady` | `LeaderInfo` | the shard's leader for `Term` has committed an entry of that term, so ReadIndex is served; see below |
 | `OnCampaignLaunched` | `EventShardInfo` | an election campaign started |
 | `OnCampaignSkipped` | `EventShardInfo` | **never fires**; see below |
 | `OnSnapshotRejected` | `SnapshotInfo` | a snapshot was rejected: a request refused or abandoned, a save that panicked, an inbound transfer refused, or a recovery that failed before the state machine's `RecoverFromSnapshot` was invoked (the engine re-drives it). `SnapshotInfo.Err` carries the cause when there is one |
 | `OnProposalDropped` | `EventShardInfo` | a proposal was dropped |
 | `OnReadIndexDropped` | `EventShardInfo` | a ReadIndex request was dropped |
+
+**`OnLeaderReady` and the end of readiness.** Raft lets a new leader serve
+ReadIndex only after it has committed an entry of its own term (thesis §6.4);
+before that, `ReadIndex` returns `ErrReadIndexNotReady`. `OnLeaderReady` is the
+event for that moment, so a consumer waits on it instead of retrying:
+
+- On the leader it fires once its first entry of the term commits. On a
+  follower or observer it fires once its commit index reaches an entry of the
+  current term, which proves the leader it forwards reads to is ready. A
+  replica that does not yet know a leader is never ready.
+- It is delivered after the `OnLeaderUpdated` with the same `LeaderID` and
+  `Term`, with no other `OnLeaderUpdated` for the shard in between, and at most
+  once per announcement. A restarted replica announces again.
+- Readiness ends with the next `OnLeaderUpdated` for the shard, which always
+  names a different pair: a new leader, no leader (a CheckQuorum step-down), or
+  the **same leader re-elected at a higher term**. `OnLeaderLost` does not fire
+  for that last case, so it cannot stand in for the end of readiness. Readiness
+  also ends with `OnShardFailed` and when the replica is unloaded.
+- A refused delivery (the listener queue is full) is retried on the next tick
+  behind its own `OnLeaderUpdated`, never dropped.
+- Witnesses store no log, cannot serve reads, and never receive it.
+
+`Host.ShardReadReady` answers the same question synchronously.
 
 > **`OnCampaignSkipped` never fires.** The field exists and is forwarded, but no
 > engine code invokes it. Do not build a leaderless-shard alert on it: the

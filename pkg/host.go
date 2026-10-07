@@ -1469,6 +1469,11 @@ type nodeState struct {
 	configChangeIndex atomic.Uint64
 	isLeader          atomic.Bool
 
+	// readReady mirrors the last OnLeaderReady: the (leaderID, term) pair
+	// above is read-ready. Every updateNodeLeader clears it — each names a new
+	// pair — and markLeaderReady sets it, both under leaderSeq.
+	readReady atomic.Bool
+
 	// leaderSeq makes leaderID, term and isLeader readable as a CONSISTENT
 	// TRIPLE via leaderAndTerm. They are three independent words, so a caller
 	// that loads them separately can observe a combination that never existed —
@@ -2471,6 +2476,40 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 		// errors.Is / Temporary / NotLeader behave identically. A pending read
 		// gets the bare error: it appended nothing that could commit.
 		c.h.failLeaderChangeRequests(ns, &NotLeaderError{ShardID: shardID, LeaderID: leaderID})
+	}
+}
+
+// OnLeaderReady records that the shard's (leaderID, term) pair is read-ready
+// for ShardReadReady and fires the OnLeaderReady listener. It runs on the
+// listener dispatcher behind the OnLeaderUpdated that announced the same pair,
+// so the mirror is set only after that update stored the pair. A witness
+// cannot serve reads, so it is neither marked nor announced.
+func (c *hostEngineCallback) OnLeaderReady(shardID, replicaID, leaderID, term uint64) {
+	v, exists := c.h.nodes.Load(shardID)
+	if !exists {
+		return
+	}
+	ns, ok := v.(*nodeState)
+	if !ok {
+		slog.Error("OnLeaderReady: nodeState type assertion failed",
+			"shard_id", shardID,
+			"error", &TypeAssertionError{
+				Context:      "OnLeaderReady nodeState lookup",
+				ExpectedType: "*nodeState",
+				ActualValue:  v,
+			})
+		return
+	}
+	if ns.cfg.IsWitness || !ns.markLeaderReady(leaderID, term) {
+		return
+	}
+	if el := c.h.cfg.EventListener; el != nil && el.OnLeaderReady != nil {
+		el.OnLeaderReady(config.LeaderInfo{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Term:      term,
+			LeaderID:  leaderID,
+		})
 	}
 }
 
@@ -6791,6 +6830,49 @@ func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error) 
 
 	leaderID, term, _ := ns.leaderAndTerm()
 	return leaderID, term, leaderID != 0, nil
+}
+
+// ShardReadReady reports, without blocking, whether a ReadIndex issued on this
+// replica now would get past Raft's read gate: whether the shard's leader for
+// the returned term has committed an entry of that term (§6.4 of the Raft
+// thesis), so the read is not refused with ErrReadIndexNotReady. It returns the
+// leader and term the answer is about, read together with it as one
+// combination that held.
+//
+// It answers from the state the OnLeaderReady and OnLeaderUpdated events
+// delivered, so a caller that installs the listeners and then queries cannot
+// miss an edge: if the query says not ready, the OnLeaderReady that changes
+// that is still to come. Like GetLeaderIDAndTerm it may be STALE — the
+// leader can have lost the term already, which the next OnLeaderUpdated
+// reports and which a ReadIndex then answers with its own error.
+//
+// The refusals ReadIndex makes before reaching Raft are returned as the same
+// errors: ErrClosed, ErrDraining, an unknown shard, ErrInvalidOperation for a
+// witness (it cannot serve reads), ErrShardNotReady before the replica is
+// running, and ErrShardFailed once its failure latch has tripped.
+func (h *Host) ShardReadReady(shardID uint64) (leaderID, term uint64, ready bool, err error) {
+	if h.closed.Load() {
+		return 0, 0, false, ErrClosed
+	}
+	if h.draining.Load() {
+		return 0, 0, false, ErrDraining
+	}
+	ns, err := h.getNode(shardID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if ns.cfg.IsWitness {
+		return 0, 0, false, ErrInvalidOperation
+	}
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil || engNode.Peer() == nil {
+		return 0, 0, false, ErrShardNotReady
+	}
+	if engNode.IsFailed() {
+		return 0, 0, false, ErrShardFailed
+	}
+	leaderID, term, _, ready = ns.leaderTermReady()
+	return leaderID, term, ready, nil
 }
 
 // RequestLeaderTransfer requests leadership transfer to a specific replica.
@@ -11388,17 +11470,27 @@ func (h *Host) releaseRemovedMemberConn(shardID, replicaID uint64, address strin
 //
 // Safe for concurrent access from any goroutine.
 func (ns *nodeState) leaderAndTerm() (leaderID, term uint64, isLeader bool) {
+	leaderID, term, isLeader, _ = ns.leaderTermReady()
+	return leaderID, term, isLeader
+}
+
+// leaderTermReady is leaderAndTerm plus the pair's read readiness, all four
+// read as one combination that co-existed.
+//
+// Safe for concurrent access from any goroutine.
+func (ns *nodeState) leaderTermReady() (leaderID, term uint64, isLeader, readReady bool) {
 	for {
 		before := ns.leaderSeq.Load()
 		if before&1 != 0 {
-			// A write is in flight; its window is three stores.
+			// A write is in flight; its window is four stores.
 			continue
 		}
 		leaderID = ns.leaderID.Load()
 		term = ns.term.Load()
 		isLeader = ns.isLeader.Load()
+		readReady = ns.readReady.Load()
 		if ns.leaderSeq.Load() == before {
-			return leaderID, term, isLeader
+			return leaderID, term, isLeader, readReady
 		}
 	}
 }
@@ -11428,7 +11520,27 @@ func (h *Host) updateNodeLeader(shardID, leaderID, term uint64) {
 	ns.leaderID.Store(leaderID)
 	ns.term.Store(term)
 	ns.isLeader.Store(leaderID == ns.replicaID)
+	ns.readReady.Store(false)
 	ns.leaderSeq.Add(1)
+}
+
+// markLeaderReady records that the cached (leaderID, term) pair is read-ready
+// and reports whether it did. A pair that is no longer the cached one is
+// refused: readiness belongs to the pair it was observed for, never to its
+// successor. The engine delivers OnLeaderReady behind its own pair's
+// OnLeaderUpdated on the one dispatcher goroutine, so the check holds by
+// construction; it is kept because a mirror that could claim readiness for
+// the wrong term would promise a read the leader refuses.
+//
+// Called only from the dispatcher goroutine, the single writer of the seqlock.
+func (ns *nodeState) markLeaderReady(leaderID, term uint64) bool {
+	if ns.leaderID.Load() != leaderID || ns.term.Load() != term {
+		return false
+	}
+	ns.leaderSeq.Add(1)
+	ns.readReady.Store(true)
+	ns.leaderSeq.Add(1)
+	return true
 }
 
 // buildWALOptions constructs waldb.Option values from the HostConfig.

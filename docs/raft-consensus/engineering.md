@@ -2383,7 +2383,7 @@ Moving the notification off the worker goroutine removes the class rather than t
 
 **Ordering**: notifications are consumed by exactly one goroutine from a FIFO channel, so delivery follows the order the engine produced them: a total order, and therefore a per-shard order. There is deliberately no ordering guarantee against the callbacks that stay synchronous; those were already unordered with respect to each other, since they run on three different worker tiers.
 
-**Queue-full policy** (`listenerQueueSize` = 1024): `dispatch` never blocks the producing worker: a worker parked on a full queue still holds `nodesMu.RLock`, which would reintroduce the deadlock. It also never drops silently: `dispatch` reports acceptance and each caller picks a policy. `OnLeaderUpdated` leaves its bookkeeping uncommitted and re-publishes next tick; `OnCampaignLaunched` and `OnShardFailed` drop, counted and logged at ERROR. The queue only fills when a listener violates the documented non-blocking contract.
+**Queue-full policy** (`listenerQueueSize` = 1024): `dispatch` never blocks the producing worker: a worker parked on a full queue still holds `nodesMu.RLock`, which would reintroduce the deadlock. It also never drops silently: `dispatch` reports acceptance and each caller picks a policy. `OnLeaderUpdated` leaves its bookkeeping uncommitted and re-publishes next tick; `OnLeaderReady` does the same, and is only attempted once its own leader change was accepted, because a consumer waiting on it has nothing else to wake it; `OnCampaignLaunched` and `OnShardFailed` drop, counted and logged at ERROR. The queue only fills when a listener violates the documented non-blocking contract.
 
 
 ### Snapshot pool
@@ -2486,6 +2486,7 @@ STEP WORKER (shardID % NumWorkers):
   • peer.HasUpdate(lastApplied)?
   • peer.GetUpdate() → Update{EntriesToSave, CommittedEntries, Messages, ...}
   • OnLeaderUpdated       → listener dispatcher (if leader changed)
+  • OnLeaderReady         → listener dispatcher (once per announced pair, after it)
   • OnCampaignLaunched    → listener dispatcher (if vote messages)
   • OnReadyToRead         → inline (if reads confirmed)
   • sendMessages() [FREE-ORDER ONLY: send BEFORE persist]
@@ -2612,7 +2613,7 @@ refuse the restarted shard nor clear the restarted shard's claim.
 
 `OnCampaignSkipped` is declared on the interface and its doc comment names the step worker as the producer, but nothing in `pkg/internal/engine` calls it: every campaign-refusal branch in `startElection` and `handleTimeoutNow` logs and returns without notifying the engine, so `selfRemoved`, `roleMismatch`, `joining`, an unresolved stale config tail and an unreadable own-log term all produce no event. The Host-side plumbing down to `EventListener.OnCampaignSkipped` is wired and works if the hook is ever called, so implement against it if you like, but do not build monitoring that depends on receiving these events today.
 
-*Via the listener dispatcher*: `OnLeaderUpdated(shardID, leaderID, term)`, `OnCampaignLaunched(shardID, replicaID, term)`, and the node-level `EventListener.OnShardFailed` (`Node.handleError`). Their queue-full policies differ: a refused `OnLeaderUpdated` leaves the step worker's published-leader bookkeeping uncommitted, so the change is re-published on the next tick and never lost. `OnCampaignLaunched` is a cold path (elections are seconds apart), so a full queue drops it (counted and logged at ERROR) rather than reporting the election at the wrong time later. The election metric is incremented inline either way, so the counter stays exact.
+*Via the listener dispatcher*: `OnLeaderUpdated(shardID, leaderID, term)`, `OnLeaderReady(shardID, replicaID, leaderID, term)`, `OnCampaignLaunched(shardID, replicaID, term)`, and the node-level `EventListener.OnShardFailed` (`Node.handleError`). Their queue-full policies differ: a refused `OnLeaderUpdated` leaves the step worker's published-leader bookkeeping uncommitted, so the change is re-published on the next tick and never lost. `OnLeaderReady` is read from the same `Peer.LeaderTermReady` triple as the leader change it follows, sent only after that change was accepted and at most once per announced pair (`prevReadyTerms`, cleared by every accepted leader change), and retried on refusal in the same way. `OnCampaignLaunched` is a cold path (elections are seconds apart), so a full queue drops it (counted and logged at ERROR) rather than reporting the election at the wrong time later. The election metric is incremented inline either way, so the counter stays exact.
 
 **Applier**: `Apply(entries, results)`, the state machine integration. Decouples engine from concrete rsm.StateMachine for testability.
 
@@ -2746,8 +2747,8 @@ membership-changing batch.
 **No proposal payload is ever logged.** It is application data.
 
 **User-visible notifications** go through `config.EventListener`.
-`OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched` and the engine's
-`OnShardFailed` are delivered on the listener dispatcher, which holds no engine
+`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and the
+engine's `OnShardFailed` are delivered on the listener dispatcher, which holds no engine
 lock, so a listener may call any `Host` API, including the synchronous
 `StopShard`. Payloads are `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`,
 `ConnectionInfo`, `DiskInfo` and `EventShardInfo`.

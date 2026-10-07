@@ -83,8 +83,8 @@ failure observed during teardown still reaches the listener.
 
 ## The listener dispatcher prevents a deadlock
 
-User-visible cold-path notifications (`OnLeaderUpdated`, `OnCampaignLaunched`,
-shard failure) run on one dedicated goroutine rather than on the worker that
+User-visible cold-path notifications (`OnLeaderUpdated`, `OnLeaderReady`,
+`OnCampaignLaunched`, shard failure) run on one dedicated goroutine rather than on the worker that
 produced them. This is a correctness rule, not a throughput optimization.
 
 The step worker holds `stepWorker.nodesMu.RLock` while it runs, and
@@ -109,6 +109,61 @@ consumer, giving a total order and therefore a per-shard order.
 | `SyncRead` / `ReadIndex` | linearizable | a heartbeat quorum round, or none under `LeaseRead` |
 | `StaleRead` | none: local state as of whatever has applied | free |
 | `FollowerRead` | waits until local apply reaches the local commit index; no leadership check, so it may lag the leader | no quorum round; may wait for apply |
+
+### Read readiness is an event, not a retry loop
+
+A new leader may not serve ReadIndex until it has committed an entry of its own
+term (PhD §6.4): its commit index could otherwise trail an entry a previous
+leader committed. Until then `ReadIndex` returns `ErrReadIndexNotReady`.
+`OnLeaderReady` tells a consumer when that ends, so it never has to poll.
+
+**Readiness is defined as the gate itself.** On the leader it is
+`hasCommittedEntryAtCurrentTerm`, the very test `handleLeaderReadIndex`
+applies, so the event cannot run ahead of what ReadIndex will accept. On a
+follower or observer the same predicate holds with no extra protocol: a
+follower learns its commit index only from a leader, and only the leader of its
+current term T can have sent it an entry of term T, so a committed entry of
+term T on the follower proves that leader had already committed it. A forwarded
+read is therefore not refused as not-ready either. Every replica that serves
+reads gets the event; witnesses store no log and are excluded.
+
+**It is published with the leader and term, as one triple.** The peer's
+leader/term seqlock carries `(leaderID, term, readReady)`, written together by
+`syncLeaderID` after every step and again at the end of `Commit`, where a
+leader's first commit of its term lands. A reader can never see readiness from
+one term paired with another term's leader. The predicate is monotonic within
+a term, so the peer caches the last answer and skips the log lookup until the
+term or the commit index moves.
+
+**Ordering rides on the leader change.** The step worker delivers
+`OnLeaderReady(leader, term)` only after the `OnLeaderUpdated` for the same
+pair was accepted by the dispatcher, so FIFO delivery puts it after that
+announcement and before the next one. The end of readiness needs no event of
+its own: every `OnLeaderUpdated` names a different `(leader, term)` pair and
+ends it, including the same leader re-elected at a higher term. `OnLeaderLost`
+does not fire there, because leadership never changed hands, which is why
+readiness is not tied to it. The host mirrors the triple in `nodeState` under
+its own seqlock, and every leader update clears the mirrored flag;
+`Host.ShardReadReady` reads that mirror, so the query is never ahead of the
+event.
+
+**A refused readiness is retried, never dropped.** A full dispatcher queue
+refuses a notification. A dropped leader change is harmless because the next
+one supersedes it, but a consumer waiting for readiness has nothing else to
+wake it, so the step worker re-publishes it on the next tick, behind its leader
+change.
+
+#### Rejected: readiness on the leader only
+
+Followers forward reads, and a consumer on a follower would be left polling. The
+follower's commit index already carries the proof, so propagating readiness
+costs nothing on the wire.
+
+#### Rejected: ending readiness with `OnLeaderLost`
+
+It fires only when the local replica stops leading. It misses a follower whose
+leader changed, and a leader re-elected at a higher term, which is not ready
+again until that term's first commit.
 
 ### ReadIndex batching, and why alias registration comes first
 

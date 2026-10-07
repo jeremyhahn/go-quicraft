@@ -80,7 +80,12 @@ type stepWorker struct {
 	// separate map (not a struct value on prevLeaders) so the two stay
 	// individually addressable.
 	prevLeaderTerms map[uint64]uint64
-	stopC           chan struct{}
+	// prevReadyTerms records, per shard, the term whose OnLeaderReady has been
+	// published for the (leader, term) pair in prevLeaders/prevLeaderTerms.
+	// Cleared whenever a leader change is published, so readiness is announced
+	// once per announced pair and again after any change that ended it.
+	prevReadyTerms map[uint64]uint64
+	stopC          chan struct{}
 
 	// listeners carries user-visible notifications off this goroutine. The step
 	// worker fires them while holding nodesMu.RLock, and a listener that calls
@@ -211,6 +216,7 @@ func newStepWorker(
 		callback:          callback,
 		prevLeaders:       make(map[uint64]uint64),
 		prevLeaderTerms:   make(map[uint64]uint64),
+		prevReadyTerms:    make(map[uint64]uint64),
 		stopC:             stopC,
 		inboxBuf:          make([]proto.Message, 0, 64),
 		proposeBuf:        make([]proto.Entry, 0, 64),
@@ -1047,10 +1053,17 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 // updates would leave a real Raft leader that the public API reports as a
 // follower, and a stepped-down node that keeps reporting itself leader —
 // clients route writes by exactly this flag.
-// The leader and term are read as a PAIR (Peer.LeaderAndTerm). All three publish
-// sites run outside raftMu, so reading the two mirrors separately could report a
-// combination that never co-existed — telling a listener a replica led in a term
-// it never led.
+// The leader and term are read as a PAIR (Peer.LeaderTermReady). All three
+// publish sites run outside raftMu, so reading the two mirrors separately could
+// report a combination that never co-existed — telling a listener a replica led
+// in a term it never led.
+//
+// The same read carries the term leader's read readiness, published here too
+// (OnLeaderReady, after the pair's OnLeaderUpdated). A leader becomes read-ready
+// when its commit index first reaches an entry of its term, and every such
+// advance is followed by one of these publish sites: the committed entries make
+// HasUpdate true, so the next processReady publishes (and tick publishes on
+// every tick regardless), with no polling of its own.
 //
 // The callback itself is DELIVERED BY THE LISTENER DISPATCHER, not on this
 // goroutine: tick() and processReady() hold nodesMu.RLock across this call, and
@@ -1062,12 +1075,27 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 	if w.callback == nil || node.peer == nil {
 		return
 	}
-	currentLeader, term := node.peer.LeaderAndTerm()
+	// One consistent triple: the readiness published below belongs to exactly
+	// the (leader, term) pair published first.
+	currentLeader, term, readReady := node.peer.LeaderTermReady()
+	if !w.publishLeaderUpdate(shardID, currentLeader, term) {
+		return
+	}
+	if readReady {
+		w.publishLeaderReady(shardID, node, currentLeader, term)
+	}
+}
+
+// publishLeaderUpdate publishes OnLeaderUpdated when (currentLeader, term)
+// differs from the last published pair, and reports whether the published pair
+// now IS (currentLeader, term) — which is what publishLeaderReady requires, so
+// readiness is never announced for a pair the listener has not been told of.
+func (w *stepWorker) publishLeaderUpdate(shardID, currentLeader, term uint64) bool {
 	// Compare the (leader, term) PAIR: a same-leader re-election at a higher
 	// term (leader unchanged, term advanced) is a real leadership event that
 	// keying on the leader ID alone would silently swallow.
 	if currentLeader == w.prevLeaders[shardID] && term == w.prevLeaderTerms[shardID] {
-		return
+		return true
 	}
 	// A term that advances while NO leader is known in either the previous or
 	// the current state is campaign churn, not a leadership event: a replica
@@ -1078,7 +1106,7 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 	// happen. Record the term so the next genuine change is still detected.
 	if currentLeader == 0 && w.prevLeaders[shardID] == 0 {
 		w.prevLeaderTerms[shardID] = term
-		return
+		return false
 	}
 	// Hand the notification to the listener dispatcher and commit the
 	// bookkeeping ONLY if it was accepted. OnLeaderUpdated maintains the Host's
@@ -1095,10 +1123,39 @@ func (w *stepWorker) publishLeaderChange(shardID uint64, node *Node) {
 			"leader_id", currentLeader,
 			"term", term,
 		)
-		return
+		return false
 	}
 	w.prevLeaders[shardID] = currentLeader
 	w.prevLeaderTerms[shardID] = term
+	// Every published leader change ends the readiness announced for the
+	// previous pair; the new pair's readiness is announced afresh.
+	delete(w.prevReadyTerms, shardID)
+	return true
+}
+
+// publishLeaderReady publishes OnLeaderReady for the published (leaderID,
+// term) pair, once. It is queued behind the OnLeaderUpdated that announced the
+// pair — both go through the FIFO dispatcher from this one goroutine — and a
+// refused dispatch is retried at the next publish exactly like a leader change,
+// so readiness is never lost: a consumer waiting on it has nothing else to wake
+// it.
+func (w *stepWorker) publishLeaderReady(shardID uint64, node *Node, leaderID, term uint64) {
+	if w.prevReadyTerms[shardID] == term {
+		return
+	}
+	cb := w.callback
+	replicaID := node.replicaID
+	if !w.listeners.dispatch(func() {
+		cb.OnLeaderReady(shardID, replicaID, leaderID, term)
+	}) {
+		slog.Warn("leader ready notification deferred: listener queue full",
+			"shard_id", shardID,
+			"leader_id", leaderID,
+			"term", term,
+		)
+		return
+	}
+	w.prevReadyTerms[shardID] = term
 }
 
 // processCallbacks detects leader changes, delivers ReadyToRead notifications,
@@ -1959,6 +2016,7 @@ func (w *stepWorker) unloadNode(shardID uint64) {
 	delete(w.commitSlots, shardID)
 	delete(w.prevLeaders, shardID)
 	delete(w.prevLeaderTerms, shardID)
+	delete(w.prevReadyTerms, shardID)
 	delete(w.deferredSnapshots, shardID)
 	w.nodesMu.Unlock()
 }

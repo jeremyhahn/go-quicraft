@@ -84,6 +84,22 @@ type Callback interface {
 	// re-published on the next tick. MUST be non-blocking.
 	OnLeaderUpdated(shardID uint64, leaderID uint64, term uint64)
 
+	// OnLeaderReady is called when the step worker observes that the leader of
+	// the current term, as replica replicaID knows it, has committed an entry
+	// of that term: on the leader itself, from that moment a ReadIndex is no
+	// longer refused with ErrReadIndexNotReady for the term; on a follower,
+	// a ReadIndex it forwards to that leader is not either. See
+	// raft.Peer.LeaderTermReady.
+	//
+	// Delivered by the listener dispatcher, ordered with OnLeaderUpdated: it
+	// follows the OnLeaderUpdated(leaderID, term) that announced the same pair,
+	// with no other OnLeaderUpdated for the shard in between, so the next
+	// OnLeaderUpdated for the shard is the one that ends the readiness. It is
+	// published at most once per announced (leaderID, term) and per loaded
+	// replica, and like OnLeaderUpdated it is retried, never dropped, when the
+	// queue is full. MUST be non-blocking.
+	OnLeaderReady(shardID, replicaID, leaderID, term uint64)
+
 	// OnReadyToRead is called by the step worker when read index
 	// requests have been confirmed by the leader via heartbeat quorum.
 	// Each ReadyToRead carries a Key for correlation and the committed

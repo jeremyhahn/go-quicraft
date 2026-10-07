@@ -408,6 +408,16 @@ it: the shard keeps running, the host logs the failure, and
 `RequestSnapshot` returns it. `OnCampaignSkipped` never fires: to detect a
 leaderless shard, watch for `ShardNoLeader` health with no election activity.
 
+A freshly elected leader cannot serve linearizable reads until it has committed
+an entry of its own term, and `ReadIndex` returns `ErrReadIndexNotReady` until
+then. Wait for `OnLeaderReady` instead of retrying: it fires on every replica,
+leader or follower, once that commit is known there, and from then on reads
+issued on that replica are not refused for that reason. The next
+`OnLeaderUpdated` ends it — including the same leader re-elected at a higher
+term, which `OnLeaderLost` does not report. `ShardReadReady` gives the same
+answer synchronously. The full contract is in
+[api.md](api.md#event-listener).
+
 ## Manage disk
 
 Set `MaxWALDiskSize`. At 85% of it the host fires `OnLogDBDiskWarning`; at 95% it

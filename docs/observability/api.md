@@ -133,7 +133,7 @@ optional callback; nil fields are skipped.
 
 | Group | Callbacks | Payload |
 |---|---|---|
-| Raft | `OnLeaderUpdated` | `LeaderInfo` |
+| Raft | `OnLeaderUpdated`, `OnLeaderReady` | `LeaderInfo` |
 | | `OnLeaderLost`, `OnCampaignLaunched`, `OnCampaignSkipped`, `OnProposalDropped`, `OnReadIndexDropped` | `EventShardInfo` |
 | | `OnSnapshotRejected` | `SnapshotInfo` |
 | System | `OnNodeHostShuttingDown` | none |
@@ -145,6 +145,14 @@ optional callback; nil fields are skipped.
 
 `OnCampaignSkipped` is never invoked. Detect a leaderless shard with
 `Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
+
+`OnLeaderReady` fires once the shard's leader for `LeaderInfo.Term` has
+committed an entry of that term, which is when ReadIndex stops returning
+`ErrReadIndexNotReady`. It follows the `OnLeaderUpdated` for the same pair and
+lasts until the next one, which also covers the same leader re-elected at a
+higher term, a case `OnLeaderLost` does not report.
+`Host.ShardReadReady` is its synchronous form. The contract is in
+[the host API](../multi-group-host/api.md#event-listener).
 
 `ShardFailedInfo.Err` is one of the public error types `quicraft.ApplyError`,
 `SMPanicError`, `SaveStateError`, `CommitError`, `WorkerPanicError`,
@@ -165,7 +173,7 @@ Delivery comes in two classes:
 
 | Class | Callbacks | Runs on | You may |
 |---|---|---|---|
-| dispatched | `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected` | one dispatcher goroutine holding no engine lock, FIFO | call any `Host` API, including `StopShard` |
+| dispatched | `OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected` | one dispatcher goroutine holding no engine lock, FIFO | call any `Host` API, including `StopShard` |
 | inline | every other callback | the goroutine that produced the event | return quickly; do not call a synchronous `Host` API that stops or unloads a shard |
 
 There is no ordering guarantee between the two classes.

@@ -86,7 +86,9 @@ const listenerQueueSize = 1024
 //     rejected publish is re-attempted on the next tick and the notification
 //     cannot be lost. This matters: OnLeaderUpdated is what maintains the
 //     Host's isLeader mirror, and losing one would leave GetShardInfo
-//     permanently wrong.
+//     permanently wrong. Read readiness (OnLeaderReady) is retried the same
+//     way, and only once its leader change was accepted: a consumer waiting
+//     on it has nothing else to wake it.
 //   - Campaign launches and shard failures are dropped, counted in
 //     ListenerNotificationsDropped, and logged at ERROR with the shard, the
 //     reason and the running total, so the event still reaches the operator's

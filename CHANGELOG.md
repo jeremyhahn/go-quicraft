@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `EventListener.OnLeaderReady` (#238): fires when the shard's leader for
+  `LeaderInfo.Term` has committed an entry of that term, the ReadIndex
+  precondition of Raft thesis §6.4. From then until the next `OnLeaderUpdated`,
+  `ReadIndex` on that replica is not refused with `ErrReadIndexNotReady`, so a
+  consumer waits on the event instead of retrying. It reaches followers and
+  observers too: a committed entry of the current term on a follower proves its
+  leader is ready. It is delivered after the `OnLeaderUpdated` for the same
+  leader and term, at most once per announcement, and a refused delivery is
+  retried rather than dropped. The next `OnLeaderUpdated`, `OnShardFailed` or
+  an unload ends it. That includes the same leader re-elected at a higher term,
+  which `OnLeaderLost` does not report. Witnesses never receive it.
+- `Host.ShardReadReady(shardID) (leaderID, term, ready, err)` (#238): the same
+  answer, synchronously and without blocking. It is never ahead of the event,
+  and it refuses as `ReadIndex` does before reaching Raft.
+
 ## [0.18.0] - 2026-10-05
 
 Release candidate. **Breaking API change, no format change:**

@@ -134,6 +134,25 @@ type Peer struct {
 	// retry, and the write window is two stores.
 	leaderSeq atomic.Uint64
 
+	// readReady completes the leaderID/term mirror, under the same seqlock:
+	// true when the leader of the current term, as this replica knows it, has
+	// committed an entry of that term. On the leader that is exactly the
+	// condition handleLeaderReadIndex tests before it stops answering
+	// ErrReadIndexNotReady (Raft PhD 6.4); on a follower it means the leader
+	// it would forward a ReadIndex to has reached it. See computeReadReady.
+	readReady atomic.Bool
+
+	// readyTerm is the term computeReadReady last found ready, and
+	// readyProbeTerm/readyProbeCommit the (term, committed) it last found NOT
+	// ready. Readiness is monotonic within a term — the commit index never
+	// moves back and every entry above a current-term entry is current-term
+	// too — so these let syncLeaderID, which runs on every step, skip the log
+	// term lookup until the term or the commit index moves. Writer-only state
+	// with the same discipline as syncLeaderID.
+	readyTerm        uint64
+	readyProbeTerm   uint64
+	readyProbeCommit uint64
+
 	// shardID and replicaID identify this peer. Cached from cfg for
 	// fast access without going through raft.
 	shardID   uint64
@@ -1961,6 +1980,10 @@ func (p *Peer) Commit(update proto.Update) error {
 			p.r.broadcastAppend()
 		}
 	}
+	// The commit just above can be the first of the leader's term, which is
+	// the moment it becomes read-ready; publish it now rather than at the
+	// next step.
+	p.syncLeaderID()
 	return nil
 }
 
@@ -2516,11 +2539,47 @@ func (p *Peer) LogMarkers() (committed, processed uint64) {
 // but the atomic leaderID on Peer provides safe concurrent reads for
 // LeaderID() and IsLeader().
 func (p *Peer) syncLeaderID() {
+	ready := p.computeReadReady()
 	// Odd for the duration of the update, even once settled: see leaderSeq.
 	p.leaderSeq.Add(1)
 	p.leaderID.Store(p.r.leaderID)
 	p.term.Store(p.r.term)
+	p.readReady.Store(ready)
 	p.leaderSeq.Add(1)
+}
+
+// computeReadReady reports whether the leader of the current term, as this
+// replica knows it, has committed an entry of the current term.
+//
+// On the leader this is hasCommittedEntryAtCurrentTerm, the very test
+// handleLeaderReadIndex applies before it serves a read, so a ReadIndex
+// stepped after a true result is not refused with ErrReadIndexNotReady while
+// the replica still leads that term.
+//
+// On a follower the same predicate carries the leader's readiness without any
+// extra protocol. A follower's commit index only ever comes from a leader, and
+// only a leader of the follower's current term T can have told it about an
+// entry of term T (the entry did not exist before that leader created it). So
+// a committed entry of term T in the follower's log means the unique leader of
+// T had already committed it: that leader is read-ready for T, and a ReadIndex
+// forwarded to it is not refused as not-ready either.
+func (p *Peer) computeReadReady() bool {
+	r := p.r
+	if r.leaderID == noLeader {
+		return false
+	}
+	if p.readyTerm == r.term {
+		return true
+	}
+	if p.readyProbeTerm == r.term && p.readyProbeCommit == r.log.committed {
+		return false
+	}
+	p.readyProbeTerm, p.readyProbeCommit = r.term, r.log.committed
+	if !r.hasCommittedEntryAtCurrentTerm() {
+		return false
+	}
+	p.readyTerm = r.term
+	return true
 }
 
 // LeaderAndTerm returns the leader ID and the term TOGETHER, as a pair that
@@ -2531,16 +2590,26 @@ func (p *Peer) syncLeaderID() {
 //
 // Safe for concurrent access from any goroutine.
 func (p *Peer) LeaderAndTerm() (uint64, uint64) {
+	leaderID, term, _ := p.LeaderTermReady()
+	return leaderID, term
+}
+
+// LeaderTermReady returns the leader ID, the term and whether that term's
+// leader is read-ready (see computeReadReady), as one CONSISTENT TRIPLE: the
+// three were published together by the same syncLeaderID. Safe from any
+// goroutine.
+func (p *Peer) LeaderTermReady() (leaderID, term uint64, readReady bool) {
 	for {
 		before := p.leaderSeq.Load()
 		if before&1 != 0 {
-			// A write is in flight; its window is two stores.
+			// A write is in flight; its window is three stores.
 			continue
 		}
-		leaderID := p.leaderID.Load()
-		term := p.term.Load()
+		leaderID = p.leaderID.Load()
+		term = p.term.Load()
+		readReady = p.readReady.Load()
 		if p.leaderSeq.Load() == before {
-			return leaderID, term
+			return leaderID, term, readReady
 		}
 	}
 }

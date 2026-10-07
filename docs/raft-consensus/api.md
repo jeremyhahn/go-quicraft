@@ -91,6 +91,7 @@ see [`architecture.md`](architecture.md).
 ```go
 func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
 func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
+func (h *Host) ShardReadReady(shardID uint64) (leaderID, term uint64, ready bool, err error)
 func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
 func (h *Host) GetLogRange(shardID uint64) (LogRange, error)
 func (h *Host) GetLogReader(shardID uint64) (ReadonlyLogReader, error)
@@ -102,6 +103,10 @@ func (h *Host) IsShardJoining(shardID uint64) bool
 
 `StateMachineHash` returns `ok == false` when the state machine does not
 implement `sm.Hasher`.
+
+`ShardReadReady` reports, without blocking, whether the shard's leader for
+`term` has committed an entry of that term as this replica knows it — the
+synchronous form of `OnLeaderReady` below. It is never ahead of the event.
 
 ### Capability: diagnostics
 
@@ -168,12 +173,23 @@ with `errors.Is` / `errors.As`.
 ### Notifications
 
 `config.EventListener` carries the user-visible callbacks. `OnLeaderUpdated`,
-`OnLeaderLost`, `OnCampaignLaunched` and `OnShardFailed` for step, commit and
+`OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and `OnShardFailed` for step, commit and
 apply failures are delivered on a dedicated dispatcher goroutine that holds no
 engine lock, so a listener may call any `Host` API, including the synchronous
 `StopShard`. Delivery is FIFO, so it is ordered per shard. The other callbacks
 run on the goroutine that produced them and must not block. There is no
 ordering guarantee between the two groups.
+
+`OnLeaderReady` fires when the shard's leader for `LeaderInfo.Term` has
+committed an entry of that term, the ReadIndex precondition of Raft thesis §6.4,
+on the leader and on every follower and observer whose commit index reaches such
+an entry. From then until the next `OnLeaderUpdated`, a `ReadIndex` on that
+replica is not refused with `ErrReadIndexNotReady`. It follows the
+`OnLeaderUpdated` for the same leader and term, at most once per announcement;
+the next `OnLeaderUpdated` (always a different pair, including the same leader
+re-elected at a higher term, which `OnLeaderLost` misses), `OnShardFailed` and
+unload end it. Witnesses never receive it. The contract in full is in
+[`../multi-group-host/api.md`](../multi-group-host/api.md#event-listener).
 
 `OnCampaignSkipped` is declared but never fires; detect a leaderless shard with
 `GetLeaderID` or `ShardInfo.Health`.

@@ -170,16 +170,30 @@ change or inbound replication.
 ```go
 hostCfg.EventListener = &config.EventListener{
     OnLeaderUpdated: func(info config.LeaderInfo) { /* ... */ },
+    OnLeaderReady:   func(info config.LeaderInfo) { /* ... */ },
     OnShardFailed:   func(info config.ShardFailedInfo) { /* ... */ },
 }
 ```
 
-`OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched` and `OnShardFailed`
-run on a dedicated goroutine that holds no engine lock, so your handler may
+`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and
+`OnShardFailed` run on a dedicated goroutine that holds no engine lock, so your handler may
 call any `Host` API, including the synchronous `StopShard`. The other
 `EventListener` callbacks run on internal worker goroutines and must return
 quickly without calling back into the `Host`. Do not assume any ordering
 between the two groups.
+
+### Wait for a shard to serve reads
+
+A new leader may not serve `ReadIndex` until it has committed an entry of its
+own term (Raft thesis §6.4); until then `ReadIndex` returns
+`ErrReadIndexNotReady`. `OnLeaderReady` is the event for that moment: it fires
+on the leader once its first entry of the term commits, and on a follower or
+observer once its own commit index reaches an entry of the current term. It
+arrives after the `OnLeaderUpdated` for the same leader and term, at most once
+per announcement, and the next `OnLeaderUpdated` ends it. That covers the same
+leader re-elected at a higher term, which `OnLeaderLost` does not. Witnesses
+never receive it. `host.ShardReadReady(shardID)` returns the same
+`(leaderID, term, ready)` without blocking.
 
 ## Diagnose a stuck shard
 

@@ -126,8 +126,8 @@ alerting surface.
 ## Two callback classes
 
 Dispatched notifications run on a dedicated dispatcher goroutine that
-holds no engine lock: `OnLeaderUpdated`, `OnLeaderLost`, `OnCampaignLaunched`,
-`OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`,
+holds no engine lock: `OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`,
+`OnCampaignLaunched`, `OnShardFailed`, `OnSnapshotCreated`, `OnSnapshotCompacted`,
 `OnSnapshotRecovered`, `OnLogCompacted`, `OnLogDBCompacted` and
 `OnSnapshotRejected`, whether the snapshot pool refused a request or rejected
 a recovery that failed before the state machine restore began, or the snapshot
