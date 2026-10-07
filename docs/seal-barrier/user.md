@@ -215,9 +215,16 @@ host, _ := quicraft.NewHost(cfg, quicraft.WithShardBarriers(func(shardID uint64)
     if b, ok := barriers[shardID]; ok {
         return b
     }
-    return nil // falls back to WithBarrier, if set
+    return nil // the host-wide route: WithBarrier, or plaintext under WithoutEncryption
 }))
 ```
+
+`WithShardBarriers` is independent of the host-wide choice. Combined with
+`WithoutEncryption`, a shard with its own barrier is still encrypted under it,
+snapshots and log alike when the LogDB routes it there, and a shard the resolver
+returns `nil` for is stored in plaintext. With neither host-wide option, a `nil`
+fails `StartShard` with `ErrShardBarrierUnresolved`. A resolved barrier that is
+sealed fails `StartShard` with `ErrBarrierSealed`.
 
 With per-shard barriers, snapshot encrypt/decrypt, snapshot transport epoch
 protection and DEK purge all dispatch per shard, and purging one tenant's

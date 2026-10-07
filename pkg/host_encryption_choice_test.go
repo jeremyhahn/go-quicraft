@@ -55,15 +55,6 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 		}
 	})
 
-	t.Run("WithoutEncryption with WithShardBarriers is refused", func(t *testing.T) {
-		b := createTestBarrier(t)
-		_, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(),
-			WithShardBarriers(func(uint64) Barrier { return b }), WithoutEncryption())
-		if !errors.Is(err, ErrAtRestEncryptionConflict) {
-			t.Fatalf("NewHost = %v, want ErrAtRestEncryptionConflict", err)
-		}
-	})
-
 	accepted := []struct {
 		name string
 		opts func(t *testing.T) []HostOption
@@ -77,6 +68,12 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 		{"WithShardBarriers over a non-durable log", func(t *testing.T) []HostOption {
 			b := createTestBarrier(t)
 			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b })}
+		}},
+		// Per-shard barriers are independent of the host-wide posture (#240):
+		// sealing disabled host-wide still gives each shard its own barrier.
+		{"WithoutEncryption with WithShardBarriers", func(t *testing.T) []HostOption {
+			b := createTestBarrier(t)
+			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b }), WithoutEncryption()}
 		}},
 	}
 	for _, tc := range accepted {

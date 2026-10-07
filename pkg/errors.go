@@ -62,10 +62,11 @@ var (
 			"or WithShardBarriers, or declare WithoutEncryption")
 
 	// ErrAtRestEncryptionConflict is returned by NewHost when
-	// WithoutEncryption is combined with WithBarrier or WithShardBarriers.
+	// WithoutEncryption is combined with WithBarrier: the two declare opposite
+	// host-wide routes. WithShardBarriers is a separate, per-shard axis and
+	// combines with either.
 	ErrAtRestEncryptionConflict = errors.New(
-		"quicraft: WithoutEncryption cannot be combined with WithBarrier " +
-			"or WithShardBarriers")
+		"quicraft: WithoutEncryption cannot be combined with WithBarrier")
 
 	// ErrBarrierPlaintextLogDB is returned by NewHost when WithBarrier is
 	// configured together with a caller-supplied LogDB that does not encrypt
@@ -73,12 +74,15 @@ var (
 	// supplied waldb.Open(dir) would store every proposed command in plaintext
 	// while snapshots were encrypted — the state a stated encryption choice
 	// must never reach. The LogDB must report logdb.AtRestBarrierEncrypted or
-	// logdb.AtRestNonDurable; one that declares nothing is treated as
-	// unprotected.
+	// logdb.AtRestNonDurable, or logdb.AtRestHostRouted with its host-wide route
+	// written through the WithBarrier barrier itself (by identity), which is
+	// how the default WAL is judged, plaintext mode included. One that declares
+	// nothing is treated as unprotected.
 	ErrBarrierPlaintextLogDB = errors.New(
 		"quicraft: WithBarrier with a supplied LogDB requires that LogDB to be " +
 			"encrypted at rest (logdb.AtRestProtectedLogDB reporting barrier_encrypted " +
-			"or non_durable); this LogDB would store plaintext")
+			"or non_durable) or host_routed through the WithBarrier barrier itself; " +
+			"this LogDB would store plaintext")
 
 	// ErrShardBarriersPlaintextWAL is returned by NewHost when
 	// WithShardBarriers is configured but the resulting WAL would hold
@@ -97,14 +101,23 @@ var (
 	// logdb.AtRestBarrierEncrypted or logdb.AtRestNonDurable, and a LogDB that
 	// does not implement logdb.AtRestProtectedLogDB at all declares nothing and
 	// is therefore treated as unprotected.
+	//
+	// Under WithoutEncryption a LogDB reporting logdb.AtRestHostRouted is also
+	// accepted: its only plaintext route is the host-wide one that
+	// WithoutEncryption declared, and each barriered shard's dedicated route is
+	// held to its barrier at StartShard (ErrShardBarrierLogDBMismatch).
+	// WithoutEncryption does not accept the default WAL or a plain waldb, which
+	// would hold the barriered shards' logs in plaintext too.
 	ErrShardBarriersPlaintextWAL = errors.New(
 		"quicraft: WithShardBarriers requires a LogDB that is encrypted at rest " +
-			"(logdb.AtRestProtectedLogDB reporting barrier_encrypted or non_durable) " +
-			"or WithBarrier (host-wide WAL key); this LogDB would store plaintext")
+			"(logdb.AtRestProtectedLogDB reporting barrier_encrypted or non_durable, " +
+			"or host_routed under WithoutEncryption) or WithBarrier (host-wide WAL " +
+			"key); this LogDB would store plaintext")
 
 	// ErrShardBarrierUnresolved is returned when WithShardBarriers is
 	// configured, the resolver returns nil for a shard, and there is no
-	// host-wide barrier to fall back to.
+	// declared host-wide route to fall back to: neither WithBarrier nor
+	// WithoutEncryption.
 	//
 	// A resolver typed func(shardID uint64) Barrier cannot distinguish "this
 	// shard is deliberately plaintext" from "I do not know this shard yet",
@@ -114,8 +127,10 @@ var (
 	// shows encryption working, so the miss fails CLOSED instead.
 	//
 	// It is NOT returned when WithBarrier supplied a host-wide barrier: a nil
-	// resolver result then means the documented fallback to that barrier, which
-	// still encrypts.
+	// resolver result then means the documented fallback to that barrier. Nor
+	// is it returned under WithoutEncryption, where the nil means the plaintext
+	// host-wide route the host declared; the declaration is what makes the nil
+	// a decision rather than a miss.
 	//
 	// Re-exported from the engine so the host paths (receive, import, export,
 	// StartShard) and the engine paths (snapshot save, recover, DEK purge) fail

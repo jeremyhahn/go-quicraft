@@ -272,9 +272,10 @@ func WithNoSync(noSync bool) Option {
 // through unconditionally and selects the strategy elsewhere.
 //
 // What the WAL owes such a caller is the truth, not a refusal: AtRestProtection
-// reports AtRestUnprotected for a plaintext-mode barrier, which is what lets the
-// host's at-rest requirement fail closed at the layer that actually holds the
-// policy.
+// reports AtRestHostRouted, never AtRestBarrierEncrypted, for a plaintext-mode
+// barrier, which is what lets the host's at-rest requirement decide at the layer
+// that actually holds the policy: it accepts the store only as its own
+// host-wide route, under its own barrier.
 func WithBarrier(b WALBarrier) Option {
 	return func(o *dbOptions) {
 		o.barrier = b
@@ -5057,6 +5058,14 @@ func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err
 // absence cannot be evidence of one, and treating every barrier that predates
 // the interface as plaintext would refuse working encrypted deployments.
 //
+// A plaintext-mode barrier is reported as AtRestHostRouted, not as
+// AtRestUnprotected: every record still goes through that ONE barrier, which
+// MinLiveEpochForBarrier names by identity. That is what lets a host accept
+// this store exactly as it accepts its own default WAL under its own
+// plaintext-mode barrier (which starts encrypting once EnableEncryption flips
+// it), and only then: the host checks the barrier is its own, so the same
+// store under any other barrier is still refused.
+//
 // This is deliberately NOT answerable by a type assertion on the LogDB: *DB
 // implements PerBarrierEpochAwareLogDB in ALL of these cases, so a caller that
 // treats the interface as evidence of encryption accepts the plaintext store.
@@ -5065,7 +5074,7 @@ func (db *DB) AtRestProtection() logdb.AtRestProtection {
 		return logdb.AtRestUnprotected
 	}
 	if pm, ok := db.barrier.(plaintextModeReporter); ok && pm.IsPlaintextMode() {
-		return logdb.AtRestUnprotected
+		return logdb.AtRestHostRouted
 	}
 	return logdb.AtRestBarrierEncrypted
 }

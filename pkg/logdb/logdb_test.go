@@ -606,6 +606,7 @@ func TestAtRestProtectionString(t *testing.T) {
 		{AtRestUnprotected, "unprotected"},
 		{AtRestNonDurable, "non_durable"},
 		{AtRestBarrierEncrypted, "barrier_encrypted"},
+		{AtRestHostRouted, "host_routed"},
 		{AtRestProtection(250), "invalid"},
 	} {
 		if got := tc.p.String(); got != tc.want {

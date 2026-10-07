@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `logdb.AtRestHostRouted` (#240): a LogDB that writes each record either
+  through a dedicated per-shard barrier or through one host-wide route that may
+  be plaintext, which is what a per-tenant multiplexing LogDB is. The host
+  accepts it under `WithoutEncryption`, or under `WithBarrier` when that route
+  writes through the `WithBarrier` barrier itself, and checks every per-shard
+  barrier against it by identity at `StartShard`
+  (`ErrShardBarrierLogDBMismatch`).
+
+### Changed
+
+- `WithShardBarriers` is independent of the host-wide at-rest choice (#240). It
+  now combines with `WithoutEncryption`: a shard with its own barrier is still
+  encrypted under it, and a shard the resolver returns `nil` for takes the
+  declared plaintext route. `ErrAtRestEncryptionConflict` is now only
+  `WithoutEncryption` with `WithBarrier`. With no host-wide option, a `nil`
+  still fails `StartShard` with `ErrShardBarrierUnresolved`. The default WAL and
+  a plain `waldb.Open(dir)` are still refused under `WithShardBarriers`.
+- A `waldb` opened under a plaintext-mode barrier reports `AtRestHostRouted`
+  rather than `AtRestUnprotected` (#240), so a plaintext-mode `WithBarrier` with
+  a caller-supplied WAL under that same barrier is accepted, as the default WAL
+  already was. It is still refused under any other barrier.
+- `StartShard` refuses a shard whose resolved per-shard barrier is sealed with
+  `ErrBarrierSealed` (#240): a missing or sealed barrier never starts a shard.
+
 ## [0.19.0] - 2026-10-07
 
 Feature release. **Additive API, no breaking change, no format change:**

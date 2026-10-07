@@ -281,6 +281,28 @@ const (
 	// PerBarrierEpochAwareLogDB.MinLiveEpochForBarrier, which answers it by
 	// barrier identity.
 	AtRestBarrierEncrypted
+
+	// AtRestHostRouted means every record this LogDB writes to durable storage
+	// takes one of two routes, each of which it names by barrier identity
+	// through PerBarrierEpochAwareLogDB:
+	//
+	//   - a dedicated route, under the per-shard barrier that shard resolves
+	//     to (MinLiveEpochForBarrier answers known == true for it); or
+	//   - ONE host-wide route, written through a single barrier that may be in
+	//     plaintext mode, or through no barrier at all.
+	//
+	// It does NOT say any record is encrypted. It says the host-wide route is
+	// the only place a cleartext record can be, so a host judges that route
+	// against the posture IT declared: under WithBarrier the route must write
+	// through that very barrier (checked by identity), exactly as the default
+	// WAL does; under WithoutEncryption a plaintext route is what was declared;
+	// with neither there is nothing to accept it against, and it is refused.
+	// Every per-shard route is still checked by identity when its shard starts.
+	//
+	// A multiplexing LogDB that keeps tenant shards in dedicated WALs and every
+	// other shard in a shared one reports it. So does a single waldb.DB whose
+	// one barrier is in plaintext mode: its only route is that barrier.
+	AtRestHostRouted
 )
 
 // String renders the classification for structured logs and error messages.
@@ -292,6 +314,8 @@ func (p AtRestProtection) String() string {
 		return "non_durable"
 	case AtRestBarrierEncrypted:
 		return "barrier_encrypted"
+	case AtRestHostRouted:
+		return "host_routed"
 	default:
 		return "invalid"
 	}

@@ -1266,7 +1266,7 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 	}
 }
 
-// TestAtRestProtection_PlaintextBarrierIsUnprotected is the regression test for
+// TestAtRestProtection_PlaintextBarrierIsNotEncrypted is the regression test for
 // the seventh plaintext-downgrade axis: AtRestProtection asked whether a barrier
 // OBJECT EXISTED, not whether it ENCRYPTS.
 //
@@ -1281,7 +1281,7 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 // The assertion is on the RAW BYTES ON DISK, not on a round trip. A round trip
 // succeeds under both a real barrier and a pass-through, which is exactly why
 // the declaration cannot be trusted to a type assertion in the first place.
-func TestAtRestProtection_PlaintextBarrierIsUnprotected(t *testing.T) {
+func TestAtRestProtection_PlaintextBarrierIsNotEncrypted(t *testing.T) {
 	barrier := newNoneBarrier(t)
 	if !barrier.IsPlaintextMode() {
 		t.Fatal("fixture: a none-strategy barrier must report IsPlaintextMode")
@@ -1315,11 +1315,14 @@ func TestAtRestProtection_PlaintextBarrierIsUnprotected(t *testing.T) {
 			"observing what it claims to", seg0)
 	}
 
-	if got := db.AtRestProtection(); got != logdb.AtRestUnprotected {
+	// AtRestHostRouted, never AtRestBarrierEncrypted: every record goes through
+	// this one barrier, which the host accepts only as its own host-wide route
+	// (#240), and the bytes on the medium are not encrypted.
+	if got := db.AtRestProtection(); got != logdb.AtRestHostRouted {
 		t.Fatalf("AtRestProtection() = %v, want %v: the user command is sitting in "+
 			"%s at offset %d in cleartext, and a host that requires at-rest "+
 			"encryption is being told this store provides it",
-			got, logdb.AtRestUnprotected, seg0, at)
+			got, logdb.AtRestHostRouted, seg0, at)
 	}
 }
 

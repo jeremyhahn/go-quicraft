@@ -143,9 +143,17 @@ in [api.md](api.md#optional-interfaces). `waldb.DB` implements
   `ListNodeInfo` fails.
 - `AtRestProtection` exists because `waldb.DB` satisfies the per-barrier
   interfaces whether or not it was opened `WithBarrier`, so a type assertion
-  alone would accept a store writing every command in the clear. A barrier
-  running `StrategyNone` reports `AtRestUnprotected`. The answer must not depend
-  on what is stored: an empty encrypted store reports `AtRestBarrierEncrypted`.
+  alone would accept a store writing every command in the clear. A store with
+  no barrier reports `AtRestUnprotected`; one whose barrier is in plaintext mode
+  (`StrategyNone`) reports `AtRestHostRouted`, so the host accepts it only where
+  the route is declared: under `WithoutEncryption`, or under `WithBarrier` with
+  that same barrier. The answer must not depend on what is stored: an empty
+  encrypted store reports `AtRestBarrierEncrypted`.
+- `AtRestHostRouted` is also what a multiplexing LogDB reports: each record goes
+  either through a dedicated per-shard barrier or through one host-wide route
+  that may be plaintext. The host judges the host-wide route against its own
+  declaration and checks each per-shard barrier by identity at `StartShard`
+  (`ErrShardBarrierLogDBMismatch`).
 
 ### Metrics
 
@@ -632,8 +640,9 @@ the WAL. Keys, epochs and algorithms are in
 A configured barrier does not by itself mean records are encrypted. Under
 `StrategyNone` it is an identity pass-through. The WAL accepts that, because it
 is not the layer that decides whether a deployment requires encryption, but it
-reports `AtRestUnprotected`, so the host's requirement fails closed where the
-policy lives.
+reports `AtRestHostRouted`, never `AtRestBarrierEncrypted`, so the host decides
+where the policy lives: it accepts the store under `WithoutEncryption` or under
+`WithBarrier` with that same barrier, and refuses it otherwise.
 
 ### Positional context-AAD
 

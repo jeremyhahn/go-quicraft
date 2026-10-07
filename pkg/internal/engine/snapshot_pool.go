@@ -186,6 +186,11 @@ type snapshotPool struct {
 	// the function for a given shard falls back to the process-wide barrier.
 	shardBarriers func(shardID uint64) SnapshotBarrier
 
+	// plaintextHostRoute is set when the host DECLARED its host-wide route
+	// plaintext (WithoutEncryption). A shard shardBarriers returns nil for then
+	// takes that route instead of failing with ErrShardBarrierUnresolved.
+	plaintextHostRoute bool
+
 	callback   Callback
 	requestC   chan snapshotRequest
 	completedC chan snapshotResult
@@ -308,6 +313,11 @@ func newSnapshotPool(workers int, ldb logdb.LogDB, barrier SnapshotBarrier, call
 // async-provisioned tenant or a remapped shard ID; reading that as plaintext
 // downgrades one tenant while every other tenant still looks encrypted.
 //
+// The exception is a host that DECLARED its host-wide route plaintext
+// (plaintextHostRoute): the nil is then that declaration, not a miss, and the
+// shard takes the plaintext route just as it would fall back to a process-wide
+// barrier.
+//
 // A nil barrier with a nil error remains the configured plaintext deployment:
 // no per-shard resolver and no process-wide barrier.
 func (p *snapshotPool) barrierForShard(shardID uint64) (SnapshotBarrier, error) {
@@ -318,6 +328,9 @@ func (p *snapshotPool) barrierForShard(shardID uint64) (SnapshotBarrier, error) 
 		return b, nil
 	}
 	if p.barrier == nil {
+		if p.plaintextHostRoute {
+			return nil, nil
+		}
 		return nil, ErrShardBarrierUnresolved
 	}
 	return p.barrier, nil

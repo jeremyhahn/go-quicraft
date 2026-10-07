@@ -145,6 +145,34 @@ func TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed(t *testing.T) {
 	}
 }
 
+// TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute verifies that a
+// host which DECLARED a plaintext host-wide route (WithoutEncryption) routes an
+// unresolved shard to it, while a resolved shard keeps its own barrier. The
+// declaration is what makes the nil a decision rather than a resolver miss.
+func TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute(t *testing.T) {
+	cfg := newTestHostConfig()
+	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+
+	tenant := newTestBarrier(3)
+	e.SetShardBarriers(func(shardID uint64) SnapshotBarrier {
+		if shardID == 1 {
+			return tenant
+		}
+		return nil
+	})
+	e.SetPlaintextHostRoute()
+
+	got, err := e.SnapshotPool().barrierForShard(1)
+	if err != nil || got != SnapshotBarrier(tenant) {
+		t.Fatalf("barrierForShard(1) = (%v, %v), want the tenant barrier", got, err)
+	}
+	got, err = e.SnapshotPool().barrierForShard(2)
+	if err != nil || got != nil {
+		t.Fatalf("barrierForShard(2) = (%v, %v), want (nil, nil): the host declared "+
+			"a plaintext host-wide route for shards with no barrier of their own", got, err)
+	}
+}
+
 // TestSaveSnapshot_UnresolvedShardBarrierWritesNothing asserts the CONSEQUENCE
 // of the refusal above: no snapshot directory, no artifact, and no LogDB record
 // are produced for a shard whose barrier does not resolve.

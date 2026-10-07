@@ -31,14 +31,17 @@ host, err := quicraft.NewHost(cfg, quicraft.WithLogDB(store), quicraft.WithoutEn
 
 Every host states its at-rest encryption: `WithBarrier` or `WithShardBarriers`
 to encrypt, or `WithoutEncryption` to store plaintext. `NewHost` refuses a host
-that says neither (`ErrAtRestEncryptionUnspecified`) or both
-(`ErrAtRestEncryptionConflict`), so you never get plaintext by leaving an option
-out.
+that says neither (`ErrAtRestEncryptionUnspecified`) or both `WithoutEncryption`
+and `WithBarrier` (`ErrAtRestEncryptionConflict`), so you never get plaintext by
+leaving an option out. `WithShardBarriers` is a per-shard axis and combines with
+either host-wide choice.
 
 The host's barrier is wired only into the default WAL. If you pass your own
 store together with `WithBarrier`, that store must itself report that it is
-encrypted (or that it is in memory), or `NewHost` fails with
-`ErrBarrierPlaintextLogDB`. Open the WAL with the same barrier:
+encrypted (or that it is in memory), or that its host-wide route writes through
+that same barrier, or `NewHost` fails with `ErrBarrierPlaintextLogDB`. Open the
+WAL with the same barrier; this holds while the barrier is still in plaintext
+mode, before `EnableEncryption`:
 
 ```go
 store, err := waldb.Open(walDir, waldb.WithBarrier(barrier))

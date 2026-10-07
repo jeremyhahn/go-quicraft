@@ -231,7 +231,16 @@ func WithBarrier(b Barrier) HostOption {
 // be sealed under its OWN barrier (per-tenant WAL/snapshot keys) instead of a
 // single host-wide barrier. The resolver fn maps a shardID to the barrier that
 // must encrypt that shard's snapshots and WAL records; returning nil for a
-// shard falls back to the host-wide barrier configured via WithBarrier.
+// shard falls back to the host-wide route: the barrier configured via
+// WithBarrier, or plaintext when the host declared WithoutEncryption.
+//
+// Per-shard barriers are independent of the host-wide posture. They combine
+// with WithBarrier (including a barrier still in plaintext mode before
+// EnableEncryption) and with WithoutEncryption alike, and a shard with a
+// barrier of its own gets its snapshots encrypted under it in every posture.
+// With neither host-wide option, a nil result has no route to fall back to and
+// the shard fails closed with ErrShardBarrierUnresolved. A shard whose barrier
+// is sealed does not start (ErrBarrierSealed); nothing stands in for it.
 //
 // This option is purely ADDITIVE and backward compatible. When it is not used,
 // the host behaves exactly as before: WithBarrier installs a single barrier
@@ -246,7 +255,12 @@ func WithBarrier(b Barrier) HostOption {
 // barrier. For per-shard barriers to also carry their own WAL records, the
 // caller supplies a multiplexing LogDB via WithLogDB that implements
 // logdb.PerBarrierEpochAwareLogDB (one dedicated single-barrier WAL per
-// tenant). All barriers must be initialized and unsealed.
+// tenant) and reports logdb.AtRestHostRouted when its shared WAL is the
+// host-wide route. StartShard then requires each barriered shard's records to
+// be stored under that shard's own barrier (ErrShardBarrierLogDBMismatch).
+// Without WithBarrier, a LogDB that would hold a barriered shard's log in
+// plaintext is refused (ErrShardBarriersPlaintextWAL), WithoutEncryption or
+// not. All barriers must be initialized and unsealed.
 //
 // A barrier's dynamic value need not be comparable; the host never compares
 // two barriers with == or uses one as a map key. Two shards share a barrier
@@ -323,8 +337,8 @@ func WithLogger(l *slog.Logger) HostOption {
 	}
 }
 
-// WithoutEncryption declares that this host stores its Raft log and its
-// snapshots UNENCRYPTED at rest.
+// WithoutEncryption declares that this host's HOST-WIDE route stores the Raft
+// log and the snapshots UNENCRYPTED at rest.
 //
 // NewHost refuses a host that neither configures at-rest encryption
 // (WithBarrier or WithShardBarriers) nor makes this declaration: plaintext at
@@ -333,7 +347,10 @@ func WithLogger(l *slog.Logger) HostOption {
 // directories can then read every proposed command and every snapshot.
 //
 // Use it for tests, benchmarks and deployments whose storage is protected by
-// other means. It cannot be combined with WithBarrier or WithShardBarriers.
+// other means. It cannot be combined with WithBarrier
+// (ErrAtRestEncryptionConflict). It can be combined with WithShardBarriers: a
+// shard with a barrier of its own is still encrypted under it, and a shard the
+// resolver returns nil for takes this plaintext route.
 func WithoutEncryption() HostOption {
 	return func(o *hostOptions) {
 		o.withoutEncryption = true
@@ -509,14 +526,26 @@ func logDBAtRestProtection(db logdb.LogDB) logdb.AtRestProtection {
 }
 
 // requireEncryptedLogDB refuses a LogDB whose Raft log would be readable off
-// the machine's storage. It backs ErrShardBarriersPlaintextWAL: with per-shard
-// barriers and no host-wide barrier, nothing else in the host encrypts the log.
+// the machine's storage in a way the host never declared. It backs
+// ErrShardBarriersPlaintextWAL and ErrBarrierPlaintextLogDB.
 //
 // AtRestNonDurable is accepted for the reason it is a distinct state: an
 // in-memory LogDB writes no file, so there is no at-rest artifact to protect
 // and no crash-surviving copy of a user command. That is a property of the
 // STORE, not a property of the caller having passed WithLogDB.
-func requireEncryptedLogDB(db logdb.LogDB, refusal error) error {
+//
+// AtRestHostRouted is accepted only against the host-wide route the HOST
+// declared, because its one possibly-plaintext route is that route:
+//
+//   - plaintextRoute (WithoutEncryption): a plaintext host-wide route is what
+//     the host declared.
+//   - hostBarrier (WithBarrier): the route must write through that very
+//     barrier, by identity, which judges the LogDB exactly as the default WAL
+//     opened under the same barrier is judged, plaintext mode included.
+//
+// With neither there is no declared route to accept it against. Each per-shard
+// route is checked when its shard starts (verifyShardLogDBBarrier).
+func requireEncryptedLogDB(db logdb.LogDB, hostBarrier Barrier, plaintextRoute bool, refusal error) error {
 	if db == nil {
 		// The default WAL is about to be created and no barrier was configured
 		// for it, so it would write plaintext segments.
@@ -525,9 +554,30 @@ func requireEncryptedLogDB(db logdb.LogDB, refusal error) error {
 	switch logDBAtRestProtection(db) {
 	case logdb.AtRestBarrierEncrypted, logdb.AtRestNonDurable:
 		return nil
+	case logdb.AtRestHostRouted:
+		if plaintextRoute || logDBWritesUnder(db, hostBarrier) {
+			return nil
+		}
+		return refusal
 	default:
 		return refusal
 	}
+}
+
+// logDBWritesUnder reports whether db stores records under barrier, answered by
+// barrier identity through logdb.PerBarrierEpochAwareLogDB. A nil barrier, one
+// without pointer identity, a LogDB that cannot answer, and an error all read
+// as no.
+func logDBWritesUnder(db logdb.LogDB, barrier Barrier) bool {
+	if barrier == nil || !logdb.SameBarrier(barrier, barrier) {
+		return false
+	}
+	perBarrier, ok := db.(logdb.PerBarrierEpochAwareLogDB)
+	if !ok {
+		return false
+	}
+	_, known, err := perBarrier.MinLiveEpochForBarrier(barrier)
+	return err == nil && known
 }
 
 // barrierForShard resolves the at-rest barrier for a shard, mirroring
@@ -544,8 +594,14 @@ func requireEncryptedLogDB(db logdb.LogDB, refusal error) error {
 // plaintext would downgrade exactly one tenant invisibly. An ABSENT barrier
 // therefore fails closed exactly as a SEALED one does everywhere else.
 //
-// A nil return with a nil error is the legitimate unencrypted deployment:
-// WithShardBarriers was never configured and no host-wide barrier exists.
+// The exception is a host that DECLARED its host-wide route plaintext with
+// WithoutEncryption: the nil is then the documented fallback to that route,
+// exactly as it is a fallback to the WithBarrier barrier when one is set, and
+// the shard is written in plaintext because the host said so.
+//
+// A nil return with a nil error is otherwise the legitimate unencrypted
+// deployment: WithShardBarriers was never configured and no host-wide barrier
+// exists.
 func (h *Host) barrierForShard(shardID uint64) (Barrier, error) {
 	if h.shardBarriers == nil {
 		return h.barrier, nil
@@ -554,6 +610,10 @@ func (h *Host) barrierForShard(shardID uint64) (Barrier, error) {
 		return b, nil
 	}
 	if h.barrier == nil {
+		if h.plaintextHostRoute {
+			h.warnBarrierFallback(shardID)
+			return nil, nil
+		}
 		return nil, ErrShardBarrierUnresolved
 	}
 	// Documented fallback: WithShardBarriers says a nil result uses the
@@ -568,6 +628,12 @@ func (h *Host) barrierForShard(shardID uint64) (Barrier, error) {
 // an unconditional warning would bury the first (and only informative) one.
 func (h *Host) warnBarrierFallback(shardID uint64) {
 	if _, warned := h.barrierFallbackWarned.LoadOrStore(shardID, struct{}{}); warned {
+		return
+	}
+	if h.barrier == nil {
+		h.logger.Warn("per-shard barrier resolver returned no barrier; "+
+			"the shard uses the plaintext host-wide route WithoutEncryption declared",
+			"shard_id", shardID)
 		return
 	}
 	h.logger.Warn("per-shard barrier resolver returned no barrier; "+
@@ -585,10 +651,20 @@ func (h *Host) warnBarrierFallback(shardID uint64) {
 // commands under tenant A's key -- exactly the cross-tenant key mixing
 // WithShardBarriers exists to prevent.
 //
-// The check applies only when there is no host-wide barrier. With WithBarrier
-// the WAL is encrypted host-wide by design (documented, and warned about at
-// construction) and the per-shard barriers cover snapshots only, so demanding
-// per-shard WAL ownership would refuse a supported configuration.
+// Which LogDBs are checked follows from what each declares:
+//
+//   - AtRestHostRouted: always, whatever the host-wide posture. The LogDB
+//     claims each barriered shard has a dedicated route under its own barrier,
+//     and this is where that claim is held to the shard. A shard with no
+//     barrier of its own (barrier == nil, reachable only on the plaintext route
+//     WithoutEncryption declared) is on the host-wide route NewHost judged.
+//   - AtRestBarrierEncrypted: only when there is no host-wide barrier. With
+//     WithBarrier such a WAL is encrypted host-wide by design (documented, and
+//     warned about at construction) and the per-shard barriers cover snapshots
+//     only, so demanding per-shard WAL ownership would refuse a supported
+//     configuration.
+//   - AtRestNonDurable has no at-rest artifact to attribute to a barrier, and
+//     AtRestUnprotected was already refused by NewHost.
 //
 // logdb.PerBarrierEpochAwareLogDB answers by barrier IDENTITY, which is pointer
 // identity: known == true means "my records for this barrier are these", which
@@ -597,12 +673,13 @@ func (h *Host) warnBarrierFallback(shardID uint64) {
 // a barrier that is not a pointer has no identity to answer for, so its shard
 // is refused too.
 func (h *Host) verifyShardLogDBBarrier(shardID uint64, barrier Barrier) error {
-	if h.shardBarriers == nil || h.barrier != nil || h.logdb == nil {
+	if h.shardBarriers == nil || h.logdb == nil || barrier == nil {
 		return nil
 	}
-	if logDBAtRestProtection(h.logdb) != logdb.AtRestBarrierEncrypted {
-		// AtRestNonDurable has no at-rest artifact to attribute to a barrier;
-		// AtRestUnprotected was already refused by NewHost.
+	protection := logDBAtRestProtection(h.logdb)
+	checked := protection == logdb.AtRestHostRouted ||
+		(protection == logdb.AtRestBarrierEncrypted && h.barrier == nil)
+	if !checked {
 		return nil
 	}
 	perBarrier, ok := h.logdb.(logdb.PerBarrierEpochAwareLogDB)
@@ -3252,6 +3329,10 @@ type Host struct {
 	logdb         logdb.LogDB
 	barrier       Barrier
 	shardBarriers func(shardID uint64) Barrier // per-shard at-rest barrier resolver; nil when WithShardBarriers unused
+	// plaintextHostRoute is set when WithoutEncryption declared the host-wide
+	// route plaintext, so a shard shardBarriers resolves to nil takes that
+	// route rather than failing with ErrShardBarrierUnresolved.
+	plaintextHostRoute bool
 	// shardBarriersGiven records every barrier shardBarriers has returned, so
 	// Close seals them. Nil when WithShardBarriers is unused.
 	shardBarriersGiven *givenBarriers
@@ -3670,13 +3751,19 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// At-rest encryption is a decision the caller states, never one it
 	// reaches by omission. Checked before anything touches the disk, so a
 	// refused host leaves no directories behind.
+	//
+	// The host-wide posture (WithBarrier or WithoutEncryption) and per-shard
+	// barriers are independent axes: a shard keeps its own barrier whichever
+	// host-wide route the others take. Only the two host-wide statements
+	// contradict each other.
 	encrypted := options.barrier != nil || options.shardBarriers != nil
 	switch {
-	case options.withoutEncryption && encrypted:
+	case options.withoutEncryption && options.barrier != nil:
 		return nil, ErrAtRestEncryptionConflict
 	case !options.withoutEncryption && !encrypted:
 		return nil, ErrAtRestEncryptionUnspecified
 	}
+	plaintextHostRoute := options.withoutEncryption && options.shardBarriers != nil
 
 	// Record every barrier the per-shard resolver hands out, so Close can seal
 	// them. The wrapped resolver replaces the caller's before any consumer is
@@ -3745,8 +3832,14 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// on "did you call WithLogDB" instead accepted an unencrypted
 	// waldb.Open(walDir) -- the exact state this refusal exists to prevent,
 	// reached by the one-line change an integrator makes to relocate the WAL.
+	//
+	// WithoutEncryption does not lift this: it declares the HOST-WIDE route
+	// plaintext, not the barriered shards' logs. It does let a LogDB that
+	// reports AtRestHostRouted through, since that LogDB's only plaintext route
+	// is the one declared; the default WAL and a plain waldb are still refused,
+	// because every barriered shard's log would sit in them in plaintext.
 	if options.shardBarriers != nil && options.barrier == nil {
-		if err := requireEncryptedLogDB(options.logdb, ErrShardBarriersPlaintextWAL); err != nil {
+		if err := requireEncryptedLogDB(options.logdb, nil, plaintextHostRoute, ErrShardBarriersPlaintextWAL); err != nil {
 			return nil, err
 		}
 	}
@@ -3755,8 +3848,12 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// WithBarrier plus waldb.Open(dir) — the one-line change that relocates the
 	// WAL — encrypted the snapshots and wrote every proposed command to disk in
 	// plaintext, with nothing to say so. A stated encryption must cover the log.
+	//
+	// A supplied LogDB whose host-wide route writes through this barrier itself
+	// is judged as the default WAL is, so a barrier still in plaintext mode
+	// before EnableEncryption is accepted for it as it is for the default WAL.
 	if options.barrier != nil && options.logdb != nil {
-		if err := requireEncryptedLogDB(options.logdb, ErrBarrierPlaintextLogDB); err != nil {
+		if err := requireEncryptedLogDB(options.logdb, options.barrier, false, ErrBarrierPlaintextLogDB); err != nil {
 			return nil, err
 		}
 	}
@@ -3871,6 +3968,9 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			}
 			return b
 		})
+		if plaintextHostRoute {
+			eng.SetPlaintextHostRoute()
+		}
 	}
 
 	// Wire the engine into the message handler so inbound messages
@@ -3919,6 +4019,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		logdb:              options.logdb,
 		barrier:            options.barrier,
 		shardBarriers:      options.shardBarriers,
+		plaintextHostRoute: plaintextHostRoute,
 		metrics:            options.metrics,
 		shardBarriersGiven: shardBarriersGiven,
 		engine:             eng,
@@ -4298,12 +4399,19 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	//
 	//  1. The resolver returned no barrier and there is no host-wide fallback:
 	//     this tenant's shard would be written in plaintext alone.
-	//  2. The LogDB holds this shard's records under some OTHER barrier: the
+	//  2. The resolved barrier is sealed: nothing for this shard can be
+	//     encrypted, and no other route may stand in for it.
+	//  3. The LogDB holds this shard's records under some OTHER barrier: the
 	//     shard is encrypted, under the wrong tenant's key.
 	if h.shardBarriers != nil {
 		shardBarrier, barrierErr := h.barrierForShard(cfg.ShardID)
 		if barrierErr != nil {
 			return barrierErr
+		}
+		if shardBarrier != nil && shardBarrier.IsSealed() {
+			h.logger.Error("refusing to start shard: its at-rest barrier is sealed",
+				"shard_id", cfg.ShardID)
+			return ErrBarrierSealed
 		}
 		if err := h.verifyShardLogDBBarrier(cfg.ShardID, shardBarrier); err != nil {
 			return err

@@ -273,6 +273,17 @@ func (e *Engine) SetShardBarriers(fn func(shardID uint64) SnapshotBarrier) {
 	e.snapshots.shardBarriers = fn
 }
 
+// SetPlaintextHostRoute records that the host DECLARED its host-wide route
+// plaintext (WithoutEncryption). A shard the per-shard resolver returns nil for
+// then takes that route, exactly as it falls back to the process-wide barrier
+// when one exists. Without the declaration such a shard fails closed with
+// ErrShardBarrierUnresolved.
+//
+// Like SetShardBarriers, it must be called before Start().
+func (e *Engine) SetPlaintextHostRoute() {
+	e.snapshots.plaintextHostRoute = true
+}
+
 // GlobalSafePurgeFloor returns the minimum barrier epoch still required by
 // any retained encrypted snapshot (across all shards) or any live WAL
 // record. DEKs for epochs strictly below this floor can be safely purged.

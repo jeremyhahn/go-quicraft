@@ -50,7 +50,9 @@ NewHost(cfg, opts...)
   |  2. Logger: WithLogger, or built from cfg.LogConfig
   |  3. Create NodeHostDir and WALDir (0750) and fsync the created chain
   |  4. Refuse a plaintext log under a stated encryption choice
-  |     (ErrShardBarriersPlaintextWAL, ErrBarrierPlaintextLogDB)
+  |     (ErrShardBarriersPlaintextWAL, ErrBarrierPlaintextLogDB); a
+  |     host_routed LogDB passes under WithoutEncryption, or when its
+  |     host-wide route writes through the WithBarrier barrier
   |  5. Open LogDB
   |     - default: waldb.Open(WALDir, ...), with the host-wide barrier and
   |       the disk monitor wired in
@@ -93,8 +95,10 @@ StartShard(members, join, create, cfg)
   |  2. Certificate exclusivity over the members' addresses (fails closed)
   |  3. Identities: with a transport, cfg.MemberIdentities must cover the
   |     members map (founder) or name another replica (joiner)
-  |  4. Resolve the shard's barrier (WithShardBarriers) and check the LogDB
-  |     holds the shard under it
+  |  4. Resolve the shard's barrier (WithShardBarriers): nil takes the
+  |     declared host-wide route or fails (ErrShardBarrierUnresolved), a
+  |     sealed one fails (ErrBarrierSealed), and the LogDB must hold the
+  |     shard under it (ErrShardBarrierLogDBMismatch)
   |  5. Refuse: already running (ErrShardAlreadyExists), a concurrent start
   |     (ErrShardNotReady), an import in progress (ErrImportInProgress), a
   |     retired replica ID (*ReplicaRetiredError)

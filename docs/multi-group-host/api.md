@@ -73,7 +73,7 @@ transport listener are running before it returns.
 | `WithMemoryLogDB()` | | In-memory LogDB, for benchmarks, CI and ephemeral nodes |
 | `WithBarrier(b)` | `Barrier` | Host-wide at-rest encryption. The barrier must already be initialized and unsealed |
 | `WithShardBarriers(fn)` | `func(shardID uint64) Barrier` | Per-shard at-rest encryption; see below |
-| `WithoutEncryption()` | | Declares plaintext at rest. Cannot be combined with the two above |
+| `WithoutEncryption()` | | Declares the host-wide route plaintext at rest. Cannot be combined with `WithBarrier`; combines with `WithShardBarriers` |
 | `WithMetrics(c)` | `MetricsCollector` | Metrics collection |
 | `WithLogger(l)` | `*slog.Logger` | Custom logger. Default: built from `LogConfig` |
 | `WithoutTransport()` | | No-op sender; messages are dropped. Single-node testing only |
@@ -81,16 +81,33 @@ transport listener are running before it returns.
 **At-rest encryption is stated, never defaulted.** Every host passes
 `WithBarrier`, `WithShardBarriers` or `WithoutEncryption`. `NewHost` returns
 `ErrAtRestEncryptionUnspecified` when none is passed and
-`ErrAtRestEncryptionConflict` for `WithoutEncryption` with either barrier
-option. Both checks run before anything touches the disk.
+`ErrAtRestEncryptionConflict` for `WithoutEncryption` with `WithBarrier`. Both
+checks run before anything touches the disk.
 
 **`WithShardBarriers`** seals each shard under its own barrier, so one tenant's
-key purge can never remove an epoch another tenant's snapshots reference. A
-resolver that returns `nil` for a shard falls back to the `WithBarrier` barrier;
-with no host-wide barrier the miss fails closed with
-`ErrShardBarrierUnresolved` rather than writing that tenant in plaintext. Key
-rotation for per-shard barriers is the caller's job: the host's rotation loop
-rotates only the `WithBarrier` barrier. `Close` seals every barrier the resolver returned.
+key purge can never remove an epoch another tenant's snapshots reference. It is
+a per-shard axis, independent of the host-wide one: it combines with
+`WithBarrier` (including a barrier still in plaintext mode before
+`EnableEncryption`) and with `WithoutEncryption`, and a shard with its own
+barrier has its snapshots encrypted under it in every posture. A resolver that
+returns `nil` for a shard sends it down the host-wide route: the `WithBarrier`
+barrier, or the plaintext route `WithoutEncryption` declared. With neither, the
+miss fails closed with `ErrShardBarrierUnresolved` rather than writing that
+tenant in plaintext. A shard whose resolved barrier is sealed does not start
+(`ErrBarrierSealed`). Key rotation for per-shard barriers is the caller's job:
+the host's rotation loop rotates only the `WithBarrier` barrier. `Close` seals
+every barrier the resolver returned.
+
+| Host-wide posture | Options | Result |
+|---|---|---|
+| Sealing disabled | `WithoutEncryption` + `WithLogDB(mux)` | accepted; no shard has a barrier, so nothing is encrypted |
+| Sealing disabled | `WithoutEncryption` + `WithLogDB(mux)` + `WithShardBarriers` | accepted; barriered shards are encrypted under their own barriers and checked against the LogDB, `nil` shards take the plaintext route |
+| None declared | `WithLogDB(mux)` + `WithShardBarriers` | `ErrShardBarriersPlaintextWAL`: the mux's plaintext route was never declared |
+| Plaintext-mode host barrier | `WithBarrier(b)` + `WithLogDB(mux)` (with or without `WithShardBarriers`) | accepted when the mux's host-wide route writes through `b` itself, as the default WAL does; `ErrBarrierPlaintextLogDB` otherwise |
+
+`mux` here is a multiplexing LogDB that reports `logdb.AtRestHostRouted`: each
+tenant shard in a dedicated WAL under its own barrier, every other shard in one
+shared WAL that is the host-wide route.
 
 Barriers are matched by pointer identity (`logdb.SameBarrier`), never with `==`, because a `Barrier`'s
 dynamic value need not be comparable. Two shards share a barrier when the
@@ -98,20 +115,24 @@ resolver returns the same pointer for both; `Close` seals it once. A barrier tha
 is not a pointer is distinct for every shard that resolves to it: `Close` seals
 it per shard (an already-sealed result is not an error), the snapshot pool
 declines the per-barrier DEK purges it cannot prove safe, and a per-barrier
-LogDB reports that it does not own it, so `StartShard` with no `WithBarrier`
-refuses it with `ErrShardBarrierLogDBMismatch`. Return pointers.
+LogDB reports that it does not own it, so `StartShard` refuses it with
+`ErrShardBarrierLogDBMismatch` wherever the per-shard check runs (see below).
+Return pointers.
 
 A stated encryption choice must cover the log, so the LogDB is checked too:
 
 | Error | Condition |
 |---|---|
-| `ErrBarrierPlaintextLogDB` | `WithBarrier` with a caller-supplied LogDB that does not report `logdb.AtRestBarrierEncrypted` or `logdb.AtRestNonDurable`. The host-wide barrier is wired only into the default WAL, so every proposed command would be written in plaintext |
-| `ErrShardBarriersPlaintextWAL` | `WithShardBarriers` with no `WithBarrier`, over a LogDB that does not report either value. Snapshots would be encrypted while every log entry stayed plaintext |
-| `ErrShardBarrierLogDBMismatch` | (at `StartShard`) the LogDB stores this shard's records under a different barrier than the resolver returned |
+| `ErrBarrierPlaintextLogDB` | `WithBarrier` with a caller-supplied LogDB that reports neither `logdb.AtRestBarrierEncrypted` nor `logdb.AtRestNonDurable`, nor `logdb.AtRestHostRouted` with its host-wide route written through the `WithBarrier` barrier itself (by identity). The host-wide barrier is wired only into the default WAL, so every proposed command would be written in plaintext |
+| `ErrShardBarriersPlaintextWAL` | `WithShardBarriers` with no `WithBarrier`, over a LogDB that reports neither of the first two values, nor `logdb.AtRestHostRouted` under `WithoutEncryption`. Snapshots would be encrypted while barriered shards' log entries stayed plaintext. The default WAL and a plain `waldb.Open(dir)` are refused under `WithoutEncryption` too |
+| `ErrShardBarrierLogDBMismatch` | (at `StartShard`) the LogDB stores this shard's records under a different barrier than the resolver returned. Checked for every `AtRestHostRouted` LogDB, and for an `AtRestBarrierEncrypted` one when there is no `WithBarrier` |
 
 Supplying `WithLogDB` does not by itself satisfy these: an unencrypted
 `waldb.Open(dir)` is exactly the state they refuse. For genuine per-shard WAL
-keys the LogDB must implement `logdb.PerBarrierEpochAwareLogDB`.
+keys the LogDB must implement `logdb.PerBarrierEpochAwareLogDB`. A `waldb`
+opened under a plaintext-mode barrier reports `AtRestHostRouted`, so it is
+accepted under `WithBarrier` with that same barrier, as the default WAL is, and
+refused under any other.
 
 **Errors:** the encryption errors above; a `pkg/config` validation error (see
 [Validation errors](#validation-errors)); otherwise `*HostInitError` naming the
@@ -1377,7 +1398,7 @@ Host and request lifecycle:
 | `ErrStopped` | the shard or engine stopped underneath an in-progress snapshot save or recovery |
 | `ErrShutdownTimeout` | drain exceeded `ShutdownTimeout` |
 | `ErrAtRestEncryptionUnspecified` | `NewHost` was given no at-rest encryption choice |
-| `ErrAtRestEncryptionConflict` | `WithoutEncryption` combined with a barrier option |
+| `ErrAtRestEncryptionConflict` | `WithoutEncryption` combined with `WithBarrier` |
 
 Request outcome:
 
@@ -1484,7 +1505,7 @@ Encryption and storage:
 | `ErrDecryptionFailed` | corrupted ciphertext or wrong key. Re-exported from `pkg/seal` |
 | `ErrBarrierPlaintextLogDB` | `WithBarrier` over a supplied LogDB that would store plaintext |
 | `ErrShardBarriersPlaintextWAL` | `WithShardBarriers` over a LogDB that would store plaintext |
-| `ErrShardBarrierUnresolved` | the per-shard resolver returned nil and there is no host-wide barrier |
+| `ErrShardBarrierUnresolved` | the per-shard resolver returned nil and there is no declared host-wide route (`WithBarrier` or `WithoutEncryption`) |
 | `ErrShardBarrierLogDBMismatch` | the LogDB stores this shard under a different barrier than the resolver returned |
 | `ErrLogDBWrite` | a LogDB write failed |
 | `ErrDecompressionBomb` | a decompressed payload exceeds the configured limit. Proposals in the failed batch receive it; `ShardFailedInfo.Err` is a `*ApplyError` wrapping it |

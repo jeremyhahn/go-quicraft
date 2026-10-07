@@ -106,7 +106,7 @@ each one enables a capability without changing a contract.
 
 | Interface | Method | Enables |
 |---|---|---|
-| `AtRestProtectedLogDB` | `AtRestProtection() AtRestProtection` | the store's own statement of at-rest protection: `AtRestUnprotected` (the zero value, and what a missing implementation means), `AtRestNonDurable` or `AtRestBarrierEncrypted`. A host that requires encryption checks this instead of inferring it from the presence of a barrier. |
+| `AtRestProtectedLogDB` | `AtRestProtection() AtRestProtection` | the store's own statement of at-rest protection: `AtRestUnprotected` (the zero value, and what a missing implementation means), `AtRestNonDurable`, `AtRestBarrierEncrypted`, or `AtRestHostRouted` (each record goes through a dedicated per-shard barrier or through one host-wide route that may be plaintext; a multiplexing LogDB, or a `waldb` under a plaintext-mode barrier). A host that requires encryption checks this instead of inferring it from the presence of a barrier, and accepts `AtRestHostRouted` only under `WithoutEncryption` or when that route writes through its own `WithBarrier` barrier. |
 | `EpochAwareLogDB` | `MinLiveEpoch() (uint64, error)` | the safe-purge floor for barrier DEKs. `0` with a nil error means no encrypted records, or no barrier. |
 | `PerBarrierEpochAwareLogDB` | `MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error)` | the same floor, restricted to one barrier's records |
 | `BarrierShardEnumerator` | `ShardsForBarrier(barrier any) (shards []uint64, known bool)` | the complete shard set behind a barrier, when that set is fixed |

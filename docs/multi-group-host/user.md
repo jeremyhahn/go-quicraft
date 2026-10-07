@@ -31,7 +31,9 @@ You need, for every node:
   so you can compute it as soon as the key exists;
 - an at-rest encryption decision: a barrier (`WithBarrier` or
   `WithShardBarriers`), or an explicit `WithoutEncryption()`. A host that
-  states neither refuses to start.
+  states neither refuses to start. `WithShardBarriers` combines with either
+  host-wide choice: under `WithoutEncryption`, shards with their own barrier
+  are still encrypted and the rest are stored in plaintext.
 
 ## Run a single node
 
@@ -302,7 +304,10 @@ host, err := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
   the seal lasts until a restart.
 - **Per-tenant keys.** `WithShardBarriers` gives each shard its own barrier. The
   default WAL is still encrypted under the host-wide barrier, so for per-tenant
-  log keys you need a LogDB that supports them.
+  log keys you need a LogDB that supports them, such as a multiplexing LogDB
+  that reports `logdb.AtRestHostRouted`. That works with `WithBarrier` (even
+  before `EnableEncryption`) and with `WithoutEncryption`; either way each
+  tenant shard is checked against the LogDB at `StartShard`.
 
 ## Monitor
 
@@ -521,7 +526,9 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | Symptom | Cause and fix |
 |---|---|
 | `NewHost` returns `ErrAtRestEncryptionUnspecified` | pass `WithBarrier`, `WithShardBarriers` or `WithoutEncryption()` |
-| `NewHost` returns `ErrBarrierPlaintextLogDB` or `ErrShardBarriersPlaintextWAL` | your custom LogDB would store the log unencrypted; use the default WAL or an encrypting LogDB |
+| `NewHost` returns `ErrBarrierPlaintextLogDB` or `ErrShardBarriersPlaintextWAL` | your custom LogDB would store the log unencrypted; use the default WAL or an encrypting LogDB. A `host_routed` LogDB needs `WithoutEncryption`, or `WithBarrier` with the barrier its host-wide route writes through |
+| `StartShard` returns `ErrShardBarrierLogDBMismatch` | the LogDB holds this shard under a different barrier than your resolver returned; return the same pointer the LogDB was given |
+| `StartShard` returns `ErrBarrierSealed` | the shard's resolved barrier is sealed; unseal it before starting the shard |
 | `NewHost` fails validation on `MTLSConfig` | the transport needs a CA, certificate and key |
 | `StartShard` or a membership add returns `ErrSharedPeerCertificate` | a node's certificate also covers another member's host; issue one certificate per node |
 | `StartShard` returns `*InvalidMemberError` about identities | `MemberIdentities` is missing a member, binds one identity twice, names no other replica on a join, or contradicts the shard's recorded identities |
