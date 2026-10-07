@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-07
+
+Feature release. **Additive API, no breaking change, no format change:**
+`EventListener.OnLeaderReady` and `Host.ShardReadReady` (#238) tell a consumer
+when a shard can serve linearizable reads, so it can wait on an event instead
+of retrying `ReadIndex` on `ErrReadIndexNotReady`. Every on-disk and wire
+format is unchanged, so 0.18.0 data directories open as they are.
+
 ### Added
 
 - `EventListener.OnLeaderReady` (#238): fires when the shard's leader for
