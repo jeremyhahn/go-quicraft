@@ -24,6 +24,24 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
 )
 
+// enclaveProtection asks the kernel how e's pages are mapped. The address is
+// read inside a borrow, so the view never outlives it; ProtectionOf never
+// dereferences the slice, only locates its mapping.
+func enclaveProtection(t *testing.T, e *enclave.MemoryEnclave) (lockedmem.Protection, error) {
+	t.Helper()
+	var (
+		prot lockedmem.Protection
+		perr error
+	)
+	if err := e.WithBytes(func(view []byte) error {
+		prot, perr = lockedmem.ProtectionOf(view)
+		return nil
+	}); err != nil {
+		t.Fatalf("WithBytes: %v", err)
+	}
+	return prot, perr
+}
+
 // TestUnsealRootKeyProtected_ReturnsFrozenPages pins that the unsealed root key
 // is returned in frozen (read-only) pages.
 //
@@ -65,14 +83,7 @@ func TestUnsealRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 	}
 	defer out.Destroy()
 
-	// Open, not WithBytes: the address is all that is wanted, and ProtectionOf
-	// never dereferences it. The enclave is owned by this goroutine alone, which
-	// is the condition Open documents.
-	view, err := out.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	prot, err := lockedmem.ProtectionOf(view)
+	prot, err := enclaveProtection(t, out)
 	if err != nil {
 		t.Skipf("this kernel cannot report mapping protections: %v", err)
 	}
@@ -99,11 +110,7 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 	}
 	defer e.Destroy()
 
-	view, err := e.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	prot, err := lockedmem.ProtectionOf(view)
+	prot, err := enclaveProtection(t, e)
 	if err != nil {
 		t.Skipf("this kernel cannot report mapping protections: %v", err)
 	}
@@ -150,11 +157,7 @@ func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 	}
 	defer got.Destroy()
 
-	view, err := got.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	prot, err := lockedmem.ProtectionOf(view)
+	prot, err := enclaveProtection(t, got)
 	if err != nil {
 		t.Skipf("this kernel cannot report mapping protections: %v", err)
 	}
@@ -171,7 +174,9 @@ func TestRootKeyProtected_ReturnsFrozenPages(t *testing.T) {
 		t.Fatalf("RootKey: %v", err)
 	}
 	defer enclave.Wipe(plain)
-	if !got.EqualTo(plain) {
+	if eq, err := got.EqualTo(plain); err != nil {
+		t.Fatalf("EqualTo: %v", err)
+	} else if !eq {
 		t.Fatal("the frozen enclave does not hold the barrier's root key")
 	}
 }

@@ -96,7 +96,7 @@ func TestNewProtectedShareWith_OnePageBudget(t *testing.T) {
 	if err := first.Validate(); err != nil {
 		t.Fatalf("earlier share invalid after refusal: %v", err)
 	}
-	if !bytes.Equal(first.Value(), want0) {
+	if !bytes.Equal(valueCopy(first), want0) {
 		t.Fatal("earlier share's value changed after refusal")
 	}
 
@@ -147,7 +147,7 @@ func TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) 
 	}
 	snapshot := make([][]byte, len(first))
 	for i, s := range first {
-		snapshot[i] = append([]byte(nil), s.Value()...)
+		snapshot[i] = append([]byte(nil), valueCopy(s)...)
 	}
 
 	second, err := SplitProtectedWith(a, secret, threshold, total)
@@ -161,7 +161,7 @@ func TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) 
 	}
 
 	for i, s := range first {
-		if !bytes.Equal(s.Value(), snapshot[i]) {
+		if !bytes.Equal(valueCopy(s), snapshot[i]) {
 			t.Fatalf("earlier share %d changed after a refused split", i)
 		}
 	}
@@ -170,7 +170,7 @@ func TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) 
 		t.Fatalf("earlier shares no longer combine: %v", err)
 	}
 	defer got.Destroy()
-	if !bytes.Equal(encBytes(got), secret) {
+	if !bytes.Equal(encCopy(got), secret) {
 		t.Fatal("earlier shares reconstruct the wrong secret after a refused split")
 	}
 }
@@ -202,7 +202,7 @@ func TestCombineProtectedWith_BeyondBudgetLeavesSharesIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("combine within budget: %v", err)
 	}
-	if !bytes.Equal(encBytes(out), secret) {
+	if !bytes.Equal(encCopy(out), secret) {
 		out.Destroy()
 		t.Fatal("combine within budget reconstructed the wrong secret")
 	}
@@ -288,7 +288,7 @@ func TestUnmarshalShareSetWith_ChargesAndDestroyRefunds(t *testing.T) {
 		destroyAll(decoded)
 		t.Fatalf("decoded shares do not combine: %v", err)
 	}
-	ok := bytes.Equal(encBytes(got), secret)
+	ok := bytes.Equal(encCopy(got), secret)
 	got.Destroy()
 	if !ok {
 		destroyAll(decoded)
@@ -325,7 +325,7 @@ func TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.
 	if held != pageBytes() {
 		t.Fatalf("InUse after one-element set = %d, want one page (%d)", held, pageBytes())
 	}
-	snapshot := append([]byte(nil), earlier[0].Value()...)
+	snapshot := append([]byte(nil), valueCopy(earlier[0])...)
 
 	second, err := UnmarshalShareSetWith(a, marshalShareSet(t, shares))
 	if second != nil {
@@ -344,7 +344,7 @@ func TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.
 	if err := earlier[0].Validate(); err != nil {
 		t.Fatalf("earlier share invalid after refusal: %v", err)
 	}
-	if !bytes.Equal(earlier[0].Value(), snapshot) {
+	if !bytes.Equal(valueCopy(earlier[0]), snapshot) {
 		t.Fatal("earlier share's value changed after a refused set")
 	}
 	if earlier[0].Index != shares[0].Index {
@@ -426,13 +426,13 @@ func TestShareProtectWith_OnePageBudget(t *testing.T) {
 	if got := a.InUse(); got != pageBytes() {
 		t.Fatalf("InUse after first share = %d, want one page (%d)", got, pageBytes())
 	}
-	if !bytes.Equal(first.Value(), []byte(plain[0].Value)) {
+	if !bytes.Equal(valueCopy(first), []byte(plain[0].Value)) {
 		t.Fatal("protected value differs from the plain share's")
 	}
 	if first.Metadata["custodian"] != "a" {
 		t.Fatal("ProtectWith dropped the share's metadata")
 	}
-	want0 := append([]byte(nil), first.Value()...)
+	want0 := append([]byte(nil), valueCopy(first)...)
 
 	before := plain[1].Value
 	second, err := plain[1].ProtectWith(a)
@@ -450,7 +450,7 @@ func TestShareProtectWith_OnePageBudget(t *testing.T) {
 	if err := first.Validate(); err != nil {
 		t.Fatalf("earlier share invalid after refusal: %v", err)
 	}
-	if !bytes.Equal(first.Value(), want0) {
+	if !bytes.Equal(valueCopy(first), want0) {
 		t.Fatal("earlier share's value changed after refusal")
 	}
 

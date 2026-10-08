@@ -168,14 +168,16 @@ whose failure path unmaps every live buffer in the process needs one, and with
 it Go's `RWMutex` writer preference turns any nested borrow of a second enclave
 into a self-deadlock. go-enclave has no such path.
 
-A borrow bounds the enclave's lifetime against the accessor call, not against a
-slice the caller kept, and that remains a caller obligation.
-`MemoryEnclave.Open` returns a slice that aliases the locked pages and is covered
-by no lock once it returns; a concurrent `Destroy` unmaps it and the next read
-faults. It is the accessor for code that owns the enclave outright (the
-`defer e.Destroy()` shape used throughout the seal barrier). `WithBytes` holds the
-read lock across the caller's use and is the accessor wherever teardown can race
-a reader.
+A borrow bounds the enclave's lifetime against the callback, not against a slice
+the caller kept, and that remains a caller obligation. `WithBytes` is the only
+read path: it holds the read lock across the caller's use, so a concurrent
+`Destroy` or `Freeze` waits for the callback to return. Each borrow is scoped to
+the code that uses the bytes, and nothing is copied out of it.
+
+*Rejected: an accessor that returns the aliasing slice.* go-enclave had one
+(`Open`) until v0.8.0. Its slice was covered by no lock once it returned, so its
+safety rested on the caller showing that no concurrent teardown existed, which is
+a property of the whole program rather than of the call site.
 
 ### Locked memory is charged by the page, and the ceiling is process-wide
 

@@ -28,8 +28,8 @@ import (
 // there is one region and no locked-to-locked copy into a second, from-bytes
 // enclave.
 //
-// The PROPERTY these pin: `Value` documents the
-// buffer as read-only, and callers rely on a stray write faulting rather than
+// The PROPERTY these pin: `WithValue` documents the
+// value as read-only, and callers rely on a stray write faulting rather than
 // silently corrupting a share or a reconstructed key. A missing Freeze is
 // invisible to every functional assertion — the share still decodes, the secret
 // still reconstructs — so the kernel's own view of the mapping is the witness.
@@ -56,7 +56,16 @@ func TestSplitProtected_ShareValuesAreFrozen(t *testing.T) {
 	}()
 
 	for _, s := range shares {
-		prot, perr := lockedmem.ProtectionOf(s.Value())
+		var (
+			prot lockedmem.Protection
+			perr error
+		)
+		if err := s.WithValue(func(v []byte) error {
+			prot, perr = lockedmem.ProtectionOf(v)
+			return nil
+		}); err != nil {
+			t.Fatalf("share %d: WithValue: %v", s.Index, err)
+		}
 		if perr != nil {
 			t.Skipf("this kernel cannot report mapping protections: %v", perr)
 		}
@@ -92,11 +101,13 @@ func TestCombineProtected_ReconstructedSecretIsFrozen(t *testing.T) {
 	}
 	defer secret.Destroy()
 
-	view, err := secret.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	var prot lockedmem.Protection
+	if werr := secret.WithBytes(func(view []byte) error {
+		prot, err = lockedmem.ProtectionOf(view)
+		return nil
+	}); werr != nil {
+		t.Fatalf("WithBytes: %v", werr)
 	}
-	prot, err := lockedmem.ProtectionOf(view)
 	if err != nil {
 		t.Skipf("this kernel cannot report mapping protections: %v", err)
 	}

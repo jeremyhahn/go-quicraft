@@ -359,12 +359,12 @@ Three obligations, and one limit, come with `ProtectedShare`:
   `mprotect`) has already returned the pages, which the kernel zeroes before
   reuse. The package's internal cleanup paths drop the report the same way,
   through one helper (`release`) whose comment records why nothing is lost.
-- **A slice from `Value` does not outlive the share.** `Value` and `Destroy` are
-  safe to call concurrently; what no lock can bound is a slice a caller kept after
-  `Value` returned, and `Destroy` unmaps the pages, so reading it faults. Where
-  one goroutine tears shares down while another still reads them (a ceremony's
-  normal shape), use `WithValue(func([]byte) error) error`: it holds the share
-  open for the whole callback, so a concurrent `Destroy` blocks until it returns.
+- **A share's value is read only inside `WithValue`.** The view it passes is
+  valid for the callback alone: it holds the share open for the whole callback,
+  so a concurrent `Destroy` blocks until it returns, and `Destroy` unmaps the
+  pages, so a view kept past the callback faults when read. Scope each borrow to
+  the code that uses the value; the callback must not call methods on the same
+  share. There is no accessor that returns the slice.
 
 Because of the second obligation, the two calls that allocate a whole set price
 it first.
@@ -537,7 +537,8 @@ Unit only. Target: `make test-crypto` (runs `./pkg/crypto/...`).
 | `protected_memory_error_test.go` | locked-memory refusals reported as `*ProtectedMemoryError`, partial sets torn down |
 | `protected_share_lockedmem_linux_test.go` | `splitLockedBytes` and the ingestion bound against the kernel's `VmLck` accounting |
 | `protected_freeze_linux_test.go` | share values and reconstructed secrets are read-only after return |
-| `protected_share_race_test.go` | concurrent `Value`/`WithValue`/`Destroy` |
+| `protected_share_race_test.go` | concurrent `WithValue`/`Destroy` |
+| `protected_borrow_test.go` | a borrow ends with its callback; split and combine release every scratch they borrow |
 
 **What a test here must always assert**: that combining a bad-but-structural
 share set returns `(garbage, nil)` rather than an error. That is the documented

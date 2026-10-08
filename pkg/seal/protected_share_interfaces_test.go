@@ -210,9 +210,9 @@ func TestProtectedAccumulatorResetDestroysWhatItHolds(t *testing.T) {
 	if got := acc.GetProgress(); got.Submitted != 0 {
 		t.Fatalf("Reset must clear the accumulated shares, got %d", got.Submitted)
 	}
-	// A destroyed share reports a nil value; that is the observable signal the
+	// A destroyed share fails Validate; that is the observable signal the
 	// wipe actually happened rather than the reference merely being dropped.
-	if v := held.Value(); v != nil {
+	if held.Validate() == nil {
 		t.Fatal("Reset must Destroy the shares it took ownership of")
 	}
 }
@@ -271,10 +271,10 @@ func TestProtectedAccumulatorExpiryReleasesEverythingItHolds(t *testing.T) {
 		t.Fatal("an expired accumulator must refuse the submission")
 	}
 
-	if v := refused.Value(); v != nil {
+	if refused.Validate() == nil {
 		t.Fatal("the refused share must be destroyed — ownership transferred with the call")
 	}
-	if v := accepted.Value(); v != nil {
+	if accepted.Validate() == nil {
 		t.Fatal("an expired ceremony must also release the shares it already accepted")
 	}
 	if got := acc.GetProgress(); got.Submitted != 0 {

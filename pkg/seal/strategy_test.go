@@ -305,7 +305,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	}
 	defer buf.Destroy()
 
-	got := encBytes(buf)
+	got := encCopy(buf)
 	if string(got) != "enclave-test-passphrase" {
 		t.Fatalf("passphrase mismatch: got %q", got)
 	}

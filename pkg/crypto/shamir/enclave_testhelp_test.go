@@ -6,19 +6,33 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// encBytes returns an enclave's bytes, or nil if it is nil or destroyed.
-// go-enclave's Open reports a destroyed enclave as an error; these tests
-// assert on a nil slice, so the error is folded into one here rather than
-// handled at ~30 assertion sites. Production code handles the error.
-func encBytes(e *enclave.MemoryEnclave) []byte {
-	if e == nil {
+// encCopy returns a heap copy of an enclave's bytes, or nil if it is nil or
+// destroyed. The copy is taken inside the borrow, so no view of the locked
+// pages outlives it; these tests assert on a nil slice, so a destroyed enclave
+// is folded into one here rather than handled at ~30 assertion sites.
+// Production code never copies protected material out like this.
+func encCopy(e *enclave.MemoryEnclave) []byte {
+	var out []byte
+	if err := e.WithBytes(func(b []byte) error {
+		out = append([]byte(nil), b...)
+		return nil
+	}); err != nil {
 		return nil
 	}
-	b, err := e.Open()
-	if err != nil {
+	return out
+}
+
+// valueCopy is encCopy for a share's value, taken through WithValue: a heap
+// copy of the base64 value, or nil if the share is nil or destroyed.
+func valueCopy(s *ProtectedShare) []byte {
+	var out []byte
+	if err := s.WithValue(func(v []byte) error {
+		out = append([]byte(nil), v...)
+		return nil
+	}); err != nil {
 		return nil
 	}
-	return b
+	return out
 }
 
 // mustFromBytes moves data into a locked, frozen enclave, failing the test if the

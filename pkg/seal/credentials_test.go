@@ -71,7 +71,9 @@ func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer opened.Destroy()
-	if !opened.EqualTo([]byte(passphrase)) {
+	if eq, err := opened.EqualTo([]byte(passphrase)); err != nil {
+		t.Fatalf("EqualTo: %v", err)
+	} else if !eq {
 		t.Fatal("the credential does not hold the passphrase it consumed")
 	}
 }

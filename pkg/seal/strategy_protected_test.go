@@ -172,7 +172,7 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 
 	recovered.Destroy()
 
-	if encBytes(recovered) != nil {
+	if encCopy(recovered) != nil {
 		t.Fatal("a destroyed root-key enclave must report no bytes")
 	}
 	if err := recovered.WithBytes(func([]byte) error { return nil }); !errors.Is(err, enclave.ErrEnclaveDestroyed) {

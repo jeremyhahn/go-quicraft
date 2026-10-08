@@ -52,7 +52,7 @@ func TestSplitProtected_RoundTrip(t *testing.T) {
 		if s.Threshold != 3 || s.Total != 5 {
 			t.Errorf("share %d: expected 3/5, got %d/%d", i, s.Threshold, s.Total)
 		}
-		if len(s.Value()) == 0 {
+		if len(valueCopy(s)) == 0 {
 			t.Errorf("share %d: value is empty", i)
 		}
 		if err := s.Validate(); err != nil {
@@ -71,11 +71,11 @@ func TestSplitProtected_RoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CombineProtected(%v) returned unexpected error: %v", subset, err)
 		}
-		if !bytes.Equal(encBytes(buf), secret) {
-			t.Errorf("CombineProtected(%v) = %q, want %q", subset, encBytes(buf), secret)
+		if !bytes.Equal(encCopy(buf), secret) {
+			t.Errorf("CombineProtected(%v) = %q, want %q", subset, encCopy(buf), secret)
 		}
 		buf.Destroy()
-		if encBytes(buf) != nil {
+		if encCopy(buf) != nil {
 			t.Errorf("subset %v: reconstructed secret survived Destroy", subset)
 		}
 	}
@@ -101,7 +101,7 @@ func TestSplitProtected_ValuesMatchSplit(t *testing.T) {
 	defer destroyAll(protected)
 
 	for i := range plain {
-		if got, want := string(protected[i].Value()), plain[i].Value; got != want {
+		if got, want := string(valueCopy(protected[i])), plain[i].Value; got != want {
 			t.Errorf("share %d: protected value %q != plain value %q", i, got, want)
 		}
 	}
@@ -151,8 +151,8 @@ func TestNewProtectedShare_WipesSource(t *testing.T) {
 			t.Fatalf("source byte %d not wiped: got %d", i, b)
 		}
 	}
-	if !bytes.Equal(share.Value(), want) {
-		t.Errorf("protected value = %q, want %q", share.Value(), want)
+	if !bytes.Equal(valueCopy(share), want) {
+		t.Errorf("protected value = %q, want %q", valueCopy(share), want)
 	}
 }
 
@@ -265,8 +265,8 @@ func TestProtectedShare_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer buf.Destroy()
-	if !bytes.Equal(encBytes(buf), secret) {
-		t.Errorf("reconstructed %q, want %q", encBytes(buf), secret)
+	if !bytes.Equal(encCopy(buf), secret) {
+		t.Errorf("reconstructed %q, want %q", encCopy(buf), secret)
 	}
 }
 
@@ -285,14 +285,14 @@ func TestProtectedShare_UnmarshalDestroysPreviousValue(t *testing.T) {
 	}
 	defer share.Destroy()
 
-	if encBytes(previous) != nil {
+	if encCopy(previous) != nil {
 		t.Error("the replaced value was not destroyed")
 	}
 	if share.Index != 2 {
 		t.Errorf("index = %d, want 2", share.Index)
 	}
-	if string(share.Value()) != replacement {
-		t.Errorf("value = %q, want %q", share.Value(), replacement)
+	if string(valueCopy(share)) != replacement {
+		t.Errorf("value = %q, want %q", valueCopy(share), replacement)
 	}
 }
 
@@ -314,7 +314,7 @@ func TestProtectedShare_UnmarshalJSON_Invalid(t *testing.T) {
 				share.Destroy()
 				t.Fatal("expected an error, got nil")
 			}
-			if share.value != nil && encBytes(share.value) != nil {
+			if share.value != nil && encCopy(share.value) != nil {
 				share.Destroy()
 				t.Error("a rejected share kept protected memory")
 			}
@@ -331,7 +331,7 @@ func TestProtectedShare_Destroy(t *testing.T) {
 	share.Destroy()
 	share.Destroy() // idempotent
 
-	if share.Value() != nil {
+	if valueCopy(share) != nil {
 		t.Error("Value survived Destroy")
 	}
 	var valErr *ValidationError
@@ -350,7 +350,7 @@ func TestProtectedShare_NilReceiver(t *testing.T) {
 	var share *ProtectedShare
 
 	share.Destroy() // must not panic
-	if share.Value() != nil {
+	if valueCopy(share) != nil {
 		t.Error("Value on a nil share returned bytes")
 	}
 	var valErr *ValidationError
@@ -403,13 +403,13 @@ func TestCombineProtected_Invalid(t *testing.T) {
 	}
 	defer destroyAll(shares)
 
-	relabelled, err := NewProtectedShare(1, 3, 9, append([]byte(nil), shares[0].Value()...))
+	relabelled, err := NewProtectedShare(1, 3, 9, append([]byte(nil), valueCopy(shares[0])...))
 	if err != nil {
 		t.Fatalf("NewProtectedShare returned unexpected error: %v", err)
 	}
 	defer relabelled.Destroy()
 
-	rethresholded, err := NewProtectedShare(1, 4, 5, append([]byte(nil), shares[0].Value()...))
+	rethresholded, err := NewProtectedShare(1, 4, 5, append([]byte(nil), valueCopy(shares[0])...))
 	if err != nil {
 		t.Fatalf("NewProtectedShare returned unexpected error: %v", err)
 	}
@@ -489,8 +489,8 @@ func TestShare_Protect(t *testing.T) {
 			t.Fatalf("share %d: Protect returned unexpected error: %v", i, err)
 		}
 		protected = append(protected, ps)
-		if string(ps.Value()) != p.Value {
-			t.Errorf("share %d: protected value %q != %q", i, ps.Value(), p.Value)
+		if string(valueCopy(ps)) != p.Value {
+			t.Errorf("share %d: protected value %q != %q", i, valueCopy(ps), p.Value)
 		}
 	}
 	defer destroyAll(protected)
@@ -503,8 +503,8 @@ func TestShare_Protect(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer buf.Destroy()
-	if !bytes.Equal(encBytes(buf), secret) {
-		t.Errorf("reconstructed %q, want %q", encBytes(buf), secret)
+	if !bytes.Equal(encCopy(buf), secret) {
+		t.Errorf("reconstructed %q, want %q", encCopy(buf), secret)
 	}
 }
 
@@ -647,7 +647,7 @@ func TestNewProtectedShare_RejectsUndecodableBase64(t *testing.T) {
 				decoded.Destroy()
 				t.Fatalf("json.Unmarshal accepted value %q; want a validation error", value)
 			}
-			if decoded.value != nil && encBytes(decoded.value) != nil {
+			if decoded.value != nil && encCopy(decoded.value) != nil {
 				decoded.Destroy()
 				t.Error("a rejected share kept protected memory")
 			}
@@ -684,8 +684,14 @@ func TestSplitProtected_ProtectedSecretRoundTrip(t *testing.T) {
 	held := mustFromBytes(t, append([]byte(nil), want...))
 	defer held.Destroy()
 
-	shares, err := SplitProtected(encBytes(held), 3, 5)
-	if err != nil {
+	// The split reads the held secret inside its borrow, so the secret is never
+	// copied out of locked memory on its way in.
+	var shares []*ProtectedShare
+	if err := held.WithBytes(func(secret []byte) error {
+		var err error
+		shares, err = SplitProtected(secret, 3, 5)
+		return err
+	}); err != nil {
 		t.Fatalf("SplitProtected returned unexpected error: %v", err)
 	}
 	defer destroyAll(shares)
@@ -696,12 +702,12 @@ func TestSplitProtected_ProtectedSecretRoundTrip(t *testing.T) {
 	}
 	defer got.Destroy()
 
-	if !bytes.Equal(encBytes(got), want) {
-		t.Errorf("reconstructed %q, want %q", encBytes(got), want)
+	if !bytes.Equal(encCopy(got), want) {
+		t.Errorf("reconstructed %q, want %q", encCopy(got), want)
 	}
 	// The source enclave is untouched by the split.
-	if !bytes.Equal(encBytes(held), want) {
-		t.Errorf("the caller's protected secret changed: %q", encBytes(held))
+	if !bytes.Equal(encCopy(held), want) {
+		t.Errorf("the caller's protected secret changed: %q", encCopy(held))
 	}
 }
 
@@ -719,7 +725,7 @@ func TestCombineProtected_LeavesSharesUsable(t *testing.T) {
 
 	values := make([]string, len(shares))
 	for i, s := range shares {
-		values[i] = string(s.Value())
+		values[i] = string(valueCopy(s))
 	}
 
 	first, err := CombineProtected(shares[:2])
@@ -729,7 +735,7 @@ func TestCombineProtected_LeavesSharesUsable(t *testing.T) {
 	first.Destroy()
 
 	for i, s := range shares {
-		if got := string(s.Value()); got != values[i] {
+		if got := string(valueCopy(s)); got != values[i] {
 			t.Errorf("share %d changed across a reconstruction", i)
 		}
 	}
@@ -738,8 +744,8 @@ func TestCombineProtected_LeavesSharesUsable(t *testing.T) {
 		t.Fatalf("second CombineProtected returned unexpected error: %v", err)
 	}
 	defer second.Destroy()
-	if !bytes.Equal(encBytes(second), secret) {
-		t.Errorf("second reconstruction = %q, want %q", encBytes(second), secret)
+	if !bytes.Equal(encCopy(second), secret) {
+		t.Errorf("second reconstruction = %q, want %q", encCopy(second), secret)
 	}
 }
 
@@ -833,13 +839,13 @@ func TestNewProtectedShare_AcceptsMaxSizeValue(t *testing.T) {
 	}
 	defer destroyAll(shares)
 
-	if got := len(shares[0].Value()); got != maxProtectedValueBytes {
+	if got := len(valueCopy(shares[0])); got != maxProtectedValueBytes {
 		t.Fatalf("largest producible share value is %d bytes, but the bound is %d", got, maxProtectedValueBytes)
 	}
 
 	// Re-entering that value through the untrusted constructor must work: it
 	// is the boundary case, one quantum below the rejection above.
-	value := append([]byte(nil), shares[0].Value()...)
+	value := append([]byte(nil), valueCopy(shares[0])...)
 	reborn, err := NewProtectedShare(shares[0].Index, shares[0].Threshold, shares[0].Total, value)
 	if err != nil {
 		t.Fatalf("NewProtectedShare rejected a legitimate max-size share: %v", err)
@@ -851,7 +857,7 @@ func TestNewProtectedShare_AcceptsMaxSizeValue(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer got.Destroy()
-	if !bytes.Equal(encBytes(got), secret) {
+	if !bytes.Equal(encCopy(got), secret) {
 		t.Error("max-size secret did not round trip through the protected path")
 	}
 }
@@ -892,8 +898,8 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 		t.Fatalf("decoded %d shares, want %d", len(decoded), len(shares))
 	}
 	for i := range shares {
-		if !bytes.Equal(decoded[i].Value(), shares[i].Value()) {
-			t.Errorf("share %d: value %q, want %q", i, decoded[i].Value(), shares[i].Value())
+		if !bytes.Equal(valueCopy(decoded[i]), valueCopy(shares[i])) {
+			t.Errorf("share %d: value %q, want %q", i, valueCopy(decoded[i]), valueCopy(shares[i]))
 		}
 	}
 
@@ -902,8 +908,8 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 		t.Fatalf("CombineProtected returned unexpected error: %v", err)
 	}
 	defer got.Destroy()
-	if !bytes.Equal(encBytes(got), secret) {
-		t.Errorf("reconstructed %q, want %q", encBytes(got), secret)
+	if !bytes.Equal(encCopy(got), secret) {
+		t.Errorf("reconstructed %q, want %q", encCopy(got), secret)
 	}
 }
 
@@ -1037,7 +1043,7 @@ func TestCombineProtected_MatchesCombineBytes(t *testing.T) {
 			// interpolates from every decoded payload at once.
 			values := make([][]byte, len(shares))
 			for i, s := range shares {
-				values[i] = append([]byte(nil), s.Value()...)
+				values[i] = append([]byte(nil), valueCopy(s)...)
 			}
 			want, err := CombineBytes(values[:threshold], threshold)
 			if err != nil {
@@ -1048,11 +1054,11 @@ func TestCombineProtected_MatchesCombineBytes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("CombineProtected(%d bytes, %d/%d): %v", secretLen, threshold, total, err)
 			}
-			if !bytes.Equal(encBytes(got), want) {
+			if !bytes.Equal(encCopy(got), want) {
 				t.Errorf("%d bytes, %d/%d: CombineProtected = %x, CombineBytes = %x",
-					secretLen, threshold, total, encBytes(got), want)
+					secretLen, threshold, total, encCopy(got), want)
 			}
-			if !bytes.Equal(encBytes(got), secret) {
+			if !bytes.Equal(encCopy(got), secret) {
 				t.Errorf("%d bytes, %d/%d: reconstruction does not match the secret", secretLen, threshold, total)
 			}
 			got.Destroy()
@@ -1083,8 +1089,8 @@ func TestCombineProtected_ReusedBufferDoesNotLeakBetweenShares(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CombineProtected(%v): %v", order, err)
 		}
-		if !bytes.Equal(encBytes(got), secret) {
-			t.Errorf("CombineProtected(%v) = %q, want %q", order, encBytes(got), secret)
+		if !bytes.Equal(encCopy(got), secret) {
+			t.Errorf("CombineProtected(%v) = %q, want %q", order, encCopy(got), secret)
 		}
 		got.Destroy()
 	}
@@ -1159,7 +1165,7 @@ func TestSplitProtected_AcceptsRealCeremonies(t *testing.T) {
 				t.Fatalf("CombineProtected returned unexpected error: %v", err)
 			}
 			defer got.Destroy()
-			if !bytes.Equal(encBytes(got), secret) {
+			if !bytes.Equal(encCopy(got), secret) {
 				t.Error("the secret did not round trip")
 			}
 		})

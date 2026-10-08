@@ -22,7 +22,7 @@ feature exists to prevent.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.7.0-alpha).
+Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.8.0-alpha).
 
 All of the surface belongs to go-enclave. go-quicraft declares no
 protected-memory type, alias or wrapper, and re-exports nothing: consumers
@@ -102,7 +102,7 @@ func (s *SealedEnclave) Open(ctx context.Context) (*MemoryEnclave, error)
 func (s *SealedEnclave) OpenWith(ctx context.Context, a *Allocator) (*MemoryEnclave, error)
 func (s *SealedEnclave) Openable() error
 func (s *SealedEnclave) IsAlive() bool
-func (s *SealedEnclave) Destroy()
+func (s *SealedEnclave) Destroy() error // always nil today
 ```
 
 | | |
@@ -134,25 +134,25 @@ different question, whether an `Open` could still succeed, which a shutdown
 
 ```go
 func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error
-func (e *MemoryEnclave) Open() ([]byte, error)
 func (e *MemoryEnclave) Size() int
 func (e *MemoryEnclave) IsAlive() bool
-func (e *MemoryEnclave) EqualTo(other []byte) bool
+func (e *MemoryEnclave) EqualTo(other []byte) (bool, error)
 func (e *MemoryEnclave) Destroy() error
 ```
 
 | | |
 |---|---|
-| Request | `WithBytes`: `fn`, called with a slice aliasing the protected region. `Open`: none. |
-| Response | `WithBytes`: `fn`'s error, unchanged. `Open`: the aliasing slice. |
+| Request | `WithBytes`: `fn`, called with a slice aliasing the protected region. `EqualTo`: the bytes to compare against, in constant time. |
+| Response | `WithBytes`: `fn`'s error, unchanged. `EqualTo`: whether the contents match. |
 | Errors | Both return `ErrEnclaveDestroyed` if the enclave is destroyed; `WithBytes` then does not call `fn`. |
 | Permission | none |
 
-`Open`'s slice aliases the locked pages and no lock is held once it returns, so
-a concurrent `Destroy` unmaps memory the caller is still reading and the read
-faults. Use it only where no concurrent teardown is possible, such as
-single-goroutine ownership with `defer e.Destroy()`. Wherever teardown can race
-a reader, use `WithBytes`, which holds the read lock across `fn`.
+`WithBytes` is the only way to read the bytes. The slice is valid for `fn`'s
+call and no longer: the read lock is held across `fn`, so a concurrent `Destroy`
+or `Freeze` waits for it, and once `fn` returns nothing covers the slice. Scope
+each borrow to the code that uses the bytes, and copy nothing out of it.
+go-enclave v0.8.0 removed `Open`, which returned a slice covered by no lock, and
+with it `OpenString` and `NewMemoryEnclaveFromString`.
 
 `Destroy` returns `nil` for a successful release, for a nil enclave and for
 every call after a successful release. It returns `ErrReleasedWithoutWipe` when
@@ -167,7 +167,8 @@ cleanup paths log it (`pkg/seal`) or document why they drop it
 use a different enclave: go-enclave holds only the borrowed enclave's own read
 lock, and there is no process-wide lock.
 
-`shamir.ProtectedShare` mirrors the pair as `Value` / `WithValue`.
+`shamir.ProtectedShare` mirrors it as `WithValue`, the share value's only
+accessor.
 
 ### Wipe an ordinary slice
 

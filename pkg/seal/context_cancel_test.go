@@ -296,7 +296,7 @@ func TestNewCredentials_EndedContextWipesSecret(t *testing.T) {
 }
 
 // TestClosedIfEnclaveGone_DistinguishesCloseFromSweep pins that only a
-// passphrase enclave that is actually gone reports ErrStrategyClosed. Under
+// passphrase enclave that is actually gone reports ErrStrategyClosed. Since
 // go-enclave v0.7 an Open can also fail with ErrEnclaveDestroyed because a
 // concurrent WipeAll destroyed one of its PER-CALL enclaves while the
 // passphrase itself is intact; naming the strategy closed there would send an

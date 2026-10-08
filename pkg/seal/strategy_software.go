@@ -861,7 +861,7 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *S
 // is the same condition as "used after Close" and must report the same error.
 //
 // ErrEnclaveDestroyed alone does not prove that, so the passphrase is asked.
-// Under go-enclave v0.7 an Open can also fail with ErrEnclaveDestroyed when a
+// Since go-enclave v0.7 an Open can also fail with ErrEnclaveDestroyed when a
 // concurrent enclave.WipeAll destroys one of the open's PER-CALL enclaves (its
 // destination or its DEK) while the passphrase envelope itself is intact. That
 // is a shutdown sweep taking the operation's working key, not this strategy
@@ -886,8 +886,8 @@ func closedIfEnclaveGone(passphrase *enclave.SealedEnclave, err error) error {
 // blob before releasing them, so Close is erasure rather than revocation.
 //
 // This method is idempotent and safe to call concurrently with Seal/Unseal, and
-// every outcome is fail-closed. Under go-enclave v0.7 Destroy does NOT wait for
-// an Open in flight. An operation whose Open has already pinned the envelope
+// every outcome is fail-closed. go-enclave's SealedEnclave.Destroy does NOT wait
+// for an Open in flight. An operation whose Open has already pinned the envelope
 // completes against it — it is ordered before the Destroy — and the ciphertext
 // is wiped by whichever of Destroy or the last such Open finishes last. An
 // operation that starts after the swap sees a nil pointer and fails with
@@ -906,9 +906,12 @@ func closedIfEnclaveGone(passphrase *enclave.SealedEnclave, err error) error {
 //
 // For deferred strategies (where the passphrase arrives in the credentials)
 // Close is a no-op, and the credential is the caller's to Destroy.
+//
+// Close returns the passphrase Destroy's error, which go-enclave documents as
+// always nil today.
 func (s *SoftwareStrategy) Close() error {
 	if passphrase := s.passphrase.Swap(nil); passphrase != nil {
-		passphrase.Destroy()
+		return passphrase.Destroy()
 	}
 	return nil
 }

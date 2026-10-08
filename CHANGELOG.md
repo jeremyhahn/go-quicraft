@@ -35,6 +35,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI tool pins moved to the upstream latest, in step with the runner image
   (#242): golangci-lint v2.14.0, govulncheck v1.8.0, Go 1.27.1 (`go.mod`,
   workflows, Dockerfiles, docs). gosec (v2.29.0) was already current.
+- **BREAKING**: go-enclave is v0.8.0-alpha (was v0.7.0-alpha) (#244). What
+  changes for an embedder that uses go-enclave alongside this library:
+  - `MemoryEnclave.Open`, `OpenString` and `NewMemoryEnclaveFromString` are
+    gone. Read through `WithBytes(func([]byte) error)`, which holds the
+    enclave's read lock for the callback and no longer; build from bytes with
+    `NewMemoryEnclave`.
+  - `MemoryEnclave.EqualTo` returns `(bool, error)`; a destroyed enclave is an
+    error, not `false`.
+  - `SealedEnclave.Destroy` returns an error (always `nil` today). The barrier
+    logs one at WARN on its cleanup paths, and `SoftwareStrategy.Close`
+    returns it.
+  - `WithProvider` and `WithMode` are replaced by `WithKeyProtector` and
+    `WithRootUnsealer`, and `WithProviderHealth` by the `HealthReporter`
+    interface. This library uses none of them.
+- **BREAKING**: `shamir.ProtectedShare.Value` is removed (#244). It returned a
+  view of the share's locked pages that no lock covered once it returned, which
+  is the shape go-enclave v0.8.0 removed. Use `WithValue`, whose callback is the
+  whole lifetime of the view.
+- Every read of locked memory in `pkg/crypto/shamir` and `pkg/seal` is a borrow
+  scoped to the code that uses the bytes (#244). `SplitProtected` borrows its
+  scratches only around share evaluation and releases each when its borrow
+  ends; `CombineProtected` ends the secret's borrow before freezing it; and
+  `Barrier.Rotate` borrows the root key separately for the derivation and the
+  state MAC re-stamp, so neither borrow spans sealing the new DEK.
 
 ## [0.19.0] - 2026-10-07
 

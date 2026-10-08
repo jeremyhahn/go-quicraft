@@ -359,7 +359,7 @@ type Barrier struct {
 // pages anyway. Nothing more is lost by not returning it.
 //
 // What a refusal leaves behind depends on whether the region is frozen, and
-// most callers here release FROZEN regions: under go-enclave v0.7 every
+// most callers here release FROZEN regions: since go-enclave v0.7 every
 // buffer returned by SealedEnclave.Open (the root key, the passphrase) is
 // read-only.
 //
@@ -384,6 +384,21 @@ type Barrier struct {
 func releaseEnclave(e *enclave.MemoryEnclave, what string) {
 	if err := e.Destroy(); err != nil {
 		slog.Warn("quicraft/seal: locked memory release was refused or ran without a wipe",
+			"enclave", what,
+			"error", err,
+		)
+	}
+}
+
+// releaseSealed destroys a SealedEnclave on a cleanup path, logging a failure
+// the way releaseEnclave does. go-enclave documents SealedEnclave.Destroy's
+// error as always nil today, returned to match MemoryEnclave.Destroy: the
+// ciphertext lives on the ordinary heap, so there is no lock or mapping for a
+// release to be refused. Logging it rather than discarding it means a future
+// failure is seen instead of silently dropped.
+func releaseSealed(s *enclave.SealedEnclave, what string) {
+	if err := s.Destroy(); err != nil {
+		slog.Warn("quicraft/seal: sealed key release failed",
 			"enclave", what,
 			"error", err,
 		)
@@ -708,7 +723,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 	}
 	rootPK, err := enclave.NewSealed(ctx, rootKey)
 	if err != nil {
-		dekPK.Destroy()
+		releaseSealed(dekPK, "initial DEK")
 		return &Error{Strategy: "initialize", Err: err}
 	}
 
@@ -1107,7 +1122,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	newCiphers := make(map[uint64]cipher.AEAD)
 	failed := func(err error) error {
 		for _, pk := range newDEKs {
-			pk.Destroy()
+			releaseSealed(pk, "unsealed epoch DEK")
 		}
 		return err
 	}
@@ -1422,10 +1437,10 @@ func (b *Barrier) seal() error {
 	//
 	// It does NOT touch an enclave a previous Open handed out: those belong to
 	// their callers, which Destroy them on their own paths.
-	b.rootKey.Destroy()
-	b.currentDEK.Destroy()
+	releaseSealed(b.rootKey, "root key")
+	releaseSealed(b.currentDEK, "current DEK")
 	for epoch, dek := range b.deks {
-		dek.Destroy()
+		releaseSealed(dek, "epoch DEK")
 		delete(b.deks, epoch)
 	}
 
@@ -1536,10 +1551,10 @@ func (b *Barrier) Reset() error {
 	// seal() has already destroyed these in every reachable sealed state; doing
 	// it again is idempotent and nil-safe, and keeps Reset correct on its own
 	// rather than by reliance on the path that led here.
-	b.rootKey.Destroy()
-	b.currentDEK.Destroy()
+	releaseSealed(b.rootKey, "root key")
+	releaseSealed(b.currentDEK, "current DEK")
 	for _, dek := range b.deks {
-		dek.Destroy()
+		releaseSealed(dek, "epoch DEK")
 	}
 
 	b.rootKey = nil
@@ -2369,14 +2384,18 @@ func (b *Barrier) rotateLocked(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	defer releaseEnclave(rootBuf, "root key")
-	// Aliases the locked pages for the rest of this function. rootBuf is opened
-	// and destroyed here and never escapes, so no concurrent Destroy can unmap it
-	// underneath the reads below — the condition go-enclave's Open requires.
-	rootBytes, err := rootBuf.Open()
-	if err != nil {
-		return 0, err
-	}
-	dek, aead, err := b.deriveEpochCipher(rootBytes, b.salt, newEpoch)
+	// The root key is borrowed twice, each borrow scoped to the one call that
+	// reads it: the derivation here and the state MAC re-stamp in step 2. Neither
+	// borrow spans the sealing in step 1b, which may block on a provider.
+	var (
+		dek  []byte
+		aead cipher.AEAD
+	)
+	err = rootBuf.WithBytes(func(root []byte) error {
+		var derr error
+		dek, aead, derr = b.deriveEpochCipher(root, b.salt, newEpoch)
+		return derr
+	})
 	if err != nil {
 		// Nothing committed yet; the old epoch remains active. deriveEpochCipher
 		// already zeroed any partial key material on its own error path, but the
@@ -2413,12 +2432,14 @@ func (b *Barrier) rotateLocked(ctx context.Context) (uint64, error) {
 	// Re-authenticate the metadata: Epoch and KnownEpochs both changed, and a
 	// blob whose MAC still covered the OLD values would be rejected by the next
 	// Unseal (correctly — it would be indistinguishable from an edited one).
-	if macErr := b.restampStateMACLocked(rootBytes, candidate); macErr != nil {
-		dekPK.Destroy()
+	if macErr := rootBuf.WithBytes(func(root []byte) error {
+		return b.restampStateMACLocked(root, candidate)
+	}); macErr != nil {
+		releaseSealed(dekPK, "rotated DEK")
 		return 0, macErr
 	}
 	if perr := persist(cloneSealedRootKey(candidate)); perr != nil {
-		dekPK.Destroy()
+		releaseSealed(dekPK, "rotated DEK")
 		slog.Error("key rotation aborted: sealed state not persisted; previous epoch remains active",
 			"from_epoch", oldEpoch, "to_epoch", newEpoch, "error", perr)
 		return 0, &StatePersistError{Op: "rotate", Epoch: newEpoch, Err: perr}
@@ -2576,7 +2597,7 @@ func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, 
 		// read) remains GC-bounded through the cipher cache. Restructuring that
 		// cache to hold wipeable key material is a hot-path change and is
 		// deliberately not made here.
-		b.deks[epoch].Destroy()
+		releaseSealed(b.deks[epoch], "purged epoch DEK")
 		delete(b.deks, epoch)
 		delete(b.ciphers, epoch)
 		delete(b.knownEpochs, epoch)
@@ -2772,7 +2793,7 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 // slice before Destroy is a WRITE to a read-only region and faults the process.
 // This is the one habit a careful caller is likely to bring to a key it owns,
 // and it is the one habit the freeze punishes. pkg/crypto/shamir's
-// ProtectedShare.Value carries the same warning for the same reason.
+// ProtectedShare.WithValue carries the same warning for the same reason.
 //
 // THE TRADE, stated rather than left for a reader to find in go-enclave: a
 // frozen region has to be made writable again before Destroy can wipe it, so the

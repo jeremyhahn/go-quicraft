@@ -1,9 +1,9 @@
 # Memory enclave: engineering contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-08
 > Conflicts with this document are defects. Fix them here first.
 
-Import path: `github.com/jeremyhahn/go-enclave` (v0.7.0-alpha in `go.mod`).
+Import path: `github.com/jeremyhahn/go-enclave` (v0.8.0-alpha in `go.mod`).
 
 go-quicraft implements none of this. There is no `pkg/enclave` and no
 protected-memory type, alias or wrapper in this repository, and
@@ -17,10 +17,9 @@ contract this repository codes against and the obligations it accepts.
 func enclave.NewMemoryEnclaveSized(n int) (*MemoryEnclave, error)      // writable; fill in place
 func enclave.NewMemoryEnclave(data []byte) (*MemoryEnclave, error)     // moves data in; FROZEN
 func enclave.NewMemoryEnclaveCopy(src []byte) (*MemoryEnclave, error)  // copies; FROZEN; src untouched
-func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error
-func (e *MemoryEnclave) Open() ([]byte, error)       // UNSAFE: the slice outlives the lock
+func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error // the only read path
 func (e *MemoryEnclave) Freeze() error               // post-fill mprotect; irreversible
-func (e *MemoryEnclave) EqualTo(other []byte) bool
+func (e *MemoryEnclave) EqualTo(other []byte) (bool, error)
 func (e *MemoryEnclave) Size() int
 func (e *MemoryEnclave) IsAlive() bool
 func (e *MemoryEnclave) Destroy() error              // reports a refused or unwiped release
@@ -30,7 +29,7 @@ func enclave.NewSealed(ctx context.Context, data []byte) (*SealedEnclave, error)
 func (s *SealedEnclave) Open(ctx context.Context) (*MemoryEnclave, error) // caller OWNS the result; FROZEN
 func (s *SealedEnclave) Openable() error
 func (s *SealedEnclave) IsAlive() bool
-func (s *SealedEnclave) Destroy()                        // WIPES the ciphertext
+func (s *SealedEnclave) Destroy() error                  // WIPES the ciphertext; always nil today
 
 // Utility
 func enclave.Wipe(b []byte)
@@ -48,24 +47,24 @@ var ErrEnclaveDestroyed, ErrEmptyEnclave, ErrInvalidSize,
 its own `sync.RWMutex` and a `SealedEnclave` its envelope with another, both
 inside go-enclave. Readers hold the read lock for the call and `Destroy` takes
 the write lock, so teardown waits out in-flight readers. Every call is safe under
-concurrency. A slice that outlives the call is not, and `MemoryEnclave.Open`
-returns exactly such a slice on purpose.
+concurrency. A slice that outlives the call is not, and since v0.8.0 go-enclave
+hands out no such slice: `WithBytes` is the only read path, and the view it
+passes is valid for the callback alone.
 
 | Operation | Concurrency | Idempotent |
 |---|---|---|
 | `SealedEnclave.Open` | safe with `Open`, `Destroy` | n/a; each call returns a new enclave |
 | `SealedEnclave.Destroy` | does not wait for an `Open` in flight: that open completes against the envelope it pinned, a later one returns `ErrEnclaveDestroyed`, and the last open out wipes the ciphertext | yes; a `nil` receiver is a no-op |
-| `MemoryEnclave.WithBytes` / `OpenString` / `EqualTo` / `Size` / `IsAlive` | readers; hold the read lock for the whole call, so a concurrent `Destroy` blocks | n/a |
+| `MemoryEnclave.WithBytes` / `EqualTo` / `Size` / `IsAlive` | readers; hold the read lock for the whole call, so a concurrent `Destroy` blocks | n/a |
 | `MemoryEnclave.Freeze` | writer; waits out every in-flight borrow | yes; irreversible |
 | `MemoryEnclave.Destroy` | writer; blocks until every in-flight reader returns | yes; a `nil` receiver and every call after a successful release return `nil`; a refused release is retried by calling it again |
-| `MemoryEnclave.Open` | returns a slice covered by no lock once it returns | n/a |
 
-- **The lock bounds the call, not the slice.** `Destroy` wipes and unmaps the
-  memory, so a slice retained past its accessor is a use-after-free that faults
-  rather than reading zeros. Where teardown can race a reader (barrier and
-  custody ceremony paths) use `WithBytes` or `ProtectedShare.WithValue`, which
-  hold the read lock across the callback. `Open` is for code that owns the
-  enclave outright and can show no concurrent teardown exists.
+- **The lock bounds the callback, not the slice.** `Destroy` wipes and unmaps
+  the memory, so a view retained past its callback is a use-after-free that
+  faults rather than reading zeros. Every borrow is scoped to the code that uses
+  the bytes: derive, compare or copy into another enclave inside the callback,
+  and return. Nothing is copied out to the heap to work on later.
+  `ProtectedShare.WithValue` is the same borrow on a share.
 - **A callback must not re-enter the same enclave**: no `WithBytes`, `Size`,
   `IsAlive`, `EqualTo`, `Freeze` or `Destroy` on the enclave it is borrowing.
   The read lock is held for the call, so a nested writer deadlocks, and a nested
@@ -228,6 +227,7 @@ material:
 | `shamir.TestSplitProtected_BudgetIsATrueUpperBound` | that `splitLockedBytes` prices every region live at the peak, by checking that every region the allocator seam handed out is still alive when the split returns |
 | `shamir.TestSplitProtected_AllocationFailureDestroysPartialShares` | that a mid-loop refusal tears down the shares already built, which the caller never receives and could never `Destroy` |
 | `shamir.TestNewProtectedShare_AllocationFailureIsNotValidation` | the ownership contract the two error types encode: a refused lock consumed the source, a validation failure did not |
+| `shamir.TestBorrow_*`, `shamir.Test{Split,Combine}ProtectedWith_Release*` | that a borrow ends with its callback, so `Freeze` and `Destroy` go through straight after it, and that every scratch split and combine borrow is released by the time they return |
 
 **Fault-injection seams.** The failure that matters, `RLIMIT_MEMLOCK`
 exhaustion, cannot be produced honestly in a shared test binary: reaching it for

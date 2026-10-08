@@ -113,7 +113,7 @@ func lockSized(a *enclave.Allocator, n int) (*enclave.MemoryEnclave, error) {
 //     refused munlock or munmap holds pages that are already zero, on
 //     go-enclave's WipeAll ledger for a later retry.
 //   - A FROZEN region (every finished share value and recovered secret this
-//     package hands out, and under go-enclave v0.7 every buffer
+//     package hands out, and every buffer go-enclave's
 //     SealedEnclave.Open returns) must be made writable before it can be wiped. A denied mprotect falls back to a bare
 //     unmap and ErrReleasedWithoutWipe — no in-process wipe, but the pages are
 //     gone and the kernel zeroes them before reuse. If that unmap is refused
@@ -130,6 +130,27 @@ func lockSized(a *enclave.Allocator, n int) (*enclave.MemoryEnclave, error) {
 // documents; that is not dropped here.
 func release(e *enclave.MemoryEnclave) {
 	_ = e.Destroy()
+}
+
+// borrow calls fn with a view of e's locked pages for exactly the duration of
+// fn, through go-enclave's WithBytes. The view must not outlive fn: the pages
+// are unmapped by Destroy, and WithBytes's read lock is what holds Destroy off.
+//
+// A borrow refused before fn ran (the enclave was already destroyed) is
+// reported as a *ProtectedMemoryError naming op. An error fn returns is passed
+// through unchanged, so a typed *SplitError or *CombineError produced inside
+// the borrow reaches the caller as itself rather than wrapped in a
+// locked-memory failure it is not.
+func borrow(e *enclave.MemoryEnclave, op string, fn func([]byte) error) error {
+	ran := false
+	err := e.WithBytes(func(b []byte) error {
+		ran = true
+		return fn(b)
+	})
+	if err != nil && !ran {
+		return &ProtectedMemoryError{Op: op, Err: err}
+	}
+	return err
 }
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
@@ -376,7 +397,7 @@ func splitLockedBytes(secretLen, threshold, total int) int {
 // metadata, they mirror Share field-for-field so migrating a caller is a move
 // rather than a rewrite, and none of them is what this type exists to protect.
 // The value is unexported precisely because it IS: routing it through
-// NewProtectedShare and Value is what makes "share material never becomes a
+// NewProtectedShare and WithValue is what makes "share material never becomes a
 // string" an invariant of the type rather than a convention.
 type ProtectedShare struct {
 	// Index is the share's 1-based position, equal to the x-coordinate
@@ -606,40 +627,52 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 		return nil, &ProtectedMemoryError{Op: "locking coefficient memory", Err: err}
 	}
 	defer release(randCoeffs)
-	rc, err := randCoeffs.Open()
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "opening coefficient memory", Err: err}
-	}
-	if _, err := io.ReadFull(randReader, rc); err != nil {
-		return nil, &SplitError{Reason: fmt.Sprintf("reading random coefficients: %v", err)}
-	}
-	// Raw coefficients are used verbatim, including a zero top coefficient,
-	// and no secret digest is embedded in shares — see SplitBytes for why
-	// both of those are deliberate and must not be "fixed".
+	// Every scratch below is borrowed for exactly the span that reads or writes
+	// it, and the borrows nest: the coefficient pool, the coefficient vector and
+	// the payload buffer are all in use for the whole of share evaluation, so
+	// that is the scope each borrow covers, and no view of any of them survives
+	// the borrow that produced it.
+	var shares []*ProtectedShare
+	if err := borrow(randCoeffs, "opening coefficient memory", func(rc []byte) error {
+		if _, err := io.ReadFull(randReader, rc); err != nil {
+			return &SplitError{Reason: fmt.Sprintf("reading random coefficients: %v", err)}
+		}
+		// Raw coefficients are used verbatim, including a zero top coefficient,
+		// and no secret digest is embedded in shares — see SplitBytes for why
+		// both of those are deliberate and must not be "fixed".
 
-	coeffs, err := lockSized(a, threshold) // [secret byte, c1..c_{t-1}]
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
+		coeffs, err := lockSized(a, threshold) // [secret byte, c1..c_{t-1}]
+		if err != nil {
+			return &ProtectedMemoryError{Op: "locking coefficient vector", Err: err}
+		}
+		defer release(coeffs)
+		return borrow(coeffs, "opening coefficient vector", func(cf []byte) error {
+			// One raw payload buffer serves every share: each iteration rewrites
+			// all of it (version, x, and one y byte per secret byte) before it is
+			// read, so no share ever sees another's bytes, and Destroy wipes the
+			// last share's payload on the way out.
+			raw, err := lockSized(a, rawShareOverhead+len(secret))
+			if err != nil {
+				return &ProtectedMemoryError{Op: "locking share payload", Err: err}
+			}
+			defer release(raw)
+			return borrow(raw, "opening share payload", func(rw []byte) error {
+				var err error
+				shares, err = evalProtectedShares(a, secret, threshold, total, rc, cf, rw)
+				return err
+			})
+		})
+	}); err != nil {
+		return nil, err
 	}
-	defer release(coeffs)
-	cf, err := coeffs.Open()
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "opening coefficient vector", Err: err}
-	}
-	// One raw payload buffer serves every share: each iteration rewrites all
-	// of it (version, x, and one y byte per secret byte) before it is read, so
-	// no share ever sees another's bytes, and Destroy wipes the last share's
-	// payload on the way out.
-	raw, err := lockSized(a, rawShareOverhead+len(secret))
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "locking share payload", Err: err}
-	}
-	defer release(raw)
-	rw, err := raw.Open()
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "opening share payload", Err: err}
-	}
+	return shares, nil
+}
 
+// evalProtectedShares evaluates the total shares of secret into locked, frozen
+// values. rc, cf and rw are views of splitProtected's coefficient pool,
+// coefficient vector and payload buffer, borrowed by the caller for the whole
+// of this call; nothing here retains them.
+func evalProtectedShares(a *enclave.Allocator, secret []byte, threshold, total int, rc, cf, rw []byte) ([]*ProtectedShare, error) {
 	encodedLen := base64.StdEncoding.EncodedLen(len(rw))
 
 	shares := make([]*ProtectedShare, 0, total)
@@ -688,7 +721,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 		}
 		// A refused freeze leaves the region alive and WRITABLE. A share whose
 		// value can still be written is not the type this package hands out —
-		// Value documents the buffer as read-only and callers rely on a stray
+		// WithValue documents the buffer as read-only and callers rely on a stray
 		// write faulting — so it is torn down rather than returned.
 		if err := value.Freeze(); err != nil {
 			release(value)
@@ -828,9 +861,8 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	// Every read of a share's value below goes through WithValue, which holds
 	// the share's borrow for the whole read. These slices alias caller-owned
 	// protected memory that another goroutine may Destroy at any moment — a
-	// cancelled or timed-out ceremony is exactly that shape — and a bare
-	// Value() would release the borrow before the decode consumed the bytes.
-	// Reconstruction obtains the slices itself, so a caller cannot make this
+	// cancelled or timed-out ceremony is exactly that shape — so the decode
+	// runs inside the borrow, never on a view that outlived it. Reconstruction obtains the slices itself, so a caller cannot make this
 	// safe from outside.
 	widest := 0
 	for _, share := range shares {
@@ -849,17 +881,11 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	}
 	defer release(buf)
 
-	// Materialized HERE, outside every WithValue below. buf is created in this
-	// function and never escapes it, so no other goroutine can destroy it while
-	// the loop runs — which is the condition go-enclave's Open documents as the
-	// one that makes an aliasing view safe. go-enclave holds only the borrowed
-	// enclave's own read lock, so opening buf inside a share's borrow would also
-	// be safe; hoisting it is a clarity choice.
-	bufBytes, err := buf.Open()
-	if err != nil {
-		return nil, &ProtectedMemoryError{Op: "opening decode buffer", Err: err}
-	}
-
+	// buf is borrowed for each pass that decodes into it, and every share is
+	// borrowed INSIDE that, through WithValue. go-enclave holds only the
+	// borrowed enclave's own read lock, so a share borrow nested in buf's
+	// contends with nothing but that share.
+	//
 	// Pass one: validate every share and collect the x-coordinates. Nothing
 	// secret is retained — a y-payload lives in buf only until the next share
 	// overwrites it, and the stale tail of a shorter decode is unreachable
@@ -868,28 +894,33 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	xs := make([]byte, len(shares))
 	seenX := make(map[byte]struct{}, len(shares))
 	secretLen := -1
-	for i, share := range shares {
-		// Read in place: the share's own locked buffer is the source operand
-		// of the decode, never a copy of it. The decode and the parse both run
-		// inside the borrow, so the source cannot be unmapped mid-read.
-		var (
-			n   int
-			x   byte
-			y   []byte
-			err error
-		)
-		if werr := share.WithValue(func(v []byte) error {
-			n, err = base64.StdEncoding.Decode(bufBytes, v)
-			if err != nil {
-				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+	if err := borrow(buf, "opening decode buffer", func(bufBytes []byte) error {
+		for i, share := range shares {
+			// Read in place: the share's own locked buffer is the source operand
+			// of the decode, never a copy of it. The decode and the parse both
+			// run inside the borrow, so the source cannot be unmapped mid-read.
+			var (
+				n   int
+				x   byte
+				y   []byte
+				err error
+			)
+			if werr := share.WithValue(func(v []byte) error {
+				n, err = base64.StdEncoding.Decode(bufBytes, v)
+				if err != nil {
+					return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+				}
+				x, y, err = parseRawShare(bufBytes[:n], i, seenX, secretLen)
+				return err
+			}); werr != nil {
+				return werr
 			}
-			x, y, err = parseRawShare(bufBytes[:n], i, seenX, secretLen)
-			return err
-		}); werr != nil {
-			return nil, werr
+			secretLen = len(y)
+			xs[i] = x
 		}
-		secretLen = len(y)
-		xs[i] = x
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	// Pass two: accumulate. The basis depends only on the x-coordinates, which
@@ -903,28 +934,32 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	if err != nil {
 		return nil, &ProtectedMemoryError{Op: "locking secret buffer", Err: err}
 	}
-	// Materialized outside the borrow for the same reason as bufBytes above.
-	secretBytes, err := secret.Open()
-	if err != nil {
-		release(secret)
-		return nil, &ProtectedMemoryError{Op: "opening secret buffer", Err: err}
-	}
-	for i, share := range shares {
-		if werr := share.WithValue(func(v []byte) error {
-			n, err := base64.StdEncoding.Decode(bufBytes, v)
-			if err != nil {
-				// Unreachable: pass one decoded this same value, and a share's
-				// value is frozen read-only from the moment it is constructed.
-				// Handled rather than ignored so a future change to either of
-				// those cannot turn it into a silently wrong secret.
-				return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+	// The secret's borrow ends before Freeze below, which waits out in-flight
+	// borrows and would otherwise deadlock on this one.
+	if err := borrow(secret, "opening secret buffer", func(secretBytes []byte) error {
+		return borrow(buf, "opening decode buffer", func(bufBytes []byte) error {
+			for i, share := range shares {
+				if werr := share.WithValue(func(v []byte) error {
+					n, err := base64.StdEncoding.Decode(bufBytes, v)
+					if err != nil {
+						// Unreachable: pass one decoded this same value, and a
+						// share's value is frozen read-only from the moment it is
+						// constructed. Handled rather than ignored so a future
+						// change to either of those cannot turn it into a
+						// silently wrong secret.
+						return &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
+					}
+					accumulateShareInto(secretBytes, bufBytes[rawShareOverhead:n], basis[i])
+					return nil
+				}); werr != nil {
+					return werr
+				}
 			}
-			accumulateShareInto(secretBytes, bufBytes[rawShareOverhead:n], basis[i])
 			return nil
-		}); werr != nil {
-			release(secret)
-			return nil, werr
-		}
+		})
+	}); err != nil {
+		release(secret)
+		return nil, err
 	}
 	// FROZEN for the same reason a share value is: the reconstructed key is final,
 	// and nothing should mutate it in place. Freeze mprotects the region the
@@ -941,43 +976,16 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	return secret, nil
 }
 
-// Value returns the share's base64 value, or nil once the share has been
-// destroyed.
-//
-// The slice ALIASES the protected buffer. It must not outlive the share
-// (Destroy zeroes and unmaps that memory), and it must not be written to: the
-// buffer is frozen read-only, so a write — including an attempt to wipe it —
-// faults. Release share material with Destroy, never by zeroing this slice.
-//
-// CONCURRENCY: this returns a slice and then releases its lock, so it cannot
-// guard the caller's USE of that slice against a concurrent Destroy — the
-// memory is unmapped, so losing that race segfaults rather than reading stale
-// bytes. Value is appropriate where the share is owned by one goroutine, which
-// is the ordinary custody shape. Where a ceremony may tear shares down while a
-// reader is still working — a cancelled or timed-out reconstruction — use
-// WithValue, which holds the lock across the callback.
-func (s *ProtectedShare) Value() []byte {
-	if s == nil || s.value == nil {
-		return nil
-	}
-	// Open aliases the locked pages without holding a lock past this return,
-	// which is Value's contract; an error here means the share was destroyed,
-	// which Value reports as nil.
-	b, err := s.value.Open()
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
 // WithValue calls fn with the share's base64 value, holding the enclave's read
 // lock for the whole call so the value cannot be destroyed underneath it. It
 // returns fn's error, or an error without calling fn if the share is nil or
 // already destroyed.
 //
-// This is the accessor to use anywhere teardown may be concurrent with the
-// read. fn must not retain the slice beyond its own return, and must not
-// RE-ENTER the same share by any method — not Value, WithValue or Validate,
+// It is the only accessor of the value: the slice is valid for fn's call and
+// no longer, because Destroy unmaps the pages it views. fn must not retain the
+// slice beyond its own return, must not write to it (the value is frozen
+// read-only, so a write faults), and must not RE-ENTER the same share by any
+// method — not WithValue or Validate,
 // and not Destroy. Mutators take priority over readers in the underlying
 // enclave, so a nested read blocks on any mutator that queued after fn started
 // while that mutator waits on fn's own borrow; a nested Destroy waits on the
@@ -996,13 +1004,9 @@ func (s *ProtectedShare) WithValue(fn func([]byte) error) error {
 
 // Destroy wipes the share's value and releases its protected memory. It is
 // safe to call on a nil receiver, more than once, and concurrently with
-// itself, with Value and with WithValue — exactly one caller performs the
-// wipe, and the enclave's lock keeps teardown from interleaving with a read in
-// progress.
-//
-// What it cannot make safe is a slice a caller already took from Value and is
-// still using; that span is outside any lock this type holds. WithValue exists
-// for exactly that case.
+// itself and with WithValue — exactly one caller performs the wipe, and the
+// enclave's lock keeps teardown from interleaving with a read in progress: a
+// Destroy that races a WithValue waits for its callback to return.
 //
 // A ProtectedShare that is not destroyed holds an mlock'd, guard-paged
 // allocation for the life of the process; nothing reclaims it, because the
@@ -1103,9 +1107,9 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 	const metaKey = `,"metadata":`
 
 	// The WHOLE encoding happens inside the borrow, not just the read of the
-	// value. Taking `val := s.Value()` and appending it afterwards would end the
-	// borrow at the point Value returns and then read the aliasing slice after
-	// the enclave was free to be destroyed — a use-after-destroy. Copying the
+	// value. Smuggling the view out of the callback and appending it afterwards
+	// would read the aliasing slice after the borrow ended and the enclave was
+	// free to be destroyed — a use-after-destroy. Copying the
 	// value out first would be worse, not better:
 	// it would mint exactly the unprotected copy of share material this type
 	// holds an enclave to avoid. So the append runs where the bytes are still

@@ -1,6 +1,6 @@
 # Memory enclave: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-08
 > Conflicts with this document are defects. Fix them here first.
 
 Use protected memory whenever your code holds a key, password, passphrase or
@@ -78,20 +78,21 @@ if err := buf.WithBytes(func(k []byte) error {
 }
 ```
 
-Two rules the compiler will not enforce:
+Three rules the compiler will not enforce:
 
 1. **`defer buf.Destroy()` right after the error check.** `Open` returns a new
    enclave each time and you own it. A missed `Destroy` leaves the plaintext
    resident for the life of the process and uses a whole page of locked-memory
    budget.
-2. **Do not keep the slice.** `WithBytes` holds the enclave open for the callback
-   and a concurrent `Destroy` waits, but the slice is invalid once the callback
-   returns. `buf.Open()` gives you the same slice with no lock at all; use it
-   only where you own the enclave and nothing else can destroy it. Storing
-   either in a struct field is a use-after-free, and it faults rather than
-   reading zeros, because `Destroy` unmaps the pages.
+2. **Do not keep the slice.** `WithBytes` is the only way to read the bytes. It
+   holds the enclave open for the callback and a concurrent `Destroy` waits, but
+   the slice is invalid once the callback returns. Scope the borrow to the code
+   that uses the bytes. Storing the slice in a struct field or a variable outside
+   the callback is a use-after-free, and it faults rather than reading zeros,
+   because `Destroy` unmaps the pages. Do not call methods on `buf` from inside
+   its own callback: that deadlocks.
 3. **Do not write into it.** The enclave `Open` returns is frozen read-only, so
-   a write through either slice faults. If you need a writable copy, allocate
+   a write through the slice faults. If you need a writable copy, allocate
    your own with `NewMemoryEnclaveSized` and copy into it inside `WithBytes`.
 
 `buf.Destroy()` returns an error. A bare `defer buf.Destroy()` discards it, which
@@ -193,9 +194,9 @@ large key set. The kernel charges a whole page per enclave, so a 32-byte key
 costs 4096 bytes. Check every `Open` for a paired `defer buf.Destroy()`; if the
 count is legitimate, raise the limit on the process or container.
 
-**A read faults, or the process dies with SIGSEGV near a key**: you kept a slice
-from `buf.Open()` past a `Destroy()`. Copy what you need inside the window, use
-`WithBytes` so `Destroy` has to wait, or move the work inside the window.
+**A read faults, or the process dies with SIGSEGV near a key**: you kept the
+slice a `WithBytes` callback was given past the end of that callback. Move the
+work inside the callback.
 
 **A write faults**: you wrote through a slice from a frozen enclave (one built
 by `NewMemoryEnclave` or `NewMemoryEnclaveCopy`, one returned by
@@ -209,8 +210,8 @@ tells the first apart. The sealed value is intact; open it again with a live
 context.
 
 **Tests are flaky under `-race` around key teardown**: you are probably holding
-a slice from `buf.Open()` across a `Destroy` on another goroutine. Every accessor
-call holds the enclave's read lock, so `Destroy` blocks until it returns, but the
-slice does not inherit that lock. Use `WithBytes` (or `ProtectedShare.WithValue`),
-which holds the enclave open for the whole callback, or give each goroutine its
-own `Open`.
+a slice past the `WithBytes` (or `ProtectedShare.WithValue`) callback that was
+given it, across a `Destroy` on another goroutine. The callback holds the
+enclave's read lock, so `Destroy` waits for it to return, but a slice kept after
+that inherits no lock. Do the work inside the callback, or give each goroutine
+its own `Open`.

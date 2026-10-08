@@ -655,7 +655,9 @@ func TestCredentials_WithSecret(t *testing.T) {
 	}
 	defer opened.Destroy()
 
-	if !opened.EqualTo([]byte("my-secret")) {
+	if eq, err := opened.EqualTo([]byte("my-secret")); err != nil {
+		t.Fatalf("EqualTo: %v", err)
+	} else if !eq {
 		t.Fatalf("the credential did not round-trip its passphrase")
 	}
 }

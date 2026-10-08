@@ -42,12 +42,23 @@ func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
 	}
 	defer e.Destroy()
 
-	view, err := e.Open()
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	// Each reading is taken inside its own borrow: Freeze waits out in-flight
+	// borrows, so it cannot run inside one.
+	protection := func() (Protection, error) {
+		var (
+			p    Protection
+			perr error
+		)
+		if err := e.WithBytes(func(view []byte) error {
+			p, perr = ProtectionOf(view)
+			return nil
+		}); err != nil {
+			t.Fatalf("WithBytes: %v", err)
+		}
+		return p, perr
 	}
 
-	before, err := ProtectionOf(view)
+	before, err := protection()
 	if err != nil {
 		t.Skipf("this kernel cannot report mapping protections: %v", err)
 	}
@@ -59,7 +70,7 @@ func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
 	if err := e.Freeze(); err != nil {
 		t.Fatalf("Freeze: %v", err)
 	}
-	after, err := ProtectionOf(view)
+	after, err := protection()
 	if err != nil {
 		t.Fatalf("ProtectionOf after Freeze: %v", err)
 	}

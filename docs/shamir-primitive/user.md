@@ -111,8 +111,8 @@ Three things to remember:
 
 - Every share must be `Destroy`ed, including one produced by `json.Unmarshal`
   (decoding is a construction).
-- A slice from `Value` must not outlive the share. Use `WithValue` where one
-  goroutine tears shares down while another reads them.
+- Read a share's value only inside `WithValue`, and keep nothing from the
+  callback: the view is gone once it returns.
 - A whole set is priced against `MaxShareSetBytes` before anything is allocated,
   so an oversized split or submission is refused up front.
 

@@ -261,7 +261,7 @@ no cryptographic meaning.
 The redaction asymmetry is deliberate: `String` and `LogValue` reach humans and
 logs, `MarshalJSON` reaches storage and distribution. `ProtectedShare` has
 `String`, `LogValue`, `MarshalJSON`, `UnmarshalJSON` and `Validate` with the same
-behaviour, plus `Value`, `WithValue` and `Destroy`.
+behaviour, plus `WithValue` and `Destroy`.
 See [`engineering.md`](engineering.md) §7.
 
 ### Error vocabulary

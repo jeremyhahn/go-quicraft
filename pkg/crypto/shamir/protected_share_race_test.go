@@ -46,14 +46,19 @@ func protectedTestShare(t *testing.T) *ProtectedShare {
 	return shares[0]
 }
 
-// TestProtectedShare_ValueDestroyRace drives Value concurrently with Destroy.
-// Value must return either the live value or nil, and -race must report
-// nothing.
-func TestProtectedShare_ValueDestroyRace(t *testing.T) {
+// TestProtectedShare_WithValueDestroyRace drives WithValue concurrently with
+// Destroy. Each WithValue either sees the whole live value or is refused
+// without running its callback, once Destroy has returned every borrow is
+// refused, and -race must report nothing.
+func TestProtectedShare_WithValueDestroyRace(t *testing.T) {
 	const iterations = 100
 
 	for i := 0; i < iterations; i++ {
 		share := protectedTestShare(t)
+		want := valueCopy(share)
+		if len(want) == 0 {
+			t.Fatal("share value is empty")
+		}
 
 		var wg sync.WaitGroup
 		start := make(chan struct{})
@@ -64,9 +69,12 @@ func TestProtectedShare_ValueDestroyRace(t *testing.T) {
 				defer wg.Done()
 				<-start
 				for k := 0; k < 25; k++ {
-					if v := share.Value(); v != nil {
-						_ = len(v)
-					}
+					_ = share.WithValue(func(v []byte) error {
+						if !bytes.Equal(v, want) {
+							t.Errorf("WithValue saw %q, want %q", v, want)
+						}
+						return nil
+					})
 				}
 			}()
 		}
@@ -82,13 +90,17 @@ func TestProtectedShare_ValueDestroyRace(t *testing.T) {
 		wg.Wait()
 
 		share.Destroy()
-		if v := share.Value(); v != nil {
-			t.Fatalf("Value after Destroy = %q, want nil", v)
+		ran := false
+		if err := share.WithValue(func([]byte) error {
+			ran = true
+			return nil
+		}); err == nil || ran {
+			t.Fatalf("WithValue after Destroy: err = %v, callback ran = %v; want a refusal without a call", err, ran)
 		}
 	}
 }
 
-// TestProtectedShare_WithValueExcludesDestroy covers the window Value cannot:
+// TestProtectedShare_WithValueExcludesDestroy covers the window a borrow exists for:
 // the caller is still READING the share's bytes when teardown arrives.
 //
 // It asserts the lifetime invariant — a callback must never be running once
@@ -167,7 +179,7 @@ func TestProtectedShare_WithValueAfterDestroy(t *testing.T) {
 }
 
 // TestProtectedShare_WithValueNilReceiver keeps WithValue consistent with
-// Value and Destroy, which are both nil-safe.
+// Destroy, which is nil-safe.
 func TestProtectedShare_WithValueNilReceiver(t *testing.T) {
 	var share *ProtectedShare
 
@@ -181,29 +193,6 @@ func TestProtectedShare_WithValueNilReceiver(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("WithValue on a nil share returned nil error")
-	}
-}
-
-// TestProtectedShare_WithValueSeesTheSameBytes checks WithValue and Value
-// agree, so the safe accessor is not a different view of the share.
-func TestProtectedShare_WithValueSeesTheSameBytes(t *testing.T) {
-	share := protectedTestShare(t)
-	defer share.Destroy()
-
-	want := string(share.Value())
-	if want == "" {
-		t.Fatal("share value is empty")
-	}
-
-	var got string
-	if err := share.WithValue(func(v []byte) error {
-		got = string(v)
-		return nil
-	}); err != nil {
-		t.Fatalf("WithValue: %v", err)
-	}
-	if got != want {
-		t.Fatalf("WithValue saw %q, Value saw %q", got, want)
 	}
 }
 
@@ -242,7 +231,7 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 				// When reconstruction wins, it must produce the real secret —
 				// a torn read that still returned nil error would be the worst
 				// outcome, so check rather than discard.
-				if got := string(encBytes(out)); got != string(secret) {
+				if got := string(encCopy(out)); got != string(secret) {
 					t.Errorf("reconstructed %q, want %q", got, string(secret))
 				}
 				out.Destroy()
@@ -271,12 +260,12 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 // Re-implementing an observation hook here to re-test it would be
 // instrumenting a dependency through its consumer. The behavioural coverage
 // needs no hook: TestProtectedShare_WithValueExcludesDestroy and
-// TestProtectedShare_ValueDestroyRace run the same collision under -race.
+// TestProtectedShare_WithValueDestroyRace run the same collision under -race.
 
 // TestProtectedShare_MarshalJSONRacesDestroy covers the MarshalJSON alias
-// lifetime. Taking `val := s.Value()` and then appending `val` into the output
-// buffer would end the borrow at the point Value returns and read protected
-// memory after the enclave was free to be unmapped. Same hazard class as
+// lifetime. Capturing the view out of the WithValue callback and then appending
+// it into the output buffer would read protected memory after the borrow ended
+// and the enclave was free to be unmapped. Same hazard class as
 // CombineProtected's, one call site further on, and unreachable by any
 // caller-side discipline because MarshalJSON obtains the slice itself.
 //
@@ -295,7 +284,7 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 // ~44 KB copy rather than a ~44 byte one — roughly a thousandfold more time
 // spent holding the alias.
 //
-// MEASURED catch rate against the `val := s.Value()` mutation, recorded so a
+// MEASURED catch rate against that captured-view mutation, recorded so a
 // future reader knows what this test is and is not worth: 10/10 runs caught it
 // under -race, 0/10 without. The detector's instrumentation is what stretches
 // the window far enough, so THIS TEST IS ONLY MEANINGFUL UNDER -race — which is
@@ -337,7 +326,7 @@ func TestProtectedShare_MarshalJSONRacesDestroy(t *testing.T) {
 			s.Destroy()
 		}
 		share := shares[0]
-		want := append([]byte(nil), share.Value()...)
+		want := valueCopy(share)
 
 		var (
 			wg       sync.WaitGroup
@@ -375,7 +364,7 @@ func TestProtectedShare_MarshalJSONRacesDestroy(t *testing.T) {
 		if uerr := json.Unmarshal(out, &decoded); uerr != nil {
 			t.Fatalf("iteration %d: MarshalJSON produced undecodable JSON (%d bytes): %v", i, len(out), uerr)
 		}
-		got := append([]byte(nil), decoded.Value()...)
+		got := valueCopy(&decoded)
 		decoded.Destroy()
 		if !bytes.Equal(got, want) {
 			t.Fatalf("iteration %d: marshalled value differs from the share value — torn read of the protected buffer", i)

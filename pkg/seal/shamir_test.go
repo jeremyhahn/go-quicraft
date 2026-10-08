@@ -110,7 +110,7 @@ func TestShamirInitResult_DestroyWipesEveryShare(t *testing.T) {
 	held := make([]*shamir.ProtectedShare, len(shares))
 	copy(held, shares)
 	for i, sh := range held {
-		if v := sh.Value(); len(v) == 0 {
+		if sh.Validate() != nil {
 			t.Fatalf("share %d must be readable before Destroy", i)
 		}
 	}
@@ -118,7 +118,7 @@ func TestShamirInitResult_DestroyWipesEveryShare(t *testing.T) {
 	result.Destroy()
 
 	for i, sh := range held {
-		if v := sh.Value(); v != nil {
+		if sh.Validate() == nil {
 			t.Fatalf("share %d survived Destroy: the result wiped nothing", i)
 		}
 	}
@@ -334,7 +334,7 @@ func TestShamirInitResult_UnmarshalIntoReusedResultWipesOldShares(t *testing.T) 
 	defer result.Destroy()
 
 	for i, sh := range held {
-		if v := sh.Value(); v != nil {
+		if sh.Validate() == nil {
 			t.Fatalf("old share %d survived the decode: its locked buffer was stranded", i)
 		}
 	}
