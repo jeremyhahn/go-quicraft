@@ -16,7 +16,7 @@ Do not report security vulnerabilities in public issues. See
 
 ## Setup
 
-You need Go 1.27.0 or later (see `go.mod`), and Docker for the containerized
+You need Go 1.27.1 or later (see `go.mod`), and Docker for the containerized
 integration suite.
 
 Dependencies under `github.com/jeremyhahn/` (go-enclave, and the Dragonboat

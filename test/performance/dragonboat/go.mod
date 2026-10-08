@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance/dragonboat
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/jeremyhahn/dragonboat/v4 v4.0.1

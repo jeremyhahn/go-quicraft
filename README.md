@@ -1,6 +1,6 @@
 <img src="assets/logo.svg" width="600">
 
-[![Go](https://img.shields.io/badge/Go-1.27.0-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.27.1-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-0.16.0-orange.svg)](VERSION)
 
@@ -53,7 +53,7 @@ before upgrading.
 go get github.com/jeremyhahn/go-quicraft
 ```
 
-Requires Go 1.27.0 or later. The public API is under
+Requires Go 1.27.1 or later. The public API is under
 `github.com/jeremyhahn/go-quicraft/pkg` (imported as `quicraft` below).
 
 QuicRaft depends on [go-enclave](https://github.com/jeremyhahn/go-enclave) for

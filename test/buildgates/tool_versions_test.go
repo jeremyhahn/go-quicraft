@@ -299,7 +299,7 @@ func TestPinCheckFailsWhenDiscoveryFindsNothing(t *testing.T) {
 	}
 
 	var missing *noPinsFoundError
-	if err := checkPins(found, "v2.12.2"); !errors.As(err, &missing) {
+	if err := checkPins(found, "v2.14.0"); !errors.As(err, &missing) {
 		t.Fatalf("checkPins over an empty discovery = %v, want *noPinsFoundError. "+
 			"A version gate that passes on zero inputs verifies nothing and "+
 			"stays green through exactly the drift it exists to catch.", err)

@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already was. It is still refused under any other barrier.
 - `StartShard` refuses a shard whose resolved per-shard barrier is sealed with
   `ErrBarrierSealed` (#240): a missing or sealed barrier never starts a shard.
+- CI tool pins moved to the upstream latest, in step with the runner image
+  (#242): golangci-lint v2.14.0, govulncheck v1.8.0, Go 1.27.1 (`go.mod`,
+  workflows, Dockerfiles, docs). gosec (v2.29.0) was already current.
 
 ## [0.19.0] - 2026-10-07
 

@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft
 
-go 1.27.0
+go 1.27.1
 
 require (
 	github.com/anishathalye/porcupine v1.3.1

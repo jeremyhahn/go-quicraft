@@ -31,7 +31,7 @@ import (
 //
 // GOLANGCI_VERSION pins WHICH ANALYSER, not WHICH GO BUILT IT, and only the
 // first half is visible to the pin gate in tool_versions_test.go. The second
-// half is what broke local linting when go.mod moved to `go 1.27.0`: a
+// half is what broke local linting when go.mod moved to `go 1.27.1`: a
 // correctly pinned golangci-lint built with go1.26.2 refuses the module before
 // reading a line of source, while CI's identically-versioned binary — built
 // with the runner image's 1.27 — passes. Same version string, opposite

@@ -36,7 +36,7 @@ GOFMT         := gofmt
 GOLINT        := golangci-lint
 # The golangci-lint version. Every literal pin in the CI workflows and
 # devcontainer Dockerfiles must match it (check-tool-versions enforces this).
-GOLANGCI_VERSION := v2.13.2
+GOLANGCI_VERSION := v2.14.0
 # Where `make install-lint` puts the analyser and the first place `make lint`
 # looks. Repo-local so another project's `go install` cannot replace it.
 TOOLS_BIN     := $(CURDIR)/.tools/bin

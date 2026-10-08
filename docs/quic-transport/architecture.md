@@ -331,7 +331,7 @@ unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences:
   Cryptographic Module. The linkname changes who can call it, not what it is.
 - It depends on a Go toolchain that has that symbol, not only on a `quic-go`
   version. `quic-go` v0.63.0 declares `go 1.26.0`; this repository requires
-  Go 1.27.0.
+  Go 1.27.1.
 - It is a stopgap. `quic-go`'s own comment cites
   [golang/go#79219](https://github.com/golang/go/issues/79219) and the pending
   `NewGCMForQUIC` constructor; when the standard library exports one, the

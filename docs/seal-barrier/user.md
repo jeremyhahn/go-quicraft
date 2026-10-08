@@ -18,7 +18,7 @@ You are making two independent decisions, and they compose freely.
 
 You also need:
 
-- Go 1.27.0 or later.
+- Go 1.27.1 or later.
 - An `RLIMIT_MEMLOCK` large enough for the protected key buffers. Containers
   often ship with a small default.
 - A decision about the algorithm. Read the next section before writing any

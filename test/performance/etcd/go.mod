@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance/etcd
 
-go 1.27.0
+go 1.27.1
 
 // The perf module is unpublished; resolve it from the sibling directory so the
 // benchmark builds standalone in Docker.

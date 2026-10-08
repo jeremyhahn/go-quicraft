@@ -37,7 +37,7 @@ env:
   # An exact patch release, never "stable", so an upstream release cannot change
   # the toolchain under a running pipeline. The `go` directive in every go.mod
   # must not exceed this, and nested modules must match the root's.
-  GO_VERSION: "1.27.0"
+  GO_VERSION: "1.27.1"
   # 90 is a floor, not a target. A failing package contributes no coverage, so
   # the gate needs some headroom over the measured total to avoid reporting a
   # flaky test as a coverage regression.
@@ -99,7 +99,7 @@ jobs:
             command -v "$t" >/dev/null 2>&1 || { echo "FAIL $t: not in the runner image"; rc=1; }
           done
           [ "$rc" -eq 0 ] || { echo "The runner image is missing a baked tool."; exit 1; }
-          check golangci-lint v2.13.2 "$(modver golangci-lint)"
+          check golangci-lint v2.14.0 "$(modver golangci-lint)"
           exit $rc
 
       # GitHub-hosted runners bake none of these tools, so install them at the
@@ -108,7 +108,7 @@ jobs:
         if: github.server_url == 'https://github.com'
         run: |
           set -euo pipefail
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
       # Every module, not only the root: contrib/ and test/performance/ are
       # separate modules that `./...` from the root never enters. They share
@@ -181,7 +181,7 @@ jobs:
           done
           [ "$rc" -eq 0 ] || { echo "The runner image is missing a baked tool."; exit 1; }
           check gosec        v2.29.0 "$(modver gosec)"
-          check govulncheck  v1.7.0  "$(modver govulncheck)"
+          check govulncheck  v1.8.0  "$(modver govulncheck)"
           exit $rc
 
       # GitHub-hosted runners bake none of these tools, so install them at the
@@ -191,7 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
-          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       # Writes SARIF (uploaded below) and still exits non-zero on findings to
       # gate the build. Tests, examples and contrib adapters are excluded.

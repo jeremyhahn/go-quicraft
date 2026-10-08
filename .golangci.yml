@@ -4,7 +4,7 @@ run:
   # Keep in lockstep with the `go` directive in go.mod and with GO_VERSION in
   # .github/workflows/ci.yml. A stale value here silently changes which
   # language-version-dependent diagnostics staticcheck emits.
-  go: "1.27.0"
+  go: "1.27.1"
   timeout: 5m
   # Test files ARE linted. This was false, which in a repository with ~265k
   # lines of test code meant the linters examined a minority of the tree — and
