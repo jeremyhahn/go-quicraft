@@ -2393,14 +2393,16 @@ func (p *Peer) DiagRemotes() string {
 			result += " "
 		}
 		rp := &progress[i]
-		result += fmt.Sprintf("r%d[match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
-			rp.ReplicaID, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
+		result += fmt.Sprintf("r%d[role=%s match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
+			rp.ReplicaID, rp.Role, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
 	}
 	return result
 }
 
 // RemoteProgress reports how far each follower has replicated, as the leader
-// currently understands it. It returns nil when this replica is not the leader,
+// currently understands it. It covers every remote the leader tracks: voters,
+// observers and witnesses, each tagged with its Role, so a caller that wants
+// voters only (quorum or health arithmetic) must filter on Role. It returns nil when this replica is not the leader,
 // because only a leader tracks remote progress at all.
 //
 // This is the structured form of what DiagRemotes renders as text, so the answer
@@ -2414,37 +2416,55 @@ func (p *Peer) RemoteProgress() []RemoteProgress {
 	if r.state != leader {
 		return nil
 	}
-	out := make([]RemoteProgress, 0, len(r.remotes))
-	for id, rm := range r.remotes {
-		state := "unknown"
-		switch rm.state {
-		case remoteProbe:
-			state = "probe"
-		case remoteReplicate:
-			state = "replicate"
-		case remoteSnapshot:
-			state = "snapshot"
+	out := make([]RemoteProgress, 0, len(r.remotes)+len(r.observers)+len(r.witnesses))
+	add := func(set map[uint64]*remote, role Role) {
+		for id, rm := range set {
+			state := "unknown"
+			switch rm.state {
+			case remoteProbe:
+				state = "probe"
+			case remoteReplicate:
+				state = "replicate"
+			case remoteSnapshot:
+				state = "snapshot"
+			}
+			out = append(out, RemoteProgress{
+				ReplicaID:  id,
+				Role:       role,
+				Match:      rm.match,
+				Next:       rm.next,
+				State:      state,
+				Paused:     rm.isPaused(),
+				Active:     rm.isActive(),
+				Inflights:  rm.inflights.Count(),
+				IsWitness:  role == RoleWitness,
+				IsObserver: role == RoleObserver,
+			})
 		}
-		_, isWitness := r.witnesses[id]
-		_, isObserver := r.observers[id]
-		out = append(out, RemoteProgress{
-			ReplicaID:  id,
-			Match:      rm.match,
-			Next:       rm.next,
-			State:      state,
-			Paused:     rm.isPaused(),
-			Active:     rm.isActive(),
-			Inflights:  rm.inflights.Count(),
-			IsWitness:  isWitness,
-			IsObserver: isObserver,
-		})
 	}
+	add(r.remotes, RoleVoter)
+	add(r.observers, RoleObserver)
+	add(r.witnesses, RoleWitness)
 	// Deterministic order: map iteration would otherwise reorder the output on
 	// every call, which makes both the diagnostic string and any consumer
 	// diffing successive samples useless.
 	sort.Slice(out, func(i, j int) bool { return out[i].ReplicaID < out[j].ReplicaID })
 	return out
 }
+
+// Role is a remote's membership role as reported by RemoteProgress. The set is
+// closed: RoleVoter, RoleObserver and RoleWitness.
+type Role string
+
+// Membership roles reported by RemoteProgress.
+const (
+	// RoleVoter is a full voting member.
+	RoleVoter Role = "voter"
+	// RoleObserver is a non-voting member (learner).
+	RoleObserver Role = "observer"
+	// RoleWitness is a voting member that carries no payload.
+	RoleWitness Role = "witness"
+)
 
 // RemoteProgress is one follower's replication position as the leader
 // understands it. Every field is the leader's local belief, which is what makes
@@ -2453,6 +2473,8 @@ func (p *Peer) RemoteProgress() []RemoteProgress {
 type RemoteProgress struct {
 	// ReplicaID identifies the follower.
 	ReplicaID uint64
+	// Role is RoleVoter, RoleObserver or RoleWitness.
+	Role Role
 	// Match is the highest log index known to be replicated to it.
 	Match uint64
 	// Next is the next index the leader will send.

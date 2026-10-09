@@ -1086,6 +1086,55 @@ func TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind(t *testing.T) {
 	}
 }
 
+// TestPeer_RemoteProgress_ReportsObserversAndWitnessesWithRole pins that the
+// snapshot covers every remote the leader tracks, not just voters, and tags
+// each with its role so voter-only callers can filter. An embedder promoting a
+// learner needs the observer's match index to know it has caught up.
+func TestPeer_RemoteProgress_ReportsObserversAndWitnessesWithRole(t *testing.T) {
+	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
+	p.r.becomeCandidate()
+	p.r.becomeLeader()
+
+	p.r.observers[4] = newRemote(1, maxInflightMsgs)
+	p.r.observers[4].match = 33
+	p.r.witnesses[5] = newRemote(1, maxInflightMsgs)
+	p.r.witnesses[5].match = 22
+	p.r.remotes[2].match = 11
+
+	progress := p.RemoteProgress()
+	if len(progress) != 4 {
+		t.Fatalf("RemoteProgress() returned %d entries, want 4 (voters 2,3, observer 4, witness 5): %+v",
+			len(progress), progress)
+	}
+	want := map[uint64]struct {
+		role  Role
+		match uint64
+	}{
+		2: {RoleVoter, 11},
+		3: {RoleVoter, 0},
+		4: {RoleObserver, 33},
+		5: {RoleWitness, 22},
+	}
+	for i := range progress {
+		w, ok := want[progress[i].ReplicaID]
+		if !ok {
+			t.Fatalf("unexpected replica %d in %+v", progress[i].ReplicaID, progress)
+		}
+		if progress[i].Role != w.role || progress[i].Match != w.match {
+			t.Errorf("replica %d: role=%q match=%d, want role=%q match=%d",
+				progress[i].ReplicaID, progress[i].Role, progress[i].Match, w.role, w.match)
+		}
+		if progress[i].IsObserver != (w.role == RoleObserver) ||
+			progress[i].IsWitness != (w.role == RoleWitness) {
+			t.Errorf("replica %d: IsObserver/IsWitness disagree with role %q",
+				progress[i].ReplicaID, w.role)
+		}
+	}
+	if progress[0].ReplicaID != 2 || progress[3].ReplicaID != 5 {
+		t.Errorf("not ordered by replica ID: %+v", progress)
+	}
+}
+
 // TestPeer_RemoteProgress_NilOnFollower pins that a non-leader reports nothing
 // rather than a stale or zero-valued view: only a leader tracks remote
 // progress, and an empty slice would read as "all followers at index 0".

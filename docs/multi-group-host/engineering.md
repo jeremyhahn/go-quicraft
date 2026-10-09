@@ -320,8 +320,8 @@ Procedure:
 6. **Add replacements normally** with `RequestAddNodeWithIdentity` once the
    shard has a leader.
 
-To verify, `ShardInfo.Replicas` on the leader reports each follower's `Match`,
-`Next`, `State` (`probe`, `replicate`, `snapshot`), `Paused`, `Active` and
+To verify, `ShardInfo.Replicas` on the leader reports each remote member's `Role`
+(`voter`, `observer`, `witness`), `Match`, `Next`, `State` (`probe`, `replicate`, `snapshot`), `Paused`, `Active` and
 `Inflights`. The slice is empty on a follower and on the first call for a shard,
 so an empty `Replicas` means "ask the leader, and ask again". Compare
 `Host.StateMachineHash` across replicas only at the same `appliedIndex`.

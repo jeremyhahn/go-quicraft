@@ -2354,14 +2354,18 @@ applied membership (a promoted observer reports `false` without a restart);
 `IsWitness` is the configured witness role. `Nodes` covers all known members;
 use `SyncGetShardMembership` for observers and witnesses separately.
 
-`Replicas` is empty on a follower, which tracks no such state, and on the first
-call for a shard, because it is published on the next tick.
+`Replicas` covers every remote member the leader tracks: voters, observers
+(learners) and witnesses, each tagged with its `Role`. It is empty on a
+follower, which tracks no such state, and on the first call for a shard, because
+it is published on the next tick. Callers that want voters only, for quorum or
+health arithmetic, filter on `Role`.
 
 ### ReplicaProgress
 
 ```go
 type ReplicaProgress struct {
     ReplicaID  uint64 `json:"replica_id"`
+    Role       ReplicaRole `json:"role"` // "voter", "observer", "witness"
     Match      uint64 `json:"match"`
     Next       uint64 `json:"next"`
     State      string `json:"state"` // "probe", "replicate", "snapshot"
@@ -2373,7 +2377,11 @@ type ReplicaProgress struct {
 }
 ```
 
-One follower's replication position as the leader sees it. A follower stuck in
+One remote member's replication position as the leader sees it. `Role` is a
+`ReplicaRole` (a string type), one of `ReplicaRoleVoter`, `ReplicaRoleObserver` or `ReplicaRoleWitness`; only voters
+and witnesses count toward quorum. To replace a replica by learner-then-promote,
+wait until the observer's `Match` reaches the leader's index, then promote it.
+A follower stuck in
 `probe` with a stale `Match` is a different problem from one that is merely
 behind, and one pinned at the inflight limit is flow-controlled rather than
 slow. Check `Active` before taking another replica down: an inactive follower

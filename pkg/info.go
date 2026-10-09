@@ -162,8 +162,10 @@ type ShardInfo struct {
 	// been applied yet.
 	ConfigChangeIndex uint64 `json:"config_change_index"`
 
-	// Replicas reports how far each follower has replicated, as this leader
-	// understands it. It is empty on a follower, which tracks no such state,
+	// Replicas reports how far each remote member has replicated, as this
+	// leader understands it: voters, observers (learners) and witnesses, each
+	// tagged with its Role. Callers that want voters only, for quorum or
+	// health arithmetic, must filter on ReplicaProgress.Role. It is empty on a follower, which tracks no such state,
 	// and empty on the first call for a shard because publication is opt-in
 	// and the next tick has not run yet.
 	//
@@ -175,14 +177,34 @@ type ShardInfo struct {
 	Replicas []ReplicaProgress `json:"replicas,omitempty"`
 }
 
-// ReplicaProgress is one follower's replication position from the leader's
-// point of view. Every field is the leader's local belief, which is precisely
+// ReplicaRole is a remote member's role in a shard, as reported in
+// ReplicaProgress.Role. The set is closed: ReplicaRoleVoter,
+// ReplicaRoleObserver and ReplicaRoleWitness are the only values.
+type ReplicaRole string
+
+const (
+	// ReplicaRoleVoter is a full voting member.
+	ReplicaRoleVoter ReplicaRole = "voter"
+	// ReplicaRoleObserver is a non-voting member (learner). It receives the
+	// log but does not count toward any quorum.
+	ReplicaRoleObserver ReplicaRole = "observer"
+	// ReplicaRoleWitness is a voting member that carries no payload.
+	ReplicaRoleWitness ReplicaRole = "witness"
+)
+
+// ReplicaProgress is one remote member's replication position from the
+// leader's point of view. The member may be a voter, an observer or a witness;
+// Role says which, and callers that only care about voters filter on it. Every field is the leader's local belief, which is precisely
 // what makes it useful when diagnosing a stall: a follower stuck in probe with
 // a stale match index is a different problem from one that is merely behind,
 // and one pinned at the inflight limit is flow-controlled rather than slow.
 type ReplicaProgress struct {
-	// ReplicaID identifies the follower.
+	// ReplicaID identifies the member.
 	ReplicaID uint64 `json:"replica_id"`
+
+	// Role is the member's role: "voter", "observer" or "witness" (the
+	// ReplicaRole constants). Only voters and witnesses count toward quorum.
+	Role ReplicaRole `json:"role"`
 
 	// Match is the highest log index known to be replicated to it.
 	Match uint64 `json:"match"`

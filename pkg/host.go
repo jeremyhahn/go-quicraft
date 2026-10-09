@@ -10913,6 +10913,7 @@ func (h *Host) replicaProgress(shardID uint64) []ReplicaProgress {
 	for i := range progress {
 		out[i] = ReplicaProgress{
 			ReplicaID:  progress[i].ReplicaID,
+			Role:       ReplicaRole(progress[i].Role),
 			Match:      progress[i].Match,
 			Next:       progress[i].Next,
 			State:      progress[i].State,

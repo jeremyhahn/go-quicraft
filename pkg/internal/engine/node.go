@@ -1391,8 +1391,8 @@ func (n *Node) DiagRemotes() string {
 			sb.WriteByte(' ')
 		}
 		rp := &snap.progress[i]
-		fmt.Fprintf(&sb, "r%d[match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
-			rp.ReplicaID, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
+		fmt.Fprintf(&sb, "r%d[role=%s match=%d next=%d state=%s paused=%v active=%v inflights=%d]",
+			rp.ReplicaID, rp.Role, rp.Match, rp.Next, rp.State, rp.Paused, rp.Active, rp.Inflights)
 	}
 	return sb.String()
 }
