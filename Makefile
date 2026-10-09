@@ -45,6 +45,14 @@ TOOLS_BIN     := $(CURDIR)/.tools/bin
 GOLANGCI_BIN   = $(shell if [ -x '$(TOOLS_BIN)/golangci-lint' ]; then \
 			echo '$(TOOLS_BIN)/golangci-lint'; \
 		else command -v $(GOLINT) 2>/dev/null; fi)
+# The workflow linter `make lint` runs over .github/workflows, at this version.
+# `make install-actionlint` builds it into TOOLS_BIN.
+ACTIONLINT_VERSION := v1.7.12
+# The repo-local build first, then PATH; recursive for the same reason as
+# GOLANGCI_BIN.
+ACTIONLINT_BIN = $(shell if [ -x '$(TOOLS_BIN)/actionlint' ]; then \
+			echo '$(TOOLS_BIN)/actionlint'; \
+		else command -v actionlint 2>/dev/null; fi)
 # The module's `go` directive, derived from go.mod (hence `override`). The
 # analyser's build toolchain is checked against it.
 override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod)
@@ -75,8 +83,16 @@ GOVULNCHECK   := govulncheck
 #         crypto/rand, and is not a security primitive
 GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 
-# Trivy
-TRIVY         := trivy
+# The trivy release `make install-trivy` and `make remote-tools` install, into
+# TOOLS_BIN. Upstream's latest on 2026-10-09; the runner images take theirs
+# from the Company Agent's versions.conf (devops.md §9).
+TRIVY_VERSION := v0.75.0
+# The scanner every trivy target runs: the repo-local install first, then PATH.
+# Recursive for the same reason as GOLANGCI_BIN; empty when there is none, which
+# check-trivy turns into a failure.
+TRIVY = $(shell if [ -x '$(TOOLS_BIN)/trivy' ]; then \
+			echo '$(TOOLS_BIN)/trivy'; \
+		else command -v trivy 2>/dev/null; fi)
 
 # Coverage floor enforced by every coverage target. The flags live in the
 # run-coverage recipe below.
@@ -1093,8 +1109,8 @@ remote-tools:
 		go install github.com/securego/gosec/v2/cmd/gosec@latest; \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
 		command -v trivy >/dev/null || curl -sfL \
-			https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-			| sh -s -- -b $$HOME/go/bin >/dev/null; \
+			https://raw.githubusercontent.com/aquasecurity/trivy/$(TRIVY_VERSION)/contrib/install.sh \
+			| sh -s -- -b $$HOME/go/bin $(TRIVY_VERSION) >/dev/null; \
 		echo "remote tools ready ($(GOLANGCI_VERSION))"'
 	@# Seed known_hosts so module fetches rewritten to ssh do not fail with
 	@# "Host key verification failed".
@@ -1168,7 +1184,8 @@ ci-cross:
 # harness entry points under test/performance (the tag selects nothing in the
 # root), without which their helpers read as unused. Every module is attempted
 # even after a failure. Mirrors the golangci-lint step in
-# .github/workflows/ci.yml.
+# .github/workflows/ci.yml. Then runs actionlint over the workflows, also after
+# a golangci-lint failure.
 .PHONY: lint
 lint: check-lint-toolchain
 	@rc=0; \
@@ -1177,7 +1194,38 @@ lint: check-lint-toolchain
 		( cd "$$dir" && '$(GOLANGCI_BIN)' run --timeout=5m --config '$(CURDIR)/.golangci.yml' \
 			--build-tags benchmark ./... ) || rc=1; \
 	done; \
+	$(MAKE) --no-print-directory actionlint || rc=1; \
 	exit $$rc
+
+# Validates workflow syntax, expressions and runner labels before CI does.
+# actionlint reads .github/actionlint.yaml by itself where one exists (the
+# place to declare self-hosted runner labels; every job here runs on
+# ubuntu-latest, so there is none). Its shell checks come from shellcheck, and
+# without shellcheck on PATH actionlint skips them and still passes, so a
+# missing shellcheck fails like a missing actionlint.
+.PHONY: actionlint
+actionlint:
+	@bin='$(ACTIONLINT_BIN)'; \
+	want='$(ACTIONLINT_VERSION)'; \
+	if [ -z "$$bin" ]; then \
+		echo "FAIL: no actionlint found, so the workflows were not linted."; \
+		echo "      Looked in $(TOOLS_BIN), then on PATH."; \
+		echo "      Install the pinned version with: make install-actionlint"; \
+		exit 1; \
+	fi; \
+	have=$$("$$bin" --version 2>/dev/null | head -1); \
+	if [ "$$have" != "$$want" ]; then \
+		echo "FAIL: $$bin is '$$have', this repo pins $$want."; \
+		echo "      Install the pinned version with: make install-actionlint"; \
+		exit 1; \
+	fi; \
+	if ! command -v shellcheck >/dev/null 2>&1; then \
+		echo "FAIL: shellcheck is not on PATH, so actionlint would skip every"; \
+		echo "      run: script. Install shellcheck (apt install shellcheck)."; \
+		exit 1; \
+	fi; \
+	echo "==> actionlint $$have: .github/workflows"; \
+	"$$bin" && echo "Workflows pass actionlint"
 
 .PHONY: vet
 vet:
@@ -1255,25 +1303,27 @@ vuln:
 .PHONY: trivy
 # Scoped to what ships: test/performance/* are separate benchmark modules that
 # consumers never fetch, and .build-cache is a local artifact. A missing binary
-# fails rather than skips, because trivy is the only secret scanner here.
-trivy:
-	@if ! command -v $(TRIVY) >/dev/null 2>&1; then \
-		echo "FAIL: trivy is not installed, so the dependency-CVE and secret scan"; \
-		echo "      did not run. This gate does not pass by default."; \
-		echo "      Install it with: make install-trivy"; \
-		exit 1; \
-	fi
+# fails rather than skips (check-trivy), because trivy is the only secret
+# scanner here.
+trivy: check-trivy
 	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
 		--skip-dirs .build-cache --skip-dirs test/performance .
 
 # Scans the locally built devcontainer image. CI does not build it, so run this
 # when a Dockerfile or its base image changes.
 .PHONY: trivy-image
-trivy-image: docker-build
-	@if command -v $(TRIVY) >/dev/null 2>&1; then \
-		$(TRIVY) image --severity CRITICAL,HIGH --exit-code 1 $(DOCKER_IMAGE):$(DOCKER_TAG); \
-	else \
-		echo "trivy not installed, skipping image scan (install: make install-trivy)"; \
+trivy-image: check-trivy docker-build
+	$(TRIVY) image --severity CRITICAL,HIGH --exit-code 1 $(DOCKER_IMAGE):$(DOCKER_TAG)
+
+# Every trivy target fails rather than skips without the binary: a scan that
+# did not run must not read as a scan that passed.
+.PHONY: check-trivy
+check-trivy:
+	@if [ -z '$(TRIVY)' ] || ! command -v '$(TRIVY)' >/dev/null 2>&1; then \
+		echo "FAIL: trivy is not installed, so the scan did not run."; \
+		echo "      This gate does not pass by default."; \
+		echo "      Install trivy $(TRIVY_VERSION) with: make install-trivy"; \
+		exit 1; \
 	fi
 
 # Nancy scans dependencies against Sonatype OSS Index, which needs credentials
@@ -1291,7 +1341,7 @@ nancy:
 # Write gosec and trivy SARIF reports, then exit non-zero if either reported
 # findings or failed. Trivy is scoped the same as the `trivy` target.
 .PHONY: security-sarif
-security-sarif:
+security-sarif: check-trivy
 	@mkdir -p $(BUILD_DIR)
 	@rc=0; \
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium -fmt=sarif -out=$(BUILD_DIR)/gosec-results.sarif ./... || rc=1; \
@@ -1316,9 +1366,21 @@ install-gosec:
 install-govulncheck:
 	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 
+# Installs the pinned scanner into $(TOOLS_BIN), where every trivy target looks
+# first. The installer comes from the same tag and checks the release
+# checksum. The closing version check is what fails the target on a failed
+# download, since `curl | sh` exits 0 on an empty one and a binary from an
+# earlier install would otherwise answer.
 .PHONY: install-trivy
 install-trivy:
-	curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b $$(go env GOPATH)/bin
+	@mkdir -p $(TOOLS_BIN)
+	curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/$(TRIVY_VERSION)/contrib/install.sh \
+		| sh -s -- -b $(TOOLS_BIN) $(TRIVY_VERSION)
+	@v=$$($(TOOLS_BIN)/trivy --version 2>/dev/null); \
+	case "$$v" in \
+		*"Version: $(patsubst v%,%,$(TRIVY_VERSION))"*) echo "trivy $(TRIVY_VERSION) installed in $(TOOLS_BIN)" ;; \
+		*) echo "FAIL: trivy $(TRIVY_VERSION) was not installed in $(TOOLS_BIN)"; exit 1 ;; \
+	esac
 
 .PHONY: install-nancy
 install-nancy:
@@ -1327,8 +1389,16 @@ install-nancy:
 # golangci-lint comes from install-lint, which builds it with the local Go
 # rather than downloading a release binary built by an older toolchain.
 .PHONY: install-tools
-install-tools: install-gosec install-govulncheck install-trivy install-nancy install-lint
-	@echo "All CI tools installed ($(GOLANGCI_VERSION))"
+install-tools: install-gosec install-govulncheck install-trivy install-nancy install-lint install-actionlint
+	@echo "All CI tools installed ($(GOLANGCI_VERSION), actionlint $(ACTIONLINT_VERSION), trivy $(TRIVY_VERSION))"
+
+# Builds the pinned workflow linter into $(TOOLS_BIN), where `make actionlint`
+# looks first. shellcheck, which it runs on every run: script, comes from the
+# system package manager.
+.PHONY: install-actionlint
+install-actionlint:
+	GOBIN=$(TOOLS_BIN) $(GO) install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+	@$(TOOLS_BIN)/actionlint --version
 
 # Builds the pinned analyser with this repo's Go into $(TOOLS_BIN), where
 # `make lint` looks first.
@@ -1530,7 +1600,7 @@ help:
 	@echo "  install-lint           Build the pinned golangci-lint with this repo's Go"
 	@echo "  install-gosec          Install gosec"
 	@echo "  install-govulncheck    Install govulncheck"
-	@echo "  install-trivy          Install Trivy"
+	@echo "  install-trivy          Install the pinned Trivy into .tools/bin"
 	@echo ""
 	@echo "Docker:"
 	@echo "  docker-build                   Build devcontainer image (this checkout's tag)"

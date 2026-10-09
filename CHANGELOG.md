@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `make lint` runs actionlint over `.github/workflows` after golangci-lint
+  (#251), through a new `make actionlint` target pinned at v1.7.12
+  (`make install-actionlint`). It fails, rather than passes, when actionlint is
+  missing or at another version, or when shellcheck is missing and actionlint
+  would skip every `run:` script. The two shellcheck findings it reported, an
+  unquoted command substitution in the coverage gate of `ci.yml` and
+  `release.yml`, are fixed.
+- `make trivy-image` fails when trivy is not installed instead of skipping the
+  image scan, and `make security-sarif` checks for trivy before scanning; both
+  share the `trivy` target's check (#251).
+- The trivy targets run the scanner from `.tools/bin` first, then PATH, and
+  `make install-trivy` installs the pinned `TRIVY_VERSION` (v0.75.0) there
+  from that tag's installer instead of whatever upstream `main` serves, and
+  fails when nothing was installed; `make remote-tools` installs the same
+  version (#251).
+
 ## [0.20.0] - 2026-10-08
 
 ### Added

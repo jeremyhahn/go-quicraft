@@ -557,7 +557,7 @@ jobs:
               exit 1 ;;
           esac
           echo "Total coverage: ${COVERAGE}%"
-          if [ $(echo "${COVERAGE} < 91" | bc -l) -eq 1 ]; then
+          if [ "$(echo "${COVERAGE} < 91" | bc -l)" -eq 1 ]; then
             echo "FAIL: coverage ${COVERAGE}% is below minimum 91%"
             exit 1
           fi

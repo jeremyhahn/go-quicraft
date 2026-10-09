@@ -315,7 +315,7 @@ jobs:
               exit 1 ;;
           esac
           echo "Total coverage: ${COVERAGE}%"
-          if [ $(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) -eq 1 ]; then
+          if [ "$(echo "${COVERAGE} < ${{ env.COVERAGE_THRESHOLD }}" | bc -l)" -eq 1 ]; then
             echo "VERDICT: COVERAGE_BELOW_THRESHOLD"
             echo "FAIL: coverage ${COVERAGE}% is below minimum ${{ env.COVERAGE_THRESHOLD }}%"
             exit 1
