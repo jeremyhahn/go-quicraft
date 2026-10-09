@@ -18,7 +18,7 @@ permissions:
 env:
   # Must match ci.yml, so the tag is certified on the toolchain the push gate
   # used.
-  GO_VERSION: "1.27.1"
+  GO_VERSION: "1.27.2"
   # Nothing here may resolve through a workspace.
   GOWORK: "off"
 
