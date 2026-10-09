@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-08
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-09
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 ## Mission
@@ -19,7 +19,7 @@ Multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`
 
 ## Next (v1.0.0 checklist)
 
-- go-enclave `Public release` milestone — upstream go-enclave at a release — blocked: no candidate yet
+- readiness: go-enclave at a public release — blocked: no candidate yet
 - readiness: compatibility policy acknowledged (`release-versioning.md` §1, §8) — open
 - readiness: publication mechanism for agent files, deferred to v1.0.0 by the owner — open
 - readiness: company CI template neutralised for the public tree — open

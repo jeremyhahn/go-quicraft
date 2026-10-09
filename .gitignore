@@ -21,7 +21,11 @@ pkg/shard-*/
 # Local session notes
 resume.txt
 
-.serena
+.serena/*
+!.serena/project.yml
+.serena/cache/
+.serena/memories/
+.serena/project.local.yml
 go.work
 go.work.sum
 

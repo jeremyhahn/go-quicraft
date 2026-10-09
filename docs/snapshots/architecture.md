@@ -1,11 +1,12 @@
 # Snapshots — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption: `pkg/snapshot_*.go`, the snapshot paths of
-> `pkg/host.go` and `pkg/messagehandler.go`, `pkg/internal/engine/snapshot_*.go`,
-> the snapshot paths of `pkg/internal/transport` and `pkg/logdb` ·
-> Last verified: 2026-10-02
+> import/export and re-encryption · Last verified: 2026-10-09
 > Conflicts with this document are defects. Fix them here first.
+>
+> Code: `pkg/snapshot_*.go`, the snapshot paths of `pkg/host.go` and
+> `pkg/messagehandler.go`, `pkg/internal/engine/snapshot_*.go`, and the
+> snapshot paths of `pkg/internal/transport` and `pkg/logdb`.
 
 ## The problem
 
