@@ -1634,7 +1634,8 @@ export GOWORK=off
 # ---------------------------------------------------------------------------
 # Release
 #
-# `make release-alpha VERSION=vX.Y.Z-alpha` or `make release VERSION=vX.Y.Z`.
+# `make release-alpha VERSION=vX.Y.Z-alpha`, `make release-candidate
+# VERSION=vX.Y.Z-rc.N` or `make release VERSION=vX.Y.Z`.
 # The version is explicit; the recipe never guesses. Every git write goes
 # through RELEASE_GIT, the tag is annotated, only the release commit and its
 # tags are pushed (atomically, by object ID), any failing step aborts before
@@ -1679,7 +1680,7 @@ export GOWORK=off
 # deps-latest updates first-party dependencies to their highest tag, including
 # -alpha prereleases, which a bare 'go get @latest' ignores.
 
-.PHONY: release release-alpha deps-latest
+.PHONY: release release-alpha release-candidate deps-latest
 
 # Each settable variable reaches the recipe once, through these target-specific
 # exports, and the body reads only the $$REL_* shell parameters, so a value is
@@ -1687,8 +1688,9 @@ export GOWORK=off
 # $(shell ...) in a command-line value. $(origin ...) accepts VERSION only from
 # the command line, not from an inherited environment variable.
 #
-# release-body is shared by release-alpha (vX.Y.Z-alpha) and release (vX.Y.Z);
-# they differ only in REL_PATTERN / REL_FORM, so every guard applies to both.
+# release-body is shared by release-alpha (vX.Y.Z-alpha), release-candidate
+# (vX.Y.Z-rc.N) and release (vX.Y.Z); they differ only in REL_PATTERN /
+# REL_FORM, so every guard applies to all three.
 # release.yml publishes a tag with no alpha/beta/rc suffix as a full release.
 #
 # The write, verify, push and read-back steps run as one shell, so the object
@@ -1778,6 +1780,20 @@ release: export override REL_TARGET  := release
 release: export override REL_FORM    := vX.Y.Z
 release: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
 release:
+	$(release-body)
+
+# release-candidate cuts a release candidate, vX.Y.Z-rc.N (release-versioning.md
+# §1a). N is a positive integer without leading zeroes. A candidate is never
+# inferred: VERSION must be stated on the command line like every other release.
+# VERSION and the CHANGELOG heading carry the unprefixed form (X.Y.Z-rc.N).
+release-candidate: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
+release-candidate: export override REL_REMOTE  := $(value RELEASE_REMOTE)
+release-candidate: export override REL_GIT     := $(value RELEASE_GIT)
+release-candidate: export override REL_SIGNERS := $(value RELEASE_ALLOWED_SIGNERS)
+release-candidate: export override REL_TARGET  := release-candidate
+release-candidate: export override REL_FORM    := vX.Y.Z-rc.N
+release-candidate: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[1-9][0-9]*$$
+release-candidate:
 	$(release-body)
 
 deps-latest:

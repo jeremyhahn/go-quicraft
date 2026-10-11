@@ -64,7 +64,7 @@ const fixtureRemote = "fixture-remote"
 // not exist at all. The last two matter most — they prove the expansion was
 // happening at PARSE time, before target selection, where no recipe guard could
 // ever have reached it.
-var makeTargets = []string{"release-alpha", "release", "build", "no-such-target-exists"}
+var makeTargets = []string{"release-alpha", "release", "release-candidate", "build", "no-such-target-exists"}
 
 // runMake runs `make -n <target> <vars...>` in the repository root and returns
 // its combined output. -n is essential: the recipe is printed, never executed,
@@ -402,6 +402,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 	}{
 		{"release-alpha", "v0.9.1-alpha", []string{"VERSION=0.9.1-alpha", "VERSION=v0.9.1", "VERSION=v01.9.1-alpha"}},
 		{"release", "v0.9.1", []string{"VERSION=0.9.1", "VERSION=v0.9.1-alpha", "VERSION=v01.9.1"}},
+		{"release-candidate", "v0.9.1-rc.1", []string{"VERSION=0.9.1-rc.1", "VERSION=v0.9.1", "VERSION=v0.9.1-alpha", "VERSION=v0.9.1-rc.0", "VERSION=v0.9.1-rc.01", "VERSION=v0.9.1-rc", "VERSION=v0.9.1-rc.1.2", "VERSION=v01.9.1-rc.1"}},
 	} {
 		t.Run(target.name, func(t *testing.T) {
 			run := func(vars ...string) string {
@@ -556,6 +557,61 @@ func TestReleaseAllowedSignersDefaultsToTheCheckoutFile(t *testing.T) {
 		t.Errorf("a refused release committed: %s commits on main, want 1", n)
 	}
 	f.requireNothingPublished()
+}
+
+// TestReleaseCandidateCutsAnRcTag runs release-candidate end to end in the
+// scratch repository against a scratch bare remote, never the real one. It pins
+// what an -rc.N version becomes: the unprefixed VERSION file, the tag names, the
+// release commit touching VERSION alone, and a refusal of a duplicate candidate.
+func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
+	const maintainer = "release@example.invalid"
+	key, pub := newSigningKey(t)
+	f := newReleaseFixture(t, true)
+	f.signWith(maintainer, key, true, true)
+	signers := writeSigners(t, maintainer+" "+pub)
+
+	const rc = "v0.9.5-rc.2"
+	appendFile(t, filepath.Join(f.dir, "CHANGELOG.md"), "\n## [0.9.5-rc.2] - 2026-01-02\n\n- fixture rc\n")
+	f.git("add", "CHANGELOG.md")
+	f.git("commit", "-qm", "changelog for the candidate")
+
+	run := func(version string) (string, error) {
+		return f.make("release-candidate", "VERSION="+version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
+	}
+
+	// A stable or alpha version is refused before anything is written.
+	headBefore := strings.TrimSpace(f.git("rev-parse", "HEAD"))
+	versionBefore := f.version()
+	for _, bad := range []string{"v0.9.5", "v0.9.5-alpha", "v0.9.5-rc.0", "v0.9.5-rc.01"} {
+		if out, err := run(bad); err == nil || !strings.Contains(out, "not of the form vX.Y.Z-rc.N") {
+			t.Fatalf("release-candidate did not refuse %s on the form guard (err=%v):\n%s", bad, err, out)
+		}
+	}
+	if f.version() != versionBefore || strings.TrimSpace(f.git("rev-parse", "HEAD")) != headBefore {
+		t.Fatalf("a refused candidate wrote VERSION or committed")
+	}
+	f.requireNothingPublished()
+
+	if out, err := run(rc); err != nil {
+		t.Fatalf("release-candidate refused %s: %v\n%s", rc, err, out)
+	}
+	if got := f.version(); got != "0.9.5-rc.2\n" {
+		t.Errorf("VERSION = %q, want %q (unprefixed)", got, "0.9.5-rc.2\n")
+	}
+	refs := f.remoteRefs()
+	for _, want := range []string{"refs/heads/main", "refs/tags/" + rc, "refs/tags/test/performance/" + rc} {
+		if !strings.Contains(refs, want) {
+			t.Errorf("remote is missing %s after a successful candidate:\n%s", want, refs)
+		}
+	}
+	if files := strings.TrimSpace(f.git("diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD")); files != "VERSION" {
+		t.Errorf("the release commit changed %q, want VERSION alone", files)
+	}
+
+	// The same candidate cannot be cut twice.
+	if out, err := run(rc); err == nil || !strings.Contains(out, "already exists") {
+		t.Errorf("a second %s was not refused as a duplicate (err=%v):\n%s", rc, err, out)
+	}
 }
 
 // TestReleaseVerifiesAgainstTheAllowedSigners drives the whole recipe, through

@@ -219,10 +219,11 @@ tag:
 
 ```bash
 make release-alpha VERSION=vX.Y.Z-alpha   # or: make release VERSION=vX.Y.Z
+make release-candidate VERSION=vX.Y.Z-rc.N   # a release candidate, N >= 1
 ```
 
 Run it on a clean `main` whose `CHANGELOG.md` has a `## [X.Y.Z-alpha]`
-heading. The recipe writes `VERSION`, commits it, creates the annotated root
+(`[X.Y.Z-rc.N]` for a candidate) heading. The recipe writes `VERSION`, commits it, creates the annotated root
 and `test/performance/` tags, verifies them, pushes the commit and both tags
 atomically, and reads the remote back. If any step before the push fails,
 nothing is pushed.
