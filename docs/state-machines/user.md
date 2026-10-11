@@ -1,7 +1,7 @@
 # State Machines — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 This is the part of go-quicraft you write code against. You implement one
@@ -223,9 +223,13 @@ expect latency proportional to batch size.
 always reads plaintext, with or without at-rest encryption.
 
 **A panic in `Update`.** The panic is recovered and logged with its stack, and
-the shard is marked failed; proposals in that batch fail with
-`ErrShardFailed`. Other shards keep running. Return errors instead of
-panicking.
+the shard is marked failed. The proposal that was applying fails with the
+`*SMPanicError` (`errors.As` reaches the panic value and stack), and every other
+proposal pending on the shard with `ErrShardFailed`; both report
+`MaybeApplied`, because the entries are committed and a reload replays them.
+Other shards keep running. `OnShardFailed` fires once. Return errors instead of
+panicking. A panic in `SaveSnapshot` is different: the shard keeps running and
+the snapshot request fails.
 
 **Lookups block during writes.** On the basic tier that is guaranteed. If you
 need concurrent reads, implement `ConcurrentStateMachine`.

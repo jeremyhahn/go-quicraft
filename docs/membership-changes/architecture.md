@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
-> `config.WitnessConfig` · Last verified: 2026-10-02
+> `config.WitnessConfig` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -65,6 +65,13 @@ observer promoted with `AddNode` becomes a voter in place, without a restart,
 as etcd promotes a learner. `IsWitness` cannot change in place, because a
 witness has no state machine; a disagreement between it and the membership is
 latched and the replica refuses to campaign or serve reads.
+
+The leader's progress view carries all three roles. `ShardInfo.Replicas` lists
+every remote member the leader tracks, tagged with a `ReplicaRole`, so a
+replacement by learner-then-promote is observable: the embedder watches the
+observer's `Match` reach the leader's index, then promotes it. Only voters and
+witnesses count toward a quorum, so a caller doing quorum arithmetic over the
+list filters on the role.
 
 A witness is a cheap tiebreaker: it takes part in elections and commit quorums
 without storing the log. Proposing to one, or asking one for a ReadIndex,

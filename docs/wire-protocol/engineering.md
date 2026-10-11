@@ -1,6 +1,6 @@
 # Wire Protocol — Engineering Contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/proto`
@@ -158,7 +158,7 @@ followed by a variable-length command payload.
 | 68     | N    | Cmd         | []byte   | State machine command (zero-copy)  |
 
 Total header: `entryHeaderSize = 8*8 + 4 = 68 bytes`
-(`pkg/proto/entry.go:86`). Total size: `68 + len(Cmd)`.
+(`entryHeaderSize` in `pkg/proto/entry.go`). Total size: `68 + len(Cmd)`.
 
 ### OwnerID
 
@@ -196,7 +196,7 @@ The `Type` field is a uint64 that encodes two pieces of information:
 ```
 
 Bits 5 and above are reserved and must be zero. They are **rejected**, not
-masked away, at both ends: `isValidEntryType` (`pkg/proto/entry.go:110`) is
+masked away, at both ends: `isValidEntryType` (in `pkg/proto/entry.go`) is
 called by `MarshalTo` and by `UnmarshalFrom`, and either returns
 `ErrInvalidEntryType` if `Type & entryTypeReservedMask` is non-zero. Masking
 would let a sender attach 59 bits of its own and have the receiver agree to a
@@ -219,7 +219,7 @@ with `ErrInvalidEntryType`. A reader that omits `EntryInitialMembership`
 cannot replay any shard's log: every shard writes that entry at log index 1
 on first start, so the very first entry a replica reads back is refused.
 
-Mask constants (`pkg/proto/constants.go:280`):
+Mask constants (`pkg/proto/constants.go`):
 
 | Constant            | Value  | Description                         |
 |---------------------|--------|-------------------------------------|
@@ -320,7 +320,7 @@ entry list and an optional inline snapshot.
 | 80     | 8    | Hint       | uint64  | uint64    | Type-specific hint data          |
 
 Fixed header: `messageFixedSize = 11 * 8 = 88 bytes`
-(`pkg/proto/message.go:98`).
+(`pkg/proto/message.go`).
 
 Note that `Reject` is a Go `bool` but encoded as `uint64` on the wire
 to maintain fixed-width alignment. The `putBool`/`getBool` functions handle
@@ -351,7 +351,7 @@ After the 88-byte fixed header:
 [Snapshot]                -- present only if HasSnapshot != 0
 ```
 
-`HeartbeatMessageSize` (`pkg/proto/message.go:105`) is the smallest valid
+`HeartbeatMessageSize` (`pkg/proto/message.go`) is the smallest valid
 message: `88 + 4 + 8 = 100 bytes`, a heartbeat with no entries and no
 snapshot. `MessageBatch` reuses it as `minMessageWireSize` when it
 cross-checks a request count against the remaining frame bytes.
@@ -662,13 +662,13 @@ Membership is the type in this package whose bytes are **persisted** as well
 as transmitted. It is marshaled into the `Cmd` of the
 `EntryInitialMembership` entry at log index 1, which then lives in the log
 for the life of the shard, and into the header of an exported snapshot
-artifact (`pkg/host.go:6824`). Those bytes outlive the binary that wrote
+artifact (`marshalSnapshotArtifactHeader` in `pkg/host.go`). Those bytes outlive the binary that wrote
 them, so the section carries its own layout version byte, independent of
 `WireVersion`. See [Version compatibility](#version-compatibility) below.
 
 The WAL's own membership section is a **different layout** with a separate
 discriminator, `waldb.membershipSectionVersion`
-(`pkg/logdb/waldb/db.go:2067`). It is not this encoding, and the two version
+(in `pkg/logdb/waldb/db.go`). It is not this encoding, and the two version
 bytes are independent. See [WAL Persistence](../log-storage/engineering.md).
 
 The layout, at version **1**:
@@ -917,7 +917,7 @@ entry. It describes a membership change operation.
 | 52+N   | 4+M  | NodeIdentity               | string | Committed node identity (always present; `M` may be 0) |
 
 Fixed portion: `configChangeFixedSize = 6*8 + 4 = 52 bytes`
-(`pkg/proto/configchange.go:77`): the six uint64-width fields plus the
+(`pkg/proto/configchange.go`): the six uint64-width fields plus the
 4-byte address length prefix. The trailing `NodeIdentity` adds its own 4-byte
 length prefix plus its bytes. The prefix is **unconditional**: an empty
 identity is four zero bytes, never a shorter buffer. The smallest complete
@@ -1163,7 +1163,7 @@ These are not a layout of their own. They are the values carried by
 | 2     | `OnDiskStateMachine`       | Persistent SM         |
 
 There is no bootstrap type in this package. The bootstrap record LogDB
-persists is `logdb.Bootstrap` (`pkg/logdb/types.go:199`), written through
+persists is `logdb.Bootstrap` (`pkg/logdb/types.go`), written through
 `SaveBootstrap`/`GetBootstrap` in each backend's own layout.
 
 ## Size limits and constants
@@ -1379,7 +1379,7 @@ Transport receive buffer --> UnmarshalFrom --> Entry.Cmd aliases buffer
 ### Transport boundary (inbound)
 
 After `UnmarshalFrom`, `Entry.Cmd` aliases the transport receive buffer.
-The transport receive path (`pkg/internal/transport/recv.go:1044`) copies
+The transport receive path (`handleMessageFrame` in `pkg/internal/transport/recv.go`) copies
 every `Entry.Cmd` into **one** allocation before returning the receive buffer
 to the pool: it sums the command lengths across the whole batch, allocates
 once, then re-points each `Cmd` at a three-index slice of that block.
@@ -1452,7 +1452,7 @@ an in-place layout change like any other: every consumer rebuilt in lockstep
 pre-release, or a `WireVersion` bump plus a persisted discriminator after
 1.0. Nothing about the current encoding makes it cheap.
 
-Source: `pkg/proto/constants.go:134` -- `MaxEntrySize uint32 = 8 * 1024 * 1024`
+Source: `pkg/proto/constants.go` -- `MaxEntrySize uint32 = 8 * 1024 * 1024`
 
 ## MessageBatch size enforcement
 
@@ -1503,7 +1503,7 @@ and nothing durable. Gated on **exact equality**: a peer speaking another
 dialect is refused outright rather than misparsed.
 
 A third constant, `transport.WireVersion = 0x01`
-(`pkg/internal/transport/frame.go:46`), is the version byte of the 8-byte
+(`pkg/internal/transport/frame.go`), is the version byte of the 8-byte
 frame header that wraps a marshaled `MessageBatch`
 (`[Magic:2][Version:1][Flags:1][Length:4]`). It is a separate constant that
 happens to hold the same value, gated on exact equality by

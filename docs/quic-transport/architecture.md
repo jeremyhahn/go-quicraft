@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
 > `pkg/internal/transport/revocation`, `pkg/internal/registry`,
-> `pkg/internal/netaddr` · Last verified: 2026-10-02
+> `pkg/internal/netaddr` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -331,7 +331,7 @@ unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences:
   Cryptographic Module. The linkname changes who can call it, not what it is.
 - It depends on a Go toolchain that has that symbol, not only on a `quic-go`
   version. `quic-go` v0.63.0 declares `go 1.26.0`; this repository requires
-  Go 1.27.1.
+  Go 1.27.2.
 - It is a stopgap. `quic-go`'s own comment cites
   [golang/go#79219](https://github.com/golang/go/issues/79219) and the pending
   `NewGCMForQUIC` constructor; when the standard library exports one, the
@@ -363,7 +363,7 @@ is stated here and not only in `go.mod`.
 |---|---|
 | Primitive | SHA-1 |
 | Where | `golang.org/x/crypto/ocsp.CreateRequest` |
-| Reached from | `revocation.Checker.queryOCSP`, `pkg/internal/transport/revocation/checker.go:942` |
+| Reached from | `revocation.Checker.queryOCSP`, `pkg/internal/transport/revocation/checker.go` |
 | Mandated by | RFC 6960 §4.1.1, `CertID.issuerNameHash` / `issuerKeyHash` |
 | What it protects | nothing; the hash is an issuer identifier, matched against a responder's index |
 | Fixable here? | No. It is in a dependency, and a compliant responder rejects any other hash |

@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-10-02
+> `pkg/internal/invariant` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem

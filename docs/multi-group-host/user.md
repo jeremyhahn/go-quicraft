@@ -1,7 +1,7 @@
 # Multi-Group Host — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — deploying, configuring,
-> monitoring and operating a `Host` · Last verified: 2026-10-02
+> monitoring and operating a `Host` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 How to run a `Host`: start it, form shards, change membership, read and write,

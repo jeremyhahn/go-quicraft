@@ -1,7 +1,7 @@
 # Snapshots — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-02
+> import/export and re-encryption · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -162,6 +162,22 @@ the typed errors `*SnapshotFailedError`, `*SnapshotTooLargeError`,
 `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`,
 `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`,
 `*ImportMembershipInvalidError`, `*ReplicaRetiredError`.
+
+### Events and failure reporting
+
+`config.EventListener` reports snapshot activity with a `config.SnapshotInfo`:
+`OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`,
+`OnSnapshotSendStarted`, `OnSnapshotSent`, `OnSnapshotSendAborted`,
+`OnSnapshotReceived` and `OnSnapshotRejected`. `SnapshotInfo.Err` is the cause
+of an `OnSnapshotRejected` when one exists and nil for every other event.
+`OnSnapshotRejected` is delivered on the listener dispatcher, so a listener may
+call `StopShard` from it. A recovery that fails before the state machine's
+restore began is rejected and re-driven; after five consecutive rejections the
+shard fails and `OnShardFailed` carries `*SnapshotRecoveryExhaustedError`
+(`*SnapshotRecoveryPanicError` is a possible cause). A `SaveSnapshot` panic
+reaches the requester as `*SnapshotSavePanicError` inside `*SnapshotFailedError`
+and does not fail the shard. Details in
+[engineering.md](engineering.md#7-observability).
 
 ### The AAD helper
 

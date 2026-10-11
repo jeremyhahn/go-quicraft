@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
 > `pkg/internal/transport/revocation`, `pkg/internal/registry`,
-> `pkg/internal/netaddr` · Last verified: 2026-10-02
+> `pkg/internal/netaddr` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are internal: they are not importable from outside the
@@ -657,8 +657,18 @@ handleMessageFrame(...)
     v
 hostMessageHandler.HandleMessage()
     |-- bind msg.From to PeerAuth.Identity (committed, pending or anchor config)
-    |-- engine.DeliverMessage(msg.ShardID, msg); engine.NotifyWork(msg.ShardID)
+    |-- LeaderExec / LeaderExecResp: host.serveLeaderExec / completeLeaderExec
+    |-- otherwise engine.DeliverMessage(msg.ShardID, msg); engine.NotifyWork(msg.ShardID)
 ```
+
+`LeaderExec` (28) and `LeaderExecResp` (29), the leader-executed request and
+its reply, are ordinary messages in an ordinary `MessageBatch`: the transport
+has no leader-exec path of its own. They pass the same deny-list, destination
+and sender-binding checks as every other message, with no type exempted, and
+only then does the host route them to the leader-exec handler instead of the
+raft engine. A frame whose sender fails binding is dropped with the usual
+reason (`missing_identity`, `unknown_member`, `identity_mismatch` and so on)
+before it reaches either.
 
 **Connection limits.** `acceptLoop` enforces `MaxIncomingConnections` (default
 256) via a semaphore and `MaxConnectionsPerIP` (default 16) via an

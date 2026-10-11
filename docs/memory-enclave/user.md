@@ -1,6 +1,6 @@
 # Memory enclave: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-08
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Use protected memory whenever your code holds a key, password, passphrase or

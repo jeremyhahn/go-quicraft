@@ -1,7 +1,7 @@
 # Snapshots — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-02
+> import/export and re-encryption · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the frame format, the AAD layout and the scope fence are in
@@ -380,10 +380,19 @@ does not apply: the window in which it can do so is the backoff schedule
 latch takes it out of the protocol. This covers
 the snapshot pool's runtime recovery only: `StartShard` restores on its own path
 and still returns integrity failures as `*HostInitError` (`ErrSnapshotCorrupt`).
-A failed save fires no event, because the shard keeps
-running: it is logged at WARN and returned to the `RequestSnapshot` caller as a
-`*SnapshotFailedError`; for automatic saves, alert on the log line or on
-`OnSnapshotCreated` going quiet.
+A save that returns an error fires no event, because the
+shard keeps running: it is logged at WARN and returned to the `RequestSnapshot`
+caller as a `*SnapshotFailedError`; for automatic saves, alert on the log line
+or on `OnSnapshotCreated` going quiet. `OnSnapshotRejected` covers the other
+save outcomes: a request the pool refuses (one already in flight, or a full queue; the
+requester sees `ErrSnapshotInProgress` or `ErrBusy`, and `SnapshotInfo.Err` the
+engine's internal duplicate or pool-busy error), an accepted
+request abandoned when the pool stops (`ErrStopped`), and a save whose
+`SaveSnapshot` panicked (`*SnapshotSavePanicError`; the shard keeps running).
+It carries the cause in `SnapshotInfo.Err`, is delivered on the listener
+dispatcher whatever produced it (the pool or the snapshot receiver), so a
+listener may call `StopShard` from it, and also reports an inbound transfer the
+receiver rejected.
 
 **Logging** uses `log/slog`. Failed saves and recoveries, verification failures,
 receive verdicts (declined, abandoned, kept) and epoch purges are logged with

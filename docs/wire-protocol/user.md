@@ -1,6 +1,6 @@
 # Wire Protocol — Usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Most people embedding go-quicraft never import `pkg/proto`. You reach it in
@@ -10,7 +10,7 @@ a layout. The third is where the damage happens.
 
 ## Before you start
 
-- Go 1.27.1 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.2 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - Every node and every consuming repository built from the same commit. Until
   the first production release, format versions are pinned and layouts change
   in place, so two binaries from different pre-release commits may be mutually

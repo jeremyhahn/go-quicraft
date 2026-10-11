@@ -1,6 +1,6 @@
 # Memory enclave: engineering contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-08
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-enclave` (v0.8.0-alpha in `go.mod`).

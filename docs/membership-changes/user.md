@@ -1,6 +1,6 @@
 # Membership changes: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 This page covers adding, removing and re-roling replicas in a shard that
@@ -104,6 +104,33 @@ there. Restarting it later with `IsObserver` still set is harmless; that bit is
 only consulted while the membership does not name the replica.
 
 A witness cannot be promoted; the add is refused with `ErrNodeAlreadyExists`.
+
+### Know when the observer has caught up
+
+The leader's `ShardInfo.Replicas` (from `Host.GetShardInfo`) lists every remote member it tracks, observers
+and witnesses included, each with a `Role` (`ReplicaRoleVoter`,
+`ReplicaRoleObserver` or `ReplicaRoleWitness`) and its `Match` index. Read it
+on the leader, not a follower (a follower's list is empty), and filter on `Role`
+wherever you do quorum or health arithmetic: observers and witnesses appear in
+the list but only voters and witnesses count toward a quorum. It is published
+on the leader's next tick, so the first call after a leader change can be empty.
+
+## Replace a replica: learner first, then promote
+
+To swap a machine out without ever shrinking the voting set below what the
+shard needs:
+
+1. Add the new machine as an observer (`SyncRequestAddObserverWithIdentity`) and
+   start it with `join = true` and `IsObserver` set.
+2. Poll the leader's `ShardInfo.Replicas` until the observer's `Match` reaches
+   the leader's last log index.
+3. Promote it (the `AddNode` above), then remove the old replica, transferring
+   leadership away first if the old replica leads.
+
+Each step is a separate change with a fresh `ConfigChangeID`. Skipping the wait
+in step 2 still works, since the observer is promoted in place and catches up
+as a voter, but until it has caught up it counts toward every quorum without
+holding the log.
 
 The voting set is capped at 64, counting voters, witnesses and self, because
 acknowledgements are tracked in a 64-bit word.

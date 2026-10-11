@@ -1,6 +1,6 @@
 # Wire Protocol — API
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

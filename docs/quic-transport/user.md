@@ -1,7 +1,7 @@
 # QUIC Transport — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport` and its
-> configuration surface · Last verified: 2026-10-02
+> configuration surface · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 You deal with the transport in four ways: giving it certificates, giving every

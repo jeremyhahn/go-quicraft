@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
 > `pkg/internal/session`, and the session fields of `pkg/proto` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Client sessions give at-most-once proposal delivery by tracking

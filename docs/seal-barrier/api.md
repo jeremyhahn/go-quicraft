@@ -1,7 +1,7 @@
 # Seal and barrier: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -199,6 +199,17 @@ Drops every key reference, clears any delegated encryptor, and resets the
 context binding to `ContextBindingUnresolved`. For a barrier wired into a host,
 host-wide or per-shard, prefer `Host.Close()`, which drains the pipeline before
 sealing so the engine does not take an `ErrBarrierSealed` storm.
+
+### Hand the barrier to a host
+
+`quicraft.WithBarrier(b)` (host-wide), `quicraft.WithShardBarriers(fn)`
+(per-shard, `fn func(shardID uint64) Barrier`) and `quicraft.WithoutEncryption()`
+are `NewHost` options; `*seal.Barrier` satisfies the host's `Barrier`
+interface. `WithShardBarriers` combines with either host-wide choice; a `nil`
+from the resolver takes the host-wide route, or fails with
+`ErrShardBarrierUnresolved` when none was declared. Routing and the LogDB checks
+are in [`architecture.md`](architecture.md) and
+[`../multi-group-host/api.md`](../multi-group-host/api.md).
 
 ### Introspect state and capability
 

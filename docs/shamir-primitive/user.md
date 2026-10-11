@@ -1,6 +1,6 @@
 # Shamir primitive: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for a developer building a key-custody layer on top of this

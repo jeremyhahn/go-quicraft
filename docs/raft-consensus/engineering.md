@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-10-02
+> `pkg/internal/invariant` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are **internal** and not importable from outside the module.
@@ -2724,7 +2724,13 @@ The signals that matter, and what each one actually tells you:
 response rather than for monitoring, and they are worth knowing about before you
 need them: `DiagRaftState`, `DiagPipelineState`, `DiagShardGates` and
 `DiagRemotes`. They report term, commit and processed indexes, queue depths, the
-recovering/saving gates and per-remote replication state.
+recovering/saving gates and per-remote replication state. The per-remote state
+covers every member the leader tracks, voters, observers and witnesses, in
+replica-ID order, each with its role (`role=` in the `DiagRemotes` text,
+`ReplicaProgress.Role` in `ShardInfo.Replicas`); it is nil on a non-leader. The
+step worker samples it once per tick into the diagnostic snapshot, once the
+first diagnostic call has enabled publication (so that first call reads
+nothing), and neither accessor takes the raft lock.
 
 **Logging** (`log/slog`). Leadership changes are logged at DEBUG and are
 better counted through the leader-change metric. Worth alerting on:

@@ -1,7 +1,7 @@
 # State Machines — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv`,
-> `pkg/internal/rsm` · Last verified: 2026-10-02
+> `pkg/internal/rsm` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem

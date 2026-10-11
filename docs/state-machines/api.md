@@ -1,7 +1,7 @@
 # State Machines — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

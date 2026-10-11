@@ -1,7 +1,7 @@
 # Client Sessions — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go` and the `Host`
-> session methods · Last verified: 2026-10-02
+> session methods · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Use a session when a proposal is not idempotent and applying it twice after a
@@ -76,6 +76,15 @@ if err != nil && quicraft.Temporary(err) {
 	result, err = host.SyncProposeWithSession(ctx, session, cmd) // same session
 }
 ```
+
+A failure after the proposal reached Raft (a timeout, a leadership change, a
+stopped or halted shard) reports `quicraft.MaybeApplied(err) == true`: the
+command may still commit. Without a session that is a hazard, because a retry
+can apply it twice. With a session it is the case the session exists for, so
+retry as above; check `MaybeApplied` only to learn that the first attempt may
+have landed. `Temporary` still says whether a retry can succeed: a halted or
+closed shard is `MaybeApplied` but not `Temporary`, and no retry helps until it
+is reloaded.
 
 If the first attempt was applied, the retry returns the cached result and the
 state machine is not called again. If it was not, the retry applies normally.

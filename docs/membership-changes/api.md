@@ -1,6 +1,6 @@
 # Membership changes: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -75,6 +75,16 @@ func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, r
 
 The identity rules are the same as for `AddNode`. The voting set
 (`voters + witnesses + self`) is capped at 64 (`ErrTooManyVotingMembers`).
+
+The leader reports the new member's catch-up through `Host.GetShardInfo`:
+`ShardInfo.Replicas` holds a `ReplicaProgress` for every remote member it
+tracks, observers and witnesses included, and `ReplicaProgress.Role` is one of
+`ReplicaRoleVoter`, `ReplicaRoleObserver` or `ReplicaRoleWitness`. An embedder
+replacing a replica by learner-then-promote waits for the observer's `Match` to
+reach the leader's index before the promoting `AddNode`. `Replicas` is empty on
+a follower and for the first call on a shard; the full type is in
+[`../multi-group-host/api.md`](../multi-group-host/api.md#replicaprogress).
+`Host.DiagRemotes` renders the same state as text with a `role=` field.
 
 ### Capability: remove a replica
 

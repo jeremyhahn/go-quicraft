@@ -1,7 +1,7 @@
 # Client Sessions — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go` and the `Host`
-> session methods · Last verified: 2026-10-02
+> session methods · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -62,6 +62,14 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 - On error the session is unchanged, and retrying with the same session is safe:
   if the first attempt was applied, the retry returns the cached result and the
   state machine is not called again.
+- Every failure delivered after the proposal was handed to Raft is wrapped in
+  `*MaybeAppliedError`, so `MaybeApplied(err)` is true: a timeout or
+  cancellation of the caller's wait, a leadership change, a stopped or halted
+  shard (`ErrAborted`, `ErrClosed`, `ErrShardFailed`), and a persist, commit or
+  apply failure. `errors.Is`, `errors.As`, `Temporary` and `NotLeader` still
+  match the underlying error. A refusal before the hand-off (the submit errors
+  above, a full proposal queue) is definite. The same classification applies to
+  `GetNewSession`, `RegisterSession` and `CloseSession`, which are proposals.
 - A no-op session is refused here with `ErrInvalidSession`. Propose without a
   session using `Propose` or `SyncPropose`.
 

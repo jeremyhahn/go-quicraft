@@ -1,7 +1,7 @@
 # Raft consensus: CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
-> `pkg/internal/engine` · Last verified: 2026-10-02
+> `pkg/internal/engine` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: go-quicraft is a library and ships no binaries, and this

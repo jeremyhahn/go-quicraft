@@ -3,7 +3,7 @@
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
 > `config.WitnessConfig`, and the membership half of `pkg/internal/raft` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the role model and the scope fence are in
@@ -490,7 +490,15 @@ cap.
 
 **Diagnostics.** `Host.DiagRemotes(shardID)` reports per-remote replication
 state, which tells a newly added replica that is catching up from one that is
-not receiving anything.
+not receiving anything. Each remote is rendered
+`r<id>[role=<role> match=... next=... state=... paused=... active=...
+inflights=...]`, and voters, observers and witnesses all appear. The structured
+form is `ShardInfo.Replicas` (`[]ReplicaProgress`, `Role` of type `ReplicaRole`:
+`ReplicaRoleVoter`, `ReplicaRoleObserver`, `ReplicaRoleWitness`), published by
+the step worker with the rest of the leader's diagnostic snapshot, so it is
+empty on a follower and on the first call for a shard. It lets an embedder
+watch an observer's `Match` reach the leader's index before promoting it; a
+caller computing a quorum or health figure must filter on `Role`.
 
 **Logging** (`log/slog`):
 

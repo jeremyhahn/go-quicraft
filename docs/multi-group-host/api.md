@@ -1,7 +1,7 @@
 # Multi-Group Host — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` and `pkg/config` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -2454,16 +2454,16 @@ health arithmetic, filter on `Role`.
 
 ```go
 type ReplicaProgress struct {
-    ReplicaID  uint64 `json:"replica_id"`
+    ReplicaID  uint64      `json:"replica_id"`
     Role       ReplicaRole `json:"role"` // "voter", "observer", "witness"
-    Match      uint64 `json:"match"`
-    Next       uint64 `json:"next"`
-    State      string `json:"state"` // "probe", "replicate", "snapshot"
-    Paused     bool   `json:"paused"`
-    Active     bool   `json:"active"`
-    Inflights  int    `json:"inflights"`
-    IsWitness  bool   `json:"is_witness"`
-    IsObserver bool   `json:"is_observer"`
+    Match      uint64      `json:"match"`
+    Next       uint64      `json:"next"`
+    State      string      `json:"state"` // "probe", "replicate", "snapshot"
+    Paused     bool        `json:"paused"`
+    Active     bool        `json:"active"`
+    Inflights  int         `json:"inflights"`
+    IsWitness  bool        `json:"is_witness"`
+    IsObserver bool        `json:"is_observer"`
 }
 ```
 

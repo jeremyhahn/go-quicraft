@@ -1,7 +1,7 @@
 # Multi-Group Host — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — host lifecycle, startup,
-> crash recovery, shutdown, and the performance contract · Last verified: 2026-10-02
+> crash recovery, shutdown, and the performance contract · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg`

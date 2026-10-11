@@ -1,7 +1,7 @@
 # QUIC Transport — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 There is no CLI: go-quicraft is a library and ships no binaries, so the

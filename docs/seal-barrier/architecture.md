@@ -1,7 +1,7 @@
 # Seal and barrier: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` (and the `pkg/crypto`
-> compatibility shim) · Last verified: 2026-10-02
+> compatibility shim) · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -413,6 +413,33 @@ makes single-writer a guarantee.
 - **Consumers in this repo**: `pkg/logdb/waldb` through its own `WALBarrier`
   interface, and `pkg/internal/engine`'s snapshot pool. Neither imports
   `pkg/seal` directly.
+
+### How the host routes barriers
+
+The host-wide choice and the per-shard choice are two independent axes
+(`WithBarrier` / `WithoutEncryption` for the first, `WithShardBarriers` for the
+second). Exactly one host-wide statement is required, and `WithoutEncryption`
+conflicts only with `WithBarrier` (`ErrAtRestEncryptionConflict`), so
+`WithShardBarriers` combines with either:
+
+- A shard whose resolver returns a barrier is encrypted under it, snapshots
+  and log alike, in every host-wide posture, including `WithoutEncryption` and
+  a `WithBarrier` barrier still in plaintext mode.
+- A shard whose resolver returns `nil` takes the host-wide route: the
+  `WithBarrier` barrier, or plaintext when `WithoutEncryption` declared it.
+  With neither, `StartShard` fails closed with `ErrShardBarrierUnresolved`.
+- A resolved barrier that is sealed fails `StartShard` with `ErrBarrierSealed`.
+- The LogDB must actually hold the shard under that barrier
+  (`ErrShardBarrierLogDBMismatch`); a LogDB that would store barriered shards'
+  log in plaintext is refused at `NewHost` (`ErrShardBarriersPlaintextWAL`,
+  `ErrBarrierPlaintextLogDB`). The contract, including the `logdb.AtRestHostRouted`
+  report a multiplexing LogDB makes, is in
+  [`../multi-group-host/api.md`](../multi-group-host/api.md).
+- Snapshot encrypt/decrypt, transport epoch protection and DEK purge dispatch
+  per shard, and barriers are matched by pointer identity, so purging one
+  tenant's barrier never removes epochs live under another's. Rotation of a
+  per-shard barrier is the embedder's; the host rotates only the `WithBarrier`
+  one. `Host.Close` seals each distinct barrier once.
 
 ## What this feature deliberately does not do
 

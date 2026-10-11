@@ -1,7 +1,7 @@
 # State Machines — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv`,
-> `pkg/internal/rsm` · Last verified: 2026-10-02
+> `pkg/internal/rsm` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 - `github.com/jeremyhahn/go-quicraft/pkg/sm`: the interfaces you implement, the
@@ -835,9 +835,19 @@ These live in the internal package to avoid an import cycle with `pkg`.
 ### Propagation
 
 - An error from your `Update` propagates out of `Apply` and fails the shard;
-  proposals in the batch fail with an error wrapping yours.
+  the proposal in flight fails with an `*ApplyError` (`ShardID`, `ReplicaID`,
+  `Err`) that unwraps to yours, so `errors.Is` finds your sentinel.
 - A panic in your code is recovered by the apply worker, logged with its stack,
-  and fails the shard; proposals in the batch fail with `ErrShardFailed`.
+  and fails the shard; the proposal in flight fails with the `*SMPanicError`
+  itself (`Value`, `Stack`), which matches `ErrShardFailed`. Every other
+  proposal pending on the shard fails with `ErrShardFailed`.
+- Those entries are committed and a reload replays them, so each of those
+  failures is wrapped in `*MaybeAppliedError` and `MaybeApplied(err)` is true.
+  Pending reads get the bare error. Requests arriving after the shard has
+  failed are refused with the bare `ErrShardFailed`.
+- A panic in `SaveSnapshot` is the exception: it only reads your state, so the
+  shard keeps running, and the requester gets a `*SnapshotSavePanicError` inside
+  its save error, which does not match `ErrShardFailed`.
 - `ErrApplyGap` fails the shard, deliberately.
 - Session register and unregister failures are per-entry results, never fatal:
   they are expected on replay (a duplicate register after recovery, a double

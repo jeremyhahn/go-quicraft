@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, and the `Host` methods that drive them ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -103,6 +103,15 @@ func (h *Host) IsShardJoining(shardID uint64) bool
 
 `StateMachineHash` returns `ok == false` when the state machine does not
 implement `sm.Hasher`.
+
+`GetShardInfo` returns a `*ShardInfo`. On the leader its `Replicas` field
+(`[]ReplicaProgress`) is the leader's progress view of every remote member it
+tracks: voters, observers (learners) and witnesses, each with a `Role`
+(`ReplicaRoleVoter`, `ReplicaRoleObserver` or `ReplicaRoleWitness`), `Match`,
+`Next` and `State`. It is empty on a follower. Only voters and witnesses count
+toward quorum, so a caller computing quorum or health figures filters on
+`Role`. The type is in
+[`../multi-group-host/api.md`](../multi-group-host/api.md#replicaprogress).
 
 `ShardReadReady` reports, without blocking, whether the shard's leader for
 `term` has committed an entry of that term as this replica knows it — the

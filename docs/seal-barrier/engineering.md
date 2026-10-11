@@ -1,7 +1,7 @@
 # Seal and barrier: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/seal`
@@ -306,6 +306,15 @@ key rotate sooner, a non-cleared nonce set only yields conservative
 false-positive rejections. A failure is logged at WARN and `Rotate` still
 returns `(newEpoch, nil)`; returning an error alongside a committed epoch is
 avoided so a caller cannot retry into a second rotation.
+
+**Root-key borrows.** `Rotate` reads the root key through go-enclave's scoped
+`MemoryEnclave.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped `Open`).
+It borrows twice, each time for the one call that reads it: the epoch-cipher
+derivation, then the `StateMAC` re-stamp. Neither borrow spans the sealing of
+the new DEK, which may block on a provider, and no view of the key outlives its
+borrow. Cleanup paths destroy a `SealedEnclave` through one helper that logs a
+failed `Destroy` at WARN rather than discarding it; go-enclave documents that
+error as always nil today.
 
 Check order in `rotateLocked`: sealed → superseded → hardware → nil sealed data
 → no persister.

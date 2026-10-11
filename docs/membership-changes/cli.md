@@ -1,6 +1,6 @@
 # Membership changes: CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: go-quicraft is a library and ships no binaries.** There is no

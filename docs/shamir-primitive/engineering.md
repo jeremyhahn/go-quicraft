@@ -1,7 +1,7 @@
 # Shamir primitive: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-02
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -66,7 +66,6 @@ type ProtectedShare struct {
     // value is unexported: it lives in an enclave.MemoryEnclave
 }
 
-func (s *ProtectedShare) Value() []byte
 func (s *ProtectedShare) WithValue(fn func([]byte) error) error
 func (s *ProtectedShare) Destroy()
 func (s *ProtectedShare) Validate() error

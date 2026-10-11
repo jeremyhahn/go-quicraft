@@ -1,6 +1,6 @@
 # Seal and barrier: CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-02
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 No CLI: go-quicraft is a library and ships no binaries (there is no `cmd/`
