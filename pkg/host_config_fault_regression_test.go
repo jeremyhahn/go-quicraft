@@ -219,9 +219,7 @@ func TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain(t *testin
 	}
 	awaitContainedDiagnostics(t)
 	var halts atomic.Int64
-	prev := slog.Default()
-	slog.SetDefault(slog.New(haltCountingHandler{halts: &halts}))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	installDefaultLogger(t, haltCountingHandler{halts: &halts})
 
 	// The halt line is emitted contained, on the diagnostics worker, after
 	// the pending requests are failed; it is awaited rather than read back

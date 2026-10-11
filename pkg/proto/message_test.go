@@ -231,7 +231,7 @@ func TestMessageInvalidType(t *testing.T) {
 	buf := make([]byte, m.Size())
 	m.MarshalTo(buf)
 	// Corrupt type to invalid value
-	putUint64(buf[0:], RateLimit+1)
+	putUint64(buf[0:], maxMessageType+1)
 	var m2 Message
 	_, err := m2.UnmarshalFrom(buf)
 	if !errors.Is(err, ErrInvalidMessageType) {

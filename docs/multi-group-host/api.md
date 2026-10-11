@@ -753,6 +753,96 @@ shard policy (session limits, witness policy) is kept, and the importing replica
 must appear in the map. A survivor that moved to a new keypair needs its
 identity supplied with `WithImportMemberIdentities`.
 
+### Leader-executed requests
+
+```go
+type LeaderHandler func(ctx context.Context, term uint64, request []byte) ([]byte, error)
+
+func (h *Host) RegisterLeaderHandler(shardID uint64, handler LeaderHandler) error
+func (h *Host) UnregisterLeaderHandler(shardID uint64)
+func (h *Host) ExecuteOnLeader(ctx context.Context, shardID uint64, request []byte) ([]byte, error)
+```
+
+`ExecuteOnLeader` has the shard's current leader run `request` through its
+registered `LeaderHandler` and returns the reply. The request is **not**
+appended to the Raft log. It is for state the leader holds in memory for the
+term it leads, such as lease deadlines, which must be decided by exactly one
+replica at a time but need not be replicated. Called on the leader, it runs in
+process. Called on any other replica, it is forwarded over the host's QUIC
+transport to the replica this host knows as leader. It passes the same receive
+gate as a forwarded proposal: mTLS, the removed-replica deny-lists, the
+destination check, and `From` bound to the connection's authenticated identity.
+
+Register the handler on **every** replica that can lead the shard. A
+registration is host-level: it may precede `StartShard` and it outlives
+`StopShard`. A leader without one answers `ErrLeaderHandlerNotRegistered`; only
+the ready leader of the request's term gives that answer, and any other replica
+refuses as not leading it.
+
+Guarantees:
+
+- **Executed only by the leader of the term.** Every attempt is sent under the
+  `(leader, term)` the caller's replica sees. The receiving replica runs the
+  handler only if it leads the shard in exactly that term and has committed an
+  entry of it (`OnLeaderReady`), so everything committed in an earlier term is
+  committed here too. A replica that does not lead in that term refuses without
+  running the handler. Leading is judged on the replica's Raft state itself as
+  well as on its cached leadership view, which the listener dispatcher updates
+  asynchronously and which can still name a leader whose Raft has already
+  stepped down. A new leader that is not yet ready holds the request until it
+  is, within the request's deadline.
+- **A deposed leader's reply is rejected.** The executor checks the term again
+  when the handler returns and withholds the reply if it no longer leads, or if
+  its shard was stopped or its failure latch tripped meanwhile. A replica whose
+  shard is stopped or failed never starts a handler: neither clears the cached
+  leadership view, so it refuses as one that does not lead, and a caller on
+  another replica retries on the leader the others elect. The caller discards
+  every answer, reply, refusal or handler failure alike, for a term older than
+  one it has already seen. Either way the request is retried on the new leader, under the new term.
+- **Never executed twice under one term.** Each attempt is sent once. If the
+  caller's view moves while an attempt is unanswered, it is abandoned, not
+  resent, and its term is treated as spent. A later attempt is made only under
+  a strictly later term, and a late answer for an abandoned attempt is dropped.
+  Across terms a request can run more than once, at most once per term, so a
+  handler must be idempotent across a leader change. This holds on the leader
+  itself too: called there, the handler runs on its own goroutine while the
+  caller watches leadership, so a handler still running when leadership moves
+  is abandoned like a forwarded attempt and does not hold the request. The
+  handler gets its own copy of the request on either path, so the caller may
+  reuse its buffer once `ExecuteOnLeader` returns.
+
+Leadership is the executing replica's own view, as for a leader-local read: a
+leader cut off from its quorum keeps executing until it steps down.
+`Config.CheckQuorum` bounds that to an election timeout.
+
+The handler's `ctx` ends with the caller's deadline (forwarded with the
+request, capped at five minutes) or when the host closes. `Close` waits for
+every execution it is running, for remote and local callers, so a handler must
+honour `ctx`.
+Handlers run concurrently; one host executes at most 1024 remote requests at
+once.
+
+**Errors:**
+
+| Error | Meaning |
+|---|---|
+| `*LeaderUnavailableError` | `ctx` ended while waiting for a leader. `errors.Is` matches `ErrNoLeader` (none known) or `ErrLeadershipChanged` (leadership moving), and `ErrTimeout` or `ErrCanceled`. Temporary. |
+| `ErrTimeout` / `ErrCanceled` | `ctx` ended with an attempt still in flight to a leader the view still names. |
+| `*LeaderHandlerError` | The handler ran and failed, panicked, or returned a reply over the payload limit. Carries the leader, the term and the error text. |
+| `ErrLeaderHandlerNotRegistered` | The leader has no handler for the shard. |
+| `ErrBusy` | The leader is already executing 1024 remote requests. Nothing ran. |
+| `*EntryTooLargeError` | The request exceeds the shard's proposal payload limit. |
+| `ErrStopped` | The shard or the host stopped while the request waited. |
+| `ErrShardFailed` | This replica's failure latch tripped (an apply or persistence failure). Permanent until the shard is reloaded. |
+| `ErrClosed`, `ErrDraining`, `ErrShardNotFound` | Refused before anything was sent. |
+
+`RegisterLeaderHandler` returns `ErrClosed` on a closed host and
+`ErrInvalidOperation` for a nil handler.
+
+On the wire the request is a `LeaderExec` message and the answer a
+`LeaderExecResp`. Both are host traffic that never reaches Raft; see
+[Message type constants](../wire-protocol/engineering.md#message-type-constants).
+
 ### Informational
 
 ```go

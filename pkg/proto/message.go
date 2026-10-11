@@ -136,7 +136,7 @@ func (m *Message) MarshalTo(buf []byte) (int, error) {
 	// handler on the receiving side, so a value outside the enum is not a
 	// cosmetic mismatch: the frame is refused wholesale and the sender sees a
 	// dead connection.
-	if m.Type > RateLimit {
+	if m.Type > maxMessageType {
 		return 0, ErrInvalidMessageType
 	}
 	// The snapshot presence flag is derived from Snapshot.IsEmpty, which asks
@@ -217,7 +217,7 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	m.Reject = getBool(buf[72:])
 	m.Hint = getUint64(buf[80:])
 	// Validate Message.Type against known range.
-	if m.Type > RateLimit {
+	if m.Type > maxMessageType {
 		return 0, ErrInvalidMessageType
 	}
 	offset := messageFixedSize

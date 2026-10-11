@@ -19,6 +19,22 @@ COVER_DIR     := $(BUILD_DIR)/coverage
 # are `override` so a command-line value is discarded. Rule: no variable
 # expanded at parse time may carry a caller-supplied value. Tool knobs such as
 # GO and BUILD_DIR stay settable.
+#
+# GNU make 4.4 and later expands every EXPORTED variable to build the
+# environment of each $(shell ...) call, and a variable given on the command
+# line is exported by default. So VERSION='$(shell ...)' would execute at parse
+# time during the first $(shell) below, `override` or not. The caller-supplied
+# release inputs are therefore unexported: they reach the release recipe only
+# through the REL_* target-specific exports, via $(value ...).
+#
+# `unexport` creates the variable if it is not defined yet, and `?=` leaves a
+# defined variable alone, so the RELEASE_* defaults are set first (see the
+# Release section below for what they mean).
+RELEASE_GIT             ?= git
+RELEASE_ALLOWED_SIGNERS ?= .release-allowed-signers
+RELEASE_REMOTE          ?= dev
+unexport VERSION RELEASE_REMOTE RELEASE_GIT RELEASE_ALLOWED_SIGNERS
+unexport BUILD_VERSION GIT_COMMIT BUILD_DATE
 override BUILD_VERSION := $(shell cat VERSION 2>/dev/null || echo "0.0.1-alpha")
 override GIT_COMMIT    := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 override BUILD_DATE    := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -55,7 +71,7 @@ ACTIONLINT_BIN = $(shell if [ -x '$(TOOLS_BIN)/actionlint' ]; then \
 		else command -v actionlint 2>/dev/null; fi)
 # The module's `go` directive, derived from go.mod (hence `override`). The
 # analyser's build toolchain is checked against it.
-override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod)
+override GO_DIRECTIVE := $(shell awk '$$1=="go"{print $$2; exit}' go.mod 2>/dev/null)
 # Every Go module in the tree: each directory holding a go.mod, skipping what
 # the go command ignores (names starting with `.` or `_`, and testdata).
 # `git ls-files` is not used because remote-% ships the tree without .git.
@@ -1646,19 +1662,20 @@ export GOWORK=off
 # transport, which the duplicate-tag check already requires. A helper that
 # rewrites the releaser's git configuration or binaries is outside what any
 # recipe can check.
-RELEASE_GIT ?= git
 
+# (RELEASE_GIT defaults to plain git; the default is set at the top of this
+# file, ahead of the `unexport` that keeps command-line values out of $(shell).)
 # RELEASE_ALLOWED_SIGNERS is the trust anchor, a git allowed-signers file
 # (gpg.ssh.allowedSignersFile format), relative to the checkout root. The
 # release commit's author e-mail must be a principal in it, and the commit and
 # both tags must carry SSH signatures that verify against a key it lists for
 # that principal. A missing file fails the release before anything is written.
-RELEASE_ALLOWED_SIGNERS ?= .release-allowed-signers
 
+# (Defaulted at the top of this file, like RELEASE_GIT.)
 # The git remote the release commit and tags are pushed to. Its existence is
 # checked before anything is written.
-RELEASE_REMOTE ?= dev
 
+# (Defaulted at the top of this file, like RELEASE_GIT.)
 # deps-latest updates first-party dependencies to their highest tag, including
 # -alpha prereleases, which a bare 'go get @latest' ignores.
 

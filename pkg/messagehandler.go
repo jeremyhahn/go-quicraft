@@ -151,6 +151,19 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transp
 			continue
 		}
 
+		// Leader-executed requests and their answers are host traffic, not
+		// raft: they pass the same gate as a forwarded proposal, then go to
+		// the host's router and never reach the shard's inbox. They are the
+		// highest types, so raft traffic pays one compare here, not a lookup.
+		if msg.Type >= proto.LeaderExec {
+			if receive, ok := leaderExecReceivers[msg.Type]; ok {
+				if h.host != nil && h.host.leaderExec != nil {
+					receive(h.host, msg)
+				}
+				continue
+			}
+		}
+
 		// DeliverMessage (not DeliverLocal) stamps the message OriginRemote.
 		// The shard inbox is shared with the in-process injectors — the
 		// snapshot receive path's InstallSnapshot, the transport's

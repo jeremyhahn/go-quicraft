@@ -393,9 +393,30 @@ no log position would therefore encode as absent and be discarded whole, so
 | 25    | `RequestPreVote`     | Pre-vote request                         |
 | 26    | `RequestPreVoteResp` | Pre-vote response                        |
 | 27    | `RateLimit`          | Rate limit notification                  |
+| 28    | `LeaderExec`         | Leader-executed request (host traffic)   |
+| 29    | `LeaderExecResp`     | Leader-executed request answer           |
 
-Validation: `Message.Type > RateLimit` returns `ErrInvalidMessageType`, on
-both write and read.
+Validation: `Message.Type > LeaderExecResp` returns `ErrInvalidMessageType`,
+on both write and read.
+
+`LeaderExec` and `LeaderExecResp` carry `Host.ExecuteOnLeader` requests. They
+pass the receive gate like every other type, then go to the host's
+leader-exec router and never reach Raft. They reuse the fixed fields:
+
+| Field      | `LeaderExec`                                   | `LeaderExecResp`                                  |
+|------------|------------------------------------------------|---------------------------------------------------|
+| `Term`     | the term the request may execute under         | echoed                                            |
+| `Hint`     | request ID, unique on the caller's host        | echoed                                            |
+| `LogIndex` | caller's remaining budget in ns (0 = none)     | refusal status when `Reject` is set               |
+| `Reject`   | —                                              | set when the request was refused or not answered  |
+| `Entries`  | exactly one; `Cmd` is the request              | exactly one; `Cmd` is the reply or error text     |
+
+Refusal statuses: 1 not leader in that term, or shard stopped or failed (not
+executed), 2 deposed, or shard stopped or failed, while executing (term spent), 3 no handler registered (sent only by the
+ready leader of that term), 4 handler failed (text in `Cmd`), 5 busy (not
+executed). A caller treats an unknown status as 2, and discards any answer,
+whatever its status, for a term older than the latest it has seen. Adding
+the two types extended the type range in place; no format version moved.
 
 ### Validation rules
 
@@ -403,7 +424,7 @@ both write and read.
 
 - Buffer shorter than 92 bytes (88 header + 4 entries count) returns
   `ErrBufferTooSmall`
-- `Message.Type > RateLimit` (27) returns `ErrInvalidMessageType`
+- `Message.Type > LeaderExecResp` (29) returns `ErrInvalidMessageType`
 - `EntriesCount > MaxEntriesPerMessage` (10,000) returns `ErrTooManyMessages`
 - `EntriesCount * entryHeaderSize` greater than the bytes remaining returns
   `ErrBufferTooSmall`, before the `Entries` slice is allocated

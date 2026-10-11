@@ -423,6 +423,33 @@ term, which `OnLeaderLost` does not report. `ShardReadReady` gives the same
 answer synchronously. The full contract is in
 [api.md](api.md#event-listener).
 
+## Run a request on the leader
+
+Some state belongs to whichever replica leads a shard and needs no
+replication, such as lease deadlines. `ExecuteOnLeader` sends a request to the
+shard's leader for the current term, runs it there, and returns the reply. It
+does not go through the Raft log. Register the handler on every replica that
+can lead the shard, before or after `StartShard`:
+
+```go
+err := host.RegisterLeaderHandler(shardID,
+    func(ctx context.Context, term uint64, req []byte) ([]byte, error) {
+        return leases.Renew(term, req) // runs only on the leader of term
+    })
+
+reply, err := host.ExecuteOnLeader(ctx, shardID, []byte("renew client-7"))
+```
+
+You can call it on any replica. A follower forwards the request over the QUIC
+transport, with the same mTLS and sender binding as a forwarded proposal. If
+leadership moves while the request is in flight, the answer of the deposed
+leader, reply or error, is discarded and the request runs again on the new leader under the new
+term. It never runs twice under one term, but it can run once in each of two
+terms, so make the handler idempotent across a leader change. If no leader
+settles before `ctx` ends, the error matches `ErrNoLeader` or
+`ErrLeadershipChanged`, both temporary. The guarantees and the full error list
+are in [api.md](api.md#leader-executed-requests).
+
 ## Manage disk
 
 Set `MaxWALDiskSize`. At 85% of it the host fires `OnLogDBDiskWarning`; at 95% it

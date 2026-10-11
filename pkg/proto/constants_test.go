@@ -49,6 +49,8 @@ func TestMessageTypeName(t *testing.T) {
 		{RequestPreVote, "RequestPreVote"},
 		{RequestPreVoteResp, "RequestPreVoteResp"},
 		{RateLimit, "RateLimit"},
+		{LeaderExec, "LeaderExec"},
+		{LeaderExecResp, "LeaderExecResp"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {

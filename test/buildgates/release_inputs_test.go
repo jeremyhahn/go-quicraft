@@ -246,7 +246,21 @@ func newReleaseFixture(t *testing.T, withRemote bool) *releaseFixture {
 // and make them pass for the wrong reason. GIT_TERMINAL_PROMPT=0 makes an
 // unreachable remote fail instead of blocking on a credential prompt.
 func isolatedEnv() []string {
-	return append(os.Environ(),
+	env := make([]string, 0, len(os.Environ())+3)
+	for _, kv := range os.Environ() {
+		// GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_PARAMETERS inject git
+		// configuration that GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM do not
+		// switch off: a launcher that sets user.signingkey or gpg.ssh.program
+		// that way would sign the "unsigned" cases and verify the wrong key.
+		if strings.HasPrefix(kv, "GIT_CONFIG_COUNT=") ||
+			strings.HasPrefix(kv, "GIT_CONFIG_KEY_") ||
+			strings.HasPrefix(kv, "GIT_CONFIG_VALUE_") ||
+			strings.HasPrefix(kv, "GIT_CONFIG_PARAMETERS=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
 		"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
 }
 

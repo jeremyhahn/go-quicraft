@@ -51,6 +51,10 @@ func sentinelTable() []sentinelClassification {
 		{"ErrShardNotReady", ErrShardNotReady, true},
 		{"ErrNotLeader", ErrNotLeader, true},
 		{"ErrReadIndexNotReady", ErrReadIndexNotReady, true},
+		// Temporary: an election settles a missing or moving leader, and the
+		// identical leader-executed request then reaches it.
+		{"ErrNoLeader", ErrNoLeader, true},
+		{"ErrLeadershipChanged", ErrLeadershipChanged, true},
 		// Temporary: the transfer completes or times out on its own and the
 		// identical request then succeeds. Produced BEFORE the entry enters
 		// the log, so it is never MaybeApplied.
@@ -59,6 +63,9 @@ func sentinelTable() []sentinelClassification {
 		{"ErrImportInProgress", ErrImportInProgress, true},
 
 		// --- permanent ---
+		// Permanent: registering a handler is the embedder's act; no retry
+		// registers one.
+		{"ErrLeaderHandlerNotRegistered", ErrLeaderHandlerNotRegistered, false},
 		{"ErrClosed", ErrClosed, false},
 		{"ErrCanceled", ErrCanceled, false},
 		{"ErrRejected", ErrRejected, false},

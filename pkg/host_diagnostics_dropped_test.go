@@ -55,12 +55,10 @@ func TestHealthCheck_ReportsDiagnosticsDropped(t *testing.T) {
 
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	prev := slog.Default()
-	slog.SetDefault(slog.New(stalledLogHandler{entered: entered, release: release}))
-	t.Cleanup(func() {
-		slog.SetDefault(prev)
-		close(release)
-	})
+	// Cleanups run last-in first-out: the handler is replaced before it is
+	// released, so the records still queued drain into the previous one.
+	t.Cleanup(func() { close(release) })
+	installDefaultLogger(t, stalledLogHandler{entered: entered, release: release})
 	for range 2 * supervise.DiagnosticQueueCapacity {
 		supervise.LogContained(func() { slog.Info("diagnostic") })
 	}

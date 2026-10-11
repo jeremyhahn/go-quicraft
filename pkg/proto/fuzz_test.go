@@ -153,8 +153,8 @@ func FuzzMessageRoundTrip(f *testing.F) {
 		entryCmd []byte) {
 
 		// Clamp message type to valid range.
-		if msgType > RateLimit {
-			msgType = msgType % (RateLimit + 1)
+		if msgType > maxMessageType {
+			msgType = msgType % (maxMessageType + 1)
 		}
 		if len(entryCmd) > int(MaxEntrySize) {
 			return
@@ -274,8 +274,8 @@ func FuzzMessageBatchRoundTrip(f *testing.F) {
 		// so only WireVersion round-trips.
 		binVer = WireVersion
 		// Clamp message type to valid range.
-		if msgType > RateLimit {
-			msgType = msgType % (RateLimit + 1)
+		if msgType > maxMessageType {
+			msgType = msgType % (maxMessageType + 1)
 		}
 		// Clamp address length.
 		if len(srcAddr) > MaxAddressLength {

@@ -739,6 +739,15 @@ func TestHandleMessage_EveryMessageTypeIsBoundToASender(t *testing.T) {
 			if err := handler.HandleMessage(genuine, certCoveringAs(memberID, memberAddr)); err != nil {
 				t.Fatalf("HandleMessage(genuine): %v", err)
 			}
+			if _, hostTraffic := leaderExecReceivers[msgType]; hostTraffic {
+				// Past the gate this type goes to the host's router, never to
+				// raft; TestHandleMessage_LeaderExecTrafficIsBoundToASender
+				// holds its positive control.
+				if len(eng.delivered) != 0 {
+					t.Fatalf("a %s reached raft: it is host traffic", name)
+				}
+				return
+			}
 			if len(eng.delivered) != 1 {
 				t.Fatalf("a %s from a configured member on its own connection was "+
 					"dropped (%d delivered): the gate refuses traffic it must not",

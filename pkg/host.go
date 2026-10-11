@@ -1566,6 +1566,14 @@ type nodeState struct {
 	// no write interleaved. Writers never block; readers retry.
 	leaderSeq atomic.Uint64
 
+	// leaderWake is the channel the next change to the leadership view
+	// closes: every updateNodeLeader and markLeaderReady, once its write has
+	// settled, and the stop of the shard. ExecuteOnLeader waits on it for a
+	// leader to appear, for the term to move past one it has spent, and for
+	// the view to abandon the leader an attempt is in flight to. See
+	// leaderChanged.
+	leaderWake atomic.Pointer[chan struct{}]
+
 	health      atomic.Uint32 // stores ShardHealth as uint32
 	nodes       map[uint64]string
 	nodesMu     sync.RWMutex
@@ -3169,6 +3177,12 @@ func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
 	// sentinel.
 	c.h.failPendingClientRequests(ns, ErrShardFailed)
 
+	// The latch leaves the cached leadership view as it was, so wake the
+	// leader-executed requests waiting on it: a caller here returns
+	// ErrShardFailed, and an execution waiting for this replica to be ready
+	// refuses instead of waiting for a term that will never be.
+	ns.signalLeaderChange()
+
 	// One log line at the moment of the halt, naming shard and replica and
 	// carrying the error that tripped the latch, so the read failures that
 	// follow have something to correlate against. The halt's cause reaches
@@ -3406,6 +3420,11 @@ type Host struct {
 	// import was in progress; claiming the start first lets it report the
 	// transient ErrShardNotReady, and leaves ErrImportInProgress to imports.
 	startingShards sync.Map
+
+	// leaderExec holds the leader-executed request handlers, the requests
+	// this host has in flight to a remote leader, and the bound on the
+	// requests it is executing for remote callers. See ExecuteOnLeader.
+	leaderExec *leaderExecRouter
 }
 
 // acquireImportLock takes the shard's exclusive import lock, waiting until it
@@ -4033,6 +4052,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		sweepStopC:         make(chan struct{}),
 		sweepDone:          make(chan struct{}),
 		fsys:               options.fsys,
+		leaderExec:         newLeaderExecRouter(),
 	}
 
 	// Wire the host into the message handler so HandleSnapshot can
@@ -5352,6 +5372,9 @@ func (h *Host) StopShard(shardID uint64) error {
 	if !ns.stopped.CompareAndSwap(false, true) {
 		return ErrShardNotFound // another StopShard/Close already owns teardown
 	}
+	// Wake ExecuteOnLeader callers waiting on this shard's leadership view;
+	// they find it stopped and return ErrStopped.
+	ns.signalLeaderChange()
 	// The state machine's Close error is the shard's LAST durability signal:
 	// for an on-disk SM it is the backing store's final flush-and-close, and a
 	// failed flush that is only logged reports a clean stop for a shard that
@@ -9166,6 +9189,11 @@ func (h *Host) Close() error {
 		close(h.sweepStopC)
 		<-h.sweepDone
 
+		// End every leader-executed request: callers return ErrStopped and
+		// the handlers running for remote callers see their context end.
+		// Waits for those handlers, so none outlives the shard state it reads.
+		h.leaderExec.close()
+
 		// Stop the engine FIRST. The engine's step workers are the only
 		// producers of snapshot sends (transportSender.SendSnapshot, which
 		// does snapshotWg.Add(1)). engine.Stop() closes stepStopC and joins
@@ -11631,6 +11659,7 @@ func (h *Host) updateNodeLeader(shardID, leaderID, term uint64) {
 	ns.isLeader.Store(leaderID == ns.replicaID)
 	ns.readReady.Store(false)
 	ns.leaderSeq.Add(1)
+	ns.signalLeaderChange()
 }
 
 // markLeaderReady records that the cached (leaderID, term) pair is read-ready
@@ -11649,7 +11678,35 @@ func (ns *nodeState) markLeaderReady(leaderID, term uint64) bool {
 	ns.leaderSeq.Add(1)
 	ns.readReady.Store(true)
 	ns.leaderSeq.Add(1)
+	ns.signalLeaderChange()
 	return true
+}
+
+// leaderChanged returns the channel the next change to the leadership view
+// closes. A waiter takes it BEFORE reading the view and waits on it only if
+// what it read did not satisfy it: a change that lands between the two has
+// either closed the channel it holds or replaced it before it was taken, and
+// then the read already saw the change. Nothing is missed.
+func (ns *nodeState) leaderChanged() <-chan struct{} {
+	for {
+		if c := ns.leaderWake.Load(); c != nil {
+			return *c
+		}
+		c := make(chan struct{})
+		if ns.leaderWake.CompareAndSwap(nil, &c) {
+			return c
+		}
+	}
+}
+
+// signalLeaderChange wakes every leaderChanged waiter. Each channel is closed
+// by the one call that swapped it out, so concurrent signals never close the
+// same channel twice. It must follow the write it announces.
+func (ns *nodeState) signalLeaderChange() {
+	c := make(chan struct{})
+	if old := ns.leaderWake.Swap(&c); old != nil {
+		close(*old)
+	}
 }
 
 // buildWALOptions constructs waldb.Option values from the HostConfig.

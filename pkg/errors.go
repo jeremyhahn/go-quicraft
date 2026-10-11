@@ -317,6 +317,21 @@ var (
 	// its current term (PhD thesis 6.4).
 	ErrReadIndexNotReady = errors.New("quicraft: read index not ready")
 
+	// ErrNoLeader is the cause a LeaderUnavailableError carries when
+	// ExecuteOnLeader's context ended while the shard had no known leader.
+	ErrNoLeader = errors.New("quicraft: shard has no leader")
+
+	// ErrLeadershipChanged is the cause a LeaderUnavailableError carries when
+	// ExecuteOnLeader's context ended while a leadership change was in
+	// flight: the leader it addressed refused the request or lost its term
+	// before answering, and no leader of a later term answered in time.
+	ErrLeadershipChanged = errors.New("quicraft: leadership changed during a leader-executed request")
+
+	// ErrLeaderHandlerNotRegistered is returned by ExecuteOnLeader when the
+	// shard's leader has no LeaderHandler registered for the shard (see
+	// Host.RegisterLeaderHandler). The request was not executed.
+	ErrLeaderHandlerNotRegistered = errors.New("quicraft: no leader handler registered for shard")
+
 	// ErrDraining is returned when a new proposal or read-index request
 	// is submitted to a host that has entered drain mode. In-flight
 	// operations are allowed to complete, but no new work is accepted.
@@ -752,6 +767,48 @@ func (e *NotLeaderError) Error() string {
 // This enables errors.Is(notLeaderErr, ErrNotLeader) to return true.
 func (e *NotLeaderError) Is(target error) bool {
 	return target == ErrNotLeader
+}
+
+// LeaderUnavailableError is returned by ExecuteOnLeader when its context ended
+// before a leader answered while the shard had no leader (Cause ErrNoLeader)
+// or a leadership change was in flight (Cause ErrLeadershipChanged). Err is
+// ErrTimeout or ErrCanceled, from the context. errors.Is matches both.
+type LeaderUnavailableError struct {
+	ShardID uint64
+	Cause   error
+	Err     error
+}
+
+// Error returns a human-readable description naming the cause and how the
+// request's context ended.
+func (e *LeaderUnavailableError) Error() string {
+	return fmt.Sprintf("quicraft: shard %d: %v: %v", e.ShardID, e.Cause, e.Err)
+}
+
+// Unwrap returns the cause and the context error, so errors.Is matches
+// ErrNoLeader or ErrLeadershipChanged, and ErrTimeout or ErrCanceled.
+func (e *LeaderUnavailableError) Unwrap() []error {
+	return []error{e.Cause, e.Err}
+}
+
+// LeaderHandlerError is returned by ExecuteOnLeader when the leader's
+// LeaderHandler ran and returned an error, or panicked, or returned a reply
+// larger than the shard's payload limit. The request WAS executed, by
+// replica LeaderID under Term. Message is the error's text: an error crosses
+// the transport as text, so a caller on the leader and a caller on a follower
+// receive the same value.
+type LeaderHandlerError struct {
+	ShardID  uint64
+	LeaderID uint64
+	Term     uint64
+	Message  string
+}
+
+// Error returns the handler's error text with the shard, leader and term it
+// was executed under.
+func (e *LeaderHandlerError) Error() string {
+	return fmt.Sprintf("quicraft: leader handler for shard %d failed on replica %d in term %d: %s",
+		e.ShardID, e.LeaderID, e.Term, e.Message)
 }
 
 // EntryTooLargeError is returned when a proposal exceeds the configured
@@ -1539,6 +1596,10 @@ var temporaryErrors = [...]error{
 	// The leader has not yet committed an entry in its current term
 	// (Raft PhD 6.4). It will, within one heartbeat interval.
 	ErrReadIndexNotReady,
+	// A leader-executed request found no leader, or leadership moving; an
+	// election settles both without any caller action.
+	ErrNoLeader,
+	ErrLeadershipChanged,
 	// Another snapshot holds the shard's single-flight slot, or every
 	// snapshot worker in the pool is occupied.
 	ErrSnapshotInProgress,
@@ -1561,8 +1622,9 @@ var temporaryErrors = [...]error{
 // interrupted operation (ErrAborted, ErrDropped), a shard that is still
 // coming up (ErrShardNotStarted, ErrShardNotReady), a request that reached
 // the wrong replica (ErrNotLeader), a leader that has not yet committed in
-// its term (ErrReadIndexNotReady), and a single-flight slot that is already
-// taken (ErrSnapshotInProgress).
+// its term (ErrReadIndexNotReady), a leader-executed request that found no
+// leader or leadership moving (ErrNoLeader, ErrLeadershipChanged), and a
+// single-flight slot that is already taken (ErrSnapshotInProgress).
 //
 // EVERY other error is reported as permanent, including errors this package
 // did not produce. That default is deliberate: retrying a permanent failure

@@ -313,7 +313,23 @@ const (
 	RequestPreVote     uint64 = 25
 	RequestPreVoteResp uint64 = 26
 	RateLimit          uint64 = 27
+	// LeaderExec carries a leader-executed request from the replica a caller
+	// submitted it on to the replica that caller believes leads the shard. It
+	// never reaches raft: the host's message handler takes it once the sender
+	// is bound and answers it with LeaderExecResp. Term is the leadership term
+	// the request may be executed under, Hint the caller's request ID,
+	// LogIndex the caller's remaining budget in nanoseconds (0 for none) and
+	// Entries[0].Cmd the request payload.
+	LeaderExec uint64 = 28
+	// LeaderExecResp answers a LeaderExec. Term and Hint echo the request's,
+	// Reject marks a refusal whose reason code is in LogIndex, and
+	// Entries[0].Cmd carries the handler's reply (or its error text).
+	LeaderExecResp uint64 = 29
 )
+
+// maxMessageType is the largest valid Message.Type, the bound MarshalTo and
+// UnmarshalFrom hold every message to.
+const maxMessageType = LeaderExecResp
 
 // Config change type constants identify the kind of membership change.
 const (
@@ -361,6 +377,8 @@ var messageTypeNames = map[uint64]string{
 	RequestPreVote:     "RequestPreVote",
 	RequestPreVoteResp: "RequestPreVoteResp",
 	RateLimit:          "RateLimit",
+	LeaderExec:         "LeaderExec",
+	LeaderExecResp:     "LeaderExecResp",
 }
 
 // MessageTypeName returns the human-readable name for a message type constant.

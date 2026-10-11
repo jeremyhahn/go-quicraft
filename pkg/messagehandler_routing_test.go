@@ -133,9 +133,7 @@ func TestHandleMessage_DropWarningsAreRateLimited(t *testing.T) {
 	handler := &hostMessageHandler{engine: eng, host: h}
 
 	var logs bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	defer slog.SetDefault(prev)
+	installDefaultLogger(t, slog.NewTextHandler(&logs, nil))
 
 	const n = 5000
 	batch := proto.MessageBatch{Requests: make([]proto.Message, n)}

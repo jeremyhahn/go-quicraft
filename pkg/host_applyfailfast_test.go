@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"log/slog"
 	"runtime"
 	"sync"
@@ -1453,9 +1454,7 @@ func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 			ns.pendingReads[key] = &pendingRead{rs: rs}
 			ns.pendingReadsMu.Unlock()
 
-			prev := slog.Default()
-			slog.SetDefault(slog.New(exitingLogHandler{exit: exit}))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			installDefaultLogger(t, exitingLogHandler{exit: exit})
 
 			cb := &hostEngineCallback{h: h}
 			done := make(chan struct{})
@@ -1475,6 +1474,23 @@ func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 			}
 		})
 	}
+}
+
+// installDefaultLogger makes handler the process's slog default for the test
+// and restores the previous one in t.Cleanup. slog.SetDefault also points the
+// log package's output and flags at the new handler, and re-installing the
+// previous slog default does not undo that, so both are restored too:
+// otherwise a later log.Printf (quic-go's buffer-size notice) reaches a
+// handler the test meant to be gone.
+func installDefaultLogger(t *testing.T, handler slog.Handler) {
+	t.Helper()
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 }
 
 // asPanicsError is a user error whose As method panics when asked for a

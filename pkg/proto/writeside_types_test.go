@@ -107,7 +107,7 @@ func TestEntryMarshalAcceptsEveryLegalType(t *testing.T) {
 // not cosmetic: UnmarshalFrom rejects the whole FRAME, taking every other
 // message batched with it, and the sender sees only a dead connection.
 func TestMessageMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
-	for _, typ := range []uint64{RateLimit + 1, 100, 1 << 63} {
+	for _, typ := range []uint64{maxMessageType + 1, 100, 1 << 63} {
 		m := Message{Type: typ, From: 1, To: 2}
 		buf := make([]byte, m.Size())
 		if _, err := m.MarshalTo(buf); !errors.Is(err, ErrInvalidMessageType) {
@@ -137,7 +137,7 @@ func TestMessageMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
 func TestMessageBatchMarshalRejectsInvalidNestedTypes(t *testing.T) {
 	t.Run("message type", func(t *testing.T) {
 		mb := MessageBatch{BinVer: WireVersion, Requests: []Message{
-			{Type: Heartbeat}, {Type: RateLimit + 1},
+			{Type: Heartbeat}, {Type: maxMessageType + 1},
 		}}
 		buf := make([]byte, mb.Size())
 		if _, err := mb.MarshalTo(buf); !errors.Is(err, ErrInvalidMessageType) {
