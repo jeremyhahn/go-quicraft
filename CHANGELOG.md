@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0-rc.1] - 2026-10-11
+
+### Added
+
+- Leader-executed requests (#257): `Host.ExecuteOnLeader` has the shard's
+  current leader run a request through the handler registered with
+  `Host.RegisterLeaderHandler` and returns its reply, without appending it to
+  the Raft log. A follower forwards the request over the existing QUIC
+  transport, through the same receive gate as a forwarded proposal. The
+  handler runs only on the replica that leads the request's term, by its Raft
+  state as well as its cached view, once that term is read-ready, and on its
+  own copy of the request; its reply is withheld if that replica was deposed,
+  or its shard stopped or failed, before the handler returned. A replica whose
+  shard has stopped or failed refuses as one that does not lead; a caller on
+  that replica gets `ErrStopped` or `ErrShardFailed`. Any answer, reply or
+  refusal, from a term the caller has seen superseded is discarded and the
+  request retried under the new term, and an attempt still unanswered when
+  leadership moves, on the leader itself as much as forwarded, is abandoned
+  and retried on the new leader; a request never executes twice under one
+  term. Only the leader of the request's term reports a missing handler.
+  New errors: `ErrNoLeader`, `ErrLeadershipChanged` (both temporary, carried
+  by `*LeaderUnavailableError`), `ErrLeaderHandlerNotRegistered`, and
+  `*LeaderHandlerError`. Two message types, `LeaderExec` (28) and
+  `LeaderExecResp` (29), extend the type range in place; no format version
+  changed.
+
+- `make release-candidate VERSION=vX.Y.Z-rc.N` cuts a release candidate
+  (release-versioning.md §1a) through the same guarded, signed, atomically
+  pushed recipe as `release-alpha` and `release`. The version is never
+  inferred; N is a positive integer without leading zeroes, so `v0.21.0`,
+  `v0.21.0-alpha`, `v0.21.0-rc.0` and `v0.21.0-rc.01` are refused before
+  anything is written. `VERSION` and the CHANGELOG heading carry
+  `X.Y.Z-rc.N`.
+
 ### Changed
 
 - `make lint` runs actionlint over `.github/workflows` after golangci-lint
@@ -24,6 +58,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from that tag's installer instead of whatever upstream `main` serves, and
   fails when nothing was installed; `make remote-tools` installs the same
   version (#251).
+
+- Tests for `pkg/logdb/waldb` behaviour that had none (the real `statfs` disk
+  probe, `NodeRemoved`, compaction-floor reconciliation, pin clearing, the
+  marker-temp helpers, typed error messages). Go 1.27.2 counts the package as
+  2435 statements where 1.27.1 counted 3150, so the same 255 uncovered
+  statements read as 89.5% rather than 91.9%; the 90% gate is unchanged.
+
+### Changed — BREAKING: `ShardInfo.Replicas` includes observers and witnesses
+
+- `ShardInfo.Replicas` on the leader now reports every remote member it
+  tracks, not only voters: observers (learners) and witnesses appear too, each
+  with a new `ReplicaProgress.Role` of the closed string type `ReplicaRole`
+  (`"voter"`, `"observer"` or `"witness"`; constants `ReplicaRoleVoter`,
+  `ReplicaRoleObserver`, `ReplicaRoleWitness`).
+  An embedder replacing a replica by learner-then-promote can watch the
+  observer's `Match` reach the leader's index before promoting it. Callers that
+  want voters only (quorum or health arithmetic) must filter on `Role`. The
+  `DiagRemotes` text gains a `role=` field. No wire or on-disk change (#259).
+
+### Security
+
+- Go 1.27.2 in every module, the CI pins and the Dockerfile bases (#252),
+  fixing the standard-library advisories govulncheck reports against go1.27.1.
+- `golang.org/x/net` v0.60.0 in every module (#252), fixing GO-2026-6617 and
+  GO-2026-6611; `github.com/prometheus/client_golang` v1.25.0.
 
 ## [0.20.0] - 2026-10-08
 
