@@ -864,6 +864,7 @@ func proposeToLeader(
 // waitForClusterLeader waits until one node becomes leader for the shard.
 func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration) int {
 	c.t.Helper()
+	start := time.Now()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	deadline := time.NewTimer(timeout)
@@ -875,10 +876,32 @@ func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration
 		}
 		select {
 		case <-deadline.C:
-			c.t.Fatalf("timed out after %v waiting for cluster leader on shard %d", timeout, shardID)
+			c.logShardState(shardID)
+			c.t.Fatalf("timed out after %v (budget %v) waiting for cluster leader on shard %d",
+				time.Since(start), timeout, shardID)
 			return -1
 		case <-ticker.C:
 		}
+	}
+}
+
+// logShardState logs what every running host reports for shardID: the view
+// a failed leader wait leaves behind, so a stuck election shows its terms.
+func (c *testCluster) logShardState(shardID uint64) {
+	c.t.Helper()
+	c.hostsMu.RLock()
+	defer c.hostsMu.RUnlock()
+	for i, h := range c.hosts {
+		if c.stopped[i].Load() {
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			c.t.Logf("node[%d] shard %d: %v", i, shardID, err)
+			continue
+		}
+		c.t.Logf("node[%d] shard %d: term=%d leader=%t leaderID=%d lastApplied=%d health=%v",
+			i, shardID, info.Term, info.IsLeader, info.LeaderID, info.LastApplied, info.Health)
 	}
 }
 
@@ -888,10 +911,14 @@ func (c *testCluster) stopNode(idx int) {
 	if c.stopped[idx].Load() {
 		return
 	}
+	// Host.Close drains in-flight client operations, so a stop is a phase of
+	// its own; its length separates a slow drain from a slow election (#309).
+	start := time.Now()
 	c.hostsMu.Lock()
 	c.hosts[idx].Close()
 	c.stopped[idx].Store(true)
 	c.hostsMu.Unlock()
+	c.t.Logf("node[%d] stopped in %v", idx, time.Since(start))
 }
 
 // restartNode recreates a stopped host with the same WAL/NodeHost directories,

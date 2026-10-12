@@ -1431,8 +1431,9 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	cluster.stopNode(leaderIdx)
 
 	// Wait for a new leader to be elected from surviving nodes.
+	electStart := time.Now()
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
-	t.Logf("new leader elected: node[%d]", newLeaderIdx)
+	t.Logf("new leader elected: node[%d] in %v (budget %v)", newLeaderIdx, time.Since(electStart), failoverTimeout)
 
 	wait()
 

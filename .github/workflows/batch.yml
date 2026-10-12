@@ -231,6 +231,36 @@ jobs:
           end=$(( $(date +%s) + SOAK_MINUTES * 60 ))
           i=0 failed=0
           mkdir -p soak-logs
+          # Each failing test's own output, so a failed iteration is
+          # diagnosable from the job log alone: the --- FAIL: line and the
+          # indented lines go test prints under it (t.Log, t.Error, nested
+          # subtests), the last 200 per failed test.
+          fail_blocks() {
+            local line inb=0 buf=()
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [ "$inb" -eq 1 ]; then
+                case "$line" in
+                  ' '*|$'\t'*) buf+=("$line"); continue ;;
+                esac
+                fail_tail
+              fi
+              case "$line" in
+                '--- FAIL:'*) inb=1; printf '%s\n' "$line" ;;
+              esac
+            done < "$1"
+            [ "$inb" -eq 0 ] || fail_tail
+          }
+          fail_tail() {
+            local from=0
+            if [ "${#buf[@]}" -gt 200 ]; then
+              from=$(( ${#buf[@]} - 200 ))
+              echo "    ... $from earlier lines elided"
+            fi
+            if [ "${#buf[@]}" -gt 0 ]; then
+              printf '%s\n' "${buf[@]:from}"
+            fi
+            inb=0 buf=()
+          }
           while [ "$(date +%s)" -lt "$end" ]; do
             i=$((i + 1))
             if bash -c "$SOAK_CMD" > "soak-logs/$i.log" 2>&1; then
@@ -239,6 +269,7 @@ jobs:
               failed=$((failed + 1))
               echo "BATCH-FINDING soak iteration $i failed"
               grep -E '^(--- FAIL|FAIL|panic:)|WARNING: DATA RACE' "soak-logs/$i.log" | head -n 40
+              fail_blocks "soak-logs/$i.log" || true
             fi
           done
           echo "soak: $i iterations, $failed failed"
