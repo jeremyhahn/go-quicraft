@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0-rc.2] - 2026-10-12
+
+### Added
+
+- `Config.MaxClockDrift` (#299): the worst clock-rate drift between
+  replicas that LeaseRead must tolerate, as a fraction. 0 keeps the default
+  of 1 %; `config.MaxClockDriftMin` (1e-6) and `config.MaxClockDriftMax`
+  (0.5) bound a non-zero value, and `Validate` rejects NaN and infinities. The
+  lease is shortened by the bound; the default lease length is unchanged.
+  Nothing at run time detects drift beyond the bound, so set it to the worst
+  drift the deployment can see. A new test drives lease reads under injected
+  clock-rate drift on either side of the bound.
+
+### Changed
+
+- `golang.org/x/crypto` v0.58.0, `golang.org/x/sync` v0.24.0 and
+  `golang.org/x/sys` v0.49.0 in every module; none of the changes touch TLS,
+  QUIC, AEAD, HKDF, FIPS or the Linux file-I/O wrappers.
+
+- CI runs in two tiers: a pull request runs the fast tier and the full tier
+  runs on push to main, on dispatch, or with the `ci:full` label (#294). A
+  dispatch-only batch workflow adds long fuzzing, `-race -count=3`, an
+  integration and network-partition soak, and benchmarks with allocations
+  (#302).
+
+### Fixed
+
+- A shard whose log write is refused because its barrier is sealed is now
+  held and retried after the unseal, instead of tripping its permanent
+  failure latch (#296). Under load a sealed replica still receives Raft
+  traffic (entries from the leader, proposals forwarded by peers), and
+  encrypting that record failed with "barrier is sealed". The commit worker
+  now parks the shard: nothing from the refused update is sent, acknowledged,
+  voted or applied, its messages go back into Raft, and its LeaseRead lease is
+  invalidated. The shard is neither ticked nor stepped until the barrier
+  unseals; the identical update (same entries, index, term and hard state) is
+  then written once. Only the exact sealed refusal takes this path; a poisoned
+  WAL, a failed rollback or any other write fault still latches the shard.
+  Proposals in flight complete when the retried write commits, or when the
+  caller's context expires. `seal.Barrier` gains `UnsealedC`. No wire or
+  on-disk change.
+
+- While a shard's barrier is sealed, client-originated work is refused up
+  front with `ErrBarrierSealed` instead of being accepted and then failing at
+  the encrypted save (#296): `Propose`, `ProposeWithSession`, the session
+  calls, the membership changes, `ReadIndex`/`SyncRead`, `StaleRead`,
+  `FollowerRead`, `StaleReadBuf`, `RequestSnapshot` and `ExecuteOnLeader`. The
+  barrier checked is the shard's own if one is configured, otherwise the
+  host's. Refusals are returned, not logged.
+
+- A failed `Unseal` now writes its brute-force backoff through
+  `BarrierConfig.StatePersister` when one is configured, so restarting the
+  process no longer resets it (#284). Only a change is written; a failed write
+  is logged and does not change the attempt's result. Without a
+  `StatePersister` the backoff stays in `SealedRootKeyData()` for the embedder
+  to save, as before. The fields already existed in `SealedRootKey` and sit
+  outside its state MAC; the layout is unchanged.
+
+- The `StartShard` recovery diagnostics (#277) are now reported on the Host's
+  logger — the one given through `WithLogger`, or built from
+  `HostConfig.LogConfig` — instead of the process's slog default, so they
+  reach the sink the operator configured. That covers the clamp of a
+  recovered commit index ahead of the recovered log, the clamp of a state
+  machine applied index ahead of the recovered commit index, committed config
+  changes below that applied index which could not be folded, a founding
+  membership entry that does not decode, and a `Config.MemberIdentities` entry
+  naming a removed identity. The records keep their messages and levels
+  (ERROR for a commit clamp over an empty log, an unfolded config window and
+  an undecodable founding entry; WARN otherwise). Recovery behaviour is
+  unchanged.
+
+- The rest of the Host's runtime logging now goes to the same logger: the
+  engine callback diagnostics (malformed `nodes`/pending-proposal values, a
+  short results slice, the shard-halt line, a committed identity this host
+  does not present, a dropped listener notification), the pending-sweep and
+  key-rotation loop restarts, `Close`, and `NewHost`'s warning that per-shard
+  barriers do not cover the default WAL. A replica's diagnostics about its
+  recovered configuration tail (`raft.Peer`) and a replicated session policy
+  that differs from the local one (`rsm`) follow it too. Messages, levels and
+  attributes are unchanged.
+
+- `DiskInfo.Shards` is now filled in for `OnLogDBDiskWarning` and
+  `OnLogDBDiskFull`. It lists, in ascending order, the shards whose data is in
+  the default WAL when the event fires: every loaded shard, and every stopped
+  shard whose data `RemoveData` has not purged. Before, it was always empty. No
+  wire or on-disk change (#279).
+
+- An on-disk state machine whose `Open` returns an applied index below the
+  replica's local snapshot (the node stopped after installing a leader's
+  snapshot and before its store recovered it, or the store lost writes it had
+  already snapshotted) now recovers from that snapshot in `StartShard`. Before,
+  the markers were seeded from `Open`'s index, below entries the log had already
+  compacted: `StartShard` failed with `ErrRecoveredTermUnknown`, or the first
+  batch was refused as `ErrApplyGap`. An index at or above the snapshot is still
+  authoritative and the snapshot is not recovered. No wire or on-disk change
+  (#280).
+
 ## [0.21.0-rc.1] - 2026-10-11
 
 ### Added
