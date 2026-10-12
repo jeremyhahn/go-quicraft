@@ -255,7 +255,7 @@ The tree roots at `<Config.DataDir>/shard-<N>/` for a shard with a `DataDir`.
 parser still reads older records for what they carry (the DEK purge-floor scan
 learns an epoch from one), but recovery refuses any record without
 `DataLen`/`DataHash`. The byte layout is in the `snapshot.meta` section of
-[Compatibility](../compatibility.md).
+[Compatibility](../compatibility/architecture.md).
 
 **`ExportPath` exports** write the same pair. Each file is staged as a temp in
 the export directory, fsynced, closed and renamed into place, `snapshot.dat`
@@ -300,8 +300,11 @@ Run with `go test ./pkg/ ./pkg/internal/engine/` (both are part of `make test`).
 | `snapshot_recv_staging_test.go` | bounded receive and staging |
 | `snapshot_sender_test.go` | chunked send |
 | `snapshot_option_test.go` | `SnapshotOption.Validate` |
-| `host_import_*_test.go` (nine files) | import: artifact, compaction, layout, membership, non-destructive, ordering, retry, staging sweep, start exclusion |
+| `host_import_*_test.go` (ten files) | import: artifact, compaction, layout, lock lifetime, membership, non-destructive, ordering, retry, staging sweep, start exclusion |
 | `host_snapshot_catchup_wedge_test.go`, `host_snapshot_gc_test.go` | the catch-up wedge and snapshot GC |
+| `host_snapshot_failure_events_test.go`, `host_snapshot_noop_save_events_test.go` | a failed save does not fail the shard; a pre-restore recovery failure is rejected, not latched; a `SaveSnapshot` panic reaches the requester as a failed save; a no-op save fires no event |
+| `snapshot_listener_dispatch_test.go`, `host_snapshot_reject_dispatch_test.go` | the engine's snapshot callbacks reach the user's listener; an inbound transfer the receiver rejected is delivered on the listener dispatcher |
+| `internal/engine/snapshot_recover_reject_test.go`, `internal/engine/recovery_redrive_test.go` | pre-restore errors reject, post-restore errors latch; the re-drive backoff, the five-attempt budget over one holding episode, and a busy pool not counted |
 
 Fault-injection seams: the host's snapshot filesystem is an interface, so the
 crash-simulating filesystem (`snapshot_crashfs_test.go`) and the failing
@@ -328,7 +331,7 @@ Watch three things:
   a transient error.
 
 **Events.** `config.EventListener` carries `OnSnapshotCreated`,
-`OnSnapshotSent`, `OnSnapshotSendAborted`, `OnSnapshotReceived`,
+`OnSnapshotSendStarted`, `OnSnapshotSent`, `OnSnapshotSendAborted`, `OnSnapshotReceived`,
 `OnSnapshotRecovered` and `OnSnapshotCompacted` with `config.SnapshotInfo`
 (shard, replica, index, sender). A save with nothing new to capture writes no
 snapshot and fires no event. A recovery that fails or panics once the state

@@ -46,7 +46,7 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 |---|---|
 | Request | shard and command; `len(cmd) <= min(MaxProposalPayloadSize, MaxEntrySize)` |
 | Response | a `*RequestState` to await, or the `sm.Result` directly |
-| Errors | `*NotLeaderError`, `ErrBusy` (`*BusyError`; the global limiter's `ErrSystemBusy` matches it), `ErrDropped` (proposal queue full), `*EntryTooLargeError`, `ErrDiskFull`, `ErrShardFailed`, `ErrTransferInProgress`, `*MaybeAppliedError`, `ErrInvalidOperation` on a witness, `ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrTimeout` / `ErrCanceled` |
+| Errors | `*NotLeaderError`, `ErrBusy` (`*BusyError`; the global limiter's `ErrSystemBusy` matches it), `ErrDropped` (proposal queue full), `*EntryTooLargeError`, `ErrDiskFull`, `ErrShardFailed`, `ErrTransferInProgress`, `*MaybeAppliedError`, `ErrInvalidOperation` on a witness, `ErrClosed`, `ErrDraining`, `ErrShardNotFound`, `ErrShardNotReady`, `ErrTimeout` / `ErrCanceled` |
 | Permission | none in this library |
 
 Rejected before any work: a done context, a closed or draining host, an unknown

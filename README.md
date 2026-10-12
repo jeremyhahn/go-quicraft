@@ -44,7 +44,7 @@ The current version is **0.16.0**, a release candidate. QuicRaft has not had a
   migrated.
 - Build every node of a cluster from the same release.
 
-See [CHANGELOG.md](CHANGELOG.md) and [docs/compatibility.md](docs/compatibility.md)
+See [CHANGELOG.md](CHANGELOG.md) and [docs/compatibility/](docs/compatibility/architecture.md)
 before upgrading.
 
 ## Install
@@ -232,7 +232,7 @@ usage guide. Good places to start:
   machine
 - [docs/multi-group-host/user.md](docs/multi-group-host/user.md): deploying and
   configuring
-- [docs/compatibility.md](docs/compatibility.md): format pinning and upgrades
+- [docs/compatibility/](docs/compatibility/architecture.md): format pinning and upgrades
 
 ## Performance
 

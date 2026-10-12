@@ -53,8 +53,8 @@ behind its back.
 
 ### Proposals
 
-`ProposeWithSession(ctx, session, cmd)` checks, in order: closed host,
-draining, nil session, shard, witness (`ErrInvalidOperation`), disk state
+`ProposeWithSession(ctx, session, cmd)` checks, in order: a context already
+done (`ErrCanceled`/`ErrTimeout`), closed host, draining, nil session, shard, witness (`ErrInvalidOperation`), disk state
 machine, `ValidForProposal` (`ErrInvalidSession`), disk full, entry size, known
 leader. It then reserves the session's series and proposes
 `Entry{Cmd, ClientID, SeriesID, RespondedTo}`.
@@ -384,7 +384,7 @@ replica, because the snapshot reflects the log.
   all four fields. Disabling expiry or the owner cap takes the explicit
   constant.
 - `Validate` rejects `SessionExpiryEntries` below 100, rejects a zero
-  `MaxSessionsPerClient`, and warns when the threshold exceeds a non-zero
+  `MaxSessionsPerClient` or `MaxTotalSessions`, and warns when the threshold exceeds a non-zero
   `SnapshotEntries`. With expiry disabled, a client that dies without
   `CloseSession` holds its slot in `MaxTotalSessions`, and in every snapshot,
   forever.
@@ -455,5 +455,5 @@ embedder's identifiers.
 - [State machines](../state-machines/engineering.md): the adapter that drives `Apply`
 - [Wire protocol](../wire-protocol/engineering.md): `Entry` session fields and `SessionPolicy`
 - [Raft consensus](../raft-consensus/engineering.md): commit, apply and snapshot ordering
-- [Compatibility](../compatibility.md): format pinning
+- [Compatibility](../compatibility/architecture.md): format pinning
 - [Multi-group host](../multi-group-host/api.md): the `Host` session methods and proposal errors

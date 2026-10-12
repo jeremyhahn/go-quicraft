@@ -178,6 +178,6 @@ replicated in `proto.Membership` and fixed for the life of the shard.
 - The session fields are part of `proto.Entry`'s 68-byte fixed header and the
   policy is part of `proto.Membership`. Both formats are pinned for the
   pre-release period; see [`../wire-protocol/api.md`](../wire-protocol/api.md)
-  and [`../compatibility.md`](../compatibility.md).
+  and [`../compatibility/`](../compatibility/architecture.md).
 - `MaxSessionsPerClient` is misnamed, not deprecated. Renaming a public field
   breaks callers, so the name stays and the meaning is documented.

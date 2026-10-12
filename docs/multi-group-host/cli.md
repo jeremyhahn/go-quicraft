@@ -28,10 +28,10 @@ own repository.
 | Target | Runs |
 |---|---|
 | `make build` | `go build ./...`. Produces no artifact |
-| `make test` | the unit suite (`go test ./...`, no build tags) |
+| `make test` | the unit suite (`go test -race -count=1 ./...`, no build tags) |
 | `make lint` | golangci-lint |
 | `make ci` | `fmt no-mutants check-tool-versions vet lint security build test` |
-| `make ci-full` | `ci` plus all modules, I/O faults, fuzz seeds and mutation, integration, network faults and the FIPS targets |
+| `make ci-full` | `ci` plus all modules, cross-platform build and vet, I/O faults, fuzz seeds and mutation, integration, network faults and the FIPS targets |
 | `make coverage` | module coverage against `COVER_MIN = 91` |
 | `make coverage-packages` | every package under `pkg/` against `COVER_MIN` |
 | `make integration-test` | real clusters in containers |
@@ -66,6 +66,7 @@ deployment:
 | `TransportConfig.MTLSConfig` | none | the host refuses to start without it whenever the transport is enabled |
 | `KeyRotationInterval` | 0 (no scheduled rotation) | 24h is a reasonable production value when a barrier is configured |
 
-Two fields do not treat zero as "off": `SnapshotEntries` and
-`SessionExpiryEntries`. Zero selects the default. Assign
-`config.SnapshotsDisabled` or `config.SessionExpiryDisabled` to turn them off.
+Three fields do not treat zero as "off": `SnapshotEntries`,
+`SessionExpiryEntries` and `MaxSessionsPerOwner`. Zero selects the default.
+Assign `config.SnapshotsDisabled`, `config.SessionExpiryDisabled` or
+`config.SessionsPerOwnerUnlimited` to turn them off.

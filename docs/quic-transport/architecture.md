@@ -29,8 +29,8 @@ QUIC 1.0 (RFC 9000) gives:
   across ticks. Heartbeats also ride a separate priority channel drained ahead
   of data, so a large replication batch cannot delay one past the election
   timeout.
-- A fixed pool of `StreamPoolSize` (16) data streams per connection, to cut
-  mutex contention. `MaxStreamPoolSize` (256) is only the ceiling `Validate`
+- A fixed pool of `StreamPoolSize` (16) stream indices per connection, index 0
+  for heartbeats and the rest for data keyed by shard, to cut mutex contention. `MaxStreamPoolSize` (256) is only the ceiling `Validate`
   checks it against; the pool does not grow at runtime.
 - Pooled byte buffers on send and receive.
 - `singleflight.Group` coalescing concurrent dials to the same peer.
@@ -88,13 +88,15 @@ TLS". No configuration produces an unauthenticated listener.
   inbound: accept ─▶ admission limits ─▶ leaf → SPKI identity
                   ─▶ frame header (wire version) ─▶ proto decode
                   ─▶ sender bound to identity ─▶ engine inbox
+                                                 (leader-exec types: host handler)
   snapshot: header ─▶ sender authorized ─▶ receive slot + memory ─▶ chunks
 ```
 
 Everything crossing the wire is `pkg/proto`'s; see
 [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md). The
-transport owns framing and the frame header's version byte
-(`transport.WireVersion`), and nothing about the payload's meaning.
+transport owns framing, the frame header's version byte
+(`transport.WireVersion`) and the 56-byte snapshot stream header, and nothing
+about the payload's meaning.
 
 ## Trust boundaries
 
@@ -160,9 +162,16 @@ Every sender is bound to its authenticated identity, in both directions:
   `From`. A replica can vouch for a sender from three facts it holds itself:
   the committed configuration, a pending configuration in its own log that
   admits the sender with an identity, and the operator anchor
-  (`Config.MemberIdentities`). Where none names the sender, the message is
-  dropped (`missing_identity` or `unknown_member`). There is no address
-  fallback.
+  (`Config.MemberIdentities`). A sender none of them names is dropped as
+  `unknown_member`; one whose committed entry records no identity is dropped as
+  `missing_identity`; one presenting an identity other than the bound one is
+  dropped as `identity_mismatch`. There is no address fallback: it was
+  removed in 0.13.0-alpha together with `TransportConfig.RequireMemberIdentity`,
+  the default-off flag that used to refuse it, so there is no setting that
+  restores address-based authorization. The
+  leader-executed request and its reply (`LeaderExec`, `LeaderExecResp`) pass
+  the same gate and are only then routed to the host's leader-exec handler
+  instead of the raft engine.
 - **Outbound.** Every message and snapshot is written only to a connection
   whose peer presents the identity membership binds to the destination
   replica. A dial whose peer presents another identity is closed, and a
@@ -222,6 +231,22 @@ A peer must not be able to make this process allocate by asserting a size.
   `MaxStreamsPerConnection` (256) bound the connection surface.
 - `StreamReadIdleTimeout` (30s) bounds how long a read waits at a clean frame
   boundary before re-checking that its connection is alive.
+
+### Embedder code runs after the transport has settled
+
+The transport calls code it does not own in three places: a `slog` handler, an
+`EventListener` callback (including the revocation `OnCertRevoked`
+notification), and a `MetricsCollector`. None of it runs between a state change
+and the cleanup that settles it, because a panic or `runtime.Goexit` there would
+skip that cleanup and leave a slot taken, a dead connection pooled or a lock
+held. Structural work finishes first. Diagnostics on a path that still has work
+to do are handed to one contained-diagnostics worker through a bounded queue, so
+a slow or hostile log handler costs that worker, not the caller. Event
+callbacks run synchronously, in order, each isolated on a helper goroutine, so
+one that panics cannot end the transport goroutine or the callbacks after it.
+Connection events for consecutive dials to one destination are delivered in
+the order the dials started. The contract and the list of windows are in
+[`engineering.md`](engineering.md#receive-path).
 
 ### What the transport does not protect
 

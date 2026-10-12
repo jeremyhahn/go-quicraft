@@ -232,10 +232,12 @@ retry.
 **`ErrDiskFull`**: the WAL disk monitor tripped. Proposals are refused rather
 than letting `fdatasync` hit ENOSPC and poison the store.
 
-**`ErrShardFailed`, or a shard that will not progress**: an apply error or a
-state machine panic marked it failed. There is no retry, by design. Check the
-`OnShardFailed` notification and your state machine's error, then stop and
-restart the shard.
+**`ErrShardFailed`, or a shard that will not progress**: a step, commit or
+apply failure marked it failed: an apply error or a state machine panic, a
+`LogDB.SaveState` that still failed after its retries, or a committed entry the
+log could no longer read. There is no retry, by design. Check the
+`OnShardFailed` notification (`ShardFailedInfo.Err` names the cause), then stop
+and restart the shard.
 
 **Reads are slower than writes**: a linearizable read costs a heartbeat quorum
 round. Use `LeaseRead` if you can meet its requirements, or `StaleRead` if you

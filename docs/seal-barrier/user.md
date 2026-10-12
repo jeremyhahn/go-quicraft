@@ -18,7 +18,7 @@ You are making two independent decisions, and they compose freely.
 
 You also need:
 
-- Go 1.27.1 or later.
+- Go 1.27.2 or later.
 - An `RLIMIT_MEMLOCK` large enough for the protected key buffers. Containers
   often ship with a small default.
 - A decision about the algorithm. Read the next section before writing any
@@ -284,10 +284,10 @@ all, needing bespoke tooling to recover. The barrier logs at ERROR once the
 set passes half the bound.
 
 Understand what a purge buys: the barrier can no longer decrypt the epoch. It is
-not crypto-shredding. Dropping the key reference makes the material
-GC-eligible; the live `cipher.AEAD` holds a copy of the DEK in its key schedule
-that no Go API can wipe. A core dump taken before collection contains every live
-and recently purged DEK.
+not crypto-shredding. The purge wipes the barrier's sealed copy of each purged
+DEK, but the dropped `cipher.AEAD` holds a copy of the DEK in its key schedule
+that no Go API can wipe, and that copy lasts until the GC reclaims it. A core
+dump taken before collection contains every live and recently purged DEK.
 
 ## Build for FIPS
 
@@ -391,8 +391,11 @@ Fix the encryptor; do not work around the probe. It runs at `Initialize` and
 `Unseal` only, never on the data path.
 
 **`ErrUnsealBackoff`**: five or more consecutive failed unseals. Backoff doubles
-from 1s to a 60s cap and is persisted, so it survives a restart. A `StateMAC`
-failure and a superseded barrier deliberately do not count toward it.
+from 1s to a 60s cap. A failed `Unseal` records the count in the in-memory blob
+but does not call your `StatePersister`, so it survives a restart only if you
+persist `SealedRootKeyData()` after the failure. A `StateMAC` failure, a
+superseded barrier, the empty key of a no-encryption barrier and a cancelled or
+timed-out `Unseal` deliberately do not count toward it.
 
 **Unseal is slow (~90 ms)**: that is the Argon2id KDF, once at startup, and it
 is the primary defence against offline attack on the sealed blob. The defaults

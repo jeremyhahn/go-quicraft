@@ -90,7 +90,7 @@ the frame, and at the sender a rejected frame looks like a broken connection.
 ## Task: size the receive budget
 
 A decoded frame is larger than its bytes: a 100-byte heartbeat becomes a
-320-byte `Message` allocation, and a membership map entry costs 12 bytes on
+304-byte `Message` allocation, and a membership map entry costs 12 bytes on
 the wire and roughly 57 in a Go map. `MaxDecodeMemoryFactor` (8) is the
 measured ceiling on that ratio; the measured worst case is 5.1x.
 

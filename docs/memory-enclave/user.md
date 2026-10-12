@@ -12,7 +12,7 @@ go-quicraft does.
 
 ## Before you start
 
-- Go 1.27.1 or later, and `github.com/jeremyhahn/go-enclave` as a dependency.
+- Go 1.27.2 or later, and `github.com/jeremyhahn/go-enclave` as a dependency.
 - A process memory-lock limit (`RLIMIT_MEMLOCK`) large enough for the keys you
   hold. Containers often ship with a small default; if allocations report a
   locked-memory failure, raise the limit rather than reduce protection.
@@ -99,7 +99,9 @@ Three rules the compiler will not enforce:
 loses nothing secret: `ErrLockedMemoryUnavailable` means the kernel refused the
 release and the pages stay on go-enclave's `WipeAll` ledger for a retry, and
 `ErrReleasedWithoutWipe` means a denied `mprotect` forced a bare unmap of pages
-the kernel zeroes before reuse. Check it where you want to see either condition.
+the kernel zeroes before reuse. `ErrEnclaveCorrupted` means something overwrote
+the canary or guard pages; the material is still wiped and the pages released.
+Check it where you want to see any of these conditions.
 
 The `cipher.AEAD` above holds its own expanded copy of the key, and neither the
 standard library nor `x/crypto` can wipe it. Build it inside the window, use it,

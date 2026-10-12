@@ -177,9 +177,9 @@ func (b *Barrier) DeregisterInFlightEpoch(epoch uint64)
 | | |
 |---|---|
 | `Rotate` response | the new epoch |
-| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, `*StatePersistError{Op:"rotate"}`, `*KeyDerivationError`, checked in that order |
+| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, then a root-key open error, `*KeyDerivationError`, `*Error{Strategy:"rotate"}` (sealing the new DEK) and `*StatePersistError{Op:"rotate"}`, in that order |
 | `PurgeEpochsBefore` response | the number of epochs dropped |
-| `PurgeEpochsBefore` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrPurgeCurrentEpoch`, `ErrNoStatePersister` (only when something would be purged), `*StatePersistError{Op:"purge"}` |
+| `PurgeEpochsBefore` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrPurgeCurrentEpoch` (`minEpoch` above the current epoch), then, only when something would be purged, `ErrNilSealedData`, `ErrNoStatePersister`, a root-key open error and `*StatePersistError{Op:"purge"}` |
 | Permission | none |
 
 Both persist before committing. `PurgeEpochsBefore` never drops the current
@@ -195,8 +195,11 @@ receive path holds across a transfer.
 func (b *Barrier) Seal() error
 ```
 
-Drops every key reference, clears any delegated encryptor, and resets the
-context binding to `ContextBindingUnresolved`. For a barrier wired into a host,
+Destroys (wipes) the sealed root key and every sealed DEK, drops the AEADs,
+clears any delegated encryptor, and resets the context binding to
+`ContextBindingUnresolved`. Each dropped `cipher.AEAD` still holds a copy of its
+DEK in its key schedule until the GC reclaims it; Go offers no key-wipe API.
+Returns `ErrBarrierSealed` when the barrier is not unsealed. For a barrier wired into a host,
 host-wide or per-shard, prefer `Host.Close()`, which drains the pipeline before
 sealing so the engine does not take an `ErrBarrierSealed` storm.
 

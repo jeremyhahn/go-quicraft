@@ -163,7 +163,7 @@ exercises churn, and the invariant itself is checked by
 ### Wire and persisted formats
 
 Read [docs/wire-protocol/engineering.md](docs/wire-protocol/engineering.md) and
-[docs/compatibility.md](docs/compatibility.md) first.
+[docs/compatibility/](docs/compatibility/architecture.md) first.
 
 - **Every format is pinned at version 1 until the first stable release.** A
   pre-1.0 layout change is made in place at version 1. Do not add a decode path

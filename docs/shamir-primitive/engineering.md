@@ -199,7 +199,10 @@ owns them: `Destroy()` releases every one, and an abandoned result holds N locke
 allocations against `RLIMIT_MEMLOCK` for the life of the process. Its
 `"shares"` JSON is an array of share objects, the encoding every other share
 surface uses, and `ShamirInitResult.UnmarshalJSON` decodes it through
-`shamir.UnmarshalShareSet`, so it is budgeted like any other ingestion.
+`shamir.UnmarshalShareSet`, so it is bounded like any other ingestion (255 shares,
+`MaxShareSetBytes`). It is not charged to an allocator, because
+`json.Unmarshaler` fixes its signature; a budgeted caller decodes the `"shares"`
+member itself through `shamir.UnmarshalShareSetWith`.
 
 ### The protected sealing pair
 
@@ -464,6 +467,9 @@ unauthenticated caller-supplied metadata.
 | `*IntegrityError` | none | never. Deprecated; retained so existing callers compile. |
 
 - All five are concrete pointer types; match with `errors.As`.
+- `UnmarshalShareSet` returns a document that is not a JSON array as
+  `encoding/json`'s own error, unwrapped and outside the five; the bounds and the
+  per-element checks run only once the array has decoded.
 - Error strings name the offending share by its position in the input slice
   (`"share 3 has zero x-coordinate"`), not by custodian identity; this package has
   no notion of one.

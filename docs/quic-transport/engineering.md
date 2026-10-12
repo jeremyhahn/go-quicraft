@@ -211,10 +211,9 @@ pre-opened streams diverging from the pool's bookkeeping.
   before any user code runs; then the diagnostics (contained) and the
   callbacks, one per target, in order, each isolated (`supervise.RunEach`), so
   a callback that panics or calls `runtime.Goexit` skips neither the others nor
-  any eviction.
-- `reapPeerIncarnations` forgets a peer's incarnation record once the address has
-  had neither a cached outbound nor traffic for `peerIncarnationRetention`
-  (10 × the interval, so 5 minutes).
+  any eviction. It also calls `reapPeerIncarnations`, which forgets a peer's
+  incarnation record once the address has had neither a cached outbound nor
+  traffic for `peerIncarnationRetention` (10 × the interval, so 5 minutes).
 - `revokeCheckConnections` re-runs the revocation verdict against every live
   inbound and outbound leaf. `VerifyConnection` fires only at handshake, so
   without this a certificate revoked after admission would keep its session for
@@ -223,6 +222,8 @@ pre-opened streams diverging from the pool's bookkeeping.
   for `inboundIdleRetention` (also 5 minutes). Nothing else can reclaim them:
   this node's keep-alive (10 s) sits below `MaxIdleTimeout` (30 s), so QUIC's
   idle timeout never fires on an accepted connection.
+- `sweepDialRefusals` drops identity-pin refusals older than
+  `dialRefusalCooldown` (1 s).
 
 The stamp used by the idle sweep is taken on every *frame*, not on stream
 acceptance. Senders cache and reuse one stream across bursts, so a connection
@@ -251,6 +252,7 @@ the code stays distinct per verdict because that is the protocol contract.
 | `0x6` | `QUICErrRevoked` | The peer's certificate is no longer admissible |
 | `0x7` | `QUICErrInboundIdle` | Reclaimed after `inboundIdleRetention` with no frames |
 | `0x8` | `QUICErrPeerRemoved` | A committed membership change removed this peer |
+| `0x9` | `QUICErrDialIdentity` | The peer did not present the identity bound to the destination: a fresh dial that failed the pin, or a pooled connection whose peer is no longer bound at the address (`replaceUnboundPeer`) |
 
 Stream-level codes: `QUICStreamErrReceiverGone` (`0x1`) means this receiver has
 abandoned the stream, `QUICStreamErrShutdown` (`0x2`) cancels a snapshot write
@@ -394,7 +396,8 @@ set it share the address and silently split its datagrams; on Windows it
 would let a socket bind over the live listener. A `setsockopt` failure is logged at WARN (on Unix, naming
 `net.core.rmem_max` / `net.core.wmem_max`) rather than failing startup, so a
 host with tight sysctls runs with the OS default instead of refusing to boot.
-Setting either buffer to 0 skips that call.
+Setting either buffer to a negative value skips that call; 0 is replaced
+with the 7 MB default before the socket is bound.
 
 ## Send path
 
@@ -1062,7 +1065,7 @@ range, because there is no version other than 1 to accept.
 pinned at 1 until the first production release. A frame layout change before
 then is made in place and every peer is rebuilt, so the byte does not move for
 it, and two builds from different commits can disagree on layout while both
-stamp `0x01`. See [Compatibility](../compatibility.md).
+stamp `0x01`. See [Compatibility](../compatibility/architecture.md).
 
 **Decompression limit:** Payloads are decompressed only if the decompressed
 size is within `MaxDecompressedSize`, which is PINNED to `MaxFrameSize` (16 MB)
@@ -1354,7 +1357,7 @@ against its SANs, so a wildcard certificate proves nothing about it, and it is
 unchanged by certificate renewal on the same keypair. It reaches membership only
 through consensus or the operator anchor (`Config.MemberIdentities`), never
 captured from a connection. See
-[Compatibility](../compatibility.md#node-identities-are-mandatory).
+[Compatibility](../compatibility/architecture.md#node-identities-are-mandatory).
 
 The internal transport builds separate server and client `tls.Config`
 instances from the provided PEM material. The `ServerName` field on the client
@@ -1424,7 +1427,9 @@ connection down for one shard's committed removal, it has to establish that no
 other shard still resolves a replica to the same address.
 
 The registry is populated by `Host.StartShard()` when members are registered,
-and cleaned by `Host.StopShard()` when a shard is unloaded.
+kept current as membership changes apply and as the message handler learns a
+certificate-covered sender address (`learnFromSource`), and cleaned by
+`Host.StopShard()` when a shard is unloaded.
 
 ### Address resolution flow
 
@@ -1464,8 +1469,8 @@ is dropped at Debug level and counted as `unresolved_target`.
 | `MaxConnectionsPerIP`           | int           | 16             | Concurrent inbound connections per source IP |
 | `MaxIncomingConnections`        | int           | 256            | Total inbound connection limit       |
 | `SendBatchMaxSize`              | int           | 64 KB          | Initial capacity of pooled send buffers; it does not cap a batch |
-| `UDPRecvBufSize`                | int           | 7 MB           | `SO_RCVBUF`; 0 uses the OS default   |
-| `UDPSendBufSize`                | int           | 7 MB           | `SO_SNDBUF`; 0 uses the OS default   |
+| `UDPRecvBufSize`                | int           | 7 MB           | `SO_RCVBUF`; 0 takes the default, a negative value leaves the OS default |
+| `UDPSendBufSize`                | int           | 7 MB           | `SO_SNDBUF`; 0 takes the default, a negative value leaves the OS default |
 | `Enable0RTT`                    | bool          | false          | 0-RTT reconnection; replayable, and the receive path refuses 0-RTT frames anyway |
 | `DisableCompression`            | bool          | false          | Disable Snappy compression           |
 | `TransportDisabled`             | bool          | false          | Skip mTLS validation and skip building the transport (same effect as `WithoutTransport()`) |
@@ -1539,7 +1544,8 @@ checked-in key is a real key.
 
 **Coverage** (measured 2026-10-02): `pkg/internal/transport` 91.4%,
 `revocation` 99.0%, `registry` and `netaddr` 100%. The repository floor is
-`COVER_MIN = 91`, applied to the module total.
+`COVER_MIN = 91`, applied to the module total (`make coverage`) and to every
+package under `pkg/` (`make coverage-packages`).
 
 ## Observability
 
@@ -1560,6 +1566,7 @@ The signals worth alerting on:
 | `IncMessagesDropped` with `identity_mismatch` | a destination replica's bound identity is not what the peer at its address presents |
 | `IncSnapshotsRejected` with `concurrency_limit` or `memory_budget` | snapshot transfers are being shed |
 | `IncUnauthorizedMessageDropped` with `identity_mismatch` | a forged `From`, or a stale identity after a key rotation; never routine |
+| `IncUnauthorizedMessageDropped` with `missing_identity` | committed membership names the sender but records no node identity for it, so nothing can authorize it; every message from that member is dropped |
 | `OnConnectionFailed` events | dial failures, including TLS handshake refusals and revoked peers |
 
 **Logging** (`log/slog`). The events worth alerting on:
@@ -1585,6 +1592,6 @@ address, both of which are already public.
 - [Raft Protocol](../raft-consensus/engineering.md) -- snapshot state machine, `SnapshotStatus` sequencing, replication
 - [Engine Pipeline](../raft-consensus/engineering.md) -- step workers, ready loop, LogReader buffer ownership
 - [Encryption](../seal-barrier/architecture.md) -- barrier epochs, at-rest snapshot and WAL sealing
-- [Compatibility](../compatibility.md) -- wire-version pinning, node identities
+- [Compatibility](../compatibility/architecture.md) -- wire-version pinning, node identities
 - [Session Deduplication](../client-sessions/engineering.md) -- Entry session fields and at-most-once delivery
 - [Deployment](../multi-group-host/user.md) -- certificate issuance, per-node SAN requirements

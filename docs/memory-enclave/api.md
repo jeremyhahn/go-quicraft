@@ -72,8 +72,21 @@ destroy it rather than return material whose protection was not established.
 
 ```go
 e, err := enclave.NewMemoryEnclaveSized(n)
-err = e.WithBytes(func(dst []byte) error { /* produce material here */ })
-err = e.Freeze() // a stray write faults from here
+if err != nil {
+	return nil, err
+}
+if err := e.WithBytes(func(dst []byte) error {
+	_, err := io.ReadFull(rand.Reader, dst) // produce material here
+	return err
+}); err != nil {
+	_ = e.Destroy()
+	return nil, err
+}
+if err := e.Freeze(); err != nil { // a stray write faults from here
+	_ = e.Destroy() // refused: still writable, so never hand it out
+	return nil, err
+}
+return e, nil
 ```
 
 go-quicraft uses this shape for the unsealed root key, a Shamir share value and a
@@ -109,7 +122,7 @@ func (s *SealedEnclave) Destroy() error // always nil today
 |---|---|
 | Request | `ctx`, which bounds the open (`OpenWith` also takes the `Allocator` to charge the destination against) |
 | Response | a new `*MemoryEnclave` holding the plaintext, `mlock`'d and FROZEN read-only. The caller owns it and must `Destroy` it. Each call returns an independent enclave. |
-| Errors | `ErrEnclaveDestroyed`, `ErrSealedAuthentication`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrOpenFailed`; `OpenWith` adds `ErrNilAllocator` and `ErrBudgetExhausted`. A context that has ended fails the open with an error matching both `ErrOpenFailed` and `ctx.Err()`, and leaves the sealed value intact. |
+| Errors | `ErrEnclaveDestroyed`, `ErrSealedAuthentication`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy`), `ErrOpenFailed`; `OpenWith` adds `ErrNilAllocator` and `ErrBudgetExhausted`. A context that has ended fails the open with an error matching both `ErrOpenFailed` and `ctx.Err()`, and leaves the sealed value intact. |
 | Permission | none |
 
 The plaintext never reaches the ordinary Go heap: the destination is allocated
@@ -158,10 +171,12 @@ with it `OpenString` and `NewMemoryEnclaveFromString`.
 every call after a successful release. It returns `ErrReleasedWithoutWipe` when
 a denied `mprotect` forced a bare unmap (the pages are gone), and
 `ErrLockedMemoryUnavailable` when the kernel refused the release (the pages are
-still held, and calling `Destroy` again retries). The two are disjoint. A bare
+still held, and calling `Destroy` again retries). The two are disjoint. It
+returns `ErrEnclaveCorrupted` when the canary or guard pages were overwritten;
+the pages are still wiped and released, and `Destroy` never panics. A bare
 `defer e.Destroy()` still compiles and discards the report; go-quicraft's own
 cleanup paths log it (`pkg/seal`) or document why they drop it
-(`pkg/crypto/shamir`). Detected canary corruption still panics.
+(`pkg/crypto/shamir`).
 
 `fn` must not let the slice escape and must not re-enter the same enclave. It may
 use a different enclave: go-enclave holds only the borrowed enclave's own read
@@ -187,6 +202,7 @@ var ErrEmptyEnclave            = errors.New("enclave: refusing to create an encl
 var ErrInvalidSize             = errors.New("enclave: enclave size must be positive and small enough to map")
 var ErrLockedMemoryUnavailable = errors.New("enclave: could not allocate locked memory")
 var ErrReleasedWithoutWipe     = errors.New("enclave: pages unmapped without an in-process wipe; mprotect was denied")
+var ErrEnclaveCorrupted        = errors.New("enclave: canary verification failed; memory ahead of the enclave was overwritten")
 var ErrSealFailed              = errors.New("enclave: could not seal material")
 var ErrOpenFailed              = errors.New("enclave: could not open sealed material")
 var ErrSealedAuthentication    = errors.New("enclave: sealed material failed authentication")

@@ -835,10 +835,10 @@ These live in the internal package to avoid an import cycle with `pkg`.
 ### Propagation
 
 - An error from your `Update` propagates out of `Apply` and fails the shard;
-  the proposal in flight fails with an `*ApplyError` (`ShardID`, `ReplicaID`,
-  `Err`) that unwraps to yours, so `errors.Is` finds your sentinel.
+  every proposal in the failed batch fails with an `*ApplyError` (`ShardID`,
+  `ReplicaID`, `Err`) that unwraps to yours, so `errors.Is` finds your sentinel.
 - A panic in your code is recovered by the apply worker, logged with its stack,
-  and fails the shard; the proposal in flight fails with the `*SMPanicError`
+  and fails the shard; every proposal in the batch fails with the `*SMPanicError`
   itself (`Value`, `Stack`), which matches `ErrShardFailed`. Every other
   proposal pending on the shard fails with `ErrShardFailed`.
 - Those entries are committed and a reload replays them, so each of those

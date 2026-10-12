@@ -16,7 +16,7 @@ QuicRaft has not reached 1.0. There is no long-term support branch and no
 backporting: a security fix is released as the next `0.x` version. Before 1.0,
 on-disk formats can change in place, so upgrading may mean wiping a replica's
 data directory and re-syncing it from peers. See [CHANGELOG.md](CHANGELOG.md)
-and [docs/compatibility.md](docs/compatibility.md).
+and [docs/compatibility/](docs/compatibility/architecture.md).
 
 ## Reporting a vulnerability
 

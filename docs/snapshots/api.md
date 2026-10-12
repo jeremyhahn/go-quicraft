@@ -33,7 +33,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 |---|---|
 | Request | the shard and a `SnapshotOption`; `DefaultSnapshotOption` (the zero value) uses the shard's defaults |
 | Response | a `*RequestState` whose result carries the snapshot index, or the index directly from the sync form |
-| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`. From the save: `*SnapshotFailedError` (wrapping `*SnapshotSavePanicError` when `SaveSnapshot` panicked), `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`. The sync form also returns `ErrTimeout` or `ErrCanceled`. |
+| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`, and `ErrCanceled` / `ErrTimeout` for a context already done (nothing is started). From the save: `*SnapshotFailedError` (wrapping `*SnapshotSavePanicError` when `SaveSnapshot` panicked), `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`. The sync form also returns `ErrTimeout` or `ErrCanceled`. |
 | Permission | none; in-process call |
 
 ```go
@@ -91,7 +91,7 @@ func WithImportMemberIdentities(identities map[uint64]string) ImportOption
 |---|---|
 | Request | the shard, a reader, and optionally the shard's data directory, a replacement membership, and node identities for the resulting membership |
 | Response | none |
-| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed` |
+| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed`. Before anything is read: `ErrInvalidOperation` (the shard is running on this host, or this host holds data for more than one of its replicas), `ErrShardNotFound` (no replica of the shard on this host), `ErrDiskFull`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
 | Permission | none in this library |
 
 **This rewrites the replica's membership.** It is an offline, deliberate
@@ -227,5 +227,5 @@ encryption is on. See [the state-machine API](../state-machines/api.md).
   `proto.WireVersion`, and its embedded `Membership` carries its own section
   version.
 - Format versions stay pinned until the first production release; see
-  [Compatibility](../compatibility.md).
+  [Compatibility](../compatibility/architecture.md).
 - Nothing here is deprecated.

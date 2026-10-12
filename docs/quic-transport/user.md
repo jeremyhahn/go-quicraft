@@ -70,7 +70,9 @@ Every admission names it:
   `SyncRequestAddObserverWithIdentity` and `SyncRequestAddWitnessWithIdentity`
   (and their async `Request*` forms). The identity-less `RequestAddNode`,
   `RequestAddObserver` and `RequestAddWitness` return
-  `ErrMemberIdentityRequired` on a host with a transport.
+  `ErrMemberIdentityRequired` on a host with a transport, unless the
+  configuration already binds that replica (a role change such as promoting an
+  observer keeps its existing binding).
 
 ```go
 err := host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID,
@@ -81,7 +83,7 @@ There is no setting for this; it follows from the host having a transport.
 Renewing a certificate on the same keypair keeps the identity. A new keypair is
 a new identity, and a restarted host must present the identity the shard
 committed for it. The full procedure is in
-[`../compatibility.md`](../compatibility.md#node-identities-are-mandatory).
+[`../compatibility.md`](../compatibility/architecture.md#node-identities-are-mandatory).
 
 ## Task: turn on revocation
 
@@ -115,7 +117,7 @@ peer loses its existing sessions too.
 The defaults suit an ordinary cluster. The ones worth revisiting:
 
 ```go
-cfg.TransportConfig.UDPRecvBufSize = 7 << 20 // 0 uses the OS default, usually far smaller
+cfg.TransportConfig.UDPRecvBufSize = 7 << 20 // the default; negative leaves the OS default, usually far smaller
 cfg.TransportConfig.UDPSendBufSize = 7 << 20
 cfg.TransportConfig.MessageReceiveBudgetFrames = 4 // or set MaxMessageReceiveMemory outright
 cfg.TransportConfig.MaxSnapshotReceiveRate = 256 << 20

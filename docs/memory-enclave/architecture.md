@@ -170,7 +170,8 @@ into a self-deadlock. go-enclave has no such path.
 
 A borrow bounds the enclave's lifetime against the callback, not against a slice
 the caller kept, and that remains a caller obligation. `WithBytes` is the only
-read path: it holds the read lock across the caller's use, so a concurrent
+path that hands out the bytes (`EqualTo` compares in place and returns only a
+verdict): it holds the read lock across the caller's use, so a concurrent
 `Destroy` or `Freeze` waits for the callback to return. Each borrow is scoped to
 the code that uses the bytes, and nothing is copied out of it.
 
@@ -211,7 +212,13 @@ still holds.
 kernel refused the release and the pages are still held; go-enclave keeps them
 on its `WipeAll` ledger and a later `Destroy` retries. `ErrReleasedWithoutWipe`
 means a denied `mprotect` forced a bare unmap: the pages are gone, and the
-kernel zeroes them before reuse. The two are disjoint.
+kernel zeroes them before reuse. The two are disjoint. A third,
+`ErrEnclaveCorrupted`, means the canary or guard pages were overwritten; the
+pages are still wiped and released.
+
+`SealedEnclave.Destroy` returns an error too, always `nil` in go-enclave
+v0.8.0. `pkg/seal` logs a non-nil one at WARN through its own helper
+(`releaseSealed`), and `SoftwareStrategy.Close` returns it.
 
 Every `MemoryEnclave` this repository destroys is a cleanup step whose operation
 already has its result, so the report never replaces that result. `pkg/seal`

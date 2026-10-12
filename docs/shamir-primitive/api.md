@@ -103,7 +103,8 @@ the page-rounded locked cost of the share values (`MaxShareSetBytes`) before
 allocating, and destroys the accepted prefix if a later element is rejected. A
 share whose locked memory is refused fails the set with a `*ProtectedMemoryError`
 naming the element, not a `*ValidationError`: the document was well formed, the
-host is out of locked memory. The caller's `data` buffer still holds share
+host is out of locked memory. A document that is not a JSON array is returned as
+`encoding/json`'s own error, unwrapped. The caller's `data` buffer still holds share
 material afterwards and is the caller's to wipe. A consumer that bounds its
 locked memory with an allocator uses `UnmarshalShareSetWith` (see "Charge share
 memory to a locked-memory budget").
@@ -359,7 +360,12 @@ enclave the caller owns and must `Destroy`.
 `ShamirInitResult` is where a ceremony holds all N shares at once. Its JSON
 `"shares"` is an array of share objects, the same encoding `shamir.Share` and
 `shamir.ProtectedShare` produce. Its `UnmarshalJSON` decodes them through
-`shamir.UnmarshalShareSet`, so it inherits the budgeted ingestion bound.
+`shamir.UnmarshalShareSet`, so it inherits the 255-share and `MaxShareSetBytes`
+bounds. It is not charged to an allocator (`json.Unmarshaler` fixes its
+signature); a caller under a budget decodes the `"shares"` member itself, as a
+`json.RawMessage`, through `shamir.UnmarshalShareSetWith`. A rejected document
+leaves the receiver unchanged, and a reused receiver's old shares are destroyed
+before the new set replaces them.
 
 Implementer obligations: `ProtectedShareAccumulator` handles deduplication,
 ordering and TTL expiration, and is not required to be safe for concurrent use.

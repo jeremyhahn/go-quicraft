@@ -1,7 +1,7 @@
 # QuicRaft documentation
 
 > **Status: REFERENCE** · Scope: the index of this repository's documentation ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 
 Technical documentation for the QuicRaft multi-group Raft consensus library.
 
@@ -22,7 +22,7 @@ be told apart from an unwritten one.
 | writing a state machine | [state-machines/user.md](state-machines/user.md) |
 | deploying it | [multi-group-host/user.md](multi-group-host/user.md) |
 | looking for a function signature | [multi-group-host/api.md](multi-group-host/api.md) |
-| upgrading | [compatibility.md](compatibility.md) |
+| upgrading | [compatibility/user.md](compatibility/user.md) |
 
 ## Features
 
@@ -42,6 +42,7 @@ be told apart from an unwritten one.
 | [shamir-primitive](shamir-primitive/architecture.md) | the GF(2^8) split/combine primitive and the share-custody interfaces |
 | [memory-enclave](memory-enclave/architecture.md) | how this library holds key material: go-enclave locked memory and sealed enclaves |
 | [observability](observability/architecture.md) | metrics, logging and event notifications |
+| [compatibility](compatibility/architecture.md) | the pinned format-version policy, every version discriminator, the interface requirements for embedders, and upgrade notes for each release |
 
 ## Cross-feature documents
 
@@ -50,7 +51,6 @@ outside the feature folders.
 
 | Document | Description |
 |---|---|
-| [Compatibility and upgrades](compatibility.md) | the pinned format-version policy, every version discriminator, upgrade notes for each release, and the interface requirements for embedders. It spans `pkg/proto`, the WAL, snapshots and the sealed root key, so it sits outside the feature folders. |
 | [Testing overview](testing/overview.md) | how the suites are organised and run, coverage gates, the Makefile target reference |
 | [Testing infrastructure](testing/infrastructure.md) | build tags, fault injectors, fuzzing, linearizability verification, test helper packages, and the gates |
 | [Benchmark regression testing](testing/benchmarking.md) | `make bench-compare`, interleaved measurement, stored baselines |

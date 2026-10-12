@@ -227,4 +227,4 @@ in [`engineering.md`](engineering.md#error-types).
 - Nothing in this package is deprecated.
 
 The repository-wide policy and per-release upgrade procedure are in
-[`../compatibility.md`](../compatibility.md).
+[`../compatibility/`](../compatibility/architecture.md).

@@ -121,8 +121,11 @@ bootstrap.
 
 - A `ClientID` is eight bytes. `GetNewSession` draws it from the system CSPRNG;
   `RegisterSession` uses one the caller chose. The library performs no client
-  authentication, and two callers registering the same `ClientID` on a shard
-  share a session.
+  authentication. A second registration of a `ClientID` the shard still holds
+  is refused, but once that session expires anyone can register the ID again,
+  and a caller still holding the old session then proposes into the new one:
+  two callers using the same `ClientID` on a shard share its deduplication
+  state.
 - Authentication and tenancy belong to the layers above. Sessions are a
   correctness mechanism, not an authorization one.
 - The response cache holds application result data and is snapshotted and

@@ -344,4 +344,4 @@ The `Host` selects it with `WithMemoryLogDB()`.
 - `Options.MaxBatchSize` is deprecated and has no effect.
 
 The policy and the per-release upgrade notes are in
-[`../compatibility.md`](../compatibility.md).
+[`../compatibility/`](../compatibility/architecture.md).

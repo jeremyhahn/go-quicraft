@@ -827,7 +827,7 @@ once.
 | Error | Meaning |
 |---|---|
 | `*LeaderUnavailableError` | `ctx` ended while waiting for a leader. `errors.Is` matches `ErrNoLeader` (none known) or `ErrLeadershipChanged` (leadership moving), and `ErrTimeout` or `ErrCanceled`. Temporary. |
-| `ErrTimeout` / `ErrCanceled` | `ctx` ended with an attempt still in flight to a leader the view still names. |
+| `ErrTimeout` / `ErrCanceled` | `ctx` had already ended when the call was made, or ended with an attempt still in flight to a leader the view still names. |
 | `*LeaderHandlerError` | The handler ran and failed, panicked, or returned a reply over the payload limit. Carries the leader, the term and the error text. |
 | `ErrLeaderHandlerNotRegistered` | The leader has no handler for the shard. |
 | `ErrBusy` | The leader is already executing 1024 remote requests. Nothing ran. |
@@ -1015,10 +1015,15 @@ Removes all persistent data for a replica (log, snapshots, metadata) and retires
 its replica ID on this host, across restarts: `StartShard` refuses it with
 `*ReplicaRetiredError`, because its term, vote and any lease vote window it owed
 are gone with its data and it could otherwise vote twice in one term. Rejoin
-under a new replica ID. The shard must be stopped first. `SyncRemoveData` behaves
-identically and exists for naming consistency.
+under a new replica ID. If the replica is loaded on this host it must be stopped
+first; a shard that is not loaded needs nothing. `SyncRemoveData` behaves
+identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
+`ctx` that has already ended, and exists for naming consistency.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `*ShardNotStoppedError`.
+**Errors:** `ErrClosed`, `*ShardNotStoppedError`, `ErrShardNotReady` (a
+`StartShard` for the shard is in progress), `ErrImportInProgress` (an
+`ImportSnapshot` for the shard is in progress), and LogDB errors. Retry the two
+transient refusals.
 
 ### Replica management
 
@@ -1031,7 +1036,12 @@ func (h *Host) HasNodeInfo(shardID, replicaID uint64) bool
 `StopReplica` checks that `replicaID` is this host's replica of the shard (a
 host runs at most one) and then stops the shard. `RequestCompaction` compacts
 the log for the pair, reclaiming entries superseded by snapshots. Both return
-`ErrClosed`, `ErrShardNotFound` or `*ReplicaNotFoundError`.
+`ErrClosed`, or `*ReplicaNotFoundError` when the loaded replica has a different
+ID. `StopReplica` returns `ErrShardNotFound` for a shard that is not loaded, and
+otherwise whatever `StopShard` returns. `RequestCompaction` on a shard that is
+not loaded is not an error: it runs segment garbage collection for the pair, so
+the `StopShard`, `RemoveData`, `RequestCompaction` sequence succeeds. It never
+compacts a stopped replica's live log.
 
 `HasNodeInfo` reports whether LogDB holds bootstrap information for the pair. It
 returns false when the host is closed or the replica was never bootstrapped
@@ -1115,7 +1125,10 @@ that writes were lost.
 A concurrent or repeated `Close` blocks until the running shutdown finishes, then
 returns the same error.
 
-Order: drain, stop key rotation, stop the pending-request sweeper, stop the
+Order: mark the host closed and fire `OnNodeHostShuttingDown` (first caller
+only), drain, stop key rotation, stop the pending-request sweeper, end every
+leader-executed request (local callers get `ErrStopped`, and the handlers
+running for remote callers see their `ctx` end and are waited for), stop the
 engine, drain in-flight snapshot sends, stop the transport, fail pending
 requests with `ErrClosed`, close state machines, close LogDB, seal the host-wide
 barrier and every per-shard barrier the resolver returned (each once).
@@ -1163,8 +1176,11 @@ func (rs *RequestState) Deadline() time.Time
   after release.
 - `ApplyResultC` returns the same channel as `ResultC`, for readability when both
   appear in one `select`.
-- `Release` is idempotent. The object returns to the pool only once the caller
-  has released it and every pending-map reference is gone, so a `Sync*` caller
+- Call `Release` exactly once. The object is pooled, so a second call, later
+  or concurrent, is a use-after-free: once the first call has recycled the
+  object for a new request, nothing tells the stale call from that request's
+  own. The object returns to the pool only once the
+  caller has released it and every pending-map reference is gone, so a `Sync*` caller
   that times out and releases while the request is still registered cannot have
   a stale result delivered into a recycled object.
 
@@ -1250,9 +1266,12 @@ minted with it would be a no-op session that looked registered, and at-most-once
 delivery would be silently off. If the CSPRNG returns zero on every attempt, the
 call fails with `ErrEntropyDegenerate` instead of looping.
 
-**Errors:** `ErrClosed`, `ErrShardNotFound`, `ErrSessionsUnsupportedOnDisk`,
-`*NotLeaderError`, `ErrSystemBusy`, `*SessionError` (wrapping
-`ErrEntropyDegenerate`, or `ErrInvalidOperation` when the owner is at its cap).
+**Errors:** `ErrClosed`, `ErrDraining`, `ErrShardNotFound`,
+`ErrSessionsUnsupportedOnDisk`, `*NotLeaderError`, `ErrSystemBusy`,
+`ErrTimeout` / `ErrCanceled` from `ctx`, `*HostInitError` (field
+`session_rand`, wrapping `ErrEntropyDegenerate` or the random source's read
+error), and `*SessionError` wrapping `ErrInvalidOperation` when the
+registration was refused (the owner, or the shard, is at its session cap).
 The per-owner cap is a replicated refusal: every replica reaches it from the log.
 
 ```go
@@ -1277,8 +1296,11 @@ func (h *Host) GetNoOPSession(shardID uint64) *Session
 ```
 
 Returns a no-op session (client ID 0). It bypasses deduplication, so use it only
-for idempotent operations. It needs no registration and is the only session form
-an `sm.DiskStateMachine` shard supports.
+for idempotent operations. It needs no registration. `ProposeWithSession`
+refuses it with `ErrInvalidSession`: it stands for a sessionless `Propose` or
+`SyncPropose`, and exists for callers that model a no-op session explicitly and
+route it to that path themselves. On an `sm.DiskStateMachine` shard the
+sessionless path is the only way to propose.
 
 ### Constants and methods
 
@@ -1426,8 +1448,8 @@ are never wrapped.
 a transient condition clears, with no operator or caller action. It is true for
 exactly: `ErrBusy` (and so `ErrSystemBusy`, which is a `*BusyError`),
 `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`,
-`ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`,
-`ErrSnapshotInProgress`, `ErrImportInProgress`, `ErrTransferInProgress`,
+`ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrNoLeader`,
+`ErrLeadershipChanged`, `ErrSnapshotInProgress`, `ErrImportInProgress`, `ErrTransferInProgress`,
 `ErrSessionBusy`.
 
 **Everything else is permanent, including errors this package did not produce.**
@@ -1485,7 +1507,7 @@ Host and request lifecycle:
 |---|---|
 | `ErrClosed` | the Host is closed, or the request never started |
 | `ErrDraining` | new work submitted during drain |
-| `ErrStopped` | the shard or engine stopped underneath an in-progress snapshot save or recovery |
+| `ErrStopped` | the shard or engine stopped underneath an in-progress snapshot save or recovery, or the shard or host stopped while an `ExecuteOnLeader` request waited |
 | `ErrShutdownTimeout` | drain exceeded `ShutdownTimeout` |
 | `ErrAtRestEncryptionUnspecified` | `NewHost` was given no at-rest encryption choice |
 | `ErrAtRestEncryptionConflict` | `WithoutEncryption` combined with `WithBarrier` |
@@ -1506,12 +1528,12 @@ Shard state:
 | Error | Returned when |
 |---|---|
 | `ErrShardNotFound` | the shard is not loaded on this Host |
-| `ErrShardNotStarted` | the shard is registered but not initialized |
+| `ErrShardNotStarted` | declared, and `Temporary`, but not returned by any `Host` method; a shard still starting answers `ErrShardNotReady` |
 | `ErrShardNotReady` | the shard is initializing or starting |
 | `ErrShardAlreadyExists` | `StartShard` for a running shard |
 | `ErrShardNotStopped` | `RemoveData` on a loaded shard |
 | `ErrReplicaRetired` | `StartShard` of a replica ID `RemoveData` retired |
-| `ErrImportInProgress` | `StartShard` while an import of the shard runs |
+| `ErrImportInProgress` | `StartShard` or `RemoveData` while an import of the shard runs |
 | `ErrShardFailed` | the shard's failure latch tripped. A `*SMPanicError` matches it |
 | `ErrReplicaNotFound` | the replica ID does not match the replica on this host |
 | `ErrInvalidShardHealth` | `ShardHealth.UnmarshalJSON` got an unrecognized value |
@@ -1520,12 +1542,20 @@ Backpressure and leadership:
 
 | Error | Returned when |
 |---|---|
-| `ErrBusy` | the per-shard in-memory log exceeded `MaxInMemLogSize` |
+| `ErrBusy` | the per-shard in-memory log exceeded `MaxInMemLogSize`, or the leader was already executing 1024 remote `ExecuteOnLeader` requests |
 | `ErrSystemBusy` | the global limit `MaxTotalInMemLogSize` was exceeded, or a read queue is full. It is a `*BusyError`, so `errors.Is(err, ErrBusy)` is also true |
 | `ErrDiskFull` | WAL usage reached the full threshold of `MaxWALDiskSize` |
 | `ErrNotLeader` | sentinel form of `*NotLeaderError` |
 | `ErrReadIndexNotReady` | the leader has no committed entry in its current term |
 | `ErrTransferInProgress` | a leadership transfer is under way; raised before the entry enters the log |
+
+Leader-executed requests (see [Leader-executed requests](#leader-executed-requests)):
+
+| Error | Returned when |
+|---|---|
+| `ErrNoLeader` | cause inside a `*LeaderUnavailableError`: `ctx` ended while the shard had no known leader |
+| `ErrLeadershipChanged` | cause inside a `*LeaderUnavailableError`: `ctx` ended while leadership was moving and no leader of a later term answered |
+| `ErrLeaderHandlerNotRegistered` | the shard's leader has no `LeaderHandler` for the shard. Nothing ran |
 
 Validation:
 
@@ -1560,11 +1590,11 @@ Sessions:
 
 | Error | Returned when |
 |---|---|
-| `ErrSessionLimitExceeded` | the shard-wide or per-owner session limit is reached. `ErrTooManySessions` is an alias for the same value |
-| `ErrSessionNotFound` | the referenced session does not exist |
+| `ErrSessionLimitExceeded` | declared but not returned by any `Host` method: a registration refused at the shard-wide or per-owner cap surfaces as a `*SessionError` wrapping `ErrInvalidOperation`. `ErrTooManySessions` is an alias for the same value |
+| `ErrSessionNotFound` | declared but not returned by any `Host` method |
 | `ErrSessionExpired` | sentinel form of `*SessionExpiredError` |
-| `ErrSessionAlreadyExists` | registering a duplicate session |
-| `ErrResponseLimitExceeded` | the session response cache is full |
+| `ErrSessionAlreadyExists` | declared but not returned by any `Host` method |
+| `ErrResponseLimitExceeded` | declared but not returned by any `Host` method |
 | `ErrSessionsUnsupportedOnDisk` | any session entry point on an `sm.DiskStateMachine` shard |
 | `ErrEntropyDegenerate` | the system CSPRNG returned the rejected value on every attempt while minting a client ID |
 
@@ -1623,15 +1653,17 @@ Each type below implements `error`; those with an `Err` field implement
 | Type | Fields | Meaning |
 |---|---|---|
 | `NotLeaderError` | `ShardID`, `LeaderID` (0 if unknown), `LeaderAddress` (empty if unknown) | Returned by membership calls and `RequestLeaderTransfer` on a non-leader, and by `Propose` when no leader is known. Matches `ErrNotLeader`. Prefer `NotLeader(err)`, which also matches the bare sentinel |
+| `LeaderUnavailableError` | `ShardID`, `Cause`, `Err` | `ExecuteOnLeader`'s `ctx` ended before a leader answered. `Unwrap() []error` returns `Cause` (`ErrNoLeader` or `ErrLeadershipChanged`) and `Err` (`ErrTimeout` or `ErrCanceled`), so `errors.Is` matches both and `Temporary` is true |
+| `LeaderHandlerError` | `ShardID`, `LeaderID`, `Term`, `Message` | The leader's `LeaderHandler` ran and failed, panicked, or returned a reply over the payload limit. The request was executed, by `LeaderID` under `Term`. `Message` is the error text, which is all that crosses the transport. No `Unwrap` |
 | `EntryTooLargeError` | `Size`, `MaxSize` | `len(cmd)` exceeded the effective limit; `MaxSize` is that limit. Matches `ErrEntryTooLarge` |
 | `BusyError` | `ShardID`, `CurrentSize`, `MaxSize`, unexported message | Per-shard rate limit. `ErrSystemBusy` is itself a `*BusyError`, so one `errors.Is(err, ErrBusy)` catches both limiters |
-| `SessionError` | `ClientID`, `Op` ("register" or "unregister"), `Err` | A session register or unregister failed: `ErrInvalidOperation` at a session cap, `ErrEntropyDegenerate` when no client ID could be minted |
+| `SessionError` | `ClientID`, `Op` ("register" or "unregister"), `Err` | A session registration failed: `ErrInvalidOperation` when it was refused (a session cap), `ErrInvalidSession` when `RegisterSession` was given client ID 0. A client ID that could not be minted is a `*HostInitError` wrapping `ErrEntropyDegenerate` instead |
 | `SessionExpiredError` | `ShardID`, `ClientID` | A session-managed proposal named a client ID whose session is no longer registered. Matches `ErrSessionExpired` |
 | `ShardNotStoppedError` | `ShardID`, `ReplicaID` | `RemoveData` on a running shard. Matches `ErrShardNotStopped` |
 | `ReplicaNotFoundError` | `ShardID`, `ReplicaID` | The replica ID does not match the local replica (`StopReplica`, `RequestCompaction`) or names no member (`RequestLeaderTransfer`). Matches `ErrReplicaNotFound` |
 | `ReplicaRetiredError` | `ShardID`, `ReplicaID` | `StartShard` of a retired replica ID. Matches `ErrReplicaRetired` |
 | `StaleConfigChangeError` | `ShardID`, `Expected`, `Got` | The `configChangeIndex` guard failed. Matches `ErrStaleConfigChange`. Re-read membership; the identical request fails forever |
-| `HostInitError` | `Field`, `Err` | A component failed in `NewHost` or `StartShard`; `Field` names it. `Err` is a public value: a stdlib or `pkg/logdb`/`pkg/proto`/`pkg/config` error, the state machine's own error, or one of the re-exports in this section (for example `snapshot_integrity` carries `*SnapshotMetaInvalidError` or `ErrSnapshotSizeMismatch`, `snapshot_decrypt` a `*SnapshotEncryptError`, `transport` a `*CACertificateParseError` or `ErrInvalidCertKeyPair`) |
+| `HostInitError` | `Field`, `Err` | A component failed in `NewHost` or `StartShard`; `Field` names it. Session registration also returns one, `session_rand`, when no client ID could be drawn. `Err` is a public value: a stdlib or `pkg/logdb`/`pkg/proto`/`pkg/config` error, the state machine's own error, or one of the re-exports in this section (for example `snapshot_integrity` carries `*SnapshotMetaInvalidError` or `ErrSnapshotSizeMismatch`, `snapshot_decrypt` a `*SnapshotEncryptError`, `transport` a `*CACertificateParseError` or `ErrInvalidCertKeyPair`) |
 | `SnapshotSendError` | `ShardID`, `ReplicaID`, `Op`, `Err` | A snapshot send failed; `Op` names the step |
 | `SnapshotReceiveError` | `ShardID`, `ReplicaID`, `Op`, `Err` | A snapshot receive failed; `Op` names the step |
 | `SnapshotChunkError` | `ChunkID`, `ChunkCount`, `Reason` | Cause inside a `SnapshotReceiveError` with `Op` "validate": the delivered chunks are not one snapshot |
@@ -1869,7 +1901,7 @@ Source: `pkg/config/hostconfig.go`.
 | `RTTMillisecond` | `uint64` | `200` | estimated round-trip time in ms; 1 to 60000 |
 | `DeploymentID` | `uint64` | required, non-zero | cluster identity token. Not cryptographic; use a separate CA per cluster for cryptographic isolation |
 | `AllowZeroDeploymentID` | `bool` | `false` | permits `DeploymentID == 0`, for development and tests |
-| `HostID` | `string` | `""` | when empty, a random 128-bit hex ID is generated and stored in `NodeHostDir/host.id` |
+| `HostID` | `string` | `""` | when empty, the ID in `NodeHostDir/host.id` is used; if that file is absent or malformed, a random 128-bit hex ID is generated and written there |
 | `NumWorkers` | `uint64` | `runtime.NumCPU()` | workers per tier |
 | `MaxApplyWorkers` | `int` | `runtime.NumCPU()` | concurrent per-shard apply goroutines |
 | `CommitCBufferSize` | `int` | `64` | commit channel buffer per worker |
@@ -1906,7 +1938,7 @@ Source: `pkg/config/config.go`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `ShardID` | `uint64` | required | shard identifier |
-| `ReplicaID` | `uint64` | required | replica identifier within the shard |
+| `ReplicaID` | `uint64` | required | replica identifier within the shard; at most `math.MaxUint32`, because the proposal key packs it |
 | `IsObserver` | `bool` | `false` | non-voting. Initial hint only; the committed membership decides |
 | `IsWitness` | `bool` | `false` | voting, no state machine. Binding; join-only |
 | `Witness` | `WitnessConfig` | zero value | seeds the replicated witness policy at bootstrap |
@@ -1922,7 +1954,7 @@ Source: `pkg/config/config.go`.
 | `MaxInMemLogSize` | `uint64` | `0` (disabled) | per-shard rate limit in bytes |
 | `MaxProposalPayloadSize` | `uint64` | `8 MB` | user-facing proposal cap; may not exceed `proto.MaxEntrySize` |
 | `MaxEntrySize` | `uint64` | `8 MB` | entry cap and the decompression ceiling on apply; may not exceed `proto.MaxEntrySize` |
-| `MaxApplyEntrySize` | `uint64` | `16711672` | replication chunk size and `SM.Update` batch bound (`config.MaxReplicationPayloadBytes`, the most a frame can carry) |
+| `MaxApplyEntrySize` | `uint64` | `16711672` | entry bytes one outbound replication message carries; may not exceed `config.MaxReplicationPayloadBytes`, the most a frame can carry. Despite the name it does not bound an `SM.Update` batch, which a fixed internal 64 MiB limit governs |
 | `MaxSnapshotSize` | `uint64` | `4 GB` | maximum snapshot file size |
 | `MaxSessionsPerClient` | `uint64` | `128` | cached responses per session. Bootstrap seed; replicated |
 | `MaxTotalSessions` | `uint64` | `16384` | shard-wide session cap. Bootstrap seed; replicated |
@@ -1963,9 +1995,12 @@ exceeds a non-zero `SnapshotEntries`.
 effective limit is the smaller. Set the first to impose a tighter user-facing
 cap.
 
-`LeaseRead` also assumes every replica uses the same `ElectionRTT`,
-`RTTMillisecond` and `LeaseRead`, and that clock rates differ by less than 1%.
-See [raft-consensus](../raft-consensus/engineering.md#15-leaseread).
+`LeaseRead` does not need every replica configured alike to be safe: each
+heartbeat acknowledgement carries the vote window its sender promises, and a
+follower that promises less than the lease (a shorter `ElectionRTT` or
+`RTTMillisecond`, or no `LeaseRead`) backs no lease, so reads take the
+heartbeat round. Configure replicas alike for lease reads to be fast. Safety
+does assume that clock rates differ by less than 1%. See [raft-consensus](../raft-consensus/engineering.md#15-leaseread).
 
 > **`IsObserver` is an initial hint; `IsWitness` is binding.** The authoritative
 > role is in replicated membership (`Membership.Observers`,
@@ -2072,6 +2107,7 @@ for the ones a caller may want to match:
 | `*MaxProposalPayloadSizeExceededError` | `MaxProposalPayloadSize` exceeds `proto.MaxEntrySize` |
 | `*SessionExpiryEntriesTooSmallError` | `SessionExpiryEntries` is non-zero and below 100 |
 | `*KeyRotationIntervalTooSmallError` | `KeyRotationInterval` is non-zero and below 1s |
+| `*MaxMessageReceiveMemoryTooSmallError` | an explicit `TransportConfig.MaxMessageReceiveMemory` cannot hold one maximum-size frame |
 | `*LeaseReadRequiresCheckQuorumError` (`ErrLeaseReadRequiresCheckQuorum`) | `LeaseRead` with `CheckQuorum` disabled |
 | `*MTLSConfigRequiredError` (`ErrMTLSConfigRequired`) | transport enabled with no `MTLSConfig` |
 
@@ -2269,10 +2305,13 @@ type EventListener struct { /* 27 optional func fields */ }
 ```
 
 Set only the callbacks you need; nil callbacks are not invoked. Engine events
-(leader updates, leader read readiness, leader loss, campaign launches, shard failure, log compaction,
-snapshot creation, snapshot rejection) are delivered in FIFO order on one
+(leader updates, leader read readiness, leader loss, campaign launches, shard failure, log and
+LogDB compaction, snapshot creation, compaction and recovery, snapshot rejection) are delivered in FIFO order on one
 dispatcher goroutine that holds no engine lock, so a handler may call any Host method, including
-`StopShard`. Other callbacks run synchronously on the goroutine that produced
+`StopShard`. The dispatcher's queue is bounded: when it is full, a leader
+change or readiness notification is re-published on the next tick, and any
+other dispatched notification is dropped and logged at ERROR
+(`listener notification dropped`, naming the event). Other callbacks run synchronously on the goroutine that produced
 them. Every callback must return promptly.
 
 Raft events:
@@ -2285,8 +2324,8 @@ Raft events:
 | `OnCampaignLaunched` | `EventShardInfo` | an election campaign started |
 | `OnCampaignSkipped` | `EventShardInfo` | **never fires**; see below |
 | `OnSnapshotRejected` | `SnapshotInfo` | a snapshot was rejected: a request refused or abandoned, a save that panicked, an inbound transfer refused, or a recovery that failed before the state machine's `RecoverFromSnapshot` was invoked (the engine re-drives it). `SnapshotInfo.Err` carries the cause when there is one |
-| `OnProposalDropped` | `EventShardInfo` | a proposal was dropped |
-| `OnReadIndexDropped` | `EventShardInfo` | a ReadIndex request was dropped |
+| `OnProposalDropped` | `EventShardInfo` | a proposal could not be handed to the shard and was failed with `ErrDropped` |
+| `OnReadIndexDropped` | `EventShardInfo` | a ReadIndex request could not be handed to the shard and was refused with `ErrSystemBusy` |
 
 **`OnLeaderReady` and the end of readiness.** Raft lets a new leader serve
 ReadIndex only after it has committed an entry of its own term (thesis §6.4);
@@ -2327,7 +2366,7 @@ System events:
 | `OnNodeDeleted` | `EventShardInfo` | a replica's data was removed |
 | `OnNodeHostShuttingDown` | none | host shutdown started |
 | `OnConnectionEstablished` | `ConnectionInfo` | a QUIC connection to a peer was established |
-| `OnConnectionFailed` | `ConnectionInfo` | a QUIC connection attempt failed |
+| `OnConnectionFailed` | `ConnectionInfo` | a QUIC connection to a peer failed to establish or was lost |
 | `OnSnapshotSendStarted` | `SnapshotInfo` | a snapshot transfer started |
 | `OnSnapshotSent` | `SnapshotInfo` | a snapshot transfer was sent |
 | `OnSnapshotSendAborted` | `SnapshotInfo` | a snapshot transfer was abandoned |
@@ -2343,8 +2382,8 @@ Failure events:
 | Callback | Payload | Fired when |
 |---|---|---|
 | `OnShardFailed` | `ShardFailedInfo` | the shard's failure latch tripped, once per shard incarnation, reporting the failure that tripped it; failures that race it are not reported again. Causes: SM error or panic, commit or save-state failure, a step-worker `GetUpdate` error, a snapshot recovery that failed or panicked once the state machine's `RecoverFromSnapshot` was invoked, a recovery whose every re-driven attempt was rejected before the restore (`*SnapshotRecoveryExhaustedError`), a corrupt committed config entry. The shard is offline until reloaded. Not fired for a failed snapshot save, which leaves the shard running (it is logged and returned to the `RequestSnapshot` caller), for a recovery that failed before `RecoverFromSnapshot` was invoked while attempts remain (rejected through `OnSnapshotRejected` and re-driven), nor when the engine declines a stale snapshot recovery, since the shard is already past that snapshot |
-| `OnLogDBDiskWarning` | `DiskInfo` | WAL usage crossed the warning threshold |
-| `OnLogDBDiskFull` | `DiskInfo` | WAL usage crossed the full threshold |
+| `OnLogDBDiskWarning` | `DiskInfo` | WAL usage crossed 85% of `HostConfig.MaxWALDiskSize`; requires `MaxWALDiskSize > 0` |
+| `OnLogDBDiskFull` | `DiskInfo` | WAL usage reached 95% of `MaxWALDiskSize`; new proposals are refused with `ErrDiskFull` until usage drops. Requires `MaxWALDiskSize > 0` |
 
 Payload types:
 
@@ -2360,6 +2399,7 @@ type EventShardInfo struct {
 
 type SnapshotInfo struct {
     ShardID, ReplicaID, Index, From uint64
+    Err error // cause of an OnSnapshotRejected event when known; nil otherwise
 }
 
 type ShardFailedInfo struct {
@@ -2381,7 +2421,8 @@ type ConnectionInfo struct {
 ```
 
 `LeaderInfo` and `EventShardInfo` declare the same names in a different order, so
-construct them with field names.
+construct them with field names. The host does not populate `DiskInfo.Shards`;
+it is always nil.
 
 `ShardFailedInfo.Err` is one of `*ApplyError`, `*SMPanicError` (matches
 `ErrShardFailed`), `*SaveStateError`, `*CommitError`, `*WorkerPanicError`,
@@ -2687,5 +2728,5 @@ if err := dest.ImportSnapshot(ctx, 7, r); err != nil {
 - [Log storage](../log-storage/engineering.md): LogDB and the WAL
 - [Seal barrier](../seal-barrier/architecture.md) and
   [key custody](../seal-barrier/user.md)
-- [Compatibility](../compatibility.md): on-disk and wire format compatibility
+- [Compatibility](../compatibility/architecture.md): on-disk and wire format compatibility
 - [Testing](../testing/overview.md): test infrastructure and fault injection

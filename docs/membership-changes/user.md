@@ -71,7 +71,7 @@ nothing else, never by its address.
 err := host.SyncRequestAddObserverWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
 
 // Witness: votes, stores no log data, cannot propose or serve reads.
-err := host.SyncRequestAddWitnessWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
+err = host.SyncRequestAddWitnessWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
 ```
 
 Choose by what you want:
@@ -197,6 +197,11 @@ your write. Re-read `ConfigChangeID` and retry.
 
 **`ErrRejected` on a config change**: an earlier change is still uncommitted.
 Retry once it commits.
+
+**An error for which `quicraft.MaybeApplied(err)` is true** (a timeout, a
+leader change, the shard stopping while the change was pending): the change
+reached Raft and may still commit. Re-read the membership before doing
+anything else; the change may already be in it.
 
 **`ErrTooManyVotingMembers`**: the voting set is capped at 64, shared by voters
 and witnesses. **`ErrTooManyWitnesses`** is the shard's own `MaxWitnesses`

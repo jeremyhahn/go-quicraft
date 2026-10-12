@@ -461,7 +461,7 @@ The membership section:
 
 - `MembershipVersion` is `membershipSectionVersion` = 1, exact match; anything
   else is `ErrUnsupportedMembershipVersion`. See
-  [Compatibility](../compatibility.md#format-versions-are-pinned-until-the-first-production-release).
+  [Compatibility](../compatibility/architecture.md#format-versions-are-pinned-until-the-first-production-release).
 - The fixed region is 18 bytes (`membershipFixedSize`), the session-policy tail
   32 (`membershipSessionPolicySize`), and the smallest section replay accepts is
   74 (`minMembershipSize`): fixed region, six empty count headers, policy. That
@@ -985,7 +985,7 @@ boot, where the discard would delete every segment written since.
 |---|---|---|
 | `ErrWALGeometryMismatch` (`*WALGeometryMismatchError`) | configured `BlockSize` differs from the marker | restore the original `BlockSize`; the error names both |
 | `ErrWALFormatMalformed` | the marker has non-zero bytes that are not this format | investigate the file. An empty or all-zero marker is read as absent. |
-| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | the marker records another format version | wipe the data directory and re-sync. See the `WALFORMAT` section of [Compatibility](../compatibility.md). |
+| `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | the marker records another format version | wipe the data directory and re-sync. See the `WALFORMAT` section of [Compatibility](../compatibility/engineering.md#4-walformat-marker). |
 | `ErrWALFormatMissing` | segments exist but no marker | wipe and re-sync |
 | `ErrRetiredRegistryMalformed` | `RETIRED` does not parse | investigate; opening without it would readmit retired replicas |
 | `ErrMidSegmentCorruption` | damage below records a completed `fdatasync` acknowledged | re-sync from peers, or authorize `waldb.Repair` |
@@ -995,7 +995,7 @@ boot, where the discard would delete every segment written since.
 | `*SegmentReadError` in `*RecoveryError` | an I/O error during the scan | hardware fault; re-sync from peers |
 | `*WALDecryptError` | a record failed authentication | wrong barrier, wrong epoch, or tampering. Never retried without the context. |
 | `ErrBarrierContextUnresolved` | the barrier is sealed at `Open` | unseal it before opening |
-| `ErrBarrierContextBindingUnreportable` | the barrier lacks `ContextBindingResolved()` | add the method to the out-of-tree barrier; see [Compatibility](../compatibility.md) |
+| `ErrBarrierContextBindingUnreportable` | the barrier lacks `ContextBindingResolved()` | add the method to the out-of-tree barrier; see [Compatibility](../compatibility/api.md#interface-requirements-for-embedders) |
 | `ErrBarrierContextUnsupported` | the barrier cannot bind caller context | use a context-capable barrier; there is no epoch-only fallback |
 | `ErrUnknownPayloadType` | a record's payload type is retired or unknown | most often a keyed WAL opened without its barrier: supply it. Otherwise the directory holds a stale layout: wipe and re-sync. |
 | `ErrUnsupportedMembershipVersion` | a snapshot record's membership version is not 1 | build skew; wipe and re-sync |
@@ -1164,7 +1164,7 @@ the latency histograms cover the same ground per batch.
   `proto.Membership`, which are separate layouts from the ones stored here
 - [Seal barrier](../seal-barrier/architecture.md): epoch DEKs and sealing
   strategies behind `WALBarrier`
-- [Compatibility](../compatibility.md): the pinned-at-1 policy and the version
+- [Compatibility](../compatibility/architecture.md): the pinned-at-1 policy and the version
   discriminators that exist
 - [Multi-group host](../multi-group-host/engineering.md): the commit worker's
   group commit, `Peer.Commit`, and the in-memory log buffer that sit above this

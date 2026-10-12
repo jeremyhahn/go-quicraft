@@ -191,9 +191,9 @@ promises, and the leader counts only acknowledgements whose window covers the
 lease, so a replica configured to promise less backs no lease rather than an
 unsound one. The promise is recorded in the replica's Raft hard state before
 any acknowledgement makes it, and a restarted replica withholds its vote, and
-does not campaign, for the recorded window, whatever configuration it
-restarted into, so a full-shard restart elects about one election timeout
-later.
+does not campaign, for the longer of the recorded window and the one it now
+promises, whatever configuration it restarted into, so a full-shard restart
+elects about one election timeout later.
 
 ## Request keys are random draws, and applied entries are placed by index too
 
@@ -289,10 +289,12 @@ All are `internal/`; the embedder drives them only through `pkg.Host`.
   hold-down, both on a monotonic clock and both bounded by the 1% clock-rate
   assumption.
 - **No sleeping to wait for consensus.** The protocol never sleeps; the engine
-  waits on channels and selects. The exceptions are fixed backoffs on the
-  snapshot paths: a 50 µs yield while an apply drains around snapshot recovery,
+  waits on channels and selects. The exceptions are fixed backoffs: on the
+  snapshot paths, a 50 µs yield while an apply drains around snapshot recovery,
   and retry backoffs (100 ms, 50 ms) when a snapshot control message or a
-  recovery request meets a full queue.
+  recovery request meets a full queue; on the commit path, the waits between
+  `LogDB.SaveState` retries (10, 50, 200, 500 ms, five attempts) before the
+  shard is failed.
 - **No multi-Raft transactions.** Each shard is independent; there is no
   cross-shard atomicity.
 - **No dynamic re-sharding.** A shard's identity is fixed at `StartShard`.

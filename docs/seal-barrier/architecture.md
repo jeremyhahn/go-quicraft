@@ -366,9 +366,12 @@ makes single-writer a guarantee.
 - **The root key** lives in an `enclave.SealedEnclave` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)),
   opened into a locked enclave only for derivation, export and unseal.
-  `Initialize` and `Unseal` generate or receive it directly into locked memory and
-  hold it there for their whole body, so it is never an ordinary heap slice on the
-  initialize path at all.
+  `Initialize` generates it directly into locked memory, so on the initialize
+  path it is never an ordinary heap slice at all. `Unseal` cannot do the same:
+  `SealingStrategy.UnsealRootKey` returns a `[]byte`, so the key does reach the
+  heap. `Unseal` copies it into locked memory and wipes the heap copy at once,
+  before MAC verification, encryptor resolution or DEK derivation, and a deferred
+  wipe covers every other return.
 - **Epoch DEKs are protected the same way and are never opened.** Each is held in
   its own `SealedEnclave` so a DEK can be re-derived, but neither `Encrypt` nor
   `Decrypt` touches one: both run off the `cipher.AEAD` cached per epoch in

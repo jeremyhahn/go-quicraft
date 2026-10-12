@@ -169,8 +169,10 @@ election timer fire mid-transfer.
 
 `becomeLeader` returns an error and can decline the promotion.
 
-1. Refuses with `ErrTooManyVotingMembers` when `votingBitCount()` exceeds
-   `MaxVotingMembers` (64). The check runs FIRST, before any field is written,
+1. Refuses with `proto.ErrLogIndexOutOfRange` when the log has already reached
+   `proto.MaxLogIndex` and has no room for the leadership no-op, and with
+   `ErrTooManyVotingMembers` when `votingBitCount()` exceeds
+   `MaxVotingMembers` (64). Both checks run FIRST, before any field is written,
    so a refused promotion leaves the replica exactly as it was.
    `checkElectionResult` then falls back to follower at this term.
 2. Re-arms `pendingConfigChange` from `hasConfigChangeToApply()`, which covers
@@ -300,7 +302,9 @@ startElection()
   |
   +-- gates: isWitness / selfRemoved / stale config fold /
   |          selfRemoved / isObserver (after the fold) /
-  |          roleMismatch / joining / unreadable last log term
+  |          roleMismatch / joining /
+  |          voteHeldDown / votePromised (LeaseRead, Section 15) /
+  |          unreadable last log term
   |
   +-- preVote enabled?
   |     |
@@ -395,7 +399,10 @@ Four gates run before the grant decision.
 
    A vote that passes these tests is still withheld while `voteHeldDown()` or
    `votePromised()` holds: the replica owes a leader its vote window under
-   `LeaseRead` (Section 15). The refusal takes the ordinary rejection path.
+   `LeaseRead` (Section 15). The one exception is the promise only, not the
+   hold-down: a transfer-hinted request at the term after the promise's, which
+   only the promisee's transfer can produce (`transferReleasesPromise`). The
+   refusal takes the ordinary rejection path.
 
 A granted PreVote response echoes `msg.Term` (the prospective term) so the
 pre-candidate counts it at the term it is campaigning for. A REJECTED PreVote
@@ -537,11 +544,16 @@ Follower processing of AppendEntries:
 2. If `msg.LogIndex < committed` the entries are stale. Answer immediately with
    `ReplicateResp{LogIndex: committed}` and return. This keeps `tryAppend` from
    ever seeing a conflict at or below the committed index.
-3. Call `log.tryAppend(msg.LogIndex, msg.LogTerm, msg.Entries)`.
-4. On success: advance commit to `min(msg.Commit, lastIdx)`, where `lastIdx` is
+3. Refuse the whole batch, before the log is touched and without a response,
+   when its last entry would sit above `proto.MaxLogIndex`
+   (`proto.ErrLogIndexOutOfRange`), or when any entry's term is 0 or above
+   `msg.Term` (`proto.ErrTermOutOfRange`): no leader can have written such an
+   entry, and persisting one would poison `lastTerm` across restarts.
+4. Call `log.tryAppend(msg.LogIndex, msg.LogTerm, msg.Entries)`.
+5. On success: advance commit to `min(msg.Commit, lastIdx)`, where `lastIdx` is
    the last index covered by the append, and respond with `ReplicateResp`
    carrying `lastIdx`.
-5. On failure: respond with `Reject: true` and a backtracking hint (below).
+6. On failure: respond with `Reject: true` and a backtracking hint (below).
 
 ### Rejection hints and term-based backtracking (Paper 5.3)
 
@@ -970,7 +982,13 @@ stale configuration tail").
 
 Processes `InstallSnapshot` on a follower (Paper Figure 13).
 
-1. **SIZE gate.** Refuse with `ErrTooManyVotingMembers` when the snapshot's
+1. **BOUNDS gate.** Refuse a snapshot whose position is outside the protocol
+   range (`Snapshot.CheckBounds`): `proto.ErrLogIndexOutOfRange` at or above
+   `proto.MaxLogIndex`, `proto.ErrTermOutOfRange` at or above `proto.MaxTerm`.
+   The transport's chunk validation and LogDB admission apply the same
+   predicate; this is the last gate before the position becomes the log's
+   arithmetic base.
+2. **SIZE gate.** Refuse with `ErrTooManyVotingMembers` when the snapshot's
    membership names more voting members than the ReadIndex `ackBits` word can
    address (`snapshotVotingBitCount > maxVotingMembers`). This is the one place
    a configuration enters the shard without having passed an admission check:
@@ -983,24 +1001,24 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13).
    than a clamp because dropping members to make the configuration fit computes
    quorum over a set no committed entry put there, which is a split-brain, not
    a degradation.
-2. **SENDER gate.** Refuse with `ErrSnapshotNotFromLeader` when
+3. **SENDER gate.** Refuse with `ErrSnapshotNotFromLeader` when
    `leaderID != noLeader && msg.From != leaderID`. This is the same gate
    `handleHeartbeat` applies, applied to the strictly more powerful message: a
    heartbeat carries no log-matching proof and may move the commit index, while
    an `InstallSnapshot` carries no proof either and may REPLACE the entire log
    and rebuild the voting set from a membership the sender chose. The gate has
    to come first rather than only guarding the accepting branches, because the
-   two unconditional writes in step 3 run even on the reject path: without it,
+   two unconditional writes in step 4 run even on the reject path: without it,
    any authenticated shard member could hold a healthy follower's election
    timer at zero indefinitely, and install itself as that follower's
    `leaderID`, simply by retransmitting one long-obsolete snapshot. Suppressing
    an election is not a lesser power than winning one. The term dimension is
    covered upstream: `step` drops a lower-term `InstallSnapshot` and, for a
    higher term, calls `becomeFollower(msg.Term, msg.From)`.
-3. Reset `electionTick` and record `leaderID = msg.From`.
-4. Reject if `ss.Index <= committed` (the snapshot is stale), answering with
+4. Reset `electionTick` and record `leaderID = msg.From`.
+5. Reject if `ss.Index <= committed` (the snapshot is stale), answering with
    `ReplicateResp{LogIndex: committed}`.
-5. **Log matching optimization**: if the existing log has an entry at
+6. **Log matching optimization**: if the existing log has an entry at
    `ss.Index` with the same term **and no snapshot is pending persistence**,
    advance the commit index (`commitTo`) and the processed marker
    (`appliedTo`). Entries following the snapshot point are retained, and
@@ -1021,18 +1039,18 @@ Processes `InstallSnapshot` on a follower (Paper Figure 13).
    `(pending.Index, ss.Index]`.
 
    The precondition is safe to enforce by falling through to `restore`: a
-   pending snapshot is always at or below `committed`, and step 4 guarantees
+   pending snapshot is always at or below `committed`, and step 5 guarantees
    `ss.Index > committed`, so the incoming snapshot is strictly newer.
    Restoring keeps the pending snapshot monotonic. The entries discarded above
    `ss.Index` were never persisted or acked (`Peer.Commit` persists entries and
    clears the pending snapshot in the same cycle), and the `ReplicateResp`
    carries `ss.Index`, so the leader re-sends them.
-6. Otherwise call `log.restore(ss)`, which discards all entries, sets
+7. Otherwise call `log.restore(ss)`, which discards all entries, sets
    `committed = processed = ss.Index`, and clears the pending config-change
    bound; then `rebuildRemotesFromMembership(ss.Membership)`.
-7. Respond with `ReplicateResp` carrying the snapshot index.
+8. Respond with `ReplicateResp` carrying the snapshot index.
 
-`handleSnapshot` is idempotent for an already-applied snapshot: step 4 rejects
+`handleSnapshot` is idempotent for an already-applied snapshot: step 5 rejects
 it and answers with the committed index.
 
 ### Snapshot sending
@@ -1115,7 +1133,12 @@ only**. When a snapshot is being restored:
 2. The step worker keeps draining the node's inbox and stepping messages, but
    calls `GetUpdate` with `moreEntriesToApply = false`, so no committed entry
    is extracted for apply. The processed marker does not advance, so those
-   entries are re-offered once the gate clears. Client work (proposals and
+   entries are re-offered once the gate clears. It holds entries the same way
+   while a snapshot the inbox drain just installed awaits adoption
+   (`snapshotAdoptionPending`): that is the window BEFORE the pool can raise
+   `recovering`, in which the log's processed marker already sits at the
+   snapshot index while the state machine does not, and extracting there would
+   hand the apply worker a gapped batch (`ErrApplyGap`). Client work (proposals and
    ReadIndex) stays queued, which lets the queues apply their own backpressure
    (`ErrSystemBusy`).
 3. The apply worker parks before touching the state machine, and the commit
@@ -1556,8 +1579,11 @@ or `selfRemoved`, the on-demand configuration fold
 (`ErrStaleConfigCannotCampaign`), `selfRemoved` and the observer role checked
 after the fold,
 `roleMismatch` (`ErrWitnessRoleMismatch`), `joining`
-(`ErrJoiningNodeCannotCampaign`), already-leader, and an unreadable last log
-term (`ErrUnreadableLogCannotCampaign`). `Peer.Handle` additionally refuses a
+(`ErrJoiningNodeCannotCampaign`), the LeaseRead vote hold-down or a standing
+vote promise (`ErrLeaseVoteHoldDown`; Section 15), already-leader, and an
+unreadable last log term (`ErrUnreadableLogCannotCampaign`). A promise is
+released only by a `TimeoutNow` from the leader it was made to, at the
+promise's own term: that leader cleared its lease before sending it. `Peer.Handle` additionally refuses a
 delivered `TimeoutNow` on a joining node before it reaches `step`.
 
 ### Catch-up replication
@@ -2096,11 +2122,14 @@ the hot path returns them with no allocation. Selected errors:
 | `ErrDuplicateMemberAddress`    | Address already held by another active member                     |
 | `ErrDuplicateMemberIdentity`   | Identity already bound to another active member                   |
 | `ErrRemovedMemberIdentity`     | Identity carries a removal tombstone                              |
+| `ErrMemberIdentityRequired`    | Admission carries no identity where `RequireMemberIdentities` is set |
 | `ErrTooManyWitnesses`          | Witness policy cap would be exceeded                              |
 | `ErrBreaksFullReplicaMajority` | Change would leave full replicas unable to form a quorum          |
 | `ErrWitnessRoleMismatch`       | Local role contradicts the replicated membership                  |
 | `ErrJoiningNodeCannotCampaign` | TimeoutNow on a replica with incomplete membership                |
 | `ErrStaleConfigCannotCampaign` | Configuration tail unresolved at a TimeoutNow                     |
+| `ErrUnreadableLogCannotCampaign` | Own last log term unreadable at a TimeoutNow                    |
+| `ErrLeaseVoteHoldDown`         | TimeoutNow inside the lease vote hold-down or a standing promise   |
 | `ErrInflightsFull`             | Inflight window at capacity (defensive backstop)                  |
 
 The raft log has no compacted or unavailable sentinel of its own. Compaction
@@ -2396,6 +2425,8 @@ Asynchronous snapshot operations. Bounded pool (NumWorkers/2, minimum 2) with pe
 
 **Save flow**: Creates directory, opens data file, calls state machine `SaveSnapshot()`, fsyncs, enforces `MaxSnapshotSize` (post-compression), encrypts if barrier unsealed, writes the `snapshot.meta` record, persists to LogDB including full cluster membership, garbage collects old snapshots (keep 3), updates `lastSnapshotIndex`, compacts log, purges old barrier epochs.
 
+The capture, `snapshot.meta` and any export are written into a staging directory of the save's own. Only the publish, which renames it onto the canonical `snapshot-<index>` directory and records it, runs under the node's write lease, the lease `UnloadNode` waits out. Unloading a shard therefore never waits for the user `SaveSnapshot`; a save whose node stops meanwhile is refused the lease and publishes nothing. (A state machine that ignores the stopper still delays its own `Close`, which must wait for an in-flight stream.)
+
 #### snapshot.meta
 
 A snapshot directory MUST describe itself: it outlives its LogDB record (up to `maxSnapshotsRetained` directories are retained while only the newest is recorded), and the DEK purge floor is computed by scanning these directories and reading the `Epoch` field back as fact.
@@ -2573,7 +2604,7 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 | `OnSnapshotCompleted(shardID, index, op, err)` | snapshot pool worker, while the shard's snapshot slots are held; `op` is `SnapshotSave` or `SnapshotRecover` |
 | `OnLogCompacted(shardID, replicaID, compaction)` | snapshot pool worker, after a save that compacted the log |
 | `OnSnapshotRequestCompleted(shardID, requestKey, index, err)` | snapshot pool worker, after the slots are released, for a save `RequestSnapshot` keyed, including one whose `SaveSnapshot` panicked |
-| `OnSnapshotRejected(shardID, replicaID)` | snapshot pool worker, the per-shard apply goroutine (automatic snapshot), or the `RequestSnapshot` caller |
+| `OnSnapshotRejected(shardID, replicaID, err)` | snapshot pool worker, the per-shard apply goroutine (automatic snapshot), or the `RequestSnapshot` caller; `err` is the cause, delivered to the listener as `SnapshotInfo.Err` |
 | `OnShardFailed(shardID, err)` | the worker that latched the failure |
 | `OnCampaignSkipped(shardID, replicaID, term)` | step worker; **not emitted** (see below) |
 
@@ -2716,7 +2747,7 @@ The signals that matter, and what each one actually tells you:
 | leader changes per shard | more than a trickle means elections are being triggered, usually by heartbeat delay rather than by node failure |
 | commit latency | the step → commit → apply pipeline including the WAL fsync |
 | apply latency | embedder code; the one number this library does not control |
-| proposal queue depth | back-pressure before it becomes `ErrBusy` |
+| proposal queue depth | back-pressure before a full queue refuses proposals with `ErrDropped` |
 | in-memory log size against `MaxTotalInMemLogSize` | a follower falling behind |
 | shards in quiesce | expected on an idle cluster |
 

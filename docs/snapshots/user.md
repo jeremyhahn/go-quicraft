@@ -201,6 +201,20 @@ its recorded length and hash, or its metadata is missing or unreadable, so
 nothing can vouch for it. There is no way to load it unverified. Re-sync the
 replica from its peers.
 
+**`OnSnapshotRejected` with a non-nil `SnapshotInfo.Err`**: a request was
+refused or abandoned, a `SaveSnapshot` panicked (the requester gets
+`*SnapshotFailedError` wrapping `*SnapshotSavePanicError`), an inbound transfer
+was rejected, or a recovery failed before your `RecoverFromSnapshot` was
+called. None of these fails the shard; a rejected recovery is retried with
+backoff. A save that returns an error fires no event: watch the WARN log line
+or `OnSnapshotCreated` going quiet.
+
+**`OnShardFailed` with `*SnapshotRecoveryExhaustedError`**: five recovery
+attempts in a row failed before reaching your state machine. `Err` is the last
+cause. Fix that cause (usually the barrier or a damaged artifact), then stop and
+restart the shard. A failure or panic inside `RecoverFromSnapshot` fails the
+shard on the first attempt.
+
 **A snapshot fails to decrypt after losing trailing bytes**: that is the
 truncation check working. Each frame records whether it is the last one, so a
 snapshot that lost frames off the end, or had frames added, fails instead of

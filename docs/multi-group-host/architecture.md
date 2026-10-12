@@ -76,7 +76,7 @@ Public API:
 
 | Package | Holds |
 |---|---|
-| `pkg/` (package `quicraft`) | `Host`, `RequestState`, `Session`, `Membership`, `ShardInfo`, errors, metrics |
+| `pkg/` (package `quicraft`) | `Host`, `RequestState`, `Session`, `Membership`, `ShardInfo`, `LeaderHandler`, errors, metrics |
 | `pkg/config/` | `HostConfig`, `Config`, `TransportConfig`, `MTLSConfig`, `EventListener` |
 | `pkg/sm/` | the `StateMachine`, `ConcurrentStateMachine` and `DiskStateMachine` interfaces |
 | `pkg/sm/kv/` | reference stores: `MemoryStore`, `ConcurrentStore` |
@@ -105,7 +105,7 @@ Internal (not importable):
 | `pkg/internal/queue/` | `EntryQueue` (double-buffered MPSC) and `SwapBuffer` |
 | `pkg/internal/server/` | the global in-memory-log rate limiter |
 | `pkg/internal/invariant/` | debug assertions |
-| `pkg/internal/supervise/` | Goexit-resilient supervision (`Supervise`, `ClassifyExit`, `RunResilient`) and contained diagnostics (`LogContained`) for every goroutine that runs user code |
+| `pkg/internal/supervise/` | Goexit-resilient supervision (`Supervise`, `ClassifyExit`, `RunResilient`, `RunEach`) and contained diagnostics (`LogContained`) for every goroutine that runs user code |
 
 `contrib/dragonboat/` is a Dragonboat API compatibility layer.
 
@@ -131,9 +131,9 @@ Host.proposeEntry()
   | proposalKey = nextRequestKey()   -- random 64-bit draw, never zero
   | entry.Key = proposalKey
   | rs = newRequestState(ns.requestPool, proposalKey, deadline)
-  | ns.pendingProposals.Store(proposalKey, &pendingProposal{rs, deadline,
-  |     floor: engNode.CommittedIndex()})
-  | engNode.DeliverProposal(...) -- MPSC proposalQ; full -> ErrDropped
+  | registerPendingProposal: ns.pendingProposals[proposalKey] =
+  |     &pendingProposal{rs, deadline, floor: engNode.CommittedIndex()}
+  | engNode.DeliverTrackedProposal(...) -- MPSC proposalQ; full -> ErrDropped
   | engine.NotifyWork(shardID)
   v
 Engine step worker (shardID % NumWorkers)
@@ -230,6 +230,40 @@ Witnesses cannot serve a ReadIndex, but their heartbeat acknowledgements count
 toward the quorum that confirms one. See
 [Witnesses and membership](#witnesses-and-membership).
 
+A new leader refuses a ReadIndex with `ErrReadIndexNotReady` until it has
+committed an entry of its own term (§6.4 of the Raft thesis). The edge is
+published: `EventListener.OnLeaderReady` fires once per announced (leader, term)
+on each loaded non-witness replica, and `Host.ShardReadReady` answers the same
+question synchronously from the state those events delivered, so a caller that
+installs the listener and then queries cannot miss the transition.
+
+### Leader-executed requests
+
+`Host.ExecuteOnLeader(ctx, shardID, request)` has the shard's leader run the
+`LeaderHandler` registered for the shard with `RegisterLeaderHandler`, and
+returns its reply. The request is never appended to the log, so a handler must
+not change replicated state; it serves what the leader holds in memory for its
+term. Called on the leader, the handler runs in-process on its own goroutine.
+Called elsewhere, the request travels as `proto.LeaderExec` (message type 28)
+and is answered with `LeaderExecResp` (29), through the same receive gate as a
+forwarded proposal.
+
+- A request executes only on the replica that leads the term it was sent under,
+  and only after that leader has committed an entry of the term.
+- It executes at most once per term. A deposed leader's reply is discarded and
+  the request retried under the new term, so it may run once per term across a
+  leader change, and handlers must be idempotent.
+- A leader runs at most 1024 remote requests at once; beyond that it answers
+  `ErrBusy`. Request and reply are held to the proposal payload limit
+  (`*EntryTooLargeError`).
+- A leader with no handler answers `ErrLeaderHandlerNotRegistered`; a failing
+  handler surfaces as `*LeaderHandlerError`; a context that ends while no leader
+  is settled yields `*LeaderUnavailableError` (`ErrNoLeader` or
+  `ErrLeadershipChanged`).
+
+Registration may precede `StartShard` and survives `StopShard`;
+`UnregisterLeaderHandler` lets requests already executing finish.
+
 ## Key design decisions
 
 ### Fixed-layout binary wire format
@@ -317,9 +351,11 @@ in-memory store from `WithMemoryLogDB`. The engine alone also supports running
 with no LogDB, in which the step worker runs `Peer.Commit` itself and forwards
 straight to `applyC`; no `Host` configuration reaches that mode.
 
-Every tier restarts on panic. A panicking worker would otherwise stall every
-shard mapped to it for good, so recovery clears `commitPending` for the affected
-nodes and re-enters the loop after a short delay.
+Every tier runs under `supervise.Supervise` and restarts on a panic or a
+`runtime.Goexit` (reported as `supervise.ErrGoexit`). A dead worker would
+otherwise stall every shard mapped to it for good, so recovery clears
+`commitPending` for the affected nodes and re-enters the loop on a fresh
+goroutine after `supervise.RestartDelay` (100 ms).
 
 Shutdown runs in six ordered steps: stop all nodes (unblocking in-flight
 snapshot I/O), then step, commit, apply, snapshot, and finally the listener
@@ -328,9 +364,9 @@ loss or shard failure observed during teardown still reaches the listener.
 
 ### Listener dispatcher
 
-Engine notifications for user code (leader changes, campaign launches, shard
-failure, log compaction, snapshot creation) run on one dedicated goroutine
-rather than on the worker that produced them.
+Engine notifications for user code (leader changes, read readiness, campaign
+launches, shard failure, log compaction, snapshot creation and rejection) run
+on one dedicated goroutine rather than on the worker that produced them.
 
 The reason is deadlock, not throughput. The step worker fires callbacks while
 holding `stepWorker.nodesMu.RLock`, and `Host.StopShard` takes the same
@@ -435,6 +471,10 @@ Three replica roles:
   propose or serve a ReadIndex (`ErrInvalidOperation`), and it is never
   promoted.
 
+On the leader, `ShardInfo.Replicas` reports each remote member's replication
+progress tagged with its `ReplicaRole` (`ReplicaRoleVoter`,
+`ReplicaRoleObserver`, `ReplicaRoleWitness`); it is empty on a follower.
+
 Witnesses use a unified quorum: the same voting set (remotes, witnesses and
 self) decides elections, commit, ReadIndex confirmation and lease reads. The
 confirmation quorum has to intersect every coalition that could win an
@@ -452,6 +492,17 @@ which config changes are legal.
 ## At-rest encryption
 
 The barrier in `pkg/seal/barrier.go` encrypts WAL records and snapshots.
+
+The host's posture must be stated: `NewHost` fails with
+`ErrAtRestEncryptionUnspecified` unless it gets `WithBarrier`,
+`WithShardBarriers` or `WithoutEncryption`, and with
+`ErrAtRestEncryptionConflict` when `WithBarrier` and `WithoutEncryption` are
+both given. `WithShardBarriers` is a separate, per-shard axis that combines with
+either host-wide option. A shard whose resolver returns nil takes the host-wide
+route (the `WithBarrier` barrier, or plaintext under `WithoutEncryption`); with
+no host-wide option it fails closed with `ErrShardBarrierUnresolved`. The
+host's key-rotation loop rotates only the `WithBarrier` barrier, and
+`Host.Close` seals every barrier the resolver returned.
 
 Algorithm selection:
 
@@ -588,8 +639,12 @@ something that can see all the nodes, not something the engine infers.
 
 `StartShard` takes `ShardID` and `ReplicaID` from `cfg`; both must be non-zero.
 On a host with a transport, `cfg.MemberIdentities` must name every member's node
-identity (the value each node reports from `Host.NodeIdentity`). A three-node
-shard, as run on node 1:
+identity (the value each node reports from `Host.NodeIdentity`). The Host
+enforces this by setting `cfg.RequireMemberIdentities` from whether it has a
+transport, overriding the caller's value; every admission path (the founding
+map, the joiner's anchor, every add, including one forwarded from another
+replica) then refuses a member with no identity. A three-node shard, as run on
+node 1:
 
 ```go
 hostCfg := config.HostConfig{
@@ -753,7 +808,7 @@ Routing and authorization are kept separate:
   `identity_mismatch`, `missing_identity`), because one aggregate counter
   cannot tell a rolling membership change from an attack.
 
-See [Compatibility](../compatibility.md#node-identities-are-mandatory) for why
+See [Compatibility](../compatibility/architecture.md#node-identities-are-mandatory) for why
 identities are required at admission.
 
 ### Forming a cluster automatically (go-qrdb)
@@ -786,4 +841,4 @@ clustering feature documentation (`docs/clustering/` in that repository).
   config-in-log, witnesses
 - [QUIC transport](../quic-transport/engineering.md): certificate exclusivity,
   sender authorization
-- [Compatibility](../compatibility.md): node identities, format pinning
+- [Compatibility](../compatibility/architecture.md): node identities, format pinning

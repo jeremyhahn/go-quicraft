@@ -13,7 +13,7 @@ are linked rather than repeated: certificates and revocation in
 Formats are pinned until the first stable release and change in place, so two
 builds can be unable to read each other's data. There is no rolling upgrade
 across a format change: you wipe and re-sync. Read
-[Compatibility and upgrades](../compatibility.md) before planning a deployment
+[Compatibility and upgrades](../compatibility/user.md) before planning a deployment
 lifecycle.
 
 ## Before you start
@@ -219,11 +219,14 @@ Shards whose state machine is an on-disk `sm.DiskStateMachine` support only
 no-op sessions (`GetNoOPSession`), so make those operations idempotent.
 
 `LeaseRead: true` lets the leader answer linearizable reads without a heartbeat
-round while its lease holds. It needs `CheckQuorum` (on by default), the same
-`ElectionRTT`, `RTTMillisecond` and `LeaseRead` on every replica, and clocks
-whose rates differ by under 1%. After a restart, a replica of a lease-read shard
-does not vote or campaign for one election timeout, so restarting the whole shard
-delays its first election by about that long.
+round while its lease holds. It needs `CheckQuorum` (on by default) and clocks
+whose rates differ by under 1%. Configure `ElectionRTT`, `RTTMillisecond` and
+`LeaseRead` alike on every replica for lease reads to be fast: a follower that
+promises a shorter vote window backs no lease, which is still safe, and reads
+take the heartbeat round while too few followers back one. After a restart, a
+replica of a lease-read shard does not vote or campaign for one election
+timeout, so restarting the whole shard delays its first election by about that
+long.
 
 ## Configure
 
@@ -402,9 +405,9 @@ cfg.EventListener = &config.EventListener{
 }
 ```
 
-Leader, campaign, shard-failure, compaction and snapshot-created events arrive in
-order on one goroutine, and a handler may call back into the host, even
-`StopShard`. Every callback must return quickly. The full list is in
+Leader, read-readiness, campaign, shard-failure, compaction, snapshot-created
+and snapshot-rejected events arrive in order on one goroutine, and a handler may
+call back into the host, even `StopShard`. Every callback must return quickly. The full list is in
 [api.md](api.md#event-listener).
 
 `OnShardFailed` fires once each time a shard's failure latch trips, and the
@@ -415,9 +418,9 @@ leaderless shard, watch for `ShardNoLeader` health with no election activity.
 
 A freshly elected leader cannot serve linearizable reads until it has committed
 an entry of its own term, and `ReadIndex` returns `ErrReadIndexNotReady` until
-then. Wait for `OnLeaderReady` instead of retrying: it fires on every replica,
-leader or follower, once that commit is known there, and from then on reads
-issued on that replica are not refused for that reason. The next
+then. Wait for `OnLeaderReady` instead of retrying: it fires on every replica
+except a witness, leader or follower, once that commit is known there, and from
+then on reads issued on that replica are not refused for that reason. The next
 `OnLeaderUpdated` ends it — including the same leader re-elected at a higher
 term, which `OnLeaderLost` does not report. `ShardReadReady` gives the same
 answer synchronously. The full contract is in
@@ -587,7 +590,7 @@ Details: [seal-barrier](../seal-barrier/user.md) and
 - [API reference](api.md): every type, method, option and error
 - [Lifecycle](engineering.md): startup, recovery, shutdown, quorum-loss runbook
 - [Architecture](architecture.md): how a host, shards and the transport fit
-- [Compatibility and upgrades](../compatibility.md)
+- [Compatibility and upgrades](../compatibility/architecture.md)
 - [QUIC transport usage](../quic-transport/user.md): certificates, identities,
   revocation, limits
 - [Seal and barrier usage](../seal-barrier/user.md): keys, rotation, purging

@@ -223,8 +223,8 @@ expect latency proportional to batch size.
 always reads plaintext, with or without at-rest encryption.
 
 **A panic in `Update`.** The panic is recovered and logged with its stack, and
-the shard is marked failed. The proposal that was applying fails with the
-`*SMPanicError` (`errors.As` reaches the panic value and stack), and every other
+the shard is marked failed. Every proposal in the batch that was applying fails
+with the `*SMPanicError` (`errors.As` reaches the panic value and stack), and every other
 proposal pending on the shard with `ErrShardFailed`; both report
 `MaybeApplied`, because the entries are committed and a reload replays them.
 Other shards keep running. `OnShardFailed` fires once. Return errors instead of

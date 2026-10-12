@@ -41,7 +41,7 @@ func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, repl
 |---|---|
 | Request | the shard, the new replica ID, its advertised address, its node identity, and the `configChangeIndex` |
 | Response | a `*RequestState`, or only an error from the `Sync` form |
-| Errors | see [Errors](#errors); before validation also `*NotLeaderError`, `ErrSystemBusy` (global rate limiter), `ErrShardNotReady`, `ErrDraining`, `ErrClosed` |
+| Errors | see [Errors](#errors); before validation also `ErrCanceled` / `ErrTimeout` (a context already done: nothing is submitted), `ErrClosed`, `ErrDraining`, `*NotLeaderError`, `ErrSystemBusy` (global rate limiter, or a full proposal queue), `ErrShardNotReady` |
 | Permission | none in this library; the caller must be talking to the leader |
 
 `identity` is the SPKI pin the transport derives from the peer's mTLS leaf,
@@ -177,6 +177,15 @@ Not a membership change, but the operation you run before removing a leader.
 
 All are exported from `quicraft` and match with `errors.Is` / `errors.As`.
 
+A failure delivered after the change was handed to Raft (leadership moved,
+the caller's own wait ended, the shard stopped or halted while it was pending)
+is wrapped in `*MaybeAppliedError`, so `MaybeApplied(err)` is true: the change
+may still commit. Re-read the membership with `SyncGetShardMembership` before
+proposing again; a retry against a configuration the change already altered is
+refused with `*StaleConfigChangeError` when it carries the old
+`configChangeIndex`. A refusal from the table below happened before the
+hand-off and is never wrapped.
+
 | Error | Meaning |
 |---|---|
 | `*StaleConfigChangeError` (`ErrStaleConfigChange`) | the `configChangeIndex` did not match; another change landed first. Re-read `Membership.ConfigChangeID` and retry. |
@@ -238,5 +247,5 @@ transport; whatever the caller puts there is overwritten.
 - The WAL has a third discriminator on the same layout,
   `membershipSectionVersion`.
 - Identities are required at admission and there is no address fallback; see
-  [`../compatibility.md`](../compatibility.md).
+  [`../compatibility/`](../compatibility/architecture.md).
 - Nothing here is deprecated.

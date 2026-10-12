@@ -48,7 +48,7 @@ Zero-valued fields take the defaults below (`SetDefaults`).
 |---|---|---|---|
 | `MTLSConfig` | `*MTLSConfig` | none | Required whenever the transport is enabled; `ErrMTLSConfigRequired` otherwise. |
 | `RevocationConfig` | `*RevocationConfig` | nil | CRL / OCSP checking; nil disables revocation checking |
-| `StreamPoolSize` | `int` | 16 (`DefaultStreamPoolSize`) | data streams per connection; index 0 carries heartbeats |
+| `StreamPoolSize` | `int` | 16 (`DefaultStreamPoolSize`) | streams per connection; index 0 carries heartbeats, the rest carry data keyed by shard |
 | `MaxStreamPoolSize` | `int` | 256 | the ceiling `Validate` checks `StreamPoolSize` against; the pool does not grow at runtime |
 | `MaxStreamsPerConnection` | `int` | 256 | concurrent inbound data streams (and goroutines) per connection |
 | `MaxIncomingConnections` | `int` | 256 | total inbound connections |
@@ -61,7 +61,7 @@ Zero-valued fields take the defaults below (`SetDefaults`).
 | `MaxSnapshotReceiveMemory` | `int64` | 1 GB | in-flight snapshot chunk memory |
 | `MaxDecompressedSize` | `uint32` | 16 MB | Snappy decompression ceiling; must equal the transport's frame size, any other value is rejected |
 | `SendBatchMaxSize` | `int` | 64 KB | initial capacity of pooled send buffers; it does not cap a batch |
-| `UDPRecvBufSize` / `UDPSendBufSize` | `int` | 7 MB each; 0 uses the OS default | socket buffers |
+| `UDPRecvBufSize` / `UDPSendBufSize` | `int` | 7 MB each | socket buffers. Zero takes the default; a negative value skips the `setsockopt` and leaves the OS default. |
 | `Enable0RTT` | `bool` | false | QUIC 0-RTT. 0-RTT data is replayable, and the receive path refuses message frames and snapshots that arrive over it. |
 | `DisableCompression` | `bool` | false | turn off Snappy for message frames (benchmarking) |
 | `TransportDisabled` | `bool` | false | set by `WithoutTransport()`; skips mTLS validation and does not build the transport |
@@ -155,4 +155,4 @@ Node identity is derived from the mTLS leaf, never from the message body:
   [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md#the-transport-version-is-a-supremum).
 - Nothing here is deprecated. There is no setting that relaxes sender
   authorization: a member is authorized by its committed node identity and by
-  nothing else. See [`../compatibility.md`](../compatibility.md).
+  nothing else. See [`../compatibility/`](../compatibility/architecture.md).

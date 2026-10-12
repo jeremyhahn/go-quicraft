@@ -307,9 +307,11 @@ false-positive rejections. A failure is logged at WARN and `Rotate` still
 returns `(newEpoch, nil)`; returning an error alongside a committed epoch is
 avoided so a caller cannot retry into a second rotation.
 
-**Root-key borrows.** `Rotate` reads the root key through go-enclave's scoped
-`MemoryEnclave.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped `Open`).
-It borrows twice, each time for the one call that reads it: the epoch-cipher
+**Root-key borrows.** The root key is held between operations as a
+`SealedEnclave`. `Rotate` opens it once into a locked `MemoryEnclave`, whose
+destruction is deferred, and reads that through go-enclave's scoped
+`MemoryEnclave.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped
+`MemoryEnclave.Open`). It borrows twice, each time for the one call that reads it: the epoch-cipher
 derivation, then the `StateMAC` re-stamp. Neither borrow spans the sealing of
 the new DEK, which may block on a provider, and no view of the key outlives its
 borrow. Cleanup paths destroy a `SealedEnclave` through one helper that logs a
@@ -449,8 +451,12 @@ there is no per-epoch mixing and no in-place upgrade of a v1 blob.
 After 5 consecutive failed `Unseal` attempts (`bruteForceThreshold`), a doubling
 backoff gates the next: 1s, 2s, 4s, 8s, 16s, 32s, then 60s
 (`bruteForceMaxDelay`). Failures at or above 20 (`bruteForceErrorThreshold`) log
-at ERROR rather than WARN. The counter resets on success and is **persisted** in
-`FailedAttempts` / `LastFailedUnixNano`, so backoff survives a restart.
+at ERROR rather than WARN. The counter resets on success. A failure writes it
+into the in-memory blob's `FailedAttempts` / `LastFailedUnixNano` and does
+**not** call `StatePersister` (only the load claim, `Rotate` and
+`PurgeEpochsBefore` do), so backoff survives a restart only if the embedder
+persists `SealedRootKeyData()` after a failed `Unseal`; `SetSealedRootKey`
+restores it from whatever blob it is given.
 
 Backoff is measured against the wall clock, so a backward clock step could
 otherwise lock a node out permanently; `Unseal` treats negative elapsed time as
@@ -484,7 +490,7 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrInvalidPassphrase` | empty passphrase to `SoftwareStrategy` |
 | `ErrCiphertextTooShort` | below the minimum frame length |
 | `ErrUnsealBackoff` | brute-force backoff active |
-| `ErrPurgeCurrentEpoch` | tried to purge the active epoch |
+| `ErrPurgeCurrentEpoch` | `PurgeEpochsBefore` with `minEpoch` above the current epoch; a floor equal to it is accepted and still keeps the current epoch |
 | (no error) | an epoch with in-flight references is **skipped** by `PurgeEpochsBefore`, not refused; the caller deregisters and purges again later |
 | `ErrEpochsInFlight` | `Reset` while any epoch holds an in-flight reference |
 | `ErrResetNotFirstBoot` | `Reset` on a barrier that loaded a blob via `SetSealedRootKey` or whose epoch advanced past 1 |
@@ -509,6 +515,12 @@ attempt at the Argon2id defaults on fast 2025 desktop hardware.
 | `ErrNoRootKeyAvailable` | `RootKey(ctx)` in no-encryption mode |
 | `ErrInvalidKeySize` | key size does not match the algorithm |
 | `ErrInvocationBudgetUnknown` | logged, never returned: the cause recorded when a restart cannot re-establish a provable budget |
+| `ErrInvalidSealedKey` | a strategy was handed a nil or structurally invalid `SealedRootKey` |
+| `ErrStrategyMismatch` | a strategy was asked to unseal a blob whose `Strategy` names another |
+| `ErrStrategyClosed` | the strategy's key material was released by `Close`; re-create it |
+| `ErrEmptyCredentials` | a deferred-passphrase strategy received a zero `Credentials` |
+| `ErrNoneStrategyEncryptedData` | `StrategyNone` asked to decrypt a frame with a non-zero epoch, i.e. data a real strategy wrote |
+| `ErrShamirThresholdInvalid`, `ErrShamirNilStorage`, `ErrShamirSplitFailed`, `ErrShamirCombineFailed`, `ErrShamirSerializationFailed`, `ErrShamirStorageFailed`, `ErrShamirShareNotFound`, `ErrShamirNoSharesFound`, `ErrShamirVerificationFailed`, `ErrShamirQuorumIncomplete` | declared for the Shamir custody layer, which go-qrdb owns; nothing in this module returns them |
 
 ### Typed errors
 
@@ -702,9 +714,9 @@ type SealedRootKey struct {
     LoadGeneration uint64
     StateMAC       []byte           // HMAC-SHA256 over the covered fields
 
-    FailedAttempts     int64        // backoff, survives restart, NOT MACed
+    FailedAttempts     int64        // backoff, survives restart if re-persisted, NOT MACed
     LastFailedUnixNano int64        // NOT MACed
-    // ... plus Nonce and the hardware/Shamir fields; see
+    // ... plus Nonce, CreatedAt and the hardware/Shamir fields; see
     //     type SealedRootKey in pkg/seal/strategy.go
 }
 ```
@@ -790,7 +802,7 @@ positional AAD; a mismatch fails authentication and there is no weaker retry.
 
 Targets: `make test-seal` (`./pkg/seal/...`), `make bench-seal`, `make fuzz-seal`.
 
-**Unit**: `pkg/seal/*_test.go`, 46 files. Notable ones and what they pin:
+**Unit**: `pkg/seal/*_test.go`, 47 files. Notable ones and what they pin:
 
 | File | Pins |
 |---|---|

@@ -38,16 +38,18 @@ func enclave.LockedSize(n int) int64
 // Sentinels
 var ErrEnclaveDestroyed, ErrEmptyEnclave, ErrInvalidSize,
     ErrLockedMemoryUnavailable, ErrReleasedWithoutWipe, ErrSealFailed,
-    ErrOpenFailed, ErrSealedAuthentication, ErrSealerWiped error
+    ErrEnclaveCorrupted, ErrOpenFailed, ErrSealedAuthentication,
+    ErrSealerWiped error
 ```
 
 ## 2. Invariants
 
 **Call safety versus slice safety.** A `MemoryEnclave` guards its mapping with
-its own `sync.RWMutex` and a `SealedEnclave` its envelope with another, both
-inside go-enclave. Readers hold the read lock for the call and `Destroy` takes
-the write lock, so teardown waits out in-flight readers. Every call is safe under
-concurrency. A slice that outlives the call is not, and since v0.8.0 go-enclave
+its own `sync.RWMutex` inside go-enclave. Readers hold the read lock for the call
+and `Destroy` takes the write lock, so teardown waits out in-flight readers. A
+`SealedEnclave`'s lock only pins and unpins its envelope and is not held across
+the open, so its `Destroy` does not wait (see the table). Every call is safe
+under concurrency. A slice that outlives the call is not, and since v0.8.0 go-enclave
 hands out no such slice: `WithBytes` is the only read path, and the view it
 passes is valid for the callback alone.
 
@@ -119,17 +121,19 @@ passes is valid for the callback alone.
   `ErrLockedMemoryUnavailable` when the kernel refused the release (the pages are
   still held and on go-enclave's `WipeAll` ledger; calling `Destroy` again
   retries) and `ErrReleasedWithoutWipe` when a denied `mprotect` forced a bare
-  unmap (the pages are gone). The two are disjoint. Every site here is a cleanup
+  unmap (the pages are gone). The two are disjoint. It returns
+  `ErrEnclaveCorrupted` when the canary or guards were overwritten. Every site here is a cleanup
   step whose operation already has its result: `pkg/seal` logs the report at
   WARN through `releaseEnclave`, and `pkg/crypto/shamir` drops it through
   `release`, whose comment records why nothing is lost.
 - **A refused `Freeze` leaves the enclave alive and writable.** Every call site
   here destroys it rather than return material whose protection was not
   established.
-- **`Destroy` panics on a canary failure**, the one panic in the path. A
-  mismatch means something wrote into memory it did not own, which the caller
-  cannot act on because the state it would act on is the state that is wrong. The
-  material is wiped and the pages released before the panic, so nothing leaks.
+- **`Destroy` never panics, a canary failure included.** A canary or guard
+  mismatch is reported as `ErrEnclaveCorrupted` after the material is wiped and
+  the pages released, so nothing leaks; if the release was also refused the
+  error matches `ErrLockedMemoryUnavailable` too. The cleanup helpers above log
+  or drop it like any other release report.
 - **A `nil` `*MemoryEnclave` or `*SealedEnclave` is a valid receiver.** It
   reports itself not alive, reads with `ErrEnclaveDestroyed` and destroys as a
   no-op, which is why `Barrier.seal()` destroys `b.rootKey` and `b.currentDEK`
@@ -150,6 +154,7 @@ passes is valid for the callback alone.
 | `ErrSealedAuthentication` | sentinel | a sealed envelope did not authenticate | Yes; deliberately indistinguishable between causes |
 | `ErrSealerWiped` | sentinel | a shutdown sweep destroyed the sealer's root or current KEK | Yes; a per-call key destroyed by a sweep is `ErrEnclaveDestroyed` instead |
 | `ErrReleasedWithoutWipe` | sentinel | `MemoryEnclave.Destroy` unmapped the pages without a wipe because `mprotect` was denied | Not a failure to protect: the pages are gone and the kernel zeroes them before reuse |
+| `ErrEnclaveCorrupted` | sentinel | `MemoryEnclave.Destroy` found the canary or guard pages overwritten | Reported, not panicked: the material is wiped and the pages released first |
 
 How `pkg/seal` and `pkg/crypto/shamir` translate them:
 
@@ -232,8 +237,8 @@ material:
 **Fault-injection seams.** The failure that matters, `RLIMIT_MEMLOCK`
 exhaustion, cannot be produced honestly in a shared test binary: reaching it for
 real fails allocations in every unrelated test. So each package that must prove
-its refusal path is clean owns a `testing.Testing()`-gated seam at its own
-allocation site:
+its refusal path is clean owns a seam at its own allocation site that
+production code cannot reach:
 
 - `seal.Barrier.lockRootKey`: a field, not a package variable, so it cannot be
   reached from another test or from production code that did not ask for it.
@@ -247,8 +252,19 @@ allocation site:
 
 ## 7. Observability
 
-No logging, metrics or audit records for protected memory itself. Every event it
-could report is about a key, and the useful fields (identity, size, lifetime) are
-exactly the ones that should not reach a log. `pkg/seal` logs barrier lifecycle
+No metrics or audit records for protected memory itself, and one kind of log
+line. Every other event it could report is about a key, and the useful fields
+(identity, size, lifetime) are exactly the ones that should not reach a log.
+
+The exception is a release report on a `pkg/seal` cleanup path, logged at WARN
+with an `enclave` field naming the role (`root key`, `epoch DEK`, ...) and the
+`error`, never the material:
+
+| Message | Helper | When |
+|---|---|---|
+| `quicraft/seal: locked memory release was refused or ran without a wipe` | `releaseEnclave` | `MemoryEnclave.Destroy` returned non-nil |
+| `quicraft/seal: sealed key release failed` | `releaseSealed` | `SealedEnclave.Destroy` returned non-nil (never, in go-enclave v0.8.0) |
+
+`pkg/crypto/shamir` has no logger and logs nothing. `pkg/seal` logs barrier lifecycle
 events without naming key material; see
 [`../observability/engineering.md`](../observability/engineering.md).

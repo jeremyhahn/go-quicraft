@@ -45,7 +45,8 @@ generation. The design priorities are:
 - **Hand-written codecs.** Every type implements `MarshalTo(buf []byte)
   (int, error)` and `UnmarshalFrom(buf []byte) (int, error)`. No
   reflection, no code generation, no dependencies outside the standard
-  library (`encoding/binary`, `sort`, `math`, `errors`, `fmt`).
+  library (`encoding/binary`, `sort`, `math`, `errors`, `fmt`, and `sync`
+  for the entry-slice pool).
 
 Source: `pkg/proto/`
 
@@ -407,7 +408,7 @@ leader-exec router and never reach Raft. They reuse the fixed fields:
 |------------|------------------------------------------------|---------------------------------------------------|
 | `Term`     | the term the request may execute under         | echoed                                            |
 | `Hint`     | request ID, unique on the caller's host        | echoed                                            |
-| `LogIndex` | caller's remaining budget in ns (0 = none)     | refusal status when `Reject` is set               |
+| `LogIndex` | caller's remaining budget in ns; 0, or more than the host's 5-minute request timeout, takes that timeout | status: 0 answered, else the refusal status below |
 | `Reject`   | —                                              | set when the request was refused or not answered  |
 | `Entries`  | exactly one; `Cmd` is the request              | exactly one; `Cmd` is the reply or error text     |
 
@@ -417,6 +418,16 @@ ready leader of that term), 4 handler failed (text in `Cmd`), 5 busy (not
 executed). A caller treats an unknown status as 2, and discards any answer,
 whatever its status, for a term older than the latest it has seen. Adding
 the two types extended the type range in place; no format version moved.
+
+The answer is bound to the attempt it names. The executor replies from its
+own replica ID to the request's `From`, echoing `Term` and `Hint`. The caller
+accepts a `LeaderExecResp` only while the attempt `Hint` names is in flight,
+and only when its `ShardID`, `From` (the replica the request was sent to) and
+`Term` match that attempt and it carries exactly one entry; anything else is
+dropped (`completeLeaderExec` in `pkg/leaderexec.go`). A `LeaderExec` without
+exactly one entry is dropped unanswered. Handler error text, including a
+recovered panic, is truncated to 1024 bytes, and a host executes at most 1024
+remote requests at once (status 5 beyond that).
 
 ### Validation rules
 
@@ -431,7 +442,9 @@ the two types extended the type range in place; no format version moved.
 - Each entry is validated recursively via `Entry.UnmarshalFrom`
 - Snapshot section requires at least 8 bytes for the `HasSnapshot` flag
 
-`MarshalTo` mirrors the first two and adds `ErrSnapshotWithoutPosition`.
+`MarshalTo` applies the type and entry-count bounds, returns
+`ErrBufferTooSmall` for a buffer shorter than `Size()`, and adds
+`ErrSnapshotWithoutPosition`.
 A producer therefore learns at the sender that its message is unparseable,
 rather than having every peer drop the frame, a rejection the sender cannot
 tell apart from a broken connection.
@@ -547,6 +560,10 @@ The `DeploymentID` field allows cross-deployment message rejection. The
 receiver compares the batch's `DeploymentID` against its own configured
 value and drops the entire batch on mismatch. This prevents accidental
 message routing between independent QuicRaft clusters sharing a network.
+The check runs before any connection state is touched, so a foreign batch
+cannot move the peer's epoch tracking. A mismatch is a protocol violation:
+the receiver resets the stream with `QUICStreamErrFrameRejected` and counts
+a `protocol_violation` drop.
 
 ## State wire format
 
@@ -803,7 +820,7 @@ That is the pre-release pinning policy: every wire and persisted format in
 this repository stays at version 1 until the first production release, a
 layout change is made IN PLACE and the consuming repos are rebuilt to match,
 and development clusters are wiped and re-synced rather than migrated. See
-[Compatibility](../compatibility.md#format-versions-are-pinned-until-the-first-production-release)
+[Compatibility](../compatibility/architecture.md#format-versions-are-pinned-until-the-first-production-release)
 for the full policy and its consequences, chiefly that two binaries from
 different pre-release commits may be mutually unreadable while both stamp 1.
 
@@ -865,6 +882,7 @@ oversized value would produce a bootstrap entry no binary can read back.
 
 - Count validated against `MaxMembershipEntries` (10,000)
 - Fixed 16 bytes per entry
+- Duplicate key returns `ErrDuplicateMapKey`
 - Empty map: 4 bytes
 
 ### Deterministic encoding
@@ -935,7 +953,9 @@ receive-side gate reads a value no inbound message can write. It is supplied
 by the operator through the Host API, never captured from a connection.
 It is empty for `RemoveNode` and `UpdateWitnessPolicy`. An add without one is
 refused on a host with a transport (`ErrMemberIdentityRequired`), both by the
-Host API and by the leader's propose-time validator.
+Host API and by the leader's propose-time validator, unless the configuration
+already binds an identity to that replica: a role change such as an observer
+promotion keeps the existing binding, so only a net-new binding is refused.
 
 ### One layout, every field mandatory
 
@@ -1196,7 +1216,7 @@ Producers MUST bound themselves by these values.
 ### MaxDecodeMemoryFactor
 
 A wire-byte budget is not a memory budget. The decoded form of a frame is
-materially larger than the frame: a 100-byte heartbeat becomes a 320-byte
+materially larger than the frame: a 100-byte heartbeat becomes a 304-byte
 `Message` in a slice, and a membership map entry costs 12 bytes on the wire
 and roughly 57 in a Go map. The transport therefore reserves the frame
 length times this factor against `MaxMessageReceiveMemory` before reading the
@@ -1490,7 +1510,7 @@ clusters are wiped and re-synced rather than migrated. The numbers increment
 for the first time at the first production release. The consequence is
 intended and worth stating plainly: two binaries from different pre-release
 commits may be mutually unreadable while both stamp 1. See
-[Compatibility](../compatibility.md#format-versions-are-pinned-until-the-first-production-release).
+[Compatibility](../compatibility/architecture.md#format-versions-are-pinned-until-the-first-production-release).
 
 Within that, the package still carries **two independent version
 namespaces**. Neither may be derived from the other, and a bump to one must
@@ -1558,7 +1578,7 @@ does not move, and it does not announce itself as a version mismatch, so
 the procedure wipes each node's data directory rather than relying on the
 gate to catch the skew.
 
-See [Compatibility](../compatibility.md) for the authoritative
+See [Compatibility](../compatibility/user.md#upgrade-notes-by-release) for the authoritative
 per-release procedure and the version history.
 
 ### No reserved padding
@@ -1648,7 +1668,7 @@ transport-level counters that count them are in
 ## Cross-references
 
 - [Architecture Overview](../multi-group-host/architecture.md) -- system overview and data flow
-- [Compatibility](../compatibility.md) -- the version-pinning policy and per-release upgrade procedure
+- [Compatibility](../compatibility/architecture.md) -- the version-pinning policy and per-release upgrade procedure
 - [WAL Persistence](../log-storage/engineering.md) -- how serialized entries are stored
 - [Engine Pipeline](../raft-consensus/engineering.md) -- Update flow between workers
 - [Transport](../quic-transport/engineering.md) -- how MessageBatch frames are sent via QUIC

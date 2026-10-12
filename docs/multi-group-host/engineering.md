@@ -14,7 +14,7 @@ regress. Each sequence is traced from the code.
 
 Wire and on-disk formats are pinned until the first stable release and change in
 place; the upgrade path across a format change is to wipe and re-sync. See
-[Compatibility and Upgrades](../compatibility.md).
+[Compatibility and Upgrades](../compatibility/architecture.md).
 
 ## Source files
 
@@ -57,19 +57,21 @@ NewHost(cfg, opts...)
   |     - default: waldb.Open(WALDir, ...), with the host-wide barrier and
   |       the disk monitor wired in
   |     - WithLogDB(l) or WithMemoryLogDB()
-  |  6. Load or generate the host ID: <NodeHostDir>/host.id, 32 hex
-  |     characters (128 random bits), mode 0600
+  |  6. Host ID: HostConfig.HostID when set; otherwise load or generate
+  |     <NodeHostDir>/host.id, 32 hex characters (128 random bits), mode 0600
   |  7. registry.NewRegistry()
   |  8. Transport (unless disabled): message handler, QUICTransport,
   |     transportSender
   |  9. engine.NewEngine(...): per-tier stop channels, commit and apply
   |     channels, snapshot pool (max(NumWorkers/2, 2)). Not started
-  | 10. Wire the message handler and sender to the engine and host
-  | 11. eng.SetCallback(hostEngineCallback); import locker
+  | 10. Wire the message handler and sender to the engine and host; per-shard
+  |     barriers and epoch trackers; the transport's listener dispatcher
+  | 11. eng.SetCallback(hostEngineCallback)
   | 12. eng.Start()
   | 13. tr.Start() -- LAST. On failure: stop the engine, stop the
   |     transport, return *HostInitError
   | 14. Start key rotation when a barrier is configured
+  | 15. Start the pending-request sweeper
 ```
 
 **The transport starts last.** Once it starts, receive goroutines call into the
@@ -78,9 +80,9 @@ Starting it earlier is a data race between those reads and `NewHost` still
 writing the fields.
 
 `Engine.Start()` launches workers bottom-up so consumers exist before producers
-send: snapshot pool, apply workers, commit workers, then step workers. Each tier
-has its own `sync.WaitGroup` (`snapshotWg`, `applyWg`, `commitWg`, `stepWg`) for
-ordered shutdown.
+send: the listener dispatcher, the snapshot pool, apply workers, commit workers,
+then step workers. Each has its own `sync.WaitGroup` (`listenerWg`, `snapshotWg`,
+`applyWg`, `commitWg`, `stepWg`) for ordered shutdown.
 
 ## StartShard
 
@@ -116,12 +118,14 @@ StartShard(members, join, create, cfg)
   |  8. raft.NewPeer(cfg, lr, globalRateLimiter)
   |  9. Create the replica's snapshot directory; rsm.NewStateMachine(...)
   |     (type detection DiskSM > ConcurrentSM > StateMachine); Open
-  | 10. In-memory tiers: recover the recorded snapshot, if any
-  | 11. Save the bootstrap record (first start, non-join)
+  | 10. Recover the recorded snapshot, if any: in-memory tiers always, an
+  |     on-disk state machine only when Open returned 0
+  | 11. Save the bootstrap record (every non-join start)
   | 12. engine.NewNode(...); engine.LoadNode(node), on step worker
   |     shardID % NumWorkers
   | 13. Register the effective membership's addresses in the registry
   | 14. engine.NotifyWork(shardID): the first tick begins
+  | 15. OnNodeReady, on the caller's goroutine
 ```
 
 Address routing uses the effective (recovered) membership, not the caller's
@@ -169,15 +173,18 @@ is never reallocated, so it lands here too); wipe and re-sync.
 ### On-disk state machines
 
 `rsm.StateMachine.Open` delegates to the user's `DiskStateMachine.Open`, which
-returns its last applied index; the adapter records it. If a snapshot exists
-above that index, the snapshot pool recovers it after the node is loaded, when
-the Raft peer detects the gap.
+returns its last applied index. A non-zero index makes the state machine's own
+database authoritative: `StartShard` does not recover the recorded snapshot,
+which would roll the database back to the snapshot index, and seeds the applied
+markers from `Open`'s index, clamped to the recovered commit index. When `Open`
+returns 0 and a snapshot is recorded (an import, or a lost database), the
+snapshot is recovered exactly as for the in-memory tiers below.
 
 ### In-memory state machines
 
 In-memory tiers start empty and must replay their last snapshot. After `Open`,
 `StartShard` reads `logdb.GetSnapshot`; when a snapshot is recorded it verifies
-the data against `snapshot.meta`, decrypts and decompresses as needed, and feeds
+the data against `snapshot.meta` and the recorded file size, decrypts and decompresses as needed, and feeds
 it to `RecoverFromSnapshot`.
 
 A recorded snapshot that cannot be opened, verified, decrypted or recovered is
@@ -200,7 +207,10 @@ that phantom match toward quorum.
 
 `newRaftLog` clamps `committed` down to what the log actually holds (0 for an
 empty log), so the replica re-learns its log and commit index from the leader.
-The clamp logs at ERROR with both indices.
+The clamp logs to the process-default `slog` logger, not `HostConfig.Logger`:
+at ERROR when the log holds nothing (`recovered commit index over an EMPTY
+log`), at WARN when it holds a shorter prefix (`recovered commit index exceeds
+last log entry, clamping`).
 
 **The host does not refuse to start.** One shard's corruption must not take down
 a process carrying thousands of shards, and self-healing from the leader is the
@@ -274,11 +284,13 @@ preconditions are yours to establish:
 
 Procedure:
 
-1. **Stop every surviving replica.** `ImportSnapshot` needs the shard stopped.
-2. **Find the most up-to-date survivor** by `ShardInfo.LastApplied` or its
-   highest recorded snapshot index. Data held only by a less advanced replica is
-   lost.
-3. **Export a snapshot from it.**
+1. **Find the most up-to-date survivor** by `ShardInfo.LastApplied` or its
+   highest recorded snapshot index, with the survivors' shards started (a shard
+   starts without quorum; it just cannot elect). Data held only by a less
+   advanced replica is lost.
+2. **Export a snapshot from it while its shard is still loaded.**
+   `ExportSnapshot` refuses a stopped shard with `ErrShardNotFound`. It exports
+   the latest snapshot recorded in LogDB, not the log after it.
 
    ```go
    f, err := os.Create("/var/backups/shard-7.artifact")
@@ -294,6 +306,8 @@ Procedure:
    }
    ```
 
+3. **Stop every surviving replica.** `ImportSnapshot` refuses a loaded shard
+   with `ErrInvalidOperation`.
 4. **Import it on every survivor**, naming only the survivors:
 
    ```go
@@ -313,6 +327,9 @@ Procedure:
    `WithImportMemberIdentities` overrides it. Every refusal matches
    `ErrImportMembershipInvalid`; none is silently resolved, because a
    configuration accepted by accident cannot be detected afterwards.
+   Separately, an artifact whose index does not advance the replica's recorded
+   snapshot is refused with `*ImportSnapshotOutOfDateError`; that includes the
+   survivor it was exported from, which already records that index.
 
 5. **Restart the survivors** with `StartShard(survivors, false, create, cfg)`,
    with `cfg.MemberIdentities` naming the survivors' identities. The shard elects
@@ -340,16 +357,19 @@ Host.Close()
   |     A timeout is logged and joined into Close's error
   |  3. Stop key rotation: close(keyRotStopC), <-keyRotDone
   |  4. Stop the pending-request sweeper: close(sweepStopC), <-sweepDone
-  |  5. engine.Stop() (ordered, below)
-  |  6. transportSender.Wait(): join snapshot sends the step workers started
-  |  7. transport.Stop()
-  |  8. For each shard: claim teardown (a concurrent StopShard owns a shard it
+  |  5. Close the leader-exec router: local callers get ErrStopped, handlers
+  |     serving remote callers see their context end, and Close waits for them
+  |  6. engine.Stop() (ordered, below)
+  |  7. transportSender.Wait(): join snapshot sends the step workers started
+  |  8. transport.Stop()
+  |  9. For each shard: claim teardown (a concurrent StopShard owns a shard it
   |     claimed first), mark unloaded, cancel an in-progress
   |     DiskStateMachine.Open, fail pending proposals, reads and snapshots
   |     with ErrClosed; a second sweep catches requests registered during
   |     the first; close each state machine
-  |  9. logdb.Close()
-  | 10. barrier.Seal() when configured
+  | 10. logdb.Close()
+  | 11. Seal the host-wide barrier and every distinct per-shard barrier the
+  |     host was given; an already-sealed barrier is not an error
 ```
 
 **The engine stops before the transport, and the transport stops last.** The
@@ -359,13 +379,16 @@ step workers are the only producers of snapshot sends, and each send does
 transport first would allow `WaitGroup.Add` concurrent with `Wait`, and send
 goroutines touching a torn-down transport.
 
-`Close` returns the `errors.Join` of every failure, including a drain that timed
-out. Returning nil after abandoning accepted work would tell the application its
+`Close` returns the `errors.Join` of an incomplete drain, each state machine's
+`Close`, the LogDB `Close` and each barrier's `Seal`. A transport stop failure is
+only logged, at DEBUG. Returning nil after abandoning accepted work would tell the application its
 shutdown was clean when it was not.
 
 `ShutdownTimeout` bounds the drain only. `Close` waits, with no timeout, for
 every in-flight `SM.Apply` to return, so a state machine that blocks in `Apply`
-blocks `Close`. The shards still applying are logged before that wait.
+blocks `Close`. When the wait has lasted 2 seconds, each apply worker logs the
+shards it is still waiting on at WARN (`apply worker still waiting for in-flight
+SM.Apply calls`).
 
 ### Engine.Stop
 
@@ -398,7 +421,8 @@ The apply worker's `wg.Wait()` means `Engine.Stop` never returns while an
 `SM.Apply` is running, so the host does not close LogDB or seal the barrier under
 a state machine still writing.
 
-`Node.Stop()` closes `stopC` once (select with default). That cancels
+`Node.Stop()` closes `stopC` once (`sync.Once`), closes the node's proposal
+queue and answers any install a snapshot receive is awaiting. Closing `stopC` cancels
 `SaveSnapshot`, `RecoverFromSnapshot` and an in-progress `Open`, all of which
 select on the stopper.
 
@@ -408,19 +432,26 @@ select on the stopper.
 
 ```
 StopShard(shardID)
-  |  1. Claim teardown; mark the node stopped and ShardUnloaded
-  |  2. Fail pending proposals, reads and snapshots with ErrAborted
-  |  3. Remove from h.nodes
-  |  4. engine.UnloadNode(shardID)
+  |  1. Claim teardown (mark the node stopped); wake ExecuteOnLeader callers
+  |     waiting on the shard, which return ErrStopped
+  |  2. Mark ShardUnloaded; cancel an in-progress DiskStateMachine.Open
+  |  3. engine.UnloadNode(shardID)
   |     - mark the node unloaded, then node.Stop(); awaited installs answered
   |     - node.awaitWriteLeases(): a snapshot receive's writes and a
   |       running snapshot recovery finish
   |     - step worker drops the node
   |     - commit fence, waited on (below)
   |     - apply unload, waited on (below)
-  |  5. Remove the shard's registry entries
-  |  6. Close the state machine; fire OnNodeUnloaded
+  |     - return the shard's share of the host-wide in-memory log limit
+  |  4. Fail pending proposals, reads and snapshots with ErrAborted
+  |  5. Remove the shard's registry entries and join window
+  |  6. Remove from h.nodes
+  |  7. Close the state machine; unregister the shard's metrics
+  |  8. Fire OnNodeUnloaded; return the state machine's Close error
 ```
+
+The node stays in `h.nodes` until the engine has unloaded it, so an apply that
+completes during the unload still finds its proposal and answers it normally.
 
 ### Commit fence
 
@@ -541,7 +572,32 @@ A LogDB write failure in `SaveState` (retries exhausted, or shutdown during a
 backoff) goes through `failBatchSaveState`: every node in the batch is marked
 failed, `commitPending` is cleared, a `SaveStateError` is reported, and the
 batch's pending proposals fail so callers do not wait for their deadline. The
-node stays failed, because its Raft state advanced past stable storage.
+node stays failed, because its Raft state advanced past stable storage. A
+`Peer.Commit` failure (`failCommit`) is treated the same way and reported as a
+`CommitError`: the processed marker has already moved, so the batch can never be
+offered to the state machine again.
+
+**What a failed caller is told.** A proposal that failed after it was handed to
+Raft (a failed `SaveState`, commit or apply, or a committed batch discarded
+unapplied) may still commit and apply, so its error is wrapped in
+`*MaybeAppliedError` and still matches its own type and sentinel. A proposal
+Raft refused before appending it (no leader, a transfer or config change in
+progress) gets the bare error. When the failure latch trips, every proposal and
+read still pending on the shard is failed with `ErrShardFailed`: a proposal's
+wrapped in `*MaybeAppliedError`, a read's bare. Snapshot requests are answered
+by the snapshot pool.
+
+**Abnormal exits in user code.** Every long-lived goroutine that runs user code
+(apply, commit and step workers, per-shard apply goroutines, snapshot pool
+workers, the listener dispatcher, the key-rotation loop and the transport's
+workers) runs under `supervise.Supervise`. A panic is recovered by the worker's
+own loop; a `runtime.Goexit`, which `recover` cannot stop, is classified as
+`supervise.ErrGoexit` and treated exactly as a panic, and the loop is restarted
+on a fresh goroutine after the same 100 ms delay. What the step worker held at
+the exit is settled, not lost: a proposal batch Raft never received fails with
+`ErrDropped` (definite), one Raft had begun to handle fails with the exit's cause
+wrapped in `*MaybeAppliedError`, and ReadIndex keys and undelivered read states
+fail with `ErrDropped`.
 
 ## Key invariants
 
@@ -554,8 +610,11 @@ node stays failed, because its Raft state advanced past stable storage.
    before stopping the next. One shared `stopC` would let apply workers exit
    before commit workers finish forwarding.
 3. **Blocking forward from commit to apply.** Persisted entries are sent to
-   `applyC` with no `stopC` escape. Dropping persisted but unapplied entries
-   would leave client proposals waiting forever.
+   `applyC` with no escape on the commit tier's own stop; the send gives up only
+   when the apply tier is stopping, which `Engine.Stop` does after the commit
+   workers have exited. While it blocks, the worker still takes unload requests.
+   Dropping persisted but unapplied entries would leave client proposals waiting
+   forever.
 4. **`Node.stopC` cancels snapshot work.** `Engine.Stop()` closes every node's
    `stopC` before stopping any tier.
 5. **The apply worker joins every `SM.Apply`** before returning, so
@@ -814,7 +873,7 @@ signatures may change.
 ## Cross-references
 
 - [Usage](user.md): configuration, monitoring, tuning, disaster recovery
-- [Compatibility and Upgrades](../compatibility.md): format versions
+- [Compatibility and Upgrades](../compatibility/architecture.md): format versions
 - [Raft protocol and engine pipeline](../raft-consensus/engineering.md)
 - [Log storage](../log-storage/engineering.md): segment format, framing,
   compaction
