@@ -1,7 +1,7 @@
 # Observability: usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-02
+> notifications · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Everything here is opt-in. A host with no collector and no listener runs fine
@@ -107,6 +107,8 @@ you want every line in one place.
 | `quicraft_transport_messages_dropped_total{reason="queue_full"}` | A peer that cannot keep up. |
 | `quicraft_raft_proposals_dropped_total` | Back-pressure reaching clients. |
 | ERROR log "sealed root key was claimed by another loader" | Two processes on one data directory; this barrier may no longer encrypt. |
+| `HealthStatus.DiagnosticsDropped` rising | Your `slog` handler is blocking or far slower than the process logs, so library log lines are being discarded. Fix the handler; the engine itself is not stalled by it. |
+| ERROR log "worker panic recovered, restarting" | An engine worker ended by panic or `Goexit` and was restarted after 100 ms. The shard's `OnShardFailed` carries the typed cause. |
 | ERROR log containing "notification dropped" | Your `EventListener` is not keeping up and a notification was lost. |
 
 Don't page on these:
@@ -152,8 +154,10 @@ status := host.HealthCheck() // *HealthStatus
 
 The library returns a value and serves nothing. Wire it into your own readiness
 endpoint. `status.DiagnosticsDropped` counts library log records dropped
-because your `slog` handler was not taking them; alert on it rising. For incident response, `host.GetShardInfo`, `host.GetNodeHostInfo`
-and `host.DiagRaftState` give per-shard detail; see
+because your `slog` handler was not taking them; alert on it rising. It is
+process-wide and is not exported as a metric, so copy it into your own gauge
+if you want a graph. For incident response, `host.GetShardInfo`,
+`host.GetNodeHostInfo` and `host.DiagRaftState` give per-shard detail; see
 [`../raft-consensus/cli.md`](../raft-consensus/cli.md).
 
 ## Troubleshooting

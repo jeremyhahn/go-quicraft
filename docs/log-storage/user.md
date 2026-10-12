@@ -1,7 +1,7 @@
 # Log Storage — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-02
+> `pkg/logdb/memdb` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 You deal with log storage in three ways: choosing a store when you build a
@@ -10,7 +10,7 @@ damaged.
 
 ## Before you start
 
-- Go 1.27.1 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.2 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A directory on a filesystem whose `fdatasync` you trust. Everything below
   assumes it.
 - A decision about block size if you will not use the default, because it
@@ -77,7 +77,9 @@ cfg.EventListener = &config.EventListener{
 }
 ```
 
-Past 95% of the ceiling, proposals fail with `quicraft.ErrDiskFull`: a clean
+The ceiling is compared with the used space of the whole filesystem holding the
+WAL (Linux `statfs`), not with the WAL's own size, so other files on the volume
+count against it. Past 95% of the ceiling, proposals fail with `quicraft.ErrDiskFull`: a clean
 refusal instead of an unrecoverable one. Writes resume when usage drops below
 the threshold.
 

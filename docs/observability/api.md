@@ -1,7 +1,7 @@
 # Observability: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-02
+> notifications · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -192,9 +192,24 @@ func (h *Host) RaftAddress() string
 
 type ShardHealth uint8 // ShardHealthy, ShardNoLeader, ShardLagging, ShardUnloaded,
                        // ShardError, ShardRecovering, ShardSnapshotting
+
+type HealthStatus struct {
+    Status             string      `json:"status"` // ok | degraded | sealed | unhealthy
+    BarrierSealed      bool        `json:"barrier_sealed"`
+    DiskOK             bool        `json:"disk_ok"`
+    ShardCount         int         `json:"shard_count"`
+    Shards             []ShardInfo `json:"shards,omitempty"`
+    DiagnosticsDropped uint64      `json:"diagnostics_dropped"` // process-wide
+}
 ```
 
 `HealthCheck` returns a value; serving it is the embedder's job.
+`DiagnosticsDropped` is the number of library log records dropped since the
+process started because the `slog.SetDefault` handler was not taking them (the
+library never blocks on its own diagnostics: see
+[`engineering.md`](engineering.md#9-contained-diagnostics-and-supervision)).
+It is process-wide, so every `Host` in a process reports the same value, and it
+does not affect `Status`. There is no Prometheus series for it.
 `ShardHealth` unmarshals from JSON and rejects an unrecognized value with
 `*InvalidShardHealthError`, which matches `ErrInvalidShardHealth`.
 

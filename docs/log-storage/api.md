@@ -1,7 +1,7 @@
 # Log Storage — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-02
+> `pkg/logdb/memdb` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -175,7 +175,10 @@ func Open(dir string, opts ...Option) (*DB, error)
 `DiskMonitorOption`s: `WithWarningPercent` (default `DefaultWarningPercent` =
 0.85), `WithFullPercent` (default `DefaultFullPercent` = 0.95), `WithCheckEvery`
 (default `DefaultCheckEvery` = 100 writes), `WithOnWarning`, `WithOnFull`,
-`WithOnRecovery`, `WithDiskUsageFunc`. Thresholds are fractions of `maxBytes`.
+`WithOnRecovery`, `WithDiskUsageFunc`. Thresholds are fractions of `maxBytes`, compared with the used bytes of the whole
+filesystem (`statfs` total minus available; a stub reporting zero on non-Linux).
+`WithCheckEvery(0)` logs a WARN and uses the default. `DiskUsageFunc` is
+`func(dir string) (usedBytes uint64, err error)`.
 Past the full threshold `SaveState` returns `ErrDiskFull`.
 
 `Options` is a declarative mirror of these (`WALDir`, `BlockSize`,

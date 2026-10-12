@@ -1,7 +1,7 @@
 # Observability: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-02
+> notifications · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale and the scope fence are in [`architecture.md`](architecture.md).
@@ -91,7 +91,8 @@ with `waldb.WithMetrics`.
   the hot-path methods.
 - **Panics are contained.** `WithMetrics` wraps the collector in
   `safeMetricsCollector`, which recovers each panic, counts it and logs at a
-  bounded rate. A collector is still expected not to panic; the wrapper exists
+  bounded rate (the 1st, 2nd, 4th, 8th, ... panic), off the calling goroutine
+  (§9). A collector is still expected not to panic; the wrapper exists
   so an embedder bug cannot unwind an engine worker and drop its in-flight
   update. `NoOpMetricsCollector` and an already wrapped collector are not
   wrapped again.
@@ -137,6 +138,9 @@ proposal.
   keeps running.
 - A dispatched notification refused by a full listener queue is dropped and
   logged at ERROR, except a leader change, which is retried on the next tick.
+- A log record that finds the contained-diagnostics queue full is dropped and
+  counted in `HealthStatus.DiagnosticsDropped`; the producing goroutine is
+  never delayed (§9).
 - `config.LogConfig.Validate` returns `*LogValidationError` (`Field`, `Message`,
   `Value`) for an unrecognized `Format` or `Level`. `NewHost` runs it as part of
   `HostConfig` validation, so it is a startup check.
@@ -210,7 +214,8 @@ panics, blocks or counts invocations is one struct. Embedding
 
 `quicraft_metrics_per_shard_enabled` is the only self-describing metric. Panics
 recovered from a collector are counted by the safe forwarder and logged at a
-bounded rate.
+bounded rate, through the contained-diagnostics queue (§9). Loss of library log
+records is reported by `HealthStatus.DiagnosticsDropped`, not by a metric.
 
 ## 8. Metric reference
 
@@ -253,3 +258,72 @@ The `_detailed_` counters are registered but stay at zero unless
 `PrometheusMetricsCollector.EnablePerMessageMetrics` is set to `true` after
 construction. They are a debugging surface: expensive, and not for a standing
 dashboard.
+
+## 9. Contained diagnostics and supervision
+
+The `slog` handler (installed through `slog.SetDefault`), a recovered panic
+value's `String`/`Error` method, a state machine, a listener and a metrics
+collector are all user code. The library therefore never lets them stand
+between an abnormal exit and its settlement. The mechanism is the internal
+package `pkg/internal/supervise` (not importable by an embedder); what an
+operator sees of it is:
+
+- **Diagnostics leave through one bounded queue.** A recovery path settles
+  everything structural first (completion signals, shard failure latches,
+  waiter release), then emits its log record with `supervise.LogContained`,
+  which queues the record for a single process-wide worker and returns at
+  once. The queue holds `supervise.DiagnosticQueueCapacity` (256) records. A
+  record that finds it full is dropped and counted. Records run one at a time
+  in submission order; a handler that panics loses only that record; a handler
+  that blocks holds the worker and one record, and nothing else. The worker
+  holds no goroutine while the queue is empty.
+- **The drop count is `HealthStatus.DiagnosticsDropped`**
+  (`json:"diagnostics_dropped"`), returned by `Host.HealthCheck`. It is
+  process-wide, as the default handler is, so every `Host` in a process reports
+  the same value; it does not affect `Status`. A count that keeps rising means
+  the default handler is blocking or far slower than the process logs. It is
+  not a Prometheus metric: no `quicraft_*` series reports it, so an embedder
+  that wants one reads it from `HealthCheck`.
+- **A record can therefore be late or lost, never blocking.** Library lines on
+  the contained path are emitted by the worker, not the producing goroutine, so
+  they can appear after the event that caused them and their order against
+  uncontained lines is not guaranteed.
+- **Supervised workers restart after a `runtime.Goexit` as well as a panic.**
+  `supervise.Supervise` restarts a long-lived worker (engine apply, commit and
+  step workers, each shard's apply goroutine, the snapshot pool workers and
+  listener dispatcher, the key-rotation and pending-sweep loops, the
+  transport's send-queue workers, connection cleanup and accept loop, and the
+  diagnostics worker itself) on a fresh goroutine after
+  `supervise.RestartDelay` (100 ms), and not at all once its stop channel has
+  closed. A Goexit is reported as `supervise.ErrGoexit` and treated exactly as
+  a panic.
+
+Log events a recovery emits (all ERROR, all through the contained queue, all
+carrying the recovered value as `panic` formatted with `fmt.Sprint`):
+
+| Message | Source | Extra attributes |
+|---|---|---|
+| `apply worker panic recovered, restarting`, `commit worker ...`, `step worker ...` | engine worker recovery | `worker_id`, `stack`, `error` (a `*WorkerPanicError`) |
+| `snapshot worker panic recovered` | snapshot pool | |
+| `state machine panic recovered` | per-shard apply | |
+| `event listener panic recovered` | listener dispatcher | |
+| `OnSnapshotRejected callback panicked`, `OnSnapshotRequestCompleted callback panicked` | snapshot pool | |
+| `snapshot recovery panicked after the state machine restore began` | snapshot pool | |
+| `step worker panicked inside a snapshot install; failed the shard`, `answering dropped snapshot installs panicked` | step worker | |
+| `shard failure report panicked while a failed batch was panicking` | node | |
+| `quicraft: panic recovered in MetricsCollector; metric discarded, consensus unaffected` | `safeMetricsCollector`, at the 1st, 2nd, 4th, 8th, ... panic | `op`, `recovered_panics`, `stack` |
+| `key rotation loop panic recovered, restarting`, `pending sweep loop panic recovered, restarting` | host | |
+| `shard halted: failure latch tripped, refusing reads and proposals until the shard is reloaded` | host | `shard_id` |
+| `panic recovered in a resilient run; resuming it` | shutdown/cleanup paths | |
+
+A shard failure additionally reaches `EventListener.OnShardFailed` with the
+typed cause in `ShardFailedInfo.Err` (`WorkerPanicError`, `SMPanicError` and
+the others listed in [`api.md`](api.md#receive-notifications)); the log line is
+the diagnostic, the callback is the signal to act on.
+
+The transport, the revocation checker and the snapshot receiver emit their
+diagnostics (accept errors, QUIC close failures, CRL/OCSP reload warnings,
+connection and snapshot-stream lifecycle lines) through the same queue. Their
+messages are catalogued in [`../quic-transport/engineering.md`](../quic-transport/engineering.md).
+Write-ahead-log events are in
+[`../log-storage/engineering.md`](../log-storage/engineering.md#observability).

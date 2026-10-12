@@ -1,7 +1,7 @@
 # Write Batching — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -76,7 +76,9 @@ func (a *Aggregator) SubmitNoCopy(ctx context.Context, shardID uint64, data []by
 
 Retrying an indeterminate failure can apply the whole batch twice: delivery is
 at-least-once. In the rare case that `Close` races your call and your
-context ends at the same moment, the bare context error is returned.
+context ends while you wait for the flush goroutine to finish, the bare
+`ctx.Err()` is returned instead of a `*FlushError`; the command was enqueued,
+so its outcome is unknown, as for an indeterminate failure.
 
 `Submit` copies `data`. `SubmitNoCopy` does not and takes ownership of the
 slice permanently, whatever it returns: the aggregator may read it later on the

@@ -1,7 +1,7 @@
 # Write Batching — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Rationale and the scope fence are in [`architecture.md`](architecture.md); the
@@ -71,9 +71,16 @@ returns `*QueueFullError` if the queue is at `QueueSize`.
   drained before reporting the context.
 - On its own context ending, `Submit` returns `*FlushError{Err: ctx.Err(),
   Indeterminate: true}`. A bare context error would read as "did not happen".
-- If `Close` races the call, `Submit` still returns the real result if the
-  close path flushes the proposal, the context error if the context ends first,
-  or `*ClosedError` once the flush goroutine has exited without delivering one.
+- If `Close` races the call (`awaitResult` takes its close branch), `Submit`
+  still returns the real result if the close path flushes the proposal, or
+  `*ClosedError` once the flush goroutine has exited without delivering one.
+  If the caller's context ends while it waits in that branch, `Submit` returns
+  the bare `ctx.Err()`, after one last non-blocking look at the result channel
+  so a delivered result still wins. That bare error is NOT wrapped in an
+  indeterminate `*FlushError`, unlike the same context ending outside a close
+  race; the proposal was enqueued, so treat it as unknown all the same. The
+  window is only the interval between `Close` beginning and the flush
+  goroutine exiting.
 
 **`Close` is one-way and idempotent**: it marks the aggregator closed, drains
 the queue into the batch (through the same byte check), flushes, waits for the
@@ -191,7 +198,20 @@ time out rather than fill, so `MaxBatchSize` is too high for the load and every
 write pays the full interval; `queue_depth` near `QueueSize` precedes
 `*QueueFullError`. `BatchLen()` gives the current unflushed count.
 
-Logging goes to the `WithLogger` logger: WARN for a failed flush (with
-`indeterminate`), ERROR for an encode failure. A failed flush is a batch of
-caller commands that did not commit, so it is the event worth alerting on.
-Command payloads are never logged.
+Logging goes to the `WithLogger` logger (`slog.Default()` when none is given).
+Every log event this package emits:
+
+| Level | Message | Attributes |
+|---|---|---|
+| ERROR | `batch encode failed` | `shard_id`, `batch_size`, `error` |
+| WARN | `batch flush failed` | `shard_id`, `batch_size`, `indeterminate`, `error` |
+| WARN | `metric name/type collision: existing collector has a different type, updates will not be scraped` | `error` |
+| DEBUG | `metric registration issue` | `error` |
+
+A failed flush is a batch of caller commands that did not commit, so it is the
+event worth alerting on. The two metric lines are registration-time only.
+Command payloads are never logged. The package does not use the engine's
+contained-diagnostics queue
+([`../observability/engineering.md`](../observability/engineering.md#9-contained-diagnostics-and-supervision)):
+it logs on its own flush goroutine, so a blocking `slog` handler blocks that
+goroutine.

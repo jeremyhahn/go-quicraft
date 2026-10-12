@@ -1,7 +1,7 @@
 # Log Storage — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-02
+> `pkg/logdb/memdb` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -154,6 +154,12 @@ in [api.md](api.md#optional-interfaces). `waldb.DB` implements
   that may be plaintext. The host judges the host-wide route against its own
   declaration and checks each per-shard barrier by identity at `StartShard`
   (`ErrShardBarrierLogDBMismatch`).
+- `logdb.SameBarrier(a, b any) bool` is how barrier handles are compared. No
+  barrier interface requires a comparable dynamic value, so `==` or a map key
+  panics when the value holds a slice, map or func; `SameBarrier` never panics.
+  It is true only for the same pointer of the same type. A nil, a typed nil or a
+  non-pointer handle has no identity and matches nothing, not even itself, so
+  `SameBarrier(b, b)` answers whether `b` has an identity at all.
 
 ### Metrics
 
@@ -781,7 +787,18 @@ segment pre-allocation forces an immediate check. Thresholds are fractions of
 `maxBytes`, not of free space: past `DefaultWarningPercent` (0.85) the warning
 callback fires; past `DefaultFullPercent` (0.95) the full callback fires and
 `SaveState` returns `ErrDiskFull`. A check runs every `DefaultCheckEvery` (100)
-writes. Callbacks fire on transitions only.
+writes. Callbacks fire on transitions only: `WithOnWarning`, `WithOnFull`, and
+`WithOnRecovery` on the way from full back below the threshold.
+
+- **The probe measures the filesystem, not the WAL directory.** On Linux
+  `platformDiskUsage` is `statfs` total minus available, so other tenants of the
+  volume count against `maxBytes`. Other platforms have a stub that reports zero,
+  which disables the monitor there. `WithDiskUsageFunc(DiskUsageFunc)` replaces
+  the probe; a failed `statfs` is a `*DiskUsageError`.
+- **`WithCheckEvery(0)` is not honored.** It would divide by zero on the commit
+  worker, so the option logs a WARN (`WithCheckEvery(0) is not a valid sampling
+  interval; using the default`) and uses `DefaultCheckEvery`. "Check every write"
+  is `WithCheckEvery(1)`.
 
 - **Once full, every call re-checks** until usage drops below the threshold.
   Followers' replication writes reach the monitor only through `SaveState` (the
@@ -1129,6 +1146,11 @@ Logging uses `log/slog` with the caller's handler:
 | WARN | compaction floor re-derived at recovery | a compaction marker was lost |
 | WARN | directory sync failed after garbage collection | deletions not yet durable; the epoch floor was not raised |
 | WARN | a barrier that cannot bind context | records are encrypted without positional binding |
+| ERROR | `OPERATOR-AUTHORIZED WAL REPAIR` | `Repair` is about to discard records above the clean prefix |
+| WARN | `WAL repair complete` | the node has lost its most recent records and must catch up from peers |
+| WARN | `WithCheckEvery(0)` rejected | the disk monitor uses `DefaultCheckEvery` |
+| WARN | `disk check after fallocate failure reports pressure` | segment pre-allocation failed and the monitor agrees |
+| DEBUG | `disk usage check failed, continuing without blocking` | the `statfs` probe failed; writes are not blocked |
 
 No key material, nonce or record payload appears in any log line. There are no
 per-record counters: the write path is the hottest loop in the repository, and
@@ -1156,7 +1178,10 @@ the latency histograms cover the same ground per batch.
 | `waldb/options.go` | `Options`, defaults, validation |
 | `waldb/errors.go` | sentinels and typed errors |
 | `waldb/fs.go`, `sync_linux.go`, `sync_other.go` | `FS`/`File`, `osFS`, `fdatasync`/`fallocate` |
-| `waldb/diskmon.go` | `DiskMonitor` |
+| `waldb/diskmon.go` | `DiskMonitor`, `DiskUsageFunc` |
+| `waldb/diskmon_linux.go`, `diskmon_other.go` | the `statfs` probe and its zero-usage stub |
+| `logdb/barrier_identity.go` | `SameBarrier` |
+| `pkg/fsutil` | `MkdirAllSyncedWith`, `SyncDirWith`; `waldb.FileMetadataSyncer` aliases its `MetadataSyncer` |
 
 ## Related documentation
 

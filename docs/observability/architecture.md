@@ -3,7 +3,7 @@
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
 > notifications: `pkg/metrics.go`, `pkg/metrics_safe.go`,
 > `pkg/metrics_prometheus.go`, `config.MetricsConfig`, `config.LogConfig`,
-> `config.EventListener` · Last verified: 2026-10-02
+> `config.EventListener` · Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -168,6 +168,30 @@ ordering guarantee between dispatched notifications and inline callbacks.
 `EventListener.OnCampaignSkipped` exists but is never invoked. Detect a
 leaderless shard with `Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
 
+## Logging must not stall the engine
+
+The `slog` handler is the embedder's code, and so is the `String` or `Error`
+method of a panic value the library has just recovered. A recovery path that
+called either inline could be blocked, or ended, by it while the engine waited
+on that path to settle. The rule is settle first, log last: every structural
+step and completion signal comes first, from defers user code cannot skip, and
+the diagnostic then goes through one process-wide bounded queue
+(256 records) drained by a single worker goroutine. A full queue drops the
+record and counts it; `HealthStatus.DiagnosticsDropped` reports the count, so a
+blocked handler shows up as a rising number instead of a stalled shard. The
+same mechanism restarts a supervised worker that ended by panic or
+`runtime.Goexit`. Details and the event catalogue are in
+[`engineering.md`](engineering.md#9-contained-diagnostics-and-supervision).
+
+Rejected: logging inline and accepting a stall when the handler blocks. A
+consensus worker that waits on a log sink misses heartbeats, and the cluster
+sees an unavailable node with no hint why. Also rejected: an unbounded queue or
+a goroutine per record, which turn a blocked handler into a memory leak.
+
+The cost is that a contained line can arrive late and out of order against
+uncontained ones, and a line can be lost under a blocked handler. Metrics and
+`EventListener` callbacks, not log lines, are the alerting surface.
+
 ## Trust boundary
 
 - No key material, nonce, passphrase, share, certificate private key or command
@@ -193,6 +217,7 @@ leaderless shard with `Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
 | `pkg/metrics_prometheus.go` | `PrometheusMetricsCollector` on a dedicated registry, and `SampledMetricsCollector` |
 | `pkg/config` | `MetricsConfig`, `LogConfig`, `NewLogger`, `SetDefaultLogger`, `EventListener` and its payload types |
 | `pkg/internal/engine/dispatch.go` | the listener dispatcher |
+| `pkg/internal/supervise` | the contained-diagnostics queue (`LogContained`, `DiagnosticsDropped`) and worker supervision |
 | `pkg/logdb/waldb` | its own `LogDBMetrics` interface, so the package does not import `pkg` |
 | `pkg/batch` | the one package that registers Prometheus collectors directly |
 

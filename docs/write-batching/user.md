@@ -1,7 +1,7 @@
 # Write Batching — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-02
+> Last verified: 2026-10-11
 > Conflicts with this document are defects. Fix them here first.
 
 Use the aggregator when you have many small writes and the fixed cost of each
