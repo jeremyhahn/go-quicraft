@@ -1788,7 +1788,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnApplied type assertion failed",
+		c.h.logger.Error("OnApplied type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnApplied nodeState lookup",
@@ -1823,7 +1823,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// applied whatever the results slice says.
 	matched := entries
 	if len(results) < len(entries) {
-		slog.Error("OnApplied: results slice is shorter than entries; "+
+		c.h.logger.Error("OnApplied: results slice is shorter than entries; "+
 			"engine invariant violated, proposals beyond the results will "+
 			"time out instead of completing",
 			"shard_id", shardID,
@@ -1874,7 +1874,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		pp, ppOK := v.(*pendingProposal)
 		if !ppOK {
 			ns.pendingProposals.CompareAndDelete(entry.Key, v)
-			slog.Error("OnApplied pendingProposal type assertion failed",
+			c.h.logger.Error("OnApplied pendingProposal type assertion failed",
 				"shard_id", shardID,
 				"entry_key", entry.Key,
 				"error", &TypeAssertionError{
@@ -1958,12 +1958,8 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// claimed[completedClaims:], BEFORE any logging below.
 				// A panic value's concrete type is caller-controlled and
 				// may implement String/Error/Format with a bug of its own,
-				// and slog.Error here is the package-level default logger,
-				// which an embedder can replace wholesale via
-				// slog.SetDefault to a Handler that can also panic —
-				// unlike c.h.logger (WithLogger), it is not even this
-				// Host's own configured logger, so a Host built with no
-				// logger option at all is still exposed to it. Logging
+				// and c.h.logger is the embedder's (WithLogger), whose
+				// Handler can also panic. Logging
 				// first would let a panic in fmt.Sprint(r) or the handler
 				// itself skip this whole deferred function, recreating
 				// exactly the stranding this recovery exists to prevent.
@@ -2013,8 +2009,9 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// or calls runtime.Goexit can replace the panic this
 				// function exists to report, or skip the re-panic below
 				// that fails the shard.
+				logger := c.h.logger
 				supervise.LogContained(func() {
-					slog.Error("panic recovered completing a membership-changing batch; "+
+					logger.Error("panic recovered completing a membership-changing batch; "+
 						"claimed proposals already completed and released",
 						"shard_id", shardID,
 						"panic", fmt.Sprint(r),
@@ -2229,7 +2226,7 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 			// so it is said as loudly as a log can.
 			if own := c.h.NodeIdentity(); cc.ReplicaID == ns.cfg.ReplicaID && own != "" &&
 				cc.NodeIdentity != "" && cc.NodeIdentity != own {
-				slog.Error("quicraft: the committed identity for this replica is not the one this host "+
+				c.h.logger.Error("quicraft: the committed identity for this replica is not the one this host "+
 					"presents; every peer will refuse its messages — restore the keypair, or remove and re-add the replica",
 					"shard", shardID,
 					"replica", cc.ReplicaID,
@@ -2334,7 +2331,7 @@ func (c *hostEngineCallback) OnReadyToRead(shardID uint64, readyToRead []proto.R
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnReadyToRead: nodeState type assertion failed",
+		c.h.logger.Error("OnReadyToRead: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnReadyToRead nodeState lookup",
@@ -2428,7 +2425,7 @@ func (c *hostEngineCallback) OnReadIndexBatched(shardID uint64, batchKey uint64,
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnReadIndexBatched: nodeState type assertion failed",
+		c.h.logger.Error("OnReadIndexBatched: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnReadIndexBatched nodeState lookup",
@@ -2481,7 +2478,7 @@ func (c *hostEngineCallback) OnLeaderUpdated(shardID uint64, leaderID uint64, te
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnLeaderUpdated: nodeState type assertion failed",
+		c.h.logger.Error("OnLeaderUpdated: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnLeaderUpdated nodeState lookup",
@@ -2596,7 +2593,7 @@ func (c *hostEngineCallback) OnLeaderReady(shardID, replicaID, leaderID, term ui
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnLeaderReady: nodeState type assertion failed",
+		c.h.logger.Error("OnLeaderReady: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnLeaderReady nodeState lookup",
@@ -2658,7 +2655,7 @@ func (c *hostEngineCallback) dispatchListener(event string, shardID uint64, fn f
 		// Dropped, as the engine drops its own notifications on a full queue
 		// (counted in ListenerNotificationsDropped); named here so an operator
 		// can tell WHICH event a shard never delivered.
-		slog.Error("listener notification dropped: the EventListener is not consuming",
+		c.h.logger.Error("listener notification dropped: the EventListener is not consuming",
 			"event", event,
 			"shard_id", shardID)
 	}
@@ -2675,7 +2672,7 @@ func (c *hostEngineCallback) OnSnapshotCompleted(shardID uint64, index uint64, o
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnSnapshotCompleted: nodeState type assertion failed",
+		c.h.logger.Error("OnSnapshotCompleted: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnSnapshotCompleted nodeState lookup",
@@ -2720,7 +2717,7 @@ func (c *hostEngineCallback) OnSnapshotRequestCompleted(shardID, requestKey, ind
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnSnapshotRequestCompleted: nodeState type assertion failed",
+		c.h.logger.Error("OnSnapshotRequestCompleted: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnSnapshotRequestCompleted nodeState lookup",
@@ -2943,7 +2940,7 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnCommitted: nodeState type assertion failed",
+		c.h.logger.Error("OnCommitted: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnCommitted nodeState lookup",
@@ -2967,7 +2964,7 @@ func (c *hostEngineCallback) OnCommitted(shardID uint64, entries []proto.Entry) 
 				continue
 			}
 			if !ppOK {
-				slog.Error("OnCommitted: pendingProposal type assertion failed",
+				c.h.logger.Error("OnCommitted: pendingProposal type assertion failed",
 					"shard_id", shardID,
 					"entry_key", entry.Key,
 					"error", &TypeAssertionError{
@@ -3039,7 +3036,7 @@ func (c *hostEngineCallback) failProposals(shardID uint64, entries []proto.Entry
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnProposalFailed: nodeState type assertion failed",
+		c.h.logger.Error("OnProposalFailed: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnProposalFailed nodeState lookup",
@@ -3059,7 +3056,7 @@ func (c *hostEngineCallback) failProposals(shardID uint64, entries []proto.Entry
 		}
 		pp, ppOK := v.(*pendingProposal)
 		if !ppOK {
-			slog.Error("OnProposalFailed: pendingProposal type assertion failed",
+			c.h.logger.Error("OnProposalFailed: pendingProposal type assertion failed",
 				"shard_id", shardID,
 				"entry_key", entry.Key,
 				"error", &TypeAssertionError{
@@ -3120,7 +3117,7 @@ func (c *hostEngineCallback) OnReadIndexFailed(shardID uint64, keys []uint64, er
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnReadIndexFailed: nodeState type assertion failed",
+		c.h.logger.Error("OnReadIndexFailed: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnReadIndexFailed nodeState lookup",
@@ -3181,7 +3178,7 @@ func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("OnShardFailed: nodeState type assertion failed",
+		c.h.logger.Error("OnShardFailed: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "OnShardFailed nodeState lookup",
@@ -3209,9 +3206,9 @@ func (c *hostEngineCallback) OnShardFailed(shardID uint64, err error) {
 	// the operator here; the requests carry only the sentinel. It comes
 	// after every pending request has been failed, and contained: the slog
 	// handler is user code and must not be able to strand them.
-	replicaID := ns.replicaID
+	replicaID, logger := ns.replicaID, c.h.logger
 	supervise.LogContained(func() {
-		slog.Error("shard halted: failure latch tripped, refusing reads and proposals until the shard is reloaded",
+		logger.Error("shard halted: failure latch tripped, refusing reads and proposals until the shard is reloaded",
 			"shard_id", shardID,
 			"replica_id", replicaID,
 			"error", err,
@@ -3920,7 +3917,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			// so the per-tenant key isolation WithShardBarriers exists to
 			// provide covers snapshots only.
 			if options.shardBarriers != nil {
-				slog.Warn("per-shard barriers do not cover the default WAL; " +
+				logger.Warn("per-shard barriers do not cover the default WAL; " +
 					"log entries are encrypted under the host-wide barrier, not " +
 					"per-shard keys. Supply WithLogDB with a multiplexing LogDB " +
 					"for per-shard WAL encryption.")
@@ -4113,7 +4110,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		if startErr := tr.Start(); startErr != nil {
 			eng.Stop()
 			if stopErr := tr.Stop(); stopErr != nil {
-				slog.Debug("transport stop failed after start error", "error", stopErr)
+				logger.Debug("transport stop failed after start error", "error", stopErr)
 			}
 			return nil, &HostInitError{Field: "transport_start", Err: startErr}
 		}
@@ -4804,6 +4801,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return &HostInitError{Field: "peer", Err: err}
 	}
 	h.logRecoveryClamp(cfg.ShardID, cfg.ReplicaID, peer.RecoveryClamp())
+	// The diagnostics the step worker reports about the recovered
+	// configuration tail go to the sink the operator configured, not the
+	// process slog default.
+	peer.SetLogger(h.logger)
 	// The read lease is measured in real time, so the peer must know how
 	// long the ticks that its election timeout is counted in really are.
 	peer.SetTickInterval(h.engine.TickInterval())
@@ -4888,6 +4889,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		cfg.ShardID, cfg.ReplicaID, create, snapshotDir,
 		configSessionPolicy(cfg), peer.SessionPolicy,
 		cfg.ZeroCopyEntryCmd,
+		rsm.WithLogger(h.logger),
 	)
 	if err != nil {
 		// Map the rsm-internal error to the public sentinel so callers
@@ -9216,7 +9218,7 @@ func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
-			slog.Error("GetNodeHostInfo: nodes map value type assertion failed",
+			h.logger.Error("GetNodeHostInfo: nodes map value type assertion failed",
 				"error", &TypeAssertionError{
 					Context:      "GetNodeHostInfo nodes range",
 					ExpectedType: "*nodeState",
@@ -9252,7 +9254,7 @@ func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQL
 	if exists {
 		ns, ok := v.(*nodeState)
 		if !ok {
-			slog.Error("DiagPipelineState: nodeState type assertion failed",
+			h.logger.Error("DiagPipelineState: nodeState type assertion failed",
 				"shard_id", shardID,
 				"error", &TypeAssertionError{
 					Context:      "DiagPipelineState nodeState lookup",
@@ -9390,7 +9392,7 @@ func (h *Host) Close() error {
 		// so no send goroutine touches a torn-down transport.
 		if h.transport != nil {
 			if err := h.transport.Stop(); err != nil {
-				slog.Debug("transport stop failed during host close", "error", err)
+				h.logger.Debug("transport stop failed during host close", "error", err)
 			}
 		}
 
@@ -9406,7 +9408,7 @@ func (h *Host) Close() error {
 		h.nodes.Range(func(key, value any) bool {
 			shardID, ok := key.(uint64)
 			if !ok {
-				slog.Error("Close: nodes map key type assertion failed",
+				h.logger.Error("Close: nodes map key type assertion failed",
 					"error", &TypeAssertionError{
 						Context:      "Close nodes range key",
 						ExpectedType: "uint64",
@@ -9416,7 +9418,7 @@ func (h *Host) Close() error {
 			}
 			ns, ok := value.(*nodeState)
 			if !ok {
-				slog.Error("Close: nodes map value type assertion failed",
+				h.logger.Error("Close: nodes map value type assertion failed",
 					"shard_id", shardID,
 					"error", &TypeAssertionError{
 						Context:      "Close nodes range value",
@@ -9710,7 +9712,7 @@ func (h *Host) failPendingProposals(ns *nodeState, err error, onlyHandedOff bool
 			// Claim it so the malformed entry does not linger; nothing to
 			// complete.
 			if ns.pendingProposals.CompareAndDelete(key, value) {
-				slog.Error("failPendingClientRequests: pendingProposals value type assertion failed",
+				h.logger.Error("failPendingClientRequests: pendingProposals value type assertion failed",
 					"error", &TypeAssertionError{
 						Context:      "failPendingClientRequests pendingProposals range",
 						ExpectedType: "*pendingProposal",
@@ -9819,8 +9821,9 @@ func (h *Host) keyRotationLoopOnce(ctx context.Context, interval time.Duration) 
 				Value:    r,
 				Stack:    stack,
 			}
+			logger := h.logger
 			supervise.LogContained(func() {
-				slog.Error("key rotation loop panic recovered, restarting",
+				logger.Error("key rotation loop panic recovered, restarting",
 					"panic", fmt.Sprint(r),
 					"stack", string(stack),
 					"error", panicErr,
@@ -10003,8 +10006,9 @@ func (h *Host) pendingSweepLoopOnce(interval time.Duration) (panicked bool) {
 				Value:    r,
 				Stack:    stack,
 			}
+			logger := h.logger
 			supervise.LogContained(func() {
-				slog.Error("pending sweep loop panic recovered, restarting",
+				logger.Error("pending sweep loop panic recovered, restarting",
 					"panic", fmt.Sprint(r),
 					"stack", string(stack),
 					"error", panicErr,
@@ -10039,7 +10043,7 @@ func (h *Host) sweepExpiredPending() {
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
-			slog.Error("sweepExpiredPending: nodes map value type assertion failed",
+			h.logger.Error("sweepExpiredPending: nodes map value type assertion failed",
 				"error", &TypeAssertionError{
 					Context:      "sweepExpiredPending nodes range",
 					ExpectedType: "*nodeState",
@@ -10062,7 +10066,7 @@ func (h *Host) sweepPendingProposals(ns *nodeState, now time.Time) {
 	ns.pendingProposals.Range(func(key, value any) bool {
 		pp, ok := value.(*pendingProposal)
 		if !ok {
-			slog.Error("sweepPendingProposals: pendingProposals value type assertion failed",
+			h.logger.Error("sweepPendingProposals: pendingProposals value type assertion failed",
 				"error", &TypeAssertionError{
 					Context:      "sweepPendingProposals pendingProposals range",
 					ExpectedType: "*pendingProposal",
@@ -10194,7 +10198,7 @@ func (h *Host) HealthCheck() *HealthStatus {
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
-			slog.Error("HealthStatus: nodes map value type assertion failed",
+			h.logger.Error("HealthStatus: nodes map value type assertion failed",
 				"error", &TypeAssertionError{
 					Context:      "HealthStatus nodes range",
 					ExpectedType: "*nodeState",
@@ -10548,7 +10552,7 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	if v, loaded := h.nodes.Load(shardID); loaded {
 		ns, ok := v.(*nodeState)
 		if !ok {
-			slog.Error("RemoveData: nodeState type assertion failed",
+			h.logger.Error("RemoveData: nodeState type assertion failed",
 				"shard_id", shardID,
 				"error", &TypeAssertionError{
 					Context:      "RemoveData nodeState lookup",
@@ -11828,7 +11832,7 @@ func (h *Host) updateNodeLeader(shardID, leaderID, term uint64) {
 	}
 	ns, ok := v.(*nodeState)
 	if !ok {
-		slog.Error("updateNodeLeader: nodeState type assertion failed",
+		h.logger.Error("updateNodeLeader: nodeState type assertion failed",
 			"shard_id", shardID,
 			"error", &TypeAssertionError{
 				Context:      "updateNodeLeader nodeState lookup",

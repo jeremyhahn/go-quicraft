@@ -16,6 +16,7 @@ package config
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -980,6 +981,56 @@ func TestConfig_Validate_LeaseReadRequiresElectionRTT(t *testing.T) {
 		c.ElectionRTT = 4
 		assertValidationError(t, c.Validate(), "ElectionRTT")
 	})
+}
+
+func TestConfig_Validate_MaxClockDrift(t *testing.T) {
+	valid := map[string]float64{
+		"zero selects the default":   0,
+		"the floor":                  MaxClockDriftMin,
+		"the default, stated":        0.01,
+		"a looser bound":             0.02,
+		"the ceiling":                MaxClockDriftMax,
+		"a tighter bound than 1%":    0.001,
+		"just above the floor":       2 * MaxClockDriftMin,
+		"just below the ceiling":     MaxClockDriftMax - MaxClockDriftMin,
+		"a typical disciplined host": 0.0005,
+	}
+	for name, drift := range valid {
+		t.Run("accepts "+name, func(t *testing.T) {
+			c := validConfig()
+			c.LeaseRead = true
+			c.MaxClockDrift = drift
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate() with MaxClockDrift %v = %v, want nil", drift, err)
+			}
+		})
+	}
+
+	invalid := map[string]float64{
+		"negative":            -0.01,
+		"below the floor":     MaxClockDriftMin / 2,
+		"above the ceiling":   MaxClockDriftMax + MaxClockDriftMin,
+		"1% as a percentage":  1,
+		"10% as a percentage": 10,
+		"NaN":                 math.NaN(),
+		"+Inf":                math.Inf(1),
+		"-Inf":                math.Inf(-1),
+	}
+	for name, drift := range invalid {
+		t.Run("rejects "+name, func(t *testing.T) {
+			c := validConfig()
+			c.LeaseRead = true
+			c.MaxClockDrift = drift
+			assertValidationError(t, c.Validate(), "MaxClockDrift")
+		})
+		// A value that would be rejected is rejected before LeaseRead is
+		// switched on, not carried silently until it is.
+		t.Run("rejects "+name+" with LeaseRead off", func(t *testing.T) {
+			c := validConfig()
+			c.MaxClockDrift = drift
+			assertValidationError(t, c.Validate(), "MaxClockDrift")
+		})
+	}
 }
 
 func TestConfig_SetDefaults_MaxInMemLogSizeZeroNotOverridden(t *testing.T) {

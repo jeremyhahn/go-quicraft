@@ -418,14 +418,15 @@ var pendingSeedBudget uint64 = 64 << 20
 //
 // The reader caps any one read at its slice limit and returns the short
 // result as success, so each stretch is read from the last index seen until
-// it is exhausted. A read failure is logged and the rest left unclassified,
+// it is exhausted. A read failure is logged on logger, the Peer's (see
+// Peer.SetLogger), and the rest left unclassified,
 // which only costs the admission this seed provides.
 //
 // It runs once, from the first PublishPendingConfig, above the configuration
 // applied by then: for an on-disk state machine that is what
 // SetProcessedIndex folded, which is often the whole committed stretch, and
 // reading it again here would cost StartShard the read for no gate benefit.
-func (l *raftLog) seedPendingAdds(applied uint64) {
+func (l *raftLog) seedPendingAdds(applied uint64, logger *slog.Logger) {
 	if l.pendingSeeded {
 		return
 	}
@@ -440,7 +441,7 @@ func (l *raftLog) seedPendingAdds(applied uint64) {
 	next := from + 1
 	for next <= l.committed && next <= last {
 		if read >= pendingSeedBudget {
-			slog.Warn("the recovered committed tail exceeds the pending-config seed budget; "+
+			logger.Warn("the recovered committed tail exceeds the pending-config seed budget; "+
 				"a config change above the budget admits its member only once the replay folds it",
 				"from", next,
 				"committed", l.committed,
@@ -449,7 +450,7 @@ func (l *raftLog) seedPendingAdds(applied uint64) {
 		}
 		entries, err := l.entries(next, min(l.committed, last)+1, pendingSeedBudget-read)
 		if err != nil || len(entries) == 0 {
-			slog.Warn("could not classify the recovered committed tail for pending config changes",
+			logger.Warn("could not classify the recovered committed tail for pending config changes",
 				"from", next,
 				"to", l.committed,
 				"error", err)
@@ -465,7 +466,7 @@ func (l *raftLog) seedPendingAdds(applied uint64) {
 	for next = max(next, l.committed+1); next <= last; {
 		entries, err := l.entries(next, last+1, 0)
 		if err != nil || len(entries) == 0 {
-			slog.Warn("could not classify the recovered uncommitted tail for pending config changes",
+			logger.Warn("could not classify the recovered uncommitted tail for pending config changes",
 				"from", next,
 				"to", last,
 				"error", err)

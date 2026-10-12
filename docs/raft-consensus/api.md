@@ -218,6 +218,7 @@ three that change behavior rather than performance:
 | `CheckQuorum` | `*bool`, nil = enabled | the leader steps down without quorum |
 | `PreVote` | `*bool`, nil = enabled | stops a partitioned node disrupting a healthy term |
 | `LeaseRead` | `false` | requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) and `ElectionRTT >= 5` (`*config.ValidationError`) |
+| `MaxClockDrift` | `0` = 1% | the clock-RATE difference between replicas the lease tolerates, as a fraction; the leader shortens its lease by it. Non-zero must be in `[config.MaxClockDriftMin, config.MaxClockDriftMax]` = `[1e-6, 0.5]`, else `*config.ValidationError` |
 
 The `*bool`s are pointers so the zero value means "unset", not "off".
 

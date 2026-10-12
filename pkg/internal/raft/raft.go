@@ -139,7 +139,38 @@ const maxPendingReadIndex = 4096
 // kernel bounds CLOCK_MONOTONIC slew to 500 ppm (0.05%), so 1% covers the
 // combined drift of both ends with a wide margin; it does NOT cover a
 // clock that stops, which is why the lease is anchored at send time.
+//
+// It is the default; Config.MaxClockDrift replaces it per shard
+// (leaseDriftPPMFor). The bound is exact: the shortest promise the leader
+// accepts (ackBacksLease) is leaseSpan itself, and a follower promising
+// exactly that, with clock rates that differ by more than the bound, frees
+// its vote while the lease it backs still holds (lease_clock_rate_test.go).
 const leaseDriftDivisor = 100
+
+// partsPerMillion is the scale of leaseDriftPPM.
+const partsPerMillion = 1_000_000
+
+// leaseDriftPPMFor converts Config.MaxClockDrift, a fraction, into the parts
+// per million the lease is shortened by. Zero selects the default bound,
+// 1/leaseDriftDivisor. Config.Validate rejects a drift that is not finite or
+// lies outside [config.MaxClockDriftMin, config.MaxClockDriftMax].
+func leaseDriftPPMFor(drift float64) uint64 {
+	if drift == 0 {
+		return partsPerMillion / leaseDriftDivisor
+	}
+	return uint64(math.Round(drift * partsPerMillion))
+}
+
+// leaseDriftShortfall is d*ppm/partsPerMillion rounded up, so the lease errs
+// short, computed without overflowing for any d a tick count can produce.
+// A ppm of partsPerMillion or more consumes the whole span.
+func leaseDriftShortfall(d time.Duration, ppm uint64) time.Duration {
+	if ppm >= partsPerMillion {
+		return d
+	}
+	q, rem := uint64(d)/partsPerMillion, uint64(d)%partsPerMillion
+	return time.Duration(q*ppm + (rem*ppm+partsPerMillion-1)/partsPerMillion)
+}
 
 // leaseRoundWindow is how many recent heartbeat rounds the leader remembers
 // the send time of (a power of two, so a round's slot is round &
@@ -581,6 +612,12 @@ type raft struct {
 	// Function pointers set on role transition for zero-branch dispatch.
 	stepFunc func(r *raft, msg proto.Message) error
 	tickFunc func(r *raft)
+
+	// leaseDriftPPM is the clock-rate drift bound, in parts per million, the
+	// lease is shortened by (Config.MaxClockDrift, or 1/leaseDriftDivisor).
+	// Read only when the tick interval is set (setTickInterval), so it sits
+	// last, clear of the fields the step and tick paths touch.
+	leaseDriftPPM uint64
 }
 
 // newRaft creates a new raft state machine with the given configuration
@@ -615,6 +652,7 @@ func newRaft(cfg config.Config, logdb LogReader) (*raft, error) {
 		isWitness:             cfg.IsWitness,
 		leaseRead:             cfg.LeaseRead,
 		leaseTimeout:          int(cfg.ElectionRTT) - 2,
+		leaseDriftPPM:         leaseDriftPPMFor(cfg.MaxClockDrift),
 		now:                   time.Now,
 		electionTimeout:       int(cfg.ElectionRTT),
 		heartbeatTimeout:      int(cfg.HeartbeatRTT),
@@ -4062,7 +4100,7 @@ func (r *raft) setTickInterval(tick time.Duration) {
 		return
 	}
 	r.leaseSpan = d
-	r.leaseDuration = d - (d+leaseDriftDivisor-1)/leaseDriftDivisor
+	r.leaseDuration = d - leaseDriftShortfall(d, r.leaseDriftPPM)
 }
 
 // ticksToDuration returns n ticks of the given interval as a duration, and

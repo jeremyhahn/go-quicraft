@@ -1965,6 +1965,7 @@ Source: `pkg/config/config.go`.
 | `Quiesce` | `bool` | `false` | quiescence for idle shards |
 | `ZeroCopyEntryCmd` | `bool` | `false` | `sm.Entry.Cmd` aliases an internal buffer; unsafe to retain past `Update` |
 | `LeaseRead` | `bool` | `false` | lease-based reads (Raft PhD §6.4). Requires `CheckQuorum` |
+| `MaxClockDrift` | `float64` | `0` (= 1%) | clock-rate drift between replicas the lease tolerates, as a fraction; the leader shortens its lease by it. Non-zero must lie in `[MaxClockDriftMin, MaxClockDriftMax]` = `[1e-6, 0.5]` |
 | `DataDir` | `string` | `""` | absolute root for this shard's on-disk state machine data; empty places it under `NodeHostDir`. The Raft log stays in the host-wide LogDB |
 
 `Config` methods: `SetDefaults`, `Validate`, `ValidateElectionTimeout(rttMillisecond)`,

@@ -227,6 +227,12 @@ type Peer struct {
 	// trustworthy test for one.
 	unfoldedConfig UnfoldedConfig
 
+	// logger receives the diagnostics the step worker reports about the
+	// recovered configuration tail (resolveStaleStartupConfig and
+	// PublishPendingConfig's first classification). nil means the process
+	// slog default; the Host sets its own through SetLogger.
+	logger *slog.Logger
+
 	// configFoldedThrough is the highest index up to which every committed entry
 	// HAS BEEN OFFERED to applyMembershipEntry. It is the lower bound
 	// resolveStaleStartupConfig resumes its scan from.
@@ -353,7 +359,7 @@ func (p *Peer) resolveStaleStartupConfig() bool {
 	}
 	complete, err := p.replayConfigChangesFrom(p.configFoldedThrough+1, p.staleConfigThrough)
 	if err != nil {
-		slog.Error("configuration tail holds an undecodable committed config entry: "+
+		p.log().Error("configuration tail holds an undecodable committed config entry: "+
 			"refusing to campaign on a configuration this replica cannot reconstruct",
 			"shard", p.shardID,
 			"replica", p.replicaID,
@@ -364,7 +370,7 @@ func (p *Peer) resolveStaleStartupConfig() bool {
 		return false
 	}
 	if !complete {
-		slog.Warn("configuration tail unresolved: refusing to campaign against a "+
+		p.log().Warn("configuration tail unresolved: refusing to campaign against a "+
 			"possibly superseded voting set",
 			"shard", p.shardID,
 			"replica", p.replicaID,
@@ -419,7 +425,7 @@ func (p *Peer) PublishPendingConfig() {
 	applied := max(p.membership.configChangeID, p.configFoldedThrough)
 	// The first publish classifies the recovered log above the applied
 	// configuration; every later one finds pendingSeeded set.
-	l.seedPendingAdds(applied)
+	l.seedPendingAdds(applied, p.log())
 	cur := p.pendingSnap.Load()
 	if cur != nil && cur.version == l.pendingVersion && cur.configChangeID == applied &&
 		(cur.committed == l.committed || len(l.pendingAdds) == 0) {
@@ -752,6 +758,22 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 // costs availability, not safety.
 func (p *Peer) SetTickInterval(d time.Duration) {
 	p.r.setTickInterval(d)
+}
+
+// SetLogger sets the logger the Peer reports its configuration-tail
+// diagnostics on; nil restores the process slog default. It must be called
+// before the Peer is handed to a worker: the logger is read on the step
+// worker without synchronization.
+func (p *Peer) SetLogger(l *slog.Logger) {
+	p.logger = l
+}
+
+// log returns the logger set through SetLogger, or the process slog default.
+func (p *Peer) log() *slog.Logger {
+	if p.logger != nil {
+		return p.logger
+	}
+	return slog.Default()
 }
 
 // Tick advances the peer's logical clock by one tick. The engine calls

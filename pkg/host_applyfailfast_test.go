@@ -1425,8 +1425,7 @@ func (h exitingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h exitingLogHandler) WithGroup(string) slog.Handler      { return h }
 
 // TestShardHaltFailsPendingRequestsBeforeLogging: OnShardFailed logged the
-// halt before failing the shard's pending requests, so a default slog
-// handler that panicked or called runtime.Goexit stranded every one of them.
+// halt before failing the shard's pending requests, so a slog handler that panicked or called runtime.Goexit stranded every one of them.
 // The requests are failed first; the diagnostic follows, contained.
 func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 	for exitName, exit := range map[string]func(){
@@ -1434,7 +1433,8 @@ func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 		"Goexit": runtime.Goexit,
 	} {
 		t.Run(exitName, func(t *testing.T) {
-			h := newTestHost(t)
+			logs := newSwitchHandler(slog.DiscardHandler)
+			h := newLoggedTestHost(t, logs)
 			ns := &nodeState{
 				shardID:      1,
 				replicaID:    1,
@@ -1454,7 +1454,10 @@ func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 			ns.pendingReads[key] = &pendingRead{rs: rs}
 			ns.pendingReadsMu.Unlock()
 
-			installDefaultLogger(t, exitingLogHandler{exit: exit})
+			logs.set(exitingLogHandler{exit: exit})
+			// Cleanups run last-in first-out: the handler is disarmed before
+			// the Host is closed.
+			t.Cleanup(func() { logs.set(slog.DiscardHandler) })
 
 			cb := &hostEngineCallback{h: h}
 			done := make(chan struct{})

@@ -2668,6 +2668,7 @@ duration, so one number retunes a cluster for its network.
 | `PreVote` | `*bool`, nil = **enabled** | the pre-vote extension, which stops a partitioned node disrupting a healthy term |
 | `OrderedConfigChange` | `*bool`, nil = **enabled** | serialize membership changes |
 | `LeaseRead` | `false` | lease-based linearizable reads (PhD §6.4). Requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) and `ElectionRTT >= 5` (`*config.ValidationError`). |
+| `MaxClockDrift` | `0` = 1% | clock-RATE drift between replicas the lease tolerates, as a fraction (`leaseDriftDivisor` is the default). The leader shortens its lease by this fraction of the lease span; the bound is exact, as `lease_clock_rate_test.go` shows. Non-zero must be in `[1e-6, 0.5]` (`*config.ValidationError`). |
 | `MaxEntrySize` | 8 MB | per-proposal cap and the decompression ceiling on apply. May not exceed `proto.MaxEntrySize`. |
 | `MaxProposalPayloadSize` | 8 MB | user-facing cap; the effective limit at `Propose` is `min(MaxProposalPayloadSize, MaxEntrySize)` |
 | `MaxApplyEntrySize` | `MaxReplicationPayloadBytes` = 16,711,672 | batch size per `SM.Update` call |

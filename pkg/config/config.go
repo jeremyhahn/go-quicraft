@@ -142,6 +142,15 @@ const (
 	SnapshotsDisabled uint64 = math.MaxUint64
 )
 
+// Bounds Validate places on a non-zero Config.MaxClockDrift. Below the floor
+// the lease would be shortened by less than a part per million, which no
+// clock is good for; above the ceiling half the lease is spent on drift, and
+// clocks that bad are better served by the heartbeat-based ReadIndex.
+const (
+	MaxClockDriftMin float64 = 1e-6
+	MaxClockDriftMax float64 = 0.5
+)
+
 // MaxReplicationPayloadBytes bounds MaxApplyEntrySize, which raft uses as the
 // size limit when chunking a replication batch. A batch larger than the
 // transport can frame is rejected at marshal time and DROPPED — and because
@@ -548,8 +557,8 @@ type Config struct {
 	// voting members has acknowledged a heartbeat round the leader SENT less
 	// than the lease duration ago, ReadIndex requests are served immediately
 	// without a heartbeat round-trip. The lease duration is ElectionRTT - 2
-	// ticks of real time (RTTMillisecond each), less 1% for clock-rate
-	// drift: a follower grants no vote to another candidate until its
+	// ticks of real time (RTTMillisecond each), less MaxClockDrift (1% by
+	// default) for clock-rate drift: a follower grants no vote to another candidate until its
 	// election timeout has elapsed since the heartbeat it acked, and the
 	// lease ends before that. Per Raft PhD thesis Section 6.4.
 	//
@@ -591,10 +600,33 @@ type Config struct {
 	// restart, as before.
 	//
 	// Safety assumes that the clock rates of any two nodes differ by less
-	// than 1%. Clock OFFSET between nodes does not matter; a clock that runs
-	// fast on a follower or slow on the leader beyond that bound does.
+	// than MaxClockDrift (1% by default). Clock OFFSET between nodes does not
+	// matter; a clock that runs fast on a follower or slow on the leader
+	// beyond that bound does.
 	// Default: false (use heartbeat-based ReadIndex).
 	LeaseRead bool
+
+	// MaxClockDrift is the largest relative difference between the clock
+	// RATES of any two replicas that LeaseRead tolerates, as a fraction:
+	// 0.01 is 1%. The leader shortens its lease by this fraction of the lease
+	// span, so that a lease measured on a leader clock running slow ends
+	// before the vote window promised by a follower whose clock runs fast.
+	// The bound is exact: with rates further apart than this, a follower
+	// that promises no more than the lease span can grant a vote while the
+	// lease its acknowledgement backs still holds, and a stale read becomes
+	// possible.
+	//
+	// Raise it on hosts whose clocks are not disciplined (no NTP or PTP) or
+	// whose oscillators are known to wander; the cost is a shorter lease, so
+	// reads fall back to the heartbeat round a little sooner. Lowering it
+	// below the default lengthens the lease and is safe only when every
+	// replica's clock rate is known to stay within the smaller bound.
+	//
+	// Only the leader reads it, and only when LeaseRead is enabled. Zero
+	// selects the default, 1%. A non-zero value must lie between
+	// MaxClockDriftMin and MaxClockDriftMax; Validate rejects anything else,
+	// including NaN and infinities.
+	MaxClockDrift float64
 
 	// DataDir is the directory where this shard's on-disk state-machine data
 	// is stored. When empty (the default), the on-disk state machine's data
@@ -890,6 +922,12 @@ func (c *Config) validateLeaseRead() error {
 	if c.LeaseRead && c.ElectionRTT < 5 {
 		return newValidationError("ElectionRTT",
 			"must be >= 5 when LeaseRead is enabled (lease timeout = ElectionRTT - 2)")
+	}
+	// Checked whether or not LeaseRead is on, so a value that would be
+	// rejected is not carried silently until the lease is enabled.
+	if d := c.MaxClockDrift; d != 0 && (math.IsNaN(d) || d < MaxClockDriftMin || d > MaxClockDriftMax) {
+		return newValidationError("MaxClockDrift",
+			"must be 0 (the default, 1%) or between MaxClockDriftMin (1e-6) and MaxClockDriftMax (0.5)")
 	}
 	return nil
 }

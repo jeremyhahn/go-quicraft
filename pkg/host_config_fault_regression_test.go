@@ -208,7 +208,8 @@ func (h haltCountingHandler) WithGroup(string) slog.Handler      { return h }
 // shard another path failed first was reported, and its reads drained, by that
 // path; a second OnShardFailed fan-out would report one halt twice.
 func TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain(t *testing.T) {
-	h := newTestHost(t)
+	logs := newSwitchHandler(slog.DiscardHandler)
+	h := newLoggedTestHost(t, logs)
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, testShardConfig(1, 1)); err != nil {
 		t.Fatalf("StartShard: %v", err)
@@ -219,7 +220,7 @@ func TestFailShardOnCorruptConfig_AlreadyFailedShardIsNotReportedAgain(t *testin
 	}
 	awaitContainedDiagnostics(t)
 	var halts atomic.Int64
-	installDefaultLogger(t, haltCountingHandler{halts: &halts})
+	logs.set(haltCountingHandler{halts: &halts})
 
 	// The halt line is emitted contained, on the diagnostics worker, after
 	// the pending requests are failed; it is awaited rather than read back

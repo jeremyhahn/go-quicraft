@@ -179,6 +179,11 @@ type StateMachine struct {
 	// made for each entry. This field mirrors Config.ZeroCopyEntryCmd.
 	zeroCopyEntryCmd bool
 
+	// logger receives the session-policy disagreement report
+	// (logPolicyDisagreement); nil means the process slog default. Set once,
+	// at construction, through WithLogger.
+	logger *slog.Logger
+
 	// Pre-allocated buffers for Apply(). Reused via [:0] reset to avoid
 	// per-call heap allocations. Safe because Apply() is called from a
 	// single apply goroutine per shard and the buffers are fully consumed
@@ -303,6 +308,7 @@ func NewStateMachine(
 	local proto.SessionPolicy,
 	replicated func() proto.SessionPolicy,
 	zeroCopyEntryCmd bool,
+	opts ...Option,
 ) (*StateMachine, error) {
 	raw := createFn(shardID, replicaID)
 	wrapper, st, err := wrapStateMachine(raw)
@@ -320,6 +326,9 @@ func NewStateMachine(
 		sessionPolicyFn:  replicated,
 		zeroCopyEntryCmd: zeroCopyEntryCmd,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
 	// Resolve before the manager exists so a shard that already knows its
 	// replicated policy — every restart, and every bootstrap — never builds a
 	// session manager with limits it is about to replace.
@@ -329,6 +338,17 @@ func NewStateMachine(
 		s.sessionPolicy.MaxSessionsPerOwner)
 	s.logPolicyDisagreement(local, s.sessionPolicy)
 	return s, nil
+}
+
+// Option configures a StateMachine at construction.
+type Option func(*StateMachine)
+
+// WithLogger sets the logger the StateMachine reports on; nil, or no
+// WithLogger at all, means the process slog default.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *StateMachine) {
+		s.logger = l
+	}
 }
 
 // effectiveSessionPolicy returns the policy the apply path must use: the
@@ -383,7 +403,11 @@ func (s *StateMachine) logPolicyDisagreement(previous, effective proto.SessionPo
 	if effective == s.localPolicy {
 		return
 	}
-	slog.Warn("rsm: applying the shard's replicated session policy, which differs "+
+	logger := s.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("rsm: applying the shard's replicated session policy, which differs "+
 		"from this node's configuration; the replicated value governs and cannot "+
 		"be overridden locally",
 		"shardID", s.shardID,
