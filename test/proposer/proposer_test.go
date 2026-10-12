@@ -113,6 +113,7 @@ func TestDrive_RetriesOnlyTheNotLeaderRejection(t *testing.T) {
 		{"read index not ready", quicraft.ErrReadIndexNotReady},
 		{"system busy", quicraft.ErrSystemBusy},
 		{"rejected", quicraft.ErrRejected},
+		{"barrier sealed", quicraft.ErrBarrierSealed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var resolves, attempts int
@@ -179,6 +180,10 @@ func TestIsNotLeaderRejection(t *testing.T) {
 		{"timeout", quicraft.ErrTimeout, false},
 		{"read index not ready", quicraft.ErrReadIndexNotReady, false},
 		{"closed", quicraft.ErrClosed, false},
+		// A sealed node refuses until an operator unseals it. Leadership has
+		// not moved, so re-resolving and retrying would only spin.
+		{"barrier sealed", quicraft.ErrBarrierSealed, false},
+		{"barrier sealed, wrapped", fmt.Errorf("propose: %w", quicraft.ErrBarrierSealed), false},
 	} {
 		if got := IsNotLeaderRejection(tc.err); got != tc.want {
 			t.Errorf("IsNotLeaderRejection(%s) = %v, want %v", tc.name, got, tc.want)
@@ -288,14 +293,26 @@ func TestDriveRead_ANeverReadyLeaderReportsItsCause(t *testing.T) {
 // already committed in its term and neither the wait nor the re-resolve
 // changes it.
 func TestDriveRead_RetriesNothingElse(t *testing.T) {
-	var resolves, attempts int
-	_, err := driveRead(countingResolver(&resolves), 1, time.Second,
-		scripted(&attempts, "never", quicraft.ErrTimeout, quicraft.ErrTimeout))
-	if !errors.Is(err, quicraft.ErrTimeout) {
-		t.Fatalf("driveRead returned %v, want ErrTimeout unchanged", err)
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1: a non-refusal must not be retried", attempts)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"timeout", quicraft.ErrTimeout},
+		// A sealed node refuses until an operator unseals it; re-resolving
+		// and retrying would only spin.
+		{"barrier sealed", quicraft.ErrBarrierSealed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resolves, attempts int
+			_, err := driveRead(countingResolver(&resolves), 1, time.Second,
+				scripted(&attempts, "never", tc.err, tc.err))
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("driveRead returned %v, want %v unchanged", err, tc.err)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1: a non-refusal must not be retried", attempts)
+			}
+		})
 	}
 }
 
@@ -329,6 +346,8 @@ func TestReadRefusal(t *testing.T) {
 		{"no leader", quicraft.ErrNoLeader, false},
 		{"dropped", quicraft.ErrDropped, false},
 		{"aborted", quicraft.ErrAborted, false},
+		{"barrier sealed", quicraft.ErrBarrierSealed, false},
+		{"barrier sealed, wrapped", fmt.Errorf("read index: %w", quicraft.ErrBarrierSealed), false},
 	} {
 		if got := readRefusal(tc.err); got != tc.want {
 			t.Errorf("readRefusal(%s) = %v, want %v", tc.name, got, tc.want)

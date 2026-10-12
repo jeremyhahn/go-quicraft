@@ -741,6 +741,51 @@ func pruneNeverReadIndeterminatePuts(events []porcupine.Event) ([]porcupine.Even
 	return kept, len(drop)
 }
 
+// pruneIndeterminateGets drops every indeterminate GET: a read whose result
+// the client never saw. It is an EXACT reduction: the pruned history is
+// linearizable iff the original is.
+//
+//   - The model steps an Unknown get to the state it was in (kvSpec), so it
+//     constrains no state and no other operation's result.
+//   - Real-time order is pairwise -- a precedes b iff a returned before b was
+//     called -- so removing an operation removes only the edges that touch
+//     it; no edge between two remaining operations is lost. Its return sits
+//     at the end of the history, so it has no successor to lose anyway.
+//   - If the original has a linearization, deleting the get from it is a
+//     linearization of the pruned history. If the pruned history has one,
+//     placing the get last satisfies its only edges (operations that returned
+//     before its call) and leaves every state unchanged.
+//
+// Porcupine does not know the operation is inert: every never-returned get
+// stays pending to the end, overlaps everything after its call, and
+// multiplies the states the search must try. A burst of reads stranded by a
+// restart is enough to exhaust the checker's budget on a legal history. Every
+// COMPLETED get stays, so a read that returned an illegal value is rejected
+// exactly as before.
+func pruneIndeterminateGets(events []porcupine.Event) ([]porcupine.Event, int) {
+	calls := make(map[int]kvInput, len(events)/2)
+	drop := make(map[int]bool)
+	for _, ev := range events {
+		if ev.Kind == porcupine.CallEvent {
+			calls[ev.Id] = ev.Value.(kvInput)
+			continue
+		}
+		if in, ok := calls[ev.Id]; ok && in.Op == "get" && ev.Value.(kvOutput).Unknown {
+			drop[ev.Id] = true
+		}
+	}
+	if len(drop) == 0 {
+		return events, 0
+	}
+	kept := make([]porcupine.Event, 0, len(events)-2*len(drop))
+	for _, ev := range events {
+		if !drop[ev.Id] {
+			kept = append(kept, ev)
+		}
+	}
+	return kept, len(drop)
+}
+
 // checkLinearizability runs porcupine on the recorded history and fails the
 // test if the result is not Ok, if the run recorded fewer operations than the
 // floor, or if any client observed a protocol violation.
@@ -794,6 +839,11 @@ func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
 	if pruned > 0 {
 		t.Logf("pruned %d indeterminate put(s) whose value no get ever returned; "+
 			"see pruneNeverReadIndeterminatePuts for why that cannot change the verdict", pruned)
+	}
+	events, prunedGets := pruneIndeterminateGets(events)
+	if prunedGets > 0 {
+		t.Logf("pruned %d indeterminate get(s) that never returned; "+
+			"see pruneIndeterminateGets for why that cannot change the verdict", prunedGets)
 	}
 	model := kvModel()
 	checkStart := time.Now()

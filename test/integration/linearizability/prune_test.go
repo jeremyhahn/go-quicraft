@@ -18,6 +18,7 @@ package linearizability_test
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -138,5 +139,91 @@ func TestPrune_IsExactlyNeverReadIndeterminatePuts(t *testing.T) {
 	}
 	if !keep[3] {
 		t.Error("indeterminate append (id 3) was pruned; appends are never prunable")
+	}
+}
+
+// strandedGetsHistory builds one key's history the way a rolling restart
+// leaves it: `stranded` gets called early that never return, then `rounds` of
+// two concurrent completed puts followed by a completed get that returns the
+// put the checker has to order second. The last get returns final. Every
+// stranded get's Unknown return sits at the end, as opRecorder.events emits
+// it.
+func strandedGetsHistory(stranded, rounds int, final string) []porcupine.Event {
+	ev := func(id, cid int, kind porcupine.EventKind, v interface{}) porcupine.Event {
+		return porcupine.Event{ClientId: cid, Kind: kind, Value: v, Id: id}
+	}
+	call, ret := porcupine.CallEvent, porcupine.ReturnEvent
+	var events, tail []porcupine.Event
+	id := 0
+	for i := 0; i < stranded; i++ {
+		events = append(events, ev(id, i, call, kvInput{Op: "get", Key: "k"}))
+		tail = append(tail, ev(id, i, ret, kvOutput{Unknown: true}))
+		id++
+	}
+	a, b, r := stranded, stranded+1, stranded+2
+	for i := 0; i < rounds; i++ {
+		va, vb := fmt.Sprintf("a%d", i), fmt.Sprintf("b%d", i)
+		events = append(events,
+			ev(id, a, call, kvInput{Op: "put", Key: "k", Value: va}),
+			ev(id+1, b, call, kvInput{Op: "put", Key: "k", Value: vb}),
+			ev(id, a, ret, kvOutput{Ok: true}),
+			ev(id+1, b, ret, kvOutput{Ok: true}),
+			ev(id+2, r, call, kvInput{Op: "get", Key: "k"}),
+			ev(id+2, r, ret, kvOutput{Value: va}),
+		)
+		id += 3
+	}
+	events = append(events,
+		ev(id, r, call, kvInput{Op: "get", Key: "k"}),
+		ev(id, r, ret, kvOutput{Value: final}),
+	)
+	return append(events, tail...)
+}
+
+// TestPrune_IndeterminateGets pins pruneIndeterminateGets: a history whose
+// stranded reads exhaust the raw search decides at once without them, the
+// verdict on a legal history is Ok, and a completed read that returned an
+// impossible value is still rejected as Illegal.
+func TestPrune_IndeterminateGets(t *testing.T) {
+	const stranded, rounds = 28, 12
+	last := fmt.Sprintf("a%d", rounds-1)
+
+	for _, tc := range []struct {
+		name  string
+		final string
+		want  porcupine.CheckResult
+	}{
+		{"legal", last, porcupine.Ok},
+		// No put ever wrote this value: no linearization exists, with or
+		// without the stranded reads.
+		{"illegal completed read", "never-written", porcupine.Illegal},
+		// The value was overwritten by every later round: also illegal.
+		{"stale completed read", "a0", porcupine.Illegal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := strandedGetsHistory(stranded, rounds, tc.final)
+			pruned, n := pruneIndeterminateGets(raw)
+			if n != stranded {
+				t.Fatalf("pruned %d, want exactly the %d stranded gets", n, stranded)
+			}
+			if got, want := len(pruned), len(raw)-2*stranded; got != want {
+				t.Fatalf("pruned history has %d events, want %d: a completed operation was dropped", got, want)
+			}
+			start := time.Now()
+			res := porcupine.CheckEventsTimeout(kvModel(), pruned, 30*time.Second)
+			if res != tc.want {
+				t.Fatalf("pruned history is %s, want %s", res, tc.want)
+			}
+			if d := time.Since(start); d > 5*time.Second {
+				t.Fatalf("pruned history took %v to decide", d)
+			}
+			if tc.want == porcupine.Illegal {
+				// The raw history is no stronger: whatever it decides within
+				// its budget, it is never Ok.
+				if res := porcupine.CheckEventsTimeout(kvModel(), raw, 2*time.Second); res == porcupine.Ok {
+					t.Fatalf("raw history is Ok; the fixture does not encode an illegal read")
+				}
+			}
+		})
 	}
 }
