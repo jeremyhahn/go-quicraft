@@ -979,7 +979,7 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 			msg.Entries = entries
 		}
 		// Snapshot is copied by VALUE with the message, but proto.Snapshot
-		// embeds Membership's four maps and a Checksum slice, all still
+		// embeds Membership's six maps and a Checksum slice, all still
 		// aliasing the caller's structures. Membership.MarshalTo ranges over
 		// those maps on the async send path, so an in-place mutation by the
 		// caller would be an unrecoverable "concurrent map iteration and map

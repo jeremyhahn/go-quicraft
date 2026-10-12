@@ -504,8 +504,9 @@ func TestSnapshotChunkValidatesBinVer(t *testing.T) {
 // A LENGTH-discriminated decoder, reading "the buffer ended" as a shorter
 // layout rather than as damage, is dangerous at the trailing NodeIdentity: a
 // payload ending where its length prefix begins would decode with err == nil
-// and an EMPTY identity — and an empty identity is exactly the compatibility state that
-// falls back to the weaker address-based authorization. So a truncated
+// and an EMPTY identity — and an empty identity was then exactly the
+// compatibility state that fell back to the weaker address-based
+// authorization (removed in 0.13.0-alpha). So a truncated
 // ConfigChange was indistinguishable from a legitimate identity-less one, and
 // truncation silently downgraded an authorization check.
 //

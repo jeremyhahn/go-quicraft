@@ -40,6 +40,31 @@ func TestNewRaftLog_ClampsCommittedToLastIndex(t *testing.T) {
 	}
 }
 
+// TestNewRaftLog_RecordsRecoveryClamp: the clamp is recorded for the Host to
+// log on its own logger (Peer.RecoveryClamp), with the recovered values, and
+// nothing is recorded when the recovered commit index is within the log.
+func TestNewRaftLog_RecordsRecoveryClamp(t *testing.T) {
+	entries := []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1}}
+
+	if c := newRaftLog(newTestLogReader(entries, proto.State{Term: 1, Commit: 3})).recoveryClamp; c.Applied() {
+		t.Fatalf("recoveryClamp = %+v for a commit index within the log, want none", c)
+	}
+
+	c := newRaftLog(newTestLogReader(entries, proto.State{Term: 1, Commit: 9})).recoveryClamp
+	want := RecoveryClamp{RecoveredCommit: 9, RecoveredTerm: 1, LastIndex: 3}
+	if c != want {
+		t.Fatalf("recoveryClamp = %+v, want %+v", c, want)
+	}
+	if !c.Applied() || c.EmptyLog() {
+		t.Fatalf("partial clamp: Applied = %v, EmptyLog = %v, want true, false", c.Applied(), c.EmptyLog())
+	}
+
+	c = newRaftLog(newTestLogReader(nil, proto.State{Term: 5, Commit: 100})).recoveryClamp
+	if !c.EmptyLog() || c.RecoveredCommit != 100 || c.RecoveredTerm != 5 {
+		t.Fatalf("total-loss recoveryClamp = %+v, want an EmptyLog clamp of commit 100 at term 5", c)
+	}
+}
+
 // TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero covers the case the
 // partial-loss test above does NOT reach: the log holds NOTHING — no entries
 // and no snapshot — while the recovered hard state still claims a commit

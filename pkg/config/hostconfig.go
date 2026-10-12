@@ -321,7 +321,11 @@ type DiskInfo struct {
 	WALDir    string
 	UsedBytes uint64
 	MaxBytes  uint64
-	Shards    []uint64
+	// Shards lists, in ascending order, the IDs of the shards whose data is in
+	// the WAL at WALDir when the event fires: every shard loaded on the host,
+	// and every stopped shard whose data RemoveData has not purged. It is
+	// empty when the WAL holds no shard data or cannot list it.
+	Shards []uint64
 }
 
 // ConnectionInfo describes a connection lifecycle event.

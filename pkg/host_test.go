@@ -8891,7 +8891,7 @@ func TestBuildWALOptions_DiskFullRecovery(t *testing.T) {
 		WALDir:         t.TempDir(),
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 
 	// Verify that options were created (disk monitor configured).
 	if len(opts) == 0 {
@@ -8929,7 +8929,7 @@ func TestBuildWALOptions_DiskFullRecoveryWithEventListener(t *testing.T) {
 		},
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options with disk monitor, got none")
 	}
@@ -14592,7 +14592,7 @@ func TestBuildWALOptions_WithDiskWarningAndFullCallbacks(t *testing.T) {
 		},
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options to contain disk monitor config")
 	}
@@ -14609,7 +14609,7 @@ func TestBuildWALOptions_NoCallbacksDiskMonitorOnly(t *testing.T) {
 		MaxWALDiskSize: 50 * 1024 * 1024,
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options to contain disk monitor config")
 	}
@@ -14628,7 +14628,7 @@ func TestBuildWALOptions_CallbacksNoSizeLimit(t *testing.T) {
 		},
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 	if len(opts) != 0 {
 		t.Fatalf("expected empty options when maxBytes=0, got %d", len(opts))
 	}
@@ -14650,7 +14650,7 @@ func TestBuildWALOptions_DiskWarningNoFullCallback(t *testing.T) {
 		},
 	}
 
-	opts := buildWALOptions(cfg, &diskFullFlag)
+	opts := buildWALOptions(cfg, &diskFullFlag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options to contain disk monitor config")
 	}
@@ -16033,7 +16033,7 @@ func TestBuildWALOptions_WarningCallbackNoFullCallback(t *testing.T) {
 		},
 	}
 	var flag atomic.Bool
-	opts := buildWALOptions(cfg, &flag)
+	opts := buildWALOptions(cfg, &flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected non-empty WAL options")
 	}
@@ -16056,7 +16056,7 @@ func TestBuildWALOptions_NoListenerWithDiskSize(t *testing.T) {
 		EventListener:  nil,
 	}
 	var flag atomic.Bool
-	opts := buildWALOptions(cfg, &flag)
+	opts := buildWALOptions(cfg, &flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected non-empty WAL options")
 	}
@@ -16081,7 +16081,7 @@ func TestBuildWALOptions_CallbacksZeroDiskSize(t *testing.T) {
 		},
 	}
 	var flag atomic.Bool
-	opts := buildWALOptions(cfg, &flag)
+	opts := buildWALOptions(cfg, &flag, nil)
 	if len(opts) != 0 {
 		t.Fatalf("expected empty WAL options for zero disk size, got %d", len(opts))
 	}
@@ -18215,7 +18215,7 @@ func TestPropose_EntryTooLarge_MaxEntrySize(t *testing.T) {
 func TestBuildWALOptions_NoDiskMonitoring(t *testing.T) {
 	cfg := config.HostConfig{}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) != 0 {
 		t.Errorf("buildWALOptions returned %d options, want 0", len(opts))
 	}
@@ -18226,7 +18226,7 @@ func TestBuildWALOptions_MaxWALDiskSizeOnly(t *testing.T) {
 		MaxWALDiskSize: 1 << 30, // 1 GiB
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("buildWALOptions returned no options with MaxWALDiskSize set")
 	}
@@ -18242,7 +18242,7 @@ func TestBuildWALOptions_CallbacksNoMaxSize(t *testing.T) {
 		},
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	// MaxWALDiskSize=0 with callbacks should return early (no options).
 	if len(opts) != 0 {
 		t.Errorf("buildWALOptions returned %d options, want 0 (no MaxWALDiskSize)", len(opts))
@@ -18261,7 +18261,7 @@ func TestBuildWALOptions_WithWarningCallback(t *testing.T) {
 		},
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options with warning callback and MaxWALDiskSize")
 	}
@@ -18279,7 +18279,7 @@ func TestBuildWALOptions_WithFullCallback(t *testing.T) {
 		},
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options with full callback and MaxWALDiskSize")
 	}
@@ -18295,7 +18295,7 @@ func TestBuildWALOptions_WithBothCallbacks(t *testing.T) {
 		},
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options with both callbacks")
 	}
@@ -18306,7 +18306,7 @@ func TestBuildWALOptions_NoEventListenerWithMaxSize(t *testing.T) {
 		MaxWALDiskSize: 1 << 30,
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	// Should add disk monitor with only recovery and full (no user) callbacks.
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options when MaxWALDiskSize > 0")
@@ -18320,9 +18320,91 @@ func TestBuildWALOptions_EventListenerNoFullCallback(t *testing.T) {
 		EventListener:  &config.EventListener{},
 	}
 	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag)
+	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) == 0 {
 		t.Fatal("expected WAL options with EventListener + MaxWALDiskSize")
+	}
+}
+
+// TestHost_DiskInfoShards_ListsShardsWithWALData verifies that a disk event
+// names the shards whose data is on the WAL: running and stopped shards
+// alike, but not one whose data RemoveData purged.
+func TestHost_DiskInfoShards_ListsShardsWithWALData(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the disk monitor measures usage only on Linux")
+	}
+	cfg := testHostConfig(t)
+	// Any real filesystem usage is past the full threshold of one byte, so the
+	// monitor trips on its first sample.
+	cfg.MaxWALDiskSize = 1
+	events := make(chan config.DiskInfo, 1)
+	cfg.EventListener = &config.EventListener{
+		OnLogDBDiskFull: func(info config.DiskInfo) {
+			select {
+			case events <- info:
+			default:
+			}
+		},
+	}
+	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	members := map[uint64]string{1: cfg.RaftAddress}
+	for _, shardID := range []uint64{1, 2, 3, 4} {
+		if err := h.StartShard(members, false, testCreateFunc, testShardConfig(shardID, 1)); err != nil {
+			t.Fatalf("StartShard(%d) failed: %v", shardID, err)
+		}
+		waitForLeader(t, h, shardID)
+	}
+	if err := h.StopShard(3); err != nil {
+		t.Fatalf("StopShard(3) failed: %v", err)
+	}
+	if err := h.StopShard(4); err != nil {
+		t.Fatalf("StopShard(4) failed: %v", err)
+	}
+	if err := h.RemoveData(4, 1); err != nil {
+		t.Fatalf("RemoveData(4, 1) failed: %v", err)
+	}
+
+	// The monitor samples every DefaultCheckEvery writes; propose until it
+	// trips. Proposals fail once it has, which is expected.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case info := <-events:
+			if info.WALDir != cfg.WALDir {
+				t.Errorf("WALDir = %q, want %q", info.WALDir, cfg.WALDir)
+			}
+			if got, want := fmt.Sprint(info.Shards), fmt.Sprint([]uint64{1, 2, 3}); got != want {
+				t.Fatalf("DiskInfo.Shards = %s, want %s: running and stopped "+
+					"shards hold WAL data, the removed one does not", got, want)
+			}
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("OnLogDBDiskFull never fired")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, _ = h.SyncPropose(ctx, 1, []byte("x"))
+		cancel()
+	}
+}
+
+// TestWalShardIDs_NilAndEmpty verifies walShardIDs reports no shards for a
+// WAL that is not open yet or holds none.
+func TestWalShardIDs_NilAndEmpty(t *testing.T) {
+	if got := walShardIDs(nil); got != nil {
+		t.Errorf("walShardIDs(nil) = %v, want nil", got)
+	}
+	if got := diskShards(nil); got != nil {
+		t.Errorf("diskShards(nil) = %v, want nil", got)
+	}
+	if got := walShardIDs(memdb.New()); got != nil {
+		t.Errorf("walShardIDs(empty) = %v, want nil", got)
 	}
 }
 

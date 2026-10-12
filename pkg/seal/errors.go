@@ -281,8 +281,11 @@ var (
 	// receives empty credentials at Seal/Unseal time.
 	ErrEmptyCredentials = errors.New("quicraft/seal: empty credentials for deferred-passphrase strategy")
 
-	// Shamir sealing-strategy errors (used by ShamirStrategy and shared with
-	// higher-layer Shamir flows such as recovery/rekey/quorum).
+	// Shamir sealing-strategy errors. Nothing in this module returns the
+	// ErrShamir* errors: they are exported for the Shamir sealing strategy and
+	// the recovery/rekey/quorum flows that go-qrdb owns, since custody does not
+	// live in this module. ErrNilSealedData is also the Barrier's own error for
+	// missing sealed root-key state.
 
 	// ErrNilSealedData is returned when sealed root-key data is nil.
 	ErrNilSealedData = errors.New("quicraft/seal: sealed data is nil")
@@ -339,9 +342,11 @@ func (e *TrackerError) Unwrap() error {
 
 // StatePersistError is returned when BarrierConfig.StatePersister fails to
 // durably write the sealed root-key state. The operation that triggered the
-// write (rotation, purge) is aborted with the previous epoch fully intact.
+// write (rotation, purge, the Unseal load-generation claim) is aborted with the
+// previous epoch fully intact.
 type StatePersistError struct {
-	// Op is the aborted operation: "rotate" or "purge".
+	// Op is the aborted operation: "rotate", "purge", or "claim" (the
+	// load-generation claim Unseal persists).
 	Op string
 	// Epoch is the epoch the aborted operation tried to persist.
 	Epoch uint64

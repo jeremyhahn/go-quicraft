@@ -243,12 +243,14 @@ type TransportConfig struct {
 	// UDPRecvBufSize is the SO_RCVBUF size for the UDP socket. Larger
 	// buffers prevent packet drops under burst traffic, especially in
 	// multi-node clusters where many QUIC connections share the same
-	// socket. Default: 7 MB. Set to 0 to use the OS default.
+	// socket. Default: 7 MB; SetDefaults replaces 0 with it. A negative
+	// value leaves SO_RCVBUF unset, so the socket keeps the OS default.
 	UDPRecvBufSize int
 
 	// UDPSendBufSize is the SO_SNDBUF size for the UDP socket. Larger
 	// buffers allow more outbound packets to be queued before blocking.
-	// Default: 7 MB. Set to 0 to use the OS default.
+	// Default: 7 MB; SetDefaults replaces 0 with it. A negative value leaves
+	// SO_SNDBUF unset, so the socket keeps the OS default.
 	UDPSendBufSize int
 
 	// Enable0RTT enables QUIC 0-RTT reconnection for reduced latency on

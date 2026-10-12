@@ -1417,8 +1417,9 @@ func (b *Barrier) resolveInvocationBudget(ctx context.Context) {
 // barrier to the sealed state. Data is inaccessible until Unseal is called.
 //
 // This method is unexported because it must only be called through
-// Host.Seal() or Host.Close(), which quiesce the engine pipeline before
-// sealing to prevent ErrBarrierSealed storms.
+// Host.Close(), which quiesces the engine pipeline before sealing to prevent
+// ErrBarrierSealed storms, or Host.EmergencySeal(), which deliberately does
+// not.
 func (b *Barrier) seal() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1470,7 +1471,8 @@ func (b *Barrier) seal() error {
 }
 
 // Seal is the exported variant of seal for testing and Host integration.
-// Production code should prefer Host.Seal() which quiesces the pipeline first.
+// Production code should prefer Host.Close(), which quiesces the pipeline
+// first; Host.EmergencySeal() calls it directly, without quiescing.
 func (b *Barrier) Seal() error {
 	return b.seal()
 }

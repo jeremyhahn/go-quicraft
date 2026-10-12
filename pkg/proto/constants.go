@@ -146,7 +146,7 @@ const MaxBatchSize uint64 = 64 * 1024 * 1024 // 64MB
 //
 // It exists because a wire-byte budget is not a memory budget. The decoded form
 // of a frame is materially larger than the frame: a 100-byte heartbeat becomes a
-// 320-byte Message in a slice, and a membership map entry costs 12 bytes on the
+// 304-byte Message in a slice, and a membership map entry costs 12 bytes on the
 // wire and about 57 in a Go map (see mapAllocBytesPerEntry). A budget charged
 // in wire bytes describes bytes read rather than bytes held: 256 MB of admitted
 // frames can occupy up to 2 GB of heap. The QUIC transport therefore reserves

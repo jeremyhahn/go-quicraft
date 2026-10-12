@@ -98,6 +98,11 @@ func TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry(t *testing.T) {
 	if p.membership.isVoter(4) {
 		t.Fatal("fixture: the corrupt entry must not have changed the membership")
 	}
+	// Recorded for the Host to log on its own logger (Peer.UnfoldedConfig).
+	if c := p.UnfoldedConfig(); !c.Recorded() || c.Index != 31 ||
+		c.StaleThrough != p.staleConfigThrough || !errors.Is(c.Err, ErrCorruptConfigEntry) {
+		t.Fatalf("UnfoldedConfig = %+v, want a recorded fold to 31 carrying ErrCorruptConfigEntry", c)
+	}
 }
 
 // TestSetProcessedIndex_CleanFoldReportsNoError is the POSITIVE CONTROL, and it
@@ -121,6 +126,9 @@ func TestSetProcessedIndex_CleanFoldReportsNoError(t *testing.T) {
 	}
 	if !p.membership.isVoter(4) {
 		t.Fatal("the readable tail was not folded")
+	}
+	if c := p.UnfoldedConfig(); c.Recorded() {
+		t.Fatalf("UnfoldedConfig = %+v after a complete fold, want none", c)
 	}
 }
 

@@ -64,7 +64,7 @@ func amplifyingFrames(t *testing.T) map[string][]byte {
 
 	frames := map[string]MessageBatch{}
 
-	// Minimal messages: 100 wire bytes each become a 320-byte Message in the
+	// Minimal messages: 100 wire bytes each become a 304-byte Message in the
 	// decoded slice. This is the floor every batch pays.
 	minimal := MessageBatch{BinVer: WireVersion, Requests: make([]Message, 1000)}
 	for i := range minimal.Requests {

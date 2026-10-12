@@ -459,7 +459,8 @@ type Config struct {
 	MaxTotalSessions uint64
 
 	// MaxSessionsPerOwner is the maximum number of concurrent sessions ONE
-	// owner may hold on this shard. Default: 128. Zero disables the cap.
+	// owner may hold on this shard. Default: 128; SetDefaults replaces 0
+	// with it. SessionsPerOwnerUnlimited turns the cap off.
 	//
 	// An "owner" is a principal the EMBEDDER declares when it registers a
 	// session (Host.GetNewSessionWithOwner, NewSessionWithOwner), carried in

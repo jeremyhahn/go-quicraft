@@ -57,9 +57,15 @@ type ConfigChange struct {
 	// UpdateWitnessPolicy, and empty for an add whose caller supplied none.
 	//
 	// An empty value is a real, encoded state (a zero length prefix), never an
-	// absent field. It selects the weaker address-based authorization on the
-	// receive side, so it must be something a WRITER chose and not something a
-	// truncated buffer produced; see UnmarshalFrom.
+	// absent field. There is no address-based authorization to fall back on:
+	// the receive-side gate authorizes a member by identity alone, so under
+	// RequireMemberIdentities (which the Host sets whenever it has a
+	// transport) an add with an empty identity is refused with
+	// ErrMemberIdentityRequired unless the configuration already binds an
+	// identity to the replica (a role change keeps the existing binding).
+	// It must therefore be something a
+	// WRITER chose and not something a truncated buffer produced; see
+	// UnmarshalFrom.
 	//
 	// It travels through consensus alongside Address so the receive-side gate
 	// reads a value no inbound message can write. It is supplied by the
@@ -164,8 +170,8 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	// part-way through left the receiver holding the NEW ConfigChangeID, Type,
 	// ReplicaID and Address bolted onto the OLD NodeIdentity — a mixture that
 	// describes no configuration any writer produced. NodeIdentity is what
-	// selects identity-based authorization over the weaker address-based
-	// path, so a stale one beside a new target is precisely the shape
+	// the receive-side gate authorizes the member by, so a stale one beside a
+	// new target is precisely the shape
 	// Membership.UnmarshalFrom was hardened against (see its comment: "a
 	// partial decode that kept a STALE Identities map would authorize a
 	// replica the decoded configuration never named"). ConfigChange carries

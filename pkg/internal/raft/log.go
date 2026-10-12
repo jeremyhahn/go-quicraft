@@ -140,6 +140,45 @@ type raftLog struct {
 	// pendingSeeded records that seedPendingAdds has classified the recovered
 	// log once; see PublishPendingConfig.
 	pendingSeeded bool
+
+	// recoveryClamp records the clamp newRaftLog applied to a recovered
+	// commit index ahead of the log; zero when none was applied.
+	// Applied() is the only trustworthy test for a clamp: a field-wise
+	// zero check is not, since a total-loss clamp has LastIndex 0.
+	recoveryClamp RecoveryClamp
+}
+
+// RecoveryClamp describes newRaftLog clamping a recovered HardState.Commit
+// down to the last index the recovered log actually holds. The zero value
+// means no clamp was applied.
+type RecoveryClamp struct {
+	// RecoveredCommit is the commit index the state record claimed.
+	RecoveredCommit uint64
+	// RecoveredTerm is the term the state record claimed.
+	RecoveredTerm uint64
+	// LastIndex is the last index the recovered log holds, and the value
+	// committed was clamped to.
+	LastIndex uint64
+	// SnapshotIndex is the recovered snapshot's index, 0 when there is none.
+	SnapshotIndex uint64
+}
+
+// Applied reports whether a clamp was applied.
+func (c RecoveryClamp) Applied() bool {
+	return c.RecoveredCommit > c.LastIndex
+}
+
+// EmptyLog reports TOTAL loss: the state record survived but the log holds
+// nothing at all — no entries and no snapshot. Clamping to 0 makes the replica
+// indistinguishable from a fresh one, which is exactly right: it re-learns its
+// whole log, and its commit index, from the leader. It is also the only state
+// in which the replica has NOTHING to prove any of its prior acknowledgements
+// with, so it is reported at ERROR rather than WARN — the shard is running one
+// replica short of its nominal durability until the leader refills it, and
+// only an operator can tell a wiped volume from a restore that was never
+// finished.
+func (c RecoveryClamp) EmptyLog() bool {
+	return c.Applied() && c.LastIndex == 0
 }
 
 // pendingAdd is one (replica, identity) a config-carrying entry admits — or,
@@ -539,27 +578,15 @@ func newRaftLog(logdb LogReader) *raftLog {
 	// invariant assertion in commitTo would eventually panic, but only after
 	// the false acknowledgement had already gone out.
 	if last := l.lastIndex(); l.committed > last {
-		if last == 0 {
-			// TOTAL loss: the state record survived but the log holds
-			// nothing at all — no entries and no snapshot. Clamping to 0
-			// makes this replica indistinguishable from a fresh one, which
-			// is exactly right: it re-learns its whole log, and its commit
-			// index, from the leader. It is also the only state in which
-			// the replica has NOTHING to prove any of its prior
-			// acknowledgements with, so it is logged at ERROR rather than
-			// WARN — the shard is running one replica short of its
-			// nominal durability until the leader refills it, and only an
-			// operator can tell a wiped volume from a restore that was
-			// never finished.
-			slog.Error("recovered commit index over an EMPTY log: entry records were lost while the state record survived; clamping to 0 and re-learning the log from the leader",
-				"recovered_commit", l.committed,
-				"recovered_term", state.Term,
-				"snapshot_index", ss.Index)
-		} else {
-			slog.Warn("recovered commit index exceeds last log entry, clamping",
-				"recovered_commit", l.committed,
-				"last_index", last,
-				"snapshot_index", ss.Index)
+		// Recorded, not logged: this package has no logger of its own, and
+		// the clamp is a recovery diagnostic for the operator. The Host reads
+		// it through Peer.RecoveryClamp and logs it on its own logger; a
+		// clamp to 0 is the total-loss case RecoveryClamp.EmptyLog describes.
+		l.recoveryClamp = RecoveryClamp{
+			RecoveredCommit: l.committed,
+			RecoveredTerm:   state.Term,
+			LastIndex:       last,
+			SnapshotIndex:   ss.Index,
 		}
 		l.committed = last
 	}

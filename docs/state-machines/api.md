@@ -66,7 +66,10 @@ type DiskStateMachine interface {
 
 `Open` returns the last index your store durably applied, or 0 on a fresh start.
 Raft replays from there, so replay of already-applied entries must be
-idempotent. Concurrency is as for tier 1. Client sessions are refused on this
+idempotent. If that index is below the replica's local snapshot, for example
+when the node stopped after receiving a snapshot from the leader and before
+your store recovered it, `RecoverFromSnapshot` is called with that snapshot
+before replay begins. Concurrency is as for tier 1. Client sessions are refused on this
 tier with `ErrSessionsUnsupportedOnDisk`.
 
 ### Values that cross the boundary

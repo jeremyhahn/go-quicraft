@@ -4294,6 +4294,34 @@ func TestPeer_SetProcessedIndex_ZeroValue(t *testing.T) {
 	}
 }
 
+// TestPeer_SetProcessedIndex_RecordsAppliedClamp: an applied index ahead of the
+// recovered commit index is clamped and recorded for the Host to log on its
+// own logger (Peer.AppliedClamp); an index within it records nothing.
+func TestPeer_SetProcessedIndex_RecordsAppliedClamp(t *testing.T) {
+	cfg := testConfig()
+	p := newTestPeerWithLog(t, cfg, contiguousEntries(50),
+		proto.State{Term: 1, Commit: 50}, singleNodeMembership())
+
+	if _, err := p.SetProcessedIndex(40); err != nil {
+		t.Fatalf("SetProcessedIndex(40): %v", err)
+	}
+	if c := p.AppliedClamp(); c.Applied() {
+		t.Fatalf("AppliedClamp = %+v for an index within the commit index, want none", c)
+	}
+
+	applied, err := p.SetProcessedIndex(70)
+	if err != nil {
+		t.Fatalf("SetProcessedIndex(70): %v", err)
+	}
+	if applied != 50 {
+		t.Fatalf("applied = %d, want 50 (clamped to the recovered commit index)", applied)
+	}
+	want := AppliedClamp{SMApplied: 70, Committed: 50}
+	if c := p.AppliedClamp(); c != want || !c.Applied() {
+		t.Fatalf("AppliedClamp = %+v, want %+v", c, want)
+	}
+}
+
 func TestPeer_SetProcessedIndex_LargeValue(t *testing.T) {
 	cfg := testConfig()
 	largeIndex := uint64(1 << 40)

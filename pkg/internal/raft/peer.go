@@ -217,6 +217,16 @@ type Peer struct {
 	// pipeline is not running at all.
 	staleConfigThrough uint64
 
+	// appliedClamp records the clamp SetProcessedIndex applied to a state
+	// machine applied index ahead of the recovered commit index; zero when
+	// none was applied. Applied() is the only trustworthy test for one.
+	appliedClamp AppliedClamp
+
+	// unfoldedConfig records the committed config window SetProcessedIndex
+	// could not fold; zero when the fold was complete. Recorded() is the only
+	// trustworthy test for one.
+	unfoldedConfig UnfoldedConfig
+
 	// configFoldedThrough is the highest index up to which every committed entry
 	// HAS BEEN OFFERED to applyMembershipEntry. It is the lower bound
 	// resolveStaleStartupConfig resumes its scan from.
@@ -550,13 +560,12 @@ func (p *Peer) SetProcessedIndex(index uint64) (uint64, error) {
 	// quorum over a voting set no other replica shares, and would push
 	// l.processed above l.committed so the first Commit trips
 	// commitUpdate's LastApplied assertions on every restart.
+	//
+	// The clamp is a recovery diagnostic for the operator. It is recorded, not
+	// logged: the Host reads it through Peer.AppliedClamp and logs it on its
+	// own logger, the one the operator configured.
 	if index > p.r.log.committed {
-		slog.Warn("state machine applied index exceeds recovered commit index, clamping",
-			"shard", p.shardID,
-			"replica", p.replicaID,
-			"sm_applied", index,
-			"committed", p.r.log.committed,
-		)
+		p.appliedClamp = AppliedClamp{SMApplied: index, Committed: p.r.log.committed}
 		index = p.r.log.committed
 	}
 	p.r.log.processed = index
@@ -587,15 +596,16 @@ func (p *Peer) SetProcessedIndex(index uint64) (uint64, error) {
 		if index > p.staleConfigThrough {
 			p.staleConfigThrough = index
 		}
-		slog.Error("committed config changes below the state machine's applied index "+
-			"were not folded: this replica will not campaign until they are",
-			"shard", p.shardID,
-			"replica", p.replicaID,
-			"index", index,
-			"folded_through", p.configFoldedThrough,
-			"stale_through", p.staleConfigThrough,
-			"error", err,
-		)
+		// Recorded, not logged, for the same reason as the clamp above: the
+		// Host reads it through Peer.UnfoldedConfig and logs it on its own
+		// logger.
+		p.unfoldedConfig = UnfoldedConfig{
+			Index:         index,
+			FoldedThrough: p.configFoldedThrough,
+			StaleThrough:  p.staleConfigThrough,
+			Err:           err,
+			recorded:      true,
+		}
 	}
 	// The watermark is armed either way before this returns, so a caller that
 	// chooses to ignore the error still gets the old fail-closed campaigning
@@ -2553,6 +2563,72 @@ func (p *Peer) CommittedIndex() uint64 {
 // cheap enough to call on every tick.
 func (p *Peer) LogMarkers() (committed, processed uint64) {
 	return p.r.log.committed, p.r.log.processed
+}
+
+// RecoveryClamp returns the clamp NewPeer applied to a recovered commit index
+// that was ahead of the recovered log; its Applied method reports whether
+// there was one. The raft package does not log it: the caller owns the logger.
+// It is set once, at construction, so reading it before the Peer is handed to
+// a worker needs no synchronization.
+func (p *Peer) RecoveryClamp() RecoveryClamp {
+	return p.r.log.recoveryClamp
+}
+
+// AppliedClamp describes SetProcessedIndex clamping a state machine applied
+// index down to the recovered commit index. The zero value means no clamp was
+// applied.
+type AppliedClamp struct {
+	// SMApplied is the applied index the state machine reported.
+	SMApplied uint64
+	// Committed is the recovered commit index, and the value the applied
+	// index was clamped to.
+	Committed uint64
+}
+
+// Applied reports whether a clamp was applied.
+func (c AppliedClamp) Applied() bool {
+	return c.SMApplied > c.Committed
+}
+
+// AppliedClamp returns the clamp SetProcessedIndex applied to a state machine
+// applied index that was ahead of the recovered commit index; its Applied
+// method reports whether there was one. The raft package does not log it: the
+// caller owns the logger. It is set by SetProcessedIndex, which runs before the
+// Peer is handed to a worker, so reading it then needs no synchronization.
+func (p *Peer) AppliedClamp() AppliedClamp {
+	return p.appliedClamp
+}
+
+// UnfoldedConfig describes SetProcessedIndex failing to fold the committed
+// config changes below the state machine's applied index, which arms the
+// staleness watermark so the replica will not campaign until they are folded.
+// The zero value means the fold was complete.
+type UnfoldedConfig struct {
+	// Index is the applied index the fold had to reach.
+	Index uint64
+	// FoldedThrough is the index the fold did reach.
+	FoldedThrough uint64
+	// StaleThrough is the staleness watermark the failure armed.
+	StaleThrough uint64
+	// Err is the fold's error: nil for a window that could not be read,
+	// ErrCorruptConfigEntry for one that will never decode.
+	Err error
+
+	recorded bool
+}
+
+// Recorded reports whether an incomplete fold was recorded.
+func (c UnfoldedConfig) Recorded() bool {
+	return c.recorded
+}
+
+// UnfoldedConfig returns the incomplete fold SetProcessedIndex recorded; its
+// Recorded method reports whether there was one. The raft package does not
+// log it: the caller owns the logger. It is set by SetProcessedIndex, which
+// runs before the Peer is handed to a worker, so reading it then needs no
+// synchronization.
+func (p *Peer) UnfoldedConfig() UnfoldedConfig {
+	return p.unfoldedConfig
 }
 
 // syncLeaderID copies the raft state machine's leaderID to the atomic

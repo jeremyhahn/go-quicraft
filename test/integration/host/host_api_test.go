@@ -225,10 +225,13 @@ func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
 // The previous version submitted the ReadIndex to a pinned host and released
 // the RequestState without reading it, which asserted only that a request was
 // accepted: a not-leader outcome, or a read index that never resolved, would
-// have surfaced in the result it never read. The warmup write is load-bearing
-// too — a leader serves ReadIndex only once it has committed an entry in its
-// own term (ErrReadIndexNotReady before that), and waitForClusterLeader
-// returns as soon as a replica claims leadership, before that entry commits.
+// have surfaced in the result it never read.
+//
+// The warmup write is not there for readiness. A leader refuses ReadIndex with
+// ErrReadIndexNotReady until it commits an entry in its own term, but
+// readIndexFromLeader goes through proposer.ReadIndex, which retries that
+// refusal (go-quicraft#275). The write gives the index == 0 assertion a floor
+// the test committed itself: a confirmed index must cover it.
 func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()

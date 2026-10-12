@@ -21,9 +21,9 @@ import "testing"
 //
 // A partial decode that left the NEW ConfigChangeID, Type, ReplicaID and
 // Address on the receiver beside the OLD NodeIdentity would produce a value
-// describing no configuration any writer produced. NodeIdentity is what selects
-// identity-based authorization over the weaker address-based path, so a stale
-// one beside a new target is the same shape Membership.UnmarshalFrom was
+// describing no configuration any writer produced. NodeIdentity is what the
+// receive-side gate authorizes the member by, so a stale one beside a new
+// target is the same shape Membership.UnmarshalFrom was
 // hardened against.
 //
 // Every truncation point is swept, so the guarantee holds wherever the payload

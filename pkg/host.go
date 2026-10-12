@@ -3571,12 +3571,15 @@ func (h *Host) checkRecoveredIdentities(cfg config.Config, m proto.Membership) e
 				"of replica %d to replica %d; one keypair cannot be two members", other, id))
 		}
 		if r, ok := removed[identity]; ok {
-			slog.Warn("quicraft: Config.MemberIdentities names an identity this shard has removed; "+
-				"the entry is inert (the removal deny-list is consulted first) and can be dropped",
-				"shard", cfg.ShardID,
-				"replica", id,
-				"removed_replica", r,
-			)
+			logger := h.logger
+			supervise.LogContained(func() {
+				logger.Warn("quicraft: Config.MemberIdentities names an identity this shard has removed; "+
+					"the entry is inert (the removal deny-list is consulted first) and can be dropped",
+					"shard", cfg.ShardID,
+					"replica", id,
+					"removed_replica", r,
+				)
+			})
 		}
 	}
 	return nil
@@ -3900,7 +3903,15 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// Create the default WAL-based LogDB when no LogDB was provided.
 	// This ensures all production hosts persist raft state to disk.
 	if options.logdb == nil {
-		walOpts := buildWALOptions(cfg, &diskFullFlag)
+		// The disk callbacks are built before the WAL they monitor is open,
+		// so they reach it through walDB, published once Open returns.
+		var walDB atomic.Pointer[waldb.DB]
+		walOpts := buildWALOptions(cfg, &diskFullFlag, func() []uint64 {
+			if db := walDB.Load(); db != nil {
+				return walShardIDs(db)
+			}
+			return nil
+		})
 		// Wire barrier encryption into the WAL when a barrier is configured.
 		if options.barrier != nil {
 			walOpts = append(walOpts, waldb.WithBarrier(options.barrier))
@@ -3923,6 +3934,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		if err != nil {
 			return nil, &HostInitError{Field: "logdb", Err: err}
 		}
+		walDB.Store(db)
 		options.logdb = db
 	}
 
@@ -4791,6 +4803,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	if err != nil {
 		return &HostInitError{Field: "peer", Err: err}
 	}
+	h.logRecoveryClamp(cfg.ShardID, cfg.ReplicaID, peer.RecoveryClamp())
 	// The read lease is measured in real time, so the peer must know how
 	// long the ticks that its election timeout is counted in really are.
 	peer.SetTickInterval(h.engine.TickInterval())
@@ -4952,9 +4965,27 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	//     snapshot index (in newRaftLog), so entries after the snapshot are
 	//     re-applied by the engine.
 	//
-	// Cases 2 and 3 share the same recovery mechanics, so they are handled by
-	// the same recoverFromLocalSnapshot path below. Only case 1 skips it.
+	//  4. On-disk SM whose Open() returns 0 < lastApplied < ss.Index. The
+	//     database is BEHIND the local snapshot record: the replica installed
+	//     a snapshot streamed from the leader and stopped before its database
+	//     recovered it, or the database lost writes it had already
+	//     snapshotted. The entries between lastApplied and ss.Index may be
+	//     compacted out of the log and survive only in snapshot.dat, so
+	//     seeding the markers from Open() leaves a hole beneath the first entry
+	//     the log can offer (ss.Index+1) — refused as ErrApplyGap by the apply
+	//     worker, or with no resolvable term for lastApplied at all. The
+	//     snapshot is AHEAD of the database, so recovering from it rolls the
+	//     database forward, not back: it is case 2, not case 1 (#280).
+	//
+	// Cases 2, 3 and 4 share the same recovery mechanics, so they are handled
+	// by the same local-snapshot path below. Only case 1 skips it.
 	onDiskRecovered := stateMachine.IsOnDisk() && lastApplied > 0
+	if onDiskRecovered && h.logdb != nil {
+		ss, ssErr := h.logdb.GetSnapshot(cfg.ShardID, cfg.ReplicaID)
+		if ssErr == nil && ss.Index > lastApplied && ss.Filepath != "" {
+			onDiskRecovered = false
+		}
+	}
 	if onDiskRecovered {
 		// On-disk SM with durable state: Open() is the sole source of the
 		// INDEX, but it knows nothing about raft terms, so the term has to be
@@ -5131,6 +5162,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		// is why it is an abort and not an Engine.FailShard.
 		var setErr error
 		recoveredIndex, setErr = peer.SetProcessedIndex(recoveredIndex)
+		h.logAppliedClamp(cfg.ShardID, cfg.ReplicaID, peer.AppliedClamp())
+		h.logUnfoldedConfig(cfg.ShardID, cfg.ReplicaID, peer.UnfoldedConfig())
 		if setErr != nil {
 			return &HostInitError{Field: "config_replay", Err: setErr}
 		}
@@ -5362,6 +5395,78 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	)
 
 	return nil
+}
+
+// logRecoveryClamp reports, on the Host's logger, a recovered commit index the
+// raft log clamped down to what the recovered log actually holds (see
+// raft.RecoveryClamp). The raft package records the clamp instead of logging
+// it so the record reaches the sink the operator configured through WithLogger
+// or LogConfig. Contained: the logger is user code and must not be able to
+// fail or stall StartShard.
+func (h *Host) logRecoveryClamp(shardID, replicaID uint64, c raft.RecoveryClamp) {
+	if !c.Applied() {
+		return
+	}
+	logger := h.logger
+	if c.EmptyLog() {
+		supervise.LogContained(func() {
+			logger.Error("recovered commit index over an EMPTY log: entry records were lost while the state record survived; clamping to 0 and re-learning the log from the leader",
+				"shard", shardID,
+				"replica", replicaID,
+				"recovered_commit", c.RecoveredCommit,
+				"recovered_term", c.RecoveredTerm,
+				"snapshot_index", c.SnapshotIndex)
+		})
+		return
+	}
+	supervise.LogContained(func() {
+		logger.Warn("recovered commit index exceeds last log entry, clamping",
+			"shard", shardID,
+			"replica", replicaID,
+			"recovered_commit", c.RecoveredCommit,
+			"last_index", c.LastIndex,
+			"snapshot_index", c.SnapshotIndex)
+	})
+}
+
+// logAppliedClamp reports, on the Host's logger, a state machine applied index
+// that raft clamped down to the recovered commit index (see raft.AppliedClamp).
+// Like logRecoveryClamp it reaches the sink configured through WithLogger, and
+// the sink is contained so a faulty handler cannot fail or stall StartShard.
+func (h *Host) logAppliedClamp(shardID, replicaID uint64, c raft.AppliedClamp) {
+	if !c.Applied() {
+		return
+	}
+	logger := h.logger
+	supervise.LogContained(func() {
+		logger.Warn("state machine applied index exceeds recovered commit index, clamping",
+			"shard", shardID,
+			"replica", replicaID,
+			"sm_applied", c.SMApplied,
+			"committed", c.Committed)
+	})
+}
+
+// logUnfoldedConfig reports, on the Host's logger, committed config changes
+// below the state machine's applied index that SetProcessedIndex could not
+// fold (see raft.UnfoldedConfig). Like logRecoveryClamp it reaches the sink
+// configured through WithLogger, contained so a faulty handler cannot fail or
+// stall StartShard.
+func (h *Host) logUnfoldedConfig(shardID, replicaID uint64, c raft.UnfoldedConfig) {
+	if !c.Recorded() {
+		return
+	}
+	logger := h.logger
+	supervise.LogContained(func() {
+		logger.Error("committed config changes below the state machine's applied index "+
+			"were not folded: this replica will not campaign until they are",
+			"shard", shardID,
+			"replica", replicaID,
+			"index", c.Index,
+			"folded_through", c.FoldedThrough,
+			"stale_through", c.StaleThrough,
+			"error", c.Err)
+	})
 }
 
 // StopShard stops all replicas of the given shard on this host.
@@ -11320,6 +11425,14 @@ func (h *Host) reconstructShardMembership(lr *logdb.LogReader, commit uint64) (p
 	}
 	ms, err := raft.ReconstructMembership([]proto.Entry{entries[0]})
 	if err != nil {
+		logger, e := h.logger, entries[0]
+		supervise.LogContained(func() {
+			logger.Error("committed initial-membership entry does not decode during recovery",
+				"entry_index", e.Index,
+				"entry_term", e.Term,
+				"entry_type", e.Type,
+				"error", err)
+		})
 		return proto.Membership{}, false, err
 	}
 	return ms, true, nil
@@ -11787,8 +11900,9 @@ func (ns *nodeState) signalLeaderChange() {
 // When MaxWALDiskSize is set and/or EventListener disk callbacks are
 // configured, a DiskMonitor is attached to the WAL database. The
 // diskFullFlag is atomically set to true when disk full is detected
-// and cleared when usage drops below the full threshold.
-func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool) []waldb.Option {
+// and cleared when usage drops below the full threshold. shards reports
+// DiskInfo.Shards when a disk callback fires; nil leaves it empty.
+func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) []waldb.Option {
 	var opts []waldb.Option
 
 	// Disable fsync when NoSyncWAL is set (testing only — never production).
@@ -11827,6 +11941,7 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool) []waldb.O
 						WALDir:    walDir,
 						UsedBytes: used,
 						MaxBytes:  maxBytes,
+						Shards:    diskShards(shards),
 					})
 				}))
 			}
@@ -11838,6 +11953,7 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool) []waldb.O
 						WALDir:    walDir,
 						UsedBytes: used,
 						MaxBytes:  maxBytes,
+						Shards:    diskShards(shards),
 					})
 				}))
 			} else {
@@ -11859,6 +11975,35 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool) []waldb.O
 	}
 
 	return opts
+}
+
+// diskShards calls shards when it is set, for DiskInfo.Shards.
+func diskShards(shards func() []uint64) []uint64 {
+	if shards == nil {
+		return nil
+	}
+	return shards()
+}
+
+// walShardIDs returns, in ascending order and without duplicates, the IDs of
+// the shards db holds data for: a stopped shard's data stays until RemoveData
+// purges it, so it is listed, and a removed one is not. It returns nil when db
+// is nil (a disk event during waldb.Open, before the handle exists) or cannot
+// list its nodes.
+func walShardIDs(db logdb.LogDB) []uint64 {
+	if db == nil {
+		return nil
+	}
+	nodes, err := db.ListNodeInfo()
+	if err != nil || len(nodes) == 0 {
+		return nil
+	}
+	ids := make([]uint64, 0, len(nodes))
+	for _, ni := range nodes {
+		ids = append(ids, ni.ShardID)
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids)
 }
 
 // mapContextError translates a context error into the corresponding

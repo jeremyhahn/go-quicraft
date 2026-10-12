@@ -281,37 +281,28 @@ func TestDriveRead_ANeverReadyLeaderReportsItsCause(t *testing.T) {
 	}
 }
 
-// TestDriveRead_RetriesNothingElse: the read set adds ErrReadIndexNotReady to
-// the not-leader rejection and nothing more. Every other error came from a
-// leader that has already committed in its term, so neither the wait nor the
-// re-resolve changes it and it reaches the caller on its first occurrence.
+// TestDriveRead_RetriesNothingElse: driveRead retries on readRefusal and
+// nothing more. Which errors are refusals is TestReadRefusal's to pin; this
+// test pins the wiring — an error the predicate rejects reaches the caller
+// unchanged on its first occurrence, because it came from a leader that has
+// already committed in its term and neither the wait nor the re-resolve
+// changes it.
 func TestDriveRead_RetriesNothingElse(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{"timeout", quicraft.ErrTimeout},
-		{"system busy", quicraft.ErrSystemBusy},
-		{"closed", quicraft.ErrClosed},
-		{"shard not ready", quicraft.ErrShardNotReady},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var resolves, attempts int
-			_, err := driveRead(countingResolver(&resolves), 1, time.Second,
-				scripted(&attempts, "never", tc.err, tc.err))
-			if !errors.Is(err, tc.err) {
-				t.Fatalf("driveRead returned %v, want %v unchanged", err, tc.err)
-			}
-			if attempts != 1 {
-				t.Fatalf("attempts = %d, want 1: %v is not a read refusal and must "+
-					"not be retried", attempts, tc.err)
-			}
-		})
+	var resolves, attempts int
+	_, err := driveRead(countingResolver(&resolves), 1, time.Second,
+		scripted(&attempts, "never", quicraft.ErrTimeout, quicraft.ErrTimeout))
+	if !errors.Is(err, quicraft.ErrTimeout) {
+		t.Fatalf("driveRead returned %v, want ErrTimeout unchanged", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1: a non-refusal must not be retried", attempts)
 	}
 }
 
-// TestReadRefusal pins the read predicate's edges: both not-leader forms and
-// ErrReadIndexNotReady in, everything else out.
+// TestReadRefusal is the home of the read predicate's edges: the not-leader
+// rejection in every form, bare or wrapped, and ErrReadIndexNotReady in;
+// everything else — including the errors a reader might mistake for a
+// transient refusal — out.
 func TestReadRefusal(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -322,10 +313,22 @@ func TestReadRefusal(t *testing.T) {
 		{"not leader", quicraft.ErrNotLeader, true},
 		{"pre-flight", preflightNotLeader(), true},
 		{"post-delivery", postDeliveryNotLeader(), true},
+		{"wrapped sentinel", fmt.Errorf("read: %w", quicraft.ErrNotLeader), true},
+		{"wrapped pre-flight", fmt.Errorf("read: %w", preflightNotLeader()), true},
+		{"wrapped post-delivery", fmt.Errorf("read: %w", postDeliveryNotLeader()), true},
 		{"read index not ready", quicraft.ErrReadIndexNotReady, true},
+		{"wrapped read index not ready", fmt.Errorf("read: %w", quicraft.ErrReadIndexNotReady), true},
 		{"timeout", quicraft.ErrTimeout, false},
 		{"busy", quicraft.ErrBusy, false},
+		// The Host surfaces the raft layer's ErrReadIndexOverloaded as
+		// ErrSystemBusy, so this row is the overloaded read index too.
+		{"system busy / read index overloaded", quicraft.ErrSystemBusy, false},
 		{"closed", quicraft.ErrClosed, false},
+		{"shard not ready", quicraft.ErrShardNotReady, false},
+		{"leadership changed", quicraft.ErrLeadershipChanged, false},
+		{"no leader", quicraft.ErrNoLeader, false},
+		{"dropped", quicraft.ErrDropped, false},
+		{"aborted", quicraft.ErrAborted, false},
 	} {
 		if got := readRefusal(tc.err); got != tc.want {
 			t.Errorf("readRefusal(%s) = %v, want %v", tc.name, got, tc.want)

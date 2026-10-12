@@ -120,7 +120,12 @@ type DiskStateMachine interface {
 
 - `Open` initializes the store in the directory QuicRaft assigns and returns the
   last applied index, or 0 on a fresh start. The adapter stores a non-zero
-  value as its own applied index (`rsm.StateMachine.Open`).
+  value as its own applied index (`rsm.StateMachine.Open`). An index at or
+  above the local snapshot's is authoritative and the snapshot is not
+  recovered. An index below it means the store is behind the snapshot, and the
+  entries in between may be compacted out of the log, so `Host.StartShard`
+  recovers the store from the snapshot and seeds the applied markers to the
+  snapshot index (#280).
 - Replay must be idempotent. The store can commit its own write and the node
   crash before QuicRaft records the matching applied index. Persist your applied
   index atomically with the data and return it from `Open`.
@@ -138,8 +143,8 @@ Every session entry point on `Host` (`GetNewSession`, `GetNewSessionWithOwner`,
 
 The reason is `Open`. The session table is replicated state that travels only
 in the snapshot stream and is restored by `RecoverFromSnapshot`. A disk state
-machine that reports a non-zero applied index from `Open` skips that path on
-restart, because recovering would roll its database back to the snapshot index.
+machine that reports a non-zero applied index at or above its local snapshot
+from `Open` skips that path on restart, because recovering would roll its database back to the snapshot index.
 The replica would come up with correct data and an empty session table, then
 answer `ResultSessionExpired` for entries its peers apply normally. Dragonboat's
 `IOnDiskStateMachine` has the same constraint.

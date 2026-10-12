@@ -16,7 +16,7 @@ package raft
 
 import (
 	"errors"
-	"log/slog"
+	"fmt"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -135,6 +135,10 @@ func initialMembershipFromEntry(e proto.Entry) (proto.Membership, error) {
 // reads the same nothing and skips identically, so it cannot diverge them, and
 // no legitimate producer emits one (the propose-time gate refuses any payload
 // that does not decode).
+//
+// It does not log the failure: the caller owns the logger. A config change
+// that does not decode names its index and term in the error; the bootstrap
+// entry is always at BootstrapMembershipIndex.
 func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 	m := newMembership(proto.Membership{})
 	for i := range entries {
@@ -153,12 +157,6 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 			}
 			ms, err := initialMembershipFromEntry(entries[i])
 			if err != nil {
-				slog.Error("committed initial-membership entry does not decode during recovery",
-					"entry_index", entries[i].Index,
-					"entry_term", entries[i].Term,
-					"entry_type", entries[i].Type,
-					"error", err,
-				)
 				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry, err)
 			}
 			m = newMembership(ms)
@@ -168,13 +166,8 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 			}
 			var cc proto.ConfigChange
 			if _, err := cc.UnmarshalFrom(entries[i].Cmd); err != nil {
-				slog.Error("committed config change entry does not decode during recovery",
-					"entry_index", entries[i].Index,
-					"entry_term", entries[i].Term,
-					"entry_type", entries[i].Type,
-					"error", err,
-				)
-				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry, err)
+				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry,
+					fmt.Errorf("config change entry %d (term %d): %w", entries[i].Index, entries[i].Term, err))
 			}
 			_ = m.apply(cc, entries[i].Index)
 		}

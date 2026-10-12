@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/golang/snappy"
 
@@ -394,6 +395,69 @@ func TestStartShard_LocalSnapshotRecovery_OnDiskBootstrap(t *testing.T) {
 					diskSM.recoveredData, payload)
 			}
 			assertNoDecryptScratch(t, dir)
+		})
+	}
+}
+
+// TestStartShard_LocalSnapshotRecovery_OnDiskBehindSnapshot covers #280: an
+// on-disk SM whose Open() reports a durable lastApplied (40) BELOW the local
+// snapshot record (80) — the replica installed a snapshot from the leader, or
+// its database lost writes it had already snapshotted, and restarted before
+// the database caught up. The log is compacted through the snapshot, so
+// entries 41..80 exist only inside snapshot.dat. Seeding the markers from
+// Open() leaves a hole beneath the first entry the log can offer (81): the
+// apply worker refuses it as ErrApplyGap, and StartShard cannot even resolve a
+// term for index 40. The database must be recovered from the snapshot instead.
+func TestStartShard_LocalSnapshotRecovery_OnDiskBehindSnapshot(t *testing.T) {
+	for _, v := range snapshotVariants {
+		t.Run(v.name, func(t *testing.T) {
+			barrier := createTestBarrier(t)
+			db := newMockLogDB()
+			payload := []byte("on-disk state through index 80")
+			dir := seedLocalSnapshot(t, db, v, barrier, 1, 1, 80, 3, payload)
+			// Compacted through the snapshot: no entry at or below 80 is in the log.
+			if err := db.SaveState([]logdb.Update{{
+				ShardID:   1,
+				ReplicaID: 1,
+				State:     logdb.State{Term: 3, Vote: 1, Commit: 80},
+			}}); err != nil {
+				t.Fatalf("SaveState: %v", err)
+			}
+
+			h, err := NewHost(testHostConfig(t), WithLogDB(db), WithBarrier(barrier), WithoutTransport())
+			if err != nil {
+				t.Fatalf("NewHost: %v", err)
+			}
+			defer h.Close()
+
+			diskSM := &recordingOnDiskSM{openLastApplied: 40}
+			create := func(_, _ uint64) interface{} { return diskSM }
+			if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, create,
+				v.shardConfig(1, 1)); startErr != nil {
+				t.Fatalf("StartShard failed for an on-disk SM behind its %s local snapshot: %v",
+					v.name, startErr)
+			}
+			if !diskSM.recoverCalled.Load() {
+				t.Fatal("RecoverFromSnapshot was not called for an on-disk SM behind its local snapshot")
+			}
+			if !bytes.Equal(diskSM.recoveredData, payload) {
+				t.Fatalf("on-disk SM recovered %q, want %q", diskSM.recoveredData, payload)
+			}
+			assertNoDecryptScratch(t, dir)
+			assertSeededApplied(t, testLoadNode(h, 1), 80, "the snapshot index, not the SM's stale 40")
+
+			// The entries past the snapshot must apply: the leader's no-op and
+			// the proposal land at 81+, a gap from 40.
+			waitForLeader(t, h, 1)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			result, err := h.SyncPropose(ctx, 1, []byte("cmd"))
+			if err != nil {
+				t.Fatalf("SyncPropose after recovery failed: %v", err)
+			}
+			if result.Value <= 80 {
+				t.Errorf("proposal applied at index %d, want > 80", result.Value)
+			}
 		})
 	}
 }

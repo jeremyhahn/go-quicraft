@@ -2421,8 +2421,12 @@ type ConnectionInfo struct {
 ```
 
 `LeaderInfo` and `EventShardInfo` declare the same names in a different order, so
-construct them with field names. The host does not populate `DiskInfo.Shards`;
-it is always nil.
+construct them with field names.
+
+`DiskInfo.Shards` lists, in ascending order, the shards whose data is in the WAL
+when the event fires: every loaded shard, and every stopped shard whose data
+`RemoveData` has not purged. Every shard on a host shares the one WAL, so the
+list is the set of shards a full disk affects.
 
 `ShardFailedInfo.Err` is one of `*ApplyError`, `*SMPanicError` (matches
 `ErrShardFailed`), `*SaveStateError`, `*CommitError`, `*WorkerPanicError`,
