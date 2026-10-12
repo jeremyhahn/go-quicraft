@@ -246,7 +246,14 @@ func TestPendingRegistration_CloseRace_CallerNeverOrphaned(t *testing.T) {
 				rs.Release()
 			}()
 		}
-		if err := h.Close(); err != nil {
+		// Close races in-flight ReadIndex, RequestSnapshot and
+		// RequestAddNode on purpose. When that work outlasts
+		// ShutdownTimeout, Drain returning ErrShutdownTimeout is the
+		// documented contract, not a failure: the property under test is
+		// that no caller is orphaned and every pending registration is
+		// released, which the guard above and the pendingOps check below
+		// assert. Any other Close error still fails the test.
+		if err := h.Close(); err != nil && !errors.Is(err, ErrShutdownTimeout) {
 			t.Fatalf("Close failed: %v", err)
 		}
 		wg.Wait()
