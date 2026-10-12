@@ -305,26 +305,36 @@ func TestSnapshotStreamRefusal_ReleasesItsSlotOnce(t *testing.T) {
 			if err != nil {
 				t.Fatalf("getConnection: %v", err)
 			}
-			openSnapshot := func() *quic.Stream {
+			// refusable marks a stream the receiver may refuse. The receiver
+			// decides on the frame header alone and cancels the stream at
+			// once, so its STOP_SENDING can land between the header's two
+			// writes (WriteFrame writes the frame header, then the payload)
+			// and fail the second one. That cancel is the refusal itself, not
+			// a test failure; any other write error still is.
+			openSnapshot := func(refusable bool) *quic.Stream {
 				s, err := conn.OpenStreamSync(context.Background())
 				if err != nil {
 					t.Fatalf("OpenStreamSync: %v", err)
 				}
 				chunk := proto.SnapshotChunk{ShardID: 1, ReplicaID: 2, From: 1, Index: 10, Term: 1, ChunkCount: 2}
 				if err := writeSnapshotHeader(s, &chunk); err != nil {
-					t.Fatalf("writeSnapshotHeader: %v", err)
+					var serr *quic.StreamError
+					if !refusable || !errors.As(err, &serr) || !serr.Remote ||
+						serr.ErrorCode != QUICStreamErrReceiverGone {
+						t.Fatalf("writeSnapshotHeader: %v", err)
+					}
 				}
 				return s
 			}
 			// The first transfer takes the connection's only snapshot slot and
 			// waits for chunks that never come.
-			first := openSnapshot()
+			first := openSnapshot(false)
 			defer first.CancelWrite(0)
 			pollUntil(t, 10*time.Second, time.Millisecond, "the first snapshot never took its slot",
 				func() bool { return receiver.snapshotTracker.InFlight() == 1 })
 
 			refused := installHostileRecords(t, "snapshot stream dropped", exit)
-			second := openSnapshot()
+			second := openSnapshot(true)
 			defer second.CancelWrite(0)
 			awaitCount(t, refused, 1, "the second snapshot stream was never refused")
 
