@@ -1,4 +1,4 @@
-# batch-template: v1 — token-free CPU work on the batch runners: fuzz,
+# batch-template: v1.1 — token-free CPU work on the batch runners: fuzz,
 # race-full, soak, bench. Dispatch only; never in a merge gate.
 #
 # It puts idle runner capacity to work: long CPU-bound checks that need no
@@ -123,6 +123,12 @@ jobs:
             if go test -tags="$FUZZ_TAGS" -run='^$' -fuzz="^${target}\$" \
                  -fuzztime="$FUZZTIME" -parallel=4 "$pkg" > "$log" 2>&1; then
               echo "ok   $pkg $target"
+            elif grep -q 'context deadline exceeded' "$log" &&
+                 ! grep -q 'Failing input written to' "$log"; then
+              # A target stopped by a duration -fuzztime can fail on the
+              # deadline itself with no failing input written: there is no
+              # crasher and no reproducer, so it is not a finding (handbook #306).
+              echo "deadline $pkg $target (no failing input; not a finding)"
             else
               echo "BATCH-FINDING fuzz $pkg $target"
               tail -n 60 "$log"
@@ -177,6 +183,13 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - name: UDP buffers for QUIC suites
+        # QUIC suites need larger socket buffers (go-quicraft ci.yml); a runner
+        # that refuses sudo runs them with the defaults (handbook #306).
+        run: |
+          sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 ||
+            echo "batch: sysctl not permitted; UDP buffers left at the defaults"
+
       - name: go test -race -count=3
         run: |
           set -o pipefail
@@ -203,6 +216,13 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
+
+      - name: UDP buffers for QUIC suites
+        # QUIC suites need larger socket buffers (go-quicraft ci.yml); a runner
+        # that refuses sudo runs them with the defaults (handbook #306).
+        run: |
+          sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 ||
+            echo "batch: sysctl not permitted; UDP buffers left at the defaults"
 
       - name: Loop the integration suite
         env:
