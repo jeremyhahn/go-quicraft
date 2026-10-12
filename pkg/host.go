@@ -1535,11 +1535,19 @@ type pendingRead struct {
 // type which manages the Raft protocol. The Host maintains this state
 // to serve local reads and routing without engine round-trips.
 type nodeState struct {
-	shardID           uint64
-	replicaID         uint64
-	cfg               config.Config
-	createFn          sm.CreateFunc
-	smType            uint64
+	shardID   uint64
+	replicaID uint64
+	cfg       config.Config
+	createFn  sm.CreateFunc
+	smType    uint64
+
+	// barrier is the at-rest barrier this shard's log and snapshots are
+	// written under, resolved once at StartShard: the shard's own barrier
+	// when a resolver supplies one, otherwise the host-wide barrier, nil when
+	// the shard is not encrypted. The client entry points read it through
+	// barrierSealed to refuse new work while it is sealed.
+	barrier Barrier
+
 	leaderID          atomic.Uint64
 	term              atomic.Uint64
 	lastApplied       atomic.Uint64
@@ -1612,6 +1620,18 @@ type nodeState struct {
 	// the snapshot to complete. Entries are added by RequestSnapshot and
 	// removed by OnSnapshotCompleted.
 	pendingSnapshots map[uint64]*RequestState
+}
+
+// barrierSealed reports whether the shard's at-rest barrier is sealed. It is
+// the admit check of every client entry point that would produce a write
+// (or a read whose answer depends on writes) on this replica: while the
+// barrier is sealed, nothing for the shard can be encrypted, so the request
+// is refused up front with ErrBarrierSealed instead of being handed to raft.
+// One atomic load on the barrier's own state; an unencrypted shard is never
+// sealed. It refuses client work only: raft's own persistence, messages and
+// elections are unaffected by it.
+func (ns *nodeState) barrierSealed() bool {
+	return ns.barrier != nil && ns.barrier.IsSealed()
 }
 
 // pendingProposal bundles a RequestState with its deadline, captured
@@ -4423,8 +4443,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	//     encrypted, and no other route may stand in for it.
 	//  3. The LogDB holds this shard's records under some OTHER barrier: the
 	//     shard is encrypted, under the wrong tenant's key.
+	shardBarrier := h.barrier
 	if h.shardBarriers != nil {
-		shardBarrier, barrierErr := h.barrierForShard(cfg.ShardID)
+		var barrierErr error
+		shardBarrier, barrierErr = h.barrierForShard(cfg.ShardID)
 		if barrierErr != nil {
 			return barrierErr
 		}
@@ -5144,6 +5166,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		cfg:              cfg,
 		createFn:         create,
 		smType:           stateMachine.SMType().TypeCode(),
+		barrier:          shardBarrier,
 		nodes:            routingNodes,
 		requestPool:      NewRequestStatePool(),
 		rsm:              stateMachine,
@@ -5668,6 +5691,10 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
+	// Refused while sealed, as StaleRead is.
+	if ns.barrierSealed() {
+		return nil, nopHostRelease, ErrBarrierSealed
+	}
 	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
 	if lookupErr != nil {
 		return nil, nopHostRelease, lookupErr
@@ -5738,6 +5765,12 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 	// log growth and potential data loss.
 	if h.diskFull != nil && h.diskFull.Load() {
 		return nil, ErrDiskFull
+	}
+
+	// Refuse while the shard's barrier is sealed: the entry could not be
+	// encrypted into the log (see nodeState.barrierSealed).
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	// Validate entry size. A proposal must not exceed EITHER the
@@ -5837,6 +5870,12 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 	// log growth and potential data loss.
 	if h.diskFull != nil && h.diskFull.Load() {
 		return nil, ErrDiskFull
+	}
+
+	// Refuse while the shard's barrier is sealed: the entry could not be
+	// encrypted into the log (see nodeState.barrierSealed).
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	// Validate entry size. A proposal must not exceed EITHER the
@@ -6178,6 +6217,14 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 		return nil, ErrInvalidOperation
 	}
 
+	// A sealed replica serves no linearizable read: the barrier that sealed
+	// is the one its log is written under, so it can neither persist nor
+	// prove the state the read would be answered from (see
+	// nodeState.barrierSealed). SyncRead and SyncReadBuf come through here.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
+	}
+
 	// Verify the engine node and Peer exist.
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil || engNode.Peer() == nil {
@@ -6338,6 +6385,11 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
+	// A sealed barrier refuses local reads too: sealing withdraws access to
+	// the shard's data, not only the ability to write it.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
+	}
 
 	return ns.rsm.Lookup(ctx, query)
 }
@@ -6400,6 +6452,11 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 	}
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
+	}
+	// A sealed barrier refuses local reads too: sealing withdraws access to
+	// the shard's data, not only the ability to write it.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	engNode := h.engine.GetNode(shardID)
@@ -6744,6 +6801,11 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 	}
 	if h.draining.Load() {
 		return nil, ErrDraining
+	}
+	// A register or unregister entry is written to the log like any other
+	// proposal, so a sealed barrier refuses it the same way.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	// If there is no known leader, fail fast. When a leader is known,
@@ -7137,6 +7199,12 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	ns, err := h.getNode(shardID)
 	if err != nil {
 		return nil, err
+	}
+
+	// A snapshot is written under the shard's barrier; refuse up front
+	// rather than claim the slot for a save that cannot encrypt.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	engNode := h.engine.GetNode(shardID)
@@ -10654,6 +10722,12 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	ns, err := h.getNode(shardID)
 	if err != nil {
 		return nil, err
+	}
+
+	// A config change is a log entry like any proposal; a sealed barrier
+	// refuses it up front (see nodeState.barrierSealed).
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	if !ns.isLeader.Load() {

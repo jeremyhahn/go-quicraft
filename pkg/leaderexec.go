@@ -330,6 +330,9 @@ func (h *Host) ExecuteOnLeader(ctx context.Context, shardID uint64, request []by
 	if err != nil {
 		return nil, err
 	}
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
+	}
 	if limit := effectiveMaxPayload(ns.cfg.MaxProposalPayloadSize, ns.cfg.MaxEntrySize); uint64(len(request)) > limit {
 		return nil, &EntryTooLargeError{Size: uint64(len(request)), MaxSize: limit}
 	}

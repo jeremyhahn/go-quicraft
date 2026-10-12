@@ -305,6 +305,25 @@ host, err := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
   unseal call. Recovery goes through the barrier object you passed in, using its
   strategy and credentials, so keep those reachable by your incident tooling, or
   the seal lasts until a restart.
+- **While a barrier is sealed.** A shard whose barrier is sealed (its own
+  barrier from `WithShardBarriers`, else the host-wide one) refuses client work
+  up front with `ErrBarrierSealed`: `Propose`, `SyncPropose`,
+  `ProposeWithSession`, session create, register and close, membership changes,
+  `ReadIndex`, `SyncRead`, `StaleRead`, `StaleReadBuf`, `FollowerRead`,
+  `QueryLocalNode`, `RequestSnapshot` and `ExecuteOnLeader`. Local reads are
+  refused too, because sealing withdraws access to the shard's data. The refusal
+  is returned, not logged, so it does not flood the log. Shards under other,
+  unsealed barriers keep serving. Once the barrier is unsealed the same calls
+  work again.
+- **The failure latch while sealed.** The refusal covers client calls only.
+  Raft keeps running: a follower still persists the entries its leader sends,
+  and a leader still persists proposals other replicas forward to it. If such a
+  write lands while the barrier is sealed, its encryption fails and the shard's
+  failure latch trips: the shard halts with `ErrShardFailed`, and
+  `OnShardFailed` fires. **Unsealing does not bring a halted shard back.** Stop
+  and restart the shard (`StopShard`, then `StartShard`) after unsealing. A seal
+  on a shard that receives no replicated writes, for example an idle cluster,
+  does not trip the latch.
 - **Per-tenant keys.** `WithShardBarriers` gives each shard its own barrier. The
   default WAL is still encrypted under the host-wide barrier, so for per-tenant
   log keys you need a LogDB that supports them, such as a multiplexing LogDB
@@ -559,6 +578,8 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | `NewHost` returns `ErrBarrierPlaintextLogDB` or `ErrShardBarriersPlaintextWAL` | your custom LogDB would store the log unencrypted; use the default WAL or an encrypting LogDB. A `host_routed` LogDB needs `WithoutEncryption`, or `WithBarrier` with the barrier its host-wide route writes through |
 | `StartShard` returns `ErrShardBarrierLogDBMismatch` | the LogDB holds this shard under a different barrier than your resolver returned; return the same pointer the LogDB was given |
 | `StartShard` returns `ErrBarrierSealed` | the shard's resolved barrier is sealed; unseal it before starting the shard |
+| `Propose`, a read or another client call returns `ErrBarrierSealed` | the shard's barrier is sealed; unseal it and retry |
+| `ErrShardFailed` after an unseal, log shows `WAL record encryption failed: ... barrier is sealed` | a replicated write reached the log while sealed and tripped the failure latch; restart the shard |
 | `NewHost` fails validation on `MTLSConfig` | the transport needs a CA, certificate and key |
 | `StartShard` or a membership add returns `ErrSharedPeerCertificate` | a node's certificate also covers another member's host; issue one certificate per node |
 | `StartShard` returns `*InvalidMemberError` about identities | `MemberIdentities` is missing a member, binds one identity twice, names no other replica on a join, or contradicts the shard's recorded identities |

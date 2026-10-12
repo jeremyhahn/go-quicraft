@@ -3442,17 +3442,39 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 }
 
 // persistBackoffState writes the current brute-force backoff counters to the
-// in-memory sealed key so that SealedRootKeyData() returns them for persistence.
+// sealed key, so that SealedRootKeyData() returns them, and through
+// BarrierConfig.StatePersister when one is configured.
 // Caller must hold b.mu (write lock).
 func (b *Barrier) persistBackoffState() {
 	if b.sealed == nil {
 		return
 	}
+	var lastFailed int64
+	if !b.lastFailedAt.IsZero() {
+		lastFailed = b.lastFailedAt.UnixNano()
+	}
+	if b.sealed.FailedAttempts == b.failedAttempts && b.sealed.LastFailedUnixNano == lastFailed {
+		return
+	}
 	b.sealed.FailedAttempts = b.failedAttempts
-	if b.lastFailedAt.IsZero() {
-		b.sealed.LastFailedUnixNano = 0
-	} else {
-		b.sealed.LastFailedUnixNano = b.lastFailedAt.UnixNano()
+	b.sealed.LastFailedUnixNano = lastFailed
+
+	// Write the change through, so the backoff survives a restart: without
+	// this a guesser resets it by restarting the process. Only a CHANGE is
+	// written, so an unseal with no failures behind it costs no extra persist.
+	// Best effort: a failed write cannot change the outcome of the attempt
+	// that caused it, so it is reported and the caller's result stands. The
+	// fields are outside StateMAC (see SealedRootKey.StateMAC), so the blob
+	// stays authentic without the root key.
+	persist := b.config.StatePersister
+	if persist == nil {
+		return
+	}
+	if err := persist(cloneSealedRootKey(b.sealed)); err != nil {
+		slog.Warn("quicraft/seal: unseal backoff state was not persisted; it resets on restart",
+			"failed_attempts", b.failedAttempts,
+			"error", err,
+		)
 	}
 }
 

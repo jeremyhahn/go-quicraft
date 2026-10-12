@@ -3019,6 +3019,107 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 	}
 }
 
+// TestBarrier_BackoffPersistedThroughStatePersister verifies that the backoff
+// counters reach the StatePersister on a failed Unseal, not only the
+// in-memory blob, so an embedder that reloads what it persisted keeps the
+// backoff across a restart, and that a successful Unseal persists the reset
+// (#284).
+func TestBarrier_BackoffPersistedThroughStatePersister(t *testing.T) {
+	var persisted *SealedRootKey
+	cfg := DefaultBarrierConfig(1)
+	cfg.StatePersister = func(s *SealedRootKey) error {
+		persisted = s
+		return nil
+	}
+	b := MustNewBarrier(cfg)
+	s := testStrategy(t)
+	defer s.Close()
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	now := time.Now()
+	b.timeNow = func() time.Time { return now }
+	wrong, err := newTestStrategy([]byte("wrong"))
+	if err != nil {
+		t.Fatalf("newTestStrategy failed: %v", err)
+	}
+	defer wrong.Close()
+
+	for i := 0; i < bruteForceThreshold; i++ {
+		now = now.Add(bruteForceMaxDelay + time.Second)
+		_ = b.Unseal(context.Background(), wrong, Credentials{})
+	}
+	if persisted == nil || persisted.FailedAttempts != int64(bruteForceThreshold) {
+		t.Fatalf("persisted FailedAttempts = %v, want %d: a failed Unseal must "+
+			"write the backoff through the StatePersister", persisted, bruteForceThreshold)
+	}
+	if persisted.LastFailedUnixNano == 0 {
+		t.Fatal("persisted LastFailedUnixNano = 0 after failures")
+	}
+
+	// Restart from what was persisted, not from the live barrier's memory.
+	b2 := MustNewBarrier(cfg)
+	b2.timeNow = func() time.Time { return now }
+	if err := b2.SetSealedRootKey(persisted); err != nil {
+		t.Fatalf("SetSealedRootKey failed: %v", err)
+	}
+	if err := b2.Unseal(context.Background(), wrong, Credentials{}); !errors.Is(err, ErrUnsealBackoff) {
+		t.Fatalf("Unseal after restart = %v, want ErrUnsealBackoff", err)
+	}
+
+	now = now.Add(bruteForceMaxDelay + time.Second)
+	if err := b2.Unseal(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Unseal with the correct passphrase failed: %v", err)
+	}
+	if persisted.FailedAttempts != 0 || persisted.LastFailedUnixNano != 0 {
+		t.Fatalf("persisted backoff after a successful Unseal = (%d, %d), want (0, 0)",
+			persisted.FailedAttempts, persisted.LastFailedUnixNano)
+	}
+}
+
+// TestBarrier_BackoffPersistFailureKeepsUnsealError verifies that a persister
+// failure while recording a failed attempt does not replace the attempt's own
+// error.
+func TestBarrier_BackoffPersistFailureKeepsUnsealError(t *testing.T) {
+	persistErr := errors.New("disk full")
+	failPersist := false
+	cfg := DefaultBarrierConfig(1)
+	cfg.StatePersister = func(*SealedRootKey) error {
+		if failPersist {
+			return persistErr
+		}
+		return nil
+	}
+	b := MustNewBarrier(cfg)
+	s := testStrategy(t)
+	defer s.Close()
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	if err := b.Seal(); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+	wrong, err := newTestStrategy([]byte("wrong"))
+	if err != nil {
+		t.Fatalf("newTestStrategy failed: %v", err)
+	}
+	defer wrong.Close()
+
+	failPersist = true
+	err = b.Unseal(context.Background(), wrong, Credentials{})
+	if err == nil || errors.Is(err, persistErr) {
+		t.Fatalf("Unseal with wrong credentials and a failing persister = %v, "+
+			"want the credential failure, not the persist error", err)
+	}
+	if got := b.SealedRootKeyData().FailedAttempts; got != 1 {
+		t.Fatalf("in-memory FailedAttempts = %d, want 1", got)
+	}
+}
+
 func TestBarrier_BackoffPersistenceZeroValuesBackwardCompat(t *testing.T) {
 	// Verify that a v1 sealed key (zero FailedAttempts/LastFailedUnixNano)
 	// results in no backoff, preserving backward compatibility.

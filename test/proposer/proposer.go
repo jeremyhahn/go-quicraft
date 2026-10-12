@@ -52,14 +52,34 @@
 // proposal is. So a read that pins a leaderHost binding fails on the same
 // election a pinned proposal fails on, and the same loop serves both: Read /
 // TryRead and ReadIndex / TryReadIndex
-// re-resolve before every attempt and retry ONLY the not-leader rejection.
+// re-resolve before every attempt.
+//
+// What they retry differs from a proposal in exactly one error. A read has a
+// refusal a proposal never sees: a leader elected a moment ago refuses ReadIndex
+// with ErrReadIndexNotReady until it has committed an entry of its own term
+// (Raft PhD 6.4), and the resolver names it the instant it wins, before that
+// commit. Between attempts the loop waits and re-resolves, and both clear this
+// refusal: the wait lets the new leader commit its no-op within a heartbeat,
+// and if it is superseded instead, the re-resolve finds its successor. So the
+// read loops retry the not-leader rejection AND ErrReadIndexNotReady — the set
+// readRefusal names — and nothing else. A read loop that stopped at the first
+// such refusal reported an ordinary election as a failed read
+// (go-quicraft#275).
 //
 // Re-issuing a refused read is safe unconditionally — a read that was refused
 // was never answered, so there is no "applied twice" to reason about — but the
-// retry set stays as narrow as it is for proposals. A timeout, a busy pipeline
-// or ErrReadIndexNotReady comes from the replica that genuinely leads the
-// shard; re-resolving changes nothing about it, so it is a real result that
-// must reach the test.
+// retry set stays narrow all the same. A timeout or a busy pipeline comes from
+// the replica that genuinely leads the shard and has already committed in its
+// term; neither a wait of retryInterval nor a fresh resolve changes it, so it
+// is a real result that must reach the test. A leader that NEVER commits in
+// its term still reaches the test, too: the loop spends its budget and returns
+// ErrReadIndexNotReady as the cause.
+//
+// The loops retry the refusal rather than wait for Host.ShardReadReady before
+// each attempt. Readiness observed before a read is the cached-leader pattern
+// again, one step down: an election in the gap leaves the read refused all the
+// same, so a pre-check would still need the retry, and it would be a second
+// polling loop beside drive.
 //
 // # The pinned callers share the same loop
 //
@@ -70,6 +90,7 @@ package proposer
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -260,6 +281,18 @@ func drive[T any](
 	}
 }
 
+// driveRead is drive with the re-resolving read loops' retry set, readRefusal.
+// TryRead and TryReadIndex both take it from here, so the two cannot disagree
+// on what a read retries, and the unit tests can script the attempt.
+func driveRead[T any](
+	resolve Resolver,
+	shardID uint64,
+	timeout time.Duration,
+	attempt func(h *quicraft.Host, budget time.Duration) (T, error),
+) (T, error) {
+	return drive(resolve, shardID, timeout, readRefusal, attempt)
+}
+
 // Once submits cmd to h and waits for the entry to commit, returning the first
 // error from either half of that round trip. It does NOT resolve the leader and
 // does NOT retry: it is the single attempt Try is built from, and the way a
@@ -312,8 +345,9 @@ func Read(
 // TryRead is Read's error-returning form, for callers that layer their own
 // retry on top and for goroutines, which must not touch a *testing.T.
 //
-// ONLY the not-leader rejection is retried, by RE-RESOLVING the leader. A read
-// that was refused was never answered, so re-issuing it cannot violate
+// It retries the not-leader rejection and a new leader's ErrReadIndexNotReady,
+// re-resolving the leader before each attempt; see readRefusal. A read that was
+// refused was never answered, so re-issuing it cannot violate
 // linearizability; a read that was answered returns on the spot and is never
 // re-issued.
 func TryRead(
@@ -322,7 +356,7 @@ func TryRead(
 	query interface{},
 	timeout time.Duration,
 ) (interface{}, error) {
-	return drive(resolve, shardID, timeout, IsNotLeaderRejection,
+	return driveRead(resolve, shardID, timeout,
 		func(h *quicraft.Host, budget time.Duration) (interface{}, error) {
 			return readOnce(h, shardID, query, budget)
 		})
@@ -399,7 +433,7 @@ func TryReadIndex(
 	shardID uint64,
 	timeout time.Duration,
 ) (uint64, error) {
-	return drive(resolve, shardID, timeout, IsNotLeaderRejection,
+	return driveRead(resolve, shardID, timeout,
 		func(h *quicraft.Host, budget time.Duration) (uint64, error) {
 			return readIndexOnce(h, shardID, budget)
 		})
@@ -428,7 +462,8 @@ func readIndexOnce(
 }
 
 // IsNotLeaderRejection reports whether err is the not-leader rejection and
-// nothing else. It is the ONLY error Try, TryRead and TryReadIndex retry.
+// nothing else. It is the ONLY error Try retries, and one of the two TryRead
+// and TryReadIndex retry (see readRefusal).
 //
 // quicraft.NotLeader matches both the bare ErrNotLeader sentinel and a
 // *quicraft.NotLeaderError, wrapped or not — including one wrapped in
@@ -440,4 +475,15 @@ func readIndexOnce(
 func IsNotLeaderRejection(err error) bool {
 	_, ok := quicraft.NotLeader(err)
 	return ok
+}
+
+// readRefusal is the Retryable of the re-resolving read loops, TryRead and
+// TryReadIndex: the not-leader rejection, or ErrReadIndexNotReady from a leader
+// that has not yet committed in its term. The package doc says why a read
+// retries the second and a proposal has no use for it.
+//
+// Still NARROW, and narrower than quicraft.Temporary: a timeout or a busy
+// pipeline from the leader is a real result here and must fail the test.
+func readRefusal(err error) bool {
+	return IsNotLeaderRejection(err) || errors.Is(err, quicraft.ErrReadIndexNotReady)
 }
