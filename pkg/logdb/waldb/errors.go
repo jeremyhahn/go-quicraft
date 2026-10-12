@@ -391,3 +391,23 @@ type WriteBootstrapBatchModeError struct{}
 func (e *WriteBootstrapBatchModeError) Error() string {
 	return "waldb: writeBootstrap called in batchMode; bootstrap writes require inline fsync"
 }
+
+// IsCleanRefusal reports that err, returned by SaveState, is a refusal caused
+// by cause that left the log exactly as it was before the call: the write was
+// refused before any byte of it was durable and the rollback completed, so the
+// same updates can be retried unchanged.
+//
+// The answer depends only on the error's shape, never on how many updates the
+// call carried: SaveState refuses a batch and a single update with the same
+// error (rollbackBatch returns the originating error when the rollback
+// completes), and an error that also carries a disk fault is never clean — a
+// poisoned DB (failed fsync, failed rollback), a rollback that did not
+// complete (BatchWriteError) or a failed segment recovery (WALWriteError).
+func IsCleanRefusal(err, cause error) bool {
+	if !errors.Is(err, cause) || errors.Is(err, ErrDBPoisoned) {
+		return false
+	}
+	var batchErr *BatchWriteError
+	var walErr *WALWriteError
+	return !errors.As(err, &batchErr) && !errors.As(err, &walErr)
+}

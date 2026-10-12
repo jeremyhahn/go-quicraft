@@ -468,6 +468,9 @@ type raft struct {
 	leaseRound     uint64               // newest heartbeat round issued; 0 = none
 	leaseRoundSent []time.Time          // ring of recent round send times, indexed by round & leaseRoundMask
 	remoteLastAck  map[uint64]time.Time // replicaID -> send time of the newest round it acked
+	// leaseRoundFloor is the newest round invalidateLease retired: an ack for
+	// it or any older round renews nothing. 0 retires only the "no round" 0.
+	leaseRoundFloor uint64
 
 	// Vote hold-down (see voteHeldDown). A restarted replica has forgotten
 	// its election timer, so without this it could grant a vote the moment
@@ -4349,7 +4352,7 @@ func (r *raft) nextLeaseRound() uint64 {
 		return 0
 	}
 	now := r.now()
-	if r.leaseRound != 0 &&
+	if r.leaseRound > r.leaseRoundFloor &&
 		now.Sub(r.leaseRoundSent[r.leaseRound&leaseRoundMask]) < r.leaseDuration/leaseRoundSlices {
 		return r.leaseRound
 	}
@@ -4363,7 +4366,7 @@ func (r *raft) nextLeaseRound() uint64 {
 // predates rounds), for a round this leader never issued, and for one old
 // enough to have left the window, none of which may renew the lease.
 func (r *raft) leaseRoundSentAt(round uint64) (time.Time, bool) {
-	if round == 0 || round > r.leaseRound || r.leaseRound-round >= leaseRoundWindow {
+	if round <= r.leaseRoundFloor || round > r.leaseRound || r.leaseRound-round >= leaseRoundWindow {
 		return time.Time{}, false
 	}
 	return r.leaseRoundSent[round&leaseRoundMask], true
@@ -5146,6 +5149,17 @@ func (r *raft) resetLeaseAcks() {
 	for id := range r.remoteLastAck {
 		delete(r.remoteLastAck, id)
 	}
+}
+
+// invalidateLease ends the lease outright. resetLeaseAcks alone drops the
+// recorded acks, but a late HeartbeatResp for a round sent before the call
+// would rebuild them from that round's send time; raising leaseRoundFloor
+// retires every round issued so far, so only an ack for a round sent AFTER
+// this call renews the lease, and nextLeaseRound opens such a round on the
+// next heartbeat instead of reusing the retired one.
+func (r *raft) invalidateLease() {
+	r.resetLeaseAcks()
+	r.leaseRoundFloor = r.leaseRound
 }
 
 // votingBitCount returns how many ReadIndex ackBits positions this replica's

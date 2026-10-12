@@ -623,6 +623,48 @@ func (h *Host) barrierForShard(shardID uint64) (Barrier, error) {
 	return h.barrier, nil
 }
 
+// isSealedLogWrite reports that a LogDB SaveState failure is exactly the
+// barrier's sealed refusal, which the engine holds the shard on until the
+// unseal instead of failing it (#296; engine.SealHold). The WAL refuses a
+// sealed write before any byte of it is durable and rolls the batch back to
+// its checkpoint, so the write is retried unchanged. An error that also
+// carries a disk fault is never a hold: a poisoned log (failed fsync), a
+// rollback that did not complete (BatchWriteError) and a failed segment
+// recovery (WALWriteError) are permanent and still fail the shard.
+//
+// It classifies by error shape alone, so it accepts a single-update refusal
+// exactly as it accepts the batch refusal of the same updates — the contract
+// engine.SealHold.IsSealed states. A caller-supplied LogDB meets it by
+// surfacing its stores' errors on the errors.Is/As chain, wrapped or joined.
+func isSealedLogWrite(err error) bool {
+	return waldb.IsCleanRefusal(err, ErrBarrierSealed)
+}
+
+// unsealNotifier is the optional Barrier capability the engine's sealed-write
+// hold waits on; seal.Barrier implements it.
+type unsealNotifier interface {
+	UnsealedC() <-chan struct{}
+}
+
+// logWriteUnsealedC resolves the barrier that seals shardID's log writes the
+// way barrierForShard does, and returns its unseal notification — nil when it
+// offers none, which makes the engine poll instead.
+func logWriteUnsealedC(hostBarrier Barrier, shardBarriers func(uint64) Barrier) func(uint64) <-chan struct{} {
+	return func(shardID uint64) <-chan struct{} {
+		var b Barrier
+		if shardBarriers != nil {
+			b = shardBarriers(shardID)
+		}
+		if b == nil {
+			b = hostBarrier
+		}
+		if n, ok := b.(unsealNotifier); ok {
+			return n.UnsealedC()
+		}
+		return nil
+	}
+}
+
 // warnBarrierFallback logs the host-wide-barrier fallback once per shard. The
 // resolution runs on every snapshot save, recovery, send, receive and purge, so
 // an unconditional warning would bury the first (and only informative) one.
@@ -4000,6 +4042,14 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		raftMetrics = options.metrics
 	}
 	eng := engine.NewEngine(cfg, options.logdb, sender, options.barrier, nil, raftMetrics)
+
+	// A log write the sealed barrier refuses holds its shard until the unseal
+	// rather than failing it (#296): sealing is an operator state, not a disk
+	// fault, and the WAL rolled the refused batch back.
+	eng.SetSealHold(engine.SealHold{
+		IsSealed:  isSealedLogWrite,
+		UnsealedC: logWriteUnsealedC(options.barrier, options.shardBarriers),
+	})
 
 	// Wire per-shard barriers into the snapshot pool when configured. This is
 	// additive: when WithShardBarriers is unset, the snapshot pool keeps using

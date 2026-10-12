@@ -186,6 +186,13 @@ type Barrier struct {
 	mu       sync.RWMutex
 	unsealed atomic.Bool // fast-path check, avoids RWMutex contention on hot path
 
+	// unsealWait is the channel UnsealedC hands out while the barrier is
+	// sealed; setUnsealed(true) closes it. notifyMu, not mu, guards it and
+	// orders it with every write of unsealed, so a waiter can never take a
+	// channel after the close that should have woken it.
+	notifyMu   sync.Mutex
+	unsealWait chan struct{}
+
 	config BarrierConfig // algorithm selection, deployment identity, tracking config
 
 	state   barrierState
@@ -696,7 +703,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 		b.knownEpochs[initialEpoch] = struct{}{}
 		b.sealed = sealed
 		b.state = barrierUnsealed
-		b.unsealed.Store(true)
+		b.setUnsealed(true)
 		b.firstBoot = true
 		b.logDelegatedMode("initialize", binding)
 		slog.Info("barrier initialized (hardware mode)", "epoch", initialEpoch, "context_binding", binding.String())
@@ -738,7 +745,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 	b.knownEpochs[initialEpoch] = struct{}{}
 	b.sealed = sealed
 	b.state = barrierUnsealed
-	b.unsealed.Store(true)
+	b.setUnsealed(true)
 	// This process created the epoch, so its counter starts at a known zero and
 	// stays authoritative until a blob describing some other lifetime is loaded.
 	b.invocationsAuthoritative = true
@@ -978,7 +985,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 			b.epoch = b.sealed.Epoch
 		}
 		b.state = barrierUnsealed
-		b.unsealed.Store(true)
+		b.setUnsealed(true)
 		b.failedAttempts = 0
 		b.lastFailedAt = time.Time{}
 		b.persistBackoffState()
@@ -1078,7 +1085,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 		b.hwEncryptor = hwEnc
 		b.rootKey = rootPK
 		b.state = barrierUnsealed
-		b.unsealed.Store(true)
+		b.setUnsealed(true)
 		b.failedAttempts = 0
 		b.lastFailedAt = time.Time{}
 		b.persistBackoffState()
@@ -1172,7 +1179,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	b.deks = newDEKs
 	b.ciphers = newCiphers
 	b.state = barrierUnsealed
-	b.unsealed.Store(true)
+	b.setUnsealed(true)
 	b.failedAttempts = 0
 	b.lastFailedAt = time.Time{}
 	b.persistBackoffState()
@@ -1464,7 +1471,7 @@ func (b *Barrier) seal() error {
 	b.strategyID = ""
 	b.strategyHardwareBacked = false
 	b.state = barrierSealed
-	b.unsealed.Store(false)
+	b.setUnsealed(false)
 
 	slog.Info("barrier sealed")
 	return nil
@@ -1580,7 +1587,7 @@ func (b *Barrier) Reset() error {
 	b.strategyID = ""
 	b.strategyHardwareBacked = false
 	b.state = barrierUninitialized
-	b.unsealed.Store(false)
+	b.setUnsealed(false)
 
 	if b.invocations != nil {
 		if err := b.invocations.Reset(); err != nil {
@@ -2695,6 +2702,47 @@ func (b *Barrier) DeregisterInFlightEpoch(epoch uint64) {
 // IsSealed returns true if the barrier is in the sealed state.
 func (b *Barrier) IsSealed() bool {
 	return !b.unsealed.Load()
+}
+
+// UnsealedC returns a channel that is closed once the barrier is unsealed:
+// already closed when it is unsealed now, otherwise closed by the next
+// transition to unsealed (Unseal, or any other path that unseals it). Each
+// sealed period hands out one channel, so a waiter that wakes and finds the
+// barrier sealed again calls UnsealedC again.
+//
+// It lets a writer whose write the barrier refused with ErrBarrierSealed wait
+// for the unseal instead of polling IsSealed; the engine parks a shard's
+// refused log write on it (#296).
+func (b *Barrier) UnsealedC() <-chan struct{} {
+	b.notifyMu.Lock()
+	defer b.notifyMu.Unlock()
+	if b.unsealed.Load() {
+		return closedUnsealC
+	}
+	if b.unsealWait == nil {
+		b.unsealWait = make(chan struct{})
+	}
+	return b.unsealWait
+}
+
+// closedUnsealC is the channel UnsealedC returns for a barrier that is
+// already unsealed.
+var closedUnsealC = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// setUnsealed records the sealed state and, on the transition to unsealed,
+// wakes every UnsealedC waiter. Every write of b.unsealed goes through here.
+func (b *Barrier) setUnsealed(unsealed bool) {
+	b.notifyMu.Lock()
+	defer b.notifyMu.Unlock()
+	b.unsealed.Store(unsealed)
+	if unsealed && b.unsealWait != nil {
+		close(b.unsealWait)
+		b.unsealWait = nil
+	}
 }
 
 // IsInitialized returns true if the barrier has been initialized (is not in

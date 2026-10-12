@@ -8556,6 +8556,55 @@ func TestLeaseRead_RoundReusedWithinGranularity(t *testing.T) {
 	}
 }
 
+func TestLeaseRead_InvalidateLeaseRetiresEarlierRounds(t *testing.T) {
+	// The engine invalidates the lease of a leader whose log write a sealed
+	// barrier refused (#296). The lease must end at once, a late ack for a
+	// round sent before the invalidation must not rebuild it, and only an
+	// ack for a round opened afterwards renews it.
+	r := newTestRaftLeaseRead(1)
+	electLeader(r)
+	commitNoOp(r)
+	ack := func(round uint64) {
+		t.Helper()
+		if err := r.step(proto.Message{
+			Type:     proto.HeartbeatResp,
+			From:     2,
+			Term:     r.term,
+			LogIndex: round,
+			LogTerm:  testLeaseWindow,
+		}); err != nil {
+			t.Fatalf("HeartbeatResp round %d: %v", round, err)
+		}
+		r.drainMessages()
+	}
+
+	before := sendLeaseRound(r)
+	ack(before)
+	if !r.hasValidLease() {
+		t.Fatal("precondition: the leader holds no lease after a quorum ack")
+	}
+
+	r.invalidateLease()
+	if r.hasValidLease() {
+		t.Fatal("lease still valid after invalidateLease")
+	}
+	ack(before)
+	if r.hasValidLease() {
+		t.Fatal("a late ack for a round sent before invalidateLease rebuilt the lease")
+	}
+
+	// Still inside the retired round's granule: a reused round would be the
+	// retired one, so a fresh round must be opened instead.
+	after := sendLeaseRound(r)
+	if after <= before {
+		t.Fatalf("round after invalidateLease = %d, want a new round above %d", after, before)
+	}
+	ack(after)
+	if !r.hasValidLease() {
+		t.Fatal("an ack for a round sent after invalidateLease did not renew the lease")
+	}
+}
+
 func TestLeaseRead_OlderAckDoesNotMoveAnchorBack(t *testing.T) {
 	// A reordered ack for an older round must not replace the date of a
 	// newer one already recorded.

@@ -226,6 +226,17 @@ type Node struct {
 		_ [127]byte // pad to 128 bytes total (atomic.Bool = 1 byte)
 	}
 
+	// sealHeld reports that the commit worker has PARKED this shard: its log
+	// write was refused because the at-rest barrier is sealed, so nothing of
+	// it reached disk and nothing it owes may be sent, acked or applied (#296).
+	// Set only while commitPending is true and cleared before commitPending
+	// is, both by the commit worker (holdSealed, releaseHeld). While it is
+	// set the step worker neither ticks the node nor steps its inbox: the shard
+	// is frozen, as a replica paused mid-fsync is, so its raft state — the
+	// unstable entries the refused write carried — is unchanged when the
+	// write is re-derived and retried after the unseal.
+	sealHeld atomic.Bool
+
 	// lastApplied tracks the highest log index applied to the state
 	// machine. Written by the apply worker, read by the step worker
 	// to determine which committed entries to include in the next

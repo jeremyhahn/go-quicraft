@@ -174,6 +174,17 @@ type commitWorker struct {
 	// membershipC receives ordered unload/reload notifications. See
 	// shardMembership for why both directions share one channel.
 	membershipC chan shardMembership
+
+	// sealHold, held and sealWakeC park shards whose log write the sealed
+	// barrier refused (see SealHold). held is owned by the run loop; each
+	// entry's waiter goroutine wakes the loop through sealWakeC (buffered,
+	// coalescing), and run joins every waiter (sealWaiters) before it
+	// returns. saveErrs is holdSealedBatch's reusable per-update result.
+	sealHold    SealHold
+	held        []*heldShard
+	sealWakeC   chan struct{}
+	sealWaiters sync.WaitGroup
+	saveErrs    []error
 }
 
 // newCommitWorker creates a commit worker. The sender parameter is used
@@ -214,6 +225,7 @@ func newCommitWorker(
 		commitTimes:        make(map[uint64]time.Time),
 		unloaded:           newUnloadedSet(),
 		membershipC:        make(chan shardMembership, 128),
+		sealWakeC:          make(chan struct{}, 1),
 	}
 }
 
@@ -231,9 +243,20 @@ func (w *commitWorker) run() {
 		select {
 		case <-w.stopC:
 			w.drainAndProcess()
+			// Every waiter selects on stopC, so this returns promptly —
+			// including for a shard the drain above held again — and leaves
+			// every held entry woken, so releaseWoken empties held. The step
+			// tier stopped first (Engine.stop), so the release hands nothing
+			// back to a running step worker; it only leaves no node marked
+			// sealHeld once the engine is down.
+			w.sealWaiters.Wait()
+			w.releaseWoken()
 			return
 		case m := <-w.membershipC:
 			w.applyMembership(m)
+			continue
+		case <-w.sealWakeC:
+			w.releaseWoken()
 			continue
 		case item := <-w.commitC:
 			w.batch = w.batch[:0]
@@ -473,6 +496,11 @@ func (w *commitWorker) processBatch() {
 			if saveErr == nil {
 				break
 			}
+			// A sealed barrier will not unseal within the backoff; the
+			// hold below settles the batch instead.
+			if w.isSealedSaveErr(saveErr) {
+				break
+			}
 			if attempt < saveStateMaxRetries-1 {
 				if cancelled := w.retryWait(attempt); cancelled {
 					// Shutdown fired during the retry backoff. The batch
@@ -492,9 +520,19 @@ func (w *commitWorker) processBatch() {
 	}
 
 	if saveErr != nil {
-		w.failBatchSaveState(saveErr)
-		observe()
-		return
+		// A sealed refusal parks the refused shards and lets every update
+		// that persisted on its own carry on below (holdSealedBatch); any
+		// other failure fails the batch.
+		if !w.isSealedSaveErr(saveErr) {
+			w.failBatchSaveState(saveErr)
+			observe()
+			return
+		}
+		if !w.holdSealedBatch() {
+			w.batchUnpersisted = false
+			observe()
+			return
+		}
 	}
 	w.batchUnpersisted = false
 	// The latency spans from step worker Update production to SaveState
@@ -530,9 +568,10 @@ func (w *commitWorker) processBatch() {
 	}
 
 	// Commit peer state and forward to apply workers. The raftMu lock
-	// serializes Commit with the step worker's Tick() call, which now
-	// runs unconditionally (even when commitPending=true) to maintain
-	// leader heartbeat liveness. The lock is per-node and sub-microsecond.
+	// serializes Commit with the step worker's Tick() call, which runs
+	// even when commitPending=true to maintain leader heartbeat liveness
+	// (only a sealHeld node is not ticked). The lock is per-node and
+	// sub-microsecond.
 	//
 	// Each update is committed to its owning node (batchNodes[i]),
 	// NOT resolved by shardID. This is critical for correctness
@@ -691,7 +730,8 @@ const (
 // node.raftMu held, and — when the update committed nothing to apply — asks the
 // peer for a piggyback update while still under the same lock, writing it to
 // the piggyback out-parameter. raftMu serializes all of this with the step
-// worker's Tick(), which runs unconditionally even while commitPending is set.
+// worker's Tick(), which runs even while commitPending is set (but not while
+// the node is sealHeld).
 //
 // Everything else processBatch does with the outcome stays in the caller,
 // outside the lock, and that placement is load-bearing rather than tidiness:
@@ -909,25 +949,29 @@ func failBatchProposals(callback Callback, u proto.Update, err error) {
 // checkpoint.
 func (w *commitWorker) failBatchSaveState(saveErr error) {
 	for i, u := range w.batch {
-		node := w.batchNodes[i]
-		saveStateErr := &SaveStateError{
-			ShardID:   u.ShardID,
-			ReplicaID: u.ReplicaID,
-			Err:       saveErr,
-		}
-		failShard(node, w.callback, saveStateErr, func() {
-			failBatchProposals(w.callback, u, saveStateErr)
-		})
-		// The latch is tripped before commitPending is cleared, so the step
-		// worker never steps the node again.
-		node.commitPending.Store(false)
-		// Return the pooled committed-entries slice after the callback (which
-		// must not retain them). clearBatch below only zeroes the slot, so
-		// without this every failed batch permanently removes a slice from
-		// proto's entry-slice pool and degrades the apply hot path.
-		u.ReleaseCommittedEntries()
+		w.failSaveState(w.batchNodes[i], u, saveErr)
 	}
 	w.clearBatch()
+}
+
+// failSaveState fails one update's shard on a SaveState error.
+func (w *commitWorker) failSaveState(node *Node, u proto.Update, saveErr error) {
+	saveStateErr := &SaveStateError{
+		ShardID:   u.ShardID,
+		ReplicaID: u.ReplicaID,
+		Err:       saveErr,
+	}
+	failShard(node, w.callback, saveStateErr, func() {
+		failBatchProposals(w.callback, u, saveStateErr)
+	})
+	// The latch is tripped before commitPending is cleared, so the step
+	// worker never steps the node again.
+	node.commitPending.Store(false)
+	// Return the pooled committed-entries slice after the callback (which
+	// must not retain them). clearBatch only zeroes the slot, so without
+	// this every failed batch permanently removes a slice from proto's
+	// entry-slice pool and degrades the apply hot path.
+	u.ReleaseCommittedEntries()
 }
 
 // failCommit handles a terminal Peer.Commit failure for one update.
@@ -1089,6 +1133,7 @@ func invalidatePersistedStateLocked(node *Node) {
 func (w *commitWorker) applyMembership(m shardMembership) {
 	if m.unload {
 		w.unloaded.add(m.shardID)
+		w.releaseUnloaded(m.shardID)
 	} else {
 		w.unloaded.remove(m.shardID)
 	}
@@ -1219,24 +1264,16 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	// re-apply. piggyback.State is that same clamped hard state, so persisting
 	// it never advertises a commit past the durable log.
 	if w.logdb != nil {
-		stateUpdate := []logdb.Update{{
-			ShardID:   piggyback.ShardID,
-			ReplicaID: piggyback.ReplicaID,
-			State:     protoStateToLogDB(&piggyback.State),
-		}}
-		// Retry with the same backoff schedule as the batch path — a transient
-		// fsync hiccup should not give up on the first attempt.
-		var saveErr error
-		for attempt := range saveStateMaxRetries {
-			saveErr = w.logdb.SaveState(stateUpdate)
-			if saveErr == nil {
-				break
-			}
-			if attempt < saveStateMaxRetries-1 {
-				if cancelled := w.retryWait(attempt); cancelled {
-					break
-				}
-			}
+		saveErr := w.savePiggybackState(&piggyback)
+		if saveErr != nil && w.isSealedSaveErr(saveErr) {
+			// Sealed: the same self-healing settlement as below, except that
+			// the step worker would re-derive this update at once and be
+			// refused again. The shard is held until the unseal instead.
+			// The ordered half is NOT always empty here — a VoteResp backed
+			// only by this hard state reaches it — so holdSealed requeues it
+			// with the rewind, as the failure path below does.
+			w.holdSealed(node, piggyback, w.orderedMsgSplitBuf)
+			return true
 		}
 		if saveErr != nil {
 			// Terminal for this cycle, but SELF-HEALING — NOT a shard failure.
@@ -1332,6 +1369,31 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		return false
 	}
 	return true
+}
+
+// savePiggybackState persists the piggyback's hard state. It retries with the
+// same backoff schedule as the batch path — a transient fsync hiccup should
+// not give up on the first attempt — but never retries the sealed barrier's
+// refusal, which no retry can clear before the unseal.
+func (w *commitWorker) savePiggybackState(piggyback *proto.Update) error {
+	stateUpdate := []logdb.Update{{
+		ShardID:   piggyback.ShardID,
+		ReplicaID: piggyback.ReplicaID,
+		State:     protoStateToLogDB(&piggyback.State),
+	}}
+	var saveErr error
+	for attempt := range saveStateMaxRetries {
+		saveErr = w.logdb.SaveState(stateUpdate)
+		if saveErr == nil || w.isSealedSaveErr(saveErr) {
+			break
+		}
+		if attempt < saveStateMaxRetries-1 {
+			if cancelled := w.retryWait(attempt); cancelled {
+				break
+			}
+		}
+	}
+	return saveErr
 }
 
 // requeueMessagesLocked hands ordered messages back to the peer with

@@ -91,6 +91,9 @@ func runSealedReplica(t *testing.T, sealLeader, underLoad bool) {
 
 	stopLoad := make(chan struct{})
 	var load sync.WaitGroup
+	// lastLoadKey is the newest load write the cluster committed while the
+	// replica was sealed; read only after load.Wait.
+	var lastLoadKey string
 	if underLoad {
 		load.Add(1)
 		go func() {
@@ -105,8 +108,11 @@ func runSealedReplica(t *testing.T, sealLeader, underLoad bool) {
 				// the leader the healthy pair cannot commit until it stops
 				// leading. The load exists only to make Raft write to the
 				// sealed replica's log.
-				_, _ = proposer.Try(proposer.Pinned(cluster.hosts[healthy]), 1,
-					encodeKVPut(fmt.Sprintf("load-%04d", i), "v"), 500*time.Millisecond)
+				key := fmt.Sprintf("load-%04d", i)
+				if _, err := proposer.Try(proposer.Pinned(cluster.hosts[healthy]), 1,
+					encodeKVPut(key, "v"), 500*time.Millisecond); err == nil {
+					lastLoadKey = key
+				}
 			}
 		}()
 	}
@@ -144,17 +150,22 @@ func runSealedReplica(t *testing.T, sealLeader, underLoad bool) {
 	engineFailures.mu.Lock()
 	tripped := engineFailures.first
 	engineFailures.mu.Unlock()
+	// A Raft-originated write refused by the sealed barrier holds the shard
+	// until the unseal (#296); it must never trip the failure latch.
 	if tripped != "" {
-		t.Skipf("#296: the sealed %s's failure latch tripped on a Raft-originated "+
-			"write while sealed, which the client admit check does not cover; "+
-			"latch reset after unseal is escalated to the owner. First failure: %s",
-			role, tripped)
+		t.Fatalf("sealed %s's failure latch tripped on a write refused while "+
+			"sealed: %s", role, tripped)
 	}
 
 	// Unsealed: the cluster commits, the replica that was sealed applies, and
 	// work addressed to it is accepted and served.
 	proposeAndWait(t, cluster.testCluster, trackers, 1, "after-unseal", "ok")
 	waitForReplication(t, cluster.testCluster, trackers, 1, "after-unseal", "ok", defaultTimeout)
+	// What the cluster committed while the replica was sealed reached it
+	// too, once its held write went through.
+	if lastLoadKey != "" {
+		waitForReplication(t, cluster.testCluster, trackers, 1, lastLoadKey, "v", defaultTimeout)
+	}
 	if _, err := proposer.TryWith(proposer.Pinned(host), 1,
 		encodeKVPut("via-unsealed", "ok"), defaultTimeout, quicraft.Temporary); err != nil {
 		t.Fatalf("propose through the unsealed %s: %v", role, err)

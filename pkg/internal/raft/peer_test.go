@@ -5603,6 +5603,64 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	}
 }
 
+// TestPeer_InvalidateLease_EndsTheLeaseUntilAFreshRound is the call the
+// engine makes when it parks a shard whose log write a sealed barrier refused
+// (#296): the parked leader stops heartbeating and may be deposed while it
+// waits, so on release it must not serve a LeaseRead from acks it collected
+// before — not even from a late ack for a round it sent before the hold.
+func TestPeer_InvalidateLease_EndsTheLeaseUntilAFreshRound(t *testing.T) {
+	cfg := testConfigWithID(1, 1)
+	cfg.PreVote = config.BoolPtr(false)
+	cfg.LeaseRead = true
+	ms := proto.Membership{
+		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+	}
+	p := newTestPeer(t, cfg, proto.State{}, ms)
+	passVoteHoldDown(p.r)
+	for range 30 {
+		p.Tick()
+	}
+	for _, from := range []uint64{2, 3} {
+		mustHandle(t, p, proto.Message{Type: proto.RequestVoteResp, From: from, Term: p.r.term})
+	}
+	if !p.IsLeader() {
+		t.Fatal("expected peer to become leader")
+	}
+	ack := func(round uint64) {
+		t.Helper()
+		for _, from := range []uint64{2, 3} {
+			mustHandle(t, p, proto.Message{
+				Type: proto.HeartbeatResp, From: from, Term: p.r.term,
+				LogIndex: round, LogTerm: testLeaseWindow,
+			})
+		}
+	}
+
+	held := sendLeaseRound(p.r)
+	ack(held)
+	if !p.r.hasValidLease() {
+		t.Fatal("fixture: a quorum of fresh acks should establish the lease")
+	}
+
+	p.InvalidateLease()
+	if p.r.hasValidLease() {
+		t.Fatal("lease still valid after InvalidateLease")
+	}
+	ack(held)
+	if p.r.hasValidLease() {
+		t.Fatal("a late ack for a round sent before the hold rebuilt the lease")
+	}
+
+	fresh := sendLeaseRound(p.r)
+	if fresh <= held {
+		t.Fatalf("round after InvalidateLease = %d, want > %d", fresh, held)
+	}
+	ack(fresh)
+	if !p.r.hasValidLease() {
+		t.Fatal("a quorum of acks for a fresh round should renew the lease")
+	}
+}
+
 // --- ValidateConfigChange ---
 
 // TestPeer_ValidateConfigChange_DuplicateAdd verifies that validating an

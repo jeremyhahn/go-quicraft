@@ -279,7 +279,8 @@ func (w *stepWorker) drainTick(ticker *time.Ticker) {
 
 // tick advances the Raft logical clock for all loaded nodes.
 //
-// Tick runs unconditionally regardless of commitPending state. This is
+// Tick runs regardless of commitPending state — the one exception is a
+// shard held on a sealed log write (Node.sealHeld), which is frozen. This is
 // critical for leader liveness: the leader must always advance its
 // heartbeat timer and send heartbeats to followers, even while WAL
 // fsync and state machine apply are in progress. Without this, the
@@ -297,7 +298,10 @@ func (w *stepWorker) tick() {
 	w.nodesMu.RLock()
 	defer w.nodesMu.RUnlock()
 	for shardID, node := range w.nodes {
-		if node.IsFailed() || node.peer == nil {
+		// A sealHeld shard is frozen until its refused log write is retried
+		// (see Node.sealHeld): no tick, so no election timeout, campaign or
+		// heartbeat moves raft past the state that write carries.
+		if node.IsFailed() || node.sealHeld.Load() || node.peer == nil {
 			continue
 		}
 		campaignTerm, campaignLaunched := w.tickNodeLocked(node)
@@ -378,9 +382,9 @@ func (w *stepWorker) tickNodeLocked(node *Node) (campaignTerm uint64, campaignLa
 // that are invisible to the WorkSignal. Shards with commitPending=true
 // skip inbox drain, HasUpdate, and GetUpdate to avoid extracting a
 // second update while the previous one is still being committed/applied.
-// Note: tick() runs unconditionally for all nodes (including
-// commitPending ones) to maintain leader heartbeat liveness; only the
-// full processReady work is deferred.
+// Note: tick() runs for all nodes (including commitPending ones) to
+// maintain leader heartbeat liveness; only the full processReady work is
+// deferred. A sealHeld node is neither ticked nor has its inbox stepped.
 func (w *stepWorker) processReady() {
 	// Swap the ready set to clear it. We iterate all loaded nodes
 	// below rather than just the notified ones, because tick-driven
@@ -429,8 +433,11 @@ func (w *stepWorker) processReady() {
 		// Only ReadOnly updates (no entries, no state change, no snapshot)
 		// are handled here; anything requiring the commit pipeline is
 		// deferred to the next normal processReady cycle.
+		// A sealHeld shard (commitPending stays set while held) steps nothing:
+		// its inbox and proposal queue are bounded and fill, as a paused
+		// replica's would, until the unseal retries its write.
 		if node.commitPending.Load() {
-			if node.peer != nil {
+			if node.peer != nil && !node.sealHeld.Load() {
 				w.processCommitPendingInbox(shardID, node)
 			}
 			continue

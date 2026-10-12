@@ -2421,6 +2421,49 @@ func TestBarrier_MultipleSealUnsealCycles(t *testing.T) {
 	}
 }
 
+func TestBarrier_UnsealedC(t *testing.T) {
+	b := MustNewBarrier(DefaultBarrierConfig(1))
+	s := testStrategy(t)
+	defer s.Close()
+
+	closed := func(c <-chan struct{}) bool {
+		select {
+		case <-c:
+			return true
+		default:
+			return false
+		}
+	}
+
+	// Uninitialized is sealed: the channel stays open.
+	if closed(b.UnsealedC()) {
+		t.Fatal("UnsealedC closed before the barrier was ever unsealed")
+	}
+	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	if !closed(b.UnsealedC()) {
+		t.Fatal("UnsealedC not closed for an unsealed barrier")
+	}
+
+	for cycle := 0; cycle < 2; cycle++ {
+		if err := b.Seal(); err != nil {
+			t.Fatalf("cycle %d: Seal failed: %v", cycle, err)
+		}
+		first, second := b.UnsealedC(), b.UnsealedC()
+		if closed(first) || closed(second) {
+			t.Fatalf("cycle %d: UnsealedC closed while sealed", cycle)
+		}
+		if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
+			t.Fatalf("cycle %d: Unseal failed: %v", cycle, err)
+		}
+		// Every waiter of the sealed period is woken, not just one.
+		if !closed(first) || !closed(second) {
+			t.Fatalf("cycle %d: Unseal did not wake every UnsealedC waiter", cycle)
+		}
+	}
+}
+
 // --- Rotate + Seal/Unseal + DecryptForEpoch cross-epoch ---
 
 func TestBarrier_RotateSealUnsealDecryptForEpoch(t *testing.T) {

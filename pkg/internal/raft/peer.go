@@ -1764,6 +1764,18 @@ func (p *Peer) InvalidatePersistedState() {
 	p.stateUnpersisted = true
 }
 
+// InvalidateLease ends any LeaseRead lease this peer holds as leader, so the
+// next lease read must be backed by a heartbeat round sent after this call.
+//
+// The engine calls this when it parks a shard whose log write the at-rest
+// barrier refused (sealed): a leader that could not persist across the seal
+// must not serve a lease read from the lease it held before it. A no-op when
+// the peer is not a lease-holding leader.
+// Must be called with the same exclusive Peer access GetUpdate requires.
+func (p *Peer) InvalidateLease() {
+	p.r.invalidateLease()
+}
+
 // GetPiggybackUpdate extracts committed entries, messages, and the
 // current hard state for piggybacking onto an empty-commit cycle.
 // Eliminates the second pipeline traversal for multi-node proposals
