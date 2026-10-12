@@ -10,6 +10,18 @@
 # and netfault and contrib-dragonboat wait on integration, because multi-node
 # QUIC suites under -race starve a shared runner when they overlap (4dc5bfd,
 # run 418). None of those jobs consumes another's output.
+#
+# Two tiers (#293; handbook sdlc.md §5a, devops.md §1/§5):
+#
+#   PR tier    every run. lint, security, build, test, cross-arch, modules.
+#   Full tier  push to main, workflow_dispatch, or a pull_request carrying
+#              the label `ci:full`. integration, netfault, errfs, zero-rtt,
+#              fuzz-seeds, contrib-dragonboat, fips.
+#
+# Each full-tier job carries the same `if:`, spelled out per job because
+# Gitea's workflow parser does not expand YAML anchors. ci-gate passes a
+# full-tier job that its tier skipped and nothing else that skipped. A
+# full-tier job may need a PR-tier one; never the reverse.
 
 name: CI
 
@@ -18,6 +30,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `labeled` so that adding `ci:full` starts a full-tier run. Any other
+    # label also starts a run, which re-runs the PR tier on the same commit.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 # Cancel superseded runs. Keyed on the ref so a branch only supersedes itself,
@@ -344,7 +359,8 @@ jobs:
   # ==========================================================================
   # Tagged suites
   #
-  # These gate a PR rather than running nightly:
+  # The full tier. These gate every push to main, and a PR labelled
+  # `ci:full`:
   #
   #   integration  ~9 min. The only CI job that starts more than one node,
   #                holds an election, partitions a cluster or streams a
@@ -356,7 +372,7 @@ jobs:
   #                deterministic regression test, not fuzzing.
   #
   # Mutation fuzzing is not here because a newly found crash would fail an
-  # unrelated PR at random. It runs on a schedule in fuzz.yml, and release.yml
+  # unrelated PR at random. It runs on dispatch in fuzz.yml, and release.yml
   # requires it and all three jobs below before a tag can publish.
   #
   # Keep each command byte-identical to the matching `ci-*` target in the
@@ -366,6 +382,7 @@ jobs:
   integration:
     name: Integration [build tag integration]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     # `needs: test` keeps the heavy jobs off the runner at the same time.
     # Overlapping multi-node QUIC suites under -race starve each other and
     # expire 30s snapshot and rolling-restart waits. The short jobs (errfs,
@@ -393,6 +410,7 @@ jobs:
   netfault:
     name: Network partitions [build tag quicraft_netfault]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     # Serialised behind the heavy jobs for the same reason as `integration`:
     # 3-to-5-node QUIC clusters under -race wait on election timeouts.
     needs: [test, integration]
@@ -416,6 +434,7 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -433,6 +452,7 @@ jobs:
   zero-rtt:
     name: 0-RTT replay policy [no -race]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -453,6 +473,7 @@ jobs:
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -616,6 +637,7 @@ jobs:
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration]
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     # Last of the three heavy jobs; see the note on `integration`.
     needs: [integration]
     timeout-minutes: 45
@@ -640,36 +662,99 @@ jobs:
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
 
   # ==========================================================================
+  # FIPS (full tier; moved from nightly.yml in #293)
+  #
+  # The Makefile's two-tier verification: `make build-fips`, `make verify-fips`
+  # (GODEBUG=fips140=only over every package except
+  # pkg/internal/transport/revocation) and `make verify-fips-exempt`
+  # (fips140=on for the revocation tree, whose OCSP CertID is SHA-1 by protocol
+  # definition). See the FIPS block in the Makefile and
+  # docs/quic-transport/architecture.md.
+  # ==========================================================================
+
+  fips:
+    name: FIPS
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    # Behind integration with netfault and contrib-dragonboat: the transport
+    # suite starts real QUIC listeners and is the slowest part of the run.
+    needs: [integration]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Tune QUIC UDP buffers
+        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
+
+      - name: Compile under the module, tagged and untagged
+        run: make build-fips
+
+      # GODEBUG=fips140=only over every package except
+      # pkg/internal/transport/revocation, including the QUIC transport.
+      # release.yml runs the same gate.
+      - name: Approved-only gate
+        run: make verify-fips
+
+      # pkg/internal/transport/revocation under GODEBUG=fips140=on. The OCSP
+      # CertID (RFC 6960 s4.1.1) is SHA-1 by protocol definition, inside
+      # golang.org/x/crypto/ocsp; docs/quic-transport/architecture.md records
+      # the exemption. This keeps the exempt tree tested rather than excluded.
+      - name: Exempt revocation tree, FIPS mode
+        run: make verify-fips-exempt
+
+  # ==========================================================================
   # The gate
   #
   # Branch protection requires a single status context, and this job speaks
   # for the whole pipeline. `if: always()` makes it report when a dependency
   # fails instead of being skipped. Anything other than `success`, including
-  # `skipped` and `cancelled`, is a failure.
+  # `cancelled`, is a failure, with one exception: `skipped` passes for a job
+  # tagged `full` when this run did not select the full tier (FULL_TIER is
+  # the same expression as the full-tier jobs' `if:`). A PR-tier job never
+  # skips legitimately, and in a full-tier run neither does a full-tier job,
+  # so `skipped` there still fails.
   #
-  # A new job must be added both to `needs` and to a `check` line;
-  # test/buildgates asserts the pairing.
+  # A new job must be added both to `needs` and to a `check` line, tagged
+  # `pr` or `full`; test/buildgates asserts the pairing.
   # ==========================================================================
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat]
+    needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
+        env:
+          FULL_TIER: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
         run: |
           BAD=0
-          check() { case "$2" in success) echo "OK   $1";; *) echo "FAIL $1 ($2)"; BAD=1;; esac; }
-          check lint              "${{ needs.lint.result }}"
-          check security          "${{ needs.security.result }}"
-          check build             "${{ needs.build.result }}"
-          check test              "${{ needs.test.result }}"
-          check integration       "${{ needs.integration.result }}"
-          check netfault          "${{ needs.netfault.result }}"
-          check errfs             "${{ needs.errfs.result }}"
-          check zero-rtt          "${{ needs.zero-rtt.result }}"
-          check fuzz-seeds        "${{ needs.fuzz-seeds.result }}"
-          check modules           "${{ needs.modules.result }}"
-          check cross-arch        "${{ needs.cross-arch.result }}"
-          check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}"
+          echo "full tier selected: ${FULL_TIER}"
+          check() { # <job> <result> <pr|full>
+            case "$2" in success) echo "OK   $1";;
+              skipped)
+                if [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
+                  echo "SKIP $1 (full tier not selected)"
+                else
+                  echo "FAIL $1 (skipped)"; BAD=1
+                fi;;
+              *) echo "FAIL $1 ($2)"; BAD=1;;
+            esac
+          }
+          check lint              "${{ needs.lint.result }}" pr
+          check security          "${{ needs.security.result }}" pr
+          check build             "${{ needs.build.result }}" pr
+          check test              "${{ needs.test.result }}" pr
+          check modules           "${{ needs.modules.result }}" pr
+          check cross-arch        "${{ needs.cross-arch.result }}" pr
+          check integration       "${{ needs.integration.result }}" full
+          check netfault          "${{ needs.netfault.result }}" full
+          check errfs             "${{ needs.errfs.result }}" full
+          check zero-rtt          "${{ needs.zero-rtt.result }}" full
+          check fuzz-seeds        "${{ needs.fuzz-seeds.result }}" full
+          check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}" full
+          check fips              "${{ needs.fips.result }}" full
           exit $BAD

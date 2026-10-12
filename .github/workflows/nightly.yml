@@ -1,18 +1,12 @@
-# Nightly jobs that verify slow-moving properties: FIPS mode, Trivy and
-# dependency freshness. They run on a schedule or on demand and gate no merge.
+# Nightly jobs that verify slow-moving properties: Trivy and dependency
+# freshness. They gate no merge and run only when dispatched: the coordinator
+# dispatches the nightly by hand, and there is no schedule (#293).
 #
-# The FIPS job runs the Makefile's two-tier verification: `make build-fips`,
-# `make verify-fips` (GODEBUG=fips140=only over every package except
-# pkg/internal/transport/revocation) and `make verify-fips-exempt`
-# (fips140=on for the revocation tree, whose OCSP CertID is SHA-1 by protocol
-# definition). See the FIPS block in the Makefile and
-# docs/quic-transport/architecture.md.
+# The FIPS job moved to ci.yml's full tier (#293), where CI Gate checks it.
 
 name: Nightly
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
   workflow_dispatch:
 
 env:
@@ -21,39 +15,6 @@ env:
   GOWORK: "off"
 
 jobs:
-  fips:
-    name: FIPS
-    runs-on: ubuntu-latest
-    # Runs standalone; build health is ci.yml's job.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      # The transport suite in the last step starts real QUIC listeners.
-      - name: Tune QUIC UDP buffers
-        run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
-
-      - name: Compile under the module, tagged and untagged
-        run: make build-fips
-
-      # GODEBUG=fips140=only over every package except
-      # pkg/internal/transport/revocation, including the QUIC transport. The
-      # transport tree is the slowest part of the run, hence the timeout.
-      # release.yml runs the same gate.
-      - name: Approved-only gate
-        run: make verify-fips
-
-      # pkg/internal/transport/revocation under GODEBUG=fips140=on. The OCSP
-      # CertID (RFC 6960 s4.1.1) is SHA-1 by protocol definition, inside
-      # golang.org/x/crypto/ocsp; docs/quic-transport/architecture.md records
-      # the exemption. This keeps the exempt tree tested rather than excluded.
-      - name: Exempt revocation tree, FIPS mode
-        run: make verify-fips-exempt
-
   trivy:
     name: Trivy
     runs-on: ubuntu-latest
@@ -109,7 +70,7 @@ jobs:
         if: github.server_url != 'https://github.com'
         run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
 
-      # Advisory: findings surface daily without blocking anything.
+      # Advisory: findings surface on each run without blocking anything.
       - name: Trivy misconfiguration scan (advisory)
         if: github.server_url != 'https://github.com'
         run: trivy fs --scanners misconfig --exit-code 0 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .

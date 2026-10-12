@@ -49,12 +49,10 @@ import (
 var (
 	makefilePath = filepath.Join("..", "..", "Makefile")
 
-	// The FIPS job runs from nightly.yml rather than ci.yml: it is known-red
-	// under runner contention, and a known-red job burning runner-minutes per
-	// push verifies nothing. It still runs -- nightly, plus on demand via workflow_dispatch -- so the
-	// gate this file protects is "some workflow still executes the FIPS
-	// targets," not "ci.yml specifically does."
-	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "nightly.yml")
+	// The FIPS job runs in ci.yml's full tier (#293): every push to main, on
+	// demand via workflow_dispatch, and on a PR labelled `ci:full`. CI Gate
+	// checks it whenever that tier runs.
+	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "ci.yml")
 
 	// fipsModePattern captures the GODEBUG=fips140 mode as a WHOLE WORD. The
 	// word boundary is load-bearing: "on" is a prefix of "only", so a substring
@@ -273,7 +271,7 @@ func TestExcludedTreeIsStillGated(t *testing.T) {
 	}
 }
 
-// TestCIRunsTheFIPSGate pins that nightly.yml actually invokes the targets
+// TestCIRunsTheFIPSGate pins that ci.yml actually invokes the targets
 // above. A target no workflow calls protects nothing.
 func TestCIRunsTheFIPSGate(t *testing.T) {
 	workflow := readRepoFile(t, fipsWorkflow)

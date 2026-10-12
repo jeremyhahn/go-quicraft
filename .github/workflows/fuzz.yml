@@ -4,9 +4,10 @@ name: Fuzz
 #
 # `go test -fuzz` is unbounded and nondeterministic, so on a PR it would fail
 # unrelated changes at random. ci.yml's `fuzz-seeds` job runs the targets
-# against their seeds and committed corpus only; the searching happens here on
-# a schedule. Promote an interesting input to the PR gate by committing it
-# under pkg/*/testdata/fuzz/.
+# against their seeds and committed corpus only; the searching happens here,
+# dispatched by hand (no schedule: a cron run nobody asked for spends runner
+# time no one reads, #293). Promote an interesting input to the full tier by
+# committing it under pkg/*/testdata/fuzz/.
 #
 # The budget is an execution count (`-fuzztime=<N>x`), never a duration. With
 # a duration, Go's fuzz coordinator can record its own expected deadline as a
@@ -16,9 +17,6 @@ name: Fuzz
 # is the only backstop.
 
 on:
-  schedule:
-    # 04:00 UTC daily.
-    - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
       execs:

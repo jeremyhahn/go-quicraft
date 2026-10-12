@@ -164,6 +164,56 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 	}
 }
 
+// fullTierIf is the condition every full-tier job carries, and the
+// expression ci-gate evaluates into FULL_TIER (#293).
+const fullTierIf = `github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')`
+
+// TestCIGateTiersMatchTheJobs pins the two tiers to the gate.
+//
+// ci-gate passes a skipped job only when its check line tags it `full` and
+// the run did not select the full tier. Two drifts would break that: a job
+// tagged `full` whose `if:` differs from FULL_TIER, so the gate excuses a skip
+// in a run that should have executed it; and a PR-tier job that gains an
+// `if:`, so it skips on some event and fails the gate there.
+func TestCIGateTiersMatchTheJobs(t *testing.T) {
+	raw, err := os.ReadFile(ciWorkflowPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ciWorkflowPath, err)
+	}
+	body := string(raw)
+
+	if !strings.Contains(body, "FULL_TIER: ${{ "+fullTierIf+" }}") {
+		t.Errorf("%s's FULL_TIER is not the full-tier condition %q", gateJobName, fullTierIf)
+	}
+
+	tiers := map[string]string{}
+	for _, c := range regexp.MustCompile(`(?m)^\s+check\s+(\S+)\s+"[^"]*"\s*(\S*)\s*$`).FindAllStringSubmatch(body, -1) {
+		tiers[c[1]] = c[2]
+	}
+
+	for _, j := range ciJobs(t, body) {
+		if j == gateJobName {
+			continue
+		}
+		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
+		hasFullIf := strings.Contains(job, "\n    if: "+fullTierIf+"\n")
+		switch tiers[j] {
+		case "full":
+			if !hasFullIf {
+				t.Errorf("job %q is tagged full in %s but lacks `if: %s`", j, gateJobName, fullTierIf)
+			}
+		case "pr":
+			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) {
+				t.Errorf("job %q is PR tier but carries a job-level `if:`; a PR-tier job "+
+					"must run on every event, and %s fails it when skipped", j, gateJobName)
+			}
+		default:
+			t.Errorf("job %q's check line in %s has tier %q; want `pr` or `full`",
+				j, gateJobName, tiers[j])
+		}
+	}
+}
+
 // missing returns the elements of want that are absent from got.
 func missing(want, got []string) []string {
 	have := make(map[string]bool, len(got))
