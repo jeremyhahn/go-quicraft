@@ -239,6 +239,43 @@ return the same `*seal.Barrier` for every shard of a tenant). Every strategy is 
 to close after `Close` returns. Calling `Barrier.Seal()` directly
 on a running host gives the engine an `ErrBarrierSealed` storm.
 
+## Serve requests while sealed
+
+A shard whose barrier is sealed serves no reads and accepts no writes. Every
+client call on it returns `ErrBarrierSealed` at once: proposals, sessions,
+membership changes, `ReadIndex`, `SyncRead`, `StaleRead`, `StaleReadBuf`,
+`FollowerRead`, `QueryLocalNode`, `RequestSnapshot` and `ExecuteOnLeader`.
+Local reads are refused too. The state machine is still in memory, but sealing
+withdraws access to the shard's data, and a replica that kept answering
+`StaleRead` would leave every byte readable after a seal. Shards under other,
+unsealed barriers keep serving.
+
+So nothing your service needs in order to unseal may live behind the barrier
+being unsealed:
+
+- **Health and seal status.** Read `Host.IsSealed()` or `Host.HealthCheck()`
+  (`Status == "sealed"`, `BarrierSealed`). Both report the `WithBarrier`
+  barrier and read no shard. For a `WithShardBarriers` barrier, call
+  `IsSealed()` on the `*seal.Barrier` you hold.
+- **The unseal call.** Authorize it with the unseal material itself, such as the
+  passphrase or share quorum your strategy checks, or with an identity the
+  transport has already verified, such as the mTLS client certificate. Do not
+  authorize it with a user lookup in a shard under the sealed barrier: that
+  lookup returns `ErrBarrierSealed`, so no caller can ever unseal.
+- **Every other request.** Test for `errors.Is(err, quicraft.ErrBarrierSealed)`
+  and report the service as sealed (for example HTTP 503 or gRPC `Unavailable`
+  with a sealed reason), so the caller unseals instead of retrying.
+- **Data you must read while a tenant is sealed**, such as a system user store,
+  belongs on a shard under its own `WithShardBarriers` barrier, sealed and
+  unsealed independently of the tenant barriers.
+
+After `Unseal` returns nil, the same calls work again with no restart, so
+`ErrBarrierSealed` is safe to retry once the barrier is unsealed. A shard whose
+log write was refused while sealed writes that update once and resumes, and its
+`LeaseRead` lease is dropped, so its first linearizable read goes through
+`ReadIndex`. A shard halted by any other write fault (`ErrShardFailed`) still
+needs `StopShard` and then `StartShard`.
+
 ## Set `MinEpoch`
 
 `StateMAC` authenticates the sealed blob's metadata but cannot detect replay: an

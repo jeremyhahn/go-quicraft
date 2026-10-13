@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- `docs/seal-barrier/user.md` gains "Serve requests while sealed" (#324).
+  Refusing reads on a sealed shard, introduced in 0.21.0-rc.2, is intended:
+  through 0.20.0 a sealed replica still answered `ReadIndex`/`SyncRead`,
+  `StaleRead`, `FollowerRead` and `StaleReadBuf` from its applied state, and it
+  no longer does. A service whose health, seal-status or unseal path reads a
+  shard under the sealed barrier can no longer be unsealed. Serve those paths
+  from `Host.IsSealed()`/`Host.HealthCheck()` and the unseal material instead.
+  No code change.
+
 ## [0.21.0-rc.2] - 2026-10-12
 
 ### Added
