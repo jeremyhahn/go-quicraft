@@ -899,6 +899,52 @@ func retryBackoff(err error) time.Duration {
 	return 25 * time.Millisecond
 }
 
+// Bounds of the back-off a client applies while the host it asks knows no
+// leader. A flat 5 ms retry during an election is about 200 refusals a second
+// per client, which fills the soak logs with errors when nothing is wrong.
+const (
+	leaderUnknownMinBackoff = 5 * time.Millisecond
+	leaderUnknownMaxBackoff = 100 * time.Millisecond
+)
+
+// leaderUnknown reports whether err says the host knows no leader for the
+// shard: a NotLeaderError without a leader hint, or a bare ErrNotLeader.
+func leaderUnknown(err error) bool {
+	var nle *quicraft.NotLeaderError
+	if errors.As(err, &nle) {
+		return nle.LeaderID == 0
+	}
+	return errors.Is(err, quicraft.ErrNotLeader)
+}
+
+// retryPacer is one client's retry pause. While the host knows no leader the
+// pause doubles from leaderUnknownMinBackoff up to leaderUnknownMaxBackoff;
+// any other error, or a completed operation, resets it, so the retry stays
+// fast whenever a leader is known and failover throughput is still measured.
+// It changes only the pause: every attempt is still recorded.
+type retryPacer struct {
+	next time.Duration
+}
+
+// wait returns the pause before retrying after err.
+func (p *retryPacer) wait(err error) time.Duration {
+	if !leaderUnknown(err) {
+		p.next = 0
+		return retryBackoff(err)
+	}
+	if p.next == 0 {
+		p.next = leaderUnknownMinBackoff
+	} else {
+		p.next = min(2*p.next, leaderUnknownMaxBackoff)
+	}
+	return p.next
+}
+
+// reset returns the pacer to its fast retry after a completed operation.
+func (p *retryPacer) reset() {
+	p.next = 0
+}
+
 // pause sleeps for d, returning early if the run is being torn down.
 func pause(d time.Duration, done <-chan struct{}) {
 	timer := time.NewTimer(d)
@@ -969,6 +1015,7 @@ func clientWorker(
 	opIdx := 0
 	attempt := 0
 	completed := 0
+	var pacer retryPacer
 
 	// A client that ran its full window without completing a single operation
 	// is a wedge, not slow progress. The aggregate floor can be met by the
@@ -1016,7 +1063,7 @@ func clientWorker(
 			if err != nil {
 				recorder.indeterminate(rec, err)
 				attempt++
-				pause(retryBackoff(err), done)
+				pause(pacer.wait(err), done)
 				if attempt >= maxAttemptsPerOp {
 					// Give up on this write and move on. The attempts stay in
 					// the history as indeterminate operations; only the chain
@@ -1055,7 +1102,7 @@ func clientWorker(
 			if err != nil {
 				recorder.indeterminate(rec, err)
 				attempt++
-				pause(retryBackoff(err), done)
+				pause(pacer.wait(err), done)
 				if attempt >= maxAttemptsPerOp {
 					opIdx++
 					attempt = 0
@@ -1085,6 +1132,7 @@ func clientWorker(
 		completed++
 		opIdx++
 		attempt = 0
+		pacer.reset()
 	}
 }
 
@@ -1125,6 +1173,7 @@ func sessionClientWorker(
 	}
 
 	opIdx := 0
+	var pacer retryPacer
 
 	for time.Now().Before(deadline) {
 		select {
@@ -1164,7 +1213,7 @@ func sessionClientWorker(
 						session = fresh
 					}
 				}
-				pause(retryBackoff(err), done)
+				pause(pacer.wait(err), done)
 				continue
 			}
 
@@ -1181,7 +1230,7 @@ func sessionClientWorker(
 
 			if err != nil {
 				recorder.indeterminate(rec, err)
-				pause(retryBackoff(err), done)
+				pause(pacer.wait(err), done)
 				continue
 			}
 
@@ -1200,12 +1249,14 @@ func sessionClientWorker(
 		}
 
 		opIdx++
+		pacer.reset()
 	}
 }
 
 // acquireSession obtains a session from any live host, retrying until the
 // deadline. Returns nil if no session could be obtained.
 func acquireSession(cluster *testCluster, shardID uint64, deadline time.Time, done <-chan struct{}) *quicraft.Session {
+	var pacer retryPacer
 	for time.Now().Before(deadline) {
 		select {
 		case <-done:
@@ -1225,7 +1276,7 @@ func acquireSession(cluster *testCluster, shardID uint64, deadline time.Time, do
 		if err == nil {
 			return session
 		}
-		pause(retryBackoff(err), done)
+		pause(pacer.wait(err), done)
 	}
 	return nil
 }

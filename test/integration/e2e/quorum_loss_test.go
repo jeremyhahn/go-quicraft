@@ -346,40 +346,54 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	// The returning node presents the LEAF it had before: the shard's
 	// committed identity for this replica is that keypair, and a host with a
 	// fresh one would be refused by every peer as an identity mismatch.
-	addr := freePort(t)
-	hostCfg := testHostConfig(t, addr, cluster.leaves[thirdStop])
-	newHost, hostErr := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
-	if hostErr != nil {
-		t.Fatalf("NewHost for recovery node failed: %v", hostErr)
-	}
-
-	// Build the original members map with the new address for the
-	// recovered replica.
+	// The node lock serializes this restart with the cluster's stop and
+	// close paths, and the host is replaced under hostsMu, as the harness
+	// helpers do (#309). The closure releases the node lock on t.Fatalf too.
 	recoveredReplicaID := uint64(thirdStop + 1)
-	members := make(map[uint64]string, len(cluster.addrs))
-	for i, a := range cluster.addrs[:5] {
-		rid := uint64(i + 1)
-		if i == thirdStop {
-			// Use the new address for the recovered node.
-			members[rid] = addr
-		} else {
-			members[rid] = a
+	var addr string
+	func() {
+		lk := cluster.nodeLock(thirdStop)
+		lk.Lock()
+		defer lk.Unlock()
+		if !cluster.stopped[thirdStop].Load() {
+			t.Fatalf("node[%d] must be stopped before recovery", thirdStop)
 		}
-	}
+		addr = freePort(t)
+		hostCfg := testHostConfig(t, addr, cluster.leaves[thirdStop])
+		newHost, hostErr := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
+		if hostErr != nil {
+			t.Fatalf("NewHost for recovery node failed: %v", hostErr)
+		}
 
-	createFn, newTracker := kvCreateFunc()
-	scfg := testShardConfig(1, recoveredReplicaID)
-	scfg.MemberIdentities = cluster.identities()
-	if startErr := newHost.StartShard(members, false, createFn, scfg); startErr != nil {
-		newHost.Close()
-		t.Fatalf("StartShard for recovery node failed: %v", startErr)
-	}
+		// Build the original members map with the new address for the
+		// recovered replica.
+		members := make(map[uint64]string, len(cluster.addrs))
+		for i, a := range cluster.addrs[:5] {
+			rid := uint64(i + 1)
+			if i == thirdStop {
+				// Use the new address for the recovered node.
+				members[rid] = addr
+			} else {
+				members[rid] = a
+			}
+		}
 
-	// Replace the stopped node in the cluster tracking.
-	cluster.hosts[thirdStop] = newHost
-	cluster.addrs[thirdStop] = addr
-	cluster.trackers[thirdStop] = newTracker
-	cluster.stopped[thirdStop].Store(false)
+		createFn, newTracker := kvCreateFunc()
+		scfg := testShardConfig(1, recoveredReplicaID)
+		scfg.MemberIdentities = cluster.identities()
+		if startErr := newHost.StartShard(members, false, createFn, scfg); startErr != nil {
+			newHost.Close()
+			t.Fatalf("StartShard for recovery node failed: %v", startErr)
+		}
+
+		// Replace the stopped node in the cluster tracking.
+		cluster.hostsMu.Lock()
+		cluster.hosts[thirdStop] = newHost
+		cluster.addrs[thirdStop] = addr
+		cluster.trackers[thirdStop] = newTracker
+		cluster.stopped[thirdStop].Store(false)
+		cluster.hostsMu.Unlock()
+	}()
 
 	if cluster.liveNodes() != 3 {
 		t.Fatalf("expected 3 live nodes after recovery, got %d", cluster.liveNodes())
