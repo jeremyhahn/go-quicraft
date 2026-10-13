@@ -16,7 +16,10 @@ and deprecation" and points here.
 | [engineering.md](engineering.md) | every version discriminator, its byte layout, its check and its error; the payload-type ladder; tests |
 | [api.md](api.md) | the interface requirements an embedder's own types must meet, and the error values each check returns |
 | [user.md](user.md) | the upgrade path, upgrade notes for every release, bootstrapping a cluster with identities |
-| [cli.md](cli.md) | no CLI |
+
+There is no `cli.md`: go-quicraft is a library and ships no binaries, and
+nothing in it migrates or inspects a data directory, so there is no upgrade verb
+to document.
 
 Sources: `pkg/proto/constants.go`, `pkg/proto/membership.go`,
 `pkg/internal/transport/frame.go`, `pkg/logdb/waldb/format.go`,

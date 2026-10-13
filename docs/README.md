@@ -5,14 +5,16 @@
 
 Technical documentation for the QuicRaft multi-group Raft consensus library.
 
-Every implemented feature has a folder holding five documents:
-`architecture.md` (design, boundaries, rejected alternatives), `engineering.md`
-(the implementation contract), `cli.md`, `api.md` and `user.md`. Together they
-are the feature's documentation and its requirements.
+[SPEC.md](SPEC.md) lists every feature. Each implemented feature has a folder
+whose documents are drawn from `architecture.md` (design, boundaries, rejected
+alternatives), `engineering.md` (the implementation contract), `cli.md`,
+`api.md` and `user.md`. A folder holds only files with content: a document with
+nothing to say is not written. Together they are the feature's documentation
+and its requirements.
 
-go-quicraft ships no binaries, so every `cli.md` says so in one line and points
-at the consuming surface. The file still exists, because an absent file cannot
-be told apart from an unwritten one.
+go-quicraft is a library and ships no binaries. Where a feature's `cli.md`
+exists, it explains why the feature has no operator verb and where the
+consuming surface is.
 
 ## Start here
 
@@ -67,5 +69,5 @@ testing documents describe the harnesses that serve all of them.
 
 ## Migration state
 
-Complete: every implemented feature has its five-file folder, and a new feature
-gets one from day one.
+Complete: every implemented feature is listed in [SPEC.md](SPEC.md) and has a
+folder holding only files with content, and a new feature gets one from day one.
