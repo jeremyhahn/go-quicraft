@@ -104,28 +104,51 @@
 //     a port handed out is recorded, and never handed out again while it may
 //     still be in flight.
 //   - Two reservations in different processes, which `go test ./...` creates by
-//     running packages in parallel. NARROWED, not removed, and deliberately so:
-//     each process starts its scan at a PID-derived offset rather than at the
-//     bottom of the window, so concurrent packages do not march over each
-//     other from the same end, and every candidate is probe-bound with a plain
-//     socket first, which detects a live host another process has already
-//     started: the probe is the same plain bind the transport makes, and a
-//     live holder refuses it.
-//     What remains is the ordinary interval between one process's probe and
-//     its own bind.
+//     running packages in parallel. REMOVED on unix, NARROWED elsewhere.
 //
-// Removing that last one needs the transport to accept a pre-bound
-// net.PacketConn, so the socket the test holds is the socket the host uses.
-// quic-go supports exactly that (quic.Transport{Conn: ...}), but
-// QUICTransport.Start binds from Config.ListenAddress, a string, and no
-// PacketConn appears anywhere in pkg/. Adding one is a change to the engine's
-// public configuration, which is outside this package's scope.
+// The PID-derived start offset and the probe were the whole cross-process
+// guard until #309, and they did not hold. Each process scans upward from its
+// own offset, but as soon as one scan reaches ports the other has reserved and
+// not yet bound, the probe passes, because a reservation is not a socket:
+// the probe binds and releases before the reserving process binds. Both
+// processes then take the same port, both advance their cursor to the next
+// one, and from there they march together, colliding on every adjacent port
+// until one of them binds first. Recycling the window and wrapping the scan
+// make that convergence a matter of time. It was measured as bursts of
+// EADDRINUSE on runs of adjacent ports in two concurrent integration
+// processes: ten in about seventy iterations.
+//
+// So a reservation now claims its port across processes as well: an
+// exclusive, non-blocking flock on <os.TempDir()>/quicraft-netport/<port>.lock,
+// taken before the probe and held by the reserving process. A port another
+// process has claimed is skipped exactly like one that fails its probe. The
+// kernel drops the lock when its holder exits, however it exits, so a crashed
+// test leaks nothing; the zero-byte files are left in place. One lock covers a
+// port for both networks, as the in-process record does. A process keeps only
+// its most recent inFlightRetain claims, since a claim covers the interval up
+// to the bind and the probe covers the bound port after it.
+//
+// What remains:
+//
+//   - On platforms without flock (windows, among the cross-builds), or when
+//     the lock directory cannot be created, the probe and the start offset
+//     are the only cross-process guard, as before.
+//   - A process unrelated to this package may still bind a reserved port in
+//     the interval before the reserving host binds it. Nothing but tests
+//     binds in this window, so that needs a misbehaving neighbour, not a
+//     race. Closing it needs the transport to accept a pre-bound
+//     net.PacketConn, so the socket the test holds is the socket the host
+//     uses. quic-go supports exactly that (quic.Transport{Conn: ...}), but
+//     QUICTransport.Start binds from Config.ListenAddress, a string, and no
+//     PacketConn appears anywhere in pkg/. Adding one is a change to the
+//     engine's public configuration, which is outside this package's scope.
 package netport
 
 import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,6 +191,14 @@ var state struct {
 	err    error
 	taken  map[int]bool
 	recent []int
+
+	// lockDir holds the per-port lock files that claim a port across
+	// processes; empty disables the claim. held maps each port this process
+	// has claimed to the function that drops the claim, and heldOrder lists
+	// them oldest first so only the most recent inFlightRetain stay held.
+	lockDir   string
+	held      map[int]func()
+	heldOrder []int
 }
 
 // ReserveUDP returns a loopback address ("127.0.0.1:port") that no other caller
@@ -269,17 +300,78 @@ func scanWindow(network string) (string, bool) {
 		if state.taken[p] {
 			continue
 		}
+		if !claim(p) {
+			// Reserved by another process that has not bound it yet. Skip it.
+			continue
+		}
 		addr := "127.0.0.1:" + strconv.Itoa(p)
 		if !probe(network, addr) {
 			// Held by something outside this process. Skip it.
+			unclaim(p)
 			continue
 		}
 		state.taken[p] = true
 		state.recent = append(state.recent, p)
 		state.next = state.lo + (p-state.lo+1)%span
+		trimClaims()
 		return addr, true
 	}
 	return "", false
+}
+
+// claim takes this process's cross-process claim on port p, and reports
+// whether p is free of any other process's claim. A claim this process already
+// holds is kept, so a port recycled within the process is not refused by its
+// own lock.
+func claim(p int) bool {
+	if state.lockDir == "" {
+		return true
+	}
+	if _, ok := state.held[p]; ok {
+		return true
+	}
+	unlock, busy := lockPort(filepath.Join(state.lockDir, strconv.Itoa(p)+".lock"))
+	if busy {
+		return false
+	}
+	if unlock != nil {
+		state.held[p] = unlock
+		state.heldOrder = append(state.heldOrder, p)
+	}
+	return true
+}
+
+// unclaim drops this process's claim on port p, if it holds one.
+func unclaim(p int) {
+	unlock, ok := state.held[p]
+	if !ok {
+		return
+	}
+	unlock()
+	delete(state.held, p)
+	for i, q := range state.heldOrder {
+		if q == p {
+			state.heldOrder = append(state.heldOrder[:i], state.heldOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+// trimClaims drops the oldest claims beyond the most recent inFlightRetain.
+//
+// A claim covers the interval between reservation and bind, and the probe
+// covers a port once it is bound, so a claim that old has done its work.
+// Holding every claim until exit would instead cost a descriptor per port
+// reserved, and a long run reserves more ports than the window holds.
+func trimClaims() {
+	for len(state.heldOrder) > inFlightRetain {
+		p := state.heldOrder[0]
+		state.heldOrder = state.heldOrder[1:]
+		if unlock, ok := state.held[p]; ok {
+			unlock()
+			delete(state.held, p)
+		}
+	}
 }
 
 // probe reports whether addr can be bound on network right now. It opens the
@@ -339,6 +431,8 @@ func recycleWindow() {
 // initWindow resolves the reservation window once per process.
 func initWindow() {
 	state.taken = make(map[int]bool)
+	state.held = make(map[int]func())
+	state.lockDir = lockDirectory()
 
 	lo, hi := defaultEphemeralLo, defaultEphemeralHi
 	if data, err := os.ReadFile(ephemeralRangeFile); err == nil {
@@ -354,6 +448,20 @@ func initWindow() {
 	}
 	state.lo, state.hi = wlo, whi
 	state.next = wlo + startOffset(os.Getpid(), whi-wlo+1)
+}
+
+// lockDirectory returns the directory every process on the host shares for
+// its per-port lock files, or "" when the platform has no cross-process claim
+// or the directory cannot be created, leaving the probe as the only guard.
+func lockDirectory() string {
+	if !crossProcessClaims {
+		return ""
+	}
+	dir := filepath.Join(os.TempDir(), "quicraft-netport")
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return ""
+	}
+	return dir
 }
 
 // startOffset spreads concurrently running test binaries across the window.

@@ -495,18 +495,24 @@ func withWindow(t *testing.T, lo, hi int) {
 	savedLo, savedHi := state.lo, state.hi
 	savedNext, savedErr := state.next, state.err
 	savedTaken, savedRecent := state.taken, state.recent
+	savedLockDir := state.lockDir
 	t.Cleanup(func() {
 		state.mu.Lock()
 		defer state.mu.Unlock()
 		state.lo, state.hi = savedLo, savedHi
 		state.next, state.err = savedNext, savedErr
 		state.taken, state.recent = savedTaken, savedRecent
+		state.lockDir = savedLockDir
 	})
 
 	state.lo, state.hi, state.next = lo, hi, lo
 	state.taken = make(map[int]bool)
 	state.recent = nil
 	state.err = nil
+	// These windows are fixed ports inside the real one, so another test
+	// process's claims would skew what the test counts. The window logic is
+	// what is under test; the cross-process claim has its own test.
+	state.lockDir = ""
 }
 
 // holdAllBut fills the installed window with live UDP listeners bound as the
