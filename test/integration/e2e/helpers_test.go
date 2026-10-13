@@ -737,6 +737,10 @@ type testCluster struct {
 	configs  []config.HostConfig
 	trackers []*smTracker
 	stopped  []atomic.Bool // tracks which nodes have been stopped
+	// nodeLocks holds one *sync.Mutex per node index, made on first use: it
+	// serializes a node's stop and restart without hostsMu, which is never
+	// held across Host.Close (see stopNode).
+	nodeLocks sync.Map
 	// ca issues every host's leaf; leaves holds each host's own leaf — its
 	// own KEYPAIR, and so its own node identity — so a host brought back
 	// for a replica presents the identity the shard committed for it. See
@@ -945,12 +949,16 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 
 // close shuts down all hosts in the cluster.
 func (c *testCluster) close() {
-	c.hostsMu.Lock()
-	defer c.hostsMu.Unlock()
-	for i, h := range c.hosts {
-		if !c.stopped[i].Load() {
+	c.hostsMu.RLock()
+	n := len(c.hosts)
+	c.hostsMu.RUnlock()
+	for i := range n {
+		lk := c.nodeLock(i)
+		lk.Lock()
+		if h := c.takeHost(i); h != nil {
 			h.Close()
 		}
+		lk.Unlock()
 	}
 }
 
@@ -1058,13 +1066,35 @@ func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration
 // findLeader, findFollower, and close skip stopped nodes.
 func (c *testCluster) stopNode(idx int) {
 	c.t.Helper()
-	if c.stopped[idx].Load() {
-		return
+	lk := c.nodeLock(idx)
+	lk.Lock()
+	defer lk.Unlock()
+	// Host.Close drains in-flight operations and can take seconds, so it runs
+	// outside hostsMu: under the write lock it stalled every reader (#309).
+	if h := c.takeHost(idx); h != nil {
+		h.Close()
 	}
+}
+
+// nodeLock returns the mutex that serializes stopNode, restartNode and close
+// on node idx, so a restart never overlaps the Close of the host it replaces.
+func (c *testCluster) nodeLock(idx int) *sync.Mutex {
+	lk, _ := c.nodeLocks.LoadOrStore(idx, new(sync.Mutex))
+	return lk.(*sync.Mutex)
+}
+
+// takeHost marks node idx stopped and returns its host, or nil when it was
+// stopped already. The mark is made under hostsMu before the caller's Close
+// begins, so a reader that honours c.stopped never picks up a closing host.
+// The caller holds nodeLock(idx).
+func (c *testCluster) takeHost(idx int) *quicraft.Host {
 	c.hostsMu.Lock()
-	c.hosts[idx].Close()
+	defer c.hostsMu.Unlock()
+	if c.stopped[idx].Load() {
+		return nil
+	}
 	c.stopped[idx].Store(true)
-	c.hostsMu.Unlock()
+	return c.hosts[idx]
 }
 
 // leaderHost returns the Host instance for the leader of the given shard.

@@ -563,6 +563,10 @@ type testCluster struct {
 	addrs    []string
 	trackers []*smTracker
 	stopped  []atomic.Bool // tracks which nodes have been stopped
+	// nodeLocks holds one *sync.Mutex per node index, made on first use: it
+	// serializes a node's stop and restart without hostsMu, which is never
+	// held across Host.Close (see stopNode).
+	nodeLocks sync.Map
 	// nodeHostDirs records each node's NodeHostDir so snapshot tests can
 	// assert that a snapshot artifact really landed on disk.
 	nodeHostDirs []string
@@ -680,12 +684,16 @@ func (c *testCluster) startShard(shardID uint64) []*smTracker {
 
 // close shuts down all hosts in the cluster.
 func (c *testCluster) close() {
-	c.hostsMu.Lock()
-	defer c.hostsMu.Unlock()
-	for i, h := range c.hosts {
-		if !c.stopped[i].Load() {
+	c.hostsMu.RLock()
+	n := len(c.hosts)
+	c.hostsMu.RUnlock()
+	for i := range n {
+		lk := c.nodeLock(i)
+		lk.Lock()
+		if h := c.takeHost(i); h != nil {
 			h.Close()
 		}
+		lk.Unlock()
 	}
 }
 
@@ -1041,13 +1049,35 @@ func waitForReplication(t *testing.T, cluster *testCluster, trackers []*smTracke
 // findLeader, findFollower, and close skip stopped nodes.
 func (c *testCluster) stopNode(idx int) {
 	c.t.Helper()
-	if c.stopped[idx].Load() {
-		return
+	lk := c.nodeLock(idx)
+	lk.Lock()
+	defer lk.Unlock()
+	// Host.Close drains in-flight operations and can take seconds, so it runs
+	// outside hostsMu: under the write lock it stalled every reader (#309).
+	if h := c.takeHost(idx); h != nil {
+		h.Close()
 	}
+}
+
+// nodeLock returns the mutex that serializes stopNode, restartNode and close
+// on node idx, so a restart never overlaps the Close of the host it replaces.
+func (c *testCluster) nodeLock(idx int) *sync.Mutex {
+	lk, _ := c.nodeLocks.LoadOrStore(idx, new(sync.Mutex))
+	return lk.(*sync.Mutex)
+}
+
+// takeHost marks node idx stopped and returns its host, or nil when it was
+// stopped already. The mark is made under hostsMu before the caller's Close
+// begins, so a reader that honours c.stopped never picks up a closing host.
+// The caller holds nodeLock(idx).
+func (c *testCluster) takeHost(idx int) *quicraft.Host {
 	c.hostsMu.Lock()
-	c.hosts[idx].Close()
+	defer c.hostsMu.Unlock()
+	if c.stopped[idx].Load() {
+		return nil
+	}
 	c.stopped[idx].Store(true)
-	c.hostsMu.Unlock()
+	return c.hosts[idx]
 }
 
 // liveNodes returns the count of nodes that are not stopped.
@@ -1963,13 +1993,13 @@ func restartNode(
 	cfgFn func(shardID, replicaID uint64) config.Config,
 ) {
 	t.Helper()
+	lk := cluster.nodeLock(idx)
+	lk.Lock()
+	defer lk.Unlock()
 
-	// Stop the node if it is still running.
-	if !cluster.stopped[idx].Load() {
-		cluster.hostsMu.Lock()
-		cluster.hosts[idx].Close()
-		cluster.stopped[idx].Store(true)
-		cluster.hostsMu.Unlock()
+	// Stop the node if it is still running, outside hostsMu (see stopNode).
+	if old := cluster.takeHost(idx); old != nil {
+		old.Close()
 	}
 
 	// Create a new host reusing the same data directories, address and LEAF:

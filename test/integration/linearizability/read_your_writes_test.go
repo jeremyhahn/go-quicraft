@@ -165,11 +165,8 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 				// and is recorded as such, since the value's provenance alone
 				// cannot see it (the old entry's index arrives in res.Data too).
 				var appliedBefore uint64
-				if leaderIdx := cluster.findLeader(shardID); leaderIdx >= 0 {
-					cluster.hostsMu.RLock()
-					info, infoErr := cluster.hosts[leaderIdx].GetShardInfo(shardID)
-					cluster.hostsMu.RUnlock()
-					if infoErr == nil {
+				if leader := cluster.leaderHost(shardID); leader != nil {
+					if info, infoErr := leader.GetShardInfo(shardID); infoErr == nil {
 						appliedBefore = info.LastApplied
 					}
 				}
