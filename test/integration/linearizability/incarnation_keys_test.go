@@ -87,8 +87,17 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// the assertion reads. A retried padding put may apply twice
 	// (quicraft.MaybeApplied); it is a last-write-wins put and only lengthens
 	// the replay.
+	//
+	// Each proposal before the restart is budgeted failoverTimeout, not
+	// proposeTimeout: these phases only build the log's shape, and over
+	// 20,000 writes a loaded runner can lose its leader to a run of split
+	// votes that outlasts 5s (batch soak on a loaded host, #309: terms 7-13 in 4s
+	// with all three replicas up, then "leader unknown"). An election is
+	// granted failoverTimeout everywhere else in this harness; the keyed
+	// collision after the restart is what this test asserts, and it keeps
+	// its own budgets.
 	for i := range padding {
-		proposeToLeader(t, cluster, shardID, encodeKVPut(fmt.Sprintf("pad-%d", i%256), "p"), proposeTimeout)
+		proposeToLeader(t, cluster, shardID, encodeKVPut(fmt.Sprintf("pad-%d", i%256), "p"), failoverTimeout)
 	}
 
 	// A gate entry goes in just before the keyed ones. When the follower
@@ -102,7 +111,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// still lies ahead of every keyed entry, and release disarms the gate
 	// before the second is applied.
 	const gateKey = "gate"
-	proposeToLeader(t, cluster, shardID, encodeKVPut(gateKey, "closed"), proposeTimeout)
+	proposeToLeader(t, cluster, shardID, encodeKVPut(gateKey, "closed"), failoverTimeout)
 
 	// The follower's first incarnation mints (R, 1..keyed) for these, so they
 	// are PINNED to it: the follower is the subject, and re-resolving would put
@@ -112,7 +121,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// follower learns the successor it forwards to.
 	for i := range keyed {
 		if _, err := proposer.TryWith(proposer.Pinned(follower), shardID,
-			encodeKVPut(fmt.Sprintf("k-%d", i), "old"), proposeTimeout, quicraft.Temporary); err != nil {
+			encodeKVPut(fmt.Sprintf("k-%d", i), "old"), failoverTimeout, quicraft.Temporary); err != nil {
 			t.Fatalf("keyed %d through follower: %v", i, err)
 		}
 	}
