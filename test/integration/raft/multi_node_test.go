@@ -250,6 +250,53 @@ func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration
 	}
 }
 
+// waitForAgreedLeader waits until every host knows a leader for shardID, all
+// of them name the same replica, and the host with that replica ID reports
+// itself leader. It returns the agreed leader's replica ID.
+//
+// It does not pin the leader seen first: CheckQuorum may step a leader down
+// and a new election move leadership while the followers are still learning
+// it, and nodes that converge on the new leader satisfy the property.
+func (c *testCluster) waitForAgreedLeader(shardID uint64, timeout time.Duration) uint64 {
+	c.t.Helper()
+	agreed := func() (uint64, bool) {
+		var leaderID uint64
+		for _, h := range c.hosts {
+			if h == nil {
+				return 0, false
+			}
+			lid, known, err := h.GetLeaderID(shardID)
+			if err != nil || !known || lid == 0 || (leaderID != 0 && lid != leaderID) {
+				return 0, false
+			}
+			leaderID = lid
+		}
+		for _, h := range c.hosts {
+			info, err := h.GetShardInfo(shardID)
+			if err == nil && info.ReplicaID == leaderID {
+				return leaderID, info.IsLeader
+			}
+		}
+		return 0, false
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		if lid, ok := agreed(); ok {
+			return lid
+		}
+		select {
+		case <-deadline.C:
+			c.t.Fatalf("timed out after %v waiting for all nodes to agree on one leader of shard %d: %s",
+				timeout, shardID, c.shardView(shardID))
+			return 0
+		case <-ticker.C:
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Multi-Node Leader Election
 // ---------------------------------------------------------------------------
@@ -292,29 +339,12 @@ func TestMultiNode_LeaderElection_AllNodesKnowLeader(t *testing.T) {
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	// The leader node should know its own ID.
-	leaderHost := cluster.hosts[leaderIdx]
-	leaderInfo, err := leaderHost.GetShardInfo(1)
-	if err != nil {
-		t.Fatalf("GetShardInfo on leader failed: %v", err)
-	}
-	expectedLeaderID := leaderInfo.ReplicaID
-
-	// Wait for all followers to learn the leader.
-	for i, h := range cluster.hosts {
-		if i == leaderIdx {
-			continue
-		}
-		waitForCondition(t, leaderElectionTimeout,
-			fmt.Sprintf("node %d learns leader", i),
-			func() bool {
-				lid, known, getErr := h.GetLeaderID(1)
-				return getErr == nil && known && lid == expectedLeaderID
-			},
-		)
-	}
+	// Every node, the leader included, must converge on one leader that
+	// names itself leader. Leadership may move after the first leader is
+	// seen; that is allowed, a split or unknown view is not.
+	cluster.waitForAgreedLeader(1, leaderElectionTimeout)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,29 +951,12 @@ func TestFiveNode_LeaderElection_AllNodesKnowLeader(t *testing.T) {
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	// The leader node should know its own ID.
-	leaderHost := cluster.hosts[leaderIdx]
-	leaderInfo, err := leaderHost.GetShardInfo(1)
-	if err != nil {
-		t.Fatalf("GetShardInfo on leader failed: %v", err)
-	}
-	expectedLeaderID := leaderInfo.ReplicaID
-
-	// Wait for all 4 followers to learn the leader.
-	for i, h := range cluster.hosts {
-		if i == leaderIdx {
-			continue
-		}
-		waitForCondition(t, leaderElectionTimeout,
-			fmt.Sprintf("node %d learns leader", i),
-			func() bool {
-				lid, known, getErr := h.GetLeaderID(1)
-				return getErr == nil && known && lid == expectedLeaderID
-			},
-		)
-	}
+	// Every node, the leader included, must converge on one leader that
+	// names itself leader. Leadership may move after the first leader is
+	// seen; that is allowed, a split or unknown view is not.
+	cluster.waitForAgreedLeader(1, leaderElectionTimeout)
 }
 
 // ---------------------------------------------------------------------------
