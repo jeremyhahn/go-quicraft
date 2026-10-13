@@ -28,7 +28,7 @@ import (
 // all of which are unreachable in these tests. A multi-voter membership is
 // what makes CheckQuorum observable: a single-node shard is always its own
 // quorum and can never step down.
-func newTestVoterPeer(t *testing.T, shardID, replicaID uint64, voters int) (*raft.Peer, *logdb.LogReader) {
+func newTestVoterPeer(t testing.TB, shardID, replicaID uint64, voters int) (*raft.Peer, *logdb.LogReader) {
 	t.Helper()
 	ldb := newTestLogDB()
 	lr := logdb.NewLogReader(shardID, replicaID, ldb)

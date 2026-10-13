@@ -304,6 +304,7 @@ func (w *stepWorker) tick() {
 		if node.IsFailed() || node.sealHeld.Load() || node.peer == nil {
 			continue
 		}
+		w.stepInboxBeforeTick(shardID, node)
 		campaignTerm, campaignLaunched := w.tickNodeLocked(node)
 		// A CheckQuorum step-down happens entirely inside Tick(): tickLeader
 		// calls becomeFollower(r.term, noLeader), which changes neither term,
@@ -338,6 +339,45 @@ func (w *stepWorker) tick() {
 // caller, OUTSIDE this method: both run arbitrary user listener code, and the
 // commit worker's Lock() for every shard this worker owns would queue behind
 // it for however long that code takes.
+// stepInboxBeforeTick steps the messages already in node's inbox before the
+// tick runs, so no tick-driven timeout — CheckQuorum above all — is evaluated
+// while a reply that has already arrived sits unprocessed. Ticking first made
+// a starved leader count a peer as inactive although its HeartbeatResp or
+// ReplicateResp was in the inbox, and step down with every replica up.
+// Handling ticks and messages in arrival order is what dragonboat does.
+//
+// This is spec-correct and never extends the read lease. A reply stepped here
+// was received before the tick, so counting it as activity in the window the
+// tick closes is exactly the Raft thesis §6.2 check (etcd's RecentActive): the
+// peer did answer within the window. An ack backs the lease from the time its
+// probe was SENT (remoteLastAck, aged by elapsed time in hasValidLease), not
+// from the time the reply is stepped, so the order of stepping cannot
+// lengthen it; stepping the ack before resetLeaseAcks can only
+// discard its credit earlier.
+//
+// The rest of the cycle is unchanged: processReady still runs after the tick,
+// finds the inbox (mostly) empty, and extracts the update. The paths are the
+// ones processReady takes, so commitPending, recovery and ordered-message
+// handling behave as they do there: a commitPending shard goes through
+// processCommitPendingInbox under raftMu, any other through
+// drainAndHandleInbox. The caller has already skipped failed, sealHeld and
+// peerless shards, so a sealHeld shard stays frozen.
+func (w *stepWorker) stepInboxBeforeTick(shardID uint64, node *Node) {
+	// An idle shard's inbox is empty on nearly every tick; one emptiness check
+	// keeps the tick cycle from paying for a drain that finds nothing. A
+	// message delivered after this read arrived after the tick decision and
+	// is stepped by processReady, as it always was. Empty is one atomic
+	// load, not the queue lock transport producers contend on.
+	if node.inboxQ.Empty() {
+		return
+	}
+	if node.commitPending.Load() {
+		w.processCommitPendingInbox(shardID, node)
+		return
+	}
+	w.drainAndHandleInbox(shardID, node, node.IsRecovering())
+}
+
 func (w *stepWorker) tickNodeLocked(node *Node) (campaignTerm uint64, campaignLaunched bool) {
 	node.raftMu.Lock()
 	defer node.raftMu.Unlock()

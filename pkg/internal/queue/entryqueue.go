@@ -14,7 +14,10 @@
 
 package queue
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // EntryQueue is a multi-producer single-consumer double-buffered queue.
 // Multiple producers call Add to append items to the active write buffer
@@ -45,6 +48,12 @@ type EntryQueue[T any] struct {
 	// closed is set once by Close; from then on nothing is added or taken,
 	// and nothing more is handed off.
 	closed bool
+	// nonEmpty mirrors "a Swap now would take something": len(writeBuf) > 0
+	// and not closed. It is written only under mu, and only on the
+	// transitions (an add into an empty buffer, a Swap that takes the
+	// buffer, Close), so a steady stream of adds pays a branch, not an
+	// atomic store. Empty reads it without mu.
+	nonEmpty atomic.Bool
 }
 
 // NewEntryQueue creates an EntryQueue with the given initial capacity
@@ -76,6 +85,9 @@ func (q *EntryQueue[T]) AddTracked(items []T, at *uint64) bool {
 	if q.closed || len(q.writeBuf)+len(items) > q.maxLen {
 		q.mu.Unlock()
 		return false
+	}
+	if len(q.writeBuf) == 0 && len(items) > 0 {
+		q.nonEmpty.Store(true)
 	}
 	q.writeBuf = append(q.writeBuf, items...)
 	if at != nil {
@@ -118,6 +130,7 @@ func (q *EntryQueue[T]) HandOff(id uint64) bool {
 func (q *EntryQueue[T]) Close() {
 	q.mu.Lock()
 	q.closed = true
+	q.nonEmpty.Store(false)
 	q.mu.Unlock()
 }
 
@@ -132,6 +145,9 @@ func (q *EntryQueue[T]) AddOne(item T) bool {
 	if q.closed || len(q.writeBuf) >= q.maxLen {
 		q.mu.Unlock()
 		return false
+	}
+	if len(q.writeBuf) == 0 {
+		q.nonEmpty.Store(true)
 	}
 	q.writeBuf = append(q.writeBuf, item)
 	q.mu.Unlock()
@@ -161,6 +177,7 @@ func (q *EntryQueue[T]) SwapBatch(buf []T) ([]T, uint64) {
 	id := q.batch
 	q.batch++
 	result := q.writeBuf
+	q.nonEmpty.Store(false)
 	// Reuse the caller's buffer as the new write buffer. Reset length
 	// to 0 but keep the backing array to avoid allocation. Zero the
 	// recycled backing array first: producers only overwrite the slots
@@ -187,4 +204,13 @@ func (q *EntryQueue[T]) Len() int {
 	n := len(q.writeBuf)
 	q.mu.Unlock()
 	return n
+}
+
+// Empty reports, without taking the lock, whether a Swap now would take
+// nothing: the buffer is empty or the queue is closed. It is exact at the
+// moment of the read; an item added after it is taken by the next Swap, so a
+// caller that skips work on Empty must already have a later Swap that picks
+// it up. It is the hot-path form of Len() == 0.
+func (q *EntryQueue[T]) Empty() bool {
+	return !q.nonEmpty.Load()
 }

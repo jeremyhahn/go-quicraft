@@ -146,6 +146,96 @@ func TestEntryQueue_Len(t *testing.T) {
 	}
 }
 
+func TestEntryQueue_EmptyTracksEveryTransition(t *testing.T) {
+	q := NewEntryQueue[int](4, 3)
+	check := func(step string, want bool) {
+		t.Helper()
+		if got := q.Empty(); got != want {
+			t.Fatalf("%s: Empty() = %v, want %v (Len %d)", step, got, want, q.Len())
+		}
+	}
+	check("new", true)
+	q.Add(nil)
+	check("add nil", true)
+	q.Add([]int{})
+	check("add empty slice", true)
+	q.Add([]int{1, 2})
+	check("add", false)
+	if q.Add([]int{3, 4}) {
+		t.Fatal("overflowing Add accepted")
+	}
+	check("rejected add", false)
+	q.Swap(nil)
+	check("swap", true)
+	q.Swap(nil)
+	check("swap of empty", true)
+	q.AddOne(5)
+	check("add one", false)
+	buf, id := q.SwapBatch(make([]int, 0, 4))
+	if len(buf) != 1 || id == 0 {
+		t.Fatalf("SwapBatch = %v, %d", buf, id)
+	}
+	check("swap batch", true)
+	q.AddOne(6)
+	check("add one again", false)
+	q.Close()
+	check("close", true)
+	if q.Add([]int{7}) || q.AddOne(8) {
+		t.Fatal("add after close accepted")
+	}
+	check("add after close", true)
+}
+
+func TestEntryQueue_EmptyAgreesWithSoleConsumer(t *testing.T) {
+	const producers, perProducer = 3, 2000
+	q := NewEntryQueue[int](8, producers*perProducer)
+	var wg sync.WaitGroup
+	for p := range producers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perProducer {
+				if i%2 == 0 {
+					q.AddOne(p)
+				} else {
+					q.Add([]int{p})
+				}
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	// Only this goroutine takes, so a queue that reported non-empty cannot
+	// be emptied before the Swap that follows.
+	taken := 0
+	var buf []int
+	for finished := false; !finished; {
+		select {
+		case <-done:
+			finished = true
+		default:
+		}
+		if q.Empty() {
+			continue
+		}
+		buf = q.Swap(buf[:0])
+		if len(buf) == 0 {
+			t.Fatal("Empty() reported false but Swap took nothing")
+		}
+		taken += len(buf)
+	}
+	taken += len(q.Swap(buf[:0]))
+	if !q.Empty() || q.Len() != 0 {
+		t.Fatalf("drained queue: Empty() = %v, Len() = %d", q.Empty(), q.Len())
+	}
+	if taken != producers*perProducer {
+		t.Fatalf("took %d items, want %d", taken, producers*perProducer)
+	}
+}
+
 func TestEntryQueue_GrowsBeyondInitialCapacity(t *testing.T) {
 	q := NewEntryQueue[int](2, 1000)
 	batch := make([]int, 100)
@@ -677,6 +767,31 @@ func BenchmarkEntryQueue_Contended(b *testing.B) {
 			q.Add(item)
 		}
 	})
+}
+
+// BenchmarkEntryQueue_LenZero and BenchmarkEntryQueue_Empty compare the two
+// ways to ask whether an idle queue holds anything; the step worker asks once
+// per shard per tick.
+func BenchmarkEntryQueue_LenZero(b *testing.B) {
+	q := NewEntryQueue[int](64, 1024)
+	empty := false
+	for b.Loop() {
+		empty = q.Len() == 0
+	}
+	if !empty {
+		b.Fatal("idle queue reported non-empty")
+	}
+}
+
+func BenchmarkEntryQueue_Empty(b *testing.B) {
+	q := NewEntryQueue[int](64, 1024)
+	empty := false
+	for b.Loop() {
+		empty = q.Empty()
+	}
+	if !empty {
+		b.Fatal("idle queue reported non-empty")
+	}
 }
 
 func BenchmarkChannel_Contended(b *testing.B) {
