@@ -67,6 +67,18 @@ const (
 	// evictionWindow is the period over which evictionBudget applies.
 	evictionWindow = 30 * time.Second
 
+	// staleOutboundDrainGrace is how long an outbound evicted by
+	// evictStaleOutboundOnRecv stays open, out of the pool, before it is
+	// closed. The eviction is decided on attribution, not liveness: an
+	// outbound dialed before the peer's epoch was known is evicted even when
+	// it reached the live incarnation, and closing it on the spot discards
+	// every frame already written to it but not yet read on the far side. A
+	// candidate does not resend a vote request within a term, so each such
+	// loss cost a whole election term (#309). One second is far above a
+	// loopback or LAN delivery and far below MaxIdleTimeout, the bound the
+	// eviction exists to beat for an outbound to a dead incarnation.
+	staleOutboundDrainGrace = time.Second
+
 	// peerIncarnationRetention is how long a peer's incarnation record
 	// survives with neither a cached outbound nor an exchanged batch. It is
 	// an order of magnitude above the QUIC MaxIdleTimeout, so an ordinary
@@ -405,8 +417,12 @@ func (t *QUICTransport) dialAndPool(target, want string) (*quic.Conn, func(), er
 	// dial, so the stamp recorded below can never be newer than the
 	// connection it describes. Stamping a NEWER epoch than the one the
 	// connection actually reached would mark a stale outbound as current and
-	// re-open the black hole; stamping an older one only costs one extra
-	// eviction and re-dial, which is self-correcting.
+	// re-open the black hole. Stamping an older one (or 0, for a peer never
+	// heard from) gets a connection that reached the live incarnation
+	// evicted by its first batch. That is NOT free for Raft: closing it
+	// would discard frames already written to it, and a candidate does not
+	// resend a vote request within its term, so evictStaleOutboundOnRecv
+	// drains the outbound (staleOutboundDrainGrace) rather than closing it.
 	dialEpoch := t.knownPeerEpoch(target)
 
 	ctx, cancel := context.WithTimeout(t.shutdownCtx, t.cfg.DialTimeout)
@@ -924,9 +940,13 @@ func (t *QUICTransport) removeAndCloseConnection(target string, reason string) b
 // CloseTarget tears down BOTH directions of this node's connectivity to
 // address: every inbound connection whose certificate authorizes that address
 // (see closeInboundFromPeer), the outbound connection and its epoch stamp
-// (conns/connEpoch), every pooled stream opened on it, the per-target send
+// (conns/connEpoch), every outbound to address still inside its stale-eviction
+// drain grace (draining; see drainOutbound), every pooled stream opened on it, the per-target send
 // queue, and the peer's incarnation record. It reports whether anything was
-// actually reclaimed.
+// actually reclaimed; a draining outbound it closes counts, since it is a
+// connection held to the removed peer, but on its own it does not trigger the
+// stream, send-queue and incarnation teardown, which stays keyed on a cached
+// outbound exactly as before.
 //
 // It exists because nothing else ever closes a connection to a peer that is
 // simply GONE. KeepAlivePeriod is below MaxIdleTimeout, so quic-go PINGs the
@@ -998,11 +1018,17 @@ func (t *QUICTransport) CloseTarget(address string) bool {
 	// the result.
 	t.forgetDialRefusals(address)
 
+	// An outbound evictStaleOutboundOnRecv took out of conns is still open
+	// until its drain grace expires. It is a connection held to the removed
+	// peer like any other, so it is closed now and counts towards the result;
+	// it is out of conns already, so it too precedes the early return below.
+	drained := t.closeDrainingTo(address, "peer removed from membership")
+
 	// Nothing cached: leave every other structure untouched so a call for an
 	// address this transport never dialed cannot disturb state that a live
 	// shard may still be using.
 	if !t.removeAndCloseConnection(address, "peer removed from membership") {
-		return inbound > 0
+		return inbound > 0 || drained > 0
 	}
 
 	// Locks are taken in the established order and never nested: connMu is
@@ -1695,8 +1721,11 @@ func (t *QUICTransport) evictStreamsForTarget(target string) {
 //     previously-dialed outbound connection — that outbound is black-holed
 //     and would otherwise linger until MaxIdleTimeout (~30s), stalling
 //     HeartbeatResp/ReplicateResp and triggering avoidable elections. On an
-//     epoch change we evict the cached outbound immediately so the next send
-//     redials a fresh connection.
+//     epoch change we take the cached outbound out of the pool immediately so
+//     the next send redials a fresh connection, and close it after
+//     staleOutboundDrainGrace (see drainOutbound): attribution cannot tell a
+//     black-holed outbound from one that reached the live incarnation, and
+//     the latter may still carry undelivered frames.
 //
 //  2. A dead outbound (context cancelled), as before.
 //
@@ -1785,21 +1814,109 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 			return
 		}
 		// The eviction comes first and its diagnostics after, contained: a
-		// log handler that panicked or called runtime.Goexit before the close
-		// left the black-holed outbound pooled, which is the stall this
-		// eviction exists to end.
-		closeErr := outbound.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation")
-		t.removeConnection(target)
+		// log handler that panicked or called runtime.Goexit before the
+		// eviction left the black-holed outbound pooled, which is the stall
+		// this eviction exists to end.
+		//
+		// The outbound leaves the pool now, so no new frame is written to it,
+		// but is closed only after staleOutboundDrainGrace: an unattributable
+		// outbound is not a dead one, and when it reached the live
+		// incarnation the frames already written to it (typically the vote
+		// request whose reply triggered this eviction) are still delivered.
+		t.drainOutbound(target, outbound)
 		t.evictStreamsForTarget(target)
 		supervise.LogContained(func() {
 			slog.Info("evicting outbound not attributable to the sending peer incarnation",
-				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp)
-			if closeErr != nil {
-				slog.Debug("transport: connection close failed during stale eviction",
-					"target", target, "error", closeErr)
-			}
+				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp,
+				"drain_grace", staleOutboundDrainGrace)
 		})
 	}
+}
+
+// drainOutbound takes conn out of the pool for target at once and closes it
+// after staleOutboundDrainGrace. The pool entry is removed only while it is
+// still conn, so a fresh outbound pooled in the meantime is left alone.
+//
+// The close is bounded on every path: the drain goroutine is joined by
+// t.wg, and an outbound still draining when the transport stops is closed by
+// stop together with the pooled ones. A transport already stopping closes it
+// here and now.
+func (t *QUICTransport) drainOutbound(target string, conn *quic.Conn) {
+	t.connMu.Lock()
+	if t.conns[target] == conn {
+		delete(t.connPeer, conn)
+		delete(t.conns, target)
+		delete(t.connEpoch, target)
+	}
+	if t.stopped.Load() {
+		t.connMu.Unlock()
+		t.closeDrained(target, conn)
+		return
+	}
+	// Registered and counted under connMu with stopped false, so stop's own
+	// connMu section (after it sets stopped) sees the entry, and the Add
+	// happens before its wg.Wait.
+	t.draining[conn] = target
+	t.wg.Add(1)
+	t.connMu.Unlock()
+	go t.closeAfterDrain(target, conn)
+}
+
+// closeAfterDrain closes a draining outbound once its grace expires, unless
+// the connection died first or the transport is stopping, in which case stop
+// owns the close (it must precede quicTr.Close to reach the peer).
+func (t *QUICTransport) closeAfterDrain(target string, conn *quic.Conn) {
+	defer t.wg.Done()
+	timer := time.NewTimer(staleOutboundDrainGrace)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-conn.Context().Done():
+	case <-t.stopC:
+		return
+	}
+	t.connMu.Lock()
+	_, owned := t.draining[conn]
+	delete(t.draining, conn)
+	t.connMu.Unlock()
+	if owned {
+		t.closeDrained(target, conn)
+	}
+}
+
+// closeDrained closes an outbound evicted by evictStaleOutboundOnRecv.
+func (t *QUICTransport) closeDrained(target string, conn *quic.Conn) {
+	if err := conn.CloseWithError(QUICErrShutdown, "outbound predates peer incarnation"); err != nil {
+		supervise.LogContained(func() {
+			slog.Debug("transport: connection close failed during stale eviction",
+				"target", target, "error", err)
+		})
+	}
+}
+
+// closeDrainingTo closes every draining outbound dialed to target and reports
+// how many it closed. Each entry is deleted under connMu before its close, so
+// the closeAfterDrain goroutine that owned it finds it gone and does not close
+// it again; the closes themselves run after connMu is released.
+func (t *QUICTransport) closeDrainingTo(target string, reason string) int {
+	var drained []*quic.Conn
+	t.connMu.Lock()
+	for conn, to := range t.draining {
+		if to == target {
+			drained = append(drained, conn)
+			delete(t.draining, conn)
+		}
+	}
+	t.connMu.Unlock()
+	for _, conn := range drained {
+		if err := conn.CloseWithError(0, reason); err != nil {
+			supervise.LogContained(func() {
+				slog.Debug("transport: draining connection close failed during CloseTarget",
+					"target", target, "error", err)
+			})
+		}
+	}
+	return len(drained)
 }
 
 // inboundAuthorizedFor reports whether the peer that authenticated on conn is

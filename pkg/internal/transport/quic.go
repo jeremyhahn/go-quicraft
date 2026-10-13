@@ -195,6 +195,15 @@ type QUICTransport struct {
 	// under decides the question without needing to remember history.
 	connEpoch map[string]uint64
 
+	// draining holds the outbounds evictStaleOutboundOnRecv has taken out of
+	// conns but not yet closed: each is closed when its
+	// staleOutboundDrainGrace expires, or by stop if that comes first. The
+	// entry is the close obligation; whoever deletes it closes the
+	// connection. The value is the target the outbound was dialed to, so
+	// CloseTarget can close a removed peer's draining outbounds at once
+	// rather than leave them to the grace timer. Guarded by connMu.
+	draining map[*quic.Conn]string
+
 	dialGroup singleflight.Group
 
 	// dialReports orders the connection events of consecutive dials to one
@@ -599,6 +608,7 @@ func NewQUICTransport(
 		conns:           make(map[string]*quic.Conn),
 		connPeer:        make(map[*quic.Conn]string),
 		connEpoch:       make(map[string]uint64),
+		draining:        make(map[*quic.Conn]string),
 		bootEpoch:       newBootEpoch(),
 		peerEpoch:       make(map[string]*peerIncarnation),
 		sendQueues:      make(map[string]*sendQueue),
@@ -843,6 +853,16 @@ func (t *QUICTransport) stop() {
 		delete(t.connPeer, conn)
 		delete(t.conns, addr)
 		delete(t.connEpoch, addr)
+	}
+	// Outbounds evicted by evictStaleOutboundOnRecv and still inside their
+	// drain grace are out of t.conns but not yet closed. Their drain
+	// goroutines return on stopC without closing, so the close is here, on
+	// the same side of quicTr.Close as the pooled ones.
+	for conn := range t.draining {
+		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
+			supervise.LogContained(func() { slog.Debug("QUIC draining connection close failed", "error", err) })
+		}
+		delete(t.draining, conn)
 	}
 	t.connMu.Unlock()
 
