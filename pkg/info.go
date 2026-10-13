@@ -122,7 +122,10 @@ type ShardInfo struct {
 	// LeaderID is the current leader's replicaID. 0 if no leader is known.
 	LeaderID uint64 `json:"leader_id"`
 
-	// Term is the current Raft term.
+	// Term is the term of the last leadership change this replica
+	// published, not its current Raft term. It does not advance while no
+	// leader is known, so during split-vote churn it stands still while the
+	// replica's real term climbs.
 	Term uint64 `json:"term"`
 
 	// IsLeader is true if this replica is the current leader.

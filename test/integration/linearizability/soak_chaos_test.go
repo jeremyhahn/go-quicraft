@@ -569,11 +569,28 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	// Close the CURRENT leader. The index found before warmup goes stale if
 	// leadership moved during the steady-state phase (a loaded host can miss
 	// heartbeats), and closing a follower instead measures nothing (#309).
+	//
+	// Poll for it rather than looking once: the same loaded host can be
+	// mid-election at this instant (a CheckQuorum stepdown, then a split vote
+	// or two). That is a timing bound, not a fault, and the test needs a
+	// leader to close, not one at an exact instant. The wait ends before the
+	// close, so the outage measured below is unchanged.
+	leaderWaitStart := time.Now()
+	leaderDeadline := leaderWaitStart.Add(failoverTimeout)
 	leaderIdx = cluster.findLeader(shardID)
+	waitedForLeader := leaderIdx < 0
+	for leaderIdx < 0 && time.Now().Before(leaderDeadline) {
+		time.Sleep(10 * time.Millisecond)
+		leaderIdx = cluster.findLeader(shardID)
+	}
 	if leaderIdx < 0 {
 		close(done)
 		wg.Wait()
-		t.Fatal("no leader at the end of the steady-state phase")
+		t.Fatalf("no leader within %v of the end of the steady-state phase", failoverTimeout)
+	}
+	if waitedForLeader {
+		t.Logf("waited %v for a leader at the end of the steady-state phase",
+			time.Since(leaderWaitStart))
 	}
 
 	// Close the leader and measure how long writes are unavailable.

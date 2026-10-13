@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-11
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-13
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 ## Mission
@@ -9,35 +9,42 @@ Multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`
 
 ## Current milestone
 
-- [`Release candidate`](../../milestone/11) — target: release candidate; projected date: not yet set. Candidate cut: **v0.21.0-rc.1** (2026-10-11), the first `-rc.N` tag.
+- [`Release candidate`](../../milestone/11) — target: release candidate; projected date: not yet set. Candidates cut: **v0.21.0-rc.1** (2026-10-11), the first `-rc.N` tag, and **v0.21.0-rc.2** (2026-10-12), the current one.
 - No other open milestone.
 
 v0.21.0-rc.1 contents, all done:
 
-- [#257](../../issues/257) — `Host.ExecuteOnLeader`: leader-executed requests with no log entry — `docs/multi-group-host/` — done
-- [#259](../../issues/259) — `ShardInfo.Replicas` reports observers and witnesses with a `Role` (breaking) — `docs/multi-group-host/` — done
-- [#250](../../issues/250) — docs conformance: roadmap line, banner stamp, `.serena/project.yml` tracked — done
-- [#251](../../issues/251) — `make lint` runs actionlint; trivy targets fail when trivy is missing — done
-- [#252](../../issues/252) — Go 1.27.2 and `golang.org/x/net` v0.60.0 security bumps — done
+- [#257](../../issues/257) — `Host.ExecuteOnLeader`: leader-executed requests with no log entry — `docs/multi-group-host/` — done (#261)
+- [#259](../../issues/259) — `ShardInfo.Replicas` reports observers and witnesses with a `Role` (breaking) — `docs/multi-group-host/` — done (#260)
+- [#250](../../issues/250) — docs conformance: roadmap line, banner stamp, `.serena/project.yml` tracked — done (#256)
+- [#251](../../issues/251) — `make lint` runs actionlint; trivy targets fail when trivy is missing — done (#254)
+- [#252](../../issues/252) — Go 1.27.2 and `golang.org/x/net` v0.60.0 security bumps — done (#253)
 - [#262](../../issues/262) — `make release-candidate VERSION=vX.Y.Z-rc.N` — done
+
+v0.21.0-rc.2 contents, all done:
+
+- [#280](../../issues/280) — an on-disk state machine whose `Open` is behind its local snapshot recovers instead of hitting `ErrApplyGap` — `docs/state-machines/` — done (#295)
+- [#279](../../issues/279) — `DiskInfo.Shards` is filled in — `docs/observability/` — done (#295)
+- [#275](../../issues/275) — `test/proposer` re-resolving reads retry a new leader's `ErrReadIndexNotReady` — `docs/testing/` — done (#295)
+- [#277](../../issues/277) — code comments and a log sink agree with the code; Host runtime logging on the Host logger — `docs/observability/` — done (#295, #301)
+- [#284](../../issues/284) — a failed `Unseal`'s backoff persists through `StatePersister` across restarts — `docs/seal-barrier/` — done (#297)
+- [#268](../../issues/268) — log-storage, write-batching and observability docs re-verified — `docs/log-storage/`, `docs/write-batching/`, `docs/observability/` — done (#271)
+- [#274](../../issues/274) — the rc.1 documentation programme re-verified on Opus 5.5 — every `docs/<feature>/` — done (#287)
+- [#282](../../issues/282) — ROADMAP.md lists every milestone and names the folder behind each item — `ROADMAP.md`, no feature folder — done (#287)
+- [#269](../../issues/269) — the v0.21.0-rc.1 release-candidate checklist — `docs/release/` — closed (#270)
+
+Closed with the question kept in the issue, awaiting an owner ruling (no code change):
+
+- [#272](../../issues/272) — an awaited `Submit` racing `Close` reports an indeterminate outcome — `docs/write-batching/`
+- [#278](../../issues/278) — exported errors no `Host` method returns, and `OnCampaignSkipped`: removed or wired up — `docs/multi-group-host/`
+- [#281](../../issues/281) — the quorum-loss runbook works on the exporting survivor and is tested end to end — `docs/multi-group-host/`
 
 ## Now
 
 The candidate's exit: deploy to staging, then consider production. Each line: issue, outcome, the `docs/<feature>/` folder that specifies it, status.
 
-- [#269](../../issues/269) — exit: v0.21.0-rc.1 deployed to staging with the joint P1 run, every consumer building against it and filtering voters on `Role` (#259) — `docs/release/` — open
-- [#280](../../issues/280) — an on-disk state machine whose `Open` is behind its local snapshot recovers instead of hitting `ErrApplyGap` — `docs/state-machines/` — in review
-- [#279](../../issues/279) — `DiskInfo.Shards` is filled in — `docs/observability/` — open
-- [#275](../../issues/275) — `test/proposer` re-resolving reads retry a new leader's `ErrReadIndexNotReady` — `docs/testing/` — in review
-- [#277](../../issues/277) — code comments and a log sink agree with the code — `docs/observability/` — open
-- [#272](../../issues/272) — an awaited `Submit` racing `Close` reports an indeterminate outcome — `docs/write-batching/` — blocked: owner ruling
-- [#284](../../issues/284) — a failed `Unseal`'s backoff persists through `StatePersister` across restarts — `docs/seal-barrier/` — blocked: owner decision
-- [#278](../../issues/278) — exported errors no `Host` method returns, and `OnCampaignSkipped`: removed or wired up — `docs/multi-group-host/` — blocked: owner decision
-- [#281](../../issues/281) — the quorum-loss runbook works on the exporting survivor and is tested end to end — `docs/multi-group-host/` — blocked: owner decision
-- [#268](../../issues/268) — log-storage, write-batching and observability docs re-verified — `docs/log-storage/`, `docs/write-batching/`, `docs/observability/` — in review
-- [#274](../../issues/274) — the rc.1 documentation programme re-verified on Opus 5.5 — every `docs/<feature>/` — open
-- [#283](../../issues/283) — spec-review scrub of `docs/` for the release candidate — every `docs/<feature>/` — blocked: department audit slot
-- [#282](../../issues/282) — ROADMAP.md lists every milestone and names the folder behind each item — `ROADMAP.md`, no feature folder — open
+- [#309](../../issues/309) — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably: the soak failure is diagnosed and the harness races it exposed are fixed — `docs/testing/` — in progress: #310, #311, #312, #314, #316, #317, #318, #319 and #321 merged after rc.2, #320, #322 and #323 open
+- [#283](../../issues/283) — spec-review scrub of `docs/` for the release candidate — every `docs/<feature>/` — in progress: department audit, slice 2 running
 
 ## Next (v1.0.0 checklist)
 
