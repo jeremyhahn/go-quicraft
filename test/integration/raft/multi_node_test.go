@@ -19,11 +19,13 @@ package raft_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
+	"github.com/jeremyhahn/go-quicraft/test/proposer"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
@@ -157,6 +159,73 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 		}
 	}
 	return nil
+}
+
+// shardView renders every host's view of shardID — replica, term, the leader
+// it believes in and whether it believes it leads — for failure messages. A
+// leader-only call that fails with "leader unknown" is only diagnosable with
+// this: a term that advanced means leadership legitimately moved, while the
+// same term with no leader anywhere means a node gave up leadership without
+// an election.
+func (c *testCluster) shardView(shardID uint64) string {
+	var b strings.Builder
+	for i, h := range c.hosts {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		if h == nil {
+			fmt.Fprintf(&b, "host[%d]=stopped", i)
+			continue
+		}
+		info, err := h.GetShardInfo(shardID)
+		if err != nil {
+			fmt.Fprintf(&b, "host[%d]=%v", i, err)
+			continue
+		}
+		fmt.Fprintf(&b, "host[%d] replica=%d term=%d leader=%d isLeader=%t",
+			i, info.ReplicaID, info.Term, info.LeaderID, info.IsLeader)
+	}
+	return b.String()
+}
+
+// onLeader runs fn against whichever host leads shardID AT THE MOMENT OF EACH
+// ATTEMPT, re-finding the leader and retrying while fn is refused as
+// not-leader, for at most budget. Any other error is returned on its first
+// occurrence, and so is success: the operation still has to succeed on a
+// leader, it just need not be the leader observed before the call.
+//
+// It exists because observing a leader does not pin it. Between
+// waitForClusterLeader and a leader-only call a loaded host can miss a
+// heartbeat, so a pre-vote or CheckQuorum moves leadership and the call is
+// refused with "leader unknown" (#309). That is Raft working, not the
+// operation failing.
+//
+// Only use it for operations whose not-leader refusal is safe to repeat:
+// a refusal wrapped in MaybeApplied means the first attempt may still take
+// effect, which for a session register leaves at most an unused session.
+func (c *testCluster) onLeader(shardID uint64, budget time.Duration, fn func(h *quicraft.Host) error) error {
+	retry := time.NewTicker(pollInterval)
+	defer retry.Stop()
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+
+	// Reported if the budget runs out without a leader ever being found,
+	// which is itself a not-leader condition.
+	var lastErr error = quicraft.ErrNotLeader
+	for {
+		if h := c.leaderHost(shardID); h != nil {
+			err := fn(h)
+			if err == nil || !proposer.IsNotLeaderRejection(err) {
+				return err
+			}
+			lastErr = err
+		}
+		select {
+		case <-deadline.C:
+			return lastErr
+		case <-retry.C:
+		}
+	}
 }
 
 // waitForClusterLeader waits until one of the nodes in the cluster
@@ -625,15 +694,20 @@ func TestMultiNode_Session_OnLeader(t *testing.T) {
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	session, err := leaderHost.GetNewSession(ctx, 1)
+	// Both calls go to whoever leads at the moment of the call: leadership
+	// can legitimately move after waitForClusterLeader returns (#309).
+	var session *quicraft.Session
+	err := cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+		var err error
+		session, err = h.GetNewSession(ctx, 1)
+		return err
+	})
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("GetNewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
 	if session == nil {
 		t.Fatal("session is nil")
@@ -645,11 +719,19 @@ func TestMultiNode_Session_OnLeader(t *testing.T) {
 		t.Error("ClientID should not be 0")
 	}
 
-	rs, err := leaderHost.CloseSession(ctx, 1, session)
+	err = cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+		rs, err := h.CloseSession(ctx, 1, session)
+		if err != nil {
+			return err
+		}
+		rs.Release()
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("CloseSession failed: %v", err)
+		t.Fatalf("CloseSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,15 +1342,20 @@ func TestFiveNode_Session_OnLeader(t *testing.T) {
 	defer cluster.close()
 
 	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	session, err := leaderHost.GetNewSession(ctx, 1)
+	// Both calls go to whoever leads at the moment of the call: leadership
+	// can legitimately move after waitForClusterLeader returns (#309).
+	var session *quicraft.Session
+	err := cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+		var err error
+		session, err = h.GetNewSession(ctx, 1)
+		return err
+	})
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("GetNewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
 	if session == nil {
 		t.Fatal("session is nil")
@@ -1280,11 +1367,19 @@ func TestFiveNode_Session_OnLeader(t *testing.T) {
 		t.Error("ClientID should not be 0")
 	}
 
-	rs, err := leaderHost.CloseSession(ctx, 1, session)
+	err = cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+		rs, err := h.CloseSession(ctx, 1, session)
+		if err != nil {
+			return err
+		}
+		rs.Release()
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("CloseSession failed: %v", err)
+		t.Fatalf("CloseSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
