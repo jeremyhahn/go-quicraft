@@ -1,6 +1,6 @@
 # Wire Protocol — CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 There is no CLI: go-quicraft is a library and ships no binaries, and a wire

@@ -85,7 +85,7 @@ privileges the defect grants:
 read the linked material before reporting:
 
 - **A host declared `WithoutEncryption()`, or one whose barrier is plaintext
-  (`seal.None`), provides no at-rest confidentiality or integrity.** Snapshot
+  (`seal.NoneStrategy`), provides no at-rest confidentiality or integrity.** Snapshot
   artifacts in particular have no integrity check under it. Plaintext is never
   reached by omission: `NewHost` refuses a host that neither configures a
   barrier nor makes that declaration. See [docs/seal-barrier/architecture.md](docs/seal-barrier/architecture.md).

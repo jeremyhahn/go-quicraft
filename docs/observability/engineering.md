@@ -1,7 +1,7 @@
 # Observability: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-11
+> notifications · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale and the scope fence are in [`architecture.md`](architecture.md).
@@ -137,7 +137,8 @@ proposal.
 - A collector panic is recovered by the safe forwarder and counted; the engine
   keeps running.
 - A dispatched notification refused by a full listener queue is dropped and
-  logged at ERROR, except a leader change, which is retried on the next tick.
+  logged at ERROR, except a leader change or a leader-ready notification,
+  which is logged at WARN as deferred and retried on the next tick.
 - A log record that finds the contained-diagnostics queue full is dropped and
   counted in `HealthStatus.DiagnosticsDropped`; the producing goroutine is
   never delayed (§9).

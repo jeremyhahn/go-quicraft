@@ -1,7 +1,7 @@
 # Compatibility and upgrades: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 What this library promises across versions, what it does not, and why. The
@@ -27,7 +27,7 @@ Sources: `pkg/proto/constants.go`, `pkg/proto/membership.go`,
 `pkg/internal/engine/snapshot_meta.go`, `pkg/snapshot_artifact_trailer.go`,
 `pkg/host.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`, `VERSION`.
 
-The current release is **0.21.0-rc.1**, a release candidate. The first stable
+The current release is **0.21.0-rc.2**, a release candidate. The first stable
 release will be 1.0.0.
 
 ## Stability guarantee

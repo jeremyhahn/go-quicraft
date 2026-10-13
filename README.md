@@ -1,8 +1,8 @@
 <img src="assets/logo.svg" width="600">
 
-[![Go](https://img.shields.io/badge/Go-1.27.1-blue.svg)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.27.2-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.16.0-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.21.0--rc.2-orange.svg)](VERSION)
 
 QuicRaft is a multi-group Raft consensus library for Go. One process hosts
 many independent Raft groups (shards), replicas talk to each other over QUIC
@@ -33,7 +33,7 @@ client sessions for at-most-once proposals.
 
 ## Status
 
-The current version is **0.16.0**, a release candidate. QuicRaft has not had a
+The current version is **0.21.0-rc.2**, a release candidate. QuicRaft has not had a
 1.0 release, so:
 
 - The public API may still change between minor versions.
@@ -53,7 +53,7 @@ before upgrading.
 go get github.com/jeremyhahn/go-quicraft
 ```
 
-Requires Go 1.27.1 or later. The public API is under
+Requires Go 1.27.2 or later. The public API is under
 `github.com/jeremyhahn/go-quicraft/pkg` (imported as `quicraft` below).
 
 QuicRaft depends on [go-enclave](https://github.com/jeremyhahn/go-enclave) for
@@ -200,7 +200,10 @@ that embeds it; in this project's own stack that is
 ## Encryption at rest
 
 Pass `quicraft.WithBarrier(barrier)` to `NewHost` and the WAL and snapshots are
-encrypted with AES-256-GCM or ChaCha20-Poly1305. The barrier holds a random
+encrypted with an AEAD: AES-256-GCM by default, or ChaCha20-Poly1305 on a
+CPU without AES-NI. `BarrierConfig.Algorithm` also takes AES-128-GCM,
+AES-192-GCM and XChaCha20-Poly1305; a `-tags fips` build compiles in only the
+AES-GCM family. The barrier holds a random
 root key, derives a data key per epoch, and supports rotation and purging of
 old epochs. The root key is sealed by a `SealingStrategy`. This module ships
 the passphrase strategy (`seal.NewSoftwareStrategy`, Argon2id, or PBKDF2 under
@@ -245,7 +248,7 @@ Xeon Gold 6258R server, measured 2026-10-04 with every engine on one common
 configuration (same timing, keys, warmup, durability and TLS; Dragonboat on its
 Tan LogDB). QuicRaft led Dragonboat in 12 of 18 head-to-head scenarios,
 etcd-io/raft in 10 of 16 and OpenRaft in 10 of 14. Dragonboat was ahead on
-concurrent writes and multi-node linearizable reads, etcd-io/raft on elections
+concurrent writes, multi-node linearizable reads and the single-node election, etcd-io/raft on elections
 (all four within 4%, effectively even) and single-node in-memory writes, and OpenRaft on single-node
 in-memory writes and 5-node sequential proposals.
 Treat these as one machine's numbers, and read the

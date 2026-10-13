@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
 > `pkg/internal/session`, and the session fields of `pkg/proto` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Client sessions give at-most-once proposal delivery by tracking
@@ -55,8 +55,8 @@ behind its back.
 
 `ProposeWithSession(ctx, session, cmd)` checks, in order: a context already
 done (`ErrCanceled`/`ErrTimeout`), closed host, draining, nil session, shard, witness (`ErrInvalidOperation`), disk state
-machine, `ValidForProposal` (`ErrInvalidSession`), disk full, entry size, known
-leader. It then reserves the session's series and proposes
+machine, `ValidForProposal` (`ErrInvalidSession`), disk full, sealed barrier
+(`ErrBarrierSealed`), entry size, known leader. It then reserves the session's series and proposes
 `Entry{Cmd, ClientID, SeriesID, RespondedTo}`.
 
 After a successful result the caller calls `session.ProposalCompleted()`, which
@@ -83,7 +83,9 @@ reservation (the series number, 0 when idle):
   `RequestState.Release`. Releasing a series other than the reserved one is a
   no-op, so a late `Release` cannot clear the next proposal's reservation.
 - Series 0 is the idle value, so `ValidForProposal` refuses a session at series
-  0 (never registered, or registered without `PrepareForPropose`).
+  0 (constructed and never registered). It also refuses the register and
+  unregister sentinels, so a session whose registration did not complete, or
+  that was closed, cannot propose.
 - `Release` pins the `RequestState` before electing the releaser, so the
   binding is not recycled mid-release. Call `Release` exactly once: the object
   is pooled, and a second call is a use-after-free.
@@ -392,7 +394,8 @@ replica, because the snapshot reflects the log.
 ### Replicated policy
 
 A founding replica writes the four values into the shard's initial membership
-(`proto.SessionPolicy` in `proto.Membership`), and every replica applies the
+(the session fields of `proto.Membership`, read as a `proto.SessionPolicy`
+through `Membership.SessionPolicy()`), and every replica applies the
 committed values from then on. That is what makes expiry deterministic in
 practice: two replicas with different thresholds or caps would diverge with
 every Raft invariant intact.
@@ -438,8 +441,9 @@ between two halves of a series.
 
 ## Observability
 
-No metrics of their own. The adapter logs at WARN when it answers
-`ResultSessionExpired` and when a session disappears mid-batch.
+No metrics of their own. The adapter logs at WARN when it answers a
+session-managed proposal `ResultSessionExpired` and when a session disappears
+mid-batch; a failed register or unregister is not logged.
 
 | Signal | Source |
 |---|---|

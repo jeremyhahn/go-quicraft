@@ -1,7 +1,7 @@
 # Observability: CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-11
+> notifications · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 No CLI surface: go-quicraft is a library and ships no binaries (there is no

@@ -1,7 +1,7 @@
 # Testing overview
 
 > **Status: REFERENCE** · Scope: how this repository's suites are organised and
-> run: `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-10-02
+> run: `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-10-13
 
 The commands, the common test patterns and the Makefile target reference. What
 each suite is built from, which build tag gates it, and why each gate is shaped
@@ -30,8 +30,9 @@ never fire.
 Unit tests run in memory (`t.TempDir()` for filesystem state), finish in
 seconds, and never modify the host. Most use the in-memory LogDB or a mock.
 `make test` runs `go test ./...` with no build tags, which also picks up the
-untagged tests under `test/` (the injector self-tests, `test/buildgates` and
-the `test/releasability` gate).
+untagged tests under `test/` (the injector self-tests, the `test/netport`,
+`test/proposer` and `test/membership` helpers' own tests, `test/buildgates`
+and the `test/releasability` gate).
 
 ### Integration and E2E tests
 
@@ -147,7 +148,7 @@ start gets the larger budget because it pays for connection handshakes first.
 
 ### E2E test files
 
-`test/integration/e2e/` holds 64 scenario tests plus one budget pin test.
+`test/integration/e2e/` holds 68 scenario tests plus one budget pin test.
 Three files also need `quicraft_netfault`.
 
 | File | Tests | Covers |
@@ -160,6 +161,7 @@ Three files also need `quicraft_netfault`.
 | `membership_election_test.go` | 4 | elections across a membership change |
 | `barrier_test.go` | 4 | propose and read through an encrypted barrier, replication, snapshot restore, 5N |
 | `replacement_test.go` | 4 | replace a follower in 3N and 5N, data integrity, continued writes |
+| `sealed_replica_test.go` | 4 | a sealed follower or leader, on an idle cluster and under load |
 | `barrier_replacement_test.go` | 3 | replacement and snapshot catch-up with a barrier, key rotation mid-replacement |
 | `snapshot_catchup_test.go` | 3 | new node catch-up via snapshot, data integrity, 5N |
 | `partition_test.go` | 3 | minority cannot elect, majority commits, heal and reconverge |

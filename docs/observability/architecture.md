@@ -3,7 +3,7 @@
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
 > notifications: `pkg/metrics.go`, `pkg/metrics_safe.go`,
 > `pkg/metrics_prometheus.go`, `config.MetricsConfig`, `config.LogConfig`,
-> `config.EventListener` · Last verified: 2026-10-11
+> `config.EventListener` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -147,8 +147,9 @@ write.
 
 Dispatched notifications are delivered FIFO by one goroutine, so they are
 totally ordered and therefore ordered per shard. The queue holds 1024 entries
-and never blocks the producer. A refused leader change is re-published on the
-next tick and is never lost; any other refused notification is dropped and
+and never blocks the producer. A refused leader change or leader-ready
+notification is logged at WARN and re-published on the next tick, so neither is
+ever lost; any other refused notification is dropped and
 logged at ERROR with the shard and event.
 
 The remaining callbacks run inline on the goroutine that produced the event and
@@ -160,8 +161,9 @@ apply path, and `OnNodeReady`, `OnNodeUnloaded`, `OnNodeDeleted`,
 goroutine calling the `Host` method that caused them.
 
 Internally, the engine's own request-resolving callbacks (`OnApplied`,
-`OnCommitted`, `OnReadyToRead`, `OnProposalFailed`, `OnReadIndexBatched`,
-`OnReadIndexFailed`) also stay inline: they have happens-before requirements
+`OnCommitted`, `OnReadyToRead`, `OnProposalFailed`, `OnProposalRejected`,
+`OnReadIndexBatched`, `OnReadIndexFailed`, `OnSnapshotRequestCompleted`) also
+stay inline: they have happens-before requirements
 against `raft.Peer.Handle` and cannot queue behind user code. There is no
 ordering guarantee between dispatched notifications and inline callbacks.
 

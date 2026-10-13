@@ -1,6 +1,6 @@
 # go-quicraft specification
 
-> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status
+> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-13
 > A feature listed here, in any status, is never deleted (not its docs, code or issues) without the owner's change to this file.
 
 ## Purpose

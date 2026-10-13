@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-10-11
+> `pkg/internal/invariant` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are **internal** and not importable from outside the module.
@@ -238,8 +238,8 @@ snapshot restore, commit-time config change).
 - **`staleConfigThrough`**: see "Restart and the stale configuration tail"
   below.
 
-Every refusing branch in `startElection` sets `leaderID = noLeader` before
-returning. `tickFollower` has already zeroed `electionTick` on the way in, so
+Every refusing branch in `startElection` except the unreadable-last-log-term
+check sets `leaderID = noLeader` before returning. `tickFollower` has already zeroed `electionTick` on the way in, so
 leaving `leaderID` set keeps the shared leader-lease test
 (`leaderID != noLeader && electionTick < electionTimeout`) true for most of
 each tick cycle, and this replica would deny PreVotes and drop higher-term
@@ -1713,7 +1713,7 @@ responding to RPCs" exists to prevent. It does not advance `prevState`;
 
 **RequeueMessages(msgs)**: returns drained messages to the FRONT of the
 outbound buffer after the engine failed to establish the durability they were
-waiting on. Dropping them is not equivalent: a lost `VoteResp` stalls an
+waiting on. Dropping them is not equivalent: a lost `RequestVoteResp` stalls an
 election until the next timeout.
 
 **Commit(update)**: acknowledges engine persistence, in this order:
@@ -2203,7 +2203,7 @@ Host.Propose()  Host.ReadIndex()  transport
                       |                 |
                       |                 +──> QUIC send: FREE-ORDER msgs
                       |                      (Heartbeat, Replicate,
-                      |                       RequestVote) BEFORE persist
+                      |                       RequestPreVote) BEFORE persist
                  commitPending = true
                       |
                    commitC
@@ -2211,7 +2211,7 @@ Host.Propose()  Host.ReadIndex()  transport
                 COMMIT WORKER ── logdb.SaveState(batch)
                       |                 |
                       |                 +──> QUIC send: ORDERED msgs
-                      |                      (VoteResp, HeartbeatResp,
+                      |                      (RequestVoteResp, HeartbeatResp,
                       |                       ReplicateResp) AFTER persist
                       |                 +──> OnCommitted (if NotifyCommit)
                  Peer.Commit()
@@ -2229,7 +2229,7 @@ Host.Propose()  Host.ReadIndex()  transport
 
 **Partitioning**: Shards hash to workers via `shardID % NumWorkers`. Shards in different partitions never contend; shards sharing a partition share one goroutine per tier.
 
-**Message ordering is a safety boundary, not a tuning knob.** Free-order messages go out from the step worker before the WAL persist, which is what overlaps network and disk I/O. Ordered messages (a vote grant, a heartbeat or replicate acknowledgement) go out from the commit worker only after `SaveState` returns, because each of them promises a state change is durable. Sending a `VoteResp` before the vote is on disk lets a crash-and-restart node vote twice in one term. Raft PhD §10.2.1.
+**Message ordering is a safety boundary, not a tuning knob.** Free-order messages go out from the step worker before the WAL persist, which is what overlaps network and disk I/O. Ordered messages (a vote grant, a heartbeat or replicate acknowledgement) go out from the commit worker only after `SaveState` returns, because each of them promises a state change is durable. Sending a `RequestVoteResp` before the vote is on disk lets a crash-and-restart node vote twice in one term. Raft PhD §10.2.1.
 
 **Batching**: The commit worker blocks on the first item, then non-blocking-drains whatever accumulated while the previous persist was in flight, and persists the lot in one `SaveState`.
 
@@ -2258,7 +2258,7 @@ The dispatcher is stopped LAST, once every tier that can produce a notification 
 
 Commit workers forward to apply unconditionally (no stopC escape) after persist: entries MUST be applied. Ordered shutdown guarantees apply workers still running.
 
-**Node management**: `LoadNode` adds to `allNodes` and to the step worker at partition `shardID % NumWorkers`. `UnloadNode` reverses via `unloadC`. `DeliverMessage` (transport boundary) looks up the node under a read lock and calls `node.Deliver(msg)`, which stamps the message `OriginRemote`.
+**Node management**: `LoadNode` adds to `allNodes` and to the step worker at partition `shardID % NumWorkers`. `UnloadNode` reverses it: it stops the node, removes it from the step worker, then sends an unload request on the commit and apply workers' `membershipC` channels and waits for each to take effect. `DeliverMessage` (transport boundary) looks up the node under a read lock and calls `node.Deliver(msg)`, which stamps the message `OriginRemote`.
 
 
 ### Step worker
@@ -2283,7 +2283,7 @@ Drains proposals from the MPSC `EntryQueue` and ReadIndex requests from the dedi
 
 What prevents `Tick()` racing `Commit()` is the per-node `raftMu` mutex, which serializes the two. Contention is minimal: both are short (counter and marker updates) and run at most once per RTT interval. `raftMu` is **not reentrant**: event callbacks such as `OnLeaderUpdated` are invoked outside it, because a callback running under `raftMu` would block the commit worker for every shard that worker owns.
 
-When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set (`Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp`) and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `VoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
+When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set (`Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp`) and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `RequestVoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
 
 **Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
 
@@ -2326,7 +2326,7 @@ Receives `Update` from step worker, persists entries to LogDB (sharded WAL with 
 
 **SaveState retry**: 5 attempts with 4 inter-attempt waits — 10ms, 50ms, 200ms, 500ms, for ~760ms of pre-failure grace. The final attempt is not followed by a wait, which is why the schedule has one fewer element than there are attempts. Both terminal outcomes — retry exhaustion AND shutdown cancellation (`stopC` fired during a retry backoff) — funnel through the shared `failBatchSaveState` helper. For every node in the batch it marks `failed = true`, clears `commitPending`, reports a `SaveStateError` via `handleError`, and fails the batch's pending proposals via `OnProposalFailed`, so callers see an immediate error rather than blocking until their context deadline. The batch's entries were extracted but never persisted, so the node is left permanently failed (recover by reloading the shard) to avoid acknowledging unpersisted entries.
 
-**Peer.Commit()**: Advances internal Peer state (log truncation, stable storage markers). Populates `LogReader.termRingBuffer` (O(log n) binary search term lookups, zero GC pressure) for efficient term resolution on restart.
+**Peer.Commit()**: Advances internal Peer state (log truncation, stable storage markers). Populates the `LogReader`'s term cache (`termBuf`, a `termRingBuffer`: O(log n) binary search term lookups, zero GC pressure) for efficient term resolution on restart.
 
 **Forward to apply (unconditional)**: After successful persist, sends `applyItem` to apply worker via blocking send WITHOUT `stopC` escape. Persisted entries MUST be applied (dropping them leaves committed-but-unapplied state). Ordered shutdown (apply workers stop after commit) guarantees consumer is running.
 
@@ -2352,7 +2352,7 @@ Per-shard goroutines gated by semaphore (MaxApplyWorkers limit). Fan-out dispatc
 4. Clears `commitPending = false` (in defer) to return ownership to step worker
 5. Wakes step worker via `workSignal.Notify()` for immediate re-processing without waiting for next tick
 
-**UnloadNode cleanup**: When `engine.UnloadNode(shardID)` called, dispatcher receives via `unloadC` channel, closes per-shard goroutine channel, allowing exit and resource cleanup. Prevents goroutine leak on node unload.
+**UnloadNode cleanup**: When `engine.UnloadNode(shardID)` called, dispatcher receives the request on its `membershipC` channel, closes per-shard goroutine channel, allowing exit and resource cleanup. Prevents goroutine leak on node unload.
 
 **Skip-apply**: An update whose first cycle carries no `CommittedEntries` bypasses the apply pipeline entirely rather than paying a dispatcher hop and a semaphore acquisition to apply nothing.
 
@@ -2485,7 +2485,7 @@ Step worker checks `commitPending.Load()` before touching Peer in `processReady(
 
 **Happens-before proof (commitIndex safety)**: the `commitPending` flag blocks the step worker from producing a new Update until the apply worker finishes, so entries MUST be persisted AND applied before the step worker produces a new Update referencing them. It also prevents duplicate CommittedEntries: when `commitPending` is cleared, `lastApplied` has advanced past the committed entries, so the next `GetUpdate(lastApplied)` does not reproduce them.
 
-The `Tick()`/`Commit()` race is prevented by the per-node `raftMu` mutex, not by the `commitPending` flag. Both `Peer.Tick()` and `Peer.Commit()` are called with `raftMu` held; `raftMu` also covers the step worker's `Peer.Step` and config-resolution paths and inbox message handling.
+The `Tick()`/`Commit()` race is prevented by the per-node `raftMu` mutex, not by the `commitPending` flag. Both `Peer.Tick()` and `Peer.Commit()` are called with `raftMu` held; `raftMu` also covers the step worker's `Peer.Handle` calls during a `commitPending` window, its config-resolution paths and its inbox message handling.
 
 **Cross-worker atomics**: commitPending and lastApplied padded to 128B to prevent false sharing. Other fields (failed, snapshotting, lastSnapshotIndex) have specific reader/writer relationships enforced by pipeline topology.
 
@@ -2540,7 +2540,7 @@ COMMIT WORKER (same partition):
    ↓
 APPLY DISPATCHER (same partition):
   • Route applyItem to per-shard goroutine
-  • Listen for unloadC (shard removal)
+  • Listen on membershipC (shard unload/reload)
    ↓
 PER-SHARD GOROUTINE:
   • DecompressEntries() (if Snappy compressed)
@@ -2600,7 +2600,8 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 | `OnReadyToRead(shardID, readyToRead)` | step worker |
 | `OnReadIndexBatched(shardID, batchKey, aliasKeys)` | step worker, BEFORE `Peer.Handle` |
 | `OnReadIndexFailed(shardID, keys, err)` | step worker |
-| `OnProposalFailed(shardID, entries, err)` | step worker |
+| `OnProposalRejected(shardID, entries, err)` | step worker, for a batch raft refused before appending it |
+| `OnProposalFailed(shardID, entries, err)` | the step, commit or apply worker that failed the batch |
 | `OnSnapshotCompleted(shardID, index, op, err)` | snapshot pool worker, while the shard's snapshot slots are held; `op` is `SnapshotSave` or `SnapshotRecover` |
 | `OnLogCompacted(shardID, replicaID, compaction)` | snapshot pool worker, after a save that compacted the log |
 | `OnSnapshotRequestCompleted(shardID, requestKey, index, err)` | snapshot pool worker, after the slots are released, for a save `RequestSnapshot` keyed, including one whose `SaveSnapshot` panicked |
@@ -2671,7 +2672,7 @@ duration, so one number retunes a cluster for its network.
 | `MaxClockDrift` | `0` = 1% | clock-RATE drift between replicas the lease tolerates, as a fraction (`leaseDriftDivisor` is the default). The leader shortens its lease by this fraction of the lease span; the bound is exact, as `lease_clock_rate_test.go` shows. Non-zero must be in `[1e-6, 0.5]` (`*config.ValidationError`). |
 | `MaxEntrySize` | 8 MB | per-proposal cap and the decompression ceiling on apply. May not exceed `proto.MaxEntrySize`. |
 | `MaxProposalPayloadSize` | 8 MB | user-facing cap; the effective limit at `Propose` is `min(MaxProposalPayloadSize, MaxEntrySize)` |
-| `MaxApplyEntrySize` | `MaxReplicationPayloadBytes` = 16,711,672 | batch size per `SM.Update` call |
+| `MaxApplyEntrySize` | `MaxReplicationPayloadBytes` = 16,711,672 | caps the entries in one outbound `Replicate` (`maxReplicationPayload`); despite the name it does not bound an `SM.Update` call, which `maxEntriesToApplySize` (64 MiB) does |
 | `Quiesce` | `false` | stop ticking an idle shard |
 | `ZeroCopyEntryCmd` | `false` | `Entry.Cmd` aliases the internal buffer; the state machine must copy to retain it |
 
@@ -2785,8 +2786,10 @@ membership-changing batch.
 **No proposal payload is ever logged.** It is application data.
 
 **User-visible notifications** go through `config.EventListener`.
-`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and the
-engine's `OnShardFailed` are delivered on the listener dispatcher, which holds no engine
+`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched`, the
+engine's `OnShardFailed`, and the snapshot and compaction events
+(`OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`,
+`OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected`) are delivered on the listener dispatcher, which holds no engine
 lock, so a listener may call any `Host` API, including the synchronous
 `StopShard`. Payloads are `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`,
 `ConnectionInfo`, `DiskInfo` and `EventShardInfo`.

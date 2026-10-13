@@ -1,7 +1,7 @@
 # Seal and barrier: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` (and the `pkg/crypto`
-> compatibility shim) · Last verified: 2026-10-11
+> compatibility shim) · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -149,7 +149,7 @@ pass one:
 
 | Consumer | Context | Layout |
 |---|---|---|
-| Snapshot frames | 40 bytes (`SnapshotFrameAADLen`) | `"QRSNAP1"(7) ‖ ShardID:8 ‖ ReplicaID:8 ‖ SnapshotIndex:8 ‖ ChunkSeq:8 ‖ Final:1`, big-endian |
+| Snapshot frames | 40 bytes (`engine.SnapshotFrameAADLen`) | `"QRSNAP1"(7) ‖ ShardID:8 ‖ ReplicaID:8 ‖ SnapshotIndex:8 ‖ ChunkSeq:8 ‖ Final:1`, big-endian |
 | WAL records | 30 bytes | `"QRWAL1"(6) ‖ WALShardIdx:8 ‖ SegmentID:8 ‖ RecordSeq:8`, big-endian |
 
 Both are magic-tagged, fixed-width and delimiter-free, so no two distinct
@@ -284,16 +284,19 @@ HMAC-SHA256 over a canonical, length-prefixed encoding, keyed by
 variable-length field carries a fixed 8-byte big-endian length prefix, so no
 field's contents can imitate another's boundary.
 
-Covered: `Strategy`, `Version`, `DeploymentID`, `Epoch`, `LoadGeneration`,
-`Salt`, `KnownEpochs`, `HKDFVersion`, `Algorithm`, `Ciphertext`, `Metadata`,
-`Nonce`, `HardwarePayload`. `Ciphertext` is included even though it
+Covered: `Strategy`, `Version`, the barrier's `BarrierConfig.DeploymentID`
+(not a blob field), `Epoch`, `LoadGeneration`, `Salt`, `KnownEpochs`,
+`HKDFVersion`, `Algorithm`, `Ciphertext`, `Metadata`, `Nonce`,
+`HardwarePayload`. `Ciphertext` is included even though it
 authenticates itself, so genuine metadata from one blob cannot be paired with a
 genuine ciphertext from another.
 
 Deliberately **not** covered: `FailedAttempts` and `LastFailedUnixNano`, written
 after a *failed* unseal when no root key is available to re-MAC with; and
 `CreatedAt`, `ShamirThreshold`, `ShamirTotal`, which are higher-layer custody
-bookkeeping go-qrdb owns.
+bookkeeping go-qrdb owns; and `KDFVersion`, which `pkg/seal` neither reads nor
+writes (the software strategy records its KDF version in `Metadata[0]`, which is
+covered).
 
 The field that matters most is `Epoch`: rewriting it downward resurrects a spent
 DEK alongside a zeroed invocation counter and an empty nonce tracker: two

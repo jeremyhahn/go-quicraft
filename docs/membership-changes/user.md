@@ -1,6 +1,6 @@
 # Membership changes: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 This page covers adding, removing and re-roling replicas in a shard that

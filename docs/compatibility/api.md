@@ -1,7 +1,7 @@
 # Compatibility and upgrades: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

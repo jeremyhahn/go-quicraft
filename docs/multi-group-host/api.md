@@ -1,7 +1,7 @@
 # Multi-Group Host — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` and `pkg/config` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -87,8 +87,9 @@ checks run before anything touches the disk.
 **`WithShardBarriers`** seals each shard under its own barrier, so one tenant's
 key purge can never remove an epoch another tenant's snapshots reference. It is
 a per-shard axis, independent of the host-wide one: it combines with
-`WithBarrier` (including a barrier still in plaintext mode before
-`EnableEncryption`) and with `WithoutEncryption`, and a shard with its own
+`WithBarrier` (including a plaintext-mode barrier, one initialized with the
+`None` strategy, for which `IsPlaintextMode` reports true) and with
+`WithoutEncryption`, and a shard with its own
 barrier has its snapshots encrypted under it in every posture. A resolver that
 returns `nil` for a shard sends it down the host-wide route: the `WithBarrier`
 barrier, or the plaintext route `WithoutEncryption` declared. With neither, the
@@ -1799,7 +1800,7 @@ naming a shard this host has not loaded.
 | `missing_identity` | the shard records no identity for a replica the configuration names. Admission requires one behind a transport, so this configuration was written without that requirement; wipe and re-bootstrap |
 | `removed_replica` | the sender was removed from the shard |
 | `removed_identity` | the connection presents an identity the shard has removed |
-| `misrouted` | the message names a shard this host does not serve |
+| `misrouted` | the message is addressed (`To`) to a different replica of a shard this host serves. A message for a shard this host has not loaded is dropped at DEBUG and counts no reason |
 
 The sender's replica ID is never a label: it arrives unauthenticated, so an
 attacker could mint unbounded series. It is in the drop log line.

@@ -1,6 +1,6 @@
 # Memory enclave: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -105,7 +105,7 @@ func NewSealed(ctx context.Context, data []byte) (*SealedEnclave, error)
 |---|---|
 | Request | `ctx`, which bounds the seal and reaches the process sealer's provider; `data []byte`, the raw key material. `data` is wiped on every return path, failure and cancellation included. |
 | Response | `*SealedEnclave`: ciphertext on the ordinary heap, holding no locked pages |
-| Errors | `ErrEmptyEnclave`, `ErrMaterialTooLarge`, `ErrSealFailed`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`. A context that has ended fails the seal with an error matching both `ErrSealFailed` and `ctx.Err()`. |
+| Errors | `ErrEmptyEnclave`, `ErrMaterialTooLarge`, `ErrSealFailed`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy` on the process sealer). A context that has ended fails the seal with an error matching both `ErrSealFailed` and `ctx.Err()`. |
 | Permission | none |
 
 ### Materialize the plaintext for a bounded window
@@ -155,7 +155,7 @@ func (e *MemoryEnclave) Destroy() error
 
 | | |
 |---|---|
-| Request | `WithBytes`: `fn`, called with a slice aliasing the protected region. `EqualTo`: the bytes to compare against, in constant time. |
+| Request | `WithBytes`: `fn`, called with a slice aliasing the protected region. `EqualTo`: the bytes to compare against; its timing reveals whether the lengths differ, never the contents. |
 | Response | `WithBytes`: `fn`'s error, unchanged. `EqualTo`: whether the contents match. |
 | Errors | Both return `ErrEnclaveDestroyed` if the enclave is destroyed; `WithBytes` then does not call `fn`. |
 | Permission | none |
@@ -164,8 +164,8 @@ func (e *MemoryEnclave) Destroy() error
 call and no longer: the read lock is held across `fn`, so a concurrent `Destroy`
 or `Freeze` waits for it, and once `fn` returns nothing covers the slice. Scope
 each borrow to the code that uses the bytes, and copy nothing out of it.
-go-enclave v0.8.0 removed `Open`, which returned a slice covered by no lock, and
-with it `OpenString` and `NewMemoryEnclaveFromString`.
+No accessor returns the slice outside a borrow, and none returns the material
+as a string.
 
 `Destroy` returns `nil` for a successful release, for a nil enclave and for
 every call after a successful release. It returns `ErrReleasedWithoutWipe` when
@@ -220,7 +220,6 @@ boundary: a destroyed strategy passphrase surfaces as `ErrStrategyClosed`.
 The protected-memory surface is versioned by go-enclave; this repository pins a
 released tag.
 
-`seal.ProtectedCredentials` and `seal.NewProtectedCredentials`, the deprecated
-aliases for `seal.Credentials` and `seal.NewCredentials`, were removed in 0.17.0.
-`Credentials.Secret` is a `*enclave.SealedEnclave`, so the two were one type;
-implementations name `Credentials`.
+`seal.Credentials`, built by `seal.NewCredentials`, is the only credentials
+type. `Credentials.Secret` is a `*enclave.SealedEnclave`, so there is no
+separate protected form; implementations name `Credentials`.

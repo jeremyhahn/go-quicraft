@@ -1,7 +1,7 @@
 # Seal and barrier: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/seal`

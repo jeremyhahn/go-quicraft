@@ -1,7 +1,7 @@
 # Log Storage — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-11
+> `pkg/logdb/memdb` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -165,7 +165,7 @@ func Open(dir string, opts ...Option) (*DB, error)
 | Option | Effect | Default |
 |---|---|---|
 | `WithBlockSize(n)` | block size: a power of two, at least 16 bytes | 32 KiB. Immutable for the life of the directory; `Open` refuses a changed value (`ErrWALGeometryMismatch`). |
-| `WithMaxFileSize(n)` | segment rotation threshold, at most 4 GiB − 1 (`ErrInvalidMaxFileSize` above) | 64 MiB. Safe to change on a populated directory: recovery never reads it, so it only moves future rotations. |
+| `WithMaxFileSize(n)` | segment rotation threshold, at most 4 GiB − 1 (`ErrInvalidMaxFileSize` above) and at least two blocks (`ErrSegmentTooSmallForEntry` below) | 64 MiB. Safe to change on a populated directory: recovery never reads it, so it only moves future rotations. |
 | `WithNoSync(true)` | skip every fsync and every directory sync | off. Tests and container benchmarks only. Nothing in such a segment is ever acknowledged, so recovery is always free to truncate it. |
 | `WithBarrier(b WALBarrier)` | at-rest encryption | none. The barrier must be initialized and unsealed before `Open`; a sealed one fails with `ErrBarrierContextUnresolved`. |
 | `WithMetrics(m LogDBMetrics)` | write, fsync and compaction latency, bytes written | nil, which skips collection |
@@ -185,7 +185,7 @@ Past the full threshold `SaveState` returns `ErrDiskFull`.
 `MaxFileSize`, `NoSync`) with `DefaultOptions`, `SetDefaults` and `Validate`;
 `Open` does not take it. Its `MaxBatchSize` field is deprecated and has no
 effect. A record is bounded by segment geometry, an entry's `Cmd` by 8 MiB, and
-the batch Raft hands to `SaveState` by `config.MaxApplyEntrySize`.
+the batch Raft hands to `SaveState` by `config.Config.MaxApplyEntrySize`.
 
 Besides the `LogDB` methods, `*DB` has `CompactedTo`, `MinLiveEpoch`,
 `MinLiveEpochForBarrier`, `AtRestProtection`, and the single-node conveniences
@@ -288,9 +288,14 @@ Sentinels: `ErrCorruptedRecord`, `ErrMidSegmentCorruption`,
 `ErrBarrierContextBindingUnreportable`, `ErrBarrierContextUnresolved`,
 `ErrBarrierContextBindingChanged`, `ErrLandingSegmentOverflow`,
 `ErrDBPoisoned`, `ErrDiskFull`, `ErrRecordTooLarge`, `ErrCmdTooLarge`,
-`ErrSnapshotReencryptRequired`, the option errors (`ErrEmptyWALDir`,
-`ErrInvalidBlockSize`, `ErrInvalidMaxFileSize`, `ErrInvalidMaxBatchSize`) and the
-repair sentinels above.
+`ErrMembershipTooLarge`, `ErrBootstrapDataDirProvenance`, `ErrSegmentFull`,
+`ErrClosed`, `ErrBufferTooSmall`, `ErrInvalidRecordType`,
+`ErrSnapshotReencryptRequired`, the replay decode errors
+(`ErrTruncatedEntryRecord`, `ErrTruncatedStateRecord`,
+`ErrTruncatedSnapshotRecord`, `ErrTruncatedBootstrapRecord`,
+`ErrTruncatedCompactionRecord`), the option errors (`ErrEmptyWALDir`,
+`ErrInvalidBlockSize`, `ErrInvalidMaxFileSize`, `ErrSegmentTooSmallForEntry`,
+`ErrInvalidMaxBatchSize`) and the repair sentinels above.
 
 Typed errors: `*SegmentCorruptionError`, `*RecoveryError`, `*DBOpenError`,
 `*SegmentReadError`, `*SegmentCreateError`, `*SegmentDiscardError`,

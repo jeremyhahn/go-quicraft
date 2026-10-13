@@ -1,7 +1,7 @@
 # Write Batching — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface.** go-quicraft is a library and ships no binaries (there is no
@@ -15,9 +15,9 @@ is nothing for an operator to invoke and the feature contributes no
 | Target | Runs |
 |---|---|
 | `make test-batch` | the `pkg/batch` unit tests |
-| `make bench-batch` | the `pkg/batch` benchmarks |
+| `make bench-batch` | `go test -bench` over `pkg/batch`, which declares no benchmarks, so it runs none |
 | `make test-writemode` | the `pkg/writemode` unit tests |
-| `make bench-writemode` | the `pkg/writemode` benchmarks |
+| `make bench-writemode` | `go test -bench` over `pkg/writemode`, which declares no benchmarks, so it runs none |
 
 ## Settings and signals
 

@@ -1,6 +1,6 @@
 # Memory enclave: architecture
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -88,8 +88,10 @@ Guaranteed:
   before unmapping. This is go-enclave's guarantee, consumed rather than
   restated.
 - `SealedEnclave` material is AES-256-GCM ciphertext under a per-value data key,
-  itself wrapped by the process sealer's in-memory key hierarchy. A memory
-  disclosure that captures only the envelope yields nothing without that
+  itself wrapped by the process sealer. This repository installs no sealer, so
+  unless the embedder calls `enclave.SetSealer` that is go-enclave's default, a
+  `SoftwareProvider` in `ModeRootKey`, whose key hierarchy is in-memory. A
+  memory disclosure that captures only the envelope yields nothing without that
   hierarchy, which is held in locked memory and dies with the process.
 - Plaintext exposure is bounded to `Open`/`Destroy` windows.
 - `Destroy` erases on both types: each wipes what it holds before releasing it.
@@ -175,10 +177,10 @@ verdict): it holds the read lock across the caller's use, so a concurrent
 `Destroy` or `Freeze` waits for the callback to return. Each borrow is scoped to
 the code that uses the bytes, and nothing is copied out of it.
 
-*Rejected: an accessor that returns the aliasing slice.* go-enclave had one
-(`Open`) until v0.8.0. Its slice was covered by no lock once it returned, so its
-safety rested on the caller showing that no concurrent teardown existed, which is
-a property of the whole program rather than of the call site.
+*Rejected: an accessor that returns the aliasing slice.* Such a slice is covered
+by no lock once the accessor returns, so its safety rests on the caller showing
+that no concurrent teardown exists, which is a property of the whole program
+rather than of the call site. go-enclave offers no such accessor.
 
 ### Locked memory is charged by the page, and the ceiling is process-wide
 

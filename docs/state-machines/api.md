@@ -1,7 +1,7 @@
 # State Machines — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -176,8 +176,8 @@ func (c *CachedDiskStateMachine) CacheStats() (hits, misses uint64)
   delete-if-match) must set `EntryApplied`. The cache is filled from the value
   in the command, and a conditional write may not have applied.
 - `GetHash` delegates to the inner store. If the inner store does not implement
-  `Hasher`, it returns `*InvalidCacheConfigError`, so `StateMachineHash` reports
-  `ok == true` with that error.
+  `Hasher`, it returns `*InvalidCacheConfigError`, and `StateMachineHash`
+  returns that error with `ok == false`.
 
 ### Errors
 

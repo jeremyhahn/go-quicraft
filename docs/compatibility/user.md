@@ -1,7 +1,7 @@
 # Compatibility and upgrades: user guide
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 How to move a cluster from one version to another, what each release changes,
@@ -63,6 +63,7 @@ this table summarises them.
 
 | Target | Data directories | What changes for an embedder |
 |---|---|---|
+| **0.21.0-rc.2** | carry over from 0.21.0-rc.1; no format changed | Run-time break: while a shard's barrier is sealed, `Propose`, `ProposeWithSession`, the session calls, the membership changes, `ReadIndex`/`SyncRead`, `StaleRead`, `FollowerRead`, `StaleReadBuf`, `RequestSnapshot` and `ExecuteOnLeader` return `ErrBarrierSealed` up front, so a health, seal-status or unseal path that reads a shard under the sealed barrier must use `Host.IsSealed()`, `Host.HealthCheck()` and the unseal material instead. Added `Config.MaxClockDrift`. |
 | **0.21.0-rc.1** | carry over from 0.20.0; no format changed | Run-time break: `ShardInfo.Replicas` on the leader now lists observers and witnesses as well as voters, each with a `ReplicaProgress.Role` (`ReplicaRoleVoter`, `ReplicaRoleObserver`, `ReplicaRoleWitness`). Code doing quorum or health arithmetic over it must filter on `Role`. `Host.ExecuteOnLeader` adds message types `LeaderExec` (28) and `LeaderExecResp` (29), which a 0.20.0 node does not know: replace every node before calling it. |
 | **0.20.0** | carry over from 0.19.0; no format changed | go-enclave is v0.8.0-alpha: `MemoryEnclave.Open`, `OpenString` and `NewMemoryEnclaveFromString` are gone (read inside `WithBytes`; construct with `NewMemoryEnclave`), `EqualTo` returns `(bool, error)` and `SealedEnclave.Destroy` returns an error. `shamir.ProtectedShare.Value` is removed: read the value inside `WithValue`. `WithShardBarriers` now combines with `WithoutEncryption`, so `ErrAtRestEncryptionConflict` is only `WithoutEncryption` with `WithBarrier`; `StartShard` refuses a sealed per-shard barrier with `ErrBarrierSealed`. |
 | **0.19.0** | carry over from 0.18.0 | no breaking change: `EventListener.OnLeaderReady` and `Host.ShardReadReady` are added |
@@ -151,8 +152,8 @@ identity, which membership refuses to commit twice.
 ## Session policy when membership carries none
 
 When the committed membership carries no session policy, each replica applies
-its own `Config`. Set `SessionExpiryEntries`, `MaxTotalSessions` and
-`MaxSessionsPerClient` identically on every replica in that case; nothing
+its own `Config`. Set `SessionExpiryEntries`, `MaxTotalSessions`,
+`MaxSessionsPerClient` and `MaxSessionsPerOwner` identically on every replica in that case; nothing
 enforces it, and disagreement diverges the state machine silently.
 
 ## Troubleshooting

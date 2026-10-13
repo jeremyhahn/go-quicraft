@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
 > `pkg/internal/transport/revocation`, `pkg/internal/registry`,
-> `pkg/internal/netaddr` · Last verified: 2026-10-11
+> `pkg/internal/netaddr` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -165,10 +165,8 @@ Every sender is bound to its authenticated identity, in both directions:
   (`Config.MemberIdentities`). A sender none of them names is dropped as
   `unknown_member`; one whose committed entry records no identity is dropped as
   `missing_identity`; one presenting an identity other than the bound one is
-  dropped as `identity_mismatch`. There is no address fallback: it was
-  removed in 0.13.0-alpha together with `TransportConfig.RequireMemberIdentity`,
-  the default-off flag that used to refuse it, so there is no setting that
-  restores address-based authorization. The
+  dropped as `identity_mismatch`. There is no address fallback, and no setting
+  that restores address-based authorization. The
   leader-executed request and its reply (`LeaderExec`, `LeaderExecResp`) pass
   the same gate and are only then routed to the host's leader-exec handler
   instead of the raft engine.
@@ -365,13 +363,13 @@ unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences:
 
 go-quicraft requires `quic-go` v0.63.0, and the dispatch, the linkname and the
 `go` directive above were re-read from that version's source. Measured
-2026-09-03 with real QUIC handshakes over loopback:
+with real QUIC handshakes over loopback:
 
 | | v0.59.1 | v0.62.0 |
 |---|---|---|
 | `pkg/internal/transport` under `fips140=only` | panics on the first dial | ok, 155.6s |
 
-Re-measured 2026-09-04 against live clusters. Under `GOFIPS140=latest
+Measured against live clusters as well. Under `GOFIPS140=latest
 GODEBUG=fips140=only go test -tags integration,fips`, three- and five-node
 clusters form, elect a leader, agree on it across every node, and replicate:
 single entries, concurrent proposals, large values, multiple shards, and stale
@@ -423,8 +421,8 @@ Four things, all checkable:
 
 1. `quic-go` at v0.60.0 or later. go-quicraft requires v0.63.0.
 2. Build with `-tags fips`. This is not for the curve list: Go filters X25519
-   out of the offer under `fips140` mode by itself, and `TestHandshakeCurves`
-   passes untagged under `only`. The tag is for the seal layer: Argon2id and
+   out of the offer under `fips140` mode by itself, and
+   `TestHandshakeCurves_InteroperateAcrossBuilds` passes untagged under `only`. The tag is for the seal layer: Argon2id and
    ChaCha20-Poly1305 are compiled out rather than refused at runtime. It is
    also the only combination `make verify-fips` exercises.
 3. Run with `GOFIPS140=latest GODEBUG=fips140=only`.

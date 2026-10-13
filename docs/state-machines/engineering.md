@@ -1,7 +1,7 @@
 # State Machines — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/sm`, `pkg/sm/kv`,
-> `pkg/internal/rsm` · Last verified: 2026-10-11
+> `pkg/internal/rsm` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 - `github.com/jeremyhahn/go-quicraft/pkg/sm`: the interfaces you implement, the
@@ -125,7 +125,7 @@ type DiskStateMachine interface {
   recovered. An index below it means the store is behind the snapshot, and the
   entries in between may be compacted out of the log, so `Host.StartShard`
   recovers the store from the snapshot and seeds the applied markers to the
-  snapshot index (#280).
+  snapshot index.
 - Replay must be idempotent. The store can commit its own write and the node
   crash before QuicRaft records the matching applied index. Persist your applied
   index atomically with the data and return it from `Open`.
@@ -467,11 +467,14 @@ func NewStateMachine(
 	local proto.SessionPolicy,
 	replicated func() proto.SessionPolicy,
 	zeroCopyEntryCmd bool,
+	opts ...Option,
 ) (*StateMachine, error)
 ```
 
 The factory runs once and the type switch runs once; every later call is a
-direct method call on the concrete wrapper.
+direct method call on the concrete wrapper. The one `Option` is `WithLogger`,
+which sets the logger the adapter reports on; without it, or with `nil`, the
+process `slog` default is used.
 
 `local` is this node's configuration, used only while the shard has no
 replicated policy (a `join=true` replica that has not yet received the shard's

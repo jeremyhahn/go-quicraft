@@ -1,7 +1,7 @@
 # Seal and barrier: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -39,7 +39,7 @@ func (c *BarrierConfig) GetNonceTracking() bool
 |---|---|
 | Request | a `BarrierConfig`; see [`engineering.md`](engineering.md) §4 for every field |
 | Response | `*Barrier` in the Uninitialized state |
-| Errors | `ErrUnsupportedAlgorithm`, `ErrAlgorithmNotFIPSApproved`, `ErrFIPSUnavailable`, and the other `Validate` failures |
+| Errors | `ErrUnsupportedAlgorithm`, `ErrAlgorithmNotFIPSApproved` or `ErrFIPSUnavailable`, the only failures `Validate` returns |
 | Permission | none; in-process call |
 
 `MustNewBarrier` panics instead of returning an error and is for
@@ -177,9 +177,9 @@ func (b *Barrier) DeregisterInFlightEpoch(epoch uint64)
 | | |
 |---|---|
 | `Rotate` response | the new epoch |
-| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, then a root-key open error, `*KeyDerivationError`, `*Error{Strategy:"rotate"}` (sealing the new DEK) and `*StatePersistError{Op:"rotate"}`, in that order |
+| `Rotate` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrNilSealedData`, `ErrNoStatePersister`, then a root-key open error, `*KeyDerivationError` or the `AEADProvider`'s own error (building the new epoch's cipher), `*Error{Strategy:"rotate"}` (sealing the new DEK), `*Error{Strategy:"state-mac"}` (re-stamping the state MAC) and `*StatePersistError{Op:"rotate"}`, in that order |
 | `PurgeEpochsBefore` response | the number of epochs dropped |
-| `PurgeEpochsBefore` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrPurgeCurrentEpoch` (`minEpoch` above the current epoch), then, only when something would be purged, `ErrNilSealedData`, `ErrNoStatePersister`, a root-key open error and `*StatePersistError{Op:"purge"}` |
+| `PurgeEpochsBefore` errors | `ErrBarrierSealed`, `ErrBarrierSuperseded`, `ErrHardwareMode`, `ErrPurgeCurrentEpoch` (`minEpoch` above the current epoch), then, only when something would be purged, `ErrNilSealedData`, `ErrNoStatePersister`, a root-key open error, `*Error{Strategy:"state-mac"}` and `*StatePersistError{Op:"purge"}` |
 | Permission | none |
 
 Both persist before committing. `PurgeEpochsBefore` never drops the current

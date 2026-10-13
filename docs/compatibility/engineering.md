@@ -1,7 +1,7 @@
 # Compatibility and upgrades: engineering
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Every version discriminator, what it guards, how it is checked and what it
@@ -285,8 +285,8 @@ expires sessions at log indexes its peers do not.
 
 When the committed membership carries no session policy (`SessionPolicy.IsSet`
 is false), each replica applies its own `Config`. `SessionExpiryEntries`,
-`MaxTotalSessions` and `MaxSessionsPerClient` must then be identical on every
-replica; nothing enforces it, and disagreement diverges the state machine
+`MaxTotalSessions`, `MaxSessionsPerClient` and `MaxSessionsPerOwner` must then
+be identical on every replica; nothing enforces it, and disagreement diverges the state machine
 silently.
 
 ## Test strategy

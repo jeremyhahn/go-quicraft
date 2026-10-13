@@ -16,7 +16,7 @@ Do not report security vulnerabilities in public issues. See
 
 ## Setup
 
-You need Go 1.27.1 or later (see `go.mod`), and Docker for the containerized
+You need Go 1.27.2 or later (see `go.mod`), and Docker for the containerized
 integration suite.
 
 Dependencies under `github.com/jeremyhahn/` (go-enclave, and the Dragonboat
@@ -27,7 +27,7 @@ fetch them from there before the first build, as described in the
 ```sh
 git clone https://github.com/jeremyhahn/go-quicraft
 cd go-quicraft
-make install-tools   # golangci-lint, gosec, govulncheck, trivy, nancy
+make install-tools   # golangci-lint, gosec, govulncheck, trivy, nancy, actionlint
 make test
 ```
 
@@ -43,12 +43,12 @@ make test
 | `make test-<pkg>` | One package, e.g. `test-raft`, `test-waldb`, `test-seal` |
 | `make fmt` | Fails if `gofmt -l` reports any file |
 | `make vet` | `go vet ./...` |
-| `make lint` | golangci-lint |
+| `make lint` | golangci-lint in every module, then actionlint over the workflows |
 | `make security` | gosec, govulncheck, `go mod verify`, Trivy |
 | `make coverage` | Coverage over `./...`, enforced against `COVER_MIN` (91%) |
 | `make coverage-<pkg>` / `make coverage-packages` | One package, or every package under `pkg/`, against the same floor |
 | `make ci` | `fmt`, `no-mutants`, `check-tool-versions`, `vet`, `lint`, `security`, `build`, `test` |
-| `make ci-full` | `ci` plus every nested module, the integration, netfault, errfs and fuzz suites, and the FIPS checks |
+| `make ci-full` | `ci` plus every nested module, built and vetted natively and for five other platforms, the integration, netfault, errfs, fuzz-seed and fuzz-mutation suites, and the FIPS checks |
 | `make integration-test` | Multi-node integration suite in Docker |
 | `make ci-integration` | The same suite on the host, as CI runs it |
 | `make ci-netfault` | Network partitions between live replicas (`quicraft_netfault` tag) |
@@ -165,8 +165,9 @@ exercises churn, and the invariant itself is checked by
 Read [docs/wire-protocol/engineering.md](docs/wire-protocol/engineering.md) and
 [docs/compatibility/](docs/compatibility/architecture.md) first.
 
-- **Every format is pinned at version 1 until the first stable release.** A
-  pre-1.0 layout change is made in place at version 1. Do not add a decode path
+- **Every format version is pinned at its current value until the first
+  stable release**: 1 for every format except the sealed-state MAC, which is 2.
+  A pre-1.0 layout change is made in place at that value. Do not add a decode path
   for an old layout and do not bump a version constant. Development data
   directories are wiped and re-synced, not migrated. The version byte stays,
   and every check on it is exact equality, so a mismatch between builds is
@@ -223,7 +224,7 @@ make release-candidate VERSION=vX.Y.Z-rc.N   # a release candidate, N >= 1
 ```
 
 Run it on a clean `main` whose `CHANGELOG.md` has a `## [X.Y.Z-alpha]`
-(`[X.Y.Z-rc.N]` for a candidate) heading. The recipe writes `VERSION`, commits it, creates the annotated root
+(`[X.Y.Z-rc.N]` for a candidate, `[X.Y.Z]` for `make release`) heading. The recipe writes `VERSION`, commits it, creates the annotated root
 and `test/performance/` tags, verifies them, pushes the commit and both tags
 atomically, and reads the remote back. If any step before the push fails,
 nothing is pushed.

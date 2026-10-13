@@ -1,7 +1,7 @@
 # contrib/dragonboat
 
 > **Status: REFERENCE** · Scope: the Dragonboat-compatible shim over QuicRaft in
-> this directory · Last verified: 2026-10-02
+> this directory · Last verified: 2026-10-13
 
 A [Dragonboat](https://github.com/lni/dragonboat) v4 compatible layer for
 [QuicRaft](../../README.md). Its `NodeHost` exposes Dragonboat's method names
@@ -19,6 +19,12 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
   concurrent and on-disk state machine interfaces and their adapters),
   `client` (`Session`), and `raftio` (event listener and LogDB interfaces and
   event types).
+- Construction: `NewNodeHost` takes a `config.NodeHostConfig` and, like
+  Dragonboat, stores the Raft log and snapshots as plaintext
+  (`quicraft.WithoutEncryption`). `NewNodeHostWithOptions` also takes
+  `quicraft.HostOption` values; they must state the at-rest encryption
+  (`quicraft.WithBarrier` or `quicraft.WithoutEncryption`), and the
+  constructor fails with a `NodeHostConstructionError` if they state neither.
 - The `NodeHost` surface:
   - lifecycle: `StartReplica`, `StartConcurrentReplica`, `StartOnDiskReplica`,
     `StopReplica`, `StopShard`, `Close`;
@@ -34,10 +40,17 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
     `ExportSnapshot`, `ImportSnapshot`, `RequestCompaction`, `RemoveData`,
     `SyncRemoveData`, `QueryRaftLog`, `GetLogReader`;
   - introspection: `ID`, `RaftAddress`, `GetNodeHostInfo`, `GetShardInfo`,
-    `HasNodeInfo`, `GetNodeHostRegistry`, `GetNodeUser`.
-- QuicRaft authorizes members by node identity. On a host with a transport, add
-  members with the `…WithIdentity` methods; the identity is the value the new
-  member's host reports from `quicraft.Host.NodeIdentity()`.
+    `HasNodeInfo`, `GetNodeHostRegistry`, `GetNodeUser`, `NodeHostConfig`,
+    `NodeIdentity`;
+  - QuicRaft extensions: `SetQueryTimeout` and `QueryTimeout` bound the
+    state machine `Lookup` behind `ReadLocalNode`. The default is 0, no
+    deadline, as in Dragonboat.
+- QuicRaft authorizes members by node identity. On a host with a transport,
+  name the founding members' identities in `config.Config.MemberIdentities`
+  (no Dragonboat counterpart) when the shard starts, and add later members
+  with the `…WithIdentity` methods. The identity is the value the member's
+  `NodeHost.NodeIdentity()` reports, which is its `quicraft.Host.NodeIdentity()`;
+  it is empty on a host started with `quicraft.WithoutTransport`.
 - Errors are translated to Dragonboat's sentinels. A QuicRaft
   `*MaybeAppliedError` survives the translation, so `quicraft.MaybeApplied`
   still distinguishes "refused before anything happened" from "accepted, then
@@ -63,7 +76,7 @@ make ci-integration     # multi-node integration suite (-tags=integration)
 ```
 
 CI runs both suites in a dedicated job, and the root `make ci-modules` builds
-every nested module so a root change that breaks the shim fails there. The
+and vets every nested module so a root change that breaks the shim fails there. The
 integration helpers resolve the current leader before config changes and
 leader-bound reads, so a retry against a stale leader cannot hide the
 forwarding the suite is meant to exercise.

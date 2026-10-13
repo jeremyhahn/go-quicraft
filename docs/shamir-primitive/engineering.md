@@ -1,7 +1,7 @@
 # Shamir primitive: engineering contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-11
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -382,11 +382,11 @@ place.
 
 Every term is priced in whole pages, through go-enclave's `LockedSize`. That is
 the unit the kernel charges: each region is its own enclave and a 32-byte enclave
-locks a full 4 KiB page, so a figure summed from requested sizes cannot be
-compared to `RLIMIT_MEMLOCK`, the only comparison the budget exists to make. A
-byte-summed price of a 255-share split of a one-byte secret is 1,536 bytes; the
-measured `VmLck` delta is 1,044,480, with the per-share rounding accounting for
-nearly all of it.
+locks a full page, so a figure summed from requested sizes cannot be compared to
+`RLIMIT_MEMLOCK`, the only comparison the budget exists to make. The byte figures
+in the rest of this section are for a 4 KiB-page host. A byte-summed price of a
+255-of-255 split of a one-byte secret is 1,532 bytes; the measured `VmLck` delta
+is 1,044,480, with the per-share rounding accounting for nearly all of it.
 
 The budget is sized for the regime the primitive serves. A full 255-share
 ceremony over a 32-byte root key costs 259 pages (1,060,864 bytes), so a
@@ -430,7 +430,7 @@ element is rejected.
   `splitLockedBytes` comparable. An element carries about 48 bytes of JSON header,
   and when the encoded value lands on an exact page multiple that header would
   push each element into a further page: a 171-share set of a 6142-byte secret
-  splits at 1,429,504 and, priced per element, would decode at 2,101,248,
+  splits at 1,421,312 and, priced per element, would decode at 2,101,248,
   admitted by one guard and refused by the other on a set the library itself
   produced. Priced per value, the decode sum is exactly `splitLockedBytes`'
   `total*lockedBytes(encoded)` term, to which that function adds further positive
@@ -544,6 +544,7 @@ Unit only. Target: `make test-crypto` (runs `./pkg/crypto/...`).
 | `protected_freeze_linux_test.go` | share values and reconstructed secrets are read-only after return |
 | `protected_share_race_test.go` | concurrent `WithValue`/`Destroy` |
 | `protected_borrow_test.go` | a borrow ends with its callback; split and combine release every scratch they borrow |
+| `enclave_testhelp_test.go` | helpers only: copying a share value or an enclave out for comparison, building an enclave from bytes |
 
 **What a test here must always assert**: that combining a bad-but-structural
 share set returns `(garbage, nil)` rather than an error. That is the documented

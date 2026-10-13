@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport`,
 > `pkg/internal/transport/revocation`, `pkg/internal/registry`,
-> `pkg/internal/netaddr` · Last verified: 2026-10-11
+> `pkg/internal/netaddr` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 These packages are internal: they are not importable from outside the
@@ -85,7 +85,7 @@ type QUICTransport struct {
 }
 ```
 
-Source: `pkg/internal/transport/conn.go`
+Source: `pkg/internal/transport/quic.go`
 
 `conns` and `connEpoch` are written and deleted at exactly the same sites under
 `connMu`, so they never diverge. `connEpoch` is what makes restart detection
@@ -139,7 +139,7 @@ and report while the previous one's goroutine has not yet reported. A
 per-destination report sequencer (`dialReports`) closes that gap. Each dial
 takes a turn when its flight starts and reports only after the dial before it
 has, so events are delivered in the order the dials started: a failed dial's
-`OnConnectionFailed` can no longer arrive after the `OnConnectionEstablished`
+`OnConnectionFailed` cannot arrive after the `OnConnectionEstablished`
 of the retry that followed it. A turn is also released by `defer`, after its
 predecessors, so a dial ended by a panic or `runtime.Goexit` before reporting
 does not hold back the dials after it. The sequencer keeps an entry only while
@@ -612,17 +612,20 @@ Source: `pkg/internal/transport/recv.go`
 QUIC Listener
     |
     v
-acceptLoop()  [scoped by shutdownCtx]
-    |-- sem = make(chan struct{}, MaxIncomingConnections)
+startAcceptLoop()
+    |-- sem = make(chan struct{}, MaxIncomingConnections)   // once, kept across restarts
+    |-- ipTracker = newIPConnTracker(MaxConnectionsPerIP)
+    v
+acceptLoop(sem, ipTracker)  [scoped by shutdownCtx]
     |-- listener.Accept(shutdownCtx) -> conn
     |-- ipTracker.tryAcquire(ip)                  // MaxConnectionsPerIP
     |-- refuseInboundPromiscuousCert(conn)        // peer cert must not cover US
     |-- sem acquire (NON-blocking; refuse at limit)
-    |-- go handleConnection(conn)
+    |-- publishInboundConn(conn) -> activity      // inboundConns entry; reclaim policies
+    |-- go handleConnection(conn, activity)
     v
-handleConnection(conn)  [scoped by conn.Context()]
+handleConnection(conn, activity)  [scoped by conn.Context()]
     |-- acquirePeerMsgBudgetRef(conn)             // per-PEER receive sub-budget
-    |-- inboundConns.Store(conn, &inboundConnState{})  // reclaim policies
     |-- streamSem = make(chan struct{}, MaxStreamsPerConnection)   // data streams
     |-- snapSem   = make(chan struct{}, MaxConcurrentSnapshotRecv) // snapshot streams
     |-- loop: conn.AcceptStream(connCtx) -> stream
@@ -1102,7 +1105,7 @@ receiver decompresses before unmarshaling.
 carrying the `SnapshotHeader`. It is what routes the stream to
 `handleSnapshotStream`. Every subsequent chunk frame on that stream is written
 with `FlagNone`: both `SendSnapshot` and `SendSnapshotStreaming` call
-`WriteFrame(stream, chunkBuf, FlagNone)`.
+`WriteFrame(stream, chunkBuf[:chunkN], FlagNone)`.
 
 ### Payload layouts
 
@@ -1475,9 +1478,11 @@ is dropped at Debug level and counted as `unresolved_target`.
 | `DisableCompression`            | bool          | false          | Disable Snappy compression           |
 | `TransportDisabled`             | bool          | false          | Skip mTLS validation and skip building the transport (same effect as `WithoutTransport()`) |
 
-The internal `transport.Config` adds two fields the public struct does not
-expose directly: `ListenAddress` and `AdvertiseAddress`, both supplied by the
-host from `HostConfig`. `AdvertiseAddress` takes priority over the OS-reported
+The internal `transport.Config` adds fields the public struct does not
+expose. The host supplies `ListenAddress`, `AdvertiseAddress` (its
+`RaftAddress`), `DeploymentID` and `EventListener` from `HostConfig`, and
+`Metrics` and `ReplicaIdentity` from its own wiring; `DialTimeout` is left at
+its 5 s default. `AdvertiseAddress` takes priority over the OS-reported
 socket address when stamping `MessageBatch.SourceAddress`, which is what lets a
 node behind NAT or in a container advertise a reachable external address rather
 than `0.0.0.0` or `[::]`.
@@ -1509,8 +1514,9 @@ label values from them creates unbounded Prometheus child series.
 | `IncSnapshotsRejected` | `shutdown`, `concurrency_limit`, `memory_budget`, `liveness`, `malformed`, `io_error`, `policy`, `unauthorized`, `not_accepting` |
 | `IncMessagesDropped` | `unresolved_target`, `queue_full`, `stream_unavailable`, `write_failed`, `marshal_failed`, `protocol_violation`, `unsendable`, `peer_rejected`, `identity_mismatch` |
 
-`shardID` is 0 for `IncSnapshotsRejected` when the transfer failed before its
-header parsed, and both `shardID` and `to` are 0 for `protocol_violation`, where
+`shardID` is 0 for `IncSnapshotsRejected` when the transfer was rejected before
+its sender was authorized, since until then the shard the header names is
+unverified, and both `shardID` and `to` are 0 for `protocol_violation`, where
 the frame is discarded before its messages are parsed.
 
 Beyond the metrics interface, `QUICTransport` keeps unconditional atomic
@@ -1529,7 +1535,7 @@ Targets: `make test-transport`, `make bench-transport`, `make ci-fuzz-seeds`,
 | **Unit** (`pkg/internal/transport/*_test.go`) | frame encode/decode, the stream pool, connection admission and per-IP limits, the mTLS config builder, node-identity derivation, the revocation checker's CRL reload and OCSP cache |
 | **Fuzz** (build tag `quicraft_fuzz`) | `FuzzFrameHeaderRoundTrip`, `FuzzFrameHeaderUnmarshalCrash`, `FuzzFrameWithPayload`, `FuzzMessageFrameDecode`, `FuzzHeartbeatDetection`: frame-header and payload decoding against arbitrary bytes. The transport is the one place in the repository where the input is genuinely adversarial. `make ci-fuzz-seeds` replays the seed corpora; `make ci-fuzz-mutation` runs a bounded mutation pass per target. |
 | **Integration** (`test/integration`) | real QUIC connections between real hosts, with real certificates (one leaf per host from a per-cluster CA, `test/testpki`) |
-| **Fault injection** (`test/netfault`, `make ci-netfault`) | directed partitions between live replicas, run over the `test/integration/e2e` suites with the `quicraft_netfault` build tag. It exercises what a process kill cannot: a live leader deposed by a quorum it can no longer reach. |
+| **Fault injection** (`test/netfault`, `make ci-netfault`) | directed partitions between live replicas, run over the `test/integration/e2e` and `test/integration/host` suites with the `quicraft_netfault` build tag. It exercises what a process kill cannot: a live leader deposed by a quorum it can no longer reach. |
 
 **Seams for fault injection**: `test/netfault` is consulted from the transport's
 send path, and only in a build tagged `quicraft_netfault` (`netfault_on.go`); in
@@ -1542,9 +1548,7 @@ are about.
 **Fixtures**: certificates are generated per test run rather than checked in. A
 checked-in key is a real key.
 
-**Coverage** (measured 2026-10-02): `pkg/internal/transport` 91.4%,
-`revocation` 99.0%, `registry` and `netaddr` 100%. The repository floor is
-`COVER_MIN = 91`, applied to the module total (`make coverage`) and to every
+**Coverage**: the repository floor is `COVER_MIN = 91`, applied to the module total (`make coverage`) and to every
 package under `pkg/` (`make coverage-packages`).
 
 ## Observability

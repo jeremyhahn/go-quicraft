@@ -1,7 +1,7 @@
 # Client Sessions — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go` and the `Host`
-> session methods · Last verified: 2026-10-11
+> session methods · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Use a session when a proposal is not idempotent and applying it twice after a
@@ -159,7 +159,7 @@ idempotent commands with `Propose`/`SyncPropose`.
 or use a separate session per concurrent worker.
 
 **`ErrInvalidSession`.** The session is a no-op session, belongs to another
-shard, or was never registered.
+shard, was never registered, or was closed.
 
 **`*SessionExpiredError`.** The shard has no record of this session: it went
 `SessionExpiryEntries` applied entries without activity, was closed, or was

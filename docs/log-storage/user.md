@@ -1,7 +1,7 @@
 # Log Storage — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-11
+> `pkg/logdb/memdb` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 You deal with log storage in three ways: choosing a store when you build a
@@ -40,8 +40,8 @@ The host's barrier is wired only into the default WAL. If you pass your own
 store together with `WithBarrier`, that store must itself report that it is
 encrypted (or that it is in memory), or that its host-wide route writes through
 that same barrier, or `NewHost` fails with `ErrBarrierPlaintextLogDB`. Open the
-WAL with the same barrier; this holds while the barrier is still in plaintext
-mode, before `EnableEncryption`:
+WAL with the same barrier; this holds too while the barrier is in plaintext
+mode (unsealed under the no-encryption strategy, `IsPlaintextMode()`):
 
 ```go
 store, err := waldb.Open(walDir, waldb.WithBarrier(barrier))

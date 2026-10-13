@@ -1,7 +1,7 @@
 # QUIC Transport — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport` and its
-> configuration surface in `pkg/config` · Last verified: 2026-10-11
+> configuration surface in `pkg/config` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

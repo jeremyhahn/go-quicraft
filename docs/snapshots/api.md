@@ -1,7 +1,7 @@
 # Snapshots — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-11
+> import/export and re-encryption · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -33,7 +33,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 |---|---|
 | Request | the shard and a `SnapshotOption`; `DefaultSnapshotOption` (the zero value) uses the shard's defaults |
 | Response | a `*RequestState` whose result carries the snapshot index, or the index directly from the sync form |
-| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`, and `ErrCanceled` / `ErrTimeout` for a context already done (nothing is started). From the save: `*SnapshotFailedError` (wrapping `*SnapshotSavePanicError` when `SaveSnapshot` panicked), `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`. The sync form also returns `ErrTimeout` or `ErrCanceled`. |
+| Errors | on submit: `*SnapshotOptionError` (`ErrInvalidSnapshotOption`), `ErrShardNotFound`, `ErrBarrierSealed` (the shard's barrier is sealed), `ErrShardNotReady`, `ErrSnapshotInProgress`, `ErrBusy`, `ErrClosed`, and `ErrCanceled` / `ErrTimeout` for a context already done (nothing is started). From the save: `*SnapshotFailedError` (wrapping `*SnapshotSavePanicError` when `SaveSnapshot` panicked), `*SnapshotTooLargeError`, `ErrSnapshotBarrierSealed`, `ErrStopped` (the snapshot pool stopped), `ErrAborted` (transient; retry). The sync form also returns `ErrTimeout` or `ErrCanceled`. |
 | Permission | none; in-process call |
 
 ```go
@@ -69,7 +69,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 |---|---|
 | Request | the shard and a destination writer |
 | Response | none; the artifact is streamed to `w` |
-| Errors | `ErrSnapshotNotFound` (the shard has no snapshot yet), `ErrSnapshotCorrupt` (the stored file fails its recorded length or hash), `*SnapshotArtifactError`, `ErrSnapshotEncryptedBarrierUnavailable`, `ErrSnapshotBarrierSealed` |
+| Errors | `ErrSnapshotNotFound` (the shard has no snapshot yet, or its data file cannot be opened), `ErrSnapshotCorrupt` (the stored file fails its recorded length or hash, or a frame fails to decrypt), `ErrSnapshotEncryptedBarrierUnavailable` (an encrypted snapshot and no barrier, or a sealed one), `ErrShardNotFound`, `ErrShardBarrierUnresolved`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
 | Permission | none |
 
 Needs a live `Host` that knows the shard. The artifact is a header, the
@@ -118,7 +118,7 @@ func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index ui
 |---|---|
 | Request | source and destination paths, the snapshot's identity, and both barriers |
 | Response | the destination's lowest at-rest epoch across the written frames. Record it as the migrated snapshot's `Epoch` so the DEK-purge floor protects every frame. `0` for an empty source or a plaintext destination. |
-| Errors | `ErrSnapshotBarrierSealed`, `*SnapshotCommittedNotDurableError`, and the underlying I/O errors |
+| Errors | `ErrSnapshotBarrierSealed`, `ErrSnapshotCorrupt` (a source frame is malformed or fails authentication), `*SnapshotCommittedNotDurableError`, and the underlying I/O errors |
 | Permission | none in this library; the barriers' credentials are the authorization |
 
 The data streams through an in-memory pipe, so a large snapshot is never fully

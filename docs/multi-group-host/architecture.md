@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — the `Host`, its options,
 > `RequestState`, `Membership`, `ShardInfo`, the error and metrics vocabulary,
-> and `pkg/config` · Last verified: 2026-10-11
+> and `pkg/config` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 The `Host` is the library's single entry point: one per process, managing shard
@@ -406,7 +406,7 @@ Not lock-free, deliberately:
   a `sync.Mutex` for one slice append and the consumer takes it once per drain;
   the goal is amortizing acquisitions, not eliminating them.
 - the per-node `raftMu`, which serializes `Peer.Tick()`, `Peer.Commit()`,
-  `Peer.Step` and inbox handling. It is not reentrant, which is why event
+  `Peer.Handle` and inbox handling. It is not reentrant, which is why event
   callbacks run outside it.
 
 ## Configuration

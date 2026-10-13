@@ -1,7 +1,7 @@
 # Write Batching — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -69,7 +69,7 @@ func (a *Aggregator) SubmitNoCopy(ctx context.Context, shardID uint64, data []by
 
 | Cause | `Indeterminate` | Command committed? |
 |---|---|---|
-| your `ctx` ended while waiting | true | no if its batch had not been encoded yet (the command is dropped), otherwise unknown |
+| your `ctx` ended while waiting | false if the flush had already dropped the command before encoding its batch; true otherwise | no when false; when true, no if its batch had not been encoded yet (the command is dropped), otherwise unknown |
 | the propose timed out or was cancelled | true | unknown |
 | the proposer returned another error (for example `*NotLeaderError`, `*EntryTooLargeError`) | false | no |
 | the command cannot be encoded (`*EncodeError`, length above `math.MaxInt32`) | false | no |

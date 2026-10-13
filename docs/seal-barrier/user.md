@@ -1,6 +1,6 @@
 # Seal and barrier: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for someone embedding go-quicraft and turning on at-rest

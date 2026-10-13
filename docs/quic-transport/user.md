@@ -1,7 +1,7 @@
 # QUIC Transport — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport` and its
-> configuration surface · Last verified: 2026-10-11
+> configuration surface · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 You deal with the transport in four ways: giving it certificates, giving every
@@ -189,7 +189,7 @@ If you deploy into a FIPS-regulated environment, this is the decision to make.
 
 ### What works, measured
 
-Measured 2026-09-04 with `quic-go` v0.62.0, `-tags fips`, real handshakes and
+Measured with `quic-go` v0.62.0, `-tags fips`, real handshakes and
 live three- and five-node clusters:
 
 | | `fips140=on` | `fips140=only` |

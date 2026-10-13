@@ -1,7 +1,7 @@
 # Testing infrastructure
 
 > **Status: NORMATIVE** · Scope: go-quicraft's test suites, build tags, injectors
-> and gates: `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-10-02
+> and gates: `Makefile`, `test/`, `.github/workflows/ci.yml` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 What each suite is built from, which build tag gates it, and why the gates are
@@ -45,9 +45,9 @@ Four packages under `test/integration/`, all behind `//go:build integration`:
 | Package | Tests | Covers |
 |---|---|---|
 | `raft/` | 31 | elections, replication, failover, snapshots, read paths, multi-shard, stress, 3N and 5N |
-| `host/` | 47 (+1 under `quicraft_netfault`) | public Host API, LeaseRead, membership change, observer promotion, rolling restart, snapshot under load |
-| `e2e/` | 60 (+5 under `quicraft_netfault`) | cluster formation, partitions, quorum loss, barrier encryption, node replacement |
-| `linearizability/` | 26 | Porcupine verification, chaos soaks, read-your-writes, proposal-key incarnations |
+| `host/` | 53 (+2 under `quicraft_netfault`) | public Host API, LeaseRead, membership change, observer promotion, rolling restart, snapshot under load |
+| `e2e/` | 64 (+5 under `quicraft_netfault`) | cluster formation, partitions, quorum loss, barrier encryption, node replacement |
+| `linearizability/` | 27 | Porcupine verification, chaos soaks, read-your-writes, proposal-key incarnations |
 
 Counts include each suite's budget pin test.
 
@@ -114,7 +114,7 @@ Every netfault test asserts `netfault.BlockedCount()` is non-zero before it
 proceeds, so building without the tag fails loudly instead of exercising a
 healthy cluster.
 
-Six tests use it:
+Seven tests use it:
 
 | Test | Package |
 |---|---|
@@ -124,6 +124,7 @@ Six tests use it:
 | `TestElectionSafety_SpentTermCannotBeWonTwice` | e2e |
 | `TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent` | e2e |
 | `TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent` | host |
+| `TestLeaderReady_SameLeaderReelectedAtHigherTerm` | host |
 
 `make ci-netfault` and CI's `netfault` job run both packages (`NETFAULT_PKGS`),
 each whole rather than filtered by test name. The target fails if a package
@@ -173,9 +174,9 @@ recovery path shows up as a race rather than a wrong answer.
 
 | Package | Targets | Surface |
 |---|---|---|
-| `pkg/proto` | 13 | Entry, Message, MessageBatch, State, Membership, ConfigChange, Snapshot: round-trip and crash |
+| `pkg/proto` | 13 | Entry, Message, MessageBatch, State, Membership, ConfigChange, Snapshot, SnapshotChunk: round-trip and crash |
 | `pkg/logdb/waldb` | 9 | WAL record codec and recovery |
-| `pkg/internal/transport` | 5 | frame header decode and the message-frame receive path |
+| `pkg/internal/transport` | 5 | frame header round-trip and decode, heartbeat detection, frames with payload, and the message-frame receive path |
 | `pkg/internal/session` | 4 | session encoding boundaries |
 | `pkg/seal` | 4 | AEAD encrypt/decrypt across epochs |
 | `pkg/internal/raft` | 2 | adversarial step sequences, log recovery |
@@ -210,7 +211,7 @@ and is not one; with a count there is no deadline to race.
 
 ### Linearizability
 
-`test/integration/linearizability`, Porcupine-based, 26 tests. Clients issue
+`test/integration/linearizability`, Porcupine-based, 27 tests. Clients issue
 put/get operations against a KV state machine while faults are applied, and the
 recorded history is checked for a valid sequential order.
 
@@ -238,8 +239,8 @@ window); three soaks in `soak_chaos_test.go` (`ChaosUnderSustainedLoad`,
 `RollingRestartUnderLoad`, `LeaderCloseDoesNotStallWrites`);
 `TestSoak_RollingRestart_ReadYourWrites`;
 `TestRestart_ProposalKeysDoNotCollideAcrossIncarnations`, which pins that
-proposal keys stay unique across restarts; and the history-pruning and
-partition-diagnosis tests behind the checker.
+proposal keys stay unique across restarts; the history-pruning and
+partition-diagnosis tests behind the checker; and the budget pin test.
 
 What makes the suite meaningful is the operation floor. An empty history, or
 one with only writes or only reads, is trivially linearizable.
@@ -272,7 +273,7 @@ Every directory under `test/`:
 | `proposer/` | submits proposals and linearizable reads to whichever replica leads at the moment of the call |
 | `membership/` | applies membership changes through the current leader and treats the retry of an already committed change as success |
 | `lockedmem/` | reads the kernel's view of this process's mappings (Linux), so tests can assert a page is locked or read-only |
-| `buildgates/` | untagged tests for the parts of the build that are not Go: analyser version pins, CI gate wiring, the integration Dockerfile, FIPS and fuzz budgets, release inputs |
+| `buildgates/` | untagged tests for the parts of the build that are not Go: action SHA pins and analyser version pins, CI gate wiring, the integration Dockerfile, module downloads and their credentials, FIPS and fuzz budgets, release inputs and the tag guard, export-ignored private workflows, the remote staging guard; and two rules over the integration trees: route through the leader, never reserve port 0 |
 | `releasability/` | the public-releasability gate; see [public-releasability.md](../release/public-releasability.md) |
 | `performance/` | the cross-system benchmark framework (separate modules) |
 
@@ -378,15 +379,15 @@ gate: it interleaves baseline and current binaries across many rounds at a fixed
 iteration count and compares the distributions with benchstat. See
 [Benchmark regression testing](benchmarking.md).
 
-## Numbers (2026-10-02)
+## Numbers (2026-10-13)
 
-- 6,799 top-level test functions across the 24 packages under `pkg/`; 7,874
+- 7,088 top-level test functions across the 26 packages under `pkg/`; 8,208
   across the module tree
-- 170 integration test functions: 164 under `integration`, 6 more under
+- 182 integration test functions: 175 under `integration`, 7 more under
   `quicraft_netfault`
 - 37 fuzz targets in six packages, all seeded; 39 committed corpus files
 - 36 errfs tests: 23 injecting, 13 testing the injector
-- 26 linearizability tests; 7 netfault injector tests
+- 27 linearizability tests; 7 netfault injector tests
 - Coverage floor 91% locally, 90% in CI, total and per package
 
 Counts drift. Regenerate with `git grep -cE '^func Test'`.

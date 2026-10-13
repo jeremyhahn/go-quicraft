@@ -1,6 +1,6 @@
 # Shamir primitive: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for a developer building a key-custody layer on top of this
@@ -17,9 +17,11 @@ belong to the database layer above; this package has no commands.
 
 ## The one thing you must not skip
 
-Combining does not check its own output. Hand it four shares of a real 5-of-9
-split and it returns 32 bytes of garbage with a `nil` error. A share corrupted in
-transit, or a share set whose `Threshold` field was relabelled, does the same.
+Combining does not check its own output. The share count is checked only against
+the threshold it is told: hand `CombineBytes` four shares of a real 5-of-9 split
+with `threshold` 4 and it returns 32 bytes of garbage with a `nil` error. A share
+corrupted in transit, a share from another split, or a share set whose
+`Threshold` field was relabelled, does the same.
 
 You must authenticate the reconstructed secret against something outside the
 share set. Usually that is the operation you were going to do anyway:
@@ -31,7 +33,9 @@ if err != nil {
 }
 defer secret.Destroy()
 
-// The real check: use the secret. Unseal fails on a wrong one.
+// The real check: use the secret. Unseal fails on a wrong one. This needs a
+// strategy that takes its passphrase from creds (NewDeferredSoftwareStrategy);
+// one built with a passphrase of its own ignores creds.
 var creds seal.Credentials
 if err := secret.WithBytes(func(b []byte) error {
 	var err error
@@ -197,7 +201,7 @@ only outrun by a rekey ceremony.
 
 ```go
 if err := shamir.VerifyShare(candidate, collected); err != nil {
-	return err // nil share, threshold/total mismatch, or duplicate index
+	return err // invalid or nil share, threshold/total mismatch, or duplicate index
 }
 ```
 
@@ -221,8 +225,10 @@ both from the same commit.
 bytes, exceeding the 65536-byte limit` when splitting): you are sharing a payload
 rather than a key. Encrypt the payload under a key and share the key.
 
-**`... need X bytes of locked memory, exceeding the Y-byte budget`**: the whole
-set does not fit `MaxShareSetBytes`. Use a smaller secret (share a key, not a
+**`... need X bytes of locked memory, exceeding the Y-byte budget`** when
+splitting (or `share set needs at least X bytes of locked memory, exceeding the
+Y-byte budget` from `UnmarshalShareSet`): the whole set does not fit
+`MaxShareSetBytes`. Use a smaller secret (share a key, not a
 payload) or fewer shares.
 
 **A `*ProtectedMemoryError`**: the process is out of locked memory

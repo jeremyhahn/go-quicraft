@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
 > `pkg/internal/session`, and the session fields of `pkg/proto` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -141,7 +141,8 @@ bootstrap.
 - **`pkg/internal/rsm`**: routes session entries before the user state machine
   sees them.
 - **`pkg/proto`**: the `Entry` session fields (`ClientID`, `SeriesID`,
-  `RespondedTo`, `OwnerID`) and `SessionPolicy` in `Membership`.
+  `RespondedTo`, `OwnerID`) and the session policy fields of `Membership`,
+  read as a `SessionPolicy` through `Membership.SessionPolicy()`.
 - **Consumers**: `Host.GetNewSession`, `GetNewSessionWithOwner`,
   `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession`,
   `CloseSession`, `GetNoOPSession`.

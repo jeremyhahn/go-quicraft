@@ -1,7 +1,7 @@
 # Client Sessions — API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go` and the `Host`
-> session methods · Last verified: 2026-10-11
+> session methods · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -48,7 +48,7 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 |---|---|
 | Request | a registered session and the command |
 | Response | a `*RequestState` (async) or the `sm.Result` (sync) |
-| Errors at submit | `ErrSessionBusy` (another proposal is in flight on this session; `Temporary`), `ErrInvalidSession` (a no-op, unregistered or wrong-shard session), `ErrSessionsUnsupportedOnDisk`, `ErrInvalidOperation` (on a witness), `*EntryTooLargeError`, `ErrDiskFull`, `*NotLeaderError`, `ErrClosed`, `ErrDraining`, and the other proposal errors in [`../multi-group-host/api.md`](../multi-group-host/api.md) |
+| Errors at submit | `ErrSessionBusy` (another proposal is in flight on this session; `Temporary`), `ErrInvalidSession` (a no-op, unregistered or wrong-shard session), `ErrSessionsUnsupportedOnDisk`, `ErrInvalidOperation` (on a witness), `*EntryTooLargeError`, `ErrDiskFull`, `ErrBarrierSealed`, `*NotLeaderError`, `ErrClosed`, `ErrDraining`, and the other proposal errors in [`../multi-group-host/api.md`](../multi-group-host/api.md) |
 | Errors in the result | `*SessionExpiredError` (`errors.Is` matches `ErrSessionExpired`), or the proposal's own failure |
 | Permission | none |
 
@@ -131,8 +131,9 @@ another proposal's cached result.
 
 `NewSession` and `NewSessionWithOwner` only construct the value;
 `Host.RegisterSession` registers it. `ValidForProposal` is false for a no-op
-session, a session on another shard, and a session still at series 0 (never
-registered, or registered without `PrepareForPropose`).
+session, a session on another shard, a session still at series 0 (constructed
+and never registered), and a session whose series is `SeriesIDForRegister` or
+`SeriesIDForUnregister` (registration not completed, or closed).
 
 ### Constants
 

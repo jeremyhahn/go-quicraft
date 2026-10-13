@@ -1,7 +1,7 @@
 # Write Batching — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Use the aggregator when you have many small writes and the fixed cost of each
@@ -173,9 +173,10 @@ of the throughput.
 batches are not filling.
 
 **A definite `*FlushError`.** The propose failed for the whole batch, and every
-caller in it gets the same error. `errors.As` the wrapped cause: a
-`*quicraft.NotLeaderError`, `quicraft.ErrBusy`, `quicraft.ErrDiskFull`,
-or `*quicraft.EntryTooLargeError` for a single command too large for an entry.
+caller in it gets the same error. Inspect the wrapped cause: `errors.As` for a
+`*quicraft.NotLeaderError`, or a `*quicraft.EntryTooLargeError` for a single
+command too large for an entry; `errors.Is` for `quicraft.ErrBusy` or
+`quicraft.ErrDiskFull`.
 
 **Submit returned nil but the state machine rejected the command.** Expected:
 the batch has one result. Use `Host.SyncPropose` when you need per-command

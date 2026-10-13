@@ -1,7 +1,7 @@
 # QUIC Transport — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/transport` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 There is no CLI: go-quicraft is a library and ships no binaries, so the
@@ -23,7 +23,7 @@ The repository has no `cmd/` directory, and the transport packages are
 |---|---|
 | `make test-transport` | `go test -race -count=1 -v ./pkg/internal/transport/...` |
 | `make bench-transport` | the transport benchmarks |
-| `make ci-netfault` | the `test/integration/e2e` suites with the `quicraft_netfault` partition injector |
+| `make ci-netfault` | the `test/integration/e2e` and `test/integration/host` suites with the `quicraft_netfault` partition injector |
 | `make verify-fips` | every package except `pkg/internal/transport/revocation/...` under `GOFIPS140=latest GODEBUG=fips140=only`, `-tags fips` |
 | `make verify-fips-exempt` | `pkg/internal/transport/revocation/...` under `GOFIPS140=latest GODEBUG=fips140=on`, `-tags fips` |
 

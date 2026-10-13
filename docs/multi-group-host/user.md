@@ -1,7 +1,7 @@
 # Multi-Group Host — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — deploying, configuring,
-> monitoring and operating a `Host` · Last verified: 2026-10-11
+> monitoring and operating a `Host` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 How to run a `Host`: start it, form shards, change membership, read and write,
@@ -328,7 +328,7 @@ host, err := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
   default WAL is still encrypted under the host-wide barrier, so for per-tenant
   log keys you need a LogDB that supports them, such as a multiplexing LogDB
   that reports `logdb.AtRestHostRouted`. That works with `WithBarrier` (even
-  before `EnableEncryption`) and with `WithoutEncryption`; either way each
+  a plaintext-mode barrier, one initialized with the `None` strategy) and with `WithoutEncryption`; either way each
   tenant shard is checked against the LogDB at `StartShard`.
 
 ## Monitor
@@ -438,7 +438,8 @@ leaderless shard, watch for `ShardNoLeader` health with no election activity.
 A freshly elected leader cannot serve linearizable reads until it has committed
 an entry of its own term, and `ReadIndex` returns `ErrReadIndexNotReady` until
 then. Wait for `OnLeaderReady` instead of retrying: it fires on every replica
-except a witness, leader or follower, once that commit is known there, and from
+except a witness (the leader, followers and observers), once that commit is
+known there, and from
 then on reads issued on that replica are not refused for that reason. The next
 `OnLeaderUpdated` ends it — including the same leader re-elected at a higher
 term, which `OnLeaderLost` does not report. `ShardReadReady` gives the same

@@ -1,7 +1,7 @@
 # Write Batching — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -73,8 +73,9 @@ result.
 ## Abandoned callers are dropped before encoding
 
 When a caller's context ends while it waits, `Submit` returns at once with an
-indeterminate `*FlushError`. If its batch has not been encoded yet, the
-aggregator then removes the command, so a caller that gave up is not carried
+indeterminate `*FlushError`, or with a definite one if the flush has already
+dropped the command. If its batch has not been encoded yet, the aggregator
+removes the command, so a caller that gave up is not carried
 into the log by whichever caller in the batch was still waiting. If no caller is
 left, the batch is not proposed at all.
 
@@ -102,7 +103,7 @@ carry the choice through configuration:
 | Mode | Acknowledged after | `IsSynchronous` / `RequiresQuorum` | `IsAsync` |
 |---|---|---|---|
 | `Sync` | quorum commit (`Host.SyncPropose`) | true | false |
-| `WALDurable` | local WAL persistence (`Host.Propose` plus `RequestState.CommittedC()`) | false | true |
+| `WALDurable` | local WAL persistence (`Host.Propose` plus `RequestState.CommittedC()`, which fires only with `HostConfig.NotifyCommit` set) | false | true |
 | `Batched` | quorum commit of the batch that carries it (the aggregator) | true | false |
 
 `Mode` is an open `uint8`, so a value outside the three constants is

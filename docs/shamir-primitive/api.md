@@ -1,7 +1,7 @@
 # Shamir primitive: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-11
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -195,7 +195,7 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error)
 |---|---|
 | Request | `values`: M..255 base64-encoded share values (what `SplitBytes` returned); `threshold`: the true M, from a trusted source |
 | Response | the reconstructed secret |
-| Errors | `*CombineError` for structural violations: too few, too many, wrong format version, zero or duplicate x, mismatched payload length, oversized payload |
+| Errors | `*CombineError` for structural violations: `threshold` below 2, no values, too few, too many, a value that is not standard base64, a share too short to carry a header, wrong format version, zero or duplicate x, mismatched payload length, oversized payload |
 | Permission | none |
 | Caller obligation | authenticate the result out of band; wipe the input buffers |
 
@@ -229,7 +229,7 @@ func VerifyShare(share *Share, otherShares []*Share) error
 |---|---|
 | Request | one share and a set to compare it against |
 | Response | `nil` if consistent |
-| Errors | `*ValidationError` for a nil share (its position named), a `Threshold`/`Total` mismatch, or a duplicate `Index` |
+| Errors | `*ValidationError` when `share` itself fails `Validate` (nil, bad header or empty value), for a nil element of `otherShares` (its position named), a `Threshold`/`Total` mismatch, or a duplicate `Index` |
 | Permission | none |
 
 This checks metadata consistency, not cryptographic validity. It cannot tell you

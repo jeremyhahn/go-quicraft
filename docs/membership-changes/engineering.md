@@ -3,7 +3,7 @@
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
 > `config.WitnessConfig`, and the membership half of `pkg/internal/raft` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the role model and the scope fence are in
@@ -389,7 +389,7 @@ Per shard, on `config.Config`:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `OrderedConfigChange` | `*bool`, nil = **enabled** | serialize membership changes; no concurrent config changes |
+| `OrderedConfigChange` | `*bool`, nil = **true** | not consulted outside `pkg/config`; one config change in flight is enforced unconditionally |
 | `IsObserver` | `false` | this replica starts as an observer: replicates but does not vote. Initial hint only: the committed membership decides from the moment it names the replica |
 | `IsWitness` | `false` | this replica votes but stores no log data |
 | `Witness` | `WitnessConfig{}` | `MaxWitnesses` and `RequireFullReplicaMajority`; bootstrap seed only |
@@ -399,7 +399,9 @@ Per shard, on `config.Config`:
 membership").
 
 `OrderedConfigChange` is a `*bool` so its zero value means "unset, use the
-default" rather than "off". Use `config.BoolPtr(false)` to disable deliberately.
+default" rather than "off". Nothing outside `pkg/config` reads it: the raft
+layer refuses a second in-flight config change with `ErrRejected` regardless,
+and `config.BoolPtr(false)` only makes `Config.Validate` log a warning.
 
 **Witness policy is replicated state, not per-node configuration.**
 `Config.Witness` seeds it at bootstrap; after that it changes only through
@@ -505,7 +507,8 @@ caller computing a quorum or health figure must filter on `Role`.
 | Level | Event | Why |
 |---|---|---|
 | WARN | a message dropped by the sender gate (rate-limited, with `drops_since_last_log`) | a stale removed node, or something impersonating a member |
-| ERROR | `config change unmarshal failed`, `initial membership entry unmarshal failed`, `refusing initial-membership entry outside the bootstrap index` | committed membership is unreadable; the shard faults |
+| ERROR | `config change unmarshal failed`, `initial membership entry unmarshal failed` | committed membership is unreadable; the shard faults |
+| ERROR | `refusing initial-membership entry outside the bootstrap index` | an `EntryInitialMembership` at an index other than 1; it is skipped identically on every replica and the shard does not fault |
 | ERROR | `shard membership exceeds the ReadIndex ackBits word` | the 64-member cap was reached on a path that fails the shard |
 | WARN | `config change apply skipped` | a deterministic apply refusal, identical on every replica |
 | INFO | `replica promoted in place` / observer role derived from the membership | the replica's own role changed |

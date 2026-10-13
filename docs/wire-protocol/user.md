@@ -1,6 +1,6 @@
 # Wire Protocol — Usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Most people embedding go-quicraft never import `pkg/proto`. You reach it in
@@ -150,9 +150,11 @@ Rebuild everything from one commit. Do not relax the check.
 **`ErrInvalidEntryType`.** Either a genuinely unknown type, or reserved bits
 above bit 4 are set. They are rejected rather than masked, on purpose.
 
-**`ErrEntrySizeLimitExceeded`.** A proposal above 8 MB. The effective cap at
-`Propose()` is `min(MaxProposalPayloadSize, MaxEntrySize)`. Split the payload
-or put it behind a reference; do not raise the constant.
+**`ErrEntrySizeLimitExceeded`.** An `Entry.Cmd` above 8 MB reached the codec.
+A proposal never gets that far: `Propose()` refuses a payload above
+`min(MaxProposalPayloadSize, MaxEntrySize)` first, with
+`*quicraft.EntryTooLargeError` (`errors.Is` `quicraft.ErrEntryTooLarge`).
+Split the payload or put it behind a reference; do not raise the constant.
 
 **`ErrDuplicateMapKey`.** A membership map repeated a key. Encoding writes each
 key once in ascending order, so a repeat means the bytes were not produced by

@@ -1,7 +1,7 @@
 # Write Batching — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Rationale and the scope fence are in [`architecture.md`](architecture.md); the
@@ -83,8 +83,9 @@ returns `*QueueFullError` if the queue is at `QueueSize`.
   goroutine exiting.
 
 **`Close` is one-way and idempotent**: it marks the aggregator closed, drains
-the queue into the batch (through the same byte check), flushes, waits for the
-flush goroutine and returns nil.
+the queue into the batch (through the same byte check, but with no
+`MaxBatchSize` check, so the final batch can hold more than `MaxBatchSize`
+proposals), flushes, waits for the flush goroutine and returns nil.
 
 **Payload format**: `[len:4 BE][cmd]...`. Encode and decode both refuse a
 length above `math.MaxInt32` (on 32-bit platforms it would wrap negative and
@@ -110,8 +111,10 @@ An unknown value reports `"unknown(N)"` and false from every predicate;
 
 `FlushError.Indeterminate` is true when the proposer's error is
 `context.DeadlineExceeded` or `context.Canceled`, when the propose context has
-ended, or when the caller's own context ended while waiting. Otherwise the
-failure is definite.
+ended, or when the caller's own context ended while waiting and no result had
+been delivered. Otherwise the failure is definite, including the `*FlushError`
+wrapping the caller's context error that the flush delivers when it drops an
+abandoned proposal; `Submit` returns that one if it arrived first.
 
 Sentinels are package-level values; each typed error implements `Is` against
 its sentinel, and `FlushError` implements `Unwrap`.
@@ -153,7 +156,8 @@ through the normal proposal path
 ## 5. Test strategy
 
 Targets: `make test-batch`, `make bench-batch`, `make test-writemode`,
-`make bench-writemode`.
+`make bench-writemode`. Neither package declares a benchmark, so the two
+`bench-` targets run none.
 
 | Covers | Where |
 |---|---|

@@ -1,7 +1,7 @@
 # Client Sessions — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/session.go`,
-> `pkg/internal/session` · Last verified: 2026-10-11
+> `pkg/internal/session` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface.** go-quicraft is a library and ships no binaries (there is no

@@ -1,6 +1,6 @@
 # Membership changes: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -25,8 +25,8 @@ Every change below is proposed to the shard's current leader and takes a
 `configChangeIndex`: pass `Membership.ConfigChangeID` read immediately before
 the call. A non-zero value that does not match the shard's current
 configuration is refused with `*StaleConfigChangeError`; 0 skips the check.
-`Sync*` forms block until the change commits and need a context with a
-deadline.
+`Sync*` forms block until the change commits. A context without a deadline is
+bounded by the host's 5-minute pending-request backstop.
 
 ### Capability: add a voting member
 
@@ -41,7 +41,7 @@ func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, repl
 |---|---|
 | Request | the shard, the new replica ID, its advertised address, its node identity, and the `configChangeIndex` |
 | Response | a `*RequestState`, or only an error from the `Sync` form |
-| Errors | see [Errors](#errors); before validation also `ErrCanceled` / `ErrTimeout` (a context already done: nothing is submitted), `ErrClosed`, `ErrDraining`, `*NotLeaderError`, `ErrSystemBusy` (global rate limiter, or a full proposal queue), `ErrShardNotReady` |
+| Errors | see [Errors](#errors); before validation also `ErrCanceled` / `ErrTimeout` (a context already done: nothing is submitted), `ErrClosed`, `ErrDraining`, `ErrShardNotFound` (the shard is not running on this host), `ErrBarrierSealed`, `*NotLeaderError`, `ErrSystemBusy` (global rate limiter, or a full proposal queue), `ErrShardNotReady`, `ErrShardFailed` (the shard halted) |
 | Permission | none in this library; the caller must be talking to the leader |
 
 `identity` is the SPKI pin the transport derives from the peer's mTLS leaf,
@@ -183,8 +183,9 @@ is wrapped in `*MaybeAppliedError`, so `MaybeApplied(err)` is true: the change
 may still commit. Re-read the membership with `SyncGetShardMembership` before
 proposing again; a retry against a configuration the change already altered is
 refused with `*StaleConfigChangeError` when it carries the old
-`configChangeIndex`. A refusal from the table below happened before the
-hand-off and is never wrapped.
+`configChangeIndex`. A refusal from the table below is definite (nothing
+entered the log) and is never wrapped; `ErrRejected` is delivered through the
+`*RequestState` rather than returned by the call.
 
 | Error | Meaning |
 |---|---|
@@ -195,7 +196,7 @@ hand-off and is never wrapped.
 | `ErrDuplicateMemberAddress` | the add names a new replica at an address another active member holds |
 | `ErrDuplicateMemberIdentity` | the add binds an identity another active member holds |
 | `ErrSharedPeerCertificate` / `*SharedPeerCertificateError` | this host's own certificate also covers the added replica's host |
-| `ErrNodeAlreadyExists` | the target already holds the requested role, or is a witness (a witness cannot be promoted) |
+| `ErrNodeAlreadyExists` | the add targets an existing member: `AddNode` on a voter or a witness (a witness cannot be promoted), an observer or witness add on any member |
 | `ErrNodeRemoved` | the replica ID was removed from this shard; IDs are never reused |
 | `ErrNodeNotFound` | a removal targets a replica that is not a member |
 | `ErrRemoveLastFullReplica`, `ErrRemoveLastVoter` | the removal would leave the shard unable to elect |
@@ -207,7 +208,7 @@ hand-off and is never wrapped.
 | `*ReplicaNotFoundError` | no such replica of this shard on this host |
 | `*ShardNotStoppedError` | a local data operation on a running replica |
 | `*EmptyMembersError`, `*SelfNotInMembersError`, `*InvalidMemberError` | `StartShard` was given an unusable founding member map |
-| `*NonVotingRoleInMembersError` (`ErrNonVotingRoleInMembers`) | `StartShard` for a replica configured as observer or witness that is also listed in the founding member map |
+| `*NonVotingRoleInMembersError` (`ErrNonVotingRoleInMembers`) | `StartShard`, on a first start, for a replica configured as observer or witness that is also listed in the founding member map |
 | `*CorruptConfigEntryError`, `*BootstrapEntryMissingError` | the log's own membership record is unreadable or absent; the shard cannot start |
 | `*UnauthorizedMessageError` | an inbound snapshot transfer from a sender not authorized for the shard. Ordinary Raft messages from such a sender are dropped and counted, not returned. |
 
@@ -228,7 +229,7 @@ Per shard, on `config.Config`.
 
 | Field | Default | Note |
 |---|---|---|
-| `OrderedConfigChange` | `*bool`, nil = enabled | serialize membership changes |
+| `OrderedConfigChange` | `*bool`, nil = true | not consulted outside `pkg/config`. One config change in flight is enforced unconditionally (`ErrRejected`); `BoolPtr(false)` only logs a warning from `Validate`. |
 | `IsObserver` / `IsWitness` | false | mutually exclusive. `IsObserver` is an initial hint: the committed membership decides once it names the replica. `IsWitness` is binding. |
 | `Witness` | `WitnessConfig{}` | bootstrap seed only |
 | `MemberIdentities` | nil | required on a host with a transport: every founder's members (`join=false`), at least one anchor replica (`join=true`). Entries beyond the members map are the operator anchor the receive gate consults for a sender no configuration names. |

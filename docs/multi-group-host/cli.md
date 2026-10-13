@@ -1,7 +1,7 @@
 # Multi-Group Host — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg`, `pkg/config` ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface: go-quicraft is a library and ships no binaries.**
@@ -28,7 +28,7 @@ own repository.
 | Target | Runs |
 |---|---|
 | `make build` | `go build ./...`. Produces no artifact |
-| `make test` | the unit suite (`go test -race -count=1 ./...`, no build tags) |
+| `make test` | the unit suite (`go test -race -count=1 -v ./...`, no build tags) |
 | `make lint` | golangci-lint |
 | `make ci` | `fmt no-mutants check-tool-versions vet lint security build test` |
 | `make ci-full` | `ci` plus all modules, cross-platform build and vet, I/O faults, fuzz seeds and mutation, integration, network faults and the FIPS targets |

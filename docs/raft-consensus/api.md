@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, and the `Host` methods that drive them ·
-> Last verified: 2026-10-11
+> Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -182,8 +182,10 @@ with `errors.Is` / `errors.As`.
 ### Notifications
 
 `config.EventListener` carries the user-visible callbacks. `OnLeaderUpdated`,
-`OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and `OnShardFailed` for step, commit and
-apply failures are delivered on a dedicated dispatcher goroutine that holds no
+`OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched`, `OnShardFailed` for step,
+commit and apply failures, and the snapshot and compaction notifications
+(`OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`,
+`OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected`) are delivered on a dedicated dispatcher goroutine that holds no
 engine lock, so a listener may call any `Host` API, including the synchronous
 `StopShard`. Delivery is FIFO, so it is ordered per shard. The other callbacks
 run on the goroutine that produced them and must not block. There is no
@@ -211,13 +213,13 @@ the [host API errors](../multi-group-host/api.md#errors).
 ## Configuration
 
 The full table is in [`engineering.md`](engineering.md#configuration). The
-three that change behavior rather than performance:
+four that change behavior rather than performance:
 
 | Field | Default | Note |
 |---|---|---|
 | `CheckQuorum` | `*bool`, nil = enabled | the leader steps down without quorum |
 | `PreVote` | `*bool`, nil = enabled | stops a partitioned node disrupting a healthy term |
-| `LeaseRead` | `false` | requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) and `ElectionRTT >= 5` (`*config.ValidationError`) |
+| `LeaseRead` | `false` | requires `CheckQuorum` (`config.ErrLeaseReadRequiresCheckQuorum`) and `ElectionRTT >= 5` (`*config.ValidationError`) |
 | `MaxClockDrift` | `0` = 1% | the clock-RATE difference between replicas the lease tolerates, as a fraction; the leader shortens its lease by it. Non-zero must be in `[config.MaxClockDriftMin, config.MaxClockDriftMax]` = `[1e-6, 0.5]`, else `*config.ValidationError` |
 
 The `*bool`s are pointers so the zero value means "unset", not "off".

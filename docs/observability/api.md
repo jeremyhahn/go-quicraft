@@ -1,7 +1,7 @@
 # Observability: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-11
+> notifications · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -160,9 +160,11 @@ higher term, a case `OnLeaderLost` does not report.
 match it with `errors.As`.
 
 `SnapshotInfo.Err` is set only on `OnSnapshotRejected`, to the rejection's
-cause when one exists: the snapshot pool's refusal (`*SnapshotDuplicateError`,
-`*SnapshotPoolBusyError`), an abandonment (`ErrStopped`, a save's
-`*SnapshotSavePanicError`), the error or `*SnapshotRecoveryPanicError` that
+cause when one exists: the snapshot pool's refusal of a duplicate request or
+of a request it has no room for, an abandonment because the pool stopped (all
+three are engine-internal errors that package `quicraft` does not export, and
+`quicraft.ErrStopped` does not match the stop), a save's
+`*SnapshotSavePanicError`, the error or `*SnapshotRecoveryPanicError` that
 rejected a recovery before the state machine restore began, or the error
 behind an inbound transfer the receiver refused. It is nil on every other
 event and on a rejection with no underlying error (an incomplete transfer, a

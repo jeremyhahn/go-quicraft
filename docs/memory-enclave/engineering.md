@@ -1,6 +1,6 @@
 # Memory enclave: engineering contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-enclave` (v0.8.0-alpha in `go.mod`).
@@ -31,6 +31,10 @@ func (s *SealedEnclave) Openable() error
 func (s *SealedEnclave) IsAlive() bool
 func (s *SealedEnclave) Destroy() error                  // WIPES the ciphertext; always nil today
 
+// Budgeted allocation (pkg/crypto/shamir's ...With entry points)
+func (a *Allocator) New(data []byte) (*MemoryEnclave, error)  // moves data in; wipes data on every path
+func (a *Allocator) NewSized(n int) (*MemoryEnclave, error)   // writable; fill in place
+
 // Utility
 func enclave.Wipe(b []byte)
 func enclave.LockedSize(n int) int64
@@ -39,7 +43,7 @@ func enclave.LockedSize(n int) int64
 var ErrEnclaveDestroyed, ErrEmptyEnclave, ErrInvalidSize,
     ErrLockedMemoryUnavailable, ErrReleasedWithoutWipe, ErrSealFailed,
     ErrEnclaveCorrupted, ErrOpenFailed, ErrSealedAuthentication,
-    ErrSealerWiped error
+    ErrSealerWiped, ErrNilAllocator, ErrBudgetExhausted error
 ```
 
 ## 2. Invariants
@@ -49,8 +53,8 @@ its own `sync.RWMutex` inside go-enclave. Readers hold the read lock for the cal
 and `Destroy` takes the write lock, so teardown waits out in-flight readers. A
 `SealedEnclave`'s lock only pins and unpins its envelope and is not held across
 the open, so its `Destroy` does not wait (see the table). Every call is safe
-under concurrency. A slice that outlives the call is not, and since v0.8.0 go-enclave
-hands out no such slice: `WithBytes` is the only read path, and the view it
+under concurrency. A slice that outlives the call is not, and go-enclave hands
+out no such slice: `WithBytes` is the only read path, and the view it
 passes is valid for the callback alone.
 
 | Operation | Concurrency | Idempotent |
@@ -147,7 +151,7 @@ passes is valid for the callback alone.
 | Error | Type | Returned when | Fail-closed? |
 |---|---|---|---|
 | `ErrEnclaveDestroyed` | sentinel | any read on a destroyed or nil enclave, either type | Yes; the callback is not called |
-| `ErrLockedMemoryUnavailable` | `*LockedMemoryError` | the kernel refuses to map, lock or mprotect the pages, usually at `RLIMIT_MEMLOCK` | Yes; that allocation alone fails |
+| `ErrLockedMemoryUnavailable` | `*LockedMemoryError` | the kernel refuses to map, lock or mprotect the pages, usually at `RLIMIT_MEMLOCK`; from `MemoryEnclave.Destroy`, the kernel refused the release | Yes; that allocation alone fails, and a refused release keeps the pages for a retry |
 | `ErrEmptyEnclave` / `ErrInvalidSize` | sentinels | an enclave over no material, or a size no enclave can have | Yes; refused before anything is mapped |
 | `ErrSealFailed` | sentinel | the AEAD, the CSPRNG or the provider failed while sealing, or the seal's context ended | Yes |
 | `ErrOpenFailed` | sentinel | an open's context ended, or a `ModePerOperation` provider's infrastructure failed | Yes; the sealed value stays intact and can be opened again |

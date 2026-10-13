@@ -1,6 +1,6 @@
 # Wire Protocol — Engineering Contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/proto` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg/proto`
@@ -654,7 +654,7 @@ uncompressed is fed to the state machine as garbage.
 
 | Field | Why not |
 |-------|---------|
-| a state machine type | Which state machine a shard runs is a property of the local process (`StateMachineFactory`, recorded durably in `logdb.Bootstrap.Type`), not of an artifact streamed from a peer |
+| a state machine type | Which state machine a shard runs is a property of the local process (the `sm.CreateFunc` passed to `StartShard`, recorded durably in `logdb.Bootstrap.Type`), not of an artifact streamed from a peer |
 | a witness flag | An empty `Filepath` is the repository-wide test for a metadata-only snapshot; a second, independently settable statement of the same fact could only disagree with it |
 | a checksum | A hash has to cover the final artifact bytes (after compression and encryption), so it belongs where the artifact is produced, not in this message. A checksum field that rides the wire but is not verified would read as an integrity control that does not exist |
 
@@ -663,7 +663,7 @@ xxhash64 of the final `snapshot.dat` bytes in the artifact's `snapshot.meta`,
 and recovery, the transport send and `ExportSnapshot` verify it as they read; a
 record with no integrity fields fails closed. That hash detects corruption, not
 tampering: authenticity rests on TLS in transit and the barrier's AEAD at rest,
-so a shard with a plaintext barrier (`seal.None`) has corruption detection but
+so a shard with a plaintext barrier (`seal.StrategyNone`) has corruption detection but
 no tamper protection on its snapshot artifacts.
 
 ## Membership wire format
@@ -1071,8 +1071,9 @@ The `ReadOnly` flag is set by `Peer.GetUpdate` when the update contains
 only `ReadyToRead` states with no entries, state changes, or snapshots.
 The step worker bypasses the commit/apply pipeline for read-only updates.
 
-`Update` also holds an unexported `committedEntriesPooled *[]Entry`. When the
-Raft log's `entriesToApply` sets it via `SetCommittedEntriesPooled`, the apply
+`Update` also holds an unexported `committedEntriesPooled *[]Entry`. When
+`Peer.GetUpdate` sets it via `SetCommittedEntriesPooled`, with the pooled
+slice the Raft log's `entriesToApply` returned, the apply
 worker returns the slice through `ReleaseCommittedEntries` after applying.
 `CommittedEntries` must be a sub-slice of that pooled slice, and must not be
 accessed after the release.
@@ -1437,9 +1438,11 @@ data from a buffer already reused by the next receive.
 
 ### LogDB boundary (outbound)
 
-When `LogDB.Entries()` returns entries, `Entry.Cmd` aliases the LogDB read
-buffer. The caller must copy `Cmd` if the data is needed beyond the current
-operation. The Raft protocol layer copies Cmd data into outbound Message
+`LogDB.IterateEntries()` returns `logdb.Entry` values whose `Cmd` the caller
+owns. The interface forbids an implementation from returning a `Cmd` that
+aliases its own storage (see `logdb.CopyEntryCmd`), because a write through it
+would corrupt the log the replica serves to followers and replays on restart.
+The Raft protocol layer copies Cmd data into outbound Message
 entries via `MarshalTo`.
 
 ### State machine boundary

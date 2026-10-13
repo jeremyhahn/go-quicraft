@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-10-11
+> `pkg/internal/invariant` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -51,7 +51,7 @@ Step Workers (N)    tick; drain proposalQ, inboxQ, readIndexQ; Peer.Handle;
        │            (Replicate, Heartbeat, …)
        ▼            commitC, cap CommitCBufferSize (64)
 Commit Workers (N)  LogDB.SaveState — persist entries + term/vote;
-                    THEN send ORDERED messages (VoteResp, HeartbeatResp);
+                    THEN send ORDERED messages (RequestVoteResp, HeartbeatResp);
        │            Peer.Commit
        ▼            applyC, cap max(CommitCBufferSize*4, 256)
 Apply Workers (N)   dispatcher fans out to a per-shard goroutine (chan cap 64),
@@ -63,7 +63,7 @@ Listener Dispatcher one goroutine, user-visible cold-path notifications
 
 **The free-order / ordered split is a correctness rule, not a latency
 optimization.** A `Replicate` or `Heartbeat` may go out before the sender's own
-state is durable, because it promises nothing about the sender. A `VoteResp` or
+state is durable, because it promises nothing about the sender. A `RequestVoteResp` or
 `HeartbeatResp` promises "I have persisted this", so it is held until the commit
 worker has actually persisted it. Sending a vote response before the vote is
 durable is how a crash produces two leaders in one term.
@@ -84,7 +84,8 @@ failure observed during teardown still reaches the listener.
 ## The listener dispatcher prevents a deadlock
 
 User-visible cold-path notifications (`OnLeaderUpdated`, `OnLeaderReady`,
-`OnCampaignLaunched`, shard failure) run on one dedicated goroutine rather than on the worker that
+`OnLeaderLost`, `OnCampaignLaunched`, shard failure, and the snapshot and
+compaction events) run on one dedicated goroutine rather than on the worker that
 produced them. This is a correctness rule, not a throughput optimization.
 
 The step worker holds `stepWorker.nodesMu.RLock` while it runs, and
@@ -236,7 +237,8 @@ Deliberately **not**, and this is stated so nobody "fixes" it:
   consumer takes it once per drain cycle. The design goal is **amortizing
   acquisitions over a batch**, not eliminating them.
 - The per-node `raftMu`, which serializes `Peer.Tick` against `Peer.Commit` and
-  covers the step worker's `Peer.Step` and inbox handling. It is not reentrant,
+  covers the step worker's `Peer.Handle` calls during a `commitPending` window
+and its inbox handling. It is not reentrant,
   which is why event callbacks are invoked outside it.
 
 ## Trust boundary

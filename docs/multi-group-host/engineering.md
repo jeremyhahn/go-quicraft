@@ -1,7 +1,7 @@
 # Multi-Group Host — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — host lifecycle, startup,
-> crash recovery, shutdown, and the performance contract · Last verified: 2026-10-11
+> crash recovery, shutdown, and the performance contract · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg`
@@ -207,7 +207,8 @@ that phantom match toward quorum.
 
 `newRaftLog` clamps `committed` down to what the log actually holds (0 for an
 empty log), so the replica re-learns its log and commit index from the leader.
-The clamp logs to the process-default `slog` logger, not `HostConfig.Logger`:
+The raft log records the clamp (`raft.RecoveryClamp`) and the Host reports
+it on its own logger, the one `WithLogger` or `LogConfig` configured:
 at ERROR when the log holds nothing (`recovered commit index over an EMPTY
 log`), at WARN when it holds a shorter prefix (`recovered commit index exceeds
 last log entry, clamping`).

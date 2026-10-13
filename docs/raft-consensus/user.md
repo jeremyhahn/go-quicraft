@@ -1,7 +1,7 @@
 # Raft consensus: usage
 
 > **Status: NORMATIVE** · Scope: consensus behavior as an embedder experiences
-> it, through `pkg.Host` · Last verified: 2026-10-11
+> it, through `pkg.Host` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 This page covers proposing, reading, tuning timing, and reading the failures.
@@ -92,7 +92,7 @@ cfg.ElectionRTT = 10         // must be >= 5
 ```
 
 Linearizable reads then resolve without a heartbeat round while the lease
-holds. Validation refuses `LeaseRead` with `ErrLeaseReadRequiresCheckQuorum` if
+holds. Validation refuses `LeaseRead` with `config.ErrLeaseReadRequiresCheckQuorum` if
 `CheckQuorum` is off, and with a `*config.ValidationError` if
 `ElectionRTT < 5`.
 
@@ -175,8 +175,10 @@ hostCfg.EventListener = &config.EventListener{
 }
 ```
 
-`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched` and
-`OnShardFailed` run on a dedicated goroutine that holds no engine lock, so your handler may
+`OnLeaderUpdated`, `OnLeaderReady`, `OnLeaderLost`, `OnCampaignLaunched`,
+`OnShardFailed` and the snapshot and compaction notifications
+(`OnSnapshotCreated`, `OnSnapshotCompacted`, `OnSnapshotRecovered`,
+`OnLogCompacted`, `OnLogDBCompacted`, `OnSnapshotRejected`) run on a dedicated goroutine that holds no engine lock, so your handler may
 call any `Host` API, including the synchronous `StopShard`. The other
 `EventListener` callbacks run on internal worker goroutines and must return
 quickly without calling back into the `Host`. Do not assume any ordering
@@ -193,7 +195,8 @@ arrives after the `OnLeaderUpdated` for the same leader and term, at most once
 per announcement, and the next `OnLeaderUpdated` ends it. That covers the same
 leader re-elected at a higher term, which `OnLeaderLost` does not. Witnesses
 never receive it. `host.ShardReadReady(shardID)` returns the same
-`(leaderID, term, ready)` without blocking.
+`(leaderID, term, ready, err)` without blocking; `err` carries the refusals a
+`ReadIndex` would make before reaching Raft.
 
 ## Diagnose a stuck shard
 

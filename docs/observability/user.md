@@ -1,7 +1,7 @@
 # Observability: usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft metrics, logging and event
-> notifications · Last verified: 2026-10-11
+> notifications · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Everything here is opt-in. A host with no collector and no listener runs fine
@@ -93,7 +93,7 @@ host, err := quicraft.NewHost(cfg, quicraft.WithLogger(logger), quicraft.Without
 Without `WithLogger`, the host builds its logger from `cfg.LogConfig`.
 `config.NewLogger` writes to stderr; for any other destination, pass your own
 `*slog.Logger`. Lower layers log through `slog.Default()`, so call
-`slog.SetDefault` with the same logger (or `config.SetDefaultLogger(cfg)`) if
+`slog.SetDefault` with the same logger (or `config.SetDefaultLogger(cfg.LogConfig)`) if
 you want every line in one place.
 
 ## Alert on the right things

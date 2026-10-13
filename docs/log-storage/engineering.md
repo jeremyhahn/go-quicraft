@@ -1,7 +1,7 @@
 # Log Storage — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-11
+> `pkg/logdb/memdb` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -277,11 +277,15 @@ new one created. New segments are pre-allocated (`fallocate` on Linux,
 | Parameter | Default | Option | Rule |
 |---|---|---|---|
 | `BlockSize` | 32768 | `WithBlockSize` | power of two, at least `recordHeaderSize + 1` (16) |
-| `MaxFileSize` | 67108864 | `WithMaxFileSize` | positive, at most 4 GiB − 1 |
+| `MaxFileSize` | 67108864 | `WithMaxFileSize` | positive, at most 4 GiB − 1; `Open` also requires at least two blocks |
 | `NoSync` | false | `WithNoSync` | tests only |
 
-`Options.Validate` and `Open` (`validateOpenOptions`) enforce the same rules.
-`Options.MaxBatchSize` is deprecated and reaches nothing.
+`Options.Validate` and `Open` (`validateOpenOptions`) share the rules above,
+with two differences. Only `Open` refuses a `MaxFileSize` smaller than two
+blocks (`ErrSegmentTooSmallForEntry`). Only `Validate` checks `WALDir`
+(`ErrEmptyWALDir`) and `MaxBatchSize > 0` (`ErrInvalidMaxBatchSize`); `Open`
+checks its `dir` argument instead. `Options.MaxBatchSize` is deprecated and
+reaches nothing else.
 
 ### Blocks and chunks
 

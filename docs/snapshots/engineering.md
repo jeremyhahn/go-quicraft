@@ -1,7 +1,7 @@
 # Snapshots — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-11
+> import/export and re-encryption · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 Design rationale, the frame format, the AAD layout and the scope fence are in
@@ -255,7 +255,7 @@ The tree roots at `<Config.DataDir>/shard-<N>/` for a shard with a `DataDir`.
 parser still reads older records for what they carry (the DEK purge-floor scan
 learns an epoch from one), but recovery refuses any record without
 `DataLen`/`DataHash`. The byte layout is in the `snapshot.meta` section of
-[Compatibility](../compatibility/architecture.md).
+[Compatibility](../compatibility/engineering.md#6-snapshotmeta).
 
 **`ExportPath` exports** write the same pair. Each file is staged as a temp in
 the export directory, fsynced, closed and renamed into place, `snapshot.dat`
