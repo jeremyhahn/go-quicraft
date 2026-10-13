@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -708,17 +709,7 @@ func TestLargeRecordExactBlockBoundary(t *testing.T) {
 // WAL block-based writing throughput.
 func BenchmarkSegmentWrite(b *testing.B) {
 	b.ReportAllocs()
-	dir := b.TempDir()
-	blockSize := 4096
-	maxFileSize := int64(1024 * 1024 * 1024) // 1GB to avoid segment full.
-
-	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, maxFileSize)
-	if err != nil {
-		b.Fatalf("createSegment: %v", err)
-	}
-	b.Cleanup(func() {
-		seg.Close()
-	})
+	bs := newBenchSegment(b, 4096, 1024*1024*1024)
 
 	record := make([]byte, 128)
 	for i := range record {
@@ -727,10 +718,66 @@ func BenchmarkSegmentWrite(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, err := seg.Write(record)
-		if err != nil {
-			b.Fatalf("Write: %v", err)
-		}
+		bs.write(record)
+	}
+}
+
+// benchSegment is a segment a benchmark writes to in a loop. A fast runner
+// can drive b.N past one segment's capacity, so write rolls to a fresh
+// segment on ErrSegmentFull, off the clock, and deletes the full one so a
+// long -benchtime does not fill the disk. Every other error fails the
+// benchmark. The timed path stays a single segment's Write.
+type benchSegment struct {
+	b           *testing.B
+	dir         string
+	blockSize   int
+	maxFileSize int64
+	seg         *segment
+}
+
+func newBenchSegment(b *testing.B, blockSize int, maxFileSize int64) *benchSegment {
+	b.Helper()
+	bs := &benchSegment{b: b, dir: b.TempDir(), blockSize: blockSize, maxFileSize: maxFileSize}
+	bs.open(1)
+	b.Cleanup(func() {
+		bs.seg.Close()
+	})
+	return bs
+}
+
+func (bs *benchSegment) open(id uint64) {
+	bs.b.Helper()
+	seg, _, err := createSegment(defaultFS(), bs.dir, id, bs.blockSize, bs.maxFileSize)
+	if err != nil {
+		bs.b.Fatalf("createSegment: %v", err)
+	}
+	bs.seg = seg
+}
+
+// roll replaces the full segment with a fresh one, outside the timer.
+func (bs *benchSegment) roll() {
+	bs.b.Helper()
+	bs.b.StopTimer()
+	id := bs.seg.ID()
+	if err := bs.seg.Close(); err != nil {
+		bs.b.Fatalf("Close: %v", err)
+	}
+	if err := os.Remove(filepath.Join(bs.dir, segmentFilename(id))); err != nil {
+		bs.b.Fatalf("Remove: %v", err)
+	}
+	bs.open(id + 1)
+	bs.b.StartTimer()
+}
+
+func (bs *benchSegment) write(record []byte) {
+	bs.b.Helper()
+	_, err := bs.seg.Write(record)
+	if errors.Is(err, ErrSegmentFull) {
+		bs.roll()
+		_, err = bs.seg.Write(record)
+	}
+	if err != nil {
+		bs.b.Fatalf("Write: %v", err)
 	}
 }
 
@@ -959,16 +1006,7 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 // BenchmarkSegmentSync benchmarks Sync() calls, measuring fdatasync overhead.
 func BenchmarkSegmentSync(b *testing.B) {
 	b.ReportAllocs()
-	dir := b.TempDir()
-	blockSize := 4096
-
-	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024*1024)
-	if err != nil {
-		b.Fatalf("createSegment: %v", err)
-	}
-	b.Cleanup(func() {
-		seg.Close()
-	})
+	bs := newBenchSegment(b, 4096, 1024*1024*1024)
 
 	// Write some initial data so Sync has something to flush.
 	record := make([]byte, 128)
@@ -976,18 +1014,14 @@ func BenchmarkSegmentSync(b *testing.B) {
 		record[i] = byte(i % 251)
 	}
 	for i := 0; i < 10; i++ {
-		if _, err := seg.Write(record); err != nil {
-			b.Fatalf("Write: %v", err)
-		}
+		bs.write(record)
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
 		// Write a record then sync to measure the fdatasync cost per call.
-		if _, err := seg.Write(record); err != nil {
-			b.Fatalf("Write: %v", err)
-		}
-		if err := seg.Sync(); err != nil {
+		bs.write(record)
+		if err := bs.seg.Sync(); err != nil {
 			b.Fatalf("Sync: %v", err)
 		}
 	}
