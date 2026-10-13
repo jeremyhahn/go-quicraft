@@ -528,6 +528,9 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 		shardID    = 1
 		// Above the observed ~5s tail, far below ShutdownTimeout (30s).
 		maxOutage = 12 * time.Second
+		// How long the clients run against a stable leader before it is
+		// closed.
+		steadyState = 2 * time.Second
 	)
 
 	cluster := newTestCluster(t, numNodes)
@@ -556,11 +559,21 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 
 	// Let the cluster reach steady state so the measurement is not dominated
 	// by warmup.
-	time.Sleep(2 * time.Second)
+	time.Sleep(steadyState)
 	if recorder.completed() == 0 {
 		close(done)
 		wg.Wait()
 		t.Fatal("no operations committed before the leader was closed")
+	}
+
+	// Close the CURRENT leader. The index found before warmup goes stale if
+	// leadership moved during the steady-state phase (a loaded host can miss
+	// heartbeats), and closing a follower instead measures nothing (#309).
+	leaderIdx = cluster.findLeader(shardID)
+	if leaderIdx < 0 {
+		close(done)
+		wg.Wait()
+		t.Fatal("no leader at the end of the steady-state phase")
 	}
 
 	// Close the leader and measure how long writes are unavailable.
@@ -641,7 +654,14 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 			"leadership was not handed off before draining", outage, maxOutage)
 	}
 
-	checkLinearizability(t, recorder, floorFor(numClients, 20*time.Second/4))
+	// The clients serve for the steady-state phase, then stop once
+	// recoveredOps more operations land after the close, so the run is far
+	// shorter than their 20s window. The floor covers the steady-state phase
+	// only: the operations after the close are a fixed count, and their pace
+	// is what the outage check above asserts. Scaling the floor to the 20s
+	// window demanded writes the run never gives the clients time to make,
+	// so a slow but healthy host failed it (#309).
+	checkLinearizability(t, recorder, floorFor(numClients, steadyState))
 }
 
 // waitForLeaderOrDump waits for a leader and, on timeout, dumps every live
