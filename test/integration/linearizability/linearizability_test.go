@@ -1174,6 +1174,14 @@ func sessionClientWorker(
 
 	opIdx := 0
 	var pacer retryPacer
+	// open is the append whose series is still being retried. A retry under
+	// the same series ID is the SAME logical operation, so it stays ONE record
+	// spanning the first attempt's call to the final result, rather than one
+	// indeterminate record per failed attempt. Split records would let a
+	// double apply hide behind an indeterminate copy of the token, and each
+	// copy doubles the checker's search: 32 of them from one leaderless
+	// stretch exhausted the per-partition budget in #309.
+	var open *opRecord
 
 	for time.Now().Before(deadline) {
 		select {
@@ -1197,7 +1205,10 @@ func sessionClientWorker(
 			// reusing the series ID would be a client protocol error and would
 			// make the cached response look like a mismatch.
 			token := fmt.Sprintf("t%d-%d", clientID, opIdx)
-			rec := recorder.begin(clientID, kvInput{Op: "append", Key: key, Value: token})
+			rec := open
+			if rec == nil {
+				rec = recorder.begin(clientID, kvInput{Op: "append", Key: key, Value: token})
+			}
 
 			// Every sessionDupEvery-th append is issued TWICE under the same
 			// seriesID to prove the dedup cache actually dedups.
@@ -1205,10 +1216,14 @@ func sessionClientWorker(
 			value, err := proposeAppend(host, session, key, token, retrySameSeries, recorder)
 			if err != nil {
 				recorder.indeterminate(rec, err)
+				open = rec
 				// A rejected or invalid session cannot be retried: the series
 				// is gone, so a fresh one has to be registered before the
-				// client can make progress again.
+				// client can make progress again. The next attempt runs under
+				// a new series and is a new operation; this record stays
+				// indeterminate.
 				if errors.Is(err, quicraft.ErrRejected) || errors.Is(err, quicraft.ErrInvalidSession) {
+					open = nil
 					if fresh := acquireSession(cluster, shardID, deadline, done); fresh != nil {
 						session = fresh
 					}
@@ -1218,6 +1233,7 @@ func sessionClientWorker(
 			}
 
 			recorder.finish(rec, kvOutput{Value: value, Ok: true})
+			open = nil
 		} else {
 			rec := recorder.begin(clientID, kvInput{Op: "get", Key: key})
 
