@@ -18,6 +18,7 @@ be told apart from an unwritten one.
 
 | If you are | Read |
 |---|---|
+| looking for what the project is and every feature | [SPEC.md](SPEC.md) |
 | new to the library | [multi-group-host/architecture.md](multi-group-host/architecture.md), which is also the system overview |
 | writing a state machine | [state-machines/user.md](state-machines/user.md) |
 | deploying it | [multi-group-host/user.md](multi-group-host/user.md) |
