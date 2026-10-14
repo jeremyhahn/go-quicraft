@@ -141,7 +141,11 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 
 	// Restart the follower: a new Host, the same replica ID, and a full-log
 	// replay ahead of it that will park at the gate entry.
-	parked, release := gateApply(t, gateKey)
+	// The gate is armed for the follower's replica alone. Every replica of
+	// this cluster runs in this process, and a peer still behind on the
+	// gate entry would otherwise park in the follower's place and close
+	// parked before the replay is anywhere near the gate (#309).
+	parked, release := gateApply(t, gateKey, shardID, uint64(followerIdx+1))
 	// Deferred AFTER cluster.close was, so it runs BEFORE it: Host.Close
 	// waits for the parked Update, and a failure while parked would
 	// otherwise wedge the shutdown ahead of the t.Cleanup that also releases.

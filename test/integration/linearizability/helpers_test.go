@@ -239,8 +239,12 @@ func assertApplyOrder(t *testing.T) {
 // kvStateMachine is a simple in-memory key-value store that implements
 // sm.StateMachine for linearizability testing.
 type kvStateMachine struct {
-	mu   sync.RWMutex
-	data map[string]string
+	// shardID and replicaID name the replica this machine belongs to, so
+	// an apply gate parks only the replica it was armed for.
+	shardID   uint64
+	replicaID uint64
+	mu        sync.RWMutex
+	data      map[string]string
 	// prevIndex is the raft index of the previously applied entry. Every
 	// entry handed to Update must carry a STRICTLY greater index: an index
 	// that repeats or moves backward means the entry was applied twice or
@@ -272,10 +276,20 @@ type kvStateMachine struct {
 // -- rather than to race it against the machine's speed, which fails on a
 // slow CI runner -- is to stop the replay at a known entry until
 // the something is done. Armed by gateApply before the entry is proposed,
-// released by the function it returns. Keyed by the KV key, process-wide,
-// because the state machine that parks is created inside StartShard by a
-// factory the test does not hold.
-var applyGates sync.Map
+// released by the function it returns. Process-wide, because the state
+// machine that parks is created inside StartShard by a factory the test does
+// not hold; keyed by the replica as well as the KV key, because every replica
+// of a test cluster lives in this process and applies the same entry. A gate
+// keyed by the KV key alone parked every replica that applied the entry after
+// arming, and a peer still behind on it closed parked in the subject's place:
+// the test then went ahead before the subject's replay was at the gate (#309).
+var applyGates sync.Map // applyGateKey -> *applyGate
+
+type applyGateKey struct {
+	shardID   uint64
+	replicaID uint64
+	key       string
+}
 
 type applyGate struct {
 	parked      chan struct{} // closed when an Update reaches the gate
@@ -284,20 +298,22 @@ type applyGate struct {
 	releaseOnce sync.Once
 }
 
-// gateApply arms a gate on key. The first put to key that any kvStateMachine
-// in this process applies parks until release is called; parked is closed
-// when it does. release is idempotent and also registered with t.Cleanup,
-// so a failed assertion while parked fails the test instead of hanging the
-// host's Close behind an apply that never returns.
-func gateApply(t *testing.T, key string) (parked <-chan struct{}, release func()) {
+// gateApply arms a gate on key for one replica. Every put to key that the
+// kvStateMachine of (shardID, replicaID) applies parks until release is
+// called; parked is closed when the first does. No other replica parks.
+// release is idempotent and also registered with t.Cleanup, so a failed
+// assertion while parked fails the test instead of hanging the host's Close
+// behind an apply that never returns.
+func gateApply(t *testing.T, key string, shardID, replicaID uint64) (parked <-chan struct{}, release func()) {
 	t.Helper()
+	gk := applyGateKey{shardID: shardID, replicaID: replicaID, key: key}
 	g := &applyGate{parked: make(chan struct{}), release: make(chan struct{})}
-	if _, loaded := applyGates.LoadOrStore(key, g); loaded {
-		t.Fatalf("an apply gate on %q is already armed", key)
+	if _, loaded := applyGates.LoadOrStore(gk, g); loaded {
+		t.Fatalf("an apply gate on %q for shard %d replica %d is already armed", key, shardID, replicaID)
 	}
 	release = func() {
 		g.releaseOnce.Do(func() {
-			applyGates.Delete(key)
+			applyGates.Delete(gk)
 			close(g.release)
 		})
 	}
@@ -308,8 +324,8 @@ func gateApply(t *testing.T, key string) (parked <-chan struct{}, release func()
 // parkAtGate is Update's side of gateApply. It runs with kv.mu held, so a
 // parked replica answers no Lookup until released; the tests that park read
 // from another replica.
-func parkAtGate(key string) {
-	v, ok := applyGates.Load(key)
+func (kv *kvStateMachine) parkAtGate(key string) {
+	v, ok := applyGates.Load(applyGateKey{shardID: kv.shardID, replicaID: kv.replicaID, key: key})
 	if !ok {
 		return
 	}
@@ -328,8 +344,10 @@ type indexedValue struct {
 	Index uint64 // 0 when the key has never been written
 }
 
-func newKVStateMachine() *kvStateMachine {
+func newKVStateMachine(shardID, replicaID uint64) *kvStateMachine {
 	return &kvStateMachine{
+		shardID:   shardID,
+		replicaID: replicaID,
 		data:      make(map[string]string),
 		lastWrite: make(map[string]uint64),
 	}
@@ -376,7 +394,7 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 			value := string(entry.Cmd[3+keyLen:])
 			kv.data[key] = value
 			kv.lastWrite[key] = entry.Index
-			parkAtGate(key)
+			kv.parkAtGate(key)
 			// Data carries the entry's index so the proposer learns WHERE
 			// its write landed; Value stays the length every existing
 			// caller checks.
@@ -610,7 +628,7 @@ func kvCreateFunc() (sm.CreateFunc, *smTracker) {
 		machines: make(map[smKey]*kvStateMachine),
 	}
 	createFn := func(shardID, replicaID uint64) interface{} {
-		machine := newKVStateMachine()
+		machine := newKVStateMachine(shardID, replicaID)
 		tracker.mu.Lock()
 		tracker.machines[smKey{shardID, replicaID}] = machine
 		tracker.mu.Unlock()
