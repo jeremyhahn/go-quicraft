@@ -13,7 +13,7 @@ The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group
 
 ## Milestones
 
-- [`Release candidate`](../../milestone/11): RC; 0 open, 60 closed; target 2026-11-02.
+- [`Dev complete`](../../milestone/11): every SPEC row shipped, no go-trusted-platform seam row on go-quicraft, API stable and complete; `-alpha` tags until then; 0 open, 60 closed; target 2026-11-02.
 
 ## Complete
 

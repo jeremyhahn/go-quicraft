@@ -93,14 +93,22 @@ Every feature is shipped; no feature is in progress, planned or future.
 
 ## Release criteria
 
-The current milestone is **Release candidate**: a public release, its version
-confirmed at the owner's publish approval. It closes when:
+The current milestone is **Dev complete** (owner ruling 2026-10-14): nothing is
+dev complete until go-trusted-platform is, and every lower library has a stable,
+complete API. Until then go-quicraft tags `-alpha` only, cuts an `-rc.N` only if
+a consumer needs one, and keeps the rc tags already cut pinned. It closes when:
 
 - #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass
   reliably (testing). Met 2026-10-13: #320, #322 and #347 merged.
 - #283 is closed: the spec-review scrub of `docs/` is verified by the
   department and its fixes have landed. Met 2026-10-13.
-- The candidate is deployed to staging; production is considered after that.
+- Every feature row is shipped. Met 2026-10-14: #350 merged.
+- Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped. It
+  names none: go-trusted-platform reaches consensus only through go-qrdb.
+- The API is stable and complete.
+
+Then release candidates are tagged, deployed to staging and released;
+production is considered after staging.
 
 The v1.0.0 bar, on top of the above:
 
