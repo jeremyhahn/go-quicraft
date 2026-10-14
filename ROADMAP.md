@@ -13,7 +13,7 @@ The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group
 
 ## Milestones
 
-- [`Dev complete`](../../milestone/11): every SPEC row shipped, no go-trusted-platform seam row on go-quicraft, API stable and complete; `-alpha` tags until then; 0 open, 60 closed; target 2026-11-02.
+- [`Dev complete`](../../milestone/11): every SPEC row shipped (shard-pause in progress), no go-trusted-platform seam row on go-quicraft, API stable and complete; `-alpha` tags until then; 0 open, 60 closed; target 2026-11-02.
 
 ## Complete
 
@@ -50,7 +50,7 @@ The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group
 
 ## Now
 
-Nothing in progress.
+- **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing (seal ruling A, go-qrdb cl1493) — in progress
 
 Closed with the question kept in the issue, decision pending: [#272](../../issues/272) (write-batching), [#278](../../issues/278) (multi-group-host), [#281](../../issues/281) (multi-group-host).
 
