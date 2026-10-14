@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0-alpha] - 2026-10-14
+
+The planned 0.21.0-rc.3. Release candidates now wait until the whole stack is
+dev complete (owner ruling 2026-10-14), so this is an alpha, and a MINOR bump
+so that it sorts above 0.21.0-rc.2.
+
 ### Fixed
 
 - A forwarded read that the leader cannot serve yet now fails fast with
