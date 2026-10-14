@@ -3173,13 +3173,28 @@ func (c *hostEngineCallback) OnReadIndexFailed(shardID uint64, keys []uint64, er
 	apiErr := c.h.translateProposalError(ns, err)
 
 	ns.pendingReadsMu.Lock()
-	for _, key := range keys {
+	// fail completes key's read with apiErr and returns its batch aliases,
+	// read before the release recycles the RequestState.
+	fail := func(key uint64) []uint64 {
 		pr, ok := ns.pendingReads[key]
-		if ok {
-			pr.rs.complete(RequestResult{Err: apiErr})
-			delete(ns.pendingReads, key)
-			pr.rs.releaseRef()
-			c.h.completePendingOp()
+		if !ok {
+			return nil
+		}
+		aliases := pr.aliases
+		pr.rs.complete(RequestResult{Err: apiErr})
+		delete(ns.pendingReads, key)
+		pr.rs.releaseRef()
+		c.h.completePendingOp()
+		return aliases
+	}
+	for _, key := range keys {
+		// A batch key's aliases fail with it. A submit failure lists them
+		// in keys already (they are gone by the time the loop reaches
+		// them), but a leader's reject of a forwarded read, like a dropped
+		// read state, names only the batch key, and its aliases are
+		// reachable through nothing else.
+		for _, aliasKey := range fail(key) {
+			fail(aliasKey)
 		}
 	}
 	ns.pendingReadsMu.Unlock()
@@ -5687,6 +5702,12 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 //  1. Submit ReadIndex to confirm leadership via heartbeat quorum
 //  2. Wait for the RequestState to resolve (lastApplied >= readIndex)
 //  3. Execute SM.Lookup(query) on the now-caught-up state machine
+//
+// A read the leader cannot serve yet (a new leader that has not committed
+// an entry of its term, a leadership transfer in progress, an overloaded
+// leader, a role that no longer permits the read) fails fast with
+// ErrReadIndexNotReady; see ReadIndex. A forwarded ReadIndex or response
+// lost in transit is bounded only by ctx, so callers must pass a deadline.
 func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
 	// Step 1: Get a confirmed read index via ReadIndex.
 	rs, err := h.ReadIndex(ctx, shardID)
@@ -6351,6 +6372,15 @@ func (h *Host) registerPendingProposal(ns *nodeState, engNode *engine.Node, key 
 //
 // Witnesses cannot serve reads (they don't store log data).
 // Observers and followers forward the ReadIndex to the leader.
+//
+// A read that cannot be served yet resolves with ErrReadIndexNotReady
+// rather than waiting: on the local replica when it has not seen an entry
+// of the current term commit, and on a follower or observer when the
+// leader refuses the forwarded read (it has not yet committed an entry of
+// its term, a leadership transfer is in progress, it is overloaded, or the
+// replica's role no longer permits the read). Retry after a short backoff.
+// A forwarded ReadIndex or its response that is lost in transit is not
+// answered by anything; that wait is bounded only by ctx.
 func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, error) {
 	// See Propose: an already-done context must not submit work, or the
 	// outcome is a coin flip between the result and the cancellation.

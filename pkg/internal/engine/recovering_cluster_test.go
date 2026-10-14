@@ -47,6 +47,15 @@ type clusterRouter struct {
 	mu      sync.RWMutex
 	engines map[uint64]*Engine
 	down    map[uint64]bool
+	// drop, when set, discards every message it returns true for.
+	drop func(proto.Message) bool
+}
+
+// setDrop installs (or, with nil, removes) the router's message filter.
+func (r *clusterRouter) setDrop(drop func(proto.Message) bool) {
+	r.mu.Lock()
+	r.drop = drop
+	r.mu.Unlock()
 }
 
 func newClusterRouter(shardID uint64) *clusterRouter {
@@ -82,7 +91,7 @@ func (r *clusterRouter) SendSnapshot(msg proto.Message) {
 
 func (r *clusterRouter) deliver(msg proto.Message) {
 	r.mu.RLock()
-	if r.down[msg.From] || r.down[msg.To] {
+	if r.down[msg.From] || r.down[msg.To] || (r.drop != nil && r.drop(msg)) {
 		r.mu.RUnlock()
 		return
 	}
@@ -120,6 +129,13 @@ type clusterOptions struct {
 	// applierFor supplies the Applier for a replica. When nil each replica
 	// gets a plain testApplier over its own testSM.
 	applierFor func(replicaID uint64) Applier
+	// callbackFor supplies the engine Callback for a replica. When nil the
+	// engines run without one.
+	callbackFor func(replicaID uint64) Callback
+}
+
+func withCallback(fn func(replicaID uint64) Callback) clusterOption {
+	return func(o *clusterOptions) { o.callbackFor = fn }
 }
 
 // withApplier makes every replica use the Applier returned by fn. It exists so
@@ -187,7 +203,11 @@ func newTestCluster(t *testing.T, shardID uint64, n int, opts ...clusterOption) 
 			applier = options.applierFor(replicaID)
 		}
 
-		e := NewEngine(hostCfg, ldb, c.router, nil, nil, nil)
+		var callback Callback
+		if options.callbackFor != nil {
+			callback = options.callbackFor(replicaID)
+		}
+		e := NewEngine(hostCfg, ldb, c.router, nil, callback, nil)
 		node := NewNode(peer, applier, lr, cfg, nil, "", nil)
 		e.LoadNode(node)
 		c.router.register(replicaID, e)

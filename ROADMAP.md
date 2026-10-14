@@ -46,10 +46,11 @@ The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group
 - **release** — Working fundamentally C7: v0.21.0-rc.2 is cut and go-qrdb adopts it — [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
 - **testing** — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably ([#320](../../pulls/320), [#322](../../pulls/322), [#347](../../pulls/347)) — [#309](../../issues/309) — done
 - **release** — spec-review scrub of every `docs/<feature>/` for the release candidate — [#283](../../issues/283) — done
+- **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it (go-qrdb Q11 B) — [go-qrdb#668](../../../go-qrdb/issues/668) — done
 
 ## Now
 
-- **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting; the fix is verified and its PR opens once go-qrdb's consuming row lands — [go-qrdb#668](../../../go-qrdb/issues/668) — blocked: go-qrdb#707
+Nothing in progress.
 
 Closed with the question kept in the issue, decision pending: [#272](../../issues/272) (write-batching), [#278](../../issues/278) (multi-group-host), [#281](../../issues/281) (multi-group-host).
 

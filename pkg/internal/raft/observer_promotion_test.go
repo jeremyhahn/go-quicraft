@@ -115,10 +115,13 @@ func TestPromotion_ObserverBecomesVoterInPlace(t *testing.T) {
 		t.Fatalf("quorum after promotion = %d, want 3 of the 4 voters", got)
 	}
 
-	// It serves linearizable reads: a follower ReadIndex is forwarded.
+	// It serves linearizable reads: a follower ReadIndex is forwarded. The
+	// read is a relayed one: a local read is also refused until an entry of
+	// the current term commits, which this fixture's term never has, and
+	// that refusal is not the role latch under test.
 	p.r.leaderID = 1
 	p.r.msgs = p.r.msgs[:0]
-	if err := p.r.handleFollowerReadIndex(proto.Message{Type: proto.ReadIndex, Hint: 9}); err != nil {
+	if err := p.r.handleFollowerReadIndex(proto.Message{Type: proto.ReadIndex, From: 2, Hint: 9}); err != nil {
 		t.Fatalf("the promoted replica refused a ReadIndex: %v", err)
 	}
 	if len(p.r.msgs) != 1 || p.r.msgs[0].To != 1 {

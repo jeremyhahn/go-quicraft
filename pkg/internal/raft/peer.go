@@ -1607,6 +1607,20 @@ func (p *Peer) DrainReadStatesOnly() []proto.ReadyToRead {
 	return readStates
 }
 
+// DrainReadRejects returns and clears the keys of forwarded reads the leader
+// refused. The caller fails each read (and its batch aliases) with
+// ErrReadIndexNotReady; without that the read waits on a response that has
+// already come back as a refusal. Must be called with the same exclusion as
+// Handle.
+func (p *Peer) DrainReadRejects() []uint64 {
+	if len(p.r.readRejects) == 0 {
+		return nil
+	}
+	keys := p.r.readRejects
+	p.r.readRejects = nil
+	return keys
+}
+
 // RequestLeaderTransfer initiates a leadership transfer to the target
 // replica. The request is wrapped in a LeaderTransfer message and
 // routed through the raft state machine. The raft state machine handles

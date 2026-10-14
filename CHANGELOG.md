@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A forwarded read that the leader cannot serve yet now fails fast with
+  `ErrReadIndexNotReady` instead of hanging until the caller's context
+  expires (go-qrdb Q11 B). A follower refuses its own read locally until it
+  has seen an entry of the current term commit. A leader that refuses a
+  forwarded `ReadIndex` (no committed entry in its term yet, a leadership
+  transfer in progress, overloaded, or a role mismatch) now answers it with a
+  rejecting `ReadIndexResp`, and the follower fails the read and its batched
+  aliases. The reject reuses the existing `Reject` field, so there is no wire
+  layout or format version change. A forwarded `ReadIndex` or response lost
+  in transit is still bounded only by the caller's context.
+
 ### Documentation
 
 - `docs/seal-barrier/user.md` gains "Serve requests while sealed" (#324).

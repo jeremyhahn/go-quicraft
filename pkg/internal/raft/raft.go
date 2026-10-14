@@ -354,6 +354,10 @@ type raft struct {
 	readStates       []proto.ReadyToRead
 	pendingReadIndex []readIndexStatus
 	readIndexCtx     uint64
+	// readRejects holds the keys of reads this replica forwarded that the
+	// leader refused (a ReadIndexResp with Reject set). Drained by
+	// Peer.DrainReadRejects; the engine fails each with ErrReadIndexNotReady.
+	readRejects []uint64
 
 	// readIndexBroadcastPending is set when handleLeaderReadIndex defers
 	// a heartbeat broadcast. Multiple ReadIndex requests in the same step
@@ -1566,7 +1570,15 @@ func stepLeader(r *raft, msg proto.Message) error {
 	case proto.HeartbeatResp:
 		return r.handleHeartbeatResp(msg)
 	case proto.ReadIndex:
-		return r.handleLeaderReadIndex(msg)
+		err := r.handleLeaderReadIndex(msg)
+		if err != nil && isForwardedRead(msg, r.replicaID) {
+			// The follower that forwarded this read has no other way to
+			// learn of the refusal: answer it, or its caller waits for a
+			// response that never comes.
+			r.rejectForwardedRead(msg, err)
+			return nil
+		}
+		return err
 	case proto.LeaderTransfer:
 		return r.handleLeaderTransfer(msg)
 	case proto.SnapshotStatus:
@@ -4411,7 +4423,7 @@ func (r *raft) handleLeaderReadIndex(msg proto.Message) error {
 			"commit_index", r.log.committed,
 			"lease_valid", leaseValid,
 		)
-		if msg.From != 0 && msg.From != r.replicaID {
+		if isForwardedRead(msg, r.replicaID) {
 			// Forwarded from a follower; respond to originator.
 			r.send(proto.Message{
 				Type:     proto.ReadIndexResp,
@@ -4516,9 +4528,47 @@ func (r *raft) handleFollowerReadIndex(msg proto.Message) error {
 	if r.leaderID == noLeader {
 		return &NotLeaderError{LeaderID: 0}
 	}
+	// A local read is refused here, where the refusal reaches the caller,
+	// while this replica has not seen an entry of the current term commit:
+	// the leader would refuse it for the same reason (handleLeaderReadIndex),
+	// and the same predicate gates Peer.computeReadReady. A read relayed
+	// from another replica is still forwarded: its originator learns of a
+	// refusal only through the leader's reject.
+	if !isForwardedRead(msg, r.replicaID) && !r.hasCommittedEntryAtCurrentTerm() {
+		return ErrReadIndexNotReady
+	}
 	msg.To = r.leaderID
 	r.send(msg)
 	return nil
+}
+
+// isForwardedRead reports whether a ReadIndex was relayed from another
+// replica rather than submitted on this one.
+func isForwardedRead(msg proto.Message, self uint64) bool {
+	return msg.From != 0 && msg.From != self
+}
+
+// rejectForwardedRead answers a forwarded ReadIndex the leader refused with
+// a ReadIndexResp that has Reject set. LogIndex is math.MaxUint64, never a
+// servable index: a receiver that ignored Reject would wait for an apply
+// index no log reaches, never serve the read at index 0. The refusal reason
+// does not travel; every refusal is retryable and reaches the caller as
+// ErrReadIndexNotReady.
+func (r *raft) rejectForwardedRead(msg proto.Message, err error) {
+	slog.Debug("forwarded read index refused",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"from", msg.From,
+		"key", msg.Hint,
+		"error", err,
+	)
+	r.send(proto.Message{
+		Type:     proto.ReadIndexResp,
+		To:       msg.From,
+		Hint:     msg.Hint,
+		LogIndex: math.MaxUint64,
+		Reject:   true,
+	})
 }
 
 // handleReadIndexResp handles a read index response forwarded from leader.
@@ -4553,6 +4603,15 @@ func (r *raft) handleReadIndexResp(msg proto.Message) error {
 			"msg_term", msg.Term,
 			"term", r.term)
 		return ErrReadIndexRespNotFromLeader
+	}
+	// A reject is a refusal, never a read state: Reject is tested before
+	// LogIndex is looked at, so no reject is served at any index.
+	if msg.Reject {
+		if len(r.readRejects) >= maxReadStates {
+			return ErrReadIndexOverloaded
+		}
+		r.readRejects = append(r.readRejects, msg.Hint)
+		return nil
 	}
 	return r.addReadState(proto.ReadyToRead{
 		Key:   msg.Hint,
