@@ -39,6 +39,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | multi-group-host | shipped | One `Host` per process manages many shards, each with its own state machine, log and membership; it routes proposals, reads, sessions and membership; it starts shards from an explicit member map and discovers no peers. [architecture.md](multi-group-host/architecture.md) | [multi-group-host/](multi-group-host/) |
 | raft-consensus | shipped | Raft per the extended paper and the thesis: election with PreVote and CheckQuorum, log replication, ReadIndex reads, leadership transfer, quiescence, run by the step/commit/apply worker pipeline. [architecture.md](raft-consensus/architecture.md) | [raft-consensus/](raft-consensus/) |
 | lease-read | shipped | Opt-in (`Config.LeaseRead`) linearizable reads that skip the heartbeat round while a lease is valid; the lease quorum spans every voting member, witnesses included; the lease is shortened by `Config.MaxClockDrift` (default 1 %). | [raft-consensus/](raft-consensus/) (engineering.md §15) |
+| read-index-readiness | in progress | A ReadIndex read, `SyncRead` included, that the shard's leader cannot serve yet because it has not committed an entry of its current term returns `ErrReadIndexNotReady` (`errors.Is`-matchable, `Temporary` reports true) instead of waiting, both on the leader and on a follower that forwarded the read. A forwarded read or reply that is lost is still bounded only by the caller's context. Seam: go-qrdb's bounded startup read retries it until its own deadline. | [raft-consensus/](raft-consensus/) |
 | membership-changes | shipped | Add and remove replicas, observers and witnesses; every member is authorized by its node identity (a hash of its certificate's public key), not its address; members join through the `...WithIdentity` requests. [architecture.md](membership-changes/architecture.md) | [membership-changes/](membership-changes/) |
 | quic-transport | shipped | All inter-node traffic, snapshots included, runs over QUIC with mandatory mutual TLS and no TCP fallback; connection and stream pools, heartbeats on stream 0; CRL/OCSP revocation fails closed; the node registry. [architecture.md](quic-transport/architecture.md) | [quic-transport/](quic-transport/) |
 | 0-rtt-policy | shipped | 0-RTT is off by default (`TransportConfig.Enable0RTT`); a node never sends early data; message frames and snapshots that arrive as 0-RTT early data are refused, because they are replayable. | [quic-transport/](quic-transport/) |
@@ -59,7 +60,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | testing | shipped | The test infrastructure: suite organisation, build tags, fault injectors, fuzzing, linearizability verification, coverage gates and benchmark regression. [overview.md](testing/overview.md) | [testing/](testing/) |
 | release | shipped | Public releasability: what may be published from this tree, the development-tooling exclusion list and the `test/releasability` gate; the release recipe (`make release-candidate`, `make release-alpha`). [public-releasability.md](release/public-releasability.md) | [release/](release/) |
 
-No feature is in progress, planned or future.
+read-index-readiness is in progress; no feature is planned or future.
 
 ## Interfaces
 
