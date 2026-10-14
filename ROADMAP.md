@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-13
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-14
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
@@ -8,12 +8,12 @@ across Complete, Now, Next, Later and Future are exactly the SPEC feature table.
 
 ## Mission
 
-Multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`SealingStrategy` interfaces, `EpochBarrier`, the Shamir GF(256) primitive and the `none` and `passphrase` strategies (handbook `docs/00` L1).
+The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`SealingStrategy` interfaces, `EpochBarrier`, the Shamir GF(256) primitive and the `none` and `passphrase` strategies (handbook `docs/00` L1). It embeds go-enclave as a library and passes its types through unchanged. go-qrdb embeds it as the one consensus engine of a deployment and re-exports it. go-quicraft holds no datastore, tenant model or client of its own ([SPEC](docs/SPEC.md) Purpose, Boundaries).
 
 
 ## Milestones
 
-- [`Release candidate`](../../milestone/11): 22 open, 36 closed; target 2026-11-02.
+- [`Release candidate`](../../milestone/11): RC; 0 open, 60 closed; target 2026-11-02.
 
 ## Complete
 
@@ -44,27 +44,18 @@ Multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`
 - **testing** — Working fundamentally C6: the nightly dependency-freshness check (`make deps-check`) is green — [milestone](../../milestone/26) — done
 - **release** — public-releasability gate — [0.16.0-alpha](../../releases/tag/v0.16.0-alpha), [#262](../../issues/262), [#269](../../issues/269) ([#270](../../pulls/270)), [#250](../../issues/250) ([#256](../../pulls/256)), [#282](../../issues/282) ([#287](../../pulls/287)) — done
 - **release** — Working fundamentally C7: v0.21.0-rc.2 is cut and go-qrdb adopts it — [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
+- **testing** — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably ([#320](../../pulls/320), [#322](../../pulls/322), [#347](../../pulls/347)) — [#309](../../issues/309) — done
+- **release** — spec-review scrub of every `docs/<feature>/` for the release candidate — [#283](../../issues/283) — done
 
 ## Now
 
-Release candidate open items:
-
-- **testing** — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably; both confirming soaks are clean, it closes when #320 and #322 merge — [#309](../../issues/309) — open
-- **testing** — engine: step received replies before the tick, for #309 — [#320](../../pulls/320) — in review
-- **testing** — transport: drain an epoch-evicted outbound, for #309 — [#322](../../pulls/322) — in review
-- **release** — spec-review scrub of every `docs/<feature>/` for the release candidate; the audit is done, the department verifies, then the fixes follow — [#283](../../issues/283) — open
+- **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting; the fix is verified and its PR opens once go-qrdb's consuming row lands — [go-qrdb#668](../../../go-qrdb/issues/668) — blocked: go-qrdb#707
 
 Closed with the question kept in the issue, decision pending: [#272](../../issues/272) (write-batching), [#278](../../issues/278) (multi-group-host), [#281](../../issues/281) (multi-group-host).
 
 ## Next
 
-The v1.0.0 bar (release criteria, not features):
-
-- **memory-enclave** — readiness: go-enclave at a public release; v0.8.0-rc.1 and v0.8.0-rc.2 are tagged, no release yet — v1.0.0 bar — open
-- **compatibility** — readiness: compatibility policy acknowledged (`release-versioning.md` §1, §8) — v1.0.0 bar — open
-- **release** — readiness: publication mechanism for agent files, deferred to v1.0.0 — v1.0.0 bar — open
-- **release** — readiness: company CI template neutralised for the public tree; `.github/workflows` still names internal repositories and domains — v1.0.0 bar — open
-- **wire-protocol** — readiness: wire and on-disk format versions stay pinned until v1.0.0 ships (also log-storage) — v1.0.0 bar — holds
+Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
@@ -76,5 +67,5 @@ No SPEC feature is future.
 
 ## Dependencies
 
-- Up: go-enclave v0.8.0-alpha (pinned); v0.8.0-rc.1 and v0.8.0-rc.2 are tagged.
+- Up: go-enclave v0.8.0-alpha (pinned); v0.8.0-rc.1 and v0.8.0-rc.2 are tagged; v1.0.0 needs a go-enclave public release.
 - Down: go-qrdb (pins v0.20.0, direct); indirect: go-xkms (v0.19.0), go-quicbaas (v0.15.0-alpha), go-signal (v0.20.0), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha). None is on v0.21.0-rc.1 yet.

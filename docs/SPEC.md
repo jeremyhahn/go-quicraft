@@ -1,17 +1,33 @@
 # go-quicraft specification
 
-> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-14
 > A feature listed here, in any status, is never deleted (not its docs, code or issues) without the owner's change to this file.
 
 ## Purpose
 
-QuicRaft is a multi-group Raft consensus library for Go with QUIC transport: one
-process hosts many independent Raft groups (shards). It is Layer 1, the
-foundational consensus engine. Its one local dependency is go-enclave, Layer 0,
-the portfolio's protected-memory primitive. go-qrdb consumes it directly, and
-through go-qrdb so do go-xkms, go-quicbaas, go-trusted-ca and the rest of the
-trusted platform stack. The protocol follows the extended Raft paper and
-Ongaro's thesis, kept in [references/](references/).
+QuicRaft is the Raft library of the stack, which is one product built in layers
+(owner ruling 2026-10-14). It is a multi-group Raft consensus library for Go
+with QUIC transport: one process hosts many independent Raft groups (shards). It
+is Layer 1, the consensus engine under every project above it. The protocol
+follows the extended Raft paper and Ongaro's thesis, kept in
+[references/](references/).
+
+**Embeds:** go-enclave, Layer 0, as a library: its one local dependency, the
+portfolio's protected-memory primitive. go-quicraft inherits locked and sealed
+memory from it, and its SDK carries go-enclave's types (`MemoryEnclave`,
+`SealedEnclave`) through unchanged, under go-enclave's names. It never aliases,
+wraps or re-models them.
+
+**Embedded by:** go-qrdb, the cluster engine and database system. go-qrdb
+embeds go-quicraft as a library and re-exports it through go-qrdb's SDK. Every
+layer above go-qrdb (go-xkms, go-quicbaas, go-trusted-platform) reaches
+consensus only through go-qrdb's SDK, never by importing go-quicraft directly.
+
+**One engine, one datastore:** a deployment runs one go-quicraft engine: the
+one go-qrdb embeds. No layer starts a second `Host` or Raft cluster of its own
+beside it. go-quicraft is not a datastore. Its WAL and snapshots replicate and
+recover the state machines an embedder supplies. Records, tenants and their
+isolation belong to go-qrdb.
 
 ## Boundaries
 
@@ -19,14 +35,19 @@ Ongaro's thesis, kept in [references/](references/).
 snapshots; the `Barrier`/`SealingStrategy` interfaces and `EpochBarrier`; the
 `none` and `passphrase` sealing strategies; the Shamir GF(256) primitive.
 
+**Inherits from go-enclave:** locked plaintext (`MemoryEnclave`) and material
+sealed at rest (`SealedEnclave`), consumed directly.
+
 **Never:**
 
+- A protected-memory type, store or handling of its own: go-enclave.
+- A database, a tenant model or a client of its own: go-qrdb. `pkg/sm/kv` holds
+  reference state machines and test fixtures, not a datastore any layer deploys.
 - Shamir custody, the ceremony, recovery/rekey/root token, peer discovery and
   cluster formation: go-qrdb. The caller hands `StartShard` the member set.
 - Hardware and cloud sealing strategies: go-xkms.
 - An implicit default sealing strategy or a strategy ranking: selection is
   always explicit at barrier setup.
-- A protected-memory type of its own: go-enclave.
 
 ## Features
 
@@ -76,10 +97,9 @@ The current milestone is **Release candidate**: a public release, its version
 confirmed at the owner's publish approval. It closes when:
 
 - #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass
-  reliably (testing). It closes when PRs #320 (engine: step received replies
-  before the tick) and #322 (transport: drain an epoch-evicted outbound) merge.
+  reliably (testing). Met 2026-10-13: #320, #322 and #347 merged.
 - #283 is closed: the spec-review scrub of `docs/` is verified by the
-  department and its fixes have landed.
+  department and its fixes have landed. Met 2026-10-13.
 - The candidate is deployed to staging; production is considered after that.
 
 The v1.0.0 bar, on top of the above:
