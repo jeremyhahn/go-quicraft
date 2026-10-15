@@ -419,6 +419,32 @@ func TestPause_AwaitEndsWhenResumed(t *testing.T) {
 	}
 }
 
+// An AwaitPause whose ctx is already done on entry returns ctx.Err(), even
+// when the pause has nothing in flight and no step-worker iteration is in
+// progress: ctx's error is decided before either is looked at, never raced
+// against them (main run 52823).
+func TestPause_AwaitDoneCtxReturnsCtxErr(t *testing.T) {
+	e := NewEngine(newTestHostConfig(), newTestLogDB(), newTestSender(), nil, nil, nil)
+	cfg := config.Config{ShardID: 1, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
+
+	e.BeginPause(node)
+	if err := e.AwaitPause(pauseCtx(t, 5*time.Second), node); err != nil {
+		t.Fatalf("AwaitPause with nothing in flight = %v, want nil", err)
+	}
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := range 100 {
+		if err := e.AwaitPause(done, node); !errors.Is(err, context.Canceled) {
+			t.Fatalf("AwaitPause(done ctx) #%d on a settled pause = %v, want context.Canceled", i, err)
+		}
+	}
+	if !node.IsPaused() {
+		t.Fatal("AwaitPause(done ctx) left the node unpaused")
+	}
+}
+
 // ResumeNode re-requests an automatic snapshot the pause refused if it is
 // still due.
 func TestPause_ResumeRequestsDroppedSave(t *testing.T) {

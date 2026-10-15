@@ -177,10 +177,16 @@ func (e *Engine) BeginPause(node *Node) {
 
 // AwaitPause waits until none of the paused node's work is in flight, as
 // PauseNode does. It returns nil at once if the node is no longer paused,
-// resumed by ResumeNode while it waited.
+// resumed by ResumeNode while it waited. A ctx already done on entry
+// returns ctx.Err(), however settled the pause is.
 func (e *Engine) AwaitPause(ctx context.Context, node *Node) error {
 	if node.IsFailed() {
 		return nil
+	}
+	// Decided here, not raced against the barrier below: with both ready a
+	// select picks either, and a done ctx would sometimes return nil.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	// The step worker may be mid-iteration over this node, having read the
 	// flag before it was set: wait for that iteration to end, so no update
@@ -261,8 +267,13 @@ func (e *Engine) requestDueSave(node *Node, appliedToTerm uint64) {
 // awaitIteration waits until any step-worker iteration in progress has
 // ended, bounded by ctx. Every iteration runs under nodesMu's read lock, so
 // acquiring the write lock once is the barrier. On ctx expiry the acquiring
-// goroutine finishes on its own when the iteration does.
+// goroutine finishes on its own when the iteration does. An idle worker is
+// the barrier at once, with no goroutine.
 func (w *stepWorker) awaitIteration(ctx context.Context) error {
+	if w.nodesMu.TryLock() {
+		w.nodesMu.Unlock() // an empty critical section is the barrier
+		return nil
+	}
 	done := make(chan struct{})
 	go func() {
 		w.nodesMu.Lock()

@@ -474,7 +474,8 @@ the pause proceeds and the old leader stops heartbeating, so the other voters
 elect a leader of their own.
 
 `PauseShard` returns once no log, apply or snapshot work of the shard is in
-flight. If `ctx` ends first it returns `ctx.Err()` and **the shard stays
+flight. If `ctx` ends first — always the case for a `ctx` already done on
+entry, however quiet the shard — it returns `ctx.Err()` and **the shard stays
 paused**; calling `PauseShard` again waits for the remaining work. `ResumeShard`
 rejoins the shard as a follower at its current term with a fresh election
 timeout. Call it after the barrier is unsealed.
