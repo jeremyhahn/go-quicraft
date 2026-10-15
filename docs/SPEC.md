@@ -107,6 +107,11 @@ a consumer needs one, and keeps the rc tags already cut pinned. It closes when:
 - Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped. It
   names none: go-trusted-platform reaches consensus only through go-qrdb.
 - The API is stable and complete.
+- CI conforms to `../handbook/software/conventions/ci-standard.md`: build,
+  unit, integration, security and the latest-version check (`make build`,
+  `make test`, `make integration-test`, `make security`, `make deps-check`),
+  all in the project's devcontainer image (release). Not yet met: the five
+  targets exist, but the repository has no `build/docker/devcontainer/`.
 
 Then release candidates are tagged, deployed to staging and released;
 production is considered after staging.
