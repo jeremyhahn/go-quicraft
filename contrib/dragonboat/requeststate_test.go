@@ -703,25 +703,19 @@ func TestRequestResult_RaftLogs_SingleEntry(t *testing.T) {
 // WrapSysOpState
 // ---------------------------------------------------------------------------
 
-func TestWrapSysOpState_CompletesWhenInnerResolves(t *testing.T) {
+func TestWrapSysOpState_CompletesWhenInnerReleased(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
 
-	sysOp := WrapSysOpState(inner)
-
-	// The inner has a buffered completedC channel. We need to send a result
-	// on it to trigger waitForCompletion. Since the inner's ResultC() returns
-	// a receive-only channel from the pool's pre-allocated buffered channel,
-	// we can complete it by releasing it (which closes the channel) -- but
-	// actually, Release does not close the channel; it marks released.
-	//
-	// For the pool-based RequestState, completedC is make(chan, 1). We need
-	// to exercise waitForCompletion which does <-src. If src (ResultC()) is
-	// nil (released), it closes completedC immediately.
-
-	// Release the inner so ResultC returns nil, which triggers the nil-src
-	// path in waitForCompletion (closes completedC immediately).
+	// A pool RequestState cannot be resolved from outside the quicraft
+	// package (completion is unexported), so this exercises the released
+	// path: ResultC returns nil and waitForCompletion closes completedC at
+	// once. Release BEFORE wrapping, as TestWrapSysOpState_Release does:
+	// releasing after wrapping raced the wrapper's goroutine, which, when it
+	// read ResultC first, held a live channel a released, never-completed
+	// request never closes, and timed out under load.
 	inner.Release()
+	sysOp := WrapSysOpState(inner)
 
 	// Wait for completion signal.
 	select {
@@ -1037,11 +1031,12 @@ func TestSysOpState_CompletionThenRelease_NormalFlow(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
 
-	sysOp := WrapSysOpState(inner)
-
-	// Release the inner so ResultC returns nil, which triggers the
-	// nil-src fast path in waitForCompletion (closes completedC).
+	// Release the inner BEFORE wrapping so ResultC returns nil, which
+	// triggers the nil-src fast path in waitForCompletion (closes
+	// completedC). Releasing after wrapping races the wrapper's goroutine;
+	// see TestWrapSysOpState_Release.
 	inner.Release()
+	sysOp := WrapSysOpState(inner)
 
 	// Wait for completion signal.
 	select {
