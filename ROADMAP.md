@@ -8,12 +8,12 @@ across Complete, Now, Next, Later and Future are exactly the SPEC feature table.
 
 ## Mission
 
-The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`SealingStrategy` interfaces, `EpochBarrier`, the Shamir GF(256) primitive and the `none` and `passphrase` strategies (handbook `docs/00` L1). It embeds go-enclave as a library and passes its types through unchanged. go-qrdb embeds it as the one consensus engine of a deployment and re-exports it. go-quicraft holds no datastore, tenant model or client of its own ([SPEC](docs/SPEC.md) Purpose, Boundaries).
+The Raft library of the one-product stack: multi-group Raft consensus over QUIC. Raft primitives only, plus the `Barrier`/`SealingStrategy` interfaces, `EpochBarrier`, the Shamir GF(256) primitive and the `none` and `passphrase` strategies (handbook `docs/00` L1). It embeds go-enclave as a library and passes its types through unchanged. go-qrdb embeds it as the one consensus engine of a deployment and re-exports it. go-quicraft holds no datastore, tenant model or client of its own ([SPEC](docs/SPEC.md) Purpose, Boundaries).
 
 
 ## Milestones
 
-- [`Dev complete`](../../milestone/11): every SPEC row shipped, no go-trusted-platform seam row on go-quicraft, API stable and complete; `-alpha` tags until then; 0 open, 60 closed; target 2026-11-02.
+- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 2 open, 62 closed.
 
 ## Complete
 
@@ -46,14 +46,12 @@ The Raft library of the one-product stack (owner ruling 2026-10-14): multi-group
 - **release** — Working fundamentally C7: v0.21.0-rc.2 is cut and go-qrdb adopts it — [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
 - **testing** — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably ([#320](../../pulls/320), [#322](../../pulls/322), [#347](../../pulls/347)) — [#309](../../issues/309) — done
 - **release** — spec-review scrub of every `docs/<feature>/` for the release candidate — [#283](../../issues/283) — done
-- **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it (go-qrdb Q11 B) — [go-qrdb#668](../../../go-qrdb/issues/668) — done
-- **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing (seal ruling A, go-qrdb cl1493) — done
+- **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it — [go-qrdb#668](../../../go-qrdb/issues/668) — done
+- **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing — [0.22.0-alpha](../../releases/tag/v0.22.0-alpha) — done
 
 ## Now
 
-Nothing in progress.
-
-Closed with the question kept in the issue, decision pending: [#272](../../issues/272) (write-batching), [#278](../../issues/278) (multi-group-host), [#281](../../issues/281) (multi-group-host).
+No feature in progress. Open in the milestone: [#363](../../issues/363) (multi-group-host restart after a clean stop), [#369](../../issues/369) (docs clean-up).
 
 ## Next
 

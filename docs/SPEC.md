@@ -1,53 +1,26 @@
 # go-quicraft specification
 
-> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-14
+> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-15
 > A feature listed here, in any status, is never deleted (not its docs, code or issues) without the owner's change to this file.
 
 ## Purpose
 
-QuicRaft is the Raft library of the stack, which is one product built in layers
-(owner ruling 2026-10-14). It is a multi-group Raft consensus library for Go
-with QUIC transport: one process hosts many independent Raft groups (shards). It
-is Layer 1, the consensus engine under every project above it. The protocol
-follows the extended Raft paper and Ongaro's thesis, kept in
-[references/](references/).
-
-**Embeds:** go-enclave, Layer 0, as a library: its one local dependency, the
-portfolio's protected-memory primitive. go-quicraft inherits locked and sealed
-memory from it, and its SDK carries go-enclave's types (`Memory`,
-`Sealed`) through unchanged, under go-enclave's names. It never aliases,
-wraps or re-models them.
-
-**Embedded by:** go-qrdb, the cluster engine and database system. go-qrdb
-embeds go-quicraft as a library and re-exports it through go-qrdb's SDK. Every
-layer above go-qrdb (go-xkms, go-quicbaas, go-trusted-platform) reaches
-consensus only through go-qrdb's SDK, never by importing go-quicraft directly.
-
-**One engine, one datastore:** a deployment runs one go-quicraft engine: the
-one go-qrdb embeds. No layer starts a second `Host` or Raft cluster of its own
-beside it. go-quicraft is not a datastore. Its WAL and snapshots replicate and
-recover the state machines an embedder supplies. Records, tenants and their
-isolation belong to go-qrdb.
+QuicRaft is the Raft library of the stack, which is one product built in layers: a multi-group Raft consensus library for Go with QUIC transport, where one process hosts many independent Raft groups (shards).
+It is Layer 1, the consensus engine under every project above it; the protocol follows the extended Raft paper and Ongaro's thesis, kept in [references/](references/).
+It embeds go-enclave (Layer 0) as a library, and go-qrdb embeds it as the one consensus engine of a deployment and re-exports it through go-qrdb's SDK.
 
 ## Boundaries
 
-**Owns:** the Raft primitives; the QUIC transport (never TCP); the WAL;
-snapshots; the `Barrier`/`SealingStrategy` interfaces and `EpochBarrier`; the
-`none` and `passphrase` sealing strategies; the Shamir GF(256) primitive.
-
-**Inherits from go-enclave:** locked plaintext (`Memory`) and material
-sealed at rest (`Sealed`), consumed directly.
-
-**Never:**
-
-- A protected-memory type, store or handling of its own: go-enclave.
-- A database, a tenant model or a client of its own: go-qrdb. `pkg/sm/kv` holds
-  reference state machines and test fixtures, not a datastore any layer deploys.
-- Shamir custody, the ceremony, recovery/rekey/root token, peer discovery and
-  cluster formation: go-qrdb. The caller hands `StartShard` the member set.
-- Hardware and cloud sealing strategies: go-xkms.
-- An implicit default sealing strategy or a strategy ranking: selection is
-  always explicit at barrier setup.
+- **Owns:** the Raft primitives; the QUIC transport (never TCP); the WAL; snapshots; the `Barrier`/`SealingStrategy` interfaces and `EpochBarrier`; the `none` and `passphrase` sealing strategies; the Shamir GF(256) primitive.
+- **Embeds go-enclave:** its one local dependency, the portfolio's protected-memory primitive; locked plaintext (`Memory`) and material sealed at rest (`Sealed`) are consumed directly and carried through the SDK under go-enclave's names, never aliased, wrapped or re-modelled.
+- **Embedded by go-qrdb only:** every layer above go-qrdb (go-xkms, go-quicbaas, go-trusted-platform) reaches consensus through go-qrdb's SDK, never by importing go-quicraft directly.
+- **One engine per deployment:** the one go-qrdb embeds; no layer starts a second `Host` or Raft cluster of its own beside it.
+- **Never a datastore:** the WAL and snapshots replicate and recover the state machines an embedder supplies; records, tenants and their isolation belong to go-qrdb.
+- **Never:** a protected-memory type, store or handling of its own (go-enclave).
+- **Never:** a database, a tenant model or a client of its own (go-qrdb); `pkg/sm/kv` holds reference state machines and test fixtures, not a datastore any layer deploys.
+- **Never:** Shamir custody, the ceremony, recovery/rekey/root token, peer discovery or cluster formation (go-qrdb); the caller hands `StartShard` the member set.
+- **Never:** hardware and cloud sealing strategies (go-xkms).
+- **Never:** an implicit default sealing strategy or a strategy ranking; selection is always explicit at barrier setup.
 
 ## Features
 
@@ -73,7 +46,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | write-batching | shipped | The proposal aggregator (at-least-once, no deduplication) and the write-durability modes. [architecture.md](write-batching/architecture.md) | [write-batching/](write-batching/) |
 | execute-on-leader | shipped | `Host.ExecuteOnLeader` runs the shard's registered `LeaderHandler` on the leader with no log entry; only on the leader of the term, after it commits an entry of that term; at most once per term; at most 1024 remote requests at once (`ErrBusy`). | [multi-group-host/](multi-group-host/) (architecture.md, Leader-executed requests) |
 | seal-barrier | shipped | AEAD encryption at rest (AES-256-GCM or ChaCha20-Poly1305) of the WAL and snapshots with per-epoch DEKs, rotation and purge; the root key is sealed by an explicit `SealingStrategy`; plaintext is an explicit choice (`WithoutEncryption`); a sealed shard refuses proposals and reads with `ErrBarrierSealed`. [architecture.md](seal-barrier/architecture.md) | [seal-barrier/](seal-barrier/) |
-| shard-pause | shipped | `Host.PauseShard(ctx, shardID)` and `Host.ResumeShard(ctx, shardID)` stop and restart one shard's replica on this host without unloading it, so that the embedder can seal the shard's barrier at runtime while the shard stays loaded (seal ruling A, 2026-10-14: sealed means only unsealing). A paused replica keeps its log, state machine, membership and persisted Raft state as they were, writes nothing to the log or the snapshot store, and `GetShardInfo` reports it paused. **Proposals:** a proposal, session operation, membership change, `ExecuteOnLeader` or leader-transfer request returns `ErrShardPaused` (`errors.Is`-matchable, `Temporary` reports true), and proposals forwarded by peers are not accepted; one accepted before the pause is never applied while paused and completes after resume, ends at its context deadline, or returns the maybe-applied `NotLeaderError` if leadership moved. **Applies:** no entry is applied while paused, including committed entries already handed to the apply worker; they apply in log order after resume. **Reads:** ReadIndex, `SyncRead`, LeaseRead, stale and follower reads return `ErrShardPaused`; read requests forwarded by peers are not served. **Leadership:** a paused replica neither campaigns, votes, replicates nor acknowledges; a paused leader first transfers leadership to an up-to-date voter if one is reachable, and otherwise stops heartbeating so the remaining members elect a leader if they hold a quorum. **Snapshots:** none is taken, sent, received, imported or recovered while paused, and a pause never exhausts snapshot recovery into a shard failure; a due snapshot or recovery runs after resume. **Timing:** `PauseShard` returns once no log, apply or snapshot work of the shard is in flight, bounded by its context; only then may the embedder seal the barrier. `ResumeShard` is called after unseal and rejoins the replica as a follower with a fresh election timeout. Both are idempotent; a pause is not persisted, so a restarted replica starts unpaused. A barrier sealed without a pause still takes the sealed-write hold (#296), never a permanent shard failure. Seam: go-qrdb pauses every shard of a node before sealing it at runtime and resumes them after unseal (go-qrdb cl1493). | [seal-barrier/](seal-barrier/) |
+| shard-pause | shipped | `Host.PauseShard(ctx, shardID)` and `Host.ResumeShard(ctx, shardID)` stop and restart one shard's replica on this host without unloading it, so that the embedder can seal the shard's barrier at runtime while the shard stays loaded (sealed means only unsealing). A paused replica keeps its log, state machine, membership and persisted Raft state as they were, writes nothing to the log or the snapshot store, and `GetShardInfo` reports it paused. **Proposals:** a proposal, session operation, membership change, `ExecuteOnLeader` or leader-transfer request returns `ErrShardPaused` (`errors.Is`-matchable, `Temporary` reports true), and proposals forwarded by peers are not accepted; one accepted before the pause is never applied while paused and completes after resume, ends at its context deadline, or returns the maybe-applied `NotLeaderError` if leadership moved. **Applies:** no entry is applied while paused, including committed entries already handed to the apply worker; they apply in log order after resume. **Reads:** ReadIndex, `SyncRead`, LeaseRead, stale and follower reads return `ErrShardPaused`; read requests forwarded by peers are not served. **Leadership:** a paused replica neither campaigns, votes, replicates nor acknowledges; a paused leader first transfers leadership to an up-to-date voter if one is reachable, and otherwise stops heartbeating so the remaining members elect a leader if they hold a quorum. **Snapshots:** none is taken, sent, received, imported or recovered while paused, and a pause never exhausts snapshot recovery into a shard failure; a due snapshot or recovery runs after resume. **Timing:** `PauseShard` returns once no log, apply or snapshot work of the shard is in flight, bounded by its context; only then may the embedder seal the barrier. `ResumeShard` is called after unseal and rejoins the replica as a follower with a fresh election timeout. Both are idempotent; a pause is not persisted, so a restarted replica starts unpaused. A barrier sealed without a pause still takes the sealed-write hold (#296), never a permanent shard failure. Seam: go-qrdb pauses every shard of a node before sealing it at runtime and resumes them after unseal. | [seal-barrier/](seal-barrier/) |
 | shamir-primitive | shipped | The GF(2^8) split/combine primitive and the share-custody interfaces; the engine never persists Shamir shares ([engineering.md §6](shamir-primitive/engineering.md#6-persistence)). [architecture.md](shamir-primitive/architecture.md) | [shamir-primitive/](shamir-primitive/) |
 | memory-enclave | shipped | Key material is held in go-enclave locked memory (`Memory`) and sealed enclaves (`Sealed`), consumed directly, never aliased or wrapped. [architecture.md](memory-enclave/architecture.md) | [memory-enclave/](memory-enclave/) |
 | observability | shipped | Metrics, logging and event notifications. [architecture.md](observability/architecture.md) | [observability/](observability/) |
@@ -94,35 +67,21 @@ Every feature is shipped; no feature is in progress, planned or future.
 
 ## Release criteria
 
-The current milestone is **Dev complete** (owner ruling 2026-10-14): nothing is
-dev complete until go-trusted-platform is, and every lower library has a stable,
-complete API. Until then go-quicraft tags `-alpha` only, cuts an `-rc.N` only if
-a consumer needs one, and keeps the rc tags already cut pinned. It closes when:
+The current milestone is **Dev complete**: go-quicraft tags `-alpha` only, cuts an `-rc.N` only if a consumer needs one, and keeps the rc tags already cut pinned. It closes when:
 
-- #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass
-  reliably (testing). Met 2026-10-13: #320, #322 and #347 merged.
-- #283 is closed: the spec-review scrub of `docs/` is verified by the
-  department and its fixes have landed. Met 2026-10-13.
+- #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably (testing). Met.
+- #283 is closed: the spec-review scrub of `docs/` is verified by the department and its fixes have landed. Met.
 - Every feature row is shipped, shard-pause included (a go-qrdb seam row).
-- Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped. It
-  names none: go-trusted-platform reaches consensus only through go-qrdb.
-- The API is stable and complete.
-- CI conforms to `../handbook/software/conventions/ci-standard.md`: build,
-  unit, integration, security and the latest-version check (`make build`,
-  `make test`, `make integration-test`, `make security`, `make deps-check`),
-  all in the project's devcontainer image (release). Not yet met: the five
-  targets exist, but the repository has no `build/docker/devcontainer/`.
+- Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped; it names none, since go-trusted-platform reaches consensus only through go-qrdb.
+- Nothing is dev complete until go-trusted-platform is, and every lower library has a stable, complete API.
+- CI conforms to `../handbook/software/conventions/ci-standard.md`: build, unit, integration, security and the latest-version check (`make build`, `make test`, `make integration-test`, `make security`, `make deps-check`), all in the project's devcontainer image (release). Not yet met: the repository has no `build/docker/devcontainer/`.
 
-Then release candidates are tagged, deployed to staging and released;
-production is considered after staging.
+Then release candidates are tagged, deployed to staging and released; production is considered after staging.
 
 The v1.0.0 bar, on top of the above:
 
 - go-enclave is at a public release (memory-enclave).
-- The compatibility policy is acknowledged (`release-versioning.md` §1, §8)
-  (compatibility).
+- The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility).
 - A publication mechanism for agent files exists (release).
-- The company CI template is neutralised for the public tree: `.github/workflows`
-  names no internal repository or domain (release).
-- Every wire and on-disk format version stays pinned until v1.0.0 ships
-  (wire-protocol, log-storage).
+- The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release).
+- Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage).
