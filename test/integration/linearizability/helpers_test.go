@@ -655,9 +655,34 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
+		// The WAL still writes every record through the real segment code;
+		// only the fdatasync is skipped. Every host of a cluster shares one
+		// disk with whatever else the machine runs, and on a contended disk
+		// a single fdatasync blocks for seconds (measured 2.5-4.6s under
+		// -race and CPU load, finishing in the same millisecond on
+		// independent hosts). Raft must persist term and vote before a
+		// RequestVote or vote grant leaves the node, so no election fits in
+		// a 0.5-1s timeout while the disk is stalled: candidates time out,
+		// re-campaign at a higher term and the shard stays leaderless long
+		// enough to miss the throughput floor (#360). Durability against
+		// power loss is not what this suite checks — every restart here
+		// reopens the same directories in the same process, so the page
+		// cache carries the data either way.
+		NoSyncWAL: true,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
 		},
+	}
+}
+
+// TestHarness_HostConfigSkipsWALSync pins the harness to NoSyncWAL. With
+// fdatasync on, a contended disk stalls every host's WAL for seconds at a
+// time and the failover tests fail on liveness for reasons that have nothing
+// to do with consensus (#360).
+func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
+	cfg := testHostConfig(t, "127.0.0.1:0", nil)
+	if !cfg.NoSyncWAL {
+		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
 	}
 }
 
