@@ -1960,6 +1960,43 @@ func assertSnapshotTaken(t *testing.T, cluster *testCluster, idx int) {
 	t.Logf("node[%d] wrote %d snapshot artifact(s) under %s", idx, len(paths), dir)
 }
 
+// waitForLogCompacted blocks until every live replica of shardID has compacted
+// its log past index 1, the first entry a replica joining with an empty log
+// needs. It is the precondition of every "a joiner catches up by snapshot"
+// test, and it must be awaited, not assumed.
+//
+// The automatic snapshot a run of applies triggers is taken, and the log
+// compacted behind it, asynchronously in the snapshot pool. Neither a
+// proposal completing nor every state machine holding every key says the
+// snapshot has finished: under load the compaction was observed landing
+// seconds after the last apply. A joiner added before it lands is probed at
+// index 0 against a log that still holds index 1, so the leader replicates
+// the log to it — correct Raft, and a pass of a snapshot catch-up test would
+// then rest on nothing but which side of that race the scheduler chose.
+//
+// Every live replica is checked, not only the current leader: AddNode is a
+// membership change, and whichever voter leads when the joiner is first
+// probed is the one that serves it.
+func waitForLogCompacted(t *testing.T, cluster *testCluster, shardID uint64, timeout time.Duration) {
+	t.Helper()
+	for i := range cluster.hosts {
+		if cluster.stopped[i].Load() {
+			continue
+		}
+		h := cluster.hosts[i]
+		var last quicraft.LogRange
+		waitForCondition(t, timeout,
+			fmt.Sprintf("node[%d] compacts shard %d past index 1", i, shardID),
+			func() bool {
+				lr, err := h.GetLogRange(shardID)
+				last = lr
+				return err == nil && lr.FirstIndex > 1
+			},
+		)
+		t.Logf("node[%d] log compacted to %+v", i, last)
+	}
+}
+
 // waitForMembershipSize polls GetShardMembership until the number of
 // voting nodes matches expectedSize.
 func waitForMembershipSize(

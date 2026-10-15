@@ -102,7 +102,8 @@ func TestE2E_Barrier_SnapshotCatchUp(t *testing.T) {
 	// Propose 50 entries to force log compaction (snapshotEntries=20).
 	expected := proposeNEntries(t, cluster.testCluster, trackers, shardID, 50, "bsnap")
 	verifyAllData(t, cluster.testCluster, trackers, shardID, expected)
-	t.Logf("50 entries proposed and verified; log compaction should have occurred")
+	waitForLogCompacted(t, cluster.testCluster, shardID, membershipTimeout)
+	t.Logf("50 entries proposed, verified and compacted")
 
 	// Add a new node with an independent barrier. Because the log has been
 	// compacted, the new node must catch up via encrypted snapshot transfer.

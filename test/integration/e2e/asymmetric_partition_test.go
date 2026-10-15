@@ -804,8 +804,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 
 	// Wait for the entries to be applied on the leader. Since
 	// proposeAndWait blocks until SM apply, LastApplied should
-	// already be past initApplied+20. This also gives the async
-	// snapshot compaction path time to trigger.
+	// already be past initApplied+20.
 	waitForCondition(t, 10*time.Second,
 		"entries applied on leader after isolation writes",
 		func() bool {
@@ -813,8 +812,12 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 			return err == nil && info.LastApplied >= initApplied+20
 		},
 	)
+	// Applied is not compacted: the snapshot those applies trigger, and the
+	// compaction behind it, finish asynchronously. The isolated follower is
+	// stopped, so only the live voters are awaited.
+	waitForLogCompacted(t, cluster, shardID, membershipTimeout)
 
-	t.Logf("wrote 20 entries during isolation (expected snapshot compaction)")
+	t.Logf("wrote 20 entries during isolation and the log is compacted")
 
 	// Heal: replace the isolated follower.
 

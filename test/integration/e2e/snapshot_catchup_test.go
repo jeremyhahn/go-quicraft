@@ -47,7 +47,8 @@ func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 
 	// Verify all 3 original nodes have the complete dataset.
 	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 50 entries replicated, adding new node (replicaID=4)")
+	waitForLogCompacted(t, cluster, 1, membershipTimeout)
+	t.Logf("all 50 entries replicated and compacted, adding new node (replicaID=4)")
 
 	// Add a 4th node. The early log entries have been compacted, so the
 	// new node must receive a snapshot transfer to catch up.
@@ -107,7 +108,8 @@ func TestE2E_SnapshotCatchUp_DataIntegrity(t *testing.T) {
 
 	// Verify replication before adding the new node.
 	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 40 entries replicated, adding new node (replicaID=4)")
+	waitForLogCompacted(t, cluster, 1, membershipTimeout)
+	t.Logf("all 40 entries replicated and compacted, adding new node (replicaID=4)")
 
 	// Add a 4th node that must catch up via snapshot.
 	result := addNodeToCluster(t, cluster, 1, 4, snapshotCfg)
@@ -187,7 +189,8 @@ func TestE2E_SnapshotCatchUp_FiveNode(t *testing.T) {
 
 	// Verify all 5 original nodes have the complete dataset.
 	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 60 entries replicated across 5 nodes, adding 6th node (replicaID=6)")
+	waitForLogCompacted(t, cluster, 1, membershipTimeout)
+	t.Logf("all 60 entries replicated and compacted across 5 nodes, adding 6th node (replicaID=6)")
 
 	// Add a 6th node. The compacted log forces snapshot-based catch-up.
 	result := addNodeToCluster(t, cluster, 1, 6, snapshotCfg)

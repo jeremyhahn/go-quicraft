@@ -375,6 +375,13 @@ func TestE2E_PausedFollower_SnapshotRecoveryAfterResume(t *testing.T) {
 		}
 	}
 	assertSnapshotTaken(t, cluster.testCluster, leader)
+	// Taking the snapshot does not compact the log: compaction runs
+	// asynchronously after the save. Until the leader's log starts past the
+	// paused follower's next index, the follower can still catch up by replay.
+	waitForCondition(t, defaultTimeout, "leader compacts past the paused follower", func() bool {
+		lr, err := cluster.hosts[leader].GetLogRange(1)
+		return err == nil && lr.FirstIndex > appliedAtPause+1
+	})
 	// Several heartbeat rounds in which the leader tries to send its snapshot.
 	time.Sleep(pauseHold)
 
