@@ -57,7 +57,11 @@
 // An "already exists" for a different address, for a replica in the wrong
 // role, or with no prior in-flight submission still fails. So does a change
 // that never lands: (2) is a positive observation of the requested state, not
-// the absence of an error.
+// the absence of an error. Nor is a failed read the absence of the change:
+// after a submission, a refusal fails only once a read has SUCCEEDED and shown
+// the change not in effect. Until then the loop keeps reading within its
+// budget, because on a loaded cluster the read after an "already exists" can
+// time out or meet a leader change exactly as the submission did.
 //
 // The address half of AddNodeLanded is load-bearing. Peer.validateAddNode
 // answers ErrNodeAlreadyExists from the replica ID alone, so "already exists"
@@ -371,8 +375,15 @@ func Drive(
 			submitted = true
 		}
 
+		// seen reports whether the read settled anything. After a submission
+		// an unread membership leaves a refusal unexplained, not proven: the
+		// "already exists" may be the submitted entry itself, so a refusal
+		// fails only once a read has shown the change is not in effect.
+		seen := false
 		if submitted {
-			landed, conflict := observe(deadline, readMembership, confirm)
+			var landed bool
+			var conflict error
+			seen, landed, conflict = observe(deadline, readMembership, confirm)
 			if conflict != nil {
 				return &FailedError{Desc: desc, Err: conflict}
 			}
@@ -381,7 +392,7 @@ func Drive(
 			}
 		}
 
-		if !IsRetryable(err) {
+		if !IsRetryable(err) && (!submitted || seen) {
 			return &FailedError{Desc: desc, Err: err}
 		}
 		lastErr = err
@@ -409,22 +420,23 @@ func attemptBudget(deadline time.Time) time.Duration {
 	return remaining
 }
 
-// observe takes one linearizable membership read and asks confirm about it. A
-// read that fails is not evidence of anything, so it reports "not landed" and
-// lets the caller try again.
+// observe takes one linearizable membership read and asks confirm about it.
+// A read that fails is not evidence of anything: it reports seen false, and
+// neither landed nor a conflict, so the caller can look again.
 func observe(
 	deadline time.Time,
 	readMembership func(context.Context) (*quicraft.Membership, error),
 	confirm Confirm,
-) (bool, error) {
+) (seen, landed bool, conflict error) {
 	ctx, cancel := context.WithTimeout(context.Background(), attemptBudget(deadline))
 	defer cancel()
 
 	m, err := readMembership(ctx)
 	if err != nil {
-		return false, nil
+		return false, false, nil
 	}
-	return confirm(m)
+	landed, conflict = confirm(m)
+	return true, landed, conflict
 }
 
 // waitBriefly blocks for d without time.Sleep, which this repository does not

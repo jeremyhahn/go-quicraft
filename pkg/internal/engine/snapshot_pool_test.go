@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -4649,6 +4650,79 @@ func TestHandleRequest_CompletedCFull_DropsResult(t *testing.T) {
 
 	close(stopC)
 	wg.Wait()
+}
+
+// TestSnapshotPool_ProductionPoolDropsNothing: a pool built as production
+// builds it has no completedC tap, so finishing more snapshots than it has
+// workers, with nothing reading results, neither warns of a dropped result
+// nor loses an outcome: each one, error included, reaches the Callback.
+func TestSnapshotPool_ProductionPoolDropsNothing(t *testing.T) {
+	logs := &logCapture{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	stopC := make(chan struct{})
+	cb := newTestCallback()
+	const workers = 2
+	pool := newSnapshotPool(workers, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+	// The package's tests tap every pool (recordSnapshotResults); remove the
+	// tap so this pool is the one production builds.
+	pool.completedC = nil
+	var wg sync.WaitGroup
+	pool.start(&wg)
+	t.Cleanup(wg.Wait)
+	t.Cleanup(func() { close(stopC) })
+
+	const requests = 4 * workers
+	for shardID := uint64(1); shardID <= requests; shardID++ {
+		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
+		cfg.SetDefaults()
+		// No snapshotter: every save fails, so each outcome carries an error.
+		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
+		// The request queue holds `workers` requests; wait out a full one.
+		for {
+			err := pool.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: 1, node: node, save: true})
+			if err == nil {
+				break
+			}
+			var busy *SnapshotPoolBusyError
+			if !errors.As(err, &busy) {
+				t.Fatalf("requestSnapshot(shard %d): %v", shardID, err)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	var calls []snapshotCall
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cb.mu.Lock()
+		n := len(cb.snapshotCalls)
+		if n == requests {
+			calls = append([]snapshotCall(nil), cb.snapshotCalls...)
+			cb.mu.Unlock()
+			break
+		}
+		cb.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("OnSnapshotCompleted fired %d times, want %d", n, requests)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	seen := make(map[uint64]bool)
+	for _, c := range calls {
+		if c.err == nil {
+			t.Fatalf("shard %d: OnSnapshotCompleted lost the save's error", c.shardID)
+		}
+		seen[c.shardID] = true
+	}
+	if len(seen) != requests {
+		t.Fatalf("OnSnapshotCompleted reported %d distinct shards, want %d", len(seen), requests)
+	}
+	if strings.Contains(logs.String(), "result dropped") {
+		t.Fatalf("a production pool logged a dropped result:\n%s", logs.String())
+	}
 }
 
 // panicOnCompletedCallback panics inside OnSnapshotCompleted, standing in for

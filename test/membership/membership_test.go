@@ -120,6 +120,73 @@ func TestRetry_TimeoutIsASubmission(t *testing.T) {
 	}
 }
 
+// scriptedMembership returns a readMembership function that fails with errs in
+// order, one per read, and then reports m.
+func scriptedMembership(m *quicraft.Membership, errs ...error) func(context.Context) (*quicraft.Membership, error) {
+	reads := 0
+	return func(context.Context) (*quicraft.Membership, error) {
+		i := reads
+		reads++
+		if i < len(errs) {
+			return nil, errs[i]
+		}
+		return m, nil
+	}
+}
+
+// TestRetry_AlreadyExistsWithAFailedReadKeepsLooking is the applied-but-
+// unacknowledged add on a loaded cluster: the add is delivered and its wait
+// lost, the retry is refused "already exists" because the first add
+// committed, and the reads that would confirm it time out. A failed read
+// decides nothing, so the refusal must not fail the loop; the next read that
+// succeeds shows the add in effect.
+func TestRetry_AlreadyExistsWithAFailedReadKeepsLooking(t *testing.T) {
+	calls := 0
+	m := &quicraft.Membership{Nodes: map[uint64]string{11: "127.0.0.1:59436"}}
+
+	err := membership.Drive("add", 2*time.Second,
+		scriptedAttempt(&calls, quicraft.ErrTimeout, quicraftAlreadyExists()),
+		scriptedMembership(m, quicraft.ErrTimeout, quicraft.ErrTimeout),
+		membership.AddNodeLanded(11, "127.0.0.1:59436"))
+	if err != nil {
+		t.Fatalf("an 'already exists' whose confirming read failed must be read again, got: %v", err)
+	}
+}
+
+// TestRetry_SubmittedRefusalNeverConfirmedIsExhausted: keeping on looking is
+// not success. When no read ever succeeds the change is never shown in effect,
+// and the loop ends exhausted with the refusal as its last error.
+func TestRetry_SubmittedRefusalNeverConfirmedIsExhausted(t *testing.T) {
+	calls := 0
+	unreadable := func(context.Context) (*quicraft.Membership, error) { return nil, quicraft.ErrTimeout }
+
+	err := membership.Drive("add", 300*time.Millisecond,
+		scriptedAttempt(&calls, quicraft.ErrTimeout, quicraftAlreadyExists()),
+		unreadable,
+		membership.AddNodeLanded(11, "127.0.0.1:59436"))
+	var exhausted *membership.ExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("a submitted add never confirmed must be exhausted, got: %v", err)
+	}
+	if !strings.Contains(exhausted.Last.Error(), "already exists") {
+		t.Fatalf("exhausted with last error %v, want the refusal", exhausted.Last)
+	}
+}
+
+// TestRetry_SubmittedRefusalShownNotInEffectFails: once a read succeeds and
+// the change is not in effect, the refusal is real and fails at once.
+func TestRetry_SubmittedRefusalShownNotInEffectFails(t *testing.T) {
+	calls := 0
+	err := membership.Drive("add", 2*time.Second,
+		scriptedAttempt(&calls, quicraft.ErrTimeout, quicraftAlreadyExists()),
+		fixedMembership(&quicraft.Membership{Nodes: map[uint64]string{}}),
+		membership.AddNodeLanded(11, "127.0.0.1:59436"))
+	var failed *membership.FailedError
+	if !errors.As(err, &failed) {
+		t.Fatalf("a refusal a successful read does not explain must fail, got: %v", err)
+	}
+}
+
 // TestRetry_AlreadyExistsAtDifferentAddressStillFails is THE mutation guard.
 // Peer.validateAddNode answers ErrNodeAlreadyExists from the replica ID
 // alone, so "already exists" is also what a genuine replica-ID collision looks

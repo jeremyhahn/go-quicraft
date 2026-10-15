@@ -158,8 +158,8 @@ type snapshotRequest struct {
 	requestKey uint64
 }
 
-// snapshotResult is the outcome of a snapshot operation, sent back
-// to the engine coordinator via the completedC channel.
+// snapshotResult is the outcome of a snapshot operation, sent on a test's
+// completedC tap (see recordSnapshotResults).
 type snapshotResult struct {
 	shardID   uint64
 	replicaID uint64
@@ -191,8 +191,13 @@ type snapshotPool struct {
 	// takes that route instead of failing with ErrShardBarrierUnresolved.
 	plaintextHostRoute bool
 
-	callback   Callback
-	requestC   chan snapshotRequest
+	callback Callback
+	requestC chan snapshotRequest
+	// completedC is a test tap: every outcome production needs (the
+	// completion, the rejection, the requester's resolution, the error) is
+	// delivered through callback. It is nil unless recordSnapshotResults was
+	// set when the pool was built, and a nil completedC is never sent on, so
+	// a production pool has no channel to fill and nothing to drop.
 	completedC chan snapshotResult
 	// inFlight is the per-shard single-flight slot: shardID -> the *Node
 	// whose request holds it. It is owned by node incarnation, not by shard:
@@ -285,18 +290,26 @@ func newSnapshotPool(workers int, ldb logdb.LogDB, barrier SnapshotBarrier, call
 	if workers < 1 {
 		workers = 2
 	}
-	return &snapshotPool{
+	p := &snapshotPool{
 		workers:    workers,
 		logdb:      ldb,
 		barrier:    barrier,
 		callback:   callback,
 		requestC:   make(chan snapshotRequest, workers),
-		completedC: make(chan snapshotResult, workers),
 		workSignal: workSignal,
 		stopC:      stopC,
 		metrics:    metrics,
 	}
+	if recordSnapshotResults {
+		p.completedC = make(chan snapshotResult, workers)
+	}
+	return p
 }
+
+// recordSnapshotResults makes newSnapshotPool give the pool a completedC
+// tap. Only the package's tests set it, before any pool is built; production
+// reads every snapshot outcome through the Callback.
+var recordSnapshotResults bool
 
 // barrierForShard returns the barrier that encrypts the given shard's
 // snapshots and WAL records. When per-shard barriers are not configured
@@ -890,19 +903,20 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	if p.callback != nil && !abandoned && req.requestKey != 0 {
 		p.callback.OnSnapshotRequestCompleted(req.shardID, req.requestKey, index, err)
 	}
-	// Non-blocking send to completedC. The callback is the
-	// production notification path; completedC is used only
-	// by tests. A blocking send would permanently stall ALL
-	// snapshot operations once the buffered channel fills up
-	// (after `workers` completions with no reader).
-	select {
-	case p.completedC <- result:
-	default:
-		slog.Warn("snapshot completedC full, result dropped",
-			"shard_id", req.shardID,
-			"replica_id", req.replicaID,
-			"index", index,
-		)
+	// The callback above is the production notification path; completedC
+	// exists only when a test tapped the pool. The send is non-blocking: a
+	// blocking send would stall ALL snapshot operations once a test stops
+	// reading and the buffer fills.
+	if p.completedC != nil {
+		select {
+		case p.completedC <- result:
+		default:
+			slog.Warn("snapshot completedC full, result dropped",
+				"shard_id", req.shardID,
+				"replica_id", req.replicaID,
+				"index", index,
+			)
+		}
 	}
 	normalReturn = true
 }
@@ -3757,15 +3771,6 @@ func (p *snapshotPool) claimInFlight(req snapshotRequest) bool {
 // holds it. A slot taken over by a later incarnation is left alone.
 func (p *snapshotPool) releaseInFlight(req snapshotRequest) {
 	p.inFlight.CompareAndDelete(req.shardID, req.node)
-}
-
-// CompletedC returns the read-only completion channel. This channel is
-// provided primarily for testing; the production notification path uses
-// the Callback interface (OnSnapshotCompleted). The channel is buffered
-// to the worker count. If no goroutine reads from it, results are
-// dropped with a warning log (non-blocking send in worker()).
-func (p *snapshotPool) CompletedC() <-chan snapshotResult {
-	return p.completedC
 }
 
 // snapshotSaveDir returns the directory path for saving a snapshot at

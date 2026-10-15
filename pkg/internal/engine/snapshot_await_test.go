@@ -66,6 +66,16 @@ func testDeadlineContext(t *testing.T) (context.Context, context.CancelFunc) {
 // dropped (CompletedC full and unread), or was never accepted.
 //
 // format and args name the request being waited for, printf-style.
+// The package's tests read snapshot outcomes from the completedC tap, so
+// every pool they build carries one. Production pools never do.
+func init() { recordSnapshotResults = true }
+
+// CompletedC returns the pool's completedC tap: one result per finished
+// request, dropped with a warning while the buffer is full.
+func (p *snapshotPool) CompletedC() <-chan snapshotResult {
+	return p.completedC
+}
+
 func awaitSnapshotResult(t *testing.T, p *snapshotPool, format string, args ...any) snapshotResult {
 	t.Helper()
 	ctx, cancel := testDeadlineContext(t)
