@@ -715,6 +715,9 @@ type testCluster struct {
 	ca  *testpki.CA
 	ids []string
 	t   *testing.T
+	// timeline records leader and term transitions for a failing test to
+	// print; every host's config carries its event listener.
+	timeline *leaderTimeline
 }
 
 // identities maps every replica ID (index+1) to the node identity its host
@@ -735,6 +738,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
 	const maxRetries = 3
+	timeline := newLeaderTimeline()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
@@ -748,6 +752,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		for attempt := range maxRetries {
 			addr = freePort(t)
 			cfg = testHostConfig(t, addr, leaves[i])
+			cfg.EventListener = timeline.listener()
 			var err error
 			h, err = quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 			if err == nil {
@@ -771,13 +776,14 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		ids[i] = h.NodeIdentity()
 	}
 	return &testCluster{
-		hosts:   hosts,
-		addrs:   addrs,
-		configs: configs,
-		stopped: make([]atomic.Bool, numNodes),
-		ca:      ca,
-		ids:     ids,
-		t:       t,
+		hosts:    hosts,
+		addrs:    addrs,
+		configs:  configs,
+		stopped:  make([]atomic.Bool, numNodes),
+		ca:       ca,
+		ids:      ids,
+		t:        t,
+		timeline: timeline,
 	}
 }
 
@@ -1037,6 +1043,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 
 	addr := freePort(c.t)
 	cfg := testHostConfig(c.t, addr, c.ca.Leaf(c.t))
+	cfg.EventListener = c.timeline.listener()
 	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
@@ -1112,29 +1119,33 @@ func (c *testCluster) removeNode(idx int, shardID uint64) {
 // Leader/Term Safety Guard
 // ---------------------------------------------------------------------------
 
-// leaderObservation is one poll sample of one host's view of a shard.
+// leaderObservation is one poll sample of one host's view of a shard. A host
+// that is down, or does not run the shard, is observed with up false.
 type leaderObservation struct {
 	index     int
+	up        bool
 	replicaID uint64
+	leaderID  uint64
 	term      uint64
 	isLeader  bool
 }
 
-// observeLeaders samples (node, IsLeader, Term) from EVERY host currently in
-// the cluster and returns the leaders it found.
+// observeShard samples (LeaderID, Term, IsLeader) from EVERY host currently in
+// the cluster and returns one observation per host index.
 //
 // It deliberately does not consult c.stopped: restartNode and addNode replace
 // or extend c.hosts, and a check that skips indices from a stale view of which
 // nodes are up is exactly how a second leader escapes notice. A host that is
-// genuinely down returns an error from GetShardInfo and contributes nothing.
-func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
+// genuinely down returns an error from GetShardInfo and is observed as down.
+func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 	c.hostsMu.RLock()
 	hosts := make([]*quicraft.Host, len(c.hosts))
 	copy(hosts, c.hosts)
 	c.hostsMu.RUnlock()
 
-	var leaders []leaderObservation
+	obs := make([]leaderObservation, len(hosts))
 	for i, h := range hosts {
+		obs[i].index = i
 		if h == nil {
 			continue
 		}
@@ -1142,17 +1153,16 @@ func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 		if err != nil {
 			continue
 		}
-		if !info.IsLeader {
-			continue
-		}
-		leaders = append(leaders, leaderObservation{
+		obs[i] = leaderObservation{
 			index:     i,
+			up:        true,
 			replicaID: info.ReplicaID,
+			leaderID:  info.LeaderID,
 			term:      info.Term,
-			isLeader:  true,
-		})
+			isLeader:  info.IsLeader,
+		}
 	}
-	return leaders
+	return obs
 }
 
 // leaderTermGuard continuously asserts the Raft election-safety invariant:
@@ -1165,6 +1175,9 @@ func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 // GetShardInfo returns (LeaderID, Term, IsLeader) as a seqlock-consistent
 // triple, so a replica can never report leading a term it did not lead; a
 // same-term pair from two replicas is therefore real and not a torn read.
+//
+// Every poll also feeds the cluster's leaderTimeline (see record), so a
+// failing test can print what each node believed about the leader and when.
 type leaderTermGuard struct {
 	t       *testing.T
 	cluster *testCluster
@@ -1173,6 +1186,141 @@ type leaderTermGuard struct {
 	doneC   chan struct{}
 	polls   atomic.Int64
 	maxTerm atomic.Uint64
+
+	// last is the previous poll's observation per node index. Only the guard
+	// goroutine, and stop once that has exited, touch it.
+	last []leaderObservation
+
+	// mu guards the no-leader-known intervals, which checkLinearizability
+	// reads from the test goroutine.
+	mu sync.Mutex
+	// clusterGap follows "no up node knows a leader"; nodeGaps, per node
+	// index, "this node is up and knows no leader".
+	clusterGap gapTracker
+	nodeGaps   []gapTracker
+}
+
+// guards maps a test to its leader/term guard, so that checkLinearizability,
+// which is handed only the test and its history, can name the no-leader gap
+// behind a throughput collapse.
+var guards sync.Map // *testing.T -> *leaderTermGuard
+
+// gapTracker follows one no-leader-known condition across the guard's polls
+// and keeps its longest interval. Times are offsets from the timeline start.
+type gapTracker struct {
+	open    bool
+	since   time.Duration
+	longest time.Duration
+	from    time.Duration
+}
+
+// observe records one poll at now. It reports whether the condition began at
+// this poll, or ended at it and after how long.
+func (g *gapTracker) observe(now time.Duration, inGap bool) (began, ended bool, length time.Duration) {
+	switch {
+	case inGap && !g.open:
+		g.open, g.since = true, now
+		return true, false, 0
+	case !inGap && g.open:
+		g.open = false
+		length = now - g.since
+		if length > g.longest {
+			g.longest, g.from = length, g.since
+		}
+		return false, true, length
+	}
+	return false, false, 0
+}
+
+// longestAt returns the longest interval so far, counting one still open at
+// now.
+func (g *gapTracker) longestAt(now time.Duration) (from, length time.Duration) {
+	if g.open && now-g.since > g.longest {
+		return g.since, now - g.since
+	}
+	return g.from, g.longest
+}
+
+// leaderTimelineCap bounds the leader timeline a failing test prints: the
+// transitions nearest the failure are the ones that explain it.
+const leaderTimelineCap = 200
+
+// leaderTimeline is a test cluster's record of leader and term transitions,
+// each stamped with its monotonic offset from the cluster's creation. Two
+// sources feed it: the leader/term guard, which writes every change it sees
+// in a node's GetShardInfo between two of its polls, and the engine's own
+// dispatched leader events (OnLeaderUpdated, OnLeaderLost, OnLeaderReady,
+// OnCampaignLaunched), installed on every host's config. The events are the
+// evidence a poll cannot give: ShardInfo.Term is the term of the last
+// leadership change a replica published, not its current Raft term, so
+// split-vote churn with no leader known shows up only as campaigns.
+//
+// Nothing is printed unless the test fails; see leaderTermGuard.stop.
+type leaderTimeline struct {
+	start   time.Time
+	mu      sync.Mutex
+	entries []string
+	total   int
+}
+
+func newLeaderTimeline() *leaderTimeline {
+	return &leaderTimeline{start: time.Now()}
+}
+
+// since is the monotonic offset of now from the timeline's start.
+func (tl *leaderTimeline) since() time.Duration {
+	return time.Since(tl.start)
+}
+
+// add appends one transition, keeping the last leaderTimelineCap. The offset
+// is taken under the lock so that entries stay in time order.
+func (tl *leaderTimeline) add(format string, args ...any) {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	line := fmt.Sprintf("+%-9v ", tl.since().Round(time.Millisecond)) + fmt.Sprintf(format, args...)
+	tl.total++
+	if len(tl.entries) == leaderTimelineCap {
+		copy(tl.entries, tl.entries[1:])
+		tl.entries = tl.entries[:leaderTimelineCap-1]
+	}
+	tl.entries = append(tl.entries, line)
+}
+
+// dump renders the retained transitions, oldest first.
+func (tl *leaderTimeline) dump() string {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "leader timeline (last %d of %d transitions, offsets from cluster start):",
+		len(tl.entries), tl.total)
+	for _, e := range tl.entries {
+		sb.WriteString("\n  ")
+		sb.WriteString(e)
+	}
+	return sb.String()
+}
+
+// listener returns the engine event callbacks that feed the timeline. They
+// run on the host's event dispatcher, never on an engine path.
+func (tl *leaderTimeline) listener() *config.EventListener {
+	return &config.EventListener{
+		OnLeaderUpdated: func(i config.LeaderInfo) {
+			tl.add("shard %d event replica=%d LeaderUpdated leader=%d term=%d",
+				i.ShardID, i.ReplicaID, i.LeaderID, i.Term)
+		},
+		OnLeaderReady: func(i config.LeaderInfo) {
+			tl.add("shard %d event replica=%d LeaderReady leader=%d term=%d",
+				i.ShardID, i.ReplicaID, i.LeaderID, i.Term)
+		},
+		OnLeaderLost: func(i config.EventShardInfo) {
+			tl.add("shard %d event replica=%d LeaderLost leader=%d term=%d",
+				i.ShardID, i.ReplicaID, i.LeaderID, i.Term)
+		},
+		OnCampaignLaunched: func(i config.EventShardInfo) {
+			tl.add("shard %d event replica=%d CampaignLaunched leader=%d term=%d",
+				i.ShardID, i.ReplicaID, i.LeaderID, i.Term)
+		},
+	}
 }
 
 // startLeaderTermGuard launches the guard and registers its shutdown so that
@@ -1186,6 +1334,8 @@ func startLeaderTermGuard(t *testing.T, cluster *testCluster, shardID uint64) *l
 		stopC:   make(chan struct{}),
 		doneC:   make(chan struct{}),
 	}
+	guards.Store(t, g)
+	t.Cleanup(func() { guards.Delete(t) })
 	go g.run()
 	t.Cleanup(g.stop)
 	return g
@@ -1208,15 +1358,19 @@ func (g *leaderTermGuard) run() {
 
 // check performs one sweep and reports any same-term multi-leader sighting.
 func (g *leaderTermGuard) check() {
-	leaders := g.cluster.observeLeaders(g.shardID)
+	obs := g.cluster.observeShard(g.shardID)
 	g.polls.Add(1)
+	g.record(obs)
 
-	byTerm := make(map[uint64][]leaderObservation, len(leaders))
-	for _, obs := range leaders {
-		if obs.term > g.maxTerm.Load() {
-			g.maxTerm.Store(obs.term)
+	byTerm := make(map[uint64][]leaderObservation, len(obs))
+	for _, o := range obs {
+		if !o.isLeader {
+			continue
 		}
-		byTerm[obs.term] = append(byTerm[obs.term], obs)
+		if o.term > g.maxTerm.Load() {
+			g.maxTerm.Store(o.term)
+		}
+		byTerm[o.term] = append(byTerm[o.term], o)
 	}
 	for term, obs := range byTerm {
 		if len(obs) < 2 {
@@ -1230,6 +1384,82 @@ func (g *leaderTermGuard) check() {
 		g.t.Errorf("election safety violated on shard %d: %d leaders in term %d:%s",
 			g.shardID, len(obs), term, sb.String())
 	}
+}
+
+// record writes every change in a node's view since the previous poll to the
+// cluster's leader timeline, and advances the no-leader-known intervals. It
+// reuses the poll check already made, so the timeline adds no sampling.
+func (g *leaderTermGuard) record(obs []leaderObservation) {
+	tl := g.cluster.timeline
+	for _, o := range obs {
+		if o.index < len(g.last) && g.last[o.index] == o {
+			continue
+		}
+		switch {
+		case !o.up:
+			tl.add("shard %d poll node[%d] down or not running the shard", g.shardID, o.index)
+		case o.isLeader:
+			tl.add("shard %d poll node[%d](replica=%d) LEADER term=%d", g.shardID, o.index, o.replicaID, o.term)
+		case o.leaderID == 0:
+			tl.add("shard %d poll node[%d](replica=%d) leader unknown term=%d", g.shardID, o.index, o.replicaID, o.term)
+		default:
+			tl.add("shard %d poll node[%d](replica=%d) follows leader=%d term=%d",
+				g.shardID, o.index, o.replicaID, o.leaderID, o.term)
+		}
+	}
+	g.last = obs
+
+	now := tl.since()
+	known := false
+	g.mu.Lock()
+	for len(g.nodeGaps) < len(obs) {
+		g.nodeGaps = append(g.nodeGaps, gapTracker{})
+	}
+	for _, o := range obs {
+		known = known || (o.up && o.leaderID != 0)
+		g.nodeGaps[o.index].observe(now, o.up && o.leaderID == 0)
+	}
+	began, ended, length := g.clusterGap.observe(now, !known)
+	g.mu.Unlock()
+	if began {
+		tl.add("shard %d poll: no node knows a leader", g.shardID)
+	}
+	if ended {
+		tl.add("shard %d poll: a leader is known again after %v", g.shardID, length.Round(time.Millisecond))
+	}
+}
+
+// gapSummary names the longest interval in which no node knew a leader of
+// the shard, and the longest in which one up node alone knew none, each with
+// its offset from the timeline start.
+func (g *leaderTermGuard) gapSummary() string {
+	now := g.cluster.timeline.since()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	from, length := g.clusterGap.longestAt(now)
+	s := fmt.Sprintf("longest no-leader-known interval on shard %d: %v with no node knowing a leader (from +%v)",
+		g.shardID, length.Round(time.Millisecond), from.Round(time.Millisecond))
+	node := -1
+	var nFrom, nLength time.Duration
+	for i := range g.nodeGaps {
+		if f, l := g.nodeGaps[i].longestAt(now); l > nLength {
+			node, nFrom, nLength = i, f, l
+		}
+	}
+	if node >= 0 {
+		s += fmt.Sprintf(", %v on node[%d] (from +%v)",
+			nLength.Round(time.Millisecond), node, nFrom.Round(time.Millisecond))
+	}
+	return s
+}
+
+// leaderGapSummary is gapSummary for the guard t started, for failure
+// messages that have only the test.
+func leaderGapSummary(t *testing.T) string {
+	if g, ok := guards.Load(t); ok {
+		return g.(*leaderTermGuard).gapSummary()
+	}
+	return "no leader/term guard ran in this test, so there is no leader timeline"
 }
 
 // stop halts the guard, runs one final sweep, and fails the test if the guard
@@ -1250,6 +1480,11 @@ func (g *leaderTermGuard) stop() {
 	}
 	if g.maxTerm.Load() == 0 {
 		g.t.Errorf("leader/term guard for shard %d never observed a leader in any term", g.shardID)
+	}
+	// A failing test explains its leadership from the log alone; a passing
+	// one prints nothing extra.
+	if g.t.Failed() {
+		g.t.Logf("%s\n%s", g.cluster.timeline.dump(), g.gapSummary())
 	}
 }
 

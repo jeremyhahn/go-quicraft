@@ -829,10 +829,12 @@ func checkLinearizability(t *testing.T, recorder *opRecorder, floor opsFloor) {
 	// A collapsed history is trivially linearizable, so throughput is part of
 	// the correctness assertion, not a nice-to-have statistic.
 	if writes < floor.writes {
-		t.Fatalf("write throughput collapsed: %d completed writes, floor is %d", writes, floor.writes)
+		t.Fatalf("write throughput collapsed: %d completed writes, floor is %d; %s",
+			writes, floor.writes, leaderGapSummary(t))
 	}
 	if reads < floor.reads {
-		t.Fatalf("read throughput collapsed: %d completed reads, floor is %d", reads, floor.reads)
+		t.Fatalf("read throughput collapsed: %d completed reads, floor is %d; %s",
+			reads, floor.reads, leaderGapSummary(t))
 	}
 
 	events, pruned := pruneNeverReadIndeterminatePuts(recorder.events())
