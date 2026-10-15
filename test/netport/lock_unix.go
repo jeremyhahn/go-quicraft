@@ -39,8 +39,13 @@ const crossProcessClaims = true
 // the process exits, however it exits. The file itself is never removed:
 // unlinking a lock file another process may be about to open would let two
 // processes lock two different inodes under one name.
+//
+// The file is created 0o600. A wider mode would not extend the claim to other
+// users: under the usual umask the shared directory and its files are not
+// writable by them, so their open fails and they fall back to the probe
+// whatever mode is asked for here.
 func lockPort(path string) (unlock func(), busy bool) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o666)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, false
 	}

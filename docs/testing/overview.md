@@ -299,11 +299,15 @@ meet the per-package coverage floor. `make coverage` measures
 
 | Target | Runs |
 |---|---|
-| `docker-build` | builds the devcontainer image (`Dockerfile.dev`), tagged for this checkout |
-| `docker-build-integration` | builds the integration image |
+| `docker-build` | builds the `toolchain` and `integration` stages of `build/docker/devcontainer/Dockerfile`, with every pin from `scripts/tool-pins.sh` |
+| `docker-run CMD=…` | `CMD` in the toolchain image as the invoking user, checkout bind-mounted (compose service `toolchain`) |
+| `toolchain-image` | prints the toolchain image tag, hashed from the Dockerfile, the pin file, `go.mod` and `go.sum` |
+| `integration-test` | the integration suites under `-race` in the integration image (compose service `integration`: read-only, no network, no capabilities) |
+| `docker-build-dev` | builds the legacy dev image (`Dockerfile.dev`), tagged for this checkout |
+| `docker-build-integration` | builds the legacy integration image (`.devcontainer/Dockerfile`) |
 | `docker-make` | `make $(DOCKER_MAKE_TARGET)` (default `ci`) in a fresh dev image; nothing is bind-mounted, so it honours `DOCKER_HOST` |
-| `docker-clean` | removes this checkout's `docker-build` images |
-| `docker-run` | a devcontainer shell |
+| `docker-clean` | removes this checkout's `docker-build*` images |
+| `docker-shell` | a legacy devcontainer shell |
 | `docker-test` | `make test` in the devcontainer |
 | `docker-integration-down` | stops and removes the integration compose stack |
 

@@ -247,6 +247,72 @@ jobs:
       - name: Run govulncheck
         run: govulncheck ./...
 
+  # CUSTOMIZE (ci-template v1.18, image job): builds the devcontainer images
+  # from build/docker/devcontainer/Dockerfile at this commit, runs the
+  # toolchain stages in the toolchain image (handbook ci-standard.md §1-§2),
+  # and gates the integration image with trivy image. The checkout is copied
+  # into each toolchain container (scripts/in-toolchain-image.sh): the daemon
+  # is reached through a socket, so a bind mount would resolve on its host.
+  # make security and make deps-check get a network, for the vulnerability
+  # databases and the module proxy; build and test run without one. The scan
+  # is a gate only: nothing is uploaded to code scanning.
+  image:
+    name: Devcontainer image [build, test, security, deps-check, trivy image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IT_IMAGE: go-quicraft-ci-it:${{ github.run_id }}-${{ github.run_attempt }}-image
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Reap stale CI stacks
+        run: scripts/reap-stale-ci-stacks.sh go-quicraft-ci-
+
+      # As in the integration job: the forge credentials reach the build only
+      # as the gomodauth BuildKit secret, from a file outside the context.
+      - name: Write the module credential file
+        run: |
+          umask 077
+          : > "$RUNNER_TEMP/gomodauth.env"
+          for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+          done
+
+      - name: Build the toolchain and integration images
+        run: |
+          make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      - name: make build (toolchain image)
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make build
+
+      - name: make test (toolchain image)
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make test
+
+      - name: make security (toolchain image)
+        env:
+          IN_IMAGE_NETWORK: bridge
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make security
+
+      - name: make deps-check (toolchain image)
+        env:
+          IN_IMAGE_NETWORK: bridge
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make deps-check
+
+      - name: trivy image (integration image)
+        env:
+          IN_IMAGE_NETWORK: bridge
+        run: |
+          docker save -o it-image.tar "$IT_IMAGE"
+          scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" \
+            trivy image --input it-image.tar --severity CRITICAL,HIGH --exit-code 1
+
+      - name: Tear down
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/gomodauth.env" it-image.tar
+          docker image rm "$IT_IMAGE" || true
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -389,23 +455,51 @@ jobs:
     # fuzz seeds) stay parallel.
     needs: [test]
     # The suite is ~9 min on a quiet machine but runs under -race with -p 1.
-    # -timeout=1800s below is the real budget; this is the outer backstop.
-    timeout-minutes: 45
+    # IT_CMD's -timeout=1800s is the real budget; this is the outer backstop,
+    # with room for building the integration image.
+    timeout-minutes: 60
+    # CUSTOMIZE (ci-template v1.18, integration job that starts containers):
+    # the suite runs in the devcontainer `integration` image built at this
+    # commit, under the hardened compose service in
+    # build/docker/devcontainer/compose.yaml (handbook ci-standard.md §2).
+    # The compose project is go-quicraft-ci-<run>-<attempt>, the reaper runs
+    # first, and the teardown runs last under if: always().
+    env:
+      IT_PROJECT: go-quicraft-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      IT_IMAGE: go-quicraft-ci-it:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Reap stale CI stacks
+        run: scripts/reap-stale-ci-stacks.sh go-quicraft-ci-
 
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
-      # -p 1 is required: each package starts multi-node QUIC clusters under
-      # -race, and running them concurrently flakes the 30s snapshot catch-up
-      # waits.
-      - name: Run integration suite
-        run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
+      # The forge credentials the runner injects (dependency-resolution.md §6)
+      # reach the image build only as the gomodauth BuildKit secret, from a
+      # file outside the build context. `docker build` does not inherit the
+      # job's environment.
+      - name: Write the module credential file
+        run: |
+          umask 077
+          : > "$RUNNER_TEMP/gomodauth.env"
+          for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+          done
+
+      # -p 1 is required (IT_CMD in the Makefile): each package starts
+      # multi-node QUIC clusters under -race, and running them concurrently
+      # flakes the 30s snapshot catch-up waits.
+      - name: Run integration suite in the integration image
+        run: make integration-test MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_PROJECT="$IT_PROJECT" IT_IMAGE="$IT_IMAGE"
+
+      - name: Tear down
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          GO_QUICRAFT_IT_IMAGE="$IT_IMAGE" docker compose -f build/docker/devcontainer/compose.yaml -p "$IT_PROJECT" down --volumes || true
+          docker image rm "$IT_IMAGE" || true
 
   netfault:
     name: Network partitions [build tag quicraft_netfault]
@@ -721,11 +815,12 @@ jobs:
   # A new job must be added both to `needs` and to a `check` line, tagged
   # `pr` or `full`; test/buildgates asserts the pairing.
   # ==========================================================================
+
   ci-gate:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat, fips]
+    needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat, fips, image]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -750,6 +845,7 @@ jobs:
           check test              "${{ needs.test.result }}" pr
           check modules           "${{ needs.modules.result }}" pr
           check cross-arch        "${{ needs.cross-arch.result }}" pr
+          check image             "${{ needs.image.result }}" pr
           check integration       "${{ needs.integration.result }}" full
           check netfault          "${{ needs.netfault.result }}" full
           check errfs             "${{ needs.errfs.result }}" full

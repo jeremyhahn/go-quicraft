@@ -1,0 +1,97 @@
+# go-quicraft devcontainer: one service per shipped stage of the Dockerfile
+# beside this file (handbook devcontainer.md §3, §6).
+#
+#   integration  `make integration-test`: the integration suites under -race in
+#                the integration image, which carries the source. The Makefile
+#                builds that image (with the forge credentials as a BuildKit
+#                secret), names it in GO_QUICRAFT_IT_IMAGE and runs this file
+#                under its own project name, so two runs on one daemon never
+#                share a container, network or volume.
+#   toolchain    `make docker-run CMD='make lint'`: a command in the toolchain
+#                image, as the invoking user, with the checkout bind-mounted.
+#                For a workstation: on a CI runner the bind mount would resolve
+#                on the daemon's host, so CI copies the checkout in instead
+#                (scripts/in-toolchain-image.sh).
+#
+# SECURITY POSTURE (x-posture, both services):
+#
+#   cap_drop ALL, no cap_add: the suites bind loopback ports above 1024, write
+#     only their own temp directories and need no privilege.
+#   no-new-privileges: nothing can gain privilege through a setuid binary.
+#   Docker's default seccomp and AppArmor profiles stay on.
+#   user: never root, so no test passes only because root bypasses a check.
+#   read_only: the root filesystem, the baked source and the module cache
+#     cannot be written. Writable: /tmp (tmpfs, `exec` because `go test` runs
+#     its binary from there) and the build-cache volume.
+#   network_mode none: the clusters talk QUIC over loopback only, and the
+#     modules are baked into the image with GOPROXY=off.
+#   init: a real PID 1 reaps children and forwards signals.
+#   pids_limit / mem_limit: bounds, so a runaway test cannot starve a shared
+#     runner host. No cpus cap: -race clusters are CPU-bound and their
+#     election timeouts are tuned for an unthrottled host.
+#
+# ULIMITS:
+#   memlock 64 MiB soft = hard: finite and the same on every daemon, so the
+#     go-enclave locked memory the sealed replicas use has one ceiling
+#     everywhere rather than the daemon's default.
+#   core 1 MiB, non-zero: go-enclave lowers RLIMIT_CORE itself; a container
+#     that started at 0 would hide whether it did.
+#   nofile: explicit; a five-node cluster holds many sockets and WAL files.
+
+x-posture: &posture
+  init: true
+  read_only: true
+  network_mode: none
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 4096
+  mem_limit: 8g
+  memswap_limit: 8g
+  ulimits:
+    memlock:
+      soft: 67108864
+      hard: 67108864
+    core:
+      soft: 1048576
+      hard: 1048576
+    nofile:
+      soft: 65536
+      hard: 65536
+  working_dir: /src
+
+services:
+  integration:
+    <<: *posture
+    image: ${GO_QUICRAFT_IT_IMAGE:-go-quicraft-it:local}
+    pull_policy: never
+    user: "10001:10001"
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=3g,mode=1777
+    volumes:
+      - gocache:/gocache
+    environment:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+      GOPROXY: "off"
+
+  toolchain:
+    <<: *posture
+    image: go-quicraft-toolchain:${GO_QUICRAFT_TOOLCHAIN_TAG:-latest}
+    pull_policy: never
+    user: "${GO_QUICRAFT_UID:-10001}:${GO_QUICRAFT_GID:-10001}"
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=3g,mode=1777
+    volumes:
+      - ../../..:/src
+      - toolchain-gocache:/gocache
+    environment:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+      GOPROXY: "off"
+      HOME: /tmp
+
+volumes:
+  gocache:
+  toolchain-gocache:

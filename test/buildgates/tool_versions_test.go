@@ -29,7 +29,8 @@ import (
 // ---------------------------------------------------------------------------
 // The golangci-lint pin gate
 //
-// GOLANGCI_VERSION in the Makefile is the single source of truth, but
+// GOLANGCI_VERSION in scripts/tool-pins.sh, which the Makefile includes, is
+// the single source of truth, but
 // .github/workflows/quality.yml and the two devcontainer Dockerfiles cannot
 // read a make variable and each carry a literal pin. They had drifted to THREE
 // versions at once, which is worse than having no analyser: each one gates on a
@@ -173,20 +174,24 @@ func recipeRegexes(t *testing.T) (pin, version *regexp.Regexp) {
 	return pin, version
 }
 
-// declaredGolangciVersion returns GOLANGCI_VERSION from the Makefile.
+// toolPinFile is the one tool pin file, included by the Makefile and sourced by
+// the devcontainer image.
+const toolPinFile = "scripts/tool-pins.sh"
+
+// declaredGolangciVersion returns GOLANGCI_VERSION from the tool pin file.
 var golangciAssignment = regexp.MustCompile(`(?m)^GOLANGCI_VERSION\s*:?=\s*(\S+)`)
 
 func declaredGolangciVersion(t *testing.T) string {
 	t.Helper()
 
-	data, err := os.ReadFile(filepath.Join(repoRoot, "Makefile"))
+	data, err := os.ReadFile(filepath.Join(repoRoot, toolPinFile))
 	if err != nil {
-		t.Fatalf("read Makefile: %v", err)
+		t.Fatalf("read %s: %v", toolPinFile, err)
 	}
 	m := golangciAssignment.FindStringSubmatch(string(data))
 	if m == nil {
-		t.Fatal("the Makefile no longer declares GOLANGCI_VERSION; the pin gate " +
-			"has nothing to compare against")
+		t.Fatalf("%s no longer declares GOLANGCI_VERSION; the pin gate "+
+			"has nothing to compare against", toolPinFile)
 	}
 	return m[1]
 }

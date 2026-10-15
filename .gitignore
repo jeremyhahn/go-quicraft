@@ -4,6 +4,10 @@
 *.out
 *.prof
 build/
+# The root build/ holds outputs, except the devcontainer image definition.
+!/build/
+/build/*
+!/build/docker/
 data/
 
 # Performance test generated artifacts

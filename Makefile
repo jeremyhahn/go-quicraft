@@ -50,9 +50,13 @@ GOFMT         := gofmt
 # The analyser's name on PATH. `make lint` runs GOLANGCI_BIN, which prefers the
 # one `make install-lint` builds.
 GOLINT        := golangci-lint
-# The golangci-lint version. Every literal pin in the CI workflows and
-# devcontainer Dockerfiles must match it (check-tool-versions enforces this).
-GOLANGCI_VERSION := v2.14.0
+# Every pinned tool version: GOLANGCI_VERSION, ACTIONLINT_VERSION,
+# TRIVY_VERSION and the rest. One file, also read by the devcontainer image
+# (handbook devcontainer.md §2). Every literal golangci-lint pin in the CI
+# workflows and devcontainer Dockerfiles must match GOLANGCI_VERSION
+# (check-tool-versions enforces this).
+TOOL_PINS     := scripts/tool-pins.sh
+include $(TOOL_PINS)
 # Where `make install-lint` puts the analyser and the first place `make lint`
 # looks. Repo-local so another project's `go install` cannot replace it.
 TOOLS_BIN     := $(CURDIR)/.tools/bin
@@ -61,9 +65,8 @@ TOOLS_BIN     := $(CURDIR)/.tools/bin
 GOLANGCI_BIN   = $(shell if [ -x '$(TOOLS_BIN)/golangci-lint' ]; then \
 			echo '$(TOOLS_BIN)/golangci-lint'; \
 		else command -v $(GOLINT) 2>/dev/null; fi)
-# The workflow linter `make lint` runs over .github/workflows, at this version.
-# `make install-actionlint` builds it into TOOLS_BIN.
-ACTIONLINT_VERSION := v1.7.12
+# The workflow linter `make lint` runs over .github/workflows, at
+# ACTIONLINT_VERSION. `make install-actionlint` builds it into TOOLS_BIN.
 # The repo-local build first, then PATH; recursive for the same reason as
 # GOLANGCI_BIN.
 ACTIONLINT_BIN = $(shell if [ -x '$(TOOLS_BIN)/actionlint' ]; then \
@@ -99,10 +102,8 @@ GOVULNCHECK   := govulncheck
 #         crypto/rand, and is not a security primitive
 GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 
-# The trivy release `make install-trivy` and `make remote-tools` install, into
-# TOOLS_BIN. Upstream's latest on 2026-10-09; the runner images take theirs
-# from the Company Agent's versions.conf (devops.md §9).
-TRIVY_VERSION := v0.75.0
+# `make install-trivy` and `make remote-tools` install TRIVY_VERSION into
+# TOOLS_BIN; the toolchain image carries the same release.
 # The scanner every trivy target runs: the repo-local install first, then PATH.
 # Recursive for the same reason as GOLANGCI_BIN; empty when there is none, which
 # check-trivy turns into a failure.
@@ -296,12 +297,18 @@ test-crypto:
 
 # Host targets: build the devcontainer image quietly, then run the tests in it.
 
+# The CI stage: IT_CMD in the devcontainer integration image, under the
+# hardened compose service (read-only, no network, no capabilities), in its
+# own compose project, torn down with its volumes however the run ends.
 .PHONY: integration-test
-integration-test:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running integration tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration make _integration-test
+integration-test: docker-build-it
+	@echo "==> Running integration tests in $(IT_IMAGE) (project $(IT_PROJECT))..."
+	@status=0; \
+	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
+		run --rm integration $(IT_CMD) || status=$$?; \
+	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
+		down --volumes >/dev/null 2>&1 || true; \
+	exit $$status
 
 .PHONY: integration-test-raft
 integration-test-raft:
@@ -354,10 +361,11 @@ integration-test-linearizability:
 _integration-test-linearizability:
 	$(GOTEST) -tags=integration -timeout=600s $(INT_TEST_DIR)/linearizability/...
 
-# CI parity: identical to the `integration` job in .github/workflows/ci.yml and
-# the `integration` gate in release.yml. Runs on the host, as a CI runner does.
-# Unlike _integration-test: no -v (large logs), and 1800s because shared runners
-# are slower and -p 1 shares one deadline.
+# The integration command on the host: the IT_CMD that `make integration-test`
+# runs in the image for the `integration` job in .github/workflows/ci.yml, and
+# the `integration` gate in release.yml. Unlike _integration-test: no -v (large
+# logs), and 1800s because shared runners are slower and -p 1 shares one
+# deadline.
 .PHONY: ci-integration
 ci-integration:
 	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
@@ -1121,8 +1129,8 @@ FORGE_SSH_PORT ?= 22
 remote-tools:
 	$(REQUIRE_REMOTE_HOST)
 	@$(REMOTE_SSH) '$(REMOTE_ENV_PATH); \
-		go install golang.org/x/vuln/cmd/govulncheck@latest; \
-		go install github.com/securego/gosec/v2/cmd/gosec@latest; \
+		go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
+		$(call GOSEC_INSTALL,go); \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
 		command -v trivy >/dev/null || curl -sfL \
 			https://raw.githubusercontent.com/aquasecurity/trivy/$(TRIVY_VERSION)/contrib/install.sh \
@@ -1325,11 +1333,11 @@ trivy: check-trivy
 	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
 		--skip-dirs .build-cache --skip-dirs test/performance .
 
-# Scans the locally built devcontainer image. CI does not build it, so run this
-# when a Dockerfile or its base image changes.
+# Scans the devcontainer integration image (handbook devops.md §8). CI's `image`
+# job runs the same scan on the image it builds at the commit under test.
 .PHONY: trivy-image
-trivy-image: check-trivy docker-build
-	$(TRIVY) image --severity CRITICAL,HIGH --exit-code 1 $(DOCKER_IMAGE):$(DOCKER_TAG)
+trivy-image: check-trivy docker-build-it
+	$(TRIVY) image --severity CRITICAL,HIGH --exit-code 1 $(IT_IMAGE)
 
 # Every trivy target fails rather than skips without the binary: a scan that
 # did not run must not read as a scan that passed.
@@ -1374,13 +1382,24 @@ security-sarif: check-trivy
 # Tool installation
 # ============================================================================
 
+# gosec builds in a throwaway module so x/tools can be raised to XTOOLS_VERSION
+# (see scripts/tool-pins.sh): a plain `go install gosec@GOSEC_VERSION` links
+# the x/tools its go.mod names, which cannot read Go 1.27 export data. The
+# Dockerfile tools stage does the same. $(1) is the go command. One shell line
+# with no single quotes, so remote-tools can embed it in its ssh command.
+GOSEC_INSTALL = ( d="$$(mktemp -d)" && cd "$$d" && export GOWORK=off && \
+	$(1) mod init gosec-build && \
+	$(1) get github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) golang.org/x/tools@$(XTOOLS_VERSION) && \
+	$(1) install github.com/securego/gosec/v2/cmd/gosec; \
+	rc=$$?; cd / && rm -rf "$$d"; exit $$rc )
+
 .PHONY: install-gosec
 install-gosec:
-	$(GO) install github.com/securego/gosec/v2/cmd/gosec@latest
+	$(call GOSEC_INSTALL,$(GO))
 
 .PHONY: install-govulncheck
 install-govulncheck:
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
 # Installs the pinned scanner into $(TOOLS_BIN), where every trivy target looks
 # first. The installer comes from the same tag and checks the release
@@ -1447,11 +1466,57 @@ REQUIRE_BUILDX = @docker buildx version >/dev/null 2>&1 || { \
 	echo "credentials as a BuildKit secret. Install the docker-buildx plugin."; \
 	exit 1; }
 
+# The devcontainer (handbook devcontainer.md): one Dockerfile whose toolchain
+# stage runs every CI stage but integration, and whose integration stage runs
+# that, under the hardened compose service beside it.
+DEVCONTAINER_DIR     := build/docker/devcontainer
+DEVCONTAINER_COMPOSE := $(DEVCONTAINER_DIR)/compose.yaml
+# The toolchain image tag, hashed from everything the image is built from, so a
+# changed pin, Dockerfile or module list is a new tag (`make toolchain-image`).
+# Recursive: only the targets that use it pay for the hash.
+TOOLCHAIN_TAG   = $(shell cat $(DEVCONTAINER_DIR)/Dockerfile $(TOOL_PINS) go.mod go.sum | sha256sum | cut -c1-16)
+TOOLCHAIN_IMAGE = go-quicraft-toolchain:$(TOOLCHAIN_TAG)
+# The integration image and the compose project it runs under, per checkout.
+# CI names both per run so that concurrent runs on one daemon never meet, and
+# scripts/reap-stale-ci-stacks.sh removes what a killed run left.
+IT_IMAGE   ?= go-quicraft-it:$(DOCKER_TAG)
+IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
+# What `make integration-test` runs in the integration image: the CI job's
+# command, -race and serialized packages (see _integration-test).
+IT_CMD     ?= go test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+# Internal: a devcontainer build of one stage. GO_IMAGE comes from the pin file;
+# GO_BUILD_PROXY, when set in the caller's environment, replaces the public
+# module proxy for the build-time fetches.
+DEVCONTAINER_BUILD = docker buildx build --load $(DOCKER_SECRET_ARGS) \
+	--build-arg GO_IMAGE=$(GO_IMAGE) \
+	$(if $(GO_BUILD_PROXY),--build-arg GO_BUILD_PROXY=$(GO_BUILD_PROXY)) \
+	-f $(DEVCONTAINER_DIR)/Dockerfile
+
 # The make target docker-make runs inside the dev image.
 DOCKER_MAKE_TARGET ?= ci
 
+# Builds both devcontainer images: toolchain, tagged by content, and integration.
 .PHONY: docker-build
-docker-build:
+docker-build: docker-build-toolchain docker-build-it
+
+.PHONY: docker-build-toolchain
+docker-build-toolchain:
+	$(REQUIRE_BUILDX)
+	$(DEVCONTAINER_BUILD) --target toolchain -t $(TOOLCHAIN_IMAGE) .
+
+.PHONY: docker-build-it
+docker-build-it:
+	$(REQUIRE_BUILDX)
+	$(DEVCONTAINER_BUILD) --target integration -t $(IT_IMAGE) .
+
+# Prints the toolchain image tag; `make docker-build` builds it.
+.PHONY: toolchain-image
+toolchain-image:
+	@echo $(TOOLCHAIN_IMAGE)
+
+# The legacy dev image (.devcontainer/Dockerfile.dev), which docker-make runs.
+.PHONY: docker-build-dev
+docker-build-dev:
 	$(REQUIRE_BUILDX)
 	docker buildx build --load $(DOCKER_SECRET_ARGS) -t $(DOCKER_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile.dev .
 
@@ -1464,19 +1529,30 @@ docker-build-integration:
 #   make docker-make DOCKER_MAKE_TARGET=test
 #   DOCKER_HOST=ssh://user@bench-host.example make docker-make
 .PHONY: docker-make
-docker-make: docker-build
+docker-make: docker-build-dev
 	docker run --rm --network host --cap-add NET_ADMIN $(DOCKER_ENV_ARGS) $(DOCKER_IMAGE):$(DOCKER_TAG) make $(DOCKER_MAKE_TARGET)
 
-# Removes the images docker-build and docker-build-integration made for this
-# checkout.
+# Removes the images the docker-build* targets made for this checkout.
 .PHONY: docker-clean
 docker-clean:
-	@for image in $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_INT_IMAGE):$(DOCKER_TAG); do \
+	@for image in $(TOOLCHAIN_IMAGE) $(IT_IMAGE) $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_INT_IMAGE):$(DOCKER_TAG); do \
 		if docker image inspect "$$image" >/dev/null 2>&1; then docker image rm "$$image"; fi; \
 	done
 
+# Runs CMD in the toolchain image as the invoking user, with the checkout
+# bind-mounted (compose service `toolchain`), offline and under the integration
+# service's posture: make docker-run CMD='make lint'. A workstation target; CI
+# copies the checkout in instead (scripts/in-toolchain-image.sh).
+CMD ?= make build
 .PHONY: docker-run
-docker-run:
+docker-run: docker-build-toolchain
+	GO_QUICRAFT_TOOLCHAIN_TAG=$(TOOLCHAIN_TAG) GO_QUICRAFT_UID=$$(id -u) GO_QUICRAFT_GID=$$(id -g) \
+		docker compose -f $(DEVCONTAINER_COMPOSE) -p go-quicraft-tc-$(DOCKER_TAG) \
+		run --rm toolchain sh -c '$(CMD)'
+
+# The legacy devcontainer shell (.devcontainer/docker-compose.yml).
+.PHONY: docker-shell
+docker-shell:
 	docker compose -f $(COMPOSE_FILE) run --rm devcontainer
 
 .PHONY: docker-test
@@ -1619,12 +1695,15 @@ help:
 	@echo "  install-trivy          Install the pinned Trivy into .tools/bin"
 	@echo ""
 	@echo "Docker:"
-	@echo "  docker-build                   Build devcontainer image (this checkout's tag)"
-	@echo "  docker-build-integration       Build integration test image"
+	@echo "  docker-build                   Build the devcontainer toolchain and integration images"
+	@echo "  docker-run CMD='make lint'     Run CMD in the toolchain image, checkout bind-mounted"
+	@echo "  toolchain-image                Print the toolchain image tag (content-hashed)"
+	@echo "  docker-build-dev               Build the legacy dev image (Dockerfile.dev)"
+	@echo "  docker-build-integration       Build the legacy integration image (.devcontainer/Dockerfile)"
 	@echo "  docker-make                    Run make DOCKER_MAKE_TARGET (default ci) in a fresh"
 	@echo "                                 dev image; honours DOCKER_HOST for a remote daemon"
-	@echo "  docker-clean                   Remove this checkout's docker-build images"
-	@echo "  docker-run                     Run devcontainer shell"
+	@echo "  docker-clean                   Remove this checkout's docker-build* images"
+	@echo "  docker-shell                   Run the legacy devcontainer shell"
 	@echo "  docker-test                    Run unit tests in devcontainer"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 

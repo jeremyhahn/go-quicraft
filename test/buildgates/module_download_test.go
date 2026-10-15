@@ -64,6 +64,7 @@ var moduleDownloadDockerfiles = map[string]string{
 	".devcontainer/Dockerfile":               ".",
 	".devcontainer/Dockerfile.dev":           ".",
 	".devcontainer/Dockerfile.integration":   ".",
+	"build/docker/devcontainer/Dockerfile":   ".",
 	"test/performance/quicraft/Dockerfile":   "test/performance/quicraft",
 	"test/performance/etcd/Dockerfile":       "test/performance/etcd",
 	"test/performance/dragonboat/Dockerfile": "test/performance/dragonboat",

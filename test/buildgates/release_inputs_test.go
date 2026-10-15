@@ -220,7 +220,11 @@ type releaseFixture struct {
 func newReleaseFixture(t *testing.T, withRemote bool) *releaseFixture {
 	t.Helper()
 	f := &releaseFixture{t: t, dir: t.TempDir()}
-	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md"} {
+	// The Makefile includes the tool pin file, so it comes along.
+	if err := os.MkdirAll(filepath.Join(f.dir, "scripts"), 0o755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", "scripts/tool-pins.sh"} {
 		writeFile(t, filepath.Join(f.dir, name), readFile(t, filepath.Join(repoRoot, name)), 0o644)
 	}
 	f.release = bumpPatch("v" + strings.TrimSpace(f.version()))
