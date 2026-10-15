@@ -529,7 +529,38 @@ func hostConfigAt(walDir, nodeHostDir, addr string, mtls *config.MTLSConfig) con
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
 	assertApplyOrder(t)
-	return hostConfigAt(t.TempDir(), t.TempDir(), listenAddr, mtls)
+	cfg := hostConfigAt(t.TempDir(), t.TempDir(), listenAddr, mtls)
+	// The WAL still writes every record through the real segment code; only
+	// the fdatasync is skipped. Raft persists term and vote before a
+	// RequestVote or vote grant leaves the node, so once every sync on the
+	// shared disk takes longer than the 0.5-1s election timeout no election
+	// can finish: candidates time out, re-campaign at a higher term and the
+	// shard stays leaderless (#362, the same stall #360 measured at 2.5-4.6s
+	// on the CI runner). These hosts get fresh directories and are never
+	// reopened, so durability is not what they check. Hosts that ARE
+	// restarted on their own directories (newTestClusterWithRestart,
+	// readyCluster) build from hostConfigAt and keep the real sync.
+	cfg.NoSyncWAL = true
+	return cfg
+}
+
+// TestHarness_HostConfigSkipsWALSync pins testHostConfig to NoSyncWAL: a
+// stalled fdatasync holds every election past its timeout (#362).
+func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
+	cfg := testHostConfig(t, "127.0.0.1:0", nil)
+	if !cfg.NoSyncWAL {
+		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
+	}
+}
+
+// TestHarness_RestartConfigKeepsWALSync pins hostConfigAt to the real sync.
+// It builds every host that is closed and reopened on its own directories,
+// and those tests assert that what the WAL acknowledged survives the restart.
+func TestHarness_RestartConfigKeepsWALSync(t *testing.T) {
+	cfg := hostConfigAt(t.TempDir(), t.TempDir(), "127.0.0.1:0", nil)
+	if cfg.NoSyncWAL {
+		t.Fatal("hostConfigAt must keep the WAL sync: restart tests reopen its directories")
+	}
 }
 
 // testShardConfig creates a per-shard config for host API testing.

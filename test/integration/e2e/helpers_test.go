@@ -699,9 +699,27 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
+		// The WAL still writes every record through the real segment code;
+		// only the fdatasync is skipped. Raft persists term and vote before a
+		// RequestVote or vote grant leaves the node, so once every sync on the
+		// shared disk takes longer than the 0.5-1s election timeout no
+		// election can finish and the shard stays leaderless (#362, #360).
+		// Every host here gets fresh directories and none is reopened (a
+		// replacement host joins as a new node), so durability across a
+		// restart is not what this suite checks.
+		NoSyncWAL: true,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
 		},
+	}
+}
+
+// TestHarness_HostConfigSkipsWALSync pins testHostConfig to NoSyncWAL: a
+// stalled fdatasync holds every election past its timeout (#362).
+func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
+	cfg := testHostConfig(t, "127.0.0.1:0", nil)
+	if !cfg.NoSyncWAL {
+		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
 	}
 }
 
