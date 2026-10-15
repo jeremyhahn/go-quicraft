@@ -18,7 +18,7 @@
 //
 // # Why this exists
 //
-// go-enclave's MemoryEnclave.Freeze mprotects a filled region read-only, which
+// go-enclave's Memory.Freeze mprotects a filled region read-only, which
 // is what turns a stray write through a retained slice from silent corruption of
 // key material into a fault. This repository freezes at three sites — a share
 // value, a reconstructed secret, an unsealed root key — and a MISSING Freeze is
@@ -51,7 +51,7 @@ import (
 type Protection string
 
 // ReadOnly reports whether the mapping is readable and NOT writable, which is
-// the state MemoryEnclave.Freeze establishes.
+// the state Memory.Freeze establishes.
 func (p Protection) ReadOnly() bool {
 	return len(p) >= 2 && p[0] == 'r' && p[1] == '-'
 }
@@ -60,7 +60,7 @@ func (p Protection) ReadOnly() bool {
 // first byte.
 //
 // b must alias memory this process has mapped — in practice a slice taken from
-// MemoryEnclave.Open, whose backing pages are the enclave's own. It reports an
+// Memory.WithBytes, whose backing pages are the enclave's own. It reports an
 // error when /proc/self/maps cannot be read or lists no mapping covering the
 // address; both are "this kernel cannot answer", which callers should skip on
 // rather than fail on, since neither says anything about the code under test.

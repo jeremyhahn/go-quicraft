@@ -53,7 +53,7 @@ type Share struct {
 	// share stays readable in the heap until the GC reclaims it, and a
 	// ceremony holding all N shares is the point of widest exposure in the
 	// whole scheme. Use ProtectedShare, whose value lives in an mlock'd,
-	// guard-paged enclave.MemoryEnclave that Destroy genuinely wipes;
+	// guard-paged enclave.Memory that Destroy genuinely wipes;
 	// SplitProtected and CombineProtected are the Split/Combine equivalents,
 	// and Share.Protect moves an existing Share onto that path. The field
 	// itself remains: this type is still the JSON shape shares are persisted

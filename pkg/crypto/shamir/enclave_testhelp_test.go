@@ -11,7 +11,7 @@ import (
 // pages outlives it; these tests assert on a nil slice, so a destroyed enclave
 // is folded into one here rather than handled at ~30 assertion sites.
 // Production code never copies protected material out like this.
-func encCopy(e *enclave.MemoryEnclave) []byte {
+func encCopy(e *enclave.Memory) []byte {
 	var out []byte
 	if err := e.WithBytes(func(b []byte) error {
 		out = append([]byte(nil), b...)
@@ -38,11 +38,11 @@ func valueCopy(s *ProtectedShare) []byte {
 // mustFromBytes moves data into a locked, frozen enclave, failing the test if the
 // kernel refuses the lock; go-enclave reports a refused mlock instead of hiding
 // it.
-func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
+func mustFromBytes(t testing.TB, data []byte) *enclave.Memory {
 	t.Helper()
-	e, err := enclave.NewMemoryEnclave(data)
+	e, err := enclave.NewMemory(data)
 	if err != nil {
-		t.Fatalf("NewMemoryEnclave: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	return e
 }

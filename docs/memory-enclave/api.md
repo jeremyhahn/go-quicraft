@@ -22,7 +22,7 @@ feature exists to prevent.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.8.0-alpha).
+Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.8.0-rc.2).
 
 All of the surface belongs to go-enclave. go-quicraft declares no
 protected-memory type, alias or wrapper, and re-exports nothing: consumers
@@ -33,15 +33,15 @@ go-enclave types.
 ### Allocate locked memory
 
 ```go
-func NewMemoryEnclaveSized(n int) (*MemoryEnclave, error)  // writable, fill in place
-func NewMemoryEnclave(data []byte) (*MemoryEnclave, error) // moves data in, FROZEN
-func NewMemoryEnclaveCopy(src []byte) (*MemoryEnclave, error) // copies, FROZEN, src untouched
+func NewMemorySized(n int) (*Memory, error)  // writable, fill in place
+func NewMemory(data []byte) (*Memory, error) // moves data in, FROZEN
+func NewMemoryCopy(src []byte) (*Memory, error) // copies, FROZEN, src untouched
 ```
 
 | | |
 |---|---|
 | Request | `n int`, or `data []byte` (wiped on every return path, failure included) |
-| Response | `*MemoryEnclave`: `mlock`'d, guard-paged, canary-checked, excluded from core dumps |
+| Response | `*Memory`: `mlock`'d, guard-paged, canary-checked, excluded from core dumps |
 | Errors | `ErrInvalidSize`, `ErrEmptyEnclave`, and `ErrLockedMemoryUnavailable` when the kernel refuses the lock |
 | Permission | none; in-process call |
 
@@ -49,13 +49,13 @@ They return an error because locking pages is a syscall the kernel can decline.
 
 Mutability differs. A sized enclave stays writable until it is frozen, which is
 what makes filling it possible, so a slice retained past a borrow can silently
-corrupt the material. One built by `NewMemoryEnclave` or `NewMemoryEnclaveCopy`
+corrupt the material. One built by `NewMemory` or `NewMemoryCopy`
 is frozen read-only, where the same mistake faults.
 
 ### Freeze material generated in place
 
 ```go
-func (e *MemoryEnclave) Freeze() error
+func (e *Memory) Freeze() error
 ```
 
 | | |
@@ -71,7 +71,7 @@ one on the same enclave. A refused freeze leaves the enclave alive and writable:
 destroy it rather than return material whose protection was not established.
 
 ```go
-e, err := enclave.NewMemoryEnclaveSized(n)
+e, err := enclave.NewMemorySized(n)
 if err != nil {
 	return nil, err
 }
@@ -90,39 +90,39 @@ return e, nil
 ```
 
 go-quicraft uses this shape for the unsealed root key, a Shamir share value and a
-reconstructed secret. `SealedEnclave.Open` freezes its own result, so
+reconstructed secret. `Sealed.Open` freezes its own result, so
 `Barrier.RootKeyProtected` needs no `Freeze` of its own. Do not freeze an enclave whose last act is to be consumed
-by `NewSealed` or `NewMemoryEnclave`: those wipe what they are handed, and a wipe
+by `NewSealed` or `NewMemory`: those wipe what they are handed, and a wipe
 of frozen pages faults the process.
 
 ### Hold a key encrypted at rest in process memory
 
 ```go
-func NewSealed(ctx context.Context, data []byte) (*SealedEnclave, error)
+func NewSealed(ctx context.Context, data []byte) (*Sealed, error)
 ```
 
 | | |
 |---|---|
 | Request | `ctx`, which bounds the seal and reaches the process sealer's provider; `data []byte`, the raw key material. `data` is wiped on every return path, failure and cancellation included. |
-| Response | `*SealedEnclave`: ciphertext on the ordinary heap, holding no locked pages |
+| Response | `*Sealed`: ciphertext on the ordinary heap, holding no locked pages |
 | Errors | `ErrEmptyEnclave`, `ErrMaterialTooLarge`, `ErrSealFailed`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy` on the process sealer). A context that has ended fails the seal with an error matching both `ErrSealFailed` and `ctx.Err()`. |
 | Permission | none |
 
 ### Materialize the plaintext for a bounded window
 
 ```go
-func (s *SealedEnclave) Open(ctx context.Context) (*MemoryEnclave, error)
-func (s *SealedEnclave) OpenWith(ctx context.Context, a *Allocator) (*MemoryEnclave, error)
-func (s *SealedEnclave) Openable() error
-func (s *SealedEnclave) IsAlive() bool
-func (s *SealedEnclave) Destroy() error // always nil today
+func (s *Sealed) Open(ctx context.Context) (*Memory, error)
+func (s *Sealed) OpenIn(ctx context.Context, b Backend) (Handle, error)
+func (s *Sealed) Openable() error
+func (s *Sealed) IsAlive() bool
+func (s *Sealed) Destroy() error // always nil today
 ```
 
 | | |
 |---|---|
-| Request | `ctx`, which bounds the open (`OpenWith` also takes the `Allocator` to charge the destination against) |
-| Response | a new `*MemoryEnclave` holding the plaintext, `mlock`'d and FROZEN read-only. The caller owns it and must `Destroy` it. Each call returns an independent enclave. |
-| Errors | `ErrEnclaveDestroyed`, `ErrSealedAuthentication`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy`), `ErrOpenFailed`; `OpenWith` adds `ErrNilAllocator` and `ErrBudgetExhausted`. A context that has ended fails the open with an error matching both `ErrOpenFailed` and `ctx.Err()`, and leaves the sealed value intact. |
+| Request | `ctx`, which bounds the open (`OpenIn` also takes the `Backend` to open into; an `*Allocator` charges the destination against its budget) |
+| Response | a new `*Memory` holding the plaintext, `mlock`'d and FROZEN read-only. The caller owns it and must `Destroy` it. Each call returns an independent enclave. `OpenIn` returns a `Handle`; into locked memory it is a `*Memory`. |
+| Errors | `ErrEnclaveDestroyed`, `ErrSealedAuthentication`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy`), `ErrOpenFailed`; `OpenIn` adds `ErrInvalidBackend`, a `*CapabilityError`, and, into an `Allocator`, `ErrNilAllocator` and `ErrBudgetExhausted`. A context that has ended fails the open with an error matching both `ErrOpenFailed` and `ctx.Err()`, and leaves the sealed value intact. |
 | Permission | none |
 
 The plaintext never reaches the ordinary Go heap: the destination is allocated
@@ -146,11 +146,11 @@ different question, whether an `Open` could still succeed, which a shutdown
 ### Read protected bytes with a bounded lifetime
 
 ```go
-func (e *MemoryEnclave) WithBytes(fn func([]byte) error) error
-func (e *MemoryEnclave) Size() int
-func (e *MemoryEnclave) IsAlive() bool
-func (e *MemoryEnclave) EqualTo(other []byte) (bool, error)
-func (e *MemoryEnclave) Destroy() error
+func (e *Memory) WithBytes(fn func([]byte) error) error
+func (e *Memory) Size() int
+func (e *Memory) IsAlive() bool
+func (e *Memory) EqualTo(other []byte) (bool, error)
+func (e *Memory) Destroy() error
 ```
 
 | | |
@@ -169,7 +169,8 @@ as a string.
 
 `Destroy` returns `nil` for a successful release, for a nil enclave and for
 every call after a successful release. It returns `ErrReleasedWithoutWipe` when
-a denied `mprotect` forced a bare unmap (the pages are gone), and
+a denied `mprotect` on a frozen enclave forced a bare unmap (the pages are
+gone; a writable enclave was wiped before the `mprotect` and returns `nil`), and
 `ErrLockedMemoryUnavailable` when the kernel refused the release (the pages are
 still held, and calling `Destroy` again retries). The two are disjoint. It
 returns `ErrEnclaveCorrupted` when the canary or guard pages were overwritten;
@@ -221,5 +222,5 @@ The protected-memory surface is versioned by go-enclave; this repository pins a
 released tag.
 
 `seal.Credentials`, built by `seal.NewCredentials`, is the only credentials
-type. `Credentials.Secret` is a `*enclave.SealedEnclave`, so there is no
+type. `Credentials.Secret` is a `*enclave.Sealed`, so there is no
 separate protected form; implementations name `Credentials`.

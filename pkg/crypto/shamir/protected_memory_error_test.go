@@ -32,7 +32,7 @@ var errLockRefused = errors.New("mlock refused")
 // refuseProtectedMemory mimics go-enclave's failure contract exactly: it WIPES
 // the source before reporting the refusal. A stub that skipped the wipe would
 // make the test pass against an implementation that leaks the caller's bytes.
-func refuseProtectedMemory(data []byte) (*enclave.MemoryEnclave, error) {
+func refuseProtectedMemory(data []byte) (*enclave.Memory, error) {
 	enclave.Wipe(data)
 	return nil, errLockRefused
 }
@@ -103,19 +103,19 @@ func TestNewProtectedShare_ValidationFailureLeavesSourceUntouched(t *testing.T) 
 // those shares are locked memory the caller never receives and therefore can
 // never Destroy itself.
 func TestSplitProtected_AllocationFailureDestroysPartialShares(t *testing.T) {
-	var built []*enclave.MemoryEnclave
+	var built []*enclave.Memory
 	calls := 0
 
 	// The SIZED seam, not the from-bytes one: a share's value is encoded
 	// straight into locked pages and frozen there, so newProtectedMemory is not
 	// on this path at all. Injecting on that seam would refuse nothing and the
 	// test would pass by never exercising the teardown.
-	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.Memory, error) {
 		calls++
 		if calls > 1 {
 			return nil, errLockRefused
 		}
-		e, err := enclave.NewMemoryEnclaveSized(n)
+		e, err := enclave.NewMemorySized(n)
 		if err == nil {
 			built = append(built, e)
 		}
@@ -248,11 +248,11 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 	const preLoopRegions = 3
 
 	var (
-		handed    []*enclave.MemoryEnclave
+		handed    []*enclave.Memory
 		handedSum int
 	)
-	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
-		e, err := enclave.NewMemoryEnclaveSized(n)
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.Memory, error) {
+		e, err := enclave.NewMemorySized(n)
 		if err == nil {
 			handed = append(handed, e)
 			handedSum += lockedBytes(n)
@@ -327,12 +327,12 @@ func TestSplitProtected_PreLoopAllocationRefusalsAreClean(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.Memory, error) {
 				defer func() { calls++ }()
 				if calls == tc.refuseN {
 					return nil, errLockRefused
 				}
-				return enclave.NewMemoryEnclaveSized(n)
+				return enclave.NewMemorySized(n)
 			})
 			shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
 			restore()
@@ -389,12 +389,12 @@ func TestCombineProtected_AllocationRefusalsAreClean(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+			restore := testOnlySizedProtectedMemory(func(n int) (*enclave.Memory, error) {
 				defer func() { calls++ }()
 				if calls == tc.refuseN {
 					return nil, errLockRefused
 				}
-				return enclave.NewMemoryEnclaveSized(n)
+				return enclave.NewMemorySized(n)
 			})
 			got, err := CombineProtected(shares[:2])
 			restore()
@@ -444,9 +444,9 @@ func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
 	}
 
 	allocated := false
-	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.MemoryEnclave, error) {
+	restore := testOnlySizedProtectedMemory(func(n int) (*enclave.Memory, error) {
 		allocated = true
-		return enclave.NewMemoryEnclaveSized(n)
+		return enclave.NewMemorySized(n)
 	})
 	defer restore()
 

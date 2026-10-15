@@ -26,7 +26,7 @@ import (
 // the passphrase's caller-side buffer is wiped or never existed, with a
 // mutation of that wipe turning the test red.
 //
-// Typing Credentials.Secret as *enclave.SealedEnclave makes the WRONG shape
+// Typing Credentials.Secret as *enclave.Sealed makes the WRONG shape
 // uncompilable, which the compiler proves. What it does not
 // prove is that NewCredentials — the only supported way to get from a caller's
 // bytes to that type — actually consumes those bytes rather than copying them.
@@ -95,7 +95,7 @@ func TestNewCredentials_RefusesEmpty(t *testing.T) {
 }
 
 // TestCredentials_ZeroValueMeansNoneSupplied pins the contract every
-// ambient-credential strategy depends on. A nil *SealedEnclave has to keep
+// ambient-credential strategy depends on. A nil *enclave.Sealed has to keep
 // meaning what a nil []byte meant: "the caller supplied none", not "the caller
 // supplied an empty passphrase".
 func TestCredentials_ZeroValueMeansNoneSupplied(t *testing.T) {

@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-14
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-15
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
@@ -69,5 +69,5 @@ No SPEC feature is future.
 
 ## Dependencies
 
-- Up: go-enclave v0.8.0-alpha (pinned); v0.8.0-rc.1 and v0.8.0-rc.2 are tagged; v1.0.0 needs a go-enclave public release.
-- Down: go-qrdb (pins v0.20.0, direct); indirect: go-xkms (v0.19.0), go-quicbaas (v0.15.0-alpha), go-signal (v0.20.0), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha). None is on v0.21.0-rc.1 yet.
+- Up: go-enclave v0.8.0-rc.2 (pinned, the newest tag); its post-rc.2 interface change (go-enclave#201) and the enclave-interface adoption wait on go-enclave#138; v1.0.0 needs a go-enclave public release.
+- Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.22.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).

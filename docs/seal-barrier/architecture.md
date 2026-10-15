@@ -366,7 +366,7 @@ makes single-writer a guarantee.
 
 ## Trust boundaries
 
-- **The root key** lives in an `enclave.SealedEnclave` (see
+- **The root key** lives in an `enclave.Sealed` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)),
   opened into a locked enclave only for derivation, export and unseal.
   `Initialize` generates it directly into locked memory, so on the initialize
@@ -376,7 +376,7 @@ makes single-writer a guarantee.
   before MAC verification, encryptor resolution or DEK derivation, and a deferred
   wipe covers every other return.
 - **Epoch DEKs are protected the same way and are never opened.** Each is held in
-  its own `SealedEnclave` so a DEK can be re-derived, but neither `Encrypt` nor
+  its own `Sealed` so a DEK can be re-derived, but neither `Encrypt` nor
   `Decrypt` touches one: both run off the `cipher.AEAD` cached per epoch in
   `b.ciphers`. Opening a key is a setup, rotation and rekey cost, not a per-frame
   one. The AEAD cache is what makes the DEK's protection free at steady state,
@@ -386,7 +386,7 @@ makes single-writer a guarantee.
   standard library nor `x/crypto` offers a wipe API. Dropping the barrier's
   reference on seal or purge makes it GC-eligible, and that is the only bound: a
   core dump taken before collection contains every live and recently purged epoch
-  DEK. The sealed copies beside them are wiped: `SealedEnclave.Destroy` zeroes
+  DEK. The sealed copies beside them are wiped: `Sealed.Destroy` zeroes
   the ciphertext.
 - **A purge revokes capability; it is not crypto-shredding.** After
   `PurgeEpochsBefore` returns, the barrier can no longer decrypt the epoch, and

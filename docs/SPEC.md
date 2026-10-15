@@ -14,8 +14,8 @@ follows the extended Raft paper and Ongaro's thesis, kept in
 
 **Embeds:** go-enclave, Layer 0, as a library: its one local dependency, the
 portfolio's protected-memory primitive. go-quicraft inherits locked and sealed
-memory from it, and its SDK carries go-enclave's types (`MemoryEnclave`,
-`SealedEnclave`) through unchanged, under go-enclave's names. It never aliases,
+memory from it, and its SDK carries go-enclave's types (`Memory`,
+`Sealed`) through unchanged, under go-enclave's names. It never aliases,
 wraps or re-models them.
 
 **Embedded by:** go-qrdb, the cluster engine and database system. go-qrdb
@@ -35,8 +35,8 @@ isolation belong to go-qrdb.
 snapshots; the `Barrier`/`SealingStrategy` interfaces and `EpochBarrier`; the
 `none` and `passphrase` sealing strategies; the Shamir GF(256) primitive.
 
-**Inherits from go-enclave:** locked plaintext (`MemoryEnclave`) and material
-sealed at rest (`SealedEnclave`), consumed directly.
+**Inherits from go-enclave:** locked plaintext (`Memory`) and material
+sealed at rest (`Sealed`), consumed directly.
 
 **Never:**
 
@@ -75,7 +75,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | seal-barrier | shipped | AEAD encryption at rest (AES-256-GCM or ChaCha20-Poly1305) of the WAL and snapshots with per-epoch DEKs, rotation and purge; the root key is sealed by an explicit `SealingStrategy`; plaintext is an explicit choice (`WithoutEncryption`); a sealed shard refuses proposals and reads with `ErrBarrierSealed`. [architecture.md](seal-barrier/architecture.md) | [seal-barrier/](seal-barrier/) |
 | shard-pause | shipped | `Host.PauseShard(ctx, shardID)` and `Host.ResumeShard(ctx, shardID)` stop and restart one shard's replica on this host without unloading it, so that the embedder can seal the shard's barrier at runtime while the shard stays loaded (seal ruling A, 2026-10-14: sealed means only unsealing). A paused replica keeps its log, state machine, membership and persisted Raft state as they were, writes nothing to the log or the snapshot store, and `GetShardInfo` reports it paused. **Proposals:** a proposal, session operation, membership change, `ExecuteOnLeader` or leader-transfer request returns `ErrShardPaused` (`errors.Is`-matchable, `Temporary` reports true), and proposals forwarded by peers are not accepted; one accepted before the pause is never applied while paused and completes after resume, ends at its context deadline, or returns the maybe-applied `NotLeaderError` if leadership moved. **Applies:** no entry is applied while paused, including committed entries already handed to the apply worker; they apply in log order after resume. **Reads:** ReadIndex, `SyncRead`, LeaseRead, stale and follower reads return `ErrShardPaused`; read requests forwarded by peers are not served. **Leadership:** a paused replica neither campaigns, votes, replicates nor acknowledges; a paused leader first transfers leadership to an up-to-date voter if one is reachable, and otherwise stops heartbeating so the remaining members elect a leader if they hold a quorum. **Snapshots:** none is taken, sent, received, imported or recovered while paused, and a pause never exhausts snapshot recovery into a shard failure; a due snapshot or recovery runs after resume. **Timing:** `PauseShard` returns once no log, apply or snapshot work of the shard is in flight, bounded by its context; only then may the embedder seal the barrier. `ResumeShard` is called after unseal and rejoins the replica as a follower with a fresh election timeout. Both are idempotent; a pause is not persisted, so a restarted replica starts unpaused. A barrier sealed without a pause still takes the sealed-write hold (#296), never a permanent shard failure. Seam: go-qrdb pauses every shard of a node before sealing it at runtime and resumes them after unseal (go-qrdb cl1493). | [seal-barrier/](seal-barrier/) |
 | shamir-primitive | shipped | The GF(2^8) split/combine primitive and the share-custody interfaces; the engine never persists Shamir shares ([engineering.md §6](shamir-primitive/engineering.md#6-persistence)). [architecture.md](shamir-primitive/architecture.md) | [shamir-primitive/](shamir-primitive/) |
-| memory-enclave | shipped | Key material is held in go-enclave locked memory (`MemoryEnclave`) and sealed enclaves (`SealedEnclave`), consumed directly, never aliased or wrapped. [architecture.md](memory-enclave/architecture.md) | [memory-enclave/](memory-enclave/) |
+| memory-enclave | shipped | Key material is held in go-enclave locked memory (`Memory`) and sealed enclaves (`Sealed`), consumed directly, never aliased or wrapped. [architecture.md](memory-enclave/architecture.md) | [memory-enclave/](memory-enclave/) |
 | observability | shipped | Metrics, logging and event notifications. [architecture.md](observability/architecture.md) | [observability/](observability/) |
 | compatibility | shipped | The pinned format-version policy, every version discriminator, the interface requirements for embedders, and upgrade notes for each release. [architecture.md](compatibility/architecture.md) | [compatibility/](compatibility/) |
 | contrib-dragonboat | shipped | A Dragonboat API compatibility layer over the `Host`, in its own module under `contrib/dragonboat/`. | [multi-group-host/](multi-group-host/) (architecture.md, Package structure) |

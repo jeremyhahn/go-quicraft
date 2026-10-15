@@ -196,18 +196,18 @@ type Barrier struct {
 	config BarrierConfig // algorithm selection, deployment identity, tracking config
 
 	state   barrierState
-	rootKey *enclave.SealedEnclave // 32 bytes, held as ciphertext at rest; opened into locked memory
-	salt    []byte                 // 32 bytes, generated at Initialize, used for HKDF
+	rootKey *enclave.Sealed // 32 bytes, held as ciphertext at rest; opened into locked memory
+	salt    []byte          // 32 bytes, generated at Initialize, used for HKDF
 
 	// hkdfVersion is the DEK-derivation info layout in force. Set to
 	// currentHKDFVersion for a fresh barrier and overwritten from the
 	// persisted SealedRootKey by SetSealedRootKey.
 	hkdfVersion HKDFVersion
 
-	epoch      uint64                            // current key rotation epoch
-	currentDEK *enclave.SealedEnclave            // derived via HKDF from rootKey + epoch, encrypted at rest
-	cipher     cipher.AEAD                       // current epoch's AEAD cipher (cached, opaque)
-	deks       map[uint64]*enclave.SealedEnclave // epoch -> DEK encrypted at rest for re-derivation
+	epoch      uint64                     // current key rotation epoch
+	currentDEK *enclave.Sealed            // derived via HKDF from rootKey + epoch, encrypted at rest
+	cipher     cipher.AEAD                // current epoch's AEAD cipher (cached, opaque)
+	deks       map[uint64]*enclave.Sealed // epoch -> DEK encrypted at rest for re-derivation
 	ciphers    map[uint64]cipher.AEAD
 
 	// knownEpochs tracks all epochs that have been used (via Initialize or
@@ -351,8 +351,8 @@ type Barrier struct {
 	// barrier stays uninitialized or sealed, and on the unseal path the
 	// strategy's heap copy is still wiped.
 	//
-	// Defaults to enclave.NewMemoryEnclaveSized; nothing but a test assigns it.
-	lockRootKey func(int) (*enclave.MemoryEnclave, error)
+	// Defaults to enclave.NewMemorySized; nothing but a test assigns it.
+	lockRootKey func(int) (*enclave.Memory, error)
 }
 
 // releaseEnclave destroys a locked-memory enclave this package created for its
@@ -367,7 +367,7 @@ type Barrier struct {
 //
 // What a refusal leaves behind depends on whether the region is frozen, and
 // most callers here release FROZEN regions: since go-enclave v0.7 every
-// buffer returned by SealedEnclave.Open (the root key, the passphrase) is
+// buffer returned by Sealed.Open (the root key, the passphrase) is
 // read-only.
 //
 //   - A WRITABLE region is wiped before any step the kernel can refuse, so a
@@ -388,7 +388,7 @@ type Barrier struct {
 //
 // Detected canary corruption still panics inside Destroy; that is go-enclave's
 // one deliberate panic and is not caught here.
-func releaseEnclave(e *enclave.MemoryEnclave, what string) {
+func releaseEnclave(e *enclave.Memory, what string) {
 	if err := e.Destroy(); err != nil {
 		slog.Warn("quicraft/seal: locked memory release was refused or ran without a wipe",
 			"enclave", what,
@@ -397,13 +397,13 @@ func releaseEnclave(e *enclave.MemoryEnclave, what string) {
 	}
 }
 
-// releaseSealed destroys a SealedEnclave on a cleanup path, logging a failure
-// the way releaseEnclave does. go-enclave documents SealedEnclave.Destroy's
-// error as always nil today, returned to match MemoryEnclave.Destroy: the
+// releaseSealed destroys a enclave.Sealed on a cleanup path, logging a failure
+// the way releaseEnclave does. go-enclave documents Sealed.Destroy's
+// error as always nil today, returned to match Memory.Destroy: the
 // ciphertext lives on the ordinary heap, so there is no lock or mapping for a
 // release to be refused. Logging it rather than discarding it means a future
 // failure is seen instead of silently dropped.
-func releaseSealed(s *enclave.SealedEnclave, what string) {
+func releaseSealed(s *enclave.Sealed, what string) {
 	if err := s.Destroy(); err != nil {
 		slog.Warn("quicraft/seal: sealed key release failed",
 			"enclave", what,
@@ -480,7 +480,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		config:         config,
 		state:          barrierUninitialized,
 		hkdfVersion:    currentHKDFVersion,
-		deks:           make(map[uint64]*enclave.SealedEnclave),
+		deks:           make(map[uint64]*enclave.Sealed),
 		ciphers:        make(map[uint64]cipher.AEAD),
 		knownEpochs:    make(map[uint64]struct{}),
 		inFlightEpochs: make(map[uint64]int64),
@@ -490,7 +490,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		maxPlaintext:   config.Algorithm.MaxPlaintextSize(),
 		timeNow:        time.Now,
 		randReader:     rand.Reader,
-		lockRootKey:    enclave.NewMemoryEnclaveSized,
+		lockRootKey:    enclave.NewMemorySized,
 	}, nil
 }
 
@@ -582,7 +582,7 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	// A SIZED enclave, not a from-bytes one: the material is produced IN PLACE by
 	// the read below, so it never transits the heap on its way in. The pages stay
 	// writable for the enclave's life, and DELIBERATELY are not frozen with
-	// MemoryEnclave.Freeze — the terminal enclave.NewSealed wipes this
+	// Memory.Freeze — the terminal enclave.NewSealed wipes this
 	// slice as it consumes it, and a wipe of frozen read-only pages faults the
 	// process. Freezing here would trade a stray-write fault for a certain one.
 	// The borrowed slice never escapes initializeWithRootKey, which is the
@@ -896,12 +896,12 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	// after the check would step over exactly that case.
 	//
 	// A wipe placed only INSIDE the borrow at the bottom would not be enough:
-	// MemoryEnclave.WithBytes returns ErrEnclaveDestroyed BEFORE it calls fn
+	// Memory.WithBytes returns ErrEnclaveDestroyed BEFORE it calls fn
 	// when the enclave is nil, destroyed OR wiped, so on that path the key would
 	// never be wiped and would survive to the collector.
 	//
 	// That path is REACHABLE IN PRODUCTION. The (nil, nil) shape needs the lockRootKey seam, true —
-	// but enclave.NewMemoryEnclaveSized documents that a successful return can
+	// but enclave.NewMemorySized documents that a successful return can
 	// hand back an ALREADY-DESTROYED enclave when enclave.WipeAll runs between
 	// publication and return, and WipeAll is a shutdown sweep belonging to
 	// whoever owns the process (docs/memory-enclave/architecture.md). A consumer
@@ -1017,7 +1017,7 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	//
 	// Sized rather than from-bytes for the same reason as Initialize: the pages
 	// must stay writable so the terminal enclave.NewSealed can wipe them as it
-	// consumes them. MemoryEnclave.Freeze is deliberately NOT used
+	// consumes them. Memory.Freeze is deliberately NOT used
 	// here — a wipe of frozen pages faults the process.
 	rootEnc, encErr := b.lockRootKey(rootKeySize)
 	if encErr != nil {
@@ -1125,7 +1125,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	// path. The one plain slice that outlives a failure is `dek`, derived before
 	// this loop and not yet sealed, which is why the two returns below wipe it
 	// by hand.
-	newDEKs := make(map[uint64]*enclave.SealedEnclave)
+	newDEKs := make(map[uint64]*enclave.Sealed)
 	newCiphers := make(map[uint64]cipher.AEAD)
 	failed := func(err error) error {
 		for _, pk := range newDEKs {
@@ -1437,7 +1437,7 @@ func (b *Barrier) seal() error {
 
 	// Destroy every live key enclave before dropping the map/field references.
 	//
-	// enclave.SealedEnclave.Destroy WIPES the ciphertext and the wrapped-key blob
+	// enclave.Sealed.Destroy WIPES the ciphertext and the wrapped-key blob
 	// before releasing them, under the value's write lock, waiting out any Open
 	// in flight. So after seal() the sealed copy of every key is gone rather than
 	// merely unreachable. Destroy is idempotent and safe on nil, and currentDEK
@@ -1455,7 +1455,7 @@ func (b *Barrier) seal() error {
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
-	b.deks = make(map[uint64]*enclave.SealedEnclave)
+	b.deks = make(map[uint64]*enclave.Sealed)
 	// Caveat, and it is the ONLY one: each cipher.AEAD below holds a COPY of
 	// its DEK inside its internal key schedule (AES expanded key / ChaCha key).
 	// Go's stdlib and x/crypto AEADs expose no key-wipe API, so dropping these
@@ -1569,7 +1569,7 @@ func (b *Barrier) Reset() error {
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
-	b.deks = make(map[uint64]*enclave.SealedEnclave)
+	b.deks = make(map[uint64]*enclave.Sealed)
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.knownEpochs = make(map[uint64]struct{})
 	b.salt = nil
@@ -2593,7 +2593,7 @@ func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, 
 		// Destroy the purged epoch's key enclave and drop its AEAD.
 		//
 		// What this guarantees, stated the same way seal() states it:
-		// SealedEnclave.Destroy WIPES the epoch's sealed DEK, so that copy is
+		// Sealed.Destroy WIPES the epoch's sealed DEK, so that copy is
 		// gone rather than merely unreachable. Deleting b.ciphers[epoch] is still only a reference drop:
 		// the cipher.AEAD holds a verbatim copy of the DEK in its key schedule
 		// (x/crypto's ChaCha20-Poly1305 keeps `key [32]byte`; AES-GCM keeps the
@@ -2813,7 +2813,7 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 }
 
 // RootKeyProtected returns the decrypted root key inside a memory-locked,
-// guard-paged MemoryEnclave. The barrier must be unsealed. The caller OWNS
+// guard-paged Memory. The barrier must be unsealed. The caller OWNS
 // the enclave and MUST Destroy it when done, which zeroes the memory
 // deterministically.
 //
@@ -2826,9 +2826,9 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 // The enclave is returned FROZEN: it is a key to read and destroy, not a buffer
 // to edit, so a stray write through a slice retained past its borrow faults
 // instead of silently rewriting the caller's copy of the key. (Only the
-// caller's copy was ever at stake — SealedEnclave.Open decrypts into a fresh,
+// caller's copy was ever at stake — Sealed.Open decrypts into a fresh,
 // independent enclave each time, so the barrier's own root key was never
-// reachable through this.) go-enclave's SealedEnclave.Open freezes the
+// reachable through this.) go-enclave's Sealed.Open freezes the
 // enclave it returns, and fails the open closed — no enclave — when the kernel
 // refuses the freeze, so there is no writable window for this accessor to
 // close. That makes it agree with
@@ -2848,7 +2848,7 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 // THE TRADE, stated rather than left for a reader to find in go-enclave: a
 // frozen region has to be made writable again before Destroy can wipe it, so the
 // wipe sits behind an mprotect the kernel can deny. On a kernel that denies
-// it the pages are released still holding the key, and MemoryEnclave.Destroy
+// it the pages are released still holding the key, and Memory.Destroy
 // returns ErrReleasedWithoutWipe — where an unfrozen region would have been
 // overwritten before anything deniable was attempted. Nothing leaks either way,
 // since the pages were mlock'd for their whole life and the kernel zeroes an
@@ -2856,7 +2856,7 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 // denying mprotect checks what Destroy returns rather than deferring it bare.
 // This is the same trade UnsealRootKeyProtected and every from-bytes enclave
 // already make.
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error) {
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {

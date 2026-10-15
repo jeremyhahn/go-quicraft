@@ -22,12 +22,12 @@ go-quicraft does.
 
 | You have | Use | Because |
 |---|---|---|
-| a key read occasionally, held for the life of a service | `SealedEnclave` | ciphertext at rest; plaintext exists only inside an `Open` |
-| a key in continuous use for the length of one operation | `MemoryEnclave` | locked plaintext, no per-use decryption |
-| material you are about to generate | `NewMemoryEnclaveSized` + `Freeze` | it never touches the ordinary heap |
+| a key read occasionally, held for the life of a service | `Sealed` | ciphertext at rest; plaintext exists only inside an `Open` |
+| a key in continuous use for the length of one operation | `Memory` | locked plaintext, no per-use decryption |
+| material you are about to generate | `NewMemorySized` + `Freeze` | it never touches the ordinary heap |
 
 go-quicraft holds its root key, every epoch DEK and every passphrase as
-`SealedEnclave`s, and opens a `MemoryEnclave` only for the window in which the
+`Sealed`s, and opens a `Memory` only for the window in which the
 bytes are read.
 
 ## Hold a key for the life of a service
@@ -93,13 +93,13 @@ Three rules the compiler will not enforce:
    its own callback: that deadlocks.
 3. **Do not write into it.** The enclave `Open` returns is frozen read-only, so
    a write through the slice faults. If you need a writable copy, allocate
-   your own with `NewMemoryEnclaveSized` and copy into it inside `WithBytes`.
+   your own with `NewMemorySized` and copy into it inside `WithBytes`.
 
 `buf.Destroy()` returns an error. A bare `defer buf.Destroy()` discards it, which
 loses nothing secret: `ErrLockedMemoryUnavailable` means the kernel refused the
 release and the pages stay on go-enclave's `WipeAll` ledger for a retry, and
-`ErrReleasedWithoutWipe` means a denied `mprotect` forced a bare unmap of pages
-the kernel zeroes before reuse. `ErrEnclaveCorrupted` means something overwrote
+`ErrReleasedWithoutWipe` means a denied `mprotect` forced a bare unmap of a
+frozen enclave's pages, which the kernel zeroes before reuse. `ErrEnclaveCorrupted` means something overwrote
 the canary or guard pages; the material is still wiped and the pages released.
 Check it where you want to see any of these conditions.
 
@@ -131,7 +131,7 @@ first and fill it where it lies. The material then never exists on the ordinary
 heap:
 
 ```go
-buf, err := enclave.NewMemoryEnclaveSized(32)
+buf, err := enclave.NewMemorySized(32)
 if err != nil {
 	return err // the kernel refused the lock; see Troubleshooting
 }
@@ -153,7 +153,7 @@ irreversible. A refused freeze leaves the enclave alive and writable, so destroy
 it rather than hand back material whose protection was not established.
 
 Do not freeze an enclave whose last act is to be consumed: `NewSealed` and
-`NewMemoryEnclave` wipe what they are handed, and a wipe of frozen pages faults
+`NewMemory` wipe what they are handed, and a wipe of frozen pages faults
 the process.
 
 ## Clean up a slice you could not avoid
@@ -163,12 +163,12 @@ enclave.Wipe(transient)
 ```
 
 Use this for the copy a third-party API forced you to make. It does not replace
-a `MemoryEnclave` (the bytes were swappable and dumpable while they existed), but
+a `Memory` (the bytes were swappable and dumpable while they existed), but
 it bounds how long they linger.
 
 ## Supply a passphrase to go-quicraft's seal layer
 
-`seal.Credentials.Secret` is a `*enclave.SealedEnclave`. Build one with the
+`seal.Credentials.Secret` is a `*enclave.Sealed`. Build one with the
 constructor, which consumes your slice:
 
 ```go
@@ -180,7 +180,7 @@ defer creds.Secret.Destroy() // the credential is yours; the seal layer never de
 ```
 
 One credential serves many calls. The seal layer opens it, derives from it and
-destroys the opened copy each time; it never touches the `SealedEnclave` itself.
+destroys the opened copy each time; it never touches the `Sealed` itself.
 
 ## Troubleshooting
 
@@ -201,8 +201,8 @@ slice a `WithBytes` callback was given past the end of that callback. Move the
 work inside the callback.
 
 **A write faults**: you wrote through a slice from a frozen enclave (one built
-by `NewMemoryEnclave` or `NewMemoryEnclaveCopy`, one returned by
-`SealedEnclave.Open`, or a sized one you already froze). That fault is the protection working. The same stray write to an
+by `NewMemory` or `NewMemoryCopy`, one returned by
+`Sealed.Open`, or a sized one you already froze). That fault is the protection working. The same stray write to an
 unfrozen enclave corrupts the material silently, which is why `Freeze` exists.
 
 **An open fails with `enclave: could not open sealed material`**

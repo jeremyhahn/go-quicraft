@@ -20,6 +20,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follower and applies held entries in log order. `ShardInfo.Paused` reports
   the state. A pause is not persisted; no wire or format change.
 
+### Changed
+
+- **BREAKING**: go-enclave is v0.8.0-rc.2 (was v0.8.0-alpha) (#358). The
+  tag carries go-enclave's v0.9 names, with no deprecated aliases. What
+  changes for an embedder that uses go-enclave alongside this library:
+  - `MemoryEnclave` is `Memory` and `SealedEnclave` is `Sealed`;
+    `NewMemoryEnclave`, `NewMemoryEnclaveCopy` and `NewMemoryEnclaveSized` are
+    `NewMemory`, `NewMemoryCopy` and `NewMemorySized`. Every signature here
+    that took or returned the old types (`seal.Credentials.Secret`,
+    `RootKeyProtected`, `SealRootKeyProtected`, `UnsealRootKeyProtected`,
+    `ReconstructProtected`, `shamir.CombineProtected`,
+    `CombineProtectedWith`) now names the new ones.
+  - `Sealed.OpenWith(ctx, a)` is `OpenIn(ctx, backend)` and returns a
+    `Handle`; `Open(ctx)` still returns a `*Memory`. This library uses `Open`.
+  - Importing go-enclave no longer lowers `RLIMIT_CORE`; `HardenProcess`
+    does. This library calls neither.
+  - `NewSealed` on a read-only borrow returns `ErrSealSourceReadOnly`; seal an
+    opened value with `NewSealedFrom`. This library seals only writable
+    buffers.
+  - `Memory`, `Allocator`, `Sealer` and `Sealed` values share their state, and
+    `go vet` reports a copy: pass pointers.
+  - Failures that came with a failed cleanup are a `*CleanupError`, not an
+    `errors.Join` composite; `errors.Is` and `errors.As` matches still hold.
+  No wire or on-disk format changed.
+
 ## [0.22.0-alpha] - 2026-10-14
 
 The planned 0.21.0-rc.3. Release candidates now wait until the whole stack is

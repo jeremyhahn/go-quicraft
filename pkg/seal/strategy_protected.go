@@ -49,7 +49,7 @@ import (
 // while leaving the material that derives it collectable and swappable — and for
 // a deferred-passphrase strategy the passphrase IS the root key's protection.
 //
-// Credentials.Secret is itself an [enclave.SealedEnclave], so there is exactly
+// Credentials.Secret is itself an [enclave.Sealed], so there is exactly
 // ONE credential type in this package and these methods take it.
 //
 // # What this does NOT change
@@ -57,7 +57,7 @@ import (
 // The Barrier still calls SealingStrategy.SealRootKey and UnsealRootKey. It
 // needs the raw key bytes for HKDF epoch-DEK derivation and for the sealed-state
 // HMAC, holds them in a locked enclave for the whole of Initialize and Unseal,
-// and then seals them into an enclave.SealedEnclave for the barrier's
+// and then seals them into an enclave.Sealed for the barrier's
 // lifetime. Switching the barrier itself onto the protected PAIR is a further
 // change and is deliberately not made here: the enclave it holds is filled in
 // place and its last act is to be consumed by enclave.NewSealed, which wipes what
@@ -75,7 +75,7 @@ type ProtectedSealingStrategy interface {
 	// The caller retains ownership of rootKey — this method neither destroys
 	// it nor takes it over. Passing a nil or destroyed enclave is an error,
 	// not an empty key.
-	SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error)
+	SealRootKeyProtected(ctx context.Context, rootKey *enclave.Memory, creds Credentials) (*SealedRootKey, error)
 
 	// UnsealRootKeyProtected decrypts the root key into locked memory and
 	// returns the enclave holding it. It is UnsealRootKey with the output on
@@ -90,7 +90,7 @@ type ProtectedSealingStrategy interface {
 	// ErrLockedMemoryUnavailable. The enclave is returned FROZEN: its contents are
 	// final, a stray write through a retained slice faults rather than
 	// corrupting the root key, and Destroy is what releases them.
-	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
+	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.Memory, error)
 }
 
 // Compile-time assertions that both strategies this package implements satisfy

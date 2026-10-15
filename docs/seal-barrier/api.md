@@ -240,7 +240,7 @@ true for both `ContextBindingUnsupported` and `ContextBindingPlaintext`;
 
 ```go
 func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error)
 func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
 func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error
 ```
@@ -277,7 +277,7 @@ Implementer obligations:
 
 - Every method takes a `context.Context` where it may block on an external
   device, and `Credentials` by value.
-- `Credentials.Secret` is a `*enclave.SealedEnclave` (built by
+- `Credentials.Secret` is a `*enclave.Sealed` (built by
   `NewCredentials`, which wipes the caller's slice). The caller owns it; a
   strategy opens it, uses the plaintext and destroys the opened copy, and never
   destroys the credential itself. Each strategy interprets it differently: the
@@ -348,7 +348,7 @@ func (s *SoftwareStrategy) DeferredPassphrase() bool
 ```
 
 - The three bound constructors take a `context.Context` because they seal a
-  copy of the passphrase into a `SealedEnclave`, which go-enclave may hand to a
+  copy of the passphrase into a `Sealed`, which go-enclave may hand to a
   blocking provider. The deferred constructors hold no passphrase and take none.
 - `NewSoftwareStrategy` auto-selects the KDF from `FIPSEnabled()`.
 - `NewSoftwareStrategyWithParams` names Argon2id explicitly and is refused with

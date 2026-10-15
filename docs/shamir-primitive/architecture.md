@@ -96,15 +96,15 @@ does fit; the payload itself is never shared.
 ```
 SplitProtected(secret, M, N) []*ProtectedShare   SplitBytes(secret, M, N) [][]byte   Split(secret, M, N) []*Share
         |                                                |                                   |
-  value in an enclave.MemoryEnclave             raw wipeable []byte buffers        Share.Value is a Go STRING
+  value in an enclave.Memory             raw wipeable []byte buffers        Share.Value is a Go STRING
         |                                                |                                   |
   mlock'd; Destroy wipes                        caller wipes when distributed       immortal until GC
         |                                                |                                   |
-CombineProtected([]*ProtectedShare) *MemoryEnclave   CombineBytes([][]byte, M) []byte   Combine([]*Share) []byte
+CombineProtected([]*ProtectedShare) *Memory   CombineBytes([][]byte, M) []byte   Combine([]*Share) []byte
 ```
 
 - **Protected (preferred).** `SplitProtected` / `CombineProtected` hold each
-  share value in an `enclave.MemoryEnclave` (see
+  share value in an `enclave.Memory` (see
   [`../memory-enclave/architecture.md`](../memory-enclave/architecture.md)).
   Both are native, not wrappers over the bytes API: they encode and interpolate
   directly into locked memory, so no secret-derived byte is ever written to an

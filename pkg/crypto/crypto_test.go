@@ -132,7 +132,7 @@ func TestNewBarrierReexport_InvalidConfig(t *testing.T) {
 }
 
 // TestNewCredentialsReexport covers the constructor re-export: Credentials is
-// re-exported above, and its Secret field is an *enclave.SealedEnclave, so
+// re-exported above, and its Secret field is an *enclave.Sealed, so
 // seal.NewCredentials is the only supported way to populate one. Without the
 // re-export the shim would expose a type its own consumers could not
 // construct.

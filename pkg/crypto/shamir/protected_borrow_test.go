@@ -34,7 +34,7 @@ import (
 // goroutine must go through once borrow has returned: both wait out in-flight
 // borrows, so a borrow that outlived its callback deadlocks this test.
 func TestBorrow_EndsWithTheCallback(t *testing.T) {
-	e, err := enclave.NewMemoryEnclaveSized(32)
+	e, err := enclave.NewMemorySized(32)
 	if err != nil {
 		t.Skipf("could not allocate locked memory: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBorrow_EndsWithTheCallback(t *testing.T) {
 // fills the reconstructed secret inside a borrow, then freezes it. Freeze waits
 // out in-flight borrows, so it can only succeed once the borrow has ended.
 func TestBorrow_FreezeAfterTheCallback(t *testing.T) {
-	e, err := enclave.NewMemoryEnclaveSized(16)
+	e, err := enclave.NewMemorySized(16)
 	if err != nil {
 		t.Skipf("could not allocate locked memory: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestBorrow_FreezeAfterTheCallback(t *testing.T) {
 // *ProtectedMemoryError naming the operation that still unwraps to go-enclave's
 // sentinel.
 func TestBorrow_RefusedBorrowIsProtectedMemoryError(t *testing.T) {
-	e, err := enclave.NewMemoryEnclaveSized(8)
+	e, err := enclave.NewMemorySized(8)
 	if err != nil {
 		t.Skipf("could not allocate locked memory: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestBorrow_RefusedBorrowIsProtectedMemoryError(t *testing.T) {
 // in a locked-memory failure would misreport a malformed share as a refused
 // lock.
 func TestBorrow_CallbackErrorIsNotWrapped(t *testing.T) {
-	e, err := enclave.NewMemoryEnclaveSized(8)
+	e, err := enclave.NewMemorySized(8)
 	if err != nil {
 		t.Skipf("could not allocate locked memory: %v", err)
 	}

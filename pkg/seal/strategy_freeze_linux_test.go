@@ -27,7 +27,7 @@ import (
 // enclaveProtection asks the kernel how e's pages are mapped. The address is
 // read inside a borrow, so the view never outlives it; ProtectionOf never
 // dereferences the slice, only locates its mapping.
-func enclaveProtection(t *testing.T, e *enclave.MemoryEnclave) (lockedmem.Protection, error) {
+func enclaveProtection(t *testing.T, e *enclave.Memory) (lockedmem.Protection, error) {
 	t.Helper()
 	var (
 		prot lockedmem.Protection
@@ -132,7 +132,7 @@ func TestInitializeRootKeyEnclaveStaysWritable(t *testing.T) {
 // succeeds, and the corruption surfaces as an unexplained ErrDecryptionFailed
 // somewhere else entirely.
 //
-// The freeze is go-enclave's: SealedEnclave.Open returns a frozen enclave, and
+// The freeze is go-enclave's: Sealed.Open returns a frozen enclave, and
 // fails the open closed when the kernel refuses the freeze, so RootKeyProtected
 // returns Open's result as it is. That makes this test the guard on a property
 // this package takes from go-enclave rather than establishing itself: a

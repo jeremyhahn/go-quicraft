@@ -88,7 +88,7 @@ type ProtectedShareAccumulator interface {
 	// ReconstructProtected reconstructs the secret from the accumulated shares
 	// into locked memory. It returns an error if the threshold has not been
 	// met. The caller owns the returned enclave and must Destroy it.
-	ReconstructProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+	ReconstructProtected(ctx context.Context) (*enclave.Memory, error)
 
 	// Reset destroys every accumulated share and resets the TTL timer.
 	Reset()

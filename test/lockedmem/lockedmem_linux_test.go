@@ -36,7 +36,7 @@ import (
 // consumers ask this package is "did MY call to Freeze take", so the thing under
 // test has to be the mapping go-enclave actually produces.
 func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
-	e, err := enclave.NewMemoryEnclaveSized(32)
+	e, err := enclave.NewMemorySized(32)
 	if err != nil {
 		t.Skipf("could not allocate locked memory: %v", err)
 	}

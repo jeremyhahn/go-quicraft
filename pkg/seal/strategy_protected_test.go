@@ -28,13 +28,13 @@ import (
 // the plaintext copy the test compares against. The comparison copy is the
 // TEST's own material, deliberately outside the enclave: a yardstick read back
 // out of the thing under test would move with it.
-func protectedRootKey(t *testing.T) (*enclave.MemoryEnclave, []byte) {
+func protectedRootKey(t *testing.T) (*enclave.Memory, []byte) {
 	t.Helper()
 	want := make([]byte, rootKeySize)
 	if _, err := rand.Read(want); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	// Frozen by construction: NewMemoryEnclave freezes as the material moves in,
+	// Frozen by construction: NewMemory freezes as the material moves in,
 	// which is the shape a CALLER of the protected pair would use for a key it
 	// already has. (A key it is about to produce belongs in a sized enclave that
 	// is filled and then Frozen; both end read-only.) want is copied first
@@ -46,7 +46,7 @@ func protectedRootKey(t *testing.T) (*enclave.MemoryEnclave, []byte) {
 
 // assertEnclaveHolds compares an enclave's contents INSIDE the borrow, so the
 // assertion never makes its own unprotected copy of the key it is checking.
-func assertEnclaveHolds(t *testing.T, enc *enclave.MemoryEnclave, want []byte) {
+func assertEnclaveHolds(t *testing.T, enc *enclave.Memory, want []byte) {
 	t.Helper()
 	if err := enc.WithBytes(func(got []byte) error {
 		if !bytes.Equal(got, want) {
@@ -235,7 +235,7 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		rootKey *enclave.MemoryEnclave
+		rootKey *enclave.Memory
 		want    error
 	}{
 		{"nil enclave", nil, ErrInvalidRootKeySize},
@@ -380,7 +380,7 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	defer recovered.Destroy()
 	assertEnclaveHolds(t, recovered, want)
 
-	// The credentials are the CALLER's: many calls, one SealedEnclave, released
+	// The credentials are the CALLER's: many calls, one enclave.Sealed, released
 	// by the caller's own Clear and never by the strategy.
 	again, err := s.UnsealRootKeyProtected(ctx, sealed, creds)
 	if err != nil {
@@ -445,7 +445,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 		wrongSize := mustSized(t, rootKeySize-1)
 		destroyOnCleanup(t, wrongSize)
 
-		for name, enc := range map[string]*enclave.MemoryEnclave{
+		for name, enc := range map[string]*enclave.Memory{
 			"nil":        nil,
 			"destroyed":  destroyed,
 			"undersized": wrongSize,

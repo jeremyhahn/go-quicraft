@@ -22,21 +22,21 @@ in the dependency graph. go-quicraft consumes two types:
 
 | Type | Holds | Guarantee |
 |---|---|---|
-| `enclave.MemoryEnclave` | key material in plaintext, `mlock`'d, guard-paged, canary-checked, excluded from core dumps | `Destroy` wipes the bytes before unmapping |
-| `enclave.SealedEnclave` | key material encrypted at rest on the ordinary heap; plaintext only inside an `Open` | `Destroy` wipes the ciphertext and the wrapped-key blob |
+| `enclave.Memory` | key material in plaintext, `mlock`'d, guard-paged, canary-checked, excluded from core dumps | `Destroy` wipes the bytes before unmapping |
+| `enclave.Sealed` | key material encrypted at rest on the ordinary heap; plaintext only inside an `Open` | `Destroy` wipes the ciphertext and the wrapped-key blob |
 
-A `MemoryEnclave` keeps plaintext locked for its whole lifetime: unswappable and
-undumpable, but present. A `SealedEnclave` keeps ciphertext, so between `Open`s
+A `Memory` keeps plaintext locked for its whole lifetime: unswappable and
+undumpable, but present. A `Sealed` keeps ciphertext, so between `Open`s
 the material is not readable at all. Material in continuous use goes in the
 first; material consulted occasionally and held for a long time goes in the
 second. That is why every long-lived key in this repository is a
-`SealedEnclave` and every working copy is a `MemoryEnclave`.
+`Sealed` and every working copy is a `Memory`.
 
 ```
 enclave.NewSealed(ctx, key []byte)   key []byte is WIPED by the constructor
         |
         v
-  SealedEnclave  ─ Open(ctx) ─►  MemoryEnclave  ── WithBytes() ──►  cipher.AEAD
+  Sealed  ─ Open(ctx) ─►  Memory  ── WithBytes() ──►  cipher.AEAD
    (ciphertext,                     (plaintext,           |
     heap)                            mlock'd, frozen)     |
         |                               |                 v
@@ -45,21 +45,21 @@ enclave.NewSealed(ctx, key []byte)   key []byte is WIPED by the constructor
 ```
 
 Material this repository generates never takes that path. It is produced
-directly into locked pages with `NewMemoryEnclaveSized`, filled inside a borrow
+directly into locked pages with `NewMemorySized`, filled inside a borrow
 and frozen (see "Fill, freeze, hand over").
 
 ## Where the two types are used
 
 | Site | Type | Why |
 |---|---|---|
-| `Barrier.rootKey` | `*SealedEnclave` | opened on rotation, export, unseal and MAC restamp, not per frame |
-| `Barrier.currentDEK`, `Barrier.deks[epoch]` | `*SealedEnclave` | never opened; kept so a DEK can be re-derived |
-| `SoftwareStrategy.passphrase` | `*SealedEnclave` | read once per seal or unseal, held for the life of the strategy |
-| `seal.Credentials.Secret` | `*SealedEnclave` | the caller's passphrase, protected at the API boundary |
-| the root key inside `Initialize`/`Unseal` | `*MemoryEnclave` | live for the whole body, in continuous use |
-| `UnsealRootKeyProtected`'s result | `*MemoryEnclave` | the AEAD decrypts straight into it |
-| `Barrier.RootKeyProtected`'s result | `*MemoryEnclave` | opened from the sealed root key; go-enclave returns it frozen |
-| a `ProtectedShare`'s value, a reconstructed secret | `*MemoryEnclave` | read in place, frozen, caller-destroyed |
+| `Barrier.rootKey` | `*Sealed` | opened on rotation, export, unseal and MAC restamp, not per frame |
+| `Barrier.currentDEK`, `Barrier.deks[epoch]` | `*Sealed` | never opened; kept so a DEK can be re-derived |
+| `SoftwareStrategy.passphrase` | `*Sealed` | read once per seal or unseal, held for the life of the strategy |
+| `seal.Credentials.Secret` | `*Sealed` | the caller's passphrase, protected at the API boundary |
+| the root key inside `Initialize`/`Unseal` | `*Memory` | live for the whole body, in continuous use |
+| `UnsealRootKeyProtected`'s result | `*Memory` | the AEAD decrypts straight into it |
+| `Barrier.RootKeyProtected`'s result | `*Memory` | opened from the sealed root key; go-enclave returns it frozen |
+| a `ProtectedShare`'s value, a reconstructed secret | `*Memory` | read in place, frozen, caller-destroyed |
 
 `Barrier.Encrypt` and `Barrier.Decrypt` open nothing. They run off a
 `cipher.AEAD` cached per epoch in `Barrier.ciphers`, so protected memory is not
@@ -83,11 +83,11 @@ exposure and the number of copies; it does not create an isolation domain.
 
 Guaranteed:
 
-- `MemoryEnclave` memory is `mlock`'d (excluded from swap), fenced by guard pages
+- `Memory` memory is `mlock`'d (excluded from swap), fenced by guard pages
   on both sides, canary-checked, marked `MADV_DONTDUMP`, and wiped by `Destroy`
   before unmapping. This is go-enclave's guarantee, consumed rather than
   restated.
-- `SealedEnclave` material is AES-256-GCM ciphertext under a per-value data key,
+- `Sealed` material is AES-256-GCM ciphertext under a per-value data key,
   itself wrapped by the process sealer. This repository installs no sealer, so
   unless the embedder calls `enclave.SetSealer` that is go-enclave's default, a
   `SoftwareProvider` in `ModeRootKey`, whose key hierarchy is in-memory. A
@@ -95,7 +95,7 @@ Guaranteed:
   hierarchy, which is held in locked memory and dies with the process.
 - Plaintext exposure is bounded to `Open`/`Destroy` windows.
 - `Destroy` erases on both types: each wipes what it holds before releasing it.
-  `MemoryEnclave.Destroy` reports a release the kernel refused, or one that ran
+  `Memory.Destroy` reports a release the kernel refused, or one that ran
   without a wipe because `mprotect` was denied; see "Releases are reported".
 
 Not guaranteed:
@@ -106,7 +106,7 @@ Not guaranteed:
   neither the standard library nor `x/crypto` can wipe it. That is the one
   un-erasable copy this repository has, and it is why `PurgeEpochsBefore` is a
   capability revocation rather than crypto-shredding.
-- A `SealedEnclave` open passes its per-value DEK's key schedule through the
+- A `Sealed` open passes its per-value DEK's key schedule through the
   ordinary heap, as any pure-Go AEAD requires. go-enclave documents that
   exposure on its internal `withAEAD`; it is an accepted, bounded cost of
   encrypting at rest in pure Go.
@@ -116,14 +116,14 @@ Not guaranteed:
 ### Fill, freeze, hand over
 
 Material this repository generates is produced into locked pages rather than
-moved into them. `NewMemoryEnclaveSized` returns writable locked memory, the
-caller fills it inside a borrow, and `MemoryEnclave.Freeze` mprotects it
+moved into them. `NewMemorySized` returns writable locked memory, the
+caller fills it inside a borrow, and `Memory.Freeze` mprotects it
 read-only once the material is final. A stray write through a retained slice
 then faults instead of silently corrupting a key.
 
 Three sites use it: the unsealed root key (`UnsealRootKeyProtected`), a Shamir
 share value, and a reconstructed secret. The root key `Barrier.RootKeyProtected`
-hands out is frozen too, but not by this repository: `SealedEnclave.Open`
+hands out is frozen too, but not by this repository: `Sealed.Open`
 freezes the enclave it returns and fails the open closed when the kernel refuses
 the freeze, so the accessor returns `Open`'s result as it is. Each `Open`
 decrypts into a fresh, independent enclave, so a caller's frozen copy affects
@@ -142,10 +142,10 @@ a term in `splitLockedBytes` and move the `MaxShareSetBytes` boundary.
 which wipes what it is handed, and a wipe of frozen pages faults the process.
 Freezing there would trade a hypothetical stray-write fault for a certain one.
 
-### `SealedEnclave` for anything long-lived, `MemoryEnclave` for anything in use
+### `Sealed` for anything long-lived, `Memory` for anything in use
 
-A `MemoryEnclave` holding a key read twice a day costs a locked page for the
-whole process lifetime and keeps the plaintext present. A `SealedEnclave` costs
+A `Memory` holding a key read twice a day costs a locked page for the
+whole process lifetime and keeps the plaintext present. A `Sealed` costs
 heap and produces plaintext for the length of one operation. Locked memory is a
 fixed, process-wide resource (`RLIMIT_MEMLOCK`), so spending it on material
 nobody is reading starves the paths that are.
@@ -210,7 +210,7 @@ still holds.
 
 ### Releases are reported
 
-`MemoryEnclave.Destroy` returns an error. `ErrLockedMemoryUnavailable` means the
+`Memory.Destroy` returns an error. `ErrLockedMemoryUnavailable` means the
 kernel refused the release and the pages are still held; go-enclave keeps them
 on its `WipeAll` ledger and a later `Destroy` retries. `ErrReleasedWithoutWipe`
 means a denied `mprotect` forced a bare unmap: the pages are gone, and the
@@ -218,11 +218,11 @@ kernel zeroes them before reuse. The two are disjoint. A third,
 `ErrEnclaveCorrupted`, means the canary or guard pages were overwritten; the
 pages are still wiped and released.
 
-`SealedEnclave.Destroy` returns an error too, always `nil` in go-enclave
+`Sealed.Destroy` returns an error too, always `nil` in go-enclave
 v0.8.0. `pkg/seal` logs a non-nil one at WARN through its own helper
 (`releaseSealed`), and `SoftwareStrategy.Close` returns it.
 
-Every `MemoryEnclave` this repository destroys is a cleanup step whose operation
+Every `Memory` this repository destroys is a cleanup step whose operation
 already has its result, so the report never replaces that result. `pkg/seal`
 logs it at WARN through one helper; `pkg/crypto/shamir`, a primitive with no
 logger, drops it through one helper whose comment says why nothing is lost.
@@ -232,7 +232,7 @@ must observe a refused release holds the enclave itself.
 ### Contexts reach the sealer
 
 Every go-enclave call that can reach the process sealer's provider takes a
-`context.Context`: `NewSealed`, `SealedEnclave.Open` and `OpenWith`. A provider
+`context.Context`: `NewSealed`, `Sealed.Open` and `OpenIn`. A provider
 can block for as long as its device does, so this repository passes the
 caller's context wherever it has one: `seal.NewCredentials`, the bound
 `NewSoftwareStrategy*` constructors, the `SealingStrategy` methods,
@@ -246,13 +246,13 @@ short would only leave encryption refused.
 
 ### Constructors consume their input
 
-`enclave.NewSealed` and `enclave.NewMemoryEnclave` wipe their argument on every
+`enclave.NewSealed` and `enclave.NewMemory` wipe their argument on every
 return path, failures included. A caller that hands over key bytes then holds no
 second copy it has to remember to clear, which is the most common way a key
 leaks. `seal.NewCredentials` inherits this: the passphrase a caller supplies is
 gone from the caller's slice by the time the constructor returns.
 
-Two exceptions, named rather than implied. `enclave.NewMemoryEnclaveCopy`
+Two exceptions, named rather than implied. `enclave.NewMemoryCopy`
 protects a copy and leaves the source alone, for callers whose source has to
 survive. `newSoftwareStrategy` copies before sealing, because its public
 constructors take a passphrase the caller may still be using.
@@ -265,7 +265,7 @@ constructors take a passphrase the caller may still be using.
 - **`pkg/seal`** holds `Barrier.rootKey`, `Barrier.currentDEK`, the per-epoch
   `deks` map, `SoftwareStrategy.passphrase` and `Credentials.Secret`.
 - **`pkg/crypto/shamir`** holds a `ProtectedShare`'s value and the secret
-  `CombineProtected` reconstructs, both frozen `MemoryEnclave`s the caller owns.
+  `CombineProtected` reconstructs, both frozen `Memory`s the caller owns.
 - **Consumers above** (go-qrdb, go-xkms, go-quicbaas, go-trusted-platform) import
   go-enclave directly, never through go-quicraft. This repository re-exports none
   of it.

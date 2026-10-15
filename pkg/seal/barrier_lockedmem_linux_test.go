@@ -93,7 +93,7 @@ func TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave(t *testing.T) {
 	before := vmLockedKB(t)
 
 	// Barriers are retained for the whole loop deliberately. A barrier holds its
-	// root key as a SealedEnclave — ciphertext on the ordinary heap, which owns no
+	// root key as a enclave.Sealed — ciphertext on the ordinary heap, which owns no
 	// locked pages at all — so holding them must NOT move VmLck. Letting them be
 	// collected instead would let a GC cycle mask a real leak.
 	kept := make([]*Barrier, 0, cycles*2)

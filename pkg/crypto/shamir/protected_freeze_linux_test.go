@@ -24,7 +24,7 @@ import (
 
 // The two sites that fill a sized enclave and then FREEZE it in place.
 //
-// MemoryEnclave.Freeze mprotects the region the material was written into, so
+// Memory.Freeze mprotects the region the material was written into, so
 // there is one region and no locked-to-locked copy into a second, from-bytes
 // enclave.
 //

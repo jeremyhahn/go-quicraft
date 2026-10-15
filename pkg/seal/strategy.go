@@ -83,10 +83,10 @@ const (
 // cannot be got wrong: every strategy implements against this
 // struct, so with a []byte every one of them would have to remember.
 //
-// A [enclave.SealedEnclave] holds the passphrase as CIPHERTEXT at rest and
+// A [enclave.Sealed] holds the passphrase as CIPHERTEXT at rest and
 // produces plaintext only inside an Open, which is the posture this material
 // wants: a credential is consulted once per seal or unseal and held for a long
-// time in between. A locked-plaintext [enclave.MemoryEnclave] would keep it
+// time in between. A locked-plaintext [enclave.Memory] would keep it
 // present-but-locked continuously and buy less.
 //
 // Build one with [NewCredentials], which CONSUMES the caller's slice, since the
@@ -96,12 +96,12 @@ const (
 // The ZERO VALUE is valid and means "no credentials", which is what a
 // passphrase-bound or ambient-credential strategy expects; it ignores this
 // entirely. The CALLER owns Secret: this package opens it, derives from it and
-// destroys the opened copy, and never destroys the SealedEnclave itself, so one
+// destroys the opened copy, and never destroys the enclave.Sealed itself, so one
 // credential serves many calls and is released by the caller's own Destroy.
 type Credentials struct {
 	// Secret is the authentication material, encrypted at rest in memory. Nil
 	// means the caller supplied none.
-	Secret *enclave.SealedEnclave // #nosec G117 -- this IS a secret field by design
+	Secret *enclave.Sealed // #nosec G117 -- this IS a secret field by design
 }
 
 // NewCredentials moves a secret into protected memory and returns the

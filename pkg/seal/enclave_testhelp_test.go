@@ -12,7 +12,7 @@ import (
 // pages outlives it; these tests assert on a nil slice, so a destroyed enclave
 // is folded into one here rather than handled at every assertion site.
 // Production code never copies protected material out like this.
-func encCopy(e *enclave.MemoryEnclave) []byte {
+func encCopy(e *enclave.Memory) []byte {
 	var out []byte
 	if err := e.WithBytes(func(b []byte) error {
 		out = append([]byte(nil), b...)
@@ -27,11 +27,11 @@ func encCopy(e *enclave.MemoryEnclave) []byte {
 // the kernel refuses the lock. go-enclave reports a refused mlock rather than
 // hiding it, and a test that ignored the refusal would assert
 // against a nil enclave for reasons unrelated to what it is testing.
-func mustSized(t testing.TB, n int) *enclave.MemoryEnclave {
+func mustSized(t testing.TB, n int) *enclave.Memory {
 	t.Helper()
-	e, err := enclave.NewMemoryEnclaveSized(n)
+	e, err := enclave.NewMemorySized(n)
 	if err != nil {
-		t.Fatalf("NewMemoryEnclaveSized(%d): %v", n, err)
+		t.Fatalf("NewMemorySized(%d): %v", n, err)
 	}
 	return e
 }
@@ -40,22 +40,22 @@ func mustSized(t testing.TB, n int) *enclave.MemoryEnclave {
 // release is refused. go-enclave's Destroy reports a refused release rather than
 // hiding it, and a test environment that cannot release locked memory is one
 // whose later allocations would fail for reasons unrelated to the test.
-func destroyOnCleanup(t testing.TB, e *enclave.MemoryEnclave) {
+func destroyOnCleanup(t testing.TB, e *enclave.Memory) {
 	t.Helper()
 	t.Cleanup(func() {
 		if err := e.Destroy(); err != nil {
-			t.Errorf("MemoryEnclave.Destroy: %v", err)
+			t.Errorf("Memory.Destroy: %v", err)
 		}
 	})
 }
 
 // mustFromBytes moves data into a locked, FROZEN enclave, failing the test if
 // the kernel refuses the lock.
-func mustFromBytes(t testing.TB, data []byte) *enclave.MemoryEnclave {
+func mustFromBytes(t testing.TB, data []byte) *enclave.Memory {
 	t.Helper()
-	e, err := enclave.NewMemoryEnclave(data)
+	e, err := enclave.NewMemory(data)
 	if err != nil {
-		t.Fatalf("NewMemoryEnclave: %v", err)
+		t.Fatalf("NewMemory: %v", err)
 	}
 	return e
 }

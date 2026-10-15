@@ -34,7 +34,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 | | |
 |---|---|
 | Request | `secret`: 1..`MaxSecretBytes` (65536) bytes; `threshold`: 2..255; `total`: `threshold`..255 |
-| Response | `[]*ProtectedShare` in `Index` order. Each share's value lives in a frozen `enclave.MemoryEnclave`: mlock'd, guard-paged, and wiped by `Destroy`. |
+| Response | `[]*ProtectedShare` in `Index` order. Each share's value lives in a frozen `enclave.Memory`: mlock'd, guard-paged, and wiped by `Destroy`. |
 | Errors | `*SplitError` on any bound violation or RNG failure, including a whole-set footprint above `MaxShareSetBytes`; `*ProtectedMemoryError` when a lock is refused |
 | Permission | none; in-process call |
 | Caller obligation | `Destroy` every share, ideally as each is consumed rather than at the end of the ceremony |
@@ -71,13 +71,13 @@ heap until GC, and a ceremony holds all N at once. Use `SplitProtected`, or
 ### Reconstruct a secret from M shares (protected form, preferred)
 
 ```go
-func CombineProtected(shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+func CombineProtected(shares []*ProtectedShare) (*enclave.Memory, error)
 ```
 
 | | |
 |---|---|
 | Request | `shares`: at least `threshold` shares of one split; `Threshold` is taken from `shares[0]` and is unauthenticated |
-| Response | the reconstructed secret in a frozen `*enclave.MemoryEnclave` |
+| Response | the reconstructed secret in a frozen `*enclave.Memory` |
 | Errors | `*CombineError` on any bound violation, duplicate/zero x-coordinate, ragged share set, or a share destroyed mid-reconstruction; `*ProtectedMemoryError` when a lock is refused |
 | Permission | none; in-process call |
 | Caller obligation | `Destroy` the returned enclave, and the input shares |
@@ -136,7 +136,7 @@ and decodes share by share with `NewProtectedShare`.
 
 ```go
 func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
-func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.MemoryEnclave, error)
+func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.Memory, error)
 func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
 func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error)
 func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error)
@@ -165,7 +165,7 @@ share set" for the budgeted route.
 go-enclave's own unbudgeted constructors do not consult
 `enclave.ProcessAllocator()`, so neither does this package implicitly: the
 budget is opted into by passing it, and a nil allocator is refused rather than
-treated as "unbudgeted", exactly as `SealedEnclave.OpenWith` refuses one.
+treated as "unbudgeted", exactly as `Sealed.OpenIn` refuses a typed-nil `*Allocator`.
 
 A budget refusal is recoverable and local to the call:
 
@@ -333,7 +333,7 @@ type ProtectedShareSplitter interface {
 type ProtectedShareAccumulator interface {
     AddProtectedShare(ctx context.Context, share *shamir.ProtectedShare) (*QuorumProgress, error)
     GetProgress() *QuorumProgress
-    ReconstructProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+    ReconstructProtected(ctx context.Context) (*enclave.Memory, error)
     Reset()
     Expired() bool
 }
@@ -380,15 +380,15 @@ may implement the protected pair:
 type ProtectedSealingStrategy interface {
     SealingStrategy
 
-    SealRootKeyProtected(ctx context.Context, rootKey *enclave.MemoryEnclave, creds Credentials) (*SealedRootKey, error)
-    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.MemoryEnclave, error)
+    SealRootKeyProtected(ctx context.Context, rootKey *enclave.Memory, creds Credentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.Memory, error)
 }
 
 // The passphrase is protected too: the same Credentials every strategy takes.
 // Built by NewCredentials, which wipes the caller's slice; the caller owns it
 // and releases it with Secret.Destroy.
 type Credentials struct {
-    Secret *enclave.SealedEnclave
+    Secret *enclave.Sealed
 }
 
 ```

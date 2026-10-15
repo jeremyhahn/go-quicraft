@@ -75,11 +75,11 @@ func (b *Barrier) NonceTracker() NonceTrackerProvider
 func (b *Barrier) SealedRootKeyData() *SealedRootKey
 func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
 func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.MemoryEnclave, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error)
 ```
 
 The three methods that open the sealed root key take the caller's context and
-pass it to go-enclave's `SealedEnclave.Open`, which may reach a blocking
+pass it to go-enclave's `Sealed.Open`, which may reach a blocking
 provider. `Rotate` and `PurgeEpochsBefore` take one too, as do the `Host`-facing
 and snapshot-pool interfaces below; their background callers pass a context
 cancelled when the host's key-rotation loop or the snapshot pool stops. The rotation
@@ -308,13 +308,13 @@ returns `(newEpoch, nil)`; returning an error alongside a committed epoch is
 avoided so a caller cannot retry into a second rotation.
 
 **Root-key borrows.** The root key is held between operations as a
-`SealedEnclave`. `Rotate` opens it once into a locked `MemoryEnclave`, whose
+`Sealed`. `Rotate` opens it once into a locked `Memory`, whose
 destruction is deferred, and reads that through go-enclave's scoped
-`MemoryEnclave.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped
+`Memory.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped
 `MemoryEnclave.Open`). It borrows twice, each time for the one call that reads it: the epoch-cipher
 derivation, then the `StateMAC` re-stamp. Neither borrow spans the sealing of
 the new DEK, which may block on a provider, and no view of the key outlives its
-borrow. Cleanup paths destroy a `SealedEnclave` through one helper that logs a
+borrow. Cleanup paths destroy a `Sealed` through one helper that logs a
 failed `Destroy` at WARN rather than discarding it; go-enclave documents that
 error as always nil today.
 

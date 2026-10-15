@@ -195,7 +195,7 @@ func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	defer s.Close()
 
 	b := MustNewBarrier(testBarrierConfig(1))
-	b.lockRootKey = func(int) (*enclave.MemoryEnclave, error) { return nil, errLockRefused }
+	b.lockRootKey = func(int) (*enclave.Memory, error) { return nil, errLockRefused }
 
 	err := b.Initialize(context.Background(), s, Credentials{})
 	if err == nil {
@@ -213,7 +213,7 @@ func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	}
 
 	// And a retry once the allocator recovers must behave like a first boot.
-	b.lockRootKey = enclave.NewMemoryEnclaveSized
+	b.lockRootKey = enclave.NewMemorySized
 	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("retry after the refusal cleared: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 	if err := b2.SetSealedRootKey(blob); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
-	b2.lockRootKey = func(int) (*enclave.MemoryEnclave, error) { return nil, errLockRefused }
+	b2.lockRootKey = func(int) (*enclave.Memory, error) { return nil, errLockRefused }
 
 	err := b2.Unseal(context.Background(), s, Credentials{})
 	if err == nil {
@@ -271,14 +271,14 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 // the one above.
 //
 // A wipe of the strategy's heap key placed only INSIDE the borrow that copies
-// it into locked memory is skipped on one path: MemoryEnclave.WithBytes returns
+// it into locked memory is skipped on one path: Memory.WithBytes returns
 // ErrEnclaveDestroyed BEFORE it calls fn when the enclave is nil or wiped, so
 // fn never runs and the full plaintext root key stays on the ordinary Go heap —
 // swappable, core-dumpable, alive until the collector reclaims it. The deferred
 // wipe is the floor that covers it.
 //
 // A (nil, nil) allocator is the shape that reaches it. The default lockRootKey
-// is enclave.NewMemoryEnclaveSized, which cannot return one, so this is not
+// is enclave.NewMemorySized, which cannot return one, so this is not
 // reachable in production — but lockRootKey is an injectable field, and the
 // comment at the borrow says the redesign exists precisely so "an error path
 // added later cannot forget one". An allocator whose refusal is a nil enclave
@@ -309,7 +309,7 @@ func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 	// default allocator produces; it is the shape the borrow's own early return
 	// is written to handle, and the point is that handling it must not skip the
 	// wipe.
-	b2.lockRootKey = func(int) (*enclave.MemoryEnclave, error) { return nil, nil }
+	b2.lockRootKey = func(int) (*enclave.Memory, error) { return nil, nil }
 
 	err := b2.Unseal(context.Background(), s, Credentials{})
 	if err == nil {
