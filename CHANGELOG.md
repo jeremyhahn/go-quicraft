@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Host.PauseShard` and `Host.ResumeShard` stop and restart one replica
+  without unloading it, so a runtime seal finds none of the shard's log, apply
+  or snapshot work in flight (go-qrdb cl1493, seal ruling A). A paused replica
+  keeps its log, state machine, membership and Raft state. It does not
+  campaign, vote, replicate, acknowledge, apply, or take, send, receive or
+  recover a snapshot, and every client call returns the new `ErrShardPaused`
+  (`Temporary`; `RequestDropped` in `contrib/dragonboat`). A paused leader
+  first transfers leadership to an up-to-date voter. `ResumeShard` rejoins as a
+  follower and applies held entries in log order. `ShardInfo.Paused` reports
+  the state. A pause is not persisted; no wire or format change.
+
 ## [0.22.0-alpha] - 2026-10-14
 
 The planned 0.21.0-rc.3. Release candidates now wait until the whole stack is

@@ -760,6 +760,47 @@ func TestExecuteOnLeader_BusyLeaderRefuses(t *testing.T) {
 	c.wantRuns(map[uint64][]uint64{})
 }
 
+// TestExecuteOnLeader_PausedOrSealedLeaderRefuses: a leader paused without
+// handing leadership over still leads in its frozen Raft, so the remote path
+// must apply the same gates as the local preflight. It answers before running
+// the handler, and the caller gets the error its own replica would give.
+func TestExecuteOnLeader_PausedOrSealedLeaderRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status uint64
+		want   error
+		gate   func(*nodeState)
+	}{
+		{"paused", leaderExecPaused, ErrShardPaused, func(ns *nodeState) { ns.paused.Store(true) }},
+		{"sealed", leaderExecSealed, ErrBarrierSealed, func(ns *nodeState) {
+			b := newTestHostBarrier(1)
+			b.sealedVal = true
+			ns.barrier = b
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newExecCluster(t)
+			c.serve(nil)
+			c.elect(1, 5, 1, 2, 3)
+			tc.gate(c.nodes[1])
+
+			res := c.execute(context.Background(), 2, "req")
+			c.deliver(c.expect(proto.LeaderExec, 2, 1, 5))
+			refusal := c.expect(proto.LeaderExecResp, 1, 2, 5)
+			if !refusal.Reject || refusal.LogIndex != tc.status {
+				t.Fatalf("%s leader answered Reject %v status %d, want status %d",
+					tc.name, refusal.Reject, refusal.LogIndex, tc.status)
+			}
+			c.deliver(refusal)
+			if err := c.result(res).err; !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			c.quiet()
+			c.wantRuns(map[uint64][]uint64{})
+		})
+	}
+}
+
 // TestExecuteOnLeader_Preflight covers the checks made before anything is
 // sent or executed.
 func TestExecuteOnLeader_Preflight(t *testing.T) {

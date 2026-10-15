@@ -276,6 +276,12 @@ log write was refused while sealed writes that update once and resumes, and its
 `ReadIndex`. A shard halted by any other write fault (`ErrShardFailed`) still
 needs `StopShard` and then `StartShard`.
 
+To seal a running shard with none of its work in flight, call
+`Host.PauseShard` before `Seal()` and `Host.ResumeShard` after `Unseal()`. A
+paused shard refuses client calls with `ErrShardPaused` instead, and a paused
+leader hands leadership to another voter first. See
+[architecture.md](architecture.md#runtime-seal-pausing-a-shard-first).
+
 ## Set `MinEpoch`
 
 `StateMAC` authenticates the sealed blob's metadata but cannot detect replay: an

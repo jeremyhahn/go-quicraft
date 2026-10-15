@@ -797,6 +797,17 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 	// The snapshot.meta record the send verifies the handle's bytes against is
 	// read here too, for the same reason. Both are a handful of syscalls on a
 	// path taken once per lagging follower, cheap enough for the step worker.
+	//
+	// The send is registered with the shard's pause first: a paused leader
+	// sends no snapshot, and a PauseShard that lands mid-send waits for it.
+	var node *engine.Node
+	if s.engine != nil {
+		node = s.engine.GetNode(msg.ShardID)
+	}
+	if node != nil && !node.BeginSnapshotTransfer() {
+		s.safeNotifySnapshotRejected(msg.ShardID, msg.From, msg.To, msg.Hint)
+		return
+	}
 	var src *verifiedSnapshotFile
 	var openErr error
 	if msg.Snapshot.Filepath != "" {
@@ -805,6 +816,9 @@ func (s *transportSender) SendSnapshot(msg proto.Message) {
 	s.snapshotWg.Add(1)
 	go func() {
 		defer s.snapshotWg.Done()
+		if node != nil {
+			defer node.EndSnapshotTransfer()
+		}
 		defer func() {
 			if src == nil {
 				return
@@ -1589,6 +1603,13 @@ type nodeState struct {
 	// the shard is not encrypted. The client entry points read it through
 	// barrierSealed to refuse new work while it is sealed.
 	barrier Barrier
+
+	// paused is set by PauseShard and cleared by ResumeShard. The client
+	// entry points load it once and refuse with ErrShardPaused; the engine
+	// node carries its own flag, which gates the replica itself.
+	paused atomic.Bool
+	// pauseGate serializes PauseShard and ResumeShard on this shard.
+	pauseGate pauseGate
 
 	leaderID          atomic.Uint64
 	term              atomic.Uint64
@@ -5869,6 +5890,10 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, nopHostRelease, ErrShardPaused
+	}
 	// Refused while sealed, as StaleRead is.
 	if ns.barrierSealed() {
 		return nil, nopHostRelease, ErrBarrierSealed
@@ -5945,6 +5970,10 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 		return nil, ErrDiskFull
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// Refuse while the shard's barrier is sealed: the entry could not be
 	// encrypted into the log (see nodeState.barrierSealed).
 	if ns.barrierSealed() {
@@ -6050,6 +6079,10 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 		return nil, ErrDiskFull
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// Refuse while the shard's barrier is sealed: the entry could not be
 	// encrypted into the log (see nodeState.barrierSealed).
 	if ns.barrierSealed() {
@@ -6404,6 +6437,10 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 		return nil, ErrInvalidOperation
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// A sealed replica serves no linearizable read: the barrier that sealed
 	// is the one its log is written under, so it can neither persist nor
 	// prove the state the read would be answered from (see
@@ -6572,6 +6609,10 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// A sealed barrier refuses local reads too: sealing withdraws access to
 	// the shard's data, not only the ability to write it.
 	if ns.barrierSealed() {
@@ -6639,6 +6680,10 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 	}
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
+	}
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
 	}
 	// A sealed barrier refuses local reads too: sealing withdraws access to
 	// the shard's data, not only the ability to write it.
@@ -6989,6 +7034,10 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 	if h.draining.Load() {
 		return nil, ErrDraining
 	}
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// A register or unregister entry is written to the log like any other
 	// proposal, so a sealed barrier refuses it the same way.
 	if ns.barrierSealed() {
@@ -7279,6 +7328,11 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 		return err
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return ErrShardPaused
+	}
+
 	if !ns.isLeader.Load() {
 		return h.buildNotLeaderError(ns)
 	}
@@ -7354,6 +7408,199 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 	return nil
 }
 
+// PauseShard stops the local replica of shardID without unloading it, so a
+// runtime seal can withdraw the shard's barrier key with no log, apply or
+// snapshot work of the shard in flight. The replica keeps its log, state
+// machine, membership and persisted raft state; ResumeShard restarts it.
+//
+// While paused the replica:
+//
+//   - refuses every proposal, session operation, membership change,
+//     ExecuteOnLeader, leader transfer, snapshot request, compaction and
+//     read (ReadIndex, SyncRead, LeaseRead, StaleRead, follower reads) with
+//     ErrShardPaused, which is Temporary;
+//   - neither campaigns, votes, replicates nor acknowledges: its election
+//     clock stops and every inbound message — proposals and reads forwarded
+//     by peers included — is discarded;
+//   - applies nothing, including committed entries already handed to the
+//     apply goroutine; they apply in log order after ResumeShard;
+//   - takes, sends, receives, imports and recovers no snapshot. A due
+//     snapshot or recovery runs after ResumeShard, and a refused recovery is
+//     never counted toward the shard-failure limit.
+//
+// A proposal accepted before the pause is never applied while paused: it
+// completes after ResumeShard, ends at its ctx deadline, or returns the
+// maybe-applied NotLeaderError if leadership moves.
+//
+// A leader first hands leadership to the reachable voter with the highest
+// replicated index, through the RequestLeaderTransfer path, and waits up to
+// one election timeout for it to take over. If no voter is reachable or the
+// transfer does not finish in time, the pause proceeds and the old leader
+// stops heartbeating; the remaining voters elect a leader of their own.
+//
+// PauseShard returns nil once none of the shard's log, apply or snapshot
+// work is in flight. If ctx ends first it returns ctx.Err() and the shard
+// STAYS paused: the in-flight work settles on its own, and calling
+// PauseShard again waits for it. Pausing a paused shard is idempotent. A
+// pause is not persisted: a restarted replica starts unpaused. An unknown
+// shard returns ErrShardNotFound; a shard that stops while the pause waits
+// returns ErrClosed.
+func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
+	// No early ctx check: a ctx error always means the shard is paused, even
+	// for a ctx already done on entry.
+	if h.closed.Load() {
+		return ErrClosed
+	}
+	ns, err := h.getNode(shardID)
+	if err != nil {
+		return err
+	}
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil {
+		return ErrShardNotFound
+	}
+
+	// Refuse new work first, so nothing the host admits from here on can
+	// race the pause below. The gate is taken without ctx: a ctx error must
+	// mean the shard is paused, and no holder keeps it longer than a
+	// leadership transfer.
+	ns.pauseGate.lock(nil)
+	if !ns.paused.Swap(true) && ns.isLeader.Load() {
+		h.transferBeforePause(ctx, ns, engNode)
+	}
+	h.engine.BeginPause(engNode)
+	ns.pauseGate.unlock()
+	if err := h.engine.AwaitPause(ctx, engNode); err != nil {
+		// The shard stopped while the pause waited.
+		if errors.Is(err, engine.ErrStopped) {
+			return ErrClosed
+		}
+		return err
+	}
+	return nil
+}
+
+// transferBeforePause hands a leader's shard to the reachable voter with the
+// highest replicated index and waits, bounded by ctx and one election
+// timeout, for this replica to step down. With no voter to hand to it waits
+// out the timeout; PauseShard proceeds either way. The engine node is not paused
+// yet, so the step worker still runs the transfer.
+func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *engine.Node) {
+	timeout := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Duration(h.cfg.RTTMillisecond) * time.Millisecond)
+	defer tick.Stop()
+
+	requested := false
+	for ns.isLeader.Load() {
+		if !requested {
+			// The progress view is published by the step worker once it is
+			// asked for, so the first read may still be empty.
+			if target := pauseTransferTarget(engNode.ReplicaProgress(), ns.replicaID); target != 0 {
+				msg := proto.Message{Type: proto.LeaderTransfer, From: ns.replicaID, Hint: target}
+				if engNode.DeliverLocal(msg) {
+					h.engine.NotifyWork(ns.shardID)
+					requested = true
+					h.logger.Info("leader transfer before pause",
+						"shard_id", ns.shardID,
+						"target_replica_id", target,
+					)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			if requested {
+				h.logger.Warn("leader transfer before pause did not finish; pausing",
+					"shard_id", ns.shardID,
+				)
+			}
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// pauseGate serializes one shard's pause and resume transitions: the host's
+// admission flag, the leadership transfer and the engine node's flag change
+// as one step, so a ResumeShard cannot run between a PauseShard's flag and
+// its engine pause and leave the two disagreeing. The wait for in-flight
+// work is outside it. Each shard has its own gate. The zero value is ready.
+type pauseGate struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+// lock takes the gate, or reports false if done closes first. A nil done
+// waits for as long as the holder: a pause holds the gate for at most its
+// leadership transfer, one election timeout.
+func (g *pauseGate) lock(done <-chan struct{}) bool {
+	g.once.Do(func() { g.ch = make(chan struct{}, 1) })
+	select {
+	case g.ch <- struct{}{}:
+		return true
+	case <-done:
+		return false
+	}
+}
+
+func (g *pauseGate) unlock() { <-g.ch }
+
+// pauseTransferTarget picks the leadership-transfer target for a pausing
+// leader: the active voter with the highest match index, 0 if none.
+func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
+	var target, match uint64
+	for _, p := range progress {
+		if p.ReplicaID == self || p.Role != raft.RoleVoter || !p.Active {
+			continue
+		}
+		if target == 0 || p.Match > match {
+			target, match = p.ReplicaID, p.Match
+		}
+	}
+	return target
+}
+
+// ResumeShard restarts a replica PauseShard paused. Call it after the
+// shard's barrier is unsealed. The replica rejoins as a follower at its
+// current term with a fresh election timeout, applies the committed entries
+// held during the pause in log order, and runs any snapshot or recovery the
+// pause deferred. The entry points stop returning ErrShardPaused once the
+// replica has rejoined. Resuming a shard that is not paused is a no-op. An
+// unknown shard returns ErrShardNotFound.
+//
+// PauseShard and ResumeShard on one shard are serialized: a resume issued
+// while a pause is handing leadership over waits for the pause to reach the
+// engine, then undoes it, so the shard ends resumed. If ctx ends first,
+// ResumeShard returns ctx.Err() and changes nothing.
+func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if h.closed.Load() {
+		return ErrClosed
+	}
+	ns, err := h.getNode(shardID)
+	if err != nil {
+		return err
+	}
+	engNode := h.engine.GetNode(shardID)
+	if engNode == nil {
+		return ErrShardNotFound
+	}
+	// A pause in its leadership transfer holds the gate; ctx bounds the wait.
+	if !ns.pauseGate.lock(ctx.Done()) {
+		return ctx.Err()
+	}
+	h.engine.ResumeNode(engNode)
+	ns.paused.Store(false)
+	ns.pauseGate.unlock()
+	return nil
+}
+
 // RequestSnapshot requests a snapshot for the given shard with the
 // specified options. The returned RequestState resolves when the snapshot
 // completes. The result's Value field carries the snapshot index on
@@ -7388,6 +7635,10 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 		return nil, err
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// A snapshot is written under the shard's barrier; refuse up front
 	// rather than claim the slot for a save that cannot encrypt.
 	if ns.barrierSealed() {
@@ -8833,8 +9084,12 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 		return 0, ErrDiskFull
 	}
 
-	// Verify shard is NOT running.
-	if _, running := h.nodes.Load(shardID); running {
+	// Verify shard is NOT running. A paused shard is still loaded; it says
+	// so, since the pause and not the import is what the caller must end.
+	if v, running := h.nodes.Load(shardID); running {
+		if ns, ok := v.(*nodeState); ok && ns.paused.Load() {
+			return 0, ErrShardPaused
+		}
 		return 0, ErrInvalidOperation
 	}
 
@@ -10755,6 +11010,10 @@ func (h *Host) RequestCompaction(shardID, replicaID uint64) error {
 	if ns.replicaID != replicaID {
 		return &ReplicaNotFoundError{ShardID: shardID, ReplicaID: replicaID}
 	}
+	// A paused replica writes nothing to its log (see Host.PauseShard).
+	if ns.paused.Load() {
+		return ErrShardPaused
+	}
 
 	return h.logdb.Compact(shardID, replicaID)
 }
@@ -10913,6 +11172,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		return nil, err
 	}
 
+	// Refused while paused (see Host.PauseShard).
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
 	// A config change is a log entry like any proposal; a sealed barrier
 	// refuses it up front (see nodeState.barrierSealed).
 	if ns.barrierSealed() {
@@ -11165,6 +11428,7 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		Health:               h.shardHealth(ns, leaderID, lastApplied),
 		LastApplied:          lastApplied,
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
+		Paused:               ns.paused.Load(),
 		Replicas:             h.replicaProgress(ns.shardID),
 	}
 }

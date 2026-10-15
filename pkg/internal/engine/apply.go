@@ -681,14 +681,24 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 				// in-flight registration is visible to WaitForApplyDrain, or
 				// the flag is visible here and we back off, releasing the slot
 				// so the drain can complete.
-				for node.IsRecovering() || node.IsSaving() {
+				//
+				// A paused shard (Engine.PauseNode) parks here the same way,
+				// blocking rather than polling until the resume: nothing is
+				// applied while paused, and the batch applies, in log order,
+				// once the shard resumes. The pause flag is set before its
+				// waiter reads applyInFlight, so the same handshake holds.
+				for node.paused.Load() || node.IsRecovering() || node.IsSaving() {
 					node.applyInFlight.Add(-1)
 					stopped := false
-					select {
-					case <-node.StopC():
-						stopped = true
-					default:
-						time.Sleep(50 * time.Microsecond)
+					if node.paused.Load() {
+						stopped = !node.awaitResume()
+					} else {
+						select {
+						case <-node.StopC():
+							stopped = true
+						default:
+							time.Sleep(50 * time.Microsecond)
+						}
 					}
 					node.applyInFlight.Add(1)
 					if stopped {

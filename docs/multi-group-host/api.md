@@ -437,8 +437,58 @@ worker where it can only be logged.
 | unknown to this shard | `*ReplicaNotFoundError` |
 
 **Errors:** the table above, plus `ErrClosed`, `ErrShardNotFound`,
-`*NotLeaderError`, `ErrShardNotReady`, `ErrSystemBusy`, and
+`*NotLeaderError`, `ErrShardNotReady`, `ErrSystemBusy`, `ErrShardPaused`, and
 `ErrCanceled` / `ErrTimeout` from `ctx`.
+
+### Pause and resume
+
+```go
+func (h *Host) PauseShard(ctx context.Context, shardID uint64) error
+func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error
+```
+
+`PauseShard` stops the local replica of a shard without unloading it, so a
+runtime seal can withdraw the shard's barrier key with none of the shard's work
+in flight. `ResumeShard` restarts it. The replica keeps its log, state machine,
+membership and persisted Raft state, and writes nothing to the log or the
+snapshot store while paused. `GetShardInfo` reports `Paused`.
+
+While paused:
+
+| Area | Behaviour |
+|---|---|
+| Client calls | Proposals, sessions, membership changes, `ExecuteOnLeader`, `RequestLeaderTransfer`, `RequestSnapshot`, `RequestCompaction`, `ImportSnapshot` and every read (`ReadIndex`, `SyncRead`, `SyncReadBuf`, LeaseRead, `StaleRead`, `StaleReadBuf`, `FollowerRead`) return `ErrShardPaused`, which is `Temporary` |
+| Forwarded work | Proposals and reads forwarded by peers, like every inbound Raft message, are discarded. An `ExecuteOnLeader` request forwarded to a paused leader is refused before its handler runs, and the caller gets `ErrShardPaused` (`ErrBarrierSealed` from a leader whose barrier is sealed) |
+| Raft | The replica neither campaigns, votes, replicates nor acknowledges |
+| Applies | Nothing applies, including committed entries already handed to the apply worker. They apply in log order after `ResumeShard` |
+| Snapshots | None is taken, sent, received, imported or recovered. A due snapshot or recovery runs after `ResumeShard`, and a refused recovery never counts toward the shard-failure limit |
+
+A proposal accepted before the pause is never applied while paused: it
+completes after `ResumeShard`, ends at its `ctx` deadline, or returns the
+maybe-applied `*NotLeaderError` if leadership moves.
+
+A paused leader first hands leadership to the active voter with the highest
+replicated index, through the same path as `RequestLeaderTransfer`, and waits up
+to one election timeout for it to take over. If no voter can take over in time,
+the pause proceeds and the old leader stops heartbeating, so the other voters
+elect a leader of their own.
+
+`PauseShard` returns once no log, apply or snapshot work of the shard is in
+flight. If `ctx` ends first it returns `ctx.Err()` and **the shard stays
+paused**; calling `PauseShard` again waits for the remaining work. `ResumeShard`
+rejoins the shard as a follower at its current term with a fresh election
+timeout. Call it after the barrier is unsealed.
+
+Both calls are idempotent, and on one shard they are serialized: a
+`ResumeShard` issued while a `PauseShard` is handing leadership over waits for
+that pause to take effect, then undoes it. A `ResumeShard` whose `ctx` ends
+while it waits returns `ctx.Err()` and changes nothing. Calls on different
+shards never wait on each other. A pause is not persisted: a restarted replica starts
+unpaused. A barrier sealed without a pause still holds the shard's refused log
+write until unseal (see [Serve requests while sealed](../seal-barrier/user.md#serve-requests-while-sealed)).
+
+**Errors:** `ErrClosed` (also when the shard stops while `PauseShard` waits),
+`ErrShardNotFound` (unknown shard), and `ctx.Err()` from either call.
 
 ### Membership changes
 
@@ -1451,7 +1501,8 @@ exactly: `ErrBusy` (and so `ErrSystemBusy`, which is a `*BusyError`),
 `ErrTimeout`, `ErrAborted`, `ErrDropped`, `ErrShardNotStarted`,
 `ErrShardNotReady`, `ErrNotLeader`, `ErrReadIndexNotReady`, `ErrNoLeader`,
 `ErrLeadershipChanged`, `ErrSnapshotInProgress`, `ErrImportInProgress`, `ErrTransferInProgress`,
-`ErrSessionBusy`.
+`ErrSessionBusy`, `ErrShardPaused`. A pause is an operator window that
+`ResumeShard` ends, unlike a sealed barrier, which needs the operator to act.
 
 **Everything else is permanent, including errors this package did not produce.**
 Retrying a permanent failure turns one bad request into sustained load. Some
@@ -1622,6 +1673,7 @@ Encryption and storage:
 | Error | Returned when |
 |---|---|
 | `ErrBarrierSealed` | encrypt or decrypt while the barrier is sealed. Re-exported from `pkg/seal` |
+| `ErrShardPaused` | any client call on a shard paused by `PauseShard`. `Temporary` |
 | `ErrBarrierNotInit` | the barrier has no sealing strategy. Re-exported from `pkg/seal` |
 | `ErrDecryptionFailed` | corrupted ciphertext or wrong key. Re-exported from `pkg/seal` |
 | `ErrBarrierPlaintextLogDB` | `WithBarrier` over a supplied LogDB that would store plaintext |
@@ -2481,6 +2533,7 @@ type ShardInfo struct {
     Health               ShardHealth       `json:"health"`
     LastApplied          uint64            `json:"last_applied"`
     ConfigChangeIndex    uint64            `json:"config_change_index"`
+    Paused               bool              `json:"paused"`
     Replicas             []ReplicaProgress `json:"replicas,omitempty"`
 }
 ```
@@ -2489,7 +2542,8 @@ A point-in-time copy returned by `GetShardInfo`. `StateMachineType` is 0
 regular, 1 concurrent, 2 on-disk. `IsObserver` is the effective role from the
 applied membership (a promoted observer reports `false` without a restart);
 `IsWitness` is the configured witness role. `Nodes` covers all known members;
-use `SyncGetShardMembership` for observers and witnesses separately.
+use `SyncGetShardMembership` for observers and witnesses separately. `Paused` is
+true between `PauseShard` and `ResumeShard`.
 
 `Replicas` covers every remote member the leader tracks: voters, observers
 (learners) and witnesses, each tagged with its `Role`. It is empty on a

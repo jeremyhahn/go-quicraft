@@ -527,6 +527,22 @@ func TestTranslateError_DiskFull_ErrorsIs(t *testing.T) {
 	}
 }
 
+// ErrShardPaused has no Dragonboat counterpart: it passes through as an
+// AdapterError, like ErrBarrierSealed, and stays matchable and temporary.
+func TestTranslateError_ShardPaused(t *testing.T) {
+	result := translateError(quicraft.ErrShardPaused)
+	var ae *AdapterError
+	if !errors.As(result, &ae) {
+		t.Fatalf("translateError(ErrShardPaused) = %T, want *AdapterError", result)
+	}
+	if !errors.Is(result, quicraft.ErrShardPaused) {
+		t.Error("translated ErrShardPaused no longer matches errors.Is")
+	}
+	if !IsTempError(result) {
+		t.Error("IsTempError(translated ErrShardPaused) = false, want true")
+	}
+}
+
 func TestTranslateError_SnapshotRecoveryFailed(t *testing.T) {
 	result := translateError(quicraft.ErrSnapshotRecoveryFailed)
 	if !errors.Is(result, ErrAborted) {

@@ -216,6 +216,7 @@ var resultCodeMappings = [...]resultCodeMapping{
 	{quicraft.ErrReadIndexNotReady, RequestDropped},
 	{quicraft.ErrShardNotReady, RequestDropped},
 	{quicraft.ErrDiskFull, RequestDropped},
+	{quicraft.ErrShardPaused, RequestDropped},
 	{quicraft.ErrTimeout, RequestTimeout},
 	{quicraft.ErrRejected, RequestRejected},
 	{quicraft.ErrDropped, RequestDropped},

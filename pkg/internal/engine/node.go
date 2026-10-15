@@ -429,6 +429,30 @@ type Node struct {
 	// committing and applying its work. The pipeline's incarnation guards
 	// read this rather than stopC, which both kinds of stop close.
 	unloaded atomic.Bool
+
+	// paused is set while the replica is paused for a runtime seal
+	// (Engine.PauseNode) and cleared by Engine.ResumeNode. While it is set
+	// the step worker neither ticks the node nor steps its inbox (inbound
+	// messages are discarded, so the replica votes, acknowledges and serves
+	// nothing), the apply goroutine parks before the state machine, and the
+	// snapshot pool refuses the shard's saves and recoveries. It is never
+	// persisted. Every gate costs one atomic load while it is clear.
+	paused atomic.Bool
+	// pauseMu serializes pause and resume, and guards resumeC: the channel a
+	// parked apply waits on, created by the pause and closed by the resume.
+	pauseMu sync.Mutex
+	resumeC chan struct{}
+	// applyParked is true while the apply goroutine holds a committed batch
+	// parked on the pause gate. It lets PauseNode tell a pipeline item that
+	// has reached the gate (settled) from one still being persisted.
+	applyParked atomic.Bool
+	// snapshotTransfers counts the host's snapshot sends and receives of this
+	// shard in progress; PauseNode waits for it to reach zero, and a transfer
+	// that would begin while paused is refused (BeginSnapshotTransfer).
+	snapshotTransfers atomic.Int64
+	// pausedSaveDropped records an automatic snapshot save the pool refused
+	// because the shard was paused, so ResumeNode re-requests it.
+	pausedSaveDropped atomic.Bool
 }
 
 // NewNode creates a new engine Node for the given shard. The node must

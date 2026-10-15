@@ -165,6 +165,11 @@ type ShardInfo struct {
 	// been applied yet.
 	ConfigChangeIndex uint64 `json:"config_change_index"`
 
+	// Paused is true while the replica is paused by Host.PauseShard and
+	// not yet resumed by Host.ResumeShard. A pause is not persisted: a
+	// restarted replica reports false.
+	Paused bool `json:"paused"`
+
 	// Replicas reports how far each remote member has replicated, as this
 	// leader understands it: voters, observers (learners) and witnesses, each
 	// tagged with its Role. Callers that want voters only, for quorum or

@@ -447,6 +447,46 @@ conflicts only with `WithBarrier` (`ErrAtRestEncryptionConflict`), so
   per-shard barrier is the embedder's; the host rotates only the `WithBarrier`
   one. `Host.Close` seals each distinct barrier once.
 
+## Runtime seal: pausing a shard first
+
+Sealing a running shard's barrier by itself leaves the engine mid-flight:
+admission refuses new client work, but a log write already extracted from Raft
+fails and is held until unseal (the sealed-write hold), and an apply or a
+snapshot under way meets `ErrBarrierSealed`. That is safe, but untidy for an
+embedder (go-qrdb) whose seal is routine. `Host.PauseShard` lets it quiesce the
+shard first, so the seal finds nothing of the shard in flight:
+
+```
+PauseShard(ctx, shard) → barrier.Seal() → … → barrier.Unseal() → ResumeShard(ctx, shard)
+```
+
+What the pause stops, and where:
+
+| Layer | Mechanism |
+|---|---|
+| Host admission | `nodeState.paused`, one atomic load per call, is checked beside the sealed check, so every client entry point returns `ErrShardPaused` (`Temporary`) |
+| Step worker | A paused node is not ticked, and its inbox is discarded each pass: no campaign, vote, append, ack, forwarded proposal or forwarded read. A snapshot install it was handed is cancelled, not run |
+| Apply | The apply worker parks a batch at the gate before the state machine, after releasing its in-flight registration, and continues it in log order on resume |
+| Snapshot pool | A request taken off the queue for a paused shard is refused without running. A recovery is re-armed without counting an attempt, so a pause can never exhaust recovery into a shard failure; a dropped automatic save is re-requested on resume |
+| Transport | A snapshot send or receive registers with the node, and is refused once paused |
+
+`PauseNode` sets the flag first, waits for the step worker's iteration in
+progress to end, then waits until no log batch is being persisted, no apply is
+running, and no snapshot save, recovery or transfer is running or queued. Each
+party that can start work registers before it reads the flag (the Dekker
+order), so the wait cannot miss work that started concurrently. On `ctx`
+expiry the shard stays paused and the work still settles.
+
+A paused leader first hands off through the ordinary leader-transfer path to
+the active voter with the highest match index, bounded by one election timeout;
+otherwise it simply stops heartbeating. `ResumeShard` makes the replica a
+follower at its current term with a fresh, randomised election timeout; the
+term is unchanged, so nothing is persisted for it. No message type, field, or
+format version was added.
+
+A pause lives in memory only. A barrier sealed without a pause keeps the
+sealed-write hold described in [user.md](user.md#serve-requests-while-sealed).
+
 ## What this feature deliberately does not do
 
 - **No TPM, HSM, PKCS#11, cloud-KMS or Shamir strategy.** `pkg/seal` names

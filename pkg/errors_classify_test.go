@@ -88,6 +88,7 @@ func sentinelTable() []sentinelClassification {
 		{"ErrSessionLimitExceeded", ErrSessionLimitExceeded, false},
 		{"ErrTooManySessions", ErrTooManySessions, false},
 		{"ErrBarrierSealed", ErrBarrierSealed, false},
+		{"ErrShardPaused", ErrShardPaused, true},
 		{"ErrBarrierNotInit", ErrBarrierNotInit, false},
 		{"ErrDiskFull", ErrDiskFull, false},
 		{"ErrDecryptionFailed", ErrDecryptionFailed, false},

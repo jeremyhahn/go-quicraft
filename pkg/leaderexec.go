@@ -73,6 +73,12 @@ const (
 	// leaderExecBusy: refused before execution; leaderExecMaxInflight
 	// requests are already executing.
 	leaderExecBusy
+	// leaderExecPaused: refused before execution by the leader of the
+	// request's term; its shard is paused (PauseShard).
+	leaderExecPaused
+	// leaderExecSealed: refused before execution by the leader of the
+	// request's term; its shard's barrier is sealed.
+	leaderExecSealed
 )
 
 // leaderExecOutcome is the answer to one attempt: its status and the reply
@@ -105,6 +111,12 @@ var leaderExecVerdicts = map[uint64]leaderExecVerdict{
 	}},
 	leaderExecBusy: {fail: func(_, _, _ uint64, _ []byte) error {
 		return ErrBusy
+	}},
+	leaderExecPaused: {fail: func(_, _, _ uint64, _ []byte) error {
+		return ErrShardPaused
+	}},
+	leaderExecSealed: {fail: func(_, _, _ uint64, _ []byte) error {
+		return ErrBarrierSealed
 	}},
 }
 
@@ -301,7 +313,9 @@ func (h *Host) UnregisterLeaderHandler(shardID uint64) {
 // attempt is in flight to a leader the view still names, ErrTimeout or
 // ErrCanceled. A failing handler is reported as a *LeaderHandlerError, a
 // leader without a handler as ErrLeaderHandlerNotRegistered, and a leader
-// already executing leaderExecMaxInflight remote requests as ErrBusy. The
+// already executing leaderExecMaxInflight remote requests as ErrBusy, and a
+// leader whose shard is paused or sealed as ErrShardPaused or
+// ErrBarrierSealed, refused before it ran, as this replica's own are. The
 // request is held to the shard's proposal payload limit (EntryTooLargeError),
 // and so is the reply. ErrStopped means the shard or the host stopped while
 // the request waited, and ErrShardFailed that this replica's failure latch
@@ -329,6 +343,9 @@ func (h *Host) ExecuteOnLeader(ctx context.Context, shardID uint64, request []by
 	ns, err := h.getNode(shardID)
 	if err != nil {
 		return nil, err
+	}
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
 	}
 	if ns.barrierSealed() {
 		return nil, ErrBarrierSealed
@@ -563,6 +580,15 @@ func (h *Host) executeLeaderRequest(ctx context.Context, ns *nodeState, term uin
 		_, current, isLeader, ready := ns.leaderTermReady()
 		if h.leaderExecShardDown(ns) != nil || !isLeader || current != term || !h.leaderExecRaftLeads(ns, term) {
 			return leaderExecOutcome{status: leaderExecNotLeader}
+		}
+		// A paused leader's frozen Raft still reports it leads, and the
+		// remote path never passes ExecuteOnLeader's preflight: the
+		// executor refuses as every client entry point does.
+		if ns.paused.Load() {
+			return leaderExecOutcome{status: leaderExecPaused}
+		}
+		if ns.barrierSealed() {
+			return leaderExecOutcome{status: leaderExecSealed}
 		}
 		if ready {
 			break

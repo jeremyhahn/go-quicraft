@@ -1790,6 +1790,24 @@ func (p *Peer) InvalidateLease() {
 	p.r.invalidateLease()
 }
 
+// RejoinAfterPause returns a replica resuming from a pause to the protocol as
+// a follower at its current term, with a fresh randomized election timeout.
+// The vote cast in this term is kept, so a resumed replica can never vote
+// twice in one term. A replica that was a follower keeps the leader it knew,
+// so proposals queued before the pause are forwarded on rather than dropped;
+// a leader or candidate rejoins with no leader and learns the current one
+// from its first heartbeat. Nothing is persisted: the term and vote are
+// unchanged. Must be called with the node's raftMu held and while no worker
+// is stepping the peer.
+func (p *Peer) RejoinAfterPause() {
+	leaderID := noLeader
+	if p.r.state == follower {
+		leaderID = p.r.leaderID
+	}
+	p.r.becomeFollower(p.r.term, leaderID)
+	p.syncLeaderID()
+}
+
 // GetPiggybackUpdate extracts committed entries, messages, and the
 // current hard state for piggybacking onto an empty-commit cycle.
 // Eliminates the second pipeline traversal for multi-node proposals

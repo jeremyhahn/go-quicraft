@@ -936,6 +936,13 @@ func (h *hostMessageHandler) admitSnapshotSender(shardID, replicaID, fromReplica
 	if node.IsStopped() {
 		return notAccepting(ErrShardNotReady)
 	}
+	// A paused replica receives no snapshot (see Host.PauseShard); the
+	// leader retransmits after the resume. HandleSnapshot also registers
+	// the receive with the pause, so a pause that lands after this check
+	// waits for it.
+	if node.IsPaused() {
+		return notAccepting(ErrShardPaused)
+	}
 	return node, nil
 }
 
@@ -1026,6 +1033,13 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 	if err != nil {
 		return err
 	}
+	// Registered with the pause before anything is staged: a PauseShard
+	// that set the flag first refuses this receive, one that sets it later
+	// waits until the receive has returned.
+	if !node.BeginSnapshotTransfer() {
+		return &SnapshotReceiveError{ShardID: shardID, ReplicaID: replicaID, Op: "admit", Err: ErrShardPaused}
+	}
+	defer node.EndSnapshotTransfer()
 	// The snapshot REPLACES this replica's committed membership, and for a
 	// joiner it is the only one it will ever hold. A binding in it for THIS
 	// replica that is not the identity this host presents — the AddNode that

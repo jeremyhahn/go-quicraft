@@ -42,6 +42,12 @@ var (
 	// queue.
 	ErrDropped = errors.New("quicraft: proposal dropped")
 
+	// ErrShardPaused reports work refused because the replica is paused
+	// (Engine.PauseNode): a snapshot save requested of a paused shard, or a
+	// snapshot transfer to or from it. The public quicraft.ErrShardPaused is
+	// this error. It clears when the replica is resumed.
+	ErrShardPaused = errors.New("quicraft: shard paused")
+
 	// ErrStopped is returned when an operation is interrupted because
 	// the stopper channel was closed.
 	ErrStopped = errors.New("engine: operation stopped")

@@ -1143,6 +1143,13 @@ func TestTranslateResultCode_Draining(t *testing.T) {
 	}
 }
 
+func TestTranslateResultCode_ShardPaused(t *testing.T) {
+	got := translateResultCode(quicraft.ErrShardPaused)
+	if got != RequestDropped {
+		t.Errorf("translateResultCode(ErrShardPaused) = %v, want RequestDropped", got)
+	}
+}
+
 func TestTranslateResultCode_DrainingNotAborted(t *testing.T) {
 	got := translateResultCode(quicraft.ErrDraining)
 	if got == RequestAborted {

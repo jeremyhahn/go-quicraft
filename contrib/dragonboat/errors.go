@@ -127,7 +127,11 @@ func IsTempError(err error) bool {
 		errors.Is(err, ErrAborted) ||
 		// Quicraft extension: a raw not-leader error can still reach a
 		// caller that bypassed the adapter, and an election is temporary.
-		errors.Is(err, ErrNotLeader)
+		errors.Is(err, ErrNotLeader) ||
+		// Quicraft extension: a paused shard (Host.PauseShard) has no
+		// dragonboat equivalent, so it reaches the caller as an AdapterError
+		// like ErrBarrierSealed does; the pause ends with ResumeShard.
+		errors.Is(err, quicraft.ErrShardPaused)
 }
 
 // AdapterError wraps a quicraft or quicraft-internal error that has no

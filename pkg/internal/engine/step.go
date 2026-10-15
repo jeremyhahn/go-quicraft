@@ -301,8 +301,9 @@ func (w *stepWorker) tick() {
 	for shardID, node := range w.nodes {
 		// A sealHeld shard is frozen until its refused log write is retried
 		// (see Node.sealHeld): no tick, so no election timeout, campaign or
-		// heartbeat moves raft past the state that write carries.
-		if node.IsFailed() || node.sealHeld.Load() || node.peer == nil {
+		// heartbeat moves raft past the state that write carries. A paused
+		// shard is not ticked either: it neither campaigns nor heartbeats.
+		if node.IsFailed() || node.sealHeld.Load() || node.paused.Load() || node.peer == nil {
 			continue
 		}
 		w.stepInboxBeforeTick(shardID, node)
@@ -436,6 +437,14 @@ func (w *stepWorker) processReady() {
 	defer w.nodesMu.RUnlock()
 	for shardID, node := range w.nodes {
 		if node.IsFailed() {
+			continue
+		}
+		// A paused shard (Engine.PauseNode) steps nothing: its inbound
+		// messages are discarded, so it votes, acknowledges and serves no
+		// forwarded request, and its proposal and ReadIndex queues stay
+		// queued until the resume.
+		if node.paused.Load() {
+			w.discardPaused(shardID, node)
 			continue
 		}
 		// When recovering is true, a snapshot recovery is in progress on
@@ -678,6 +687,29 @@ func (w *stepWorker) redeliverDeferredSnapshots(shardID uint64, node *Node) {
 		deferred[i] = proto.Message{}
 	}
 	w.deferredSnapshots[shardID] = kept
+}
+
+// discardPaused empties a paused node's inbox without stepping it. Raft
+// tolerates lost messages: the leader re-sends what it replicates, and a
+// voter that never answered simply did not vote. A local InstallSnapshot —
+// whether just drained or deferred behind a recovery — has a snapshot
+// receive waiting on its verdict; it is answered InstallSuperseded, so the
+// receive discards its artifact and the leader re-sends after the resume.
+func (w *stepWorker) discardPaused(shardID uint64, node *Node) {
+	w.inboxBuf = node.DrainInbox(w.inboxBuf)
+	for i := range w.inboxBuf {
+		if msg := &w.inboxBuf[i]; msg.Type == proto.InstallSnapshot && msg.Origin == proto.OriginLocal {
+			node.signalInstallVerdict(msg.Snapshot.Index, InstallVerdict{Outcome: InstallSuperseded})
+		}
+	}
+	if deferred, ok := w.deferredSnapshots[shardID]; ok {
+		for i := range deferred {
+			if deferred[i].Origin == proto.OriginLocal {
+				node.signalInstallVerdict(deferred[i].Snapshot.Index, InstallVerdict{Outcome: InstallSuperseded})
+			}
+		}
+		delete(w.deferredSnapshots, shardID)
+	}
 }
 
 // deferSnapshot buffers an InstallSnapshot message for redelivery once

@@ -785,6 +785,17 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 		}
 	}()
 
+	// A paused shard takes, recovers and installs no snapshot. Checked once
+	// the request holds the shard's slot, which PauseNode waits on, so a
+	// request either runs to completion before the pause returns or is
+	// refused here.
+	if req.node.paused.Load() {
+		p.refusePaused(req)
+		progress.released = true
+		normalReturn = true
+		return
+	}
+
 	var (
 		index      uint64
 		compaction LogCompaction

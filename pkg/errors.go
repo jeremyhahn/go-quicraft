@@ -245,6 +245,11 @@ var (
 	// attempted while the barrier is sealed. Re-exported from seal package.
 	ErrBarrierSealed = seal.ErrBarrierSealed
 
+	// ErrShardPaused is returned by every proposal, read, session,
+	// membership, snapshot and leader-transfer entry point of a shard that
+	// Host.PauseShard paused, until Host.ResumeShard. It is Temporary.
+	ErrShardPaused = engine.ErrShardPaused
+
 	// ErrBarrierNotInit is returned when the barrier has not been
 	// initialized with a sealing strategy. Re-exported from seal package.
 	ErrBarrierNotInit = seal.ErrBarrierNotInit
@@ -1612,6 +1617,10 @@ var temporaryErrors = [...]error{
 	// The session's in-flight proposal completes, fails or is released on
 	// its own, and the identical proposal then reserves the series.
 	ErrSessionBusy,
+	// The shard is paused for a runtime seal (Host.PauseShard). A pause is
+	// an operator window that ResumeShard ends after the unseal, never a
+	// terminal state, so the identical request succeeds after it.
+	ErrShardPaused,
 }
 
 // Temporary reports whether err represents a transient condition that may

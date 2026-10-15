@@ -52,6 +52,7 @@ var allSentinelErrors = []struct {
 	{"ErrSessionLimitExceeded", ErrSessionLimitExceeded},
 	{"ErrTooManySessions", ErrTooManySessions},
 	{"ErrBarrierSealed", ErrBarrierSealed},
+	{"ErrShardPaused", ErrShardPaused},
 	{"ErrBarrierNotInit", ErrBarrierNotInit},
 	{"ErrDiskFull", ErrDiskFull},
 	{"ErrDecryptionFailed", ErrDecryptionFailed},
