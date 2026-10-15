@@ -629,7 +629,7 @@ func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 			"the first production release, and a pre-release framing change is made "+
 			"IN PLACE, with detection carried by retiring the record's payload-type "+
 			"byte rather than by bumping this constant (see "+
-			"docs/compatibility.md)", walFormatVersion)
+			"docs/compatibility/architecture.md)", walFormatVersion)
 	}
 }
 

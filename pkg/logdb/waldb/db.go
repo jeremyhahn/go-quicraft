@@ -146,7 +146,7 @@ type walContextBarrier interface {
 // and gets a hard startup failure. "Barrier does not support context-bound
 // encryption" is actively misleading in that case: the barrier supports it
 // perfectly well and is missing one reporting method. Naming the method turns
-// a mystifying refusal to boot into a one-line fix. See docs/compatibility.md.
+// a mystifying refusal to boot into a one-line fix. See docs/compatibility/architecture.md.
 type legacyContextBarrier interface {
 	EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
 	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)

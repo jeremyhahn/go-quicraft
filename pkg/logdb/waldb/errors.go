@@ -53,7 +53,7 @@ var (
 	// method compiles and then fails at Open. It gets its own error because the
 	// generic one — "does not support context-bound encryption" — is false here
 	// and sends the reader looking for a missing capability instead of a
-	// missing method. See docs/compatibility.md.
+	// missing method. See docs/compatibility/architecture.md.
 	ErrBarrierContextBindingUnreportable = errors.New(
 		"waldb: barrier is missing ContextBindingResolved() bool, required since the " +
 			"WAL must distinguish a barrier that cannot bind context from one that is " +

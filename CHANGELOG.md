@@ -1234,7 +1234,7 @@ written by 0.13.x does not authenticate under the new frame context.
 - **Coverage raised on four packages:** `registry` 78.4 → 100%, `logdb`
   89.2 → 97.9%, `engine` 90.6 → 91.4%, `transport` 90.9 → 91.4%.
 - **Hot path benchmarked against 0.12.0** (`make bench-compare
-  BASELINE=v0.12.0-alpha` on ci-node-2, raft/engine/proto): no significant
+  BASELINE=v0.12.0-alpha` on the dual-socket bench host, raft/engine/proto): no significant
   change.
 - **Releases verify FIPS at runtime.** `make verify-fips`
   (`GODEBUG=fips140=only`) is now a release gate.
@@ -1413,7 +1413,7 @@ in place.
   new CRC, recovery truncates to an empty log with no hard state, and a quorum
   member upgraded in place can vote twice in one term.** Stop the node, wipe
   its WAL and NodeHost directories, upgrade and re-sync from peers, one replica
-  at a time; see `docs/compatibility.md` §WALFORMAT.
+  at a time; see the `WALFORMAT` marker in `docs/log-storage/engineering.md`.
 - `WithMaxFileSize` above 4 GiB − 1 returns `ErrInvalidMaxFileSize`.
 
 ### Changed — contrib/dragonboat
@@ -1471,7 +1471,7 @@ in place.
 - **`Node.CommittedIndex` is seeded from the recovered log at construction.**
   It read 0 until the first tick, so a proposal registered right after
   `StartShard` had no committed-index floor against replayed entries.
-- README badge, `docs/compatibility.md` and `SECURITY.md` now name the current
+- README badge, `docs/compatibility/architecture.md` and `SECURITY.md` now name the current
   release; stale doc paths and comments were corrected.
 
 ## [0.12.0-alpha] - 2026-09-16
@@ -2369,8 +2369,8 @@ commit.
   captured on that machine.** `test/performance/profiles/<name>/` holds
   `env.json` (captured by `capture-env.sh` on the target), `results/*.json`,
   generated `charts/` and `<system>.md` documents, and a hand-written
-  `analysis.md`. Two profiles are tracked: `omega` (single-socket,
-  desktop-grade) and `r640` (dual-socket, server-grade). The profile name is a
+  `analysis.md`. Two profiles are tracked: `omega` (the single-socket bench
+  host) and `r640` (the dual-socket bench host). The profile name is a
   required argument. A field the capture could not obtain renders as
   "not captured", never as zero.
 

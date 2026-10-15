@@ -587,7 +587,7 @@ jobs:
             echo "go get github.com/jeremyhahn/go-quicraft@v$VERSION"
             echo "\`\`\`"
             echo ""
-            echo "See [docs/compatibility.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/compatibility.md) for the API-stability guarantee and the upgrade path."
+            echo "See [docs/compatibility/architecture.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/compatibility/architecture.md) for the API-stability guarantee and the upgrade path."
           } >> release-notes.md
 
       # Tag immutability, checked against the remote.

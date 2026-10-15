@@ -13,7 +13,7 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Milestones
 
-- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 2 open, 62 closed.
+- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 3 open, 62 closed.
 
 ## Complete
 
@@ -51,7 +51,7 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Now
 
-No feature in progress. Open in the milestone: [#363](../../issues/363) (multi-group-host restart after a clean stop), [#369](../../issues/369) (docs clean-up).
+No feature in progress. Open in the milestone: [#363](../../issues/363) (multi-group-host restart after a clean stop), [#369](../../issues/369) (docs clean-up), [#370](../../issues/370) (CI in the devcontainer image).
 
 ## Next
 

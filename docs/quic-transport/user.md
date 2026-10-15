@@ -83,7 +83,7 @@ There is no setting for this; it follows from the host having a transport.
 Renewing a certificate on the same keypair keeps the identity. A new keypair is
 a new identity, and a restarted host must present the identity the shard
 committed for it. The full procedure is in
-[`../compatibility.md`](../compatibility/architecture.md#node-identities-are-mandatory).
+[`../compatibility/architecture.md`](../compatibility/architecture.md#node-identities-are-mandatory).
 
 ## Task: turn on revocation
 

@@ -109,7 +109,7 @@ var ErrWALFormatMalformed = errors.New("waldb: WAL format marker is malformed or
 // than a corruption investigation.
 //
 // There is no migration and no compatibility window. go-quicraft is pre-1.0 and
-// makes no on-disk guarantee across minor versions; see docs/compatibility.md.
+// makes no on-disk guarantee across minor versions; see docs/compatibility/architecture.md.
 // Wipe the data directory and let the node
 // re-sync from its peers, or restore from an exported snapshot.
 var ErrWALFormatUnsupportedVersion = errors.New("waldb: WAL directory was written in an on-disk format this build cannot read; wipe the data directory and re-sync this node")
@@ -128,7 +128,7 @@ var ErrWALFormatUnsupportedVersion = errors.New("waldb: WAL directory was writte
 // It is fatal for that reason alone. Adopting an absent marker would mean
 // assuming the segments are in the current format, and that assumption is
 // exactly what may not be made when being wrong destroys the log. Wipe the data
-// directory and re-sync this node; see docs/compatibility.md.
+// directory and re-sync this node; see docs/compatibility/architecture.md.
 var ErrWALFormatMissing = errors.New("waldb: WAL directory holds segments but no format marker, so it predates this on-disk format; wipe the data directory and re-sync this node")
 
 // WALFormatVersionError reports a marker recording a version this build cannot

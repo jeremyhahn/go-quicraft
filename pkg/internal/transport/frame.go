@@ -42,7 +42,7 @@ const (
 	// format in this repository it is PINNED at 1 for the whole pre-release
 	// period: a layout change is made in place and every peer is rebuilt, so
 	// the number does not move for it. Receivers gate on EXACT equality; see
-	// ValidateFrameHeader and docs/compatibility.md.
+	// ValidateFrameHeader and docs/compatibility/architecture.md.
 	WireVersion byte = 0x01
 
 	// MaxFrameSize is the maximum allowed frame payload size (16MB).
@@ -229,7 +229,7 @@ func ValidateFrameHeader(buf []byte) error {
 	// EXACT equality, not a range. Both ends of a QUIC connection are live
 	// processes and every format in this repository is pinned at version 1
 	// until the first production release, so there is no window of accepted
-	// versions to express — see docs/compatibility.md. Written as
+	// versions to express — see docs/compatibility/architecture.md. Written as
 	// `buf[2] >= 1 && buf[2] <= WireVersion` the gate degenerates to the same
 	// test today and silently WIDENS into a compatibility window the moment
 	// the constant moves, which is the drift the pinning policy exists to

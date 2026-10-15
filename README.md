@@ -243,7 +243,7 @@ usage guide. Good places to start:
 etcd-io/raft, Dragonboat and OpenRaft on single-node, 3-node and 5-node
 configurations. Each result set is tied to the machine that measured it. The
 most recent full run is the
-[`ci-node-2` profile](test/performance/profiles/ci-node-2/), a dual-socket <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
+[bench-host profile](test/performance/profiles/ci-node-2/), a dual-socket <!-- lab-string-ok: benchmark provenance: the link path is the profile directory, named for the machine that measured the numbers -->
 Xeon Gold 6258R server, measured 2026-10-04 with every engine on one common
 configuration (same timing, keys, warmup, durability and TLS; Dragonboat on its
 Tan LogDB). QuicRaft led Dragonboat in 12 of 18 head-to-head scenarios,

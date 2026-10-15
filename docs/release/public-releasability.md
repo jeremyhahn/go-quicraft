@@ -17,8 +17,8 @@ internal identities. Concretely, five classes:
 | Class | What it covers | Use instead |
 |---|---|---|
 | `lab-address` | An address on the fleet subnet | RFC 5737 documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) or a name under `.example` |
-| `lab-host` | A fleet hostname (`vstation-NN`, `dellemc-NN`, the GPU review box, the spare-capacity build and bench host) | The role, not the machine: `build-host.example`, `user@bench-host.example`, `forge.example`, `bench-01` |
-| `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, `/home/agent` |
+| `lab-host` | A fleet build or bench host name | The role, not the machine: `build-host.example`, `user@bench-host.example`, `forge.example`, `bench-01` |
+| `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
 | `owner-account` | The owner's account name on its own | A role: `user`, `operator`, or the module path |
 | `internal-identity` | An address in the internal mail domain, or an agent principal of the form `agent-<name>@...` on any domain | A neutral example identity: `release@example.invalid`, `ops@forge.example` |
 
