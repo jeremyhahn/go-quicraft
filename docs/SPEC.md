@@ -72,7 +72,7 @@ The current milestone is **Dev complete**: go-quicraft tags `-alpha` only, cuts 
 
 - #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably (testing). Met.
 - #283 is closed: the spec-review scrub of `docs/` is verified by the department and its fixes have landed. Met.
-- Every feature row is shipped, shard-pause included (a go-qrdb seam row).
+- Every feature row planned for Dev complete is shipped, shard-pause included (a go-qrdb seam row); heartbeat-under-fsync (#390) is planned after Dev complete.
 - Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped; it names none, since go-trusted-platform reaches consensus only through go-qrdb.
 - Nothing is dev complete until go-trusted-platform is, and every lower library has a stable, complete API.
 - CI conforms to `../handbook/software/conventions/ci-standard.md`: build, unit, integration, security and the latest-version check (`make build`, `make test`, `make integration-test`, `make security`, `make deps-check`), all in the project's devcontainer image (release). Partly met: `build/docker/devcontainer/` exists, the `integration` job runs `make integration-test` in the integration image, and the `image` job runs the other four stages in the toolchain image built at the commit under test. Not yet met: the canonical template's `build`, `test` and `security` jobs still run on the runner too, outside their `CUSTOMIZE` blocks, so only a template change can remove them.
