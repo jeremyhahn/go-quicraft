@@ -15,7 +15,6 @@
 package engine
 
 import (
-	"bytes"
 	"errors"
 	"log/slog"
 	"strings"
@@ -165,9 +164,9 @@ var _ Callback = (*raftMuProbeCallback)(nil)
 func TestNotePiggybackFailure_CountsAndRateLimits(t *testing.T) {
 	// captureLogOutput filters at ERROR; the degradation record is a WARN, so
 	// this test installs its own handler.
-	var logBuf bytes.Buffer
+	logBuf := &logCapture{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	defer slog.SetDefault(prev)
 
 	// Claim the report slot so the interval is running, and start from a known

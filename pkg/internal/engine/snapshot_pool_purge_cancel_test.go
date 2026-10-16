@@ -15,7 +15,6 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -44,13 +43,13 @@ func (b *blockingPurgeBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch u
 
 // capturePurgeLogs routes the default logger into a buffer at DEBUG for the
 // duration of the test.
-func capturePurgeLogs(t *testing.T) *bytes.Buffer {
+func capturePurgeLogs(t *testing.T) *logCapture {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &logCapture{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
+	return buf
 }
 
 // TestApplyPurge_LifetimeCancelAbandonsAtDebug pins that a purge the pool's

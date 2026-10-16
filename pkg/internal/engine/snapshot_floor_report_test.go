@@ -15,7 +15,6 @@
 package engine
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"log/slog"
@@ -125,12 +124,12 @@ func TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport(t *testing.T
 
 // captureWarnOutput installs a Warn-level slog handler backed by a buffer.
 // captureLogOutput filters at Error, which drops the record under test.
-func captureWarnOutput(t *testing.T) (*bytes.Buffer, func()) {
+func captureWarnOutput(t *testing.T) (*logCapture, func()) {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &logCapture{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	return &buf, func() { slog.SetDefault(prev) }
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	return buf, func() { slog.SetDefault(prev) }
 }
 
 // ---------------------------------------------------------------------------

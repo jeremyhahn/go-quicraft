@@ -61,6 +61,20 @@ func (c *logCapture) String() string {
 	return c.buf.String()
 }
 
+// Reset discards all output captured so far.
+func (c *logCapture) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf.Reset()
+}
+
+// Len returns the number of bytes captured so far.
+func (c *logCapture) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Len()
+}
+
 // Await returns the captured output once it contains want, or whatever was
 // captured when a five-second deadline passes.
 func (c *logCapture) Await(want string) string {
