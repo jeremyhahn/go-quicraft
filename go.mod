@@ -9,7 +9,7 @@ require (
 	github.com/jeremyhahn/go-enclave v0.8.0-rc.2
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	github.com/quic-go/quic-go v0.63.0
+	github.com/quic-go/quic-go v0.64.0
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.24.0
