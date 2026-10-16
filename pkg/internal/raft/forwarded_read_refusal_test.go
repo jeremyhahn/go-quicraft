@@ -73,6 +73,36 @@ func TestForwardedRead_UnreadyLeaderRejects(t *testing.T) {
 	requireReject(t, r, 2, 7)
 }
 
+// TestForwardedRead_RejectIsFreeOrder: while the engine's commit pipeline is
+// busy it transmits only what drainFreeOrderMessages returns, and an unready
+// leader's pipeline is busy for exactly the window its refusals cover. The
+// reject must come out of that drain, not wait in r.msgs for the next
+// GetUpdate (#376).
+func TestForwardedRead_RejectIsFreeOrder(t *testing.T) {
+	r := newTestRaft(1)
+	electLeader(r)
+	if r.hasCommittedEntryAtCurrentTerm() {
+		t.Fatal("fixture: the leader committed its term-opening entry")
+	}
+	r.msgs = r.msgs[:0]
+
+	if err := r.step(proto.Message{Type: proto.ReadIndex, From: 2, Term: r.term, Hint: 7}); err != nil {
+		t.Fatalf("an answered refusal is not a step error: %v", err)
+	}
+	var sent []proto.Message
+	for _, m := range r.drainFreeOrderMessages() {
+		if m.Type == proto.ReadIndexResp {
+			sent = append(sent, m)
+		}
+	}
+	if len(sent) != 1 || !sent[0].Reject || sent[0].To != 2 || sent[0].Hint != 7 {
+		t.Fatalf("free-order drain returned ReadIndexResp %+v, want one reject to 2 for key 7", sent)
+	}
+	if left := readIndexResps(r); len(left) != 0 {
+		t.Fatalf("the reject was also left in r.msgs: %+v", left)
+	}
+}
+
 // TestForwardedRead_TransferringLeaderRejects covers the refusal a read-ready
 // follower cannot predict from its own state: a leader in a leadership
 // transfer refuses reads, and must say so to the follower.

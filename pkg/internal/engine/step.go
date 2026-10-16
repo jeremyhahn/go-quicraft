@@ -1009,7 +1009,7 @@ func (w *stepWorker) enqueueForCommit(shardID uint64, node *Node, update proto.U
 	if len(update.Messages) > 0 {
 		w.freeOrderBuf = w.freeOrderBuf[:0]
 		for i := range update.Messages {
-			if proto.IsFreeOrderMessage(update.Messages[i].Type) {
+			if proto.IsFreeOrder(&update.Messages[i]) {
 				w.freeOrderBuf = append(w.freeOrderBuf, update.Messages[i])
 			} else {
 				item.orderedMsgs = append(item.orderedMsgs, update.Messages[i])
@@ -1386,7 +1386,7 @@ func (w *stepWorker) commitMemoryMode(node *Node, update proto.Update) bool {
 	w.orderedMsgBuf = w.orderedMsgBuf[:0]
 	if len(update.Messages) > 0 {
 		for i := range update.Messages {
-			if proto.IsFreeOrderMessage(update.Messages[i].Type) {
+			if proto.IsFreeOrder(&update.Messages[i]) {
 				w.freeOrderBuf = append(w.freeOrderBuf, update.Messages[i])
 			} else {
 				w.orderedMsgBuf = append(w.orderedMsgBuf, update.Messages[i])

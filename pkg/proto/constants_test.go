@@ -199,6 +199,29 @@ func TestIsFreeOrderMessage_UnknownType(t *testing.T) {
 	}
 }
 
+// TestIsFreeOrder_ReadIndexResp verifies that a leader's refusal of a
+// forwarded read is free-order while an accepted ReadIndexResp stays ordered,
+// and that every other message follows its type's classification.
+func TestIsFreeOrder_ReadIndexResp(t *testing.T) {
+	if !IsFreeOrder(&Message{Type: ReadIndexResp, Reject: true}) {
+		t.Error("a rejected ReadIndexResp is ordered, want free-order")
+	}
+	if IsFreeOrder(&Message{Type: ReadIndexResp}) {
+		t.Error("an accepted ReadIndexResp is free-order, want ordered")
+	}
+	for _, m := range []Message{
+		{Type: Replicate},
+		{Type: Heartbeat},
+		{Type: ReplicateResp, Reject: true},
+		{Type: RequestVoteResp, Reject: true},
+		{Type: HeartbeatResp},
+	} {
+		if got, want := IsFreeOrder(&m), IsFreeOrderMessage(m.Type); got != want {
+			t.Errorf("IsFreeOrder(type %d, reject %v) = %v, want %v", m.Type, m.Reject, got, want)
+		}
+	}
+}
+
 // TestStateMachineTypeName verifies that all known state machine type
 // codes return their expected human-readable names.
 func TestStateMachineTypeName(t *testing.T) {

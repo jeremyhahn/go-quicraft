@@ -4993,7 +4993,7 @@ func (r *raft) drainMessages() []proto.Message {
 // inside processCommitPendingInbox, so reusing freeMsgBuf there would let one
 // worker overwrite the batch the other is still sending. Operating on the
 // caller's already-swapped drainMessages() slice keeps each worker on its own
-// storage while applying the identical proto.IsFreeOrderMessage rule.
+// storage while applying the identical proto.IsFreeOrder rule.
 //
 // The in-place compaction is safe because the write index never runs ahead of
 // the read index, and r.msgs is the OTHER half of the drainMessages double
@@ -5001,7 +5001,7 @@ func (r *raft) drainMessages() []proto.Message {
 func (r *raft) withholdOrderedMessages(msgs []proto.Message) []proto.Message {
 	n := 0
 	for i := range msgs {
-		if proto.IsFreeOrderMessage(msgs[i].Type) {
+		if proto.IsFreeOrder(&msgs[i]) {
 			msgs[n] = msgs[i]
 			n++
 		} else {
@@ -5043,7 +5043,7 @@ func (r *raft) drainFreeOrderMessages() []proto.Message {
 	r.freeMsgBuf = r.freeMsgBuf[:0]
 	n := 0
 	for i := range r.msgs {
-		if proto.IsFreeOrderMessage(r.msgs[i].Type) {
+		if proto.IsFreeOrder(&r.msgs[i]) {
 			r.freeMsgBuf = append(r.freeMsgBuf, r.msgs[i])
 		} else {
 			r.msgs[n] = r.msgs[i]

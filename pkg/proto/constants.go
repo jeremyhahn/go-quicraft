@@ -443,6 +443,20 @@ func IsFreeOrderMessage(msgType uint64) bool {
 		msgType == RequestPreVote || msgType == RequestPreVoteResp
 }
 
+// IsFreeOrder is IsFreeOrderMessage for a message rather than a type, and it
+// is the predicate every free-order/ordered split applies. It adds the one
+// case the type alone cannot decide: a ReadIndexResp with Reject set. A
+// leader's refusal of a forwarded read names no index and depends on no
+// state the leader persists (Raft PhD 6.4 refuses the read precisely because
+// nothing of the term has committed), so it has nothing to wait for. Held as
+// ordered it waited out the leader's commit pipeline, which for a leader that
+// has not yet committed in its term is the whole window the refusal covers,
+// and the follower's caller waited with it (#376). An accepted ReadIndexResp
+// stays ordered.
+func IsFreeOrder(m *Message) bool {
+	return IsFreeOrderMessage(m.Type) || (m.Type == ReadIndexResp && m.Reject)
+}
+
 // State machine type constants.
 const (
 	RegularStateMachine    uint64 = 0

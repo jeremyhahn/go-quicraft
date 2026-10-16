@@ -1244,7 +1244,7 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	w.orderedMsgSplitBuf = w.orderedMsgSplitBuf[:0]
 	if len(piggyback.Messages) > 0 {
 		for j := range piggyback.Messages {
-			if proto.IsFreeOrderMessage(piggyback.Messages[j].Type) {
+			if proto.IsFreeOrder(&piggyback.Messages[j]) {
 				w.freeOrderBuf = append(w.freeOrderBuf, piggyback.Messages[j])
 			} else {
 				w.orderedMsgSplitBuf = append(w.orderedMsgSplitBuf, piggyback.Messages[j])

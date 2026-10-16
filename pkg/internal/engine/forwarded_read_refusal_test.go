@@ -110,6 +110,88 @@ func TestForwardedRead_NewLeaderNotReady_FailsFast(t *testing.T) {
 	}
 }
 
+// TestForwardedRead_RefusedUnderCommitPending_IsAnswered is the #376 shape: the
+// new leader has not committed in its term AND its commit/apply pipeline is
+// busy, so the forwarded ReadIndex is stepped by processCommitPendingInbox, not
+// processReady. That path transmits only free-order messages; a refusal kept
+// behind the pipeline waits as long as the pipeline does, and the follower's
+// caller waits with it. The reject carries no state the leader must persist
+// first, so it leaves now, and the read is still never served (PhD 6.4).
+func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
+	const shardID = 43
+	c, cbs := newCallbackCluster(t, shardID)
+	c.router.setDrop(func(m proto.Message) bool { return m.Type == proto.Replicate })
+
+	leader := c.waitForLeader(t, 10*time.Second)
+	if leader == 0 {
+		t.Fatal("no leader elected")
+	}
+	follower := leader%3 + 1
+	fnode := c.replicas[follower].node
+	lnode := c.replicas[leader].node
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if l, _ := fnode.LeaderAndTerm(); l == leader {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("follower %d never learned leader %d", follower, leader)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Hold the leader in commitPending. A hand-off in flight when the flag is
+	// raised clears it on completion, so raise it until it stays up; once it
+	// does, processReady skips the leader and nothing else lowers it.
+	t.Cleanup(func() {
+		lnode.commitPending.Store(false)
+		c.replicas[leader].engine.NotifyWork(shardID)
+	})
+	held := false
+	for range 100 {
+		lnode.commitPending.Store(true)
+		time.Sleep(50 * time.Millisecond)
+		if lnode.commitPending.Load() {
+			held = true
+			break
+		}
+	}
+	if !held {
+		t.Fatal("fixture: the leader's commitPending would not stay raised")
+	}
+	if got := lnode.CommittedIndex(); got != 0 {
+		t.Fatalf("fixture: the leader committed index %d with every Replicate dropped", got)
+	}
+
+	// Delivered to the leader as the transport would: a follower that has not
+	// seen the term commit refuses its own reads locally, so the leader's
+	// refusal is reached by a read relayed across a leader change.
+	_, term := lnode.LeaderAndTerm()
+	const key = 0x376
+	if !c.replicas[leader].engine.DeliverMessage(shardID, proto.Message{
+		Type:    proto.ReadIndex,
+		ShardID: shardID,
+		From:    follower,
+		To:      leader,
+		Term:    term,
+		Hint:    key,
+	}) {
+		t.Fatal("DeliverMessage(ReadIndex) refused")
+	}
+	c.replicas[leader].engine.NotifyWork(shardID)
+
+	if err := awaitReadFailure(t, cbs[follower], key); !errors.Is(err, raft.ErrReadIndexNotReady) {
+		t.Fatalf("read failed with %v, want ErrReadIndexNotReady", err)
+	}
+	if !lnode.commitPending.Load() {
+		t.Fatal("fixture: the leader left commitPending before the refusal arrived; " +
+			"the reject may have gone out through processReady instead")
+	}
+	if got := lnode.CommittedIndex(); got != 0 {
+		t.Fatalf("the leader committed index %d while held; the refusal proves nothing", got)
+	}
+}
+
 // TestForwardedRead_LeaderRefusalIsAnswered covers the refusal a read-ready
 // follower cannot predict: the leader is mid leadership transfer (to a
 // replica that is down, so the transfer aborts and the leader stays leader).

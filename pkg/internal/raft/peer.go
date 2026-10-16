@@ -1884,7 +1884,7 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	// withheld, never dropped: len(r.msgs) > 0 keeps HasUpdate true, and the
 	// next GetUpdate cycle — which DOES carry EntriesToSave through SaveState —
 	// releases them after the fsync. This reuses the existing free-order split
-	// (proto.IsFreeOrderMessage) rather than inventing a second rule; the
+	// (proto.IsFreeOrder) rather than inventing a second rule; the
 	// step worker applies exactly the same predicate for the same reason while
 	// commitPending is set.
 	if len(p.r.msgs) > 0 {
