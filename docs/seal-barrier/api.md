@@ -240,7 +240,7 @@ true for both `ContextBindingUnsupported` and `ContextBindingPlaintext`;
 
 ```go
 func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (enclave.ByteAccess, error)
 func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
 func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed *SealedRootKey) error
 ```
@@ -277,7 +277,7 @@ Implementer obligations:
 
 - Every method takes a `context.Context` where it may block on an external
   device, and `Credentials` by value.
-- `Credentials.Secret` is a `*enclave.Sealed` (built by
+- `Credentials.Secret` is an `enclave.Sealed` (built by
   `NewCredentials`, which wipes the caller's slice). The caller owns it; a
   strategy opens it, uses the plaintext and destroys the opened copy, and never
   destroys the credential itself. Each strategy interprets it differently: the

@@ -75,7 +75,7 @@ type ProtectedSealingStrategy interface {
 	// The caller retains ownership of rootKey — this method neither destroys
 	// it nor takes it over. Passing a nil or destroyed enclave is an error,
 	// not an empty key.
-	SealRootKeyProtected(ctx context.Context, rootKey *enclave.Memory, creds Credentials) (*SealedRootKey, error)
+	SealRootKeyProtected(ctx context.Context, rootKey enclave.ByteAccess, creds Credentials) (*SealedRootKey, error)
 
 	// UnsealRootKeyProtected decrypts the root key into locked memory and
 	// returns the enclave holding it. It is UnsealRootKey with the output on
@@ -90,7 +90,7 @@ type ProtectedSealingStrategy interface {
 	// ErrLockedMemoryUnavailable. The enclave is returned FROZEN: its contents are
 	// final, a stray write through a retained slice faults rather than
 	// corrupting the root key, and Destroy is what releases them.
-	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.Memory, error)
+	UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (enclave.ByteAccess, error)
 }
 
 // Compile-time assertions that both strategies this package implements satisfy

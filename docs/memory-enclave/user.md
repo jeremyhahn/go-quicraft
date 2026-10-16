@@ -168,7 +168,7 @@ it bounds how long they linger.
 
 ## Supply a passphrase to go-quicraft's seal layer
 
-`seal.Credentials.Secret` is a `*enclave.Sealed`. Build one with the
+`seal.Credentials.Secret` is an `enclave.Sealed`. Build one with the
 constructor, which consumes your slice:
 
 ```go

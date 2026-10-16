@@ -27,7 +27,7 @@ import (
 // enclaveProtection asks the kernel how e's pages are mapped. The address is
 // read inside a borrow, so the view never outlives it; ProtectionOf never
 // dereferences the slice, only locates its mapping.
-func enclaveProtection(t *testing.T, e *enclave.Memory) (lockedmem.Protection, error) {
+func enclaveProtection(t *testing.T, e enclave.ByteAccess) (lockedmem.Protection, error) {
 	t.Helper()
 	var (
 		prot lockedmem.Protection
@@ -56,7 +56,7 @@ func enclaveProtection(t *testing.T, e *enclave.Memory) (lockedmem.Protection, e
 // KERNEL what it believes about the page, which is the only witness that cannot
 // be fooled by the library's own bookkeeping.
 //
-// Verified by mutation: deleting the `out.Freeze()` call in
+// Verified by mutation: deleting the `freezeEnclave(out)` call in
 // UnsealRootKeyProtected fails here with
 //
 //	strategy_freeze_linux_test.go:81: the unsealed root key is mapped "rw-p":

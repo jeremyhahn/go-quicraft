@@ -28,7 +28,7 @@ import (
 // the plaintext copy the test compares against. The comparison copy is the
 // TEST's own material, deliberately outside the enclave: a yardstick read back
 // out of the thing under test would move with it.
-func protectedRootKey(t *testing.T) (*enclave.Memory, []byte) {
+func protectedRootKey(t *testing.T) (enclave.ByteAccess, []byte) {
 	t.Helper()
 	want := make([]byte, rootKeySize)
 	if _, err := rand.Read(want); err != nil {
@@ -46,7 +46,7 @@ func protectedRootKey(t *testing.T) (*enclave.Memory, []byte) {
 
 // assertEnclaveHolds compares an enclave's contents INSIDE the borrow, so the
 // assertion never makes its own unprotected copy of the key it is checking.
-func assertEnclaveHolds(t *testing.T, enc *enclave.Memory, want []byte) {
+func assertEnclaveHolds(t *testing.T, enc enclave.ByteAccess, want []byte) {
 	t.Helper()
 	if err := enc.WithBytes(func(got []byte) error {
 		if !bytes.Equal(got, want) {
@@ -235,7 +235,7 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		rootKey *enclave.Memory
+		rootKey enclave.ByteAccess
 		want    error
 	}{
 		{"nil enclave", nil, ErrInvalidRootKeySize},
@@ -445,7 +445,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 		wrongSize := mustSized(t, rootKeySize-1)
 		destroyOnCleanup(t, wrongSize)
 
-		for name, enc := range map[string]*enclave.Memory{
+		for name, enc := range map[string]enclave.ByteAccess{
 			"nil":        nil,
 			"destroyed":  destroyed,
 			"undersized": wrongSize,

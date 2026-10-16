@@ -67,6 +67,6 @@ No SPEC feature is future.
 
 ## Dependencies
 
-- Up: go-enclave v0.8.0-rc.2 (pinned, the newest tag); its post-rc.2 interface change (go-enclave#201) and the enclave-interface adoption wait on go-enclave#138; v1.0.0 needs a go-enclave public release.
+- Up: go-enclave v0.9.0-alpha (pinned, the newest tag), which carries the enclave-interface API (go-enclave#138, #201); v1.0.0 needs a go-enclave public release.
 - Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.22.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).
 - Standards watch: draft-irtf-cfrg-xchacha pinned at -03 (`AlgXChaCha20Poly1305`) — [pkg/seal](pkg/seal); copy in [docs/references/](docs/references/README.md)

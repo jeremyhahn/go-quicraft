@@ -23,16 +23,16 @@ func CombineUnverified(shares []*Share) ([]byte, error)
 
 // Split / combine: protected-memory form
 func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, error)
-func CombineProtected(shares []*ProtectedShare) (*enclave.Memory, error)
+func CombineProtected(shares []*ProtectedShare) (enclave.ByteAccess, error)
 func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedShare, error)
 func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error)
 
 // The same, with every locked region charged to a go-enclave Allocator;
 // a nil allocator is refused with enclave.ErrNilAllocator
-func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
-func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.Memory, error)
-func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
-func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error)
+func SplitProtectedWith(a enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error)
+func CombineProtectedWith(a enclave.Allocator, shares []*ProtectedShare) (enclave.ByteAccess, error)
+func NewProtectedShareWith(a enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
+func UnmarshalShareSetWith(a enclave.Allocator, data []byte) ([]*ProtectedShare, error)
 
 // Split / combine: wipeable bytes form
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
@@ -51,7 +51,7 @@ type Share struct {
 
 func (s *Share) Bytes() ([]byte, error)
 func (s *Share) Protect() (*ProtectedShare, error)
-func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error)
+func (s *Share) ProtectWith(a enclave.Allocator) (*ProtectedShare, error)
 func (s *Share) Validate() error
 func (s *Share) String() string
 func (s *Share) LogValue() slog.Value
@@ -63,7 +63,7 @@ type ProtectedShare struct {
     Threshold int
     Total     int
     Metadata  map[string]string   // NOT protected memory: no secrets here
-    // value is unexported: it lives in an enclave.Memory
+    // value is unexported: it lives in an enclave.ByteAccess
 }
 
 func (s *ProtectedShare) WithValue(fn func([]byte) error) error
@@ -101,13 +101,13 @@ N shares at once is the widest exposure in the scheme. That field, and the
 are deprecated.
 
 The replacement is `ProtectedShare`, whose value lives in a frozen
-`enclave.Memory`: mlock'd, guard-paged, canary-checked, and wiped by
+`enclave.ByteAccess`: mlock'd, guard-paged, canary-checked, and wiped by
 `Destroy`.
 
 | Deprecated (string custody) | Protected replacement |
 |---|---|
 | `Split` | `SplitProtected` |
-| `Combine`, `CombineUnverified` | `CombineProtected` (returns the secret in a `*enclave.Memory`) |
+| `Combine`, `CombineUnverified` | `CombineProtected` (returns the secret in an `enclave.ByteAccess`) |
 | `&Share{…, Value: v}` | `NewProtectedShare(index, threshold, total, value)`: wipes the source on success and on `*ProtectedMemoryError`; leaves it untouched on `*ValidationError` |
 | an existing `*Share` | `(*Share).Protect()`, or `(*Share).ProtectWith(a)` under a locked-memory budget |
 
@@ -144,7 +144,7 @@ type ProtectedShareSplitter interface {
 type ProtectedShareAccumulator interface {
     AddProtectedShare(ctx context.Context, share *shamir.ProtectedShare) (*QuorumProgress, error)
     GetProgress() *QuorumProgress
-    ReconstructProtected(ctx context.Context) (*enclave.Memory, error)
+    ReconstructProtected(ctx context.Context) (enclave.ByteAccess, error)
     Reset()
     Expired() bool
 }
@@ -190,7 +190,7 @@ consumer could then migrate to `SplitProtected`/`CombineProtected`, silence ever
 Both ends of the protected family are protected deliberately: `AddProtectedShare`
 takes ownership of a share already in locked memory (destroying it whether or not
 it is accepted and whether or not the quorum completes), and
-`ReconstructProtected` returns the secret in an `enclave.Memory` rather
+`ReconstructProtected` returns the secret in an `enclave.ByteAccess` rather
 than an ordinary `[]byte`. Protecting one end only would leave the exposure
 intact at the other.
 
@@ -213,12 +213,12 @@ optional sibling interface sits beside them:
 type ProtectedSealingStrategy interface {
     SealingStrategy
 
-    SealRootKeyProtected(ctx context.Context, rootKey *enclave.Memory, creds Credentials) (*SealedRootKey, error)
-    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.Memory, error)
+    SealRootKeyProtected(ctx context.Context, rootKey enclave.ByteAccess, creds Credentials) (*SealedRootKey, error)
+    UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (enclave.ByteAccess, error)
 }
 
 type Credentials struct {
-    Secret *enclave.Sealed
+    Secret enclave.Sealed
 }
 
 func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) // moves and WIPES secret
@@ -259,7 +259,7 @@ reference implementation ignores is not a contract.
 Both sides of the boundary are protected. For a deferred-passphrase strategy the
 passphrase is that key's protection, not a lesser secret, so accepting it in a
 plain `[]byte` would protect the wrong half. `Credentials.Secret` is a
-`*enclave.Sealed` for every strategy method.
+`enclave.Sealed` for every strategy method.
 
 Every root-key method derives straight from the credential's sealed passphrase
 rather than building a temporary inner strategy from a plain slice, so a

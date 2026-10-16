@@ -75,7 +75,7 @@ func (b *Barrier) NonceTracker() NonceTrackerProvider
 func (b *Barrier) SealedRootKeyData() *SealedRootKey
 func (b *Barrier) StampSealedStateMAC(ctx context.Context, sealed *SealedRootKey) error
 func (b *Barrier) RootKey(ctx context.Context) ([]byte, error)
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error)
+func (b *Barrier) RootKeyProtected(ctx context.Context) (enclave.ByteAccess, error)
 ```
 
 The three methods that open the sealed root key take the caller's context and

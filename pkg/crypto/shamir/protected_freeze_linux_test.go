@@ -39,7 +39,7 @@ import (
 
 // TestSplitProtected_ShareValuesAreFrozen is a mutation target.
 //
-// Verified by mutation: deleting the `value.Freeze()` call in
+// Verified by mutation: deleting the `freeze(value)` call in
 // SplitProtected fails here with
 //
 //	protected_freeze_linux_test.go:66: share 1's value is mapped "rw-p": it was
@@ -78,7 +78,7 @@ func TestSplitProtected_ShareValuesAreFrozen(t *testing.T) {
 
 // TestCombineProtected_ReconstructedSecretIsFrozen is the other mutation target.
 //
-// Verified by mutation: deleting the `scratch.Freeze()` call in
+// Verified by mutation: deleting the `freeze(secret)` call in
 // CombineProtected fails here with
 //
 //	protected_freeze_linux_test.go:106: the reconstructed secret is mapped "rw-p":

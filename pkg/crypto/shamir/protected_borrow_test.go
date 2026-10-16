@@ -78,7 +78,7 @@ func TestBorrow_FreezeAfterTheCallback(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	if err := e.Freeze(); err != nil {
+	if err := freeze(e); err != nil {
 		t.Fatalf("Freeze after the borrow: %v", err)
 	}
 	if eq, err := e.EqualTo(want); err != nil || !eq {

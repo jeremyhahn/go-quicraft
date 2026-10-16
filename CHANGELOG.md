@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: go-enclave is v0.9.0-alpha (was v0.8.0-rc.2). Its
+  constructors return interfaces, so every signature here that named a
+  go-enclave pointer type now names the interface:
+  - `*enclave.Memory` is gone; locked plaintext is `enclave.ByteAccess`.
+    `seal.Credentials.Secret`, `Barrier.RootKeyProtected`,
+    `SealRootKeyProtected`, `UnsealRootKeyProtected`, `ReconstructProtected`,
+    `shamir.CombineProtected`, `CombineProtectedWith` and the other
+    protected-memory surfaces in `pkg/seal` and `pkg/crypto/shamir` take or
+    return `enclave.ByteAccess`.
+  - `*enclave.Sealed`, `*enclave.Sealer` and `*enclave.Allocator` are the
+    interfaces `enclave.Sealed`, `enclave.Sealer` and `enclave.Allocator`;
+    drop the `*`.
+  - `Freeze` is the `enclave.Freezer` capability, reached with `enclave.As`.
+    The unsealed root key, Shamir share values and a reconstructed secret are
+    still frozen; a handle without the capability is refused with a
+    `*enclave.CapabilityError` rather than returned writable.
+  - A nil `ByteAccess` passed to `SealRootKeyProtected` is refused as the
+    wrong size, as a nil `*Memory` was.
+
+  No wire or on-disk format changed.
+
 ## [0.23.0-alpha] - 2026-10-16
 
 A MINOR bump: the go-enclave adoption below changes exported types (pre-1.0, a

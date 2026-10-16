@@ -67,7 +67,11 @@ func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
 			"or every consumer's freeze assertion passes vacuously", before)
 	}
 
-	if err := e.Freeze(); err != nil {
+	var f enclave.Freezer
+	if !enclave.As(e, &f) {
+		t.Fatal("the memory enclave lacks the Freezer capability")
+	}
+	if err := f.Freeze(); err != nil {
 		t.Fatalf("Freeze: %v", err)
 	}
 	after, err := protection()

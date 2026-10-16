@@ -40,7 +40,7 @@ func MustNewBarrier(config BarrierConfig) *Barrier { return seal.MustNewBarrier(
 // NewCredentials calls seal.NewCredentials, CONSUMING the caller's slice.
 //
 // Credentials is re-exported above, and its Secret field is an
-// *enclave.Sealed, so seal.NewCredentials is the only supported way to
+// enclave.Sealed, so seal.NewCredentials is the only supported way to
 // populate one. Without this re-export the package would expose a type its own
 // consumers could not construct.
 func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) {

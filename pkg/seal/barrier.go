@@ -196,18 +196,18 @@ type Barrier struct {
 	config BarrierConfig // algorithm selection, deployment identity, tracking config
 
 	state   barrierState
-	rootKey *enclave.Sealed // 32 bytes, held as ciphertext at rest; opened into locked memory
-	salt    []byte          // 32 bytes, generated at Initialize, used for HKDF
+	rootKey enclave.Sealed // 32 bytes, held as ciphertext at rest; opened into locked memory
+	salt    []byte         // 32 bytes, generated at Initialize, used for HKDF
 
 	// hkdfVersion is the DEK-derivation info layout in force. Set to
 	// currentHKDFVersion for a fresh barrier and overwritten from the
 	// persisted SealedRootKey by SetSealedRootKey.
 	hkdfVersion HKDFVersion
 
-	epoch      uint64                     // current key rotation epoch
-	currentDEK *enclave.Sealed            // derived via HKDF from rootKey + epoch, encrypted at rest
-	cipher     cipher.AEAD                // current epoch's AEAD cipher (cached, opaque)
-	deks       map[uint64]*enclave.Sealed // epoch -> DEK encrypted at rest for re-derivation
+	epoch      uint64                    // current key rotation epoch
+	currentDEK enclave.Sealed            // derived via HKDF from rootKey + epoch, encrypted at rest
+	cipher     cipher.AEAD               // current epoch's AEAD cipher (cached, opaque)
+	deks       map[uint64]enclave.Sealed // epoch -> DEK encrypted at rest for re-derivation
 	ciphers    map[uint64]cipher.AEAD
 
 	// knownEpochs tracks all epochs that have been used (via Initialize or
@@ -352,7 +352,7 @@ type Barrier struct {
 	// strategy's heap copy is still wiped.
 	//
 	// Defaults to enclave.NewMemorySized; nothing but a test assigns it.
-	lockRootKey func(int) (*enclave.Memory, error)
+	lockRootKey func(int) (enclave.ByteAccess, error)
 }
 
 // releaseEnclave destroys a locked-memory enclave this package created for its
@@ -388,7 +388,10 @@ type Barrier struct {
 //
 // Detected canary corruption still panics inside Destroy; that is go-enclave's
 // one deliberate panic and is not caught here.
-func releaseEnclave(e *enclave.Memory, what string) {
+func releaseEnclave(e enclave.ByteAccess, what string) {
+	if e == nil {
+		return
+	}
 	if err := e.Destroy(); err != nil {
 		slog.Warn("quicraft/seal: locked memory release was refused or ran without a wipe",
 			"enclave", what,
@@ -397,13 +400,27 @@ func releaseEnclave(e *enclave.Memory, what string) {
 	}
 }
 
+// freezeEnclave makes e read-only through its Freezer capability. A handle
+// without the capability is refused with a *enclave.CapabilityError rather
+// than handed back writable.
+func freezeEnclave(e enclave.ByteAccess) error {
+	var f enclave.Freezer
+	if !enclave.As(e, &f) {
+		return &enclave.CapabilityError{Backend: e.Backend().Name(), Capability: enclave.CapabilityFreeze}
+	}
+	return f.Freeze()
+}
+
 // releaseSealed destroys a enclave.Sealed on a cleanup path, logging a failure
 // the way releaseEnclave does. go-enclave documents Sealed.Destroy's
 // error as always nil today, returned to match Memory.Destroy: the
 // ciphertext lives on the ordinary heap, so there is no lock or mapping for a
 // release to be refused. Logging it rather than discarding it means a future
 // failure is seen instead of silently dropped.
-func releaseSealed(s *enclave.Sealed, what string) {
+func releaseSealed(s enclave.Sealed, what string) {
+	if s == nil {
+		return
+	}
 	if err := s.Destroy(); err != nil {
 		slog.Warn("quicraft/seal: sealed key release failed",
 			"enclave", what,
@@ -480,7 +497,7 @@ func NewBarrier(config BarrierConfig) (*Barrier, error) {
 		config:         config,
 		state:          barrierUninitialized,
 		hkdfVersion:    currentHKDFVersion,
-		deks:           make(map[uint64]*enclave.Sealed),
+		deks:           make(map[uint64]enclave.Sealed),
 		ciphers:        make(map[uint64]cipher.AEAD),
 		knownEpochs:    make(map[uint64]struct{}),
 		inFlightEpochs: make(map[uint64]int64),
@@ -594,6 +611,9 @@ func (b *Barrier) Initialize(ctx context.Context, strategy SealingStrategy, cred
 	rootEnc, err := b.lockRootKey(rootKeySize)
 	if err != nil {
 		return &Error{Strategy: "initialize", Err: err}
+	}
+	if rootEnc == nil {
+		return &Error{Strategy: "initialize", Err: enclave.ErrEnclaveDestroyed}
 	}
 	defer releaseEnclave(rootEnc, "root key")
 
@@ -1017,11 +1037,16 @@ func (b *Barrier) Unseal(ctx context.Context, strategy SealingStrategy, creds Cr
 	//
 	// Sized rather than from-bytes for the same reason as Initialize: the pages
 	// must stay writable so the terminal enclave.NewSealed can wipe them as it
-	// consumes them. Memory.Freeze is deliberately NOT used
+	// consumes them. Freeze is deliberately NOT used
 	// here — a wipe of frozen pages faults the process.
 	rootEnc, encErr := b.lockRootKey(rootKeySize)
 	if encErr != nil {
 		return &Error{Strategy: "unseal", Err: encErr}
+	}
+	// A nil enclave with a nil error is a refusal too: go-enclave's handles are
+	// interfaces, and a nil one cannot be borrowed from.
+	if rootEnc == nil {
+		return &Error{Strategy: "unseal", Err: enclave.ErrEnclaveDestroyed}
 	}
 	defer releaseEnclave(rootEnc, "root key")
 
@@ -1125,7 +1150,7 @@ func (b *Barrier) unsealWithRootKey(ctx context.Context, strategy SealingStrateg
 	// path. The one plain slice that outlives a failure is `dek`, derived before
 	// this loop and not yet sealed, which is why the two returns below wipe it
 	// by hand.
-	newDEKs := make(map[uint64]*enclave.Sealed)
+	newDEKs := make(map[uint64]enclave.Sealed)
 	newCiphers := make(map[uint64]cipher.AEAD)
 	failed := func(err error) error {
 		for _, pk := range newDEKs {
@@ -1455,7 +1480,7 @@ func (b *Barrier) seal() error {
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
-	b.deks = make(map[uint64]*enclave.Sealed)
+	b.deks = make(map[uint64]enclave.Sealed)
 	// Caveat, and it is the ONLY one: each cipher.AEAD below holds a COPY of
 	// its DEK inside its internal key schedule (AES expanded key / ChaCha key).
 	// Go's stdlib and x/crypto AEADs expose no key-wipe API, so dropping these
@@ -1569,7 +1594,7 @@ func (b *Barrier) Reset() error {
 	b.rootKey = nil
 	b.currentDEK = nil
 	b.cipher = nil
-	b.deks = make(map[uint64]*enclave.Sealed)
+	b.deks = make(map[uint64]enclave.Sealed)
 	b.ciphers = make(map[uint64]cipher.AEAD)
 	b.knownEpochs = make(map[uint64]struct{})
 	b.salt = nil
@@ -2856,7 +2881,7 @@ func (b *Barrier) RootKey(ctx context.Context) ([]byte, error) {
 // denying mprotect checks what Destroy returns rather than deferring it bare.
 // This is the same trade UnsealRootKeyProtected and every from-bytes enclave
 // already make.
-func (b *Barrier) RootKeyProtected(ctx context.Context) (*enclave.Memory, error) {
+func (b *Barrier) RootKeyProtected(ctx context.Context) (enclave.ByteAccess, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.state != barrierUnsealed {

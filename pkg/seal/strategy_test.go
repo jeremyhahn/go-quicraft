@@ -299,7 +299,7 @@ func TestSoftwareStrategy_PassphraseInEnclave(t *testing.T) {
 	defer s.Close()
 
 	// The passphrase should be stored in a sealed enclave.
-	buf, openErr := s.passphrase.Load().Open(context.Background())
+	buf, openErr := (*s.passphrase.Load()).Open(context.Background())
 	if openErr != nil {
 		t.Fatalf("passphrase.Open() failed: %v", openErr)
 	}

@@ -3,7 +3,7 @@
 > **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
-Import path: `github.com/jeremyhahn/go-enclave` (v0.8.0-rc.2 in `go.mod`).
+Import path: `github.com/jeremyhahn/go-enclave` (v0.9.0-alpha in `go.mod`).
 
 go-quicraft implements none of this. There is no `pkg/enclave` and no
 protected-memory type, alias or wrapper in this repository, and
@@ -13,27 +13,27 @@ contract this repository codes against and the obligations it accepts.
 ## 1. Surface used
 
 ```go
-// Locked plaintext
-func enclave.NewMemorySized(n int) (*Memory, error)      // writable; fill in place
-func enclave.NewMemory(data []byte) (*Memory, error)     // moves data in; FROZEN
-func enclave.NewMemoryCopy(src []byte) (*Memory, error)  // copies; FROZEN; src untouched
-func (e *Memory) WithBytes(fn func([]byte) error) error // the only read path
-func (e *Memory) Freeze() error               // post-fill mprotect; irreversible
-func (e *Memory) EqualTo(other []byte) (bool, error)
-func (e *Memory) Size() int
-func (e *Memory) IsAlive() bool
-func (e *Memory) Destroy() error              // reports a refused or unwiped release
+// Locked plaintext: a memory enclave, held as the ByteAccess interface
+func enclave.NewMemorySized(n int) (ByteAccess, error)      // writable; fill in place
+func enclave.NewMemory(data []byte) (ByteAccess, error)     // moves data in; FROZEN
+func enclave.NewMemoryCopy(src []byte) (ByteAccess, error)  // copies; FROZEN; src untouched
+ByteAccess.WithBytes(fn func([]byte) error) error // the only read path
+Freezer.Freeze() error                  // post-fill mprotect; irreversible; reached with enclave.As
+ByteAccess.EqualTo(other []byte) (bool, error)
+ByteAccess.Size() int
+ByteAccess.IsAlive() bool
+ByteAccess.Destroy() error              // reports a refused or unwiped release
 
-// Ciphertext at rest
-func enclave.NewSealed(ctx context.Context, data []byte) (*Sealed, error)
-func (s *Sealed) Open(ctx context.Context) (*Memory, error) // caller OWNS the result; FROZEN
-func (s *Sealed) Openable() error
-func (s *Sealed) IsAlive() bool
-func (s *Sealed) Destroy() error                  // WIPES the ciphertext; always nil today
+// Ciphertext at rest: the Sealed interface
+func enclave.NewSealed(ctx context.Context, data []byte) (Sealed, error)
+Sealed.Open(ctx context.Context) (ByteAccess, error) // caller OWNS the result; FROZEN
+Sealed.Openable() error
+Sealed.IsAlive() bool
+Sealed.Destroy() error                  // WIPES the ciphertext; always nil today
 
-// Budgeted allocation (pkg/crypto/shamir's ...With entry points)
-func (a *Allocator) New(data []byte) (*Memory, error)  // moves data in; wipes data on every path
-func (a *Allocator) NewSized(n int) (*Memory, error)   // writable; fill in place
+// Budgeted allocation (pkg/crypto/shamir's ...With entry points): the Allocator interface
+Allocator.New(data []byte) (ByteAccess, error)  // moves data in; wipes data on every path
+Allocator.NewSized(n int) (ByteAccess, error)   // writable; fill in place
 
 // Utility
 func enclave.Wipe(b []byte)
@@ -139,10 +139,13 @@ passes is valid for the callback alone.
   the pages released, so nothing leaks; if the release was also refused the
   error matches `ErrLockedMemoryUnavailable` too. The cleanup helpers above log
   or drop it like any other release report.
-- **A `nil` `*Memory` or `*Sealed` is a valid receiver.** It
-  reports itself not alive, reads with `ErrEnclaveDestroyed` and destroys as a
-  no-op, which is why `Barrier.seal()` destroys `b.rootKey` and `b.currentDEK`
-  without nil checks.
+- **A nil `ByteAccess` or `Sealed` is a nil interface, not a valid
+  receiver.** go-enclave v0.9.0-alpha returns interfaces and a failed
+  constructor returns a nil one, so calling through it panics. The release
+  helpers (`releaseEnclave`, `releaseSealed`, shamir's `release`) skip a nil
+  value, which is why `Barrier.seal()` can release `b.rootKey` and
+  `b.currentDEK` without checks of its own, and `SealRootKeyProtected`
+  refuses a nil root key as the wrong size.
 - **No signal handler is installed.** Neither go-enclave nor this repository
   calls `signal.Reset` or registers a handler: a library does not get to detach
   the embedding application's handlers.
@@ -268,7 +271,7 @@ with an `enclave` field naming the role (`root key`, `epoch DEK`, ...) and the
 | Message | Helper | When |
 |---|---|---|
 | `quicraft/seal: locked memory release was refused or ran without a wipe` | `releaseEnclave` | `Memory.Destroy` returned non-nil |
-| `quicraft/seal: sealed key release failed` | `releaseSealed` | `Sealed.Destroy` returned non-nil (never, in go-enclave v0.8.0) |
+| `quicraft/seal: sealed key release failed` | `releaseSealed` | `Sealed.Destroy` returned non-nil (never, in go-enclave v0.9.0-alpha) |
 
 `pkg/crypto/shamir` has no logger and logs nothing. `pkg/seal` logs barrier lifecycle
 events without naming key material; see

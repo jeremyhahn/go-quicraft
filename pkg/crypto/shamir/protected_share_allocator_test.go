@@ -35,7 +35,7 @@ import (
 func pageBytes() int64 { return enclave.LockedSize(1) }
 
 // newBudget returns an allocator admitting exactly pages pages.
-func newBudget(t *testing.T, pages int64) *enclave.Allocator {
+func newBudget(t *testing.T, pages int64) enclave.Allocator {
 	t.Helper()
 	a, err := enclave.NewAllocator(pages * pageBytes())
 	if err != nil {

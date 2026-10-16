@@ -22,7 +22,7 @@ in the dependency graph. go-quicraft consumes two types:
 
 | Type | Holds | Guarantee |
 |---|---|---|
-| `enclave.Memory` | key material in plaintext, `mlock`'d, guard-paged, canary-checked, excluded from core dumps | `Destroy` wipes the bytes before unmapping |
+| `enclave.ByteAccess` | key material in plaintext, `mlock`'d, guard-paged, canary-checked, excluded from core dumps | `Destroy` wipes the bytes before unmapping |
 | `enclave.Sealed` | key material encrypted at rest on the ordinary heap; plaintext only inside an `Open` | `Destroy` wipes the ciphertext and the wrapped-key blob |
 
 A `Memory` keeps plaintext locked for its whole lifetime: unswappable and
@@ -52,14 +52,14 @@ and frozen (see "Fill, freeze, hand over").
 
 | Site | Type | Why |
 |---|---|---|
-| `Barrier.rootKey` | `*Sealed` | opened on rotation, export, unseal and MAC restamp, not per frame |
-| `Barrier.currentDEK`, `Barrier.deks[epoch]` | `*Sealed` | never opened; kept so a DEK can be re-derived |
-| `SoftwareStrategy.passphrase` | `*Sealed` | read once per seal or unseal, held for the life of the strategy |
-| `seal.Credentials.Secret` | `*Sealed` | the caller's passphrase, protected at the API boundary |
-| the root key inside `Initialize`/`Unseal` | `*Memory` | live for the whole body, in continuous use |
-| `UnsealRootKeyProtected`'s result | `*Memory` | the AEAD decrypts straight into it |
-| `Barrier.RootKeyProtected`'s result | `*Memory` | opened from the sealed root key; go-enclave returns it frozen |
-| a `ProtectedShare`'s value, a reconstructed secret | `*Memory` | read in place, frozen, caller-destroyed |
+| `Barrier.rootKey` | `Sealed` | opened on rotation, export, unseal and MAC restamp, not per frame |
+| `Barrier.currentDEK`, `Barrier.deks[epoch]` | `Sealed` | never opened; kept so a DEK can be re-derived |
+| `SoftwareStrategy.passphrase` | `Sealed` | read once per seal or unseal, held for the life of the strategy |
+| `seal.Credentials.Secret` | `Sealed` | the caller's passphrase, protected at the API boundary |
+| the root key inside `Initialize`/`Unseal` | `ByteAccess` | live for the whole body, in continuous use |
+| `UnsealRootKeyProtected`'s result | `ByteAccess` | the AEAD decrypts straight into it |
+| `Barrier.RootKeyProtected`'s result | `ByteAccess` | opened from the sealed root key; go-enclave returns it frozen |
+| a `ProtectedShare`'s value, a reconstructed secret | `ByteAccess` | read in place, frozen, caller-destroyed |
 
 `Barrier.Encrypt` and `Barrier.Decrypt` open nothing. They run off a
 `cipher.AEAD` cached per epoch in `Barrier.ciphers`, so protected memory is not
@@ -219,7 +219,7 @@ kernel zeroes them before reuse. The two are disjoint. A third,
 pages are still wiped and released.
 
 `Sealed.Destroy` returns an error too, always `nil` in go-enclave
-v0.8.0. `pkg/seal` logs a non-nil one at WARN through its own helper
+v0.9.0-alpha. `pkg/seal` logs a non-nil one at WARN through its own helper
 (`releaseSealed`), and `SoftwareStrategy.Close` returns it.
 
 Every `Memory` this repository destroys is a cleanup step whose operation

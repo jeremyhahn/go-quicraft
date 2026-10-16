@@ -195,7 +195,7 @@ func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	defer s.Close()
 
 	b := MustNewBarrier(testBarrierConfig(1))
-	b.lockRootKey = func(int) (*enclave.Memory, error) { return nil, errLockRefused }
+	b.lockRootKey = func(int) (enclave.ByteAccess, error) { return nil, errLockRefused }
 
 	err := b.Initialize(context.Background(), s, Credentials{})
 	if err == nil {
@@ -242,7 +242,7 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 	if err := b2.SetSealedRootKey(blob); err != nil {
 		t.Fatalf("SetSealedRootKey: %v", err)
 	}
-	b2.lockRootKey = func(int) (*enclave.Memory, error) { return nil, errLockRefused }
+	b2.lockRootKey = func(int) (enclave.ByteAccess, error) { return nil, errLockRefused }
 
 	err := b2.Unseal(context.Background(), s, Credentials{})
 	if err == nil {
@@ -309,7 +309,7 @@ func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 	// default allocator produces; it is the shape the borrow's own early return
 	// is written to handle, and the point is that handling it must not skip the
 	// wipe.
-	b2.lockRootKey = func(int) (*enclave.Memory, error) { return nil, nil }
+	b2.lockRootKey = func(int) (enclave.ByteAccess, error) { return nil, nil }
 
 	err := b2.Unseal(context.Background(), s, Credentials{})
 	if err == nil {

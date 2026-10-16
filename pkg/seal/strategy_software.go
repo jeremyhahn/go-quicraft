@@ -67,7 +67,8 @@ type SoftwareStrategy struct {
 	// reference) cannot race the Seal/Unseal paths that read it. Those paths
 	// load the pointer ONCE into a local and operate on the local; a Close
 	// that lands mid-operation therefore cannot turn a validated non-nil
-	// reference into a nil dereference.
+	// reference into a nil dereference. enclave.Sealed is an interface, so the
+	// pointer is to the interface value NewSoftwareStrategy stored.
 	passphrase atomic.Pointer[enclave.Sealed]
 	kdfVersion KDFVersion
 	kdfParams  KDFParams
@@ -316,7 +317,7 @@ func newSoftwareStrategy(ctx context.Context, passphrase []byte, version KDFVers
 		kdfParams:  params,
 		randReader: rand.Reader,
 	}
-	s.passphrase.Store(sealed)
+	s.passphrase.Store(&sealed)
 	return s, nil
 }
 
@@ -411,7 +412,7 @@ func (s *SoftwareStrategy) SealRootKey(ctx context.Context, rootKey []byte, cred
 // sealRootKeyWith performs the seal operation under an already-resolved
 // passphrase — the credentials' for a deferred strategy, the bound one
 // otherwise. See resolvePassphrase for why the two cases stopped differing.
-func (s *SoftwareStrategy) sealRootKeyWith(ctx context.Context, passphrase *enclave.Sealed, rootKey []byte) (*SealedRootKey, error) {
+func (s *SoftwareStrategy) sealRootKeyWith(ctx context.Context, passphrase enclave.Sealed, rootKey []byte) (*SealedRootKey, error) {
 	if len(rootKey) != 32 {
 		return nil, ErrInvalidRootKeySize
 	}
@@ -497,7 +498,7 @@ func (s *SoftwareStrategy) UnsealRootKey(ctx context.Context, sealed *SealedRoot
 // split out so the []byte and protected paths cannot drift in what they
 // validate — and so the protected path can prepare its cipher before it takes
 // an enclave borrow, which is the ordering wrappingCipher explains.
-func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase *enclave.Sealed, sealed *SealedRootKey) (cipher.AEAD, []byte, error) {
+func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase enclave.Sealed, sealed *SealedRootKey) (cipher.AEAD, []byte, error) {
 	if sealed == nil {
 		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrBarrierNotInit}
 	}
@@ -551,7 +552,7 @@ func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase *enclave
 // unsealRootKeyWith performs the unseal operation under an already-resolved
 // passphrase, returning the root key as an ordinary slice the caller must wipe.
 // The protected sibling is UnsealRootKeyProtected.
-func (s *SoftwareStrategy) unsealRootKeyWith(ctx context.Context, passphrase *enclave.Sealed, sealed *SealedRootKey) ([]byte, error) {
+func (s *SoftwareStrategy) unsealRootKeyWith(ctx context.Context, passphrase enclave.Sealed, sealed *SealedRootKey) ([]byte, error) {
 	aead, rest, err := s.unsealCipher(ctx, passphrase, sealed)
 	if err != nil {
 		return nil, err
@@ -637,13 +638,13 @@ func unsealStrategyError(err error) error {
 // runs, which degrades every later locked allocation in the process.
 //
 // It is a separate step, rather than inline in the seal/unseal bodies, because
-// the protected paths run their key-touching half inside a enclave.Memory
+// the protected paths run their key-touching half inside an enclave.ByteAccess
 // borrow. go-enclave borrows take only the borrowed enclave's own read lock, so
 // opening the passphrase inside that borrow would be legal — but preparing the
 // cipher first keeps the key-touching window as short as it can be, and the
 // AEAD holds only the expanded key schedule in ordinary memory, which the
 // borrow may touch freely.
-func wrappingCipher(ctx context.Context, passphrase *enclave.Sealed, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
+func wrappingCipher(ctx context.Context, passphrase enclave.Sealed, salt []byte, version KDFVersion, params KDFParams, wrap func(error) error) (cipher.AEAD, error) {
 	ppBuf, err := passphrase.Open(ctx)
 	if err != nil {
 		return nil, wrap(closedIfEnclaveGone(passphrase, err))
@@ -698,7 +699,7 @@ func wrappingCipher(ctx context.Context, passphrase *enclave.Sealed, salt []byte
 // which is a new public error for a case a caller reaches only by using a
 // credential it has already released. It is uniform across all four root-key
 // methods.
-func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error) error) (*enclave.Sealed, error) {
+func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error) error) (enclave.Sealed, error) {
 	if s.deferPassphrase {
 		if creds.Secret == nil {
 			return nil, ErrEmptyCredentials
@@ -711,7 +712,7 @@ func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error)
 	if passphrase == nil {
 		return nil, wrap(ErrStrategyClosed)
 	}
-	return passphrase, nil
+	return *passphrase, nil
 }
 
 // SealRootKeyProtected is SealRootKey with BOTH secrets on the protected side —
@@ -724,7 +725,7 @@ func (s *SoftwareStrategy) resolvePassphrase(creds Credentials, wrap func(error)
 // Seal — which touches no protected memory but the root key itself — runs
 // inside the borrow. The key is therefore never copied out of its enclave, and
 // the borrow cannot deadlock against a process-wide purge. See wrappingCipher.
-func (s *SoftwareStrategy) SealRootKeyProtected(ctx context.Context, rootKey *enclave.Memory, creds Credentials) (*SealedRootKey, error) {
+func (s *SoftwareStrategy) SealRootKeyProtected(ctx context.Context, rootKey enclave.ByteAccess, creds Credentials) (*SealedRootKey, error) {
 	passphrase, err := s.resolvePassphrase(creds, sealStrategyError)
 	if err != nil {
 		return nil, err
@@ -732,7 +733,7 @@ func (s *SoftwareStrategy) SealRootKeyProtected(ctx context.Context, rootKey *en
 	// A nil or already-destroyed enclave both report zero here. Neither is an
 	// empty root key: the size check refuses them before the KDF is paid for,
 	// and WithBytes below would refuse a destroyed one again.
-	if rootKey.Size() != rootKeySize {
+	if rootKey == nil || rootKey.Size() != rootKeySize {
 		return nil, ErrInvalidRootKeySize
 	}
 
@@ -779,7 +780,7 @@ func (s *SoftwareStrategy) SealRootKeyProtected(ctx context.Context, rootKey *en
 // The allocation happens BEFORE the borrow, because allocating locked memory is
 // a process-wide purge-exclusive operation that a borrow may not nest (see
 // wrappingCipher), and the KDF runs before that for the same reason.
-func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (*enclave.Memory, error) {
+func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *SealedRootKey, creds Credentials) (enclave.ByteAccess, error) {
 	passphrase, err := s.resolvePassphrase(creds, unsealStrategyError)
 	if err != nil {
 		return nil, err
@@ -817,7 +818,7 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *S
 	// Destroyed on every failure below, and only on failure: a successful return
 	// hands ownership to the caller, which the contract on
 	// ProtectedSealingStrategy.UnsealRootKeyProtected makes explicit.
-	failed := func(err error) (*enclave.Memory, error) {
+	failed := func(err error) (enclave.ByteAccess, error) {
 		releaseEnclave(out, "unsealed root key")
 		return nil, &UnsealError{Strategy: passphraseStrategyName, Err: err}
 	}
@@ -849,7 +850,7 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *S
 	// rather than returned: handing back a writable enclave from a method whose
 	// documentation says the contents are final would be reporting a guarantee
 	// that was not established.
-	if ferr := out.Freeze(); ferr != nil {
+	if ferr := freezeEnclave(out); ferr != nil {
 		return failed(ferr)
 	}
 	return out, nil
@@ -872,7 +873,7 @@ func (s *SoftwareStrategy) UnsealRootKeyProtected(ctx context.Context, sealed *S
 // For a deferred strategy the passphrase is the caller's credential, so a
 // credential the caller destroyed still reports ErrStrategyClosed — the rough
 // edge resolvePassphrase documents.
-func closedIfEnclaveGone(passphrase *enclave.Sealed, err error) error {
+func closedIfEnclaveGone(passphrase enclave.Sealed, err error) error {
 	if errors.Is(err, enclave.ErrEnclaveDestroyed) && !passphrase.IsAlive() {
 		return ErrStrategyClosed
 	}
@@ -911,7 +912,7 @@ func closedIfEnclaveGone(passphrase *enclave.Sealed, err error) error {
 // always nil today.
 func (s *SoftwareStrategy) Close() error {
 	if passphrase := s.passphrase.Swap(nil); passphrase != nil {
-		return passphrase.Destroy()
+		return (*passphrase).Destroy()
 	}
 	return nil
 }

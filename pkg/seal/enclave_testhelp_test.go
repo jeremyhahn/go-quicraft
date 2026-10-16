@@ -12,7 +12,7 @@ import (
 // pages outlives it; these tests assert on a nil slice, so a destroyed enclave
 // is folded into one here rather than handled at every assertion site.
 // Production code never copies protected material out like this.
-func encCopy(e *enclave.Memory) []byte {
+func encCopy(e enclave.ByteAccess) []byte {
 	var out []byte
 	if err := e.WithBytes(func(b []byte) error {
 		out = append([]byte(nil), b...)
@@ -27,7 +27,7 @@ func encCopy(e *enclave.Memory) []byte {
 // the kernel refuses the lock. go-enclave reports a refused mlock rather than
 // hiding it, and a test that ignored the refusal would assert
 // against a nil enclave for reasons unrelated to what it is testing.
-func mustSized(t testing.TB, n int) *enclave.Memory {
+func mustSized(t testing.TB, n int) enclave.ByteAccess {
 	t.Helper()
 	e, err := enclave.NewMemorySized(n)
 	if err != nil {
@@ -40,7 +40,7 @@ func mustSized(t testing.TB, n int) *enclave.Memory {
 // release is refused. go-enclave's Destroy reports a refused release rather than
 // hiding it, and a test environment that cannot release locked memory is one
 // whose later allocations would fail for reasons unrelated to the test.
-func destroyOnCleanup(t testing.TB, e *enclave.Memory) {
+func destroyOnCleanup(t testing.TB, e enclave.ByteAccess) {
 	t.Helper()
 	t.Cleanup(func() {
 		if err := e.Destroy(); err != nil {
@@ -51,7 +51,7 @@ func destroyOnCleanup(t testing.TB, e *enclave.Memory) {
 
 // mustFromBytes moves data into a locked, FROZEN enclave, failing the test if
 // the kernel refuses the lock.
-func mustFromBytes(t testing.TB, data []byte) *enclave.Memory {
+func mustFromBytes(t testing.TB, data []byte) enclave.ByteAccess {
 	t.Helper()
 	e, err := enclave.NewMemory(data)
 	if err != nil {

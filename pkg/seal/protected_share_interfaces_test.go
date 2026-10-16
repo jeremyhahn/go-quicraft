@@ -87,7 +87,7 @@ func (a *protectedAccumulator) GetProgress() *QuorumProgress {
 	}
 }
 
-func (a *protectedAccumulator) ReconstructProtected(_ context.Context) (*enclave.Memory, error) {
+func (a *protectedAccumulator) ReconstructProtected(_ context.Context) (enclave.ByteAccess, error) {
 	if len(a.shares) < a.threshold {
 		return nil, errors.New("threshold not met")
 	}

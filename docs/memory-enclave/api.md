@@ -22,7 +22,7 @@ feature exists to prevent.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.8.0-rc.2).
+Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.9.0-alpha).
 
 All of the surface belongs to go-enclave. go-quicraft declares no
 protected-memory type, alias or wrapper, and re-exports nothing: consumers
@@ -33,15 +33,15 @@ go-enclave types.
 ### Allocate locked memory
 
 ```go
-func NewMemorySized(n int) (*Memory, error)  // writable, fill in place
-func NewMemory(data []byte) (*Memory, error) // moves data in, FROZEN
-func NewMemoryCopy(src []byte) (*Memory, error) // copies, FROZEN, src untouched
+func NewMemorySized(n int) (ByteAccess, error)  // writable, fill in place
+func NewMemory(data []byte) (ByteAccess, error) // moves data in, FROZEN
+func NewMemoryCopy(src []byte) (ByteAccess, error) // copies, FROZEN, src untouched
 ```
 
 | | |
 |---|---|
 | Request | `n int`, or `data []byte` (wiped on every return path, failure included) |
-| Response | `*Memory`: `mlock`'d, guard-paged, canary-checked, excluded from core dumps |
+| Response | a `ByteAccess` handle to a memory enclave: `mlock`'d, guard-paged, canary-checked, excluded from core dumps. The enclave's type is internal to go-enclave; a failed call returns a nil interface. |
 | Errors | `ErrInvalidSize`, `ErrEmptyEnclave`, and `ErrLockedMemoryUnavailable` when the kernel refuses the lock |
 | Permission | none; in-process call |
 
@@ -55,8 +55,15 @@ is frozen read-only, where the same mistake faults.
 ### Freeze material generated in place
 
 ```go
-func (e *Memory) Freeze() error
+type Freezer interface {
+	Handle
+	Freeze() error
+}
 ```
+
+`Freeze` is the `Freezer` capability, reached from a `ByteAccess` with
+`enclave.As`. A handle without it is refused with a `*CapabilityError`
+(`CapabilityFreeze`), never handed back writable.
 
 | | |
 |---|---|
@@ -82,7 +89,12 @@ if err := e.WithBytes(func(dst []byte) error {
 	_ = e.Destroy()
 	return nil, err
 }
-if err := e.Freeze(); err != nil { // a stray write faults from here
+var f enclave.Freezer
+if !enclave.As(e, &f) {
+	_ = e.Destroy()
+	return nil, &enclave.CapabilityError{Backend: e.Backend().Name(), Capability: enclave.CapabilityFreeze}
+}
+if err := f.Freeze(); err != nil { // a stray write faults from here
 	_ = e.Destroy() // refused: still writable, so never hand it out
 	return nil, err
 }
@@ -98,30 +110,31 @@ of frozen pages faults the process.
 ### Hold a key encrypted at rest in process memory
 
 ```go
-func NewSealed(ctx context.Context, data []byte) (*Sealed, error)
+func NewSealed(ctx context.Context, data []byte) (Sealed, error)
 ```
 
 | | |
 |---|---|
 | Request | `ctx`, which bounds the seal and reaches the process sealer's provider; `data []byte`, the raw key material. `data` is wiped on every return path, failure and cancellation included. |
-| Response | `*Sealed`: ciphertext on the ordinary heap, holding no locked pages |
+| Response | `Sealed`, an interface: ciphertext on the ordinary heap, holding no locked pages; a nil interface on failure |
 | Errors | `ErrEmptyEnclave`, `ErrMaterialTooLarge`, `ErrSealFailed`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy` on the process sealer). A context that has ended fails the seal with an error matching both `ErrSealFailed` and `ctx.Err()`. |
 | Permission | none |
 
 ### Materialize the plaintext for a bounded window
 
 ```go
-func (s *Sealed) Open(ctx context.Context) (*Memory, error)
-func (s *Sealed) OpenIn(ctx context.Context, b Backend) (Handle, error)
-func (s *Sealed) Openable() error
-func (s *Sealed) IsAlive() bool
-func (s *Sealed) Destroy() error // always nil today
+// Sealed interface methods
+Open(ctx context.Context) (ByteAccess, error)
+OpenIn(ctx context.Context, b Backend) (Handle, error)
+Openable() error
+IsAlive() bool
+Destroy() error // always nil today
 ```
 
 | | |
 |---|---|
-| Request | `ctx`, which bounds the open (`OpenIn` also takes the `Backend` to open into; an `*Allocator` charges the destination against its budget) |
-| Response | a new `*Memory` holding the plaintext, `mlock`'d and FROZEN read-only. The caller owns it and must `Destroy` it. Each call returns an independent enclave. `OpenIn` returns a `Handle`; into locked memory it is a `*Memory`. |
+| Request | `ctx`, which bounds the open (`OpenIn` also takes the `Backend` to open into; an `Allocator` charges the destination against its budget) |
+| Response | a new memory enclave, as a `ByteAccess`, holding the plaintext, `mlock`'d and FROZEN read-only. The caller owns it and must `Destroy` it. Each call returns an independent enclave. `OpenIn` returns a `Handle`; into locked memory it is a `ByteAccess`. |
 | Errors | `ErrEnclaveDestroyed`, `ErrSealedAuthentication`, `ErrLockedMemoryUnavailable`, `ErrSealerWiped`, `ErrSealerDestroyed` (after `Sealer.Destroy`), `ErrOpenFailed`; `OpenIn` adds `ErrInvalidBackend`, a `*CapabilityError`, and, into an `Allocator`, `ErrNilAllocator` and `ErrBudgetExhausted`. A context that has ended fails the open with an error matching both `ErrOpenFailed` and `ctx.Err()`, and leaves the sealed value intact. |
 | Permission | none |
 
@@ -146,11 +159,12 @@ different question, whether an `Open` could still succeed, which a shutdown
 ### Read protected bytes with a bounded lifetime
 
 ```go
-func (e *Memory) WithBytes(fn func([]byte) error) error
-func (e *Memory) Size() int
-func (e *Memory) IsAlive() bool
-func (e *Memory) EqualTo(other []byte) (bool, error)
-func (e *Memory) Destroy() error
+// ByteAccess interface methods (Size, IsAlive and Destroy come from Handle)
+WithBytes(fn func([]byte) error) error
+Size() int
+IsAlive() bool
+EqualTo(other []byte) (bool, error)
+Destroy() error
 ```
 
 | | |
@@ -222,5 +236,5 @@ The protected-memory surface is versioned by go-enclave; this repository pins a
 released tag.
 
 `seal.Credentials`, built by `seal.NewCredentials`, is the only credentials
-type. `Credentials.Secret` is a `*enclave.Sealed`, so there is no
+type. `Credentials.Secret` is an `enclave.Sealed`, so there is no
 separate protected form; implementations name `Credentials`.

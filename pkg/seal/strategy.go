@@ -86,7 +86,7 @@ const (
 // A [enclave.Sealed] holds the passphrase as CIPHERTEXT at rest and
 // produces plaintext only inside an Open, which is the posture this material
 // wants: a credential is consulted once per seal or unseal and held for a long
-// time in between. A locked-plaintext [enclave.Memory] would keep it
+// time in between. A locked-plaintext [enclave.ByteAccess] would keep it
 // present-but-locked continuously and buy less.
 //
 // Build one with [NewCredentials], which CONSUMES the caller's slice, since the
@@ -101,7 +101,7 @@ const (
 type Credentials struct {
 	// Secret is the authentication material, encrypted at rest in memory. Nil
 	// means the caller supplied none.
-	Secret *enclave.Sealed // #nosec G117 -- this IS a secret field by design
+	Secret enclave.Sealed // #nosec G117 -- this IS a secret field by design
 }
 
 // NewCredentials moves a secret into protected memory and returns the

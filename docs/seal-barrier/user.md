@@ -179,7 +179,7 @@ it. The strategy copies it into protected memory and leaves your slice to you. R
 value is already an immutable string in the process. Read it from a pipe, a
 prompt, or an agent socket if the distinction matters to you. A strategy bound
 at construction ignores `Credentials`; the deferred form reads
-`Credentials.Secret` per call, which is a `*enclave.Sealed` built with
+`Credentials.Secret` per call, which is an `enclave.Sealed` built with
 `seal.NewCredentials(ctx, secret)`. That call moves the secret into protected memory
 and wipes the slice it was given; you destroy the credential when you are done.
 

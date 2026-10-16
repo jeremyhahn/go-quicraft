@@ -81,7 +81,7 @@ var newSizedProtectedMemory = enclave.NewMemorySized
 // Both constructors take ownership of value and wipe it on every path,
 // including a budget refusal, so callers keep one ownership contract whichever
 // is chosen.
-func lockValue(a *enclave.Allocator, value []byte) (*enclave.Memory, error) {
+func lockValue(a enclave.Allocator, value []byte) (enclave.ByteAccess, error) {
 	if a == nil {
 		return newProtectedMemory(value)
 	}
@@ -91,7 +91,7 @@ func lockValue(a *enclave.Allocator, value []byte) (*enclave.Memory, error) {
 // lockSized allocates n bytes of locked, zeroed, writable memory, admitted
 // against a when the caller supplied one and unbudgeted when a is nil. See
 // lockValue.
-func lockSized(a *enclave.Allocator, n int) (*enclave.Memory, error) {
+func lockSized(a enclave.Allocator, n int) (enclave.ByteAccess, error) {
 	if a == nil {
 		return newSizedProtectedMemory(n)
 	}
@@ -128,8 +128,22 @@ func lockSized(a *enclave.Allocator, n int) (*enclave.Memory, error) {
 //
 // Detected canary corruption still panics inside Destroy, as go-enclave
 // documents; that is not dropped here.
-func release(e *enclave.Memory) {
+func release(e enclave.ByteAccess) {
+	if e == nil {
+		return
+	}
 	_ = e.Destroy()
+}
+
+// freeze makes e read-only through its Freezer capability. A handle without
+// the capability is refused with a *enclave.CapabilityError rather than
+// handed back writable.
+func freeze(e enclave.ByteAccess) error {
+	var f enclave.Freezer
+	if !enclave.As(e, &f) {
+		return &enclave.CapabilityError{Backend: e.Backend().Name(), Capability: enclave.CapabilityFreeze}
+	}
+	return f.Freeze()
 }
 
 // borrow calls fn with a view of e's locked pages for exactly the duration of
@@ -141,7 +155,7 @@ func release(e *enclave.Memory) {
 // through unchanged, so a typed *SplitError or *CombineError produced inside
 // the borrow reaches the caller as itself rather than wrapped in a
 // locked-memory failure it is not.
-func borrow(e *enclave.Memory, op string, fn func([]byte) error) error {
+func borrow(e enclave.ByteAccess, op string, fn func([]byte) error) error {
 	ran := false
 	err := e.WithBytes(func(b []byte) error {
 		ran = true
@@ -155,7 +169,7 @@ func borrow(e *enclave.Memory, op string, fn func([]byte) error) error {
 
 // testOnlyProtectedMemory replaces the locked-memory constructor and returns a
 // function restoring the previous one. It PANICS outside a test binary.
-func testOnlyProtectedMemory(fn func([]byte) (*enclave.Memory, error)) func() {
+func testOnlyProtectedMemory(fn func([]byte) (enclave.ByteAccess, error)) func() {
 	if !testing.Testing() {
 		panic("shamir.testOnlyProtectedMemory: test-only allocator override called outside a test binary")
 	}
@@ -168,7 +182,7 @@ func testOnlyProtectedMemory(fn func([]byte) (*enclave.Memory, error)) func() {
 // allocator. Same gate, same restore contract, and separate because the two
 // constructors have different signatures and different callers: overriding one
 // must not silently change the behaviour of the other.
-func testOnlySizedProtectedMemory(fn func(int) (*enclave.Memory, error)) func() {
+func testOnlySizedProtectedMemory(fn func(int) (enclave.ByteAccess, error)) func() {
 	if !testing.Testing() {
 		panic("shamir.testOnlySizedProtectedMemory: test-only allocator override called outside a test binary")
 	}
@@ -378,7 +392,7 @@ func splitLockedBytes(secretLen, threshold, total int) int {
 // be zeroed, so every share stays readable in the heap until the GC reclaims
 // it, and a ceremony holding all N shares is the point of widest exposure in
 // the whole scheme. A ProtectedShare's value is held in an
-// enclave.Memory — mlock'd (excluded from swap), guard-paged,
+// enclave.ByteAccess — mlock'd (excluded from swap), guard-paged,
 // canary-checked, and genuinely WIPED by Destroy — so share material can be
 // released the moment a custodian is done with it rather than waiting on the
 // collector.
@@ -416,7 +430,7 @@ type ProtectedShare struct {
 
 	// value is the base64-encoded [version][x][y...] payload — exactly the
 	// bytes of Share.Value — in an mlock'd, guard-paged buffer.
-	value *enclave.Memory
+	value enclave.ByteAccess
 }
 
 // NewProtectedShare builds a share whose value is copied into protected memory.
@@ -467,7 +481,7 @@ func NewProtectedShare(index, threshold, total int, value []byte) (*ProtectedSha
 // rather than falling back to the unbudgeted constructor: a caller that asked
 // for a budget and supplied none has a bug, and silently locking outside the
 // budget would hide it. Libraries obtain a from [enclave.ProcessAllocator].
-func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
+func NewProtectedShareWith(a enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
 	if a == nil {
 		return nil, enclave.ErrNilAllocator
 	}
@@ -477,7 +491,7 @@ func NewProtectedShareWith(a *enclave.Allocator, index, threshold, total int, va
 // newProtectedShare is the one implementation behind NewProtectedShare and
 // NewProtectedShareWith; a nil a selects the unbudgeted constructor (see
 // lockValue).
-func newProtectedShare(a *enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
+func newProtectedShare(a enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error) {
 	if err := validateShareHeader(index, threshold, total); err != nil {
 		return nil, err
 	}
@@ -550,7 +564,7 @@ func newProtectedShare(a *enclave.Allocator, index, threshold, total int, value 
 // buffers.
 //
 // The secret argument itself is the caller's: pass a slice that is already
-// protected memory (an enclave.Memory's Bytes, say) to keep the material
+// protected memory (an enclave.ByteAccess's Bytes, say) to keep the material
 // protected end to end. This function neither copies nor wipes it.
 //
 // Every returned share must be Destroyed. Each is one mlock'd allocation
@@ -591,7 +605,7 @@ func SplitProtected(secret []byte, threshold, total int) ([]*ProtectedShare, err
 // A nil a is refused with [enclave.ErrNilAllocator] before anything is
 // allocated, rather than falling back to the unbudgeted path. Libraries obtain
 // a from [enclave.ProcessAllocator].
-func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
+func SplitProtectedWith(a enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
 	if a == nil {
 		return nil, enclave.ErrNilAllocator
 	}
@@ -601,7 +615,7 @@ func SplitProtectedWith(a *enclave.Allocator, secret []byte, threshold, total in
 // splitProtected is the one implementation behind SplitProtected and
 // SplitProtectedWith; a nil a selects the unbudgeted constructors (see
 // lockSized).
-func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
+func splitProtected(a enclave.Allocator, secret []byte, threshold, total int) ([]*ProtectedShare, error) {
 	if err := validateSplitParams(secret, threshold, total); err != nil {
 		return nil, err
 	}
@@ -672,7 +686,7 @@ func splitProtected(a *enclave.Allocator, secret []byte, threshold, total int) (
 // values. rc, cf and rw are views of splitProtected's coefficient pool,
 // coefficient vector and payload buffer, borrowed by the caller for the whole
 // of this call; nothing here retains them.
-func evalProtectedShares(a *enclave.Allocator, secret []byte, threshold, total int, rc, cf, rw []byte) ([]*ProtectedShare, error) {
+func evalProtectedShares(a enclave.Allocator, secret []byte, threshold, total int, rc, cf, rw []byte) ([]*ProtectedShare, error) {
 	encodedLen := base64.StdEncoding.EncodedLen(len(rw))
 
 	shares := make([]*ProtectedShare, 0, total)
@@ -723,7 +737,7 @@ func evalProtectedShares(a *enclave.Allocator, secret []byte, threshold, total i
 		// value can still be written is not the type this package hands out —
 		// WithValue documents the buffer as read-only and callers rely on a stray
 		// write faulting — so it is torn down rather than returned.
-		if err := value.Freeze(); err != nil {
+		if err := freeze(value); err != nil {
 			release(value)
 			return nil, failed("freezing share value", err)
 		}
@@ -783,7 +797,7 @@ func evalProtectedShares(a *enclave.Allocator, secret []byte, threshold, total i
 //
 // Its locked memory is UNBUDGETED: it is charged to no [enclave.Allocator]. A
 // caller that bounds its locked memory with one uses CombineProtectedWith.
-func CombineProtected(shares []*ProtectedShare) (*enclave.Memory, error) {
+func CombineProtected(shares []*ProtectedShare) (enclave.ByteAccess, error) {
 	return combineProtected(nil, shares)
 }
 
@@ -801,7 +815,7 @@ func CombineProtected(shares []*ProtectedShare) (*enclave.Memory, error) {
 // A nil a is refused with [enclave.ErrNilAllocator] before anything is
 // allocated, rather than falling back to the unbudgeted path. Libraries obtain
 // a from [enclave.ProcessAllocator].
-func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.Memory, error) {
+func CombineProtectedWith(a enclave.Allocator, shares []*ProtectedShare) (enclave.ByteAccess, error) {
 	if a == nil {
 		return nil, enclave.ErrNilAllocator
 	}
@@ -811,7 +825,7 @@ func CombineProtectedWith(a *enclave.Allocator, shares []*ProtectedShare) (*encl
 // combineProtected is the one implementation behind CombineProtected and
 // CombineProtectedWith; a nil a selects the unbudgeted constructors (see
 // lockSized).
-func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.Memory, error) {
+func combineProtected(a enclave.Allocator, shares []*ProtectedShare) (enclave.ByteAccess, error) {
 	if len(shares) == 0 {
 		return nil, &CombineError{Reason: "no shares provided"}
 	}
@@ -969,7 +983,7 @@ func combineProtected(a *enclave.Allocator, shares []*ProtectedShare) (*enclave.
 	//
 	// A refused freeze is destroyed rather than returned: the caller is promised
 	// material it can read and destroy, not a buffer it can silently corrupt.
-	if ferr := secret.Freeze(); ferr != nil {
+	if ferr := freeze(secret); ferr != nil {
 		release(secret)
 		return nil, &ProtectedMemoryError{Op: "freezing reconstructed secret", Err: ferr}
 	}
@@ -1192,7 +1206,7 @@ func (s *ProtectedShare) UnmarshalJSON(data []byte) error {
 // ONE share object into a new ProtectedShare whose value is locked through
 // newProtectedShare, admitted against a when a is non-nil and unbudgeted when it
 // is nil (see lockValue).
-func decodeProtectedShare(a *enclave.Allocator, data []byte) (*ProtectedShare, error) {
+func decodeProtectedShare(a enclave.Allocator, data []byte) (*ProtectedShare, error) {
 	var aux struct {
 		Index     int               `json:"index"`
 		Threshold int               `json:"threshold"`
@@ -1306,7 +1320,7 @@ func elementLockedBytes(elem json.RawMessage) int {
 // bound cannot help: it runs on shares that have already been allocated.
 //
 // Two checks run against the undecoded document, in this order and before the
-// first enclave.Memory exists:
+// first enclave.ByteAccess exists:
 //
 //   - at most maxShares (255) elements — the scheme's own bound, since the
 //     x-coordinate is a non-zero byte and no larger set can hold distinct
@@ -1358,7 +1372,7 @@ func UnmarshalShareSet(data []byte) ([]*ProtectedShare, error) {
 // A nil a is refused with [enclave.ErrNilAllocator] before data is read, rather
 // than falling back to the unbudgeted path. Libraries obtain a from
 // [enclave.ProcessAllocator].
-func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
+func UnmarshalShareSetWith(a enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
 	if a == nil {
 		return nil, enclave.ErrNilAllocator
 	}
@@ -1368,7 +1382,7 @@ func UnmarshalShareSetWith(a *enclave.Allocator, data []byte) ([]*ProtectedShare
 // unmarshalShareSet is the one implementation behind UnmarshalShareSet and
 // UnmarshalShareSetWith; a nil a selects the unbudgeted constructor (see
 // lockValue).
-func unmarshalShareSet(a *enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
+func unmarshalShareSet(a enclave.Allocator, data []byte) ([]*ProtectedShare, error) {
 	// Into raw elements, not shares: this decode allocates ordinary heap that
 	// the collector reclaims, and it is what makes the bounds checkable before
 	// anything is locked.
@@ -1462,7 +1476,7 @@ func (s *Share) Protect() (*ProtectedShare, error) {
 // A nil a is refused with [enclave.ErrNilAllocator] before s is read, rather
 // than falling back to the unbudgeted path. Libraries obtain a from
 // [enclave.ProcessAllocator].
-func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error) {
+func (s *Share) ProtectWith(a enclave.Allocator) (*ProtectedShare, error) {
 	if a == nil {
 		return nil, enclave.ErrNilAllocator
 	}
@@ -1471,7 +1485,7 @@ func (s *Share) ProtectWith(a *enclave.Allocator) (*ProtectedShare, error) {
 
 // protect is the one implementation behind Protect and ProtectWith; a nil a
 // selects the unbudgeted constructor (see lockValue).
-func (s *Share) protect(a *enclave.Allocator) (*ProtectedShare, error) {
+func (s *Share) protect(a enclave.Allocator) (*ProtectedShare, error) {
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
