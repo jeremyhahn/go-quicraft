@@ -232,6 +232,11 @@ type QUICTransport struct {
 
 	streamShards [streamShardCount]streamShard
 
+	// beforeStreamInsert is a test seam, nil outside tests: when set,
+	// getStream calls it after opening a stream on the slow path and before
+	// taking the shard lock, so a test can stage the races that path resolves.
+	beforeStreamInsert func()
+
 	// sendQueuesMu protects the sendQueues map. Reads (fast path in Send)
 	// use RLock; writes (queue creation for new targets) use Lock.
 	sendQueuesMu sync.RWMutex

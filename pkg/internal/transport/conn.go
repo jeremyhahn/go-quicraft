@@ -1202,6 +1202,9 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 	if err != nil {
 		return nil, err
 	}
+	if t.beforeStreamInsert != nil {
+		t.beforeStreamInsert()
+	}
 
 	shard.mu.Lock()
 	// Double-check another goroutine didn't create it.
