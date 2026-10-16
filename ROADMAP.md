@@ -55,13 +55,11 @@ No feature in progress. Open in the milestone: [#363](../../issues/363) (multi-g
 
 ## Next
 
-- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index. Seam row from go-qrdb. After Dev complete; not a Dev-complete item — planned
-
-The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
+Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
-Nothing accepted. New work arrives as issues.
+- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — go-qrdb seam, after Dev complete; the issue follows go-qrdb's consumer row — open
 
 ## Future
 
