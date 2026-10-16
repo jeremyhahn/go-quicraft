@@ -33,7 +33,7 @@ import (
 // notification pipeline: WAL-durable commit then state machine apply.
 func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NotifyCommit = true
 
@@ -41,6 +41,7 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.
@@ -113,7 +114,7 @@ func TestIntegration_DB_NotifyCommit_ProposalCommitted(t *testing.T) {
 // spurious commit notification or block the apply pipeline.
 func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	// NotifyCommit defaults to false; do not set it.
 
@@ -121,6 +122,7 @@ func TestIntegration_DB_NotifyCommit_Disabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.

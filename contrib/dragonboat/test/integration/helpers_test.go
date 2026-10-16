@@ -34,7 +34,6 @@ import (
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
@@ -948,10 +947,11 @@ func (p *dbTestPKI) leaf(t *testing.T) dbMTLSFiles {
 	return p.ca.LeafFiles(t, p.dir)
 }
 
-func freePort(t *testing.T) string {
-	t.Helper()
-	return netport.MustReserveUDP(t.Fatalf)
-}
+// kernelAddr binds a host on a loopback port the kernel assigns. Read the
+// bound address from NodeHost.RaftAddress once the host exists: a port
+// reserved up front and bound later can be taken by a concurrent CI job that
+// shares the network but not the reservation's lock directory (#386).
+const kernelAddr = "127.0.0.1:0"
 
 // dbTestNodeHostConfig creates a dragonboat NodeHostConfig for
 // integration testing with mTLS.
@@ -1039,33 +1039,24 @@ func (c *dbTestCluster) shardConfig(shardID, replicaID uint64) dbConfig.Config {
 func newDBTestCluster(t *testing.T, numNodes int) *dbTestCluster {
 	t.Helper()
 
-	const maxRetries = 3
 	pki := dbTestPKIFor(t)
 	addrs := make([]string, numNodes)
 	hosts := make([]*dragonboat.NodeHost, numNodes)
 
+	// Each host binds a kernel-assigned port; the member map is built from
+	// the bound addresses before any shard starts.
 	for i := range numNodes {
-		var nh *dragonboat.NodeHost
-		var addr string
-		for attempt := range maxRetries {
-			addr = freePort(t)
-			nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
-			var err error
-			nh, err = dragonboat.NewNodeHostWithOptions(nhConfig,
-				quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption(),
-			)
-			if err == nil {
-				break
+		nhConfig := dbTestNodeHostConfig(t, kernelAddr, pki.leaf(t))
+		nh, err := dragonboat.NewNodeHostWithOptions(nhConfig,
+			quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption(),
+		)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				hosts[j].Close()
 			}
-			if attempt == maxRetries-1 {
-				for j := 0; j < i; j++ {
-					hosts[j].Close()
-				}
-				t.Fatalf("NewNodeHostWithOptions[%d] failed after %d attempts: %v", i, maxRetries, err)
-			}
-			t.Logf("NewNodeHostWithOptions[%d] at %s failed (attempt %d), retrying: %v", i, addr, attempt+1, err)
+			t.Fatalf("NewNodeHostWithOptions[%d] failed: %v", i, err)
 		}
-		addrs[i] = addr
+		addrs[i] = nh.RaftAddress()
 		hosts[i] = nh
 	}
 

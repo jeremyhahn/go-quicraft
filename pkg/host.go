@@ -4200,6 +4200,11 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			}
 			return nil, &HostInitError{Field: "transport_start", Err: startErr}
 		}
+		// A RaftAddress with port 0 asked for a kernel-assigned port: the
+		// host's own identity is the address the transport now advertises.
+		// No caller can see h yet, and the receive path never reads it.
+		cfg.RaftAddress = tr.AdvertisedAddr()
+		h.cfg.RaftAddress = cfg.RaftAddress
 	}
 
 	// Start the key rotation loop whenever a barrier is configured. With

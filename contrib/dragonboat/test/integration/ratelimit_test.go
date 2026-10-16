@@ -72,13 +72,14 @@ func TestIntegration_DB_ProposalsWorkWhenRateLimited(t *testing.T) {
 // to detect that the in-memory log size exceeds MaxInMemLogSize.
 func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Configure with the smallest MaxInMemLogSize dragonboat accepts

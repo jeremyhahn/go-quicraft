@@ -144,7 +144,7 @@ var _ raftio.ISystemEventListener = (*testSystemEventListener)(nil)
 func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 	listener := &testRaftEventListener{}
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.RaftEventListener = listener
@@ -153,6 +153,7 @@ func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.
@@ -202,7 +203,7 @@ func TestIntegration_DB_RaftEventListener_LeaderUpdated(t *testing.T) {
 func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 	sysListener := &testSystemEventListener{}
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
@@ -211,6 +212,7 @@ func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.
@@ -253,7 +255,7 @@ func TestIntegration_DB_SystemEventListener_NodeReady(t *testing.T) {
 func TestIntegration_DB_SystemEventListener_NodeUnloaded(t *testing.T) {
 	sysListener := &testSystemEventListener{}
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.SystemEventListener = sysListener
@@ -262,6 +264,7 @@ func TestIntegration_DB_SystemEventListener_NodeUnloaded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.

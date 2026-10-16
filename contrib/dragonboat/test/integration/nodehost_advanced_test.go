@@ -161,13 +161,14 @@ func TestIntegration_DB_LeaderInfoIsReported(t *testing.T) {
 // Matches dragonboat's TestDroppedRequestsAreReported.
 func TestIntegration_DB_DroppedRequestsOnInvalidShard(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -316,13 +317,14 @@ func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 // GetNodeHostRegistry returns nil/false since quicraft doesn't support gossip.
 func TestIntegration_DB_GetNodeHostRegistry(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	registry, ok := nh.GetNodeHostRegistry()
@@ -339,13 +341,14 @@ func TestIntegration_DB_GetNodeHostRegistry(t *testing.T) {
 // functional INodeUser for proposal and read operations.
 func TestIntegration_DB_GetNodeUser(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// GetNodeUser on non-existent shard should fail.

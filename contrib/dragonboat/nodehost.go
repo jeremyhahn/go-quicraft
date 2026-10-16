@@ -408,6 +408,8 @@ func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 		return nil, &NodeHostConstructionError{Reason: "host creation", Err: err}
 	}
 
+	// A port-0 RaftAddress is resolved to the bound port by the host.
+	nhConfig.RaftAddress = host.RaftAddress()
 	nh := &NodeHost{
 		host:   host,
 		config: nhConfig,
@@ -448,6 +450,8 @@ func NewNodeHostWithOptions(nhConfig dbConfig.NodeHostConfig, opts ...quicraft.H
 		return nil, &NodeHostConstructionError{Reason: "host creation", Err: err}
 	}
 
+	// A port-0 RaftAddress is resolved to the bound port by the host.
+	nhConfig.RaftAddress = host.RaftAddress()
 	nh := &NodeHost{
 		host:   host,
 		config: nhConfig,

@@ -312,8 +312,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
 	// Create the 4th node on a new NodeHost.
-	newAddr := freePort(t)
-	nhConfig := dbTestNodeHostConfig(t, newAddr, cluster.pki.leaf(t))
+	nhConfig := dbTestNodeHostConfig(t, kernelAddr, cluster.pki.leaf(t))
 	newHost, nhErr := dragonboat.NewNodeHostWithOptions(nhConfig,
 		quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption(),
 	)
@@ -321,6 +320,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 		t.Fatalf("NewNodeHostWithOptions for 4th node failed: %v", nhErr)
 	}
 	defer newHost.Close()
+	newAddr := newHost.RaftAddress()
 
 	// Add the 4th replica to the cluster's membership through the current
 	// leader, confirmed by a linearizable read showing it as a voter at

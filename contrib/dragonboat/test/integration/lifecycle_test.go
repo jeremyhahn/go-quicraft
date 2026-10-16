@@ -93,13 +93,14 @@ func TestIntegration_DB_StopAndRestartShard(t *testing.T) {
 // TestRemoveNodeDataRemovesAllNodeData.
 func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.
@@ -150,13 +151,14 @@ func TestIntegration_DB_RemoveNodeData(t *testing.T) {
 // TestRemoveNodeDataWillFailWhenNodeIsStillRunning.
 func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	members := map[uint64]dragonboat.Target{1: addr}
@@ -180,13 +182,14 @@ func TestIntegration_DB_RemoveData_StillRunning(t *testing.T) {
 // TestNodeHostIDIsStatic.
 func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	id1 := nh.ID()
@@ -205,13 +208,14 @@ func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 // dragonboat's TestNodeHostHasNodeInfo.
 func TestIntegration_DB_HasNodeInfo(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Before starting any shard.
@@ -244,13 +248,14 @@ func TestIntegration_DB_HasNodeInfo(t *testing.T) {
 // and StopReplica stops a specific replica.
 func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	members := map[uint64]dragonboat.Target{1: addr}
@@ -288,13 +293,14 @@ func TestIntegration_DB_StopShard_And_StopReplica(t *testing.T) {
 // shard that is already running returns an error.
 func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	members := map[uint64]dragonboat.Target{1: addr}
@@ -322,13 +328,14 @@ func TestIntegration_DB_StartDuplicateReplica(t *testing.T) {
 // operations on a closed NodeHost return errors.
 func TestIntegration_DB_UsingClosedNodeHost(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	nh.Close()
 
 	// All operations should fail on closed host.
@@ -376,7 +383,7 @@ func TestIntegration_DB_NewNodeHost_InvalidConfig(t *testing.T) {
 // NodeHostID in NodeHostConfig produces that exact ID from nh.ID().
 func TestIntegration_DB_NodeHostID_CustomID(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 	nhConfig.NodeHostID = "custom-test-host-id-12345"
 
@@ -384,6 +391,7 @@ func TestIntegration_DB_NodeHostID_CustomID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	got := nh.ID()

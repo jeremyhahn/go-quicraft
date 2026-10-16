@@ -717,6 +717,10 @@ func (t *QUICTransport) Start() error {
 	// calls on every sendBatch invocation.
 	t.localAddrStr = t.udpConn.LocalAddr().String()
 
+	// A kernel-assigned port is resolved before anything serializes the
+	// advertised address, so no peer is ever told port 0.
+	t.resolveAdvertisedPort()
+
 	// Pre-serialize the heartbeat MessageBatch header now that the local
 	// address is resolved. This enables the zero-alloc heartbeat fast path.
 	t.initHeartbeatPrefix()
@@ -940,6 +944,28 @@ func (t *QUICTransport) Addr() net.Addr {
 		return nil
 	}
 	return t.udpConn.LocalAddr()
+}
+
+// AdvertisedAddr returns the address this transport tells peers to reach it
+// at. After Start it carries the bound port when the configured advertise
+// address asked for a kernel-assigned one (port 0).
+func (t *QUICTransport) AdvertisedAddr() string {
+	return t.localAddr()
+}
+
+// resolveAdvertisedPort replaces a port-0 AdvertiseAddress with the port the
+// listener actually bound, keeping the advertised host. Start calls it once,
+// after binding and before any goroutine reads the config.
+func (t *QUICTransport) resolveAdvertisedPort() {
+	host, port, err := net.SplitHostPort(t.cfg.AdvertiseAddress)
+	if err != nil || port != "0" {
+		return
+	}
+	_, bound, err := net.SplitHostPort(t.localAddrStr)
+	if err != nil {
+		return
+	}
+	t.cfg.AdvertiseAddress = net.JoinHostPort(host, bound)
 }
 
 // Send delivers Raft messages to their target replicas via non-blocking

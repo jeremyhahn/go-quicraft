@@ -31,13 +31,14 @@ import (
 // returns an error when called on a closed NodeHost.
 func TestIntegration_DB_ProposeOnClosedNodeHost(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 
 	// Start a shard so we have something to propose to.
 	members := map[uint64]dragonboat.Target{1: addr}
@@ -159,7 +160,7 @@ func TestIntegration_DB_GetLeaderID_InvalidShard(t *testing.T) {
 func TestIntegration_DB_StaleRead_Uninitialized(t *testing.T) {
 	pki := dbTestPKIFor(t)
 	mtls := pki.leaf(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbConfig.NodeHostConfig{
 		WALDir:         t.TempDir(),
 		NodeHostDir:    t.TempDir(),
@@ -177,6 +178,7 @@ func TestIntegration_DB_StaleRead_Uninitialized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// StaleRead on shard 1 which has not been started.
@@ -364,13 +366,14 @@ func TestIntegration_DB_InvalidAddressIsRejected(t *testing.T) {
 // fails with ErrReplicaRemoved.
 func TestIntegration_DB_RestartWithRemovedData_Rejected(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.
@@ -414,13 +417,14 @@ func TestIntegration_DB_RestartWithRemovedData_Rejected(t *testing.T) {
 // successfully remove the shard data, confirmed by HasNodeInfo returning false.
 func TestIntegration_DB_SyncRemoveData(t *testing.T) {
 	pki := dbTestPKIFor(t)
-	addr := freePort(t)
+	addr := kernelAddr
 	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
 
 	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
+	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// Start a single-node shard.

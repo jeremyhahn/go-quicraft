@@ -24,8 +24,8 @@ import (
 	"testing"
 )
 
-// clusterBindHost is the address test cluster nodes actually listen on. freePort
-// binds "<clusterBindHost>:0", so the kernel may hand a node ANY port in the
+// clusterBindHost is the address test cluster nodes actually listen on. kernelAddr
+// is "<clusterBindHost>:0", so the kernel may hand a node ANY port in the
 // host's ephemeral range.
 const clusterBindHost = "127.0.0.1"
 
@@ -71,7 +71,7 @@ func TestDummyAddressesCannotCollideWithClusterNodes(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			// ":0" is freePort asking the kernel to choose; that is the
+			// ":0" is kernelAddr asking the kernel to choose; that is the
 			// mechanism under test, not a violation of it.
 			if port == 0 {
 				continue

@@ -16,6 +16,7 @@ package quicraft
 
 import (
 	"context"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,5 +159,51 @@ func TestNewHost_TransportEnabledWithShardBarriers(t *testing.T) {
 
 	if resolved.Load() == 0 {
 		t.Fatal("the per-shard barrier resolver was never consulted")
+	}
+}
+
+// TestNewHost_KernelAssignedPortIsAdvertised verifies that a host configured
+// with port 0 reports, and advertises to peers, the port the kernel bound, so
+// a test can create a host first and read its address afterwards (#386).
+func TestNewHost_KernelAssignedPortIsAdvertised(t *testing.T) {
+	cfg := testTransportHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	addr := h.RaftAddress()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("RaftAddress %q: %v", addr, err)
+	}
+	if host != "127.0.0.1" || port == "0" || port == "" {
+		t.Fatalf("RaftAddress = %q, want 127.0.0.1 with the bound port", addr)
+	}
+	if bound := h.transport.Addr().String(); bound != addr {
+		t.Fatalf("RaftAddress = %q, transport bound %q", addr, bound)
+	}
+	if got := h.transport.AdvertisedAddr(); got != addr {
+		t.Fatalf("transport advertises %q, host reports %q", got, addr)
+	}
+	if got := h.GetNodeHostInfo(NodeHostInfoOption{}).RaftAddress; got != addr {
+		t.Fatalf("NodeHostInfo.RaftAddress = %q, want %q", got, addr)
+	}
+}
+
+// TestNewHost_FixedPortIsKept verifies a RaftAddress naming a port is
+// advertised unchanged, even when the listener binds a kernel-assigned port.
+func TestNewHost_FixedPortIsKept(t *testing.T) {
+	cfg := testTransportHostConfig(t)
+	cfg.RaftAddress = "node-a.example:4001"
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	if got := h.RaftAddress(); got != "node-a.example:4001" {
+		t.Fatalf("RaftAddress = %q, want the configured address", got)
 	}
 }
