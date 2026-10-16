@@ -90,7 +90,7 @@ func TestForwardedRead_RejectIsFreeOrder(t *testing.T) {
 		t.Fatalf("an answered refusal is not a step error: %v", err)
 	}
 	var sent []proto.Message
-	for _, m := range r.drainFreeOrderMessages() {
+	for _, m := range r.drainFreeOrderMessages(false) {
 		if m.Type == proto.ReadIndexResp {
 			sent = append(sent, m)
 		}

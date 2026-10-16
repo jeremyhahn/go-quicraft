@@ -4481,7 +4481,7 @@ func TestPeer_DrainFreeOrderMessages_ExtractsOnlyFreeOrderTypes(t *testing.T) {
 	// Populate with a mix of free-order and ordered messages.
 	p.r.msgs = append(p.r.msgs,
 		proto.Message{Type: proto.Heartbeat, To: 2},       // free-order
-		proto.Message{Type: proto.HeartbeatResp, To: 2},   // ordered
+		proto.Message{Type: proto.ReadIndexResp, To: 2},   // ordered
 		proto.Message{Type: proto.Replicate, To: 3},       // free-order
 		proto.Message{Type: proto.ReplicateResp, To: 3},   // ordered
 		proto.Message{Type: proto.RequestVoteResp, To: 2}, // ordered
@@ -4534,9 +4534,10 @@ func TestPeer_DrainFreeOrderMessages_AllOrderedReturnsNil(t *testing.T) {
 	ms := threeNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
 
-	// Populate with only ordered messages.
+	// Populate with only ordered messages. HeartbeatResp is left out: it
+	// is free-order here, the hard state being unchanged (#390).
 	p.r.msgs = append(p.r.msgs,
-		proto.Message{Type: proto.HeartbeatResp, To: 2},
+		proto.Message{Type: proto.ReadIndexResp, To: 2},
 		proto.Message{Type: proto.ReplicateResp, To: 3},
 		proto.Message{Type: proto.RequestVoteResp, To: 2},
 	)

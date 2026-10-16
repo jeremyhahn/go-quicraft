@@ -2897,7 +2897,7 @@ func TestRaft_DrainMessages_AlternatingEmptyAndFull(t *testing.T) {
 
 func TestRaft_DrainFreeOrderMessages_Empty(t *testing.T) {
 	r := newTestRaft(1)
-	if msgs := r.drainFreeOrderMessages(); msgs != nil {
+	if msgs := r.drainFreeOrderMessages(false); msgs != nil {
 		t.Fatalf("expected nil from empty buffer, got %v", msgs)
 	}
 }
@@ -2906,7 +2906,7 @@ func TestRaft_DrainFreeOrderMessages_OnlyFreeOrder(t *testing.T) {
 	r := newTestRaft(1)
 	r.send(proto.Message{Type: proto.Heartbeat, To: 2})
 	r.send(proto.Message{Type: proto.Replicate, To: 3})
-	msgs := r.drainFreeOrderMessages()
+	msgs := r.drainFreeOrderMessages(false)
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 free-order messages, got %d", len(msgs))
 	}
@@ -2920,7 +2920,7 @@ func TestRaft_DrainFreeOrderMessages_OnlyOrdered(t *testing.T) {
 	r := newTestRaft(1)
 	r.send(proto.Message{Type: proto.RequestVoteResp, To: 2})
 	r.send(proto.Message{Type: proto.HeartbeatResp, To: 3})
-	msgs := r.drainFreeOrderMessages()
+	msgs := r.drainFreeOrderMessages(false)
 	if msgs != nil {
 		t.Fatalf("expected nil when no free-order messages, got %d", len(msgs))
 	}
@@ -2938,7 +2938,7 @@ func TestRaft_DrainFreeOrderMessages_MixedPreservesOrdered(t *testing.T) {
 	r.send(proto.Message{Type: proto.Replicate, To: 4})
 	r.send(proto.Message{Type: proto.ReplicateResp, To: 5})
 
-	free := r.drainFreeOrderMessages()
+	free := r.drainFreeOrderMessages(false)
 	if len(free) != 2 {
 		t.Fatalf("expected 2 free-order messages, got %d", len(free))
 	}

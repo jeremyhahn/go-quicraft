@@ -48,6 +48,7 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 - **release** — spec-review scrub of every `docs/<feature>/` for the release candidate — [#283](../../issues/283) — done
 - **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it — [go-qrdb#668](../../../go-qrdb/issues/668) — done
 - **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing — [0.22.0-alpha](../../releases/tag/v0.22.0-alpha) — done
+- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state and log unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — [Unreleased](CHANGELOG.md), [#390](../../issues/390) — done
 
 ## Now
 
@@ -59,7 +60,7 @@ Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
-- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — go-qrdb seam, after Dev complete — [#390](../../issues/390) — open
+No feature is later.
 
 ## Future
 

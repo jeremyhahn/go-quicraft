@@ -87,6 +87,22 @@ type Peer struct {
 	// persist new hard state.
 	prevState proto.State
 
+	// durableState is the hard state last confirmed on stable storage: the
+	// recovered state at construction, then the State of every update
+	// Commit is handed after SaveState and every piggyback hard state the
+	// engine reports persisted. Unlike prevState it never runs ahead of
+	// the disk, which is what DrainFreeOrderMessages needs: a HeartbeatResp
+	// may leave during an in-flight fsync only while the term, vote and
+	// promised vote window it answers under are already durable (#390).
+	durableState proto.State
+
+	// stepMarkIndex and stepMarkTerm are the log's last index and term when
+	// the outbound buffer was last drained (or the update extracted). A log
+	// that moved since then was appended to by the current step, and that
+	// step's HeartbeatResp stays ordered behind the fsync.
+	stepMarkIndex uint64
+	stepMarkTerm  uint64
+
 	// stateUnpersisted forces the next GetUpdate to report a state change even
 	// when the hard state equals prevState.
 	//
@@ -285,6 +301,8 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 		shardID:    cfg.ShardID,
 		replicaID:  cfg.ReplicaID,
 	}
+	p.durableState = p.prevState
+	p.markStep()
 
 	// Arm the config-in-log staleness watermark and install the resolver the
 	// campaign gates consult. Both happen HERE, together, so the two halves can
@@ -827,9 +845,55 @@ func (p *Peer) DrainMessages() []proto.Message {
 // would silently drop ordered messages, preventing elections from
 // completing during commit+apply cycles.
 //
+// A HeartbeatResp is drained too when heartbeatRespFreeOrder holds: the
+// step that produced it changed nothing the reply depends on, so it need
+// not wait out an fsync it has no part in (#390). See proto.IsFreeOrder.
+//
 // The caller must hold raftMu (or otherwise ensure exclusive access).
 func (p *Peer) DrainFreeOrderMessages() []proto.Message {
-	return p.r.drainFreeOrderMessages()
+	msgs := p.r.drainFreeOrderMessages(p.heartbeatRespFreeOrder())
+	p.markStep()
+	return msgs
+}
+
+// heartbeatRespFreeOrder reports whether a HeartbeatResp produced since the
+// last drain may leave before the in-flight WAL write completes (#390). It
+// holds when the step left the hard state as it is on disk and appended
+// nothing:
+//
+//   - term, vote and the promised vote window equal durableState. A
+//     Heartbeat that raised the term, a vote granted, or a promise widened
+//     in the same step is not yet durable, and the reply stays ordered;
+//   - the log has not moved since the last drain, and no snapshot waits to
+//     be saved: an append or install in the same step keeps it ordered;
+//   - no extracted update was lost before SaveState (stateUnpersisted).
+//
+// The commit index is deliberately not compared. A HeartbeatResp reports no
+// index of this replica — it echoes the leader's read context (Hint) and
+// lease round (LogIndex) and carries the vote window (LogTerm) — and the
+// leader uses it only for activity (CheckQuorum), ReadIndex and lease
+// confirmation, and to resume replication from its own progress record.
+// None of that reads the follower's commit, and a commit lost in a crash is
+// re-learned from the leader.
+func (p *Peer) heartbeatRespFreeOrder() bool {
+	r := p.r
+	if p.stateUnpersisted || p.hasPendingSnapshot ||
+		r.term != p.durableState.Term ||
+		r.vote != p.durableState.Vote ||
+		r.voteWindowOwed != p.durableState.VoteWindow ||
+		r.log.lastIndex() != p.stepMarkIndex ||
+		r.log.pendingSnapshot() != nil {
+		return false
+	}
+	t, _ := r.log.lastTerm()
+	return t == p.stepMarkTerm
+}
+
+// markStep records the log position a later heartbeatRespFreeOrder compares
+// against: whatever the log holds now belongs to a step already drained.
+func (p *Peer) markStep() {
+	p.stepMarkIndex = p.r.log.lastIndex()
+	p.stepMarkTerm, _ = p.r.log.lastTerm()
 }
 
 // Handle routes an incoming Raft protocol message to the raft state
@@ -1758,6 +1822,7 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 	// reaches SaveState.
 	p.prevState = hs
 	p.stateUnpersisted = false
+	p.markStep()
 	p.syncLeaderID()
 
 	return update, nil
@@ -1895,6 +1960,7 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 		if len(msgs) > 0 {
 			update.Messages = msgs
 		}
+		p.markStep()
 	}
 	p.syncLeaderID()
 	return update, nil
@@ -1916,6 +1982,7 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 // The caller must hold raftMu.
 func (p *Peer) NotePiggybackPersisted(hs proto.State) {
 	p.prevState = hs
+	p.durableState = hs
 }
 
 // RequeueMessages returns messages to the outbound buffer after the engine
@@ -2042,6 +2109,13 @@ func (p *Peer) Commit(update proto.Update) error {
 	}
 
 	p.r.log.commitUpdate(uc)
+
+	// The engine calls Commit only after SaveState, so the update's hard
+	// state is on disk now. A ReadOnly update bypassed SaveState and carries
+	// nothing new.
+	if !update.ReadOnly {
+		p.durableState = update.State
+	}
 
 	// Persistence edge: tryCommit uses the leader's durable index
 	// (inmem.savedTo) as its own match, so a commit that was blocked only

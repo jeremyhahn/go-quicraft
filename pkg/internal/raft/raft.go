@@ -347,6 +347,13 @@ type raft struct {
 	// needed.
 	freeMsgBuf []proto.Message
 
+	// orderedHeld is the length of the prefix of msgs a free-order drain
+	// has already classified as ordered. A HeartbeatResp in that prefix
+	// was produced by a step that changed the hard state or appended, so a
+	// later drain whose step left everything untouched must not release it
+	// (drainFreeOrderMessages). Reset when msgs is handed out whole.
+	orderedHeld int
+
 	// Read index state. readIndexCtx is pre-incremented before use so
 	// the first ReadIndex ctx is 1, reserving ctx=0 for regular heartbeats
 	// (broadcastHeartbeat). This prevents regular heartbeat responses from
@@ -4978,6 +4985,7 @@ func (r *raft) drainMessages() []proto.Message {
 	msgs := r.msgs
 	r.msgs = r.msgsBuf[:0]
 	r.msgsBuf = msgs[:0]
+	r.orderedHeld = 0
 	return msgs
 }
 
@@ -5008,6 +5016,7 @@ func (r *raft) withholdOrderedMessages(msgs []proto.Message) []proto.Message {
 			r.msgs = append(r.msgs, msgs[i])
 		}
 	}
+	r.orderedHeld = len(r.msgs)
 	return msgs[:n]
 }
 
@@ -5020,6 +5029,9 @@ func (r *raft) requeueMessages(msgs []proto.Message) {
 	if len(msgs) == 0 {
 		return
 	}
+	// The requeued messages were handed out as ordered once already; they
+	// keep that classification ahead of whatever is queued now.
+	r.orderedHeld = min(r.orderedHeld, len(r.msgs)) + len(msgs)
 	if len(r.msgs) == 0 {
 		r.msgs = append(r.msgs, msgs...)
 		return
@@ -5036,14 +5048,22 @@ func (r *raft) requeueMessages(msgs []proto.Message) {
 // This is used by the step worker during commitPending ticks: heartbeats
 // must be sent immediately for leader liveness, but ordered messages must
 // remain in the buffer until the next GetUpdate after WAL persistence.
-func (r *raft) drainFreeOrderMessages() []proto.Message {
+//
+// heartbeatRespFree releases HeartbeatResp as well (#390). The caller
+// (Peer.DrainFreeOrderMessages) sets it only when the step that produced
+// the messages left the hard state durable and appended nothing; a
+// HeartbeatResp held by an earlier drain (the orderedHeld prefix) stays
+// ordered regardless.
+func (r *raft) drainFreeOrderMessages(heartbeatRespFree bool) []proto.Message {
 	if len(r.msgs) == 0 {
 		return nil
 	}
+	held := min(r.orderedHeld, len(r.msgs))
 	r.freeMsgBuf = r.freeMsgBuf[:0]
 	n := 0
 	for i := range r.msgs {
-		if proto.IsFreeOrder(&r.msgs[i]) {
+		if proto.IsFreeOrder(&r.msgs[i]) ||
+			(heartbeatRespFree && i >= held && r.msgs[i].Type == proto.HeartbeatResp) {
 			r.freeMsgBuf = append(r.freeMsgBuf, r.msgs[i])
 		} else {
 			r.msgs[n] = r.msgs[i]
@@ -5051,6 +5071,9 @@ func (r *raft) drainFreeOrderMessages() []proto.Message {
 		}
 	}
 	r.msgs = r.msgs[:n]
+	// Everything left is ordered and stays ordered: a HeartbeatResp kept
+	// back here was produced by a step that changed the hard state.
+	r.orderedHeld = n
 	if len(r.freeMsgBuf) == 0 {
 		return nil
 	}

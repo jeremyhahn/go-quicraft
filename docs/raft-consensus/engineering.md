@@ -2162,6 +2162,23 @@ or acknowledge a log position, so releasing one before the corresponding WAL
 write lets a leader count a match it may lose in a crash, or lets a vote be
 answered with no record of it on disk.
 
+**Conditionally free-order** (#390, heartbeat-under-fsync): `HeartbeatResp`,
+in `Peer.DrainFreeOrderMessages` only. A `HeartbeatResp` carries no log index
+of the follower's — it echoes the ReadIndex ctx (`Hint`), the lease round
+(`LogIndex`) and promises the vote window (`LogTerm`) — so what it vouches for
+is the follower's term, its vote and the window it owes. `Peer` keeps the
+last durable hard state (`durableState`, set by `Commit` and
+`NotePiggybackPersisted`) and the log position at the last drain or update
+(`markStep`). The drain releases a `HeartbeatResp` when term, vote and the
+owed vote window equal the durable values, the log's last index and term are
+unchanged since the mark, and no snapshot or lost update is pending. A commit
+index advance does not hold it: the leader reads nothing commit-related from
+the reply, and a follower that loses an undurable commit index re-learns it.
+A reply held by an earlier drain stays held (`orderedHeld`), so a reply never
+overtakes the ordered messages of the step that produced it. The decision is
+in memory only: no wire field, no format change. The `GetUpdate`, piggyback
+and memory-mode paths keep `HeartbeatResp` ordered.
+
 Three drains apply the rule:
 
 - `drainMessages()` takes everything (the normal `GetUpdate` path, which is
@@ -2283,7 +2300,7 @@ Drains proposals from the MPSC `EntryQueue` and ReadIndex requests from the dedi
 
 What prevents `Tick()` racing `Commit()` is the per-node `raftMu` mutex, which serializes the two. Contention is minimal: both are short (counter and marker updates) and run at most once per RTT interval. `raftMu` is **not reentrant**: event callbacks such as `OnLeaderUpdated` are invoked outside it, because a callback running under `raftMu` would block the commit worker for every shard that worker owns.
 
-When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set (`Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp`) and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `RequestVoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
+When `commitPending` is true, a `Tick()` may still produce messages that must go out immediately. `Peer.DrainFreeOrderMessages()` extracts only the free-order set (`Replicate`, `Ping`, `Heartbeat`, `Quiesce`, `RequestPreVote`, `RequestPreVoteResp`), plus a `HeartbeatResp` whose step left the hard state and log unchanged (#390, see above), and leaves ordered messages in the outbound buffer for the next `GetUpdate` cycle. Using the plain `DrainMessages()` here would silently drop a `RequestVoteResp` produced by `processCommitPendingInbox`, so elections could not complete during a commit+apply cycle. Nothing ordered is ever sent before the WAL persist completes.
 
 **Deferred InstallSnapshot redelivery**: Inbound `InstallSnapshot` messages that arrive during a `commitPending` window are buffered per-shard in `deferredSnapshots` rather than re-delivered to the inbox (avoiding a CPU-burning drain-redeliver loop). When the shard becomes processable again, `redeliverDeferredSnapshots` re-injects them via `node.Deliver()`. Only messages that `Deliver()` reports as accepted are dropped; messages rejected because the inbox is full are retained (compacted to the front of the buffer) for a later retry, so a transient full inbox never permanently loses a deferred snapshot.
 

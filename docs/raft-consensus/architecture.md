@@ -68,6 +68,14 @@ state is durable, because it promises nothing about the sender. A `RequestVoteRe
 worker has actually persisted it. Sending a vote response before the vote is
 durable is how a crash produces two leaders in one term.
 
+One narrowing (#390, heartbeat-under-fsync): while a WAL write is in flight, a
+`HeartbeatResp` whose step left term, vote and the owed vote window at their
+durable values and appended nothing is released with the free-order set. It
+carries no log index of the follower's, so the only state it vouches for is
+already on disk, and CheckQuorum no longer deposes a leader whose followers sit
+in a bounded fsync stall. A reply from a step that did change the hard state or
+the log stays ordered behind the fsync.
+
 **When the LogDB is nil** (memory mode), step workers inline `Peer.Commit` and
 forward straight to `applyC`, cutting three hops to two.
 
