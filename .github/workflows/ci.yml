@@ -1,4 +1,12 @@
-# ci-template: v1.15 (customized)
+# ci-template: v1.19 (customized)
+#
+# v1.19: the image job's trivy image takes --ignore-unfixed (a fixed CVE still
+# blocks; an advisory with no fixed package does not), and the github.com
+# gosec install builds the latest gosec tag against the latest x/tools
+# (handbook devcontainer.md §2). v1.18: the integration and image jobs run
+# scripts/reap-stale-ci-stacks.sh first. v1.17: third-party actions pinned by
+# commit, the tag in a trailing comment. v1.16: Gitea jobs use the runner
+# image's baked analysis tools; installs run on github.com only.
 #
 # Every job starts at once (ci-template v1.14, automatethethings#207/#209), so a
 # run takes as long as its slowest job; ci-gate, the one required check, needs
@@ -67,9 +75,9 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -162,10 +170,10 @@ jobs:
     runs-on: ubuntu-latest
     # No `needs` (v1.14): starts with lint and build, not after them.
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -199,13 +207,23 @@ jobs:
           check govulncheck  v1.8.0  "$(modver govulncheck)"
           exit $rc
 
-      # GitHub-hosted runners bake none of these tools, so install them at the
-      # same pins.
+      # GitHub-hosted runners bake none of these tools, so install them.
+      # v1.19 (handbook devcontainer.md §2): the latest gosec tag, built in a
+      # throwaway module against the latest x/tools. A release's own x/tools
+      # can trail the toolchain's export data (gosec v2.29.0 carries x/tools
+      # v0.49.0, which cannot read Go 1.27's version 5). Drop the x/tools
+      # argument once a gosec release reads it. Retried for the sum.golang.org
+      # flake class; full sumdb verification kept.
       - name: Provision analysis tools (GitHub-hosted)
         if: github.server_url == 'https://github.com'
         run: |
           set -euo pipefail
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          for i in 1 2 3; do
+            ( cd "$(mktemp -d)" && go mod init gosec-build &&
+              go get github.com/securego/gosec/v2/cmd/gosec@latest golang.org/x/tools@latest &&
+              go install github.com/securego/gosec/v2/cmd/gosec ) && break
+            if [ "$i" -lt 3 ]; then echo "install attempt $i failed; retrying"; sleep 10; else echo "tool install failed after 3 attempts"; exit 1; fi
+          done
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       # Writes SARIF (uploaded below) and still exits non-zero on findings to
@@ -239,7 +257,7 @@ jobs:
       - name: Upload gosec SARIF
         # Gitea has no code-scanning API; the upload 404s and fails the job.
         if: always() && github.server_url == 'https://github.com'
-        uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
         with:
           sarif_file: gosec.sarif
           category: gosec
@@ -250,7 +268,9 @@ jobs:
   # CUSTOMIZE (ci-template v1.18, image job): builds the devcontainer images
   # from build/docker/devcontainer/Dockerfile at this commit, runs the
   # toolchain stages in the toolchain image (handbook ci-standard.md §1-§2),
-  # and gates the integration image with trivy image. The checkout is copied
+  # and gates the integration image with trivy image --ignore-unfixed (v1.19:
+  # an advisory with no fixed package does not block; a fixed CVE does, and
+  # make security's trivy fs never takes the flag). The checkout is copied
   # into each toolchain container (scripts/in-toolchain-image.sh): the daemon
   # is reached through a socket, so a bind mount would resolve on its host.
   # make security and make deps-check get a network, for the vulnerability
@@ -263,7 +283,7 @@ jobs:
     env:
       IT_IMAGE: go-quicraft-ci-it:${{ github.run_id }}-${{ github.run_attempt }}-image
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh go-quicraft-ci-
@@ -305,7 +325,7 @@ jobs:
         run: |
           docker save -o it-image.tar "$IT_IMAGE"
           scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" \
-            trivy image --input it-image.tar --severity CRITICAL,HIGH --exit-code 1
+            trivy image --input it-image.tar --ignore-unfixed --severity CRITICAL,HIGH --exit-code 1
 
       - name: Tear down
         if: always()
@@ -317,9 +337,9 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -339,9 +359,9 @@ jobs:
     # No `needs` (v1.14): every job starts at once.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -468,7 +488,7 @@ jobs:
       IT_PROJECT: go-quicraft-ci-${{ github.run_id }}-${{ github.run_attempt }}
       IT_IMAGE: go-quicraft-ci-it:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh go-quicraft-ci-
@@ -510,9 +530,9 @@ jobs:
     needs: [test, integration]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -531,9 +551,9 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -549,9 +569,9 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -570,9 +590,9 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -625,9 +645,9 @@ jobs:
           - { goos: darwin, goarch: arm64 }
           - { goos: freebsd, goarch: amd64 }
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -666,9 +686,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -736,9 +756,9 @@ jobs:
     needs: [integration]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -775,9 +795,9 @@ jobs:
     needs: [integration]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: ${{ env.GO_VERSION }}
 
