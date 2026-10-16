@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -52,23 +51,16 @@ type testCluster struct {
 func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
-	addrs := make([]string, numNodes)
-	for i := range numNodes {
-		// Reserve from a window outside the kernel's ephemeral range, so the
-		// port cannot be handed to anything else before NewHost binds it.
-		// Binding 127.0.0.1:0 and closing it would leave nothing holding the
-		// port between the close and the bind, and two nodes of one cluster
-		// could be given the same one.
-		addrs[i] = netport.MustReserveUDP(t.Fatalf)
-	}
-
 	// One CA, one leaf — one keypair, one node identity — per host; see
 	// test/testpki.
 	ca := testpki.NewCA(t)
 	hosts := make([]*quicraft.Host, numNodes)
 	nodeHostDirs := make([]string, numNodes)
+	// Each host binds a kernel-assigned port; the member map is built from
+	// the bound addresses before any shard starts (#386).
+	addrs := make([]string, numNodes)
 	for i := range numNodes {
-		cfg := testHostConfig(t, addrs[i], ca.Leaf(t))
+		cfg := testHostConfig(t, "127.0.0.1:0", ca.Leaf(t))
 		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
@@ -76,8 +68,9 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
-			t.Fatalf("NewHost[%d] at %s failed: %v", i, addrs[i], err)
+			t.Fatalf("NewHost[%d] failed: %v", i, err)
 		}
+		addrs[i] = h.RaftAddress()
 		hosts[i] = h
 	}
 

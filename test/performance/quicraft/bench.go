@@ -26,7 +26,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/performance/benchutil"
 	"github.com/jeremyhahn/go-quicraft/test/performance/perfresult"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
@@ -114,26 +113,22 @@ func (c *BenchCluster) Leader() *quicraft.Host {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// reservePorts returns n loopback addresses for hosts that do not exist yet.
-//
-// Binding 127.0.0.1:0 for each and holding the socket open until the caller is
-// ready, closing them "immediately before" the transport binds the same
-// addresses, only NARROWS the race rather than removing it: the addresses
-// still come from the kernel's ephemeral range, which is the same pool the
-// kernel draws from for the local end of every outbound connection, so a
-// transport still running from the previous benchmark could be handed one in
-// the close-then-bind window.
-//
-// test/netport removes the class instead: it allocates from a window OUTSIDE
-// the ephemeral range, which the kernel never auto-assigns, so there is no
-// window to be tight about and no socket for the caller to release.
-func reservePorts(b *testing.B, n int) []string {
-	b.Helper()
-	addrs := make([]string, n)
-	for i := range n {
-		addrs[i] = netport.MustReserveUDP(b.Fatalf)
+// kernelAddr binds a host on a loopback port the kernel assigns. A port
+// reserved up front and bound later can be taken by a concurrent job that
+// shares the network but not the reservation's lock directory (#386); a host
+// that binds port 0 holds its port from the moment it exists.
+const kernelAddr = "127.0.0.1:0"
+
+// boundMembers reads each host's bound address back and builds the initial
+// members map from them: replicaID (1-indexed) -> address.
+func boundMembers(hosts []*quicraft.Host) ([]string, map[uint64]string) {
+	addrs := make([]string, len(hosts))
+	members := make(map[uint64]string, len(hosts))
+	for i, h := range hosts {
+		addrs[i] = h.RaftAddress()
+		members[uint64(i+1)] = addrs[i]
 	}
-	return addrs
+	return addrs, members
 }
 
 // benchShardConfig returns the shard configuration every benchmark replica
@@ -161,14 +156,6 @@ func benchShardConfig(replicaID uint64, identities map[uint64]string) config.Con
 func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
-	addrs := reservePorts(b, numNodes)
-
-	// Build the initial members map: replicaID (1-indexed) -> address.
-	members := make(map[uint64]string, numNodes)
-	for i, addr := range addrs {
-		members[uint64(i+1)] = addr
-	}
-
 	// One CA for the cluster so the nodes verify each other, one leaf per
 	// node: a host with a transport is admitted by its node identity, which
 	// is its leaf's key, so the leaves must differ and the founding map must
@@ -183,8 +170,8 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
-			RaftAddress:           addrs[i],
-			ListenAddress:         addrs[i],
+			RaftAddress:           kernelAddr,
+			ListenAddress:         kernelAddr,
 			RTTMillisecond:        quicraftRTT,
 			DeploymentID:          1,
 			AllowZeroDeploymentID: false,
@@ -204,6 +191,7 @@ func SetupQuicRaftCluster(b *testing.B, numNodes int) *BenchCluster {
 		}
 		hosts[i] = h
 	}
+	addrs, members := boundMembers(hosts)
 
 	// Start the shard on all hosts.
 	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
@@ -340,13 +328,6 @@ func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int) {
 func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	addrs := reservePorts(b, numNodes)
-
-	members := make(map[uint64]string, numNodes)
-	for j, addr := range addrs {
-		members[uint64(j+1)] = addr
-	}
-
 	// Generate mTLS material once for the entire cluster so all nodes
 	// share the same CA and can verify each other.
 	ca := testpki.NewCA(b)
@@ -361,8 +342,8 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
-			RaftAddress:           addrs[j],
-			ListenAddress:         addrs[j],
+			RaftAddress:           kernelAddr,
+			ListenAddress:         kernelAddr,
 			RTTMillisecond:        quicraftRTT,
 			DeploymentID:          1,
 			AllowZeroDeploymentID: false,
@@ -381,6 +362,7 @@ func BenchQuicRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.La
 		}
 		hosts[j] = h
 	}
+	_, members := boundMembers(hosts)
 	defer func() {
 		closeHosts(b, hosts...)
 	}()
@@ -1060,13 +1042,6 @@ func BenchQuicRaftCommitLatency(b *testing.B, h *quicraft.Host, rec *perfresult.
 func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 	b.Helper()
 
-	addrs := reservePorts(b, numNodes)
-
-	members := make(map[uint64]string, numNodes)
-	for i, addr := range addrs {
-		members[uint64(i+1)] = addr
-	}
-
 	// One CA for the cluster, one leaf (identity) per node.
 	ca := testpki.NewCA(b)
 
@@ -1077,8 +1052,8 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		hostCfg := config.HostConfig{
 			WALDir:                dir + "/wal",
 			NodeHostDir:           dir + "/data",
-			RaftAddress:           addrs[i],
-			ListenAddress:         addrs[i],
+			RaftAddress:           kernelAddr,
+			ListenAddress:         kernelAddr,
 			RTTMillisecond:        quicraftRTT,
 			DeploymentID:          1,
 			AllowZeroDeploymentID: false,
@@ -1097,6 +1072,7 @@ func SetupQuicRaftClusterLeaseRead(b *testing.B, numNodes int) *BenchCluster {
 		}
 		hosts[i] = h
 	}
+	addrs, members := boundMembers(hosts)
 
 	createFn := sm.NewCreateFunc(func(_, _ uint64) sm.StateMachine {
 		return newQuicraftKVSM()

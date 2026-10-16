@@ -40,7 +40,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/membership"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -733,14 +732,11 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// freePort returns a loopback address for a host that does not exist yet,
-// reserved so that nothing else can be handed the same port before the host
-// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
-// carries the reasoning and the measurements.
-func freePort(t *testing.T) string {
-	t.Helper()
-	return netport.MustReserveUDP(t.Fatalf)
-}
+// kernelAddr binds a host on a loopback port the kernel assigns. Read the
+// bound address from Host.RaftAddress once the host exists: a port reserved
+// up front and bound later can be taken by a concurrent CI job that shares the
+// network but not the reservation's lock directory (#386).
+const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
 // Test Cluster
@@ -811,12 +807,11 @@ func (c *testCluster) nodeHostDir(idx int) string {
 // newTestCluster creates an N-node cluster with real QUIC transport.
 // Each host gets a unique listen address on the loopback interface.
 // The cluster is not started (no shards); call startShard to begin.
-// Host creation retries with a fresh port on bind failures (TOCTOU
-// between freePort and NewHost).
+// Each host binds a kernel-assigned port; the member map is built from the
+// bound addresses before any shard starts.
 func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
-	const maxRetries = 3
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
@@ -824,27 +819,16 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	configs := make([]config.HostConfig, numNodes)
 
 	for i := range numNodes {
-		var h *quicraft.Host
-		var addr string
-		var cfg config.HostConfig
-		for attempt := range maxRetries {
-			addr = freePort(t)
-			cfg = testHostConfig(t, addr, leaves[i])
-			var err error
-			h, err = quicraft.NewHost(cfg, quicraft.WithoutEncryption())
-			if err == nil {
-				break
+		cfg := testHostConfig(t, kernelAddr, leaves[i])
+		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
+		if err != nil {
+			// Clean up any previously created hosts.
+			for j := 0; j < i; j++ {
+				hosts[j].Close()
 			}
-			if attempt == maxRetries-1 {
-				// Clean up any previously created hosts.
-				for j := 0; j < i; j++ {
-					hosts[j].Close()
-				}
-				t.Fatalf("NewHost[%d] failed after %d attempts: %v", i, maxRetries, err)
-			}
-			t.Logf("NewHost[%d] at %s failed (attempt %d), retrying: %v", i, addr, attempt+1, err)
+			t.Fatalf("NewHost[%d] failed: %v", i, err)
 		}
-		addrs[i] = addr
+		addrs[i] = h.RaftAddress()
 		hosts[i] = h
 		configs[i] = cfg
 	}
@@ -1689,9 +1673,8 @@ func addNodeToCluster(
 	// Create a new host on a fresh port under its own leaf from the cluster's
 	// CA — its own keypair, its own identity — so existing peers verify it
 	// and it verifies them.
-	addr := freePort(t)
 	leaf := cluster.ca.Leaf(t)
-	hostCfg := testHostConfig(t, addr, leaf)
+	hostCfg := testHostConfig(t, kernelAddr, leaf)
 	if len(opts) == 0 {
 		opts = []quicraft.HostOption{quicraft.WithoutEncryption()}
 	}
@@ -1699,6 +1682,7 @@ func addNodeToCluster(
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}
+	addr := h.RaftAddress()
 
 	// Request membership addition from whichever node is currently the leader,
 	// retrying a re-election rather than failing on it.
@@ -2280,7 +2264,6 @@ func testBarrierConfig(deploymentID uint64) seal.BarrierConfig {
 func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 	t.Helper()
 
-	const maxRetries = 3
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
 	addrs := make([]string, numNodes)
@@ -2308,25 +2291,15 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		}
 		barriers[i] = b
 
-		var h *quicraft.Host
-		var addr string
-		var cfg config.HostConfig
-		for attempt := range maxRetries {
-			addr = freePort(t)
-			cfg = testHostConfig(t, addr, leaves[i])
-			h, err = quicraft.NewHost(cfg, quicraft.WithBarrier(b))
-			if err == nil {
-				break
+		cfg := testHostConfig(t, kernelAddr, leaves[i])
+		h, err := quicraft.NewHost(cfg, quicraft.WithBarrier(b))
+		if err != nil {
+			for j := 0; j < i; j++ {
+				hosts[j].Close()
 			}
-			if attempt == maxRetries-1 {
-				for j := 0; j < i; j++ {
-					hosts[j].Close()
-				}
-				t.Fatalf("NewHost[%d] with barrier failed after %d attempts: %v", i, maxRetries, err)
-			}
-			t.Logf("NewHost[%d] at %s failed (attempt %d), retrying: %v", i, addr, attempt+1, err)
+			t.Fatalf("NewHost[%d] with barrier failed: %v", i, err)
 		}
-		addrs[i] = addr
+		addrs[i] = h.RaftAddress()
 		hosts[i] = h
 		configs[i] = cfg
 	}

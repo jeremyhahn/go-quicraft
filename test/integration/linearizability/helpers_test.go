@@ -33,7 +33,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/membership"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -696,14 +695,11 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// freePort returns a loopback address for a host that does not exist yet,
-// reserved so that nothing else can be handed the same port before the host
-// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
-// carries the reasoning and the measurements.
-func freePort(t *testing.T) string {
-	t.Helper()
-	return netport.MustReserveUDP(t.Fatalf)
-}
+// kernelAddr binds a host on a loopback port the kernel assigns. Read the
+// bound address from Host.RaftAddress once the host exists: a port reserved
+// up front and bound later can be taken by a concurrent CI job that shares the
+// network but not the reservation's lock directory (#386).
+const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
 // Test Cluster
@@ -762,7 +758,6 @@ func (c *testCluster) identities() map[uint64]string {
 func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	t.Helper()
 
-	const maxRetries = 3
 	timeline := newLeaderTimeline()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
@@ -770,28 +765,21 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	hosts := make([]*quicraft.Host, numNodes)
 	configs := make([]config.HostConfig, numNodes)
 
+	// Each host binds a kernel-assigned port and keeps it: the recorded
+	// config names the bound address, so restartNode reopens the host there.
 	for i := range numNodes {
-		var h *quicraft.Host
-		var addr string
-		var cfg config.HostConfig
-		for attempt := range maxRetries {
-			addr = freePort(t)
-			cfg = testHostConfig(t, addr, leaves[i])
-			cfg.EventListener = timeline.listener()
-			var err error
-			h, err = quicraft.NewHost(cfg, quicraft.WithoutEncryption())
-			if err == nil {
-				break
+		cfg := testHostConfig(t, kernelAddr, leaves[i])
+		cfg.EventListener = timeline.listener()
+		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
+		if err != nil {
+			for j := 0; j < i; j++ {
+				hosts[j].Close()
 			}
-			if attempt == maxRetries-1 {
-				for j := 0; j < i; j++ {
-					hosts[j].Close()
-				}
-				t.Fatalf("NewHost[%d] failed after %d attempts: %v", i, maxRetries, err)
-			}
-			t.Logf("NewHost[%d] at %s failed (attempt %d), retrying: %v", i, addr, attempt+1, err)
+			t.Fatalf("NewHost[%d] failed: %v", i, err)
 		}
-		addrs[i] = addr
+		cfg.RaftAddress = h.RaftAddress()
+		cfg.ListenAddress = cfg.RaftAddress
+		addrs[i] = cfg.RaftAddress
 		hosts[i] = h
 		configs[i] = cfg
 	}
@@ -1066,13 +1054,15 @@ func (c *testCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID, r
 func (c *testCluster) addNode(shardID uint64) int {
 	c.t.Helper()
 
-	addr := freePort(c.t)
-	cfg := testHostConfig(c.t, addr, c.ca.Leaf(c.t))
+	cfg := testHostConfig(c.t, kernelAddr, c.ca.Leaf(c.t))
 	cfg.EventListener = c.timeline.listener()
 	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		c.t.Fatalf("addNode: NewHost failed: %v", err)
 	}
+	addr := h.RaftAddress()
+	cfg.RaftAddress = addr
+	cfg.ListenAddress = addr
 
 	newReplicaID := uint64(len(c.addrs) + 1)
 

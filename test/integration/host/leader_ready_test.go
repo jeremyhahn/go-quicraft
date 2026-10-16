@@ -165,8 +165,8 @@ func newReadyCluster(t *testing.T, n int) *readyCluster {
 	}
 	c.leaves = c.ca.Leaves(t, n)
 	for i := range n {
-		c.addrs[i] = freePort(t)
-		c.dirs[i] = nodeConfig{walDir: t.TempDir(), nodeHostDir: t.TempDir(), addr: c.addrs[i]}
+		c.addrs[i] = kernelAddr
+		c.dirs[i] = nodeConfig{walDir: t.TempDir(), nodeHostDir: t.TempDir()}
 		c.logs[i] = newReadyLog()
 	}
 	t.Cleanup(func() {
@@ -176,8 +176,12 @@ func newReadyCluster(t *testing.T, n int) *readyCluster {
 			}
 		}
 	})
+	// Each host binds a kernel-assigned port and keeps it: restart reopens
+	// the host on the address recorded here.
 	for i := range n {
 		c.hosts[i] = c.newHost(i)
+		c.addrs[i] = c.hosts[i].RaftAddress()
+		c.dirs[i].addr = c.addrs[i]
 		c.ids[uint64(i+1)] = c.hosts[i].NodeIdentity()
 	}
 	for i := range n {

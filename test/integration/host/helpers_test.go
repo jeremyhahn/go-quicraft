@@ -40,7 +40,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 	"github.com/jeremyhahn/go-quicraft/test/membership"
-	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -573,14 +572,11 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// freePort returns a loopback address for a host that does not exist yet,
-// reserved so that nothing else can be handed the same port before the host
-// binds it. Binding 127.0.0.1:0 and closing the socket would not; test/netport
-// carries the reasoning and the measurements.
-func freePort(t *testing.T) string {
-	t.Helper()
-	return netport.MustReserveUDP(t.Fatalf)
-}
+// kernelAddr binds a host on a loopback port the kernel assigns. Read the
+// bound address from Host.RaftAddress once the host exists: a port reserved
+// up front and bound later can be taken by a concurrent CI job that shares the
+// network but not the reservation's lock directory (#386).
+const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
 // Test Cluster
@@ -649,15 +645,13 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
 
+	// Each host binds a kernel-assigned port; the member map is built from
+	// the bound addresses before any shard starts.
 	addrs := make([]string, numNodes)
-	for i := range numNodes {
-		addrs[i] = freePort(t)
-	}
-
 	hosts := make([]*quicraft.Host, numNodes)
 	nodeHostDirs := make([]string, numNodes)
 	for i := range numNodes {
-		cfg := testHostConfig(t, addrs[i], leaves[i])
+		cfg := testHostConfig(t, kernelAddr, leaves[i])
 		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
@@ -665,8 +659,9 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
-			t.Fatalf("NewHost[%d] at %s failed: %v", i, addrs[i], err)
+			t.Fatalf("NewHost[%d] failed: %v", i, err)
 		}
+		addrs[i] = h.RaftAddress()
 		hosts[i] = h
 	}
 
@@ -1581,13 +1576,13 @@ func joinNodeToCluster(
 
 	// Create a new host on a fresh port, under its own leaf from the
 	// cluster's CA: its own keypair, its own identity.
-	addr := freePort(t)
 	leaf := cluster.ca.Leaf(t)
-	hostCfg := testHostConfig(t, addr, leaf)
+	hostCfg := testHostConfig(t, kernelAddr, leaf)
 	h, err := quicraft.NewHost(hostCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost for new node failed: %v", err)
 	}
+	addr := h.RaftAddress()
 
 	// Request the membership addition — with the new node's identity —
 	// through whichever node leads the shard at each attempt, and accept only
@@ -1972,24 +1967,23 @@ func newTestClusterWithRestart(t *testing.T, numNodes int) (*testCluster, []node
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, numNodes)
 
+	// Each host binds a kernel-assigned port and keeps it: restartNode
+	// reopens the host on the address recorded here.
 	addrs := make([]string, numNodes)
-	for i := range numNodes {
-		addrs[i] = freePort(t)
-	}
-
 	hosts := make([]*quicraft.Host, numNodes)
 	configs := make([]nodeConfig, numNodes)
 	nodeHostDirs := make([]string, numNodes)
 	for i := range numNodes {
 		walDir := t.TempDir()
 		nodeHostDir := t.TempDir()
-		h, err := quicraft.NewHost(hostConfigAt(walDir, nodeHostDir, addrs[i], leaves[i]), quicraft.WithoutEncryption())
+		h, err := quicraft.NewHost(hostConfigAt(walDir, nodeHostDir, kernelAddr, leaves[i]), quicraft.WithoutEncryption())
 		if err != nil {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
-			t.Fatalf("NewHost[%d] at %s failed: %v", i, addrs[i], err)
+			t.Fatalf("NewHost[%d] failed: %v", i, err)
 		}
+		addrs[i] = h.RaftAddress()
 		hosts[i] = h
 		nodeHostDirs[i] = nodeHostDir
 		configs[i] = nodeConfig{
