@@ -23,7 +23,8 @@
 #
 #   PR tier    every run. lint, security, build, test, cross-arch, modules.
 #   Full tier  push to main, workflow_dispatch, or a pull_request carrying
-#              the label `ci:full`. integration, netfault, errfs, zero-rtt,
+#              the label `ci:full` (from its next push; a label alone starts
+#              no run). integration, netfault, errfs, zero-rtt,
 #              fuzz-seeds, contrib-dragonboat, fips.
 #
 # Each full-tier job carries the same `if:`, spelled out per job because
@@ -38,9 +39,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # `labeled` so that adding `ci:full` starts a full-tier run. Any other
-    # label also starts a run, which re-runs the PR tier on the same commit.
-    types: [opened, synchronize, reopened, labeled]
+    # No `labeled` (go-trusted-platform #853, claude-agents #180). Gitea 1.27.1
+    # sends every label add AND remove as `label_updated`, and its matcher maps
+    # that to `labeled` whichever label moved, with no `github.event.label` in
+    # the payload. Each `task:*`, `code-review` or review-request lock change
+    # then started a full PR run that the `concurrency` block let cancel the
+    # run in progress, so every Codex review cost two runs. An action outside
+    # `types` matches nothing: no run, no status. The cost: adding `ci:full`
+    # takes effect on the PR's next push or update-branch, or via
+    # workflow_dispatch.
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 # Cancel superseded runs. Keyed on the ref so a branch only supersedes itself,
@@ -838,7 +846,7 @@ jobs:
 
   ci-gate:
     name: CI Gate
-    runs-on: ubuntu-latest
+    runs-on: ci-gate
     if: always()
     needs: [lint, security, build, test, integration, netfault, errfs, zero-rtt, fuzz-seeds, modules, cross-arch, contrib-dragonboat, fips, image]
     steps:
