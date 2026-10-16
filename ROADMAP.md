@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-15
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-16
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
@@ -13,7 +13,8 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Milestones
 
-- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 3 open, 62 closed.
+- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 1 open ([#400](../../issues/400)), 75 closed.
+- [`Working fundamentally`](../../milestone/26): closed.
 
 ## Complete
 
@@ -52,7 +53,7 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Now
 
-No feature in progress. Open in the milestone: [#363](../../issues/363) (multi-group-host restart after a clean stop), [#369](../../issues/369) (docs clean-up), [#370](../../issues/370) (CI in the devcontainer image).
+No feature in progress. Open in the milestone: [#400](../../issues/400) (ROADMAP and SPEC describe main); [#363](../../issues/363), [#369](../../issues/369), [#370](../../issues/370) and [#390](../../issues/390) are closed.
 
 ## Next
 
@@ -69,5 +70,5 @@ No SPEC feature is future.
 ## Dependencies
 
 - Up: go-enclave v0.9.0-alpha (pinned, the newest tag), which carries the enclave-interface API (go-enclave#138, #201); v1.0.0 needs a go-enclave public release.
-- Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.22.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).
+- Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.23.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).
 - Standards watch: draft-irtf-cfrg-xchacha pinned at -03 (`AlgXChaCha20Poly1305`) — [pkg/seal](pkg/seal); copy in [docs/references/](docs/references/README.md)
