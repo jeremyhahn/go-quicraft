@@ -16,6 +16,7 @@ package quicraft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -86,6 +87,12 @@ const (
 type leaderExecOutcome struct {
 	status  uint64
 	payload []byte
+
+	// ctxEnded marks a handler failure that is the handler's context
+	// ending, the caller's or the host's, rather than an answer of its own.
+	// It is set only by an in-process execution and never crosses the wire:
+	// a forwarded answer's context is the leader's, not this host's.
+	ctxEnded bool
 }
 
 // leaderExecVerdict is what ExecuteOnLeader does with an attempt that did
@@ -506,10 +513,25 @@ func (h *Host) awaitAttempt(ctx context.Context, ns *nodeState, leaderID, term u
 	done <-chan leaderExecOutcome, changed <-chan struct{}) (leaderExecOutcome, <-chan struct{}, error) {
 
 	r := h.leaderExec
+	// settle decides an outcome the execution produced. A failure that is
+	// only the execution's context ending, which this host's close or the
+	// caller's own context caused, is not the handler's answer: it gets
+	// the same error as a wait those contexts ended.
+	settle := func(out leaderExecOutcome) (leaderExecOutcome, <-chan struct{}, error) {
+		if out.ctxEnded {
+			if r.ctx.Err() != nil {
+				return leaderExecOutcome{}, changed, ErrStopped
+			}
+			if err := ctx.Err(); err != nil {
+				return leaderExecOutcome{}, changed, mapContextError(err)
+			}
+		}
+		return out, changed, nil
+	}
 	for {
 		select {
 		case out := <-done:
-			return out, changed, nil
+			return settle(out)
 		case <-changed:
 			changed = ns.leaderChanged()
 			viewLeader, viewTerm, _ := ns.leaderAndTerm()
@@ -518,8 +540,20 @@ func (h *Host) awaitAttempt(ctx context.Context, ns *nodeState, leaderID, term u
 			}
 			return leaderExecOutcome{status: leaderExecDeposed}, changed, nil
 		case <-ctx.Done():
+			// select picks at random among ready cases: an outcome already
+			// produced is the answer, whichever case won.
+			select {
+			case out := <-done:
+				return settle(out)
+			default:
+			}
 			return leaderExecOutcome{}, changed, mapContextError(ctx.Err())
 		case <-r.ctx.Done():
+			select {
+			case out := <-done:
+				return settle(out)
+			default:
+			}
 			return leaderExecOutcome{}, changed, ErrStopped
 		}
 	}
@@ -607,14 +641,14 @@ func (h *Host) executeLeaderRequest(ctx context.Context, ns *nodeState, term uin
 		return leaderExecOutcome{status: leaderExecNoHandler}
 	}
 
-	reply, failure, failed := callLeaderHandler(ctx, handler, term, request)
+	reply, failure, failed, ctxEnded := callLeaderHandler(ctx, handler, term, request)
 
 	if _, current, isLeader, _ := ns.leaderTermReady(); h.leaderExecShardDown(ns) != nil ||
 		!isLeader || current != term || !h.leaderExecRaftLeads(ns, term) {
 		return leaderExecOutcome{status: leaderExecDeposed}
 	}
 	if failed {
-		return leaderExecOutcome{status: leaderExecHandlerFailed, payload: []byte(failure)}
+		return leaderExecOutcome{status: leaderExecHandlerFailed, payload: []byte(failure), ctxEnded: ctxEnded}
 	}
 	if limit := effectiveMaxPayload(ns.cfg.MaxProposalPayloadSize, ns.cfg.MaxEntrySize); uint64(len(reply)) > limit {
 		failure = (&EntryTooLargeError{Size: uint64(len(reply)), MaxSize: limit}).Error()
@@ -625,20 +659,22 @@ func (h *Host) executeLeaderRequest(ctx context.Context, ns *nodeState, term uin
 
 // callLeaderHandler runs handler, converting an error or a panic into its
 // text, bounded to leaderExecMaxFailureText. A remote caller's request must
-// not be able to take the leader's process down with it.
+// not be able to take the leader's process down with it. ctxEnded reports
+// that the error is ctx's own ending, which the handler passed back.
 func callLeaderHandler(ctx context.Context, handler LeaderHandler, term uint64,
-	request []byte) (reply []byte, failure string, failed bool) {
+	request []byte) (reply []byte, failure string, failed, ctxEnded bool) {
 
 	defer func() {
 		if p := recover(); p != nil {
-			reply, failure, failed = nil, truncateFailure(fmt.Sprintf("panic: %v", p)), true
+			reply, failure, failed, ctxEnded = nil, truncateFailure(fmt.Sprintf("panic: %v", p)), true, false
 		}
 	}()
 	reply, err := handler(ctx, term, request)
 	if err != nil {
-		return nil, truncateFailure(err.Error()), true
+		ended := ctx.Err() != nil && errors.Is(err, ctx.Err())
+		return nil, truncateFailure(err.Error()), true, ended
 	}
-	return reply, "", false
+	return reply, "", false, false
 }
 
 func truncateFailure(text string) string {

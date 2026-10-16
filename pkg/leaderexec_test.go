@@ -1195,6 +1195,110 @@ func TestLeaderExecRouter_CloseWaitsForLocalExecutions(t *testing.T) {
 	}
 }
 
+// settleAttempts runs the in-process execution of one request n times, each
+// to completion, and only then lets awaitAttempt wait for it: its outcome is
+// already in done when the select runs, so every case ctx has ended is ready
+// alongside it, and select's random choice is exercised on every attempt.
+func settleAttempts(ctx context.Context, t *testing.T, c *execCluster, n int,
+	check func(out leaderExecOutcome, err error)) {
+
+	t.Helper()
+	h, ns := c.hosts[1], c.nodes[1]
+	for range n {
+		execCtx, cancel := h.leaderExec.bind(ctx)
+		done := make(chan leaderExecOutcome, 1)
+		done <- h.executeLeaderRequest(execCtx, ns, 5, []byte("req"))
+		cancel()
+		out, _, err := h.awaitAttempt(ctx, ns, 1, 5, done, ns.leaderChanged())
+		check(out, err)
+	}
+}
+
+func TestExecuteOnLeader_HostCloseCancellationIsErrStopped(t *testing.T) {
+	c := newExecCluster(t)
+	h := c.hosts[1]
+	var ran atomic.Int64
+	err := h.RegisterLeaderHandler(execShard, func(ctx context.Context, _ uint64, _ []byte) ([]byte, error) {
+		ran.Add(1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.elect(1, 5, 1)
+	h.leaderExec.close()
+
+	settleAttempts(context.Background(), t, c, 64, func(_ leaderExecOutcome, err error) {
+		if !errors.Is(err, ErrStopped) {
+			t.Fatalf("err = %v, want ErrStopped", err)
+		}
+	})
+	if got := ran.Load(); got != 64 {
+		t.Fatalf("handler ran %d times, want 64", got)
+	}
+}
+
+func TestExecuteOnLeader_ReplyCompletedBeforeHostCloseIsKept(t *testing.T) {
+	c := newExecCluster(t)
+	h := c.hosts[1]
+	err := h.RegisterLeaderHandler(execShard, func(context.Context, uint64, []byte) ([]byte, error) {
+		return []byte("done"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.elect(1, 5, 1)
+	h.leaderExec.close()
+
+	settleAttempts(context.Background(), t, c, 64, func(out leaderExecOutcome, err error) {
+		if err != nil || out.status != leaderExecOK || string(out.payload) != "done" {
+			t.Fatalf("outcome = %d %q, err = %v, want the reply", out.status, out.payload, err)
+		}
+	})
+}
+
+func TestExecuteOnLeader_HandlerFailureCompletedBeforeHostCloseIsKept(t *testing.T) {
+	c := newExecCluster(t)
+	h := c.hosts[1]
+	err := h.RegisterLeaderHandler(execShard, func(context.Context, uint64, []byte) ([]byte, error) {
+		return nil, errors.New("refused")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.elect(1, 5, 1)
+	h.leaderExec.close()
+
+	settleAttempts(context.Background(), t, c, 64, func(out leaderExecOutcome, err error) {
+		if err != nil || out.status != leaderExecHandlerFailed || string(out.payload) != "refused" {
+			t.Fatalf("outcome = %d %q, err = %v, want the handler's failure", out.status, out.payload, err)
+		}
+	})
+}
+
+func TestExecuteOnLeader_CallerCancellationIsTheCallersError(t *testing.T) {
+	c := newExecCluster(t)
+	h := c.hosts[1]
+	err := h.RegisterLeaderHandler(execShard, func(ctx context.Context, _ uint64, _ []byte) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.elect(1, 5, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	want := mapContextError(context.Canceled)
+	settleAttempts(ctx, t, c, 64, func(_ leaderExecOutcome, err error) {
+		if !errors.Is(err, want) {
+			t.Fatalf("err = %v, want %v", err, want)
+		}
+	})
+}
+
 func asResult(errs <-chan error) <-chan execResult {
 	out := make(chan execResult, 1)
 	go func() { out <- execResult{err: <-errs} }()
