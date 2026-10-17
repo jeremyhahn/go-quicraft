@@ -1,7 +1,7 @@
 # Compatibility and upgrades: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-13
+> Last verified: 2026-10-16
 > Conflicts with this document are defects. Fix them here first.
 
 What this library promises across versions, what it does not, and why. The
@@ -12,7 +12,7 @@ and deprecation" and points here.
 
 | Document | Holds |
 |---|---|
-| this file | the stability guarantee, the pinning policy, the identity requirement, rejected alternatives |
+| this file | the stability guarantee, the pinning policy, the policy from v1.0.0, the identity requirement, rejected alternatives |
 | [engineering.md](engineering.md) | every version discriminator, its byte layout, its check and its error; the payload-type ladder; tests |
 | [api.md](api.md) | the interface requirements an embedder's own types must meet, and the error values each check returns |
 | [user.md](user.md) | the upgrade path, upgrade notes for every release, bootstrapping a cluster with identities |
@@ -116,6 +116,133 @@ because deriving the persisted version from the wire version would change the
 byte every replica expects at log index 1 on the first transport-only bump. The
 compile-time guard and the test that hold this are in
 [engineering.md](engineering.md#the-supremum-is-enforced-at-compile-time).
+
+## From v1.0.0
+
+> **Status: AWAITING THE OWNER'S ACKNOWLEDGEMENT (#404).** This section restates
+> what the company conventions already bind for a post-1.0 release; it sets no
+> policy of its own. Where the conventions are silent it lists the gap under
+> [Open questions for the owner](#open-questions-for-the-owner) and does not
+> answer it. The SPEC v1.0.0 bar requires the policy to be acknowledged
+> (release-versioning.md §1, §8); the owner acknowledges it, not the change
+> that wrote it.
+
+The binding source is
+[release-versioning.md](../../../handbook/software/conventions/release-versioning.md).
+Where this section and that document disagree, the handbook wins and this
+section is the defect.
+
+### Semantic versioning after 1.0
+
+The bump rules change at 1.0
+([§1](../../../handbook/software/conventions/release-versioning.md#1-semantic-versioning-with--alpha)):
+
+| Bump | Pre-1.0 (today) | Post-1.0 |
+|---|---|---|
+| PATCH | Bug fix, no API change | Bug fix |
+| MINOR | Added API or a breaking change | Added API, backward compatible |
+| MAJOR | Reserved for 1.0 | Breaking change. "The module path gains `/vN` and every consumer's imports change, so take a major deliberately, never mechanically." |
+
+For go-quicraft a breaking change after 1.0 is any of the kinds this library
+already lists under BREAKING: an exported identifier removed or renamed, a
+signature changed, an observable run-time behaviour changed, or an on-disk or
+wire layout changed. Each is a MAJOR release under the `/vN` module path; the
+release workflow already refuses a v2+ tag without the suffix
+([Released versions](#released-versions)). A published tag is never moved or
+deleted, and a consumer's pin never decreases
+([§3](../../../handbook/software/conventions/release-versioning.md#3-version-monotonicity)).
+
+### The breaking-change protocol, bottom-up
+
+A breaking change follows
+[§8](../../../handbook/software/conventions/release-versioning.md#8-breaking-change-protocol):
+"Changes travel bottom-up (00 L6), in the build order of
+02-dependency-graph.md, and all consumers are updated before merging."
+go-quicraft sits directly above go-enclave, so a break here starts the walk:
+
+1. Land it here with a CHANGELOG entry carrying `BREAKING:` in its heading
+   (`### Changed — BREAKING: …`, §5), and get `go build ./... && go test ./...`
+   green.
+2. Tag go-quicraft.
+3. Walk up the graph through every consumer (go-qrdb, go-xkms, go-quicbaas,
+   go-trusted-ca and on up): "at each layer bump the pin, adapt, verify build
+   and tests, then move up. Never skip a layer or pin a consumer to a version
+   its own dependency lacks."
+4. Re-verify at the top: go-trusted-platform builds and passes.
+5. Update the documents the change falsifies, in the same change.
+6. "Never merge a partial walk. If a layer cannot be updated now, stop and
+   report the gap."
+
+§8 step 1 reads "bump MINOR", the pre-1.0 rule; how it reads after 1.0 is
+[open question 1](#open-questions-for-the-owner).
+
+### Format versions start moving
+
+The pinning rule above ends when v1 ships. Until the first stable production
+v1 release, every format version stays at its current value, and none moves
+without the owner's explicit approval, asked for and granted each time
+([CLAUDE.md](../../CLAUDE.md)). The constants this governs are those in
+[engineering.md](engineering.md#version-discriminators): `proto.WireVersion`,
+`transport.WireVersion`, the `Membership` section version and `waldb`
+`membershipSectionVersion`, `walFormatVersion` (the `WALFORMAT` marker),
+`snapshotMetaVersion`, `snapshotArtifactVersion`, and the sealed root key
+versions and `sealedStateMACVersion`. After v1 the version numbers start
+incrementing, and the supremum rule for `proto.WireVersion`
+([above](#the-transport-version-is-a-supremum)) takes effect. The first
+post-1.0 bump of any of them is still the owner's to approve.
+
+### Migration discipline
+
+§1: "Until a project's first public release, backward compatibility, data
+migrations and upgrade paths are non-goals." and "After the first public
+release, §8 and real migration discipline apply." Wipe and re-sync, the only
+[upgrade path](user.md#upgrade-path) today, stops being an acceptable answer
+for a released layout. The handbook does not yet say what "real migration
+discipline" consists of; the gaps are open questions 2 to 6 below.
+
+### What does not change
+
+- All transport is QUIC. There is no TCP fallback before or after 1.0
+  ([CLAUDE.md](../../CLAUDE.md): "All transport must use QUIC, never fall back
+  to TCP").
+- Node identities stay mandatory on every host with a transport
+  ([Node identities are mandatory](#node-identities-are-mandatory)).
+- One discriminator per thing it protects; the persisted `Membership` version
+  is never derived from `proto.WireVersion`.
+- Every decoder fails closed on a layout it does not read.
+
+### Open questions for the owner
+
+These are gaps in the conventions, not decisions. Nothing in this repository
+answers them until the owner does.
+
+1. **§8 after 1.0.** §8 step 1 says "bump MINOR"; the post-1.0 bump table says a
+   breaking change is MAJOR with a `/vN` path. Does §8 read MAJOR from 1.0, with
+   every consumer's walk changing imports to the `/vN` path?
+2. **Supported read window.** After a bump of `walFormatVersion`, a WAL
+   payload-type layout, `snapshotMetaVersion`, `snapshotArtifactVersion` or a
+   sealed-root-key version, how many prior versions must a release still read,
+   and for how long?
+3. **Mixed-version clusters.** After a bump of `proto.WireVersion` or
+   `transport.WireVersion`, must a release interoperate with the previous wire
+   version so a cluster can be upgraded node by node (a rolling upgrade), and
+   if so, by negotiation or by accepting a fixed window? Today the check is
+   exact match and mixed-version clusters are unsupported.
+4. **Migration mechanism.** Is a migration done in place on open, by a
+   separate offline tool, or by re-sync from upgraded peers, and is a
+   migration allowed to be one-way?
+5. **Downgrades.** Is any downgrade supported after 1.0?
+6. **Deprecation.** release-versioning.md §5: "There is no deprecation policy
+   (open: handbook#222 P3)." Does a post-1.0 exported name get a deprecation
+   window before a MAJOR removes it?
+7. **Payload-type retirement after 1.0.** Before 1.0 a detectable layout
+   change retires a payload-type byte instead of bumping a version. Does that
+   rule continue after 1.0, or does a released layout change bump
+   `walFormatVersion` instead?
+8. **Which event starts it.** §1 ties migration discipline to "the first public
+   release" and ends the pre-publication exception "when the module is pushed
+   to public GitHub"; CLAUDE.md pins format versions until "the first stable
+   production v1 release". Are these the same event, v1.0.0?
 
 ## Node identities are mandatory
 

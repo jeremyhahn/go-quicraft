@@ -1,7 +1,7 @@
 # Compatibility and upgrades: user guide
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-13
+> Last verified: 2026-10-16
 > Conflicts with this document are defects. Fix them here first.
 
 How to move a cluster from one version to another, what each release changes,
@@ -118,6 +118,30 @@ Not supported at any boundary. A downgrade is a wipe and a restore from a backup
 taken on the older version. An older binary reads a current `snapshot.meta` as
 corrupt and fails closed on a payload-type byte it does not know; anything else
 it accepts by version and then misreads.
+
+## From v1.0.0
+
+> **Status: AWAITING THE OWNER'S ACKNOWLEDGEMENT (#404).** The full statement,
+> and the questions it leaves open, are in
+> [architecture.md](architecture.md#from-v100).
+
+Everything above describes the pre-release policy. From the first stable
+release, per
+[release-versioning.md §1](../../../handbook/software/conventions/release-versioning.md#1-semantic-versioning-with--alpha):
+
+- A PATCH is a bug fix and a MINOR adds API without breaking it, so either can
+  be taken without reading for breakage.
+- A breaking change, API or format, is a MAJOR release under a new module path
+  (`github.com/jeremyhahn/go-quicraft/v2`, ...): upgrading means changing your
+  imports.
+- Format version numbers (`walFormatVersion`, `transport.WireVersion` and the
+  rest in [engineering.md](engineering.md#version-discriminators)) start
+  incrementing instead of staying pinned.
+- "Real migration discipline" applies, so wipe and re-sync stops being the
+  only upgrade path. How far back a release reads old data, whether
+  mixed-version clusters and downgrades are supported, and how a migration is
+  run are not decided yet; until they are, plan an upgrade as described above.
+- Transport stays QUIC only, with no TCP fallback.
 
 ## Bootstrapping and growing a cluster
 
