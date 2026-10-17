@@ -355,7 +355,7 @@ Three obligations, and one limit, come with `ProtectedShare`:
   share is one locked allocation. Destroy shares as they are consumed rather than
   at the end of a ceremony.
 - **`Destroy` does not report a refused release.** go-enclave's
-  `Memory.Destroy` returns an error, and `ProtectedShare.Destroy` returns
+  `ByteAccess.Destroy` returns an error, and `ProtectedShare.Destroy` returns
   nothing: a release the kernel refuses stays on go-enclave's `WipeAll` ledger
   for a later retry, and a release that ran without a wipe (a denied
   `mprotect`) has already returned the pages, which the kernel zeroes before

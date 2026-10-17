@@ -25,23 +25,23 @@ in the dependency graph. go-quicraft consumes two types:
 | `enclave.ByteAccess` | key material in plaintext, `mlock`'d, guard-paged, canary-checked, excluded from core dumps | `Destroy` wipes the bytes before unmapping |
 | `enclave.Sealed` | key material encrypted at rest on the ordinary heap; plaintext only inside an `Open` | `Destroy` wipes the ciphertext and the wrapped-key blob |
 
-A `Memory` keeps plaintext locked for its whole lifetime: unswappable and
+A `ByteAccess` keeps plaintext locked for its whole lifetime: unswappable and
 undumpable, but present. A `Sealed` keeps ciphertext, so between `Open`s
 the material is not readable at all. Material in continuous use goes in the
 first; material consulted occasionally and held for a long time goes in the
 second. That is why every long-lived key in this repository is a
-`Sealed` and every working copy is a `Memory`.
+`Sealed` and every working copy is a `ByteAccess`.
 
 ```
 enclave.NewSealed(ctx, key []byte)   key []byte is WIPED by the constructor
         |
         v
-  Sealed  ─ Open(ctx) ─►  Memory  ── WithBytes() ──►  cipher.AEAD
-   (ciphertext,                     (plaintext,           |
-    heap)                            mlock'd, frozen)     |
-        |                               |                 v
-    Destroy()                       Destroy()        (use, then discard)
-  WIPES ciphertext                WIPES + unmaps
+  Sealed  ─ Open(ctx) ─►  ByteAccess  ── WithBytes() ──►  cipher.AEAD
+   (ciphertext,                         (plaintext,           |
+    heap)                                mlock'd, frozen)     |
+        |                                   |                 v
+    Destroy()                           Destroy()        (use, then discard)
+  WIPES ciphertext                    WIPES + unmaps
 ```
 
 Material this repository generates never takes that path. It is produced
@@ -83,7 +83,7 @@ exposure and the number of copies; it does not create an isolation domain.
 
 Guaranteed:
 
-- `Memory` memory is `mlock`'d (excluded from swap), fenced by guard pages
+- `ByteAccess` memory is `mlock`'d (excluded from swap), fenced by guard pages
   on both sides, canary-checked, marked `MADV_DONTDUMP`, and wiped by `Destroy`
   before unmapping. This is go-enclave's guarantee, consumed rather than
   restated.
@@ -95,7 +95,7 @@ Guaranteed:
   hierarchy, which is held in locked memory and dies with the process.
 - Plaintext exposure is bounded to `Open`/`Destroy` windows.
 - `Destroy` erases on both types: each wipes what it holds before releasing it.
-  `Memory.Destroy` reports a release the kernel refused, or one that ran
+  A `ByteAccess`'s `Destroy` reports a release the kernel refused, or one that ran
   without a wipe because `mprotect` was denied; see "Releases are reported".
 
 Not guaranteed:
@@ -117,7 +117,8 @@ Not guaranteed:
 
 Material this repository generates is produced into locked pages rather than
 moved into them. `NewMemorySized` returns writable locked memory, the
-caller fills it inside a borrow, and `Memory.Freeze` mprotects it
+caller fills it inside a borrow, and `Freezer.Freeze` (the capability reached
+with `enclave.As`) mprotects it
 read-only once the material is final. A stray write through a retained slice
 then faults instead of silently corrupting a key.
 
@@ -142,9 +143,9 @@ a term in `splitLockedBytes` and move the `MaxShareSetBytes` boundary.
 which wipes what it is handed, and a wipe of frozen pages faults the process.
 Freezing there would trade a hypothetical stray-write fault for a certain one.
 
-### `Sealed` for anything long-lived, `Memory` for anything in use
+### `Sealed` for anything long-lived, `ByteAccess` for anything in use
 
-A `Memory` holding a key read twice a day costs a locked page for the
+A `ByteAccess` holding a key read twice a day costs a locked page for the
 whole process lifetime and keeps the plaintext present. A `Sealed` costs
 heap and produces plaintext for the length of one operation. Locked memory is a
 fixed, process-wide resource (`RLIMIT_MEMLOCK`), so spending it on material
@@ -210,7 +211,7 @@ still holds.
 
 ### Releases are reported
 
-`Memory.Destroy` returns an error. `ErrLockedMemoryUnavailable` means the
+A `ByteAccess`'s `Destroy` returns an error. `ErrLockedMemoryUnavailable` means the
 kernel refused the release and the pages are still held; go-enclave keeps them
 on its `WipeAll` ledger and a later `Destroy` retries. `ErrReleasedWithoutWipe`
 means a denied `mprotect` forced a bare unmap: the pages are gone, and the
@@ -222,7 +223,7 @@ pages are still wiped and released.
 v0.9.0-alpha. `pkg/seal` logs a non-nil one at WARN through its own helper
 (`releaseSealed`), and `SoftwareStrategy.Close` returns it.
 
-Every `Memory` this repository destroys is a cleanup step whose operation
+Every `ByteAccess` this repository destroys is a cleanup step whose operation
 already has its result, so the report never replaces that result. `pkg/seal`
 logs it at WARN through one helper; `pkg/crypto/shamir`, a primitive with no
 logger, drops it through one helper whose comment says why nothing is lost.
@@ -265,7 +266,7 @@ constructors take a passphrase the caller may still be using.
 - **`pkg/seal`** holds `Barrier.rootKey`, `Barrier.currentDEK`, the per-epoch
   `deks` map, `SoftwareStrategy.passphrase` and `Credentials.Secret`.
 - **`pkg/crypto/shamir`** holds a `ProtectedShare`'s value and the secret
-  `CombineProtected` reconstructs, both frozen `Memory`s the caller owns.
+  `CombineProtected` reconstructs, both frozen `ByteAccess` enclaves the caller owns.
 - **Consumers above** (go-qrdb, go-xkms, go-quicbaas, go-trusted-platform) import
   go-enclave directly, never through go-quicraft. This repository re-exports none
   of it.

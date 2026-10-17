@@ -48,7 +48,7 @@ var ErrEnclaveDestroyed, ErrEmptyEnclave, ErrInvalidSize,
 
 ## 2. Invariants
 
-**Call safety versus slice safety.** A `Memory` guards its mapping with
+**Call safety versus slice safety.** A `ByteAccess` guards its mapping with
 its own `sync.RWMutex` inside go-enclave. Readers hold the read lock for the call
 and `Destroy` takes the write lock, so teardown waits out in-flight readers. A
 `Sealed`'s lock only pins and unpins its envelope and is not held across
@@ -60,10 +60,10 @@ passes is valid for the callback alone.
 | Operation | Concurrency | Idempotent |
 |---|---|---|
 | `Sealed.Open` | safe with `Open`, `Destroy` | n/a; each call returns a new enclave |
-| `Sealed.Destroy` | does not wait for an `Open` in flight: that open completes against the envelope it pinned, a later one returns `ErrEnclaveDestroyed`, and the last open out wipes the ciphertext | yes; a `nil` receiver is a no-op |
-| `Memory.WithBytes` / `EqualTo` / `Size` / `IsAlive` | readers; hold the read lock for the whole call, so a concurrent `Destroy` blocks | n/a |
-| `Memory.Freeze` | writer; waits out every in-flight borrow | yes; irreversible |
-| `Memory.Destroy` | writer; blocks until every in-flight reader returns | yes; a `nil` receiver and every call after a successful release return `nil`; a refused release is retried by calling it again |
+| `Sealed.Destroy` | does not wait for an `Open` in flight: that open completes against the envelope it pinned, a later one returns `ErrEnclaveDestroyed`, and the last open out wipes the ciphertext | yes |
+| `ByteAccess.WithBytes` / `EqualTo` / `Size` / `IsAlive` | readers; hold the read lock for the whole call, so a concurrent `Destroy` blocks | n/a |
+| `Freezer.Freeze`, reached with `enclave.As` | writer; waits out every in-flight borrow | yes; irreversible |
+| `ByteAccess.Destroy` | writer; blocks until every in-flight reader returns | yes; every call after a successful release returns `nil`; a refused release is retried by calling it again |
 
 - **The lock bounds the callback, not the slice.** `Destroy` wipes and unmaps
   the memory, so a view retained past its callback is a use-after-free that
@@ -82,12 +82,12 @@ passes is valid for the callback alone.
 - **There is no process-wide purge.** go-enclave maps its own memory, and an
   allocation that fails, fails alone.
 - **`WipeAll` is the one other thing that can destroy an enclave.** go-enclave's
-  shutdown sweep destroys every live `Memory` in the process, including a
+  shutdown sweep destroys every live memory enclave in the process, including a
   `Sealer`'s key hierarchy, after which a `Sealed` still reports `IsAlive`
   while `Open` fails with `ErrSealerWiped`. This repository never calls it: it
   belongs to whoever owns the process.
 - **Every `Open` is paired with a `Destroy`.** `Sealed.Open` materializes
-  plaintext into a fresh `Memory` the caller owns. A leaked enclave keeps
+  plaintext into a fresh `ByteAccess` the caller owns. A leaked enclave keeps
   plaintext resident for the life of the process and holds a whole page of
   `RLIMIT_MEMLOCK`, which makes later locks fail with `ErrLockedMemoryUnavailable`.
 - **Constructors consume their input.** `NewSealed(data)` and
@@ -121,7 +121,7 @@ passes is valid for the callback alone.
   rotation loop and the snapshot pool pass a context cancelled when they stop,
   and the forced rotation inside `Unseal` passes
   `context.WithoutCancel` of the unseal's context.
-- **`Memory.Destroy` reports its release.** It returns
+- **`ByteAccess.Destroy` reports its release.** It returns
   `ErrLockedMemoryUnavailable` when the kernel refused the release (the pages are
   still held and on go-enclave's `WipeAll` ledger; calling `Destroy` again
   retries) and `ErrReleasedWithoutWipe` when a denied `mprotect` forced a bare
@@ -154,15 +154,15 @@ passes is valid for the callback alone.
 
 | Error | Type | Returned when | Fail-closed? |
 |---|---|---|---|
-| `ErrEnclaveDestroyed` | sentinel | any read on a destroyed or nil enclave, either type | Yes; the callback is not called |
-| `ErrLockedMemoryUnavailable` | `*LockedMemoryError` | the kernel refuses to map, lock or mprotect the pages, usually at `RLIMIT_MEMLOCK`; from `Memory.Destroy`, the kernel refused the release | Yes; that allocation alone fails, and a refused release keeps the pages for a retry |
+| `ErrEnclaveDestroyed` | sentinel | any read on a destroyed enclave, either type | Yes; the callback is not called |
+| `ErrLockedMemoryUnavailable` | `*LockedMemoryError` | the kernel refuses to map, lock or mprotect the pages, usually at `RLIMIT_MEMLOCK`; from `ByteAccess.Destroy`, the kernel refused the release | Yes; that allocation alone fails, and a refused release keeps the pages for a retry |
 | `ErrEmptyEnclave` / `ErrInvalidSize` | sentinels | an enclave over no material, or a size no enclave can have | Yes; refused before anything is mapped |
 | `ErrSealFailed` | sentinel | the AEAD, the CSPRNG or the provider failed while sealing, or the seal's context ended | Yes |
 | `ErrOpenFailed` | sentinel | an open's context ended, or a `ModePerOperation` provider's infrastructure failed | Yes; the sealed value stays intact and can be opened again |
 | `ErrSealedAuthentication` | sentinel | a sealed envelope did not authenticate | Yes; deliberately indistinguishable between causes |
 | `ErrSealerWiped` | sentinel | a shutdown sweep destroyed the sealer's root or current KEK | Yes; a per-call key destroyed by a sweep is `ErrEnclaveDestroyed` instead |
-| `ErrReleasedWithoutWipe` | sentinel | `Memory.Destroy` unmapped a frozen enclave's pages without a wipe because `mprotect` was denied | Not a failure to protect: the pages are gone and the kernel zeroes them before reuse |
-| `ErrEnclaveCorrupted` | sentinel | `Memory.Destroy` found the canary or guard pages overwritten | Reported, not panicked: the material is wiped and the pages released first |
+| `ErrReleasedWithoutWipe` | sentinel | `ByteAccess.Destroy` unmapped a frozen enclave's pages without a wipe because `mprotect` was denied | Not a failure to protect: the pages are gone and the kernel zeroes them before reuse |
+| `ErrEnclaveCorrupted` | sentinel | `ByteAccess.Destroy` found the canary or guard pages overwritten | Reported, not panicked: the material is wiped and the pages released first |
 
 How `pkg/seal` and `pkg/crypto/shamir` translate them:
 
@@ -270,7 +270,7 @@ with an `enclave` field naming the role (`root key`, `epoch DEK`, ...) and the
 
 | Message | Helper | When |
 |---|---|---|
-| `quicraft/seal: locked memory release was refused or ran without a wipe` | `releaseEnclave` | `Memory.Destroy` returned non-nil |
+| `quicraft/seal: locked memory release was refused or ran without a wipe` | `releaseEnclave` | `ByteAccess.Destroy` returned non-nil |
 | `quicraft/seal: sealed key release failed` | `releaseSealed` | `Sealed.Destroy` returned non-nil (never, in go-enclave v0.9.0-alpha) |
 
 `pkg/crypto/shamir` has no logger and logs nothing. `pkg/seal` logs barrier lifecycle

@@ -23,11 +23,11 @@ go-quicraft does.
 | You have | Use | Because |
 |---|---|---|
 | a key read occasionally, held for the life of a service | `Sealed` | ciphertext at rest; plaintext exists only inside an `Open` |
-| a key in continuous use for the length of one operation | `Memory` | locked plaintext, no per-use decryption |
-| material you are about to generate | `NewMemorySized` + `Freeze` | it never touches the ordinary heap |
+| a key in continuous use for the length of one operation | `ByteAccess` | locked plaintext, no per-use decryption |
+| material you are about to generate | `NewMemorySized` + `Freezer.Freeze` | it never touches the ordinary heap |
 
 go-quicraft holds its root key, every epoch DEK and every passphrase as
-`Sealed`s, and opens a `Memory` only for the window in which the
+`Sealed`s, and opens a `ByteAccess` only for the window in which the
 bytes are read.
 
 ## Hold a key for the life of a service
@@ -140,8 +140,14 @@ if err := buf.WithBytes(deriveInto); err != nil {
 	return err
 }
 // The material is final: make the pages read-only, so a stray write through a
-// retained slice faults instead of silently corrupting the key.
-if err := buf.Freeze(); err != nil {
+// retained slice faults instead of silently corrupting the key. Freeze is the
+// Freezer capability, reached with enclave.As.
+var f enclave.Freezer
+if !enclave.As(buf, &f) {
+	buf.Destroy()
+	return &enclave.CapabilityError{Backend: buf.Backend().Name(), Capability: enclave.CapabilityFreeze}
+}
+if err := f.Freeze(); err != nil {
 	buf.Destroy()
 	return err
 }
@@ -163,7 +169,7 @@ enclave.Wipe(transient)
 ```
 
 Use this for the copy a third-party API forced you to make. It does not replace
-a `Memory` (the bytes were swappable and dumpable while they existed), but
+a `ByteAccess` (the bytes were swappable and dumpable while they existed), but
 it bounds how long they linger.
 
 ## Supply a passphrase to go-quicraft's seal layer

@@ -226,7 +226,7 @@ var ErrSealedAuthentication    = errors.New("enclave: sealed material failed aut
 Match with `errors.Is`. `LockedMemoryError` and `BudgetError` carry diagnostic
 detail and match their sentinels, so callers never need the types.
 
-A destroyed or nil enclave reports `ErrEnclaveDestroyed`; one sentinel meaning
+A destroyed enclave reports `ErrEnclaveDestroyed`; one sentinel meaning
 "the material is gone" is the whole contract. `pkg/seal` translates it at its own
 boundary: a destroyed strategy passphrase surfaces as `ErrStrategyClosed`.
 

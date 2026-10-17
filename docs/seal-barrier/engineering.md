@@ -308,9 +308,9 @@ returns `(newEpoch, nil)`; returning an error alongside a committed epoch is
 avoided so a caller cannot retry into a second rotation.
 
 **Root-key borrows.** The root key is held between operations as a
-`Sealed`. `Rotate` opens it once into a locked `Memory`, whose
+`Sealed`. `Rotate` opens it once into a locked `ByteAccess`, whose
 destruction is deferred, and reads that through go-enclave's scoped
-`Memory.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped
+`ByteAccess.WithBytes` (go-enclave v0.8.0-alpha removed the unscoped
 `MemoryEnclave.Open`). It borrows twice, each time for the one call that reads it: the epoch-cipher
 derivation, then the `StateMAC` re-stamp. Neither borrow spans the sealing of
 the new DEK, which may block on a provider, and no view of the key outlives its
