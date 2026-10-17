@@ -286,7 +286,7 @@ jobs:
   # is a gate only: nothing is uploaded to code scanning.
   image:
     name: Devcontainer image [build, test, security, deps-check, trivy image]
-    runs-on: ubuntu-latest
+    runs-on: bigdisk
     timeout-minutes: 90
     env:
       IT_IMAGE: go-quicraft-ci-it:${{ github.run_id }}-${{ github.run_attempt }}-image
