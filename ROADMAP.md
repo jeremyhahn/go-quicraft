@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-16
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-17
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
@@ -57,7 +57,9 @@ No feature in progress. Open in the milestone: [#400](../../issues/400) (ROADMAP
 
 ## Next
 
-Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
+- **pq-key-exchange** — the non-FIPS build offers X25519MLKEM768 first, with P-256 kept as the shared group; the FIPS build follows once a lane confirms the fips140 module accepts the hybrid (owner ruling 2026-10-17, queue 49 option A) — [#412](../../issues/412). It waits for a seat.
+
+The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
@@ -72,3 +74,4 @@ No SPEC feature is future.
 - Up: go-enclave v0.9.0-alpha (pinned, the newest tag), which carries the enclave-interface API (go-enclave#138, #201); v1.0.0 needs a go-enclave public release.
 - Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.23.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).
 - Standards watch: draft-irtf-cfrg-xchacha pinned at -03 (`AlgXChaCha20Poly1305`) — [pkg/seal](pkg/seal); copy in [docs/references/](docs/references/README.md)
+- Standards watch: draft-ietf-tls-ecdhe-mlkem pinned at -05 (2026-08-10; `X25519MLKEM768`) — [pkg/internal/transport](pkg/internal/transport); its copy lands in [docs/references/](docs/references/README.md) with [#412](../../issues/412)

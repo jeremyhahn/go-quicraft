@@ -1,6 +1,6 @@
 # go-quicraft specification
 
-> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-16
+> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-17
 > A feature listed here, in any status, is never deleted (not its docs, code or issues) without the owner's change to this file.
 
 ## Purpose
@@ -39,6 +39,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | quic-transport | shipped | All inter-node traffic, snapshots included, runs over QUIC with mandatory mutual TLS and no TCP fallback; connection and stream pools, heartbeats on stream 0; CRL/OCSP revocation fails closed; the node registry. [architecture.md](quic-transport/architecture.md) | [quic-transport/](quic-transport/) |
 | 0-rtt-policy | shipped | 0-RTT is off by default (`TransportConfig.Enable0RTT`); a node never sends early data; message frames and snapshots that arrive as 0-RTT early data are refused, because they are replayable. | [quic-transport/](quic-transport/) |
 | fips-builds | shipped | `GOFIPS140` selects FIPS 140-3 mode and `-tags fips` compiles non-approved algorithms out; the boundary covers data at rest and the QUIC transport; OCSP revocation is the one exempt path; `make verify-fips` is the check. | [quic-transport/](quic-transport/), [seal-barrier/](seal-barrier/) |
+| pq-key-exchange | planned | The TLS 1.3 handshake offers the hybrid group X25519MLKEM768 first in the non-FIPS build, per draft-ietf-tls-ecdhe-mlkem pinned at -05 (FIPS 203 ML-KEM). P-256 stays the group shared with FIPS builds, so a mixed fleet still negotiates. The FIPS build adds a hybrid only once a test shows the Go fips140 module accepts it. No quicraft format version changes. Owner ruling 2026-10-17 (queue 49, option A); [#412](../../issues/412). | [quic-transport/](quic-transport/) |
 | wire-protocol | shipped | A fixed-layout binary wire format with no protobuf, in two version namespaces; every format version stays pinned until v1.0.0. [architecture.md](wire-protocol/architecture.md) | [wire-protocol/](wire-protocol/) |
 | log-storage | shipped | A 16-shard WAL (directory shard `shardID % 16`) with no embedded database; the `LogDB` interface, recovery, compaction and repair. [architecture.md](log-storage/architecture.md) | [log-storage/](log-storage/) |
 | snapshots | shipped | Snapshot creation, streaming over QUIC, import and export, and re-encryption. [architecture.md](snapshots/architecture.md) | [snapshots/](snapshots/) |
@@ -56,7 +57,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | testing | shipped | The test infrastructure: suite organisation, build tags, fault injectors, fuzzing, linearizability verification, coverage gates and benchmark regression. [overview.md](testing/overview.md) | [testing/](testing/) |
 | release | shipped | Public releasability: what may be published from this tree, the development-tooling exclusion list and the `test/releasability` gate; the release recipe (`make release-candidate`, `make release-alpha`). [public-releasability.md](release/public-releasability.md) | [release/](release/) |
 
-Every feature is shipped; no feature is planned, in progress or future.
+Every feature is shipped except pq-key-exchange, which is planned (#412); no feature is in progress or future.
 
 ## Interfaces
 
@@ -72,7 +73,7 @@ The current milestone is **Dev complete**: go-quicraft tags `-alpha` only, cuts 
 
 - #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably (testing). Met.
 - #283 is closed: the spec-review scrub of `docs/` is verified by the department and its fixes have landed. Met.
-- Every feature row planned for Dev complete is shipped, shard-pause included (a go-qrdb seam row); heartbeat-under-fsync (#390), planned after Dev complete, is shipped too (#398). Met: every row in Features is `shipped`, and #363, #369, #370 and #390 are closed.
+- Every feature row planned for Dev complete is shipped, shard-pause included (a go-qrdb seam row); heartbeat-under-fsync (#390), planned after Dev complete, is shipped too (#398). Met: every Dev complete row in Features is `shipped` (pq-key-exchange, #412, is planned after Dev complete), and #363, #369, #370 and #390 are closed.
 - Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped; it names none, since go-trusted-platform reaches consensus only through go-qrdb. Met.
 - Nothing is dev complete until go-trusted-platform is, and every lower library has a stable, complete API. Not met: this holds until go-trusted-platform is dev complete, which this repository does not decide.
 - CI conforms to `../handbook/software/conventions/ci-standard.md`: build, unit, integration, security and the latest-version check (`make build`, `make test`, `make integration-test`, `make security`, `make deps-check`), all in the project's devcontainer image (release). Partly met (ci-template v1.19): `build/docker/devcontainer/` exists; the `image` job runs `make build`, `make test`, `make security` and `make deps-check` in the toolchain image built at the commit under test, and the `integration` job (full tier) runs `make integration-test` in the integration image. Not yet met: the template's `build` (`go build`), `test` (`go test -race` with the coverage gates) and `security` (gosec, govulncheck) jobs still run the same stages on the runner, outside their `CUSTOMIZE` blocks, so only a template change can remove them; `lint`, `modules`, `cross-arch`, `netfault`, `errfs`, `zero-rtt`, `fuzz-seeds`, `contrib-dragonboat` and `fips` also run on the runner, and `ci-gate` on the `ci-gate` runners.
