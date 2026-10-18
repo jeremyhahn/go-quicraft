@@ -1,4 +1,12 @@
-# ci-template: v1.21.1 (customized)
+# ci-template: v1.22 (customized)
+# v1.22 (Company Agent m616 item 2, 2026-10-18, after CI job layers filled the
+# runner disks): the image job's stages keep the Go build, golangci-lint and
+# module caches in named volumes on the runner's Docker host, kept across jobs
+# and split by trust class (CI_CACHE_CLASS: `main` for a push to main, `pr`
+# otherwise), never in a job container's writable layer or its /tmp
+# (ci-standard.md §6; in-toolchain-image.sh v2). A new step,
+# trim-ci-caches.sh, bounds the repo's cache volumes on the host
+# (CI_CACHE_MAX_GIB, default 32).
 # v1.21.1 (Company Agent m605 item 8, 2026-10-18, after a forge token printed
 # in a go-xkms run): the image and integration jobs mask the forge
 # credentials first, and no step or make target prints an env file, the job
@@ -299,6 +307,11 @@ jobs:
   # image's module cache; security and deps-check get one (IN_IMAGE_NETWORK=
   # bridge) for the vulnerability databases and the module proxy.
   #
+  # v1.22: every stage mounts the build and golangci-lint cache volumes, and a
+  # bridge stage the module cache volume, from the runner's Docker host
+  # (in-toolchain-image.sh v2, ci-standard.md §6), so a stage writes its
+  # caches there and not into its container's layer.
+  #
   # The forge credentials reach the image build only as the gomodauth BuildKit
   # secret, from a file outside the context that the job removes.
   # No step and no make target prints that file, the job environment (`env`,
@@ -316,6 +329,10 @@ jobs:
     timeout-minutes: 90       # CUSTOMIZE: give the stages honest headroom
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      # v1.22: the cache volumes' trust class. Only a push to main writes the
+      # caches main's build reads; every other event, pull requests included,
+      # gets the `pr` set (ci-standard.md §6).
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
       IT_IMAGE: ${{ github.event.repository.name }}-ci-it:${{ github.run_id }}-${{ github.run_attempt }}-image
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -356,6 +373,12 @@ jobs:
           make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # v1.22: bound this repo's cache volumes on the host before the stages
+      # add to them (ci-standard.md §6). It never fails the job.
+      - name: Trim the CI caches
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
 
       # make lint: gofmt, vet, golangci-lint, actionlint with shellcheck
       # (devops.md §4). .golangci.yml enables staticcheck, errcheck, unused,
@@ -504,6 +527,10 @@ jobs:
   # >>> CUSTOMIZE (go-quicraft)
   # Full-tier suites the unit run does not reach. Each command is the
   # matching ci-* target in the Makefile; `make ci-full` reproduces them.
+  # Every job here sets the image job's CI_CACHE_CLASS (v1.22), so its stages
+  # share the image job's cache volumes for the same trust class. They do not
+  # trim: they run on the same runner label, so the image job's trim step
+  # bounds the volumes on every host they reach.
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
@@ -512,6 +539,7 @@ jobs:
     timeout-minutes: 30
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -561,6 +589,7 @@ jobs:
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -605,6 +634,7 @@ jobs:
     timeout-minutes: 10
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -651,6 +681,7 @@ jobs:
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -710,6 +741,7 @@ jobs:
           - { goos: freebsd, goarch: amd64 }
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
       PLATFORM: ${{ matrix.goos }}/${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -755,6 +787,7 @@ jobs:
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -803,6 +836,7 @@ jobs:
     timeout-minutes: 45
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -860,6 +894,7 @@ jobs:
     timeout-minutes: 45
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ github.event_name == 'push' && 'main' || 'pr' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 

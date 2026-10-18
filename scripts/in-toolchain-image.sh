@@ -4,6 +4,10 @@
 #   usage: scripts/in-toolchain-image.sh <image> <command...>
 #   e.g.   scripts/in-toolchain-image.sh go-quicraft-toolchain:abc make build
 #
+# in-toolchain-template: v2 (ci-template v1.22). Ships beside ci.yml; copy it to
+# scripts/ with the workflow. From go-quicraft's scripts/in-toolchain-image.sh
+# (a141c3c), with the container prefix and uid taken from the environment.
+#
 # How CI runs a stage in the devcontainer image (handbook ci-standard.md §2). A
 # CI runner reaches its Docker daemon through a socket, so a bind mount would
 # resolve on the daemon's host, where the checkout does not exist. This
@@ -21,13 +25,28 @@
 # IN_IMAGE_NETWORK=bridge gives the container a network, for the stages that
 # must reach one: `make deps-check` asks the module proxy for the newest
 # releases, and `make security` fetches the vulnerability databases. Only then
-# are GOPROXY reopened, a writable module cache used under /tmp, and the forge
-# credentials passed through, by NAME from
+# are GOPROXY reopened, a writable module cache mounted (below; /tmp/gomodcache
+# with CI_CACHE=off), and the forge credentials passed through, by NAME from
 # this environment (the four variables dependency-resolution.md §6 has the
 # runner inject), so no token ever appears on a command line.
 #
-# The container is named go-quicraft-ci-tc-<pid>-<random>, under the prefix
-# scripts/reap-stale-ci-stacks.sh reaps, and is removed on every exit.
+# v2 (ci-template v1.22, Company Agent m616 item 2): the caches live in named
+# volumes on the daemon's host (ci-standard.md §6), never in the container's
+# writable layer or its 3 GB /tmp: GOCACHE at /cache/gobuild and
+# GOLANGCI_LINT_CACHE at /cache/golangci for every stage, and, for a bridge
+# stage, GOMODCACHE at /cache/gomod (a no-network stage keeps the image's own
+# read-only module cache, so it still proves the image works offline). The
+# volumes are <CI_STACK_PREFIX>cache-<class>-{gobuild,golangci,gomod}, one set
+# per repo, trust class and daemon host, kept across jobs. CI_CACHE_CLASS
+# (default pr) is `main` only for a push to main, so a pull request never
+# writes a cache that main's build reads. A new volume's root is given to
+# IN_IMAGE_UID by a helper container holding CHOWN and nothing else.
+# scripts/trim-ci-caches.sh bounds their size. CI_CACHE=off mounts none (v1).
+#
+# The container is named <CI_STACK_PREFIX>tc-<pid>-<random>, under the prefix
+# scripts/reap-stale-ci-stacks.sh reaps (default <checkout dir>-ci-, which in CI
+# is <repo>-ci-), and is removed on every exit. IN_IMAGE_UID is the non-root
+# uid the command runs as (default 10001; devcontainer.md §5: any non-root uid).
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
@@ -42,8 +61,22 @@ case $network in
   *) echo "IN_IMAGE_NETWORK must be none or bridge: $network" >&2; exit 2 ;;
 esac
 
-uid=10001
-name="go-quicraft-ci-tc-$$-${RANDOM}"
+uid=${IN_IMAGE_UID:-10001}
+case $uid in
+  "" | 0 | *[!0-9]*) echo "IN_IMAGE_UID must be a non-root numeric uid: $uid" >&2; exit 2 ;;
+esac
+prefix=${CI_STACK_PREFIX:-$(basename "$PWD")-ci-}
+name="${prefix}tc-$$-${RANDOM}"
+cache=${CI_CACHE:-on}
+case $cache in
+  on | off) ;;
+  *) echo "CI_CACHE must be on or off: $cache" >&2; exit 2 ;;
+esac
+class=${CI_CACHE_CLASS:-pr}
+case $class in
+  pr | main) ;;
+  *) echo "CI_CACHE_CLASS must be pr or main: $class" >&2; exit 2 ;;
+esac
 args=(
   --name "$name"
   --init
@@ -60,10 +93,26 @@ args=(
   --env HOME=/tmp
   --env CI="${CI:-}"
 )
+modcache=/tmp/gomodcache
+if [ "$cache" = on ]; then
+  vols="${prefix}cache-${class}"
+  docker run --rm --network none --cap-drop ALL --cap-add CHOWN \
+    --security-opt no-new-privileges:true --user 0:0 \
+    -v "$vols-gobuild:/c/gobuild" -v "$vols-golangci:/c/golangci" -v "$vols-gomod:/c/gomod" \
+    "$image" sh -c "for d in /c/*; do [ \"\$(stat -c %u:%g \"\$d\")\" = $uid:$uid ] || chown $uid:$uid \"\$d\"; done" >/dev/null
+  args+=(
+    -v "$vols-gobuild:/cache/gobuild" --env GOCACHE=/cache/gobuild
+    -v "$vols-golangci:/cache/golangci" --env GOLANGCI_LINT_CACHE=/cache/golangci
+  )
+  if [ "$network" = bridge ]; then
+    args+=(-v "$vols-gomod:/cache/gomod")
+    modcache=/cache/gomod
+  fi
+fi
 if [ "$network" = bridge ]; then
   # The baked module cache is read-only to the run's user and holds only the
   # root module's build list; the nested modules deps-check walks fetch more.
-  args+=(--env "GOPROXY=https://proxy.golang.org,direct" --env GOMODCACHE=/tmp/gomodcache)
+  args+=(--env "GOPROXY=https://proxy.golang.org,direct" --env "GOMODCACHE=$modcache")
   for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
     if [ -n "${!v:-}" ]; then args+=(--env "$v"); fi
   done
