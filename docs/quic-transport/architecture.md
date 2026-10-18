@@ -113,35 +113,59 @@ There is exactly one TLS-config constructor, `buildMTLSTLS`:
 | `ClientAuth` | `RequireAndVerifyClientCert` against `ClientCAs` |
 | Server verification | `RootCAs` plus a per-dial `ServerName`, so hostname verification against the SANs is active; the dial is then kept only if the peer presents the node identity membership binds to the destination replica (`Config.ReplicaIdentity`) |
 | ALPN | `NextProtos: ["quicraft"]` |
-| Curves | build-dependent: `[X25519, P-256, P-384]` standard, `[P-256, P-384]` with `-tags fips` |
+| Curves | build-dependent: `[X25519MLKEM768, SecP256r1MLKEM768, X25519, P-256, P-384]` standard, `[SecP256r1MLKEM768, P-256, P-384]` with `-tags fips` |
 
 `InsecureSkipVerify` appears nowhere in non-test `pkg/` code. There is no TCP
 listener and no TCP dialer. Cipher suites are not restricted, because Go does
 not expose TLS 1.3 suite selection.
 
-Naming the curve list at all suppresses post-quantum hybrid (ML-KEM)
-negotiation, which saves about 5% of handshake cost on intra-cluster traffic
-where both endpoints are ours. X25519 leads the standard list because it is the
-fastest ECDH curve at 128-bit security.
+Both lists lead with a post-quantum hybrid from draft-ietf-tls-ecdhe-mlkem,
+pinned at -05 ([copy](../references/draft-ietf-tls-ecdhe-mlkem-05.txt)), which
+combines an ECDH exchange with FIPS 203 ML-KEM-768
+([copy](../references/NIST.FIPS.203.pdf)). These connections carry every byte
+of replicated user data, and a classical handshake recorded today can be
+decrypted by a future quantum adversary; the hybrid's secret is at least as
+strong as its ECDH half if ML-KEM is ever broken. A full handshake costs about
+0.5 ms more than the classical list did (`BenchmarkQUICHandshake`, a 28%
+increase in a standard build), paid once per connection, never per message.
+
+The standard list offers `X25519MLKEM768` first, the group two standard nodes
+always land on in one round trip, and `SecP256r1MLKEM768` second, the hybrid a
+FIPS build offers. The classical groups follow in their old order for a peer
+that offers no hybrid.
 
 The list is build-dependent because X25519 is not FIPS 140-3 approved.
-`tls_curves_fips.go` compiles it out of a `-tags fips` build;
-`tls_curves_nofips.go` keeps it in a standard build and adds the NIST curves
-after it. Neither list has a single entry, and that is the part that matters:
-TLS 1.3 needs the two lists to intersect, and P-256 is the group they share, so
-a cluster can move to FIPS one node at a time.
+`tls_curves_fips.go` compiles every group with an X25519 half out of a
+`-tags fips` build; `tls_curves_nofips.go` keeps them in a standard build and
+adds the groups a FIPS build offers. Neither list has a single entry, and that
+is the part that matters: TLS 1.3 needs the two lists to intersect.
+`SecP256r1MLKEM768` is the hybrid they share and P-256 the classical group, so
+a cluster can move to FIPS one node at a time without leaving post-quantum key
+exchange.
 
-| client offers ↓ / server offers → | `[X25519, P-256, P-384]` | `[P-256, P-384]` |
+| client offers ↓ / server offers → | standard list | FIPS list |
 |---|---|---|
-| `[X25519, P-256, P-384]` | X25519 | P-256, after a HelloRetryRequest |
-| `[P-256, P-384]` | P-256 | P-256 |
+| standard list | X25519MLKEM768 | SecP256r1MLKEM768, after a HelloRetryRequest |
+| FIPS list | SecP256r1MLKEM768 | SecP256r1MLKEM768 |
+
+The one HelloRetryRequest is a standard client dialling a FIPS server: the
+client sends its key share for X25519MLKEM768, which the server does not offer,
+so the server asks for SecP256r1MLKEM768. In the other direction the FIPS
+client's share is for SecP256r1MLKEM768, which the standard server accepts
+rather than asking for its own first choice.
+
+An ML-KEM-768 key share adds about 1.2 KB, so a hybrid ClientHello no longer
+fits in one QUIC Initial packet. quic-go carries it in CRYPTO frames across two
+Initial packets and reassembles them; nothing in the transport configures that.
 
 An `[X25519]`-only list on either side would have an empty intersection with a
 FIPS build, and every such handshake would fail with `tls: no supported
 elliptic curves for ECDHE`. Because Go filters non-approved groups out of the
 offer under `GODEBUG=fips140=on` or `=only`, such a list would also fail every
 intra-cluster handshake in a FIPS-mode process.
-`TestHandshakeCurves_InteroperateAcrossBuilds` pins every cell above.
+`TestHandshakeCurves_InteroperateAcrossBuilds` pins every cell above over TLS,
+and `TestHandshakeCurves_QUIC` pins the negotiated group and the
+HelloRetryRequest of each cell over QUIC, from both ends.
 
 ### Peer identity is an SPKI pin, not a name
 
@@ -269,13 +293,21 @@ formation, and the two builds interoperate:
 
 | Build | Groups offered (`handshakeCurves()`) |
 |---|---|
-| `-tags fips` | `P-256`, `P-384` |
-| standard | `X25519`, `P-256`, `P-384` |
+| `-tags fips` | `SecP256r1MLKEM768`, `P-256`, `P-384` |
+| standard | `X25519MLKEM768`, `SecP256r1MLKEM768`, `X25519`, `P-256`, `P-384` |
 
 X25519 is absent from the FIPS list rather than deprioritised. Under
 `GODEBUG=fips140=on` Go removes it from the offer anyway, and a list holding
 nothing else would fail every handshake with `tls: no supported elliptic curves
 for ECDHE`.
+
+`SecP256r1MLKEM768` leads the FIPS list because the Go Cryptographic Module
+negotiates it under `GODEBUG=fips140=only`, with the v1.0.0 module and with the
+toolchain's own (`TestFIPSOnlyNegotiatesHybrid`, run by `make verify-fips`).
+Both of its halves are approved: P-256 ECDH under SP 800-56A and ML-KEM-768
+under FIPS 203. The module accepts `X25519MLKEM768` too, but its classical half
+is X25519, so the FIPS list leaves it out; a mixed cluster loses nothing,
+because the standard list offers `SecP256r1MLKEM768` as well.
 
 ### Why there is no cluster-formation negotiation
 
@@ -286,13 +318,13 @@ decides what a node will offer; TLS decides what a given pair will use.
 
 ### Rolling migration, with no flag day
 
-The two lists intersect on `P-256` and `P-384`, so a `-tags fips` node and a
-standard node complete a handshake in either direction. A cluster migrates one
-node at a time:
+The two lists intersect on `SecP256r1MLKEM768`, `P-256` and `P-384`, so a
+`-tags fips` node and a standard node complete a handshake in either direction.
+A cluster migrates one node at a time:
 
 1. Replace nodes with `-tags fips` builds one by one, in any order. Each new
    node handshakes with the remaining standard nodes, and with other upgraded
-   nodes, on P-256.
+   nodes, on SecP256r1MLKEM768.
 2. No step requires quorum loss, a coordinated restart, or a window in which
    part of the cluster cannot reach the rest.
 3. Once every node is a `-tags fips` build, nobody offers X25519 and the
@@ -310,8 +342,9 @@ fail, so a passing interoperability test means an intersection exists.
 
 It makes key exchange approved as a property of the binary, and nothing more.
 Under `GODEBUG=fips140=on` or `=only` Go already filters X25519 out of the
-offer, so the module is satisfied either way; the build tag adds that a
-`-tags fips` binary cannot offer X25519 even with the module inactive. That is
+offer (it keeps `X25519MLKEM768`, whose ML-KEM half it counts), so the module
+is satisfied either way; the build tag adds that a `-tags fips` binary cannot
+offer any group with an X25519 half, even with the module inactive. That is
 the same absence-not-refusal shape `pkg/seal` uses, but it is not what makes a
 deployment approved-only.
 

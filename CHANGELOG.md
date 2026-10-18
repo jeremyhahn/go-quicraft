@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HeartbeatResp carries no follower log index and so never acknowledges an
   entry that is not durable; a reply from a step that changed the hard state
   or appended stays ordered behind the fsync. No wire or format change.
+- pq-key-exchange (#412): the intra-cluster TLS 1.3 handshake offers a
+  post-quantum hybrid of draft-ietf-tls-ecdhe-mlkem-05 (ECDH plus FIPS 203
+  ML-KEM-768) first. A standard build offers `X25519MLKEM768`,
+  `SecP256r1MLKEM768`, X25519, P-256, P-384; a `-tags fips` build offers
+  `SecP256r1MLKEM768`, P-256, P-384, which the Go fips140 module accepts under
+  `GODEBUG=fips140=only`. The builds share `SecP256r1MLKEM768`, so a mixed
+  cluster negotiates a hybrid too, after one HelloRetryRequest when a standard
+  node dials a FIPS node. A full handshake costs about 0.5 ms more
+  (`BenchmarkQUICHandshake`); nothing per message. Both builds still
+  interoperate with a peer on the previous lists, over P-256 or X25519. No
+  wire or format change.
 
 ### Changed
 

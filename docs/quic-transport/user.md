@@ -195,7 +195,7 @@ live three- and five-node clusters:
 | | `fips140=on` | `fips140=only` |
 |---|---|---|
 | seal layer, WAL, snapshots (at rest) | works | works |
-| TLS 1.3 handshake, approved curves | works | works |
+| TLS 1.3 handshake, approved curves and the SecP256r1MLKEM768 hybrid | works | works |
 | QUIC packet protection | works | works |
 | Raft replication across a live cluster | works | works |
 | OCSP revocation checking | works | panics |
@@ -233,7 +233,9 @@ depth, and you want it anyway:
    any handshake.
 2. **`-tags fips`.** Not for the curve list: Go filters X25519 out of the
    offered groups under `fips140` mode on its own, and an untagged build
-   handshakes fine under `only`. The tag is for the seal layer: it compiles
+   handshakes fine under `only` (on `X25519MLKEM768`, whose ML-KEM half the
+   module counts; a tagged build uses `SecP256r1MLKEM768`, both halves
+   approved). The tag is for the seal layer: it compiles
    Argon2id and ChaCha20-Poly1305 out of the binary, so no configuration,
    environment or stored metadata can reach them. Untagged, they are present
    and refused at runtime (`ErrKDFNotFIPSApproved`). Absence beats refusal,

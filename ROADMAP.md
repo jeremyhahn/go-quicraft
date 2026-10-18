@@ -50,6 +50,7 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 - **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it — [go-qrdb#668](../../../go-qrdb/issues/668) — done
 - **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing — [0.22.0-alpha](../../releases/tag/v0.22.0-alpha) — done
 - **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state and log unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — [Unreleased](CHANGELOG.md), [#390](../../issues/390) — done
+- **pq-key-exchange** — the handshake offers a post-quantum hybrid first: X25519MLKEM768 then SecP256r1MLKEM768 in the non-FIPS build, SecP256r1MLKEM768 in the FIPS build (the fips140 module accepts it under `only`); P-256 stays the shared classical group (owner ruling 2026-10-17, queue 49 option A) — [Unreleased](CHANGELOG.md), [#412](../../issues/412) — done
 
 ## Now
 
@@ -61,7 +62,7 @@ Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
-- **pq-key-exchange** — the non-FIPS build offers X25519MLKEM768 first, with P-256 kept as the shared group; the FIPS build follows once a lane confirms the fips140 module accepts the hybrid (owner ruling 2026-10-17, queue 49 option A) — [#412](../../issues/412) — open
+Nothing queued.
 
 ## Future
 
@@ -72,4 +73,4 @@ No SPEC feature is future.
 - Up: go-enclave v0.9.0-alpha (pinned, the newest tag), which carries the enclave-interface API (go-enclave#138, #201); v1.0.0 needs a go-enclave public release.
 - Down: go-qrdb (pins v0.20.0, direct); go-qrdb#695 adopts the newer go-quicraft tags (v0.23.0-alpha is tagged). Indirect: go-xkms (v0.20.0), go-signal (v0.20.0), go-quicbaas (v0.15.0-alpha), go-trusted-platform (v0.13.1-alpha), go-recountly (v0.6.2-alpha).
 - Standards watch: draft-irtf-cfrg-xchacha pinned at -03 (`AlgXChaCha20Poly1305`) — [pkg/seal](pkg/seal); copy in [docs/references/](docs/references/README.md)
-- Standards watch: draft-ietf-tls-ecdhe-mlkem pinned at -05 (2026-08-10; `X25519MLKEM768`) — [pkg/internal/transport](pkg/internal/transport); its copy lands in [docs/references/](docs/references/README.md) with [#412](../../issues/412)
+- Standards watch: draft-ietf-tls-ecdhe-mlkem pinned at -05 (dated 26 May 2026; `X25519MLKEM768`, `SecP256r1MLKEM768`) — [pkg/internal/transport](pkg/internal/transport); copy in [docs/references/](docs/references/draft-ietf-tls-ecdhe-mlkem-05.txt), indexed in [README](docs/references/README.md)

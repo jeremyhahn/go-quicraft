@@ -78,7 +78,8 @@ Zero-valued fields take the defaults below (`SetDefaults`).
 Everything else about the TLS configuration is fixed and not exposed: TLS 1.3
 minimum, `RequireAndVerifyClientCert`, `RootCAs` plus a per-dial `ServerName`,
 ALPN `"quicraft"`, and a curve list that depends on the build tag
-(`[X25519, P-256, P-384]`, or `[P-256, P-384]` with `-tags fips`). See
+(`[X25519MLKEM768, SecP256r1MLKEM768, X25519, P-256, P-384]`, or
+`[SecP256r1MLKEM768, P-256, P-384]` with `-tags fips`). See
 [`architecture.md`](architecture.md#the-tls-configuration-is-fixed-not-configurable).
 
 Certificate requirements an issuer must satisfy:

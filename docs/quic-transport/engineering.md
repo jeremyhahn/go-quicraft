@@ -1186,17 +1186,22 @@ at-rest side.
 - **ALPN**: `"quicraft"`.
 - **Minimum version**: TLS 1.3 (`MinVersion: tls.VersionTLS13`).
 - **Curve preference**: `handshakeCurves()`, which is build-dependent:
-  `[X25519, P-256, P-384]` in a standard build (`tls_curves_nofips.go`),
-  `[P-256, P-384]` with `-tags fips` (`tls_curves_fips.go`). Pinning any list
-  is what suppresses ML-KEM hybrid negotiation, worth roughly 5% for
-  intra-cluster traffic where both endpoints are ours, and X25519 leads the
-  standard list because it is the fastest ECDH curve at 128-bit security.
+  `[X25519MLKEM768, SecP256r1MLKEM768, X25519, P-256, P-384]` in a standard
+  build (`tls_curves_nofips.go`), `[SecP256r1MLKEM768, P-256, P-384]` with
+  `-tags fips` (`tls_curves_fips.go`). Each list leads with a post-quantum
+  hybrid of draft-ietf-tls-ecdhe-mlkem-05 (ECDH plus FIPS 203 ML-KEM-768),
+  because a recorded classical handshake over replicated data could be
+  decrypted later; it costs about 0.5 ms per full handshake
+  (`BenchmarkQUICHandshake`) and nothing per message. The larger ClientHello
+  spans two QUIC Initial packets, which quic-go reassembles.
   X25519 is not FIPS 140-3 approved, so a FIPS build must not be able to name
-  it; the NIST curves are in BOTH lists so the two builds still share a group
-  and a cluster can be converted one node at a time. Do not trim either list to
-  one entry: `TestHandshakeCurves_InteroperateAcrossBuilds` fails, and an
-  X25519-only list fails every intra-cluster handshake under
-  `GODEBUG=fips140=on`. No cipher suites are configured explicitly; TLS 1.3
+  it or any hybrid built on it; the module accepts `SecP256r1MLKEM768` under
+  `GODEBUG=fips140=only` (`TestFIPSOnlyNegotiatesHybrid`), and both builds
+  offer it and P-256, so the two builds still share a hybrid and a classical
+  group and a cluster can be converted one node at a time. Do not trim either
+  list to one entry: `TestHandshakeCurves_InteroperateAcrossBuilds` and
+  `TestHandshakeCurves_QUIC` fail, and an X25519-only list fails every
+  intra-cluster handshake under `GODEBUG=fips140=on`. No cipher suites are configured explicitly; TLS 1.3
   suite selection is left to `crypto/tls`. FIPS-mode *cipher* selection is a
   sealing-layer concern; see [Encryption](../seal-barrier/architecture.md).
 - **Session resumption**: the client keeps a

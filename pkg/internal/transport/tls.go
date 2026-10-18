@@ -200,19 +200,21 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		}
 	}
 
-	// Naming the key-exchange groups explicitly is what suppresses ML-KEM
-	// (post-quantum hybrid) negotiation and its ~5% handshake cost, which
-	// intra-cluster traffic between endpoints we control does not need.
+	// The key-exchange groups are named explicitly, and post-quantum hybrids
+	// lead both lists (draft-ietf-tls-ecdhe-mlkem-05 with FIPS 203 ML-KEM):
+	// these connections carry all replicated user data, and a recorded
+	// classical handshake could be decrypted once a quantum adversary exists.
+	// The larger hybrid key share spans two QUIC Initial packets, which
+	// quic-go reassembles (TestHandshakeCurves_QUIC).
 	//
 	// WHICH groups is build-dependent, because X25519 is not FIPS 140-3
 	// approved: a list holding nothing else fails every intra-cluster
-	// handshake — which carries all replicated user data — with
-	// `tls: no supported elliptic curves for ECDHE` under GODEBUG=fips140=on
-	// as well as =only, so the library could not run inside a FIPS process at
-	// all. A `-tags fips` build compiles the non-approved group out
-	// (tls_curves_fips.go); a standard build keeps it and adds the NIST curves
-	// so the two builds can still handshake with each other
-	// (tls_curves_nofips.go).
+	// handshake with `tls: no supported elliptic curves for ECDHE` under
+	// GODEBUG=fips140=on as well as =only. A `-tags fips` build offers
+	// SecP256r1MLKEM768, P-256 and P-384 and compiles every X25519 group out
+	// (tls_curves_fips.go); a standard build offers X25519MLKEM768 first and
+	// SecP256r1MLKEM768 and P-256 too, so the two builds still agree on a
+	// hybrid with each other (tls_curves_nofips.go).
 	curves := handshakeCurves()
 
 	serverCfg := &tls.Config{
