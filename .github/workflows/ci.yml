@@ -1,4 +1,12 @@
-# ci-template: v1.22 (customized)
+# ci-template: v1.22.1 (customized)
+# v1.22.1 (Company Agent m636 item 2, 2026-10-18, after go-quicbaas main
+# fe167500f was left with no completed run): the concurrency block is
+# canonical. A newer push to a PR ref still cancels that ref's older run, but
+# a push to main never cancels an in-flight main run: each main commit keeps
+# its run, so every merge is validated. Every repository carried the block as
+# a CUSTOMIZE copy with `cancel-in-progress: true` on every ref, main included
+# (devops.md §9); the copy goes and the canonical block replaces it. Adopted
+# with the v1.22 rollout.
 # v1.22 (Company Agent m616 item 2, 2026-10-18, after CI job layers filled the
 # runner disks): the image job's stages keep the Go build, golangci-lint and
 # module caches in named volumes on the runner's Docker host, kept across jobs
@@ -268,12 +276,12 @@ on:
                                         # only retry when a run was never
                                         # created (see v1.3 correction above)
 
-# >>> CUSTOMIZE (go-quicraft)
-# A newer push to the same ref supersedes the older run.
+# One group per ref (v1.22.1). On a PR ref the newer run cancels the older; on
+# main nothing is cancelled, and a newer main run waits for the older one, so
+# no main commit loses its run. Never set `cancel-in-progress: true` on main.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-# <<< CUSTOMIZE
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
