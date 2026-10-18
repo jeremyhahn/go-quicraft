@@ -57,13 +57,11 @@ No feature in progress. Open in the milestone: [#400](../../issues/400) (ROADMAP
 
 ## Next
 
-- **pq-key-exchange** — the non-FIPS build offers X25519MLKEM768 first, with P-256 kept as the shared group; the FIPS build follows once a lane confirms the fips140 module accepts the hybrid (owner ruling 2026-10-17, queue 49 option A) — [#412](../../issues/412). It waits for a seat.
-
-The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
+Nothing queued. The v1.0.0 bar is in [SPEC](docs/SPEC.md) Release criteria.
 
 ## Later
 
-No feature is later.
+- **pq-key-exchange** — the non-FIPS build offers X25519MLKEM768 first, with P-256 kept as the shared group; the FIPS build follows once a lane confirms the fips140 module accepts the hybrid (owner ruling 2026-10-17, queue 49 option A) — [#412](../../issues/412) — open
 
 ## Future
 
