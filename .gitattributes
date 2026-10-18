@@ -18,4 +18,5 @@ AGENTS.md export-ignore
 # nightly.yml and fuzz.yml neither call nor read them, and a public maintainer
 # names their own signers file with RELEASE_ALLOWED_SIGNERS.
 .github/workflows/automerge.yml export-ignore
+.github/workflows/revert-red-main.yml export-ignore
 /.release-allowed-signers export-ignore

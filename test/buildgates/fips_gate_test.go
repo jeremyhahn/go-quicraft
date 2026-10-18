@@ -49,8 +49,8 @@ import (
 var (
 	makefilePath = filepath.Join("..", "..", "Makefile")
 
-	// The FIPS job runs in ci.yml's full tier (#293): every push to main, on
-	// demand via workflow_dispatch, and on a PR labelled `ci:full`. CI Gate
+	// The FIPS job runs in ci.yml's full tier (#293): every event but a pull
+	// request (push to main, nightly, dispatch), and a PR labelled `ci:full`. CI Gate
 	// checks it whenever that tier runs.
 	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "ci.yml")
 

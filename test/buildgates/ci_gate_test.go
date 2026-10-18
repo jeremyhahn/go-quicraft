@@ -166,8 +166,10 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 }
 
 // fullTierIf is the condition every full-tier job carries, and the
-// expression ci-gate evaluates into FULL_TIER (#293).
-const fullTierIf = `github.event_name == 'push' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:full')`
+// expression of the workflow's CI_FULL_TIER, which ci-gate reads into
+// FULL_TIER (#293; ci-template v1.23: every event but a PR, and a PR
+// labelled ci:full).
+const fullTierIf = `github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')`
 
 // TestCIGateTiersMatchTheJobs pins the two tiers to the gate.
 //
@@ -183,8 +185,11 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	}
 	body := string(raw)
 
-	if !strings.Contains(body, "FULL_TIER: ${{ "+fullTierIf+" }}") {
-		t.Errorf("%s's FULL_TIER is not the full-tier condition %q", gateJobName, fullTierIf)
+	if !strings.Contains(body, "\n  CI_FULL_TIER: ${{ "+fullTierIf+" }}\n") {
+		t.Errorf("the workflow's CI_FULL_TIER is not the full-tier condition %q", fullTierIf)
+	}
+	if !strings.Contains(body, "FULL_TIER: ${{ env.CI_FULL_TIER }}") {
+		t.Errorf("%s's FULL_TIER is not ${{ env.CI_FULL_TIER }}", gateJobName)
 	}
 
 	tiers := map[string]string{}
@@ -197,11 +202,11 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			continue
 		}
 		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
-		hasFullIf := strings.Contains(job, "\n    if: "+fullTierIf+"\n")
+		hasFullIf := strings.Contains(job, "\n    if: ${{ "+fullTierIf+" }}\n")
 		switch tiers[j] {
 		case "full":
 			if !hasFullIf {
-				t.Errorf("job %q is tagged full in %s but lacks `if: %s`", j, gateJobName, fullTierIf)
+				t.Errorf("job %q is tagged full in %s but lacks `if: ${{ %s }}`", j, gateJobName, fullTierIf)
 			}
 		case "pr":
 			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) {

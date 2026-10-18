@@ -1520,10 +1520,19 @@ DEVCONTAINER_COMPOSE := $(DEVCONTAINER_DIR)/compose.yaml
 # Recursive: only the targets that use it pay for the hash.
 TOOLCHAIN_TAG   = $(shell cat $(DEVCONTAINER_DIR)/Dockerfile $(TOOL_PINS) go.mod go.sum | sha256sum | cut -c1-16)
 TOOLCHAIN_IMAGE = go-quicraft-toolchain:$(TOOLCHAIN_TAG)
-# The integration image and the compose project it runs under, per checkout.
-# CI names both per run so that concurrent runs on one daemon never meet, and
-# scripts/reap-stale-ci-stacks.sh removes what a killed run left.
-IT_IMAGE   ?= go-quicraft-it:$(DOCKER_TAG)
+# The integration image tag, hashed from everything the integration stage is
+# built from (handbook ci-standard.md §9): the GO_IMAGE build argument, the
+# Dockerfile and every path its stages COPY from the context, tracked or
+# untracked but not ignored, so a changed file is a new tag and runs of one
+# tree on one daemon share one image (`make it-image`). A deleted tracked file
+# drops out of the hash. Recursive: only the targets that use it pay for it.
+IT_INPUTS = $(DEVCONTAINER_DIR)/Dockerfile $(TOOL_PINS) go.mod go.sum pkg test
+IT_TAG    = $(shell { echo 'GO_IMAGE=$(GO_IMAGE)'; git ls-files -co --exclude-standard -- $(IT_INPUTS) | LC_ALL=C sort -u | xargs -r -d '\n' sha256sum 2>/dev/null; } | sha256sum | cut -c1-16)
+# The integration image and the compose project it runs under. CI names the
+# project per run so that concurrent runs on one daemon never meet, and
+# scripts/reap-stale-ci-stacks.sh removes what a killed run left, the image
+# included once no container uses it.
+IT_IMAGE   ?= go-quicraft-ci-it:$(IT_TAG)
 IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # What `make integration-test` runs in the integration image: the CI job's
 # command, -race and serialized packages (see _integration-test).
@@ -1548,15 +1557,27 @@ docker-build-toolchain:
 	$(REQUIRE_BUILDX)
 	$(DEVCONTAINER_BUILD) --target toolchain -t $(TOOLCHAIN_IMAGE) .
 
+# Built only when the daemon lacks the tag: the tag is the content, so a held
+# image is this tree's (handbook devcontainer.md §6).
 .PHONY: docker-build-it
 docker-build-it:
 	$(REQUIRE_BUILDX)
-	$(DEVCONTAINER_BUILD) --target integration -t $(IT_IMAGE) .
+	@if docker image inspect '$(IT_IMAGE)' >/dev/null 2>&1; then \
+		echo "==> $(IT_IMAGE) is already on the daemon"; \
+	else \
+		$(DEVCONTAINER_BUILD) --target integration -t '$(IT_IMAGE)' .; \
+	fi
 
 # Prints the toolchain image tag; `make docker-build` builds it.
 .PHONY: toolchain-image
 toolchain-image:
 	@echo $(TOOLCHAIN_IMAGE)
+
+# Prints the integration image tag, go-quicraft-ci-it:<hash>, from the content
+# (never from IT_IMAGE); `make docker-build` builds it when the daemon lacks it.
+.PHONY: it-image
+it-image:
+	@echo go-quicraft-ci-it:$(IT_TAG)
 
 # The legacy dev image (.devcontainer/Dockerfile.dev), which docker-make runs.
 .PHONY: docker-build-dev

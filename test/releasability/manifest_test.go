@@ -61,13 +61,14 @@ func isDevelopmentTooling(name string) bool {
 }
 
 // privateWorkflowFiles are exact root-relative paths that only the private
-// forge and the private release recipe read: forge-side auto-merge
-// automation, and the trust anchor pinning the internal agent principal. They
+// forge and the private release recipe read: forge-side auto-merge and
+// red-main revert automation, and the trust anchor pinning the internal agent principal. They
 // name internal identities and hosts and do nothing for a public reader, so
 // they stay in the private repository. The list is exact on purpose: the
 // public CI workflows beside them are published.
 var privateWorkflowFiles = []string{
 	".github/workflows/automerge.yml",
+	".github/workflows/revert-red-main.yml",
 	".release-allowed-signers",
 }
 

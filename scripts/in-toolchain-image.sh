@@ -4,7 +4,7 @@
 #   usage: scripts/in-toolchain-image.sh <image> <command...>
 #   e.g.   scripts/in-toolchain-image.sh go-quicraft-toolchain:abc make build
 #
-# in-toolchain-template: v2 (ci-template v1.22). Ships beside ci.yml; copy it to
+# in-toolchain-template: v3 (ci-template v1.22.2). Ships beside ci.yml; copy it to
 # scripts/ with the workflow. From go-quicraft's scripts/in-toolchain-image.sh
 # (a141c3c), with the container prefix and uid taken from the environment.
 #
@@ -43,6 +43,14 @@
 # IN_IMAGE_UID by a helper container holding CHOWN and nothing else.
 # scripts/trim-ci-caches.sh bounds their size. CI_CACHE=off mounts none (v1).
 #
+# v3 (ci-template v1.22.2, Company Agent m641 item 2 and m646 item 3): the
+# stage runs in this sibling container, so the sibling holds the job slot's
+# CPU bound. The job container's cgroup cpu.max gives it (rounded up; nproc
+# when the job has no quota; IN_IMAGE_CPUS overrides), and the sibling gets
+# --cpus N with GOMAXPROCS=N and GOFLAGS=-p=N. golangci-lint's default
+# concurrency follows the container CPU quota, so lint takes N with no flag.
+# A 4-CPU slot on either runner host gives 4; never a hardcoded number.
+#
 # The container is named <CI_STACK_PREFIX>tc-<pid>-<random>, under the prefix
 # scripts/reap-stale-ci-stacks.sh reaps (default <checkout dir>-ci-, which in CI
 # is <repo>-ci-), and is removed on every exit. IN_IMAGE_UID is the non-root
@@ -77,8 +85,23 @@ case $class in
   pr | main) ;;
   *) echo "CI_CACHE_CLASS must be pr or main: $class" >&2; exit 2 ;;
 esac
+cpus=${IN_IMAGE_CPUS:-}
+if [ -z "$cpus" ]; then
+  quota=max period=100000
+  if [ -r /sys/fs/cgroup/cpu.max ]; then read -r quota period < /sys/fs/cgroup/cpu.max; fi
+  case $quota in
+    max | "" | *[!0-9]*) cpus=$(nproc) ;;
+    *) cpus=$(((quota + period - 1) / period)) ;;
+  esac
+fi
+case $cpus in
+  "" | 0 | *[!0-9]*) echo "IN_IMAGE_CPUS must be a positive integer: $cpus" >&2; exit 2 ;;
+esac
 args=(
   --name "$name"
+  --cpus "$cpus"
+  --env GOMAXPROCS="$cpus"
+  --env GOFLAGS="-p=$cpus"
   --init
   --cap-drop ALL
   --security-opt no-new-privileges:true

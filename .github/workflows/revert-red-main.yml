@@ -1,0 +1,254 @@
+# revert-red-main v1 (ci-template v1.23; owner item 101 as approved, Company
+# Agent m650 item 3, 2026-10-18): "red on main reverts the merge and reopens
+# the PR". Source of truth: software/templates/github-actions/revert-red-main.yml
+# in the handbook. Copy to .github/workflows/revert-red-main.yml beside ci.yml.
+#
+# A PR merges on the PR tier (lint, build, unit test, race); main then runs
+# the full tier (ci-standard.md §8). When main's full tier goes red because
+# of a merge, this workflow:
+#   1. opens a PR `revert/<sha12>` that reverts the merge commit onto main's
+#      tip, as the repository's own agent (AGENT_TOKEN). Every change reaches
+#      main through a PR (sdlc.md §2): nothing is pushed to main and nothing
+#      is force-pushed. automerge.yml merges it when its PR tier is green;
+#   2. puts the change back up for its author, as a draft so automerge does
+#      not merge it again before it is fixed. A merged PR cannot be reopened
+#      on Gitea, so a directly merged PR #N comes back as a new draft PR
+#      `reland/N` from its recorded head, titled "WIP: Reland #N: <title>". A
+#      merge train closes the PRs it carries without merging them, so each
+#      carried PR is reopened itself, its branch restored at the head the
+#      train recorded and its title prefixed "WIP: ";
+#   3. reopens the issues the merged PR closed, and comments on every PR it
+#      touched with the failing run. Every PR it puts back up carries, as the
+#      first line of its body, and every issue it reopens carries, as a
+#      comment, one line naming the red run and the failed job (Company Agent
+#      m700 Q1), so nobody has to find out why it came back.
+#
+# It reverts only a failure it can pin on the merge; anything else is left to
+# the coordinator:
+#   - the run is a push to main (not schedule, dispatch or a PR) whose
+#     conclusion is failure, read again from the API by run id;
+#   - a job failed in a step named in REVERT_STEPS, the deterministic stages.
+#     security, deps-check and trivy can turn red on main with no merge at
+#     fault (a new advisory, a new upstream release), so they never revert;
+#     neither does a failure in a setup step (checkout, image build, reap);
+#   - no failed job's log carries an INFRA_MARKERS line (a runner, Docker,
+#     disk or OOM fault: devops.md §10's "red job, zero findings" is a rerun);
+#   - the parent commit's `CI / CI Gate (push)` is success, so main was green
+#     before this merge and the merge is the culprit;
+#   - the merge is not itself a revert (head branch revert/*), and main does
+#     not already carry a revert of it.
+# A cancelled run never reaches it (conclusion cancelled, not failure).
+#
+# Runs only from the base branch's definition (workflow_run), like
+# automerge.yml; it fetches refs and runs no PR code. Gitea only: the
+# github.com mirror takes no merges.
+
+name: Revert Red Main
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: revert-red-main
+  cancel-in-progress: false
+
+jobs:
+  revert:
+    name: Revert a merge that turned main red
+    if: >-
+      github.server_url != 'https://github.com' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Revert, reland, report
+        env:
+          BOT: ${{ secrets.AGENT_TOKEN }}
+          REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          RED_RUN: ${{ github.event.workflow_run.id }}
+          AGENT_DOMAIN: example.internal
+          GATE_CONTEXT: 'CI / CI Gate (push)'
+          # CUSTOMIZE: the step names of the repo's deterministic stages, an
+          # extended regex over ci.yml's step names. Add the repo's CUSTOMIZE
+          # lint, build, unit, race and integration-class steps; never a
+          # security, deps-check, trivy or setup step.
+          REVERT_STEPS: '^(make lint|Assert every build tag selects code|make build|make coverage.*|make integration-test.*|Soak.*|No direct go-objstore import.*|make ci-netfault|make ci-errfs|Run the 0-RTT tests without the race detector|make ci-fuzz-seeds|make ci-cross for .*|make ci-modules|contrib/dragonboat unit tests|contrib/dragonboat integration suite|Compile under the module, tagged and untagged|Approved-only gate|Exempt revocation tree, FIPS mode)$'
+          INFRA_MARKERS: 'Cannot connect to the Docker daemon|no space left on device|signal: killed|exit status 137|exit code 137|OOMKilled|toomanyrequests|lost communication with the server|The runner has received a shutdown signal'
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          [ -n "${BOT:-}" ] || { echo "::error::AGENT_TOKEN is not set on this repository"; exit 1; }
+          case "$REPOSITORY" in
+            */automatethethings) me=agent-company ;;
+            *) me="agent-${REPOSITORY#*/}" ;;
+          esac
+          me_email="$me@$AGENT_DOMAIN"
+          # The token reaches curl as a header from a file descriptor, never
+          # on its command line.
+          api() { # method path [body] -> http code; body in /tmp/api.json
+            curl -sS -o /tmp/api.json -w '%{http_code}' -X "$1" \
+              -H @<(printf 'Authorization: token %s\n' "$BOT") -H 'Content-Type: application/json' \
+              ${3:+-d "$3"} "$REPO_API$2"
+          }
+          die() { echo "::error::$*"; exit 1; }
+          leave() { echo "not reverting: $*"; exit 0; }
+          comment() { # issue-or-pr body
+            api POST "/issues/$1/comments" "$(jq -n --arg b "$2" '{body: $b}')" >/dev/null || true
+          }
+
+          # 1. The run, read again by id: a push to main that failed.
+          [ "$(api GET "/actions/runs/$RED_RUN")" = 200 ] || die "cannot read run $RED_RUN"
+          event=$(jq -r '.event // ""' /tmp/api.json)
+          branch=$(jq -r '.head_branch // ""' /tmp/api.json)
+          conclusion=$(jq -r '.conclusion // ""' /tmp/api.json)
+          sha=$(jq -r '.head_sha // ""' /tmp/api.json)
+          run_url=$(jq -r '.html_url // ""' /tmp/api.json)
+          [ "$event" = push ] && [ "$branch" = main ] || leave "run $RED_RUN is $event on $branch, not a push to main"
+          [ "$conclusion" = failure ] || leave "run $RED_RUN concluded $conclusion"
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "run $RED_RUN has no head sha"
+          short=${sha:0:12}
+
+          # 2. A deterministic stage failed, and no failed job shows an infra fault.
+          [ "$(api GET "/actions/runs/$RED_RUN/jobs?limit=100")" = 200 ] || die "cannot read the jobs of run $RED_RUN"
+          cp /tmp/api.json /tmp/jobs.json
+          failed=$(jq -r '.jobs[] | select(.conclusion == "failure" and .name != "CI Gate") | .id' /tmp/jobs.json)
+          [ -n "$failed" ] || leave "no job but CI Gate failed in run $RED_RUN"
+          hit="" jobs_red=""
+          for id in $failed; do
+            name=$(jq -r --argjson i "$id" '.jobs[] | select(.id == $i) | .name' /tmp/jobs.json)
+            jobs_red="$jobs_red${jobs_red:+, }$name"
+            steps=$(jq -r --argjson i "$id" '.jobs[] | select(.id == $i) | .steps[]? | select(.conclusion == "failure") | .name' /tmp/jobs.json)
+            # Every failed job's log is read, or there is no revert: an
+            # unreadable log is no evidence the fault was not the runner's.
+            rm -f /tmp/job.log
+            if ! curl -fsS -H @<(printf 'Authorization: token %s\n' "$BOT") "$REPO_API/actions/jobs/$id/logs" -o /tmp/job.log \
+               || [ ! -s /tmp/job.log ]; then
+              leave "cannot read the log of job \"$name\"; the coordinator decides"
+            fi
+            if grep -Eq "$INFRA_MARKERS" /tmp/job.log; then
+              leave "job \"$name\" shows a runner or host fault; rerun it (devops.md §10)"
+            fi
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              if [[ $s =~ $REVERT_STEPS ]]; then hit="$hit${hit:+, }$name: $s"; fi
+            done <<< "$steps"
+          done
+          [ -n "$hit" ] || leave "no failed step in run $RED_RUN is a deterministic stage ($jobs_red)"
+
+          # 3. The merge, and main green before it.
+          [ "$(api GET "/git/commits/$sha")" = 200 ] || die "cannot read commit $short"
+          parents=$(jq -r '.parents | length' /tmp/api.json)
+          parent=$(jq -r '.parents[0].sha // ""' /tmp/api.json)
+          [ -n "$parent" ] || leave "$short has no parent"
+          gate=$(api GET "/commits/$parent/statuses?limit=100" >/dev/null; jq -r --arg c "$GATE_CONTEXT" \
+            '[.[] | select(.context == $c)] | sort_by(.id) | last | .status // "none"' /tmp/api.json)
+          [ "$gate" = success ] || leave "the parent ${parent:0:12} has $GATE_CONTEXT $gate, so the culprit is not proven"
+
+          pr="" ; title=""
+          if [ "$(api GET "/commits/$sha/pull")" = 200 ]; then
+            pr=$(jq -r '.number' /tmp/api.json)
+          else
+            pr=$(api GET "/git/commits/$sha" >/dev/null; jq -r '.commit.message' /tmp/api.json | head -1 | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
+          fi
+          [[ $pr =~ ^[0-9]+$ ]] || leave "no PR found for $short"
+          [ "$(api GET "/pulls/$pr")" = 200 ] || die "cannot read PR #$pr"
+          cp /tmp/api.json /tmp/pr.json
+          title=$(jq -r '.title' /tmp/pr.json)
+          head_ref=$(jq -r '.head.ref' /tmp/pr.json)
+          case $head_ref in revert/*) leave "#$pr is a revert; a red revert goes to the coordinator" ;; esac
+
+          # 4. The revert, onto main's tip, in a fresh repository. Config by
+          # environment keeps the token out of argv (automerge.yml's form).
+          repo=/tmp/revert-repo
+          rm -rf "$repo"; git init -q "$repo"
+          auth=$(printf '%s:%s' "$me" "$BOT" | base64 -w0)
+          export GIT_CONFIG_COUNT=3 \
+            GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+            GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null \
+            GIT_CONFIG_KEY_2=commit.gpgSign GIT_CONFIG_VALUE_2=false \
+            GIT_AUTHOR_NAME="$me" GIT_AUTHOR_EMAIL="$me_email" \
+            GIT_COMMITTER_NAME="$me" GIT_COMMITTER_EMAIL="$me_email"
+          git -C "$repo" fetch -q --no-tags "$GIT_URL" "+refs/heads/main:refs/red/main" "+refs/pull/$pr/head:refs/red/pr" \
+            || die "cannot fetch main and #$pr"
+          git -C "$repo" merge-base --is-ancestor "$sha" refs/red/main || leave "$short is not on main"
+          if git -C "$repo" log --format=%B refs/red/main | grep -q "^This reverts commit $sha"; then
+            leave "main already carries a revert of $short"
+          fi
+          if [ "$(api GET "/branches/revert/$short")" = 200 ]; then leave "revert/$short already exists"; fi
+          git -C "$repo" checkout -q --detach refs/red/main
+          mflag=(); [ "$parents" -gt 1 ] && mflag=(-m 1)
+          if ! git -C "$repo" revert --no-edit "${mflag[@]}" "$sha" >/tmp/revert.log 2>&1; then
+            comment "$pr" "Main went red after this merged ($run_url: $hit), and $short does not revert cleanly onto main's tip. Left to the coordinator."
+            die "$short does not revert cleanly onto main"
+          fi
+          git -C "$repo" push -q "$GIT_URL" "HEAD:refs/heads/revert/$short" || die "cannot push revert/$short"
+          body=$(printf 'Reverts %s (#%s): main went red at that merge.\n\nRun: %s\nFailed: %s\nParent %s was green (%s).\n\nOpened by revert-red-main.yml (ci-template v1.23, owner item 101). It merges on the PR tier like any PR.' \
+            "$short" "$pr" "$run_url" "$hit" "${parent:0:12}" "$GATE_CONTEXT")
+          code=$(api POST /pulls "$(jq -n --arg t "Revert \"$title\" (#$pr)" --arg b "$body" --arg h "revert/$short" \
+            '{title: $t, body: $b, head: $h, base: "main"}')")
+          [ "$code" = 201 ] || die "cannot open the revert PR (HTTP $code)"
+          rpr=$(jq -r '.number' /tmp/api.json)
+          echo "opened revert PR #$rpr for $short (#$pr)"
+
+          # 5. Put the change back up as a draft, and reopen what it closed.
+          note="Main went red after this merged: $run_url ($hit). Reverted by #$rpr (owner item 101)."
+          why="Reopened by revert-red-main.yml: run $run_url failed in $hit; reverted by #$rpr."
+          carried=()
+          case $head_ref in
+            merge-train/*)
+              # The train's head commit records "pr <n> <head>" per carried PR.
+              while read -r _ n h; do carried+=("$n $h"); done < <(git -C "$repo" log -1 --format=%B refs/red/pr | grep -E '^pr [0-9]+ [0-9a-f]{40}$' || true) ;;
+            *) carried=("$pr $(jq -r '.head.sha' /tmp/pr.json)") ;;
+          esac
+          relanded=""
+          for c in "${carried[@]}"; do
+            read -r n h <<< "$c"
+            [ "$(api GET "/pulls/$n")" = 200 ] || { echo "cannot read #$n; not relanded"; continue; }
+            cp /tmp/api.json /tmp/c.json
+            ctitle=$(jq -r '.title' /tmp/c.json)
+            cref=$(jq -r '.head.ref' /tmp/c.json)
+            git -C "$repo" fetch -q --no-tags "$GIT_URL" "+refs/pull/$n/head:refs/red/c$n" || { echo "cannot fetch #$n"; continue; }
+            [ "$(git -C "$repo" rev-parse "refs/red/c$n")" = "$h" ] || { comment "$n" "$note This PR's head moved from $h; not reopened."; continue; }
+            if [ "$(jq -r '.merged' /tmp/c.json)" = true ]; then
+              # Merged: Gitea cannot reopen it, so a new draft PR from its head.
+              git -C "$repo" push -q "$GIT_URL" "$h:refs/heads/reland/$n" || { echo "cannot push reland/$n"; continue; }
+              cbody=$(printf '%s\n\nRelands #%s. Fix the failure, then drop the WIP prefix to merge.\n\n%s' \
+                "$why" "$n" "$(jq -r '.body // ""' /tmp/c.json | grep -iE '^(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' || true)")
+              code=$(api POST /pulls "$(jq -n --arg t "WIP: Reland #$n: $ctitle" --arg b "$cbody" --arg h "reland/$n" \
+                '{title: $t, body: $b, head: $h, base: "main"}')")
+              if [ "$code" = 201 ]; then
+                l=$(jq -r '.number' /tmp/api.json); relanded="$relanded #$l"
+                comment "$n" "$note Relanded as draft #$l."
+              else
+                comment "$n" "$note The draft reland PR could not be opened (HTTP $code)."
+              fi
+            else
+              # Closed by the train: restore its branch at the recorded head
+              # and reopen it as a draft.
+              if ! git -C "$repo" push -q "$GIT_URL" "$h:refs/heads/$cref"; then
+                comment "$n" "$note Its branch $cref could not be restored at $h; not reopened."; continue
+              fi
+              case $ctitle in WIP:*) ;; *) ctitle="WIP: $ctitle" ;; esac
+              cbody=$(printf '%s\n\n%s' "$why" "$(jq -r '.body // ""' /tmp/c.json)")
+              code=$(api PATCH "/pulls/$n" "$(jq -n --arg t "$ctitle" --arg b "$cbody" '{state: "open", title: $t, body: $b}')")
+              if [ "$code" = 201 ] || [ "$code" = 200 ]; then
+                relanded="$relanded #$n"; comment "$n" "$note Reopened as a draft; fix the failure, then drop the WIP prefix."
+              else
+                comment "$n" "$note It could not be reopened (HTTP $code)."
+              fi
+            fi
+          done
+          for i in $(jq -r '.body // ""' /tmp/pr.json | grep -ioE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' | grep -oE '[0-9]+$' | sort -u); do
+            [ "$(api GET "/pulls/$i")" = 200 ] && continue   # a carried PR, handled above
+            [ "$(api PATCH "/issues/$i" '{"state":"open"}')" = 201 ] && comment "$i" "$why"
+          done
+          comment "$pr" "$note Back up as draft:${relanded:- none}."
+          echo "reverted $short (#$pr) in #$rpr; drafts:${relanded:- none}"

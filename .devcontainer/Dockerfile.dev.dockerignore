@@ -42,6 +42,7 @@ go.work.sum
 
 # The rest of the .gitattributes exclusion list. No image build reads them.
 .github/workflows/automerge.yml
+.github/workflows/revert-red-main.yml
 .release-allowed-signers
 
 # Module credentials (.devcontainer/.env.example). The build mounts them as a

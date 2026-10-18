@@ -38,11 +38,13 @@ var (
 		"**/.claude/** export-ignore",
 		"**/.serena/** export-ignore",
 		".github/workflows/automerge.yml export-ignore",
+		".github/workflows/revert-red-main.yml export-ignore",
 		"/.release-allowed-signers export-ignore",
 	}
 	dockerignoreEntries = []string{
 		"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena",
 		".github/workflows/automerge.yml",
+		".github/workflows/revert-red-main.yml",
 		".release-allowed-signers",
 	}
 )
@@ -187,6 +189,7 @@ func TestIsPrivateWorkflowFile(t *testing.T) {
 	cases := map[string]bool{
 		".github/workflows/claude-review.yml":    false,
 		".github/workflows/automerge.yml":        true,
+		".github/workflows/revert-red-main.yml":  true,
 		".release-allowed-signers":               true,
 		".github/workflows/ci.yml":               false,
 		".github/workflows/release.yml":          false,

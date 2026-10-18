@@ -62,6 +62,7 @@ Two groups of tracked files are never published:
   | Path | What it is |
   |---|---|
   | `.github/workflows/automerge.yml` | Arms the private forge's auto-merge when a PR opens |
+  | `.github/workflows/revert-red-main.yml` | Opens the private forge's revert PR when a merge turns `main` red |
   | `.release-allowed-signers` | The private repository's release trust anchor: the internal principal and its public key |
 
   None of them does anything for a public reader. `ci.yml`, `release.yml`,
