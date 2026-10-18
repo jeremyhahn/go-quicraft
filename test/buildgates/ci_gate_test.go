@@ -157,7 +157,8 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 			"status, and a required context never arrives.", gateJobName, gate)
 	}
 	// Fail-closed: anything that is not success must be treated as failure.
-	if !strings.Contains(gate, `case "$2" in success)`) {
+	// ci-template v1.21 breaks the line after `in`.
+	if !regexp.MustCompile(`case "\$2" in\s+success\)`).MatchString(gate) {
 		t.Errorf("%s's check does not compare against `success` explicitly. It must "+
 			"treat skipped and cancelled as failure — a job skipped because its own "+
 			"dependency failed has not passed.", gateJobName)

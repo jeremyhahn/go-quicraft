@@ -44,6 +44,23 @@ LDFLAGS       := -X main.version=$(BUILD_VERSION) -X main.gitCommit=$(GIT_COMMIT
 export GOTOOLCHAIN := auto
 GO            := go
 GOTEST        := $(GO) test -race -count=1 -v
+# The repo's build-tag set, space separated, as CI passes it to lint, build,
+# coverage, security and integration-test (handbook devcontainer.md §6). Empty:
+# no package of the default build is tag-gated; each tagged suite has its own
+# ci-* target. GO_TAGS_FLAG is the go tool's form, empty when the set is.
+GO_BUILD_TAGS ?=
+space         := $(subst ,, )
+GO_TAGS_CSV    = $(subst $(space),$(comma),$(strip $(GO_BUILD_TAGS)))
+GO_TAGS_FLAG   = $(if $(strip $(GO_BUILD_TAGS)),-tags=$(GO_TAGS_CSV))
+
+# GOFIPS140=v1.0.0 unpacks the frozen FIPS module into the module cache, which
+# the toolchain image bakes read-only with GOPROXY=off (devcontainer.md §4).
+# Where the cache is not writable, FIPS_GOENV serves it as a file proxy into a
+# writable one outside the module (./... would walk it), so the snapshot builds
+# offline; elsewhere it is empty and the go tool uses the cache as is.
+GOMODCACHE_DIR := $(shell $(GO) env GOMODCACHE 2>/dev/null)
+FIPS_MODCACHE  ?= $(or $(TMPDIR),/tmp)/go-quicraft-fips-modcache
+FIPS_GOENV     := $(if $(shell test -w '$(GOMODCACHE_DIR)' || echo ro),GOMODCACHE='$(FIPS_MODCACHE)' GOPROXY='file://$(GOMODCACHE_DIR)/cache/download' GOPRIVATE= GONOPROXY= GOFLAGS='-mod=readonly -modcacherw')
 GOBENCH       := $(GO) test -run=^$$ -bench=. -benchmem
 GOVET         := $(GO) vet
 GOFMT         := gofmt
@@ -113,7 +130,8 @@ TRIVY = $(shell if [ -x '$(TOOLS_BIN)/trivy' ]; then \
 
 # Coverage floor enforced by every coverage target. The flags live in the
 # run-coverage recipe below.
-COVER_MIN     := 91
+COVERAGE_THRESHOLD ?= 91
+COVER_MIN     := $(COVERAGE_THRESHOLD)
 
 # Docker
 DOCKER_IMAGE  := go-quicraft-dev
@@ -172,7 +190,9 @@ all: build test lint
 
 .PHONY: build
 build:
-	$(GO) build ./...
+	$(GO) build $(GO_TAGS_FLAG) ./...
+	@# The FIPS variant, so CI's build stage compiles both (ci-template v1.21).
+	$(FIPS_GOENV) GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build $(GO_TAGS_FLAG) ./...
 
 .PHONY: clean
 clean:
@@ -796,7 +816,7 @@ define check-coverage
 			exit 1 ;; \
 	esac; \
 	echo "$(2) coverage: $${COVERAGE}%"; \
-	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]; then \
+	if awk -v c="$${COVERAGE}" -v m="$(COVER_MIN)" 'BEGIN { exit !(c < m) }'; then \
 		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)%"; \
 		exit 1; \
 	fi
@@ -808,19 +828,20 @@ endef
 # -coverpkg is deliberately not passed: packages without tests already count at
 # 0%, and -coverpkg would credit cross-package coverage and loosen the gate.
 define run-coverage
-	$(GOTEST) -coverprofile=$(COVER_DIR)/$(1).out $(2)
+	$(GOTEST) $(GO_TAGS_FLAG) -coverprofile=$(COVER_DIR)/$(1).out $(2)
 	$(call check-coverage,$(COVER_DIR)/$(1).out,$(1))
 endef
 
 .PHONY: coverage
 coverage: | $(COVER_DIR)
 	$(call run-coverage,total,./...)
+	scripts/check-coverage-packages.sh $(COVER_DIR)/total.out $(COVER_MIN) github.com/jeremyhahn/go-quicraft/pkg
 
-# Holds every package under pkg/ to COVER_MIN, from the profile `coverage`
-# writes, so no package hides under the total. CI runs the same script.
+# `coverage` also holds every package under pkg/ to COVER_MIN, from the profile
+# it writes, so no package hides under the total: CI's test stage is
+# `make coverage` (ci-template v1.21). coverage-packages is the old name.
 .PHONY: coverage-packages
 coverage-packages: coverage
-	scripts/check-coverage-packages.sh $(COVER_DIR)/total.out $(COVER_MIN) github.com/jeremyhahn/go-quicraft/pkg
 
 .PHONY: coverage-proto
 coverage-proto: | $(COVER_DIR)
@@ -933,8 +954,8 @@ FIPS_EXCLUDED := github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revoca
 
 .PHONY: build-fips
 build-fips:
-	GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" ./...
-	GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -tags fips -ldflags="$(LDFLAGS)" ./...
+	$(FIPS_GOENV) GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -ldflags="$(LDFLAGS)" ./...
+	$(FIPS_GOENV) GOFIPS140=v1.0.0 CGO_ENABLED=0 $(GO) build -tags fips -ldflags="$(LDFLAGS)" ./...
 
 .PHONY: verify-fips
 verify-fips:
@@ -1155,6 +1176,8 @@ remote-tools:
 # Every go.mod is discovered from the tree (MODULE_DIRS). ci-modules mirrors the
 # `modules` job in .github/workflows/ci.yml; ci-cross mirrors the `cross-arch`
 # job, building and vetting every module for each of CROSS_PLATFORMS.
+# ci-cross sets CGO_ENABLED=0 because the toolchain image enables cgo for
+# -race, and a cgo cross build needs a C cross compiler the image lacks.
 #
 # GOWORK=off (exported below) matters: in a workspace the modules would resolve
 # the root through it rather than their own require/replace directives.
@@ -1162,12 +1185,30 @@ remote-tools:
 # Every module is attempted even after a failure, so one broken module cannot
 # hide another.
 # ============================================================================
+# MODULE_FLOOR fails both targets when discovery comes back short, so a broken
+# walk cannot pass over an empty set. Lower it in the commit that removes a
+# module.
+MODULE_FLOOR := 6
+define check-module-floor
+	n=$$(printf '%s\n' $(MODULE_DIRS) | grep -c .); \
+	echo "Discovered $$n module(s)"; \
+	if [ "$$n" -lt $(MODULE_FLOOR) ]; then \
+		echo "FAIL: discovered $$n modules but expected at least $(MODULE_FLOOR)."; exit 1; \
+	fi
+endef
+
+# Nested modules also run their tests (perfresult and benchutil gate
+# `make bench-compare`); the root's run in `make coverage`. Every module is
+# vetted with -tags=benchmark too, which nothing else compiles.
 .PHONY: ci-modules
 ci-modules:
-	@rc=0; \
+	@$(check-module-floor); \
+	rc=0; \
 	for dir in $(MODULE_DIRS); do \
 		echo "==> $$dir"; \
-		if ! ( cd "$$dir" && $(GO) build ./... && $(GOVET) ./... ); then \
+		test_cmd=true; [ "$$dir" = . ] || test_cmd="$(GO) test -count=1 ./..."; \
+		if ! ( cd "$$dir" && $(GO) build ./... && $(GOVET) ./... && $(GOVET) -tags=benchmark ./... \
+				&& $$test_cmd ); then \
 			echo "    FAIL: $$dir"; rc=1; \
 		fi; \
 	done; \
@@ -1180,13 +1221,14 @@ ci-modules:
 
 .PHONY: ci-cross
 ci-cross:
-	@rc=0; \
+	@$(check-module-floor); \
+	rc=0; \
 	for platform in $(CROSS_PLATFORMS); do \
 		goos=$${platform%/*}; goarch=$${platform#*/}; \
 		for dir in $(MODULE_DIRS); do \
 			echo "==> $$platform $$dir"; \
-			if ! ( cd "$$dir" && GOOS=$$goos GOARCH=$$goarch $(GO) build ./... \
-					&& GOOS=$$goos GOARCH=$$goarch $(GOVET) ./... ); then \
+			if ! ( cd "$$dir" && CGO_ENABLED=0 GOOS=$$goos GOARCH=$$goarch $(GO) build ./... \
+					&& CGO_ENABLED=0 GOOS=$$goos GOARCH=$$goarch $(GOVET) ./... ); then \
 				echo "    FAIL: $$platform $$dir"; rc=1; \
 			fi; \
 		done; \
@@ -1207,16 +1249,18 @@ ci-cross:
 # modules share the root's .golangci.yml, and -tags=benchmark brings in the
 # harness entry points under test/performance (the tag selects nothing in the
 # root), without which their helpers read as unused. Every module is attempted
-# even after a failure. Mirrors the golangci-lint step in
-# .github/workflows/ci.yml. Then runs actionlint over the workflows, also after
-# a golangci-lint failure.
+# even after a failure. gofmt and go vet run first, and actionlint over the
+# workflows last, each also after an earlier failure: this is CI's lint stage
+# (ci-template v1.21).
 .PHONY: lint
 lint: check-lint-toolchain
 	@rc=0; \
+	$(MAKE) --no-print-directory fmt || rc=1; \
+	$(GOVET) $(GO_TAGS_FLAG) ./... || rc=1; \
 	for dir in $(MODULE_DIRS); do \
 		echo "==> $$dir"; \
 		( cd "$$dir" && '$(GOLANGCI_BIN)' run --timeout=5m --config '$(CURDIR)/.golangci.yml' \
-			--build-tags benchmark ./... ) || rc=1; \
+			--build-tags benchmark$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) ./... ) || rc=1; \
 	done; \
 	$(MAKE) --no-print-directory actionlint || rc=1; \
 	exit $$rc
@@ -1313,16 +1357,16 @@ deps-check:
 	@./scripts/deps-check.sh
 
 .PHONY: gosec
-# Scans more than the CI job: only test/performance (separate modules that
-# never ship) is excluded. Do not narrow this to match CI.
+# CI's security stage runs this target (ci-template v1.21): only
+# test/performance (separate modules that never ship) is excluded.
 gosec:
-	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
+	$(GOSEC) $(GO_TAGS_FLAG) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
 
 .PHONY: vuln
 # Fails on any reachable vulnerability govulncheck finds. Record any accepted
 # exception explicitly rather than hiding it here.
 vuln:
-	$(GOVULNCHECK) ./...
+	$(GOVULNCHECK) $(GO_TAGS_FLAG) ./...
 
 .PHONY: trivy
 # Scoped to what ships: test/performance/* are separate benchmark modules that
@@ -1483,7 +1527,7 @@ IT_IMAGE   ?= go-quicraft-it:$(DOCKER_TAG)
 IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # What `make integration-test` runs in the integration image: the CI job's
 # command, -race and serialized packages (see _integration-test).
-IT_CMD     ?= go test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 # Internal: a devcontainer build of one stage. GO_IMAGE comes from the pin file;
 # GO_BUILD_PROXY, when set in the caller's environment, replaces the public
 # module proxy for the build-time fetches.

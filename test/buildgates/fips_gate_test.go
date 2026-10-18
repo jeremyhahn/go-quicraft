@@ -293,7 +293,8 @@ func TestCIRunsTheFIPSGate(t *testing.T) {
 	for _, target := range []string{"make build-fips", "make verify-fips", "make verify-fips-exempt"} {
 		var found bool
 		for _, run := range runs {
-			if run == target {
+			// CI runs each target in the toolchain image (ci-template v1.21).
+			if run == target || run == `scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" `+target {
 				found = true
 				break
 			}
