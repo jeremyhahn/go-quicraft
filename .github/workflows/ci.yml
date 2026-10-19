@@ -1,4 +1,8 @@
-# ci-template: v1.23 (customized)
+# ci-template: v1.23.1 (customized)
+# v1.23.1 (handbook #392, 2026-10-19): ships reap-stale-ci-stacks.sh v3, which
+# ages an integration image from the later of its creation and its last tag,
+# so a parallel job's reaper no longer removes an image just rebuilt from
+# cache (go-quicraft main runs 57389 and 57484). No job changes.
 # v1.23 (owner item 101 as approved, Company Agent m650 item 3, 2026-10-18):
 # two tiers. A pull request runs the PR tier only: lint (with
 # assert-build-tags and arch-gates), build, and the unit suite under -race

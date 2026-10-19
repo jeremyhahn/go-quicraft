@@ -3,7 +3,7 @@
 #
 #   usage: scripts/reap-stale-ci-stacks.sh <prefix> [min-age-seconds]
 #
-# v1 (ci-template v1.18, dept-infra 2026-10-12); v2 below. An integration job's
+# v1 (ci-template v1.18, dept-infra 2026-10-12); v2 and v3 below. An integration job's
 # `if: always()` teardown runs only while the job process lives. When the host
 # or its Docker daemon dies mid-job, the job is gone and so is its teardown: the
 # compose stack stays behind, exited, with its networks and volumes (11 stacks
@@ -30,6 +30,12 @@
 # (ci.yml). A lease a dead job leaves is stale like any other container
 # outside compose, and goes after <min-age-seconds>; its image goes on the
 # reap after that.
+# v3 (ci-template v1.23.1, handbook #392, 2026-10-19): an image's age runs
+# from the later of its `.Created` and its last tag time
+# (`.Metadata.LastTagTime`). A rebuild from a full cache keeps the old
+# `.Created` but re-tags the image, so v2 saw a just-rebuilt image as stale and
+# a parallel job's reaper removed it between its build and its lease
+# (go-quicraft main runs 57389 and 57484).
 #
 # Stale: exited or dead and finished at least <min-age-seconds> ago, or
 # created and never started at least that long ago. A project with any
@@ -122,10 +128,12 @@ docker ps -a --filter "name=^$prefix" \
 images=0
 for ref in $(docker images --filter "reference=${prefix}it" --format '{{.Repository}}:{{.Tag}}'); do
   case $ref in "${prefix}it:"*) ;; *) continue ;; esac
-  created=$(docker image inspect -f '{{.Created}}' "$ref" 2>/dev/null) || continue
+  read -r created tagged < <(docker image inspect -f '{{.Created}} {{.Metadata.LastTagTime.Unix}}' "$ref" 2>/dev/null) || continue
   t=$(date -d "$created" +%s 2>/dev/null) || continue
+  # A never-tagged image reports the zero time, a large negative number.
+  case $tagged in ''|*[!0-9]*) ;; *) [ "$tagged" -le "$t" ] || t=$tagged ;; esac
   if [ $((now - t)) -lt "$image_min_age" ]; then
-    echo "keep  image $ref (created within ${image_min_age}s)"
+    echo "keep  image $ref (created or tagged within ${image_min_age}s)"
     continue
   fi
   echo "reap  image $ref"
