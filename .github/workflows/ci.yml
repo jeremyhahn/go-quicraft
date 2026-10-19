@@ -1,4 +1,10 @@
-# ci-template: v1.23.1 (customized)
+# ci-template: v1.24 (customized)
+# v1.24 (owner ruling 2026-10-19, Company Agent m749 and m751 (a), (e)):
+# a PR whose every changed file is markdown or under docs/ (DOCS_ONLY_PATTERN,
+# the new `changes` job) runs lint alone: build, the build-tag assertion and
+# make coverage skip. Soak moves off main pushes and ci:full to the nightly
+# schedule and workflow_dispatch, a `nightly` job in the Gate (ci-standard.md
+# §8, §10).
 # v1.23.1 (handbook #392, 2026-10-19): ships reap-stale-ci-stacks.sh v3, which
 # ages an integration image from the later of its creation and its last tag,
 # so a parallel job's reaper no longer removes an image just rebuilt from
@@ -279,11 +285,14 @@
 # host-specific steps are guarded on github.server_url (devops.md §1).
 
 # >>> CUSTOMIZE (go-quicraft)
-# go-quicraft runs the v1.23 tiers. The pr tier (image, arch-gates) runs on
-# every event. The full tier (integration, soak, netfault, errfs, zero-rtt,
-# fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips) runs on push to
-# main, nightly, on workflow_dispatch and on a PR labelled ci:full; its jobs
-# carry CI_FULL_TIER's expression as `if:`. go-quicraft has no separate race
+# go-quicraft runs the v1.24 tiers. The pr tier (changes, image, arch-gates)
+# runs on every event. The full tier (integration, netfault, errfs, zero-rtt,
+# cross-arch, modules, contrib-dragonboat, fips) runs on push to main,
+# nightly, on workflow_dispatch and on a PR labelled ci:full; its jobs carry
+# CI_FULL_TIER's expression as `if:`. Soak and fuzz-seeds are nightly: the
+# schedule and workflow_dispatch only (m751 (e)). A docs-only PR still runs
+# the releasability scan of the tracked tree (the image job's CUSTOMIZE step
+# after make coverage), since its markdown is what that scan reads. go-quicraft has no separate race
 # job: the image job's `make coverage` is the race run. Every job runs its commands in the
 # devcontainer images built at this commit: the five stages are steps of the
 # image job, and each CUSTOMIZE job builds the toolchain image and runs one
@@ -339,10 +348,46 @@ env:
   # v1.23: the full tier (ci-standard.md §8). Every event but pull_request
   # (push to main, schedule, workflow_dispatch), and a PR labelled ci:full.
   # Steps read it as env.CI_FULL_TIER; a job-level `if:` cannot read env, so
-  # the integration and soak jobs repeat this expression. Keep them equal.
+  # the integration job repeats this expression. Keep them equal.
   CI_FULL_TIER: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+  # v1.24 (CA m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
+  # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
+  DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
 
 jobs:
+  # v1.24 (CA m749, m751 (a)): a PR whose every changed file matches DOCS_ONLY_PATTERN
+  # runs lint only; build and make coverage are skipped. Off pull_request, or
+  # on a ci:full PR, docs_only is always false. Any doubt (a failed diff, an
+  # empty list) reads as false, so the tier fails toward running the tests.
+  changes:
+    name: Changed files
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: ${{ github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true' }}
+        with:
+          fetch-depth: 0
+      - name: Is every changed file docs or markdown?
+        id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          docs_only=false
+          if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
+            if files=$(git diff --name-only "$BASE...$HEAD") && [ -n "$files" ]; then
+              if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
+                docs_only=true
+              fi
+              printf '%s\n' "$files"
+            fi
+          fi
+          echo "docs only: $docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   # v1.21: every stage runs in the project's own devcontainer image and no
   # other (ci-standard.md §2, devcontainer.md §7). One image job (Company Agent
   # m601 (a)) builds the images once from build/docker/devcontainer/Dockerfile
@@ -384,6 +429,7 @@ jobs:
   image:
     name: Devcontainer image [lint, build, test, security, deps-check, trivy image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    needs: changes             # v1.24 (CA m749, m751 (a))
     timeout-minutes: 90       # CUSTOMIZE: give the stages honest headroom
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -477,13 +523,13 @@ jobs:
       # (tests included), it is misspelled or dead. Compares files, not
       # packages, and a tag may swap files (a `!foo` stub for a `foo` body).
       - name: Assert every build tag selects code
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' && needs.changes.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "GO_BUILD_TAGS='$GO_BUILD_TAGS' sh scripts/assert-build-tags.sh"
 
       # CUSTOMIZE: nested modules (sdk/go, xkey) and variants (FIPS) are built
       # by `make build` itself, never by an extra step here.
       - name: make build
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make build GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
       # The test stage (m601 (c)): make coverage runs the whole unit suite with
@@ -493,8 +539,18 @@ jobs:
       # Tags matter here too: without them tag-gated packages are neither
       # tested nor counted. The integration stage is its own job below.
       - name: make coverage (unit tests and the threshold)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make coverage GO_BUILD_TAGS='$GO_BUILD_TAGS' COVERAGE_THRESHOLD=$COVERAGE_THRESHOLD"
+
+      # >>> CUSTOMIZE (go-quicraft)
+      # A docs-only PR skips make coverage, which carries test/releasability:
+      # the scan of every tracked file, markdown included, for values that
+      # cannot be published. Docs are what that scan mostly reads, so a
+      # docs-only PR runs that package alone.
+      - name: Releasability scan (docs-only PR)
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only == 'true' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 ./test/releasability/"
+      # <<< CUSTOMIZE
 
       # make security: gosec, govulncheck, go mod verify (devops.md §8), with
       # trivy fs per the phase (§8a). The target owns gosec's flags and its
@@ -617,12 +673,13 @@ jobs:
 
   # Soak (v1.23, owner item 101): the integration suite looped in the
   # integration image until SOAK_MINUTES have passed, each iteration its own
-  # compose stack, torn down before the next. Full tier only, so it runs on
-  # main after every merge and nightly; the first red iteration fails the job.
-  # It replaces nothing in batch.yml, whose soak stays a dispatch.
+  # compose stack, torn down before the next; the first red iteration fails
+  # the job. v1.24 (owner ruling 2026-10-19, Company Agent m751 (e)): nightly
+  # and workflow_dispatch only, off main pushes and off ci:full; the Gate marks
+  # it `nightly`. It replaces nothing in batch.yml, whose soak stays a dispatch.
   soak:
     name: Soak [integration image]
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
@@ -871,11 +928,13 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/gomodauth.env"
 
-  # Every fuzz target against its seeds and committed corpus.
+  # Every fuzz target against its seeds and committed corpus. Nightly and
+  # workflow_dispatch only, like soak (v1.24, Company Agent m751 (e): fuzz off
+  # main pushes); the Gate marks it `nightly`.
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1193,7 +1252,7 @@ jobs:
     if: always()
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs.
-    needs: [image, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
+    needs: [changes, image, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -1201,15 +1260,19 @@ jobs:
           # PR labelled ci:full. A job marked `full` may be skipped below only
           # when it is not selected; a `pr` job may never be skipped.
           FULL_TIER: ${{ env.CI_FULL_TIER }}
+          # v1.24: a `nightly` job runs on schedule and workflow_dispatch only.
+          NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           BAD=0
-          echo "full tier selected: ${FULL_TIER}"
-          check() { # <job> <result> <pr|full>
+          echo "full tier selected: ${FULL_TIER}; nightly selected: ${NIGHTLY}"
+          check() { # <job> <result> <pr|full|nightly>
             case "$2" in
               success) echo "OK   $1";;
               skipped)
                 if [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
                   echo "SKIP $1 (full tier not selected)"
+                elif [ "$3" = nightly ] && [ "${NIGHTLY}" != true ]; then
+                  echo "SKIP $1 (nightly and dispatch only)"
                 else
                   echo "FAIL $1 (skipped)"; BAD=1
                 fi;;
@@ -1217,16 +1280,18 @@ jobs:
             esac
           }
           # CUSTOMIZE: one line per job in needs above. A job gated to the
-          # full tier by its `if:` is marked full; every other job is pr.
+          # full tier by its `if:` is marked full, one gated to schedule and
+          # workflow_dispatch is nightly; every other job is pr.
+          check changes     "${{ needs.changes.result }}" pr
           check image       "${{ needs.image.result }}" pr
           check integration "${{ needs.integration.result }}" full
-          check soak        "${{ needs.soak.result }}" full
+          check soak        "${{ needs.soak.result }}" nightly
           check arch-gates  "${{ needs.arch-gates.result }}" pr
           # >>> CUSTOMIZE (go-quicraft)
           check netfault    "${{ needs.netfault.result }}" full
           check errfs       "${{ needs.errfs.result }}" full
           check zero-rtt    "${{ needs.zero-rtt.result }}" full
-          check fuzz-seeds  "${{ needs.fuzz-seeds.result }}" full
+          check fuzz-seeds  "${{ needs.fuzz-seeds.result }}" nightly
           check cross-arch  "${{ needs.cross-arch.result }}" full
           check modules     "${{ needs.modules.result }}" full
           check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}" full

@@ -171,13 +171,19 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 // labelled ci:full).
 const fullTierIf = `github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')`
 
-// TestCIGateTiersMatchTheJobs pins the two tiers to the gate.
+// nightlyIf is the condition every nightly job carries, and the expression
+// ci-gate reads into NIGHTLY (ci-template v1.24, Company Agent m751 (e): the
+// schedule and workflow_dispatch only).
+const nightlyIf = `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`
+
+// TestCIGateTiersMatchTheJobs pins the three tiers to the gate.
 //
 // ci-gate passes a skipped job only when its check line tags it `full` and
-// the run did not select the full tier. Two drifts would break that: a job
-// tagged `full` whose `if:` differs from FULL_TIER, so the gate excuses a skip
-// in a run that should have executed it; and a PR-tier job that gains an
-// `if:`, so it skips on some event and fails the gate there.
+// the run did not select the full tier, or tags it `nightly` and the run is
+// neither scheduled nor dispatched. Two drifts would break that: a job tagged
+// `full` or `nightly` whose `if:` differs from the gate's expression, so the
+// gate excuses a skip in a run that should have executed it; and a PR-tier
+// job that gains an `if:`, so it skips on some event and fails the gate there.
 func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	raw, err := os.ReadFile(ciWorkflowPath)
 	if err != nil {
@@ -190,6 +196,9 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	}
 	if !strings.Contains(body, "FULL_TIER: ${{ env.CI_FULL_TIER }}") {
 		t.Errorf("%s's FULL_TIER is not ${{ env.CI_FULL_TIER }}", gateJobName)
+	}
+	if !strings.Contains(body, "NIGHTLY: ${{ "+nightlyIf+" }}") {
+		t.Errorf("%s's NIGHTLY is not the nightly condition %q", gateJobName, nightlyIf)
 	}
 
 	tiers := map[string]string{}
@@ -208,13 +217,17 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			if !hasFullIf {
 				t.Errorf("job %q is tagged full in %s but lacks `if: ${{ %s }}`", j, gateJobName, fullTierIf)
 			}
+		case "nightly":
+			if !strings.Contains(job, "\n    if: ${{ "+nightlyIf+" }}\n") {
+				t.Errorf("job %q is tagged nightly in %s but lacks `if: ${{ %s }}`", j, gateJobName, nightlyIf)
+			}
 		case "pr":
 			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) {
 				t.Errorf("job %q is PR tier but carries a job-level `if:`; a PR-tier job "+
 					"must run on every event, and %s fails it when skipped", j, gateJobName)
 			}
 		default:
-			t.Errorf("job %q's check line in %s has tier %q; want `pr` or `full`",
+			t.Errorf("job %q's check line in %s has tier %q; want `pr`, `full` or `nightly`",
 				j, gateJobName, tiers[j])
 		}
 	}
