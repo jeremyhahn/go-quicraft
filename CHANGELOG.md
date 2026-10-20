@@ -38,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`BenchmarkQUICHandshake`); nothing per message. Both builds still
   interoperate with a peer on the previous lists, over P-256 or X25519. No
   wire or format change.
+- contrib/dragonboat is importable (#443): the release recipe pins its
+  `require` of the root module to the version being cut, in the release
+  commit, and tags `contrib/dragonboat/vX.Y.Z` beside the root and
+  test/performance tags, signed, verified and pushed atomically with them.
+  `go get github.com/jeremyhahn/go-quicraft/contrib/dragonboat@vX.Y.Z` works
+  from the next release on.
+- contrib/dragonboat `NAReadLocalNode` (#443) follows Dragonboat v4: after a
+  completed `ReadIndex` it calls the state machine's `IExtended.NALookup`,
+  under the same read guard and `QueryTimeout` as `ReadLocalNode`, and
+  returns `statemachine.ErrNotImplemented` when the state machine does not
+  implement `IExtended`. It returned `ErrNotImplemented` unconditionally.
+  `WriteHealthMetrics` (QuicRaft metrics are per host, via
+  `quicraft.WithMetrics`) and external snapshot files are documented as
+  unsupported.
 
 ### Changed
 

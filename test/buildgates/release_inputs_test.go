@@ -221,10 +221,14 @@ func newReleaseFixture(t *testing.T, withRemote bool) *releaseFixture {
 	t.Helper()
 	f := &releaseFixture{t: t, dir: t.TempDir()}
 	// The Makefile includes the tool pin file, so it comes along.
-	if err := os.MkdirAll(filepath.Join(f.dir, "scripts"), 0o755); err != nil {
-		t.Fatalf("mkdir scripts: %v", err)
+	// contrib/dragonboat/go.mod comes along because the release commit pins
+	// its requirement of the parent.
+	for _, sub := range []string{"scripts", "contrib/dragonboat"} {
+		if err := os.MkdirAll(filepath.Join(f.dir, sub), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
 	}
-	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", "scripts/tool-pins.sh"} {
+	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", "scripts/tool-pins.sh", "contrib/dragonboat/go.mod"} {
 		writeFile(t, filepath.Join(f.dir, name), readFile(t, filepath.Join(repoRoot, name)), 0o644)
 	}
 	f.release = bumpPatch("v" + strings.TrimSpace(f.version()))
@@ -603,13 +607,18 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 		t.Errorf("VERSION = %q, want %q (unprefixed)", got, "0.9.5-rc.2\n")
 	}
 	refs := f.remoteRefs()
-	for _, want := range []string{"refs/heads/main", "refs/tags/" + rc, "refs/tags/test/performance/" + rc} {
+	for _, want := range []string{"refs/heads/main", "refs/tags/" + rc, "refs/tags/test/performance/" + rc, "refs/tags/contrib/dragonboat/" + rc} {
 		if !strings.Contains(refs, want) {
 			t.Errorf("remote is missing %s after a successful candidate:\n%s", want, refs)
 		}
 	}
-	if files := strings.TrimSpace(f.git("diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD")); files != "VERSION" {
-		t.Errorf("the release commit changed %q, want VERSION alone", files)
+	if files := strings.TrimSpace(f.git("diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD")); files != "VERSION\ncontrib/dragonboat/go.mod" {
+		t.Errorf("the release commit changed %q, want VERSION and contrib/dragonboat/go.mod alone", files)
+	}
+	// contrib/dragonboat is importable at the candidate: its go.mod requires
+	// the parent at the same version, the version its tag sits beside.
+	if mod := f.git("show", "HEAD:contrib/dragonboat/go.mod"); !strings.Contains(mod, "\nrequire github.com/jeremyhahn/go-quicraft "+rc+"\n") {
+		t.Errorf("contrib/dragonboat/go.mod does not require the parent at %s:\n%s", rc, mod)
 	}
 
 	// The same candidate cannot be cut twice.
@@ -634,7 +643,7 @@ func TestReleaseVerifiesAgainstTheAllowedSigners(t *testing.T) {
 	published := func(t *testing.T, f *releaseFixture) {
 		t.Helper()
 		refs := f.remoteRefs()
-		for _, want := range []string{"refs/heads/main", "refs/tags/" + f.release, "refs/tags/test/performance/" + f.release} {
+		for _, want := range []string{"refs/heads/main", "refs/tags/" + f.release, "refs/tags/test/performance/" + f.release, "refs/tags/contrib/dragonboat/" + f.release} {
 			if !strings.Contains(refs, want) {
 				t.Errorf("remote is missing %s after a successful release:\n%s", want, refs)
 			}
@@ -824,12 +833,13 @@ func signingHelper(t *testing.T, key, maintainer, onWrite, onPush string) string
 		"g=(git -c gpg.format=ssh -c user.signingkey="+key+" -c commit.gpgsign=true -c tag.gpgsign=true "+
 		"-c user.name=release -c user.email="+maintainer+")\n"+
 		"if [ \"$1\" != push ]; then\n"+onWrite+"\nexec \"${g[@]}\" \"$@\"\nfi\n"+
-		"remote= branch= tag= ptag=\n"+
+		"remote= branch= tag= ptag= ctag=\n"+
 		"for a in \"${@:2}\"; do\n"+
 		"  case \"$a\" in\n"+
 		"    -*) ;;\n"+
 		"    *:refs/heads/*) branch=$a ;;\n"+
 		"    *:refs/tags/test/performance/*) ptag=$a ;;\n"+
+		"    *:refs/tags/contrib/dragonboat/*) ctag=$a ;;\n"+
 		"    *:refs/tags/*) tag=$a ;;\n"+
 		"    *) remote=$a ;;\n"+
 		"  esac\n"+
@@ -862,10 +872,12 @@ func TestReleasePushesObjectIDsThroughTheHelper(t *testing.T) {
 	commit := strings.TrimSpace(f.git("rev-parse", "main"))
 	tag := strings.TrimSpace(f.git("rev-parse", "refs/tags/"+f.release))
 	ptag := strings.TrimSpace(f.git("rev-parse", "refs/tags/test/performance/"+f.release))
+	ctag := strings.TrimSpace(f.git("rev-parse", "refs/tags/contrib/dragonboat/"+f.release))
 	want := "push --atomic " + fixtureRemote + " " +
 		commit + ":refs/heads/main " +
 		tag + ":refs/tags/" + f.release + " " +
-		ptag + ":refs/tags/test/performance/" + f.release
+		ptag + ":refs/tags/test/performance/" + f.release + " " +
+		ctag + ":refs/tags/contrib/dragonboat/" + f.release
 	if pushes[0] != want {
 		t.Errorf("the push does not name the verified objects by ID, atomically:\n got: %s\nwant: %s", pushes[0], want)
 	}
@@ -883,12 +895,13 @@ func TestReleaseVerifiesWhatTheRemoteHolds(t *testing.T) {
 	key, pub := newSigningKey(t)
 
 	for _, tc := range []struct{ name, onPush string }{
-		{"pushes a different commit to the branch", `"${g[@]}" push --atomic "$remote" "HEAD~1:${branch#*:}" "$tag" "$ptag"`},
-		{"pushes a different object under the release tag", `"${g[@]}" push --atomic "$remote" "$branch" "HEAD:${tag#*:}" "$ptag"`},
-		{"skips the test/performance tag", `"${g[@]}" push --atomic "$remote" "$branch" "$tag"`},
+		{"pushes a different commit to the branch", `"${g[@]}" push --atomic "$remote" "HEAD~1:${branch#*:}" "$tag" "$ptag" "$ctag"`},
+		{"pushes a different object under the release tag", `"${g[@]}" push --atomic "$remote" "$branch" "HEAD:${tag#*:}" "$ptag" "$ctag"`},
+		{"skips the test/performance tag", `"${g[@]}" push --atomic "$remote" "$branch" "$tag" "$ctag"`},
+		{"skips the contrib/dragonboat tag", `"${g[@]}" push --atomic "$remote" "$branch" "$tag" "$ptag"`},
 		{"drops --atomic and stops after the branch", `"${g[@]}" push "$remote" "$branch"`},
 		{"reports success without pushing", `:`},
-		{"pushes to a different remote", `"${g[@]}" push --atomic "$DECOY" "$branch" "$tag" "$ptag"`},
+		{"pushes to a different remote", `"${g[@]}" push --atomic "$DECOY" "$branch" "$tag" "$ptag" "$ctag"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newReleaseFixture(t, true)
@@ -924,6 +937,11 @@ func TestReleaseBindsTheVerifiedObjectsToTheRelease(t *testing.T) {
 		{
 			"commit carries more than VERSION",
 			`if [ "$1" = commit ]; then echo planted > planted.txt; "${g[@]}" add planted.txt; fi`,
+			"changes more than VERSION",
+		},
+		{
+			"commit edits contrib/dragonboat/go.mod beyond the parent pin",
+			`if [ "$1" = commit ]; then echo '// planted' >> contrib/dragonboat/go.mod; "${g[@]}" add contrib/dragonboat/go.mod; fi`,
 			"changes more than VERSION",
 		},
 		{

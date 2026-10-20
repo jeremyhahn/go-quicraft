@@ -224,10 +224,20 @@ make release-candidate VERSION=vX.Y.Z-rc.N   # a release candidate, N >= 1
 ```
 
 Run it on a clean `main` whose `CHANGELOG.md` has a `## [X.Y.Z-alpha]`
-(`[X.Y.Z-rc.N]` for a candidate, `[X.Y.Z]` for `make release`) heading. The recipe writes `VERSION`, commits it, creates the annotated root
-and `test/performance/` tags, verifies them, pushes the commit and both tags
+(`[X.Y.Z-rc.N]` for a candidate, `[X.Y.Z]` for `make release`) heading. The recipe writes `VERSION`, pins `contrib/dragonboat/go.mod`'s
+`require github.com/jeremyhahn/go-quicraft` line to the version being cut,
+commits both, creates the annotated root, `test/performance/` and
+`contrib/dragonboat/` tags, verifies them, pushes the commit and all three tags
 atomically, and reads the remote back. If any step before the push fails,
 nothing is pushed.
+
+`contrib/dragonboat` is a module of its own, so `go get
+github.com/jeremyhahn/go-quicraft/contrib/dragonboat@vX.Y.Z-alpha` resolves the
+`contrib/dragonboat/vX.Y.Z-alpha` tag. A consumer ignores the module's
+`replace github.com/jeremyhahn/go-quicraft => ../..`, which stays for in-tree
+development, and resolves the parent through its `require`, which the release
+commit points at the same version. Between releases that `require` names the
+last release; the `replace` keeps the in-tree build on the working tree.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -239,7 +249,7 @@ With plain git, signing comes from your own configuration: `gpg.format=ssh`,
 `user.signingkey`, `commit.gpgsign=true` and `tag.gpgsign=true`. Before
 pushing, the recipe requires the release commit's author e-mail to be a
 principal in the allowed-signers file (matched literally), and the commit and
-both tags to carry SSH signatures that verify against a key the file lists for
+every tag to carry SSH signatures that verify against a key the file lists for
 that principal. A missing file stops the recipe before anything is written.
 The default file belongs to the private repository and is not published, so a
 public maintainer keeps their own and passes it:
@@ -253,12 +263,13 @@ make release-alpha VERSION=vX.Y.Z-alpha RELEASE_REMOTE=origin \
 `RELEASE_GIT` is trusted to authenticate and for nothing else. It runs the
 writes and the push, because a signing wrapper is also what carries the push
 credentials; every read is plain git. Before pushing, plain git resolves the
-commit and both tag objects to object IDs and checks that the commit is
-exactly the `VERSION` change on top of the `main` you started from and that
+commit and its tag objects to object IDs and checks that the commit is
+exactly the `VERSION` change and the `contrib/dragonboat` parent pin on top of
+the `main` you started from and that
 each tag targets it under its own name. The signatures are verified on those
 IDs, and the push names those IDs, not refs. After the push, plain git reads
 the remote back at the URL resolved before `RELEASE_GIT` first ran, and the
-release fails unless `main` and both tags hold exactly the verified objects.
+release fails unless `main` and every tag hold exactly the verified objects.
 If that read-back fails after a successful push, something was published:
 inspect the remote before announcing or re-running anything. Your plain git
 must be able to read `RELEASE_REMOTE`; the duplicate-tag check needs that too.

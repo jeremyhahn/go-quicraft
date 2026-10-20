@@ -22,6 +22,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/contrib/dragonboat/internal/nalookup"
 	qcSM "github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -1169,6 +1170,86 @@ func TestSnapshotFileCollection_NoOp(t *testing.T) {
 	fc := &snapshotFileCollection{}
 	// Verify AddFile does not panic.
 	fc.AddFile(1, "/path", []byte("meta"))
+}
+
+// naExtension adds IExtended to the counter state machines.
+type naExtension struct {
+	err error
+}
+
+func (e naExtension) NALookup(key []byte) ([]byte, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return append([]byte("na:"), key...), nil
+}
+
+type extendedCounterSM struct {
+	counterSM
+	naExtension
+}
+
+type extendedConcurrentCounterSM struct {
+	concurrentCounterSM
+	naExtension
+}
+
+type extendedDiskCounterSM struct {
+	diskCounterSM
+	naExtension
+}
+
+// TestAdapters_NALookupQuery checks that every adapter answers a
+// nalookup.Query with IExtended.NALookup when the state machine implements
+// it, with ErrNotImplemented when it does not, and leaves a []byte query to
+// Lookup.
+func TestAdapters_NALookupQuery(t *testing.T) {
+	lookupErr := errors.New("na lookup failed")
+	type lookuper interface {
+		Lookup(context.Context, interface{}) (interface{}, error)
+	}
+	for _, tc := range []struct {
+		name               string
+		plain, ext, failed lookuper
+	}{
+		{"regular", &regularAdapter{inner: &counterSM{count: 7}},
+			&regularAdapter{inner: &extendedCounterSM{counterSM: counterSM{count: 7}}},
+			&regularAdapter{inner: &extendedCounterSM{naExtension: naExtension{err: lookupErr}}}},
+		{"concurrent", &concurrentAdapter{inner: &concurrentCounterSM{count: 7}},
+			&concurrentAdapter{inner: &extendedConcurrentCounterSM{concurrentCounterSM: concurrentCounterSM{count: 7}}},
+			&concurrentAdapter{inner: &extendedConcurrentCounterSM{naExtension: naExtension{err: lookupErr}}}},
+		{"disk", &diskAdapter{inner: &diskCounterSM{count: 7}},
+			&diskAdapter{inner: &extendedDiskCounterSM{diskCounterSM: diskCounterSM{count: 7}}},
+			&diskAdapter{inner: &extendedDiskCounterSM{naExtension: naExtension{err: lookupErr}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			q := nalookup.Query{Key: []byte("k")}
+
+			if _, err := tc.plain.Lookup(ctx, q); err != ErrNotImplemented {
+				t.Errorf("without IExtended: err = %v, want ErrNotImplemented", err)
+			}
+
+			got, err := tc.ext.Lookup(ctx, q)
+			if err != nil {
+				t.Fatalf("with IExtended: %v", err)
+			}
+			if b, ok := got.([]byte); !ok || string(b) != "na:k" {
+				t.Errorf("with IExtended: result = %v, want %q", got, "na:k")
+			}
+
+			// A plain query still goes to Lookup on an IExtended state machine.
+			if got, err := tc.ext.Lookup(ctx, "count"); err != nil || got != uint64(7) {
+				t.Errorf("Lookup on an IExtended state machine = %v, %v; want 7", got, err)
+			}
+
+			_, err = tc.failed.Lookup(ctx, q)
+			var le *AdapterLookupError
+			if !errors.As(err, &le) || !errors.Is(err, lookupErr) {
+				t.Errorf("NALookup error = %v, want an AdapterLookupError wrapping %v", err, lookupErr)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

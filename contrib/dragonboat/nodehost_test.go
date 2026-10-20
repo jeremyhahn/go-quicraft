@@ -101,6 +101,12 @@ func newTestNodeHost(t *testing.T) *NodeHost {
 // and waits for the leader to be elected.
 func startTestShard(t *testing.T, nh *NodeHost, shardID, replicaID uint64) {
 	t.Helper()
+	startTestShardWith(t, nh, shardID, replicaID, testSMFactory())
+}
+
+// startTestShardWith is startTestShard with the state machine factory given.
+func startTestShardWith(t *testing.T, nh *NodeHost, shardID, replicaID uint64, factory dbSM.CreateStateMachineFunc) {
+	t.Helper()
 	members := map[uint64]Target{replicaID: nh.RaftAddress()}
 	cfg := dbConfig.Config{
 		ShardID:         shardID,
@@ -111,7 +117,7 @@ func startTestShard(t *testing.T, nh *NodeHost, shardID, replicaID uint64) {
 		SnapshotEntries: 0,
 	}
 
-	err := nh.StartReplica(members, false, testSMFactory(), cfg)
+	err := nh.StartReplica(members, false, factory, cfg)
 	if err != nil {
 		t.Fatalf("StartReplica: %v", err)
 	}
@@ -899,16 +905,97 @@ func TestNodeHost_GetNodeHostRegistry_ReturnsFalse(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNodeHost_NAReadLocalNode_ReturnsNotImplemented(t *testing.T) {
+	// testStateMachine does not implement IExtended, so, as in dragonboat,
+	// the read is refused with the statemachine package's sentinel itself.
 	nh := newTestNodeHost(t)
-	result := RequestResult{code: RequestCompleted}
-	rs := newResolvedRequestState(result)
+	startTestShard(t, nh, 1, 1)
+	rs := completedReadIndex(t, nh, 1)
 
 	_, err := nh.NAReadLocalNode(rs, []byte("query"))
-	if err == nil {
-		t.Error("expected error from NAReadLocalNode")
+	if err != dbSM.ErrNotImplemented {
+		t.Errorf("expected dbSM.ErrNotImplemented, got %v", err)
 	}
-	if !errors.Is(err, dbSM.ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented, got %v", err)
+}
+
+// extendedTestStateMachine implements the optional IExtended interface.
+type extendedTestStateMachine struct {
+	testStateMachine
+	naErr error
+}
+
+func (sm *extendedTestStateMachine) NALookup(key []byte) ([]byte, error) {
+	if sm.naErr != nil {
+		return nil, sm.naErr
+	}
+	return append(append([]byte("na:"), key...), sm.data...), nil
+}
+
+var _ dbSM.IExtended = (*extendedTestStateMachine)(nil)
+
+// completedReadIndex runs a ReadIndex on shardID and waits for it to
+// complete, the precondition of ReadLocalNode and NAReadLocalNode.
+func completedReadIndex(t *testing.T, nh *NodeHost, shardID uint64) *RequestState {
+	t.Helper()
+	rs, err := nh.ReadIndex(shardID, 5*time.Second)
+	if err != nil {
+		t.Fatalf("ReadIndex: %v", err)
+	}
+	t.Cleanup(rs.Release)
+	if s := <-rs.ResultC(); !s.Completed() {
+		t.Fatalf("ReadIndex did not complete: code=%v", s.code)
+	}
+	return rs
+}
+
+func TestNodeHost_NAReadLocalNode_ServesNALookup(t *testing.T) {
+	nh := newTestNodeHost(t)
+	startTestShardWith(t, nh, 1, 1, func(uint64, uint64) dbSM.IStateMachine {
+		return &extendedTestStateMachine{}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := nh.SyncPropose(ctx, nh.GetNoOPSession(1), []byte("-applied")); err != nil {
+		t.Fatalf("SyncPropose: %v", err)
+	}
+	rs := completedReadIndex(t, nh, 1)
+
+	got, err := nh.NAReadLocalNode(rs, []byte("key"))
+	if err != nil {
+		t.Fatalf("NAReadLocalNode: %v", err)
+	}
+	if string(got) != "na:key-applied" {
+		t.Errorf("NAReadLocalNode = %q, want %q", got, "na:key-applied")
+	}
+
+	// A []byte query to ReadLocalNode still reaches Lookup, not NALookup.
+	val, err := nh.ReadLocalNode(rs, []byte("key"))
+	if err != nil {
+		t.Fatalf("ReadLocalNode: %v", err)
+	}
+	if b, ok := val.([]byte); !ok || string(b) != "-applied" {
+		t.Errorf("ReadLocalNode = %v, want Lookup's %q", val, "-applied")
+	}
+}
+
+func TestNodeHost_NAReadLocalNode_PropagatesNALookupError(t *testing.T) {
+	naErr := errors.New("na lookup failed")
+	nh := newTestNodeHost(t)
+	startTestShardWith(t, nh, 1, 1, func(uint64, uint64) dbSM.IStateMachine {
+		return &extendedTestStateMachine{naErr: naErr}
+	})
+	rs := completedReadIndex(t, nh, 1)
+
+	if _, err := nh.NAReadLocalNode(rs, []byte("key")); !errors.Is(err, naErr) {
+		t.Errorf("NAReadLocalNode error = %v, want one wrapping %v", err, naErr)
+	}
+}
+
+func TestNodeHost_NAReadLocalNode_UnresolvedFailsFast(t *testing.T) {
+	nh := newTestNodeHost(t)
+	rs := &RequestState{CompletedC: make(chan RequestResult, 1), shardID: 1}
+
+	if _, err := nh.NAReadLocalNode(rs, []byte("key")); !errors.Is(err, ErrInvalidOperation) {
+		t.Errorf("NAReadLocalNode on an unresolved RequestState = %v, want ErrInvalidOperation", err)
 	}
 }
 

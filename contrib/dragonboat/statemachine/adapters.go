@@ -19,8 +19,24 @@ import (
 	"errors"
 	"io"
 
+	"github.com/jeremyhahn/go-quicraft/contrib/dragonboat/internal/nalookup"
 	qcSM "github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
+
+// naLookup answers a NAReadLocalNode query the way dragonboat v4 does: with
+// the state machine's IExtended.NALookup when it implements the optional
+// interface, otherwise with ErrNotImplemented.
+func naLookup(inner interface{}, q nalookup.Query) (interface{}, error) {
+	ext, ok := inner.(IExtended)
+	if !ok {
+		return nil, ErrNotImplemented
+	}
+	result, err := ext.NALookup(q.Key)
+	if err != nil {
+		return nil, &AdapterLookupError{Cause: err}
+	}
+	return result, nil
+}
 
 // translateSnapshotControlError passes dragonboat's snapshot control-flow
 // sentinels through unwrapped. ErrSnapshotStopped and ErrSnapshotAborted
@@ -90,6 +106,9 @@ func (a *regularAdapter) Update(_ context.Context, entries []qcSM.Entry, results
 
 // Lookup delegates to the inner IStateMachine.Lookup.
 func (a *regularAdapter) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	if q, ok := query.(nalookup.Query); ok {
+		return naLookup(a.inner, q)
+	}
 	result, err := a.inner.Lookup(query)
 	if err != nil {
 		return nil, &AdapterLookupError{Cause: err}
@@ -171,6 +190,9 @@ func (a *concurrentAdapter) Update(_ context.Context, entries []qcSM.Entry, resu
 
 // Lookup delegates to the inner IConcurrentStateMachine.Lookup.
 func (a *concurrentAdapter) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	if q, ok := query.(nalookup.Query); ok {
+		return naLookup(a.inner, q)
+	}
 	result, err := a.inner.Lookup(query)
 	if err != nil {
 		return nil, &AdapterLookupError{Cause: err}
@@ -278,6 +300,9 @@ func (a *diskAdapter) Update(_ context.Context, entries []qcSM.Entry, results []
 
 // Lookup delegates to the inner IOnDiskStateMachine.Lookup.
 func (a *diskAdapter) Lookup(_ context.Context, query interface{}) (interface{}, error) {
+	if q, ok := query.(nalookup.Query); ok {
+		return naLookup(a.inner, q)
+	}
 	result, err := a.inner.Lookup(query)
 	if err != nil {
 		return nil, &AdapterLookupError{Cause: err}

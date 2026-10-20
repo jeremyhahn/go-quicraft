@@ -1,7 +1,7 @@
 # contrib/dragonboat
 
 > **Status: REFERENCE** · Scope: the Dragonboat-compatible shim over QuicRaft in
-> this directory · Last verified: 2026-10-13
+> this directory · Last verified: 2026-10-20
 
 A [Dragonboat](https://github.com/lni/dragonboat) v4 compatible layer for
 [QuicRaft](../../README.md). Its `NodeHost` exposes Dragonboat's method names
@@ -11,10 +11,13 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
 
 ## What it is, and is not
 
-- A nested Go module, `github.com/jeremyhahn/go-quicraft/contrib/dragonboat`,
-  whose `go.mod` replaces the root module with `../..`. No tag carries it,
-  so it always builds against the QuicRaft tree it sits in. Applications
-  written for QuicRaft use `pkg` directly.
+- A nested Go module, `github.com/jeremyhahn/go-quicraft/contrib/dragonboat`.
+  Every release tags it `contrib/dragonboat/vX.Y.Z` beside the root `vX.Y.Z`,
+  and the release commit pins its `require` of the root module to that same
+  version, so `go get github.com/jeremyhahn/go-quicraft/contrib/dragonboat@vX.Y.Z`
+  works. Its `go.mod` also replaces the root module with `../..`; a consumer
+  ignores that, and in-tree builds use it to build against the QuicRaft tree
+  the module sits in. Applications written for QuicRaft use `pkg` directly.
 - Packages: `config` (`NodeHostConfig`, `Config`), `statemachine` (the regular,
   concurrent and on-disk state machine interfaces and their adapters),
   `client` (`Session`), and `raftio` (event listener and LogDB interfaces and
@@ -45,6 +48,23 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
   - QuicRaft extensions: `SetQueryTimeout` and `QueryTimeout` bound the
     state machine `Lookup` behind `ReadLocalNode`. The default is 0, no
     deadline, as in Dragonboat.
+- `NAReadLocalNode` behaves as in Dragonboat v4: after a completed
+  `ReadIndex` it passes the byte-slice query to the state machine's
+  `statemachine.IExtended.NALookup` and returns `statemachine.ErrNotImplemented`
+  when the state machine does not implement `IExtended`. It runs under the same
+  read guard and `QueryTimeout` as `ReadLocalNode`.
+- Not supported:
+  - `WriteHealthMetrics` writes nothing. Dragonboat writes its own
+    process-wide metrics; QuicRaft's metrics are per `quicraft.Host`, through
+    a `quicraft.MetricsCollector` (for example
+    `quicraft.NewPrometheusMetricsCollector`) passed to
+    `NewNodeHostWithOptions` with `quicraft.WithMetrics`, and are exposed by
+    that collector. `config.NodeHostConfig.EnableMetrics` is accepted and
+    ignored.
+  - External snapshot files. A state machine that adds a file to the
+    `ISnapshotFileCollection` during `SaveSnapshot` fails the snapshot with
+    `statemachine.ErrSnapshotFilesNotSupported` rather than producing one
+    without the file; keep all state in the snapshot stream.
 - QuicRaft authorizes members by node identity. On a host with a transport,
   name the founding members' identities in `config.Config.MemberIdentities`
   (no Dragonboat counterpart) when the shard starts, and add later members

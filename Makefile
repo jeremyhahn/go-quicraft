@@ -1797,14 +1797,14 @@ export GOWORK=off
 # Trust model. RELEASE_GIT is trusted to authenticate and nothing else; in the
 # company flow it is the wrapper that carries the push credentials, so the push
 # has to run through it. Every read is plain git. After the writes, plain git
-# resolves the release commit and both tag objects to object IDs, checks that
-# the commit is exactly the VERSION bump on top of the main it started from and
-# that each tag object targets it under its own name, and verifies all three
-# signatures against RELEASE_ALLOWED_SIGNERS. The push names those object IDs,
+# resolves the release commit and its tag objects to object IDs, checks that
+# the commit is exactly the VERSION bump (plus the contrib/dragonboat parent
+# pin) on top of the main it started from and that each tag object targets it
+# under its own name, and verifies every signature against RELEASE_ALLOWED_SIGNERS. The push names those object IDs,
 # never a ref a helper could move. A helper can still ignore what it is asked
 # to push, so afterwards plain git reads the remote back, at the URL resolved
-# before RELEASE_GIT first ran, and the release fails unless the branch and both
-# tags name exactly the verified objects. The read-back uses the releaser's own
+# before RELEASE_GIT first ran, and the release fails unless the branch and every
+# tag name exactly the verified objects. The read-back uses the releaser's own
 # transport, which the duplicate-tag check already requires. A helper that
 # rewrites the releaser's git configuration or binaries is outside what any
 # recipe can check.
@@ -1846,6 +1846,17 @@ export GOWORK=off
 # verify. The gpg.*program settings disable OpenPGP and X.509 verification: only
 # an SSH signature checked against the anchor can pass, never a key that merely
 # happens to be trusted in a local keyring.
+#
+# contrib/dragonboat is its own module. A consumer ignores its replace of the
+# parent and resolves the parent through its require, so the release commit
+# pins that require to the version being cut and the contrib/dragonboat/<version>
+# tag is made beside the root and test/performance tags, signed and pushed the
+# same way. release-contrib-pin rewrites the one require line on stdin or in the
+# named file to $$REL_VERSION and fails unless exactly one such line exists; the
+# guard runs it read-only before anything is written, and the verification
+# re-derives the pinned go.mod from main to compare it with the release commit.
+release-contrib-pin = awk -v v="$$REL_VERSION" '$$1 == "require" && $$2 == "github.com/jeremyhahn/go-quicraft" && NF == 3 { $$3 = v; n++ } { print } END { exit n == 1 ? 0 : 1 }'
+
 define release-body
 @test -n "$$REL_VERSION" || { echo "ERROR: state the version explicitly: make $$REL_TARGET VERSION=$$REL_FORM (release-versioning.md decides patch/minor/major -- the recipe refuses to guess)"; exit 1; }
 @printf '%s' "$$REL_VERSION" | grep -Eq "$$REL_PATTERN" || { echo "ERROR: VERSION is not of the form $$REL_FORM (no leading zeroes): $$REL_VERSION"; exit 1; }
@@ -1863,23 +1874,30 @@ case "$$rc" in \
 esac
 @test -z "$$(git status --porcelain)" || { echo 'ERROR: working tree not clean'; exit 1; }
 @ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
+@$(release-contrib-pin) contrib/dragonboat/go.mod >/dev/null || { echo "ERROR: contrib/dragonboat/go.mod does not hold exactly one 'require github.com/jeremyhahn/go-quicraft <version>' line. The release commit pins it to $$REL_VERSION so the contrib/dragonboat/$$REL_VERSION tag is importable; nothing has been written."; exit 1; }
+@! git rev-parse -q --verify "refs/tags/contrib/dragonboat/$$REL_VERSION" >/dev/null || { echo "ERROR: tag contrib/dragonboat/$$REL_VERSION already exists locally"; exit 1; }
 @url="$$(git remote get-url "$$REL_REMOTE")" && base="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" || { echo "ERROR: could not resolve $$REL_REMOTE's URL or main before writing anything"; exit 1; }; \
 relgit() { printf '%s\n' "$$REL_GIT $$*"; $$REL_GIT "$$@"; }; \
+cmod=contrib/dragonboat/go.mod; \
 printf '%s\n' "$${REL_VERSION#v}" > VERSION || exit 1; \
-relgit add VERSION || exit 1; \
+$(release-contrib-pin) "$$cmod" > "$$cmod.release" && mv "$$cmod.release" "$$cmod" || { rm -f "$$cmod.release"; echo "ERROR: could not pin $$cmod to $$REL_VERSION. Nothing has been committed. Reset with: git checkout -- VERSION $$cmod"; exit 1; }; \
+relgit add VERSION "$$cmod" || exit 1; \
 relgit commit -m "chore(release): $$REL_VERSION" || exit 1; \
 relgit tag -a "$$REL_VERSION" -m "$$REL_VERSION" || exit 1; \
 relgit tag -a "test/performance/$$REL_VERSION" -m "test/performance $$REL_VERSION (lockstep with root $$REL_VERSION)" || exit 1; \
-reset="git reset --hard $$base && git tag -d $$REL_VERSION test/performance/$$REL_VERSION"; \
+relgit tag -a "contrib/dragonboat/$$REL_VERSION" -m "contrib/dragonboat $$REL_VERSION (lockstep with root $$REL_VERSION)" || exit 1; \
+reset="git reset --hard $$base && git tag -d $$REL_VERSION test/performance/$$REL_VERSION contrib/dragonboat/$$REL_VERSION"; \
 commit="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" && \
 tag="$$(git rev-parse --verify -q "refs/tags/$$REL_VERSION")" && \
-ptag="$$(git rev-parse --verify -q "refs/tags/test/performance/$$REL_VERSION")" || { echo "ERROR: the release commit or one of its tags does not resolve. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
-for t in "$$tag" "$$ptag"; do \
+ptag="$$(git rev-parse --verify -q "refs/tags/test/performance/$$REL_VERSION")" && \
+ctag="$$(git rev-parse --verify -q "refs/tags/contrib/dragonboat/$$REL_VERSION")" || { echo "ERROR: the release commit or one of its tags does not resolve. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+for t in "$$tag" "$$ptag" "$$ctag"; do \
   test "$$(git cat-file -t "$$t")" = tag || { echo "ERROR: $$t is not a tag object -- a lightweight tag; releases are annotated and signed. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
 done; \
 test "$$(git rev-list --parents -n 1 "$$commit")" = "$$commit $$base" || { echo "ERROR: the release commit $$commit is not a single commit on top of main $$base. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
-test "$$(git diff-tree -r --no-commit-id --name-only "$$base" "$$commit")" = VERSION && test "$$(git cat-file blob "$$commit:VERSION")" = "$${REL_VERSION#v}" || { echo "ERROR: the release commit $$commit changes more than VERSION, or VERSION does not read $${REL_VERSION#v}. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
-for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION"; do \
+test "$$(git diff-tree -r --no-commit-id --name-only "$$base" "$$commit")" = "$$(printf 'VERSION\n%s' "$$cmod")" && test "$$(git cat-file blob "$$commit:VERSION")" = "$${REL_VERSION#v}" && \
+pinned_mod="$$(git cat-file blob "$$base:$$cmod" | $(release-contrib-pin))" && test "$$(git cat-file blob "$$commit:$$cmod")" = "$$pinned_mod" || { echo "ERROR: the release commit $$commit changes more than VERSION and the parent requirement in $$cmod, or VERSION does not read $${REL_VERSION#v}, or $$cmod does not require the parent at $$REL_VERSION. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
+for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION" "$$ctag contrib/dragonboat/$$REL_VERSION"; do \
   set -- $$pair; \
   git cat-file tag "$$1" | awk -v o="object $$commit" -v n="tag $$2" 'NR == 1 { a = ($$0 == o) } NR == 2 { b = ($$0 == "type commit") } NR == 3 { c = ($$0 == n) } END { exit !(a && b && c) }' || { echo "ERROR: tag object $$1 does not point at the release commit $$commit under the name $$2. Nothing has been pushed. Reset with: $$reset"; exit 1; }; \
 done; \
@@ -1890,20 +1908,20 @@ test -s "$$pinned" || { echo "ERROR: the release commit's author <$$author> is n
 verify() { git -c gpg.program=false -c gpg.openpgp.program=false -c gpg.x509.program=false -c gpg.ssh.allowedSignersFile="$$pinned" "$$@" >/dev/null 2>&1; }; \
 rc=0; \
 verify verify-commit "$$commit" || { echo "ERROR: the release commit's signature does not verify against a key $$REL_SIGNERS lists for <$$author>. Nothing has been pushed. Reset with: $$reset"; rc=1; }; \
-for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION"; do \
+for pair in "$$tag $$REL_VERSION" "$$ptag test/performance/$$REL_VERSION" "$$ctag contrib/dragonboat/$$REL_VERSION"; do \
   set -- $$pair; \
   verify verify-tag "$$1" || { echo "ERROR: tag $$2's signature does not verify against a key $$REL_SIGNERS lists for <$$author>. Nothing has been pushed. Reset with: $$reset"; rc=1; }; \
 done; \
 test $$rc -eq 0 || exit 1; \
-relgit push --atomic "$$REL_REMOTE" "$$commit:refs/heads/main" "$$tag:refs/tags/$$REL_VERSION" "$$ptag:refs/tags/test/performance/$$REL_VERSION" || { echo "ERROR: the push through RELEASE_GIT failed. An atomic push publishes nothing on failure, but RELEASE_GIT is not trusted to have been atomic: inspect $$url before running the release again."; exit 1; }; \
-published="$$(git ls-remote "$$url" refs/heads/main "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION")" || { echo "ERROR: RELEASE_GIT reported a successful push, but $$url could not be read back, so it does not hold the verified release as far as this recipe can tell. Inspect it before announcing anything."; exit 1; }; \
-for pair in "refs/heads/main $$commit" "refs/tags/$$REL_VERSION $$tag" "refs/tags/test/performance/$$REL_VERSION $$ptag"; do \
+relgit push --atomic "$$REL_REMOTE" "$$commit:refs/heads/main" "$$tag:refs/tags/$$REL_VERSION" "$$ptag:refs/tags/test/performance/$$REL_VERSION" "$$ctag:refs/tags/contrib/dragonboat/$$REL_VERSION" || { echo "ERROR: the push through RELEASE_GIT failed. An atomic push publishes nothing on failure, but RELEASE_GIT is not trusted to have been atomic: inspect $$url before running the release again."; exit 1; }; \
+published="$$(git ls-remote "$$url" refs/heads/main "refs/tags/$$REL_VERSION" "refs/tags/test/performance/$$REL_VERSION" "refs/tags/contrib/dragonboat/$$REL_VERSION")" || { echo "ERROR: RELEASE_GIT reported a successful push, but $$url could not be read back, so it does not hold the verified release as far as this recipe can tell. Inspect it before announcing anything."; exit 1; }; \
+for pair in "refs/heads/main $$commit" "refs/tags/$$REL_VERSION $$tag" "refs/tags/test/performance/$$REL_VERSION $$ptag" "refs/tags/contrib/dragonboat/$$REL_VERSION $$ctag"; do \
   set -- $$pair; \
   got="$$(printf '%s\n' "$$published" | awk -v r="$$1" '$$2 == r { print $$1 }')"; \
   test "$$got" = "$$2" || { echo "ERROR: $$url has $$1 at $${got:-nothing}; the verified release has it at $$2."; rc=1; }; \
 done; \
 test $$rc -eq 0 || { echo "ERROR: RELEASE_GIT reported a successful push, but $$url does not hold the verified release. Do not announce it; inspect the remote."; exit 1; }; \
-echo "Released $$REL_VERSION (signed, annotated; root and test/performance tags pushed atomically and read back from $$url)"
+echo "Released $$REL_VERSION (signed, annotated; root, test/performance and contrib/dragonboat tags pushed atomically and read back from $$url)"
 endef
 
 release-alpha: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)

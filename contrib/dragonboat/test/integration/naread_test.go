@@ -21,14 +21,29 @@ import (
 	"testing"
 	"time"
 
+	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 )
 
 // TestIntegration_DB_NAReadLocalNode verifies that NAReadLocalNode returns
-// ErrNotImplemented since the QuicRaft adapter does not currently support
-// the IExtended/NALookup interface. This test ensures the method exists,
-// is callable, and returns the correct sentinel error rather than panicking
-// or returning an unexpected error.
+// ErrNotImplemented, as in Dragonboat v4, when the state machine does not
+// implement IExtended: the KV state machine here has no NALookup. It checks
+// that a completed ReadIndex reaches the state machine and comes back with
+// that sentinel rather than a panic or another error.
+// awaitReadIndex waits for rs to complete. NAReadLocalNode, like
+// ReadLocalNode, serves only a completed ReadIndex. The caller releases rs.
+func awaitReadIndex(t *testing.T, rs *dragonboat.RequestState, timeout time.Duration) {
+	t.Helper()
+	select {
+	case r := <-rs.ResultC():
+		if !r.Completed() {
+			t.Fatalf("ReadIndex did not complete: %+v", r)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("ReadIndex did not resolve within %v", timeout)
+	}
+}
+
 func TestIntegration_DB_NAReadLocalNode(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -54,8 +69,9 @@ func TestIntegration_DB_NAReadLocalNode(t *testing.T) {
 	// is presented to must be the same one.
 	ri := cluster.readIndexFromLeader(t, 1, defaultTimeout)
 	defer ri.RS.Release()
+	awaitReadIndex(t, ri.RS, defaultTimeout)
 
-	// Call NAReadLocalNode which should return ErrNotImplemented.
+	// The KV state machine does not implement IExtended.
 	_, naErr := ri.Host.NAReadLocalNode(ri.RS, encodeKVGet("naread-key"))
 	if naErr == nil {
 		t.Fatal("NAReadLocalNode should return an error (ErrNotImplemented)")
@@ -93,6 +109,7 @@ func TestIntegration_DB_NAReadLocalNode_AllNodes(t *testing.T) {
 		if rsErr != nil {
 			t.Fatalf("ReadIndex on node[%d] failed: %v", i, rsErr)
 		}
+		awaitReadIndex(t, rs, defaultTimeout)
 
 		_, naErr := nh.NAReadLocalNode(rs, encodeKVGet("warmup"))
 		rs.Release()

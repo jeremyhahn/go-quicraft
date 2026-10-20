@@ -5,10 +5,13 @@ module github.com/jeremyhahn/go-quicraft/contrib/dragonboat
 // the parent requires a newer Go than this line.
 go 1.27.2
 
+// The release recipe (make release-alpha / release-candidate / release) pins
+// this require to the version it cuts and tags contrib/dragonboat/<version>
+// beside the root tag, so importers resolve the parent at that version.
 require github.com/jeremyhahn/go-quicraft v0.0.0
 
-// Always built against the parent tree it ships with, never a published
-// version.
+// In-tree builds use the parent tree this module ships with. A consumer's
+// build ignores this replace and follows the require above.
 replace github.com/jeremyhahn/go-quicraft => ../..
 
 require (

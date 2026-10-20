@@ -31,6 +31,7 @@ import (
 
 	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 	dbConfig "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/config"
+	"github.com/jeremyhahn/go-quicraft/contrib/dragonboat/internal/nalookup"
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
@@ -1100,6 +1101,39 @@ func (nh *NodeHost) ReadIndex(shardID uint64, timeout time.Duration) (*RequestSt
 // ReadIndex has completed returns ErrInvalidOperation; calling it after a
 // failed ReadIndex returns that failure's error.
 func (nh *NodeHost) ReadLocalNode(rs *RequestState, query interface{}) (interface{}, error) {
+	return nh.readLocalNode(rs, query)
+}
+
+// NAReadLocalNode is the byte-slice variant of ReadLocalNode, as in
+// dragonboat v4: the query is passed to the state machine's
+// statemachine.IExtended NALookup method and its result is returned as is.
+// It returns statemachine.ErrNotImplemented when the state machine does not
+// implement IExtended. Like ReadLocalNode, it may only be called after the
+// ReadIndex that produced rs has completed, and is served under the same
+// read guard and query timeout.
+func (nh *NodeHost) NAReadLocalNode(rs *RequestState, query []byte) ([]byte, error) {
+	val, err := nh.readLocalNode(rs, nalookup.Query{Key: query})
+	if err != nil {
+		if errors.Is(err, dbSM.ErrNotImplemented) {
+			return nil, dbSM.ErrNotImplemented
+		}
+		return nil, err
+	}
+	if val == nil {
+		return nil, nil
+	}
+	b, ok := val.([]byte)
+	if !ok {
+		// The adapters answer a nalookup.Query with NALookup's []byte
+		// result only; anything else is a broken invariant, not data.
+		return nil, ErrInvalidOperation
+	}
+	return b, nil
+}
+
+// readLocalNode is the local read shared by ReadLocalNode and
+// NAReadLocalNode.
+func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interface{}, error) {
 	result, ok := rs.completedResult()
 	if !ok {
 		// The ReadIndex has not resolved (or the caller never waited
@@ -1126,17 +1160,6 @@ func (nh *NodeHost) ReadLocalNode(rs *RequestState, query interface{}) (interfac
 		return nil, translateError(err)
 	}
 	return val, nil
-}
-
-// NAReadLocalNode performs a non-agreement read on the local node. This
-// would call the state machine's NALookup method if the state machine
-// implements the IExtended interface. QuicRaft does not currently
-// support NALookup, so this returns ErrNotImplemented from the
-// statemachine package.
-func (nh *NodeHost) NAReadLocalNode(rs *RequestState, query []byte) ([]byte, error) {
-	_ = rs    // accepted for dragonboat v4 API compatibility
-	_ = query // accepted for dragonboat v4 API compatibility
-	return nil, dbSM.ErrNotImplemented
 }
 
 // StaleRead reads local state machine state directly without any
@@ -1730,11 +1753,15 @@ func (nh *NodeHost) RemoveData(shardID, replicaID uint64) error {
 // Health Metrics
 // ---------------------------------------------------------------------------
 
-// WriteHealthMetrics writes health metrics to the provided writer.
-// This is a no-op in QuicRaft; it exists for dragonboat v4 API
-// compatibility.
+// WriteHealthMetrics is not supported and writes nothing to w. It exists for
+// dragonboat v4 API compatibility, where it writes dragonboat's process-wide
+// metrics. QuicRaft keeps metrics per host, in the quicraft.MetricsCollector
+// passed to NewNodeHostWithOptions with quicraft.WithMetrics; read them from
+// that collector.
 func WriteHealthMetrics(w io.Writer) {
-	_ = w // accepted for dragonboat v4 API compatibility
+	// Deliberately writes nothing: there is no process-wide metric set to
+	// write. See the doc comment.
+	_ = w
 }
 
 // ---------------------------------------------------------------------------
