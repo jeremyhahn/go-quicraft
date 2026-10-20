@@ -410,89 +410,14 @@ func TestUnmarshalShareSet_LockRefusalIsProtectedMemoryError(t *testing.T) {
 	}
 }
 
-func TestShareProtectWith_OnePageBudget(t *testing.T) {
-	plain, err := Split([]byte("issue-211 protect"), 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	plain[0].Metadata = map[string]string{"custodian": "a"}
-
-	a := newBudget(t, 1)
-	first, err := plain[0].ProtectWith(a)
-	if err != nil {
-		t.Fatalf("first ProtectWith within budget: %v", err)
-	}
-	defer first.Destroy()
-	if got := a.InUse(); got != pageBytes() {
-		t.Fatalf("InUse after first share = %d, want one page (%d)", got, pageBytes())
-	}
-	if !bytes.Equal(valueCopy(first), []byte(plain[0].Value)) {
-		t.Fatal("protected value differs from the plain share's")
-	}
-	if first.Metadata["custodian"] != "a" {
-		t.Fatal("ProtectWith dropped the share's metadata")
-	}
-	want0 := append([]byte(nil), valueCopy(first)...)
-
-	before := plain[1].Value
-	second, err := plain[1].ProtectWith(a)
-	if second != nil {
-		second.Destroy()
-		t.Fatal("second share beyond a one-page budget was admitted")
-	}
-	assertBudgetExhausted(t, err)
-	if got := a.InUse(); got != pageBytes() {
-		t.Fatalf("InUse after refusal = %d, want it unchanged at %d", got, pageBytes())
-	}
-	if plain[1].Value != before {
-		t.Fatal("a refused ProtectWith changed the plain share")
-	}
-	if err := first.Validate(); err != nil {
-		t.Fatalf("earlier share invalid after refusal: %v", err)
-	}
-	if !bytes.Equal(valueCopy(first), want0) {
-		t.Fatal("earlier share's value changed after refusal")
-	}
-
-	// The plain share is intact, so the refused call can be retried against a
-	// budget that admits it.
-	retry, err := plain[1].ProtectWith(newBudget(t, 1))
-	if err != nil {
-		t.Fatalf("retry against a fresh budget: %v", err)
-	}
-	retry.Destroy()
-
-	first.Destroy()
-	if got := a.InUse(); got != 0 {
-		t.Fatalf("InUse after Destroy = %d, want 0", got)
-	}
-}
-
-// TestUnmarshalAndProtectWith_RefuseNilAllocator pins the nil-allocator refusal
-// for the UnmarshalShareSetWith and ProtectWith variants, and that it is
-// decided before the input is read: a document that does not parse and a nil Share both report
-// ErrNilAllocator rather than their own errors.
-func TestUnmarshalAndProtectWith_RefuseNilAllocator(t *testing.T) {
+// TestUnmarshalShareSetWith_RefusesNilAllocator pins the nil-allocator refusal
+// for UnmarshalShareSetWith, and that it is decided before the input is read:
+// a document that does not parse reports ErrNilAllocator rather than its own
+// error.
+func TestUnmarshalShareSetWith_RefusesNilAllocator(t *testing.T) {
 	shares, err := UnmarshalShareSetWith(nil, []byte("not json"))
 	if shares != nil || !errors.Is(err, enclave.ErrNilAllocator) {
 		destroyAll(shares)
 		t.Fatalf("UnmarshalShareSetWith(nil) err = %v, want ErrNilAllocator", err)
-	}
-
-	var nilShare *Share
-	p, err := nilShare.ProtectWith(nil)
-	if p != nil || !errors.Is(err, enclave.ErrNilAllocator) {
-		p.Destroy()
-		t.Fatalf("(*Share)(nil).ProtectWith(nil) err = %v, want ErrNilAllocator", err)
-	}
-
-	plain, err := Split([]byte("nil allocator"), 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	p, err = plain[0].ProtectWith(nil)
-	if p != nil || !errors.Is(err, enclave.ErrNilAllocator) {
-		p.Destroy()
-		t.Fatalf("ProtectWith(nil) err = %v, want ErrNilAllocator", err)
 	}
 }

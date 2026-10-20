@@ -145,9 +145,9 @@ func TestHostAPI_Session_Lifecycle_ThreeNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	session, err := leaderHost.GetNewSession(ctx, 1)
+	session, err := leaderHost.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 	if session.ClientID() == 0 {
 		t.Error("session ClientID is 0")
@@ -251,7 +251,7 @@ func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 // specific target and verifies that leadership actually moved to THAT target.
 //
 // The previous version only checked that RequestLeaderTransfer returned nil
-// and that GetShardInfo still reported ShardID == 1 — a value the test itself
+// and that ShardInfo still reported ShardID == 1 — a value the test itself
 // passed in, so it could never be wrong. An engine that ignored the requested
 // target, or never transferred at all, passed.
 func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
@@ -275,9 +275,9 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 
 	// Leadership must be held by the REQUESTED replica, not merely by
 	// someone.
-	targetInfo, err := cluster.hosts[targetIdx].GetShardInfo(1)
+	targetInfo, err := cluster.hosts[targetIdx].ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
+		t.Fatalf("ShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
 	}
 	if !targetInfo.IsLeader {
 		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
@@ -292,7 +292,7 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 		fmt.Sprintf("all nodes report replica %d as leader", targetReplicaID),
 		func() bool {
 			for _, i := range cluster.liveNodeIndexes() {
-				leaderID, known, leaderErr := cluster.hosts[i].GetLeaderID(1)
+				leaderID, known, leaderErr := cluster.hosts[i].LeaderID(1)
 				if leaderErr != nil || !known || leaderID != targetReplicaID {
 					return false
 				}
@@ -302,9 +302,9 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 	)
 
 	// The original leader is still queryable and still reports the shard.
-	info, err := leaderHost.GetShardInfo(1)
+	info, err := leaderHost.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo after transfer request failed: %v", err)
+		t.Fatalf("ShardInfo after transfer request failed: %v", err)
 	}
 	if info.ShardID != 1 {
 		t.Errorf("ShardID = %d, want 1", info.ShardID)
@@ -328,16 +328,16 @@ func TestHostAPI_GetShardInfo_AllNodes(t *testing.T) {
 		waitForCondition(t, leaderElectionTimeout,
 			fmt.Sprintf("node[%d] learns term", idx),
 			func() bool {
-				info, err := host.GetShardInfo(1)
+				info, err := host.ShardInfo(1)
 				return err == nil && info.Term > 0
 			},
 		)
 	}
 
 	for i, h := range cluster.hosts {
-		info, err := h.GetShardInfo(1)
+		info, err := h.ShardInfo(1)
 		if err != nil {
-			t.Fatalf("node[%d] GetShardInfo failed: %v", i, err)
+			t.Fatalf("node[%d] ShardInfo failed: %v", i, err)
 		}
 		if info.ShardID != 1 {
 			t.Errorf("node[%d] ShardID = %d, want 1", i, info.ShardID)
@@ -361,9 +361,9 @@ func TestHostAPI_GetNodeHostInfo_AllNodes(t *testing.T) {
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		shardCount := len(info.ShardInfoList)
 		if shardCount != 1 {
@@ -406,9 +406,9 @@ func TestHostAPI_MultipleShards_ThreeNode(t *testing.T) {
 
 	// Verify host info shows all 3 shards.
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		shardCount := len(info.ShardInfoList)
 		if shardCount != 3 {
@@ -669,9 +669,9 @@ func TestHostAPI_Session_Lifecycle_FiveNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	session, err := leaderHost.GetNewSession(ctx, 1)
+	session, err := leaderHost.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 	if session.ClientID() == 0 {
 		t.Error("session ClientID is 0")
@@ -778,9 +778,9 @@ func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 
 	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
 
-	targetInfo, err := cluster.hosts[targetIdx].GetShardInfo(1)
+	targetInfo, err := cluster.hosts[targetIdx].ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
+		t.Fatalf("ShardInfo on transfer target node[%d] failed: %v", targetIdx, err)
 	}
 	if !targetInfo.IsLeader {
 		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
@@ -794,7 +794,7 @@ func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 		fmt.Sprintf("all nodes report replica %d as leader", targetReplicaID),
 		func() bool {
 			for _, i := range cluster.liveNodeIndexes() {
-				leaderID, known, leaderErr := cluster.hosts[i].GetLeaderID(1)
+				leaderID, known, leaderErr := cluster.hosts[i].LeaderID(1)
 				if leaderErr != nil || !known || leaderID != targetReplicaID {
 					return false
 				}
@@ -803,9 +803,9 @@ func TestHostAPI_LeaderTransfer_FiveNode(t *testing.T) {
 		},
 	)
 
-	info, err := leaderHost.GetShardInfo(1)
+	info, err := leaderHost.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo after transfer request failed: %v", err)
+		t.Fatalf("ShardInfo after transfer request failed: %v", err)
 	}
 	if info.ShardID != 1 {
 		t.Errorf("ShardID = %d, want 1", info.ShardID)
@@ -830,16 +830,16 @@ func TestHostAPI_GetShardInfo_FiveNode(t *testing.T) {
 		waitForCondition(t, leaderElectionTimeout,
 			fmt.Sprintf("node[%d] learns term", idx),
 			func() bool {
-				info, err := host.GetShardInfo(1)
+				info, err := host.ShardInfo(1)
 				return err == nil && info.Term > 0
 			},
 		)
 	}
 
 	for i, h := range cluster.hosts {
-		info, err := h.GetShardInfo(1)
+		info, err := h.ShardInfo(1)
 		if err != nil {
-			t.Fatalf("node[%d] GetShardInfo failed: %v", i, err)
+			t.Fatalf("node[%d] ShardInfo failed: %v", i, err)
 		}
 		if info.ShardID != 1 {
 			t.Errorf("node[%d] ShardID = %d, want 1", i, info.ShardID)
@@ -858,7 +858,7 @@ func TestHostAPI_GetShardInfo_FiveNode(t *testing.T) {
 	waitForCondition(t, leaderElectionTimeout, "exactly 1 leader", func() bool {
 		count := 0
 		for _, h := range cluster.hosts {
-			info, err := h.GetShardInfo(1)
+			info, err := h.ShardInfo(1)
 			if err != nil {
 				return false
 			}
@@ -879,9 +879,9 @@ func TestHostAPI_GetNodeHostInfo_FiveNode(t *testing.T) {
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		shardCount := len(info.ShardInfoList)
 		if shardCount != 1 {
@@ -932,9 +932,9 @@ func TestHostAPI_MultipleShards_FiveNode(t *testing.T) {
 
 	// Verify host info shows all 3 shards.
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		shardCount := len(info.ShardInfoList)
 		if shardCount != 3 {

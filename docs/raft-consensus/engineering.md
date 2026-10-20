@@ -2086,7 +2086,7 @@ this section covers only the raft-visible parts.
   index. Candidates are sorted by client ID before the per-call cap, so every
   replica picks the same subset.
 - **The session policy is replicated.** The expiry threshold, the total session
-  cap, the per-session response-cache depth (`MaxSessionsPerClient`, default
+  cap, the per-session response-cache depth (`MaxResponsesPerSession`, default
   128) and the per-owner cap are carried on `proto.Membership` as a
   `proto.SessionPolicy`, seeded at bootstrap from `config.Config`. No config
   change alters it after bootstrap, and that is load-bearing: the state machine
@@ -2624,7 +2624,6 @@ Two different things reach a caller as the public `ErrShardFailed`. The proposal
 | `OnSnapshotRequestCompleted(shardID, requestKey, index, err)` | snapshot pool worker, after the slots are released, for a save `RequestSnapshot` keyed, including one whose `SaveSnapshot` panicked |
 | `OnSnapshotRejected(shardID, replicaID, err)` | snapshot pool worker, the per-shard apply goroutine (automatic snapshot), or the `RequestSnapshot` caller; `err` is the cause, delivered to the listener as `SnapshotInfo.Err` |
 | `OnShardFailed(shardID, err)` | the worker that latched the failure |
-| `OnCampaignSkipped(shardID, replicaID, term)` | step worker; **not emitted** (see below) |
 
 The producer column is the goroutine that calls the engine callback. The
 host's snapshot and log-compaction callbacks do not run user code there: they
@@ -2660,7 +2659,7 @@ incarnation is taken over by the next one. A request abandoned because its node
 stopped is fenced from shared state by the write lease, so it can neither
 refuse the restarted shard nor clear the restarted shard's claim.
 
-`OnCampaignSkipped` is declared on the interface and its doc comment names the step worker as the producer, but nothing in `pkg/internal/engine` calls it: every campaign-refusal branch in `startElection` and `handleTimeoutNow` logs and returns without notifying the engine, so `selfRemoved`, `roleMismatch`, `joining`, an unresolved stale config tail and an unreadable own-log term all produce no event. The Host-side plumbing down to `EventListener.OnCampaignSkipped` is wired and works if the hook is ever called, so implement against it if you like, but do not build monitoring that depends on receiving these events today.
+No callback reports a refused election: every campaign-refusal branch in `startElection` and `handleTimeoutNow` logs and returns without notifying the engine, so `selfRemoved`, `roleMismatch`, `joining`, an unresolved stale config tail and an unreadable own-log term all produce no event. Detect a leaderless shard from the leader ID or shard health.
 
 *Via the listener dispatcher*: `OnLeaderUpdated(shardID, leaderID, term)`, `OnLeaderReady(shardID, replicaID, leaderID, term)`, `OnCampaignLaunched(shardID, replicaID, term)`, and the node-level `EventListener.OnShardFailed` (`Node.handleError`). Their queue-full policies differ: a refused `OnLeaderUpdated` leaves the step worker's published-leader bookkeeping uncommitted, so the change is re-published on the next tick and never lost. `OnLeaderReady` is read from the same `Peer.LeaderTermReady` triple as the leader change it follows, sent only after that change was accepted and at most once per announced pair (`prevReadyTerms`, cleared by every accepted leader change), and retried on refusal in the same way. `OnCampaignLaunched` is a cold path (elections are seconds apart), so a full queue drops it (counted and logged at ERROR) rather than reporting the election at the wrong time later. The election metric is incremented inline either way, so the counter stays exact.
 
@@ -2668,7 +2667,7 @@ refuse the restarted shard nor clear the restarted shard's claim.
 
 **Snapshotter**: `SaveSnapshot(ctx, writer, stopper)`, `RecoverFromSnapshot(ctx, reader, stopper)`, `LastApplied()`. rsm.StateMachine satisfies both.
 
-**SnapshotBarrier**: AEAD encryption (algorithm-agile: AES-256-GCM or ChaCha20-Poly1305) for snapshot data at rest. Concrete implementation: `seal.Barrier` (`crypto.Barrier` is a type alias for it). Nil means plaintext. `DecryptForEpoch()` supports key rotation, decrypting an old snapshot with its epoch-specific DEK after the epoch has advanced. `PurgeEpochsBefore()` zeros key material for epochs no longer in use.
+**SnapshotBarrier**: AEAD encryption (algorithm-agile: AES-256-GCM or ChaCha20-Poly1305) for snapshot data at rest. Concrete implementation: `seal.Barrier`. Nil means plaintext. `DecryptForEpoch()` supports key rotation, decrypting an old snapshot with its epoch-specific DEK after the epoch has advanced. `PurgeEpochsBefore()` zeros key material for epochs no longer in use.
 
 ---
 
@@ -2776,7 +2775,7 @@ need them: `DiagRaftState`, `DiagPipelineState`, `DiagShardGates` and
 `DiagRemotes`. They report term, commit and processed indexes, queue depths, the
 recovering/saving gates and per-remote replication state. The per-remote state
 covers every member the leader tracks, voters, observers and witnesses, in
-replica-ID order, each with its role (`role=` in the `DiagRemotes` text,
+replica-ID order, each with its role (`role=` in `RemotesDiag.Text`,
 `ReplicaProgress.Role` in `ShardInfo.Replicas`); it is nil on a non-leader. The
 step worker samples it once per tick into the diagnostic snapshot, once the
 first diagnostic call has enabled publication (so that first call reads

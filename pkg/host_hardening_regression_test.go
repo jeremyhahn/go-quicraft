@@ -728,9 +728,9 @@ func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
-	before, err := h.GetLogRange(1)
+	before, err := h.LogRange(1)
 	if err != nil {
-		t.Fatalf("GetLogRange failed: %v", err)
+		t.Fatalf("LogRange failed: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -751,9 +751,9 @@ func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 		}
 	}
 
-	after, err := h.GetLogRange(1)
+	after, err := h.LogRange(1)
 	if err != nil {
-		t.Fatalf("GetLogRange failed: %v", err)
+		t.Fatalf("LogRange failed: %v", err)
 	}
 	if after.LastIndex != before.LastIndex {
 		t.Fatalf("a canceled proposal still reached the log: last index moved %d -> %d",
@@ -786,9 +786,9 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
-	before, err := h.GetShardMembership(1)
+	before, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership: %v", err)
+		t.Fatalf("ShardMembership: %v", err)
 	}
 	// The baseline has to come from a PUBLISHED diagnostics snapshot. The first
 	// DiagRaftState call merely arms publication and returns zeros until the
@@ -798,10 +798,11 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	// kind. On a loaded host the arming tick is slower, which is why this only
 	// ever failed in the full suite.
 	waitForDiagLive(t, h, 1)
-	_, _, _, lastIdxBefore, _, _, err := h.DiagRaftState(1)
+	rsBefore, err := h.DiagRaftState(1)
 	if err != nil {
 		t.Fatalf("DiagRaftState: %v", err)
 	}
+	lastIdxBefore := rsBefore.LastIndex
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -818,20 +819,21 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	// than guessing at a duration.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		commitPending, qLen, inbox, pending, derr := h.DiagPipelineState(1)
+		p, derr := h.DiagPipelineState(1)
 		if derr != nil {
 			t.Fatalf("DiagPipelineState: %v", derr)
 		}
-		if !commitPending && qLen == 0 && inbox == 0 && pending == 0 {
+		if p == (PipelineDiag{}) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	_, _, _, lastIdxAfter, _, _, err := h.DiagRaftState(1)
+	rsAfter, err := h.DiagRaftState(1)
 	if err != nil {
 		t.Fatalf("DiagRaftState after: %v", err)
 	}
+	lastIdxAfter := rsAfter.LastIndex
 	if lastIdxAfter != lastIdxBefore {
 		t.Fatalf("a cancelled config change appended to the log: last index "+
 			"moved %d -> %d. ErrCanceled told the caller the membership was "+
@@ -839,9 +841,9 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 			lastIdxBefore, lastIdxAfter)
 	}
 
-	after, err := h.GetShardMembership(1)
+	after, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership after: %v", err)
+		t.Fatalf("ShardMembership after: %v", err)
 	}
 	if len(after.Nodes) != len(before.Nodes) {
 		t.Fatalf("a cancelled config change altered the membership: %d -> %d nodes",

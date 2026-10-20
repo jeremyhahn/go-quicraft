@@ -56,9 +56,9 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 			return kv
 		})
 		local := proto.SessionPolicy{
-			ExpiryEntries:        localExpiry,
-			MaxTotalSessions:     100,
-			MaxSessionsPerClient: 100,
+			ExpiryEntries:          localExpiry,
+			MaxTotalSessions:       100,
+			MaxResponsesPerSession: 100,
 		}
 		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), local,
 			func() proto.SessionPolicy { return replicated }, false)
@@ -118,9 +118,9 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		// client 42 at index 200 and answered the write at index 300 with
 		// ResultSessionExpired while its peer applied it.
 		replicated := proto.SessionPolicy{
-			ExpiryEntries:        0,
-			MaxTotalSessions:     100,
-			MaxSessionsPerClient: 100,
+			ExpiryEntries:          0,
+			MaxTotalSessions:       100,
+			MaxResponsesPerSession: 100,
 		}
 		a, akv := newReplica(t, 0, replicated)
 		b, bkv := newReplica(t, 100, replicated)
@@ -160,9 +160,9 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		// must expire client 42 at the index-200 checkpoint and reject the
 		// write — including the one whose local configuration disables expiry.
 		replicated := proto.SessionPolicy{
-			ExpiryEntries:        100,
-			MaxTotalSessions:     100,
-			MaxSessionsPerClient: 100,
+			ExpiryEntries:          100,
+			MaxTotalSessions:       100,
+			MaxResponsesPerSession: 100,
 		}
 		a, akv := newReplica(t, 0, replicated)
 		b, bkv := newReplica(t, 100, replicated)
@@ -208,9 +208,9 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		// write — a different observable, on both the session table and the
 		// user state.
 		replicated := proto.SessionPolicy{
-			ExpiryEntries:        100,
-			MaxTotalSessions:     100,
-			MaxSessionsPerClient: 100,
+			ExpiryEntries:          100,
+			MaxTotalSessions:       100,
+			MaxResponsesPerSession: 100,
 		}
 		a, akv := newReplica(t, 0, replicated)
 		b, bkv := newReplica(t, 1000, replicated)
@@ -251,9 +251,9 @@ func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 		return kv
 	})
 	local := proto.SessionPolicy{
-		ExpiryEntries:        700,
-		MaxTotalSessions:     11,
-		MaxSessionsPerClient: 7,
+		ExpiryEntries:          700,
+		MaxTotalSessions:       11,
+		MaxResponsesPerSession: 7,
 	}
 	// The shard's policy, published later — as a joiner's peer publishes it
 	// when the shard's initial membership replicates.
@@ -269,15 +269,15 @@ func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 		t.Fatalf("policy with no shard value = %+v, want the local %+v",
 			rsm.sessionPolicy, local)
 	}
-	if got := rsm.Sessions().MaxResponses(); got != local.MaxSessionsPerClient {
+	if got := rsm.Sessions().MaxResponses(); got != local.MaxResponsesPerSession {
 		t.Fatalf("session manager MaxResponses = %d, want the local %d",
-			got, local.MaxSessionsPerClient)
+			got, local.MaxResponsesPerSession)
 	}
 
 	replicated = proto.SessionPolicy{
-		ExpiryEntries:        900,
-		MaxTotalSessions:     22,
-		MaxSessionsPerClient: 9,
+		ExpiryEntries:          900,
+		MaxTotalSessions:       22,
+		MaxResponsesPerSession: 9,
 	}
 	// An ordinary apply is the adoption point: nothing else runs on a joiner
 	// between learning its configuration and applying the entries that carried
@@ -292,11 +292,11 @@ func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 			"that keeps its local policy once the shard's is known applies on "+
 			"limits no peer shares", rsm.sessionPolicy, replicated)
 	}
-	if got := rsm.Sessions().MaxResponses(); got != replicated.MaxSessionsPerClient {
+	if got := rsm.Sessions().MaxResponses(); got != replicated.MaxResponsesPerSession {
 		t.Fatalf("session manager MaxResponses = %d, want the replicated %d; the "+
 			"limits inside the manager have to move with the policy or the "+
 			"response cache stays bounded by local configuration",
-			got, replicated.MaxSessionsPerClient)
+			got, replicated.MaxResponsesPerSession)
 	}
 	// The registration bound moved too: with the replicated MaxTotalSessions of
 	// 22 the twelfth session is admitted, where the local 11 would refuse it.
@@ -328,9 +328,9 @@ func TestSessionExpiry_DisabledSentinelAppliesEverything(t *testing.T) {
 	// math.MaxUint64 is config.SessionExpiryDisabled; rsm does not import
 	// config, so the value is spelled out.
 	policy := proto.SessionPolicy{
-		ExpiryEntries:        ^uint64(0),
-		MaxTotalSessions:     100,
-		MaxSessionsPerClient: 100,
+		ExpiryEntries:          ^uint64(0),
+		MaxTotalSessions:       100,
+		MaxResponsesPerSession: 100,
 	}
 	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), policy, nil, false)
 	if err != nil {

@@ -56,7 +56,7 @@ func isLeaderAt(c *testCluster, idx int, shardID uint64) bool {
 	c.hostsMu.RLock()
 	h := c.hosts[idx]
 	c.hostsMu.RUnlock()
-	info, err := h.GetShardInfo(shardID)
+	info, err := h.ShardInfo(shardID)
 	if err != nil {
 		return false
 	}

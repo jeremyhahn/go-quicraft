@@ -209,7 +209,7 @@ func (c *diskRestartCluster) hostApplied(idx int) uint64 {
 	c.hostsMu.RLock()
 	h := c.hosts[idx]
 	c.hostsMu.RUnlock()
-	info, err := h.GetShardInfo(c.shardID)
+	info, err := h.ShardInfo(c.shardID)
 	if err != nil {
 		return 0
 	}

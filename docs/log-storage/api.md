@@ -191,8 +191,7 @@ kernel releases it when the process dies. The lock file is never removed.
 
 `Options` is a declarative mirror of these (`WALDir`, `BlockSize`,
 `MaxFileSize`, `NoSync`) with `DefaultOptions`, `SetDefaults` and `Validate`;
-`Open` does not take it. Its `MaxBatchSize` field is deprecated and has no
-effect. A record is bounded by segment geometry, an entry's `Cmd` by 8 MiB, and
+`Open` does not take it. A record is bounded by segment geometry, an entry's `Cmd` by 8 MiB, and
 the batch Raft hands to `SaveState` by `config.Config.MaxApplyEntrySize`.
 
 Besides the `LogDB` methods, `*DB` has `CompactedTo`, `MinLiveEpoch`,
@@ -302,8 +301,8 @@ Sentinels: `ErrCorruptedRecord`, `ErrMidSegmentCorruption`,
 (`ErrTruncatedEntryRecord`, `ErrTruncatedStateRecord`,
 `ErrTruncatedSnapshotRecord`, `ErrTruncatedBootstrapRecord`,
 `ErrTruncatedCompactionRecord`), the option errors (`ErrEmptyWALDir`,
-`ErrInvalidBlockSize`, `ErrInvalidMaxFileSize`, `ErrSegmentTooSmallForEntry`,
-`ErrInvalidMaxBatchSize`) and the repair sentinels above.
+`ErrInvalidBlockSize`, `ErrInvalidMaxFileSize`, `ErrSegmentTooSmallForEntry`)
+and the repair sentinels above.
 
 Typed errors: `*SegmentCorruptionError`, `*RecoveryError`, `*DBOpenError`,
 `*SegmentReadError`, `*SegmentCreateError`, `*SegmentDiscardError`,
@@ -357,7 +356,6 @@ The `Host` selects it with `WithMemoryLogDB()`.
   payload-type byte and takes the next free one, so a stale record fails replay
   with `ErrUnknownPayloadType`. The remedy is always the same: wipe the data
   directory and re-sync from peers.
-- `Options.MaxBatchSize` is deprecated and has no effect.
 
 The policy and the per-release upgrade notes are in
 [`../compatibility/`](../compatibility/architecture.md).

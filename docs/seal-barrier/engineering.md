@@ -1,6 +1,6 @@
 # Seal and barrier: engineering contract
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` ·
 > Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
@@ -193,10 +193,6 @@ func StampSealedStateMACWithRootKey(rootKey []byte, deploymentID uint64, sealed 
 func BoolPtr(v bool) *bool
 ```
 
-`pkg/crypto` re-exports `Barrier`, `BarrierConfig`, `Credentials`,
-`SealedRootKey` and `SealingStrategy` as type aliases and `NewBarrier`,
-`MustNewBarrier` and `NewCredentials` as forwarding functions, for backward
-compatibility. It contains no implementation.
 
 ### The `Host`-facing interface
 

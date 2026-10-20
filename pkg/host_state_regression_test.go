@@ -33,24 +33,24 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Session limits: MaxTotalSessions and MaxSessionsPerClient are not transposed
+// Session limits: MaxTotalSessions and MaxResponsesPerSession are not transposed
 // ---------------------------------------------------------------------------
 
 // TestStartShard_SessionLimitsAreNotTransposed pins the argument ORDER of
 // rsm.NewStateMachine, which is invisible at the call site because both limits
 // are uint64.
 //
-// The transposed wiring capped a shard at MaxSessionsPerClient concurrent
+// The transposed wiring capped a shard at MaxResponsesPerSession concurrent
 // sessions (default 128 instead of 16384) while letting a single client pin
 // MaxTotalSessions cached results. The limits are chosen so each one fails a
-// different assertion: with the arguments swapped the THIRD GetNewSession is
+// different assertion: with the arguments swapped the THIRD NewSession is
 // rejected and MaxResponses reports 3.
 func TestStartShard_SessionLimitsAreNotTransposed(t *testing.T) {
 	h := newTestHost(t)
 
 	scfg := testShardConfig(1, 1)
 	scfg.MaxTotalSessions = 3
-	scfg.MaxSessionsPerClient = 2
+	scfg.MaxResponsesPerSession = 2
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
@@ -59,7 +59,7 @@ func TestStartShard_SessionLimitsAreNotTransposed(t *testing.T) {
 
 	// The per-session response cache is the maxResponses argument.
 	if got := testLoadNode(h, 1).rsm.Sessions().MaxResponses(); got != 2 {
-		t.Errorf("session manager MaxResponses = %d, want 2 (MaxSessionsPerClient)", got)
+		t.Errorf("session manager MaxResponses = %d, want 2 (MaxResponsesPerSession)", got)
 	}
 
 	// The shard-wide session count is the maxTotalSessions argument: three
@@ -67,16 +67,16 @@ func TestStartShard_SessionLimitsAreNotTransposed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for i := 1; i <= 3; i++ {
-		if _, err := h.GetNewSession(ctx, 1); err != nil {
-			t.Fatalf("GetNewSession #%d failed: %v (MaxTotalSessions=3 must admit it)", i, err)
+		if _, err := h.NewSession(ctx, 1); err != nil {
+			t.Fatalf("NewSession #%d failed: %v (MaxTotalSessions=3 must admit it)", i, err)
 		}
 	}
 	// The over-limit registration applies to an empty result, which
-	// GetNewSession reports as a registration failure.
-	_, err := h.GetNewSession(ctx, 1)
+	// NewSession reports as a registration failure.
+	_, err := h.NewSession(ctx, 1)
 	var sessErr *SessionError
 	if !errors.As(err, &sessErr) || sessErr.Op != "register" {
-		t.Fatalf("GetNewSession #4 error = %v, want a *SessionError from register "+
+		t.Fatalf("NewSession #4 error = %v, want a *SessionError from register "+
 			"(MaxTotalSessions=3 must reject it)", err)
 	}
 }
@@ -608,9 +608,9 @@ func TestNodeStateLeaderAndTerm_NeverTorn(t *testing.T) {
 		go func() {
 			defer readers.Done()
 			for i := 0; i < 5000; i++ {
-				info, err := h.GetShardInfo(1)
+				info, err := h.ShardInfo(1)
 				if err != nil {
-					t.Errorf("GetShardInfo: %v", err)
+					t.Errorf("ShardInfo: %v", err)
 					return
 				}
 				want, known := published[info.LeaderID]
@@ -624,9 +624,9 @@ func TestNodeStateLeaderAndTerm_NeverTorn(t *testing.T) {
 					return
 				}
 
-				leaderID, term, _, err := h.GetLeaderIDAndTerm(1)
+				leaderID, term, _, err := h.LeaderIDAndTerm(1)
 				if err != nil {
-					t.Errorf("GetLeaderIDAndTerm: %v", err)
+					t.Errorf("LeaderIDAndTerm: %v", err)
 					return
 				}
 				if pair, ok := published[leaderID]; !ok || pair.term != term {

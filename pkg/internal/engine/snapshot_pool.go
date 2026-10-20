@@ -43,7 +43,7 @@ import (
 )
 
 // SnapshotBarrier is the interface for encrypting and decrypting snapshot
-// data at rest. The concrete implementation is crypto.Barrier. This
+// data at rest. The concrete implementation is seal.Barrier. This
 // interface lives in the engine package to avoid an import cycle:
 // engine cannot import quicraft or crypto directly.
 type SnapshotBarrier interface {

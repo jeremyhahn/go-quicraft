@@ -201,8 +201,8 @@ never receive it. `host.ShardReadReady(shardID)` returns the same
 ## Diagnose a stuck shard
 
 ```go
-term, committed, processed, lastIdx, msgs, state, err := host.DiagRaftState(shardID)
-remotes, err := host.DiagRemotes(shardID)
+rs, err := host.DiagRaftState(shardID)   // rs.Term, rs.Committed, rs.Processed, rs.LastIndex, rs.State
+remotes, err := host.DiagRemotes(shardID) // remotes.Text: one entry per remote
 ```
 
 Those two answer what this replica thinks the term and commit index are, and

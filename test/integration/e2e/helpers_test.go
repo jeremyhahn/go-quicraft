@@ -901,13 +901,13 @@ func shardStateDump(shardID uint64) string {
 			fmt.Fprintf(&b, "  node[%d]: stopped\n", i)
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
-			fmt.Fprintf(&b, "  node[%d]: GetShardInfo: %v\n", i, err)
+			fmt.Fprintf(&b, "  node[%d]: ShardInfo: %v\n", i, err)
 			continue
 		}
 		logSpan := "unavailable"
-		if lr, err := h.GetLogRange(shardID); err == nil {
+		if lr, err := h.LogRange(shardID); err == nil {
 			logSpan = fmt.Sprintf("[%d,%d]", lr.FirstIndex, lr.LastIndex)
 		}
 		fmt.Fprintf(&b,
@@ -973,7 +973,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -1003,7 +1003,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 // it were — with the slice index treated as the replica ID. The remedy is: read
 // the value from whatever owns it instead of recomputing it. A host's replica
 // ID for a shard is fixed when StartShard is called and never changes while the
-// host runs, so GetShardInfo is authoritative here and — unlike IsLeader — is
+// host runs, so ShardInfo is authoritative here and — unlike IsLeader — is
 // not a value that can move between the look and the use.
 //
 // ok is false when idx is out of range, the node is stopped, or the host is not
@@ -1019,7 +1019,7 @@ func (c *testCluster) replicaIDAt(shardID uint64, idx int) (uint64, bool) {
 	if c.stopped[idx].Load() {
 		return 0, false
 	}
-	info, err := c.hosts[idx].GetShardInfo(shardID)
+	info, err := c.hosts[idx].ShardInfo(shardID)
 	if err != nil {
 		return 0, false
 	}
@@ -1107,7 +1107,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -1184,7 +1184,7 @@ type leaderObservation struct {
 // down but which is still running — or one that was restarted and re-added —
 // is exactly where a second leader hides, and skipping it is how a same-term
 // split brain becomes invisible. A host that is genuinely closed returns an
-// error from GetShardInfo and contributes nothing.
+// error from ShardInfo and contributes nothing.
 func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 	c.hostsMu.RLock()
 	hosts := make([]*quicraft.Host, len(c.hosts))
@@ -1196,7 +1196,7 @@ func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 		if h == nil {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil || !info.IsLeader {
 			continue
 		}
@@ -1286,7 +1286,7 @@ func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.
 	defer deadline.Stop()
 	for {
 		failFastOnEngineFailure(t)
-		leaderID, known, err := h.GetLeaderID(shardID)
+		leaderID, known, err := h.LeaderID(shardID)
 		if err == nil && known && leaderID > 0 {
 			return
 		}
@@ -1309,7 +1309,7 @@ func waitForApplied(t *testing.T, h *quicraft.Host, shardID, targetIndex uint64,
 	defer deadline.Stop()
 	for {
 		failFastOnEngineFailure(t)
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err == nil && info.LastApplied >= targetIndex {
 			return
 		}
@@ -1972,7 +1972,7 @@ func waitForLogCompacted(t *testing.T, cluster *testCluster, shardID uint64, tim
 		waitForCondition(t, timeout,
 			fmt.Sprintf("node[%d] compacts shard %d past index 1", i, shardID),
 			func() bool {
-				lr, err := h.GetLogRange(shardID)
+				lr, err := h.LogRange(shardID)
 				last = lr
 				return err == nil && lr.FirstIndex > 1
 			},
@@ -1981,7 +1981,7 @@ func waitForLogCompacted(t *testing.T, cluster *testCluster, shardID uint64, tim
 	}
 }
 
-// waitForMembershipSize polls GetShardMembership until the number of
+// waitForMembershipSize polls ShardMembership until the number of
 // voting nodes matches expectedSize.
 func waitForMembershipSize(
 	t *testing.T,
@@ -1994,7 +1994,7 @@ func waitForMembershipSize(
 	waitForCondition(t, timeout,
 		fmt.Sprintf("membership size=%d", expectedSize),
 		func() bool {
-			m, err := host.GetShardMembership(shardID)
+			m, err := host.ShardMembership(shardID)
 			if err != nil {
 				return false
 			}
@@ -2090,9 +2090,9 @@ func membershipDivergence(
 		if slices.Contains(wantRemoved, uint64(i+1)) {
 			continue
 		}
-		m, err := h.GetShardMembership(shardID)
+		m, err := h.ShardMembership(shardID)
 		if err != nil {
-			fmt.Fprintf(&sb, "\n  node[%d]: GetShardMembership failed: %v", i, err)
+			fmt.Fprintf(&sb, "\n  node[%d]: ShardMembership failed: %v", i, err)
 			continue
 		}
 		var missing, unexpected, notRemoved []uint64

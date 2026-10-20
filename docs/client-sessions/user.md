@@ -25,7 +25,7 @@ there.
 ## Propose with a session
 
 ```go
-session, err := host.GetNewSession(ctx, shardID)
+session, err := host.NewSession(ctx, shardID)
 if err != nil {
 	return err
 }
@@ -38,7 +38,7 @@ defer func() {
 result, err := host.SyncProposeWithSession(ctx, session, cmd)
 ```
 
-`GetNewSession` registers through the log, so it can fail like any proposal.
+`NewSession` registers through the log, so it can fail like any proposal.
 Keep one session per client or connection for its whole conversation with the
 shard, not one per proposal.
 
@@ -100,14 +100,14 @@ Do not create a new session to retry: a new session is a new
 result, err := host.SyncPropose(ctx, shardID, cmd)
 ```
 
-`Propose` and `SyncPropose` bypass deduplication. `GetNoOPSession` returns a
+`Propose` and `SyncPropose` bypass deduplication. `NoOPSession` returns a
 no-op session for code that needs a session value, but `ProposeWithSession`
 rejects it with `ErrInvalidSession`.
 
 ## Attach an owner
 
 ```go
-session, err := host.GetNewSessionWithOwner(ctx, shardID, tenantID)
+session, err := host.NewSessionWithOwner(ctx, shardID, tenantID)
 ```
 
 The owner groups sessions by your principal (tenant, account or authenticated
@@ -120,7 +120,7 @@ the shard's `MaxTotalSessions` (default 16384).
 
 ## Choose the client ID yourself
 
-`GetNewSession` picks a random client ID. To use one you persist (for example,
+`NewSession` picks a random client ID. To use one you persist (for example,
 to re-register after your client restarts and its old session has expired),
 register it explicitly:
 
@@ -142,7 +142,7 @@ values.
 |---|---|---|
 | `MaxTotalSessions` | 16384 | a busy shard refuses registrations |
 | `MaxSessionsPerOwner` | 128 | one owner legitimately needs more concurrent sessions |
-| `MaxSessionsPerClient` | 128 | rarely: it is the response-cache depth per session, not a session count |
+| `MaxResponsesPerSession` | 128 | rarely: it is the response-cache depth per session, not a session count |
 | `SessionExpiryEntries` | 100000 | sessions expire under normal traffic |
 
 `SessionExpiryEntries` counts applied log entries, not seconds. A busy shard
@@ -180,7 +180,7 @@ are per shard.
 result, so the new command reused its series.
 
 **Two clients see each other's results.** They registered the same client ID
-with `RegisterSession`. Use `GetNewSession`, or derive IDs from something your
+with `RegisterSession`. Use `NewSession`, or derive IDs from something your
 layer guarantees unique.
 
 **Sessions never expire on a quiet shard.** By design: expiry counts entries.

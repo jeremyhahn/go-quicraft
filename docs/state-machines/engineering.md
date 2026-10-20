@@ -135,7 +135,7 @@ type DiskStateMachine interface {
 
 #### Client sessions are not available on this tier
 
-Every session entry point on `Host` (`GetNewSession`, `GetNewSessionWithOwner`,
+Every session entry point on `Host` (`NewSession`, `NewSessionWithOwner`,
 `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession`,
 `CloseSession`) refuses a shard backed by a `DiskStateMachine` with
 `ErrSessionsUnsupportedOnDisk`. Use idempotent commands proposed with
@@ -821,7 +821,7 @@ One `Update` call is bounded by `maxEntriesToApplySize`, a fixed 64 MiB constant
 in `pkg/internal/raft/log.go`, with each `Cmd` at most `MaxEntrySize`.
 
 The session limits (`SessionExpiryEntries`, `MaxTotalSessions`,
-`MaxSessionsPerClient`, `MaxSessionsPerOwner`) are bootstrap seeds for a
+`MaxResponsesPerSession`, `MaxSessionsPerOwner`) are bootstrap seeds for a
 replicated policy; see
 [`../client-sessions/engineering.md`](../client-sessions/engineering.md).
 Snapshot cadence is covered in
@@ -920,7 +920,7 @@ disappears mid-batch; it logs at ERROR on `ErrApplyGap`.
 | proposal latency | the host's `MetricsCollector` |
 | shard failed after an `Update` error or panic | `config.HostConfig` `EventListener.OnShardFailed` |
 | cross-replica divergence | `Host.StateMachineHash(shardID)`, which needs `sm.Hasher` |
-| last applied index | `Host.GetShardInfo` (`ShardInfo.LastApplied`) |
+| last applied index | `Host.ShardInfo` (`ShardInfo.LastApplied`) |
 
 `StateMachineHash` is the one worth a periodic check: divergence from a
 non-deterministic `Update` has no other symptom until a restart replays the log

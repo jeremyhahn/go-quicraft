@@ -107,8 +107,8 @@ func pausedRefusals(t *testing.T, host *quicraft.Host, role string, peer uint64)
 	//quicraft:direct-read the paused replica itself is the subject: it must refuse
 	_, err = host.FollowerRead(ctx, 1, encodeKVGet("warmup"))
 	add("FollowerRead", err)
-	_, err = host.GetNewSession(ctx, 1)
-	add("GetNewSession", err)
+	_, err = host.NewSession(ctx, 1)
+	add("NewSession", err)
 	_, err = host.ExecuteOnLeader(ctx, 1, []byte("req"))
 	add("ExecuteOnLeader", err)
 	add("RequestLeaderTransfer", host.RequestLeaderTransfer(ctx, 1, peer))
@@ -132,7 +132,7 @@ func healthyLeader(cluster *testCluster, skip int) uint64 {
 		if i == skip {
 			continue
 		}
-		id, ok, err := h.GetLeaderID(1)
+		id, ok, err := h.LeaderID(1)
 		if err != nil || !ok || id == 0 {
 			return 0
 		}
@@ -205,8 +205,8 @@ func runPausedReplica(t *testing.T, sc pauseScenario) {
 	_, inFlightAppliedBeforePause := machine.Get("in-flight")
 	appliedAtPause := machine.LastApplied()
 	recoversAtPause := machine.RecoverCount()
-	if info, err := host.GetShardInfo(1); err != nil || !info.Paused {
-		t.Fatalf("GetShardInfo on the paused %s = %+v, %v; want Paused", role, info, err)
+	if info, err := host.ShardInfo(1); err != nil || !info.Paused {
+		t.Fatalf("ShardInfo on the paused %s = %+v, %v; want Paused", role, info, err)
 	}
 	if sc.sealCycle {
 		if err := cluster.barriers[target].Seal(); err != nil {
@@ -298,8 +298,8 @@ func runPausedReplica(t *testing.T, sc pauseScenario) {
 	if err := host.ResumeShard(rctx, 1); err != nil {
 		t.Fatalf("ResumeShard node[%d]: %v", target, err)
 	}
-	if info, err := host.GetShardInfo(1); err != nil || info.Paused {
-		t.Fatalf("GetShardInfo after ResumeShard = %+v, %v; want not Paused", info, err)
+	if info, err := host.ShardInfo(1); err != nil || info.Paused {
+		t.Fatalf("ShardInfo after ResumeShard = %+v, %v; want not Paused", info, err)
 	}
 
 	// Everything committed while paused reaches the resumed replica, in log
@@ -379,7 +379,7 @@ func TestE2E_PausedFollower_SnapshotRecoveryAfterResume(t *testing.T) {
 	// asynchronously after the save. Until the leader's log starts past the
 	// paused follower's next index, the follower can still catch up by replay.
 	waitForCondition(t, defaultTimeout, "leader compacts past the paused follower", func() bool {
-		lr, err := cluster.hosts[leader].GetLogRange(1)
+		lr, err := cluster.hosts[leader].LogRange(1)
 		return err == nil && lr.FirstIndex > appliedAtPause+1
 	})
 	// Several heartbeat rounds in which the leader tries to send its snapshot.
@@ -439,8 +439,8 @@ func TestE2E_PausedShard_SharedWorkerUnaffected(t *testing.T) {
 	if _, err := host.StaleRead(ctx, 2, encodeKVGet("other-09")); err != nil {
 		t.Fatalf("StaleRead of shard 2 on the replica with shard 1 paused: %v", err)
 	}
-	if info, err := host.GetShardInfo(2); err != nil || info.Paused {
-		t.Fatalf("GetShardInfo(2) = %+v, %v; want not Paused", info, err)
+	if info, err := host.ShardInfo(2); err != nil || info.Paused {
+		t.Fatalf("ShardInfo(2) = %+v, %v; want not Paused", info, err)
 	}
 	if got := paused.LastApplied(); got != appliedAtPause {
 		t.Fatalf("paused shard 1 applied index %d (was %d)", got, appliedAtPause)

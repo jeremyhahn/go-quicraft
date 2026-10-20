@@ -56,7 +56,7 @@ type Entry struct {
 	// — is not in the log and is not the same on a replica replaying it after a
 	// restart. Anything the apply path consults must ride in the entry.
 	//
-	// It is SUPPLIED BY THE EMBEDDER (Host.GetNewSessionWithOwner,
+	// It is SUPPLIED BY THE EMBEDDER (Host.NewSessionWithOwner,
 	// NewSessionWithOwner). This library has no notion of who a client is: a
 	// clientID is eight bytes the caller chooses, so it cannot be used to group
 	// sessions by principal, and the engine must not invent an identity it

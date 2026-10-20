@@ -73,9 +73,9 @@ func TestE2E_AddNode_ThreeToFour(t *testing.T) {
 	waitForMembershipConverged(t, cluster, shardID,
 		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
 
-	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
+	m, err := cluster.hosts[leaderIdx].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if len(m.Nodes) != 4 {
 		t.Errorf("expected 4 voting nodes, got %d: %v", len(m.Nodes), m.Nodes)
@@ -94,7 +94,7 @@ func TestE2E_AddNode_ThreeToFour(t *testing.T) {
 }
 
 // TestE2E_RemoveNode_FourToThree verifies that a follower can be removed
-// from a 4-node cluster via SyncRequestDeleteNode, the cluster shrinks
+// from a 4-node cluster via SyncRequestRemoveNode, the cluster shrinks
 // to 3 nodes, and subsequent proposals succeed on the remaining nodes.
 func TestE2E_RemoveNode_FourToThree(t *testing.T) {
 	cluster := newTestCluster(t, 4)
@@ -156,9 +156,9 @@ func TestE2E_RemoveNode_FourToThree(t *testing.T) {
 	t.Logf("5 post-removal entries replicated to remaining 3 nodes")
 
 	// Verify the removed replica ID appears in Membership.Removed.
-	m, err := cluster.hosts[liveIdx].GetShardMembership(shardID)
+	m, err := cluster.hosts[liveIdx].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if _, removed := m.Removed[removedReplicaID]; !removed {
 		t.Errorf("replicaID %d not found in Membership.Removed: %v", removedReplicaID, m.Removed)
@@ -218,9 +218,9 @@ func TestE2E_AddNode_FiveToSix(t *testing.T) {
 	waitForMembershipConverged(t, cluster, shardID,
 		[]uint64{1, 2, 3, 4, 5, newReplicaID}, nil, membershipTimeout)
 
-	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
+	m, err := cluster.hosts[leaderIdx].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if len(m.Nodes) != 6 {
 		t.Errorf("expected 6 voting nodes, got %d: %v", len(m.Nodes), m.Nodes)
@@ -314,9 +314,9 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	verifyAllData(t, cluster, trackers, shardID, allExpected)
 
 	// Final stability check: verify exact membership.
-	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
+	m, err := cluster.hosts[leaderIdx].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if len(m.Nodes) != 3 {
 		t.Errorf("expected 3 voting nodes after round trip, got %d: %v", len(m.Nodes), m.Nodes)
@@ -407,9 +407,9 @@ func TestE2E_RemoveNode_ThenPropose(t *testing.T) {
 	}
 
 	// Verify membership state.
-	m, err := cluster.hosts[leaderIdx].GetShardMembership(shardID)
+	m, err := cluster.hosts[leaderIdx].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if len(m.Nodes) != 2 {
 		t.Errorf("expected 2 voting nodes, got %d: %v", len(m.Nodes), m.Nodes)

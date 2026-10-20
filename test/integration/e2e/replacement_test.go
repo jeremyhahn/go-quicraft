@@ -22,7 +22,7 @@ import (
 )
 
 // TestE2E_ReplaceFollower_ThreeNode verifies that a stopped follower in a
-// 3-node cluster can be removed via SyncRequestDeleteNode, replaced with a
+// 3-node cluster can be removed via SyncRequestRemoveNode, replaced with a
 // new node via SyncRequestAddNode, and that the replacement catches up on
 // all existing data and accepts new proposals.
 func TestE2E_ReplaceFollower_ThreeNode(t *testing.T) {
@@ -111,9 +111,9 @@ func TestE2E_ReplaceFollower_ThreeNode(t *testing.T) {
 	// Assert: the removed replica appears in Membership.Removed. Resolve the
 	// leader now rather than reusing one captured before the membership change,
 	// which a re-election in between would have deposed.
-	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].GetShardMembership(shardID)
+	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if _, removed := membership.Removed[removedReplicaID]; !removed {
 		t.Fatalf("replicaID=%d not found in Membership.Removed: %v", removedReplicaID, membership.Removed)
@@ -210,9 +210,9 @@ func TestE2E_ReplaceFollower_FiveNode(t *testing.T) {
 
 	// Assert: membership is correct. Resolve the leader now rather than reusing
 	// one captured before the membership change.
-	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].GetShardMembership(shardID)
+	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if _, removed := membership.Removed[removedReplicaID]; !removed {
 		t.Fatalf("replicaID=%d not found in Membership.Removed: %v", removedReplicaID, membership.Removed)

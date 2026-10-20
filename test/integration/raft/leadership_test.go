@@ -37,9 +37,9 @@ func TestIntegration_GetLeaderID_MultiNode_AllAgree(t *testing.T) {
 	// Determine the expected leader ID from the node that reports itself
 	// as leader.
 	leaderHost := cluster.hosts[leaderIdx]
-	leaderInfo, err := leaderHost.GetShardInfo(1)
+	leaderInfo, err := leaderHost.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on leader node failed: %v", err)
+		t.Fatalf("ShardInfo on leader node failed: %v", err)
 	}
 	expectedLeaderID := leaderInfo.ReplicaID
 
@@ -48,7 +48,7 @@ func TestIntegration_GetLeaderID_MultiNode_AllAgree(t *testing.T) {
 		waitForCondition(t, leaderElectionTimeout,
 			fmt.Sprintf("node %d agrees on leader ID %d", i, expectedLeaderID),
 			func() bool {
-				lid, known, getErr := h.GetLeaderID(1)
+				lid, known, getErr := h.LeaderID(1)
 				return getErr == nil && known && lid == expectedLeaderID
 			},
 		)
@@ -69,7 +69,7 @@ func TestIntegration_GetLeaderID_MultiNode_AllAgree(t *testing.T) {
 // answering as leader after stepping down is the front half of split brain.
 
 // leaderView is one node's answer about who leads the shard and in what term.
-// The pair is read through Host.GetLeaderIDAndTerm rather than through two
+// The pair is read through Host.LeaderIDAndTerm rather than through two
 // separate calls, so it is a combination that actually held on that replica.
 type leaderView struct {
 	index    int
@@ -82,7 +82,7 @@ type leaderView struct {
 func observeLeaderViews(c *testCluster, shardID uint64) []leaderView {
 	views := make([]leaderView, 0, len(c.hosts))
 	for i, h := range c.hosts {
-		leaderID, term, known, err := h.GetLeaderIDAndTerm(shardID)
+		leaderID, term, known, err := h.LeaderIDAndTerm(shardID)
 		if err != nil {
 			continue
 		}
@@ -519,7 +519,7 @@ func requestTransferUntilLeader(t *testing.T, c *testCluster, shardID, targetRep
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		info, err := c.hosts[targetIdx].GetShardInfo(shardID)
+		info, err := c.hosts[targetIdx].ShardInfo(shardID)
 		if err == nil && info.IsLeader {
 			return
 		}
@@ -629,9 +629,9 @@ func TestIntegration_SteppedDownLeader_StopsActingAsLeader(t *testing.T) {
 	oldLeader := cluster.hosts[oldLeaderIdx]
 
 	// It must no longer claim leadership.
-	info, err := oldLeader.GetShardInfo(shardID)
+	info, err := oldLeader.ShardInfo(shardID)
 	if err != nil {
-		t.Fatalf("GetShardInfo on the stepped-down replica %d failed: %v", oldLeaderReplica, err)
+		t.Fatalf("ShardInfo on the stepped-down replica %d failed: %v", oldLeaderReplica, err)
 	}
 	if info.IsLeader {
 		t.Fatalf("replica %d handed leadership to replica %d and still reports "+
@@ -641,7 +641,7 @@ func TestIntegration_SteppedDownLeader_StopsActingAsLeader(t *testing.T) {
 	}
 
 	// It must name the replica that took over, and be at least as current.
-	leaderID, known, err := oldLeader.GetLeaderID(shardID)
+	leaderID, known, err := oldLeader.LeaderID(shardID)
 	if err != nil || !known {
 		t.Fatalf("the stepped-down replica %d does not know who leads shard %d "+
 			"(known=%v, err=%v); it stepped down without learning who to follow",

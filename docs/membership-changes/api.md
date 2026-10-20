@@ -76,7 +76,7 @@ func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, r
 The identity rules are the same as for `AddNode`. The voting set
 (`voters + witnesses + self`) is capped at 64 (`ErrTooManyVotingMembers`).
 
-The leader reports the new member's catch-up through `Host.GetShardInfo`:
+The leader reports the new member's catch-up through `Host.ShardInfo`:
 `ShardInfo.Replicas` holds a `ReplicaProgress` for every remote member it
 tracks, observers and witnesses included, and `ReplicaProgress.Role` is one of
 `ReplicaRoleVoter`, `ReplicaRoleObserver` or `ReplicaRoleWitness`. An embedder
@@ -90,7 +90,7 @@ a follower and for the first call on a shard; the full type is in
 
 ```go
 func (h *Host) RequestRemoveNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) (*RequestState, error)
-func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error
+func (h *Host) SyncRequestRemoveNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error
 ```
 
 Removal is a consensus operation. Once it commits, the removed replica's
@@ -118,7 +118,7 @@ tighten.
 ### Capability: read the current membership
 
 ```go
-func (h *Host) GetShardMembership(shardID uint64) (*Membership, error)
+func (h *Host) ShardMembership(shardID uint64) (*Membership, error)
 func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Membership, error)
 func NewMembership() *Membership
 func (m *Membership) ConfigChangeIndex() uint64 // alias for ConfigChangeID

@@ -126,8 +126,7 @@ type ShamirConfig struct {
 // parts.
 //
 // The WIRE SHAPE: `"shares"` is an array of share OBJECTS — the
-// `{"index","threshold","total","value"}` encoding that shamir.Share and
-// shamir.ProtectedShare both produce, which is the shape shares are persisted
+// `{"index","threshold","total","value"}` encoding that\n// shamir.ProtectedShare produces, which is the shape shares are persisted
 // and distributed in everywhere else in the stack. An array of bare share
 // value strings does not decode into this type; there is no dual-format
 // reader. TestShamirInitResult_JSONMatchesTheShareObjectShape pins what it

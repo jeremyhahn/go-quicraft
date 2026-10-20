@@ -243,6 +243,83 @@ type ReplicaProgress struct {
 	IsObserver bool `json:"is_observer"`
 }
 
+// PipelineDiag is a shard's engine pipeline state, returned by
+// Host.DiagPipelineState for debugging stalls. Every field is a point-in-time
+// read; the fields are not captured atomically together.
+type PipelineDiag struct {
+	// CommitPending is true while a batch is handed to the commit worker and
+	// not yet persisted.
+	CommitPending bool `json:"commit_pending"`
+
+	// ProposalQueueLen is the number of proposals queued for the step worker.
+	ProposalQueueLen int `json:"proposal_queue_len"`
+
+	// InboxLen is the number of inbound raft messages queued for the step
+	// worker.
+	InboxLen int `json:"inbox_len"`
+
+	// PendingProposals is the number of proposals the host is still waiting
+	// to resolve.
+	PendingProposals int `json:"pending_proposals"`
+}
+
+// ShardGatesDiag reports the snapshot gates that suspend a shard's state
+// machine work, returned by Host.DiagShardGates.
+type ShardGatesDiag struct {
+	// Recovering is true while the state machine is being replaced by a
+	// received snapshot: it applies nothing and extracts no committed
+	// entries, though it keeps voting and replicating.
+	Recovering bool `json:"recovering"`
+
+	// Saving is true while a snapshot capture has quiesced applies.
+	Saving bool `json:"saving"`
+
+	// ApplyInFlight is the drain counter both gates wait on before touching
+	// the state machine. A non-zero value with a gate up means the drain has
+	// not completed yet.
+	ApplyInFlight int64 `json:"apply_in_flight"`
+}
+
+// RaftStateDiag is a shard's raft state, returned by Host.DiagRaftState. It is
+// read from the snapshot the step worker last published, so it lags the live
+// state by up to one tick.
+type RaftStateDiag struct {
+	// Term is the replica's current term.
+	Term uint64 `json:"term"`
+
+	// Committed is the highest log index known to be committed.
+	Committed uint64 `json:"committed"`
+
+	// Processed is the highest log index handed to the apply pipeline.
+	Processed uint64 `json:"processed"`
+
+	// LastIndex is the index of the last entry in the replica's log.
+	LastIndex uint64 `json:"last_index"`
+
+	// PendingMessages is the number of outbound raft messages not yet sent.
+	PendingMessages int `json:"pending_messages"`
+
+	// State is the replica's role with its timers, for example
+	// "leader(hb=1 et=4)" or "follower(et=7)", followed by " self-removed"
+	// when the replica is absent from the current configuration and by
+	// " unreadable-log-denials=N" when N votes were denied because its own
+	// last log term could not be read. Before the first publication it is
+	// "(diagnostics warming up)". It is for humans; do not parse it.
+	State string `json:"state"`
+}
+
+// RemotesDiag is the leader's view of its remotes, returned by
+// Host.DiagRemotes for debugging commit stalls.
+type RemotesDiag struct {
+	// Text renders each remote as
+	// "r<id>[role= match= next= state= paused= active= inflights=]",
+	// space-separated in replica-ID order. It is "not leader" on a replica
+	// that tracks no remotes and "(diagnostics warming up)" before the first
+	// publication. It is for humans; ShardInfo.Replicas carries the same
+	// state structured.
+	Text string `json:"text"`
+}
+
 // HealthStatus describes the overall health of a Host instance. The Status
 // field is one of "ok", "degraded", "sealed", or "unhealthy".
 type HealthStatus struct {
@@ -273,7 +350,7 @@ type HealthStatus struct {
 	DiagnosticsDropped uint64 `json:"diagnostics_dropped"`
 }
 
-// NodeHostInfoOption controls what information GetNodeHostInfo returns.
+// NodeHostInfoOption controls what information NodeHostInfo returns.
 type NodeHostInfoOption struct {
 	// SkipLogInfo when true omits per-shard log entry information,
 	// making the call faster for health checks that only need shard status.

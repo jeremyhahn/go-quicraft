@@ -68,7 +68,7 @@ func TestStopShard_ConcurrentClaimDecrementsOnce(t *testing.T) {
 		t.Fatalf("ShardCount = %d, want 0", got)
 	}
 	// A monitoring call must not panic on the (zero, never negative) count.
-	_ = h.GetNodeHostInfo(NodeHostInfoOption{})
+	_ = h.NodeHostInfo(NodeHostInfoOption{})
 	_ = h.HealthCheck()
 }
 

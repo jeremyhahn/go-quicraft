@@ -51,13 +51,13 @@ func TestMembership_RemovedIdentitiesSurfaceThroughTheHostAPI(t *testing.T) {
 	if len(added.RemovedIdentities) != 0 {
 		t.Fatalf("RemovedIdentities before any removal = %v, want empty", added.RemovedIdentities)
 	}
-	if err := h.SyncRequestDeleteNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
-		t.Fatalf("SyncRequestDeleteNode: %v", err)
+	if err := h.SyncRequestRemoveNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
+		t.Fatalf("SyncRequestRemoveNode: %v", err)
 	}
 
 	for name, read := range map[string]func() (*Membership, error){
 		"SyncGetShardMembership": func() (*Membership, error) { return h.SyncGetShardMembership(ctx, 1) },
-		"GetShardMembership":     func() (*Membership, error) { return h.GetShardMembership(1) },
+		"ShardMembership":        func() (*Membership, error) { return h.ShardMembership(1) },
 	} {
 		m, err := read()
 		if err != nil {
@@ -109,9 +109,9 @@ func TestProtoMembershipToPublic_RemovedIdentitiesCopied(t *testing.T) {
 func TestShardInfo_IsObserverFollowsTheCommittedMembership(t *testing.T) {
 	h := startSingleVoterShard(t)
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo: %v", err)
+		t.Fatalf("ShardInfo: %v", err)
 	}
 	if info.IsObserver {
 		t.Fatal("ShardInfo reports the shard's only voter as an observer")

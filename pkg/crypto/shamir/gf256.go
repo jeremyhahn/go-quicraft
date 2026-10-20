@@ -76,7 +76,7 @@ func gfPolyEval(coefficients []byte, x byte) byte {
 // x=0 for the given x-coordinates: L_j = Π_{m≠j} x_m / (x_j ⊕ x_m).
 // The x-coordinates are public (share indices), so this is not
 // secret-dependent. All x values must be non-zero and pairwise distinct
-// (enforced by Combine before calling).
+// (enforced by parseRawShare before calling).
 func gfLagrangeZero(xs []byte) []byte {
 	basis := make([]byte, len(xs))
 	for j := range xs {

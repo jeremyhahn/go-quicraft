@@ -167,7 +167,7 @@ per shard at a time.
 | add an observer (replicates, does not vote) | `SyncRequestAddObserverWithIdentity` |
 | add a witness (votes, stores no data) | `SyncRequestAddWitnessWithIdentity` |
 | promote an observer to voter | `SyncRequestAddNodeWithIdentity` with the same replica ID, address and identity |
-| remove a replica | `SyncRequestDeleteNode` (async form: `RequestRemoveNode`) |
+| remove a replica | `SyncRequestRemoveNode` (async form: `RequestRemoveNode`) |
 | move leadership | `RequestLeaderTransfer(ctx, shardID, target)`; the target must be a voter |
 | change witness policy | `SyncRequestUpdateWitnessPolicy` |
 
@@ -209,7 +209,7 @@ and a new key.
 | You need | Use |
 |---|---|
 | a write | `SyncPropose`, or `Propose` and wait on the `RequestState` |
-| a write applied at most once across retries | a session: `GetNewSession`, then `SyncProposeWithSession` |
+| a write applied at most once across retries | a session: `NewSession`, then `SyncProposeWithSession` |
 | a read that sees every committed write | `SyncRead` (or `SyncReadBuf` for `[]byte` keys) |
 | a cheaper read, current with what this replica knows is committed | `FollowerRead` |
 | the fastest read, possibly stale | `StaleRead` |
@@ -232,9 +232,9 @@ time (`ErrSessionBusy` otherwise), and after each success you call
 `session.ProposalCompleted()` (`SyncProposeWithSession` does it for you). Close
 sessions you are done with, or they expire after `SessionExpiryEntries` applied
 entries. To cap how many sessions one tenant can hold, open them with
-`GetNewSessionWithOwner` and an owner ID you have authenticated yourself.
+`NewSessionWithOwner` and an owner ID you have authenticated yourself.
 Shards whose state machine is an on-disk `sm.DiskStateMachine` support only
-no-op sessions (`GetNoOPSession`), so make those operations idempotent.
+no-op sessions (`NoOPSession`), so make those operations idempotent.
 
 `LeaseRead: true` lets the leader answer linearizable reads without a heartbeat
 round while its lease holds. It needs `CheckQuorum` (on by default) and clocks
@@ -268,11 +268,11 @@ Witness policy and the four session limits are copied into the shard when it is
 created and then live in the shard itself. Changing them in a node's `Config`
 afterwards has no effect (a differing session limit is logged as a warning when
 the node starts); read what a shard is actually using with
-`GetShardMembership`. Witness policy can be changed with
+`ShardMembership`. Witness policy can be changed with
 `SyncRequestUpdateWitnessPolicy`; the session limits cannot be changed after
 creation, so size `MaxTotalSessions` up front.
 
-`MaxSessionsPerClient` limits cached responses per session, not the number of
+`MaxResponsesPerSession` limits cached responses per session, not the number of
 sessions.
 
 ### Tuning
@@ -425,7 +425,7 @@ status := host.HealthCheck()
 
 Only a shard in `error` degrades the host. Shards in `no-leader`, `lagging`,
 `recovering` or `snapshotting` leave it `"ok"`, so alert on `status.Shards`
-yourself if you care about them. `GetShardInfo` gives one shard's state,
+yourself if you care about them. `ShardInfo` gives one shard's state,
 including its replicas' progress when asked on the leader.
 
 ### Events
@@ -450,7 +450,7 @@ call back into the host, even `StopShard`. Every callback must return quickly. T
 `OnShardFailed` fires once each time a shard's failure latch trips, and the
 shard stays offline until it is reloaded. A failed snapshot save does not fire
 it: the shard keeps running, the host logs the failure, and
-`RequestSnapshot` returns it. `OnCampaignSkipped` never fires: to detect a
+`RequestSnapshot` returns it. No event reports a refused election: to detect a
 leaderless shard, watch for `ShardNoLeader` health with no election activity.
 
 A freshly elected leader cannot serve linearizable reads until it has committed
@@ -559,7 +559,7 @@ To restore onto a host:
    fail before anything is written. Keep each shard's `DataDir` with your
    restore procedure.
 3. `StartShard` with the same `Config.DataDir`.
-4. Confirm: `GetShardInfo` shows `LastApplied` reaching the snapshot index and
+4. Confirm: `ShardInfo` shows `LastApplied` reaching the snapshot index and
    `Health` leaving `recovering`.
 
 An import refuses an artifact that is not newer than the shard's current

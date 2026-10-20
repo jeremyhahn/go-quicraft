@@ -36,25 +36,25 @@ func TestStartShard_SeedsSessionPolicyIntoMembership(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	scfg.SessionExpiryEntries = 5000
 	scfg.MaxTotalSessions = 3
-	scfg.MaxSessionsPerClient = 2
+	scfg.MaxResponsesPerSession = 2
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 	waitForLeader(t, h, 1)
 
-	m, err := h.GetShardMembership(1)
+	m, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership: %v", err)
+		t.Fatalf("ShardMembership: %v", err)
 	}
 	if m.SessionExpiryEntries != 5000 || m.MaxTotalSessions != 3 ||
-		m.MaxSessionsPerClient != 2 {
+		m.MaxResponsesPerSession != 2 {
 		t.Fatalf("committed session policy = {expiry:%d total:%d perClient:%d}, "+
 			"want {5000 3 2}. StartShard must seed the shard's replicated "+
 			"membership from this founder's Config; a shard that commits no "+
 			"policy leaves every replica expiring sessions on its own "+
 			"configuration",
-			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient)
+			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxResponsesPerSession)
 	}
 
 	// The apply path must be evaluating the same limits: the response cache
@@ -76,7 +76,7 @@ func TestStartShard_SeedsSessionPolicyIntoMembership(t *testing.T) {
 // state machines would part company with every Raft invariant intact.
 //
 // The observable is deliberately end-to-end rather than a field read: the
-// fourth GetNewSession is refused because the SHARD committed a cap of 3, while
+// fourth NewSession is refused because the SHARD committed a cap of 3, while
 // this node is configured with 50.
 func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 	h := newTestHost(t)
@@ -84,7 +84,7 @@ func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	scfg.SessionExpiryEntries = 5000
 	scfg.MaxTotalSessions = 3
-	scfg.MaxSessionsPerClient = 2
+	scfg.MaxResponsesPerSession = 2
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
@@ -101,7 +101,7 @@ func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 	restarted := testShardConfig(1, 1)
 	restarted.SessionExpiryEntries = 100000
 	restarted.MaxTotalSessions = 50
-	restarted.MaxSessionsPerClient = 40
+	restarted.MaxResponsesPerSession = 40
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, restarted); err != nil {
 		t.Fatalf("StartShard after restart failed: %v", err)
@@ -110,29 +110,29 @@ func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 
 	// The committed policy is unchanged by the restart: a rejoining replica
 	// adopts the shard's configuration, it does not re-seed it.
-	m, err := h.GetShardMembership(1)
+	m, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership after restart: %v", err)
+		t.Fatalf("ShardMembership after restart: %v", err)
 	}
 	if m.SessionExpiryEntries != 5000 || m.MaxTotalSessions != 3 ||
-		m.MaxSessionsPerClient != 2 {
+		m.MaxResponsesPerSession != 2 {
 		t.Fatalf("committed session policy after restart = {expiry:%d total:%d "+
 			"perClient:%d}, want the bootstrap {5000 3 2}",
-			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient)
+			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxResponsesPerSession)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for i := 1; i <= 3; i++ {
-		if _, err := h.GetNewSession(ctx, 1); err != nil {
-			t.Fatalf("GetNewSession #%d failed: %v (the committed MaxTotalSessions "+
+		if _, err := h.NewSession(ctx, 1); err != nil {
+			t.Fatalf("NewSession #%d failed: %v (the committed MaxTotalSessions "+
 				"of 3 must admit it)", i, err)
 		}
 	}
-	_, err = h.GetNewSession(ctx, 1)
+	_, err = h.NewSession(ctx, 1)
 	var sessErr *SessionError
 	if !errors.As(err, &sessErr) || sessErr.Op != "register" {
-		t.Fatalf("GetNewSession #4 error = %v, want a *SessionError from register. "+
+		t.Fatalf("NewSession #4 error = %v, want a *SessionError from register. "+
 			"The shard committed MaxTotalSessions=3; this node is configured with "+
 			"50, and a replica that applies its own limit admits sessions its "+
 			"peers refuse", err)

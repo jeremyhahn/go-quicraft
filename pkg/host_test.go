@@ -584,11 +584,11 @@ func waitForDiagLive(t *testing.T, h *Host, shardID uint64) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		_, _, _, lastIdx, _, _, err := h.DiagRaftState(shardID)
+		rs, err := h.DiagRaftState(shardID)
 		if err != nil {
 			t.Fatalf("waitForDiagLive: DiagRaftState: %v", err)
 		}
-		if lastIdx > 0 {
+		if rs.LastIndex > 0 {
 			return
 		}
 		runtime.Gosched()
@@ -753,12 +753,12 @@ func assertSeededApplied(t *testing.T, ns *nodeState, want uint64, why string) {
 // waitForLogEntry waits until the shard's log range reports at least one
 // committed entry (LastIndex >= 1). After leader election the leader appends
 // a no-op entry, but it may not be visible through the LogReader immediately.
-// This helper polls GetLogRange until the entry appears or the timeout expires.
+// This helper polls LogRange until the entry appears or the timeout expires.
 func waitForLogEntry(t *testing.T, h *Host, shardID uint64) LogRange {
 	t.Helper()
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		lr, err := h.GetLogRange(shardID)
+		lr, err := h.LogRange(shardID)
 		if err == nil && lr.LastIndex >= 1 {
 			return lr
 		}
@@ -1401,7 +1401,7 @@ func TestStaleRead_ShardNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNewSession
+// NewSession
 // ---------------------------------------------------------------------------
 
 func TestGetNewSession_Success(t *testing.T) {
@@ -1419,12 +1419,12 @@ func TestGetNewSession_Success(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 	if session == nil {
-		t.Fatal("GetNewSession returned nil")
+		t.Fatal("NewSession returned nil")
 	}
 	if session.ShardID() != 1 {
 		t.Errorf("ShardID = %d, want 1", session.ShardID())
@@ -1446,9 +1446,9 @@ func TestGetNewSession_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	_, err = h.GetNewSession(context.Background(), 1)
+	_, err = h.NewSession(context.Background(), 1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetNewSession error = %v, want ErrClosed", err)
+		t.Errorf("NewSession error = %v, want ErrClosed", err)
 	}
 }
 
@@ -1460,9 +1460,9 @@ func TestGetNewSession_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, err = h.GetNewSession(context.Background(), 999)
+	_, err = h.NewSession(context.Background(), 999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetNewSession error = %v, want ErrShardNotFound", err)
+		t.Errorf("NewSession error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -1596,9 +1596,9 @@ func TestCloseSession_Success(t *testing.T) {
 	// Register a session first so we can close it.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	// Close the session through Raft.
@@ -1653,7 +1653,7 @@ func TestCloseSession_ClosedHost(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNoOPSession
+// NoOPSession
 // ---------------------------------------------------------------------------
 
 func TestGetNoOPSession_Success(t *testing.T) {
@@ -1664,9 +1664,9 @@ func TestGetNoOPSession_Success(t *testing.T) {
 	}
 	defer h.Close()
 
-	session := h.GetNoOPSession(42)
+	session := h.NoOPSession(42)
 	if session == nil {
-		t.Fatal("GetNoOPSession returned nil")
+		t.Fatal("NoOPSession returned nil")
 	}
 	if session.ShardID() != 42 {
 		t.Errorf("ShardID = %d, want 42", session.ShardID())
@@ -1680,7 +1680,7 @@ func TestGetNoOPSession_Success(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetShardInfo
+// ShardInfo
 // ---------------------------------------------------------------------------
 
 func TestGetShardInfo_Success(t *testing.T) {
@@ -1696,9 +1696,9 @@ func TestGetShardInfo_Success(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 1, 5)
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.ShardID != 1 {
 		t.Errorf("ShardID = %d, want 1", info.ShardID)
@@ -1728,9 +1728,9 @@ func TestGetShardInfo_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	_, err = h.GetShardInfo(1)
+	_, err = h.ShardInfo(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetShardInfo error = %v, want ErrClosed", err)
+		t.Errorf("ShardInfo error = %v, want ErrClosed", err)
 	}
 }
 
@@ -1742,14 +1742,14 @@ func TestGetShardInfo_NotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, err = h.GetShardInfo(999)
+	_, err = h.ShardInfo(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetShardInfo error = %v, want ErrShardNotFound", err)
+		t.Errorf("ShardInfo error = %v, want ErrShardNotFound", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// GetLeaderID
+// LeaderID
 // ---------------------------------------------------------------------------
 
 func TestGetLeaderID_WithLeader(t *testing.T) {
@@ -1765,9 +1765,9 @@ func TestGetLeaderID_WithLeader(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 2, 3)
 
-	leaderID, ok, err := h.GetLeaderID(1)
+	leaderID, ok, err := h.LeaderID(1)
 	if err != nil {
-		t.Fatalf("GetLeaderID failed: %v", err)
+		t.Fatalf("LeaderID failed: %v", err)
 	}
 	if !ok {
 		t.Error("ok should be true when leader is known")
@@ -1789,9 +1789,9 @@ func TestGetLeaderID_NoLeader(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 
-	leaderID, ok, err := h.GetLeaderID(1)
+	leaderID, ok, err := h.LeaderID(1)
 	if err != nil {
-		t.Fatalf("GetLeaderID failed: %v", err)
+		t.Fatalf("LeaderID failed: %v", err)
 	}
 	if ok {
 		t.Error("ok should be false when no leader")
@@ -1809,9 +1809,9 @@ func TestGetLeaderID_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	_, _, err = h.GetLeaderID(1)
+	_, _, err = h.LeaderID(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetLeaderID error = %v, want ErrClosed", err)
+		t.Errorf("LeaderID error = %v, want ErrClosed", err)
 	}
 }
 
@@ -1823,14 +1823,14 @@ func TestGetLeaderID_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, _, err = h.GetLeaderID(999)
+	_, _, err = h.LeaderID(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetLeaderID error = %v, want ErrShardNotFound", err)
+		t.Errorf("LeaderID error = %v, want ErrShardNotFound", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// GetLeaderIDAndTerm
+// LeaderIDAndTerm
 // ---------------------------------------------------------------------------
 
 func TestGetLeaderIDAndTerm_ConsistentValues(t *testing.T) {
@@ -1846,9 +1846,9 @@ func TestGetLeaderIDAndTerm_ConsistentValues(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	h.updateNodeLeader(1, 2, 42)
 
-	leaderID, term, valid, err := h.GetLeaderIDAndTerm(1)
+	leaderID, term, valid, err := h.LeaderIDAndTerm(1)
 	if err != nil {
-		t.Fatalf("GetLeaderIDAndTerm failed: %v", err)
+		t.Fatalf("LeaderIDAndTerm failed: %v", err)
 	}
 	if !valid {
 		t.Error("valid should be true when leader is known")
@@ -1873,9 +1873,9 @@ func TestGetLeaderIDAndTerm_NoLeader(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 
-	leaderID, term, valid, err := h.GetLeaderIDAndTerm(1)
+	leaderID, term, valid, err := h.LeaderIDAndTerm(1)
 	if err != nil {
-		t.Fatalf("GetLeaderIDAndTerm failed: %v", err)
+		t.Fatalf("LeaderIDAndTerm failed: %v", err)
 	}
 	if valid {
 		t.Error("valid should be false when no leader")
@@ -1896,9 +1896,9 @@ func TestGetLeaderIDAndTerm_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	_, _, _, err = h.GetLeaderIDAndTerm(1)
+	_, _, _, err = h.LeaderIDAndTerm(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetLeaderIDAndTerm error = %v, want ErrClosed", err)
+		t.Errorf("LeaderIDAndTerm error = %v, want ErrClosed", err)
 	}
 }
 
@@ -1910,9 +1910,9 @@ func TestGetLeaderIDAndTerm_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, _, _, err = h.GetLeaderIDAndTerm(999)
+	_, _, _, err = h.LeaderIDAndTerm(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetLeaderIDAndTerm error = %v, want ErrShardNotFound", err)
+		t.Errorf("LeaderIDAndTerm error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -2055,7 +2055,7 @@ func TestRequestSnapshot_ShardNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNodeHostInfo
+// NodeHostInfo
 // ---------------------------------------------------------------------------
 
 func TestGetNodeHostInfo_Empty(t *testing.T) {
@@ -2066,7 +2066,7 @@ func TestGetNodeHostInfo_Empty(t *testing.T) {
 	}
 	defer h.Close()
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{})
+	info := h.NodeHostInfo(NodeHostInfoOption{})
 	if info.RaftAddress != "127.0.0.1:5000" {
 		t.Errorf("RaftAddress = %q, want %q", info.RaftAddress, "127.0.0.1:5000")
 	}
@@ -2089,7 +2089,7 @@ func TestGetNodeHostInfo_WithShards(t *testing.T) {
 		h.StartShard(members, false, testCreateFunc, scfg)
 	}
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{})
+	info := h.NodeHostInfo(NodeHostInfoOption{})
 	if len(info.ShardInfoList) != 3 {
 		t.Errorf("ShardInfoList length = %d, want 3", len(info.ShardInfoList))
 	}
@@ -2108,7 +2108,7 @@ func TestGetNodeHostInfo_WithLogDB(t *testing.T) {
 	}
 	defer h.Close()
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
+	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
 	if len(info.LogInfo) != 2 {
 		t.Errorf("LogInfo length = %d, want 2", len(info.LogInfo))
 	}
@@ -2124,7 +2124,7 @@ func TestGetNodeHostInfo_SkipLogInfo(t *testing.T) {
 	}
 	defer h.Close()
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: true})
+	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: true})
 	if info.LogInfo != nil {
 		t.Error("LogInfo should be nil when SkipLogInfo is true")
 	}
@@ -2377,9 +2377,9 @@ func TestUpdateNodeLeader_SetsFields(t *testing.T) {
 
 	h.updateNodeLeader(1, 1, 10)
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.LeaderID != 1 {
 		t.Errorf("LeaderID = %d, want 1", info.LeaderID)
@@ -2429,9 +2429,9 @@ func TestNodeState_LastApplied_SetsField(t *testing.T) {
 	waitForLeader(t, h, 1)
 	ns.lastApplied.Store(500)
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.LastApplied != 500 {
 		t.Errorf("LastApplied = %d, want 500", info.LastApplied)
@@ -2470,9 +2470,9 @@ func TestNodeState_Health_SetsField(t *testing.T) {
 	ns := testLoadNode(h, 1)
 	ns.health.Store(uint32(ShardError))
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Health != ShardError {
 		t.Errorf("Health = %v, want ShardError", info.Health)
@@ -2605,24 +2605,24 @@ func TestHost_ConcurrentOperations(t *testing.T) {
 	var wg sync.WaitGroup
 	ctx := context.Background()
 
-	// Concurrent GetShardInfo.
+	// Concurrent ShardInfo.
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				h.GetShardInfo(1)
+				h.ShardInfo(1)
 			}
 		}()
 	}
 
-	// Concurrent GetLeaderID.
+	// Concurrent LeaderID.
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				h.GetLeaderID(1)
+				h.LeaderID(1)
 			}
 		}()
 	}
@@ -2641,13 +2641,13 @@ func TestHost_ConcurrentOperations(t *testing.T) {
 		}()
 	}
 
-	// Concurrent GetNoOPSession.
+	// Concurrent NoOPSession.
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				h.GetNoOPSession(1)
+				h.NoOPSession(1)
 			}
 		}()
 	}
@@ -3098,9 +3098,9 @@ func TestStartShard_ConcurrentSM(t *testing.T) {
 		t.Fatalf("StartShard with concurrent SM failed: %v", err)
 	}
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.StateMachineType != rsm.SMTypeConcurrent.TypeCode() {
 		t.Errorf("StateMachineType = %d, want %d", info.StateMachineType, rsm.SMTypeConcurrent.TypeCode())
@@ -3125,9 +3125,9 @@ func TestStartShard_OnDiskSM(t *testing.T) {
 		t.Fatalf("StartShard with on-disk SM failed: %v", err)
 	}
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.StateMachineType != rsm.SMTypeOnDisk.TypeCode() {
 		t.Errorf("StateMachineType = %d, want %d", info.StateMachineType, rsm.SMTypeOnDisk.TypeCode())
@@ -3674,9 +3674,9 @@ func TestGetNode_StoppedNode(t *testing.T) {
 	ns.stopped.Store(true)
 
 	// getNode should return ErrShardNotFound for stopped nodes.
-	_, err = h.GetShardInfo(1)
+	_, err = h.ShardInfo(1)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetShardInfo on stopped node error = %v, want ErrShardNotFound", err)
+		t.Errorf("ShardInfo on stopped node error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -7956,10 +7956,10 @@ func TestSyncRequestAddNode_ContextTimeout(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncRequestDeleteNode
+// SyncRequestRemoveNode
 // ---------------------------------------------------------------------------
 
-func TestSyncRequestDeleteNode_HostClosed(t *testing.T) {
+func TestSyncRequestRemoveNode_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -7968,13 +7968,13 @@ func TestSyncRequestDeleteNode_HostClosed(t *testing.T) {
 	h.Close()
 
 	ctx := context.Background()
-	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
+	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	if err != ErrClosed {
 		t.Errorf("expected ErrClosed, got %v", err)
 	}
 }
 
-func TestSyncRequestDeleteNode_ShardNotFound(t *testing.T) {
+func TestSyncRequestRemoveNode_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -7983,13 +7983,13 @@ func TestSyncRequestDeleteNode_ShardNotFound(t *testing.T) {
 	defer h.Close()
 
 	ctx := context.Background()
-	err = h.SyncRequestDeleteNode(ctx, 999, 2, 0)
+	err = h.SyncRequestRemoveNode(ctx, 999, 2, 0)
 	if err != ErrShardNotFound {
 		t.Errorf("expected ErrShardNotFound, got %v", err)
 	}
 }
 
-func TestSyncRequestDeleteNode_NotLeader(t *testing.T) {
+func TestSyncRequestRemoveNode_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -8004,13 +8004,13 @@ func TestSyncRequestDeleteNode_NotLeader(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
+	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	if !errors.Is(err, ErrNotLeader) {
 		t.Errorf("expected NotLeaderError, got %v", err)
 	}
 }
 
-func TestSyncRequestDeleteNode_Success(t *testing.T) {
+func TestSyncRequestRemoveNode_Success(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -8032,13 +8032,13 @@ func TestSyncRequestDeleteNode_Success(t *testing.T) {
 	// Replica 2 is not a member, so the delete is now rejected at propose
 	// time with ErrNodeNotFound rather than committing a no-op config change
 	// entry (the Host pre-validates membership changes).
-	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
+	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	if !errors.Is(err, raft.ErrNodeNotFound) {
-		t.Fatalf("SyncRequestDeleteNode error = %v, want ErrNodeNotFound", err)
+		t.Fatalf("SyncRequestRemoveNode error = %v, want ErrNodeNotFound", err)
 	}
 }
 
-func TestSyncRequestDeleteNode_ContextTimeout(t *testing.T) {
+func TestSyncRequestRemoveNode_ContextTimeout(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -8058,7 +8058,7 @@ func TestSyncRequestDeleteNode_ContextTimeout(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
 	defer cancel()
 
-	err = h.SyncRequestDeleteNode(ctx, 1, 2, 0)
+	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	// RequestRemoveNode itself may fail with ErrTimeout or the select may
 	// catch the expired context. Either way, the error must be non-nil.
 	if err == nil {
@@ -8534,7 +8534,7 @@ func TestSyncGetShardMembership_Draining(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetShardMembership
+// ShardMembership
 // ---------------------------------------------------------------------------
 
 func TestGetShardMembership_ClosedHost(t *testing.T) {
@@ -8545,9 +8545,9 @@ func TestGetShardMembership_ClosedHost(t *testing.T) {
 	}
 	h.Close()
 
-	_, err = h.GetShardMembership(1)
+	_, err = h.ShardMembership(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetShardMembership error = %v, want ErrClosed", err)
+		t.Errorf("ShardMembership error = %v, want ErrClosed", err)
 	}
 }
 
@@ -8559,9 +8559,9 @@ func TestGetShardMembership_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, err = h.GetShardMembership(999)
+	_, err = h.ShardMembership(999)
 	if !errors.Is(err, ErrShardNotReady) {
-		t.Errorf("GetShardMembership error = %v, want ErrShardNotReady", err)
+		t.Errorf("ShardMembership error = %v, want ErrShardNotReady", err)
 	}
 }
 
@@ -8583,9 +8583,9 @@ func TestGetShardMembership_Success(t *testing.T) {
 		t.Fatalf("StartShard failed: %v", startErr)
 	}
 
-	m, err := h.GetShardMembership(1)
+	m, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if m == nil {
 		t.Fatal("membership should not be nil")
@@ -8614,9 +8614,9 @@ func TestGetShardMembership_MapsNotNil(t *testing.T) {
 		t.Fatalf("StartShard failed: %v", startErr)
 	}
 
-	m, err := h.GetShardMembership(1)
+	m, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	// All maps must be non-nil to prevent nil map dereference.
 	if m.Nodes == nil {
@@ -8788,9 +8788,9 @@ func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 	}
 
 	// No pending proposals yet.
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Pending != 0 {
 		t.Errorf("Pending = %d, want 0 (no proposals)", info.Pending)
@@ -8803,9 +8803,9 @@ func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{}, true)})
 	}
 
-	info, err = h.GetShardInfo(1)
+	info, err = h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Pending != 5 {
 		t.Errorf("Pending = %d, want 5", info.Pending)
@@ -8815,9 +8815,9 @@ func TestGetShardInfo_PendingReflectsProposals(t *testing.T) {
 	ns.pendingProposals.Delete(uint64(1))
 	ns.pendingProposals.Delete(uint64(2))
 
-	info, err = h.GetShardInfo(1)
+	info, err = h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Pending != 3 {
 		t.Errorf("Pending = %d, want 3 after removing 2", info.Pending)
@@ -8840,9 +8840,9 @@ func TestGetShardInfo_PendingZeroWithNoMap(t *testing.T) {
 
 	// Ensure Pending is zero even when pendingProposals map is empty
 	// (not nil; StartShard initializes it).
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Pending != 0 {
 		t.Errorf("Pending = %d, want 0", info.Pending)
@@ -8870,7 +8870,7 @@ func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 		ns.pendingProposals.Store(i, &pendingProposal{rs: newRequestState(pool, i, time.Time{}, true)})
 	}
 
-	nhInfo := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: true})
+	nhInfo := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: true})
 	if len(nhInfo.ShardInfoList) != 1 {
 		t.Fatalf("ShardInfoList length = %d, want 1", len(nhInfo.ShardInfoList))
 	}
@@ -10347,25 +10347,25 @@ func TestHasNodeInfo_NotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetLogReader
+// LogReader
 // ---------------------------------------------------------------------------
 
 func TestGetLogReader_ClosedHost(t *testing.T) {
 	h := newTestHost(t)
 	h.closed.Store(true)
 
-	_, err := h.GetLogReader(1)
+	_, err := h.LogReader(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("GetLogReader closed: got %v, want ErrClosed", err)
+		t.Fatalf("LogReader closed: got %v, want ErrClosed", err)
 	}
 }
 
 func TestGetLogReader_ShardNotFound(t *testing.T) {
 	h := newTestHost(t)
 
-	_, err := h.GetLogReader(999)
+	_, err := h.LogReader(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Fatalf("GetLogReader not found: got %v, want ErrShardNotFound", err)
+		t.Fatalf("LogReader not found: got %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -10545,9 +10545,9 @@ func TestSyncProposeWithSession_Success_AutoComplete(t *testing.T) {
 	// Register a session through Raft so the RSM knows about it.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	seriesBefore := session.SeriesID()
@@ -10605,9 +10605,9 @@ func TestSyncProposeWithSession_DeadlineExceeded(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	// Use an already-expired deadline to trigger DeadlineExceeded.
@@ -10630,9 +10630,9 @@ func TestSyncProposeWithSession_ContextCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	// Use an already-canceled context to trigger ErrCanceled (not DeadlineExceeded).
@@ -10801,7 +10801,7 @@ func TestSyncRequestAddNode_ContextCanceled(t *testing.T) {
 	// reaching the select, which is acceptable.
 }
 
-func TestSyncRequestDeleteNode_ContextCanceled(t *testing.T) {
+func TestSyncRequestRemoveNode_ContextCanceled(t *testing.T) {
 	h := newTestHost(t)
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
@@ -10814,7 +10814,7 @@ func TestSyncRequestDeleteNode_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := h.SyncRequestDeleteNode(ctx, 1, 2, 0)
+	err := h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	if err == nil {
 		t.Fatal("expected error from canceled context")
 	}
@@ -11523,78 +11523,6 @@ func TestHostEngineCallback_OnCampaignLaunched_NilCallback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// hostEngineCallback: OnCampaignSkipped
-// ---------------------------------------------------------------------------
-
-func TestHostEngineCallback_OnCampaignSkipped_WithListener(t *testing.T) {
-	cfg := testHostConfig(t)
-
-	var called atomic.Bool
-	var captured config.EventShardInfo
-	var mu sync.Mutex
-	cfg.EventListener = &config.EventListener{
-		OnCampaignSkipped: func(info config.EventShardInfo) {
-			mu.Lock()
-			captured = info
-			mu.Unlock()
-			called.Store(true)
-		},
-	}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnCampaignSkipped(11, 5, 99)
-
-	if !called.Load() {
-		t.Fatal("expected OnCampaignSkipped listener to be called")
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if captured.ShardID != 11 {
-		t.Errorf("ShardID = %d, want 11", captured.ShardID)
-	}
-	if captured.ReplicaID != 5 {
-		t.Errorf("ReplicaID = %d, want 5", captured.ReplicaID)
-	}
-	if captured.Term != 99 {
-		t.Errorf("Term = %d, want 99", captured.Term)
-	}
-}
-
-func TestHostEngineCallback_OnCampaignSkipped_NilListener(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	// Should not panic with nil EventListener.
-	cb.OnCampaignSkipped(1, 1, 1)
-}
-
-func TestHostEngineCallback_OnCampaignSkipped_NilCallback(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.EventListener = &config.EventListener{}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	// Should not panic with nil callback function.
-	cb.OnCampaignSkipped(1, 1, 1)
-}
-
-// ---------------------------------------------------------------------------
 // hostEngineCallback: OnSnapshotRejected
 // ---------------------------------------------------------------------------
 
@@ -11944,10 +11872,11 @@ func TestHost_DiagPipelineState_ReturnsState(t *testing.T) {
 	h.StartShard(members, false, testCreateFunc, scfg)
 	waitForLeader(t, h, 1)
 
-	commitPending, proposalQLen, inboxLen, pendingProposals, diagErr := h.DiagPipelineState(1)
+	pd, diagErr := h.DiagPipelineState(1)
 	if diagErr != nil {
 		t.Fatalf("DiagPipelineState failed: %v", diagErr)
 	}
+	commitPending, proposalQLen, inboxLen, pendingProposals := pd.CommitPending, pd.ProposalQueueLen, pd.InboxLen, pd.PendingProposals
 
 	// After leader election with no pending work, values should be
 	// reasonable (non-negative). We don't assert exact values because
@@ -11972,7 +11901,7 @@ func TestHost_DiagPipelineState_NonexistentShard(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, _, _, _, diagErr := h.DiagPipelineState(999)
+	_, diagErr := h.DiagPipelineState(999)
 	if diagErr == nil {
 		t.Fatal("expected error for nonexistent shard")
 	}
@@ -12353,7 +12282,7 @@ func TestHost_QueryRaftLog_CanceledContext(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetLogRange
+// LogRange
 // ---------------------------------------------------------------------------
 
 func TestHost_GetLogRange_Success(t *testing.T) {
@@ -12376,7 +12305,7 @@ func TestHost_GetLogRange_Success(t *testing.T) {
 	// After leader election, the log should have at least one entry
 	// (the initial no-op).
 	if lr.FirstIndex > lr.LastIndex {
-		t.Errorf("GetLogRange returned inverted range: first=%d, last=%d",
+		t.Errorf("LogRange returned inverted range: first=%d, last=%d",
 			lr.FirstIndex, lr.LastIndex)
 	}
 }
@@ -12384,9 +12313,9 @@ func TestHost_GetLogRange_Success(t *testing.T) {
 func TestHost_GetLogRange_ShardNotFound(t *testing.T) {
 	h := newTestHost(t)
 
-	_, err := h.GetLogRange(999)
+	_, err := h.LogRange(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetLogRange unknown shard: got %v, want ErrShardNotFound", err)
+		t.Errorf("LogRange unknown shard: got %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -12394,9 +12323,9 @@ func TestHost_GetLogRange_ClosedHost(t *testing.T) {
 	h := newTestHost(t)
 	h.Close()
 
-	_, err := h.GetLogRange(1)
+	_, err := h.LogRange(1)
 	if !errors.Is(err, ErrClosed) {
-		t.Errorf("GetLogRange closed host: got %v, want ErrClosed", err)
+		t.Errorf("LogRange closed host: got %v, want ErrClosed", err)
 	}
 }
 
@@ -13072,16 +13001,15 @@ func TestDiagPipelineState_Success(t *testing.T) {
 	waitForLeader(t, h, 1)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		commitPending, proposalQLen, inboxLen, pendingProposals, err := h.DiagPipelineState(1)
+		pd, err := h.DiagPipelineState(1)
 		if err != nil {
 			t.Fatalf("DiagPipelineState failed: %v", err)
 		}
-		if !commitPending && proposalQLen == 0 && inboxLen == 0 && pendingProposals == 0 {
+		if pd == (PipelineDiag{}) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pipeline never quiesced: commitPending=%v proposalQLen=%d inboxLen=%d pendingProposals=%d",
-				commitPending, proposalQLen, inboxLen, pendingProposals)
+			t.Fatalf("pipeline never quiesced: %+v", pd)
 		}
 		runtime.Gosched()
 	}
@@ -13097,7 +13025,7 @@ func TestDiagPipelineState_InvalidShard(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, _, _, _, err = h.DiagPipelineState(999)
+	_, err = h.DiagPipelineState(999)
 	if err == nil {
 		t.Fatal("expected error for non-existent shard")
 	}
@@ -13113,7 +13041,7 @@ func TestDiagRaftState_InvalidShard(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, _, _, _, _, _, err = h.DiagRaftState(999)
+	_, err = h.DiagRaftState(999)
 	if err == nil {
 		t.Fatal("expected error for non-existent shard")
 	}
@@ -13232,7 +13160,7 @@ func TestTranslateProposalError_NotLeader(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNewSession / CloseSession
+// NewSession / CloseSession
 // ---------------------------------------------------------------------------
 
 // TestGetNewSession_AndCloseSession verifies that a session can be created
@@ -13256,9 +13184,9 @@ func TestGetNewSession_AndCloseSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 	if session == nil {
 		t.Fatal("expected non-nil session")
@@ -13274,7 +13202,7 @@ func TestGetNewSession_AndCloseSession(t *testing.T) {
 	}
 }
 
-// TestGetNewSession_InvalidShard verifies that GetNewSession returns an
+// TestGetNewSession_InvalidShard verifies that NewSession returns an
 // error for a non-existent shard.
 func TestGetNewSession_InvalidShard(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -13287,7 +13215,7 @@ func TestGetNewSession_InvalidShard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err = h.GetNewSession(ctx, 999)
+	_, err = h.NewSession(ctx, 999)
 	if err == nil {
 		t.Fatal("expected error for non-existent shard")
 	}
@@ -13458,7 +13386,7 @@ func TestStaleRead_NonExistent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// HasNodeInfo / GetLogReader
+// HasNodeInfo / LogReader
 // ---------------------------------------------------------------------------
 
 // TestHasNodeInfo_ExistingShard verifies that HasNodeInfo returns true
@@ -13499,7 +13427,7 @@ func TestHasNodeInfo_NonExistentShard(t *testing.T) {
 	}
 }
 
-// TestGetLogReader_Success verifies that GetLogReader returns a non-nil
+// TestGetLogReader_Success verifies that LogReader returns a non-nil
 // reader for a loaded shard.
 func TestGetLogReader_Success(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -13515,9 +13443,9 @@ func TestGetLogReader_Success(t *testing.T) {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	reader, err := h.GetLogReader(1)
+	reader, err := h.LogReader(1)
 	if err != nil {
-		t.Fatalf("GetLogReader failed: %v", err)
+		t.Fatalf("LogReader failed: %v", err)
 	}
 	if reader == nil {
 		t.Fatal("expected non-nil log reader")
@@ -13533,9 +13461,9 @@ func TestGetLogReader_NonExistent(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, err = h.GetLogReader(999)
+	_, err = h.LogReader(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetLogReader error = %v, want ErrShardNotFound", err)
+		t.Errorf("LogReader error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -13645,9 +13573,9 @@ func TestProposeWithSession_MultipleProposals(t *testing.T) {
 	defer cancel()
 
 	// Create a session.
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	// Propose with session.
@@ -13678,10 +13606,10 @@ func TestProposeWithSession_MultipleProposals(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetShardInfo
+// ShardInfo
 // ---------------------------------------------------------------------------
 
-// TestGetShardInfo_Success verifies that GetShardInfo returns valid info
+// TestGetShardInfo_Success verifies that ShardInfo returns valid info
 // for a running shard.
 func TestGetShardInfo_ReturnsValidInfo(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -13699,9 +13627,9 @@ func TestGetShardInfo_ReturnsValidInfo(t *testing.T) {
 
 	waitForLeader(t, h, 1)
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.ShardID != 1 {
 		t.Errorf("ShardID = %d, want 1", info.ShardID)
@@ -13720,9 +13648,9 @@ func TestGetShardInfo_ShardNotFound(t *testing.T) {
 	}
 	defer h.Close()
 
-	_, err = h.GetShardInfo(999)
+	_, err = h.ShardInfo(999)
 	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("GetShardInfo error = %v, want ErrShardNotFound", err)
+		t.Errorf("ShardInfo error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -13775,9 +13703,9 @@ func TestCloseSession_InvalidSession(t *testing.T) {
 	defer cancel()
 
 	// Create a session for shard 1.
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v", err)
+		t.Fatalf("NewSession failed: %v", err)
 	}
 
 	// Try to close it against shard 999 (different shard).
@@ -13788,10 +13716,10 @@ func TestCloseSession_InvalidSession(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNoOPSession
+// NoOPSession
 // ---------------------------------------------------------------------------
 
-// TestGetNoOPSession_Success verifies that GetNoOPSession returns a
+// TestGetNoOPSession_Success verifies that NoOPSession returns a
 // non-nil session with the expected shard ID.
 func TestGetNoOPSession_HasCorrectShardID(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -13801,7 +13729,7 @@ func TestGetNoOPSession_HasCorrectShardID(t *testing.T) {
 	}
 	defer h.Close()
 
-	session := h.GetNoOPSession(42)
+	session := h.NoOPSession(42)
 	if session == nil {
 		t.Fatal("expected non-nil no-op session")
 	}
@@ -13916,9 +13844,9 @@ func TestGetShardInfo_AfterPropose(t *testing.T) {
 		}
 	}
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.LeaderID == 0 {
 		t.Error("expected non-zero LeaderID")
@@ -14892,11 +14820,11 @@ func TestSyncGetShardMembership_DrainingReturnsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNewSession - draining host returns error
+// NewSession - draining host returns error
 // ---------------------------------------------------------------------------
 
 // TestGetNewSession_DrainingReturnsError verifies that calling
-// GetNewSession on a draining host returns ErrDraining.
+// NewSession on a draining host returns ErrDraining.
 func TestGetNewSession_DrainingReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -14905,7 +14833,7 @@ func TestGetNewSession_DrainingReturnsError(t *testing.T) {
 	}
 	defer h.Close()
 
-	// Must start a shard first since GetNewSession checks shard existence
+	// Must start a shard first since NewSession checks shard existence
 	// before the draining check (proposeSession checks draining).
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
@@ -14917,7 +14845,7 @@ func TestGetNewSession_DrainingReturnsError(t *testing.T) {
 	h.draining.Store(true)
 
 	ctx := context.Background()
-	_, err = h.GetNewSession(ctx, 1)
+	_, err = h.NewSession(ctx, 1)
 	if !errors.Is(err, ErrDraining) {
 		t.Fatalf("expected ErrDraining, got %v", err)
 	}
@@ -15453,12 +15381,12 @@ func TestDiagPipelineState_WithPendingProposals(t *testing.T) {
 		fakeRS.Release()
 	}()
 
-	_, _, _, pp, err := h.DiagPipelineState(1)
+	pd, err := h.DiagPipelineState(1)
 	if err != nil {
 		t.Fatalf("DiagPipelineState failed: %v", err)
 	}
-	if pp < 1 {
-		t.Fatalf("expected at least 1 pending proposal, got %d", pp)
+	if pd.PendingProposals < 1 {
+		t.Fatalf("expected at least 1 pending proposal, got %d", pd.PendingProposals)
 	}
 }
 
@@ -15638,10 +15566,10 @@ func TestSyncGetShardMembership_ClosedReturnsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetNewSession - closed host path
+// NewSession - closed host path
 // ---------------------------------------------------------------------------
 
-// TestGetNewSession_ClosedReturnsError verifies that GetNewSession returns
+// TestGetNewSession_ClosedReturnsError verifies that NewSession returns
 // ErrClosed when the host is closed.
 func TestGetNewSession_ClosedReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -15652,7 +15580,7 @@ func TestGetNewSession_ClosedReturnsError(t *testing.T) {
 	h.Close()
 
 	ctx := context.Background()
-	_, err = h.GetNewSession(ctx, 1)
+	_, err = h.NewSession(ctx, 1)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
 	}
@@ -15683,7 +15611,7 @@ func TestSyncProposeWithSession_DeadlineExceededPath(t *testing.T) {
 	defer cancel()
 	<-ctx.Done() // ensure context is expired
 
-	session := h.GetNoOPSession(1)
+	session := h.NoOPSession(1)
 	_, err = h.SyncProposeWithSession(ctx, session, []byte("data"))
 	if err == nil {
 		t.Fatal("expected error for expired deadline")
@@ -15783,12 +15711,12 @@ func TestSyncRequestAddNode_DeadlineExceeded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncRequestDeleteNode - deadline exceeded path
+// SyncRequestRemoveNode - deadline exceeded path
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestDeleteNode_DeadlineExceeded verifies that
-// SyncRequestDeleteNode returns ErrTimeout when the deadline expires.
-func TestSyncRequestDeleteNode_DeadlineExceeded(t *testing.T) {
+// TestSyncRequestRemoveNode_DeadlineExceeded verifies that
+// SyncRequestRemoveNode returns ErrTimeout when the deadline expires.
+func TestSyncRequestRemoveNode_DeadlineExceeded(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -15809,7 +15737,7 @@ func TestSyncRequestDeleteNode_DeadlineExceeded(t *testing.T) {
 
 	// Attempt to remove a phantom node. The request goes through Raft but
 	// the context is already expired so the select hits ctx.Done.
-	err = h.SyncRequestDeleteNode(ctx, 1, 99, 0)
+	err = h.SyncRequestRemoveNode(ctx, 1, 99, 0)
 	if err == nil {
 		t.Fatal("expected error for expired deadline")
 	}
@@ -16144,7 +16072,7 @@ func TestProposeSession_NoLeaderReturnsNotLeaderError(t *testing.T) {
 	ns.leaderID.Store(0)
 
 	ctx := context.Background()
-	_, err = h.GetNewSession(ctx, 1)
+	_, err = h.NewSession(ctx, 1)
 	var nle *NotLeaderError
 	if !errors.As(err, &nle) {
 		t.Fatalf("expected NotLeaderError, got %v", err)
@@ -16215,10 +16143,10 @@ func TestExportSnapshot_ClosedHostReturnsError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetLogReader - closed host path
+// LogReader - closed host path
 // ---------------------------------------------------------------------------
 
-// TestGetLogReader_ClosedHostReturnsError verifies that GetLogReader
+// TestGetLogReader_ClosedHostReturnsError verifies that LogReader
 // returns ErrClosed when the host has been closed.
 func TestGetLogReader_ClosedHostReturnsError(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -16228,7 +16156,7 @@ func TestGetLogReader_ClosedHostReturnsError(t *testing.T) {
 	}
 	h.Close()
 
-	_, err = h.GetLogReader(1)
+	_, err = h.LogReader(1)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
 	}
@@ -16604,10 +16532,10 @@ func TestDrain_NoPendingOps(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetShardMembership - local path
+// ShardMembership - local path
 // ---------------------------------------------------------------------------
 
-// TestGetShardMembership_Success verifies that GetShardMembership returns
+// TestGetShardMembership_Success verifies that ShardMembership returns
 // the correct membership for a running shard without going through Raft.
 func TestGetShardMembership_ReturnsNodes(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -16624,9 +16552,9 @@ func TestGetShardMembership_ReturnsNodes(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
-	membership, err := h.GetShardMembership(1)
+	membership, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership failed: %v", err)
+		t.Fatalf("ShardMembership failed: %v", err)
 	}
 	if len(membership.Nodes) == 0 {
 		t.Fatal("expected non-empty membership nodes")
@@ -17721,7 +17649,7 @@ func TestDiagRaftState_ClosedHost(t *testing.T) {
 	h := newTestHost(t)
 	h.Close()
 
-	_, _, _, _, _, _, err := h.DiagRaftState(1)
+	_, err := h.DiagRaftState(1)
 	if !errors.Is(err, ErrShardNotReady) {
 		// DiagRaftState doesn't check closed - it checks engine node existence.
 		// After close, GetNode returns nil, so ErrShardNotReady.
@@ -17944,7 +17872,7 @@ func TestImportSnapshot_ContextCanceledBeforeWrite(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: GetNewSession and RegisterSession draining paths
+// Coverage: NewSession and RegisterSession draining paths
 // ---------------------------------------------------------------------------
 
 func TestGetNewSession_DrainingReturnsErrDraining(t *testing.T) {
@@ -17956,14 +17884,14 @@ func TestGetNewSession_DrainingReturnsErrDraining(t *testing.T) {
 	}
 	waitForLeader(t, h, 1)
 
-	// Set draining to test the error path in proposeSession (via GetNewSession).
+	// Set draining to test the error path in proposeSession (via NewSession).
 	h.draining.Store(true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err := h.GetNewSession(ctx, 1)
+	_, err := h.NewSession(ctx, 1)
 	if !errors.Is(err, ErrDraining) {
-		t.Errorf("GetNewSession while draining = %v, want ErrDraining", err)
+		t.Errorf("NewSession while draining = %v, want ErrDraining", err)
 	}
 }
 
@@ -18158,7 +18086,7 @@ func TestStopShard_WithEventListener(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: GetNodeHostInfo with LogDB error
+// Coverage: NodeHostInfo with LogDB error
 // ---------------------------------------------------------------------------
 
 func TestGetNodeHostInfo_LogDBError(t *testing.T) {
@@ -18171,10 +18099,10 @@ func TestGetNodeHostInfo_LogDBError(t *testing.T) {
 	}
 	defer h.Close()
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
+	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
 	// Should still return info, just with nil LogInfo.
 	if info == nil {
-		t.Fatal("GetNodeHostInfo() returned nil")
+		t.Fatal("NodeHostInfo() returned nil")
 	}
 	if info.LogInfo != nil {
 		t.Error("expected nil LogInfo when logdb returns error")
@@ -19431,7 +19359,7 @@ func TestSyncRead_ContextCanceledAfterNonBlockingReceive(t *testing.T) {
 func TestDiagRaftState_EngineNodeNil(t *testing.T) {
 	h := newTestHost(t)
 
-	_, _, _, _, _, _, err := h.DiagRaftState(999)
+	_, err := h.DiagRaftState(999)
 	if !errors.Is(err, ErrShardNotReady) {
 		t.Errorf("expected ErrShardNotReady, got: %v", err)
 	}
@@ -19669,7 +19597,7 @@ func TestOnLeaderUpdated_LostLeadership(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: OnCampaignLaunched and OnCampaignSkipped
+// Coverage: OnCampaignLaunched
 // ---------------------------------------------------------------------------
 
 func TestOnCampaignLaunched_NoListener(t *testing.T) {
@@ -19698,35 +19626,6 @@ func TestOnCampaignLaunched_WithListener(t *testing.T) {
 	cb.OnCampaignLaunched(1, 1, 5)
 	if !fired.Load() {
 		t.Error("expected OnCampaignLaunched event to fire")
-	}
-}
-
-func TestOnCampaignSkipped_NoListener(t *testing.T) {
-	h := newTestHost(t)
-
-	cb := &hostEngineCallback{h: h}
-	// Should not panic when no event listener is set.
-	cb.OnCampaignSkipped(1, 1, 5)
-}
-
-func TestOnCampaignSkipped_WithListener(t *testing.T) {
-	var fired atomic.Bool
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnCampaignSkipped: func(info config.EventShardInfo) {
-			fired.Store(true)
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnCampaignSkipped(1, 1, 5)
-	if !fired.Load() {
-		t.Error("expected OnCampaignSkipped event to fire")
 	}
 }
 
@@ -20013,14 +19912,14 @@ func TestIsDraining_TrueAfterDrain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: GetNodeHostInfo - closed host
+// Coverage: NodeHostInfo - closed host
 // ---------------------------------------------------------------------------
 
 func TestGetNodeHostInfo_BadNodeStateType(t *testing.T) {
 	h := newTestHost(t)
 	h.nodes.Store(uint64(99), "not-a-nodeState")
 
-	info := h.GetNodeHostInfo(NodeHostInfoOption{})
+	info := h.NodeHostInfo(NodeHostInfoOption{})
 	if info == nil {
 		t.Fatal("expected non-nil info")
 	}
@@ -20034,7 +19933,7 @@ func TestGetNodeHostInfo_BadNodeStateType(t *testing.T) {
 
 func TestGetNodeHostInfo_WithLogInfo(t *testing.T) {
 	h := newTestHost(t)
-	info := h.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
+	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
 	if info == nil {
 		t.Fatal("expected non-nil info")
 	}
@@ -20366,7 +20265,7 @@ func TestSyncRead_SuccessPath(t *testing.T) {
 func TestDiagPipelineState_ShardNotReady(t *testing.T) {
 	h := newTestHost(t)
 
-	_, _, _, _, err := h.DiagPipelineState(999)
+	_, err := h.DiagPipelineState(999)
 	if !errors.Is(err, ErrShardNotReady) {
 		t.Errorf("expected ErrShardNotReady, got: %v", err)
 	}
@@ -21382,11 +21281,11 @@ func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
 	deadline := time.Now().Add(10 * time.Second)
 	var processed uint64
 	for {
-		_, _, p, _, _, _, drErr := h.DiagRaftState(shardID)
+		rs, drErr := h.DiagRaftState(shardID)
 		if drErr != nil {
 			t.Fatalf("DiagRaftState failed: %v", drErr)
 		}
-		processed = p
+		processed = rs.Processed
 		if processed >= want || time.Now().After(deadline) {
 			break
 		}
@@ -21979,50 +21878,50 @@ func TestShardHealth_ReportsSnapshotGates(t *testing.T) {
 		t.Fatal("engine node missing for started shard")
 	}
 
-	info, err := h.GetShardInfo(1)
+	info, err := h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Health != ShardHealthy {
 		t.Fatalf("baseline health = %v, want healthy", info.Health)
 	}
 
 	engNode.SetRecovering(true)
-	info, err = h.GetShardInfo(1)
+	info, err = h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Health != ShardRecovering {
 		t.Fatalf("health during snapshot recovery = %v, want recovering", info.Health)
 	}
-	recovering, saving, _, err := h.DiagShardGates(1)
+	gates, err := h.DiagShardGates(1)
 	if err != nil {
 		t.Fatalf("DiagShardGates failed: %v", err)
 	}
-	if !recovering || saving {
-		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (true, false)", recovering, saving)
+	if !gates.Recovering || gates.Saving {
+		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (true, false)", gates.Recovering, gates.Saving)
 	}
 	engNode.SetRecovering(false)
 
 	engNode.SetSaving(true)
-	info, err = h.GetShardInfo(1)
+	info, err = h.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+		t.Fatalf("ShardInfo failed: %v", err)
 	}
 	if info.Health != ShardSnapshotting {
 		t.Fatalf("health during snapshot save = %v, want snapshotting", info.Health)
 	}
-	recovering, saving, _, err = h.DiagShardGates(1)
+	gates, err = h.DiagShardGates(1)
 	if err != nil {
 		t.Fatalf("DiagShardGates failed: %v", err)
 	}
-	if recovering || !saving {
-		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (false, true)", recovering, saving)
+	if gates.Recovering || !gates.Saving {
+		t.Fatalf("DiagShardGates = (recovering=%v, saving=%v), want (false, true)", gates.Recovering, gates.Saving)
 	}
 	engNode.SetSaving(false)
 
-	if info, err = h.GetShardInfo(1); err != nil {
-		t.Fatalf("GetShardInfo failed: %v", err)
+	if info, err = h.ShardInfo(1); err != nil {
+		t.Fatalf("ShardInfo failed: %v", err)
 	} else if info.Health != ShardHealthy {
 		t.Fatalf("health after the gates cleared = %v, want healthy", info.Health)
 	}

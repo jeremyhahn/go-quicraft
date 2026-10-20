@@ -43,7 +43,7 @@ const (
 )
 
 // Session represents a client session for at-most-once proposal semantics.
-// Sessions are created via Host.GetNewSession and closed via Host.CloseSession.
+// Sessions are created via Host.NewSession and closed via Host.CloseSession.
 //
 // The seriesID field advances monotonically with each proposal. The session
 // manager uses (clientID, seriesID) to detect and deduplicate retransmissions.

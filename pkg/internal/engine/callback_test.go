@@ -31,31 +31,29 @@ import (
 // testCallback is a test implementation of Callback that records
 // all calls for verification.
 type testCallback struct {
-	mu                   sync.Mutex
-	shardFailedCalls     []shardFailedCall
-	shardFailedCount     atomic.Int64
-	appliedCalls         []appliedCall
-	committedCalls       []committedCall
-	leaderCalls          []leaderCall
-	readyToReadKeys      []readyToReadCall
-	appliedCount         atomic.Int64
-	committedCount       atomic.Int64
-	leaderCallCount      atomic.Int64
-	leaderEvents         []leaderEvent
-	leaderReadyCount     atomic.Int64
-	readyCount           atomic.Int64
-	snapshotCalls        []snapshotCall
-	compactionCalls      []compactionCall
-	requestCalls         []requestCall
-	snapshotCallCount    atomic.Int64
-	campaignCalls        []campaignCall
-	campaignCount        atomic.Int64
-	campaignSkippedCalls []campaignCall
-	campaignSkippedCount atomic.Int64
-	readIndexBatchCalls  []readIndexBatchCall
-	batchCount           atomic.Int64
-	proposalFailedCalls  []proposalFailedCall
-	proposalFailedCount  atomic.Int64
+	mu                  sync.Mutex
+	shardFailedCalls    []shardFailedCall
+	shardFailedCount    atomic.Int64
+	appliedCalls        []appliedCall
+	committedCalls      []committedCall
+	leaderCalls         []leaderCall
+	readyToReadKeys     []readyToReadCall
+	appliedCount        atomic.Int64
+	committedCount      atomic.Int64
+	leaderCallCount     atomic.Int64
+	leaderEvents        []leaderEvent
+	leaderReadyCount    atomic.Int64
+	readyCount          atomic.Int64
+	snapshotCalls       []snapshotCall
+	compactionCalls     []compactionCall
+	requestCalls        []requestCall
+	snapshotCallCount   atomic.Int64
+	campaignCalls       []campaignCall
+	campaignCount       atomic.Int64
+	readIndexBatchCalls []readIndexBatchCall
+	batchCount          atomic.Int64
+	proposalFailedCalls []proposalFailedCall
+	proposalFailedCount atomic.Int64
 	// proposalRejectedCalls records OnProposalRejected: proposals raft refused
 	// before appending them.
 	proposalRejectedCalls []proposalFailedCall
@@ -289,17 +287,6 @@ func (c *testCallback) getCampaignCalls() []campaignCall {
 	result := make([]campaignCall, len(c.campaignCalls))
 	copy(result, c.campaignCalls)
 	return result
-}
-
-func (c *testCallback) OnCampaignSkipped(shardID, replicaID, term uint64) {
-	c.campaignSkippedCount.Add(1)
-	c.mu.Lock()
-	c.campaignSkippedCalls = append(c.campaignSkippedCalls, campaignCall{
-		shardID:   shardID,
-		replicaID: replicaID,
-		term:      term,
-	})
-	c.mu.Unlock()
 }
 
 func (c *testCallback) OnSnapshotRejected(_, _ uint64, err error) {

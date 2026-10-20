@@ -39,7 +39,7 @@ type staleRead struct {
 	wrote        uint64 // index of the client's own acknowledged put
 	readIndex    uint64 // the index the leader confirmed for this read
 	smApplied    uint64 // the serving SM's applied marker when the read completed
-	hostApplied  uint64 // the host's applied marker (GetShardInfo) at the same moment
+	hostApplied  uint64 // the host's applied marker (ShardInfo) at the same moment
 	observed     uint64 // index of the write that produced the value returned
 	value        string
 	leader       int
@@ -125,7 +125,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 			if cluster.stopped[i].Load() {
 				continue
 			}
-			if info, err := h.GetShardInfo(shardID); err == nil && info.IsLeader {
+			if info, err := h.ShardInfo(shardID); err == nil && info.IsLeader {
 				return h, i
 			}
 		}
@@ -166,7 +166,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 				// cannot see it (the old entry's index arrives in res.Data too).
 				var appliedBefore uint64
 				if leader := cluster.leaderHost(shardID); leader != nil {
-					if info, infoErr := leader.GetShardInfo(shardID); infoErr == nil {
+					if info, infoErr := leader.ShardInfo(shardID); infoErr == nil {
 						appliedBefore = info.LastApplied
 					}
 				}
@@ -244,7 +244,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 					if machine := tracker.Get(shardID, replica); machine != nil {
 						smApplied = machine.LastApplied()
 					}
-					if info, infoErr := host.GetShardInfo(shardID); infoErr == nil {
+					if info, infoErr := host.ShardInfo(shardID); infoErr == nil {
 						hostApplied = info.LastApplied
 					}
 				}

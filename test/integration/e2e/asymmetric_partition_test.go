@@ -299,9 +299,9 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 	}
 
 	// Record the old leader's term before partition.
-	oldLeaderInfo, err := cluster.hosts[oldLeaderIdx].GetShardInfo(shardID)
+	oldLeaderInfo, err := cluster.hosts[oldLeaderIdx].ShardInfo(shardID)
 	if err != nil {
-		t.Fatalf("GetShardInfo for old leader failed: %v", err)
+		t.Fatalf("ShardInfo for old leader failed: %v", err)
 	}
 	oldLeaderTerm := oldLeaderInfo.Term
 	t.Logf("old leader node[%d] at term=%d", oldLeaderIdx, oldLeaderTerm)
@@ -346,7 +346,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 	waitForCondition(t, failoverTimeout,
 		"new leader term advances beyond old leader term",
 		func() bool {
-			info, infoErr := cluster.hosts[newLeaderIdx].GetShardInfo(shardID)
+			info, infoErr := cluster.hosts[newLeaderIdx].ShardInfo(shardID)
 			if infoErr != nil {
 				return false
 			}
@@ -354,9 +354,9 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 		},
 	)
 
-	newLeaderInfo, err := cluster.hosts[newLeaderIdx].GetShardInfo(shardID)
+	newLeaderInfo, err := cluster.hosts[newLeaderIdx].ShardInfo(shardID)
 	if err != nil {
-		t.Fatalf("GetShardInfo for new leader failed: %v", err)
+		t.Fatalf("ShardInfo for new leader failed: %v", err)
 	}
 	t.Logf("new leader node[%d] at term=%d (old term=%d)",
 		newLeaderIdx, newLeaderInfo.Term, oldLeaderTerm)
@@ -469,7 +469,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 		waitForCondition(t, membershipTimeout,
 			fmt.Sprintf("replacement node[%d] sees advanced term", i),
 			func() bool {
-				info, infoErr := cluster.hosts[i].GetShardInfo(shardID)
+				info, infoErr := cluster.hosts[i].ShardInfo(shardID)
 				if infoErr != nil {
 					return false
 				}
@@ -789,7 +789,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	t.Logf("active leader during isolation: node[%d]", activeLeaderIdx)
 
 	// Capture LastApplied BEFORE writes so we can detect advancement.
-	initInfo, initErr := cluster.hosts[activeLeaderIdx].GetShardInfo(shardID)
+	initInfo, initErr := cluster.hosts[activeLeaderIdx].ShardInfo(shardID)
 	initApplied := uint64(0)
 	if initErr == nil {
 		initApplied = initInfo.LastApplied
@@ -808,7 +808,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	waitForCondition(t, 10*time.Second,
 		"entries applied on leader after isolation writes",
 		func() bool {
-			info, err := cluster.hosts[activeLeaderIdx].GetShardInfo(shardID)
+			info, err := cluster.hosts[activeLeaderIdx].ShardInfo(shardID)
 			return err == nil && info.LastApplied >= initApplied+20
 		},
 	)

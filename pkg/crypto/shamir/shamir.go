@@ -51,7 +51,7 @@ const rawShareOverhead = 2
 // root key, and every larger payload costs O(shares x len) field operations
 // with roughly 1.75x the input held in memory at once while combining. Without
 // a bound, a caller (or an attacker submitting shares to a recovery ceremony)
-// could hand Combine 255 shares of a megabyte each — ~340 MB of input, ~0.75x
+// could hand CombineBytes 255 shares of a megabyte each — ~340 MB of input, ~0.75x
 // of it copied, and seconds of CPU — from unauthenticated material, since
 // shares cannot be authenticated before they are combined. 64 KiB is four
 // orders of magnitude above any legitimate key and caps the work at a few
@@ -61,8 +61,8 @@ const MaxSecretBytes = 64 << 10
 
 // maxShares is the number of distinct shares the scheme can express: the
 // x-coordinate is a non-zero byte, so 255 is a property of GF(2^8), not a
-// policy. Combine applies it up front so an oversized share list is rejected
-// before any of it is decoded.
+// policy. Every combine path applies it up front so an oversized share list
+// is rejected before any of it is decoded.
 const maxShares = 255
 
 // randReader is the source of cryptographic randomness for polynomial
@@ -119,56 +119,17 @@ func validateSplitParams(secret []byte, threshold, total int) error {
 	return nil
 }
 
-// Split divides a secret into N shares where any M shares can reconstruct it.
-//
-// Each share's Value is the base64 encoding of [version:1][x:1][y...]
-// where x is the share's field coordinate (equal to Share.Index) and y
-// has one byte per secret byte. The x-coordinate embedded in the value is
-// authoritative for reconstruction, so a share string is self-contained.
-//
-// Share.Value is a Go STRING and therefore immortal: it cannot be zeroed, and
-// every share stays readable in the heap until the GC reclaims it. Split wipes
-// the byte buffer it encoded from, but the string it hands back is the one copy
-// it cannot take away. A ceremony holds all N shares at once, so this is the
-// point of widest exposure in the whole scheme — callers that can keep share
-// material in wipeable buffers should use SplitBytes and feed CombineBytes.
-//
-// Deprecated: the shares this returns carry their value in that un-wipeable
-// string. Use SplitProtected, which returns the same shares with their values
-// in mlock'd, guard-paged buffers that Destroy wipes, or SplitBytes if the
-// caller manages the buffers itself. Split remains for the consumers compiled
-// against it; nothing about the shares it produces has changed.
-func Split(secret []byte, threshold, total int) ([]*Share, error) {
-	values, err := SplitBytes(secret, threshold, total)
-	if err != nil {
-		return nil, err
-	}
-	shares := make([]*Share, total)
-	for i, v := range values {
-		shares[i] = &Share{
-			Index:     i + 1,
-			Threshold: threshold,
-			Total:     total,
-			Value:     string(v),
-			Metadata:  make(map[string]string),
-		}
-		// string(v) copied the bytes, so the buffer SplitBytes allocated is
-		// now redundant share material. Wipe it; the string copy is the only
-		// one that must survive, and the only one that cannot be wiped.
-		wipe(v)
-	}
-	return shares, nil
-}
-
 // SplitBytes divides a secret into N share VALUES — the base64-encoded
-// [version:1][x:1][y...] payloads that are exactly the bytes of Share.Value,
+// [version:1][x:1][y...] payloads that are exactly the bytes of a
+// ProtectedShare's value, where x is the share's field coordinate (equal to
+// its Index) and y has one byte per secret byte. They are
 // returned in Index order, so values[i] is the value of share Index i+1.
 //
 // It is the generation-side counterpart of CombineBytes: the returned buffers
 // are owned by the caller and are wipeable, so share material can be carried in
 // memory-locked buffers from the moment it exists and zeroed the moment it is
-// distributed, never becoming an un-wipeable Go string. Split is a thin wrapper
-// that encodes these into Share structs and wipes them.
+// distributed, never becoming an un-wipeable Go string. SplitProtected is the
+// form that returns them already in protected memory.
 //
 // The caller MUST wipe the returned buffers when done with them.
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
@@ -196,7 +157,7 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	// No secret digest is embedded in shares: storing sha256(secret) per share
 	// is an offline oracle that defeats information-theoretic secrecy for
 	// low-entropy secrets. Integrity is verified out-of-band by the caller (see
-	// Combine).
+	// CombineBytes).
 	values := make([][]byte, total)
 	coeffs := make([]byte, threshold) // [secret byte, c1..c_{t-1}]
 	for i := 0; i < total; i++ {
@@ -224,131 +185,10 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	return values, nil
 }
 
-// Combine reconstructs the original secret from M (== threshold) or more shares
-// via GF(2^8) Lagrange interpolation at x=0.
-//
-// Combine performs NO self-verification of the reconstructed secret. Shares
-// carry no digest of the secret — embedding one would be an offline brute-force
-// oracle that defeats Shamir's information-theoretic secrecy for low-entropy
-// secrets (see Share). With fewer-than-threshold genuine shares, or a corrupted
-// or mismatched share, reconstruction yields indistinguishable garbage, NOT an
-// error. The caller MUST authenticate the result out-of-band — for example by
-// using it as the key in an authenticated decrypt that fails on a wrong key.
-// Combine is identical to CombineUnverified; both names are retained to let
-// callers express intent.
-//
-// Deprecated: it reconstructs from shares whose values are un-wipeable Go
-// strings, and returns the secret in an ordinary heap buffer. Use
-// CombineProtected, which reads the share values in place out of protected
-// memory and returns the secret in a buffer the caller can wipe, or
-// CombineBytes if the caller manages the buffers itself.
-func Combine(shares []*Share) ([]byte, error) {
-	return CombineUnverified(shares)
-}
-
-// CombineUnverified reconstructs the original secret from M or more
-// shares WITHOUT integrity verification. The caller MUST validate the
-// reconstructed secret out-of-band (for example by authenticating it
-// against an independent commitment or by using it in an authenticated
-// decrypt that will fail on a wrong key): with fewer-than-threshold
-// genuine shares or a corrupted share, reconstruction yields
-// indistinguishable garbage, not an error.
-//
-// Deprecated: for the reason given on Combine, which this is identical to. Use
-// CombineProtected or CombineBytes. Neither replacement verifies either — no
-// reconstruction here does, and none can (see Combine).
-func CombineUnverified(shares []*Share) ([]byte, error) {
-	if len(shares) == 0 {
-		return nil, &CombineError{Reason: "no shares provided"}
-	}
-	return combine(shares)
-}
-
-// combine performs the shared validation and GF(2^8) Lagrange
-// interpolation at x=0. Digest policy is applied by the callers.
-func combine(shares []*Share) ([]byte, error) {
-	// Reject nil elements BEFORE any dereference, including the shares[0]
-	// reads below. A nil *Share is not an exotic input: custody lives above
-	// this package and necessarily decodes operator-submitted shares, and
-	// json.Unmarshal of `[null]` into a []*Share produces exactly this. One
-	// malformed submission must not panic the process running an unseal
-	// ceremony.
-	// The x-coordinate is a non-zero byte, so no set larger than maxShares can
-	// contain distinct shares. Rejecting up front bounds the decode work an
-	// unauthenticated submission can force; the duplicate-x check below would
-	// otherwise only notice after decoding its way there.
-	if len(shares) > maxShares {
-		return nil, &CombineError{Reason: fmt.Sprintf("too many shares: %d exceeds the maximum of %d", len(shares), maxShares)}
-	}
-	for i, share := range shares {
-		if share == nil {
-			return nil, &CombineError{Reason: fmt.Sprintf("share %d is nil", i)}
-		}
-	}
-
-	threshold := shares[0].Threshold
-	total := shares[0].Total
-
-	for i, share := range shares {
-		if err := share.Validate(); err != nil {
-			return nil, &CombineError{Reason: fmt.Sprintf("invalid share %d: %v", i, err)}
-		}
-		if share.Threshold != threshold {
-			return nil, &CombineError{Reason: fmt.Sprintf("share %d has different threshold (%d) than share 0 (%d)", i, share.Threshold, threshold)}
-		}
-		if share.Total != total {
-			return nil, &CombineError{Reason: fmt.Sprintf("share %d has different total (%d) than share 0 (%d)", i, share.Total, total)}
-		}
-	}
-
-	if len(shares) < threshold {
-		return nil, &CombineError{Reason: fmt.Sprintf("need at least %d shares, got %d", threshold, len(shares))}
-	}
-
-	// Decode the raw share values. The x-coordinate embedded in the value
-	// is authoritative (a share string is self-contained); duplicate or
-	// zero x-coordinates are rejected — interpolation divides by
-	// (x_j ⊕ x_m), and a repeated coordinate yields a zero denominator.
-	xs := make([]byte, len(shares))
-	ys := make([][]byte, len(shares))
-	seenX := make(map[byte]struct{}, len(shares))
-	secretLen := -1
-	// Wipe every decoded buffer on every return path, mirroring
-	// CombineBytes. The share strings themselves are immutable and cannot
-	// be wiped, but leaving additional decoded copies of share material on
-	// the heap — including on validation-error returns — needlessly widens
-	// the exposure. The reconstructed secret is a separate buffer.
-	decoded := make([][]byte, 0, len(shares))
-	defer func() {
-		for _, d := range decoded {
-			wipe(d)
-		}
-	}()
-	for i, share := range shares {
-		raw, err := base64.StdEncoding.DecodeString(share.Value)
-		// Register before the error check: DecodeString returns the bytes
-		// decoded so far alongside a corrupt-input error, and those partial
-		// bytes are share material that must be wiped too.
-		decoded = append(decoded, raw)
-		if err != nil {
-			return nil, &CombineError{Reason: fmt.Sprintf("failed to decode share %d: %v", i, err)}
-		}
-		x, y, err := parseRawShare(raw, i, seenX, secretLen)
-		if err != nil {
-			return nil, err
-		}
-		secretLen = len(y)
-		xs[i] = x
-		ys[i] = y
-	}
-
-	return interpolateSecret(xs, ys, secretLen), nil
-}
-
 // parseRawShare validates a decoded [version][x][y...] share payload and
 // returns its x-coordinate and y-payload. It is the single copy of the share
-// wire-format rules shared by combine and CombineBytes, so the string and
-// byte reconstruction paths can never diverge on which shares they accept.
+// wire-format rules shared by CombineBytes and CombineProtected, so the byte
+// and protected reconstruction paths can never diverge on which shares they accept.
 // seenX tracks duplicate x-coordinates across the share set; secretLen is
 // the y-payload length established by share 0, or -1 when not yet known.
 func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (byte, []byte, error) {
@@ -431,11 +271,19 @@ func interpolateSecret(xs []byte, ys [][]byte, secretLen int) []byte {
 
 // CombineBytes reconstructs the secret from M-or-more raw share VALUES — the
 // base64-encoded [version][x][y...] payloads that are exactly the bytes of
-// Share.Value — WITHOUT integrity verification. It exists so callers that hold
+// a ProtectedShare's value — WITHOUT integrity verification. It exists so callers that hold
 // share material in wipeable []byte buffers (e.g. memory-locked enclaves) never
 // have to copy it into an immutable, un-wipeable Go string just to reconstruct.
 // threshold is the M of the M-of-N scheme and must be at least 2, matching
-// Split. The same out-of-band-validation caveat as CombineUnverified applies.
+// SplitBytes.
+//
+// It performs NO self-verification of the reconstructed secret. Shares carry
+// no digest of the secret — embedding one would be an offline brute-force
+// oracle that defeats Shamir's information-theoretic secrecy for low-entropy
+// secrets. With fewer-than-threshold genuine shares, or a corrupted or
+// mismatched share, reconstruction yields indistinguishable garbage, NOT an
+// error. The caller MUST authenticate the result out-of-band — for example by
+// using it as the key in an authenticated decrypt that fails on a wrong key.
 // Every decoded buffer — including partially decoded or validation-rejected
 // shares — is wiped on every return path; the caller still owns (and must
 // wipe) the input buffers.
@@ -449,7 +297,7 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	if len(values) < threshold {
 		return nil, &CombineError{Reason: fmt.Sprintf("need at least %d shares, got %d", threshold, len(values))}
 	}
-	// Same bound as combine: no distinct share set can exceed the 255 non-zero
+	// Same bound as CombineProtected: no distinct share set can exceed the 255 non-zero
 	// x-coordinates GF(2^8) provides.
 	if len(values) > maxShares {
 		return nil, &CombineError{Reason: fmt.Sprintf("too many shares: %d exceeds the maximum of %d", len(values), maxShares)}
@@ -499,8 +347,8 @@ func wipe(b []byte) {
 
 // VerifyShare checks if a share is valid and consistent with other shares.
 // A nil share — or a nil element of otherShares — is reported as a validation
-// error naming its position, never dereferenced (see combine).
-func VerifyShare(share *Share, otherShares []*Share) error {
+// error naming its position, never dereferenced (see CombineProtected).
+func VerifyShare(share *ProtectedShare, otherShares []*ProtectedShare) error {
 	if err := share.Validate(); err != nil {
 		return err
 	}

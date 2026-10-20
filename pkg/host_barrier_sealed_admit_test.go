@@ -38,8 +38,8 @@ func sealedAdmitCalls(h *Host, session *Session) []sealedAdmitCall {
 			_, err := h.ProposeWithSession(ctx, session, []byte("cmd"))
 			return err
 		}},
-		{"GetNewSession", func(ctx context.Context) error {
-			_, err := h.GetNewSession(ctx, 1)
+		{"NewSession", func(ctx context.Context) error {
+			_, err := h.NewSession(ctx, 1)
 			return err
 		}},
 		{"RegisterSession", func(ctx context.Context) error {
@@ -104,9 +104,9 @@ func assertSealedAdmitRefusals(t *testing.T, h *Host, barrier *testHostBarrier) 
 		t.Fatalf("StartShard: %v", err)
 	}
 	waitForLeader(t, h, 1)
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession: %v", err)
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	barrier.setSealed(true)

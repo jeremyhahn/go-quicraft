@@ -732,7 +732,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -755,7 +755,7 @@ func (c *testCluster) findFollower(shardID uint64) int {
 		if c.stopped[i].Load() || i == leaderIdx {
 			continue
 		}
-		leaderID, known, err := h.GetLeaderID(shardID)
+		leaderID, known, err := h.LeaderID(shardID)
 		if err != nil || !known || leaderID == 0 {
 			continue
 		}
@@ -775,7 +775,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -843,7 +843,7 @@ func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
-		leaderID, known, err := h.GetLeaderID(shardID)
+		leaderID, known, err := h.LeaderID(shardID)
 		if err == nil && known && leaderID > 0 {
 			return
 		}
@@ -924,14 +924,14 @@ func shardStateDump(cluster *testCluster, shardID uint64) string {
 			continue
 		}
 
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
-			fmt.Fprintf(&b, "  node[%d]: GetShardInfo: %v\n", i, err)
+			fmt.Fprintf(&b, "  node[%d]: ShardInfo: %v\n", i, err)
 			continue
 		}
 
 		logSpan := "unavailable"
-		if lr, err := h.GetLogRange(shardID); err == nil {
+		if lr, err := h.LogRange(shardID); err == nil {
 			logSpan = fmt.Sprintf("[%d,%d]", lr.FirstIndex, lr.LastIndex)
 		}
 
@@ -1365,7 +1365,7 @@ func verifyAllData(
 	}
 }
 
-// waitForMembershipSize polls GetShardMembership until the number of
+// waitForMembershipSize polls ShardMembership until the number of
 // voting nodes matches expectedSize.
 func waitForMembershipSize(
 	t *testing.T,
@@ -1378,7 +1378,7 @@ func waitForMembershipSize(
 	waitForCondition(t, timeout,
 		fmt.Sprintf("membership size=%d", expectedSize),
 		func() bool {
-			m, err := host.GetShardMembership(shardID)
+			m, err := host.ShardMembership(shardID)
 			if err != nil {
 				return false
 			}
@@ -1465,9 +1465,9 @@ func membershipDivergence(
 		if slices.Contains(wantRemoved, uint64(i+1)) {
 			continue
 		}
-		m, err := h.GetShardMembership(shardID)
+		m, err := h.ShardMembership(shardID)
 		if err != nil {
-			fmt.Fprintf(&sb, "\n  node[%d]: GetShardMembership failed: %v", i, err)
+			fmt.Fprintf(&sb, "\n  node[%d]: ShardMembership failed: %v", i, err)
 			continue
 		}
 		var missing, unexpected, notRemoved []uint64
@@ -1934,7 +1934,7 @@ func transferLeadershipTo(t *testing.T, cluster *testCluster, shardID uint64, ta
 		// Give the target an election timeout or two to take over before
 		// asking again.
 		if waitForConditionNoFatal(3*time.Second, func() bool {
-			info, infoErr := cluster.hosts[targetIdx].GetShardInfo(shardID)
+			info, infoErr := cluster.hosts[targetIdx].ShardInfo(shardID)
 			return infoErr == nil && info.IsLeader
 		}) {
 			return

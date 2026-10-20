@@ -859,7 +859,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -881,7 +881,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -940,7 +940,7 @@ func (c *testCluster) logShardState(shardID uint64) {
 		if c.stopped[i].Load() {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			c.t.Logf("node[%d] shard %d: %v", i, shardID, err)
 			continue
@@ -1151,7 +1151,7 @@ type leaderObservation struct {
 // It deliberately does not consult c.stopped: restartNode and addNode replace
 // or extend c.hosts, and a check that skips indices from a stale view of which
 // nodes are up is exactly how a second leader escapes notice. A host that is
-// genuinely down returns an error from GetShardInfo and is observed as down.
+// genuinely down returns an error from ShardInfo and is observed as down.
 func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 	c.hostsMu.RLock()
 	hosts := make([]*quicraft.Host, len(c.hosts))
@@ -1164,7 +1164,7 @@ func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 		if h == nil {
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -1187,7 +1187,7 @@ func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 // state that resolves itself, it is a log-safety violation that has already
 // happened.
 //
-// GetShardInfo returns (LeaderID, Term, IsLeader) as a seqlock-consistent
+// ShardInfo returns (LeaderID, Term, IsLeader) as a seqlock-consistent
 // triple, so a replica can never report leading a term it did not lead; a
 // same-term pair from two replicas is therefore real and not a torn read.
 //
@@ -1263,7 +1263,7 @@ const leaderTimelineCap = 200
 // leaderTimeline is a test cluster's record of leader and term transitions,
 // each stamped with its monotonic offset from the cluster's creation. Two
 // sources feed it: the leader/term guard, which writes every change it sees
-// in a node's GetShardInfo between two of its polls, and the engine's own
+// in a node's ShardInfo between two of its polls, and the engine's own
 // dispatched leader events (OnLeaderUpdated, OnLeaderLost, OnLeaderReady,
 // OnCampaignLaunched), installed on every host's config. The events are the
 // evidence a poll cannot give: ShardInfo.Term is the term of the last

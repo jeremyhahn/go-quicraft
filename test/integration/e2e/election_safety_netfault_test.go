@@ -171,7 +171,7 @@ func termAt(c *testCluster, idx int, shardID uint64) (term uint64, isLeader, ok 
 	c.hostsMu.RLock()
 	h := c.hosts[idx]
 	c.hostsMu.RUnlock()
-	info, err := h.GetShardInfo(shardID)
+	info, err := h.ShardInfo(shardID)
 	if err != nil {
 		return 0, false, false
 	}

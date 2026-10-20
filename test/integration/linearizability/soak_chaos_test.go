@@ -417,11 +417,11 @@ func waitForCatchUp(t *testing.T, cluster *testCluster, shardID uint64, idx, lea
 		if cluster.stopped[idx].Load() || cluster.stopped[leaderIdx].Load() {
 			return false
 		}
-		self, err := cluster.hosts[idx].GetShardInfo(shardID)
+		self, err := cluster.hosts[idx].ShardInfo(shardID)
 		if err != nil {
 			return false
 		}
-		leader, err := cluster.hosts[leaderIdx].GetShardInfo(shardID)
+		leader, err := cluster.hosts[leaderIdx].ShardInfo(shardID)
 		if err != nil {
 			return false
 		}
@@ -486,22 +486,19 @@ func dumpClusterState(t *testing.T, cluster *testCluster, shardID uint64) {
 			t.Logf("  node[%d]: STOPPED", i)
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
-			t.Logf("  node[%d]: GetShardInfo: %v", i, err)
+			t.Logf("  node[%d]: ShardInfo: %v", i, err)
 			continue
 		}
-		term, committed, processed, lastIdx, msgs, state, rerr := h.DiagRaftState(shardID)
-		recovering, saving, inFlight, gerr := h.DiagShardGates(shardID)
-		commitPending, propQ, inbox, pending, perr := h.DiagPipelineState(shardID)
+		rs, rerr := h.DiagRaftState(shardID)
+		gates, gerr := h.DiagShardGates(shardID)
+		pipe, perr := h.DiagPipelineState(shardID)
 		remotes, _ := h.DiagRemotes(shardID)
-		t.Logf("  node[%d] applied=%d leader=%d term=%d isLeader=%v health=%v | raft{term=%d committed=%d processed=%d last=%d msgs=%d state=%s err=%v} "+
-			"gates{recovering=%v saving=%v inflight=%d err=%v} pipe{commitPending=%v propQ=%d inbox=%d pending=%d err=%v} remotes=%s",
+		t.Logf("  node[%d] applied=%d leader=%d term=%d isLeader=%v health=%v | raft%+v err=%v "+
+			"gates%+v err=%v pipe%+v err=%v remotes=%s",
 			i, info.LastApplied, info.LeaderID, info.Term, info.IsLeader, info.Health,
-			term, committed, processed, lastIdx, msgs, state, rerr,
-			recovering, saving, inFlight, gerr,
-			commitPending, propQ, inbox, pending, perr,
-			remotes)
+			rs, rerr, gates, gerr, pipe, perr, remotes.Text)
 	}
 }
 
@@ -704,9 +701,9 @@ func waitForLeaderOrDump(t *testing.T, cluster *testCluster, shardID uint64,
 			t.Logf("  node[%d]: STOPPED", i)
 			continue
 		}
-		info, err := cluster.hosts[i].GetShardInfo(shardID)
+		info, err := cluster.hosts[i].ShardInfo(shardID)
 		if err != nil {
-			t.Logf("  node[%d]: GetShardInfo error: %v", i, err)
+			t.Logf("  node[%d]: ShardInfo error: %v", i, err)
 			continue
 		}
 		t.Logf("  node[%d]: replica=%d term=%d leader=%d isLeader=%v "+

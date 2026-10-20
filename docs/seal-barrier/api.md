@@ -1,6 +1,6 @@
 # Seal and barrier: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal`, `pkg/crypto` ·
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` ·
 > Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
@@ -408,23 +408,6 @@ func BoolPtr(v bool) *bool
 | `AlgAES256GCM` | 0x03 | 32 | 12 | yes, with hardware AES or under FIPS |
 | `AlgChaCha20Poly1305` | 0x04 | 32 | 12 | yes, without hardware AES and outside FIPS mode (absent in a FIPS build) |
 | `AlgXChaCha20Poly1305` | 0x05 | 32 | 24 | never (absent in a FIPS build) |
-
-## `pkg/crypto`: compatibility shim
-
-```go
-type Barrier         = seal.Barrier
-type BarrierConfig   = seal.BarrierConfig
-type Credentials     = seal.Credentials
-type SealedRootKey   = seal.SealedRootKey
-type SealingStrategy = seal.SealingStrategy
-func NewBarrier(config BarrierConfig) (*Barrier, error)   // calls seal.NewBarrier
-func MustNewBarrier(config BarrierConfig) *Barrier        // calls seal.MustNewBarrier
-func NewCredentials(ctx context.Context, secret []byte) (Credentials, error) // calls seal.NewCredentials, consuming secret
-```
-
-Type aliases and forwarding functions only (functions, not `var`s holding
-function values, for the reason given at `NewEpochBarrier`). No cipher code
-lives there. New code should import `pkg/seal`.
 
 ## Versioning and deprecation
 

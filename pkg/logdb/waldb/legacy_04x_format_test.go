@@ -378,12 +378,12 @@ func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 	wantSnap := logdb.Snapshot{
 		Index: 1, Term: 2, Filepath: "snap-1.dat", FileSize: 4096, OnDiskIndex: 1,
 		Membership: logdb.Membership{
-			ConfigChangeID:       7,
-			Addresses:            map[uint64]string{1: "quic://a:1"},
-			SessionExpiryEntries: 100,
-			MaxTotalSessions:     200,
-			MaxSessionsPerClient: 300,
-			MaxSessionsPerOwner:  400,
+			ConfigChangeID:         7,
+			Addresses:              map[uint64]string{1: "quic://a:1"},
+			SessionExpiryEntries:   100,
+			MaxTotalSessions:       200,
+			MaxResponsesPerSession: 300,
+			MaxSessionsPerOwner:    400,
 		},
 	}
 	if err := db.SaveSnapshot(1, 1, wantSnap); err != nil {
@@ -426,7 +426,7 @@ func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 		gotSnap.Membership.Addresses[1] != wantSnap.Membership.Addresses[1] ||
 		gotSnap.Membership.SessionExpiryEntries != wantSnap.Membership.SessionExpiryEntries ||
 		gotSnap.Membership.MaxTotalSessions != wantSnap.Membership.MaxTotalSessions ||
-		gotSnap.Membership.MaxSessionsPerClient != wantSnap.Membership.MaxSessionsPerClient ||
+		gotSnap.Membership.MaxResponsesPerSession != wantSnap.Membership.MaxResponsesPerSession ||
 		gotSnap.Membership.MaxSessionsPerOwner != wantSnap.Membership.MaxSessionsPerOwner {
 		t.Fatalf("snapshot = %+v, want %+v", gotSnap, wantSnap)
 	}

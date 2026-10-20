@@ -770,7 +770,7 @@ type CACertificateParseError = transport.CACertificateParseError
 
 // NotLeaderError is returned when a proposal targets a non-leader node.
 // It carries the current leader's identity so clients can redirect
-// immediately without a separate GetShardInfo() call.
+// immediately without a separate ShardInfo() call.
 type NotLeaderError struct {
 	ShardID       uint64
 	LeaderID      uint64 // 0 if no known leader
@@ -1720,7 +1720,7 @@ func (e *MaybeAppliedError) Unwrap() error { return e.Err }
 //
 // Check this BEFORE acting on Temporary. A blind retry of an unsessioned
 // proposal when this returns true can double-apply the command; use a client
-// session (Host.GetNewSession / SyncProposeWithSession) if the operation is
+// session (Host.NewSession / SyncProposeWithSession) if the operation is
 // not idempotent, and the session layer will deduplicate the retry.
 //
 // A nil error returns false.

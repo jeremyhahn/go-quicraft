@@ -117,7 +117,7 @@ func TestBorrow_RefusedBorrowIsProtectedMemoryError(t *testing.T) {
 }
 
 // TestBorrow_CallbackErrorIsNotWrapped pins that an error produced INSIDE the
-// borrow reaches the caller as itself. Split and combine return typed
+// borrow reaches the caller as itself. SplitBytes and CombineBytes return typed
 // *SplitError and *CombineError values from inside their borrows; wrapping them
 // in a locked-memory failure would misreport a malformed share as a refused
 // lock.

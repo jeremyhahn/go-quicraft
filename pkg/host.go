@@ -110,7 +110,7 @@ const (
 
 // Barrier is the interface for at-rest encryption barriers. This interface
 // is defined in the quicraft package to break the import cycle between
-// quicraft and quicraft/crypto. The crypto.Barrier type satisfies this
+// quicraft and quicraft/seal. The seal.Barrier type satisfies this
 // interface.
 type Barrier interface {
 	// IsSealed returns true if the barrier is in the sealed state.
@@ -1626,7 +1626,7 @@ type nodeState struct {
 	// TRIPLE via leaderAndTerm. They are three independent words, so a caller
 	// that loads them separately can observe a combination that never existed —
 	// updateNodeLeader may land between two of the loads — and report that a
-	// replica led in a term it never led. GetLeaderIDAndTerm and GetShardInfo
+	// replica led in a term it never led. LeaderIDAndTerm and ShardInfo
 	// return exactly that pair/triple to callers who route writes by it.
 	//
 	// This is a seqlock, the same construction Peer uses one level down for the
@@ -2946,27 +2946,6 @@ func (c *hostEngineCallback) OnCampaignLaunched(shardID, replicaID, term uint64)
 		})
 	}
 	c.h.logger.Info("campaign launched",
-		"shard", shardID,
-		"replica", replicaID,
-		"term", term,
-	)
-}
-
-// OnCampaignSkipped is DEAD CODE at runtime: the engine never invokes it,
-// so neither this method nor the EventListener.OnCampaignSkipped callback it
-// forwards to is ever reached in production. The plumbing is kept complete
-// and correct so that a future raft-to-engine notification path has a
-// working destination — see engine.Callback.OnCampaignSkipped for why no
-// such path exists today. Its unit tests exercise it by calling it directly.
-func (c *hostEngineCallback) OnCampaignSkipped(shardID, replicaID, term uint64) {
-	if el := c.h.cfg.EventListener; el != nil && el.OnCampaignSkipped != nil {
-		el.OnCampaignSkipped(config.EventShardInfo{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Term:      term,
-		})
-	}
-	c.h.logger.Info("campaign skipped",
 		"shard", shardID,
 		"replica", replicaID,
 		"term", term,
@@ -5624,7 +5603,7 @@ func (h *Host) StopShard(shardID uint64) error {
 	// activeNodes. Without this, two concurrent StopShard calls (or a StopShard
 	// racing Close) for the same shard both pass the existence check above and
 	// both decrement activeNodes — driving it negative. The counter is later
-	// used as a slice capacity (GetNodeHostInfo, HealthCheck), where a negative
+	// used as a slice capacity (NodeHostInfo, HealthCheck), where a negative
 	// value panics with "makeslice: cap out of range", and the shard would be
 	// double-unloaded and its state machine closed twice (e.g. a Pebble
 	// close-after-close).
@@ -6046,7 +6025,7 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 }
 
 // ProposeWithSession submits a session-managed proposal with at-most-once
-// delivery semantics. The session must have been obtained via GetNewSession
+// delivery semantics. The session must have been obtained via NewSession
 // and must be in the normal proposal state (after registration completes).
 //
 // The caller MUST call session.ProposalCompleted() after receiving a
@@ -6069,7 +6048,7 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 //
 // It returns ErrSessionsUnsupportedOnDisk when the shard's state machine is an
 // sm.DiskStateMachine and the session is session-managed, for the reason given
-// on that error. A NO-OP session (Host.GetNoOPSession) is refused with
+// on that error. A NO-OP session (Host.NoOPSession) is refused with
 // ErrInvalidSession on any shard that gets as far as session validation (a
 // closed or draining host, an unknown shard and a witness shard fail earlier
 // with their own errors): it carries no session state, so a caller holding
@@ -6830,7 +6809,7 @@ func rejectSessionsOnDisk(ns *nodeState) error {
 	return ErrSessionsUnsupportedOnDisk
 }
 
-// GetNewSession creates a new client session for at-most-once proposal
+// NewSession creates a new client session for at-most-once proposal
 // semantics. The session registration is proposed through Raft consensus
 // so all replicas register the session. Blocks until the registration
 // is committed and applied, or ctx is cancelled.
@@ -6842,16 +6821,16 @@ func rejectSessionsOnDisk(ns *nodeState) error {
 // those shards and make the operations idempotent.
 //
 // The session declares no owner, so it is exempt from the shard's per-owner
-// session cap. Use GetNewSessionWithOwner to declare one.
-func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error) {
-	return h.GetNewSessionWithOwner(ctx, shardID, 0)
+// session cap. Use NewSessionWithOwner to declare one.
+func (h *Host) NewSession(ctx context.Context, shardID uint64) (*Session, error) {
+	return h.NewSessionWithOwner(ctx, shardID, 0)
 }
 
-// GetNewSessionWithOwner creates a new client session that declares ownerID as
+// NewSessionWithOwner creates a new client session that declares ownerID as
 // the principal holding it, so it counts against — and is limited by — the
 // shard's replicated per-owner session cap
 // (config.Config.MaxSessionsPerOwner). It is otherwise identical to
-// GetNewSession, including the generated client ID.
+// NewSession, including the generated client ID.
 //
 // Registration fails with a *SessionError wrapping ErrInvalidOperation when the
 // owner is already at the cap, which is the same failure a shard-wide
@@ -6860,10 +6839,10 @@ func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, err
 // call observes. It is a REPLICATED refusal — every replica reaches it from the
 // log alone — not a leader-local admission decision.
 //
-// An ownerID of zero declares no owner and is exactly GetNewSession. See
+// An ownerID of zero declares no owner and is exactly NewSession. See
 // NewSessionWithOwner for what belongs in this value and why the cap is only as
 // trustworthy as the embedder's own authentication.
-func (h *Host) GetNewSessionWithOwner(
+func (h *Host) NewSessionWithOwner(
 	ctx context.Context, shardID, ownerID uint64,
 ) (*Session, error) {
 	if h.closed.Load() {
@@ -6926,7 +6905,7 @@ const clientIDRerollLimit = 8
 // session, and the failure is silent in both directions: the registration entry
 // fails Entry.IsNewSessionRequest, so the state machine skips it entirely and
 // returns an empty result, and the caller's own check is
-// `result.Value != clientID`, which 0 != 0 satisfies. GetNewSession therefore
+// `result.Value != clientID`, which 0 != 0 satisfies. NewSession therefore
 // returned SUCCESS and handed back a session whose every later proposal is
 // unsessioned — at-most-once delivery silently off for that client, which is
 // the one guarantee the API exists to provide. RegisterSession already rejects
@@ -6956,7 +6935,7 @@ var ErrEntropyDegenerate = errors.New(
 	"quicraft: the system random source returned a degenerate value repeatedly")
 
 // RegisterSession registers the given session through Raft consensus,
-// preserving its existing client ID. Unlike GetNewSession, which generates
+// preserving its existing client ID. Unlike NewSession, which generates
 // a new random client ID, RegisterSession uses the client ID already set
 // on the provided session. This is used by adapters that create sessions
 // with caller-specified client IDs (e.g., the dragonboat compatibility
@@ -7064,7 +7043,7 @@ func (h *Host) CloseSession(ctx context.Context, shardID uint64, session *Sessio
 // and return a RequestState the caller can wait on.
 func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Session) (*RequestState, error) {
 	// Same already-cancelled guard as Propose. Without it a
-	// cancelled GetNewSession/RegisterSession/CloseSession still appends its
+	// cancelled NewSession/RegisterSession/CloseSession still appends its
 	// session entry: a session the caller discarded gets registered, a retry
 	// fails as a duplicate, or a session the caller believes is live is
 	// unregistered — all while the caller was told ErrCanceled.
@@ -7114,7 +7093,7 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 	return h.proposeEntry(ctx, ns, session.ShardID(), entry, nil)
 }
 
-// GetNoOPSession returns a no-op session for proposals that do not require
+// NoOPSession returns a no-op session for proposals that do not require
 // at-most-once semantics. The no-op session has a fixed clientID of 0 and
 // carries no session state. Use for idempotent operations only.
 //
@@ -7124,7 +7103,7 @@ func (h *Host) proposeSession(ctx context.Context, ns *nodeState, session *Sessi
 // and route it to the sessionless path themselves. On a shard backed by an sm.DiskStateMachine
 // that sessionless path is the only way to propose: every session-managed entry
 // point returns ErrSessionsUnsupportedOnDisk there.
-func (h *Host) GetNoOPSession(shardID uint64) *Session {
+func (h *Host) NoOPSession(shardID uint64) *Session {
 	return NewNoOPSession(shardID)
 }
 
@@ -7166,11 +7145,11 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 	return h.getMembershipFromPeer(shardID)
 }
 
-// GetShardMembership returns the current membership of a shard from local
+// ShardMembership returns the current membership of a shard from local
 // in-memory state. The result may be stale if a config change has been
 // committed but not yet observed by this host. For a linearizable view,
 // use SyncGetShardMembership.
-func (h *Host) GetShardMembership(shardID uint64) (*Membership, error) {
+func (h *Host) ShardMembership(shardID uint64) (*Membership, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -7204,10 +7183,10 @@ func (h *Host) getMembershipFromPeer(shardID uint64) (*Membership, error) {
 // "disabled" rather than an absent policy.
 func configSessionPolicy(cfg config.Config) proto.SessionPolicy {
 	return proto.SessionPolicy{
-		ExpiryEntries:        cfg.SessionExpiryEntries,
-		MaxTotalSessions:     cfg.MaxTotalSessions,
-		MaxSessionsPerClient: cfg.MaxSessionsPerClient,
-		MaxSessionsPerOwner:  cfg.MaxSessionsPerOwner,
+		ExpiryEntries:          cfg.SessionExpiryEntries,
+		MaxTotalSessions:       cfg.MaxTotalSessions,
+		MaxResponsesPerSession: cfg.MaxResponsesPerSession,
+		MaxSessionsPerOwner:    cfg.MaxSessionsPerOwner,
 	}
 }
 
@@ -7222,7 +7201,7 @@ func protoMembershipToPublic(pm *proto.Membership) *Membership {
 		RequireFullReplicaMajority: pm.RequireFullReplicaMajority,
 		SessionExpiryEntries:       pm.SessionExpiryEntries,
 		MaxTotalSessions:           pm.MaxTotalSessions,
-		MaxSessionsPerClient:       pm.MaxSessionsPerClient,
+		MaxResponsesPerSession:     pm.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        pm.MaxSessionsPerOwner,
 		Nodes:                      make(map[uint64]string, len(pm.Addresses)),
 		Observers:                  make(map[uint64]string, len(pm.Observers)),
@@ -7252,8 +7231,8 @@ func protoMembershipToPublic(pm *proto.Membership) *Membership {
 	return m
 }
 
-// GetShardInfo returns a point-in-time snapshot of the shard's status.
-func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error) {
+// ShardInfo returns a point-in-time snapshot of the shard's status.
+func (h *Host) ShardInfo(shardID uint64) (*ShardInfo, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -7266,10 +7245,10 @@ func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error) {
 	return h.buildShardInfo(ns), nil
 }
 
-// GetLeaderID returns the current leader's replicaID for the given shard
+// LeaderID returns the current leader's replicaID for the given shard
 // and whether a leader is known. The result is from local in-memory state
 // and may be stale.
-func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error) {
+func (h *Host) LeaderID(shardID uint64) (uint64, bool, error) {
 	if h.closed.Load() {
 		return 0, false, ErrClosed
 	}
@@ -7283,14 +7262,14 @@ func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error) {
 	return leaderID, leaderID != 0, nil
 }
 
-// GetLeaderIDAndTerm returns the current leader's replicaID, the current term,
+// LeaderIDAndTerm returns the current leader's replicaID, the current term,
 // whether a leader is known, and any error for the given shard. The pair is
 // read through the nodeState's seqlock, so it is a combination that actually
-// held — unlike calling GetLeaderID and GetShardInfo separately, where an
+// held — unlike calling LeaderID and ShardInfo separately, where an
 // intervening leader update can produce a (leader, term) pair that never
 // existed. Both values are still local in-memory state and may be STALE: this
 // eliminates torn pairs, not staleness.
-func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error) {
+func (h *Host) LeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error) {
 	if h.closed.Load() {
 		return 0, 0, false, ErrClosed
 	}
@@ -7314,7 +7293,7 @@ func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error) 
 // It answers from the state the OnLeaderReady and OnLeaderUpdated events
 // delivered, so a caller that installs the listeners and then queries cannot
 // miss an edge: if the query says not ready, the OnLeaderReady that changes
-// that is still to come. Like GetLeaderIDAndTerm it may be STALE — the
+// that is still to come. Like LeaderIDAndTerm it may be STALE — the
 // leader can have lost the term already, which the next OnLeaderUpdated
 // reports and which a ReadIndex then answers with its own error.
 //
@@ -8299,7 +8278,7 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
-		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {
@@ -9586,8 +9565,8 @@ func clampNonNegative(n int64) int {
 	return int(n)
 }
 
-// GetNodeHostInfo returns a snapshot of the host's state for monitoring.
-func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
+// NodeHostInfo returns a snapshot of the host's state for monitoring.
+func (h *Host) NodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 	info := &NodeHostInfo{
 		RaftAddress: h.cfg.RaftAddress,
 	}
@@ -9596,9 +9575,9 @@ func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
-			h.logger.Error("GetNodeHostInfo: nodes map value type assertion failed",
+			h.logger.Error("NodeHostInfo: nodes map value type assertion failed",
 				"error", &TypeAssertionError{
-					Context:      "GetNodeHostInfo nodes range",
+					Context:      "NodeHostInfo nodes range",
 					ExpectedType: "*nodeState",
 					ActualValue:  value,
 				})
@@ -9621,10 +9600,10 @@ func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 // DiagPipelineState returns diagnostic pipeline state for the given shard.
 // Used for debugging pipeline stalls. The snapshot gates that can also stall
 // a shard are reported by DiagShardGates.
-func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQLen int, inboxLen int, pendingProposals int, err error) {
+func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error) {
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
-		return false, 0, 0, 0, ErrShardNotReady
+		return PipelineDiag{}, ErrShardNotReady
 	}
 	d := engNode.DiagState() // readIndexQLen not exposed in DiagPipelineState
 	v, exists := h.nodes.Load(shardID)
@@ -9646,48 +9625,57 @@ func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQL
 			})
 		}
 	}
-	return d.CommitPending, d.ProposalQLen, d.InboxLen, pp, nil
+	return PipelineDiag{
+		CommitPending:    d.CommitPending,
+		ProposalQueueLen: d.ProposalQLen,
+		InboxLen:         d.InboxLen,
+		PendingProposals: pp,
+	}, nil
 }
 
 // DiagShardGates reports the snapshot gates that suspend a shard's state
 // machine work, together with the number of apply closures still in flight.
 //
-// While recovering is true the shard's state machine is being replaced by a
-// received snapshot: it applies nothing and extracts no committed entries,
-// though it keeps voting and replicating. While saving is true a snapshot
-// capture has quiesced applies. applyInFlight is the drain counter both
-// gates wait on before touching the state machine; a non-zero value with a
-// gate up means the drain has not completed yet.
-//
-// Both states are also surfaced through ShardInfo.Health as ShardRecovering
-// and ShardSnapshotting.
-func (h *Host) DiagShardGates(shardID uint64) (recovering, saving bool, applyInFlight int64, err error) {
+// See ShardGatesDiag for what each gate means. Both states are also surfaced
+// through ShardInfo.Health as ShardRecovering and ShardSnapshotting.
+func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error) {
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
-		return false, false, 0, ErrShardNotReady
+		return ShardGatesDiag{}, ErrShardNotReady
 	}
 	d := engNode.DiagState()
-	return d.Recovering, d.Saving, d.ApplyInFlight, nil
+	return ShardGatesDiag{
+		Recovering:    d.Recovering,
+		Saving:        d.Saving,
+		ApplyInFlight: d.ApplyInFlight,
+	}, nil
 }
 
 // DiagRaftState returns diagnostic raft state for the given shard.
 // Used for debugging pipeline stalls.
-func (h *Host) DiagRaftState(shardID uint64) (term, committed, processed, lastIdx uint64, msgs int, state string, err error) {
+func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error) {
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
-		return 0, 0, 0, 0, 0, "", ErrShardNotReady
+		return RaftStateDiag{}, ErrShardNotReady
 	}
 	t, c, p, li, m, s := engNode.DiagRaftState()
-	return t, c, p, li, m, s, nil
+	return RaftStateDiag{
+		Term:            t,
+		Committed:       c,
+		Processed:       p,
+		LastIndex:       li,
+		PendingMessages: m,
+		State:           s,
+	}, nil
 }
 
 // DiagRemotes returns diagnostic remote state for debugging commit stalls.
-func (h *Host) DiagRemotes(shardID uint64) (string, error) {
+func (h *Host) DiagRemotes(shardID uint64) (RemotesDiag, error) {
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
-		return "", ErrShardNotReady
+		return RemotesDiag{}, ErrShardNotReady
 	}
-	return engNode.DiagRemotes(), nil
+	return RemotesDiag{Text: engNode.DiagRemotes()}, nil
 }
 
 // Close shuts down the host, stopping all shards and releasing resources.
@@ -10738,12 +10726,12 @@ func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64
 	return awaitConfigChange(ctx, rs, err)
 }
 
-// SyncRequestDeleteNode removes a replica from the shard's membership and
+// SyncRequestRemoveNode removes a replica from the shard's membership and
 // blocks until the membership change is committed. This is a convenience
 // wrapper around RequestRemoveNode for callers that prefer a synchronous API.
 //
 // The context must carry a deadline or timeout to bound the wait.
-func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error {
+func (h *Host) SyncRequestRemoveNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error {
 	rs, err := h.RequestRemoveNode(ctx, shardID, replicaID, configChangeIndex)
 	return awaitConfigChange(ctx, rs, err)
 }
@@ -11084,10 +11072,10 @@ func (h *Host) HasNodeInfo(shardID, replicaID uint64) bool {
 	return false
 }
 
-// GetLogReader returns a read-only view of the Raft log for the given
+// LogReader returns a read-only view of the Raft log for the given
 // shard. The returned ReadonlyLogReader provides access to log range
 // and node state without permitting mutations.
-func (h *Host) GetLogReader(shardID uint64) (ReadonlyLogReader, error) {
+func (h *Host) LogReader(shardID uint64) (ReadonlyLogReader, error) {
 	if h.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -11152,11 +11140,11 @@ func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint
 	return result, nil
 }
 
-// GetLogRange returns the available log index range for the given shard.
+// LogRange returns the available log index range for the given shard.
 // The returned LogRange contains the first and last available entry indices
 // (both inclusive). Returns ErrClosed if the host is closed, or
 // ErrShardNotFound if the shard does not exist on this host.
-func (h *Host) GetLogRange(shardID uint64) (LogRange, error) {
+func (h *Host) LogRange(shardID uint64) (LogRange, error) {
 	if h.closed.Load() {
 		return LogRange{}, ErrClosed
 	}
@@ -11499,7 +11487,7 @@ func (h *Host) shardIsObserver(ns *nodeState) bool {
 // not run yet.
 //
 // It reads the snapshot the step worker publishes rather than the Peer, so it
-// takes no raft lock: GetShardInfo is an operator call and must not be able to
+// takes no raft lock: ShardInfo is an operator call and must not be able to
 // queue behind a SaveState.
 func (h *Host) replicaProgress(shardID uint64) []ReplicaProgress {
 	engNode := h.engine.GetNode(shardID)
@@ -12051,7 +12039,7 @@ func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
-		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {

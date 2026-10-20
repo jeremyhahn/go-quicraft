@@ -61,7 +61,7 @@ before reading a field.
 | 17 | 8 | `RequireFullReplicaMajority` (bool as uint64) |
 | 25 | 8 | `SessionExpiryEntries` |
 | 33 | 8 | `MaxTotalSessions` |
-| 41 | 8 | `MaxSessionsPerClient` |
+| 41 | 8 | `MaxResponsesPerSession` |
 | 49 | 8 | `MaxSessionsPerOwner` |
 | 57 | var | `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities`, `RemovedIdentities` maps |
 
@@ -98,7 +98,7 @@ offset and growing the fixed region would move every map.
 | 9 | 8 | `MaxWitnesses` |
 | 17 | 1 | policy flags (`RequireFullReplicaMajority`) |
 | 18 | var | `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities` maps |
-| — | 32 | session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`, `MaxSessionsPerOwner` |
+| — | 32 | session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession`, `MaxSessionsPerOwner` |
 | — | var | `RemovedIdentities` map |
 
 Its fixed region is 18 bytes (`membershipFixedSize` in `waldb`) and an empty
@@ -285,7 +285,7 @@ expires sessions at log indexes its peers do not.
 
 When the committed membership carries no session policy (`SessionPolicy.IsSet`
 is false), each replica applies its own `Config`. `SessionExpiryEntries`,
-`MaxTotalSessions`, `MaxSessionsPerClient` and `MaxSessionsPerOwner` must then
+`MaxTotalSessions`, `MaxResponsesPerSession` and `MaxSessionsPerOwner` must then
 be identical on every replica; nothing enforces it, and disagreement diverges the state machine
 silently.
 

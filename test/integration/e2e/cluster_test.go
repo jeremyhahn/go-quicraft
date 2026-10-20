@@ -61,7 +61,7 @@ func TestE2E_ThreeNodeCluster_AllNodesAgreeOnLeader(t *testing.T) {
 			if cluster.stopped[i].Load() {
 				continue
 			}
-			info, err := h.GetShardInfo(1)
+			info, err := h.ShardInfo(1)
 			if err != nil || info.LeaderID == 0 {
 				return false
 			}
@@ -154,7 +154,7 @@ func TestE2E_FiveNodeCluster_AllNodesAgreeOnLeader(t *testing.T) {
 			if cluster.stopped[i].Load() {
 				continue
 			}
-			info, err := h.GetShardInfo(1)
+			info, err := h.ShardInfo(1)
 			if err != nil || info.LeaderID == 0 {
 				return false
 			}

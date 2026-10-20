@@ -89,12 +89,12 @@ see [`architecture.md`](architecture.md).
 ### Capability: inspect consensus state
 
 ```go
-func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
-func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
+func (h *Host) LeaderID(shardID uint64) (uint64, bool, error)
+func (h *Host) LeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
 func (h *Host) ShardReadReady(shardID uint64) (leaderID, term uint64, ready bool, err error)
-func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
-func (h *Host) GetLogRange(shardID uint64) (LogRange, error)
-func (h *Host) GetLogReader(shardID uint64) (ReadonlyLogReader, error)
+func (h *Host) ShardInfo(shardID uint64) (*ShardInfo, error)
+func (h *Host) LogRange(shardID uint64) (LogRange, error)
+func (h *Host) LogReader(shardID uint64) (ReadonlyLogReader, error)
 func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint64, lastIndex uint64, maxSize uint64) ([]proto.Entry, error)
 func (h *Host) StateMachineHash(shardID uint64) (hash uint64, appliedIndex uint64, ok bool, err error)
 func (h *Host) HealthCheck() *HealthStatus
@@ -104,7 +104,7 @@ func (h *Host) IsShardJoining(shardID uint64) bool
 `StateMachineHash` returns `ok == false` when the state machine does not
 implement `sm.Hasher`.
 
-`GetShardInfo` returns a `*ShardInfo`. On the leader its `Replicas` field
+`ShardInfo` returns a `*ShardInfo`. On the leader its `Replicas` field
 (`[]ReplicaProgress`) is the leader's progress view of every remote member it
 tracks: voters, observers (learners) and witnesses, each with a `Role`
 (`ReplicaRoleVoter`, `ReplicaRoleObserver` or `ReplicaRoleWitness`), `Match`,
@@ -120,14 +120,14 @@ synchronous form of `OnLeaderReady` below. It is never ahead of the event.
 ### Capability: diagnostics
 
 ```go
-func (h *Host) DiagRaftState(shardID uint64) (term, committed, processed, lastIdx uint64, msgs int, state string, err error)
-func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQLen int, inboxLen int, pendingProposals int, err error)
-func (h *Host) DiagShardGates(shardID uint64) (recovering, saving bool, applyInFlight int64, err error)
-func (h *Host) DiagRemotes(shardID uint64) (string, error)
+func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error)
+func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error)
+func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error)
+func (h *Host) DiagRemotes(shardID uint64) (RemotesDiag, error)
 ```
 
-For incident response, not monitoring; their signatures are diagnostic and may
-change.
+For incident response, not monitoring. The struct fields are listed in
+[`../multi-group-host/api.md`](../multi-group-host/api.md#diagnostics).
 
 ### Capability: transfer leadership
 
@@ -202,8 +202,8 @@ re-elected at a higher term, which `OnLeaderLost` misses), `OnShardFailed` and
 unload end it. Witnesses never receive it. The contract in full is in
 [`../multi-group-host/api.md`](../multi-group-host/api.md#event-listener).
 
-`OnCampaignSkipped` is declared but never fires; detect a leaderless shard with
-`GetLeaderID` or `ShardInfo.Health`.
+No event reports a refused election; detect a leaderless shard with
+`LeaderID` or `ShardInfo.Health`.
 
 Payload types: `LeaderInfo`, `ShardFailedInfo`, `SnapshotInfo`,
 `ConnectionInfo`, `DiskInfo`, `EventShardInfo`. `ShardFailedInfo.Err` is a

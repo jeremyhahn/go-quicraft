@@ -187,7 +187,7 @@ func TestNewHost_KernelAssignedPortIsAdvertised(t *testing.T) {
 	if got := h.transport.AdvertisedAddr(); got != addr {
 		t.Fatalf("transport advertises %q, host reports %q", got, addr)
 	}
-	if got := h.GetNodeHostInfo(NodeHostInfoOption{}).RaftAddress; got != addr {
+	if got := h.NodeHostInfo(NodeHostInfoOption{}).RaftAddress; got != addr {
 		t.Fatalf("NodeHostInfo.RaftAddress = %q, want %q", got, addr)
 	}
 }

@@ -320,7 +320,7 @@ func lockedBytes(n int) int {
 // go-enclave's Allocator is the mechanism for that, and it belongs to whoever
 // owns the process's locked-memory policy, not to this primitive. This package
 // only accepts one: SplitProtectedWith, CombineProtectedWith,
-// NewProtectedShareWith, UnmarshalShareSetWith and Share.ProtectWith charge
+// NewProtectedShareWith, and UnmarshalShareSetWith charge
 // every locked allocation they make to the allocator they are handed, so the
 // caller's budget covers share material too.
 //
@@ -382,20 +382,22 @@ func splitLockedBytes(secretLen, threshold, total int) int {
 // ProtectedShare is a Shamir share whose VALUE lives in memory-protected
 // storage instead of a Go string.
 //
-// It is the protected-memory counterpart of Share and carries the same wire
-// shape: the value is the base64 encoding of [version:1][x:1][y...], the JSON
-// encoding is byte-for-byte what Share produces, and the same warnings apply —
-// shares carry no digest of the secret, and Threshold and Total are
-// unauthenticated caller-supplied metadata (see Share).
+// The value is the base64 encoding of [version:1][x:1][y...], exactly a value
+// SplitBytes returns, and its JSON shape is {"index","threshold","total",
+// "value","metadata"}. Shares carry NO digest of the secret: an embedded
+// sha256(secret) would be an offline brute-force ORACLE — a single shareholder
+// could confirm guessed secrets without reaching the threshold, defeating
+// Shamir's information-theoretic secrecy for low-entropy secrets. Threshold and
+// Total are unauthenticated caller-supplied metadata. Integrity is therefore
+// the caller's, established out-of-band (see CombineProtected).
 //
-// The difference is lifetime. Share.Value is an immutable Go string: it cannot
-// be zeroed, so every share stays readable in the heap until the GC reclaims
-// it, and a ceremony holding all N shares is the point of widest exposure in
-// the whole scheme. A ProtectedShare's value is held in an
-// enclave.ByteAccess — mlock'd (excluded from swap), guard-paged,
-// canary-checked, and genuinely WIPED by Destroy — so share material can be
-// released the moment a custodian is done with it rather than waiting on the
-// collector.
+// A Go string is immortal: it cannot be zeroed, so a share held in one stays
+// readable in the heap until the GC reclaims it, and a ceremony holding all N
+// shares is the point of widest exposure in the whole scheme. A
+// ProtectedShare's value is held in an enclave.ByteAccess — mlock'd (excluded
+// from swap), guard-paged, canary-checked, and genuinely WIPED by Destroy — so
+// share material can be released the moment a custodian is done with it rather
+// than waiting on the collector.
 //
 // Two consequences the caller owns:
 //
@@ -408,8 +410,7 @@ func splitLockedBytes(secretLen, threshold, total int) int {
 //     of the ceremony.
 //
 // Index, Threshold, Total and Metadata stay exported: they are non-secret
-// metadata, they mirror Share field-for-field so migrating a caller is a move
-// rather than a rewrite, and none of them is what this type exists to protect.
+// metadata, and none of them is what this type exists to protect.
 // The value is unexported precisely because it IS: routing it through
 // NewProtectedShare and WithValue is what makes "share material never becomes a
 // string" an invariant of the type rather than a convention.
@@ -418,7 +419,7 @@ type ProtectedShare struct {
 	// embedded in the value.
 	Index int
 	// Threshold is the M of the M-of-N scheme. It is UNAUTHENTICATED
-	// caller-supplied metadata, exactly as on Share: CombineProtected takes
+	// caller-supplied metadata: CombineProtected takes
 	// the threshold from shares[0], so a relabelled share set reconstructs
 	// garbage rather than returning an error.
 	Threshold int
@@ -429,14 +430,14 @@ type ProtectedShare struct {
 	Metadata map[string]string
 
 	// value is the base64-encoded [version][x][y...] payload — exactly the
-	// bytes of Share.Value — in an mlock'd, guard-paged buffer.
+	// bytes of a SplitBytes value — in an mlock'd, guard-paged buffer.
 	value enclave.ByteAccess
 }
 
 // NewProtectedShare builds a share whose value is copied into protected memory.
 //
 // value is the base64-encoded [version:1][x:1][y...] payload, i.e. exactly the
-// bytes SplitBytes returns and exactly the bytes of Share.Value. It is WIPED:
+// bytes SplitBytes returns. It is WIPED:
 // ownership of the share material transfers to the returned share, which is
 // the point — a custody caller can carry share bytes in a wipeable buffer from
 // the moment they exist to the moment they enter protected memory, with no
@@ -510,7 +511,7 @@ func newProtectedShare(a enclave.Allocator, index, threshold, total int, value [
 	// Bound the value BEFORE it is allocated, not after it is decoded.
 	//
 	// On the string path an oversized share costs an ordinary heap allocation
-	// and parseRawShare rejects it during combine. Here the allocation is
+	// and parseRawShare rejects it during CombineProtected. Here the allocation is
 	// mlock'd memory: a finite PROCESS-WIDE resource (RLIMIT_MEMLOCK), so what
 	// one caller takes is denied to every other, and the next to reach the
 	// ceiling is refused with ErrLockedMemoryUnavailable. UnmarshalJSON constructs from
@@ -550,10 +551,9 @@ func newProtectedShare(a enclave.Allocator, index, threshold, total int, value [
 // SplitProtected divides a secret into N shares, any M of which reconstruct it,
 // with every share value held in protected memory.
 //
-// It is the protected-memory counterpart of Split and produces identical
-// shares; only the custody of the value differs. Use it instead of Split
-// wherever the shares are held rather than immediately handed off — Split's
-// values are immortal Go strings.
+// It produces the same share values as SplitBytes; only the custody of the
+// value differs. Use it wherever the shares are held rather than immediately
+// handed off.
 //
 // Generation is protected-NATIVE. The random polynomial coefficients, the
 // per-share coefficient vector, the raw [version][x][y...] payload and each
@@ -755,10 +755,10 @@ func evalProtectedShares(a enclave.Allocator, secret []byte, threshold, total in
 // CombineProtected reconstructs the secret from M-or-more protected shares and
 // returns it in protected memory. The caller MUST Destroy the returned enclave.
 //
-// Like Combine it performs NO integrity check and is NOT self-verifying: with
+// Like CombineBytes it performs NO integrity check and is NOT self-verifying: with
 // fewer-than-threshold genuine shares, or a corrupted or mismatched share,
 // reconstruction yields indistinguishable garbage rather than an error, and
-// the caller must authenticate the result out-of-band (see Combine).
+// the caller must authenticate the result out-of-band (see CombineBytes).
 //
 // Reconstruction is protected-NATIVE. Each share value is read IN PLACE out of
 // its own locked buffer and base64-decoded into another locked buffer; the
@@ -829,7 +829,7 @@ func combineProtected(a enclave.Allocator, shares []*ProtectedShare) (enclave.By
 	if len(shares) == 0 {
 		return nil, &CombineError{Reason: "no shares provided"}
 	}
-	// Same bound, applied for the same reason, as combine: the x-coordinate is
+	// Same bound, applied for the same reason, as CombineBytes: the x-coordinate is
 	// a non-zero byte, so no set larger than maxShares can hold distinct
 	// shares, and rejecting up front bounds the work an unauthenticated
 	// submission can force — here that work is locked-memory allocation, which
@@ -844,11 +844,11 @@ func combineProtected(a enclave.Allocator, shares []*ProtectedShare) (enclave.By
 		}
 	}
 
-	// The metadata checks below restate combine's, because they are checks on
+	// The metadata checks below are CombineProtected's own, because they are checks on
 	// this type's fields. The rules that actually decide what reconstructs —
 	// the wire format and the duplicate/zero x-coordinate and payload-length
 	// rules — are NOT restated: this path runs parseRawShare, the single copy
-	// shared with combine and CombineBytes, so the string and protected paths
+	// shared with CombineBytes, so the byte and protected paths
 	// cannot diverge on which share sets they accept.
 	threshold := shares[0].Threshold
 	total := shares[0].Total
@@ -1039,8 +1039,8 @@ func (s *ProtectedShare) Destroy() {
 
 // Validate checks that the share has valid parameters and still holds a value.
 // It is safe to call on a nil receiver: a nil share is a validation failure,
-// not a panic (see Share.Validate — custody layers decode operator input, and
-// a JSON null decodes to a nil *ProtectedShare).
+// not a panic: custody layers decode operator input, and a JSON null decodes
+// to a nil *ProtectedShare.
 func (s *ProtectedShare) Validate() error {
 	if s == nil {
 		return &ValidationError{Field: "share", Reason: "share is nil"}
@@ -1070,7 +1070,7 @@ func (s *ProtectedShare) Validate() error {
 }
 
 // String returns a string representation of the share. The share value is
-// NEVER included, for the reason it is never included in Share.String: this is
+// NEVER included: this is
 // what reaches logs and %v/%s formatting, and even a prefix would leak share
 // bytes.
 func (s *ProtectedShare) String() string {
@@ -1090,11 +1090,10 @@ func (s *ProtectedShare) LogValue() slog.Value {
 	return slog.StringValue(s.String())
 }
 
-// MarshalJSON implements json.Marshaler, producing byte-for-byte the JSON that
-// Share produces for the same share, so a ProtectedShare can be persisted or
-// distributed anywhere a Share was.
+// MarshalJSON implements json.Marshaler, producing the
+// {"index","threshold","total","value","metadata"} JSON shape.
 //
-// Like Share.MarshalJSON it is NOT redacted, and must not be: this is the
+// It is NOT redacted, and must not be: this is the
 // SERIALIZATION path, and a custody layer that persists or distributes shares
 // as JSON needs the real value back. Redaction belongs to String and LogValue.
 //
@@ -1165,8 +1164,8 @@ func (s *ProtectedShare) MarshalJSON() ([]byte, error) {
 	return out, nil
 }
 
-// UnmarshalJSON implements json.Unmarshaler for the JSON shape Share and
-// ProtectedShare both produce.
+// UnmarshalJSON implements json.Unmarshaler for the JSON shape MarshalJSON
+// produces.
 //
 // A share decoded this way holds protected memory and MUST be Destroyed like
 // any other; decoding is a construction. Note that the caller's own JSON input
@@ -1303,7 +1302,7 @@ func elementLockedBytes(elem json.RawMessage) int {
 }
 
 // UnmarshalShareSet decodes a JSON array of shares — the shape json.Marshal
-// produces for a []*Share or a []*ProtectedShare — bounding the set BEFORE it
+// produces for a []*ProtectedShare — bounding the set BEFORE it
 // allocates any locked memory for it.
 //
 // This is the ingestion path for shares arriving from outside the process, and
@@ -1445,69 +1444,11 @@ func unmarshalShareSet(a enclave.Allocator, data []byte) ([]*ProtectedShare, err
 	return shares, nil
 }
 
-// Protect moves a plain Share's value into protected memory, returning the
-// ProtectedShare equivalent. It is the migration path for callers that already
-// hold Shares — from Split, or decoded from JSON.
-//
-// It bounds FURTHER exposure; it cannot undo what has happened. The Share's
-// value is a Go string and stays readable in the heap until the GC reclaims
-// it, whichever copies were made of it along the way. A caller that can choose
-// where the share material is born should call SplitProtected instead and
-// never create the string.
-//
-// The value's locked memory is UNBUDGETED: it is charged to no
-// [enclave.Allocator]. A caller that bounds its locked memory with one uses
-// ProtectWith.
-func (s *Share) Protect() (*ProtectedShare, error) {
-	return s.protect(nil)
-}
-
-// ProtectWith is Protect with the value's locked memory admitted against a, so a
-// consumer's locked-memory budget covers the migrated share.
-//
-// Its contract is Protect's, with one addition. When admitting the value would
-// exceed a's budget it returns a *ProtectedMemoryError matching
-// [enclave.ErrBudgetExhausted] under errors.Is, and nothing stays allocated.
-// The Share is never modified — its value is a string, and the one copy this
-// makes of it is wiped on every path — so a refused call can be retried against
-// a larger budget. Shares built earlier, from a or anywhere else, are
-// untouched.
-//
-// A nil a is refused with [enclave.ErrNilAllocator] before s is read, rather
-// than falling back to the unbudgeted path. Libraries obtain a from
-// [enclave.ProcessAllocator].
-func (s *Share) ProtectWith(a enclave.Allocator) (*ProtectedShare, error) {
-	if a == nil {
-		return nil, enclave.ErrNilAllocator
-	}
-	return s.protect(a)
-}
-
-// protect is the one implementation behind Protect and ProtectWith; a nil a
-// selects the unbudgeted constructor (see lockValue).
-func (s *Share) protect(a enclave.Allocator) (*ProtectedShare, error) {
-	if err := s.Validate(); err != nil {
-		return nil, err
-	}
-	// The conversion copies; newProtectedShare wipes that copy into the
-	// enclave. The string itself is the one copy nothing can take away.
-	value := []byte(s.Value)
-	protected, err := newProtectedShare(a, s.Index, s.Threshold, s.Total, value)
-	if err != nil {
-		wipe(value)
-		return nil, err
-	}
-	for k, v := range s.Metadata {
-		protected.Metadata[k] = v
-	}
-	return protected, nil
-}
-
 // validateShareHeader checks the non-secret, unauthenticated metadata every
-// share carries. It is the single copy of those rules, shared by
-// Share.Validate and ProtectedShare.Validate so the deprecated string path and
-// the protected path cannot drift into accepting different share sets — the
-// same reason parseRawShare is the single copy of the wire-format rules.
+// share carries. It is the single copy of those rules, used by
+// ProtectedShare.Validate and the share constructor so the two cannot drift into
+// accepting different share sets — the same reason parseRawShare is the single
+// copy of the wire-format rules.
 func validateShareHeader(index, threshold, total int) error {
 	if index < 1 {
 		return &ValidationError{Field: "index", Reason: fmt.Sprintf("must be >= 1, got %d", index)}
@@ -1536,12 +1477,12 @@ func validateShareHeader(index, threshold, total int) error {
 // exists to avoid, and the grammar is decidable from the encoded form alone.
 //
 // The grammar checked is exactly the one base64.StdEncoding.Decode accepts, so
-// a value that passes here is a value the combine path can decode. That
+// a value that passes here is a value the combine paths can decode. That
 // includes non-canonical trailing bits in the final quantum (the low bits
 // dropped by the padding), which the standard-library decoder tolerates and
 // only StdEncoding.Strict rejects: refusing them here would reject shares the
-// decoder — and therefore the deprecated Share path — accepts, splitting the
-// two paths on which shares are valid.
+// decoder — and therefore CombineBytes — accepts, splitting the byte and
+// protected paths on which shares are valid.
 func isStandardBase64(b []byte) bool {
 	if len(b) == 0 || len(b)%4 != 0 {
 		return false

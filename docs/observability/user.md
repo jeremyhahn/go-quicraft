@@ -143,7 +143,7 @@ callback (connections, snapshot transfers, disk usage, membership changes, node
 lifecycle, dropped proposals and reads) runs inline on the goroutine that
 produced it: return quickly and don't stop or unload shards from it.
 
-`OnCampaignSkipped` never fires. Use `host.GetLeaderID` or
+No event reports a refused election. Use `host.LeaderID` or
 `ShardInfo.Health == ShardNoLeader` to detect a leaderless shard.
 
 ## Check health
@@ -156,8 +156,8 @@ The library returns a value and serves nothing. Wire it into your own readiness
 endpoint. `status.DiagnosticsDropped` counts library log records dropped
 because your `slog` handler was not taking them; alert on it rising. It is
 process-wide and is not exported as a metric, so copy it into your own gauge
-if you want a graph. For incident response, `host.GetShardInfo`,
-`host.GetNodeHostInfo` and `host.DiagRaftState` give per-shard detail; see
+if you want a graph. For incident response, `host.ShardInfo`,
+`host.NodeHostInfo` and `host.DiagRaftState` give per-shard detail; see
 [`../raft-consensus/cli.md`](../raft-consensus/cli.md).
 
 ## Troubleshooting

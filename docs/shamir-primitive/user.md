@@ -54,7 +54,8 @@ The AEAD tag inside `Unseal` is what tells you the shares were right. Any
 authenticated decrypt, or a comparison against an independent commitment, works
 the same way.
 
-Do not wait for `IntegrityError`. It exists in the package and is never returned.
+Do not wait for an integrity error. The package has none: nothing it does can
+tell a right reconstruction from a wrong one.
 
 ## Run a ceremony in protected memory (preferred)
 
@@ -122,7 +123,7 @@ Three things to remember:
 
 If your process bounds its locked memory with a go-enclave `Allocator`, use the
 `...With` forms (`SplitProtectedWith`, `CombineProtectedWith`,
-`UnmarshalShareSetWith`, `NewProtectedShareWith`, `Share.ProtectWith`) so share
+`UnmarshalShareSetWith`, `NewProtectedShareWith`) so share
 material is charged to it.
 
 ## Split a root key into wipeable buffers
@@ -168,18 +169,10 @@ defer enclave.Wipe(key)
 You still own the input buffers and must wipe them. `CombineBytes` wipes only the
 copies it decoded internally.
 
-## `Share` structs (deprecated)
-
-`Split`, `Combine`, `CombineUnverified` and `Share.Value` are deprecated.
-`Share.Value` is a Go string, which cannot be zeroed: every share created this way
-stays readable in process memory until the garbage collector reclaims it, and a
-ceremony holds all N at once. If you have `*Share` values from older code,
-convert them with `Share.Protect()` and use the protected path.
-
 ## Log or print a share safely
 
-You do not need to do anything. Both human-facing paths are redacted, for `Share`
-and `ProtectedShare` alike:
+You do not need to do anything. Both human-facing paths of a `ProtectedShare` are
+redacted:
 
 ```go
 fmt.Printf("%v\n", share)                     // value omitted

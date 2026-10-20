@@ -59,8 +59,8 @@ func TestConfig_SetDefaults(t *testing.T) {
 		if c.MaxSnapshotSize != DefaultMaxSnapshotSize {
 			t.Errorf("MaxSnapshotSize = %d, want %d", c.MaxSnapshotSize, DefaultMaxSnapshotSize)
 		}
-		if c.MaxSessionsPerClient != DefaultMaxSessionsPerClient {
-			t.Errorf("MaxSessionsPerClient = %d, want %d", c.MaxSessionsPerClient, DefaultMaxSessionsPerClient)
+		if c.MaxResponsesPerSession != DefaultMaxResponsesPerSession {
+			t.Errorf("MaxResponsesPerSession = %d, want %d", c.MaxResponsesPerSession, DefaultMaxResponsesPerSession)
 		}
 		if c.MaxTotalSessions != DefaultMaxTotalSessions {
 			t.Errorf("MaxTotalSessions = %d, want %d", c.MaxTotalSessions, DefaultMaxTotalSessions)
@@ -78,12 +78,12 @@ func TestConfig_SetDefaults(t *testing.T) {
 
 	t.Run("preserves non-zero fields", func(t *testing.T) {
 		c := Config{
-			ElectionRTT:          20,
-			HeartbeatRTT:         2,
-			CompactionOverhead:   10000,
-			MaxEntrySize:         16 * 1024 * 1024,
-			MaxSessionsPerClient: 256,
-			MaxTotalSessions:     32768,
+			ElectionRTT:            20,
+			HeartbeatRTT:           2,
+			CompactionOverhead:     10000,
+			MaxEntrySize:           16 * 1024 * 1024,
+			MaxResponsesPerSession: 256,
+			MaxTotalSessions:       32768,
 		}
 		c.SetDefaults()
 
@@ -99,8 +99,8 @@ func TestConfig_SetDefaults(t *testing.T) {
 		if c.MaxEntrySize != 16*1024*1024 {
 			t.Errorf("MaxEntrySize = %d, want %d", c.MaxEntrySize, 16*1024*1024)
 		}
-		if c.MaxSessionsPerClient != 256 {
-			t.Errorf("MaxSessionsPerClient = %d, want 256", c.MaxSessionsPerClient)
+		if c.MaxResponsesPerSession != 256 {
+			t.Errorf("MaxResponsesPerSession = %d, want 256", c.MaxResponsesPerSession)
 		}
 		if c.MaxTotalSessions != 32768 {
 			t.Errorf("MaxTotalSessions = %d, want 32768", c.MaxTotalSessions)
@@ -412,11 +412,11 @@ func TestConfig_Validate_MaxEntrySize(t *testing.T) {
 }
 
 func TestConfig_Validate_Sessions(t *testing.T) {
-	t.Run("zero MaxSessionsPerClient", func(t *testing.T) {
+	t.Run("zero MaxResponsesPerSession", func(t *testing.T) {
 		c := validConfig()
-		c.MaxSessionsPerClient = 0
+		c.MaxResponsesPerSession = 0
 		err := c.Validate()
-		assertValidationError(t, err, "MaxSessionsPerClient")
+		assertValidationError(t, err, "MaxResponsesPerSession")
 	})
 
 	t.Run("zero MaxTotalSessions", func(t *testing.T) {

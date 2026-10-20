@@ -81,15 +81,15 @@ func TestSplitProtected_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestSplitProtected_ValuesMatchSplit(t *testing.T) {
+func TestSplitProtected_ValuesMatchSplitBytes(t *testing.T) {
 	// The two paths must produce the same share bytes for the same
 	// randomness: only the custody of the value differs.
 	secret := []byte("identical share material")
 	restore := testOnlyRandReader(bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)))
-	plain, err := Split(secret, 2, 3)
+	plain, err := SplitBytes(secret, 2, 3)
 	restore()
 	if err != nil {
-		t.Fatalf("Split returned unexpected error: %v", err)
+		t.Fatalf("SplitBytes returned unexpected error: %v", err)
 	}
 
 	restore = testOnlyRandReader(bytes.NewReader(bytes.Repeat([]byte{0x5a}, 4096)))
@@ -101,8 +101,8 @@ func TestSplitProtected_ValuesMatchSplit(t *testing.T) {
 	defer destroyAll(protected)
 
 	for i := range plain {
-		if got, want := string(valueCopy(protected[i])), plain[i].Value; got != want {
-			t.Errorf("share %d: protected value %q != plain value %q", i, got, want)
+		if got, want := valueCopy(protected[i]), plain[i]; !bytes.Equal(got, want) {
+			t.Errorf("share %d: protected value %q != SplitBytes value %q", i, got, want)
 		}
 	}
 }
@@ -198,10 +198,19 @@ func TestNewProtectedShare_Invalid(t *testing.T) {
 	}
 }
 
-func TestProtectedShare_JSONMatchesShare(t *testing.T) {
+func TestProtectedShare_JSONShape(t *testing.T) {
+	// plainShare is the persisted and distributed share shape, field for
+	// field and tag for tag: ProtectedShare must encode exactly this.
+	type plainShare struct {
+		Index     int               `json:"index"`
+		Threshold int               `json:"threshold"`
+		Total     int               `json:"total"`
+		Value     string            `json:"value"`
+		Metadata  map[string]string `json:"metadata,omitempty"`
+	}
 	value := base64.StdEncoding.EncodeToString([]byte{shareFormatVersion, 0x02, 0x11, 0x22})
 	for _, metadata := range []map[string]string{nil, {"custodian": "sre-2", "issued": "2026-08-18"}} {
-		plain := &Share{Index: 2, Threshold: 3, Total: 5, Value: value, Metadata: metadata}
+		plain := &plainShare{Index: 2, Threshold: 3, Total: 5, Value: value, Metadata: metadata}
 		protected, err := NewProtectedShare(2, 3, 5, []byte(value))
 		if err != nil {
 			t.Fatalf("NewProtectedShare returned unexpected error: %v", err)
@@ -210,7 +219,7 @@ func TestProtectedShare_JSONMatchesShare(t *testing.T) {
 
 		wantJSON, err := json.Marshal(plain)
 		if err != nil {
-			t.Fatalf("marshalling Share: %v", err)
+			t.Fatalf("marshalling plain share: %v", err)
 		}
 		gotJSON, err := json.Marshal(protected)
 		if err != nil {
@@ -474,75 +483,10 @@ func TestCombineProtected_WireFormatRulesAreShared(t *testing.T) {
 	}
 }
 
-func TestShare_Protect(t *testing.T) {
-	secret := []byte("migrated from the string path")
-	plain, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split returned unexpected error: %v", err)
-	}
-	plain[0].Metadata["custodian"] = "sre-3"
-
-	protected := make([]*ProtectedShare, 0, len(plain))
-	for i, p := range plain {
-		ps, err := p.Protect()
-		if err != nil {
-			t.Fatalf("share %d: Protect returned unexpected error: %v", i, err)
-		}
-		protected = append(protected, ps)
-		if string(valueCopy(ps)) != p.Value {
-			t.Errorf("share %d: protected value %q != %q", i, valueCopy(ps), p.Value)
-		}
-	}
-	defer destroyAll(protected)
-
-	if protected[0].Metadata["custodian"] != "sre-3" {
-		t.Errorf("metadata not carried over: %v", protected[0].Metadata)
-	}
-	buf, err := CombineProtected(protected[1:])
-	if err != nil {
-		t.Fatalf("CombineProtected returned unexpected error: %v", err)
-	}
-	defer buf.Destroy()
-	if !bytes.Equal(encCopy(buf), secret) {
-		t.Errorf("reconstructed %q, want %q", encCopy(buf), secret)
-	}
-}
-
-func TestShare_Protect_Invalid(t *testing.T) {
-	tests := []struct {
-		name  string
-		share *Share
-		field string
-	}{
-		{"nil share", nil, "share"},
-		{"empty value", &Share{Index: 1, Threshold: 2, Total: 3}, "value"},
-		{"index out of range", &Share{Index: 4, Threshold: 2, Total: 3, Value: "AQEC"}, "index"},
-		{"value not base64", &Share{Index: 1, Threshold: 2, Total: 3, Value: "not base64!"}, "value"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			protected, err := tt.share.Protect()
-			if err == nil {
-				protected.Destroy()
-				t.Fatal("expected an error, got nil")
-			}
-			if protected != nil {
-				t.Error("expected a nil share alongside the error")
-			}
-			var valErr *ValidationError
-			if !errors.As(err, &valErr) {
-				t.Fatalf("expected *ValidationError, got %T: %v", err, err)
-			}
-			if valErr.Field != tt.field {
-				t.Errorf("error field = %q, want %q", valErr.Field, tt.field)
-			}
-		})
-	}
-}
-
-func TestProtectedShare_InteropWithPlainShare(t *testing.T) {
-	// A protected share serialized as JSON is a plain share on the wire: a
-	// custody layer can persist one and reconstruct with the other.
+func TestProtectedShare_InteropWithCombineBytes(t *testing.T) {
+	// A protected share serialized as JSON carries the SplitBytes value on
+	// the wire: a custody layer can persist one and reconstruct from the raw
+	// values with CombineBytes.
 	secret := []byte("interoperable share material")
 	protected, err := SplitProtected(secret, 2, 3)
 	if err != nil {
@@ -554,16 +498,18 @@ func TestProtectedShare_InteropWithPlainShare(t *testing.T) {
 		t.Fatalf("marshalling protected shares: %v", err)
 	}
 
-	var plain []*Share
+	var plain []struct {
+		Value string `json:"value"`
+	}
 	if err := json.Unmarshal(encoded, &plain); err != nil {
 		t.Fatalf("unmarshalling as plain shares: %v", err)
 	}
-	reconstructed, err := Combine(plain[:2])
+	reconstructed, err := CombineBytes([][]byte{[]byte(plain[0].Value), []byte(plain[1].Value)}, 2)
 	if err != nil {
-		t.Fatalf("Combine returned unexpected error: %v", err)
+		t.Fatalf("CombineBytes returned unexpected error: %v", err)
 	}
 	if !bytes.Equal(reconstructed, secret) {
-		t.Errorf("Combine reconstructed %q, want %q", reconstructed, secret)
+		t.Errorf("CombineBytes reconstructed %q, want %q", reconstructed, secret)
 	}
 }
 

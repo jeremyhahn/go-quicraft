@@ -78,9 +78,9 @@ const (
 // the cap floors at 64 while still admitting all 500 clients with margin.
 func seedFixturePolicy() proto.SessionPolicy {
 	return proto.SessionPolicy{
-		ExpiryEntries:        seedFixtureExpiry,
-		MaxTotalSessions:     510,
-		MaxSessionsPerClient: 100,
+		ExpiryEntries:          seedFixtureExpiry,
+		MaxTotalSessions:       510,
+		MaxResponsesPerSession: 100,
 	}
 }
 

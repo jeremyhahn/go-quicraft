@@ -68,7 +68,7 @@ type metaSegments struct {
 }
 
 // WALBarrier is the encryption interface used by WAL segments. It mirrors
-// the methods needed from crypto.Barrier without importing the crypto package.
+// the methods needed from seal.Barrier without importing the seal package.
 type WALBarrier interface {
 	// Encrypt encrypts plaintext using the current epoch's DEK.
 	Encrypt(dst, plaintext []byte) ([]byte, error)
@@ -2078,7 +2078,7 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumWitnesses:4]{ [ReplicaID:8][AddrLen:4][Addr:N] }...
 // [NumRemoved:4]{ [ReplicaID:8] }...
 // [NumIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
-// [SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+// [SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
 // [MaxSessionsPerOwner:8]
 // [NumRemovedIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
@@ -2146,7 +2146,7 @@ func membershipRemovedMapSize(m map[uint64]bool) int {
 }
 
 // membershipSessionPolicySize is the size of the session-policy tail:
-// SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxSessionsPerClient(8) +
+// SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxResponsesPerSession(8) +
 // MaxSessionsPerOwner(8).
 const membershipSessionPolicySize = 4 * 8 // 32 bytes
 
@@ -2418,7 +2418,7 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	}
 	membership.SessionExpiryEntries = binary.LittleEndian.Uint64(data[pos:])
 	membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
-	membership.MaxSessionsPerClient = binary.LittleEndian.Uint64(data[pos+16:])
+	membership.MaxResponsesPerSession = binary.LittleEndian.Uint64(data[pos+16:])
 	membership.MaxSessionsPerOwner = binary.LittleEndian.Uint64(data[pos+24:])
 	pos += membershipSessionPolicySize
 
@@ -4092,7 +4092,7 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalAddrMap(buf, pos, ss.Membership.Identities)
 	binary.LittleEndian.PutUint64(buf[pos:], ss.Membership.SessionExpiryEntries)
 	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
-	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxSessionsPerClient)
+	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxResponsesPerSession)
 	binary.LittleEndian.PutUint64(buf[pos+24:], ss.Membership.MaxSessionsPerOwner)
 	pos += membershipSessionPolicySize
 	pos = marshalAddrMap(buf, pos, ss.Membership.RemovedIdentities)

@@ -21,7 +21,7 @@ package proto
 // The v1 layout is:
 //
 //	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
-//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
 //	[MaxSessionsPerOwner:8]
 //	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
 //
@@ -101,7 +101,7 @@ const (
 
 	// membershipSessionPolicySize is what the replicated session policy
 	// occupies: SessionExpiryEntries(8) + MaxTotalSessions(8) +
-	// MaxSessionsPerClient(8) + MaxSessionsPerOwner(8).
+	// MaxResponsesPerSession(8) + MaxSessionsPerOwner(8).
 	membershipSessionPolicySize = 4 * 8 // 32 bytes
 
 	// membershipFixedSize is the wire size of the whole fixed region, and thus
@@ -120,7 +120,7 @@ const (
 //   - MaxTotalSessions bounds session.Manager.Register shard-wide. A replica
 //     that refuses a registration its peers admit answers ResultSessionExpired
 //     for every later entry of that session while they apply it normally.
-//   - MaxSessionsPerClient bounds the per-session RESPONSE CACHE
+//   - MaxResponsesPerSession bounds the per-session RESPONSE CACHE
 //     (CanRecord/RecordResult), and diverges the same way.
 //   - MaxSessionsPerOwner bounds session.Manager.Register per OWNER, and is
 //     what stops one principal consuming the whole table.
@@ -131,20 +131,17 @@ type SessionPolicy struct {
 	ExpiryEntries uint64
 	// MaxTotalSessions is the cap on concurrently registered sessions.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the RESPONSE-CACHE DEPTH: the maximum number of
+	// MaxResponsesPerSession is the RESPONSE-CACHE DEPTH: the maximum number of
 	// cached results one registered session retains for duplicate detection
 	// (session.Manager.CanRecord/RecordResult). It is NOT, and has never been,
 	// a limit on how many sessions anything may hold.
 	//
-	// The name is wrong and is kept only because the wire format is pinned:
-	// it is the mirror of config.Config.MaxSessionsPerClient, which chose the
-	// name before the field was wired to the response cache. Read it as
-	// "max responses per session". The cap the name suggests is
-	// MaxSessionsPerOwner, which is a different field with a different meaning
-	// and a different failure mode — mixing the two up caps a shard at a
+	// It mirrors config.Config.MaxResponsesPerSession. The per-principal
+	// session cap is MaxSessionsPerOwner, a different field with a different
+	// meaning and a different failure mode — mixing the two up caps a shard at a
 	// response depth or lets one client pin the whole session table, and both
 	// have happened here before.
-	MaxSessionsPerClient uint64
+	MaxResponsesPerSession uint64
 	// MaxSessionsPerOwner is the cap on how many sessions may be concurrently
 	// registered under ONE owner — the principal an embedder declares in
 	// Entry.OwnerID.
@@ -183,7 +180,7 @@ func (p SessionPolicy) IsSet() bool {
 // replicas, plus the shard's replicated witness policy and session policy.
 // The wire format encodes a version byte and the fixed fields
 // (ConfigChangeID, MaxWitnesses, RequireFullReplicaMajority,
-// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient,
+// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession,
 // MaxSessionsPerOwner) followed by six maps (Addresses, Observers, Witnesses,
 // Removed, Identities, RemovedIdentities), each with sorted keys for
 // deterministic output.
@@ -208,10 +205,10 @@ type Membership struct {
 	// Non-zero in every committed policy, which is what makes it the
 	// policy-present discriminator.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the shard's replicated RESPONSE-CACHE DEPTH — the
+	// MaxResponsesPerSession is the shard's replicated RESPONSE-CACHE DEPTH — the
 	// number of cached results one session retains, not a session count. See
-	// SessionPolicy.MaxSessionsPerClient for why the name says otherwise.
-	MaxSessionsPerClient uint64
+	// SessionPolicy.MaxResponsesPerSession for why the name says otherwise.
+	MaxResponsesPerSession uint64
 	// MaxSessionsPerOwner is the shard's replicated cap on concurrent sessions
 	// per declared owner (Entry.OwnerID); zero disables it. See
 	// SessionPolicy.MaxSessionsPerOwner.
@@ -307,10 +304,10 @@ type Membership struct {
 // fixed region is always present, so an absent policy is 32 zero bytes.
 func (m *Membership) SessionPolicy() SessionPolicy {
 	return SessionPolicy{
-		ExpiryEntries:        m.SessionExpiryEntries,
-		MaxTotalSessions:     m.MaxTotalSessions,
-		MaxSessionsPerClient: m.MaxSessionsPerClient,
-		MaxSessionsPerOwner:  m.MaxSessionsPerOwner,
+		ExpiryEntries:          m.SessionExpiryEntries,
+		MaxTotalSessions:       m.MaxTotalSessions,
+		MaxResponsesPerSession: m.MaxResponsesPerSession,
+		MaxSessionsPerOwner:    m.MaxSessionsPerOwner,
 	}
 }
 
@@ -318,7 +315,7 @@ func (m *Membership) SessionPolicy() SessionPolicy {
 func (m *Membership) SetSessionPolicy(p SessionPolicy) {
 	m.SessionExpiryEntries = p.ExpiryEntries
 	m.MaxTotalSessions = p.MaxTotalSessions
-	m.MaxSessionsPerClient = p.MaxSessionsPerClient
+	m.MaxResponsesPerSession = p.MaxResponsesPerSession
 	m.MaxSessionsPerOwner = p.MaxSessionsPerOwner
 }
 
@@ -326,7 +323,7 @@ func (m *Membership) SetSessionPolicy(p SessionPolicy) {
 // current (membershipFormatVersion) layout.
 // Format: [Version:1][ConfigChangeID:8][MaxWitnesses:8]
 // [RequireFullReplicaMajority:8][SessionExpiryEntries:8][MaxTotalSessions:8]
-// [MaxSessionsPerClient:8][MaxSessionsPerOwner:8]
+// [MaxResponsesPerSession:8][MaxSessionsPerOwner:8]
 // [Addresses map][Observers map][Witnesses map][Removed boolMap]
 // [Identities map][RemovedIdentities map]
 func (m *Membership) Size() int {
@@ -392,7 +389,7 @@ func (m *Membership) MarshalTo(buf []byte) (int, error) {
 	putBool(buf[17:], m.RequireFullReplicaMajority)
 	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
-	putUint64(buf[sessionPolicyOffset+16:], m.MaxSessionsPerClient)
+	putUint64(buf[sessionPolicyOffset+16:], m.MaxResponsesPerSession)
 	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
 	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
@@ -456,7 +453,7 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	decoded.RequireFullReplicaMajority = getBool(buf[17:])
 	decoded.SessionExpiryEntries = getUint64(buf[sessionPolicyOffset:])
 	decoded.MaxTotalSessions = getUint64(buf[sessionPolicyOffset+8:])
-	decoded.MaxSessionsPerClient = getUint64(buf[sessionPolicyOffset+16:])
+	decoded.MaxResponsesPerSession = getUint64(buf[sessionPolicyOffset+16:])
 	decoded.MaxSessionsPerOwner = getUint64(buf[sessionPolicyOffset+24:])
 	offset := membershipFixedSize
 	var n int
@@ -503,7 +500,7 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 func (m *Membership) isZero() bool {
 	return m.ConfigChangeID == 0 && m.MaxWitnesses == 0 &&
 		!m.RequireFullReplicaMajority && m.SessionExpiryEntries == 0 &&
-		m.MaxTotalSessions == 0 && m.MaxSessionsPerClient == 0 &&
+		m.MaxTotalSessions == 0 && m.MaxResponsesPerSession == 0 &&
 		m.MaxSessionsPerOwner == 0 &&
 		len(m.Addresses) == 0 && len(m.Observers) == 0 && len(m.Witnesses) == 0 &&
 		len(m.Removed) == 0 && len(m.Identities) == 0 &&
@@ -517,7 +514,7 @@ func (m *Membership) Reset() {
 	m.RequireFullReplicaMajority = false
 	m.SessionExpiryEntries = 0
 	m.MaxTotalSessions = 0
-	m.MaxSessionsPerClient = 0
+	m.MaxResponsesPerSession = 0
 	m.MaxSessionsPerOwner = 0
 	m.Addresses = nil
 	m.Observers = nil

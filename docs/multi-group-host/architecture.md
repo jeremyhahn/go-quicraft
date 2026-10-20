@@ -428,8 +428,7 @@ The full field tables, with defaults, are in
   enabled.
 - `Config.Witness` and the four session limits are bootstrap seeds. The live
   values are replicated state in `proto.Membership`.
-- `MaxSessionsPerClient` bounds cached responses per session, not sessions. The
-  name is kept because renaming a public field breaks callers.
+- `MaxResponsesPerSession` bounds cached responses per session, not sessions.
 
 ## State machine tiers
 
@@ -566,7 +565,7 @@ would actually swap in is a transport without mTLS. See
 
 ### Returning only `error` from every accessor
 
-`GetLeaderID` returns `(uint64, bool, error)` and `StateMachineHash` returns
+`LeaderID` returns `(uint64, bool, error)` and `StateMachineHash` returns
 `(uint64, uint64, bool, error)`. The `bool` separates "no answer yet" from
 "failed to ask"; collapsing them would make an ordinary startup race look like
 a fault.
@@ -704,7 +703,7 @@ observer with `join = true` and add it with `RequestAddWitnessWithIdentity` or
 `RequestAddObserverWithIdentity`.
 
 Other primitives a cluster manager builds on: `Host.StopShard`,
-`Host.GetLeaderID`, `Host.GetLeaderIDAndTerm`, `Host.GetShardMembership` and the
+`Host.LeaderID`, `Host.LeaderIDAndTerm`, `Host.ShardMembership` and the
 membership requests in `pkg/membership.go`.
 
 ### What StartShard commits, and what it refuses
@@ -722,7 +721,7 @@ member, so the first real proposal lands at index 2.
 marshals its maps with sorted keys, so the entry is byte-identical across
 founders given identical input. The input is the whole `Membership`: addresses,
 `MemberIdentities`, the witness policy (`Config.Witness`) and the session policy
-(`SessionExpiryEntries`, `MaxTotalSessions`, `MaxSessionsPerClient`,
+(`SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession`,
 `MaxSessionsPerOwner`), all seeded from each founder's local config. Founders
 that disagree produce different entries at the same `(index=1, term=1)`, and
 AppendEntries matches on `(index, term)` alone, so the divergence is never

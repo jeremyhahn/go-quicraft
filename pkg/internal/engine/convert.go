@@ -72,7 +72,7 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 		RequireFullReplicaMajority: m.RequireFullReplicaMajority,
 		SessionExpiryEntries:       m.SessionExpiryEntries,
 		MaxTotalSessions:           m.MaxTotalSessions,
-		MaxSessionsPerClient:       m.MaxSessionsPerClient,
+		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
 	}
 	if len(m.Addresses) > 0 {

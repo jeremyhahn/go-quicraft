@@ -16,30 +16,26 @@ package shamir
 
 import (
 	"bytes"
-	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
 )
 
-// TestShare_JSONLoggingIsRedacted is the regression for the share-material leak
-// through structured logging. Share.String redacted the value, but slog does
-// not call String when a json.Marshaler is available: a *Share logged through
-// slog.JSONHandler was marshalled by Share.MarshalJSON and its full base64
-// share value written to the log. A single leaked share is a permanent,
-// unrevocable disclosure of root-key custody material.
+// TestProtectedShare_StructuredLoggingIsRedacted is the regression for the
+// share-material leak through structured logging: slog does not call String
+// when a json.Marshaler is available, so a share logged through
+// slog.JSONHandler would be marshalled with its full base64 value. A single
+// leaked share is a permanent, unrevocable disclosure of root-key custody
+// material.
 //
 // The fix is slog.LogValuer, which slog resolves BEFORE consulting any
 // marshaller — so the redaction holds on every handler rather than only on the
 // one that happens to use fmt.
-func TestShare_JSONLoggingIsRedacted(t *testing.T) {
+func TestProtectedShare_StructuredLoggingIsRedacted(t *testing.T) {
 	secret := []byte("root-key-material-32-bytes-long!")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	share := shares[0]
-	if share.Value == "" {
+	share := splitProtectedShares(t, secret, 2, 3)[0]
+	value := string(valueCopy(share))
+	if value == "" {
 		t.Fatal("share has no value to leak")
 	}
 
@@ -54,7 +50,7 @@ func TestShare_JSONLoggingIsRedacted(t *testing.T) {
 			var buf bytes.Buffer
 			slog.New(tc.handler(&buf)).Info("custody event", "share", share)
 			out := buf.String()
-			if strings.Contains(out, share.Value) {
+			if strings.Contains(out, value) {
 				t.Fatalf("%s handler logged the raw share value: %s", tc.name, out)
 			}
 			if !strings.Contains(out, "redacted") {
@@ -68,23 +64,8 @@ func TestShare_JSONLoggingIsRedacted(t *testing.T) {
 	var buf bytes.Buffer
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("custody event",
 		slog.Group("ceremony", slog.Any("share", share)))
-	if strings.Contains(buf.String(), share.Value) {
+	if strings.Contains(buf.String(), value) {
 		t.Fatalf("grouped attr logged the raw share value: %s", buf.String())
-	}
-
-	// SERIALIZATION is deliberately NOT redacted: a custody layer that persists
-	// or distributes shares as JSON must get the real value back, and conflating
-	// the two would silently destroy custody material instead of protecting it.
-	encoded, err := json.Marshal(share)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	var round Share
-	if err := json.Unmarshal(encoded, &round); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	if round.Value != share.Value {
-		t.Fatal("json.Marshal must round-trip the share value for persistence")
 	}
 }
 
@@ -113,12 +94,9 @@ func TestCombine_BoundsPayloadAndShareCount(t *testing.T) {
 
 	// More shares than GF(2^8) has non-zero x-coordinates is rejected up front,
 	// on both reconstruction paths.
-	tooMany := make([]*Share, maxShares+1)
-	for i := range tooMany {
-		tooMany[i] = &Share{Index: 1, Threshold: 2, Total: 3, Value: "AQE="}
-	}
-	if _, err := Combine(tooMany); err == nil {
-		t.Fatal("Combine accepted more than maxShares shares")
+	tooMany := make([]*ProtectedShare, maxShares+1)
+	if _, err := CombineProtected(tooMany); err == nil {
+		t.Fatal("CombineProtected accepted more than maxShares shares")
 	}
 	tooManyValues := make([][]byte, maxShares+1)
 	for i := range tooManyValues {

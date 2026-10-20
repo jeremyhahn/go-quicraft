@@ -1078,7 +1078,7 @@ func (n *Node) handleError(err error) {
 	// and the only way the queue is full is a listener that is not consuming,
 	// so holding engine liveness for it would be the deadlock this dispatcher
 	// exists to remove. The event still reaches the operator through the log
-	// below, and the shard's failed state remains observable via GetShardInfo.
+	// below, and the shard's failed state remains observable via ShardInfo.
 	if !n.listeners.dispatch(func() { cb(info) }) {
 		slog.Error("shard failure notification dropped: listener queue full",
 			"shard", n.shardID,

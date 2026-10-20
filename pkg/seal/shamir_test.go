@@ -144,20 +144,28 @@ func TestShamirInitResult_DestroyIsSafeOnNilAndRepeated(t *testing.T) {
 
 // Protected shares change what "shares" is on the wire: an array of share OBJECTS
 // rather than an array of bare values. This pins that it is the SAME object
-// encoding shamir.Share produces — the shape the rest of the stack already
-// persists and distributes shares in — so the protected types introduce no
-// third format for a consumer to special-case.
+// encoding shamir.ProtectedShare produces on its own — the shape the rest of the
+// stack already persists and distributes shares in — so the protected types
+// introduce no third format for a consumer to special-case.
 func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
-	plain := []*shamir.Share{
+	// plainShare is the share-object shape, spelled out with encoding/json
+	// tags so the yardstick does not reuse the type under test.
+	type plainShare struct {
+		Index     int    `json:"index"`
+		Threshold int    `json:"threshold"`
+		Total     int    `json:"total"`
+		Value     string `json:"value"`
+	}
+	plain := []*plainShare{
 		{Index: 1, Threshold: 2, Total: 3, Value: "AQEC"},
 		{Index: 2, Threshold: 2, Total: 3, Value: "AQID"},
 	}
 
 	protected := make([]*shamir.ProtectedShare, 0, len(plain))
 	for _, sh := range plain {
-		p, err := sh.Protect()
+		p, err := shamir.NewProtectedShare(sh.Index, sh.Threshold, sh.Total, []byte(sh.Value))
 		if err != nil {
-			t.Fatalf("Protect: %v", err)
+			t.Fatalf("NewProtectedShare: %v", err)
 		}
 		protected = append(protected, p)
 	}
@@ -173,9 +181,9 @@ func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
 	// fields, encoded by encoding/json itself — not by reusing the type under
 	// test, which would move with any drift instead of catching it.
 	want, err := json.Marshal(struct {
-		Shares      []*shamir.Share `json:"shares"`
-		Threshold   int             `json:"threshold"`
-		TotalShares int             `json:"total_shares"`
+		Shares      []*plainShare `json:"shares"`
+		Threshold   int           `json:"threshold"`
+		TotalShares int           `json:"total_shares"`
 	}{Shares: plain, Threshold: 2, TotalShares: 3})
 	if err != nil {
 		t.Fatalf("marshal reference shape: %v", err)

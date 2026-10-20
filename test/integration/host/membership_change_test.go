@@ -220,7 +220,7 @@ func TestHostAPI_MembershipChange_AddNodeWhileWriting(t *testing.T) {
 // that continues to accept writes and serve linearizable reads.
 //
 // The test exercises:
-// - Follower removal via SyncRequestDeleteNode
+// - Follower removal via SyncRequestRemoveNode
 // - Quorum maintenance with 2 nodes
 // - Continued write and read operations after removal
 func TestHostAPI_MembershipChange_RemoveFollower(t *testing.T) {

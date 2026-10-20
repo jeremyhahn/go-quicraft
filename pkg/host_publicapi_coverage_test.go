@@ -162,9 +162,9 @@ func TestQueryRaftLog_ReturnsOwnedEntryCopies(t *testing.T) {
 		t.Fatalf("SyncPropose: %v", err)
 	}
 
-	rng, err := h.GetLogRange(1)
+	rng, err := h.LogRange(1)
 	if err != nil {
-		t.Fatalf("GetLogRange: %v", err)
+		t.Fatalf("LogRange: %v", err)
 	}
 
 	entries, err := h.QueryRaftLog(ctx, 1, rng.FirstIndex, rng.LastIndex+1, 1<<20)
@@ -257,8 +257,8 @@ func TestRequestLeaderTransfer_ObserverAndRemovedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SyncGetShardMembership: %v", err)
 	}
-	if err := h.SyncRequestDeleteNode(ctx, 1, 10, membership.ConfigChangeID); err != nil {
-		t.Fatalf("SyncRequestDeleteNode: %v", err)
+	if err := h.SyncRequestRemoveNode(ctx, 1, 10, membership.ConfigChangeID); err != nil {
+		t.Fatalf("SyncRequestRemoveNode: %v", err)
 	}
 
 	err = h.RequestLeaderTransfer(ctx, 1, 10)
@@ -285,9 +285,9 @@ func TestSyncWitnessChanges_ContextEndsUncommittedWait(t *testing.T) {
 		if err := h.SyncRequestAddNode(setupCtx, 1, 4, "127.0.0.1:6001", 0); err != nil {
 			t.Fatalf("SyncRequestAddNode: %v", err)
 		}
-		members, err := h.GetShardMembership(1)
+		members, err := h.ShardMembership(1)
 		if err != nil {
-			t.Fatalf("GetShardMembership: %v", err)
+			t.Fatalf("ShardMembership: %v", err)
 		}
 		if _, ok := members.Nodes[4]; !ok {
 			t.Fatalf("replica 4 is not a voter, quorum is still reachable: %+v", members.Nodes)
@@ -311,9 +311,9 @@ func TestSyncWitnessChanges_ContextEndsUncommittedWait(t *testing.T) {
 		if err := h.SyncRequestAddWitness(ctx, 1, 7, "127.0.0.1:6002", 0); !errors.Is(err, ErrCanceled) {
 			t.Fatalf("SyncRequestAddWitness error = %v, want ErrCanceled", err)
 		}
-		members, err := h.GetShardMembership(1)
+		members, err := h.ShardMembership(1)
 		if err != nil {
-			t.Fatalf("GetShardMembership: %v", err)
+			t.Fatalf("ShardMembership: %v", err)
 		}
 		if _, ok := members.Witnesses[7]; ok {
 			t.Fatal("an uncommitted witness addition became visible in membership")

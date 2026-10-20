@@ -73,9 +73,9 @@ func newPauseTestHost(t *testing.T, shards ...uint64) *Host {
 
 func shardPaused(t *testing.T, h *Host, shardID uint64) bool {
 	t.Helper()
-	info, err := h.GetShardInfo(shardID)
+	info, err := h.ShardInfo(shardID)
 	if err != nil {
-		t.Fatalf("GetShardInfo(%d): %v", shardID, err)
+		t.Fatalf("ShardInfo(%d): %v", shardID, err)
 	}
 	return info.Paused
 }
@@ -87,19 +87,19 @@ func TestPauseShard_RefusesEveryEntryPoint(t *testing.T) {
 	h := newPauseTestHost(t, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession: %v", err)
+		t.Fatalf("NewSession: %v", err)
 	}
 	if shardPaused(t, h, 1) {
-		t.Fatal("GetShardInfo reports a fresh shard paused")
+		t.Fatal("ShardInfo reports a fresh shard paused")
 	}
 
 	if err := h.PauseShard(ctx, 1); err != nil {
 		t.Fatalf("PauseShard: %v", err)
 	}
 	if !shardPaused(t, h, 1) {
-		t.Fatal("GetShardInfo does not report the shard paused")
+		t.Fatal("ShardInfo does not report the shard paused")
 	}
 	for _, c := range append(sealedAdmitCalls(h, session), pauseOnlyCalls(h)...) {
 		err := c.call(ctx)
@@ -119,7 +119,7 @@ func TestPauseShard_RefusesEveryEntryPoint(t *testing.T) {
 		t.Fatalf("ResumeShard: %v", err)
 	}
 	if shardPaused(t, h, 1) {
-		t.Fatal("GetShardInfo reports the shard paused after ResumeShard")
+		t.Fatal("ShardInfo reports the shard paused after ResumeShard")
 	}
 	waitForLeader(t, h, 1)
 	if _, err := h.SyncPropose(ctx, 1, []byte("after-resume")); err != nil {

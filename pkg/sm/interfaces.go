@@ -126,8 +126,8 @@ type ConcurrentStateMachine interface {
 // # Client sessions are not available
 //
 // A shard backed by a DiskStateMachine supports no client sessions. Every
-// session-managed entry point on the host — GetNewSession,
-// GetNewSessionWithOwner, RegisterSession, ProposeWithSession,
+// session-managed entry point on the host — NewSession,
+// NewSessionWithOwner, RegisterSession, ProposeWithSession,
 // SyncProposeWithSession, CloseSession — refuses the shard with
 // ErrSessionsUnsupportedOnDisk, and idempotent operations proposed without a
 // session (Propose, SyncPropose) are the supported substitute.

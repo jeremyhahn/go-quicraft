@@ -201,8 +201,7 @@ multiply out of hand it uses a priced refusal instead: `MaxShareSetBytes` refuse
 an over-budget Shamir split before taking a single page. A consumer that does
 buffer key material before authenticating a peer should admit those allocations
 through an `Allocator` at its own layer, and can extend that budget to share
-material: `SplitProtectedWith`, `CombineProtectedWith`, `NewProtectedShareWith`,
-`UnmarshalShareSetWith` and `Share.ProtectWith` charge every region they lock to
+material: `SplitProtectedWith`, `CombineProtectedWith`, `NewProtectedShareWith`\nand `UnmarshalShareSetWith` charge every region they lock to
 the `Allocator` the caller passes.
 
 This repository never calls `WipeAll`. It is a shutdown sweep for whoever owns

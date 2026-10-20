@@ -575,7 +575,7 @@ func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
-		leaderID, known, err := h.GetLeaderID(shardID)
+		leaderID, known, err := h.LeaderID(shardID)
 		if err == nil && known && leaderID > 0 {
 			return
 		}
@@ -597,7 +597,7 @@ func waitForApplied(t *testing.T, h *quicraft.Host, shardID, targetIndex uint64,
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err == nil && info.LastApplied >= targetIndex {
 			return
 		}
@@ -955,9 +955,9 @@ func waitForSnapshotArtifact(t *testing.T, dir string, shardID, replicaID, index
 func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, replicaID uint64) uint64 {
 	t.Helper()
 
-	info, err := h.GetShardInfo(shardID)
+	info, err := h.ShardInfo(shardID)
 	if err != nil {
-		t.Fatalf("GetShardInfo(shard %d) before snapshot: %v", shardID, err)
+		t.Fatalf("ShardInfo(shard %d) before snapshot: %v", shardID, err)
 	}
 	appliedBefore := info.LastApplied
 	if appliedBefore == 0 {

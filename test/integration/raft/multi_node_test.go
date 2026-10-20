@@ -127,7 +127,7 @@ func (c *testCluster) close() {
 // for the given shard, or -1 if no leader is known.
 func (c *testCluster) findLeader(shardID uint64) int {
 	for i, h := range c.hosts {
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -143,7 +143,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 // resolve and address the leader in one step.
 func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 	for _, h := range c.hosts {
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			continue
 		}
@@ -170,7 +170,7 @@ func (c *testCluster) shardView(shardID uint64) string {
 			fmt.Fprintf(&b, "host[%d]=stopped", i)
 			continue
 		}
-		info, err := h.GetShardInfo(shardID)
+		info, err := h.ShardInfo(shardID)
 		if err != nil {
 			fmt.Fprintf(&b, "host[%d]=%v", i, err)
 			continue
@@ -258,14 +258,14 @@ func (c *testCluster) waitForAgreedLeader(shardID uint64, timeout time.Duration)
 			if h == nil {
 				return 0, false
 			}
-			lid, known, err := h.GetLeaderID(shardID)
+			lid, known, err := h.LeaderID(shardID)
 			if err != nil || !known || lid == 0 || (leaderID != 0 && lid != leaderID) {
 				return 0, false
 			}
 			leaderID = lid
 		}
 		for _, h := range c.hosts {
-			info, err := h.GetShardInfo(shardID)
+			info, err := h.ShardInfo(shardID)
 			if err == nil && info.ReplicaID == leaderID {
 				return leaderID, info.IsLeader
 			}
@@ -313,7 +313,7 @@ func TestMultiNode_LeaderElection(t *testing.T) {
 	waitForCondition(t, leaderElectionTimeout, "exactly 1 leader", func() bool {
 		count := 0
 		for _, h := range cluster.hosts {
-			info, err := h.GetShardInfo(1)
+			info, err := h.ShardInfo(1)
 			if err != nil {
 				return false
 			}
@@ -399,9 +399,9 @@ func TestMultiNode_ProposeAndReplicate(t *testing.T) {
 		// Timeout - dump diagnostics.
 		for di, dh := range cluster.hosts {
 			dReplicaID := uint64(di + 1)
-			info, derr := dh.GetShardInfo(1)
+			info, derr := dh.ShardInfo(1)
 			if derr != nil {
-				t.Logf("  node[%d]: GetShardInfo error: %v", di, derr)
+				t.Logf("  node[%d]: ShardInfo error: %v", di, derr)
 			} else {
 				t.Logf("  node[%d]: isLeader=%v leaderID=%d lastApplied=%d",
 					di, info.IsLeader, info.LeaderID, info.LastApplied)
@@ -548,9 +548,9 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	oldLeaderReplicaID := uint64(leaderIdx + 1)
 
-	oldLeaderInfo, err := cluster.hosts[leaderIdx].GetShardInfo(1)
+	oldLeaderInfo, err := cluster.hosts[leaderIdx].ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on the original leader failed: %v", err)
+		t.Fatalf("ShardInfo on the original leader failed: %v", err)
 	}
 	oldTerm := oldLeaderInfo.Term
 	if oldTerm == 0 {
@@ -606,7 +606,7 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 			if i == leaderIdx {
 				continue
 			}
-			info, getErr := h.GetShardInfo(1)
+			info, getErr := h.ShardInfo(1)
 			if getErr == nil && info.IsLeader {
 				newLeaderIdx = i
 				return true
@@ -625,9 +625,9 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 	}
 	newLeaderHost := cluster.hosts[newLeaderIdx]
 
-	newLeaderInfo, err := newLeaderHost.GetShardInfo(1)
+	newLeaderInfo, err := newLeaderHost.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on the new leader failed: %v", err)
+		t.Fatalf("ShardInfo on the new leader failed: %v", err)
 	}
 	if newLeaderInfo.Term <= oldTerm {
 		t.Errorf("new leader term = %d, want > old leader term %d: the failover did not start a new term",
@@ -726,11 +726,11 @@ func TestMultiNode_Session_OnLeader(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 		defer cancel()
 		var err error
-		session, err = h.GetNewSession(ctx, 1)
+		session, err = h.NewSession(ctx, 1)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
+		t.Fatalf("NewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
 	if session == nil {
 		t.Fatal("session is nil")
@@ -815,7 +815,7 @@ func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestMultiNode_GetNodeHostInfo verifies that each node in the cluster
-// returns accurate shard information from GetNodeHostInfo.
+// returns accurate shard information from NodeHostInfo.
 func TestMultiNode_GetNodeHostInfo(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -824,9 +824,9 @@ func TestMultiNode_GetNodeHostInfo(t *testing.T) {
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		if len(info.ShardInfoList) != 1 {
 			t.Errorf("node[%d] ShardInfoList length = %d, want 1", i, len(info.ShardInfoList))
@@ -925,7 +925,7 @@ func TestFiveNode_LeaderElection(t *testing.T) {
 	waitForCondition(t, leaderElectionTimeout, "exactly 1 leader in 5-node cluster", func() bool {
 		count := 0
 		for _, h := range cluster.hosts {
-			info, err := h.GetShardInfo(1)
+			info, err := h.ShardInfo(1)
 			if err != nil {
 				return false
 			}
@@ -1106,9 +1106,9 @@ func TestFiveNode_LeaderFailover(t *testing.T) {
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	oldLeaderReplicaID := uint64(leaderIdx + 1)
 
-	oldLeaderInfo, err := cluster.hosts[leaderIdx].GetShardInfo(1)
+	oldLeaderInfo, err := cluster.hosts[leaderIdx].ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on the original leader failed: %v", err)
+		t.Fatalf("ShardInfo on the original leader failed: %v", err)
 	}
 	oldTerm := oldLeaderInfo.Term
 	if oldTerm == 0 {
@@ -1161,7 +1161,7 @@ func TestFiveNode_LeaderFailover(t *testing.T) {
 			if i == leaderIdx {
 				continue
 			}
-			info, getErr := h.GetShardInfo(1)
+			info, getErr := h.ShardInfo(1)
 			if getErr == nil && info.IsLeader {
 				newLeaderIdx = i
 				return true
@@ -1180,9 +1180,9 @@ func TestFiveNode_LeaderFailover(t *testing.T) {
 	}
 	newLeaderHost := cluster.hosts[newLeaderIdx]
 
-	newLeaderInfo, err := newLeaderHost.GetShardInfo(1)
+	newLeaderInfo, err := newLeaderHost.ShardInfo(1)
 	if err != nil {
-		t.Fatalf("GetShardInfo on the new leader failed: %v", err)
+		t.Fatalf("ShardInfo on the new leader failed: %v", err)
 	}
 	if newLeaderInfo.Term <= oldTerm {
 		t.Errorf("new leader term = %d, want > old leader term %d: the failover did not start a new term",
@@ -1357,11 +1357,11 @@ func TestFiveNode_Session_OnLeader(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 		defer cancel()
 		var err error
-		session, err = h.GetNewSession(ctx, 1)
+		session, err = h.NewSession(ctx, 1)
 		return err
 	})
 	if err != nil {
-		t.Fatalf("GetNewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
+		t.Fatalf("NewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
 	}
 	if session == nil {
 		t.Fatal("session is nil")
@@ -1434,7 +1434,7 @@ func TestFiveNode_RequestSnapshot_OnLeader(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestFiveNode_GetNodeHostInfo verifies that each node in a 5-node cluster
-// returns accurate shard information from GetNodeHostInfo.
+// returns accurate shard information from NodeHostInfo.
 func TestFiveNode_GetNodeHostInfo(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -1443,9 +1443,9 @@ func TestFiveNode_GetNodeHostInfo(t *testing.T) {
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
 	for i, h := range cluster.hosts {
-		info := h.GetNodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
 		if info == nil {
-			t.Fatalf("node[%d] GetNodeHostInfo returned nil", i)
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
 		}
 		if len(info.ShardInfoList) != 1 {
 			t.Errorf("node[%d] ShardInfoList length = %d, want 1",

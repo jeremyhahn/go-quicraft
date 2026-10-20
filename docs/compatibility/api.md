@@ -78,7 +78,6 @@ API requests and per-tenant settings.
 | `seal.NewBarrier(cfg)` | `(*Barrier, error)` | configuration assembled at run time |
 | `seal.MustNewBarrier(cfg)` | `*Barrier`, panics | configuration from compile-time constants |
 | `seal.NewEpochBarrier` / `seal.MustNewEpochBarrier` | aliases | the same functions under the epoch-barrier name |
-| `crypto.NewBarrier` / `crypto.MustNewBarrier` | aliases | `pkg/crypto` re-exports |
 
 ## Errors the version checks return
 

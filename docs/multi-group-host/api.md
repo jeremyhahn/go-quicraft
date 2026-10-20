@@ -24,9 +24,9 @@ application's job.
 ## Naming: the `Get` prefix
 
 Ten `Host` methods carry a `Get` prefix that Go convention would drop:
-`GetNewSession`, `GetNewSessionWithOwner`, `GetNoOPSession`,
-`GetShardMembership`, `GetShardInfo`, `GetLeaderID`, `GetLeaderIDAndTerm`,
-`GetNodeHostInfo`, `GetLogReader`, `GetLogRange`. They are kept on purpose: four
+`NewSession`, `NewSessionWithOwner`, `NoOPSession`,
+`ShardMembership`, `ShardInfo`, `LeaderID`, `LeaderIDAndTerm`,
+`NodeHostInfo`, `LogReader`, `LogRange`. They are kept on purpose: four
 are Dragonboat's own names, which `contrib/dragonboat` exists to present, and
 renaming any of them would break every caller for the sake of convention alone.
 New methods do not take the prefix. The `config.Config` accessors over `*bool`
@@ -269,7 +269,7 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 ```
 
 Submits a session-managed proposal for at-most-once delivery. The session must
-be registered and prepared for proposals (`GetNewSession` does both); one that
+be registered and prepared for proposals (`NewSession` does both); one that
 is not returns `ErrInvalidSession`. After a successful result the caller must
 call `session.ProposalCompleted()`, or the series ID goes stale and no further
 proposal on that session succeeds.
@@ -421,7 +421,7 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 ```
 
 Asks for leadership to move to a specific replica. Once the target validates,
-the call returns and the transfer completes asynchronously. Watch `GetLeaderID`
+the call returns and the transfer completes asynchronously. Watch `LeaderID`
 or `OnLeaderUpdated` for the outcome.
 
 `targetReplicaID` must name a current voting member. It is checked here rather
@@ -451,7 +451,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error
 runtime seal can withdraw the shard's barrier key with none of the shard's work
 in flight. `ResumeShard` restarts it. The replica keeps its log, state machine,
 membership and persisted Raft state, and writes nothing to the log or the
-snapshot store while paused. `GetShardInfo` reports `Paused`.
+snapshot store while paused. `ShardInfo` reports `Paused`.
 
 While paused:
 
@@ -627,24 +627,24 @@ shard already violates is rejected with `ErrTooManyWitnesses` or
 
 ```go
 func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
-func (h *Host) SyncRequestDeleteNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error
+func (h *Host) SyncRequestRemoveNode(ctx context.Context, shardID, replicaID uint64, configChangeIndex uint64) error
 func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
 func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error
 ```
 
-Block until the change is applied. The remove variant is `SyncRequestDeleteNode`
-(Dragonboat's name); there is no `SyncRequestRemoveNode`.
+Block until the change is applied. Each is the synchronous form of the
+matching `Request*` call (`SyncRequestRemoveNode` of `RequestRemoveNode`).
 
 #### Membership queries
 
 ```go
 func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Membership, error)
-func (h *Host) GetShardMembership(shardID uint64) (*Membership, error)
+func (h *Host) ShardMembership(shardID uint64) (*Membership, error)
 ```
 
 `SyncGetShardMembership` is a linearizable read (a ReadIndex round-trip); every
 config change committed before the call is reflected. `ctx` must carry a
-deadline. `GetShardMembership` returns the local membership without a quorum
+deadline. `ShardMembership` returns the local membership without a quorum
 check and may be stale. Both return deep copies.
 
 ### Snapshots
@@ -902,16 +902,16 @@ func (h *Host) ID() string
 func (h *Host) RaftAddress() string
 func (h *Host) NodeIdentity() string
 func (h *Host) ShardCount() int
-func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
-func (h *Host) GetLeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
+func (h *Host) LeaderID(shardID uint64) (uint64, bool, error)
+func (h *Host) LeaderIDAndTerm(shardID uint64) (uint64, uint64, bool, error)
 func (h *Host) ShardReadReady(shardID uint64) (leaderID, term uint64, ready bool, err error)
-func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
-func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
+func (h *Host) ShardInfo(shardID uint64) (*ShardInfo, error)
+func (h *Host) NodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
 func (h *Host) IsShardJoining(shardID uint64) bool
 func (h *Host) StateMachineHash(shardID uint64) (hash uint64, appliedIndex uint64, ok bool, err error)
 ```
 
-`GetLeaderID` returns `(leaderID, known, err)` and `GetLeaderIDAndTerm`
+`LeaderID` returns `(leaderID, known, err)` and `LeaderIDAndTerm`
 `(leaderID, term, known, err)`. Both read local atomic state and may be stale.
 
 `ShardReadReady` is the synchronous form of `OnLeaderReady`: `ready` is true
@@ -925,7 +925,7 @@ It refuses as `ReadIndex` does before reaching Raft: `ErrClosed`, `ErrDraining`,
 `ErrShardNotFound`, `ErrInvalidOperation` on a witness, `ErrShardNotReady`
 before the shard is in the engine, and `ErrShardFailed` once the failure latch
 has tripped.
-`GetNodeHostInfo` returns a snapshot of all loaded shards; pass
+`NodeHostInfo` returns a snapshot of all loaded shards; pass
 `NodeHostInfoOption{SkipLogInfo: true}` to skip the per-shard log info, which is
 the expensive part.
 
@@ -1102,13 +1102,13 @@ here.
 ### Log access
 
 ```go
-func (h *Host) GetLogReader(shardID uint64) (ReadonlyLogReader, error)
+func (h *Host) LogReader(shardID uint64) (ReadonlyLogReader, error)
 func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex, lastIndex, maxSize uint64) ([]proto.Entry, error)
-func (h *Host) GetLogRange(shardID uint64) (LogRange, error)
+func (h *Host) LogRange(shardID uint64) (LogRange, error)
 ```
 
-`GetLogReader` returns a read-only view of the shard's log (range and node
-state). `GetLogRange` returns the first and last available indices. Both return
+`LogReader` returns a read-only view of the shard's log (range and node
+state). `LogRange` returns the first and last available indices. Both return
 `ErrClosed` or `ErrShardNotFound`.
 
 `QueryRaftLog` returns the entries in the half-open range
@@ -1121,22 +1121,54 @@ as `logdb.ErrCompacted`.
 ### Diagnostics
 
 ```go
-func (h *Host) DiagPipelineState(shardID uint64) (commitPending bool, proposalQLen int, inboxLen int, pendingProposals int, err error)
-func (h *Host) DiagRaftState(shardID uint64) (term, committed, processed, lastIdx uint64, msgs int, state string, err error)
-func (h *Host) DiagRemotes(shardID uint64) (string, error)
-func (h *Host) DiagShardGates(shardID uint64) (recovering, saving bool, applyInFlight int64, err error)
+func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error)
+func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error)
+func (h *Host) DiagRemotes(shardID uint64) (RemotesDiag, error)
+func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error)
+
+type PipelineDiag struct {
+	CommitPending    bool
+	ProposalQueueLen int
+	InboxLen         int
+	PendingProposals int
+}
+
+type RaftStateDiag struct {
+	Term, Committed, Processed, LastIndex uint64
+	PendingMessages                       int
+	State                                 string
+}
+
+type RemotesDiag struct {
+	Text string
+}
+
+type ShardGatesDiag struct {
+	Recovering, Saving bool
+	ApplyInFlight      int64
+}
 ```
 
-For incident response, not monitoring; their signatures may change.
-`DiagPipelineState` shows commit queuing, proposal queue depth and inbox
-backlog. `DiagRaftState` shows term, commit index, processed index, last index,
-pending message count and role. `DiagRemotes` renders peer replication state as
-text; prefer `ShardInfo.Replicas` for structured data.
+For incident response, not monitoring. Each returns `ErrShardNotReady` when the
+shard is not loaded on this host. The structs carry JSON tags, so they can be
+logged or served as they are.
+
+`DiagPipelineState` shows commit queuing, proposal queue depth, inbox backlog
+and the proposals the host is still waiting to resolve; the four fields are read
+one after another, not atomically together. `DiagRaftState` shows term, commit
+index, processed index, last index, outbound message count and `State`, a
+human-readable role with its timers (`leader(hb=1 et=4)`), followed by
+`self-removed` or `unreadable-log-denials=N` when they apply. `DiagRaftState` and
+`DiagRemotes` read the snapshot the step worker publishes each tick; the first
+call enables publication, so it reports `(diagnostics warming up)`.
+`DiagRemotes.Text` renders the leader's view of each remote, and is
+`not leader` elsewhere; use `ShardInfo.Replicas` for the same state structured.
+Neither `State` nor `Text` is a format to parse.
 
 `DiagShardGates` reports the two gates that suspend state machine work. While
-`recovering` is true the state machine is being replaced by a received
+`Recovering` is true the state machine is being replaced by a received
 snapshot: the replica applies nothing, though it keeps voting and replicating.
-While `saving` is true a snapshot capture has quiesced applies. `applyInFlight`
+While `Saving` is true a snapshot capture has quiesced applies. `ApplyInFlight`
 is the drain counter both gates wait on. Both states also appear in
 `ShardInfo.Health`.
 
@@ -1303,8 +1335,8 @@ trustworthy as the embedder's own authentication: a caller free to choose any
 ### Registration
 
 ```go
-func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error)
-func (h *Host) GetNewSessionWithOwner(ctx context.Context, shardID, ownerID uint64) (*Session, error)
+func (h *Host) NewSession(ctx context.Context, shardID uint64) (*Session, error)
+func (h *Host) NewSessionWithOwner(ctx context.Context, shardID, ownerID uint64) (*Session, error)
 ```
 
 1. Draw a client ID from `crypto/rand`, rejecting zero.
@@ -1344,7 +1376,7 @@ Proposes unregistration (`seriesID = SeriesIDForUnregister`). The
 session), `ErrInvalidSession` (wrong shard, or a no-op session).
 
 ```go
-func (h *Host) GetNoOPSession(shardID uint64) *Session
+func (h *Host) NoOPSession(shardID uint64) *Session
 ```
 
 Returns a no-op session (client ID 0). It bypasses deduplication, so use it only
@@ -1401,7 +1433,7 @@ type Membership struct {
     // No config change alters these afterwards.
     SessionExpiryEntries uint64
     MaxTotalSessions     uint64
-    MaxSessionsPerClient uint64
+    MaxResponsesPerSession uint64
     MaxSessionsPerOwner  uint64
 
     // Committed node identities: replicaID -> NodeIdentity() value.
@@ -1416,7 +1448,7 @@ func (m *Membership) ConfigChangeIndex() uint64 // returns ConfigChangeID
 ```
 
 The committed membership of a shard, returned by `SyncGetShardMembership` and
-`GetShardMembership`. `NewMembership` returns a value with every map
+`ShardMembership`. `NewMembership` returns a value with every map
 initialized.
 
 **Session policy is replicated.** A replica evaluating the limits from its own
@@ -1426,7 +1458,7 @@ replica reads the shard's copy. They are exposed so you can see what the shard
 committed. If someone edits a node's `Config` after bootstrap, the shard's value
 governs and the node logs the disagreement at startup.
 
-`MaxSessionsPerClient` is the response-cache depth: how many cached results one
+`MaxResponsesPerSession` is the response-cache depth: how many cached results one
 session keeps for duplicate detection. It does not limit sessions.
 `MaxSessionsPerOwner` is the per-principal session cap and `MaxTotalSessions`
 the shard-wide one.
@@ -2010,7 +2042,7 @@ Source: `pkg/config/config.go`.
 | `MaxEntrySize` | `uint64` | `8 MB` | entry cap and the decompression ceiling on apply; may not exceed `proto.MaxEntrySize` |
 | `MaxApplyEntrySize` | `uint64` | `16711672` | entry bytes one outbound replication message carries; may not exceed `config.MaxReplicationPayloadBytes`, the most a frame can carry. Despite the name it does not bound an `SM.Update` batch, which a fixed internal 64 MiB limit governs |
 | `MaxSnapshotSize` | `uint64` | `4 GB` | maximum snapshot file size |
-| `MaxSessionsPerClient` | `uint64` | `128` | cached responses per session. Bootstrap seed; replicated |
+| `MaxResponsesPerSession` | `uint64` | `128` | cached responses per session. Bootstrap seed; replicated |
 | `MaxTotalSessions` | `uint64` | `16384` | shard-wide session cap. Bootstrap seed; replicated |
 | `MaxSessionsPerOwner` | `uint64` | `128` | per-owner session cap; `config.SessionsPerOwnerUnlimited` removes it. Bootstrap seed; replicated |
 | `SessionExpiryEntries` | `uint64` | `100000` | inactivity threshold in log entries; a non-zero value must be at least 100. `config.SessionExpiryDisabled` turns expiry off. Bootstrap seed; replicated |
@@ -2284,9 +2316,9 @@ the store unchanged.
 ### Sessions and on-disk state machines
 
 A shard backed by an `sm.DiskStateMachine` supports no-op sessions only.
-`GetNewSession`, `GetNewSessionWithOwner`, `RegisterSession`,
+`NewSession`, `NewSessionWithOwner`, `RegisterSession`,
 `ProposeWithSession`, `SyncProposeWithSession` and `CloseSession` return
-`ErrSessionsUnsupportedOnDisk` there. Use `GetNoOPSession` and make operations
+`ErrSessionsUnsupportedOnDisk` there. Use `NoOPSession` and make operations
 idempotent, the same constraint Dragonboat places on `IOnDiskStateMachine`.
 
 The reason is `Open`. The session table travels only inside the snapshot
@@ -2377,7 +2409,6 @@ Raft events:
 | `OnLeaderLost` | `EventShardInfo` | the local replica lost leadership |
 | `OnLeaderReady` | `LeaderInfo` | the shard's leader for `Term` has committed an entry of that term, so ReadIndex is served; see below |
 | `OnCampaignLaunched` | `EventShardInfo` | an election campaign started |
-| `OnCampaignSkipped` | `EventShardInfo` | **never fires**; see below |
 | `OnSnapshotRejected` | `SnapshotInfo` | a snapshot was rejected: a request refused or abandoned, a save that panicked, an inbound transfer refused, or a recovery that failed before the state machine's `RecoverFromSnapshot` was invoked (the engine re-drives it). `SnapshotInfo.Err` carries the cause when there is one |
 | `OnProposalDropped` | `EventShardInfo` | a proposal could not be handed to the shard and was failed with `ErrDropped` |
 | `OnReadIndexDropped` | `EventShardInfo` | a ReadIndex request could not be handed to the shard and was refused with `ErrSystemBusy` |
@@ -2404,12 +2435,6 @@ event for that moment, so a consumer waits on it instead of retrying:
 - Witnesses store no log, cannot serve reads, and never receive it.
 
 `Host.ShardReadReady` answers the same question synchronously.
-
-> **`OnCampaignSkipped` never fires.** The field exists and is forwarded, but no
-> engine code invokes it. Do not build a leaderless-shard alert on it: the
-> conditions it would report are exactly those that leave a shard without a
-> leader while quorum looks intact, and silence is indistinguishable from
-> health. Use `GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
 
 System events:
 
@@ -2539,7 +2564,7 @@ type ShardInfo struct {
 }
 ```
 
-A point-in-time copy returned by `GetShardInfo`. `StateMachineType` is 0
+A point-in-time copy returned by `ShardInfo`. `StateMachineType` is 0
 regular, 1 concurrent, 2 on-disk. `IsObserver` is the effective role from the
 applied membership (a promoted observer reports `false` without a restart);
 `IsWitness` is the configured witness role. `Nodes` covers all known members;
@@ -2666,7 +2691,7 @@ if err != nil {
 ### At-most-once propose with a session
 
 ```go
-session, err := host.GetNewSession(ctx, shardID)
+session, err := host.NewSession(ctx, shardID)
 if err != nil {
     return err
 }

@@ -16,7 +16,7 @@ surface in [`api.md`](api.md).
 | Source | Holds |
 |---|---|
 | `pkg/session.go` | the public `Session` type |
-| `pkg/host.go` | `GetNewSession`, `GetNewSessionWithOwner`, `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession`, `CloseSession`, `GetNoOPSession` |
+| `pkg/host.go` | `NewSession`, `NewSessionWithOwner`, `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession`, `CloseSession`, `NoOPSession` |
 | `pkg/internal/session/manager.go`, `session.go`, `errors.go` | the session manager |
 | `pkg/internal/rsm/statemachine.go` | routing of session entries in `Apply` |
 | `pkg/proto/entry.go`, `constants.go`, `membership.go` | entry fields, sentinels, `SessionPolicy` |
@@ -25,7 +25,7 @@ surface in [`api.md`](api.md).
 
 ### Registration
 
-`GetNewSessionWithOwner(ctx, shardID, ownerID)` (and `GetNewSession`, which is
+`NewSessionWithOwner(ctx, shardID, ownerID)` (and `NewSession`, which is
 the same with owner 0):
 
 1. Refuse a `DiskStateMachine` shard with `ErrSessionsUnsupportedOnDisk`.
@@ -279,7 +279,7 @@ since zero there means the cap is off. Existing sessions are kept; lowering
 eight bytes the caller picks, so one client could register until the table is
 full and every other tenant loses at-most-once delivery. `MaxSessionsPerOwner`
 bounds concurrent sessions per declared owner, carried in the log as
-`Entry.OwnerID` from `GetNewSessionWithOwner` or `NewSessionWithOwner`.
+`Entry.OwnerID` from `NewSessionWithOwner` or `NewSessionWithOwner`.
 
 - It is a state machine decision. Every replica must reach the same verdict from
   the log alone, including on replay; the connection that carried the proposal
@@ -372,21 +372,21 @@ replica, because the snapshot reflects the log.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `MaxSessionsPerClient` | 128 | response-cache depth per session (`maxResponses`) |
+| `MaxResponsesPerSession` | 128 | response-cache depth per session (`maxResponses`) |
 | `MaxTotalSessions` | 16384 | sessions per shard |
 | `MaxSessionsPerOwner` | 128 | sessions per declared owner; `config.SessionsPerOwnerUnlimited` disables the cap |
 | `SessionExpiryEntries` | 100000 | inactivity threshold in applied entries; `config.SessionExpiryDisabled` (`math.MaxUint64`) disables expiry |
 
-- **`MaxSessionsPerClient` does not limit sessions.** It is the number of cached
-  results one session keeps. The name is kept because renaming a public field
-  breaks callers, and it appears in `proto.SessionPolicy` too. Transposing it
+- **`MaxResponsesPerSession` does not limit sessions.** It is the number of cached
+  results one session keeps, and it appears in `proto.SessionPolicy` too.
+  Transposing it
   with `MaxTotalSessions` fails silently either way, which is why the adapter
   takes the policy as one struct.
 - **Zero means "not chosen".** `SetDefaults` replaces zero with the default for
   all four fields. Disabling expiry or the owner cap takes the explicit
   constant.
 - `Validate` rejects `SessionExpiryEntries` below 100, rejects a zero
-  `MaxSessionsPerClient` or `MaxTotalSessions`, and warns when the threshold exceeds a non-zero
+  `MaxResponsesPerSession` or `MaxTotalSessions`, and warns when the threshold exceeds a non-zero
   `SnapshotEntries`. With expiry disabled, a client that dies without
   `CloseSession` holds its slot in `MaxTotalSessions`, and in every snapshot,
   forever.
@@ -407,7 +407,7 @@ disabled) instead of reading as "no policy".
 - All founders must supply the same values, or their index-1 entries differ.
 - A node whose configuration disagrees applies the shard's values and logs the
   disagreement at WARN; it does not refuse to start.
-- `Host.GetShardMembership` reports the committed policy.
+- `Host.ShardMembership` reports the committed policy.
 - There is no config change for the policy; it is fixed for the life of the
   shard.
 

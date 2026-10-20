@@ -584,7 +584,7 @@ func (e *fixedEntropy) Read(p []byte) (int, error) {
 // Zero is the value that marks an entry as carrying NO session, and the failure
 // it produced was silent in both directions: the registration entry fails
 // Entry.IsNewSessionRequest, so the state machine skips it and returns an empty
-// result, and GetNewSession's own check is `result.Value != clientID` — which
+// result, and NewSession's own check is `result.Value != clientID` — which
 // 0 != 0 satisfies. The call therefore REPORTED SUCCESS and handed back a
 // session whose every later proposal is unsessioned, silently turning off
 // at-most-once delivery for that client. RegisterSession already rejects a zero
@@ -613,7 +613,7 @@ func TestNewClientID_RejectsTheReservedZero(t *testing.T) {
 
 // TestNewClientID_FailsOnADegenerateEntropySource pins the bound on the
 // re-roll. An entropy source that returns the same rejected value forever is
-// broken, and looping on it would hang a caller inside GetNewSession; minting
+// broken, and looping on it would hang a caller inside NewSession; minting
 // from it anyway would hand out predictable identifiers.
 func TestNewClientID_FailsOnADegenerateEntropySource(t *testing.T) {
 	src := &fixedEntropy{draws: [][]byte{make([]byte, 8)}}
@@ -631,7 +631,7 @@ func TestNewClientID_FailsOnADegenerateEntropySource(t *testing.T) {
 }
 
 // TestGetNewSession_MintsAUsableSession is the end-to-end companion: the
-// session GetNewSession hands back must actually be session-managed, so a
+// session NewSession hands back must actually be session-managed, so a
 // proposal made with it is deduplicated rather than silently unsessioned.
 func TestGetNewSession_MintsAUsableSession(t *testing.T) {
 	h := newTestHost(t)
@@ -644,16 +644,16 @@ func TestGetNewSession_MintsAUsableSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession: %v", err)
+		t.Fatalf("NewSession: %v", err)
 	}
 	if session.ClientID() == proto.NotSessionManagedClientID {
-		t.Fatal("GetNewSession reported SUCCESS for a session carrying the " +
+		t.Fatal("NewSession reported SUCCESS for a session carrying the " +
 			"reserved no-session client ID: every proposal made with it is " +
 			"unsessioned, so at-most-once delivery is off for this client")
 	}
 	if session.IsNoOPSession() {
-		t.Fatal("GetNewSession returned a no-op session")
+		t.Fatal("NewSession returned a no-op session")
 	}
 }

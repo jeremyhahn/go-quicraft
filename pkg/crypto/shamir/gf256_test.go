@@ -17,7 +17,6 @@ package shamir
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"testing"
 )
@@ -111,23 +110,16 @@ func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 			if _, err := rand.Read(secret); err != nil {
 				t.Fatalf("rand: %v", err)
 			}
-			shares, err := Split(secret, cfg.threshold, cfg.total)
-			if err != nil {
-				t.Fatalf("Split(%d,%d): %v", cfg.threshold, cfg.total, err)
-			}
+			values := splitValues(t, secret, cfg.threshold, cfg.total)
 
 			// All threshold-sized combinations.
 			idx := make([]int, cfg.threshold)
 			var rec func(start, k int)
 			rec = func(start, k int) {
 				if k == cfg.threshold {
-					subset := make([]*Share, cfg.threshold)
-					for i, j := range idx {
-						subset[i] = shares[j]
-					}
-					got, cerr := Combine(subset)
+					got, cerr := CombineBytes(pick(values, idx...), cfg.threshold)
 					if cerr != nil {
-						t.Fatalf("Combine subset %v: %v", idx, cerr)
+						t.Fatalf("CombineBytes subset %v: %v", idx, cerr)
 					}
 					if !bytes.Equal(got, secret) {
 						t.Fatalf("subset %v reconstructed wrong secret", idx)
@@ -142,9 +134,9 @@ func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 			rec(0, 0)
 
 			// All shares together also reconstruct exactly.
-			got, err := Combine(shares)
+			got, err := CombineBytes(values, cfg.threshold)
 			if err != nil {
-				t.Fatalf("Combine all: %v", err)
+				t.Fatalf("CombineBytes all: %v", err)
 			}
 			if !bytes.Equal(got, secret) {
 				t.Fatal("all-shares reconstruction mismatch")
@@ -153,28 +145,22 @@ func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 	}
 }
 
-// TestCombineTamperedShareYieldsGarbage verifies the contract: flipping a
+// TestCombineTamperedShareYieldsGarbage verifies that flipping a payload
 // byte in a share is NOT self-detected (shares carry no secret digest — that
-// would be an offline oracle). Combine returns garbage, not an error; the caller
-// must catch this via out-of-band authentication.
+// would be an offline oracle). CombineBytes returns garbage, not an error; the
+// caller must catch this via out-of-band authentication.
 func TestCombineTamperedShareYieldsGarbage(t *testing.T) {
 	secret := []byte("tamper detection secret")
-	shares, err := Split(secret, 3, 5)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
+	values := splitValues(t, secret, 3, 5)
 
 	// Tamper with a payload byte of share 1 (re-encode base64).
-	raw, err := shares[1].Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	raw := decodeValue(t, values[1])
 	raw[rawShareOverhead] ^= 0x01
-	shares[1].Value = encodeB64(raw)
+	values[1] = encodeB64(raw)
 
-	got, err := Combine(shares[:3])
+	got, err := CombineBytes(values[:3], 3)
 	if err != nil {
-		t.Fatalf("Combine must not error on a tampered share: %v", err)
+		t.Fatalf("CombineBytes must not error on a tampered share: %v", err)
 	}
 	if bytes.Equal(got, secret) {
 		t.Fatal("tampered share unexpectedly reconstructed the original secret")
@@ -185,16 +171,12 @@ func TestCombineTamperedShareYieldsGarbage(t *testing.T) {
 // current format version byte is rejected explicitly rather than
 // misinterpreted (gates legacy pre-GF(256) shares).
 func TestCombineRejectsLegacyFormat(t *testing.T) {
-	secret := []byte("format version gate")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	raw, _ := shares[0].Bytes()
+	values := splitValues(t, []byte("format version gate"), 2, 3)
+	raw := decodeValue(t, values[0])
 	raw[0] = 0x7F // unknown version
-	shares[0].Value = encodeB64(raw)
+	values[0] = encodeB64(raw)
 
-	_, err = CombineUnverified(shares[:2])
+	_, err := CombineBytes(values[:2], 2)
 	var combineErr *CombineError
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("err = %v, want CombineError", err)
@@ -204,66 +186,20 @@ func TestCombineRejectsLegacyFormat(t *testing.T) {
 // TestCombineRejectsDuplicateXCoordinate verifies that two shares with
 // the same field coordinate are rejected (zero Lagrange denominator).
 func TestCombineRejectsDuplicateXCoordinate(t *testing.T) {
-	secret := []byte("dup x")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	// Same value under a different Share.Index: the embedded x is what
-	// counts.
-	dup := *shares[0]
-	dup.Index = 2
-	_, err = Combine([]*Share{shares[0], &dup})
+	values := splitValues(t, []byte("dup x"), 2, 3)
+	// The same value twice: the embedded x is what counts.
+	_, err := CombineBytes(pick(values, 0, 0), 2)
 	var combineErr *CombineError
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("err = %v, want CombineError for duplicate x", err)
 	}
 }
 
-// TestCombineRequiresDigest verifies that Combine refuses digest-less
-// shares and CombineUnverified accepts them (explicit opt-out, not a
-// silent sentinel).
-// TestCombineEqualsCombineUnverified verifies the contract: shares carry no
-// secret digest, so Combine performs no self-verification and is identical to
-// CombineUnverified — both reconstruct the secret and leave integrity to the
-// caller's out-of-band authentication.
-func TestCombineEqualsCombineUnverified(t *testing.T) {
-	secret := []byte("digest policy")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-
-	gotCombine, err := Combine(shares[:2])
-	if err != nil {
-		t.Fatalf("Combine: %v", err)
-	}
-	gotUnverified, err := CombineUnverified(shares[:2])
-	if err != nil {
-		t.Fatalf("CombineUnverified: %v", err)
-	}
-	if !bytes.Equal(gotCombine, secret) || !bytes.Equal(gotUnverified, secret) {
-		t.Fatal("reconstruction mismatch")
-	}
-	if !bytes.Equal(gotCombine, gotUnverified) {
-		t.Fatal("Combine and CombineUnverified produced different results")
-	}
-}
-
-// TestFewerThanThresholdSharesRevealNothing verifies (probabilistically)
-// that threshold-1 shares do not reconstruct the secret.
+// TestFewerThanThresholdSharesRevealNothing verifies that threshold-1 shares
+// are refused rather than reconstructed.
 func TestFewerThanThresholdSharesRevealNothing(t *testing.T) {
-	secret := []byte("below threshold")
-	shares, err := Split(secret, 3, 5)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	if _, err := CombineUnverified(shares[:2]); err == nil {
+	values := splitValues(t, []byte("below threshold"), 3, 5)
+	if _, err := CombineBytes(values[:2], 3); err == nil {
 		t.Fatal("threshold check must reject 2 of 3 shares")
 	}
-}
-
-// encodeB64 is a test helper mirroring the share value encoding.
-func encodeB64(raw []byte) string {
-	return base64.StdEncoding.EncodeToString(raw)
 }

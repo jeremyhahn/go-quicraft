@@ -38,8 +38,8 @@ func artifactMembership() proto.Membership {
 		Observers: map[uint64]string{9: "10.0.0.9:9000"},
 	}
 	m.SetSessionPolicy(proto.SessionPolicy{
-		MaxTotalSessions:     4096,
-		MaxSessionsPerClient: 32,
+		MaxTotalSessions:       4096,
+		MaxResponsesPerSession: 32,
 	})
 	return m
 }
@@ -113,7 +113,7 @@ func TestResolveImportMembership_ReconstitutesAfterQuorumLoss(t *testing.T) {
 
 	// Policy is not membership and must survive.
 	sp := got.SessionPolicy()
-	if sp.MaxTotalSessions != 4096 || sp.MaxSessionsPerClient != 32 {
+	if sp.MaxTotalSessions != 4096 || sp.MaxResponsesPerSession != 32 {
 		t.Errorf("session policy lost in the rewrite: %+v", sp)
 	}
 	if got.MaxWitnesses != 2 {

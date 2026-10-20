@@ -57,9 +57,8 @@ who reads one persisted share, could test guessed secrets against the digest
 without reaching the threshold. That destroys Shamir's information-theoretic
 secrecy exactly where it matters most: low-entropy secrets.
 
-Shares carry no digest. `IntegrityError` remains in the package, deprecated and
-never returned, so existing callers keep compiling. Do not write code that waits
-for it.
+Shares carry no digest, and the package has no integrity error: nothing can
+report a wrong reconstruction, so do not write code that waits for one.
 
 The consequence runs through every document about this feature: with fewer than
 threshold genuine shares, or a corrupted or mismatched share, reconstruction
@@ -91,16 +90,16 @@ shares to a recovery ceremony could hand combine 255 one-megabyte shares: about
 a few megabytes and milliseconds. Large payloads are enveloped under a key that
 does fit; the payload itself is never shared.
 
-## Three APIs
+## Two APIs
 
 ```
-SplitProtected(secret, M, N) []*ProtectedShare   SplitBytes(secret, M, N) [][]byte   Split(secret, M, N) []*Share
-        |                                                |                                   |
-  value in an enclave.ByteAccess         raw wipeable []byte buffers        Share.Value is a Go STRING
-        |                                                |                                   |
-  mlock'd; Destroy wipes                        caller wipes when distributed       immortal until GC
-        |                                                |                                   |
-CombineProtected([]*ProtectedShare) ByteAccess CombineBytes([][]byte, M) []byte   Combine([]*Share) []byte
+SplitProtected(secret, M, N) []*ProtectedShare      SplitBytes(secret, M, N) [][]byte
+        |                                                   |
+  value in an enclave.ByteAccess                 raw wipeable []byte buffers
+        |                                                   |
+  mlock'd; Destroy wipes                         caller wipes when distributed
+        |                                                   |
+CombineProtected([]*ProtectedShare) ByteAccess     CombineBytes([][]byte, M) []byte
 ```
 
 - **Protected (preferred).** `SplitProtected` / `CombineProtected` hold each
@@ -115,17 +114,17 @@ CombineProtected([]*ProtectedShare) ByteAccess CombineBytes([][]byte, M) []byte 
   material in wipeable buffers they manage themselves. `CombineBytes` wipes every
   decoded buffer on every return path, including partially decoded and rejected
   shares; the caller still owns and must wipe the inputs.
-- **Struct (deprecated).** `Share.Value` is a Go `string` and cannot be zeroed,
-  so every share stays readable in the heap until the garbage collector reclaims
-  it. `Split` wipes the buffer it encoded from, but the string it returns is the
-  one copy it cannot take back, and a ceremony holds all N shares at once: the
-  widest exposure in the scheme. `Split`, `Combine`, `CombineUnverified` and the
-  `Share.Value` field are deprecated for that reason.
 
-The three are interchangeable on the wire: a `ProtectedShare` marshals
-byte-for-byte what a `Share` does, so a consumer migrates one call site at a
-time. The full contract, including the obligations that come with locked memory,
-is in [`engineering.md`](engineering.md#share-values-in-protected-memory).
+There is deliberately no third form holding the value in a Go `string`. A string
+cannot be zeroed, so every share would stay readable in the heap until the
+garbage collector reclaimed it, and a ceremony holds all N shares at once: the
+widest exposure in the scheme. The deprecated struct form that did this was
+removed before v1.0.0.
+
+The two are interchangeable on the wire: a `SplitBytes` value is byte-for-byte
+the `"value"` a `ProtectedShare` marshals, so a consumer can move between them
+one call site at a time. The full contract, including the obligations that come
+with locked memory, is in [`engineering.md`](engineering.md#share-values-in-protected-memory).
 
 ## Data flow, and where it stops
 

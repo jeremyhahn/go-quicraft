@@ -135,7 +135,7 @@ func TestBuildInitialMembershipEntry_LegalMembershipStillRoundTrips(t *testing.T
 // Layout, spelled out because that is half the point of the test:
 //
 //	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
-//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8]
+//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
 //	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
 //
 // with each map encoded as [count:4] followed by [key:8][len:4][value] per entry

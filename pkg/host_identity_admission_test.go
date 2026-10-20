@@ -520,8 +520,8 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 	if err := restarted.SyncRequestAddObserverWithIdentity(ctx, 1, 2, "node-b.raft.test:5000", testIdentity(2), 0); err != nil {
 		t.Fatalf("SyncRequestAddObserverWithIdentity: %v", err)
 	}
-	if err := restarted.SyncRequestDeleteNode(ctx, 1, 2, 0); err != nil {
-		t.Fatalf("SyncRequestDeleteNode: %v", err)
+	if err := restarted.SyncRequestRemoveNode(ctx, 1, 2, 0); err != nil {
+		t.Fatalf("SyncRequestRemoveNode: %v", err)
 	}
 	// A snapshot, so the restart recovers the tombstone rather than the
 	// founding entry alone (checkRecoveredIdentities sees what recovery

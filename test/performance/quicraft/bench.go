@@ -242,7 +242,7 @@ func waitForClusterLeader(hosts []*quicraft.Host, shardID uint64, timeout time.D
 	for {
 		lastErrors = lastErrors[:0]
 		for i, h := range hosts {
-			info, err := h.GetShardInfo(shardID)
+			info, err := h.ShardInfo(shardID)
 			if err == nil && info.IsLeader {
 				return i, nil
 			}
@@ -749,7 +749,7 @@ func waitForQuicRaftLeader(h *quicraft.Host) error {
 	deadline := time.NewTimer(quicraftElectionWait)
 	defer deadline.Stop()
 	for {
-		leaderID, ok, err := h.GetLeaderID(quicraftShardID)
+		leaderID, ok, err := h.LeaderID(quicraftShardID)
 		if err == nil && ok && leaderID > 0 {
 			return nil
 		}

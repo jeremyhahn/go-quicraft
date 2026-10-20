@@ -1787,7 +1787,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 				RequireFullReplicaMajority: first.Membership.RequireFullReplicaMajority,
 				SessionExpiryEntries:       first.Membership.SessionExpiryEntries,
 				MaxTotalSessions:           first.Membership.MaxTotalSessions,
-				MaxSessionsPerClient:       first.Membership.MaxSessionsPerClient,
+				MaxResponsesPerSession:     first.Membership.MaxResponsesPerSession,
 				MaxSessionsPerOwner:        first.Membership.MaxSessionsPerOwner,
 				Addresses:                  copyMapUint64String(first.Membership.Addresses),
 				Observers:                  copyMapUint64String(first.Membership.Observers),

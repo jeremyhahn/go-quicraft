@@ -173,7 +173,7 @@ because the cap is a state machine decision: every replica has to accept or
 refuse a registration identically from the log alone, and a leader-local fact
 is not in the log and is not available to a replica replaying after a restart.
 
-The value is supplied by the embedder (`Host.GetNewSessionWithOwner`,
+The value is supplied by the embedder (`Host.NewSessionWithOwner`,
 `NewSessionWithOwner`). This library has no notion of who a client is, and a
 `ClientID` is eight bytes the caller chooses, so it cannot serve to group
 sessions by principal. **Zero means unset**, and an unset owner is never
@@ -729,7 +729,7 @@ The layout, at version **1**:
 | 17     | 8    | RequireFullReplicaMajority   | bool   | Replicated full-replica-majority policy |
 | 25     | 8    | SessionExpiryEntries         | uint64 | Replicated session inactivity threshold |
 | 33     | 8    | MaxTotalSessions             | uint64 | Replicated cap on registered sessions |
-| 41     | 8    | MaxSessionsPerClient         | uint64 | Replicated cap on cached responses per session |
+| 41     | 8    | MaxResponsesPerSession         | uint64 | Replicated cap on cached responses per session |
 | 49     | 8    | MaxSessionsPerOwner          | uint64 | Replicated cap on sessions per declared owner |
 
 Fixed region: `membershipFixedSize = sessionPolicyOffset (25) +
@@ -761,13 +761,11 @@ invariant intact.
 |------------------------|----------------|
 | `SessionExpiryEntries` | The interval of `rsm.StateMachine.Apply`'s expiry checkpoint walk. Two replicas with different intervals expire different sessions at different log indexes |
 | `MaxTotalSessions`     | `session.Manager.Register`, shard-wide. A replica that refuses a registration its peers admit answers `ResultSessionExpired` for every later entry of that session |
-| `MaxSessionsPerClient` | The per-session **response cache** depth (`CanRecord`/`RecordResult`) |
+| `MaxResponsesPerSession` | The per-session **response cache** depth (`CanRecord`/`RecordResult`) |
 | `MaxSessionsPerOwner`  | `session.Manager.Register` per owner (`Entry.OwnerID`); zero disables it |
 
-`MaxSessionsPerClient` is misnamed and the name is kept only because the wire
-format is pinned. It is the mirror of `config.Config.MaxSessionsPerClient`,
-which chose the name before the field was wired to the response cache. Read
-it as "max responses per session". The cap the name suggests is
+`MaxResponsesPerSession` mirrors `config.Config.MaxResponsesPerSession`. It
+does not limit sessions; the per-principal session cap is
 `MaxSessionsPerOwner`, a different field with a different failure mode.
 
 `MaxTotalSessions` is the policy-present discriminator: `config.Validate`

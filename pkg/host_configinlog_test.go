@@ -242,9 +242,9 @@ func TestConfigInLog_MembershipReconstructsFromLogOnRestart(t *testing.T) {
 	}
 	defer func() { _ = h.StopShard(shardID) }()
 
-	memb, err := h.GetShardMembership(shardID)
+	memb, err := h.ShardMembership(shardID)
 	if err != nil {
-		t.Fatalf("GetShardMembership: %v", err)
+		t.Fatalf("ShardMembership: %v", err)
 	}
 	if _, ok := memb.Nodes[99]; ok {
 		t.Fatal("recovered membership contains phantom voter 99 from the restart " +

@@ -277,7 +277,7 @@ func TestListenerDispatcher_FullQueueRefusesWithoutBlocking(t *testing.T) {
 // TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull pins the one
 // queue-full policy that is NOT drop. OnLeaderUpdated maintains the Host's
 // isLeader mirror — the flag clients route writes by — so losing one leaves
-// GetShardInfo permanently wrong. publishLeaderChange therefore commits its
+// ShardInfo permanently wrong. publishLeaderChange therefore commits its
 // prevLeaders bookkeeping only when the dispatch is accepted, which makes a
 // refused publish retry on the next tick instead of vanishing.
 func TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull(t *testing.T) {

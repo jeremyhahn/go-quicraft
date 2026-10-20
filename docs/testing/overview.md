@@ -183,7 +183,7 @@ drop packets between replicas that are still running; see
   contention.
 - **Poll every node for leader agreement.** `waitForClusterLeader` returns once
   one node leads; followers may not know it yet. Use `waitForCondition` over
-  `GetShardInfo` on every live node.
+  `ShardInfo` on every live node.
 - **Route through the current leader.** `test/proposer` and `test/membership`
   submit proposals, reads and membership changes to whichever replica leads at
   the moment of each attempt, and treat the retry of an already committed

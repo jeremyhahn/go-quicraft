@@ -122,7 +122,7 @@ var configChangeCalls = map[string]bool{
 	"SyncRequestAddNode":                 true,
 	"SyncRequestAddNodeWithIdentity":     true,
 	"RequestRemoveNode":                  true,
-	"SyncRequestDeleteNode":              true,
+	"SyncRequestRemoveNode":              true,
 	"RequestAddObserver":                 true,
 	"RequestAddObserverWithIdentity":     true,
 	"SyncRequestAddObserver":             true,
@@ -554,7 +554,7 @@ var pendingReadSites = []pendingSite{}
 
 // TestIntegrationConfigChangesAreIdempotent fails when an integration test
 // issues a membership change directly — SyncRequestAddNode,
-// SyncRequestDeleteNode, RequestAddReplica and the rest of configChangeCalls —
+// SyncRequestRemoveNode, RequestAddReplica and the rest of configChangeCalls —
 // instead of through the suite's idempotent, leader-resolving helper.
 //
 // # Why this gate exists
@@ -582,7 +582,7 @@ var pendingReadSites = []pendingSite{}
 //
 // A shared helper alone does not end the class, any more than it ends the
 // propose class: it covers only the sites that happen to use it. Any test
-// can still call SyncRequestDeleteNode itself, with its own retry, and get none
+// can still call SyncRequestRemoveNode itself, with its own retry, and get none
 // of it. So this is a rule about the CALL, like the propose gate above, and no
 // binding or private retry loop can hide from it.
 //

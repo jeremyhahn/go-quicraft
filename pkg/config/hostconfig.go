@@ -185,19 +185,6 @@ type EventListener struct {
 	// OnCampaignLaunched fires when this replica starts an election.
 	OnCampaignLaunched func(info EventShardInfo)
 
-	// OnCampaignSkipped NEVER FIRES. A callback installed here is never
-	// called. The forwarding from the engine down to this field is complete
-	// and correct, but nothing in the engine invokes the hook it forwards,
-	// so no event is ever produced.
-	//
-	// It is reserved to report an election the replica refused to start.
-	// Do NOT build alerting on it: the conditions it would report are the
-	// ones that leave a shard without a leader while quorum looks intact,
-	// and silence here is indistinguishable from health. Detect a
-	// leaderless shard with Host.GetLeaderID or ShardInfo.Health ==
-	// ShardNoLeader instead.
-	OnCampaignSkipped func(info EventShardInfo)
-
 	// OnSnapshotRejected fires when a snapshot is refused or abandoned: a
 	// snapshot request the snapshot pool would not accept, an accepted request
 	// abandoned when the pool stops or failed by a panic mid-save, a recovery

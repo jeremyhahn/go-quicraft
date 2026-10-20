@@ -18,22 +18,18 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 )
 
-func TestSplit_Success(t *testing.T) {
+func TestSplitProtected_Success(t *testing.T) {
 	secret := []byte("This is a secret message for testing!")
 	threshold := 3
 	total := 5
 
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split returned unexpected error: %v", err)
-	}
+	shares := splitProtectedShares(t, secret, threshold, total)
 	if len(shares) != total {
 		t.Fatalf("expected %d shares, got %d", total, len(shares))
 	}
@@ -48,7 +44,7 @@ func TestSplit_Success(t *testing.T) {
 		if share.Total != total {
 			t.Errorf("share %d: expected total %d, got %d", i, total, share.Total)
 		}
-		if share.Value == "" {
+		if len(valueCopy(share)) == 0 {
 			t.Errorf("share %d: value is empty", i)
 		}
 		if err := share.Validate(); err != nil {
@@ -57,8 +53,8 @@ func TestSplit_Success(t *testing.T) {
 	}
 }
 
-func TestSplit_InvalidThreshold(t *testing.T) {
-	_, err := Split([]byte("secret"), 1, 5)
+func TestSplitBytes_InvalidThreshold(t *testing.T) {
+	_, err := SplitBytes([]byte("secret"), 1, 5)
 	if err == nil {
 		t.Fatal("expected error for threshold < 2, got nil")
 	}
@@ -71,8 +67,8 @@ func TestSplit_InvalidThreshold(t *testing.T) {
 	}
 }
 
-func TestSplit_TotalLessThanThreshold(t *testing.T) {
-	_, err := Split([]byte("secret"), 5, 3)
+func TestSplitBytes_TotalLessThanThreshold(t *testing.T) {
+	_, err := SplitBytes([]byte("secret"), 5, 3)
 	if err == nil {
 		t.Fatal("expected error for total < threshold, got nil")
 	}
@@ -85,8 +81,8 @@ func TestSplit_TotalLessThanThreshold(t *testing.T) {
 	}
 }
 
-func TestSplit_ThresholdExceeds255(t *testing.T) {
-	_, err := Split([]byte("secret"), 256, 300)
+func TestSplitBytes_ThresholdExceeds255(t *testing.T) {
+	_, err := SplitBytes([]byte("secret"), 256, 300)
 	if err == nil {
 		t.Fatal("expected error for threshold > 255, got nil")
 	}
@@ -99,8 +95,8 @@ func TestSplit_ThresholdExceeds255(t *testing.T) {
 	}
 }
 
-func TestSplit_TotalExceeds255(t *testing.T) {
-	_, err := Split([]byte("secret"), 3, 256)
+func TestSplitBytes_TotalExceeds255(t *testing.T) {
+	_, err := SplitBytes([]byte("secret"), 3, 256)
 	if err == nil {
 		t.Fatal("expected error for total > 255, got nil")
 	}
@@ -113,8 +109,8 @@ func TestSplit_TotalExceeds255(t *testing.T) {
 	}
 }
 
-func TestSplit_EmptySecret(t *testing.T) {
-	_, err := Split([]byte{}, 3, 5)
+func TestSplitBytes_EmptySecret(t *testing.T) {
+	_, err := SplitBytes([]byte{}, 3, 5)
 	if err == nil {
 		t.Fatal("expected error for empty secret, got nil")
 	}
@@ -127,47 +123,32 @@ func TestSplit_EmptySecret(t *testing.T) {
 	}
 }
 
-func TestCombine_Success(t *testing.T) {
-	secret := []byte("Reconstruct this secret perfectly")
+func TestCombineBytes_Success(t *testing.T) {
+	secret := []byte("Reconstruct this secret via raw byte shares")
 	threshold := 3
 	total := 5
 
-	shares, err := Split(secret, threshold, total)
+	values := splitValues(t, secret, threshold, total)
+	reconstructed, err := CombineBytes(pick(values, 0, 2, 4), threshold)
 	if err != nil {
-		t.Fatalf("Split failed: %v", err)
+		t.Fatalf("CombineBytes failed: %v", err)
 	}
-
-	reconstructed, err := Combine(shares)
-	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
-	}
-
 	if !bytes.Equal(secret, reconstructed) {
 		t.Errorf("reconstructed secret does not match original\noriginal:      %q\nreconstructed: %q", secret, reconstructed)
 	}
 }
 
-func TestCombine_SubsetOfShares(t *testing.T) {
+func TestCombineBytes_SubsetOfShares(t *testing.T) {
 	secret := []byte("Only need threshold shares")
 	threshold := 3
 	total := 7
 
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	// Use exactly threshold shares (not all of them)
-	subsets := [][]*Share{
-		{shares[0], shares[2], shares[4]},
-		{shares[1], shares[3], shares[6]},
-		{shares[0], shares[5], shares[6]},
-	}
-
+	values := splitValues(t, secret, threshold, total)
+	subsets := [][]int{{0, 2, 4}, {1, 3, 6}, {0, 5, 6}}
 	for i, subset := range subsets {
-		reconstructed, err := Combine(subset)
+		reconstructed, err := CombineBytes(pick(values, subset...), threshold)
 		if err != nil {
-			t.Fatalf("subset %d: Combine failed: %v", i, err)
+			t.Fatalf("subset %d: CombineBytes failed: %v", i, err)
 		}
 		if !bytes.Equal(secret, reconstructed) {
 			t.Errorf("subset %d: reconstructed secret does not match original", i)
@@ -175,102 +156,33 @@ func TestCombine_SubsetOfShares(t *testing.T) {
 	}
 }
 
-func TestCombine_NoShares(t *testing.T) {
-	_, err := Combine([]*Share{})
-	if err == nil {
-		t.Fatal("expected error for empty shares, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-	if combineErr.Reason != "no shares provided" {
-		t.Errorf("unexpected reason: %s", combineErr.Reason)
-	}
-}
-
-func TestCombine_InsufficientShares(t *testing.T) {
-	secret := []byte("need more shares")
-	threshold := 4
-	total := 7
-
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	// Provide fewer than threshold
-	subset := []*Share{shares[0], shares[2], shares[5]}
-	_, err = Combine(subset)
-	if err == nil {
-		t.Fatal("expected error for insufficient shares, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-	expected := fmt.Sprintf("need at least %d shares, got %d", threshold, len(subset))
-	if combineErr.Reason != expected {
-		t.Errorf("unexpected reason: %s (expected: %s)", combineErr.Reason, expected)
-	}
-}
-
-func TestCombineBytes_Success(t *testing.T) {
-	secret := []byte("Reconstruct this secret via raw byte shares")
-	threshold := 3
-	total := 5
-
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	// Use exactly threshold raw share VALUES (the bytes of Share.Value).
-	values := [][]byte{
-		[]byte(shares[0].Value),
-		[]byte(shares[2].Value),
-		[]byte(shares[4].Value),
-	}
-	reconstructed, err := CombineBytes(values, threshold)
-	if err != nil {
-		t.Fatalf("CombineBytes failed: %v", err)
-	}
-	if !bytes.Equal(secret, reconstructed) {
-		t.Errorf("reconstructed secret does not match original\noriginal:      %q\nreconstructed: %q", secret, reconstructed)
-	}
-}
-
-func TestCombineBytes_MatchesCombine(t *testing.T) {
-	secret := []byte("byte-combine and string-combine must agree")
+func TestCombineBytes_MatchesCombineProtected(t *testing.T) {
+	secret := []byte("byte-combine and protected-combine must agree")
 	threshold, total := 2, 4
 
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	restore := testOnlyRandReader(bytes.NewReader(bytes.Repeat([]byte{0x3c}, 4096)))
+	values := splitValues(t, secret, threshold, total)
+	restore()
+	shares := splitProtectedShares(t, secret, threshold, total)
 
-	viaShares, err := Combine([]*Share{shares[0], shares[3]})
-	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
-	}
-	viaBytes, err := CombineBytes([][]byte{[]byte(shares[0].Value), []byte(shares[3].Value)}, threshold)
+	viaBytes, err := CombineBytes(pick(values, 0, 3), threshold)
 	if err != nil {
 		t.Fatalf("CombineBytes failed: %v", err)
 	}
-	if !bytes.Equal(viaShares, viaBytes) {
-		t.Errorf("CombineBytes disagrees with Combine:\nCombine:      %q\nCombineBytes: %q", viaShares, viaBytes)
+	viaShares, err := CombineProtected([]*ProtectedShare{shares[0], shares[3]})
+	if err != nil {
+		t.Fatalf("CombineProtected failed: %v", err)
+	}
+	defer viaShares.Destroy()
+	if !bytes.Equal(encCopy(viaShares), viaBytes) {
+		t.Errorf("CombineBytes disagrees with CombineProtected:\nCombineProtected: %q\nCombineBytes:     %q", encCopy(viaShares), viaBytes)
 	}
 }
 
 func TestCombineBytes_InvalidThreshold(t *testing.T) {
-	secret := []byte("threshold below 2 must be rejected")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-	values := [][]byte{[]byte(shares[0].Value), []byte(shares[1].Value)}
+	values := splitValues(t, []byte("threshold below 2 must be rejected"), 2, 3)
 	for _, threshold := range []int{1, 0, -1} {
-		_, err := CombineBytes(values, threshold)
+		_, err := CombineBytes(values[:2], threshold)
 		var combineErr *CombineError
 		if !errors.As(err, &combineErr) || !strings.Contains(combineErr.Reason, "threshold must be at least 2") {
 			t.Fatalf("threshold %d: expected threshold CombineError, got %v", threshold, err)
@@ -287,19 +199,15 @@ func TestCombineBytes_NoShares(t *testing.T) {
 }
 
 func TestCombineBytes_InsufficientShares(t *testing.T) {
-	secret := []byte("need more byte shares")
 	threshold, total := 4, 7
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-	values := [][]byte{[]byte(shares[0].Value), []byte(shares[1].Value)}
-	_, err = CombineBytes(values, threshold)
+	values := splitValues(t, []byte("need more byte shares"), threshold, total)
+	subset := pick(values, 0, 2, 5)
+	_, err := CombineBytes(subset, threshold)
 	var combineErr *CombineError
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("expected *CombineError, got %T: %v", err, err)
 	}
-	expected := fmt.Sprintf("need at least %d shares, got %d", threshold, len(values))
+	expected := fmt.Sprintf("need at least %d shares, got %d", threshold, len(subset))
 	if combineErr.Reason != expected {
 		t.Errorf("unexpected reason: %s (expected: %s)", combineErr.Reason, expected)
 	}
@@ -311,114 +219,32 @@ func TestCombineBytes_InvalidBase64(t *testing.T) {
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("expected *CombineError for bad base64, got %T: %v", err, err)
 	}
+
+	// One corrupt value among valid ones is refused too.
+	values := splitValues(t, []byte("test secret"), 3, 5)
+	values[1] = []byte("!!!invalid-base64!!!")
+	if _, err := CombineBytes(values[:3], 3); !errors.As(err, &combineErr) {
+		t.Fatalf("expected *CombineError for one bad value, got %T: %v", err, err)
+	}
 }
 
 func TestCombineBytes_DuplicateXCoordinate(t *testing.T) {
-	secret := []byte("dup x-coordinate is rejected")
 	threshold, total := 2, 5
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	values := splitValues(t, []byte("dup x-coordinate is rejected"), threshold, total)
 	// Same share twice → duplicate x-coordinate.
-	values := [][]byte{[]byte(shares[0].Value), []byte(shares[0].Value)}
-	_, err = CombineBytes(values, threshold)
+	_, err := CombineBytes(pick(values, 0, 0), threshold)
 	var combineErr *CombineError
 	if !errors.As(err, &combineErr) || !strings.Contains(combineErr.Reason, "duplicate share") {
 		t.Fatalf("expected duplicate-share CombineError, got %v", err)
 	}
 }
 
-func TestCombine_MismatchedThreshold(t *testing.T) {
-	shares := []*Share{
-		{Index: 1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-		{Index: 2, Threshold: 4, Total: 5, Value: "dGVzdA=="},
-		{Index: 3, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-	}
-
-	_, err := CombineUnverified(shares)
-	if err == nil {
-		t.Fatal("expected error for mismatched threshold, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-	expected := "share 1 has different threshold (4) than share 0 (3)"
-	if combineErr.Reason != expected {
-		t.Errorf("unexpected reason: %s (expected: %s)", combineErr.Reason, expected)
-	}
-}
-
-func TestCombine_MismatchedTotal(t *testing.T) {
-	shares := []*Share{
-		{Index: 1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-		{Index: 2, Threshold: 3, Total: 7, Value: "dGVzdA=="},
-		{Index: 3, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-	}
-
-	_, err := CombineUnverified(shares)
-	if err == nil {
-		t.Fatal("expected error for mismatched total, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-	expected := "share 1 has different total (7) than share 0 (5)"
-	if combineErr.Reason != expected {
-		t.Errorf("unexpected reason: %s (expected: %s)", combineErr.Reason, expected)
-	}
-}
-
-func TestCombine_InvalidShare(t *testing.T) {
-	shares := []*Share{
-		{Index: 1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-		{Index: 2, Threshold: 3, Total: 5, Value: ""}, // empty value fails validation
-		{Index: 3, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-	}
-
-	_, err := Combine(shares)
-	if err == nil {
-		t.Fatal("expected error for invalid share, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-	if combineErr.Reason == "" {
-		t.Error("expected non-empty reason")
-	}
-}
-
-func TestCombine_InvalidBase64(t *testing.T) {
-	shares, err := Split([]byte("test secret"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	// Corrupt one share's base64 value
-	shares[1].Value = "!!!invalid-base64!!!"
-
-	_, err = Combine([]*Share{shares[0], shares[1], shares[2]})
-	if err == nil {
-		t.Fatal("expected error for invalid base64, got nil")
-	}
-	var combineErr *CombineError
-	if !errors.As(err, &combineErr) {
-		t.Fatalf("expected *CombineError, got %T: %v", err, err)
-	}
-}
-
 func TestVerifyShare_Success(t *testing.T) {
-	shares, err := Split([]byte("verify me"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	shares := splitProtectedShares(t, []byte("verify me"), 3, 5)
 
 	// Verify each share against the others
 	for i, share := range shares {
-		others := make([]*Share, 0, len(shares)-1)
+		others := make([]*ProtectedShare, 0, len(shares)-1)
 		for j, s := range shares {
 			if j != i {
 				others = append(others, s)
@@ -431,12 +257,8 @@ func TestVerifyShare_Success(t *testing.T) {
 }
 
 func TestVerifyShare_InvalidShare(t *testing.T) {
-	badShare := &Share{
-		Index:     0, // invalid: must be >= 1
-		Threshold: 3,
-		Total:     5,
-		Value:     "dGVzdA==",
-	}
+	badShare := splitProtectedShares(t, []byte("invalid share"), 3, 5)[0]
+	badShare.Index = 0 // invalid: must be >= 1
 
 	err := VerifyShare(badShare, nil)
 	if err == nil {
@@ -452,20 +274,12 @@ func TestVerifyShare_InvalidShare(t *testing.T) {
 }
 
 func TestVerifyShare_DuplicateIndex(t *testing.T) {
-	shares, err := Split([]byte("duplicate test"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	shares := splitProtectedShares(t, []byte("duplicate test"), 3, 5)
 
-	// Create a share with the same index as shares[0]
-	duplicate := &Share{
-		Index:     shares[0].Index,
-		Threshold: shares[0].Threshold,
-		Total:     shares[0].Total,
-		Value:     "dGVzdA==",
-	}
+	// A share from another split with the same index as shares[0].
+	duplicate := splitProtectedShares(t, []byte("another split"), 3, 5)[0]
 
-	err = VerifyShare(duplicate, shares)
+	err := VerifyShare(duplicate, shares)
 	if err == nil {
 		t.Fatal("expected error for duplicate index, got nil")
 	}
@@ -479,19 +293,11 @@ func TestVerifyShare_DuplicateIndex(t *testing.T) {
 }
 
 func TestVerifyShare_ThresholdMismatch(t *testing.T) {
-	shares, err := Split([]byte("threshold test"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	shares := splitProtectedShares(t, []byte("threshold test"), 3, 5)
+	// Index 4, a valid index within total, under a different threshold.
+	badShare := splitProtectedShares(t, []byte("threshold test"), 4, 5)[3]
 
-	badShare := &Share{
-		Index:     4, // valid index within total
-		Threshold: 4, // different threshold
-		Total:     5,
-		Value:     "dGVzdA==",
-	}
-
-	err = VerifyShare(badShare, shares[:2])
+	err := VerifyShare(badShare, shares[:2])
 	if err == nil {
 		t.Fatal("expected error for threshold mismatch, got nil")
 	}
@@ -505,19 +311,11 @@ func TestVerifyShare_ThresholdMismatch(t *testing.T) {
 }
 
 func TestVerifyShare_TotalMismatch(t *testing.T) {
-	shares, err := Split([]byte("total test"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	shares := splitProtectedShares(t, []byte("total test"), 3, 5)
+	// Index 4 of a split with a different total.
+	badShare := splitProtectedShares(t, []byte("total test"), 3, 9)[3]
 
-	badShare := &Share{
-		Index:     4,
-		Threshold: 3,
-		Total:     9, // different total
-		Value:     "dGVzdA==",
-	}
-
-	err = VerifyShare(badShare, shares[:2])
+	err := VerifyShare(badShare, shares[:2])
 	if err == nil {
 		t.Fatal("expected error for total mismatch, got nil")
 	}
@@ -530,240 +328,16 @@ func TestVerifyShare_TotalMismatch(t *testing.T) {
 	}
 }
 
-func TestShare_Bytes(t *testing.T) {
-	shares, err := Split([]byte("bytes test secret"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	for i, share := range shares {
-		b, err := share.Bytes()
-		if err != nil {
-			t.Errorf("share %d: Bytes() returned error: %v", i, err)
-		}
-		if len(b) == 0 {
-			t.Errorf("share %d: Bytes() returned empty slice", i)
-		}
-	}
-}
-
-func TestShare_Bytes_InvalidBase64(t *testing.T) {
-	share := &Share{
-		Index:     1,
-		Threshold: 3,
-		Total:     5,
-		Value:     "!!!not-valid-base64!!!",
-	}
-
-	_, err := share.Bytes()
-	if err == nil {
-		t.Fatal("expected error for invalid base64, got nil")
-	}
-}
-
-func TestShare_String(t *testing.T) {
-	shares, err := Split([]byte("string test"), 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	for i, share := range shares {
-		s := share.String()
-		expected := fmt.Sprintf("Index: %d", i+1)
-		if len(s) == 0 {
-			t.Errorf("share %d: String() returned empty", i)
-		}
-		if !strings.Contains(s, expected) {
-			t.Errorf("share %d: String() %q does not contain %q", i, s, expected)
-		}
-		if !strings.Contains(s, "Share{Index:") {
-			t.Errorf("share %d: String() %q does not contain 'Share{Index:'", i, s)
-		}
-	}
-}
-
-func TestShare_String_RedactsValue(t *testing.T) {
-	share := &Share{
-		Index:     1,
-		Threshold: 3,
-		Total:     5,
-		Value:     "supersecretsharevalue",
-	}
-	s := share.String()
-	if strings.Contains(s, "supersecret") {
-		t.Errorf("String() %q leaks share value material", s)
-	}
-	if !strings.Contains(s, "[redacted]") {
-		t.Errorf("String() %q does not mark the value as redacted", s)
-	}
-}
-
-func TestShare_Validate_AllCases(t *testing.T) {
-	tests := []struct {
-		name      string
-		share     *Share
-		wantErr   bool
-		wantField string
-	}{
-		{
-			name:    "valid share",
-			share:   &Share{Index: 1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-			wantErr: false,
-		},
-		{
-			name:      "index zero",
-			share:     &Share{Index: 0, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "index",
-		},
-		{
-			name:      "index negative",
-			share:     &Share{Index: -1, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "index",
-		},
-		{
-			name:      "threshold too low",
-			share:     &Share{Index: 1, Threshold: 1, Total: 5, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "threshold",
-		},
-		{
-			name:      "threshold zero",
-			share:     &Share{Index: 1, Threshold: 0, Total: 5, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "threshold",
-		},
-		{
-			name:      "total less than threshold",
-			share:     &Share{Index: 1, Threshold: 5, Total: 3, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "total",
-		},
-		{
-			name:      "index exceeds total",
-			share:     &Share{Index: 6, Threshold: 3, Total: 5, Value: "dGVzdA=="},
-			wantErr:   true,
-			wantField: "index",
-		},
-		{
-			name:      "empty value",
-			share:     &Share{Index: 1, Threshold: 3, Total: 5, Value: ""},
-			wantErr:   true,
-			wantField: "value",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.share.Validate()
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				var valErr *ValidationError
-				if !errors.As(err, &valErr) {
-					t.Fatalf("expected *ValidationError, got %T: %v", err, err)
-				}
-				if valErr.Field != tt.wantField {
-					t.Errorf("expected field %q, got %q", tt.wantField, valErr.Field)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestShare_MarshalUnmarshal(t *testing.T) {
-	original := &Share{
-		Index:     2,
-		Threshold: 3,
-		Total:     5,
-		Value:     "dGVzdCBkYXRh",
-		Metadata:  map[string]string{"owner": "alice", "created": "2026-01-15"},
-	}
-
-	data, err := json.Marshal(original)
-	if err != nil {
-		t.Fatalf("MarshalJSON failed: %v", err)
-	}
-
-	var decoded Share
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("UnmarshalJSON failed: %v", err)
-	}
-
-	if decoded.Index != original.Index {
-		t.Errorf("Index: expected %d, got %d", original.Index, decoded.Index)
-	}
-	if decoded.Threshold != original.Threshold {
-		t.Errorf("Threshold: expected %d, got %d", original.Threshold, decoded.Threshold)
-	}
-	if decoded.Total != original.Total {
-		t.Errorf("Total: expected %d, got %d", original.Total, decoded.Total)
-	}
-	if decoded.Value != original.Value {
-		t.Errorf("Value: expected %q, got %q", original.Value, decoded.Value)
-	}
-	if decoded.Metadata["owner"] != "alice" {
-		t.Errorf("Metadata[owner]: expected 'alice', got %q", decoded.Metadata["owner"])
-	}
-	if decoded.Metadata["created"] != "2026-01-15" {
-		t.Errorf("Metadata[created]: expected '2026-01-15', got %q", decoded.Metadata["created"])
-	}
-}
-
-func TestShare_UnmarshalJSON_InvalidData(t *testing.T) {
-	var share Share
-	err := share.UnmarshalJSON([]byte("not valid json"))
-	if err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
-	}
-}
-
-func TestShare_MarshalUnmarshal_NoMetadata(t *testing.T) {
-	original := &Share{
-		Index:     1,
-		Threshold: 2,
-		Total:     3,
-		Value:     "dGVzdA==",
-	}
-
-	data, err := json.Marshal(original)
-	if err != nil {
-		t.Fatalf("MarshalJSON failed: %v", err)
-	}
-
-	var decoded Share
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("UnmarshalJSON failed: %v", err)
-	}
-
-	if decoded.Index != original.Index {
-		t.Errorf("Index: expected %d, got %d", original.Index, decoded.Index)
-	}
-	if decoded.Value != original.Value {
-		t.Errorf("Value: expected %q, got %q", original.Value, decoded.Value)
-	}
-}
-
-func TestSplit_BinarySecret(t *testing.T) {
+func TestSplitBytes_BinarySecret(t *testing.T) {
 	secret := make([]byte, 256)
 	if _, err := rand.Read(secret); err != nil {
 		t.Fatalf("failed to generate random secret: %v", err)
 	}
 
-	shares, err := Split(secret, 3, 5)
+	values := splitValues(t, secret, 3, 5)
+	reconstructed, err := CombineBytes(pick(values, 1, 2, 4), 3)
 	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-
-	reconstructed, err := Combine([]*Share{shares[1], shares[2], shares[4]})
-	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
+		t.Fatalf("CombineBytes failed: %v", err)
 	}
 
 	if !bytes.Equal(secret, reconstructed) {
@@ -771,24 +345,20 @@ func TestSplit_BinarySecret(t *testing.T) {
 	}
 }
 
-func TestSplit_LargeSecret(t *testing.T) {
+func TestSplitBytes_LargeSecret(t *testing.T) {
 	secret := make([]byte, 1024)
 	if _, err := rand.Read(secret); err != nil {
 		t.Fatalf("failed to generate random secret: %v", err)
 	}
 
-	shares, err := Split(secret, 5, 9)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
-	if len(shares) != 9 {
-		t.Fatalf("expected 9 shares, got %d", len(shares))
+	values := splitValues(t, secret, 5, 9)
+	if len(values) != 9 {
+		t.Fatalf("expected 9 shares, got %d", len(values))
 	}
 
-	subset := []*Share{shares[0], shares[2], shares[4], shares[6], shares[8]}
-	reconstructed, err := Combine(subset)
+	reconstructed, err := CombineBytes(pick(values, 0, 2, 4, 6, 8), 5)
 	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
+		t.Fatalf("CombineBytes failed: %v", err)
 	}
 
 	if !bytes.Equal(secret, reconstructed) {
@@ -796,21 +366,17 @@ func TestSplit_LargeSecret(t *testing.T) {
 	}
 }
 
-func TestCombine_MoreThanThreshold(t *testing.T) {
+func TestCombineBytes_MoreThanThreshold(t *testing.T) {
 	secret := []byte("more than threshold test")
 	threshold := 3
 	total := 5
 
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	values := splitValues(t, secret, threshold, total)
 
 	// Use 4 shares (more than threshold of 3)
-	subset := []*Share{shares[0], shares[1], shares[3], shares[4]}
-	reconstructed, err := Combine(subset)
+	reconstructed, err := CombineBytes(pick(values, 0, 1, 3, 4), threshold)
 	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
+		t.Fatalf("CombineBytes failed: %v", err)
 	}
 
 	if !bytes.Equal(secret, reconstructed) {
@@ -835,84 +401,59 @@ func TestErrors_Format(t *testing.T) {
 	}
 }
 
-func TestCombine_ReconstructsSecret(t *testing.T) {
+func TestCombineBytes_ReconstructsSecret(t *testing.T) {
 	secret := []byte("reconstruction test secret")
-	shares, err := Split(secret, 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	values := splitValues(t, secret, 3, 5)
 
 	// A threshold subset reconstructs the original.
-	reconstructed, err := Combine([]*Share{shares[0], shares[2], shares[4]})
+	reconstructed, err := CombineBytes(pick(values, 0, 2, 4), 3)
 	if err != nil {
-		t.Fatalf("Combine failed: %v", err)
+		t.Fatalf("CombineBytes failed: %v", err)
 	}
 	if !bytes.Equal(secret, reconstructed) {
 		t.Error("reconstructed secret does not match original")
 	}
 }
 
-// TestCombine_TamperedShareYieldsGarbageNotError documents the contract:
+// TestCombineBytes_TamperedShareYieldsGarbageNotError documents the contract:
 // shares carry NO secret digest (it would be an offline oracle), so a tampered
-// share is NOT self-detected — Combine returns garbage, not an error. The caller
-// must authenticate the reconstructed secret out-of-band.
-func TestCombine_TamperedShareYieldsGarbageNotError(t *testing.T) {
+// share is NOT self-detected — CombineBytes returns garbage, not an error. The
+// caller must authenticate the reconstructed secret out-of-band.
+func TestCombineBytes_TamperedShareYieldsGarbageNotError(t *testing.T) {
 	secret := []byte("tamper test secret of sufficient length")
-	shares, err := Split(secret, 3, 5)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	values := splitValues(t, secret, 3, 5)
 
-	// Tamper with one share's reconstructed value.
-	raw, err := shares[0].Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
+	// Tamper with one share's y-payload.
+	raw := decodeValue(t, values[0])
 	raw[len(raw)-1] ^= 0xFF
-	shares[0].Value = base64.StdEncoding.EncodeToString(raw)
+	values[0] = encodeB64(raw)
 
-	got, err := Combine([]*Share{shares[0], shares[1], shares[2]})
+	got, err := CombineBytes(pick(values, 0, 1, 2), 3)
 	if err != nil {
-		t.Fatalf("Combine must not error on a tampered share (no self-verification): %v", err)
+		t.Fatalf("CombineBytes must not error on a tampered share (no self-verification): %v", err)
 	}
 	if bytes.Equal(got, secret) {
 		t.Fatal("tampered share unexpectedly reconstructed the original secret")
 	}
 }
 
-// TestCombine_ForgedLowThreshold documents that forging a lower threshold on
-// shares is not self-detected (no digest): it yields garbage that the caller
-// must reject via out-of-band authentication. A SILENT correct reconstruction
-// of the real secret from a forged sub-threshold set would be a failure.
-func TestCombine_ForgedLowThreshold(t *testing.T) {
+// TestCombineBytes_ForgedLowThreshold documents that claiming a lower
+// threshold than the split used is not self-detected (no digest): it yields
+// garbage that the caller must reject via out-of-band authentication. A SILENT
+// correct reconstruction of the real secret from a sub-threshold set would be
+// a failure.
+func TestCombineBytes_ForgedLowThreshold(t *testing.T) {
 	secret := []byte("forged threshold test secret")
-	shares, err := Split(secret, 4, 7)
-	if err != nil {
-		t.Fatalf("Split failed: %v", err)
-	}
+	values := splitValues(t, secret, 4, 7)
 
-	forged := []*Share{shares[0], shares[1]}
-	for _, s := range forged {
-		s.Threshold = 2
-		s.Total = 3
-	}
-
-	got, err := Combine(forged)
+	got, err := CombineBytes(pick(values, 0, 1), 2)
 	if err == nil && bytes.Equal(got, secret) {
 		t.Fatal("forged low-threshold combine unexpectedly reconstructed the original secret")
 	}
 }
 
-func TestIntegrityError_Format(t *testing.T) {
-	e := &IntegrityError{}
-	want := "quicraft/shamir: integrity verification failed: reconstructed secret digest does not match share digest"
-	if e.Error() != want {
-		t.Errorf("IntegrityError.Error() = %q, want %q", e.Error(), want)
-	}
-}
-
-func TestSplit_NilSecret(t *testing.T) {
-	_, err := Split(nil, 3, 5)
+func TestSplitBytes_NilSecret(t *testing.T) {
+	_, err := SplitBytes(nil, 3, 5)
 	if err == nil {
 		t.Fatal("expected error for nil secret, got nil")
 	}
@@ -922,66 +463,60 @@ func TestSplit_NilSecret(t *testing.T) {
 	}
 }
 
-// BenchmarkSplit_SmallSecret benchmarks splitting a small secret.
-func BenchmarkSplit_SmallSecret(b *testing.B) {
+// BenchmarkSplitBytes_SmallSecret benchmarks splitting a small secret.
+func BenchmarkSplitBytes_SmallSecret(b *testing.B) {
 	secret := []byte("Small secret for benchmarking")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = Split(secret, 3, 5)
+		_, _ = SplitBytes(secret, 3, 5)
 	}
 }
 
-// BenchmarkSplit_LargeSecret benchmarks splitting a large secret.
-func BenchmarkSplit_LargeSecret(b *testing.B) {
+// BenchmarkSplitBytes_LargeSecret benchmarks splitting a large secret.
+func BenchmarkSplitBytes_LargeSecret(b *testing.B) {
 	secret := make([]byte, 1024)
 	_, _ = rand.Read(secret)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = Split(secret, 5, 9)
+		_, _ = SplitBytes(secret, 5, 9)
 	}
 }
 
-// BenchmarkCombine benchmarks combining shares.
-func BenchmarkCombine(b *testing.B) {
+// BenchmarkCombineBytes benchmarks combining shares.
+func BenchmarkCombineBytes(b *testing.B) {
 	secret := []byte("Benchmark secret")
-	shares, _ := Split(secret, 3, 5)
-	subset := []*Share{shares[0], shares[2], shares[4]}
+	values := splitValues(b, secret, 3, 5)
+	subset := pick(values, 0, 2, 4)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = Combine(subset)
+		_, _ = CombineBytes(subset, 3)
 	}
 }
 
-// TestSplit_CoefficientsUsedVerbatim asserts that Split uses the raw
+// TestSplitBytes_CoefficientsUsedVerbatim asserts that SplitBytes uses the raw
 // crypto/rand coefficient bytes verbatim, without resampling zero top
 // coefficients. Excluding c_{t-1}=0 would let a t-1 coalition eliminate one
 // candidate secret per byte, so a zero top coefficient MUST be accepted.
 // With an all-zeros randReader every sharing polynomial degenerates to its
 // constant term, so each share's y-payload must equal the secret exactly.
-func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
+func TestSplitBytes_CoefficientsUsedVerbatim(t *testing.T) {
 	secret := []byte{0x00, 0x01, 0x7F, 0xFF}
 	threshold, total := 3, 5
 
 	// All-zero coefficients: p(x) = secret byte for every x.
 	restore := testOnlyRandReader(zeroReader{})
 	defer restore()
-	shares, err := Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split with zero coefficients: %v", err)
-	}
-	for i, share := range shares {
-		raw, err := base64.StdEncoding.DecodeString(share.Value)
-		if err != nil {
-			t.Fatalf("decode share %d: %v", i, err)
-		}
+	values := splitValues(t, secret, threshold, total)
+	for i, v := range values {
+		raw := decodeValue(t, v)
 		if !bytes.Equal(raw[rawShareOverhead:], secret) {
 			t.Fatalf("share %d: zero coefficients were not used verbatim: y-payload %x, want %x",
 				i, raw[rawShareOverhead:], secret)
 		}
 	}
-	got, err := Combine(shares[:threshold])
+	got, err := CombineBytes(values[:threshold], threshold)
 	if err != nil {
-		t.Fatalf("Combine: %v", err)
+		t.Fatalf("CombineBytes: %v", err)
 	}
 	if !bytes.Equal(got, secret) {
 		t.Fatalf("round-trip with zero top coefficients: got %x, want %x", got, secret)
@@ -991,15 +526,9 @@ func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
 	// evaluation with exactly the supplied bytes.
 	coeffBytes := []byte{0x11, 0x00, 0x22, 0x00, 0x33, 0x00, 0x44, 0x00}
 	testOnlyRandReader(bytes.NewReader(coeffBytes))
-	shares, err = Split(secret, threshold, total)
-	if err != nil {
-		t.Fatalf("Split with fixed coefficients: %v", err)
-	}
-	for i, share := range shares {
-		raw, err := base64.StdEncoding.DecodeString(share.Value)
-		if err != nil {
-			t.Fatalf("decode share %d: %v", i, err)
-		}
+	values = splitValues(t, secret, threshold, total)
+	for i, v := range values {
+		raw := decodeValue(t, v)
 		x := raw[1]
 		for b := range secret {
 			coeffs := append([]byte{secret[b]}, coeffBytes[b*(threshold-1):(b+1)*(threshold-1)]...)
@@ -1010,9 +539,9 @@ func TestSplit_CoefficientsUsedVerbatim(t *testing.T) {
 			}
 		}
 	}
-	got, err = Combine(shares[:threshold])
+	got, err = CombineBytes(values[:threshold], threshold)
 	if err != nil {
-		t.Fatalf("Combine: %v", err)
+		t.Fatalf("CombineBytes: %v", err)
 	}
 	if !bytes.Equal(got, secret) {
 		t.Fatalf("round-trip with fixed coefficients: got %x, want %x", got, secret)
@@ -1032,7 +561,7 @@ func (zeroReader) Read(p []byte) (int, error) {
 // TestWipe asserts the shared wipe helper zeroes its argument. wipe delegates
 // to go-enclave's Wipe, whose zeroing is resistant to dead-store
 // elimination; every secret-derived scratch buffer in this package — including
-// the per-share raw buffer Split builds before base64-encoding it — goes
+// the per-share raw buffer SplitBytes builds before base64-encoding it — goes
 // through it.
 func TestWipe(t *testing.T) {
 	b := []byte{1, 2, 3, 4, 5}
@@ -1045,75 +574,15 @@ func TestWipe(t *testing.T) {
 	wipe(nil) // must not panic
 }
 
-// TestCombine_NilShareIsRejectedNotDereferenced is the panic regression:
-// combine read shares[0].Threshold before validating anything, and
-// (*Share).Validate dereferenced its receiver unconditionally, so a nil element
-// crashed the process. Custody lives above this package and necessarily decodes
-// operator-submitted shares — json.Unmarshal of a list containing null into a
-// []*Share yields exactly these inputs — so one malformed submission during an
-// unseal ceremony must be an error, not a crash.
-func TestCombine_NilShareIsRejectedNotDereferenced(t *testing.T) {
-	valid, err := Split([]byte("root key material"), 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-
-	for _, tc := range []struct {
-		name   string
-		shares []*Share
-	}{
-		{"all nil", []*Share{nil, nil}},
-		{"leading nil", []*Share{nil, valid[0]}},
-		{"trailing nil", []*Share{valid[0], nil}},
-		{"single nil", []*Share{nil}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := Combine(tc.shares)
-			if err == nil {
-				t.Fatalf("Combine(%s) succeeded, want error", tc.name)
-			}
-			if got != nil {
-				t.Errorf("Combine(%s) returned %d secret bytes alongside an error", tc.name, len(got))
-			}
-			var cerr *CombineError
-			if !errors.As(err, &cerr) {
-				t.Fatalf("Combine(%s) error is %T, want *CombineError", tc.name, err)
-			}
-		})
-	}
-
-	// The same input through the JSON path the ceremony actually uses.
-	var decoded []*Share
-	if err := json.Unmarshal([]byte(`[null, null]`), &decoded); err != nil {
-		t.Fatalf("test premise broken, Unmarshal: %v", err)
-	}
-	if _, err := CombineUnverified(decoded); err == nil {
-		t.Fatal("CombineUnverified of a decoded [null,null] succeeded, want error")
-	}
-}
-
-// TestValidate_NilReceiver pins that a nil share reports a validation failure
-// rather than panicking, for both entry points that reach it.
-func TestValidate_NilReceiver(t *testing.T) {
-	var nilShare *Share
-	if err := nilShare.Validate(); err == nil {
-		t.Fatal("(*Share)(nil).Validate() returned nil, want a validation error")
-	} else {
-		var verr *ValidationError
-		if !errors.As(err, &verr) {
-			t.Fatalf("error is %T, want *ValidationError", err)
-		}
-	}
-
+// TestVerifyShare_NilShare pins that a nil share reports a validation failure
+// rather than panicking, whether it is the share or one of the others.
+func TestVerifyShare_NilShare(t *testing.T) {
 	if err := VerifyShare(nil, nil); err == nil {
 		t.Fatal("VerifyShare(nil, nil) returned nil, want a validation error")
 	}
 
-	valid, err := Split([]byte("root key material"), 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	if err := VerifyShare(valid[0], []*Share{nil}); err == nil {
+	valid := splitProtectedShares(t, []byte("root key material"), 2, 3)
+	if err := VerifyShare(valid[0], []*ProtectedShare{nil}); err == nil {
 		t.Fatal("VerifyShare with a nil other-share returned nil, want a validation error")
 	}
 }
@@ -1166,7 +635,7 @@ func TestSplitBytes_RoundTripsThroughCombineBytes(t *testing.T) {
 }
 
 // TestSplitBytes_RejectsInvalidParameters keeps the parameter contract
-// identical to Split's, which now delegates to it.
+// pinned for each invalid shape.
 func TestSplitBytes_RejectsInvalidParameters(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

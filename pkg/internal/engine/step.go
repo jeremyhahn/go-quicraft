@@ -313,7 +313,7 @@ func (w *stepWorker) tick() {
 		// vote nor commit index and emits no message. hasStateChanged() is
 		// therefore false and HasUpdate() false, so processReady skips the
 		// shard and NEITHER of the two other publish sites can ever run. The
-		// node kept reporting itself leader through Host.GetShardInfo() —
+		// node kept reporting itself leader through Host.ShardInfo() —
 		// the flag clients route writes by — until it campaigned roughly an
 		// election timeout later. Publishing here is the only way this
 		// transition is ever observed. Runs outside raftMu (LeaderID/Term are
@@ -1145,7 +1145,7 @@ func (w *stepWorker) drainAndHandleReadIndex(shardID uint64, node *Node) {
 
 // publishLeaderChange fires OnLeaderUpdated when this shard's leader differs
 // from the last value published, and is the ONLY way ns.isLeader — and
-// therefore Host.GetShardInfo().IsLeader — ever changes.
+// therefore Host.ShardInfo().IsLeader — ever changes.
 //
 // It must be reachable from every path that can change leadership, not just
 // the one that produces a proto.Update. A node can win an election entirely
@@ -1212,7 +1212,7 @@ func (w *stepWorker) publishLeaderUpdate(shardID, currentLeader, term uint64) bo
 	}
 	// Hand the notification to the listener dispatcher and commit the
 	// bookkeeping ONLY if it was accepted. OnLeaderUpdated maintains the Host's
-	// isLeader mirror, so a dropped one would leave GetShardInfo permanently
+	// isLeader mirror, so a dropped one would leave ShardInfo permanently
 	// wrong; recording prevLeaders only on acceptance makes a refused dispatch
 	// (queue full) re-publish on the next tick instead of losing the event.
 	// This is why the queue-full policy for leadership is retry, not drop.
@@ -1679,7 +1679,7 @@ func (w *stepWorker) runCommitPendingPhase2(shardID uint64, node *Node, otherMsg
 	// HeartbeatResp, so it is sorted into otherMsgs and stepped HERE — after the
 	// Phase 1 publish has already run. A node that won its election on a vote
 	// response delivered while commitPending was set would otherwise be reported
-	// as a follower by GetShardInfo until some later cycle happened to publish.
+	// as a follower by ShardInfo until some later cycle happened to publish.
 	w.publishLeaderChange(shardID, node)
 
 	// Observability last, outside every window above.
@@ -1763,7 +1763,7 @@ func (w *stepWorker) commitPendingPhase1Locked(
 	//
 	// A CheckQuorum step-down driven by the HeartbeatResps stepped above
 	// produces no proto.Update at all, so without publishing it the Host would
-	// keep serving a stale IsLeader through GetShardInfo — the flag clients
+	// keep serving a stale IsLeader through ShardInfo — the flag clients
 	// route writes by. The publish itself happens in the caller, after the
 	// deferred unlock.
 	freeOrder = node.peer.DrainFreeOrderMessages()

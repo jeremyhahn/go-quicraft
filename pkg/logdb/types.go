@@ -83,7 +83,7 @@ type Membership struct {
 	// RequireFullReplicaMajority is the shard's replicated
 	// full-replica-majority witness policy.
 	RequireFullReplicaMajority bool
-	// SessionExpiryEntries, MaxTotalSessions, MaxSessionsPerClient and
+	// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession and
 	// MaxSessionsPerOwner are the shard's replicated SESSION POLICY (see
 	// proto.SessionPolicy). They must
 	// survive this round-trip for the same reason Identities must: they enter
@@ -101,10 +101,10 @@ type Membership struct {
 	// non-zero in every committed policy and is therefore the field that says
 	// whether a policy was recorded at all: see proto.SessionPolicy.IsSet.
 	MaxTotalSessions uint64
-	// MaxSessionsPerClient is the replicated RESPONSE-CACHE DEPTH: the number
+	// MaxResponsesPerSession is the replicated RESPONSE-CACHE DEPTH: the number
 	// of cached results one session retains, not a session count. See
-	// proto.SessionPolicy.MaxSessionsPerClient for why the name says otherwise.
-	MaxSessionsPerClient uint64
+	// proto.SessionPolicy.MaxResponsesPerSession.
+	MaxResponsesPerSession uint64
 	// MaxSessionsPerOwner is the replicated cap on concurrent sessions per
 	// declared owner; 0 disables it. See proto.SessionPolicy.MaxSessionsPerOwner.
 	MaxSessionsPerOwner uint64

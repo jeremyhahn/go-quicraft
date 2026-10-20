@@ -31,7 +31,7 @@ func replicaProgressOf(cluster *testCluster, shardID, replicaID uint64) (rp quic
 	if leader == nil {
 		return rp, 0, false
 	}
-	info, err := leader.GetShardInfo(shardID)
+	info, err := leader.ShardInfo(shardID)
 	if err != nil {
 		return rp, 0, false
 	}
@@ -65,7 +65,7 @@ func TestHostAPI_ReplicaProgressReportsObserverThenVoter(t *testing.T) {
 	waitForNodeData(t, joined.tracker, shardID, observerID, data, membershipTimeout)
 
 	// The observer appears in the leader's Replicas with its role, and its
-	// Match reaches the leader's applied index. The first GetShardInfo enables
+	// Match reaches the leader's applied index. The first ShardInfo enables
 	// publication, so the entry shows up after the next tick.
 	waitForCondition(t, membershipTimeout, "the observer's Match reaches the leader's applied index", func() bool {
 		rp, applied, ok := replicaProgressOf(cluster, shardID, observerID)
@@ -78,7 +78,7 @@ func TestHostAPI_ReplicaProgressReportsObserverThenVoter(t *testing.T) {
 		if leader == nil {
 			return false
 		}
-		info, err := leader.GetShardInfo(shardID)
+		info, err := leader.ShardInfo(shardID)
 		if err != nil {
 			return false
 		}

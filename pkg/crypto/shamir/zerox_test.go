@@ -16,13 +16,12 @@ package shamir
 
 import (
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"testing"
 )
 
-// TestCombineRejectsZeroXCoordinate pins the rule that makes Combine's output
-// un-choosable.
+// TestCombineRejectsZeroXCoordinate pins the rule that makes reconstruction's
+// output un-choosable.
 //
 // Deleting the x == 0 branch from parseRawShare left the whole package suite
 // green — the duplicate-x and format-version guards beside it are both tested,
@@ -37,19 +36,16 @@ import (
 // dictates the output of a recovery ceremony.
 func TestCombineRejectsZeroXCoordinate(t *testing.T) {
 	secret := []byte("root-key-material-32-bytes-long!")
-	shares, err := Split(secret, 2, 3)
-	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
+	values := splitValues(t, secret, 2, 3)
 
 	// Forge share 0 with x = 0 and an attacker-chosen payload.
 	chosen := bytes.Repeat([]byte{0xAA}, len(secret))
 	forged := append([]byte{shareFormatVersion, 0x00}, chosen...)
-	shares[0].Value = base64.StdEncoding.EncodeToString(forged)
+	values[0] = encodeB64(forged)
 
-	got, err := Combine(shares[:2])
+	got, err := CombineBytes(values[:2], 2)
 	if err == nil {
-		t.Fatalf("Combine ACCEPTED a zero x-coordinate share and returned %x. "+
+		t.Fatalf("CombineBytes ACCEPTED a zero x-coordinate share and returned %x. "+
 			"With x=0 the Lagrange basis collapses to 1 for that share and 0 "+
 			"for every other, so the attacker's bytes ARE the reconstructed "+
 			"secret", got)
@@ -58,13 +54,6 @@ func TestCombineRejectsZeroXCoordinate(t *testing.T) {
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("err = %T (%v), want *CombineError", err, err)
 	}
-
-	// The byte-slice path must reject it identically; it is the path a
-	// memory-locked enclave caller uses.
-	vals := [][]byte{[]byte(shares[0].Value), []byte(shares[1].Value)}
-	if _, err := CombineBytes(vals, 2); err == nil {
-		t.Fatal("CombineBytes accepted a zero x-coordinate share")
-	}
 }
 
 // TestCombineRejectsZeroX_ControlStillReconstructs is the control: the
@@ -72,15 +61,12 @@ func TestCombineRejectsZeroXCoordinate(t *testing.T) {
 // the test having produced shares that cannot combine at all.
 func TestCombineRejectsZeroX_ControlStillReconstructs(t *testing.T) {
 	secret := []byte("root-key-material-32-bytes-long!")
-	shares, err := Split(secret, 2, 3)
+	values := splitValues(t, secret, 2, 3)
+	got, err := CombineBytes(values[:2], 2)
 	if err != nil {
-		t.Fatalf("Split: %v", err)
-	}
-	got, err := Combine(shares[:2])
-	if err != nil {
-		t.Fatalf("Combine on untouched shares: %v", err)
+		t.Fatalf("CombineBytes on untouched shares: %v", err)
 	}
 	if !bytes.Equal(got, secret) {
-		t.Fatalf("Combine = %x, want %x", got, secret)
+		t.Fatalf("CombineBytes = %x, want %x", got, secret)
 	}
 }

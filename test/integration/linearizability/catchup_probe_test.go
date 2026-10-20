@@ -116,7 +116,7 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 		cluster.hostsMu.RLock()
 		for _, h := range cluster.hosts {
 			_, _ = h.DiagRemotes(shardID)
-			_, _, _, _, _, _, _ = h.DiagRaftState(shardID)
+			_, _ = h.DiagRaftState(shardID)
 		}
 		cluster.hostsMu.RUnlock()
 
@@ -135,8 +135,8 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 			if stopped {
 				continue
 			}
-			li, lerr := leaderHost.GetShardInfo(shardID)
-			vi, verr := victimHost.GetShardInfo(shardID)
+			li, lerr := leaderHost.ShardInfo(shardID)
+			vi, verr := victimHost.ShardInfo(shardID)
 			if lerr != nil || verr != nil {
 				continue
 			}

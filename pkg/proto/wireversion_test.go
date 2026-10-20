@@ -212,7 +212,7 @@ const membershipGoldenFixedHead = "0807060504030201" + // ConfigChangeID
 // the fixed region. The values are goldenMembershipSessionPolicy.
 const membershipGoldenSessionPolicy = "a086010000000000" + // SessionExpiryEntries = 100000
 	"0040000000000000" + // MaxTotalSessions = 16384
-	"8000000000000000" + // MaxSessionsPerClient = 128 (response-cache depth)
+	"8000000000000000" + // MaxResponsesPerSession = 128 (response-cache depth)
 	"4000000000000000" // MaxSessionsPerOwner = 64
 
 // membershipGoldenMaps is the first four maps of the map region.
@@ -240,10 +240,10 @@ const membershipGoldenRemovedIdentities = "01000000" + // RemovedIdentities coun
 // spells out in bytes.
 func goldenMembershipSessionPolicy() SessionPolicy {
 	return SessionPolicy{
-		ExpiryEntries:        100000,
-		MaxTotalSessions:     16384,
-		MaxSessionsPerClient: 128,
-		MaxSessionsPerOwner:  64,
+		ExpiryEntries:          100000,
+		MaxTotalSessions:       16384,
+		MaxResponsesPerSession: 128,
+		MaxSessionsPerOwner:    64,
 	}
 }
 
@@ -345,7 +345,7 @@ func TestMembershipFullRoundTripIsByteIdentical(t *testing.T) {
 		RemovedIdentities:          map[uint64]string{30: "spki:thirty", 31: "spki:thirtyone"},
 	}
 	m.SetSessionPolicy(SessionPolicy{
-		ExpiryEntries: 1234, MaxTotalSessions: 5678, MaxSessionsPerClient: 90,
+		ExpiryEntries: 1234, MaxTotalSessions: 5678, MaxResponsesPerSession: 90,
 	})
 
 	first := make([]byte, m.Size())

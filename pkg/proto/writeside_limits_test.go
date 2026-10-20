@@ -240,7 +240,7 @@ func marshalMembershipUnchecked(t *testing.T, m Membership) []byte {
 	putBool(buf[17:], m.RequireFullReplicaMajority)
 	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
-	putUint64(buf[sessionPolicyOffset+16:], m.MaxSessionsPerClient)
+	putUint64(buf[sessionPolicyOffset+16:], m.MaxResponsesPerSession)
 	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
 	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
@@ -287,7 +287,7 @@ func TestMembershipUnmarshalLeavesNoPartialState(t *testing.T) {
 			RemovedIdentities:          map[uint64]string{4: "spki:old-removed"},
 		}
 		m.SetSessionPolicy(SessionPolicy{
-			ExpiryEntries: 11, MaxTotalSessions: 22, MaxSessionsPerClient: 33,
+			ExpiryEntries: 11, MaxTotalSessions: 22, MaxResponsesPerSession: 33,
 		})
 		return m
 	}
@@ -305,7 +305,7 @@ func TestMembershipUnmarshalLeavesNoPartialState(t *testing.T) {
 		}
 		src.RemovedIdentities = map[uint64]string{6: "spki:new-removed"}
 		src.SetSessionPolicy(SessionPolicy{
-			ExpiryEntries: 1, MaxTotalSessions: 2, MaxSessionsPerClient: 3,
+			ExpiryEntries: 1, MaxTotalSessions: 2, MaxResponsesPerSession: 3,
 		})
 		buf := make([]byte, src.Size())
 		n, err := src.MarshalTo(buf)
@@ -368,7 +368,7 @@ func TestMembershipUnmarshalClearsStaleReceiverFields(t *testing.T) {
 		RemovedIdentities: map[uint64]string{8: "spki:stale-tombstone"},
 	}
 	got.SetSessionPolicy(SessionPolicy{
-		ExpiryEntries: 77, MaxTotalSessions: 88, MaxSessionsPerClient: 99,
+		ExpiryEntries: 77, MaxTotalSessions: 88, MaxResponsesPerSession: 99,
 	})
 	if _, err := got.UnmarshalFrom(buf[:n]); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)

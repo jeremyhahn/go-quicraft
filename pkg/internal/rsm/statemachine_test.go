@@ -34,9 +34,9 @@ import (
 // from a Config or reads it from the shard's membership.
 func testPolicy(maxTotalSessions, maxResponses, expiryEntries uint64) proto.SessionPolicy {
 	return proto.SessionPolicy{
-		ExpiryEntries:        expiryEntries,
-		MaxTotalSessions:     maxTotalSessions,
-		MaxSessionsPerClient: maxResponses,
+		ExpiryEntries:          expiryEntries,
+		MaxTotalSessions:       maxTotalSessions,
+		MaxResponsesPerSession: maxResponses,
 	}
 }
 

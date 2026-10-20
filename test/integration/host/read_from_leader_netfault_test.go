@@ -101,7 +101,7 @@ func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.
 	// leader-unknown refusal rather than a healthy cluster that forwarded the
 	// ReadIndex on.
 	waitForCondition(t, failoverTimeout, "the isolated incumbent steps down", func() bool {
-		info, err := cluster.hosts[staleIdx].GetShardInfo(shardID)
+		info, err := cluster.hosts[staleIdx].ShardInfo(shardID)
 		return err == nil && !info.IsLeader
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

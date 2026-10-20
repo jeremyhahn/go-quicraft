@@ -141,7 +141,7 @@ func identityMembership() logdb.Membership {
 		RequireFullReplicaMajority: true,
 		SessionExpiryEntries:       12345,
 		MaxTotalSessions:           4321,
-		MaxSessionsPerClient:       77,
+		MaxResponsesPerSession:     77,
 		MaxSessionsPerOwner:        33,
 		Addresses:                  map[uint64]string{1: "10.0.0.1:5001", 2: "10.0.0.2:5001"},
 		Observers:                  map[uint64]string{3: "10.0.0.3:5001"},
@@ -451,7 +451,7 @@ func assertSessionPolicy(t *testing.T, where string, got, want logdb.Membership)
 	t.Helper()
 	if got.SessionExpiryEntries == want.SessionExpiryEntries &&
 		got.MaxTotalSessions == want.MaxTotalSessions &&
-		got.MaxSessionsPerClient == want.MaxSessionsPerClient &&
+		got.MaxResponsesPerSession == want.MaxResponsesPerSession &&
 		got.MaxSessionsPerOwner == want.MaxSessionsPerOwner {
 		return
 	}
@@ -469,9 +469,9 @@ func assertSessionPolicy(t *testing.T, where string, got, want logdb.Membership)
 		"proto.Membership, and the policy must be written in walShard.writeSnapshot, "+
 		"counted in membershipSize, and read back in walShard.replaySnapshot ahead "+
 		"of that function's trailing-bytes check.",
-		where, got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxSessionsPerClient,
+		where, got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxResponsesPerSession,
 		got.MaxSessionsPerOwner,
-		want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient,
+		want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxResponsesPerSession,
 		want.MaxSessionsPerOwner)
 }
 

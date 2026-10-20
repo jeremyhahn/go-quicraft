@@ -204,8 +204,8 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 				if err != nil {
 					t.Fatalf("SyncGetShardMembership: %v", err)
 				}
-				if err := h.SyncRequestDeleteNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
-					t.Fatalf("SyncRequestDeleteNode: %v", err)
+				if err := h.SyncRequestRemoveNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
+					t.Fatalf("SyncRequestRemoveNode: %v", err)
 				}
 			},
 			call: func(ctx context.Context, h *Host) error {
@@ -229,8 +229,8 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 				if err != nil {
 					t.Fatalf("SyncGetShardMembership: %v", err)
 				}
-				if err := h.SyncRequestDeleteNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
-					t.Fatalf("SyncRequestDeleteNode: %v", err)
+				if err := h.SyncRequestRemoveNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
+					t.Fatalf("SyncRequestRemoveNode: %v", err)
 				}
 			},
 			call: func(ctx context.Context, h *Host) error {

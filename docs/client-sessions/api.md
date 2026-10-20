@@ -19,8 +19,8 @@ Import: `github.com/jeremyhahn/go-quicraft/pkg` (package `quicraft`).
 ### Obtain a session
 
 ```go
-func (h *Host) GetNewSession(ctx context.Context, shardID uint64) (*Session, error)
-func (h *Host) GetNewSessionWithOwner(ctx context.Context, shardID, ownerID uint64) (*Session, error)
+func (h *Host) NewSession(ctx context.Context, shardID uint64) (*Session, error)
+func (h *Host) NewSessionWithOwner(ctx context.Context, shardID, ownerID uint64) (*Session, error)
 func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session, error)
 ```
 
@@ -31,7 +31,7 @@ func (h *Host) RegisterSession(ctx context.Context, session *Session) (*Session,
 | Errors | `ErrSessionsUnsupportedOnDisk`; `*SessionError` wrapping `ErrInvalidOperation` when the shard refused the registration (shard full, owner at its cap, or the client ID already registered); `*SessionError` wrapping `ErrInvalidSession` for a zero client ID (`RegisterSession`); `ErrInvalidSession` for a nil session; the proposal errors below; `ErrTimeout` or `ErrCanceled` |
 | Permission | none; `ClientID` and `OwnerID` are not authenticated by this library |
 
-`GetNewSession` draws the client ID from the system CSPRNG (never zero) and
+`NewSession` draws the client ID from the system CSPRNG (never zero) and
 registers it through the log, so it can fail like any proposal and blocks until
 the registration is applied or `ctx` ends. `RegisterSession` registers a
 caller-chosen client ID, which is how a client that persists its ID survives its
@@ -69,7 +69,7 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
   apply failure. `errors.Is`, `errors.As`, `Temporary` and `NotLeader` still
   match the underlying error. A refusal before the hand-off (the submit errors
   above, a full proposal queue) is definite. The same classification applies to
-  `GetNewSession`, `RegisterSession` and `CloseSession`, which are proposals.
+  `NewSession`, `RegisterSession` and `CloseSession`, which are proposals.
 - A no-op session is refused here with `ErrInvalidSession`. Propose without a
   session using `Propose` or `SyncPropose`.
 
@@ -92,7 +92,7 @@ an idle shard never expires anything.
 ### No-op sessions
 
 ```go
-func (h *Host) GetNoOPSession(shardID uint64) *Session
+func (h *Host) NoOPSession(shardID uint64) *Session
 func NewNoOPSession(shardID uint64) *Session
 ```
 
@@ -169,7 +169,7 @@ replicated in `proto.Membership` and fixed for the life of the shard.
 
 | Field | Default | Bounds |
 |---|---|---|
-| `MaxSessionsPerClient` | 128 | cached responses per session. Misnamed and kept for compatibility; read it as "max responses per session". |
+| `MaxResponsesPerSession` | 128 | cached responses per session (the at-most-once response cache depth), not a session count |
 | `MaxTotalSessions` | 16384 | sessions on the shard |
 | `MaxSessionsPerOwner` | 128 | concurrent sessions per declared `OwnerID`; ownerless sessions are exempt. Zero selects the default; `config.SessionsPerOwnerUnlimited` disables the cap. |
 | `SessionExpiryEntries` | 100000 | inactivity threshold in applied entries. Zero selects the default; `config.SessionExpiryDisabled` disables expiry; values below 100 are rejected. |
@@ -180,5 +180,3 @@ replicated in `proto.Membership` and fixed for the life of the shard.
   policy is part of `proto.Membership`. Both formats are pinned for the
   pre-release period; see [`../wire-protocol/api.md`](../wire-protocol/api.md)
   and [`../compatibility/`](../compatibility/architecture.md).
-- `MaxSessionsPerClient` is misnamed, not deprecated. Renaming a public field
-  breaks callers, so the name stays and the meaning is documented.

@@ -90,10 +90,10 @@ func TestReconstructShardMembership_PreservesNonVoterRolesAndPolicy(t *testing.T
 		RequireFullReplicaMajority: true,
 	}
 	want.SetSessionPolicy(proto.SessionPolicy{
-		ExpiryEntries:        9999,
-		MaxTotalSessions:     64,
-		MaxSessionsPerClient: 4,
-		MaxSessionsPerOwner:  6,
+		ExpiryEntries:          9999,
+		MaxTotalSessions:       64,
+		MaxResponsesPerSession: 4,
+		MaxSessionsPerOwner:    6,
 	})
 
 	ldb := bootstrapLogDBFor(t, want)
@@ -134,7 +134,7 @@ func TestReconstructShardMembership_PreservesNonVoterRolesAndPolicy(t *testing.T
 			got.MaxWitnesses, got.RequireFullReplicaMajority)
 	}
 	if sp := got.SessionPolicy(); sp.ExpiryEntries != 9999 ||
-		sp.MaxTotalSessions != 64 || sp.MaxSessionsPerClient != 4 ||
+		sp.MaxTotalSessions != 64 || sp.MaxResponsesPerSession != 4 ||
 		sp.MaxSessionsPerOwner != 6 {
 		t.Fatalf("session policy = %+v, want {9999, 64, 4, 6}: it is replicated "+
 			"state, so a reverted value expires different sessions at the same "+
@@ -263,7 +263,7 @@ func TestStartShard_MissingBootstrapEntryFailsClosed(t *testing.T) {
 		testShardConfig(shardID, replicaID))
 	if startErr == nil {
 		_ = h.StopShard(shardID)
-		memb, membErr := h.GetShardMembership(shardID)
+		memb, membErr := h.ShardMembership(shardID)
 		t.Fatalf("StartShard on a log whose index 1 is not the bootstrap entry "+
 			"succeeded, with membership %+v (err %v): the shard's configuration "+
 			"was re-seeded from the caller's members map, dropping the witnesses, "+
@@ -279,7 +279,7 @@ func TestStartShard_MissingBootstrapEntryFailsClosed(t *testing.T) {
 
 	// A refused start must leave nothing loaded, or the next attempt is met
 	// with ErrShardAlreadyExists over a shard that never came up.
-	if _, err := h.GetShardMembership(shardID); err == nil {
+	if _, err := h.ShardMembership(shardID); err == nil {
 		t.Fatal("the shard is still loaded after StartShard failed closed")
 	}
 }

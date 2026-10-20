@@ -1289,7 +1289,7 @@ func acquireSession(cluster *testCluster, shardID uint64, deadline time.Time, do
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		session, err := host.GetNewSession(ctx, shardID)
+		session, err := host.NewSession(ctx, shardID)
 		cancel()
 		if err == nil {
 			return session
@@ -1610,7 +1610,7 @@ func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 		cluster.hostsMu.RLock()
 		h := cluster.hosts[leaderIdx]
 		cluster.hostsMu.RUnlock()
-		_, err := h.GetShardInfo(shardID)
+		_, err := h.ShardInfo(shardID)
 		return err == nil
 	})
 
@@ -1804,7 +1804,7 @@ func TestLinearizability_3Node_FollowerRestart(t *testing.T) {
 		cluster.hostsMu.RLock()
 		h := cluster.hosts[followerIdx]
 		cluster.hostsMu.RUnlock()
-		_, err := h.GetShardInfo(shardID)
+		_, err := h.ShardInfo(shardID)
 		return err == nil
 	})
 	t.Logf("follower node[%d] has rejoined the cluster", followerIdx)
@@ -1868,7 +1868,7 @@ func TestLinearizability_5Node_RollingRestart(t *testing.T) {
 				cluster.hostsMu.RLock()
 				h := cluster.hosts[followerIdx]
 				cluster.hostsMu.RUnlock()
-				_, err := h.GetShardInfo(shardID)
+				_, err := h.ShardInfo(shardID)
 				return err == nil
 			})
 		t.Logf("round %d: follower node[%d] has rejoined", round, followerIdx)
@@ -1968,7 +1968,7 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 		cluster.hostsMu.RLock()
 		h := cluster.hosts[leaderIdx]
 		cluster.hostsMu.RUnlock()
-		_, err := h.GetShardInfo(shardID)
+		_, err := h.ShardInfo(shardID)
 		return err == nil
 	})
 	t.Logf("old leader node[%d] has rejoined the cluster", leaderIdx)
@@ -2019,7 +2019,7 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 		cluster.hostsMu.RLock()
 		h := cluster.hosts[newIdx]
 		cluster.hostsMu.RUnlock()
-		_, err := h.GetShardInfo(shardID)
+		_, err := h.ShardInfo(shardID)
 		return err == nil
 	})
 	t.Logf("node[%d] has joined and caught up", newIdx)

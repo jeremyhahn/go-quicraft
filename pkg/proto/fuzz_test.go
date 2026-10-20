@@ -653,11 +653,11 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 				// The authorization maps and the replicated session policy.
 				// No shape carried them, so the comparisons below could not
 				// observe a converter or codec that dropped either.
-				Identities:           map[uint64]string{addrKey: identityPrefix + addrVal},
-				RemovedIdentities:    map[uint64]string{removedKey: identityPrefix + "removed"},
-				SessionExpiryEntries: ccID,
-				MaxTotalSessions:     maxWitnesses + 1,
-				MaxSessionsPerClient: maxWitnesses + 2,
+				Identities:             map[uint64]string{addrKey: identityPrefix + addrVal},
+				RemovedIdentities:      map[uint64]string{removedKey: identityPrefix + "removed"},
+				SessionExpiryEntries:   ccID,
+				MaxTotalSessions:       maxWitnesses + 1,
+				MaxResponsesPerSession: maxWitnesses + 2,
 			},
 			{
 				ConfigChangeID:             ccID,
@@ -773,10 +773,10 @@ func checkMembershipRoundTrip(t *testing.T, m *Membership) {
 		}
 		if m.SessionExpiryEntries != m2.SessionExpiryEntries ||
 			m.MaxTotalSessions != m2.MaxTotalSessions ||
-			m.MaxSessionsPerClient != m2.MaxSessionsPerClient {
+			m.MaxResponsesPerSession != m2.MaxResponsesPerSession {
 			t.Fatalf("session policy mismatch: %d/%d/%d != %d/%d/%d",
-				m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient,
-				m2.SessionExpiryEntries, m2.MaxTotalSessions, m2.MaxSessionsPerClient)
+				m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxResponsesPerSession,
+				m2.SessionExpiryEntries, m2.MaxTotalSessions, m2.MaxResponsesPerSession)
 		}
 	}
 }

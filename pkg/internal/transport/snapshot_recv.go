@@ -136,7 +136,7 @@ type chunkReader interface {
 
 // EpochTracker manages in-flight epoch reference counts to prevent
 // premature purge of encryption keys while snapshot transfers are
-// in progress. The concrete implementation is crypto.Barrier.
+// in progress. The concrete implementation is seal.Barrier.
 type EpochTracker interface {
 	// RegisterInFlightEpoch increments the in-flight reference count.
 	RegisterInFlightEpoch(epoch uint64)

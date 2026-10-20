@@ -809,7 +809,7 @@ func TestReplaySnapshotRoundTripsEveryMembershipField(t *testing.T) {
 		RequireFullReplicaMajority: true,
 		SessionExpiryEntries:       100000,
 		MaxTotalSessions:           16384,
-		MaxSessionsPerClient:       128,
+		MaxResponsesPerSession:     128,
 		Addresses:                  map[uint64]string{1: "node-a:5000", 2: "node-b:5000"},
 		Observers:                  map[uint64]string{10: "obs-10:5000"},
 		Witnesses:                  map[uint64]string{20: "wit-20:5000"},
@@ -848,9 +848,9 @@ func TestReplaySnapshotRoundTripsEveryMembershipField(t *testing.T) {
 	}
 	if m.SessionExpiryEntries != want.SessionExpiryEntries ||
 		m.MaxTotalSessions != want.MaxTotalSessions ||
-		m.MaxSessionsPerClient != want.MaxSessionsPerClient {
+		m.MaxResponsesPerSession != want.MaxResponsesPerSession {
 		t.Fatalf("session policy changed in round trip: {expiry:%d total:%d perClient:%d}",
-			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxSessionsPerClient)
+			m.SessionExpiryEntries, m.MaxTotalSessions, m.MaxResponsesPerSession)
 	}
 	for name, pair := range map[string][2]map[uint64]string{
 		"Addresses":         {want.Addresses, m.Addresses},

@@ -85,7 +85,7 @@ const listenerQueueSize = 1024
 //     its prevLeaders/prevLeaderTerms bookkeeping only on acceptance, so a
 //     rejected publish is re-attempted on the next tick and the notification
 //     cannot be lost. This matters: OnLeaderUpdated is what maintains the
-//     Host's isLeader mirror, and losing one would leave GetShardInfo
+//     Host's isLeader mirror, and losing one would leave ShardInfo
 //     permanently wrong. Read readiness (OnLeaderReady) is retried the same
 //     way, and only once its leader change was accepted: a consumer waiting
 //     on it has nothing else to wake it.

@@ -69,15 +69,15 @@ func wantPolicyAttrs(t *testing.T, r slog.Record, previous, effective, local pro
 		t.Errorf("record level = %v, want WARN", r.Level)
 	}
 	want := map[string]uint64{
-		"shardID":                       1,
-		"replicaID":                     2,
-		"previous_expiry_entries":       previous.ExpiryEntries,
-		"expiry_entries":                effective.ExpiryEntries,
-		"local_expiry_entries":          local.ExpiryEntries,
-		"max_total_sessions":            effective.MaxTotalSessions,
-		"local_max_total_sessions":      local.MaxTotalSessions,
-		"max_sessions_per_client":       effective.MaxSessionsPerClient,
-		"local_max_sessions_per_client": local.MaxSessionsPerClient,
+		"shardID":                         1,
+		"replicaID":                       2,
+		"previous_expiry_entries":         previous.ExpiryEntries,
+		"expiry_entries":                  effective.ExpiryEntries,
+		"local_expiry_entries":            local.ExpiryEntries,
+		"max_total_sessions":              effective.MaxTotalSessions,
+		"local_max_total_sessions":        local.MaxTotalSessions,
+		"max_responses_per_session":       effective.MaxResponsesPerSession,
+		"local_max_responses_per_session": local.MaxResponsesPerSession,
 	}
 	got := map[string]uint64{}
 	r.Attrs(func(a slog.Attr) bool {
@@ -105,8 +105,8 @@ func TestLogPolicyDisagreement_ReachesWithLogger(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	local := proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 11, MaxSessionsPerClient: 7}
-	first := proto.SessionPolicy{ExpiryEntries: 800, MaxTotalSessions: 16, MaxSessionsPerClient: 8}
+	local := proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 11, MaxResponsesPerSession: 7}
+	first := proto.SessionPolicy{ExpiryEntries: 800, MaxTotalSessions: 16, MaxResponsesPerSession: 8}
 	replicated := first
 	logs := &policyLogs{}
 
@@ -123,7 +123,7 @@ func TestLogPolicyDisagreement_ReachesWithLogger(t *testing.T) {
 	}
 	wantPolicyAttrs(t, got[0], local, first, local)
 
-	replicated = proto.SessionPolicy{ExpiryEntries: 900, MaxTotalSessions: 22, MaxSessionsPerClient: 9}
+	replicated = proto.SessionPolicy{ExpiryEntries: 900, MaxTotalSessions: 22, MaxResponsesPerSession: 9}
 	results := make([]sm.Result, 1)
 	if err := s.Apply([]proto.Entry{{Index: 1, Cmd: makeCmd("k", "v")}}, results); err != nil {
 		t.Fatalf("Apply = %v", err)
@@ -141,7 +141,7 @@ func TestLogPolicyDisagreement_AgreementIsSilent(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
-	local := proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 11, MaxSessionsPerClient: 7}
+	local := proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 11, MaxResponsesPerSession: 7}
 	logs := &policyLogs{}
 	s, err := NewStateMachine(1, 2, createFn, t.TempDir(), local,
 		func() proto.SessionPolicy { return local }, false, WithLogger(slog.New(logs)))

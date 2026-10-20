@@ -1841,7 +1841,7 @@ func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk) error 
 // currently implemented. This is a potential future defense-in-depth enhancement
 // for deployments where the TLS termination point is untrusted, but for
 // standard deployments the QUIC TLS layer provides sufficient protection.
-// At-rest snapshot encryption is handled by the crypto.Barrier when configured.
+// At-rest snapshot encryption is handled by the seal.Barrier when configured.
 func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	if len(chunks) == 0 {
 		return nil

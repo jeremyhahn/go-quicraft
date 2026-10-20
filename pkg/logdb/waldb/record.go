@@ -167,7 +167,7 @@ const maxRecordDataLen = (1 << 16) - 1
 // adversary with disk access can trivially recompute a valid CRC32 after
 // modifying record contents.
 //
-// For tamper protection of WAL data at rest, the crypto.Barrier must be
+// For tamper protection of WAL data at rest, the seal.Barrier must be
 // configured. When enabled, the barrier encrypts each WAL record payload with
 // AES-256-GCM, which provides authenticated encryption (confidentiality +
 // integrity + authenticity). The CRC32 remains as a fast first-pass corruption

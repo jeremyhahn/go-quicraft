@@ -733,9 +733,9 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	// target rather than on whoever happens to lead next.
 	transferLeadershipTo(t, cluster, shardID, targetIdx, failoverTimeout)
 
-	targetInfo, targetErr := cluster.hosts[targetIdx].GetShardInfo(shardID)
+	targetInfo, targetErr := cluster.hosts[targetIdx].ShardInfo(shardID)
 	if targetErr != nil {
-		t.Fatalf("GetShardInfo on transfer target node[%d] failed: %v", targetIdx, targetErr)
+		t.Fatalf("ShardInfo on transfer target node[%d] failed: %v", targetIdx, targetErr)
 	}
 	if !targetInfo.IsLeader {
 		t.Fatalf("transfer target node[%d] is not the leader after transfer", targetIdx)
@@ -799,7 +799,7 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	if oldLeaderErr == nil {
 		// If the old leader still serves reads, it may have been
 		// re-elected. Verify it is not the leader anymore.
-		info, infoErr := leaderHost.GetShardInfo(shardID)
+		info, infoErr := leaderHost.ShardInfo(shardID)
 		if infoErr == nil && info.IsLeader {
 			t.Logf("old leader was re-elected, which is valid raft behavior")
 		}

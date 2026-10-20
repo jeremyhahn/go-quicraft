@@ -1,7 +1,6 @@
 # Seal and barrier: architecture
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` (and the `pkg/crypto`
-> compatibility shim) · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-13
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -408,9 +407,6 @@ makes single-writer a guarantee.
 - **`pkg/seal`**: the whole barrier (epoch DEKs, the AEAD data path, the two
   strategies, the safety trackers, the sealed-state format, the AAD binding
   probe) and the `StrategyID` type.
-- **`pkg/crypto`**: five type aliases (`Barrier`, `BarrierConfig`,
-  `SealingStrategy`, `Credentials`, `SealedRootKey`) and three forwarding
-  functions (`NewBarrier`, `MustNewBarrier`, `NewCredentials`). No cipher code.
 - **`pkg.Barrier`** (in `pkg/host.go`): the interface the `Host` accepts,
   declared there to break an import cycle. `*seal.Barrier` satisfies it.
 - **`github.com/jeremyhahn/go-enclave`** (Layer 0): memory protection for all

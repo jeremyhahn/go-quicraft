@@ -80,8 +80,8 @@ func TestSessions_RefusedOnDiskStateMachine(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"GetNewSession", func() error {
-			_, err := h.GetNewSession(ctx, shardID)
+		{"NewSession", func() error {
+			_, err := h.NewSession(ctx, shardID)
 			return err
 		}},
 		{"RegisterSession", func() error {
@@ -150,9 +150,9 @@ func TestSessions_NoOPSessionStillWorksOnDiskStateMachine(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	noop := h.GetNoOPSession(shardID)
+	noop := h.NoOPSession(shardID)
 	if noop == nil || !noop.IsNoOPSession() {
-		t.Fatalf("GetNoOPSession returned %+v, want a no-op session", noop)
+		t.Fatalf("NoOPSession returned %+v, want a no-op session", noop)
 	}
 	// A no-op session carries no session state, so it is not what
 	// ErrSessionsUnsupportedOnDisk refuses. It is not valid for

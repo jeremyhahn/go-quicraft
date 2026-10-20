@@ -102,7 +102,7 @@ func driveToLeader(t *testing.T, peer *raft.Peer, self, granter uint64) {
 // reaching a publish site. The engine's only writer of the shard's leader
 // flag — OnLeaderUpdated — was reachable from just two places, both of which
 // require an update or a non-empty inbox, so the step-down was invisible:
-// Host.GetShardInfo().IsLeader kept reporting true, and every `!isLeader`
+// Host.ShardInfo().IsLeader kept reporting true, and every `!isLeader`
 // guard in the Host kept admitting writes to a replica that had already
 // relinquished leadership. The stale value survived until the node campaigned,
 // roughly a full election timeout later.
@@ -148,7 +148,7 @@ func TestStepWorker_Tick_PublishesCheckQuorumStepDown(t *testing.T) {
 
 	if got := lastLeader(cb); got == 1 {
 		t.Fatalf("the engine still advertises replica 1 as leader after a "+
-			"CheckQuorum step-down (raft leaderID=%d): Host.GetShardInfo().IsLeader "+
+			"CheckQuorum step-down (raft leaderID=%d): Host.ShardInfo().IsLeader "+
 			"and every !isLeader write guard read this stale value until the node "+
 			"campaigned, ~one election timeout later", peer.LeaderID())
 	}
@@ -464,7 +464,7 @@ func TestCommitPendingInbox_Phase1OnlyStepDownIsPublished(t *testing.T) {
 	}
 	if got := lastLeader(cb); got == 1 {
 		t.Fatalf("step-down in PHASE 1 was never published (last published leader=%d, "+
-			"raft leaderID=%d): Host.GetShardInfo().IsLeader keeps reporting this node "+
+			"raft leaderID=%d): Host.ShardInfo().IsLeader keeps reporting this node "+
 			"as leader", got, peer.LeaderID())
 	}
 }

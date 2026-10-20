@@ -24,15 +24,15 @@ import (
 
 // Default values for Config fields.
 const (
-	DefaultElectionRTT          uint64 = 10
-	DefaultHeartbeatRTT         uint64 = 1
-	DefaultCompactionOverhead   uint64 = 5000
-	DefaultMaxInMemLogSize      uint64 = 0               // 0 = disabled
-	DefaultMaxEntrySize         uint64 = 8 * 1024 * 1024 // 8 MB
-	DefaultMaxApplyEntrySize    uint64 = MaxReplicationPayloadBytes
-	DefaultMaxSnapshotSize      uint64 = 4 * 1024 * 1024 * 1024
-	DefaultMaxSessionsPerClient uint64 = 128
-	DefaultMaxTotalSessions     uint64 = 16384
+	DefaultElectionRTT            uint64 = 10
+	DefaultHeartbeatRTT           uint64 = 1
+	DefaultCompactionOverhead     uint64 = 5000
+	DefaultMaxInMemLogSize        uint64 = 0               // 0 = disabled
+	DefaultMaxEntrySize           uint64 = 8 * 1024 * 1024 // 8 MB
+	DefaultMaxApplyEntrySize      uint64 = MaxReplicationPayloadBytes
+	DefaultMaxSnapshotSize        uint64 = 4 * 1024 * 1024 * 1024
+	DefaultMaxResponsesPerSession uint64 = 128
+	DefaultMaxTotalSessions       uint64 = 16384
 
 	// DefaultMaxSessionsPerOwner is the number of concurrent sessions one
 	// declared owner may hold on a shard that does not choose otherwise.
@@ -46,7 +46,7 @@ const (
 	//
 	// It costs existing embedders nothing. The cap applies only to sessions
 	// that declare an owner (proto.Entry.OwnerID), and an embedder that does
-	// not use Host.GetNewSessionWithOwner declares none, so every session it
+	// not use Host.NewSessionWithOwner declares none, so every session it
 	// registers is exempt no matter what this value is.
 	DefaultMaxSessionsPerOwner uint64 = 128
 
@@ -439,7 +439,7 @@ type Config struct {
 	// Default: 4 GB.
 	MaxSnapshotSize uint64
 
-	// MaxSessionsPerClient is the RESPONSE-CACHE DEPTH: the maximum number of
+	// MaxResponsesPerSession is the RESPONSE-CACHE DEPTH: the maximum number of
 	// cached RESPONSES retained per registered session, which is the depth of
 	// the at-most-once dedup cache and not a count of sessions at all.
 	// Default: 128.
@@ -456,7 +456,7 @@ type Config struct {
 	// happened here before, and neither mistake fails loudly — one caps a shard
 	// at a response depth, the other lets a single client pin the whole session
 	// table.
-	MaxSessionsPerClient uint64
+	MaxResponsesPerSession uint64
 
 	// MaxTotalSessions is the maximum total sessions per shard across all
 	// clients. Default: 16384.
@@ -472,7 +472,7 @@ type Config struct {
 	// with it. SessionsPerOwnerUnlimited turns the cap off.
 	//
 	// An "owner" is a principal the EMBEDDER declares when it registers a
-	// session (Host.GetNewSessionWithOwner, NewSessionWithOwner), carried in
+	// session (Host.NewSessionWithOwner, NewSessionWithOwner), carried in
 	// the replicated log as proto.Entry.OwnerID. This library cannot derive one
 	// on its own: it authenticates nodes, not clients, and a clientID is eight
 	// bytes the caller picks. Sessions registered without an owner — every
@@ -527,7 +527,7 @@ type Config struct {
 	// It is therefore REPLICATED, and this field is only the SEED. A founding
 	// replica writes it into the shard's initial membership at bootstrap
 	// (proto.SessionPolicy, alongside MaxTotalSessions and
-	// MaxSessionsPerClient); from then on the apply path reads the committed
+	// MaxResponsesPerSession); from then on the apply path reads the committed
 	// value and this field governs nothing. All founders must supply the same
 	// value or their index-1 entries differ; a replica whose configuration
 	// disagrees with what its shard committed logs the disagreement at startup
@@ -693,8 +693,8 @@ func (c *Config) SetDefaults() {
 	if c.MaxSnapshotSize == 0 {
 		c.MaxSnapshotSize = DefaultMaxSnapshotSize
 	}
-	if c.MaxSessionsPerClient == 0 {
-		c.MaxSessionsPerClient = DefaultMaxSessionsPerClient
+	if c.MaxResponsesPerSession == 0 {
+		c.MaxResponsesPerSession = DefaultMaxResponsesPerSession
 	}
 	if c.MaxTotalSessions == 0 {
 		c.MaxTotalSessions = DefaultMaxTotalSessions
@@ -883,8 +883,8 @@ func (c *Config) validateSizeLimits() error {
 }
 
 func (c *Config) validateSessions() error {
-	if c.MaxSessionsPerClient == 0 {
-		return newValidationError("MaxSessionsPerClient", "must be > 0")
+	if c.MaxResponsesPerSession == 0 {
+		return newValidationError("MaxResponsesPerSession", "must be > 0")
 	}
 	if c.MaxTotalSessions == 0 {
 		return newValidationError("MaxTotalSessions", "must be > 0")

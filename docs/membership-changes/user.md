@@ -9,7 +9,7 @@ already exists. Forming the shard in the first place is `StartShard`; see
 
 ## Before you start
 
-- Send the change to the current leader (`GetLeaderID`).
+- Send the change to the current leader (`LeaderID`).
 - Read the current `ConfigChangeID` immediately before the change.
 - Collect the new node's identity: the value its host reports from
   `NodeIdentity()`. It is a hash of the certificate's public key, safe to log
@@ -31,7 +31,7 @@ err = host.SyncRequestAddNodeWithIdentity(ctx, shardID,
 
 Two rules:
 
-1. **Use the `Sync` read.** `GetShardMembership` reads local state, which may
+1. **Use the `Sync` read.** `ShardMembership` reads local state, which may
    be behind, and a stale `ConfigChangeID` guarantees the change is refused.
 2. **Pass `ConfigChangeID`.** It is the replay guard. If another change landed
    between your read and your write you get `*StaleConfigChangeError`; re-read
@@ -107,7 +107,7 @@ A witness cannot be promoted; the add is refused with `ErrNodeAlreadyExists`.
 
 ### Know when the observer has caught up
 
-The leader's `ShardInfo.Replicas` (from `Host.GetShardInfo`) lists every remote member it tracks, observers
+The leader's `ShardInfo.Replicas` (from `Host.ShardInfo`) lists every remote member it tracks, observers
 and witnesses included, each with a `Role` (`ReplicaRoleVoter`,
 `ReplicaRoleObserver` or `ReplicaRoleWitness`) and its `Match` index. Read it
 on the leader, not a follower (a follower's list is empty), and filter on `Role`
@@ -145,7 +145,7 @@ err := host.RequestLeaderTransfer(ctx, shardID, otherReplicaID)
 
 // 2. Remove it from the cluster. This is a consensus operation.
 m, _ := host.SyncGetShardMembership(ctx, shardID)
-err = host.SyncRequestDeleteNode(ctx, shardID, replicaID, m.ConfigChangeID)
+err = host.SyncRequestRemoveNode(ctx, shardID, replicaID, m.ConfigChangeID)
 
 // 3. On that node: stop the shard, then delete its data.
 err = removedHost.StopShard(shardID)

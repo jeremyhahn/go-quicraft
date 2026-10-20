@@ -79,7 +79,7 @@ func observerPromotedInPlace(t *testing.T, cfgFn func(shardID, replicaID uint64)
 	joined := addObserverToCluster(t, cluster, shardID, observerID, cfgFn)
 	waitForMembershipConverged(t, cluster, shardID, []uint64{1, 2, 3}, nil, membershipTimeout)
 	waitForNodeData(t, joined.tracker, shardID, observerID, data, membershipTimeout)
-	if info, err := joined.host.GetShardInfo(shardID); err != nil || !info.IsObserver {
+	if info, err := joined.host.ShardInfo(shardID); err != nil || !info.IsObserver {
 		t.Fatalf("phase 1: the joined replica's ShardInfo = %+v (err %v), want IsObserver", info, err)
 	}
 	// The state machine the replica runs now is the one it must still be
@@ -92,7 +92,7 @@ func observerPromotedInPlace(t *testing.T, cfgFn func(shardID, replicaID uint64)
 	waitForMembershipConverged(t, cluster, shardID, []uint64{1, 2, 3, observerID}, nil, membershipTimeout)
 
 	waitForCondition(t, membershipTimeout, "the promoted replica reports itself a voter", func() bool {
-		info, err := joined.host.GetShardInfo(shardID)
+		info, err := joined.host.ShardInfo(shardID)
 		return err == nil && !info.IsObserver
 	})
 

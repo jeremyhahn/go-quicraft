@@ -24,7 +24,7 @@
 //
 //	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
 //	...
-//	cluster.hosts[leaderIdx].SyncRequestDeleteNode(ctx, shardID, id, 0)
+//	cluster.hosts[leaderIdx].SyncRequestRemoveNode(ctx, shardID, id, 0)
 //
 // has read a value that was true when it looked and treated it as fixed.
 // Package test/proposer records that class for proposals; a membership change
@@ -518,9 +518,9 @@ func TryPromoteNode(resolve proposer.Resolver, shardID, replicaID uint64, addr, 
 // shows it holding no role. It is DeleteNode's error-returning form.
 func TryDeleteNode(resolve proposer.Resolver, shardID, replicaID uint64, budget time.Duration) error {
 	attempt, read := resolved(resolve, shardID, func(ctx context.Context, h *quicraft.Host) error {
-		return h.SyncRequestDeleteNode(ctx, shardID, replicaID, 0) //quicraft:direct-config-change the single attempt Drive is built from
+		return h.SyncRequestRemoveNode(ctx, shardID, replicaID, 0) //quicraft:direct-config-change the single attempt Drive is built from
 	})
-	desc := fmt.Sprintf("SyncRequestDeleteNode(replica=%d)", replicaID)
+	desc := fmt.Sprintf("SyncRequestRemoveNode(replica=%d)", replicaID)
 	return Drive(desc, budget, attempt, read, DeleteNodeLanded(replicaID))
 }
 

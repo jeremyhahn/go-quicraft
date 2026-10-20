@@ -114,7 +114,7 @@ func benchStartKVShard(b *testing.B, h *Host, shardID uint64, key, value []byte)
 // ---------------------------------------------------------------------------
 
 // BenchmarkGetNoOPSession measures the cost of allocating a no-op session.
-// GetNoOPSession creates a lightweight Session struct with a fixed clientID
+// NoOPSession creates a lightweight Session struct with a fixed clientID
 // of 0. This is a pure allocation benchmark with no engine interaction.
 func BenchmarkGetNoOPSession(b *testing.B) {
 	h := benchNewHost(b)
@@ -129,7 +129,7 @@ func BenchmarkGetNoOPSession(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = h.GetNoOPSession(shardID)
+		_ = h.NoOPSession(shardID)
 	}
 }
 
@@ -138,7 +138,7 @@ func BenchmarkGetNoOPSession(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 // BenchmarkGetLeaderID measures the cost of reading the cached leader ID.
-// After election, GetLeaderID performs an atomic load and a map lookup,
+// After election, LeaderID performs an atomic load and a map lookup,
 // expected to complete in the nanosecond range.
 func BenchmarkGetLeaderID(b *testing.B) {
 	h := benchNewHost(b)
@@ -155,7 +155,7 @@ func BenchmarkGetLeaderID(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		_, _, _ = h.GetLeaderID(shardID)
+		_, _, _ = h.LeaderID(shardID)
 	}
 }
 

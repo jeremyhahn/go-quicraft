@@ -95,7 +95,7 @@ const defaultMaxExpirePerCheckpoint = 64
 // A fixed 64 makes the worst-case recovery time depend on MaxTotalSessions: at
 // the defaults (16384 sessions, 100000-entry expiry window) a full table needs
 // 16384/64 = 256 windows to drain, i.e. 25.6 MILLION applied entries during
-// which every new GetNewSession on the shard fails. A crashed client fleet —
+// which every new NewSession on the shard fails. A crashed client fleet —
 // a rolling deploy of a service that does not close its sessions — is enough
 // to reach that state, and the recovery constant is three orders of magnitude
 // larger than the failure that caused it.
@@ -299,7 +299,7 @@ type StateMachine struct {
 //
 // Passing the policy as one value also removes a hazard the previous signature
 // had: it took the two limits as adjacent uint64 parameters, and transposing
-// them compiled cleanly while silently capping a shard at MaxSessionsPerClient
+// them compiled cleanly while silently capping a shard at MaxResponsesPerSession
 // clients and letting one client pin MaxTotalSessions cached results.
 func NewStateMachine(
 	shardID, replicaID uint64,
@@ -334,7 +334,7 @@ func NewStateMachine(
 	// session manager with limits it is about to replace.
 	s.sessionPolicy = s.effectiveSessionPolicy()
 	s.sessions = session.NewManager(
-		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient,
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxResponsesPerSession,
 		s.sessionPolicy.MaxSessionsPerOwner)
 	s.logPolicyDisagreement(local, s.sessionPolicy)
 	return s, nil
@@ -385,7 +385,7 @@ func (s *StateMachine) refreshSessionPolicy() {
 	}
 	previous := s.sessionPolicy
 	s.sessionPolicy = effective
-	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxSessionsPerClient,
+	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxResponsesPerSession,
 		effective.MaxSessionsPerOwner)
 	s.logPolicyDisagreement(previous, effective)
 }
@@ -395,7 +395,7 @@ func (s *StateMachine) refreshSessionPolicy() {
 //
 // The shard's value governs and there is no way for one replica to opt out, so
 // this is a warning and not an error — but it is never silent. MaxTotalSessions
-// and MaxSessionsPerClient bound this process's memory, so a replicated value
+// and MaxResponsesPerSession bound this process's memory, so a replicated value
 // above the local one is an operator-visible resource decision that was taken
 // elsewhere (at bootstrap, by the founders) and must be discoverable from this
 // node's logs rather than only by reading the shard's membership.
@@ -417,8 +417,8 @@ func (s *StateMachine) logPolicyDisagreement(previous, effective proto.SessionPo
 		"local_expiry_entries", s.localPolicy.ExpiryEntries,
 		"max_total_sessions", effective.MaxTotalSessions,
 		"local_max_total_sessions", s.localPolicy.MaxTotalSessions,
-		"max_sessions_per_client", effective.MaxSessionsPerClient,
-		"local_max_sessions_per_client", s.localPolicy.MaxSessionsPerClient,
+		"max_responses_per_session", effective.MaxResponsesPerSession,
+		"local_max_responses_per_session", s.localPolicy.MaxResponsesPerSession,
 	)
 }
 
@@ -1290,7 +1290,7 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// advances r to exactly the position the user restore must start from,
 	// whether or not the staged manager is ultimately adopted.
 	staged := session.NewManager(
-		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxSessionsPerClient,
+		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxResponsesPerSession,
 		s.sessionPolicy.MaxSessionsPerOwner)
 	if err := staged.UnmarshalFrom(r); err != nil {
 		return err

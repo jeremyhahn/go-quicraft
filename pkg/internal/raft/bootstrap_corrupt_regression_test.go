@@ -127,10 +127,10 @@ func TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy(t *testing.
 		RequireFullReplicaMajority: true,
 	}
 	want.SetSessionPolicy(proto.SessionPolicy{
-		ExpiryEntries:        1234,
-		MaxTotalSessions:     77,
-		MaxSessionsPerClient: 5,
-		MaxSessionsPerOwner:  9,
+		ExpiryEntries:          1234,
+		MaxTotalSessions:       77,
+		MaxResponsesPerSession: 5,
+		MaxSessionsPerOwner:    9,
 	})
 
 	e, err := BuildInitialMembershipEntry(want)
@@ -173,7 +173,7 @@ func TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy(t *testing.
 			"rule than its peers", got.MaxWitnesses, got.RequireFullReplicaMajority)
 	}
 	if sp := got.SessionPolicy(); sp.ExpiryEntries != 1234 ||
-		sp.MaxTotalSessions != 77 || sp.MaxSessionsPerClient != 5 ||
+		sp.MaxTotalSessions != 77 || sp.MaxResponsesPerSession != 5 ||
 		sp.MaxSessionsPerOwner != 9 {
 		t.Fatalf("session policy = %+v, want {1234, 77, 5, 9}: it is replicated "+
 			"state, so a divergent value expires different sessions at the same "+

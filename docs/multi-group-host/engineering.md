@@ -229,7 +229,7 @@ it. When you see the clamp's ERROR line, treat the replica as having lost its
 identity:
 
 1. Stop the replica.
-2. Remove it (`RequestRemoveNode` or `SyncRequestDeleteNode`) and wait for the
+2. Remove it (`RequestRemoveNode` or `SyncRequestRemoveNode`) and wait for the
    change to commit.
 3. `RemoveData` on its host, which retires the replica ID.
 4. Re-add it under a **new replica ID** with
@@ -812,7 +812,7 @@ default is a trap:
 | `Config.SnapshotEntries` | 100000 | zero selects the default; use `config.SnapshotsDisabled` |
 | `Config.SessionExpiryEntries` | 100000 | zero selects the default; use `config.SessionExpiryDisabled` |
 | `Config.CheckQuorum`, `PreVote`, `OrderedConfigChange` | nil = enabled | use `config.BoolPtr(false)` to disable; each logs a warning |
-| `Config.MaxSessionsPerClient` | 128 | bounds cached responses per session, not sessions |
+| `Config.MaxResponsesPerSession` | 128 | bounds cached responses per session, not sessions |
 | `Config.LeaseRead` | false | requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) |
 | `Config.Witness` | zero | bootstrap seed only; the live policy is replicated |
 | `TransportConfig.MTLSConfig` | nil | required whenever the transport is enabled (`ErrMTLSConfigRequired`) |
@@ -863,16 +863,17 @@ Host-level introspection, separate from metrics:
 
 ```go
 host.HealthCheck()                // *HealthStatus
-host.GetNodeHostInfo(opt)         // *NodeHostInfo
-host.GetShardInfo(shardID)        // *ShardInfo, including ShardHealth
+host.NodeHostInfo(opt)         // *NodeHostInfo
+host.ShardInfo(shardID)        // *ShardInfo, including ShardHealth
 host.ShardCount()
 host.ID(); host.NodeIdentity(); host.RaftAddress()
 host.IsSealed(); host.IsDraining()
 host.DiagRaftState / DiagPipelineState / DiagShardGates / DiagRemotes
 ```
 
-The `Diag*` accessors are for incident response, not monitoring, and their
-signatures may change.
+The `Diag*` accessors are for incident response, not monitoring. Each returns a
+typed struct (`RaftStateDiag`, `PipelineDiag`, `ShardGatesDiag`, `RemotesDiag`);
+see [api.md](api.md#diagnostics).
 
 ## Cross-references
 

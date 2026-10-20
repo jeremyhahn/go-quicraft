@@ -167,8 +167,8 @@ stay inline: they have happens-before requirements
 against `raft.Peer.Handle` and cannot queue behind user code. There is no
 ordering guarantee between dispatched notifications and inline callbacks.
 
-`EventListener.OnCampaignSkipped` exists but is never invoked. Detect a
-leaderless shard with `Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
+No event reports a refused election. Detect a
+leaderless shard with `Host.LeaderID` or `ShardInfo.Health == ShardNoLeader`.
 
 ## Logging must not stall the engine
 
@@ -201,7 +201,7 @@ uncontained ones, and a line can be lost under a blocked handler. Metrics and
   the embedder.
 - Barrier decryption returns the single `ErrDecryptionFailed` for every failure
   mode, so neither the error nor its log line is an oracle.
-- `shamir.Share` and `shamir.ProtectedShare` implement `LogValue()` as well as
+- `shamir.ProtectedShare` implements `LogValue()` as well as
   `String()`. `slog` resolves a `LogValuer` first; without one, a `JSONHandler`
   falls back to `json.Marshaler`, which would write the share material. See
   [`../shamir-primitive/engineering.md`](../shamir-primitive/engineering.md).

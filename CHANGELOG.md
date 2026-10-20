@@ -61,6 +61,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wrong size, as a nil `*Memory` was.
 
   No wire or on-disk format changed.
+- **BREAKING**: API freeze for v1.0.0 (#439). Deprecated surfaces are removed
+  and names are normalized. Each item below gives the replacement. No wire or
+  on-disk format changed.
+  - `pkg/crypto/shamir`: the `Share` type is removed, with its string `Value`
+    field and its methods (`Bytes`, `Protect`, `ProtectWith`, `Validate`,
+    `String`, `LogValue`, `MarshalJSON`, `UnmarshalJSON`). Use
+    `ProtectedShare`, built with `NewProtectedShare` or decoded with
+    `UnmarshalShareSet`. Its JSON encoding is the one `Share` had.
+  - `shamir.Split` is removed. Use `SplitProtected`, or `SplitBytes`.
+  - `shamir.Combine` and `shamir.CombineUnverified` are removed. Use
+    `CombineProtected`, or `CombineBytes`.
+  - `shamir.IntegrityError` is removed. It was never returned.
+  - `shamir.VerifyShare` takes `*ProtectedShare` and `[]*ProtectedShare`.
+  - `pkg/crypto` is deleted. Import `pkg/seal` and use `seal.Barrier`,
+    `seal.BarrierConfig`, `seal.Credentials`, `seal.SealedRootKey`,
+    `seal.SealingStrategy`, `seal.NewBarrier`, `seal.MustNewBarrier` and
+    `seal.NewCredentials`.
+  - `waldb.Options.MaxBatchSize` is removed, with `waldb.ErrInvalidMaxBatchSize`.
+    It bounded nothing. Size the WAL with `BlockSize` and `MaxFileSize`.
+  - `config.EventListener.OnCampaignSkipped` is removed. Nothing ever invoked
+    it. Detect a leaderless shard with `ShardInfo.Health == ShardNoLeader`.
+  - `Host.DiagPipelineState`, `Host.DiagRaftState`, `Host.DiagRemotes` and
+    `Host.DiagShardGates` return typed structs (`PipelineDiag`,
+    `RaftStateDiag`, `RemotesDiag`, `ShardGatesDiag`) in place of
+    `map[string]any`, and their signatures are now part of the stable API.
+  - `config.Config.MaxSessionsPerClient` is renamed `MaxResponsesPerSession`,
+    and `config.DefaultMaxSessionsPerClient` is renamed
+    `DefaultMaxResponsesPerSession`. It bounds the cached responses of one
+    session, not a session count. The `proto.SessionPolicy`,
+    `proto.Membership` and `logdb.Membership` fields of the same name follow,
+    and the log keys become `max_responses_per_session` and
+    `local_max_responses_per_session`. The encoded layout is unchanged.
+  - `Host.SyncRequestDeleteNode` is renamed `SyncRequestRemoveNode`, the
+    synchronous form of `RequestRemoveNode`.
+  - The `Get` prefix is dropped from the `Host` accessors: `GetLeaderIDAndTerm`,
+    `GetLeaderID`, `GetShardInfo`, `GetShardMembership`, `GetNodeHostInfo`,
+    `GetLogRange`, `GetLogReader`, `GetNewSessionWithOwner`, `GetNewSession`
+    and `GetNoOPSession` become `LeaderIDAndTerm`, `LeaderID`, `ShardInfo`,
+    `ShardMembership`, `NodeHostInfo`, `LogRange`, `LogReader`,
+    `NewSessionWithOwner`, `NewSession` and `NoOPSession`.
+  - `contrib/dragonboat` keeps its Dragonboat-compatible names
+    (`NodeHost.GetLeaderID`, `SyncRequestDeleteNode` and the rest); only its
+    calls into `Host` changed.
 
 ### Fixed
 

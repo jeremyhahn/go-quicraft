@@ -132,7 +132,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	// keyed entry was APPLIED there, so its LastApplied covers them all, and
 	// it needs no leader to answer.
 	logEnd := uint64(0)
-	if info, err := follower.GetShardInfo(shardID); err == nil {
+	if info, err := follower.ShardInfo(shardID); err == nil {
 		logEnd = info.LastApplied
 	}
 	if logEnd == 0 {
@@ -185,7 +185,7 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 			deadline := time.Now().Add(proposeTimeout)
 			for time.Now().Before(deadline) {
 				var appliedAtSubmit uint64
-				if info, err := follower.GetShardInfo(shardID); err == nil {
+				if info, err := follower.ShardInfo(shardID); err == nil {
 					appliedAtSubmit = info.LastApplied
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)

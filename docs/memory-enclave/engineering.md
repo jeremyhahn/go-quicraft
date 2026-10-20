@@ -211,8 +211,7 @@ illegal footprint it prices and refuses the whole operation up front instead
 (`MaxShareSetBytes` against `splitLockedBytes`). A consumer that buffers key
 material before authenticating a peer should admit those allocations through an
 `Allocator` at its own layer, and can pass the same allocator to
-`shamir.SplitProtectedWith`, `CombineProtectedWith`, `NewProtectedShareWith`,
-`UnmarshalShareSetWith` and `Share.ProtectWith` so its budget covers share
+`shamir.SplitProtectedWith`, `CombineProtectedWith`, `NewProtectedShareWith`\nand `UnmarshalShareSetWith` so its budget covers share
 material too. A nil allocator is refused there, never treated as unbudgeted.
 `ProtectedShare.UnmarshalJSON` is the one share constructor that cannot take an
 allocator; a budgeted consumer decodes through `UnmarshalShareSetWith` instead.

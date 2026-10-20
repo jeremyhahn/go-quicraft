@@ -175,8 +175,7 @@ transport, WAL, seal) log through `slog.Default()`.
 
 A struct of optional callbacks; nil fields are skipped and a nil listener costs
 nothing. Payload types: `LeaderInfo`, `EventShardInfo`, `SnapshotInfo`,
-`ShardFailedInfo`, `ConnectionInfo`, `DiskInfo`. `OnCampaignSkipped` is never
-invoked.
+`ShardFailedInfo`, `ConnectionInfo`, `DiskInfo`.
 
 ### Sampling
 

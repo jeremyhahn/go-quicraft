@@ -87,7 +87,7 @@ toward a lease.
 
 **`Membership`**: `ConfigChangeID`, `MaxWitnesses`,
 `RequireFullReplicaMajority`, `SessionExpiryEntries`, `MaxTotalSessions`,
-`MaxSessionsPerClient` (a response-cache depth, not a session count),
+`MaxResponsesPerSession` (a response-cache depth, not a session count),
 `MaxSessionsPerOwner` (0 disables it), `Addresses`, `Observers`, `Witnesses`,
 `Removed`, `Identities`, `RemovedIdentities`.
 
@@ -283,9 +283,7 @@ new one created. New segments are pre-allocated (`fallocate` on Linux,
 `Options.Validate` and `Open` (`validateOpenOptions`) share the rules above,
 with two differences. Only `Open` refuses a `MaxFileSize` smaller than two
 blocks (`ErrSegmentTooSmallForEntry`). Only `Validate` checks `WALDir`
-(`ErrEmptyWALDir`) and `MaxBatchSize > 0` (`ErrInvalidMaxBatchSize`); `Open`
-checks its `dir` argument instead. `Options.MaxBatchSize` is deprecated and
-reaches nothing else.
+(`ErrEmptyWALDir`); `Open` checks its `dir` argument instead.
 
 ### Blocks and chunks
 
@@ -465,7 +463,7 @@ The membership section:
 [NumWitnesses:4]{...}
 [NumRemoved:4]{[ReplicaID:8]}...
 [NumIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]}...
-[SessionExpiryEntries:8][MaxTotalSessions:8][MaxSessionsPerClient:8][MaxSessionsPerOwner:8]
+[SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8][MaxSessionsPerOwner:8]
 [NumRemovedIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]}...
 ```
 

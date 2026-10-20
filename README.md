@@ -189,7 +189,7 @@ that embeds it; in this project's own stack that is
 | Write, wait for apply | `SyncPropose` | [multi-group-host](docs/multi-group-host/user.md) |
 | Write, asynchronous | `Propose`, then `RequestState.ResultC()`; with `HostConfig.NotifyCommit`, also `CommittedC()` / `ApplyResultC()` | [write-batching](docs/write-batching/user.md) |
 | Batch many writes into one entry | `batch.NewAggregator` (at-least-once; no deduplication) | [write-batching](docs/write-batching/user.md) |
-| At-most-once writes | `GetNewSession`, `SyncProposeWithSession`, `CloseSession` | [client-sessions](docs/client-sessions/user.md) |
+| At-most-once writes | `NewSession`, `SyncProposeWithSession`, `CloseSession` | [client-sessions](docs/client-sessions/user.md) |
 | Linearizable read | `SyncRead` (ReadIndex; lease-based when `Config.LeaseRead` is set) | [multi-group-host](docs/multi-group-host/user.md) |
 | Local reads | `StaleRead`, `QueryLocalNode`; `SyncReadBuf` / `StaleReadBuf` for pooled buffers | [multi-group-host](docs/multi-group-host/user.md) |
 | Membership | `RequestAddNodeWithIdentity`, `RequestAddObserverWithIdentity`, `RequestAddWitnessWithIdentity`, `RequestRemoveNode` | [membership-changes](docs/membership-changes/user.md) |

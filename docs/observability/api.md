@@ -134,7 +134,7 @@ optional callback; nil fields are skipped.
 | Group | Callbacks | Payload |
 |---|---|---|
 | Raft | `OnLeaderUpdated`, `OnLeaderReady` | `LeaderInfo` |
-| | `OnLeaderLost`, `OnCampaignLaunched`, `OnCampaignSkipped`, `OnProposalDropped`, `OnReadIndexDropped` | `EventShardInfo` |
+| | `OnLeaderLost`, `OnCampaignLaunched`, `OnProposalDropped`, `OnReadIndexDropped` | `EventShardInfo` |
 | | `OnSnapshotRejected` | `SnapshotInfo` |
 | System | `OnNodeHostShuttingDown` | none |
 | | `OnNodeReady`, `OnNodeUnloaded`, `OnNodeDeleted`, `OnMembershipChanged`, `OnLogCompacted`, `OnLogDBCompacted` | `EventShardInfo` |
@@ -143,8 +143,8 @@ optional callback; nil fields are skipped.
 | Failure | `OnShardFailed` | `ShardFailedInfo` |
 | | `OnLogDBDiskWarning`, `OnLogDBDiskFull` | `DiskInfo` |
 
-`OnCampaignSkipped` is never invoked. Detect a leaderless shard with
-`Host.GetLeaderID` or `ShardInfo.Health == ShardNoLeader`.
+No event reports a refused election. Detect a leaderless shard with
+`Host.LeaderID` or `ShardInfo.Health == ShardNoLeader`.
 
 `OnLeaderReady` fires once the shard's leader for `LeaderInfo.Term` has
 committed an entry of that term, which is when ReadIndex stops returning
@@ -184,9 +184,9 @@ There is no ordering guarantee between the two classes.
 
 ```go
 func (h *Host) HealthCheck() *HealthStatus
-func (h *Host) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
-func (h *Host) GetShardInfo(shardID uint64) (*ShardInfo, error)
-func (h *Host) GetLeaderID(shardID uint64) (uint64, bool, error)
+func (h *Host) NodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo
+func (h *Host) ShardInfo(shardID uint64) (*ShardInfo, error)
+func (h *Host) LeaderID(shardID uint64) (uint64, bool, error)
 func (h *Host) ShardCount() int
 func (h *Host) ID() string
 func (h *Host) NodeIdentity() string
@@ -232,4 +232,3 @@ does not affect `Status`. There is no Prometheus series for it.
   what dashboards see; removing one silently drops a series.
 - Metric names belong to the reference implementation, not the interface. An
   embedder with its own collector chooses its own names.
-- `EventListener.OnCampaignSkipped` is reserved and never fires.

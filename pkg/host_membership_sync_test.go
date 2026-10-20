@@ -46,16 +46,16 @@ func startSingleVoterShard(t *testing.T) *Host {
 }
 
 // ---------------------------------------------------------------------------
-// SyncRequestDeleteNode
+// SyncRequestRemoveNode
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestDeleteNode_RemovesObserver verifies the committed path of the
+// TestSyncRequestRemoveNode_RemovesObserver verifies the committed path of the
 // public synchronous membership removal: an observer that was added through
 // consensus is removed through consensus, the call returns only once the
 // change is applied, and the shard membership no longer lists the replica.
 // Observers do not count toward quorum, so the removal commits on the single
 // voter without any peer being reachable.
-func TestSyncRequestDeleteNode_RemovesObserver(t *testing.T) {
+func TestSyncRequestRemoveNode_RemovesObserver(t *testing.T) {
 	h := startSingleVoterShard(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -73,8 +73,8 @@ func TestSyncRequestDeleteNode_RemovesObserver(t *testing.T) {
 		t.Fatalf("observer 10 missing from membership after add: %+v", added.Observers)
 	}
 
-	if err := h.SyncRequestDeleteNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
-		t.Fatalf("SyncRequestDeleteNode: %v", err)
+	if err := h.SyncRequestRemoveNode(ctx, 1, 10, added.ConfigChangeID); err != nil {
+		t.Fatalf("SyncRequestRemoveNode: %v", err)
 	}
 
 	removed, err := h.SyncGetShardMembership(ctx, 1)
@@ -82,7 +82,7 @@ func TestSyncRequestDeleteNode_RemovesObserver(t *testing.T) {
 		t.Fatalf("SyncGetShardMembership after delete: %v", err)
 	}
 	if _, ok := removed.Observers[10]; ok {
-		t.Fatalf("observer 10 still present after SyncRequestDeleteNode: %+v", removed.Observers)
+		t.Fatalf("observer 10 still present after SyncRequestRemoveNode: %+v", removed.Observers)
 	}
 	if _, ok := removed.Nodes[10]; ok {
 		t.Fatalf("replica 10 reappeared as a voter after removal: %+v", removed.Nodes)
@@ -92,14 +92,14 @@ func TestSyncRequestDeleteNode_RemovesObserver(t *testing.T) {
 	}
 }
 
-// TestSyncRequestDeleteNode_ContextEndsUncommittedWait verifies that a removal
+// TestSyncRequestRemoveNode_ContextEndsUncommittedWait verifies that a removal
 // which cannot commit does not block the caller forever: the call is bounded
 // by the caller's context and reports ErrCanceled / ErrTimeout accordingly.
 //
 // The setup makes the removal genuinely uncommittable: replica 4 is added as a
 // voter (the add commits under the OLD single-voter quorum), after which the
 // shard needs 2 of 2 acks and replica 4 does not exist.
-func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
+func TestSyncRequestRemoveNode_ContextEndsUncommittedWait(t *testing.T) {
 	tests := []struct {
 		name    string
 		ctxFn   func() (context.Context, context.CancelFunc)
@@ -134,9 +134,9 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 			}
 			// Read locally: with two voters and one of them absent, a
 			// linearizable read can no longer reach quorum.
-			members, err := h.GetShardMembership(1)
+			members, err := h.ShardMembership(1)
 			if err != nil {
-				t.Fatalf("GetShardMembership: %v", err)
+				t.Fatalf("ShardMembership: %v", err)
 			}
 			if _, ok := members.Nodes[4]; !ok {
 				t.Fatalf("replica 4 not a voter, removal would be rejected early: %+v", members.Nodes)
@@ -145,15 +145,15 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 			ctx, cancel := tt.ctxFn()
 			defer cancel()
 
-			err = h.SyncRequestDeleteNode(ctx, 1, 4, 0)
+			err = h.SyncRequestRemoveNode(ctx, 1, 4, 0)
 			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("SyncRequestDeleteNode error = %v, want %v", err, tt.wantErr)
+				t.Fatalf("SyncRequestRemoveNode error = %v, want %v", err, tt.wantErr)
 			}
 
 			// The uncommitted change must not have mutated local membership.
-			after, err := h.GetShardMembership(1)
+			after, err := h.ShardMembership(1)
 			if err != nil {
-				t.Fatalf("GetShardMembership after abandoned removal: %v", err)
+				t.Fatalf("ShardMembership after abandoned removal: %v", err)
 			}
 			if _, ok := after.Nodes[4]; !ok {
 				t.Fatalf("replica 4 removed from membership by an uncommitted config change: %+v", after.Nodes)
@@ -162,10 +162,10 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 	}
 }
 
-// TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention pins
+// TestSyncRequestRemoveNode_ConfigChangeIndexRoundTripsUnderContention pins
 // that OnApplied advances ns.configChangeIndex for a config-change entry
 // BEFORE completing its RequestState — unblocking the caller of
-// SyncRequestAddObserver / SyncRequestDeleteNode. Completing first would let a
+// SyncRequestAddObserver / SyncRequestRemoveNode. Completing first would let a
 // caller that immediately round-trips SyncGetShardMembership's ConfigChangeID
 // into the next config-change call, exactly as SyncGetShardMembership
 // documents, receive a false-positive StaleConfigChangeError.
@@ -184,11 +184,11 @@ func TestSyncRequestDeleteNode_ContextEndsUncommittedWait(t *testing.T) {
 //
 // Mutation-verified: with the ordering in pkg/host.go reversed, this fails in
 // most runs under `go test -race -count=30`, always on the expected
-// StaleConfigChangeError. The narrower TestSyncRequestDeleteNode_RemovesObserver
+// StaleConfigChangeError. The narrower TestSyncRequestRemoveNode_RemovesObserver
 // above — one add/read/remove, no background load — is not a reliable repro on
 // its own: the defect surfaces only under the scheduling contention of a full
 // `-race ./...` suite, and the noise load above stands in for that contention.
-func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *testing.T) {
+func TestSyncRequestRemoveNode_ConfigChangeIndexRoundTripsUnderContention(t *testing.T) {
 	h := startSingleVoterShard(t)
 
 	const iterations = 500
@@ -249,9 +249,9 @@ func TestSyncRequestDeleteNode_ConfigChangeIndexRoundTripsUnderContention(t *tes
 			t.Fatalf("iteration %d: SyncGetShardMembership after add: %v", i, err)
 		}
 
-		if err := h.SyncRequestDeleteNode(ctx, 1, observerID, added.ConfigChangeID); err != nil {
+		if err := h.SyncRequestRemoveNode(ctx, 1, observerID, added.ConfigChangeID); err != nil {
 			cancel()
-			t.Fatalf("iteration %d: SyncRequestDeleteNode: %v", i, err)
+			t.Fatalf("iteration %d: SyncRequestRemoveNode: %v", i, err)
 		}
 		cancel()
 	}
@@ -381,9 +381,9 @@ pollClaimed:
 		t.Fatal("RequestAddObserver never completed after routing unblocked")
 	}
 
-	members, err := h.GetShardMembership(1)
+	members, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership: %v", err)
+		t.Fatalf("ShardMembership: %v", err)
 	}
 	if _, ok := members.Observers[10]; !ok {
 		t.Fatalf("observer 10 missing after a successful add — rollbackPreRegister ran on an applied, "+
@@ -496,9 +496,9 @@ pollClaimed:
 		t.Fatal("RequestAddObserver never completed after the reads scan unblocked")
 	}
 
-	members, err := h.GetShardMembership(1)
+	members, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership: %v", err)
+		t.Fatalf("ShardMembership: %v", err)
 	}
 	if _, ok := members.Observers[10]; !ok {
 		t.Fatalf("observer 10 missing after a successful add — rollbackPreRegister ran on an applied, "+

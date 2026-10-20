@@ -52,21 +52,10 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error)
 | | |
 |---|---|
 | Request | `secret`: 1..`MaxSecretBytes` (65536) bytes; `threshold`: 2..255; `total`: `threshold`..255 |
-| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the base64 encoding of `[version:1][x:1][y...]`, byte-for-byte what `Share.Value` holds, not the pre-encoding payload. |
+| Response | `[][]byte` in `Index` order: `values[i]` is the value of share `i+1`. Each is the base64 encoding of `[version:1][x:1][y...]`, byte-for-byte what a `ProtectedShare` holds and what its JSON `"value"` carries, not the pre-encoding payload. |
 | Errors | `*SplitError` on any bound violation or RNG failure |
 | Permission | none; in-process call |
 | Caller obligation | wipe the returned buffers once distributed |
-
-### Split a secret into N shares (struct form, deprecated)
-
-```go
-func Split(secret []byte, threshold, total int) ([]*Share, error)
-```
-
-Same parameters and errors. Returns `[]*Share` with `Index` 1..N. Deprecated:
-`Share.Value` is a Go string and cannot be zeroed, so it stays readable in the
-heap until GC, and a ceremony holds all N at once. Use `SplitProtected`, or
-`SplitBytes` if you manage the wipeable buffers yourself.
 
 ### Reconstruct a secret from M shares (protected form, preferred)
 
@@ -139,26 +128,25 @@ func SplitProtectedWith(a enclave.Allocator, secret []byte, threshold, total int
 func CombineProtectedWith(a enclave.Allocator, shares []*ProtectedShare) (enclave.ByteAccess, error)
 func NewProtectedShareWith(a enclave.Allocator, index, threshold, total int, value []byte) (*ProtectedShare, error)
 func UnmarshalShareSetWith(a enclave.Allocator, data []byte) ([]*ProtectedShare, error)
-func (s *Share) ProtectWith(a enclave.Allocator) (*ProtectedShare, error)
 ```
 
 | | |
 |---|---|
 | Request | as the allocator-less form, plus `a`, a go-enclave `*Allocator`, normally `enclave.ProcessAllocator()` |
 | Response | as the allocator-less form; every locked region the call makes is charged to `a` until it is `Destroy`ed |
-| Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (decided before the input is read: nothing allocated, `value`/`data`/the `Share` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
+| Errors | as the allocator-less form, plus `enclave.ErrNilAllocator` for a nil `a` (decided before the input is read: nothing allocated, `value`/`data` untouched) and a `*ProtectedMemoryError` matching `enclave.ErrBudgetExhausted` under `errors.Is` when an allocation would exceed `a`'s budget |
 | Permission | none; in-process call |
 | Caller obligation | as the allocator-less form |
 
 The allocator-less `SplitProtected`, `CombineProtected`, `NewProtectedShare`,
-`UnmarshalShareSet`, `Share.Protect` and `ProtectedShare.UnmarshalJSON` lock
+`UnmarshalShareSet` and `ProtectedShare.UnmarshalJSON` lock
 memory through go-enclave's unbudgeted constructors, which no `Allocator` sees,
 so a consumer that bounds its locked memory with a process allocator would have
 every share escape that bound. The `...With` forms charge every region they lock
 to the allocator they are handed: for a split, the coefficient pool, the
 coefficient vector, the payload scratch and each share's value; for a combine,
-the decode buffer and the returned secret; for a set decode or a `Protect`, each
-share's value. Both forms share one implementation. `UnmarshalJSON` alone has no
+the decode buffer and the returned secret; for a set decode, each share's
+value. Both forms share one implementation. `UnmarshalJSON` alone has no
 `...With` form, because `json.Unmarshaler` fixes its signature; see "Decode a
 share set" for the budgeted route.
 
@@ -176,9 +164,7 @@ A budget refusal is recoverable and local to the call:
   returned by earlier calls, and the input shares to a combine, are untouched.
 - `NewProtectedShareWith` keeps `NewProtectedShare`'s ownership contract: a
   `*ProtectedMemoryError`, budget refusal included, means `value` has already
-  been wiped. `ProtectWith` never modifies the `Share` (its value is a string,
-  and the one copy it makes is wiped on every path), so a refused call can be
-  retried against a larger budget.
+  been wiped.
 
 `MaxShareSetBytes` still bounds a single split, and a single set decode, up
 front (`UnmarshalShareSetWith` runs the 255-share and `MaxShareSetBytes` checks
@@ -202,27 +188,17 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error)
 Every decoded buffer is wiped on every return path, including partially decoded
 and validation-rejected shares.
 
-### Reconstruct a secret from M shares (struct form, deprecated)
-
-```go
-func Combine(shares []*Share) ([]byte, error)
-func CombineUnverified(shares []*Share) ([]byte, error)
-```
-
-Identical implementations, both deprecated for the reason given on `Split`; use
-`CombineProtected`. `threshold` is taken from `shares[0].Threshold`, which is
-unauthenticated.
-
-**Neither verifies the result.** With fewer than threshold genuine shares, a
+**No combine form verifies the result.** With fewer than threshold genuine shares, a
 corrupted share, a share from another split, or a mislabelled `Threshold`, the
 return is `(indistinguishable garbage, nil)`. The canonical out-of-band check is
 to use the result as a key in an authenticated decrypt that fails on a wrong
-key, which is what `Barrier.Unseal` does. The same holds for every combine form.
+key, which is what `Barrier.Unseal` does. `CombineProtected` takes `threshold`
+from `shares[0].Threshold`, which is unauthenticated, so the same holds there.
 
 ### Cross-check one share against others
 
 ```go
-func VerifyShare(share *Share, otherShares []*Share) error
+func VerifyShare(share *ProtectedShare, otherShares []*ProtectedShare) error
 ```
 
 | | |
@@ -238,31 +214,28 @@ a share is genuine.
 ### Inspect and serialize a share
 
 ```go
-type Share struct {
-    Index     int               `json:"index"`
-    Threshold int               `json:"threshold"`
-    Total     int               `json:"total"`
-    Value     string            `json:"value"` // Deprecated: un-wipeable
-    Metadata  map[string]string `json:"metadata,omitempty"`
+type ProtectedShare struct {
+    Index     int               // JSON "index"
+    Threshold int               // JSON "threshold"
+    Total     int               // JSON "total"
+    Metadata  map[string]string // JSON "metadata", omitted when empty
+    // value: unexported, base64 [version][x][y...] in locked memory; JSON "value"
 }
 
-func (s *Share) Bytes() ([]byte, error)        // raw decoded value
-func (s *Share) Protect() (*ProtectedShare, error)                         // unbudgeted
-func (s *Share) ProtectWith(a enclave.Allocator) (*ProtectedShare, error) // charged to a
-func (s *Share) Validate() error               // nil-receiver safe
-func (s *Share) String() string                // value REDACTED
-func (s *Share) LogValue() slog.Value          // value REDACTED
-func (s *Share) MarshalJSON() ([]byte, error)  // value INCLUDED
-func (s *Share) UnmarshalJSON([]byte) error
+func (s *ProtectedShare) WithValue(fn func([]byte) error) error // borrow the value
+func (s *ProtectedShare) Destroy()                              // wipe and unlock
+func (s *ProtectedShare) Validate() error                       // nil-receiver safe
+func (s *ProtectedShare) String() string                        // value REDACTED
+func (s *ProtectedShare) LogValue() slog.Value                  // value REDACTED
+func (s *ProtectedShare) MarshalJSON() ([]byte, error)          // value INCLUDED
+func (s *ProtectedShare) UnmarshalJSON([]byte) error            // unbudgeted
 ```
 
 `Threshold` and `Total` are unauthenticated caller metadata. `Metadata` carries
 no cryptographic meaning.
 
 The redaction asymmetry is deliberate: `String` and `LogValue` reach humans and
-logs, `MarshalJSON` reaches storage and distribution. `ProtectedShare` has
-`String`, `LogValue`, `MarshalJSON`, `UnmarshalJSON` and `Validate` with the same
-behaviour, plus `WithValue` and `Destroy`.
+logs, `MarshalJSON` reaches storage and distribution.
 See [`engineering.md`](engineering.md) §7.
 
 ### Error vocabulary
@@ -272,11 +245,10 @@ type SplitError           struct{ Reason string }
 type CombineError         struct{ Reason string }
 type ValidationError      struct{ Field, Reason string }
 type ProtectedMemoryError struct{ Op string; Err error }  // Unwrap() error
-type IntegrityError       struct{}   // Deprecated: never returned
 ```
 
-Match with `errors.As`. Never branch on `*IntegrityError`: shares carry no
-digest, so no code path constructs one.
+Match with `errors.As`. There is no integrity error: shares carry no digest, so
+a wrong reconstruction is never reported as one.
 
 **`ProtectedMemoryError` versus `ValidationError` is an ownership contract**, and
 `NewProtectedShare` is where it matters. A `*ValidationError` means the value
@@ -358,8 +330,8 @@ enclave the caller owns and must `Destroy`.
 | `QuorumProgress{Required, Submitted, Complete}` | accumulator state |
 
 `ShamirInitResult` is where a ceremony holds all N shares at once. Its JSON
-`"shares"` is an array of share objects, the same encoding `shamir.Share` and
-`shamir.ProtectedShare` produce. Its `UnmarshalJSON` decodes them through
+`"shares"` is an array of share objects, the same encoding
+`shamir.ProtectedShare` produces. Its `UnmarshalJSON` decodes them through
 `shamir.UnmarshalShareSet`, so it inherits the 255-share and `MaxShareSetBytes`
 bounds. It is not charged to an allocator (`json.Unmarshaler` fixes its
 signature); a caller under a budget decodes the `"shares"` member itself, as a
@@ -413,9 +385,9 @@ cannot hold nothing.
   the first production release a layout change is made in place at version 1 and
   consumers are updated in the same change (see
   [`../wire-protocol/architecture.md`](../wire-protocol/architecture.md)).
-- **Deprecated**: `Split`, `Combine`, `CombineUnverified`, the `Share.Value`
-  field and `IntegrityError` (never returned). Each is retained so existing
-  callers compile. `seal.ProtectedCredentials` and `seal.NewProtectedCredentials`
+- **No string-custody form.** The deprecated struct-and-string share API was
+  removed before v1.0.0; `CHANGELOG.md` lists each removed name with its
+  replacement. The share JSON encoding is unchanged. `seal.ProtectedCredentials` and `seal.NewProtectedCredentials`
   were removed in 0.17.0; use `seal.Credentials` and `seal.NewCredentials`.
 - A signature change to `ProtectedShareSplitter`, `ProtectedShareAccumulator` or
   `ProtectedSealingStrategy` breaks go-qrdb's implementations. Sequence such

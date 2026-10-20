@@ -23,7 +23,7 @@ when it is founded and fixed after that:
 |---|---|---|
 | `MaxTotalSessions` | 16384 | registrations refused on a busy shard |
 | `MaxSessionsPerOwner` | 128 | one owner exhausting its quota |
-| `MaxSessionsPerClient` | 128 | cached responses per session, not a session count |
+| `MaxResponsesPerSession` | 128 | cached responses per session, not a session count |
 | `SessionExpiryEntries` | 100000 | counted in applied entries, not seconds; an idle shard expires nothing |
 
 ## Build-time targets

@@ -2976,7 +2976,7 @@ func TestNodeHost_GetLeaderID_ConsistentLeaderIDAndTerm(t *testing.T) {
 	replicaID := uint64(1)
 	startTestShard(t, nh, shardID, replicaID)
 
-	// The adapter's GetLeaderID now uses GetLeaderIDAndTerm internally,
+	// The adapter's GetLeaderID now uses LeaderIDAndTerm internally,
 	// so leaderID and term are read from the same nodeState atomically.
 	leaderID, term, valid, err := nh.GetLeaderID(shardID)
 	if err != nil {

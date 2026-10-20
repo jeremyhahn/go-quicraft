@@ -28,19 +28,15 @@ func TestSetDefaultsFillsValues(t *testing.T) {
 	if o.MaxFileSize != 64*1024*1024 {
 		t.Fatalf("MaxFileSize = %d, want %d", o.MaxFileSize, int64(64*1024*1024))
 	}
-	if o.MaxBatchSize != 64*1024*1024 {
-		t.Fatalf("MaxBatchSize = %d, want %d", o.MaxBatchSize, 64*1024*1024)
-	}
 }
 
 // TestSetDefaultsPreservesExisting verifies that SetDefaults does not overwrite
 // fields that already have non-zero values.
 func TestSetDefaultsPreservesExisting(t *testing.T) {
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    4096,
-		MaxFileSize:  128 * 1024 * 1024,
-		MaxBatchSize: 32 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   4096,
+		MaxFileSize: 128 * 1024 * 1024,
 	}
 	o.SetDefaults()
 
@@ -50,18 +46,14 @@ func TestSetDefaultsPreservesExisting(t *testing.T) {
 	if o.MaxFileSize != 128*1024*1024 {
 		t.Fatalf("MaxFileSize = %d, want %d", o.MaxFileSize, int64(128*1024*1024))
 	}
-	if o.MaxBatchSize != 32*1024*1024 {
-		t.Fatalf("MaxBatchSize = %d, want %d", o.MaxBatchSize, 32*1024*1024)
-	}
 }
 
 // TestValidateValid verifies that Validate passes with valid options.
 func TestValidateValid(t *testing.T) {
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    32 * 1024,
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   32 * 1024,
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	if err := o.Validate(); err != nil {
@@ -77,10 +69,9 @@ func TestValidateVariousBlockSizes(t *testing.T) {
 	validSizes := []int{16, 32, 64, 128, 256, 512, 1024, 4096, 32768}
 	for _, bs := range validSizes {
 		o := &Options{
-			WALDir:       "/tmp/wal",
-			BlockSize:    bs,
-			MaxFileSize:  64 * 1024 * 1024,
-			MaxBatchSize: 64 * 1024 * 1024,
+			WALDir:      "/tmp/wal",
+			BlockSize:   bs,
+			MaxFileSize: 64 * 1024 * 1024,
 		}
 		if err := o.Validate(); err != nil {
 			t.Errorf("Validate(BlockSize=%d): unexpected error: %v", bs, err)
@@ -91,10 +82,9 @@ func TestValidateVariousBlockSizes(t *testing.T) {
 // TestValidateEmptyDir verifies that Validate fails when WALDir is empty.
 func TestValidateEmptyDir(t *testing.T) {
 	o := &Options{
-		WALDir:       "",
-		BlockSize:    32 * 1024,
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "",
+		BlockSize:   32 * 1024,
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	err := o.Validate()
@@ -107,10 +97,9 @@ func TestValidateEmptyDir(t *testing.T) {
 // not a power of two.
 func TestValidateInvalidBlockSize(t *testing.T) {
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    100, // not power of two
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   100, // not power of two
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	err := o.Validate()
@@ -122,10 +111,9 @@ func TestValidateInvalidBlockSize(t *testing.T) {
 // TestValidateZeroBlockSize verifies that Validate fails when BlockSize is zero.
 func TestValidateZeroBlockSize(t *testing.T) {
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    0,
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   0,
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	err := o.Validate()
@@ -137,10 +125,9 @@ func TestValidateZeroBlockSize(t *testing.T) {
 // TestValidateNegativeBlockSize verifies that Validate fails when BlockSize is negative.
 func TestValidateNegativeBlockSize(t *testing.T) {
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    -1024,
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   -1024,
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	err := o.Validate()
@@ -157,32 +144,13 @@ func TestValidateInvalidMaxFileSize(t *testing.T) {
 	tests := []int64{0, -1, -1024 * 1024, maxSegmentFileSize + 1, 1 << 33}
 	for _, mfs := range tests {
 		o := &Options{
-			WALDir:       "/tmp/wal",
-			BlockSize:    32 * 1024,
-			MaxFileSize:  mfs,
-			MaxBatchSize: 64 * 1024 * 1024,
+			WALDir:      "/tmp/wal",
+			BlockSize:   32 * 1024,
+			MaxFileSize: mfs,
 		}
 		err := o.Validate()
 		if err != ErrInvalidMaxFileSize {
 			t.Errorf("Validate(MaxFileSize=%d): error = %v, want %v", mfs, err, ErrInvalidMaxFileSize)
-		}
-	}
-}
-
-// TestValidateInvalidMaxBatchSize verifies that Validate fails when MaxBatchSize
-// is zero or negative.
-func TestValidateInvalidMaxBatchSize(t *testing.T) {
-	tests := []int{0, -1, -64 * 1024 * 1024}
-	for _, mbs := range tests {
-		o := &Options{
-			WALDir:       "/tmp/wal",
-			BlockSize:    32 * 1024,
-			MaxFileSize:  64 * 1024 * 1024,
-			MaxBatchSize: mbs,
-		}
-		err := o.Validate()
-		if err != ErrInvalidMaxBatchSize {
-			t.Errorf("Validate(MaxBatchSize=%d): error = %v, want %v", mbs, err, ErrInvalidMaxBatchSize)
 		}
 	}
 }
@@ -192,10 +160,9 @@ func TestValidateInvalidMaxBatchSize(t *testing.T) {
 func TestValidateBlockSizeTooSmallForHeader(t *testing.T) {
 	// BlockSize of 4 is a power of two but too small for header (7 bytes) + 1.
 	o := &Options{
-		WALDir:       "/tmp/wal",
-		BlockSize:    4,
-		MaxFileSize:  64 * 1024 * 1024,
-		MaxBatchSize: 64 * 1024 * 1024,
+		WALDir:      "/tmp/wal",
+		BlockSize:   4,
+		MaxFileSize: 64 * 1024 * 1024,
 	}
 
 	err := o.Validate()
@@ -211,9 +178,6 @@ func TestDefaultOptionsValues(t *testing.T) {
 	}
 	if DefaultOptions.MaxFileSize != 64*1024*1024 {
 		t.Fatalf("DefaultOptions.MaxFileSize = %d, want %d", DefaultOptions.MaxFileSize, int64(64*1024*1024))
-	}
-	if DefaultOptions.MaxBatchSize != 64*1024*1024 {
-		t.Fatalf("DefaultOptions.MaxBatchSize = %d, want %d", DefaultOptions.MaxBatchSize, 64*1024*1024)
 	}
 }
 

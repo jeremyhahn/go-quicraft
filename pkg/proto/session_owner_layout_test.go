@@ -44,12 +44,12 @@ func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 	}
 	// Every value distinct, so a transposition between two policy fields is a
 	// failure rather than a coincidence. Transposing MaxTotalSessions with
-	// MaxSessionsPerClient has shipped here before.
+	// MaxResponsesPerSession has shipped here before.
 	want.SetSessionPolicy(SessionPolicy{
-		ExpiryEntries:        11111,
-		MaxTotalSessions:     22222,
-		MaxSessionsPerClient: 33333,
-		MaxSessionsPerOwner:  44444,
+		ExpiryEntries:          11111,
+		MaxTotalSessions:       22222,
+		MaxResponsesPerSession: 33333,
+		MaxSessionsPerOwner:    44444,
 	})
 
 	buf := make([]byte, want.Size())

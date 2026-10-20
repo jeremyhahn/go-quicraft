@@ -228,9 +228,9 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 			}
 
 			// The role really did come from REPLICATED state, not local config.
-			after, memErr := h.GetShardMembership(shardID)
+			after, memErr := h.ShardMembership(shardID)
 			if memErr != nil {
-				t.Fatalf("GetShardMembership failed: %v", memErr)
+				t.Fatalf("ShardMembership failed: %v", memErr)
 			}
 			roleMap := after.Witnesses
 			if scfg.IsObserver {
@@ -417,9 +417,9 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 			deadline := time.Now().Add(10 * time.Second)
 			for {
 				var memErr error
-				after, memErr = h.GetShardMembership(shardID)
+				after, memErr = h.ShardMembership(shardID)
 				if memErr != nil {
-					t.Fatalf("GetShardMembership failed: %v", memErr)
+					t.Fatalf("ShardMembership failed: %v", memErr)
 				}
 				if after.ConfigChangeID == 2 {
 					break
@@ -493,9 +493,9 @@ func TestStartShard_WitnessEntersMembershipThroughConfigChange(t *testing.T) {
 	// and applied, and the shard's voting set is now {1 full + 1 witness} with
 	// the witness unreachable — CheckQuorum steps the sole leader down, which
 	// would make a second ReadIndex fail for reasons this test is not about.
-	after, err := h.GetShardMembership(1)
+	after, err := h.ShardMembership(1)
 	if err != nil {
-		t.Fatalf("GetShardMembership after the add failed: %v", err)
+		t.Fatalf("ShardMembership after the add failed: %v", err)
 	}
 	if _, ok := after.Witnesses[2]; !ok {
 		t.Fatalf("replica 2 is not in Membership.Witnesses after the config change: %+v", after)

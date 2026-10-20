@@ -603,7 +603,7 @@ func (nh *NodeHost) waitShardReady(shardID uint64) {
 	ticker := time.NewTicker(waitReadyPollInterval)
 	defer ticker.Stop()
 	for {
-		if _, _, valid, err := nh.host.GetLeaderIDAndTerm(shardID); err == nil && valid {
+		if _, _, valid, err := nh.host.LeaderIDAndTerm(shardID); err == nil && valid {
 			return
 		}
 		select {
@@ -875,11 +875,11 @@ func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClie
 	if err := checkContextDeadline(ctx); err != nil {
 		return nil, err
 	}
-	info, infoErr := nh.host.GetShardInfo(shardID)
+	info, infoErr := nh.host.ShardInfo(shardID)
 	if infoErr == nil && info.StateMachineType == proto.OnDiskStateMachine {
 		return nil, ErrRejected
 	}
-	session, err := nh.host.GetNewSession(ctx, shardID)
+	session, err := nh.host.NewSession(ctx, shardID)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -934,7 +934,7 @@ func (nh *NodeHost) requireNoOPSessionOnDisk(session *dbClient.Session) error {
 	if session == nil || session.IsNoOPSession() {
 		return nil
 	}
-	info, err := nh.host.GetShardInfo(session.ShardID)
+	info, err := nh.host.ShardInfo(session.ShardID)
 	if err != nil {
 		return translateError(err)
 	}
@@ -1025,7 +1025,7 @@ func (nh *NodeHost) ProposeSession(session *dbClient.Session, timeout time.Durat
 
 	// Surface shard lookup failures synchronously, matching dragonboat's
 	// getShard check before the proposal is started.
-	if _, err := nh.host.GetShardInfo(session.ShardID); err != nil {
+	if _, err := nh.host.ShardInfo(session.ShardID); err != nil {
 		return nil, translateError(err)
 	}
 	if err := nh.requireNoOPSessionOnDisk(session); err != nil {
@@ -1172,7 +1172,7 @@ func (nh *NodeHost) SyncGetShardMembership(ctx context.Context, shardID uint64) 
 // loaded on this host. This matches dragonboat's three-value return
 // signature for shard info queries.
 func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
-	info, err := nh.host.GetShardInfo(shardID)
+	info, err := nh.host.ShardInfo(shardID)
 	if err != nil {
 		return nil, false, translateError(err)
 	}
@@ -1188,7 +1188,7 @@ func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 // membership directly from the local replica's Raft peer state and does
 // not perform a ReadIndex round-trip.
 func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
-	m, err := nh.host.GetShardMembership(shardID)
+	m, err := nh.host.ShardMembership(shardID)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -1200,7 +1200,7 @@ func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 // return signature. Quicraft's GetLeaderID returns (leaderID, valid, error);
 // the term is obtained from GetShardInfo.
 func (nh *NodeHost) GetLeaderID(shardID uint64) (uint64, uint64, bool, error) {
-	leaderID, term, valid, err := nh.host.GetLeaderIDAndTerm(shardID)
+	leaderID, term, valid, err := nh.host.LeaderIDAndTerm(shardID)
 	if err != nil {
 		return 0, 0, false, translateError(err)
 	}
@@ -1296,7 +1296,7 @@ func (nh *NodeHost) SyncRequestDeleteReplica(ctx context.Context, shardID, repli
 	if err := checkContextDeadline(ctx); err != nil {
 		return err
 	}
-	return translateError(nh.host.SyncRequestDeleteNode(ctx, shardID, replicaID, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestRemoveNode(ctx, shardID, replicaID, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
 }
 
 // RequestLeaderTransfer requests leadership transfer to the specified
@@ -1555,7 +1555,7 @@ func (u *nodeUser) ReadIndex(timeout time.Duration) (*RequestState, error) {
 // GetNodeUser returns an INodeUser for direct access to the shard's replica.
 // The shard must be running on this host.
 func (nh *NodeHost) GetNodeUser(shardID uint64) (INodeUser, error) {
-	info, err := nh.host.GetShardInfo(shardID)
+	info, err := nh.host.ShardInfo(shardID)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -1581,7 +1581,7 @@ func (nh *NodeHost) GetNodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 	qcOpt := quicraft.NodeHostInfoOption{
 		SkipLogInfo: opt.SkipLogInfo,
 	}
-	qcInfo := nh.host.GetNodeHostInfo(qcOpt)
+	qcInfo := nh.host.NodeHostInfo(qcOpt)
 	if qcInfo == nil {
 		return &NodeHostInfo{}
 	}
@@ -1679,7 +1679,7 @@ func (nh *NodeHost) QueryRaftLog(shardID, firstIndex, lastIndex, maxSize uint64)
 // shard. A lookup failure yields the zero LogRange: the range is
 // advisory pagination detail, never the reason the query failed.
 func (nh *NodeHost) availableLogRange(shardID uint64) LogRange {
-	r, err := nh.host.GetLogRange(shardID)
+	r, err := nh.host.LogRange(shardID)
 	if err != nil {
 		return LogRange{}
 	}
@@ -1691,7 +1691,7 @@ func (nh *NodeHost) availableLogRange(shardID uint64) LogRange {
 // ErrLogDBNotCreatedOrClosed, so the adapter does the same rather than
 // distinguishing them with ErrShardNotFound.
 func (nh *NodeHost) GetLogReader(shardID uint64) (ReadonlyLogReader, error) {
-	reader, err := nh.host.GetLogReader(shardID)
+	reader, err := nh.host.LogReader(shardID)
 	if err != nil {
 		return nil, ErrLogDBNotCreatedOrClosed
 	}

@@ -72,10 +72,10 @@ func identityProtoMembership() proto.Membership {
 		// unguarded here: a snapshot that loses it comes back unset, the
 		// replica falls back to its own Config, and it expires sessions at log
 		// indexes its peers do not.
-		SessionExpiryEntries: 7000,
-		MaxTotalSessions:     8192,
-		MaxSessionsPerClient: 32,
-		MaxSessionsPerOwner:  11,
+		SessionExpiryEntries:   7000,
+		MaxTotalSessions:       8192,
+		MaxResponsesPerSession: 32,
+		MaxSessionsPerOwner:    11,
 	}
 }
 
@@ -135,13 +135,13 @@ func TestMembershipConvertersRoundTripIdentities(t *testing.T) {
 	}
 	if got.SessionExpiryEntries != want.SessionExpiryEntries ||
 		got.MaxTotalSessions != want.MaxTotalSessions ||
-		got.MaxSessionsPerClient != want.MaxSessionsPerClient ||
+		got.MaxResponsesPerSession != want.MaxResponsesPerSession ||
 		got.MaxSessionsPerOwner != want.MaxSessionsPerOwner {
 		t.Fatalf("round-trip lost the replicated session policy: "+
 			"expiry=%d total=%d perClient=%d perOwner=%d, want %d/%d/%d/%d",
-			got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxSessionsPerClient,
+			got.SessionExpiryEntries, got.MaxTotalSessions, got.MaxResponsesPerSession,
 			got.MaxSessionsPerOwner,
-			want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxSessionsPerClient,
+			want.SessionExpiryEntries, want.MaxTotalSessions, want.MaxResponsesPerSession,
 			want.MaxSessionsPerOwner)
 	}
 }

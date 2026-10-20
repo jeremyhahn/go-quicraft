@@ -123,9 +123,9 @@ func TestProposeWithSession_RefusesConcurrentProposal(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession: %v", err)
+		t.Fatalf("NewSession: %v", err)
 	}
 
 	rs1, err := h.ProposeWithSession(ctx, session, []byte("debit A"))
@@ -205,9 +205,9 @@ func TestSyncProposeWithSession_ReleaseWithoutCompletedAdmitsNext(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.GetNewSession(ctx, 1)
+	session, err := h.NewSession(ctx, 1)
 	if err != nil {
-		t.Fatalf("GetNewSession: %v", err)
+		t.Fatalf("NewSession: %v", err)
 	}
 	rs, err := h.ProposeWithSession(ctx, session, []byte("cmd"))
 	if err != nil {

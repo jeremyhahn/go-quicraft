@@ -23,7 +23,7 @@ change is recognized there too.
 
 ```
   client                          log                   every replica
-    │  GetNewSession ──▶ register entry ──────────▶ session created
+    │  NewSession ──▶ register entry ──────────▶ session created
     │
     │  ProposeWithSession(series N) ──▶ entry ──▶ seen N before?
     │                                             ├─ no  ──▶ Update, cache result
@@ -94,7 +94,7 @@ which lets the cache release entries without a separate round trip.
 
 | Setting | Default | Bounds |
 |---|---|---|
-| `MaxSessionsPerClient` | 128 | cached responses retained per session. The name is wrong and kept for compatibility; read it as "max responses per session". It does not bound how many sessions exist. |
+| `MaxResponsesPerSession` | 128 | cached responses retained per session. It does not bound how many sessions exist. |
 | `MaxTotalSessions` | 16384 | sessions on a shard |
 | `MaxSessionsPerOwner` | 128 | concurrent sessions one declared `OwnerID` may hold; sessions without an owner are exempt |
 
@@ -119,7 +119,7 @@ bootstrap.
 
 ## Trust boundary
 
-- A `ClientID` is eight bytes. `GetNewSession` draws it from the system CSPRNG;
+- A `ClientID` is eight bytes. `NewSession` draws it from the system CSPRNG;
   `RegisterSession` uses one the caller chose. The library performs no client
   authentication. A second registration of a `ClientID` the shard still holds
   is refused, but once that session expires anyone can register the ID again,
@@ -143,9 +143,9 @@ bootstrap.
 - **`pkg/proto`**: the `Entry` session fields (`ClientID`, `SeriesID`,
   `RespondedTo`, `OwnerID`) and the session policy fields of `Membership`,
   read as a `SessionPolicy` through `Membership.SessionPolicy()`.
-- **Consumers**: `Host.GetNewSession`, `GetNewSessionWithOwner`,
+- **Consumers**: `Host.NewSession`, `NewSessionWithOwner`,
   `RegisterSession`, `ProposeWithSession`, `SyncProposeWithSession`,
-  `CloseSession`, `GetNoOPSession`.
+  `CloseSession`, `NoOPSession`.
 
 ## What this feature deliberately does not do
 

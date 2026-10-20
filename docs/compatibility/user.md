@@ -116,7 +116,7 @@ Changes from 0.4.0 that compile but fail at run time on a jump from 0.3.x:
 | Symptom | Meaning | Remedy |
 |---|---|---|
 | `ErrSealedStateUnauthenticated` on first unseal | the sealed root key predates the state MAC | set `BarrierConfig.AllowUnauthenticatedSealedState = true`, start once, re-persist `SealedRootKeyData()`, clear the flag |
-| `ErrSessionsUnsupportedOnDisk` | client sessions on an `sm.DiskStateMachine` shard; the session table lives only in the snapshot stream, which an on-disk state machine never recovers from on restart | use no-op sessions (`Host.GetNoOPSession`) and idempotent operations |
+| `ErrSessionsUnsupportedOnDisk` | client sessions on an `sm.DiskStateMachine` shard; the session table lives only in the snapshot stream, which an on-disk state machine never recovers from on restart | use no-op sessions (`Host.NoOPSession`) and idempotent operations |
 | `ErrKDFNotFIPSApproved` on unseal | an Argon2id-wrapped blob under FIPS mode | unseal once with FIPS off, re-seal with `NewSoftwareStrategyFIPS` (PBKDF2-SHA256) |
 
 ## Downgrades
@@ -168,7 +168,7 @@ identity, which membership refuses to commit twice.
 
 When the committed membership carries no session policy, each replica applies
 its own `Config`. Set `SessionExpiryEntries`, `MaxTotalSessions`,
-`MaxSessionsPerClient` and `MaxSessionsPerOwner` identically on every replica in that case; nothing
+`MaxResponsesPerSession` and `MaxSessionsPerOwner` identically on every replica in that case; nothing
 enforces it, and disagreement diverges the state machine silently.
 
 ## Troubleshooting
