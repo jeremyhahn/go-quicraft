@@ -5006,6 +5006,12 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		if errors.Is(err, rsm.ErrInvalidSMType) {
 			return ErrInvalidSMType
 		}
+		// A restarting replica already knows the shard's committed session
+		// policy here, so a Config that disagrees with it is refused before
+		// the shard runs. The error names the setting and both values.
+		if errors.Is(err, rsm.ErrSessionPolicyMismatch) {
+			return err
+		}
 		return &HostInitError{Field: "state_machine", Err: err}
 	}
 
@@ -12030,8 +12036,8 @@ func (h *Host) recoverLogReader(lr *logdb.LogReader, shardID, replicaID uint64) 
 // (recoverLogReader), so Identities has to survive it or the shard comes back
 // authorizing by address alone. See logdb.Membership.Identities. The session
 // policy travels the same path and for the same reason: this is where a
-// restarting replica relearns the limits its apply path must use instead of
-// its own Config. See proto.SessionPolicy.
+// restarting replica relearns the limits its own Config is checked against.
+// See proto.SessionPolicy.
 func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 	result := proto.Membership{
 		ConfigChangeID:             m.ConfigChangeID,

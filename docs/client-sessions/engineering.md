@@ -355,8 +355,9 @@ Little-endian. Sorting makes identical tables produce identical bytes.
 violation returns `*BoundsError`, which matches `ErrSnapshotCorrupted`. It parses
 into a staging map and swaps it in only after the whole table parses.
 
-On recovery the adapter adopts the replicated policy first (the table was
-written under the shard's limits, not this node's), decodes into a separate
+On recovery the adapter checks the replicated policy first (the table was
+written under the shard's limits, and a node whose `Config` disagrees with them
+is refused with `ErrSessionPolicyMismatch` before anything is read), decodes into a separate
 staged manager, restores the user state machine, and adopts the staged table
 only if that succeeds. Session metadata and user state therefore always
 describe the same index. See
@@ -368,7 +369,12 @@ replica, because the snapshot reflects the log.
 
 ## Configuration
 
-`pkg/config/config.go`. All four are seeds for the replicated policy.
+`pkg/config/config.go`. All four are seeds for the replicated policy, and
+every replica must carry the shard's values: the state machine compares them
+with the committed policy when it is built (a restart: `StartShard` returns the
+error) and when a joiner first learns it in Apply or snapshot recovery (the
+shard fails), refusing a disagreement with `ErrSessionPolicyMismatch` wrapped
+with the setting's name and both values.
 
 | Field | Default | Meaning |
 |---|---|---|

@@ -293,9 +293,12 @@ type StateMachine struct {
 //
 //   - local is this node's own configuration. It is used only while the shard
 //     has no replicated policy of its own.
-//   - replicated returns the shard's committed policy and always wins over
-//     local. It may be nil, which pins the state machine to local — the shape
-//     tests want, and never what a live shard wants.
+//   - replicated returns the shard's committed policy. Once it is set it must
+//     equal local: a disagreement is refused with ErrSessionPolicyMismatch,
+//     here when the policy is already known (every restart, and every
+//     bootstrap) and in Apply or RecoverFromSnapshot when a joining replica
+//     learns it later. It may be nil, which pins the state machine to local —
+//     the shape tests want, and never what a live shard wants.
 //
 // Passing the policy as one value also removes a hazard the previous signature
 // had: it took the two limits as adjacent uint64 parameters, and transposing
@@ -333,10 +336,12 @@ func NewStateMachine(
 	// replicated policy — every restart, and every bootstrap — never builds a
 	// session manager with limits it is about to replace.
 	s.sessionPolicy = s.effectiveSessionPolicy()
+	if err := s.checkSessionPolicy(s.sessionPolicy); err != nil {
+		return nil, err
+	}
 	s.sessions = session.NewManager(
 		s.sessionPolicy.MaxTotalSessions, s.sessionPolicy.MaxResponsesPerSession,
 		s.sessionPolicy.MaxSessionsPerOwner)
-	s.logPolicyDisagreement(local, s.sessionPolicy)
 	return s, nil
 }
 
@@ -355,12 +360,13 @@ func WithLogger(l *slog.Logger) Option {
 // shard's replicated policy when one is known, this node's configuration
 // otherwise.
 //
-// The replicated value wins even when it is the LOOSER of the two. That is not
-// a preference, it is the only choice that terminates: the alternative — a
-// replica that enforces its own stricter limit — is a replica that refuses
-// registrations its peers admit, and from then on answers ResultSessionExpired
-// for entries the rest of the shard applies normally. A local limit cannot be
-// honoured by one replica alone; it can only be proposed, at bootstrap.
+// A replicated value that differs from the local one is never applied:
+// checkSessionPolicy refuses it first. Enforcing the local value instead would
+// be a replica that refuses registrations its peers admit, and from then on
+// answers ResultSessionExpired for entries the rest of the shard applies
+// normally; silently adopting the shard's would override the limits this node
+// was configured with. A local limit cannot be honoured by one replica alone;
+// it can only be proposed, at bootstrap.
 func (s *StateMachine) effectiveSessionPolicy() proto.SessionPolicy {
 	if s.sessionPolicyFn == nil {
 		return s.localPolicy
@@ -371,55 +377,84 @@ func (s *StateMachine) effectiveSessionPolicy() proto.SessionPolicy {
 	return s.localPolicy
 }
 
-// refreshSessionPolicy adopts the shard's replicated session policy if it has
-// changed since the last call.
+// refreshSessionPolicy checks the shard's replicated session policy against
+// this node's configuration whenever the policy it observes has changed since
+// the last call, and returns an error wrapping ErrSessionPolicyMismatch when
+// the two disagree (see checkSessionPolicy).
 //
 // It runs on the apply goroutine (and during snapshot recovery, which the
 // engine quiesces applies around), so it may mutate the session manager's
 // limits directly. In steady state the shard's policy never changes, so this
-// is one atomic load and a three-field comparison per Apply batch.
-func (s *StateMachine) refreshSessionPolicy() {
+// is one atomic load and a four-field comparison per Apply batch; the check
+// itself runs only when the observed policy changes, which is once, when a
+// joining replica first learns the shard's configuration.
+func (s *StateMachine) refreshSessionPolicy() error {
 	effective := s.effectiveSessionPolicy()
 	if effective == s.sessionPolicy {
-		return
+		return nil
 	}
-	previous := s.sessionPolicy
+	if err := s.checkSessionPolicy(effective); err != nil {
+		return err
+	}
 	s.sessionPolicy = effective
 	s.sessions.SetLimits(effective.MaxTotalSessions, effective.MaxResponsesPerSession,
 		effective.MaxSessionsPerOwner)
-	s.logPolicyDisagreement(previous, effective)
+	return nil
 }
 
-// logPolicyDisagreement records, loudly, that the policy the apply path uses is
-// not the one this node is configured with.
+// checkSessionPolicy refuses a replicated session policy that disagrees with
+// this node's configuration. A policy that is not set (proto.SessionPolicy.IsSet
+// false: a shard bootstrapped before the policy was replicated, or a joining
+// replica that has not learned it yet) is accepted, and the node keeps applying
+// its own configuration.
 //
-// The shard's value governs and there is no way for one replica to opt out, so
-// this is a warning and not an error — but it is never silent. MaxTotalSessions
-// and MaxResponsesPerSession bound this process's memory, so a replicated value
-// above the local one is an operator-visible resource decision that was taken
-// elsewhere (at bootstrap, by the founders) and must be discoverable from this
-// node's logs rather than only by reading the shard's membership.
-func (s *StateMachine) logPolicyDisagreement(previous, effective proto.SessionPolicy) {
-	if effective == s.localPolicy {
-		return
+// The replica is refused rather than made to adopt the shard's value, so that a
+// configuration which disagrees with the shard is a startup failure an operator
+// sees and fixes, not a silent override of the limits this node was given.
+// MaxTotalSessions and MaxResponsesPerSession bound this process's memory, and a
+// committed value above the local one is a resource decision taken elsewhere.
+// The error names the first disagreeing config.Config setting and both values.
+func (s *StateMachine) checkSessionPolicy(committed proto.SessionPolicy) error {
+	err := sessionPolicyMismatch(s.localPolicy, committed)
+	if err == nil {
+		return nil
 	}
 	logger := s.logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger.Warn("rsm: applying the shard's replicated session policy, which differs "+
-		"from this node's configuration; the replicated value governs and cannot "+
-		"be overridden locally",
+	logger.Error("rsm: refusing the shard: this node's session settings disagree "+
+		"with the shard's committed session policy",
 		"shardID", s.shardID,
 		"replicaID", s.replicaID,
-		"previous_expiry_entries", previous.ExpiryEntries,
-		"expiry_entries", effective.ExpiryEntries,
-		"local_expiry_entries", s.localPolicy.ExpiryEntries,
-		"max_total_sessions", effective.MaxTotalSessions,
-		"local_max_total_sessions", s.localPolicy.MaxTotalSessions,
-		"max_responses_per_session", effective.MaxResponsesPerSession,
-		"local_max_responses_per_session", s.localPolicy.MaxResponsesPerSession,
+		"error", err,
 	)
+	return err
+}
+
+// sessionPolicyMismatch returns nil when committed is unset or equal to local,
+// and otherwise ErrSessionPolicyMismatch wrapped with the first disagreeing
+// config.Config setting's name and both values.
+func sessionPolicyMismatch(local, committed proto.SessionPolicy) error {
+	if !committed.IsSet() || local == committed {
+		return nil
+	}
+	settings := [...]struct {
+		name             string
+		local, committed uint64
+	}{
+		{"SessionExpiryEntries", local.ExpiryEntries, committed.ExpiryEntries},
+		{"MaxTotalSessions", local.MaxTotalSessions, committed.MaxTotalSessions},
+		{"MaxResponsesPerSession", local.MaxResponsesPerSession, committed.MaxResponsesPerSession},
+		{"MaxSessionsPerOwner", local.MaxSessionsPerOwner, committed.MaxSessionsPerOwner},
+	}
+	for _, st := range settings {
+		if st.local != st.committed {
+			return fmt.Errorf("%w: %s is %d in this node's Config, %d in the shard's committed policy",
+				ErrSessionPolicyMismatch, st.name, st.local, st.committed)
+		}
+	}
+	return nil
 }
 
 // wrapStateMachine performs the one-time type switch to determine the
@@ -569,8 +604,11 @@ func (s *StateMachine) Apply(entries []proto.Entry, results []sm.Result) error {
 	// Adopt the shard's replicated policy before a single entry is classified,
 	// so the limits this batch is evaluated against are the shard's and not
 	// this node's. See sessionPolicyFn for why it is read here rather than
-	// captured once at construction.
-	s.refreshSessionPolicy()
+	// captured once at construction. A policy that disagrees with this node's
+	// configuration fails the batch, and with it the shard.
+	if err := s.refreshSessionPolicy(); err != nil {
+		return err
+	}
 
 	lastIndex := entries[len(entries)-1].Index
 
@@ -1268,8 +1306,11 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// it against this node's configuration instead would reject a snapshot the
 	// rest of the shard considers well-formed, and the reject is fatal to
 	// recovery. For a replica bootstrapped by an InstallSnapshot this is also
-	// the first point at which a policy is known at all.
-	s.refreshSessionPolicy()
+	// the first point at which a policy is known at all, so a disagreement
+	// with this node's configuration fails the recovery here.
+	if err := s.refreshSessionPolicy(); err != nil {
+		return err
+	}
 
 	// The session table is decoded into a STAGED manager and swapped in only
 	// after the user state machine has also restored. Restoring a snapshot is

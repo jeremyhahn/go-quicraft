@@ -129,6 +129,9 @@ func sentinelTable() []sentinelClassification {
 		// Permanent: a removed member's identity is banned from the shard for
 		// good, under any replica ID, so retrying the same add never succeeds.
 		{"ErrRemovedMemberIdentity", ErrRemovedMemberIdentity, false},
+		// Permanent: the committed session policy never changes, so the
+		// same Config is refused on every retry until the operator fixes it.
+		{"ErrSessionPolicyMismatch", ErrSessionPolicyMismatch, false},
 		{"ErrNodeRemoved", ErrNodeRemoved, false},
 		{"ErrRemoveLastVoter", ErrRemoveLastVoter, false},
 		{"ErrTooManyVotingMembers", ErrTooManyVotingMembers, false},

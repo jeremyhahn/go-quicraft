@@ -15,7 +15,10 @@
 package rsm
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -69,6 +72,35 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		return rsm, kv
 	}
 
+	// refused asserts that a replica whose LOCAL expiry disagrees with the
+	// shard's committed policy is not built at all: it would expire sessions
+	// at log indexes its peers do not.
+	refused := func(t *testing.T, localExpiry uint64, replicated proto.SessionPolicy) {
+		t.Helper()
+		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+			return newTestKV()
+		})
+		local := proto.SessionPolicy{
+			ExpiryEntries:          localExpiry,
+			MaxTotalSessions:       100,
+			MaxResponsesPerSession: 100,
+		}
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), local,
+			func() proto.SessionPolicy { return replicated }, false)
+		if err == nil {
+			_ = rsm.Close()
+			t.Fatalf("NewStateMachine(local expiry=%d, shard expiry=%d) = nil error, "+
+				"want ErrSessionPolicyMismatch", localExpiry, replicated.ExpiryEntries)
+		}
+		if !errors.Is(err, ErrSessionPolicyMismatch) {
+			t.Fatalf("NewStateMachine(local expiry=%d) = %v, want ErrSessionPolicyMismatch",
+				localExpiry, err)
+		}
+		if !strings.Contains(err.Error(), "SessionExpiryEntries") {
+			t.Fatalf("error %q does not name the disagreeing setting", err)
+		}
+	}
+
 	// The log both replicas are fed, in the identical order:
 	//
 	//	index 1   register client 42
@@ -113,17 +145,18 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 	}
 
 	t.Run("shard disabled expiry, one replica configured to expire", func(t *testing.T) {
-		// The shard committed expiry=0. The second replica is configured with
-		// 100 — under the old node-local semantics it would have expired
-		// client 42 at index 200 and answered the write at index 300 with
-		// ResultSessionExpired while its peer applied it.
+		// The shard committed expiry=0. A replica configured with 100 would
+		// expire client 42 at index 200 and answer the write at index 300 with
+		// ResultSessionExpired while its peer applied it, so it is refused;
+		// the replicas that do run agree.
 		replicated := proto.SessionPolicy{
 			ExpiryEntries:          0,
 			MaxTotalSessions:       100,
 			MaxResponsesPerSession: 100,
 		}
+		refused(t, 100, replicated)
 		a, akv := newReplica(t, 0, replicated)
-		b, bkv := newReplica(t, 100, replicated)
+		b, bkv := newReplica(t, 0, replicated)
 
 		applyLog(t, a)
 		applyLog(t, b)
@@ -158,13 +191,14 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 	t.Run("shard enabled expiry, one replica configured not to", func(t *testing.T) {
 		// The mirror image: the shard committed expiry=100, so BOTH replicas
 		// must expire client 42 at the index-200 checkpoint and reject the
-		// write — including the one whose local configuration disables expiry.
+		// write, and one whose local configuration disables expiry is refused.
 		replicated := proto.SessionPolicy{
 			ExpiryEntries:          100,
 			MaxTotalSessions:       100,
 			MaxResponsesPerSession: 100,
 		}
-		a, akv := newReplica(t, 0, replicated)
+		refused(t, 0, replicated)
+		a, akv := newReplica(t, 100, replicated)
 		b, bkv := newReplica(t, 100, replicated)
 
 		applyLog(t, a)
@@ -201,27 +235,25 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		// different sessions at different indexes, and one then answers
 		// ResultSessionExpired for entries the other applies normally.
 		//
-		// Here the shard commits 100 while replica B is configured with 1000.
-		// Under the replicated policy both expire client 42 at the index-200
-		// checkpoint and reject the write. Under B's local value no checkpoint
-		// falls before index 300, so B would hold the session and APPLY the
-		// write — a different observable, on both the session table and the
-		// user state.
+		// Here the shard commits 100 and a replica configured with 1000 is
+		// refused: under its local value no checkpoint falls before index 300,
+		// so it would hold the session and APPLY the write its peers reject.
+		// The replicas that run expire client 42 at the index-200 checkpoint.
 		replicated := proto.SessionPolicy{
 			ExpiryEntries:          100,
 			MaxTotalSessions:       100,
 			MaxResponsesPerSession: 100,
 		}
-		a, akv := newReplica(t, 0, replicated)
-		b, bkv := newReplica(t, 1000, replicated)
+		refused(t, 1000, replicated)
+		a, akv := newReplica(t, 100, replicated)
+		b, bkv := newReplica(t, 100, replicated)
 
 		applyLog(t, a)
 		applyLog(t, b)
 
 		if a.Sessions().IsRegistered(clientID) || b.Sessions().IsRegistered(clientID) {
 			t.Fatalf("session held: A=%v B=%v; the shard committed expiry=100, "+
-				"so BOTH replicas must expire client %d — including the one "+
-				"whose local configuration says 1000",
+				"so BOTH replicas must expire client %d",
 				a.Sessions().IsRegistered(clientID),
 				b.Sessions().IsRegistered(clientID), clientID)
 		}
@@ -243,69 +275,162 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 // membership at all until it replicates one. Both yield a policy whose IsSet
 // reports false, and only then may local configuration drive apply. The second
 // half is the part that matters: once a policy arrives, the state machine must
-// switch to it WITHOUT a restart, because a joiner learns its shard's
-// configuration after its state machine already exists.
+// check it WITHOUT a restart, because a joiner learns its shard's
+// configuration after its state machine already exists. A policy that agrees
+// is applied on; one that disagrees in any setting fails the batch with
+// ErrSessionPolicyMismatch, which fails the shard.
 func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
-	kv := newTestKV()
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-		return kv
-	})
 	local := proto.SessionPolicy{
 		ExpiryEntries:          700,
 		MaxTotalSessions:       11,
 		MaxResponsesPerSession: 7,
+		MaxSessionsPerOwner:    3,
 	}
-	// The shard's policy, published later — as a joiner's peer publishes it
-	// when the shard's initial membership replicates.
-	var replicated proto.SessionPolicy
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), local,
-		func() proto.SessionPolicy { return replicated }, false)
-	if err != nil {
-		t.Fatalf("NewStateMachine = %v", err)
-	}
-	defer rsm.Close()
-
-	if rsm.sessionPolicy != local {
-		t.Fatalf("policy with no shard value = %+v, want the local %+v",
-			rsm.sessionPolicy, local)
-	}
-	if got := rsm.Sessions().MaxResponses(); got != local.MaxResponsesPerSession {
-		t.Fatalf("session manager MaxResponses = %d, want the local %d",
-			got, local.MaxResponsesPerSession)
-	}
-
-	replicated = proto.SessionPolicy{
-		ExpiryEntries:          900,
-		MaxTotalSessions:       22,
-		MaxResponsesPerSession: 9,
-	}
-	// An ordinary apply is the adoption point: nothing else runs on a joiner
-	// between learning its configuration and applying the entries that carried
-	// it.
-	results := make([]sm.Result, 1)
-	if err := rsm.Apply([]proto.Entry{{Index: 1, Cmd: makeCmd("k", "v")}}, results); err != nil {
-		t.Fatalf("Apply = %v", err)
-	}
-
-	if rsm.sessionPolicy != replicated {
-		t.Fatalf("policy after the shard published one = %+v, want %+v; a replica "+
-			"that keeps its local policy once the shard's is known applies on "+
-			"limits no peer shares", rsm.sessionPolicy, replicated)
-	}
-	if got := rsm.Sessions().MaxResponses(); got != replicated.MaxResponsesPerSession {
-		t.Fatalf("session manager MaxResponses = %d, want the replicated %d; the "+
-			"limits inside the manager have to move with the policy or the "+
-			"response cache stays bounded by local configuration",
-			got, replicated.MaxResponsesPerSession)
-	}
-	// The registration bound moved too: with the replicated MaxTotalSessions of
-	// 22 the twelfth session is admitted, where the local 11 would refuse it.
-	for i := uint64(1); i <= 12; i++ {
-		if err := rsm.Sessions().Register(i, 0, 1); err != nil {
-			t.Fatalf("Register #%d = %v; the replicated MaxTotalSessions of %d "+
-				"must admit it, the local %d would not",
-				i, err, replicated.MaxTotalSessions, local.MaxTotalSessions)
+	// newJoiner builds a replica whose shard policy is published later — as a
+	// joiner's peer publishes it when the shard's initial membership
+	// replicates — and returns a setter for it.
+	newJoiner := func(t *testing.T) (*StateMachine, *proto.SessionPolicy) {
+		t.Helper()
+		kv := newTestKV()
+		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+			return kv
+		})
+		replicated := new(proto.SessionPolicy)
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), local,
+			func() proto.SessionPolicy { return *replicated }, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
 		}
+		t.Cleanup(func() { _ = rsm.Close() })
+		if rsm.sessionPolicy != local {
+			t.Fatalf("policy with no shard value = %+v, want the local %+v",
+				rsm.sessionPolicy, local)
+		}
+		return rsm, replicated
+	}
+	// An ordinary apply is the check point: nothing else runs on a joiner
+	// between learning its configuration and applying the entries that
+	// carried it.
+	apply := func(rsm *StateMachine, index uint64) error {
+		results := make([]sm.Result, 1)
+		return rsm.Apply([]proto.Entry{{Index: index, Cmd: makeCmd("k", "v")}}, results)
+	}
+
+	t.Run("shard policy matches the local one", func(t *testing.T) {
+		rsm, replicated := newJoiner(t)
+		*replicated = local
+		if err := apply(rsm, 1); err != nil {
+			t.Fatalf("Apply = %v", err)
+		}
+		if rsm.sessionPolicy != local {
+			t.Fatalf("policy = %+v, want %+v", rsm.sessionPolicy, local)
+		}
+		if got := rsm.Sessions().MaxResponses(); got != local.MaxResponsesPerSession {
+			t.Fatalf("session manager MaxResponses = %d, want %d",
+				got, local.MaxResponsesPerSession)
+		}
+	})
+
+	// Each setting on its own: a disagreement in any one of the four is
+	// refused, and the error names that setting and both values.
+	cases := []struct {
+		setting string
+		mutate  func(*proto.SessionPolicy)
+		want    string
+	}{
+		{"SessionExpiryEntries", func(p *proto.SessionPolicy) { p.ExpiryEntries = 900 },
+			"SessionExpiryEntries is 700 in this node's Config, 900 in the shard's committed policy"},
+		{"MaxTotalSessions", func(p *proto.SessionPolicy) { p.MaxTotalSessions = 22 },
+			"MaxTotalSessions is 11 in this node's Config, 22 in the shard's committed policy"},
+		{"MaxResponsesPerSession", func(p *proto.SessionPolicy) { p.MaxResponsesPerSession = 9 },
+			"MaxResponsesPerSession is 7 in this node's Config, 9 in the shard's committed policy"},
+		{"MaxSessionsPerOwner", func(p *proto.SessionPolicy) { p.MaxSessionsPerOwner = 0 },
+			"MaxSessionsPerOwner is 3 in this node's Config, 0 in the shard's committed policy"},
+	}
+	for _, tc := range cases {
+		t.Run("shard policy disagrees on "+tc.setting, func(t *testing.T) {
+			rsm, replicated := newJoiner(t)
+			committed := local
+			tc.mutate(&committed)
+			*replicated = committed
+			err := apply(rsm, 1)
+			if !errors.Is(err, ErrSessionPolicyMismatch) {
+				t.Fatalf("Apply = %v, want ErrSessionPolicyMismatch; a replica that "+
+					"applies once the shard's policy is known on limits no peer "+
+					"shares diverges silently", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not contain %q", err, tc.want)
+			}
+			if got := rsm.LastApplied(); got != 0 {
+				t.Fatalf("LastApplied = %d after a refused batch, want 0", got)
+			}
+			// The limits inside the manager stay the local ones: nothing
+			// from the refused policy is adopted.
+			if got := rsm.Sessions().MaxResponses(); got != local.MaxResponsesPerSession {
+				t.Fatalf("session manager MaxResponses = %d, want the local %d",
+					got, local.MaxResponsesPerSession)
+			}
+		})
+	}
+}
+
+// TestSessionPolicy_SnapshotInstallChecksThePolicy pins the other point at
+// which a joiner first learns its shard's session policy: an InstallSnapshot,
+// whose membership publishes the policy before the session table is read. A
+// joiner configured with the shard's values recovers; one that disagrees is
+// refused before its state machine is touched.
+func TestSessionPolicy_SnapshotInstallChecksThePolicy(t *testing.T) {
+	committed := proto.SessionPolicy{
+		ExpiryEntries:          500,
+		MaxTotalSessions:       10,
+		MaxResponsesPerSession: 4,
+	}
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	src, err := NewStateMachine(1, 1, createFn, t.TempDir(), committed,
+		func() proto.SessionPolicy { return committed }, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine(source) = %v", err)
+	}
+	defer src.Close()
+	results := make([]sm.Result, 1)
+	if err := src.Apply([]proto.Entry{{Index: 1, Cmd: makeCmd("k", "v")}}, results); err != nil {
+		t.Fatalf("Apply(source) = %v", err)
+	}
+	var snap bytes.Buffer
+	if err := src.SaveSnapshot(context.Background(), &snap, nil); err != nil {
+		t.Fatalf("SaveSnapshot = %v", err)
+	}
+
+	recoverInto := func(t *testing.T, local proto.SessionPolicy) error {
+		t.Helper()
+		var replicated proto.SessionPolicy
+		joiner, err := NewStateMachine(1, 2, createFn, t.TempDir(), local,
+			func() proto.SessionPolicy { return replicated }, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine(joiner) = %v", err)
+		}
+		t.Cleanup(func() { _ = joiner.Close() })
+		// The installed snapshot's membership is published before recovery.
+		replicated = committed
+		return joiner.RecoverFromSnapshot(context.Background(),
+			bytes.NewReader(snap.Bytes()), nil)
+	}
+
+	if err := recoverInto(t, committed); err != nil {
+		t.Fatalf("RecoverFromSnapshot with matching settings = %v", err)
+	}
+	disagreeing := committed
+	disagreeing.MaxResponsesPerSession = 8
+	err = recoverInto(t, disagreeing)
+	if !errors.Is(err, ErrSessionPolicyMismatch) {
+		t.Fatalf("RecoverFromSnapshot with MaxResponsesPerSession=8 against a shard "+
+			"that committed 4 = %v, want ErrSessionPolicyMismatch", err)
+	}
+	if !strings.Contains(err.Error(), "MaxResponsesPerSession is 8 in this node's Config, 4") {
+		t.Fatalf("error %q does not name the setting and both values", err)
 	}
 }
 

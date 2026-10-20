@@ -22,6 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
@@ -518,6 +519,19 @@ var (
 	// replica will ever hear from. The remedy is a NEW keypair; recycling the
 	// removed machine's address under a new replica ID remains legal.
 	ErrRemovedMemberIdentity = raft.ErrRemovedMemberIdentity
+
+	// ErrSessionPolicyMismatch is returned when this node's Config session
+	// settings — SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession
+	// and MaxSessionsPerOwner — disagree with the session policy the shard
+	// committed at bootstrap. The error wraps it with the first disagreeing
+	// setting's name and both values. A restarting replica, which knows the
+	// committed policy at start, gets it from StartShard; a joining replica,
+	// which learns the policy from the log or an installed snapshot, fails the
+	// shard with it (config.ShardFailedInfo.Err, through
+	// EventListener.OnShardFailed). The remedy is to start the replica with
+	// the shard's values. A shard bootstrapped before the policy was recorded
+	// has none to compare against, and each replica applies its own Config.
+	ErrSessionPolicyMismatch = rsm.ErrSessionPolicyMismatch
 
 	// ErrDuplicateMemberAddress is returned when an add (RequestAddNode,
 	// RequestAddObserver, RequestAddWitness, their *WithIdentity forms and

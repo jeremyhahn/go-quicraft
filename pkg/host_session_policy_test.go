@@ -17,8 +17,14 @@ package quicraft
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
 // TestStartShard_SeedsSessionPolicyIntoMembership pins that the shard's session
@@ -64,21 +70,18 @@ func TestStartShard_SeedsSessionPolicyIntoMembership(t *testing.T) {
 	}
 }
 
-// TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig is the end-to-end
-// half, and the one that pins the actual fix.
+// TestStartShard_RefusesConfigThatDisagreesWithSessionPolicy is the end-to-end
+// half, and the one that pins the check.
 //
 // A shard is bootstrapped with a session policy, stopped, and restarted with a
 // DIFFERENT local configuration — the disagreement an edited config file or a
-// binary with new defaults produces. The restarted replica must apply the
-// COMMITTED limits, because its peers are applying those: a replica that
-// admitted registrations its peers refuse would answer subsequent entries of
-// that session normally while they answer ResultSessionExpired, and the two
-// state machines would part company with every Raft invariant intact.
-//
-// The observable is deliberately end-to-end rather than a field read: the
-// fourth NewSession is refused because the SHARD committed a cap of 3, while
-// this node is configured with 50.
-func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
+// binary with new defaults produces. A replica applying its own limits would
+// admit registrations its peers refuse and the two state machines would part
+// company with every Raft invariant intact; one silently adopting the
+// committed limits would run on values it was not configured with. StartShard
+// refuses it, naming the setting and both values, and a restart with the
+// shard's values then starts and enforces them.
+func TestStartShard_RefusesConfigThatDisagreesWithSessionPolicy(t *testing.T) {
 	h := newTestHost(t)
 
 	scfg := testShardConfig(1, 1)
@@ -95,21 +98,43 @@ func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 		t.Fatalf("StopShard: %v", err)
 	}
 
-	// Restart with limits that disagree with what the shard committed, in the
-	// direction that matters: every local limit is LOOSER, so a replica reading
-	// its own configuration would admit what its peers refuse.
-	restarted := testShardConfig(1, 1)
-	restarted.SessionExpiryEntries = 100000
-	restarted.MaxTotalSessions = 50
-	restarted.MaxResponsesPerSession = 40
+	// Each setting on its own is enough to refuse the restart.
+	for _, tc := range []struct {
+		setting string
+		mutate  func(*config.Config)
+		want    string
+	}{
+		{"SessionExpiryEntries", func(c *config.Config) { c.SessionExpiryEntries = 100000 },
+			"SessionExpiryEntries is 100000 in this node's Config, 5000"},
+		{"MaxTotalSessions", func(c *config.Config) { c.MaxTotalSessions = 50 },
+			"MaxTotalSessions is 50 in this node's Config, 3"},
+		{"MaxResponsesPerSession", func(c *config.Config) { c.MaxResponsesPerSession = 40 },
+			"MaxResponsesPerSession is 40 in this node's Config, 2"},
+		{"MaxSessionsPerOwner", func(c *config.Config) { c.MaxSessionsPerOwner = scfg.MaxSessionsPerOwner + 1 },
+			"MaxSessionsPerOwner is"},
+	} {
+		restarted := scfg
+		tc.mutate(&restarted)
+		err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+			testCreateFunc, restarted)
+		if !errors.Is(err, ErrSessionPolicyMismatch) {
+			t.Fatalf("StartShard with a disagreeing %s = %v, want ErrSessionPolicyMismatch",
+				tc.setting, err)
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("StartShard error %q does not contain %q", err, tc.want)
+		}
+	}
+
+	// The shard's own values start it.
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
-		testCreateFunc, restarted); err != nil {
-		t.Fatalf("StartShard after restart failed: %v", err)
+		testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard after restart with the committed values failed: %v", err)
 	}
 	waitForLeader(t, h, 1)
 
 	// The committed policy is unchanged by the restart: a rejoining replica
-	// adopts the shard's configuration, it does not re-seed it.
+	// is held to the shard's configuration, it does not re-seed it.
 	m, err := h.ShardMembership(1)
 	if err != nil {
 		t.Fatalf("ShardMembership after restart: %v", err)
@@ -132,9 +157,97 @@ func TestStartShard_ReplicatedSessionPolicyOverridesLocalConfig(t *testing.T) {
 	_, err = h.NewSession(ctx, 1)
 	var sessErr *SessionError
 	if !errors.As(err, &sessErr) || sessErr.Op != "register" {
-		t.Fatalf("NewSession #4 error = %v, want a *SessionError from register. "+
-			"The shard committed MaxTotalSessions=3; this node is configured with "+
-			"50, and a replica that applies its own limit admits sessions its "+
-			"peers refuse", err)
+		t.Fatalf("NewSession #4 error = %v, want a *SessionError from register; "+
+			"the shard committed MaxTotalSessions=3", err)
+	}
+}
+
+// recordSnapshotWithSessionPolicy records a snapshot at index whose
+// membership carries the given session policy, the state a replica whose log
+// was compacted past the index-1 EntryInitialMembership restarts from. A zero
+// policy is a shard bootstrapped before the policy was recorded.
+func recordSnapshotWithSessionPolicy(t *testing.T, h *Host, index uint64, p logdb.Membership) {
+	t.Helper()
+	snapDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"),
+		[]byte{0, 0, 0, 0}, 0o600); err != nil {
+		t.Fatalf("writing the snapshot artifact: %v", err)
+	}
+	stampTestSnapshotMeta(t, snapDir, index, 1)
+	p.ConfigChangeID = 1
+	p.Addresses = map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.logdb.SaveSnapshot(1, 1, logdb.Snapshot{
+		Index:      index,
+		Term:       1,
+		Membership: p,
+		Filepath:   snapDir,
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := h.logdb.SaveState([]logdb.Update{{
+		ShardID:   1,
+		ReplicaID: 1,
+		State:     logdb.State{Term: 1, Vote: 1, Commit: index},
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+}
+
+// TestStartShard_SessionPolicySurvivesSnapshotRecovery pins that the check
+// holds for a replica that relearns the policy from the snapshot-metadata
+// record rather than from the log: the disagreeing Config is refused and the
+// shard's values start the shard on the committed limits.
+func TestStartShard_SessionPolicySurvivesSnapshotRecovery(t *testing.T) {
+	h := newTestHost(t)
+	scfg := testShardConfig(1, 1)
+	scfg.SessionExpiryEntries = 6000
+	scfg.MaxTotalSessions = 7
+	scfg.MaxResponsesPerSession = 5
+	recordSnapshotWithSessionPolicy(t, h, 40, logdb.Membership{
+		SessionExpiryEntries:   6000,
+		MaxTotalSessions:       7,
+		MaxResponsesPerSession: 5,
+		MaxSessionsPerOwner:    scfg.MaxSessionsPerOwner,
+	})
+
+	disagreeing := scfg
+	disagreeing.MaxTotalSessions = 8
+	err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		testCreateFunc, disagreeing)
+	if !errors.Is(err, ErrSessionPolicyMismatch) {
+		t.Fatalf("StartShard with MaxTotalSessions=8 on a snapshot that recorded 7 = %v, "+
+			"want ErrSessionPolicyMismatch", err)
+	}
+
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard with the recorded values: %v", err)
+	}
+	defer func() { _ = h.StopShard(1) }()
+	waitForLeader(t, h, 1)
+	if got := testLoadNode(h, 1).rsm.Sessions().MaxResponses(); got != 5 {
+		t.Fatalf("session manager MaxResponses = %d, want the recorded 5", got)
+	}
+}
+
+// TestStartShard_NoRecordedSessionPolicyKeepsLocalConfig pins the documented
+// behaviour for a shard bootstrapped before the session policy was recorded:
+// there is nothing to compare against, so any Config starts and the replica
+// applies its own limits.
+func TestStartShard_NoRecordedSessionPolicyKeepsLocalConfig(t *testing.T) {
+	h := newTestHost(t)
+	recordSnapshotWithSessionPolicy(t, h, 40, logdb.Membership{})
+
+	scfg := testShardConfig(1, 1)
+	scfg.MaxTotalSessions = 9
+	scfg.MaxResponsesPerSession = 6
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard on a shard with no recorded session policy: %v", err)
+	}
+	defer func() { _ = h.StopShard(1) }()
+	waitForLeader(t, h, 1)
+	if got := testLoadNode(h, 1).rsm.Sessions().MaxResponses(); got != 6 {
+		t.Fatalf("session manager MaxResponses = %d, want the local 6", got)
 	}
 }

@@ -550,6 +550,7 @@ wrapping:
 | `ErrRemoveLastVoter` | Remove targets the last voting member |
 | `ErrMemberIdentityRequired` | An identity-less add on a host with a transport |
 | `ErrRemovedMemberIdentity` | The add binds a node identity this shard has removed, under any replica ID. The tombstone is never evicted, so the remedy is a new keypair. `Membership.RemovedIdentities` lists these identities, so a host can classify a joiner before proposing it |
+| `ErrSessionPolicyMismatch` | This node's `Config` session settings (`SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession`, `MaxSessionsPerOwner`) disagree with the policy the shard committed at bootstrap; wrapped with the setting's name and both values. Returned by `StartShard` on a restart; a joiner that learns the policy later fails the shard with it (`ShardFailedInfo.Err`). Start the replica with the shard's values |
 | `ErrDuplicateMemberAddress` | The add names a new replica at an address another active member already holds. Promoting an observer at its own address is allowed |
 | `ErrDuplicateMemberIdentity` | The add binds a node identity another active member already holds. There is no co-location exception |
 | `ErrSharedPeerCertificate` / `*SharedPeerCertificateError` | This node's own certificate also covers the host of the replica being added; issue one certificate per node |

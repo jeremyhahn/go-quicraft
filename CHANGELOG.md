@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ErrHostIdentityMismatch` naming both. A changed `RaftAddress` is logged,
   not refused. New files only; no existing format changes.
 
+- session-settings agreement (#444): a replica whose `Config` session settings
+  (`SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession`,
+  `MaxSessionsPerOwner`) disagree with the session policy its shard committed
+  at bootstrap is refused with the new `quicraft.ErrSessionPolicyMismatch`,
+  wrapped with the setting's name and both values. A restart gets it from
+  `StartShard`; a joiner that learns the policy from the log or an installed
+  snapshot fails the shard with it (`OnShardFailed`). Previously the committed
+  value silently replaced the local one with a warning. A shard bootstrapped
+  before the policy was recorded has nothing to check against and keeps
+  applying each replica's own `Config`. The check runs once per change of the
+  observed policy, not per entry. No wire or format change.
 - heartbeat-under-fsync (#390): while a WAL write is in flight a follower
   answers a leader's Heartbeat without waiting for the fsync when the step
   left its term, vote, owed vote window and log unchanged, so CheckQuorum no

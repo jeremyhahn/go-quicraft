@@ -87,9 +87,10 @@ const (
 	// node-local configuration, changing it would have made a mixed-version
 	// cluster — old binary on one replica, new on another — expire different
 	// sessions at different log indexes and diverge silently. It is now seeded
-	// into the shard's membership at bootstrap, so an upgraded replica adopts
-	// whatever its shard committed and this default applies only to shards
-	// bootstrapped by this binary.
+	// into the shard's membership at bootstrap, so this default applies only
+	// to shards bootstrapped by this binary, and a replica of an older shard
+	// must be configured with the value that shard committed or it is refused
+	// with ErrSessionPolicyMismatch.
 	DefaultSessionExpiryEntries uint64 = 100000
 
 	// SessionExpiryDisabled turns automatic session expiry off. Assign it to
@@ -528,10 +529,11 @@ type Config struct {
 	// replica writes it into the shard's initial membership at bootstrap
 	// (proto.SessionPolicy, alongside MaxTotalSessions and
 	// MaxResponsesPerSession); from then on the apply path reads the committed
-	// value and this field governs nothing. All founders must supply the same
-	// value or their index-1 entries differ; a replica whose configuration
-	// disagrees with what its shard committed logs the disagreement at startup
-	// and applies the shard's value. There is currently no config change that
+	// value. All founders must supply the same value or their index-1 entries
+	// differ, and every later replica must carry it too: one whose
+	// configuration disagrees with what its shard committed is refused with
+	// ErrSessionPolicyMismatch (StartShard on a restart; the shard fails when
+	// a joiner learns the policy). There is currently no config change that
 	// alters the committed policy, so it is fixed for the life of the shard.
 	//
 	// Assign SessionExpiryDisabled to disable automatic expiry. Zero does NOT

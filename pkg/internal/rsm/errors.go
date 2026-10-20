@@ -42,4 +42,13 @@ var (
 	// session expiry checkpoint walk run against a different entry sequence
 	// than every other replica ran it against.
 	ErrApplyGap = errors.New("rsm: committed entry gap before apply")
+
+	// ErrSessionPolicyMismatch is returned when this node's configured session
+	// settings (config.Config SessionExpiryEntries, MaxTotalSessions,
+	// MaxResponsesPerSession, MaxSessionsPerOwner) disagree with the session
+	// policy the shard committed at bootstrap (proto.SessionPolicy). The
+	// error wraps it with the first disagreeing setting's name and both
+	// values. The quicraft package re-exports it as its public
+	// ErrSessionPolicyMismatch, hence the public prefix.
+	ErrSessionPolicyMismatch = errors.New("quicraft: configured session settings disagree with the shard's committed session policy")
 )

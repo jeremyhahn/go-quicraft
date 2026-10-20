@@ -16,7 +16,9 @@ package rsm
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -57,82 +59,75 @@ func (c *policyLogs) matching(msg string) []slog.Record {
 	return out
 }
 
-const policyDisagreementMsg = "rsm: applying the shard's replicated session policy, which differs " +
-	"from this node's configuration; the replicated value governs and cannot " +
-	"be overridden locally"
+const policyDisagreementMsg = "rsm: refusing the shard: this node's session settings disagree " +
+	"with the shard's committed session policy"
 
-// wantPolicyAttrs asserts the disagreement record's level and the attributes
-// that name the previous, effective and local policies.
-func wantPolicyAttrs(t *testing.T, r slog.Record, previous, effective, local proto.SessionPolicy) {
+// wantPolicyAttrs asserts the refusal record's level, its shard and replica,
+// and that its error names the disagreeing setting.
+func wantPolicyAttrs(t *testing.T, r slog.Record, setting string) {
 	t.Helper()
-	if r.Level != slog.LevelWarn {
-		t.Errorf("record level = %v, want WARN", r.Level)
+	if r.Level != slog.LevelError {
+		t.Errorf("record level = %v, want ERROR", r.Level)
 	}
-	want := map[string]uint64{
-		"shardID":                         1,
-		"replicaID":                       2,
-		"previous_expiry_entries":         previous.ExpiryEntries,
-		"expiry_entries":                  effective.ExpiryEntries,
-		"local_expiry_entries":            local.ExpiryEntries,
-		"max_total_sessions":              effective.MaxTotalSessions,
-		"local_max_total_sessions":        local.MaxTotalSessions,
-		"max_responses_per_session":       effective.MaxResponsesPerSession,
-		"local_max_responses_per_session": local.MaxResponsesPerSession,
-	}
-	got := map[string]uint64{}
+	got := map[string]slog.Value{}
 	r.Attrs(func(a slog.Attr) bool {
-		got[a.Key] = a.Value.Uint64()
+		got[a.Key] = a.Value
 		return true
 	})
-	for k, v := range want {
-		g, ok := got[k]
-		if !ok {
-			t.Errorf("record has no %q attribute", k)
-			continue
-		}
-		if g != v {
-			t.Errorf("%s = %d, want %d", k, g, v)
-		}
+	if v := got["shardID"]; v.Uint64() != 1 {
+		t.Errorf("shardID = %v, want 1", v)
+	}
+	if v := got["replicaID"]; v.Uint64() != 2 {
+		t.Errorf("replicaID = %v, want 2", v)
+	}
+	if v, ok := got["error"]; !ok || !strings.Contains(v.String(), setting) {
+		t.Errorf("error attribute = %v, want one naming %s", v, setting)
 	}
 }
 
-// TestLogPolicyDisagreement_ReachesWithLogger pins that the WARN for a shard
-// whose replicated session policy differs from this node's configuration
+// TestLogPolicyDisagreement_ReachesWithLogger pins that the ERROR refusing a
+// shard whose replicated session policy differs from this node's configuration
 // reaches the logger given through WithLogger: at construction, for a policy
-// the shard already knows, and on the apply path, when the shard publishes a
-// new one.
+// the shard already knows, and on the apply path, when a joiner learns it.
 func TestLogPolicyDisagreement_ReachesWithLogger(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
 	})
 	local := proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 11, MaxResponsesPerSession: 7}
-	first := proto.SessionPolicy{ExpiryEntries: 800, MaxTotalSessions: 16, MaxResponsesPerSession: 8}
-	replicated := first
-	logs := &policyLogs{}
 
+	// Construction: a restart, where the shard's policy is already known.
+	logs := &policyLogs{}
+	replicated := proto.SessionPolicy{ExpiryEntries: 800, MaxTotalSessions: 11, MaxResponsesPerSession: 7}
+	if _, err := NewStateMachine(1, 2, createFn, t.TempDir(), local,
+		func() proto.SessionPolicy { return replicated }, false,
+		WithLogger(slog.New(logs))); !errors.Is(err, ErrSessionPolicyMismatch) {
+		t.Fatalf("NewStateMachine = %v, want ErrSessionPolicyMismatch", err)
+	}
+	got := logs.matching(policyDisagreementMsg)
+	if len(got) != 1 {
+		t.Fatalf("%d refusal records at construction, want 1", len(got))
+	}
+	wantPolicyAttrs(t, got[0], "SessionExpiryEntries")
+
+	// Apply: a joiner, which learns the shard's policy after construction.
+	logs = &policyLogs{}
+	replicated = proto.SessionPolicy{}
 	s, err := NewStateMachine(1, 2, createFn, t.TempDir(), local,
 		func() proto.SessionPolicy { return replicated }, false, WithLogger(slog.New(logs)))
 	if err != nil {
 		t.Fatalf("NewStateMachine = %v", err)
 	}
 	defer s.Close()
-
-	got := logs.matching(policyDisagreementMsg)
-	if len(got) != 1 {
-		t.Fatalf("%d disagreement records at construction, want 1", len(got))
-	}
-	wantPolicyAttrs(t, got[0], local, first, local)
-
-	replicated = proto.SessionPolicy{ExpiryEntries: 900, MaxTotalSessions: 22, MaxResponsesPerSession: 9}
+	replicated = proto.SessionPolicy{ExpiryEntries: 700, MaxTotalSessions: 22, MaxResponsesPerSession: 7}
 	results := make([]sm.Result, 1)
-	if err := s.Apply([]proto.Entry{{Index: 1, Cmd: makeCmd("k", "v")}}, results); err != nil {
-		t.Fatalf("Apply = %v", err)
+	if err := s.Apply([]proto.Entry{{Index: 1, Cmd: makeCmd("k", "v")}}, results); !errors.Is(err, ErrSessionPolicyMismatch) {
+		t.Fatalf("Apply = %v, want ErrSessionPolicyMismatch", err)
 	}
 	got = logs.matching(policyDisagreementMsg)
-	if len(got) != 2 {
-		t.Fatalf("%d disagreement records after the shard published a new policy, want 2", len(got))
+	if len(got) != 1 {
+		t.Fatalf("%d refusal records after the shard published a disagreeing policy, want 1", len(got))
 	}
-	wantPolicyAttrs(t, got[1], first, replicated, local)
+	wantPolicyAttrs(t, got[0], "MaxTotalSessions")
 }
 
 // TestLogPolicyDisagreement_AgreementIsSilent pins that a replicated policy

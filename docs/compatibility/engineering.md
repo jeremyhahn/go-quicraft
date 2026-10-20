@@ -283,11 +283,28 @@ still-valid certificate would be readmitted on the restart after its removal.
 A replica that loses the session policy falls back to its own `Config` and
 expires sessions at log indexes its peers do not.
 
+Every shard bootstrapped by `StartShard` records the founder's
+`SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession` and
+`MaxSessionsPerOwner` in its initial membership, so `SessionPolicy.IsSet` is
+true from index 1. Each replica's `Config` must carry the same four values, and
+a replica whose `Config` disagrees is refused with `ErrSessionPolicyMismatch`,
+wrapped with the first disagreeing setting's name and both values:
+
+| When the replica learns the committed policy | Where the refusal surfaces |
+|---|---|
+| at start, from its own log or snapshot record (every restart) | `StartShard` returns the error |
+| later, as a joiner, from the replicated index-1 entry or an installed snapshot | the shard fails: `EventListener.OnShardFailed` with the error in `ShardFailedInfo.Err` |
+
+The check runs once per change of the observed policy, never per entry, and
+reads only committed state, so commit, apply and election order are untouched.
+The remedy is to start the replica with the shard's values.
+
 When the committed membership carries no session policy (`SessionPolicy.IsSet`
-is false), each replica applies its own `Config`. `SessionExpiryEntries`,
-`MaxTotalSessions`, `MaxResponsesPerSession` and `MaxSessionsPerOwner` must then
-be identical on every replica; nothing enforces it, and disagreement diverges the state machine
-silently.
+is false: a shard bootstrapped before the policy was recorded), there is
+nothing to check against and each replica applies its own `Config`. The four
+settings must then be identical on every replica; no check covers such a
+shard, and disagreement diverges the state machine silently. No migration
+records a policy for it.
 
 ## Test strategy
 

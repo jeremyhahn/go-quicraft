@@ -17,7 +17,8 @@ expiry exists to prevent.
 ## Settings
 
 Bootstrap seeds on `config.Config`, written into the shard's replicated policy
-when it is founded and fixed after that:
+when it is founded and fixed after that. Every replica must be started with the
+same values; one that is not is refused with `ErrSessionPolicyMismatch`:
 
 | Setting | Default | Watch for |
 |---|---|---|

@@ -115,7 +115,9 @@ shard's initial membership at bootstrap and replicated through the log,
 snapshots and the WAL. `Config`'s session fields are only the bootstrap seed. A
 per-node value would let replicas disagree about which registrations are legal,
 the same class of bug as time-based expiry. The policy cannot be changed after
-bootstrap.
+bootstrap, and a replica whose `Config` disagrees with it is refused with
+`ErrSessionPolicyMismatch` (see
+[`../compatibility/engineering.md`](../compatibility/engineering.md#identities-and-session-policy-across-a-restart)).
 
 ## Trust boundary
 
