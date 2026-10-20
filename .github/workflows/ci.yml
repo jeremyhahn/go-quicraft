@@ -1,4 +1,13 @@
-# ci-template: v1.24.1 (customized)
+# ci-template: v1.25 (customized)
+# v1.25 (Company Agent m857, 2026-10-20): main has one concurrency group per
+# event, so a newer push to main cancels the older in-progress main push run.
+# At 20:00Z go-qrdb had three main-push runs in progress on three commits and
+# 148 jobs waited fleet-wide. The main group is `main-{event}` (m774 option
+# (i), on go-qrdb main since m772), not the ref alone, so a workflow_dispatch
+# or schedule run on main never cancels a push run. This reverses v1.22.1 and
+# v1.23 (m636, m695): an older main commit no longer keeps its own run, and
+# the newest run validates every merge under it. cancel-in-progress stays a
+# literal `true`. A PR ref is one group, as before. Only the group changes.
 # v1.24.1 (2026-10-20): the changelog and comments cite no internal
 # repository and no internal issue number, so a repository that publishes its
 # workflows passes its releasability scan. One job change: the `changes`
@@ -328,14 +337,15 @@ on:
   schedule:
     - cron: '0 5 * * *'
 
-# v1.23: a literal cancel-in-progress and a main-specific group. A PR ref is
-# one group, so its newer run cancels the older. On main the group carries the
-# event and the commit, so each main commit and event has its own group and no
-# main run cancels or waits for another. No expression reaches
-# cancel-in-progress: Gitea 1.27.1 never released go-qrdb main run 57063, the
-# first run after v1.22.1 set it to an expression (Company Agent m695).
+# v1.25: on main the group is the workflow and the event, so a push to main
+# cancels the in-progress main push run of an older commit, and a schedule or
+# workflow_dispatch run cancels only an older run of its own event (Company
+# Agent m857, m774 option (i)). Every other ref is one group, so a PR's newer
+# run cancels the older. No expression reaches cancel-in-progress: Gitea
+# 1.27.1 never released go-qrdb main run 57063, the first run after v1.22.1
+# set it to an expression (Company Agent m695).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && format('main-{0}-{1}', github.event_name, github.sha) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && format('main-{0}', github.event_name) || github.ref }}
   cancel-in-progress: true
 
 permissions:
