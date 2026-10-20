@@ -504,13 +504,19 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 		// 256, and reading that as the tail stopped the scan early and tore an
 		// earlier block — below records a later fdatasync had acknowledged,
 		// which recovery rightly refuses rather than truncating.
-		if len(block) < recordHeaderSize+1 || isAllZero(block) {
+		//
+		// A SHORT final block is not the tail either. A segment rotated out is
+		// truncated to its written size, and when the Sync before the rotation
+		// lands on a block boundary its sync mark opens the next block alone:
+		// recordHeaderSize bytes naming that boundary as the acknowledged end.
+		// Skipping it tore the block below, under acknowledged bytes (run 58372).
+		if isAllZero(block) {
 			break
 		}
 		if completed > 0 {
 			best = int64(blockStart)
 		}
-		for pos := 0; pos+recordHeaderSize < len(block) && !isAllZero(block[pos:]); {
+		for pos := 0; pos+recordHeaderSize <= len(block) && !isAllZero(block[pos:]); {
 			_, recType, _, _, n, err := decodeRecord(block[pos:])
 			if err != nil {
 				t.Fatalf("segment already corrupt at offset %d before tearing: %v",
@@ -591,6 +597,56 @@ func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 	}
 	t.Fatalf("no segment in %s holds a complete record to tear after", shardDir)
 	return "", 0
+}
+
+// TestCrashTearSegmentHeaderOnlyFinalBlock pins the layout behind nightly run
+// 58372. When a Sync lands exactly on a block boundary, its sync mark opens
+// the next block, and a segment rotated out then is truncated to its written
+// size: its final block is that mark alone, recordHeaderSize bytes naming the
+// boundary as the acknowledged end. The tear must land at or above that end;
+// tearing the block below it destroys bytes an fdatasync acknowledged, which
+// recovery rightly refuses as damage below acknowledged data.
+func TestCrashTearSegmentHeaderOnlyFinalBlock(t *testing.T) {
+	dir := t.TempDir()
+	seg, _, err := createSegment(defaultFS(), dir, 1, crashBlockSize, crashMaxFileSize)
+	if err != nil {
+		t.Fatalf("createSegment: %v", err)
+	}
+	// Two records that each fill a block exactly, so the Sync's flushed
+	// watermark is the block boundary at 2*crashBlockSize.
+	fill := bytes.Repeat([]byte{0xAA}, crashBlockSize-recordHeaderSize)
+	for i := 0; i < 2; i++ {
+		if _, err := seg.Write(fill); err != nil {
+			t.Fatalf("Write[%d]: %v", i, err)
+		}
+	}
+	if err := seg.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	ackedEnd := int64(2 * crashBlockSize)
+	if size := statSize(t, filepath.Join(dir, segmentFilename(1))); size != ackedEnd+recordHeaderSize {
+		t.Fatalf("segment is %d bytes, want %d (a header-only final block)", size, ackedEnd+recordHeaderSize)
+	}
+
+	_, tearAt := crashTearSegment(t, dir)
+	if tearAt < ackedEnd {
+		t.Fatalf("tore at %d, below the acknowledged end %d", tearAt, ackedEnd)
+	}
+	rseg := openSegmentForTest(t, dir, 1, crashBlockSize)
+	defer rseg.Close()
+	records, cleanEnd, err := rseg.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll after tear: %v", err)
+	}
+	if rseg.acknowledgedDataLost || rseg.ackedDataAfterCorruption || rseg.sequenceRegression {
+		t.Fatalf("recovery refuses the tear at %d as damage below acknowledged data", tearAt)
+	}
+	if cleanEnd != tearAt || len(records) != 2 {
+		t.Fatalf("recovery keeps %d records ending at %d, want 2 ending at %d", len(records), cleanEnd, tearAt)
+	}
 }
 
 // TestWALCrashTornTailRepairedAcrossRestarts kills a real writer and then
