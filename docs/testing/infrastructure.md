@@ -298,7 +298,17 @@ below it, and `make coverage-packages` applies it to every package under `pkg/`
 from the same profile. CI's `test` job runs the same total and per-package
 checks at `COVERAGE_THRESHOLD = 90`, one point lower so a single package's
 flaky test (which contributes no coverage when it fails) does not fail the gate
-twice.
+twice. CI passes that value to `make coverage`, overriding the Makefile's
+`COVERAGE_THRESHOLD ?= 91`, so the tolerance is the workflow's, not the
+Makefile's.
+
+The tolerance stays (#438). It guards any package's flake, not a named one:
+the two #438 looked at were not open flakes. The `contrib/dragonboat` shard
+warmup already waits, under a deadline, for a linearizable membership read to
+succeed after the election (clean at `-count=20` and under `-race`), and
+`TestSnapshotOver0RTTRejected` was a race-detector skip, not a failure, and now
+runs under `-race`. Removing the point is a change to the CI template, not to
+this repository's Makefile.
 
 `check-coverage` fails on a missing or empty profile and on any value that is
 not a number before it compares. Without those guards an empty percentage made

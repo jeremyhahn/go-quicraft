@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   No wire or on-disk format changed.
 
+### Fixed
+
+- `TestSnapshotOver0RTTRejected` runs under `-race` again (#438). The quic-go
+  `Conn.peerParams` race it skipped for no longer reproduces on quic-go
+  v0.64.1 (clean over 120 race-detector runs), so the skip and the
+  race-detector build flag it read are gone. Test-only.
+
 ## [0.23.0-alpha] - 2026-10-16
 
 A MINOR bump: the go-enclave adoption below changes exported types (pre-1.0, a
