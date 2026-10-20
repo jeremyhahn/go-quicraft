@@ -27,8 +27,9 @@ Sources: `pkg/proto/constants.go`, `pkg/proto/membership.go`,
 `pkg/internal/engine/snapshot_meta.go`, `pkg/snapshot_artifact_trailer.go`,
 `pkg/host.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`, `VERSION`.
 
-The current release is **0.23.0-alpha**, an internal alpha. The first stable
-release will be 1.0.0.
+The current release is the one in `VERSION` at the repository root, an
+internal alpha; this document does not repeat the number, so it cannot go
+stale. The first stable release will be 1.0.0.
 
 ## Stability guarantee
 

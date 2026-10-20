@@ -201,13 +201,18 @@ Three different things are called fuzzing here:
   campaign's per-target budget divided by `FUZZ_MUT_DIVISOR` (6). A package
   without a calibrated budget fails the gate instead of running unbounded.
 
-The unbounded search is `.github/workflows/fuzz.yml` on a nightly schedule,
-deliberately off the PR path: a crash it finds depends on the RNG schedule, and
-failing unrelated pull requests at random is how a gate stops being trusted.
-Both the nightly and the release gate budget by execution count, not duration.
+The unbounded search runs on dispatch, deliberately off the PR path: a crash it
+finds depends on the RNG schedule, and failing unrelated pull requests at random
+is how a gate stops being trusted. Neither workflow that runs it has a schedule:
+`.github/workflows/fuzz.yml` is dispatched by hand, and the `fuzz` job of
+`.github/workflows/batch.yml` (itself dispatched, with `jobs` set to `all` or
+`fuzz`) fuzzes every target for its `fuzztime` input on the batch runners.
+Both `fuzz.yml` and the release gate budget by execution count, not duration.
 With a duration budget Go installs a deadline context, and its coordinator can
 report a bare "context deadline exceeded" at shutdown that reads like a crash
-and is not one; with a count there is no deadline to race.
+and is not one; with a count there is no deadline to race. `batch.yml` budgets
+by duration, so it reports a target that failed on the deadline with no failing
+input written as `deadline`, not as a finding.
 
 ### Linearizability
 

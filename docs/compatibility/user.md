@@ -1,7 +1,7 @@
 # Compatibility and upgrades: user guide
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-16
+> Last verified: 2026-10-20
 > Conflicts with this document are defects. Fix them here first.
 
 How to move a cluster from one version to another, what each release changes,
@@ -26,35 +26,42 @@ are what they are is in [architecture.md](architecture.md).
 
 ## Upgrade path
 
-There is none beyond wipe and re-sync. Nothing in the codebase migrates an old
-data directory, and legacy formats fail closed.
+Before v1.0.0 there is none beyond wipe and re-sync. Nothing in the codebase
+migrates an old data directory, and legacy formats fail closed.
 
-Across a boundary that changes an on-disk format, per node:
+The wire format is exact-match: two binaries built from different pre-release
+commits may be mutually unreadable while both stamp the same version, so nothing
+refuses the skew for you. A rolling upgrade is therefore not supported, at any
+boundary: a new node and an old node never exchange traffic, so a node that
+starts on the new version cannot re-sync from peers still on the old one.
 
-1. Confirm the remaining nodes hold a quorum without this one.
-2. Stop the node.
-3. Delete its `WALDir` and `NodeHostDir` contents, including the `WALFORMAT`
-   marker (segments left without it are refused with `ErrWALFormatMissing`).
-   Keep the sealed root key unless the release notes list an encryption break.
-4. Start the node on the new version and let it re-sync from the leader by
-   snapshot and log replay.
-5. Wait for `ShardInfo.Health` to leave `recovering` and `LastApplied` to catch
-   up before moving to the next node.
+Every upgrade is a whole-cluster cold upgrade:
 
-This is a rolling replacement, not a rolling upgrade: a new node and an old node
-should never exchange traffic. Across a pre-release layout change both binaries
-stamp the same versions, so nothing refuses the skew for you. Expect reduced
-redundancy for the duration, and never take down a majority at once.
+1. If you need a restore point, export a snapshot per shard on the old version
+   (see [Before upgrading](#before-upgrading)).
+2. Stop every node.
+3. Replace the binary on every node, and rebuild every consuming repository,
+   from one commit.
+4. If the [notes by release](#upgrade-notes-by-release) say data directories
+   carry over, skip to step 6.
+5. If the target changes an on-disk format, wipe every node: delete its
+   `WALDir` and `NodeHostDir` contents, including the `WALFORMAT` marker
+   (segments left without it are refused with `ErrWALFormatMissing`). Keep the
+   sealed root key unless the release notes list an encryption break. Then
+   restore each shard from an application-level backup, or import the
+   artifact exported in step 1 on every replica of the shard as described in
+   [Back up and restore](../multi-group-host/user.md#back-up-and-restore).
+   Artifacts exported by a build with an older artifact layout are refused;
+   in that case the application-level backup is the only restore point.
+6. Start every node, and wait for `ShardInfo.Health` to leave `recovering` and
+   `LastApplied` to catch up before the cluster takes traffic.
 
-For a whole-cluster cold upgrade, stop everything, wipe everything, and restore
-from an application-level backup or from snapshots exported under the old
-version and imported under the new one. `waldb.Reencrypt` re-serialises every
-record for a barrier migration; it is not a format migration tool.
+`waldb.Reencrypt` re-serialises every record for a barrier migration; it is not
+a format migration tool.
 
-Across a boundary with no format change, replace the binaries; data directories
-carry over. Still build every node and consuming repository from one commit,
-and still replace every node before the cluster takes traffic that uses a new
-message type.
+From v1.0.0 the upgrade path is the acknowledged policy in
+[architecture.md, From v1.0.0](architecture.md#from-v100); this page does not
+restate it.
 
 ## Upgrade notes by release
 

@@ -1,6 +1,6 @@
 # go-quicraft specification
 
-> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-17
+> **Status: NORMATIVE** · Scope: what go-quicraft is, every feature, its requirements and status · Last verified: 2026-10-20
 > A feature listed here, in any status, is never deleted (not its docs, code or issues) without the owner's change to this file.
 
 ## Purpose
@@ -59,6 +59,18 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 
 Every feature is shipped; no feature is in progress, planned or future.
 
+## Decisions
+
+Non-goals, decided and not planned. Each row is a scope decision, not a missing
+feature; its reason is the one the cited architecture document gives.
+
+| Non-goal | Decision | Reason | Source |
+|---|---|---|---|
+| Tracing and a health endpoint | Not provided | `context.Context` is threaded through the public API, so an embedder carries its own spans; `Host.HealthCheck()` returns a value, and serving it is the embedder's job. No OpenTelemetry integration, no metrics server. | [observability/architecture.md](observability/architecture.md#what-this-feature-deliberately-does-not-do) |
+| Joint consensus | Rejected: one membership change at a time | Joint consensus needs two quorums live at once, a second configuration in flight, and a state machine with more states to get wrong; one-at-a-time reaches the same configurations by composition, at the cost of more round trips on a rare operation. | [membership-changes/architecture.md](membership-changes/architecture.md#rejected-joint-consensus) |
+| Snapshot backup and retention policy | Not provided | Which exported snapshots to keep, and where, belongs to the layer that owns the data directory; `ExportSnapshot` and `ImportSnapshot` are the mechanism. | [snapshots/architecture.md](snapshots/architecture.md) |
+| Client sessions on on-disk state machines | Rejected: refused with `ErrSessionsUnsupportedOnDisk` | The session table travels only in the snapshot stream; a disk state machine that reports a non-zero applied index from `Open` skips that recovery on restart, so the replica would come up with no sessions and answer `SESSION_EXPIRED` for entries its peers apply. Make commands idempotent and propose them without a session. | [client-sessions/architecture.md](client-sessions/architecture.md#rejected-sessions-on-disk-state-machines) |
+
 ## Interfaces
 
 - Go SDK: the `quicraft` package (`pkg/`) and `pkg/config`: [multi-group-host/api.md](multi-group-host/api.md).
@@ -82,8 +94,9 @@ Then release candidates are tagged, deployed to staging and released; production
 
 The v1.0.0 bar, on top of the above:
 
-- go-enclave is at a public release (memory-enclave).
+- go-enclave is at a public release (memory-enclave). Open: #427, which waits on go-enclave's public release.
 - The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility). Met: the owner acknowledged it on 2026-10-20, every answer as written (#404).
-- A publication mechanism for agent files exists (release).
-- The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release).
-- Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage).
+- A publication mechanism for agent files exists (release). Met (#436): the agent files are published and scanned like any other file; `.gitattributes` export-ignores only the private forge workflows and the release trust anchor, and `test/releasability` enforces the list ([release/public-releasability.md](release/public-releasability.md)).
+- The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release). Met (#436): every published workflow passes the `test/releasability` scan; the private forge's own workflows are export-ignored ([release/public-releasability.md](release/public-releasability.md)).
+- Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage). Holding: every discriminator is at its pinned value ([compatibility/engineering.md](compatibility/engineering.md#version-discriminators)); it is met when v1.0.0 ships with none moved.
+- The rest of the bar is rows V1-A to V1-M of the `v1.0.0 bar` milestone, one issue each. V1-A (#437: doc drift, the upgrade and root-key-compromise runbooks, the non-goal decisions below) is Met; V1-B to V1-M are Open until their issues close.

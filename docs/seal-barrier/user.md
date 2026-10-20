@@ -1,6 +1,6 @@
 # Seal and barrier: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/seal` · Last verified: 2026-10-20
 > Conflicts with this document are defects. Fix them here first.
 
 This page is for someone embedding go-quicraft and turning on at-rest
@@ -331,6 +331,51 @@ not crypto-shredding. The purge wipes the barrier's sealed copy of each purged
 DEK, but the dropped `cipher.AEAD` holds a copy of the DEK in its key schedule
 that no Go API can wipe, and that copy lasts until the GC reclaims it. A core
 dump taken before collection contains every live and recently purged DEK.
+
+## Respond to a key compromise
+
+Know what each remedy reaches first. Every epoch DEK is derived from the root
+key, which `Initialize` generates once and nothing in the barrier ever changes
+([Epochs](architecture.md#epochs-rotation-without-re-encryption)). So:
+
+- **One epoch's DEK leaked** (a core dump, say), root key intact: `Rotate` so
+  new writes use a fresh epoch, then `PurgeEpochsBefore` once compaction has
+  retired every segment and snapshot under the leaked epoch. Data already
+  written under it stays readable to whoever holds that DEK until it is gone.
+- **The root key leaked**: `Rotate` does not help. The next epoch's DEK is
+  derived from the same root key, so whoever holds it derives every DEK, past
+  and future. The node needs a new barrier.
+
+Root-key compromise, per affected node (barriers are per node, so the other
+replicas are not exposed by this one's key):
+
+1. Construct a second barrier with `NewBarrier` and `Initialize` it with your
+   sealing strategy and fresh credentials. That draws a new root key and salt.
+   Do not overwrite the old sealed blob yet.
+2. With the node's host stopped and both barriers unsealed, copy the WAL into
+   an empty directory with `waldb.Reencrypt(srcDir, oldBarrier, dstDir,
+   newBarrier, snapFn, opts...)`, passing the options the node normally opens
+   its WAL with and a `snapFn` that calls `quicraft.ReencryptSnapshotFile` for
+   each snapshot ([log storage](../log-storage/user.md),
+   [snapshots](../snapshots/user.md)).
+3. Verify the destination, swap it into place, persist the new barrier's
+   sealed blob (`SealedRootKeyData`), then destroy the old blob and every backup of it. Snapshot
+   artifacts exported by `ExportSnapshot` are plaintext and are not covered
+   by either key; treat them by your own backup policy.
+4. Start the host with the new barrier.
+
+Rather than re-encrypting, you can wipe the node and let it re-sync from its
+peers under a freshly initialised barrier; the old key then protects nothing
+the node still holds.
+
+Re-wrapping the sealed root key (a passphrase change, a rekey, a new share
+split) protects the blob against future theft but does not change the root key,
+so it is no remedy once the root key itself is out. Custody of the root key,
+its rekey and any share ceremony belong to the embedder's sealing strategy, not
+to this library ([the Layer-1 scope fence](../shamir-primitive/architecture.md#the-scope-fence-comes-first)).
+An embedder that re-wraps must stamp the MAC last, with `StampSealedStateMAC`
+or `StampSealedStateMACWithRootKey`
+([sealed root key](../compatibility/engineering.md#sealed-root-key)).
 
 ## Build for FIPS
 

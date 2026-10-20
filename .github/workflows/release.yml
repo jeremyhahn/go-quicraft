@@ -436,8 +436,8 @@ jobs:
 
       # The seed pass is the gate: deterministic, covers every target, and must
       # pass. The bounded mutation pass afterwards is a short last look for a
-      # crash the committed corpus does not encode; real fuzzing is fuzz.yml's
-      # nightly schedule.
+      # crash the committed corpus does not encode; real fuzzing is dispatched:
+      # fuzz.yml (no schedule) or batch.yml's fuzz job.
       - name: Seed and committed-corpus pass
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
 

@@ -21,16 +21,21 @@
 // with a 4-byte count prefix and entries sorted by key ascending for
 // deterministic output.
 //
-// # Compatibility contract: every format is PINNED at version 1 pre-release
+// # Compatibility contract: every format version is PINNED pre-release
 //
 // go-quicraft has not made a production release. Until it does, EVERY wire and
-// persisted format in this repository is pinned at version 1 — WireVersion,
-// membershipFormatVersion, internal/transport.WireVersion and
-// logdb/waldb.membershipSectionVersion alike — and every decoder gates on
-// EXACT equality with 1.
+// persisted format version in this repository is pinned at its current value.
+// Most sit at 1:
+// WireVersion, membershipFormatVersion, internal/transport.WireVersion,
+// logdb/waldb.membershipSectionVersion, logdb/waldb.walFormatVersion and
+// internal/engine.snapshotMetaVersion. Two sit at 2 and stay there: the
+// exported snapshot artifact (snapshotArtifactVersion in package quicraft) and
+// the sealed-state MAC (seal.sealedStateMACVersion). The rest of this comment
+// speaks of the formats this package owns, which sit at 1 and whose decoders
+// gate on EXACT equality with 1.
 //
-// A layout change during this period is made IN PLACE, at version 1, and the
-// consuming repositories (go-qrdb and any other embedder) are
+// A layout change during this period is made IN PLACE, at the pinned version,
+// and the consuming repositories (go-qrdb and any other embedder) are
 // updated to match in the same change. Development clusters are WIPED and
 // re-synced rather than migrated. There is no dual-read path, no migration
 // window, and no legacy decode case, because there is no deployed data and no
