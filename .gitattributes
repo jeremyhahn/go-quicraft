@@ -1,22 +1,21 @@
 # The published tree: every archive built from this repository (an archive of
 # a release commit, and a forge's source tarball for a tag) leaves these out.
-# They are the private development workflow -- agent instructions, agent
-# definitions and working notes -- which name the private forge and internal
-# identities. They stay in the private repository. test/releasability enforces
-# this list and scans only what it leaves in
+#
+# The agent files (CLAUDE.md, AGENTS.md, .claude/, .serena/) and every
+# workflow under .github/workflows except the two below are published, and
+# scanned like any other file: they carry no internal host, repository or
+# domain (owner ruling on #406 and #407, option (a)). test/releasability
+# enforces this list and scans everything it leaves in
 # (docs/release/public-releasability.md).
-CLAUDE.md export-ignore
-AGENTS.md export-ignore
-**/.claude/** export-ignore
-**/.serena/** export-ignore
-
-# Private-forge and private-release workflow. These files drive only the
-# private forge's SDLC -- arming the forge's auto-merge (automerge) -- and the
-# private repository's release trust anchor (.release-allowed-signers, which
-# pins the internal principal `make release-alpha` verifies against by
-# default). Nothing a public reader runs depends on them: ci.yml, release.yml,
-# nightly.yml and fuzz.yml neither call nor read them, and a public maintainer
-# names their own signers file with RELEASE_ALLOWED_SIGNERS.
+#
+# The private forge's own workflows stay out. They are not the CI template:
+# they drive only the private forge's SDLC -- arming its auto-merge
+# (automerge) and opening its revert PR when a merge turns main red
+# (revert-red-main) -- and nothing a public reader runs calls or reads them.
 .github/workflows/automerge.yml export-ignore
 .github/workflows/revert-red-main.yml export-ignore
+
+# The private repository's release trust anchor stays out: it pins the
+# internal principal `make release-alpha` verifies against by default, and a
+# public maintainer names their own signers file with RELEASE_ALLOWED_SIGNERS.
 /.release-allowed-signers export-ignore

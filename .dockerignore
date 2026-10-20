@@ -30,8 +30,8 @@ test/performance/openraft/target/
 go.work
 go.work.sum
 
-# Agent and editor context files: the same list .gitattributes keeps out of
-# every archive, enforced by test/releasability.
+# Agent and editor context files. They are published (.gitattributes), but no
+# image runs them; test/releasability pins these entries.
 **/CLAUDE.md
 **/AGENTS.md
 **/.claude
@@ -39,7 +39,8 @@ go.work.sum
 .cursor/
 .codex/
 
-# The rest of the .gitattributes exclusion list. No image build reads them.
+# The private forge's workflows and the release trust anchor (the .gitattributes
+# exclusions). No image build reads them.
 .github/workflows/automerge.yml
 .github/workflows/revert-red-main.yml
 .release-allowed-signers

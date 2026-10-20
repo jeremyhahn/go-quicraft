@@ -92,6 +92,12 @@ const (
 	// workflow: an address in the internal mail domain, or an agent
 	// principal.
 	classInternalIdentity class = "internal-identity"
+
+	// classInternalRepository is a repository of the private forge that is
+	// not this project: the company repository, the handbook's issue
+	// tracker, the agent tooling repository. A public reader can open none
+	// of them, so a citation of one is a dead reference.
+	classInternalRepository class = "internal-repository"
 )
 
 // waiverPrefix marks a line whose lab value is the point of the line. The text
@@ -184,6 +190,26 @@ var patterns = []pattern{
 		guidance: "the internal mail domain resolves nowhere public: use a name under .example or .invalid",
 	},
 	{
+		// After the domain rule on purpose: the company repository's name
+		// inside the mail domain is reported once, as the domain.
+		class:    classInternalRepository,
+		expr:     regexp.MustCompile(`(?i)\bautomatethethings\b`), // lab-string-ok: the repository name this rule exists to find
+		needle:   "automatethethings",                             // lab-string-ok: the repository name this rule exists to find
+		guidance: internalRepositoryGuidance,
+	},
+	{
+		class:    classInternalRepository,
+		expr:     regexp.MustCompile(`(?i)\bhandbook ?#\d+`), // lab-string-ok: the issue reference this rule exists to find
+		needle:   "handbook",
+		guidance: internalRepositoryGuidance,
+	},
+	{
+		class:    classInternalRepository,
+		expr:     regexp.MustCompile(`(?i)\bclaude-agents\b`), // lab-string-ok: the repository name this rule exists to find
+		needle:   "claude-agents",                             // lab-string-ok: the repository name this rule exists to find
+		guidance: internalRepositoryGuidance,
+	},
+	{
 		// Last on purpose: a match inside a span an earlier rule already
 		// reported (the account inside an owner path) is not reported twice.
 		class:    classOwnerAccount,
@@ -192,6 +218,9 @@ var patterns = []pattern{
 		guidance: "name a role, not a person: operator, user, or the project's own module path",
 	},
 }
+
+// internalRepositoryGuidance is what every internal-repository rule asks for.
+const internalRepositoryGuidance = "a private-forge repository and its issue numbers resolve nowhere public: state the decision itself, or cite a public document"
 
 // sieveNeedles is every pattern's needle, in the form the sieve wants. Almost
 // no file contains a lab value, so settling "nothing here" has to be cheap.

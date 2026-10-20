@@ -1,18 +1,18 @@
 # Public releasability
 
 > **Status: REFERENCE** · Scope: what may be published from this repository,
-> and the gate that enforces it · Last verified: 2026-10-04
+> and the gate that enforces it · Last verified: 2026-10-20
 
 This repository ships publicly: as a Go module and as release archives built
-from a tagged commit. Everything tracked here is published except the private
-development workflow and the private forge and release workflow, which
-`.gitattributes` excludes (below). This page states the rule and the gate that
+from a tagged commit. Everything tracked here is published, the agent files and
+the CI template's workflows included, except the private forge's own workflows
+and the private release trust anchor, which `.gitattributes` excludes (below). This page states the rule and the gate that
 enforces it.
 
 ## The rule
 
-No published file names the private development fleet, its owner or its
-internal identities. Concretely, five classes:
+No published file names the private development fleet, its owner, its
+internal identities or its internal repositories. Concretely, six classes:
 
 | Class | What it covers | Use instead |
 |---|---|---|
@@ -21,6 +21,7 @@ internal identities. Concretely, five classes:
 | `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
 | `owner-account` | The owner's account name on its own | A role: `user`, `operator`, or the module path |
 | `internal-identity` | An address in the internal mail domain, or an agent principal of the form `agent-<name>@...` on any domain | A neutral example identity: `release@example.invalid`, `ops@forge.example` |
+| `internal-repository` | A private-forge repository that is not this project (the company repository, the agent tooling repository) or an issue number on the handbook's tracker | The decision itself, stated in place, or a public document |
 
 The fleet's own subnet, hostnames, path prefixes and internal mail domain are
 written down in one place, the `patterns` list in
@@ -49,50 +50,50 @@ fixtures (`bench-01`, `198.51.100.x`, `forge.example`). Only the gate's own
 tests plant fleet values, because they are what the rules exist to find, and
 each such line carries an inline waiver.
 
-## Private workflow stays private
+## What is published
 
-Two groups of tracked files are never published:
+Every tracked file is published except three:
 
-- **Development tooling.** `CLAUDE.md` and `AGENTS.md` (at any depth),
-  `.claude/` and `.serena/` are the agent development workflow
-  (`isDevelopmentTooling`).
-- **The private forge and release workflow** (`privateWorkflowFiles`, exact
-  paths):
+| Path | What it is |
+|---|---|
+| `.github/workflows/automerge.yml` | The private forge's auto-merge driver: part of its SDLC, not the CI template |
+| `.github/workflows/revert-red-main.yml` | The private forge's red-main revert driver: part of its SDLC, not the CI template |
+| `.release-allowed-signers` | The private repository's release trust anchor: the internal principal and its public key |
 
-  | Path | What it is |
-  |---|---|
-  | `.github/workflows/automerge.yml` | Arms the private forge's auto-merge when a PR opens |
-  | `.github/workflows/revert-red-main.yml` | Opens the private forge's revert PR when a merge turns `main` red |
-  | `.release-allowed-signers` | The private repository's release trust anchor: the internal principal and its public key |
+Nothing a public reader runs calls or reads the two workflows. `make
+release-alpha` reads the trust anchor from the checkout it runs in by default; a
+maintainer releasing from an export names their own allowed-signers file with
+`RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`). The three are
+`privateWorkflowFiles` in `test/releasability/manifest_test.go`, exact paths.
 
-  None of them does anything for a public reader. `ci.yml`, `release.yml`,
-  `nightly.yml` and `fuzz.yml` neither call nor read them. `make release-alpha`
-  reads `.release-allowed-signers` from the checkout it runs in by default; a
-  maintainer releasing from an export names their own allowed-signers file with
-  `RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`).
-  `.github/dependabot.yml` stays published: it is a github.com service file,
-  inert on the private forge.
-
-All of these name the private forge, its hosts or internal identities, so they
-stay in the private repository.
+The agent files (`CLAUDE.md` and `AGENTS.md` at any depth, `.claude/`,
+`.serena/`) and every other workflow under `.github/workflows` are published as
+they are and scanned like everything else (owner ruling on #406 and #407,
+option (a)).
+So they are neutralised the same way as the rest of the tree: no internal host,
+repository number or domain. `.github/dependabot.yml` is published too: it is a
+github.com service file, inert on the private forge.
 
 The exclusion list is `.gitattributes`. Each entry is `export-ignore`, which
 every archive git builds applies: `git archive`, and the source tarball a forge
-serves for a tag. `.dockerignore` carries the same entries, so no image build
-context includes them. `test/releasability` enforces both:
+serves for a tag. `.dockerignore` is a separate list: it keeps the agent files
+and the private forge's workflows out of every image build context as well,
+because an image runs the code and carries no development tooling.
+`test/releasability` enforces both:
 
-- `TestThePublishedTreeCarriesNoDevelopmentTooling`: the published manifest
-  (`publishedFiles`, the index minus export-ignored paths) holds none of them,
-  and nothing else is export-ignored.
+- `TestThePublishedTreeIsTheTrackedTreeLessThePrivateWorkflow`: the published
+  manifest (`publishedFiles`, the index minus export-ignored paths) holds no
+  `privateWorkflowFiles` entry, holds the agent files and the CI template's
+  workflows, and nothing else is export-ignored.
 - `TestGitArchiveHonoursTheExclusionList`: a repository carrying this tree's
-  `.gitattributes`, archived as a forge would, contains none of them and keeps
-  the public workflows beside them.
-- `TestTheExclusionListsNameTheDevelopmentTooling`: `.gitattributes` and
+  `.gitattributes`, archived as a forge would, leaves out the private forge's
+  workflows and the trust anchor and keeps the agent files and every other
+  workflow.
+- `TestTheExclusionListsCarryTheirEntries`: `.gitattributes` and
   `.dockerignore` both carry every entry.
 
-A new agent tool's files go in `isDevelopmentTooling`, a new private-forge file
-in `privateWorkflowFiles` (both `test/releasability/manifest_test.go`), and
-either one in `.gitattributes` and `.dockerignore` together.
+A new private-release file goes in `privateWorkflowFiles` and in
+`.gitattributes` and `.dockerignore` together.
 
 The release recipe names no identity of its own. `test/buildgates` drives
 `make release-alpha` end to end with plain git, throwaway ed25519 keys and a
@@ -112,15 +113,16 @@ export-ignored, so an export skips the gate instead of failing it.
 **Not covered: the module zip and a history push.** The Go module zip
 (`proxy.golang.org`, `go mod download`) is built from the repository at the
 tag and does not honour `export-ignore`. Neither does pushing this repository's
-history to a public remote, where every commit carries the agent files, the
-private forge workflows and the internal signer principal. For the exclusion to
+history to a public remote, where every commit carries the internal signer
+principal and every earlier commit the agent files and workflows as they were
+before they were neutralised. For the exclusion to
 hold there, the public repository must be produced as an export (`git archive`
 of the release commit, committed fresh), not as a push of this history.
 
 ## The gate
 
 `test/releasability` scans every published file and reports each line carrying
-a value in one of the five classes. It runs as
+a value in one of the six classes. It runs as
 `TestTheTrackedTreeIsPubliclyReleasable`, and `make test` (`go test ./...`)
 includes the package, so there is no target to remember. Every file in the
 package is a `_test.go` file: the gate adds nothing to the module's importable

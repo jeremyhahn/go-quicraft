@@ -322,9 +322,9 @@ confirm*.
    downgrade procedure in later releases (*practice to confirm*); this
    answer stays stricter.
 
-6. **Deprecation.** release-versioning.md §5: "There is no deprecation policy
-   (open: handbook#222 P3)." Does a post-1.0 exported name get a deprecation
-   window before a MAJOR removes it?
+6. **Deprecation.** The company release-versioning convention (§5) has no
+   deprecation policy yet; it is an open question there. Does a post-1.0
+   exported name get a deprecation window before a MAJOR removes it?
 
    **Answer (acknowledged 2026-10-20): yes.** A name is marked with a `// Deprecated:` comment
    naming its replacement, in a MINOR release at least one release before the
@@ -334,7 +334,8 @@ confirm*.
    removes a capability without a replacement. *Why:* `// Deprecated:` is the
    Go convention that gopls and staticcheck (SA1019) already report, and
    Keep a Changelog already has the heading, so the policy adds no machinery.
-   *Follow-up:* the rule belongs in the handbook (handbook#222 P3).
+   *Follow-up:* the rule belongs in the company release-versioning
+   convention, where the question is open.
 
 7. **Payload-type retirement after 1.0.** Before 1.0 a detectable layout
    change retires a payload-type byte instead of bumping a version. Does that

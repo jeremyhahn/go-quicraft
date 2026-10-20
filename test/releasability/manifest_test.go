@@ -21,7 +21,6 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -32,40 +31,15 @@ import (
 // for a tag. .gitattributes is therefore the one exclusion list.
 const exportIgnoreAttr = "export-ignore"
 
-// developmentToolingNames are file names that belong to the private
-// development workflow wherever they appear: per-directory agent instructions.
-var developmentToolingNames = []string{"CLAUDE.md", "AGENTS.md"}
-
-// developmentToolingDirs are directories, at any depth, that belong to the
-// private development workflow: agent definitions, skills and working notes.
-var developmentToolingDirs = []string{".claude", ".serena"}
-
-// isDevelopmentTooling reports whether a slash-separated, root-relative path is
-// part of the private development workflow. Such files name the private forge
-// and internal identities; they stay in the private repository.
-func isDevelopmentTooling(name string) bool {
-	for _, base := range developmentToolingNames {
-		if path.Base(name) == base {
-			return true
-		}
-	}
-	segments := strings.Split(name, "/")
-	for _, segment := range segments[:len(segments)-1] {
-		for _, dir := range developmentToolingDirs {
-			if segment == dir {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// privateWorkflowFiles are exact root-relative paths that only the private
-// forge and the private release recipe read: forge-side auto-merge and
-// red-main revert automation, and the trust anchor pinning the internal agent principal. They
-// name internal identities and hosts and do nothing for a public reader, so
-// they stay in the private repository. The list is exact on purpose: the
-// public CI workflows beside them are published.
+// privateWorkflowFiles are exact root-relative paths that stay in the private
+// repository: the private forge's own workflows (forge-side auto-merge and
+// red-main revert automation, which are not the CI template) and the release
+// trust anchor pinning the internal agent principal, which only the private
+// release recipe reads. Everything else is published -- the agent files
+// (CLAUDE.md, AGENTS.md, .claude/, .serena/) and every other workflow under
+// .github/workflows included (owner ruling on #406 and #407, option (a)) --
+// and scanned like any other file. The list is exact on purpose: a file of
+// the same name elsewhere is published.
 var privateWorkflowFiles = []string{
 	".github/workflows/automerge.yml",
 	".github/workflows/revert-red-main.yml",
@@ -76,12 +50,6 @@ var privateWorkflowFiles = []string{
 // is one of privateWorkflowFiles.
 func isPrivateWorkflowFile(name string) bool {
 	return slices.Contains(privateWorkflowFiles, name)
-}
-
-// isUnpublished reports whether a path belongs in the exclusion list: the
-// private development workflow or the private forge and release workflow.
-func isUnpublished(name string) bool {
-	return isDevelopmentTooling(name) || isPrivateWorkflowFile(name)
 }
 
 // gitCommand builds a git invocation against root. safe.directory is set for

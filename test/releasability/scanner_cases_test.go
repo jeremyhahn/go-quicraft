@@ -36,9 +36,12 @@ const (
 	plantedMount     = "/mnt/vstation"  // lab-string-ok: planted fixture for the owner-path rule
 	plantedAccount   = "jhahn"          // lab-string-ok: planted fixture for the owner-account rule
 
-	plantedDomain    = "example.internal"                   // lab-string-ok: planted fixture for the internal-identity rule
-	plantedPrincipal = "agent-go-quicraft@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
-	plantedSibling   = "agent-go-qrdb@forge.example"                  // lab-string-ok: an agent principal outside the internal domain is still one
+	plantedDomain        = "example.internal"                   // lab-string-ok: planted fixture for the internal-identity rule
+	plantedPrincipal     = "agent-go-quicraft@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
+	plantedSibling       = "agent-go-qrdb@forge.example"                  // lab-string-ok: an agent principal outside the internal domain is still one
+	plantedCompanyRepo   = "automatethethings"                            // lab-string-ok: planted fixture for the internal-repository rule
+	plantedHandbookIssue = "handbook #392"                                // lab-string-ok: planted fixture for the internal-repository rule
+	plantedAgentsRepo    = "claude-agents"                                // lab-string-ok: planted fixture for the internal-repository rule
 )
 
 // writeTree writes files into a temporary directory and returns the root plus
@@ -136,6 +139,27 @@ func TestScanReportsEveryClassWithItsLineAndMatch(t *testing.T) {
 			content:   "Mail ops@" + plantedDomain + " for access.\n",
 			wantClass: classInternalIdentity,
 			wantMatch: plantedDomain,
+			wantLine:  1,
+		},
+		{
+			name:      "company repository issue in a workflow comment",
+			content:   "# v1.15 (" + plantedCompanyRepo + "#211): push runs on main\n",
+			wantClass: classInternalRepository,
+			wantMatch: plantedCompanyRepo,
+			wantLine:  1,
+		},
+		{
+			name:      "handbook issue in a doc",
+			content:   "# Notes\n\nSee " + strings.ToUpper(plantedHandbookIssue) + " for the ruling.\n",
+			wantClass: classInternalRepository,
+			wantMatch: strings.ToUpper(plantedHandbookIssue),
+			wantLine:  3,
+		},
+		{
+			name:      "agent tooling repository in a script",
+			content:   "# from the " + plantedAgentsRepo + " repository\n",
+			wantClass: classInternalRepository,
+			wantMatch: plantedAgentsRepo,
 			wantLine:  1,
 		},
 		{
@@ -454,6 +478,9 @@ func TestPatternsEveryNeedleIsImpliedByItsExpr(t *testing.T) {
 		`/mnt/vstation`:                                    {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`: {plantedPrincipal, "user.email=" + strings.ToUpper(plantedSibling)},
 		`(?i)\bautomatethethings\.internal\b`:              {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
+		`(?i)\bautomatethethings\b`:                        {plantedCompanyRepo + "#207", "repo " + strings.ToUpper(plantedCompanyRepo)},          // lab-string-ok: the rule's own source text, as the map key
+		`(?i)\bhandbook ?#\d+`:                             {plantedHandbookIssue, "Handbook#44"},                                                 // lab-string-ok: a planted sample for the internal-repository rule
+		`(?i)\bclaude-agents\b`:                            {plantedAgentsRepo + "#92", strings.ToUpper(plantedAgentsRepo)},                       // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bjhahn\b`:                                    {plantedAccount + "@example.com", "signed off by " + strings.ToUpper(plantedAccount)}, // lab-string-ok: the rule's own source text, as the map key
 	}
 
