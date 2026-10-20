@@ -1,7 +1,7 @@
 # Compatibility and upgrades: architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-16
+> Last verified: 2026-10-20
 > Conflicts with this document are defects. Fix them here first.
 
 What this library promises across versions, what it does not, and why. The
@@ -27,7 +27,7 @@ Sources: `pkg/proto/constants.go`, `pkg/proto/membership.go`,
 `pkg/internal/engine/snapshot_meta.go`, `pkg/snapshot_artifact_trailer.go`,
 `pkg/host.go`, `pkg/seal/barrier.go`, `CHANGELOG.md`, `VERSION`.
 
-The current release is **0.21.0-rc.2**, a release candidate. The first stable
+The current release is **0.23.0-alpha**, an internal alpha. The first stable
 release will be 1.0.0.
 
 ## Stability guarantee
@@ -55,8 +55,11 @@ shim. Pin an exact version and upgrade deliberately.
   library content as `v0.5.0-alpha`.
 - `v0.13.0-alpha` was tagged but not published; `v0.13.1-alpha` supersedes it
   with one test fix.
-- From 0.16.0 every release is a candidate for staging, not a production
-  release. A newer candidate supersedes the older ones.
+- From 0.16.0 to 0.21.0-rc.2 every release was a candidate for staging, not
+  a production release. A newer candidate supersedes the older ones.
+- From 0.22.0-alpha releases are internal alphas again: no release candidate
+  is cut until the stack is dev complete
+  ([release-versioning.md §1a](../../../handbook/software/conventions/release-versioning.md#1a-release-taxonomy)).
 - A future v2+ line takes the `/v2` module path suffix; the release workflow
   refuses a v2+ tag without it.
 
@@ -119,12 +122,12 @@ compile-time guard and the test that hold this are in
 
 ## From v1.0.0
 
-> **Status: AWAITING THE OWNER'S ACKNOWLEDGEMENT (#404).** This section restates
-> what the company conventions already bind for a post-1.0 release; it sets no
-> policy of its own. Where the conventions are silent it lists the gap under
-> [Open questions for the owner](#open-questions-for-the-owner) and does not
-> answer it. The SPEC v1.0.0 bar requires the policy to be acknowledged
-> (release-versioning.md §1, §8); the owner acknowledges it, not the change
+> **Status: ACKNOWLEDGED BY THE OWNER ON 2026-10-20 (#404), EVERY ANSWER AS
+> WRITTEN.** This section restates what the company conventions already bind
+> for a post-1.0 release. Where the conventions are silent it lists the gap
+> under [Open questions for the owner](#open-questions-for-the-owner) with its
+> answer. The SPEC v1.0.0 bar requires the policy to be acknowledged
+> (release-versioning.md §1, §8); the owner acknowledged it, not the change
 > that wrote it.
 
 The binding source is
@@ -157,7 +160,8 @@ deleted, and a consumer's pin never decreases
 A breaking change follows
 [§8](../../../handbook/software/conventions/release-versioning.md#8-breaking-change-protocol):
 "Changes travel bottom-up (00 L6), in the build order of
-02-dependency-graph.md, and all consumers are updated before merging."
+[../docs/02-dependency-graph.md](../../../handbook/software/docs/02-dependency-graph.md#build-order),
+and all consumers are updated before merging."
 go-quicraft sits directly above go-enclave, so a break here starts the walk:
 
 1. Land it here with a CHANGELOG entry carrying `BREAKING:` in its heading
@@ -171,7 +175,7 @@ go-quicraft sits directly above go-enclave, so a break here starts the walk:
 4. Re-verify at the top: go-trusted-platform builds and passes.
 5. Update the documents the change falsifies, in the same change.
 6. "Never merge a partial walk. If a layer cannot be updated now, stop and
-   report the gap."
+   report the gap (00 L8)."
 
 §8 step 1 reads "bump MINOR", the pre-1.0 rule; how it reads after 1.0 is
 [open question 1](#open-questions-for-the-owner).
@@ -213,36 +217,156 @@ discipline" consists of; the gaps are open questions 2 to 6 below.
 
 ### Open questions for the owner
 
-These are gaps in the conventions, not decisions. Nothing in this repository
-answers them until the owner does.
+These are gaps in the conventions. Each carries an **answer**: a
+recommendation with its reason and its source, which the owner acknowledged
+as written on 2026-10-20 (#404) and which now binds. Every answer takes the
+strict, simple option that keeps Raft safety,
+the fail-closed decoders and the pinned-format rule intact, and none removes a
+feature.
+
+Sources cited: the Go modules reference, [go.dev/ref/mod](https://go.dev/ref/mod)
+("Major version suffixes", the import compatibility rule, `retract`); the
+handbook; this repository's code; and etcd's and dragonboat's documented
+practice where it is known reliably. A claim about another engine that has not
+been checked against its current documentation is marked *practice to
+confirm*.
 
 1. **§8 after 1.0.** §8 step 1 says "bump MINOR"; the post-1.0 bump table says a
    breaking change is MAJOR with a `/vN` path. Does §8 read MAJOR from 1.0, with
    every consumer's walk changing imports to the `/vN` path?
+
+   **Answer (acknowledged 2026-10-20): yes.** From v1.0.0, §8 step 1 reads "bump MAJOR and move
+   the module path to `/vN`", and every layer of the walk changes its imports.
+   A format bump that keeps the read window of question 2 and the upgrade
+   window of question 3 is not a break and ships as MINOR; one that drops
+   either window is MAJOR. *Why:* go.dev/ref/mod states the import
+   compatibility rule ("If an old package and a new package have the same
+   import path, the new package must be backwards compatible with the old
+   package") and requires a `/vN` suffix from v2; §1's own table already says
+   so, and only §8's wording predates it. The pre-publication exception (MINOR
+   with a `BREAKING` marker) ends at publication (§1), so nothing else can
+   carry a break after v1.0.0. The release workflow already refuses a v2+ tag
+   without the suffix. *Follow-up:* §8's wording is the handbook's to change,
+   not this repository's.
+
 2. **Supported read window.** After a bump of `walFormatVersion`, a WAL
    payload-type layout, `snapshotMetaVersion`, `snapshotArtifactVersion` or a
    sealed-root-key version, how many prior versions must a release still read,
    and for how long?
+
+   **Answer (acknowledged 2026-10-20): exactly one prior MINOR.** A release `N.M.x` reads every
+   layout that `N.(M-1)` wrote, and nothing older. It writes only its own
+   layouts (subject to question 3's gate). A MAJOR may drop the window and
+   says so under BREAKING. Data older than the window upgrades by stepping
+   through each MINOR in turn, or is re-synced from upgraded peers. Each
+   decoder still gates on exact equality, now against a closed set of two
+   values (current and previous), and refuses everything else as it does
+   today (`walFormatVersion` in `waldb/format.go`, `snapshotMetaVersion`,
+   `snapshotArtifactVersion` in `pkg/host.go`, `sealedStateMACVersion`).
+   *Why:* one prior version is the smallest window that makes a rolling
+   upgrade possible, and every extra version is a decoder that has to stay
+   correct for data nobody writes any more. The step-through rule is etcd's
+   documented upgrade path, one minor version at a time with no skipping.
+
 3. **Mixed-version clusters.** After a bump of `proto.WireVersion` or
    `transport.WireVersion`, must a release interoperate with the previous wire
    version so a cluster can be upgraded node by node (a rolling upgrade), and
    if so, by negotiation or by accepting a fixed window? Today the check is
    exact match and mixed-version clusters are unsupported.
+
+   **Answer (acknowledged 2026-10-20): yes, a rolling upgrade across one MINOR, by a fixed
+   window and never by negotiation.** A release `N.M` accepts both its own
+   wire version and `N.(M-1)`'s. It keeps sending the previous version, and
+   writing the previous persisted layouts, until a cluster-wide switch is
+   committed through the Raft log once every member runs `N.M`. A new message
+   type (such as `LeaderExec` was) is sent only after that switch. The switch
+   never goes back. Across a MAJOR there is no rolling upgrade unless its
+   CHANGELOG says otherwise. *Why:* a committed switch is decided once, in the
+   log, so every replica applies it at the same index and replays it the same
+   way after a crash. Per-connection negotiation would let a leader send
+   different layouts to different followers on a decision that is not in the
+   log. Mixed versions stay confined to the upgrade itself. This is etcd's
+   model: a rolling upgrade one minor version at a time, with the cluster
+   version raised only when every member supports it. The exact-match checks
+   (`frame.go` `buf[2] != WireVersion`, `MessageBatch.BinVer` and
+   `SnapshotChunk.BinVer` against `proto.WireVersion`) widen to the same
+   two-value set and keep failing closed outside it.
+
 4. **Migration mechanism.** Is a migration done in place on open, by a
    separate offline tool, or by re-sync from upgraded peers, and is a
    migration allowed to be one-way?
+
+   **Answer (acknowledged 2026-10-20): in place, by the library, after the switch of
+   question 3, and one-way.** The library reads the old layout and writes new
+   records, segments and snapshots in the new one. It never rewrites an
+   existing file in place: old records age out through compaction and
+   snapshots, so a crash mid-migration leaves only layouts the release reads.
+   Re-sync from an upgraded peer stays a valid remedy at every version. There
+   is no offline tool. *Why:* go-quicraft is a library and ships no binary
+   (this document's opening), so a tool would be a second product to keep
+   correct. Lazy, append-only migration reuses the WAL's existing crash
+   safety instead of adding a rewrite path with its own failure modes.
+   Dragonboat, which this library rewrites, refuses a data directory whose
+   binary version it does not match and offers no migration tool (*practice
+   to confirm* against its current release).
+
 5. **Downgrades.** Is any downgrade supported after 1.0?
+
+   **Answer (acknowledged 2026-10-20): only to the previous MINOR, and only before the
+   question 3 switch is committed.** Until then no new layout has been
+   written, so a node can be replaced with the release it was upgraded from.
+   After the switch, no downgrade: the remedy is to restore a backup or
+   re-sync. *Why:* a downgrade after new layouts exist needs a reverse
+   migration that is code nobody runs in normal operation. The switch draws
+   the line at a point every replica agrees on. etcd added a cluster-wide
+   downgrade procedure in later releases (*practice to confirm*); this
+   answer stays stricter.
+
 6. **Deprecation.** release-versioning.md §5: "There is no deprecation policy
    (open: handbook#222 P3)." Does a post-1.0 exported name get a deprecation
    window before a MAJOR removes it?
+
+   **Answer (acknowledged 2026-10-20): yes.** A name is marked with a `// Deprecated:` comment
+   naming its replacement, in a MINOR release at least one release before the
+   MAJOR that removes it, and the CHANGELOG lists it under `### Deprecated`
+   (Keep a Changelog 1.1.0, which §5 already adopts). The name stays for the
+   rest of that MAJOR line, which semver already forces. A deprecation never
+   removes a capability without a replacement. *Why:* `// Deprecated:` is the
+   Go convention that gopls and staticcheck (SA1019) already report, and
+   Keep a Changelog already has the heading, so the policy adds no machinery.
+   *Follow-up:* the rule belongs in the handbook (handbook#222 P3).
+
 7. **Payload-type retirement after 1.0.** Before 1.0 a detectable layout
    change retires a payload-type byte instead of bumping a version. Does that
    rule continue after 1.0, or does a released layout change bump
    `walFormatVersion` instead?
+
+   **Answer (acknowledged 2026-10-20): the rule continues, extended by the read window.** A
+   record layout change allocates the next free payload-type byte. The old
+   byte is still decoded for the window of question 2, then retired: left
+   unallocated, never reused, so a stale record falls through to
+   `ErrUnknownPayloadType`, still the one invalid-format error.
+   `walFormatVersion` moves only when the chunk or segment framing changes.
+   *Why:* one discriminator per thing it protects
+   ([above](#one-discriminator-per-thing-it-protects)): a record change
+   bumping the framing version would put every record type behind one switch.
+   The payload-type ladder in [engineering.md](engineering.md) already records
+   each byte's status.
+
 8. **Which event starts it.** §1 ties migration discipline to "the first public
    release" and ends the pre-publication exception "when the module is pushed
    to public GitHub"; CLAUDE.md pins format versions until "the first stable
    production v1 release". Are these the same event, v1.0.0?
+
+   **Answer (acknowledged 2026-10-20): yes, one event: the `v1.0.0` tag, published to GitHub
+   with it and not before.** §1a: "a plain `vX.Y.Z` is always production", so
+   `v1.0.0` is the first stable production release and every `-rc.N` and
+   `-alpha` before it stays pre-release. *Why:* if the module were pushed to
+   public GitHub earlier, §1 would start migration discipline while
+   CLAUDE.md still pins every format version, which leaves no way to version a
+   layout change. Making the two one event removes that conflict. If the
+   owner publishes earlier anyway, §1 governs as the handbook wins, and this
+   section is revised in the same change.
 
 ## Node identities are mandatory
 

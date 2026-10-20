@@ -83,7 +83,7 @@ Then release candidates are tagged, deployed to staging and released; production
 The v1.0.0 bar, on top of the above:
 
 - go-enclave is at a public release (memory-enclave).
-- The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility).
+- The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility). Met: the owner acknowledged it on 2026-10-20, every answer as written (#404).
 - A publication mechanism for agent files exists (release).
 - The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release).
 - Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage).
