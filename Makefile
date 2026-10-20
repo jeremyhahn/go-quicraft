@@ -1350,7 +1350,8 @@ modverify:
 
 .PHONY: deps-check
 # Fail when a direct dependency of any module here is behind its newest
-# release. deps-latest, by contrast, only updates github.com/jeremyhahn/*.
+# release, once that release is 7 days old (a younger one is reported as NEW
+# and does not fail). deps-latest, by contrast, only updates github.com/jeremyhahn/*.
 # Runs nightly rather than in the push gate, since an upstream release does not
 # make a commit wrong. Needs only a go toolchain and network.
 deps-check:

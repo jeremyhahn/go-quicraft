@@ -8,8 +8,16 @@
 # line in go.mod contains the words DOCUMENTED PIN. There is no ignore list or
 # flag, so a pin is always recorded beside the version it holds.
 #
-# Exit 0 = every module current or documented. Exit 1 = at least one
-# undocumented lag. Exit 2 = the check could not run, which is not a pass.
+# A newest release published less than GRACE_DAYS (7) days ago is reported as
+# NEW, not failed: a release that young has not had its notes read or its
+# fixes settled, and a nightly that turns red on the day of an upstream tag
+# blocks merges for no defect here (CA m823). Once it is older than that, an
+# undocumented lag fails as before. A release whose publication time the
+# proxy does not report is treated as old, so the check fails closed.
+#
+# Exit 0 = every module current, documented, or behind only a release under
+# GRACE_DAYS old. Exit 1 = at least one undocumented lag behind an older
+# release. Exit 2 = the check could not run, which is not a pass.
 
 set -eu
 
@@ -36,19 +44,28 @@ test -n "$mods" || {
 	exit 2
 }
 
+GRACE_DAYS=7
+now=$(date -u +%s)
+grace_end=$((now - GRACE_DAYS * 86400))
+
 status=0
+young=0
 
 for dir in $mods; do
 	# The exit status is checked: `go list -m -u` prints nothing when it
 	# cannot resolve the module graph (go.sum mismatch, unreachable proxy),
 	# and that must be exit 2, not a pass.
 	#
+	# Each line is: path version -> update release-time [replacement].
+	# release-time is the newest release's publication time in Unix
+	# seconds, or - when the proxy does not report one.
+	#
 	# A module replaced by a directory (the nested modules' `=> ../..`) has
 	# no update, whatever tag the registry reports. The replacement path is
-	# appended as a fourth field and judged below; a replacement by another
+	# appended as a last field and judged below; a replacement by another
 	# module version is still checked.
 	if ! raw=$(cd "$dir" && go list -m -u \
-		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}' \
+		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}} {{if .Update.Time}}{{.Update.Time.Unix}}{{else}}-{{end}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}' \
 		all 2>&1); then
 		echo "deps-check: 'go list -m -u' failed in $dir; refusing to report a pass" >&2
 		printf '%s\n' "$raw" | sed 's/^/    /' >&2
@@ -60,10 +77,15 @@ for dir in $mods; do
 
 	while IFS= read -r line; do
 		test -n "$line" || continue
-		path=${line%% *}
-		case "$line" in
-		*' -> '*' '.*|*' -> '*' '/*)
-			echo "ok   $dir: ${line% *}  [replaced by a directory]"
+		# shellcheck disable=SC2086 # the fields are split on purpose
+		set -- $line
+		path=$1
+		released=$5
+		repl=${6:-}
+		line="$1 $2 -> $4"
+		case "$repl" in
+		.*|/*)
+			echo "ok   $dir: $line  [replaced by a directory]"
 			continue ;;
 		esac
 
@@ -85,6 +107,9 @@ for dir in $mods; do
 
 		if [ "$documented" = yes ]; then
 			echo "ok   $dir: $line  [DOCUMENTED PIN]"
+		elif [ "$released" != - ] && [ "$released" -gt "$grace_end" ]; then
+			echo "NEW  $dir: $line  [released $(((now - released) / 86400))d ago, under ${GRACE_DAYS}d: reported, not failed]"
+			young=1
 		else
 			echo "LAG  $dir: $line"
 			status=1
@@ -101,7 +126,9 @@ if [ "$status" -ne 0 ]; then
 
 deps-check: a direct dependency is behind its newest release.
 
-Every dependency is kept on its current release. To clear this:
+Every dependency is kept on its current release. A release under 7 days old
+is reported as NEW and does not fail; a LAG line is behind an older one.
+To clear this:
 
   1. Read the release notes; crypto and transport libraries have changed
      behaviour here before.
@@ -113,4 +140,8 @@ EOF
 	exit 1
 fi
 
-echo "deps-check: every direct dependency is current (or carries a DOCUMENTED PIN)."
+if [ "$young" -ne 0 ]; then
+	echo "deps-check: no failing lag; NEW lines are releases under ${GRACE_DAYS} days old, to bump as the next row."
+else
+	echo "deps-check: every direct dependency is current (or carries a DOCUMENTED PIN)."
+fi
