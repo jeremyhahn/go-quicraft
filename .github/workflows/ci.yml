@@ -1,11 +1,16 @@
-# ci-template: v1.24 (customized)
+# ci-template: v1.24.1 (customized)
+# v1.24.1 (2026-10-20): the changelog and comments cite no internal
+# repository and no internal issue number, so a repository that publishes its
+# workflows passes its releasability scan. One job change: the `changes`
+# job's diff takes --no-renames, so a file moved from code into docs/ lists
+# its old path too and the PR is not docs-only.
 # v1.24 (owner ruling 2026-10-19, Company Agent m749 and m751 (a), (e)):
 # a PR whose every changed file is markdown or under docs/ (DOCS_ONLY_PATTERN,
 # the new `changes` job) runs lint alone: build, the build-tag assertion and
 # make coverage skip. Soak moves off main pushes and ci:full to the nightly
 # schedule and workflow_dispatch, a `nightly` job in the Gate (ci-standard.md
 # §8, §10).
-# v1.23.1 (handbook #392, 2026-10-19): ships reap-stale-ci-stacks.sh v3, which
+# v1.23.1 (2026-10-19): ships reap-stale-ci-stacks.sh v3, which
 # ages an integration image from the later of its creation and its last tag,
 # so a parallel job's reaper no longer removes an image just rebuilt from
 # cache (go-quicraft main runs 57389 and 57484). No job changes.
@@ -94,7 +99,7 @@
 # .trivyignore for it. The github.com gosec install builds the latest gosec
 # tag against the latest x/tools in the one form of devcontainer.md §2.
 #
-# v1.18 (dept-infra, 2026-10-12): a CUSTOMIZE integration job that starts
+# v1.18 (2026-10-12): a CUSTOMIZE integration job that starts
 # containers on the runner host runs scripts/reap-stale-ci-stacks.sh first
 # (ships beside this file). Its `if: always()` teardown dies with the job when
 # the host or the Docker daemon goes down, and nothing removed the stack after:
@@ -102,14 +107,14 @@
 # hosts after the 2026-10-11/12 restarts. See the CUSTOMIZE note above
 # ci-gate.
 #
-# v1.17 (handbook#44, #40): third-party actions pinned by commit, the tag in a
+# v1.17: third-party actions pinned by commit, the tag in a
 # trailing comment (devops.md §9 "Actions are pinned by commit").
 #
-# v1.16 (dept-software#64, go-libsignal#42): gosec, govulncheck and actionlint
+# v1.16: gosec, govulncheck and actionlint
 # install only on github.com; Gitea jobs use the runner image's baked, pinned
 # tools.
 #
-# v1.15 (2026-10-05, automatethethings#211; go-enclave#122): push runs on main
+# v1.15 (2026-10-05): push runs on main
 # only again. automerge.yml v7 opens each merge train as a PR from
 # merge-train/* into main, so the train gets its CI from the pull_request
 # trigger like any PR, and block_on_outdated_branch stays on (owner,
@@ -117,7 +122,7 @@
 # sure we are requiring the latest from main in all branches before they get
 # merged in"). The parallel stages of v1.14 stay.
 #
-# v1.14 (2026-10-04, automatethethings#207; go-enclave#118): every job starts
+# v1.14 (2026-10-04): every job starts
 # at once, so a run takes as long as its slowest job. security, test and any
 # CUSTOMIZE integration job no longer wait on lint + build; CI Gate, the one
 # required check, still needs every job and fails closed on any result but
@@ -128,7 +133,7 @@
 # ordering: a broken push now spends the heavy tier too, in exchange for the
 # shortest wall-clock to a green gate, which is what a train waits on.
 #
-# v1.13 (2026-09-27, automatethethings#189): GO_VERSION 1.26.7 -> 1.27.1, in
+# v1.13 (2026-09-27): GO_VERSION 1.26.7 -> 1.27.1, in
 # lockstep with nightly-template v1.6.
 #
 # v1.12 (2026-08-28, go-blockstore #22 round 2): refresh install-shellcheck.sh to
@@ -276,7 +281,7 @@
 # 2026-08-14). `ghcr.io` likewise does not exist on Gitea — use the Gitea
 # registry (lessons.md).
 # Source of truth: software/templates/github-actions/ci.yml in the
-# automatethethings repo. Copied into each repo (never workflow_call: the
+# handbook. Copied into each repo (never workflow_call: the
 # template lives inside the security boundary and cannot be referenced from
 # github.com). Blocks marked CUSTOMIZE are the only expected divergence;
 # everything else drifting from the template is a defect (devops.md §8).
@@ -342,7 +347,7 @@ env:
   # tool's own form. Leave EMPTY if no package is tag-gated. Every analysis step
   # below derives its own form from this ONE value; never write the tag list
   # twice. A tag-gated package that is not named here is analysed by NOTHING
-  # while the gate still reports green (automatethethings#7: go-signal had eight
+  # while the gate still reports green (one repository had eight
   # such packages, including its whole WebAuthn implementation).
   GO_BUILD_TAGS: ""
   # v1.23: the full tier (ci-standard.md §8). Every event but pull_request
@@ -378,7 +383,7 @@ jobs:
         run: |
           docs_only=false
           if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
-            if files=$(git diff --name-only "$BASE...$HEAD") && [ -n "$files" ]; then
+            if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
               if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
                 docs_only=true
               fi
@@ -485,7 +490,7 @@ jobs:
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
-      # v1.23: a lease on the integration image (Codex on handbook #384). A
+      # v1.23: a lease on the integration image (from a Codex review). A
       # reused image can be older than REAP_IMAGE_MIN_AGE, so its age alone
       # does not keep another run's reap step off it while this job needs it.
       # A created, never-started container that names the image holds it,
@@ -631,7 +636,7 @@ jobs:
       - name: Name the integration image
         run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
 
-      # v1.23: a lease on the integration image (Codex on handbook #384). A
+      # v1.23: a lease on the integration image (from a Codex review). A
       # reused image can be older than REAP_IMAGE_MIN_AGE, so its age alone
       # does not keep another run's reap step off it while this job needs it.
       # A created, never-started container that names the image holds it,
@@ -712,7 +717,7 @@ jobs:
       - name: Name the integration image
         run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
 
-      # v1.23: a lease on the integration image (Codex on handbook #384). A
+      # v1.23: a lease on the integration image (from a Codex review). A
       # reused image can be older than REAP_IMAGE_MIN_AGE, so its age alone
       # does not keep another run's reap step off it while this job needs it.
       # A created, never-started container that names the image holds it,

@@ -3,7 +3,7 @@
 #
 #   usage: scripts/reap-stale-ci-stacks.sh <prefix> [min-age-seconds]
 #
-# v1 (ci-template v1.18, dept-infra 2026-10-12); v2 and v3 below. An integration job's
+# v1 (ci-template v1.18, 2026-10-12); v2 and v3 below. An integration job's
 # `if: always()` teardown runs only while the job process lives. When the host
 # or its Docker daemon dies mid-job, the job is gone and so is its teardown: the
 # compose stack stays behind, exited, with its networks and volumes (11 stacks
@@ -30,7 +30,7 @@
 # (ci.yml). A lease a dead job leaves is stale like any other container
 # outside compose, and goes after <min-age-seconds>; its image goes on the
 # reap after that.
-# v3 (ci-template v1.23.1, handbook #392, 2026-10-19): an image's age runs
+# v3 (ci-template v1.23.1, 2026-10-19): an image's age runs
 # from the later of its `.Created` and its last tag time
 # (`.Metadata.LastTagTime`). A rebuild from a full cache keeps the old
 # `.Created` but re-tags the image, so v2 saw a just-rebuilt image as stale and

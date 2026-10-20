@@ -127,7 +127,7 @@ jobs:
                  ! grep -q 'Failing input written to' "$log"; then
               # A target stopped by a duration -fuzztime can fail on the
               # deadline itself with no failing input written: there is no
-              # crasher and no reproducer, so it is not a finding (handbook #306).
+              # crasher and no reproducer, so it is not a finding.
               echo "deadline $pkg $target (no failing input; not a finding)"
             else
               echo "BATCH-FINDING fuzz $pkg $target"
@@ -185,7 +185,7 @@ jobs:
 
       - name: UDP buffers for QUIC suites
         # QUIC suites need larger socket buffers (go-quicraft ci.yml); a runner
-        # that refuses sudo runs them with the defaults (handbook #306).
+        # that refuses sudo runs them with the defaults.
         run: |
           sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 ||
             echo "batch: sysctl not permitted; UDP buffers left at the defaults"
@@ -219,7 +219,7 @@ jobs:
 
       - name: UDP buffers for QUIC suites
         # QUIC suites need larger socket buffers (go-quicraft ci.yml); a runner
-        # that refuses sudo runs them with the defaults (handbook #306).
+        # that refuses sudo runs them with the defaults.
         run: |
           sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 ||
             echo "batch: sysctl not permitted; UDP buffers left at the defaults"
