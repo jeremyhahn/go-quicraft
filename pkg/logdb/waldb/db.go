@@ -479,6 +479,11 @@ type walShard struct {
 	// Per-node compaction markers. Protected by dataMu.
 	compactedTo map[nodeKey]uint64
 
+	// durableFloors is the content of the shard directory's COMPACTED file:
+	// the floors last published outside the WAL, which every segment unlink
+	// waits for. Protected by mu. See compaction_floor.go.
+	durableFloors map[nodeKey]uint64
+
 	// Set of all segment IDs that have ever been created in this shard.
 	// Segment file state: protected by mu.
 	knownSegments map[uint64]bool
@@ -1128,6 +1133,14 @@ func (s *walShard) recover() error {
 	if err != nil {
 		return &DBOpenError{Dir: s.dir, Err: err}
 	}
+	// The durable floors are read before replay and applied after it (see
+	// reconcileCompactionFloors). A file that does not parse refuses the
+	// open: the floors it held cannot be proven any other way.
+	floors, err := loadCompactionFloors(s.fs, s.dir)
+	if err != nil {
+		return &DBOpenError{Dir: s.dir, Err: err}
+	}
+	s.durableFloors = floors
 
 	// Collect and sort segment IDs.
 	var segIDs []uint64
@@ -1320,15 +1333,19 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 }
 
 // reconcileCompactionFloors repairs a recovered state whose entry index starts
-// ABOVE the recovered compaction floor, when a recorded snapshot explains the
-// gap, and leaves it unchanged otherwise.
+// ABOVE the replayed compaction floor: from the durable floor file first, then,
+// when a recorded snapshot explains the gap, from the index; it leaves the
+// floor unchanged otherwise.
 //
-// The floor is durable only as a WAL marker record, but its effect — the segment
-// holding the compacted entries being unlinked — is irreversible. Tear the block
-// holding that marker and replay comes back with a LOWER floor (often 0) while
-// the entries it covered are physically gone. Nothing else re-derives it.
+// The WAL marker record is as durable as one block, but its effect — the
+// segment holding the compacted entries being unlinked — is irreversible. Tear
+// the block holding that marker and replay comes back with a LOWER floor (often
+// 0) while the entries it covered are physically gone. The COMPACTED file is
+// what restores it: every unlink waits for the file to cover the floor (see
+// compaction_floor.go), so the higher of the two copies is never below the
+// floor any unlinked entry was compacted under.
 //
-// That state FAILS OPEN, which is what makes it dangerous: the index itself is
+// Without that file the state would FAIL OPEN, which is what makes it dangerous: the index itself is
 // self-consistent (a missing PREFIX keeps span == count, unlike an interior hole),
 // so EntryRange accepts it and the node starts. Reads below the real floor then
 // return ErrLogGapDetected instead of ErrCompacted, and raft would never fall
@@ -1349,9 +1366,12 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 // captured. It is not an error either, because an absent prefix with no
 // covering snapshot is indistinguishable from a node that legitimately starts
 // at a high index; reads below the first index keep reporting
-// ErrLogGapDetected. Failing that case closed would need the floor to be
-// durable independently of one WAL block, which is a format change.
+// ErrLogGapDetected. A prefix lost to compaction never reaches this case: its
+// floor is in the durable file, which recovery has already applied.
 func (s *walShard) reconcileCompactionFloors() error {
+	// The durable floor file first: it is the proof, and a floor it restores
+	// leaves no missing prefix for the snapshot rule below to consider.
+	s.applyDurableFloors()
 	for key, idx := range s.indexes {
 		first, _, count := idx.Bounds()
 		if count == 0 {
@@ -4512,6 +4532,13 @@ func (db *DB) Compact(shardID, _ uint64) error {
 	// holding the sole durable copy of a node's metadata.
 	shard.addMetaSegmentsToLive(liveSegments)
 
+	// No segment is unlinked until the floors that cover its entries are
+	// durable outside the WAL: a torn marker block must not be able to lower
+	// a floor whose entries are gone. Failing here unlinks nothing.
+	if err := shard.publishCompactionFloorsLocked(); err != nil {
+		return err
+	}
+
 	deleted, err := comp.GarbageCollect(liveSegments, shard.activeSegmentID, shard.committedSegmentHWM)
 
 	// Fsync the parent directory so the segment-file deletions survive a
@@ -4707,6 +4734,14 @@ func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
 	// These record types are not tracked by an entry index, so they must be
 	// folded in explicitly before GC.
 	s.addMetaSegmentsToLive(liveSegments)
+	// The surviving nodes' floors are published first, exactly as in Compact:
+	// a reclaimed segment may hold their compacted entries too.
+	if err := s.publishCompactionFloorsLocked(); err != nil {
+		slog.Warn("waldb: publishing compaction floors failed after "+op+
+			"; skipping garbage collection",
+			append([]any{"shard_dir", s.dir, "error", err}, logAttrs...)...)
+		return
+	}
 	comp := newCompactor(s.fs, s.dir, s.opts.blockSize)
 	_, gcErr := comp.GarbageCollect(liveSegments, s.activeSegmentID, s.committedSegmentHWM)
 	if gcErr != nil {

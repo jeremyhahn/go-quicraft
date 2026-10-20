@@ -198,6 +198,13 @@ Besides the `LogDB` methods, `*DB` has `CompactedTo`, `MinLiveEpoch`,
 `MinLiveEpochForBarrier`, `AtRestProtection`, and the single-node conveniences
 `SaveEntries`, `GetEntries`, `SaveNodeState` and `GetState`.
 
+`Compact` makes the shard directory's compaction floors durable in its
+`COMPACTED` file before it unlinks any segment, and unlinks nothing when that
+publication fails: the error is returned and the next call retries. The floor
+`CompactedTo` reports after a restart is the higher of that file's and the
+replayed marker's, so a torn marker block cannot lower it (see
+[Reconciling a lost compaction floor](engineering.md#reconciling-a-lost-compaction-floor)).
+
 ### Repair a corrupt segment
 
 ```go
@@ -291,7 +298,8 @@ Sentinels: `ErrCorruptedRecord`, `ErrMidSegmentCorruption`,
 `ErrUnsupportedMembershipVersion`, `ErrUnsupportedSnapshotCompression`,
 `ErrWALFormatMissing`, `ErrWALFormatMalformed`,
 `ErrWALFormatUnsupportedVersion`, `ErrWALGeometryMismatch`,
-`ErrRetiredRegistryMalformed`, `ErrBarrierContextUnsupported`,
+`ErrRetiredRegistryMalformed`, `ErrCompactionFloorsMalformed`,
+`ErrBarrierContextUnsupported`,
 `ErrBarrierContextBindingUnreportable`, `ErrBarrierContextUnresolved`,
 `ErrBarrierContextBindingChanged`, `ErrLandingSegmentOverflow`,
 `ErrDBPoisoned`, `ErrDiskFull`, `ErrRecordTooLarge`, `ErrCmdTooLarge`,

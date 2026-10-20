@@ -136,6 +136,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Conn.peerParams` race it skipped for no longer reproduces on quic-go
   v0.64.1 (clean over 120 race-detector runs), so the skip and the
   race-detector build flag it read are gone. Test-only.
+- waldb compaction floor is durable outside a single WAL block (#447). A
+  torn block holding the last compaction marker, after `Compact` had unlinked
+  the segments below it, used to replay a lower floor over a missing prefix:
+  reads reported `ErrLogGapDetected` instead of `ErrCompacted`, so raft never
+  fell back to InstallSnapshot. Each shard directory now keeps its floors in a
+  `COMPACTED` file (temp, fsync, rename, directory fsync), published before any
+  segment is unlinked; recovery takes the higher of that file's floor and the
+  replayed one, and a malformed file refuses the open with
+  `ErrCompactionFloorsMalformed`. A new metadata file, no format version
+  change; wipe dev data directories rather than migrate.
 
 ## [0.23.0-alpha] - 2026-10-16
 

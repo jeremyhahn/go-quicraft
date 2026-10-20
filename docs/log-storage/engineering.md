@@ -208,14 +208,15 @@ Every mutator of a `dataMu` field also holds `mu`.
   WALFORMAT        16-byte marker: block size + format version
   RETIRED          retired-replica registry (absent until a replica is removed)
   shard-0/
+    COMPACTED      durable compaction floors (absent until a segment is reclaimed)
     000000.log
     000001.log
   ...
   shard-15/
 ```
 
-Segments are named `%06d.log`, starting at 0. `WALFORMAT.tmp` and `RETIRED.tmp`
-may appear while a file is being published. None of these names parses as a
+Segments are named `%06d.log`, starting at 0. `WALFORMAT.tmp`, `RETIRED.tmp`
+and `COMPACTED.tmp` may appear while a file is being published. None of these names parses as a
 segment, so recovery ignores them.
 
 ### The format marker
@@ -266,6 +267,23 @@ rewritten whole on each retirement and published like the marker (temp, fsync,
 rename, directory fsync). A registry that is present but has the wrong length,
 magic or checksum fails `Open` with `ErrRetiredRegistryMalformed`: opening
 without it would hand retired IDs back.
+
+### The durable compaction floors
+
+```
+magic "QRFLOORS"[8] | count:u64 | count × (shardID:u64 | replicaID:u64 | floor:u64) | crc32c:u32
+```
+
+One `COMPACTED` file per shard directory, holding the floor of every replica
+whose records live there. Little-endian, entries sorted by key, CRC over every
+byte before it, rewritten whole and published like the marker (temp, fsync,
+rename, directory fsync). It is the second copy of each floor, independent of
+the WAL block holding the marker; see
+[Reconciling a lost compaction floor](#reconciling-a-lost-compaction-floor) for
+when it is written and how recovery uses it. A file that is present but has the
+wrong length, magic or checksum fails `Open` with
+`ErrCompactionFloorsMalformed`: the floors it held cannot be proven any other
+way, so guessing them would fail open.
 
 ## Segment format
 
@@ -1007,6 +1025,7 @@ boot, where the discard would delete every segment written since.
 | `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | the marker records another format version | wipe the data directory and re-sync. See the `WALFORMAT` section of [Compatibility](../compatibility/engineering.md#4-walformat-marker). |
 | `ErrWALFormatMissing` | segments exist but no marker | wipe and re-sync |
 | `ErrRetiredRegistryMalformed` | `RETIRED` does not parse | investigate; opening without it would readmit retired replicas |
+| `ErrCompactionFloorsMalformed` | a shard directory's `COMPACTED` does not parse | wipe and re-sync from peers; opening without it could report compacted entries as a log gap |
 | `ErrMidSegmentCorruption` | damage below records a completed `fdatasync` acknowledged | re-sync from peers, or authorize `waldb.Repair` |
 | `ErrAcknowledgedDataLost` | damage begins below the acknowledged end the survivors name | re-sync from peers, or authorize `waldb.Repair` |
 | `ErrNonFinalSegmentCorruption` | damage in a segment that is not the highest | re-sync from peers, or authorize `waldb.Repair` |
@@ -1085,22 +1104,42 @@ offset, bytes discarded and segments deleted.
 
 ### Reconciling a lost compaction floor
 
-The floor is durable only as a marker record, but its effect (the compacted
-segment being unlinked) is irreversible. Tear the block holding the marker and
-replay comes back with a lower floor, often 0, while the entries are gone. That
-state fails open: a missing prefix keeps span equal to count, so `EntryRange`
-accepts it, reads below the real floor return `ErrLogGapDetected` instead of
-`ErrCompacted`, and Raft never falls back to a snapshot.
+A marker record is as durable as the one block it lands in, but its effect (the
+compacted segment being unlinked) is irreversible. Tear the block holding the
+marker and replay comes back with a lower floor, often 0, while the entries are
+gone. That state would fail open: a missing prefix keeps span equal to count,
+so `EntryRange` accepts it, reads below the real floor return
+`ErrLogGapDetected` instead of `ErrCompacted`, and Raft never falls back to a
+snapshot.
 
-The last step of `recover()` (`reconcileCompactionFloors`) re-derives the floor
-as `firstIndex - 1` from the rebuilt index when a recorded snapshot covers the
-missing prefix, and logs a `WARN`. It never anchors on the snapshot index,
-because the snapshot pool keeps `CompactionOverhead` entries below the snapshot
-for follower catch-up, and anchoring there would mark them unreadable. When no
-snapshot covers the prefix, nothing is changed: that shape is indistinguishable
-from a node that legitimately starts at a high index. Making it fail closed
-would need the floor to be durable outside one WAL block, which is a format
-change.
+Each floor therefore has a second copy in the shard directory's `COMPACTED`
+file ([format](#the-durable-compaction-floors)). The ordering is the argument:
+
+1. `RemoveEntriesTo` makes the marker durable first. The file only ever copies
+   floors the WAL already acknowledged, so it never claims more.
+2. `Compact`, and the reclaim after `RemoveNodeData`, publish the file before
+   any segment is unlinked, and only when a floor changed since the last
+   publication, so a compaction that raised nothing costs no I/O. A failed
+   publication unlinks nothing: `Compact` returns the error, and the reclaim
+   logs a `WARN` and skips garbage collection.
+3. A crash after the publication and before the unlink leaves the segments on
+   disk under a floor that already covers them. A crash before the rename
+   leaves the old file and every segment.
+4. `recover()` reads the file before replay. Its last step,
+   `reconcileCompactionFloors`, raises each replayed floor to the file's floor
+   when the file's is higher, drops the entries the restored floor covers from
+   the index and the entry map so none is served, and logs a `WARN`. Losing
+   either copy alone cannot lower a floor.
+
+After that, a prefix still missing below the floor is re-derived as
+`firstIndex - 1` from the rebuilt index when a recorded snapshot covers it, with
+a `WARN`. It never anchors on the snapshot index, because the snapshot pool
+keeps `CompactionOverhead` entries below the snapshot for follower catch-up,
+and anchoring there would mark them unreadable. When neither the file nor a
+snapshot covers the prefix, nothing is changed and nothing below the first
+entry is reported compacted: compaction cannot leave that shape, because every
+unlink waited for the file, so it is a node that legitimately starts at a high
+index.
 
 ## Filesystem abstraction
 

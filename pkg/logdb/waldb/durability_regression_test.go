@@ -973,8 +973,17 @@ func TestCompact_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 	}
 
 	// GC succeeds but the directory fsync fails: the deletions are not proven
-	// durable, so the floor must NOT rise.
-	shardDir := db.getShard(nodeA).dir
+	// durable, so the floor must NOT rise. The compaction floors are published
+	// first, so the injected failure hits the post-GC directory sync rather
+	// than the floor publication that precedes every unlink.
+	shard := db.getShard(nodeA)
+	shard.mu.Lock()
+	pubErr := shard.publishCompactionFloorsLocked()
+	shard.mu.Unlock()
+	if pubErr != nil {
+		t.Fatalf("publishCompactionFloorsLocked: %v", pubErr)
+	}
+	shardDir := shard.dir
 	ffs.mu.Lock()
 	ffs.failDir = shardDir
 	ffs.syncErr = errors.New("simulated EIO on directory fsync")
