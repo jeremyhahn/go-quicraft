@@ -3454,13 +3454,16 @@ type Host struct {
 	registry              *registry.Registry
 	sender                engine.MessageSender
 	transport             *transport.QUICTransport // nil when transport is disabled
-	nodes                 sync.Map                 // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
-	activeNodes           atomic.Int64             // tracks the number of loaded shards (replaces len(h.nodes))
-	closed                atomic.Bool
-	draining              atomic.Bool
-	diskFull              *atomic.Bool // set by disk full callback in buildWALOptions
-	id                    string
-	stopOnce              sync.Once
+	// dirLock is the exclusive lock on NodeHostDir (hostLockFileName),
+	// held from NewHost until Close.
+	dirLock     *fsutil.DirLock
+	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
+	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
+	closed      atomic.Bool
+	draining    atomic.Bool
+	diskFull    *atomic.Bool // set by disk full callback in buildWALOptions
+	id          string
+	stopOnce    sync.Once
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
@@ -3932,6 +3935,38 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		return nil, &HostInitError{Field: "WALDir", Err: err}
 	}
 
+	// One live Host per NodeHostDir, and one deployment per NodeHostDir for
+	// its life: both are settled before the log is opened, so a second
+	// opener or a directory from another deployment never replays a record.
+	// The default WAL takes its own lock on WALDir in waldb.Open.
+	dirLock, err := fsutil.LockDir(cfg.NodeHostDir, hostLockFileName)
+	if err != nil {
+		return nil, &HostInitError{Field: "NodeHostDir", Err: err}
+	}
+	// Every failure from here releases what this call opened, so a refused
+	// start never leaves its directories held.
+	var createdWAL *waldb.DB
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		if createdWAL != nil {
+			if closeErr := createdWAL.Close(); closeErr != nil {
+				logger.Debug("closing the WAL after a failed host start failed", "error", closeErr)
+			}
+		}
+		if closeErr := dirLock.Close(); closeErr != nil {
+			logger.Debug("releasing NodeHostDir after a failed host start failed", "error", closeErr)
+		}
+	}()
+	if err := checkHostIdentity(logger, cfg.NodeHostDir, hostIdentity{
+		deploymentID: cfg.DeploymentID,
+		raftAddress:  cfg.RaftAddress,
+	}); err != nil {
+		return nil, err
+	}
+
 	// Shared disk full flag set by the WAL's disk monitor callback and
 	// read by Host.HealthCheck(). Allocated before the WAL is opened so
 	// the callback closure captures the same atomic as the Host struct.
@@ -4010,6 +4045,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			return nil, &HostInitError{Field: "logdb", Err: err}
 		}
 		walDB.Store(db)
+		createdWAL = db
 		options.logdb = db
 	}
 
@@ -4168,6 +4204,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		sweepDone:          make(chan struct{}),
 		fsys:               options.fsys,
 		leaderExec:         newLeaderExecRouter(),
+		dirLock:            dirLock,
 	}
 
 	// Wire the host into the message handler so HandleSnapshot can
@@ -4248,6 +4285,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		"transport", transportMode,
 	)
 
+	started = true
 	return h, nil
 }
 
@@ -9843,6 +9881,9 @@ func (h *Host) Close() error {
 				closeErr = errors.Join(closeErr, sealOnClose(b))
 			}
 		})
+
+		// Release NodeHostDir last, once nothing the host owns writes under it.
+		closeErr = errors.Join(closeErr, h.dirLock.Close())
 
 		h.logger.Info("host closed", "id", h.id)
 		h.closeErr = closeErr

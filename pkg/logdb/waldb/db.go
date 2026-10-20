@@ -17,6 +17,7 @@ package waldb
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -329,7 +330,10 @@ type DB struct {
 	retired *retiredRegistry
 	diskMon *DiskMonitor
 	metrics LogDBMetrics
-	closed  atomic.Bool
+	// lock is the exclusive lock on dir (walLockFilename), held from Open
+	// to Close; nil when the FS is not a DirLocker.
+	lock   io.Closer
+	closed atomic.Bool
 	// poisoned fail-stops the DB after an fsync failure. A failed
 	// fdatasync leaves written-but-unsynced bytes whose durability the
 	// kernel no longer guarantees (it may mark dirty pages clean without
@@ -744,6 +748,7 @@ func walDirHoldsSegments(filesystem FS, dir string) (bool, error) {
 // holding its own WAL segment files.
 //
 // The order of the steps below is part of the contract, not an accident: the
+// directory lock is taken before the format is read or recorded, the
 // geometry check runs before any segment is touched, and the barrier's
 // context-binding capability is resolved before any shard exists to latch it
 // into. Both are fixes, not incidental sequencing — see the geometry comment
@@ -758,6 +763,47 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 
+	if err := createWALRoot(o, dir); err != nil {
+		return nil, err
+	}
+	// Under noSync createWALRoot leaves the root to the first write, but the
+	// lock below is taken inside it, so a missing root is created here.
+	if o.noSync {
+		if _, statErr := o.fs.Stat(dir); statErr != nil {
+			if !errors.Is(statErr, fs.ErrNotExist) {
+				return nil, &DBOpenError{Dir: dir, Err: statErr}
+			}
+			if mkErr := o.fs.MkdirAll(dir, 0o700); mkErr != nil {
+				return nil, &DBOpenError{Dir: dir, Err: mkErr}
+			}
+		}
+	}
+
+	// One writer per directory: a second Open, in this process or another,
+	// is refused here, before it reads or records the directory's format and
+	// before it replays or repairs a single segment the first is still
+	// writing. Taking the lock any later lets an opener that found the
+	// directory empty, and is then refused, overwrite the format marker the
+	// winner already recorded and is writing segments under. Every failure
+	// below releases the lock.
+	var lock io.Closer
+	if locker, ok := o.fs.(DirLocker); ok {
+		l, err := locker.LockDir(dir, walLockFilename)
+		if err != nil {
+			return nil, &DBOpenError{Dir: dir, Err: err}
+		}
+		lock = l
+	}
+	releaseLock := func() {
+		if lock == nil {
+			return
+		}
+		if err := lock.Close(); err != nil {
+			slog.Debug("waldb: releasing the directory lock after a failed open failed",
+				"dir", dir, "error", err)
+		}
+	}
+
 	// Refuse a block size, or an on-disk format version, that differs from the
 	// one this directory was written with, BEFORE touching a single segment.
 	// Neither is recorded in the segments themselves, so getting either wrong
@@ -767,9 +813,11 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	// a documented upgrade) and a restore-from-peers. See format.go.
 	recordedBlockSize, formatPresent, err := readWALFormat(o.fs, dir)
 	if err != nil {
+		releaseLock()
 		return nil, &DBOpenError{Dir: dir, Err: err}
 	}
 	if formatPresent && recordedBlockSize != o.blockSize {
+		releaseLock()
 		return nil, &DBOpenError{Dir: dir, Err: &WALGeometryMismatchError{
 			Dir:        dir,
 			Recorded:   recordedBlockSize,
@@ -778,6 +826,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	}
 
 	if err := resolveBarrierContextBinding(dir, o.barrier); err != nil {
+		releaseLock()
 		return nil, err
 	}
 
@@ -786,6 +835,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		opts:    o,
 		barrier: o.barrier,
 		metrics: o.metrics,
+		lock:    lock,
 	}
 
 	// Create the DiskMonitor if maxBytes is configured.
@@ -793,15 +843,12 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		db.diskMon = NewDiskMonitor(dir, o.diskMonMaxBytes, o.diskMonOpts...)
 	}
 
-	if err := createWALRoot(o, dir); err != nil {
-		return nil, err
-	}
-
 	// Settle the on-disk format before a single segment is created: either this
 	// directory already records one (checked above), or it is empty and this
-	// process records one for it now. See establishWALFormat.
+	// process records one for it now, under the lock. See establishWALFormat.
 	if !formatPresent {
 		if err := establishWALFormat(o, dir); err != nil {
+			releaseLock()
 			return nil, err
 		}
 	}
@@ -811,6 +858,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	// record of a retired replica.
 	retired, err := loadRetiredRegistry(o.fs, dir)
 	if err != nil {
+		releaseLock()
 		return nil, &DBOpenError{Dir: dir, Err: err}
 	}
 	db.retired = retired
@@ -824,6 +872,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 			for j := 0; j < i; j++ {
 				db.shards[j].closeAfterFailedOpen()
 			}
+			releaseLock()
 			return nil, err
 		}
 		shard.poison = db.poison
@@ -4877,6 +4926,12 @@ func (db *DB) Close() error {
 	var firstErr error
 	for i := 0; i < DefaultShardCount; i++ {
 		if err := db.shards[i].close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// Released last, once nothing more will be written under it.
+	if db.lock != nil {
+		if err := db.lock.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

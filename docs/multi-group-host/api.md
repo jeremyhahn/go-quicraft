@@ -1948,8 +1948,8 @@ Source: `pkg/config/hostconfig.go`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `WALDir` | `string` | required | write-ahead log directory |
-| `NodeHostDir` | `string` | required | metadata, snapshots, host ID |
+| `WALDir` | `string` | required | write-ahead log directory; the default WAL holds an exclusive lock on it (`WALDir/LOCK`) until `Close` |
+| `NodeHostDir` | `string` | required | metadata, snapshots, host ID; held under an exclusive lock (`NodeHostDir/host.lock`) until `Close`, and bound to the `DeploymentID` it was first started with (`NodeHostDir/host.identity`) |
 | `RaftAddress` | `string` | required | address peers dial |
 | `ListenAddress` | `string` | required | local bind address (`host:port`) |
 | `RTTMillisecond` | `uint64` | `200` | estimated round-trip time in ms; 1 to 60000 |

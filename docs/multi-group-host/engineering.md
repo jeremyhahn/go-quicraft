@@ -48,14 +48,17 @@ NewHost(cfg, opts...)
   |     - DeploymentID 0 rejected unless AllowZeroDeploymentID
   |     - MTLSConfig required unless the transport is disabled
   |  2. Logger: WithLogger, or built from cfg.LogConfig
-  |  3. Create NodeHostDir and WALDir (0750) and fsync the created chain
+  |  3. Create NodeHostDir and WALDir (0750) and fsync the created chain;
+  |     lock NodeHostDir (host.lock, ErrDirLocked) and check or record
+  |     host.identity (ErrHostIdentityMismatch on a DeploymentID change).
+  |     Every later failure closes the WAL it opened and releases the lock
   |  4. Refuse a plaintext log under a stated encryption choice
   |     (ErrShardBarriersPlaintextWAL, ErrBarrierPlaintextLogDB); a
   |     host_routed LogDB passes under WithoutEncryption, or when its
   |     host-wide route writes through the WithBarrier barrier
   |  5. Open LogDB
   |     - default: waldb.Open(WALDir, ...), with the host-wide barrier and
-  |       the disk monitor wired in
+  |       the disk monitor wired in; it locks WALDir (LOCK) until Close
   |     - WithLogDB(l) or WithMemoryLogDB()
   |  6. Host ID: HostConfig.HostID when set; otherwise load or generate
   |     <NodeHostDir>/host.id, 32 hex characters (128 random bits), mode 0600

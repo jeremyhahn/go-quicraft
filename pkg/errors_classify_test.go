@@ -71,6 +71,8 @@ func sentinelTable() []sentinelClassification {
 		{"ErrRejected", ErrRejected, false},
 		{"ErrAtRestEncryptionUnspecified", ErrAtRestEncryptionUnspecified, false},
 		{"ErrAtRestEncryptionConflict", ErrAtRestEncryptionConflict, false},
+		{"ErrDirLocked", ErrDirLocked, false},
+		{"ErrHostIdentityMismatch", ErrHostIdentityMismatch, false},
 		{"ErrBarrierPlaintextLogDB", ErrBarrierPlaintextLogDB, false},
 		{"ErrShardBarriersPlaintextWAL", ErrShardBarriersPlaintextWAL, false},
 		{"ErrShardBarrierUnresolved", ErrShardBarrierUnresolved, false},

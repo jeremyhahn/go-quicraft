@@ -415,6 +415,9 @@ func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
 	}
 
 	// A host with no transport has no certificate and therefore no identity.
+	// It runs beside h, so it takes its own NodeHostDir: h holds the lock on
+	// the first.
+	cfg.NodeHostDir = t.TempDir()
 	noTransport, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost(WithoutTransport) failed: %v", err)

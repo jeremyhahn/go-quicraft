@@ -436,9 +436,10 @@ as not counting at all.
 **`ErrBarrierSuperseded`**: another process loaded the same sealed blob. This
 barrier has stopped encrypting, permanently, and sealing and unsealing again
 will not clear it. Find the second process. Exactly one process must own a
-sealed blob at a time; the fence detects the violation but is not a lock, so
-enforce it with an exclusive data-directory lock or a compare-and-swap
-persister.
+sealed blob at a time; the fence detects the violation but is not a lock. A
+`Host` already holds an exclusive lock on its `NodeHostDir` and `WALDir`
+(`ErrDirLocked`), which covers a blob persisted inside them; a blob persisted
+anywhere else needs its own exclusive lock or a compare-and-swap persister.
 
 **`ErrSealedEpochRollback`**: the blob you loaded is older than `MinEpoch`, or
 older than the state the barrier already holds. Either you restored a backup, or

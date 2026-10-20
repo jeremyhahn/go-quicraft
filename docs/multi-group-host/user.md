@@ -64,6 +64,24 @@ if err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg); e
 Without a transport no identities are needed, and messages to other replicas
 are dropped.
 
+### One host per data directory
+
+A host owns its `NodeHostDir` and `WALDir` exclusively while it runs. `NewHost`
+takes a non-blocking exclusive lock on each (`NodeHostDir/host.lock`, and
+`WALDir/LOCK` for the default WAL) and holds them until `Close`; a second host
+over either directory, in the same process or another, fails at once with
+`ErrDirLocked`, which names the lock file. The locks are released by `Close`,
+by a `NewHost` that fails, and by the kernel when the process dies, so a crash
+never leaves a stale lock to clear by hand. Do not delete the lock files.
+
+The first start also records the `DeploymentID` and `RaftAddress` in
+`NodeHostDir/host.identity`. A later start under a different `DeploymentID`
+fails with `ErrHostIdentityMismatch`, naming both IDs, before the log is
+opened: the directory holds another deployment's Raft state. Configure the
+recorded ID, or give the host fresh, empty `NodeHostDir` and `WALDir` and let
+it re-sync from its peers. A changed `RaftAddress` is logged and allowed, since
+a member may restart at a new address.
+
 ## Form a multi-node shard
 
 The library takes an explicit member map; it does not discover peers. If you

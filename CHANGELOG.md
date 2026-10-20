@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- data-dir lock and host identity (#440): `NewHost` holds a non-blocking
+  exclusive lock on `NodeHostDir` (`host.lock`) and `waldb.Open` one on its
+  directory (`LOCK`), flock on unix and `LockFileEx` on Windows, until
+  `Close`; a second opener in the same process or another fails with
+  `ErrDirLocked` naming the lock file, and a failed start releases both. The
+  first start records the `DeploymentID` and `RaftAddress` in
+  `NodeHostDir/host.identity` (magic and CRC-32C, published by rename); a
+  later start under another `DeploymentID` fails with
+  `ErrHostIdentityMismatch` naming both. A changed `RaftAddress` is logged,
+  not refused. New files only; no existing format changes.
+
 - heartbeat-under-fsync (#390): while a WAL write is in flight a follower
   answers a leader's Heartbeat without waiting for the fsync when the step
   left its term, vote, owed vote window and log unchanged, so CheckQuorum no

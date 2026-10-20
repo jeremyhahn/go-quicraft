@@ -169,7 +169,7 @@ func Open(dir string, opts ...Option) (*DB, error)
 | `WithNoSync(true)` | skip every fsync and every directory sync | off. Tests and container benchmarks only. Nothing in such a segment is ever acknowledged, so recovery is always free to truncate it. |
 | `WithBarrier(b WALBarrier)` | at-rest encryption | none. The barrier must be initialized and unsealed before `Open`; a sealed one fails with `ErrBarrierContextUnresolved`. |
 | `WithMetrics(m LogDBMetrics)` | write, fsync and compaction latency, bytes written | nil, which skips collection |
-| `WithFS(fs FS)` | filesystem abstraction | `DefaultFS()`. The fault-injection seam. |
+| `WithFS(fs FS)` | filesystem abstraction | `DefaultFS()`. The fault-injection seam. An `FS` that also implements `DirLocker` (as `DefaultFS()` does) is used to lock the directory; one that does not opens unlocked, so a wrapper around the real filesystem should forward `LockDir`. |
 | `WithDiskMonitorOpts(maxBytes, ...DiskMonitorOption)` | disk-usage ceiling | none |
 
 `DiskMonitorOption`s: `WithWarningPercent` (default `DefaultWarningPercent` =
@@ -180,6 +180,14 @@ filesystem (`statfs` total minus available; a stub reporting zero on non-Linux).
 `WithCheckEvery(0)` logs a WARN and uses the default. `DiskUsageFunc` is
 `func(dir string) (usedBytes uint64, err error)`.
 Past the full threshold `SaveState` returns `ErrDiskFull`.
+
+A directory has one writer. `Open` takes a non-blocking exclusive lock on
+`dir/LOCK` (flock on unix, `LockFileEx` on Windows) before it replays a
+segment, and holds it until `Close`. A second `Open` of the same directory, in
+this process or another, fails with a `*DBOpenError` wrapping
+`fsutil.ErrDirLocked` (`quicraft.ErrDirLocked` is the same value) that names
+the lock file. An `Open` that fails after taking the lock releases it, and the
+kernel releases it when the process dies. The lock file is never removed.
 
 `Options` is a declarative mirror of these (`WALDir`, `BlockSize`,
 `MaxFileSize`, `NoSync`) with `DefaultOptions`, `SetDefaults` and `Validate`;

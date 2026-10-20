@@ -19,11 +19,31 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
+)
+
+// Data-directory ownership errors, returned by NewHost before it touches the
+// log or the transport.
+var (
+	// ErrDirLocked is returned, wrapped with the lock file's path, when
+	// NodeHostDir or WALDir is already held by another opener: another
+	// process, or another Host or waldb.Open in this one. It is the same
+	// value as fsutil.ErrDirLocked, which waldb.Open returns, so errors.Is
+	// matches whichever directory was refused.
+	ErrDirLocked = fsutil.ErrDirLocked
+
+	// ErrHostIdentityMismatch is returned when NodeHostDir records a
+	// different DeploymentID from the one configured: the directory belongs
+	// to another deployment, and a host that joined it would carry that
+	// deployment's Raft state into this one. The wrapped message names both
+	// values. The remedy is the configured DeploymentID, or a fresh
+	// NodeHostDir and WALDir re-synced from peers.
+	ErrHostIdentityMismatch = errors.New("quicraft: NodeHostDir belongs to a different deployment")
 )
 
 // Sentinel errors are pre-allocated for zero-alloc hot path returns and

@@ -15,6 +15,7 @@
 package waldb
 
 import (
+	"io"
 	"io/fs"
 	"os"
 
@@ -59,6 +60,25 @@ type FileMetadataSyncer = fsutil.MetadataSyncer
 // ftruncate(2).
 type FilePreAllocator interface {
 	PreAllocate(size int64) error
+}
+
+// walLockFilename is the lock file Open holds in the WAL root.
+const walLockFilename = "LOCK"
+
+// DirLocker is optionally implemented by FS implementations that can hold an
+// exclusive lock on a directory. Open takes it on the WAL root for the life of
+// the DB, so a second Open of the same directory, in this process or another,
+// fails with fsutil.ErrDirLocked instead of interleaving its records with the
+// first writer's.
+//
+// The production filesystem implements it. An FS that does not (an in-memory
+// test filesystem, whose directories no other process can reach) opens
+// unlocked; an FS that wraps the real filesystem should forward it.
+type DirLocker interface {
+	// LockDir locks dir through the file name inside it, failing
+	// immediately with an error wrapping fsutil.ErrDirLocked when it is
+	// held. Closing the result releases the lock.
+	LockDir(dir, name string) (io.Closer, error)
 }
 
 // FS abstracts filesystem operations used by the WAL database. Production
@@ -126,6 +146,11 @@ func (osFS) Remove(name string) error {
 // directory for the atomicity the marker publication depends on.
 func (osFS) Rename(oldpath, newpath string) error {
 	return os.Rename(oldpath, newpath)
+}
+
+// LockDir takes the exclusive directory lock through fsutil.LockDir.
+func (osFS) LockDir(dir, name string) (io.Closer, error) {
+	return fsutil.LockDir(dir, name)
 }
 
 // osFile implements File by wrapping *os.File with platform-optimized sync.
