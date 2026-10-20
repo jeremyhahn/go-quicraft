@@ -43,6 +43,7 @@ go.work.sum
 # exclusions). No image build reads them.
 .github/workflows/automerge.yml
 .github/workflows/revert-red-main.yml
+.github/workflows/code-review.yml
 .release-allowed-signers
 
 # Module credentials for the benchmark image builds (test/performance/README.md).

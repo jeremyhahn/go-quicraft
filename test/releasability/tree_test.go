@@ -36,12 +36,14 @@ var (
 	gitattributesEntries = []string{
 		".github/workflows/automerge.yml export-ignore",
 		".github/workflows/revert-red-main.yml export-ignore",
+		".github/workflows/code-review.yml export-ignore",
 		"/.release-allowed-signers export-ignore",
 	}
 	dockerignoreEntries = []string{
 		"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena",
 		".github/workflows/automerge.yml",
 		".github/workflows/revert-red-main.yml",
+		".github/workflows/code-review.yml",
 		".release-allowed-signers",
 	}
 )
@@ -167,6 +169,7 @@ func TestIsPrivateWorkflowFile(t *testing.T) {
 		".release-allowed-signers.sample":        false,
 		".github/workflows/automerge.yml":        true,
 		".github/workflows/revert-red-main.yml":  true,
+		".github/workflows/code-review.yml":      true,
 		".github/workflows/automerge.yml.sample": false,
 		"sub/.github/workflows/automerge.yml":    false,
 		".github/workflows/batch.yml":            false,

@@ -3,3 +3,7 @@ self-hosted-runner:
     - batch
     # The reserved 1-CPU runners the CI Gate runs on (workflows/ci.yml ci-gate).
     - ci-gate
+    # The code-review workflow's runners (workflows/code-review.yml): Codex
+    # reviews on `codex`, the advisory opencode review on `qwen` (CUSTOMIZE).
+    - codex
+    - qwen
