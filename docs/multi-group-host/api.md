@@ -1193,7 +1193,7 @@ human-readable role with its timers (`leader(hb=1 et=4)`), followed by
 `self-removed` or `unreadable-log-denials=N` when they apply. `DiagRaftState` and
 `DiagRemotes` read the snapshot the step worker publishes each tick; the first
 call enables publication, so it reports `(diagnostics warming up)`.
-`DiagRemotes.Text` renders the leader's view of each remote, and is
+`RemotesDiag.Text` renders the leader's view of each remote, and is
 `not leader` elsewhere; use `ShardInfo.Replicas` for the same state structured.
 Neither `State` nor `Text` is a format to parse.
 

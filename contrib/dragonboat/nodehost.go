@@ -1220,8 +1220,8 @@ func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 
 // GetLeaderID returns the leader's replicaID, the current term, whether
 // a leader is known, and any error. This matches dragonboat's four-value
-// return signature. Quicraft's GetLeaderID returns (leaderID, valid, error);
-// the term is obtained from GetShardInfo.
+// return signature, which Quicraft's Host.LeaderIDAndTerm returns as is
+// (Host.LeaderID returns only leaderID, valid and error).
 func (nh *NodeHost) GetLeaderID(shardID uint64) (uint64, uint64, bool, error) {
 	leaderID, term, valid, err := nh.host.LeaderIDAndTerm(shardID)
 	if err != nil {

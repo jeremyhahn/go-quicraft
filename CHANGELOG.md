@@ -235,6 +235,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files, and lists the BREAKING API and run-time changes; the troubleshooting
   table covers the new start-time errors, and engineering.md's `Membership`
   layouts carry the committed `WireVersion`.
+- Identifier and example sweep after the API freeze (#474): every exported
+  identifier named in `README.md`, `docs/` and `contrib/dragonboat/` was
+  checked against the code and every complete Go example compiled against it;
+  `docs/multi-group-host/api.md` now names `RemotesDiag.Text`, the field of the
+  typed result `DiagRemotes` returns. The doc comments of the nested modules
+  (`contrib/dragonboat`, `test/performance` and its benchmark modules) were
+  swept the same way; `NodeHost.GetLeaderID` now names `Host.LeaderIDAndTerm`,
+  and a transport comment no longer claims Go's hostname check falls back to
+  the certificate's CommonName.
 
 ## [0.23.0-alpha] - 2026-10-16
 

@@ -1959,8 +1959,8 @@ func (t *QUICTransport) inboundAuthorizedFor(conn *quic.Conn, target string) boo
 		return false
 	}
 	// certs[0] is the verified leaf. VerifyHostname matches host against the
-	// cert's DNSNames/IPAddresses (and legacy CN), exactly as the dial path's
-	// ServerName check does.
+	// cert's DNSNames/IPAddresses only (Go ignores the Subject CommonName),
+	// exactly as the dial path's ServerName check does.
 	return certs[0].VerifyHostname(host) == nil
 }
 
