@@ -105,6 +105,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- post-quantum key exchange re-pinned from draft-ietf-tls-ecdhe-mlkem-05 to
+  RFC 10024 (#466): same code points, share sizes and shared-secret layout, so
+  no behaviour or format change; the draft copy stays, marked superseded.
+
 - **BREAKING, wire and on disk** (#449): `MessageBatch`'s fixed header grows
   from 24 to 32 bytes (`MaxBinVer`), `ConfigChange` gains `WireVersion` (fixed
   portion 60 bytes) and `Membership` gains `WireVersion` (fixed region 65

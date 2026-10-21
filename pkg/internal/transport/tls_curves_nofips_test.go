@@ -44,7 +44,7 @@ func assertHandshakeCurves(t *testing.T, role string, curves []tls.CurveID) {
 
 	if curves[0] != tls.X25519MLKEM768 {
 		t.Errorf("%s: first curve is %v, want X25519MLKEM768. A standard build offers "+
-			"the post-quantum hybrid first (draft-ietf-tls-ecdhe-mlkem-05).", role, curves[0])
+			"the post-quantum hybrid first (RFC 10024).", role, curves[0])
 	}
 
 	for _, need := range []tls.CurveID{tls.SecP256r1MLKEM768, tls.CurveP256} {

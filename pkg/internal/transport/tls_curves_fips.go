@@ -22,7 +22,7 @@ import "crypto/tls"
 // intra-cluster TLS 1.3 handshake in a `-tags fips` build: the
 // SecP256r1MLKEM768 hybrid, then the two FIPS 140-3 approved ECDH groups.
 //
-// SecP256r1MLKEM768 (draft-ietf-tls-ecdhe-mlkem-05, pinned; docs/references/)
+// SecP256r1MLKEM768 (RFC 10024; docs/references/)
 // combines P-256 ECDH with FIPS 203 ML-KEM-768, so BOTH halves are approved
 // and the shared secret is approved whichever half an assessor credits. The Go
 // Cryptographic Module negotiates it under GODEBUG=fips140=only, for the

@@ -1189,7 +1189,7 @@ at-rest side.
   `[X25519MLKEM768, SecP256r1MLKEM768, X25519, P-256, P-384]` in a standard
   build (`tls_curves_nofips.go`), `[SecP256r1MLKEM768, P-256, P-384]` with
   `-tags fips` (`tls_curves_fips.go`). Each list leads with a post-quantum
-  hybrid of draft-ietf-tls-ecdhe-mlkem-05 (ECDH plus FIPS 203 ML-KEM-768),
+  hybrid of RFC 10024 (ECDH plus FIPS 203 ML-KEM-768),
   because a recorded classical handshake over replicated data could be
   decrypted later; it costs about 0.5 ms per full handshake
   (`BenchmarkQUICHandshake`) and nothing per message. The larger ClientHello

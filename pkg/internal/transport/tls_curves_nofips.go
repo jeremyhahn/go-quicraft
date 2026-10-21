@@ -21,7 +21,7 @@ import "crypto/tls"
 // handshakeCurves is the key-exchange group list for both roles of the
 // intra-cluster TLS 1.3 handshake in a standard build.
 //
-// X25519MLKEM768 comes first: the hybrid of draft-ietf-tls-ecdhe-mlkem-05
+// X25519MLKEM768 comes first: the hybrid of RFC 10024
 // (pinned; docs/references/), X25519 combined with the FIPS 203 ML-KEM-768
 // KEM. Every byte of replicated user data crosses these connections, and a
 // recorded classical handshake is one a future quantum adversary can decrypt;

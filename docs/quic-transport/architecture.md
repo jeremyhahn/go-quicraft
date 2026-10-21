@@ -119,8 +119,8 @@ There is exactly one TLS-config constructor, `buildMTLSTLS`:
 listener and no TCP dialer. Cipher suites are not restricted, because Go does
 not expose TLS 1.3 suite selection.
 
-Both lists lead with a post-quantum hybrid from draft-ietf-tls-ecdhe-mlkem,
-pinned at -05 ([copy](../references/draft-ietf-tls-ecdhe-mlkem-05.txt)), which
+Both lists lead with a post-quantum hybrid from RFC 10024
+([copy](../references/rfc10024.txt)), which
 combines an ECDH exchange with FIPS 203 ML-KEM-768
 ([copy](../references/NIST.FIPS.203.pdf)). These connections carry every byte
 of replicated user data, and a classical handshake recorded today can be

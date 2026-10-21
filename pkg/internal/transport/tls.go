@@ -211,7 +211,7 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 	}
 
 	// The key-exchange groups are named explicitly, and post-quantum hybrids
-	// lead both lists (draft-ietf-tls-ecdhe-mlkem-05 with FIPS 203 ML-KEM):
+	// lead both lists (RFC 10024 with FIPS 203 ML-KEM):
 	// these connections carry all replicated user data, and a recorded
 	// classical handshake could be decrypted once a quantum adversary exists.
 	// The larger hybrid key share spans two QUIC Initial packets, which
