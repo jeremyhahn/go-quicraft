@@ -154,6 +154,16 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 	// This ensures revocation checks happen even for TLS session resumption.
 	var verifyConn func(tls.ConnectionState) error
 	if checker != nil {
+		// The pair's own issuer snapshot, parsed from the bundle its pool
+		// holds, backs its handshakes' revocation checks. The checker's
+		// shared set follows the latest reload, and a handshake that began
+		// under the previous config was verified against the previous
+		// bundle: resolving its leaf in the new set lost the issuer scope
+		// and with it every issuer-scoped revocation of the CA it chains to.
+		issuers, err := parseCACertificates(mtls.CACert)
+		if err != nil {
+			return nil, err
+		}
 		onRevoked := checker.OnCertRevoked()
 		verifyConn = func(cs tls.ConnectionState) error {
 			// Only revocation-check the LEAF certificate (PeerCertificates[0]).
@@ -179,7 +189,7 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 				return ErrNoPeerCertificate
 			}
 			leaf := cs.PeerCertificates[0]
-			revoked, checkErr := checker.IsRevoked(leaf)
+			revoked, checkErr := checker.IsRevokedUnder(leaf, issuers)
 			if checkErr != nil {
 				return checkErr
 			}
@@ -226,6 +236,18 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: curves,
 		VerifyConnection: verifyConn,
+	}
+	// Session tickets are sealed with THIS config's own automatically rotated
+	// ticket keys. Without the two hooks crypto/tls takes the keys from the
+	// listener's base config rather than the one GetConfigForClient returned,
+	// so a ticket issued before ReloadMTLS would still resume after it — with
+	// the old leaf, and with a client chain the new pool never verified. A
+	// ticket this config cannot decrypt yields a full handshake.
+	serverCfg.WrapSession = func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+		return serverCfg.EncryptTicket(cs, ss)
+	}
+	serverCfg.UnwrapSession = func(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
+		return serverCfg.DecryptTicket(identity, cs)
 	}
 
 	clientCfg := &tls.Config{

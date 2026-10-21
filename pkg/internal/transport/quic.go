@@ -159,10 +159,18 @@ type sendQueue struct {
 //
 // QUICTransport is safe for concurrent use by multiple goroutines.
 type QUICTransport struct {
-	cfg      Config
-	handler  MessageHandler
-	reg      *registry.Registry
-	tlsPair  *tlsPair
+	cfg     Config
+	handler MessageHandler
+	reg     *registry.Registry
+	// tlsState is the current certificate, CA pool and derived
+	// verification state, swapped whole by ReloadMTLS. Every new handshake
+	// reads it (listenerTLS, dial), so a reload reaches the next handshake
+	// without touching an established connection. Read it through
+	// currentTLS.
+	tlsState atomic.Pointer[tlsPair]
+	// reloadMu serializes ReloadMTLS, so the checker's issuer set and the
+	// stored pair are always replaced together.
+	reloadMu sync.Mutex
 	quicCfg  *quic.Config
 	udpConn  *net.UDPConn
 	quicTr   *quic.Transport
@@ -608,7 +616,6 @@ func NewQUICTransport(
 		cfg:             cfg,
 		handler:         handler,
 		reg:             reg,
-		tlsPair:         pair,
 		quicCfg:         qcfg,
 		conns:           make(map[string]*quic.Conn),
 		connPeer:        make(map[*quic.Conn]string),
@@ -638,6 +645,8 @@ func NewQUICTransport(
 			},
 		},
 	}
+
+	t.tlsState.Store(pair)
 
 	for i := range t.streamShards {
 		t.streamShards[i].streams = make(map[streamKey]*quic.Stream)
@@ -703,7 +712,7 @@ func (t *QUICTransport) Start() error {
 		Conn: udpConn,
 	}
 
-	serverTLS := t.tlsPair.server.Clone()
+	serverTLS := t.listenerTLS()
 	listener, err := t.quicTr.Listen(serverTLS, t.quicCfg)
 	if err != nil {
 		if closeErr := udpConn.Close(); closeErr != nil {

@@ -428,7 +428,9 @@ func (t *QUICTransport) dialAndPool(target, want string) (*quic.Conn, func(), er
 	ctx, cancel := context.WithTimeout(t.shutdownCtx, t.cfg.DialTimeout)
 	defer cancel()
 
-	clientTLS := t.tlsPair.client.Clone()
+	// The current pair is read per dial, so a reloaded leaf or CA pool
+	// reaches the next outbound handshake.
+	clientTLS := t.currentTLS().client.Clone()
 	clientTLS.ServerName = host
 
 	conn, err := t.quicTr.Dial(ctx, udpAddr, clientTLS, t.quicCfg)
@@ -1380,14 +1382,22 @@ func (t *QUICTransport) revokeCheckConnections() {
 	if t.revocationChecker == nil {
 		return
 	}
+	// live collects the leaves of the connections the sweep keeps: an issuer
+	// a CA reload dropped is retained by the checker only while one of them
+	// needs it, and released at the end of the sweep after the last closes.
+	var live []*x509.Certificate
 	drop := func(conn *quic.Conn) {
 		certs := conn.ConnectionState().TLS.PeerCertificates
 		if len(certs) == 0 {
 			return
 		}
 		leaf := certs[0]
-		revoked, err := t.revocationChecker.IsRevoked(leaf)
+		// Established, not IsRevoked: a session admitted under a CA the
+		// bundle has since dropped is checked against that CA, not failed
+		// for lacking an issuer in the new set.
+		revoked, err := t.revocationChecker.IsRevokedEstablished(leaf)
 		if !revoked && err == nil {
+			live = append(live, leaf)
 			return
 		}
 		// A checker ERROR is treated the same as revoked, matching the
@@ -1427,6 +1437,7 @@ func (t *QUICTransport) revokeCheckConnections() {
 	for _, c := range outbound {
 		drop(c)
 	}
+	t.revocationChecker.PruneRetainedIssuers(live)
 }
 
 // inboundConnState is the per-INBOUND-connection liveness record held in
@@ -2026,12 +2037,13 @@ func isCoLocatedCertHost(selfHost, peerHost string) bool {
 // SANs on DISTINCT hosts are therefore a hard deployment precondition for the
 // guarantees above; co-located replicas do not get them.
 func (t *QUICTransport) VerifyPeerAddressExclusivity(selfAddr string, peers []string) error {
-	if t.tlsPair == nil || t.tlsPair.leaf == nil {
+	pair := t.currentTLS()
+	if pair == nil || pair.leaf == nil {
 		// Unreachable: NewQUICTransport fails when the leaf cannot be parsed.
 		// Fail CLOSED rather than silently skipping a security precondition.
 		return ErrNoLocalCertificate
 	}
-	return verifyCertificateExclusivity(t.tlsPair.leaf, selfAddr, peers)
+	return verifyCertificateExclusivity(pair.leaf, selfAddr, peers)
 }
 
 // verifyCertificateExclusivity is VerifyPeerAddressExclusivity over an explicit
@@ -2103,7 +2115,7 @@ func verifyCertificateExclusivity(leaf *x509.Certificate, selfAddr string, peers
 // silently disables all of the above, and is reported rather than tolerated —
 // see unnameableCertSelfHost and reportPromiscuousCertCoverage.
 func (t *QUICTransport) refuseInboundPromiscuousCert(conn *quic.Conn) error {
-	if conn == nil || t.tlsPair == nil {
+	if conn == nil || t.currentTLS() == nil {
 		return nil
 	}
 	selfHost := canonicalCertHost(certAuthHost(t.localAddr()))

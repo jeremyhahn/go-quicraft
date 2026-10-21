@@ -193,6 +193,23 @@ func (r *Registry) ReplicasAt(address string) []NodeInfo {
 	return at
 }
 
+// Addresses returns every distinct address registered, in no particular
+// order. A certificate reload uses it to re-run the SAN-exclusivity check
+// against every peer this host currently knows.
+func (r *Registry) Addresses() []string {
+	seen := make(map[string]struct{})
+	var addrs []string
+	r.addresses.Range(func(_, val any) bool {
+		addr := val.(string)
+		if _, ok := seen[addr]; !ok {
+			seen[addr] = struct{}{}
+			addrs = append(addrs, addr)
+		}
+		return true
+	})
+	return addrs
+}
+
 // Count returns the number of registered nodes.
 func (r *Registry) Count() int {
 	return int(r.count.Load())

@@ -76,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WriteHealthMetrics` (QuicRaft metrics are per host, via
   `quicraft.WithMetrics`) and external snapshot files are documented as
   unsupported.
+- mtls-hot-reload (#448): `Host.ReloadMTLS` replaces a running node's
+  certificate, key and CA pool without a restart, and contrib/dragonboat's
+  `NodeHost.ReloadMutualTLS` re-reads the configured files. The new material
+  is validated as at start, plus two reload rules: the leaf must keep the
+  node's key (`NodeIdentityChangedError`), and it must not cover a peer's
+  host. A refused reload returns `*MTLSReloadError` and changes nothing. New
+  handshakes, inbound and outbound, use the new material; established
+  connections keep their session until they reconnect, and a session ticket
+  issued before a reload no longer resumes after it. With revocation enabled
+  the checker's issuer set is swapped in the same step. The CA-rollover
+  runbook is `docs/quic-transport/ca-rollover.md`. No wire or format change.
 
 ### Changed
 

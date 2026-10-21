@@ -48,6 +48,22 @@ There is no way to run without mTLS material. Omitting it fails with
 `config.ErrMTLSConfigRequired`; `WithoutTransport()` disables the transport
 entirely rather than relaxing it.
 
+## Task: renew a certificate or replace the CA
+
+Reload the new material in place. A node does not need to restart:
+
+```go
+err := host.ReloadMTLS(&config.MTLSConfig{CACert: caPEM, Cert: certPEM, Key: keyPEM})
+```
+
+The leaf must be issued for the node's existing key, because the key is the
+node's identity (next task). A refused reload returns `*MTLSReloadError` and
+leaves the old material in force. New handshakes use the new material right
+away. Connections that are already up keep theirs until they reconnect. To
+replace the CA itself, follow the three-step
+[CA rollover runbook](ca-rollover.md). A node reloaded out of order refuses
+its peers.
+
 ## Task: give every member its identity
 
 A member is authorized by its node identity and by nothing else. A peer whose

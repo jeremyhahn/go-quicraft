@@ -1390,10 +1390,11 @@ func NodeIdentityFromCertificate(leaf *x509.Certificate) string {
 // It returns "" when no leaf is available, which NewQUICTransport makes
 // unreachable (an unparsable leaf fails construction).
 func (t *QUICTransport) LocalNodeIdentity() string {
-	if t.tlsPair == nil {
+	pair := t.currentTLS()
+	if pair == nil {
 		return ""
 	}
-	return NodeIdentityFromCertificate(t.tlsPair.leaf)
+	return NodeIdentityFromCertificate(pair.leaf)
 }
 
 // discardFrameBody consumes a frame payload that will not be processed so the

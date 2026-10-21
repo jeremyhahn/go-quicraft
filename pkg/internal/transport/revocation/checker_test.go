@@ -2417,7 +2417,7 @@ func TestIssuerForNoUsableIssuer(t *testing.T) {
 	// The same condition surfaces as a typed error through the OCSP path: no
 	// issuer means no request can be built and no verdict can be scoped.
 	checker.cfg.OCSPResponderURL = "http://ocsp.invalid"
-	if _, err := checker.checkOCSPRaw(leaf); !errors.Is(err, ErrNoIssuerCertificate) {
+	if _, err := checker.checkOCSPRaw(leaf, checker.issuerFor(leaf)); !errors.Is(err, ErrNoIssuerCertificate) {
 		t.Fatalf("checkOCSPRaw error = %v, want ErrNoIssuerCertificate", err)
 	}
 }

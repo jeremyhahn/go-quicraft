@@ -896,6 +896,37 @@ On the wire the request is a `LeaderExec` message and the answer a
 `LeaderExecResp`. Both are host traffic that never reaches Raft; see
 [Message type constants](../wire-protocol/engineering.md#message-type-constants).
 
+### Live mTLS reload
+
+```go
+func (h *Host) ReloadMTLS(mtls *config.MTLSConfig) error
+```
+
+`ReloadMTLS` replaces this node's certificate, key and CA pool without a
+restart. The material is validated exactly as `NewHost` validates
+`TransportConfig.MTLSConfig`, and two more rules apply:
+
+- the leaf must carry the key in force, because peers committed the identity
+  `NodeIdentity` derives from it (`*NodeIdentityChangedError`,
+  `ErrNodeIdentityChanged`);
+- the leaf must not cover the host of any peer in the address registry, the
+  `StartShard` exclusivity rule (`*SharedPeerCertificateError`).
+
+The material is swapped only when every check passes. Otherwise nothing
+changes and the call returns a `*MTLSReloadError` (`ErrMTLSReload`) that wraps
+the failed check, so `errors.Is` finds `ErrIncompleteMTLSConfig`,
+`ErrInvalidCACert`, `ErrNodeIdentityChanged` and so on through it. Every
+handshake that starts after the call returns uses the new material. Live
+connections keep their session until they reconnect. It returns `ErrClosed`
+on a closed host, and an `*MTLSReloadError` for `ErrNoLocalCertificate` under
+`WithoutTransport`. The PEM buffers are read during the call and not retained.
+Calls are serialised; it is safe alongside all other Host methods. The
+procedure for replacing a CA is the
+[CA rollover runbook](../quic-transport/ca-rollover.md).
+
+contrib/dragonboat exposes it as `NodeHost.ReloadMutualTLS()`, which re-reads
+`CAFile`, `CertFile` and `KeyFile`.
+
 ### Informational
 
 ```go

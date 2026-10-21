@@ -1207,7 +1207,39 @@ at-rest side.
 - **Session resumption**: the client keeps a
   `tls.NewLRUClientSessionCache(256)`, cutting a reconnect from two round trips
   to one. Revocation still applies on resumption, because the callback is
-  `VerifyConnection` (below).
+  `VerifyConnection` (below). Resumption is scoped to one set of TLS
+  material. Each `buildMTLSTLS` call gets its own client cache, and its server
+  config seals tickets with its own keys through `WrapSession`/`UnwrapSession`.
+  Without those hooks, `crypto/tls` would take the ticket keys from the
+  listener's base config instead of the config `GetConfigForClient` returned,
+  and a ticket would resume across `ReloadMTLS` without its chain being
+  checked against the new pool (`TestReloadMTLS_TicketsResumeOnlyWithinOnePair`).
+- **Live reload**: the server config, client config and own leaf form one
+  `tlsPair` in an `atomic.Pointer`. The listener is created once with
+  `GetConfigForClient` returning the current pair's server config. Each dial
+  clones the current client config. `ReloadMTLS` validates and builds a whole
+  new pair, checks that the key is unchanged and that the leaf is exclusive,
+  swaps the revocation issuer set, and stores the pair. A connection keeps its
+  session until it reconnects. See the [CA rollover runbook](ca-rollover.md).
+- **Issuers of established sessions**: `Checker.SetIssuers` moves an issuer
+  the new bundle drops into a retained set instead of forgetting it. The
+  handshake path calls `IsRevoked`, which resolves against the trusted set
+  only, so a retained issuer never admits a connection. The sweep in
+  `revokeCheckConnections` calls `IsRevokedEstablished`, which falls back to
+  the retained set, so an old-CA session keeps its issuer-scoped CRL entries
+  and its OCSP lookups instead of being closed for want of an issuer. CRL
+  signatures verify against both sets. After each sweep
+  `PruneRetainedIssuers` keeps only the retained issuers a surviving leaf
+  needs (`TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP`,
+  `TestReloadMTLS_CADropStillRevokesUnderIssuerScopedCRL`).
+- **Reload against admission**: `Host.ReloadMTLS` and peer admission
+  (`StartShard`, a membership add) share `Host.peerAdmitMu`. Admission checks
+  SAN exclusivity under it and records the addresses in an admitting set
+  until they are in the registry; reload checks the registry plus that set
+  and publishes the pair under the same lock. A conflicting reload and
+  admission cannot both succeed
+  (`TestHostReloadMTLS_SerializedWithPeerAdmission`). The lock is taken on
+  admission and reload only, never per message.
 
 **CA bundle parsing.** `parseCACertificates` parses *every* CERTIFICATE block in
 the bundle and keeps those able to issue. TLS verification consumes the whole

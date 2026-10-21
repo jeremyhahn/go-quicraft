@@ -98,6 +98,15 @@ var (
 	// security precondition.
 	ErrNoLocalCertificate = errors.New("transport: local leaf certificate unavailable")
 
+	// ErrMTLSReload is the sentinel form of MTLSReloadError, for errors.Is()
+	// matching: a ReloadMTLS was refused and the previous material stays in
+	// use.
+	ErrMTLSReload = errors.New("transport: mTLS reload refused")
+
+	// ErrNodeIdentityChanged is the sentinel form of
+	// NodeIdentityChangedError, for errors.Is() matching.
+	ErrNodeIdentityChanged = errors.New("transport: reloaded certificate changes the node identity")
+
 	// ErrInvalidMaxStreamsPerConnection is returned when MaxStreamsPerConnection < 1.
 	ErrInvalidMaxStreamsPerConnection = errors.New("transport: max streams per connection must be >= 1")
 
@@ -767,6 +776,58 @@ func (e *SharedPeerCertificateError) Error() string {
 // Is reports whether target matches the sentinel ErrSharedPeerCertificate.
 func (e *SharedPeerCertificateError) Is(target error) bool {
 	return target == ErrSharedPeerCertificate
+}
+
+// MTLSReloadError reports that ReloadMTLS refused new mTLS material. Nothing
+// was swapped: every handshake keeps using the material in force before the
+// call. Err is the check that failed — ErrMTLSConfigRequired or
+// ErrIncompleteMTLSConfig (material missing), ErrInvalidCertKeyPair (the
+// leaf does not parse or its key does not match), ErrInvalidCACert (no
+// certificate in the CA bundle), a *CACertificateParseError (revocation is
+// enabled and the bundle holds no issuer), a *NodeIdentityChangedError, or a
+// *SharedPeerCertificateError — the same checks NewQUICTransport runs.
+type MTLSReloadError struct {
+	Err error
+}
+
+// Error returns a human-readable description of the refused reload.
+func (e *MTLSReloadError) Error() string {
+	return fmt.Sprintf("transport: mTLS reload refused, previous material kept: %v", e.Err)
+}
+
+// Is reports whether target matches the sentinel ErrMTLSReload.
+func (e *MTLSReloadError) Is(target error) bool {
+	return target == ErrMTLSReload
+}
+
+// Unwrap returns the check that failed.
+func (e *MTLSReloadError) Unwrap() error {
+	return e.Err
+}
+
+// NodeIdentityChangedError reports a reloaded leaf whose public key differs
+// from the one in force. The node identity is the SHA-256 of the leaf's
+// SubjectPublicKeyInfo, and peers count this node's quorum-bearing messages
+// only under the identity they committed for it, so a reload that changed it
+// would lock this node out of every shard it serves. Renewing or re-issuing
+// the certificate on the SAME keypair keeps the identity; a new keypair goes
+// through a membership change that commits the new identity.
+type NodeIdentityChangedError struct {
+	// Current is the identity of the leaf in force.
+	Current string
+	// Reloaded is the identity of the refused leaf.
+	Reloaded string
+}
+
+// Error returns a human-readable description of the identity change.
+func (e *NodeIdentityChangedError) Error() string {
+	return fmt.Sprintf("transport: reloaded certificate changes the node identity from %s to %s; "+
+		"re-issue the certificate on the same keypair", e.Current, e.Reloaded)
+}
+
+// Is reports whether target matches the sentinel ErrNodeIdentityChanged.
+func (e *NodeIdentityChangedError) Is(target error) bool {
+	return target == ErrNodeIdentityChanged
 }
 
 // PromiscuousPeerCertificateError reports that an INBOUND peer's verified leaf

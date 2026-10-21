@@ -145,6 +145,13 @@ func sentinelTable() []sentinelClassification {
 		// Permanent: only re-issuing this node's certificate with per-node
 		// SANs clears it.
 		{"ErrSharedPeerCertificate", ErrSharedPeerCertificate, false},
+		// Permanent: a refused certificate reload is refused again until the
+		// operator supplies different material.
+		{"ErrMTLSReload", ErrMTLSReload, false},
+		{"ErrNodeIdentityChanged", ErrNodeIdentityChanged, false},
+		{"ErrIncompleteMTLSConfig", ErrIncompleteMTLSConfig, false},
+		{"ErrInvalidCACert", ErrInvalidCACert, false},
+		{"ErrNoLocalCertificate", ErrNoLocalCertificate, false},
 		// A malformed health value in a decoded document does not become
 		// well-formed by decoding it again.
 		{"ErrInvalidShardHealth", ErrInvalidShardHealth, false},

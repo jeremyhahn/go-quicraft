@@ -767,6 +767,21 @@ func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, regis
 	if address == "" || h.host == nil || h.host.registry == nil {
 		return
 	}
+	// Steady state: the mapping already says what this message would write.
+	// Skipping the store keeps every inbound message from a settled member off
+	// sync.Map's write path, which is what the registry's read-biased design is
+	// for, and off peerAdmitMu. A concurrent writer that changed the entry since
+	// the snapshot was taken is authoritative (it is a committed config change),
+	// so leaving its value in place is the correct outcome, not a lost update.
+	if registered == address {
+		return
+	}
+	// Every write below publishes an address no committed entry decided, so it
+	// goes through publishLearnedAddress: under peer admission, and refused
+	// when the installed certificate covers the address, as a concurrent
+	// Host.ReloadMTLS would otherwise install one covering it between a check
+	// and the write.
+	//
 	// A sender the committed configuration does not name may establish a
 	// mapping, but must never REPLACE one. That keeps first contact working for
 	// a joining replica (which knows no members yet, and must record the
@@ -777,25 +792,18 @@ func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, regis
 	// between them lets two concurrent receives both observe no mapping and both
 	// store, so the invariant above holds only when the receives are serialized.
 	// LoadOrStore makes "establish but never replace" actually atomic — which is
-	// why the `registered` snapshot is not consulted on this path.
+	// why the `registered` snapshot is not consulted past the steady-state check.
 	if !mayOverwrite {
-		if existing, stored := h.host.registry.RegisterIfAbsent(shardID, replicaID, address); !stored && existing != address {
-			slog.Warn("ignoring address change from a replica outside the configuration",
-				"shard", shardID,
-				"replica", replicaID,
-				"registered", existing,
-				"offered", address,
-			)
-		}
-		return
-	}
-	// Steady state: the mapping already says what this message would write.
-	// Skipping the store keeps every inbound message from a settled member off
-	// sync.Map's write path, which is what the registry's read-biased design is
-	// for. A concurrent writer that changed the entry since the snapshot was
-	// taken is authoritative (it is a committed config change), so leaving its
-	// value in place is the correct outcome, not a lost update.
-	if registered == address {
+		h.host.publishLearnedAddress(shardID, replicaID, address, func() {
+			if existing, stored := h.host.registry.RegisterIfAbsent(shardID, replicaID, address); !stored && existing != address {
+				slog.Warn("ignoring address change from a replica outside the configuration",
+					"shard", shardID,
+					"replica", replicaID,
+					"registered", existing,
+					"offered", address,
+				)
+			}
+		})
 		return
 	}
 	// Replacing an ESTABLISHED mapping re-points every future send for this
@@ -803,15 +811,17 @@ func (h *hostMessageHandler) learnSourceAddress(shardID, replicaID uint64, regis
 	// black-holing that member. Both are rare and neither is visible anywhere
 	// else, so log it: it no longer affects authorization, but it is the signal
 	// an operator needs when a member goes silent for no apparent reason.
-	if registered != "" {
-		slog.Warn("replacing the registered address of a configured replica",
-			"shard", shardID,
-			"replica", replicaID,
-			"registered", registered,
-			"offered", address,
-		)
-	}
-	h.host.registry.Register(shardID, replicaID, address)
+	h.host.publishLearnedAddress(shardID, replicaID, address, func() {
+		if registered != "" {
+			slog.Warn("replacing the registered address of a configured replica",
+				"shard", shardID,
+				"replica", replicaID,
+				"registered", registered,
+				"offered", address,
+			)
+		}
+		h.host.registry.Register(shardID, replicaID, address)
+	})
 }
 
 // admitSnapshotSender applies every check a snapshot's sender must pass before
@@ -1620,8 +1630,15 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 		// shard, go through the committed membership the snapshot below is
 		// about to install. Authorization stopped reading the registry
 		// precisely because this write exists.
+		//
+		// The address is committed membership the leader holds, not one this
+		// replica learned from a connection, so it is published as every
+		// committed address is: under peer admission, never refused, with a
+		// conflict against the installed certificate reported. Refusing it
+		// would only delay it: installing the snapshot below reconciles the
+		// same membership through the same path.
 		if senderAddr := first.Membership.Addresses[fromReplicaID]; senderAddr != "" {
-			h.host.registry.Register(shardID, fromReplicaID, senderAddr)
+			h.host.publishCommittedAddress(shardID, fromReplicaID, senderAddr)
 		}
 	}
 

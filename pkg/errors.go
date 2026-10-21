@@ -607,6 +607,41 @@ var ErrSharedPeerCertificate = transport.ErrSharedPeerCertificate
 // the membership-add API return.
 type SharedPeerCertificateError = transport.SharedPeerCertificateError
 
+// ErrMTLSReload is returned by Host.ReloadMTLS when the new certificate
+// material was refused and the previous material stays in force. The
+// concrete error is a *MTLSReloadError wrapping the check that failed.
+var ErrMTLSReload = transport.ErrMTLSReload
+
+// MTLSReloadError is the error behind ErrMTLSReload. Its Err is the failed
+// check: ErrIncompleteMTLSConfig, ErrInvalidCertKeyPair, ErrInvalidCACert,
+// a *CACertificateParseError, a *NodeIdentityChangedError, a
+// *SharedPeerCertificateError, or ErrNoLocalCertificate on a host without a
+// transport.
+type MTLSReloadError = transport.MTLSReloadError
+
+// ErrNodeIdentityChanged is the cause inside a *MTLSReloadError when the
+// reloaded leaf carries a different public key, which would change this
+// host's NodeIdentity. The concrete error is a *NodeIdentityChangedError.
+var ErrNodeIdentityChanged = transport.ErrNodeIdentityChanged
+
+// NodeIdentityChangedError is the error behind ErrNodeIdentityChanged,
+// naming the identity in force and the refused one.
+type NodeIdentityChangedError = transport.NodeIdentityChangedError
+
+// The remaining causes a *MTLSReloadError can carry, for errors.Is matching.
+var (
+	// ErrIncompleteMTLSConfig: the material is missing CACert, or both the
+	// pre-built Certificate and the Cert/Key pair.
+	ErrIncompleteMTLSConfig = transport.ErrIncompleteMTLSConfig
+
+	// ErrInvalidCACert: the CA bundle yields no certificate for the pool.
+	ErrInvalidCACert = transport.ErrInvalidCACert
+
+	// ErrNoLocalCertificate: the host has no transport, so it holds no
+	// certificate to replace.
+	ErrNoLocalCertificate = transport.ErrNoLocalCertificate
+)
+
 // Errors built inside the engine, raft and transport packages that reach a
 // caller through one of three channels: the result of a proposal whose batch
 // failed to apply or persist, config.ShardFailedInfo.Err, and the cause inside

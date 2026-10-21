@@ -408,7 +408,8 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 // TestVerifyPeerAddressExclusivity_NoLeafFailsClosed proves the check refuses
 // to answer "fine" when it cannot see this node's own certificate.
 func TestVerifyPeerAddressExclusivity_NoLeafFailsClosed(t *testing.T) {
-	tr := &QUICTransport{tlsPair: &tlsPair{}}
+	tr := &QUICTransport{}
+	tr.tlsState.Store(&tlsPair{})
 	if err := tr.VerifyPeerAddressExclusivity("node-a.raft.test:5000",
 		[]string{"node-b.raft.test:5000"}); !errors.Is(err, ErrNoLocalCertificate) {
 		t.Fatalf("error = %v, want ErrNoLocalCertificate", err)

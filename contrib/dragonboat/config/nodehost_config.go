@@ -417,24 +417,36 @@ func (c NodeHostConfig) ToQuicraft() (qcConfig.HostConfig, error) {
 	}
 
 	if c.MutualTLS {
-		caCert, err := os.ReadFile(c.CAFile)
+		mtls, err := c.ReadMutualTLS()
 		if err != nil {
-			return qcConfig.HostConfig{}, &FileReadError{Path: c.CAFile, Err: err}
+			return qcConfig.HostConfig{}, err
 		}
-		cert, err := os.ReadFile(c.CertFile)
-		if err != nil {
-			return qcConfig.HostConfig{}, &FileReadError{Path: c.CertFile, Err: err}
-		}
-		key, err := os.ReadFile(c.KeyFile)
-		if err != nil {
-			return qcConfig.HostConfig{}, &FileReadError{Path: c.KeyFile, Err: err}
-		}
-		hc.TransportConfig.MTLSConfig = &qcConfig.MTLSConfig{
-			CACert: caCert,
-			Cert:   cert,
-			Key:    key,
-		}
+		hc.TransportConfig.MTLSConfig = mtls
 	}
 
 	return hc, nil
+}
+
+// ReadMutualTLS reads the CA, certificate and key files into a quicraft
+// MTLSConfig. ToQuicraft calls it at start and NodeHost.ReloadMutualTLS
+// calls it again to pick up files an operator has replaced. Returns a
+// *FileReadError naming the first file that cannot be read.
+func (c NodeHostConfig) ReadMutualTLS() (*qcConfig.MTLSConfig, error) {
+	caCert, err := os.ReadFile(c.CAFile)
+	if err != nil {
+		return nil, &FileReadError{Path: c.CAFile, Err: err}
+	}
+	cert, err := os.ReadFile(c.CertFile)
+	if err != nil {
+		return nil, &FileReadError{Path: c.CertFile, Err: err}
+	}
+	key, err := os.ReadFile(c.KeyFile)
+	if err != nil {
+		return nil, &FileReadError{Path: c.KeyFile, Err: err}
+	}
+	return &qcConfig.MTLSConfig{
+		CACert: caCert,
+		Cert:   cert,
+		Key:    key,
+	}, nil
 }

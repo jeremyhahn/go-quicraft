@@ -2280,7 +2280,7 @@ func (c *hostEngineCallback) applyMembershipRouting(ns *nodeState, shardID uint6
 			ns.nodesMu.Lock()
 			ns.nodes[cc.ReplicaID] = cc.Address
 			ns.nodesMu.Unlock()
-			c.h.registry.Register(shardID, cc.ReplicaID, cc.Address)
+			c.h.publishCommittedAddress(shardID, cc.ReplicaID, cc.Address)
 			// The entry that binds THIS replica's identity is learned here
 			// when it was committed after the snapshot a restart recovered
 			// from — the one window checkRecoveredIdentities cannot see. A
@@ -2376,7 +2376,7 @@ func (c *hostEngineCallback) registerBootstrapAddresses(ns *nodeState, shardID u
 	ns.nodesMu.Unlock()
 	for _, group := range groups {
 		for id, addr := range group {
-			c.h.registry.Register(shardID, id, addr)
+			c.h.publishCommittedAddress(shardID, id, addr)
 		}
 	}
 	return true
@@ -2893,7 +2893,7 @@ func (c *hostEngineCallback) reconcileMembershipFromPeer(shardID uint64, ns *nod
 	// Add or update nodes from the snapshot membership.
 	for replicaID, addr := range newNodes {
 		ns.nodes[replicaID] = addr
-		c.h.registry.Register(shardID, replicaID, addr)
+		c.h.publishCommittedAddress(shardID, replicaID, addr)
 	}
 	ns.nodesMu.Unlock()
 
@@ -3424,6 +3424,12 @@ type Host struct {
 	// shardBarriersGiven records every barrier shardBarriers has returned, so
 	// Close seals them. Nil when WithShardBarriers is unused.
 	shardBarriersGiven *givenBarriers
+	// peerAdmitMu serializes peer admission (StartShard, membership add) with
+	// ReloadMTLS, so the SAN-exclusivity check and the change it gates cannot
+	// interleave. admittingPeers counts the addresses an admission has passed
+	// and not yet published to the registry. See admitMemberAddresses.
+	peerAdmitMu    sync.Mutex
+	admittingPeers map[string]int
 	// barrierFallbackWarned records the shards already warned about falling
 	// back from an unresolved per-shard barrier to the host-wide one, so the
 	// warning fires once per shard instead of once per snapshot operation.
@@ -4292,8 +4298,9 @@ func copyIdentityMap(src map[uint64]string) map[uint64]string {
 	return dst
 }
 
-// verifyMemberCertificateExclusivity rejects a configuration whose hosts this
-// node's own leaf certificate also covers. See
+// admitMemberAddresses rejects a configuration whose hosts this node's own
+// leaf certificate also covers, and otherwise records the addresses as being
+// admitted until the caller runs release. See
 // transport.QUICTransport.VerifyPeerAddressExclusivity for why SAN PRESENCE is
 // only an authorization when SANs are EXCLUSIVE.
 //
@@ -4308,9 +4315,18 @@ func copyIdentityMap(src map[uint64]string) map[uint64]string {
 // requestConfigChange with the single address a membership add introduces; the
 // latter is what covers the grow-by-join flow, whose initial members map is
 // empty on every node.
-func (h *Host) verifyMemberCertificateExclusivity(members map[uint64]string) error {
+//
+// The check and the record happen under peerAdmitMu, the lock ReloadMTLS
+// holds while it checks a new certificate against the registry plus the
+// admitting set and publishes it. An admission therefore sees either the old
+// certificate before the reload has read the peer set, or the new one after
+// it is published, and a reload sees every address an admission has passed:
+// the two cannot both pass against state the other is about to change. The
+// caller releases the addresses once they are in the registry (or the
+// admission failed). This is admission and reload only, never per message.
+func (h *Host) admitMemberAddresses(members map[uint64]string) (release func(), err error) {
 	if h.transport == nil || len(members) == 0 {
-		return nil
+		return func() {}, nil
 	}
 	peers := make([]string, 0, len(members))
 	for _, addr := range members {
@@ -4319,9 +4335,89 @@ func (h *Host) verifyMemberCertificateExclusivity(members map[uint64]string) err
 		}
 	}
 	if len(peers) == 0 {
+		return func() {}, nil
+	}
+
+	h.peerAdmitMu.Lock()
+	defer h.peerAdmitMu.Unlock()
+	if err := h.transport.VerifyPeerAddressExclusivity(h.cfg.RaftAddress, peers); err != nil {
+		return nil, err
+	}
+	if h.admittingPeers == nil {
+		h.admittingPeers = make(map[string]int)
+	}
+	for _, addr := range peers {
+		h.admittingPeers[addr]++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			h.peerAdmitMu.Lock()
+			defer h.peerAdmitMu.Unlock()
+			for _, addr := range peers {
+				if h.admittingPeers[addr]--; h.admittingPeers[addr] <= 0 {
+					delete(h.admittingPeers, addr)
+				}
+			}
+		})
+	}, nil
+}
+
+// publishCommittedAddress registers a member address that a committed entry,
+// the bootstrap membership or an installed snapshot published. It takes
+// peerAdmitMu around the registration, as admitMemberAddresses does, so a
+// concurrent Host.ReloadMTLS either sees the address in the registry and
+// checks its certificate's SANs against it, or completes before the address
+// is published and is then checked by the exclusivity check here. A committed
+// entry is never refused: Raft has already decided it, so a conflict with
+// the installed certificate is logged and the address is registered anyway.
+// On that conflict it is the reload that loses, because the next reload sees
+// the address and refuses a certificate that covers it.
+func (h *Host) publishCommittedAddress(shardID, replicaID uint64, addr string) {
+	h.peerAdmitMu.Lock()
+	defer h.peerAdmitMu.Unlock()
+	if err := h.peerAddressCoveredLocked(addr); err != nil {
+		h.logger.Error("quicraft: a committed member address is covered by this host's certificate; "+
+			"registering it because a committed entry is never refused, and the next certificate reload must not cover it",
+			"shard", shardID,
+			"replica", replicaID,
+			"address", addr,
+			"error", err,
+		)
+	}
+	h.registry.Register(shardID, replicaID, addr)
+}
+
+// publishLearnedAddress runs publish, a registry write of addr learned from
+// an inbound message's source rather than from committed membership, under
+// peerAdmitMu, and only when the installed certificate does not cover addr.
+// Unlike a committed address, a learned one is refused on a conflict:
+// nothing has decided it, and publishing it would leave the active
+// certificate covering a registered peer. Holding the lock
+// across the check and the write keeps a concurrent Host.ReloadMTLS from
+// installing a covering certificate between them.
+func (h *Host) publishLearnedAddress(shardID, replicaID uint64, addr string, publish func()) {
+	h.peerAdmitMu.Lock()
+	defer h.peerAdmitMu.Unlock()
+	if err := h.peerAddressCoveredLocked(addr); err != nil {
+		h.logger.Warn("quicraft: not learning a source address this host's certificate covers",
+			"shard", shardID,
+			"replica", replicaID,
+			"address", addr,
+			"error", err,
+		)
+		return
+	}
+	publish()
+}
+
+// peerAddressCoveredLocked returns the exclusivity error when the installed
+// certificate covers addr, a peer's address. Callers hold peerAdmitMu.
+func (h *Host) peerAddressCoveredLocked(addr string) error {
+	if h.transport == nil || addr == "" || addr == h.cfg.RaftAddress {
 		return nil
 	}
-	return h.transport.VerifyPeerAddressExclusivity(h.cfg.RaftAddress, peers)
+	return h.transport.VerifyPeerAddressExclusivity(h.cfg.RaftAddress, []string{addr})
 }
 
 // StartShard starts a Raft shard on this host. members maps replicaID to
@@ -4531,9 +4627,15 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// remediation is re-issuing certificates — something that must happen
 	// before the cluster carries data, not after an incident. Refusing to start
 	// is also cheap to fix and impossible to miss.
-	if err := h.verifyMemberCertificateExclusivity(members); err != nil {
+	//
+	// The members stay in the admitting set until StartShard returns, by which
+	// point they are in the registry: a ReloadMTLS running meanwhile checks the
+	// incoming certificate against them either way.
+	releaseMembers, err := h.admitMemberAddresses(members)
+	if err != nil {
 		return err
 	}
+	defer releaseMembers()
 
 	// With the certificates known to be per-node, every member must be
 	// admitted with the identity that certificate proves. Checked after the
@@ -10631,6 +10733,58 @@ func (h *Host) NodeIdentity() string {
 	return h.transport.LocalNodeIdentity()
 }
 
+// ReloadMTLS replaces this host's TLS certificate, key and CA pool without a
+// restart. It is how an operator renews a leaf or rolls the cluster's CA
+// (docs/quic-transport/ca-rollover.md gives the order).
+//
+// The new material gets the checks NewHost runs on it — presence, leaf parse
+// and key match, a non-empty CA pool, the bundle's issuers when revocation
+// checking is enabled — and two more: the leaf must keep this host's
+// NodeIdentity (the same keypair, since peers committed its hash), and it
+// must not cover the host of any peer this host currently knows (the check
+// StartShard runs). Only when every check passes is the material swapped; on
+// any failure the previous material stays in force and the error is a
+// *MTLSReloadError (errors.Is ErrMTLSReload) wrapping the check that failed.
+//
+// The reload reaches every handshake that starts after it returns, inbound
+// and outbound. Established connections keep the session they were
+// authenticated with until they reconnect; nothing is torn down.
+//
+// The PEM buffers are parsed during the call and not retained, so the caller
+// may zero them once it returns.
+func (h *Host) ReloadMTLS(mtls *config.MTLSConfig) error {
+	if h.closed.Load() {
+		return ErrClosed
+	}
+	if h.transport == nil {
+		return &MTLSReloadError{Err: ErrNoLocalCertificate}
+	}
+	var tm *transport.MTLSConfig
+	if mtls != nil {
+		tm = &transport.MTLSConfig{
+			CACert:      mtls.CACert,
+			Cert:        mtls.Cert,
+			Key:         mtls.Key,
+			Certificate: mtls.Certificate,
+		}
+	}
+	// The peer set is read and the certificate published under peerAdmitMu:
+	// an admission in flight is in admittingPeers, one that has finished is
+	// in the registry, and none can start until the new certificate is live.
+	h.peerAdmitMu.Lock()
+	defer h.peerAdmitMu.Unlock()
+	var peers []string
+	for _, addr := range h.registry.Addresses() {
+		if addr != "" && addr != h.cfg.RaftAddress {
+			peers = append(peers, addr)
+		}
+	}
+	for addr := range h.admittingPeers {
+		peers = append(peers, addr)
+	}
+	return h.transport.ReloadMTLS(tm, h.cfg.RaftAddress, peers)
+}
+
 // RequestAddNode proposes adding a replica to the shard via a Raft
 // config change. The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID to ensure ordered config
@@ -11293,12 +11447,18 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// all. Failing here is also the least damaging place to fail: the shard
 	// keeps running with its current membership and the operator gets the
 	// error on the API call rather than at the next restart.
+	//
+	// The address is held in the admitting set until this call returns, past
+	// the pre-registration below, so a concurrent ReloadMTLS sees it in one
+	// place or the other.
 	if cc.Address != "" {
-		if err := h.verifyMemberCertificateExclusivity(map[uint64]string{
+		releaseAddr, admitErr := h.admitMemberAddresses(map[uint64]string{
 			cc.ReplicaID: cc.Address,
-		}); err != nil {
-			return nil, err
+		})
+		if admitErr != nil {
+			return nil, admitErr
 		}
+		defer releaseAddr()
 	}
 
 	// Pre-register the address in the transport registry for Add operations.

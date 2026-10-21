@@ -531,13 +531,13 @@ func TestStartWithInvalidUDPAddress(t *testing.T) {
 		cfg:            cfg,
 		handler:        handler,
 		reg:            reg,
-		tlsPair:        pair,
 		quicCfg:        qcfg,
 		conns:          make(map[string]*quic.Conn),
 		stopC:          make(chan struct{}),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 	}
+	tr.tlsState.Store(pair)
 	for i := range tr.streamShards {
 		tr.streamShards[i].streams = make(map[streamKey]*quic.Stream)
 	}

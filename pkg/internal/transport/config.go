@@ -590,16 +590,23 @@ func (c *Config) Validate() error {
 	if c.Enable0RTT && c.MTLSConfig == nil {
 		return ErrInsecure0RTT
 	}
-	if c.MTLSConfig == nil {
+	return validateMTLSConfig(c.MTLSConfig)
+}
+
+// validateMTLSConfig checks that mTLS material is present and complete. It is
+// the presence half of the checks NewQUICTransport and ReloadMTLS both run;
+// buildMTLSTLS does the parsing half.
+func validateMTLSConfig(m *MTLSConfig) error {
+	if m == nil {
 		return ErrMTLSConfigRequired
 	}
 	// CACert is always required; the node leaf comes from either a pre-built
 	// Certificate or the PEM Cert/Key pair.
-	if len(c.MTLSConfig.CACert) == 0 {
+	if len(m.CACert) == 0 {
 		return ErrIncompleteMTLSConfig
 	}
-	if c.MTLSConfig.Certificate == nil &&
-		(len(c.MTLSConfig.Cert) == 0 || len(c.MTLSConfig.Key) == 0) {
+	if m.Certificate == nil &&
+		(len(m.Cert) == 0 || len(m.Key) == 0) {
 		return ErrIncompleteMTLSConfig
 	}
 	return nil

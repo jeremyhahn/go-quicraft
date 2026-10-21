@@ -93,6 +93,28 @@ Certificate requirements an issuer must satisfy:
   `"spki:" + hex(sha256(leaf.RawSubjectPublicKeyInfo))`; `Host.NodeIdentity()`
   reports it, and every member admission names it.
 
+### Reloading the material
+
+`Host.ReloadMTLS(*config.MTLSConfig) error` replaces the certificate, key and
+CA pool of a running node. It validates the material exactly as at start, and
+it also refuses a leaf for a different key (`NodeIdentityChangedError`) or a
+leaf covering a peer's host (`SharedPeerCertificateError`). A refused reload
+returns `*MTLSReloadError` and changes nothing; see
+[the Host API](../multi-group-host/api.md#live-mtls-reload). The fixed settings
+above are unchanged by a reload. With revocation enabled, the checker's
+issuer set is replaced in the same step; an issuer it drops is kept only to
+check the established connections it admitted, until the last one closes.
+
+The transport keeps the material in one atomically swapped value. The
+listener's `GetConfigForClient` and each dial read it at the start of a
+handshake, so every new handshake, inbound and outbound, uses the material in
+force at that moment. **An established connection keeps the session it was
+authenticated with until it closes and reconnects.** Each server
+configuration seals session tickets with its own keys, and each client
+configuration has its own session cache, so a session from before a reload
+never resumes after it. The reconnect is a full handshake against the new
+pool. Replacing a CA is the [CA rollover runbook](ca-rollover.md).
+
 ### `RevocationConfig`
 
 | Field | Type | Default | Meaning |

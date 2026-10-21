@@ -490,3 +490,25 @@ func TestReplicasAt(t *testing.T) {
 		t.Fatalf("ReplicasAt of an unused address = %v, want none", got)
 	}
 }
+
+func TestAddresses(t *testing.T) {
+	r := NewRegistry()
+	if got := r.Addresses(); len(got) != 0 {
+		t.Fatalf("Addresses of an empty registry = %v, want none", got)
+	}
+	r.Register(1, 1, "10.0.0.1:5000")
+	r.Register(2, 3, "10.0.0.1:5000") // co-located: one address, two replicas
+	r.Register(1, 2, "10.0.0.2:5000")
+
+	got := r.Addresses()
+	slices.Sort(got)
+	want := []string{"10.0.0.1:5000", "10.0.0.2:5000"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Addresses = %v, want %v (each address once)", got, want)
+	}
+
+	r.Remove(1, 2)
+	if got := r.Addresses(); !slices.Equal(got, []string{"10.0.0.1:5000"}) {
+		t.Fatalf("Addresses after Remove = %v, want [10.0.0.1:5000]", got)
+	}
+}

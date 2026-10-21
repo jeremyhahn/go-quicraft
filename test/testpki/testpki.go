@@ -97,6 +97,32 @@ func (ca *CA) Leaf(t testing.TB) *config.MTLSConfig {
 	if err != nil {
 		t.Fatalf("testpki: generate leaf key: %v", err)
 	}
+	return ca.sign(t, key)
+}
+
+// Reissue signs a new leaf for the key of leaf, issued by this CA and trusting
+// only this CA. The node identity (the SHA-256 of the public key) is
+// unchanged, which is what a CA rollover reload requires.
+func (ca *CA) Reissue(t testing.TB, leaf *config.MTLSConfig) *config.MTLSConfig {
+	t.Helper()
+	block, _ := pem.Decode(leaf.Key)
+	if block == nil {
+		t.Fatal("testpki: reissue: leaf key is not PEM")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("testpki: reissue: parse leaf key: %v", err)
+	}
+	return ca.sign(t, key)
+}
+
+// PEM returns the CA certificate, PEM-encoded, for building trust bundles.
+func (ca *CA) PEM() []byte {
+	return ca.certPE
+}
+
+func (ca *CA) sign(t testing.TB, key *ecdsa.PrivateKey) *config.MTLSConfig {
+	t.Helper()
 	ca.serial++
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(ca.serial),

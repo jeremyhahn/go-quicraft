@@ -1289,6 +1289,26 @@ func (nh *NodeHost) NodeIdentity() string {
 	return nh.host.NodeIdentity()
 }
 
+// ReloadMutualTLS re-reads NodeHostConfig's CAFile, CertFile and KeyFile and
+// makes them the material every new handshake uses, without a restart. It is
+// quicraft's Host.ReloadMTLS over the configured files: the new material is
+// validated as at start, must keep this NodeHost's NodeIdentity (re-issue on
+// the same keypair), and is swapped only when every check passes. A file
+// that cannot be read returns a *config.FileReadError; refused material
+// returns a *quicraft.MTLSReloadError. Either way the previous material stays
+// in force. Established connections keep their session until they
+// reconnect.
+func (nh *NodeHost) ReloadMutualTLS() error {
+	if !nh.config.MutualTLS {
+		return nh.host.ReloadMTLS(nil)
+	}
+	mtls, err := nh.config.ReadMutualTLS()
+	if err != nil {
+		return err
+	}
+	return nh.host.ReloadMTLS(mtls)
+}
+
 // SyncRequestAddNonVoting adds a non-voting observer replica and blocks
 // until the membership change is committed.
 func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replicaID uint64, target Target, configChangeIndex uint64) error {
