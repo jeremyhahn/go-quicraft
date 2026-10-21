@@ -1,7 +1,7 @@
 # Compatibility and upgrades: engineering
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-13
+> Last verified: 2026-10-20
 > Conflicts with this document are defects. Fix them here first.
 
 Every version discriminator, what it guards, how it is checked and what it
@@ -261,6 +261,92 @@ after the ciphertext: `(*Barrier).StampSealedStateMAC(ctx, sealed)` with the
 barrier unsealed, or `StampSealedStateMACWithRootKey(rootKey, deploymentID,
 sealed)` when only the root key is in hand.
 
+## Pinned layouts and their golden fixtures
+
+Every layout another build must read, with the function that writes it, the
+function that reads it, and the fixture that pins its bytes. Fixtures live under
+the owning package's `testdata/golden/`.
+
+| Layout | Encoder | Decoder | Fixture |
+|---|---|---|---|
+| `proto.Entry` | `(*Entry).MarshalTo` | `(*Entry).UnmarshalFrom` | `pkg/proto/testdata/golden/entry.bin` |
+| `proto.ConfigChange` | `(*ConfigChange).MarshalTo` | `(*ConfigChange).UnmarshalFrom` | `pkg/proto/testdata/golden/configchange.bin` |
+| `proto.Membership` | `(*Membership).MarshalTo` | `(*Membership).UnmarshalFrom` | `pkg/proto/testdata/golden/membership.bin` |
+| `proto.Snapshot` | `(*Snapshot).MarshalTo` | `(*Snapshot).UnmarshalFrom` | `pkg/proto/testdata/golden/snapshot.bin` |
+| `proto.State` | `(*State).MarshalTo` | `(*State).UnmarshalFrom` | `pkg/proto/testdata/golden/state.bin` |
+| `proto.SnapshotFile` | `(*SnapshotFile).MarshalTo` | `(*SnapshotFile).UnmarshalFrom` | `pkg/proto/testdata/golden/snapshotfile.bin` |
+| `proto.Message` | `(*Message).MarshalTo` | `(*Message).UnmarshalFrom` | `pkg/proto/testdata/golden/message.bin` |
+| `proto.MessageBatch` | `(*MessageBatch).MarshalTo` | `(*MessageBatch).UnmarshalFrom` | `pkg/proto/testdata/golden/messagebatch.bin` |
+| `proto.SnapshotChunk` | `(*SnapshotChunk).MarshalTo` | `(*SnapshotChunk).UnmarshalFrom` | `pkg/proto/testdata/golden/snapshotchunk.bin` |
+| transport frame header | `transport.MarshalFrame` | `transport.ReadFrameHeader` | `pkg/internal/transport/testdata/golden/frame.bin` |
+| snapshot stream header | `(*SnapshotHeader).MarshalTo` | `(*SnapshotHeader).UnmarshalFrom` | `pkg/internal/transport/testdata/golden/snapshot-header.bin` |
+| `WALFORMAT` marker | `writeWALFormat` | `readWALFormat` | `pkg/logdb/waldb/testdata/golden/walformat.bin` |
+| WAL chunk framing | `encodeRecord` | `decodeRecord` | `pkg/logdb/waldb/testdata/golden/chunk.bin` |
+| WAL entries record (`0x0b`) | `(*walShard).writeEntries` | `(*walShard).replayEntries` | `pkg/logdb/waldb/testdata/golden/record-entries.bin` |
+| WAL state record (`0x0d`) | `(*walShard).writeState` | `(*walShard).replayState` | `pkg/logdb/waldb/testdata/golden/record-state.bin` |
+| WAL snapshot record (`0x0c`), with the `waldb` membership section | `(*walShard).writeSnapshot` | `(*walShard).replaySnapshot` | `pkg/logdb/waldb/testdata/golden/record-snapshot.bin` |
+| WAL bootstrap record (`0x04`) | `(*walShard).writeBootstrap` | `(*walShard).replayBootstrap` | `pkg/logdb/waldb/testdata/golden/record-bootstrap.bin` |
+| WAL compaction record (`0x05`) | `(*DB).RemoveEntriesTo` | `(*walShard).replayCompaction` | `pkg/logdb/waldb/testdata/golden/record-compact.bin` |
+| `RETIRED` registry | `marshalRetiredRegistry` | `parseRetiredRegistry` | `pkg/logdb/waldb/testdata/golden/retired.bin` |
+| `COMPACTED` floor file (`QRFLOORS`) | `marshalCompactionFloors` | `parseCompactionFloors` | `pkg/logdb/waldb/testdata/golden/floors.bin` |
+| `snapshot.meta` | `engine.MarshalSnapshotMeta` | `engine.ParseSnapshotMeta` | `pkg/internal/engine/testdata/golden/snapshot-meta.bin` |
+| at-rest snapshot frame context (`QRSNAP1`) | `(*SnapshotAAD).Frame` | rebuilt by the reader and authenticated | `pkg/internal/engine/testdata/golden/snapshot-frame-aad.bin` |
+| exported artifact (`QRSNAP01` header, payload, `QRSNTRLR` trailer) | `marshalSnapshotArtifactHeader`, `snapshotArtifactTrailer.marshal` | `readSnapshotArtifactHeader`, `parseSnapshotArtifactTrailer` | `pkg/testdata/golden/export-artifact.bin` |
+| barrier ciphertext frame (epoch, algorithm, nonce, ciphertext and tag) | `(*Barrier).encryptLocked` | `(*Barrier).decryptLocked` | `pkg/seal/testdata/golden/barrier-frame.bin` |
+| sealed root key ciphertext (salt, nonce, wrapped key and tag) | `(*SoftwareStrategy).sealedFromCipher` | `(*SoftwareStrategy).UnsealRootKey` | `pkg/seal/testdata/golden/sealed-root-key.bin` |
+| sealed state MAC (version 2) | `sealedStateMAC` | `verifySealedStateMAC` | `pkg/seal/testdata/golden/sealed-state-mac.bin` |
+
+### Regenerating a fixture
+
+Each owning package's `golden_test.go` holds one fixed input per layout: fixed
+IDs, keys, nonces, salts and timestamps, and no wall clock or randomness. Every
+map in a waldb input holds at most one entry, because the bootstrap and
+membership-section encoders walk Go maps in iteration order. Each test checks
+both directions: encoding the input reproduces the fixture byte for byte, and
+decoding the fixture yields the input field for field and encodes back to it.
+The shared helper is `pkg/internal/golden`.
+
+The encrypted layouts (barrier frame, sealed root key) are written through
+`fixedNonceAEAD`, a test-only AEAD in `pkg/seal/golden_test.go` with the
+production module-nonce shape (`NonceSize() == 0`, the nonce prepended to the
+`Seal` output) and a fixed nonce. Decoding uses the production AEAD, so it runs
+under `GODEBUG=fips140=only` as well; only the re-encode step skips there,
+because FIPS 140-only mode refuses a caller-chosen GCM nonce.
+
+A fixture is regenerated only for a deliberate layout change, which takes a new
+payload-type byte or record-level discriminator, never a version bump:
+
+```
+go test ./pkg/proto/ -run TestGolden -update-golden
+go test -race ./pkg/proto/ -run TestGolden
+```
+
+The fixture diff is committed with the layout change and reviewed with it. CI
+never passes `-update-golden`, so a layout that changed with no fixture diff
+fails its package's tests. Recording a layout that has not shipped yet, such
+as a new record type, adds a row here and a fixture in the same commit.
+
+## Exported-API gate
+
+`make api-check` (`scripts/api-check.sh`), which `make lint` runs, compares the
+exported API of every public package of the root module and
+`contrib/dragonboat` with the last release tag. A public package is any
+non-`main` package outside an `internal/` or `test/` directory. The base is the
+newest `v*` tag reachable from `HEAD`, or `API_BASE`. It is read with
+`git archive`, and both sides are compared with `apidiff`, which the root
+`go.mod` pins with a `tool` directive and the script builds into a temporary
+directory. Nothing is installed on the host.
+
+| Base tag | An incompatible change |
+|---|---|
+| none reachable | nothing to compare; reported, passes |
+| before v1.0.0 | printed, passes |
+| v1.0.0 or later | fails, unless the major in `VERSION` is above the base's major |
+
+A removed public package is an incompatible change, and a new one is a
+compatible change. `test/buildgates/api_check_test.go` runs the gate on a
+temporary module with a planted removal and proves each row of the table.
+
 ## Identities and session policy across a restart
 
 Identities and the session policy travel through the log (the index-1
@@ -315,6 +401,8 @@ records a policy for it.
 | `pkg/logdb/waldb/format_test.go`, `durability_seq_test.go` | the `WALFORMAT` marker's round trip, malformed and zeroed markers, publish-by-rename, and `walFormatVersion` pinned at 1 (`TestWALFormatVersionIsPinnedAtOne`) |
 | `pkg/logdb/waldb/legacy_04x_format_test.go`, `gap_hardening_test.go`, `db_test.go` | retired and unknown payload-type bytes fail replay with `ErrUnknownPayloadType` |
 | `pkg/logdb/waldb/retired_test.go` | the `RETIRED` registry is 16 bytes per replica and a malformed one is refused |
+| `pkg/proto`, `pkg/internal/transport`, `pkg/logdb/waldb`, `pkg/internal/engine`, `pkg/seal`, `pkg`: `golden_test.go` (`golden_artifact_test.go` in `pkg`) | every layout in [Pinned layouts](#pinned-layouts-and-their-golden-fixtures) decodes from its fixture field for field and re-encodes to it byte for byte |
+| `test/buildgates/api_check_test.go` | the exported-API gate fails on a planted removal after v1.0.0, and passes for a new major or before v1.0.0 |
 
 A layout change updates the golden encodings in the same commit; a golden
 change with no layout change is a defect.

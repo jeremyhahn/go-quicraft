@@ -84,6 +84,18 @@ Each package builds fixtures through small helpers and cleans up with
 Table-driven tests appear in both styles: `t.Run` subtests (config, session)
 and a slice of cases ranged over (raft, memdb).
 
+### Golden format fixtures
+
+Every pinned wire and on-disk layout has a fixture under its owning package's
+`testdata/golden/`, checked through `pkg/internal/golden`. `golden.Check`
+compares encoded bytes with a fixture and reports the first differing offset;
+`golden.Load` reads one for the decode side. Each `TestGolden*` test encodes a
+fixed input (no clock, no randomness) and decodes the fixture back to it, and
+runs under `-race`. `-update-golden` rewrites a package's fixtures for a
+deliberate layout change only; CI never passes it. The inventory and the
+regeneration procedure are in
+[compatibility/engineering.md](../compatibility/engineering.md#pinned-layouts-and-their-golden-fixtures).
+
 ### In-memory storage
 
 `pkg/logdb/memdb` implements the full `logdb.LogDB` over Go maps:
@@ -289,7 +301,8 @@ meet the per-package coverage floor. `make coverage` measures
 |---|---|
 | `fmt` | fails if `gofmt -l .` lists anything |
 | `vet` | `go vet ./...` |
-| `lint` | `golangci-lint run --build-tags benchmark ./...` in every `go.mod` directory with the root's config, after `check-lint-toolchain` |
+| `lint` | `golangci-lint run --build-tags benchmark ./...` in every `go.mod` directory with the root's config, after `check-lint-toolchain`; then `actionlint` and `api-check` |
+| `api-check` | the exported API of every public package (root module and `contrib/dragonboat`) against the last `v*` tag with the pinned `apidiff`; from v1.0.0 an incompatible change fails unless `VERSION` is a new major ([compatibility/engineering.md](../compatibility/engineering.md#exported-api-gate)) |
 | `no-mutants` | fails if `if false {`, `MUTANT` or `MUTATION` appears in non-test Go under `pkg/`, `test/`, `contrib/` |
 | `security` | `gosec`, `vuln` (govulncheck), `modverify` (`go mod verify`), `trivy` (filesystem scan) |
 | `trivy-image`, `nancy`, `security-sarif` | opt-in scans outside `ci` |

@@ -326,6 +326,42 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			},
 			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
 		},
+		{
+			// A record longer than any this format writes is foreign: its
+			// epoch is indeterminate, so the read fails safe.
+			name: "oversized_record",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				writeMetaFile(t, dir, make([]byte, maxSnapshotMetaFileLen+1))
+			},
+			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
+		},
+		{
+			// No record, and the artifact cannot even be stat'd: whether it
+			// exists is unknown, so the read fails safe rather than reporting
+			// a garbage-collected snapshot.
+			name: "missing_record_artifact_unstatable",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				artifact := filepath.Join(dir, snapshotDataFile)
+				if err := os.Symlink(artifact, artifact); err != nil {
+					t.Fatalf("symlink artifact: %v", err)
+				}
+			},
+			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
+		},
+		{
+			// The record path opens but cannot be read: a real read error,
+			// never mistaken for a missing record.
+			name: "record_is_a_directory",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.Mkdir(filepath.Join(dir, snapshotMetadataFile), 0o750); err != nil {
+					t.Fatalf("mkdir record: %v", err)
+				}
+			},
+			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -337,6 +373,25 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 					epoch, status, tt.wantEpoch, tt.wantStatus)
 			}
 		})
+	}
+}
+
+// TestSnapshotEpochStatus_String pins the label each status is logged under,
+// including the fallback for a value no status carries.
+func TestSnapshotEpochStatus_String(t *testing.T) {
+	tests := []struct {
+		status snapshotEpochStatus
+		want   string
+	}{
+		{snapshotEpochKnown, "known"},
+		{snapshotEpochLegacy, "legacy_record_without_epoch"},
+		{snapshotEpochUnknown, "unreadable"},
+		{snapshotEpochStatus(255), "invalid"},
+	}
+	for _, tt := range tests {
+		if got := tt.status.String(); got != tt.want {
+			t.Errorf("snapshotEpochStatus(%d).String() = %q, want %q", tt.status, got, tt.want)
+		}
 	}
 }
 

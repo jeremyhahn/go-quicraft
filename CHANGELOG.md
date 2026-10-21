@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the policy was recorded has nothing to check against and keeps
   applying each replica's own `Config`. The check runs once per change of the
   observed policy, not per entry. No wire or format change.
+
+- golden-fixtures (#455): every pinned wire and on-disk layout (proto
+  messages, transport frame and snapshot header, WAL marker, chunk, records
+  and `RETIRED` registry, `snapshot.meta`, the snapshot frame context, the
+  exported artifact, the barrier frame, the sealed root key and the
+  sealed-state MAC) has a checked-in fixture under its package's
+  `testdata/golden/`, decoded field for field and re-encoded byte for byte.
+  `-update-golden` regenerates them; CI never passes it. No wire or format
+  change.
+- api-check (#455): `make lint` now compares the exported API of every
+  public package with the last release tag through `apidiff`, pinned by a
+  `tool` directive in `go.mod`. Before v1.0.0 incompatible changes are
+  printed; from v1.0.0 they fail unless `VERSION` is a new major.
 - heartbeat-under-fsync (#390): while a WAL write is in flight a follower
   answers a leader's Heartbeat without waiting for the fsync when the step
   left its term, vote, owed vote window and log unchanged, so CheckQuorum no

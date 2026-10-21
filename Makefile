@@ -1263,7 +1263,17 @@ lint: check-lint-toolchain
 			--build-tags benchmark$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) ./... ) || rc=1; \
 	done; \
 	$(MAKE) --no-print-directory actionlint || rc=1; \
+	$(MAKE) --no-print-directory api-check || rc=1; \
 	exit $$rc
+
+# Compares the exported API of every public package (root module and
+# contrib/dragonboat) with the last release tag, using apidiff pinned by the
+# root go.mod's tool directive. Before v1.0.0 incompatible changes are
+# printed and pass; from v1.0.0 one fails unless VERSION is a new major. See
+# scripts/api-check.sh and docs/compatibility/engineering.md.
+.PHONY: api-check
+api-check:
+	@./scripts/api-check.sh
 
 # Validates workflow syntax, expressions and runner labels before CI does.
 # actionlint reads .github/actionlint.yaml by itself where one exists (the
