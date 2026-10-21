@@ -496,7 +496,16 @@ jobs:
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          # >>> CUSTOMIZE (go-quicraft)
+          # Only the full tier uses the integration image (the trivy image
+          # step here, the integration and soak jobs), so a PR-tier run, a
+          # docs-only PR included, builds the toolchain image alone. The
+          # integration image's tag hashes pkg/ and test/, so building it on
+          # a PR rebuilt an image nothing in the run read.
+          target=docker-build-toolchain
+          [ "$CI_FULL_TIER" != true ] || target=docker-build
+          make "$target" MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          # <<< CUSTOMIZE
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
