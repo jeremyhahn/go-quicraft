@@ -29,7 +29,7 @@ permissions:
 
 env:
   # Must match ci.yml's pin.
-  GO_VERSION: "1.27.2"
+  GO_VERSION: "1.27.3"
   # Never resolve through a stray workspace.
   GOWORK: "off"
 

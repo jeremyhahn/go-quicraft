@@ -10,7 +10,7 @@ a layout. The third is where the damage happens.
 
 ## Before you start
 
-- Go 1.27.2 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.3 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - Every node and every consuming repository built from the same commit. Until
   the first production release, format versions are pinned and layouts change
   in place, so two binaries from different pre-release commits may be mutually

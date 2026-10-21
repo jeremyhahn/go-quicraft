@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance
 
-go 1.27.2
+go 1.27.3
 
 // benchutil's port reservation comes from test/netport. The harnesses are
 // always built against the parent tree they ship with, never a published

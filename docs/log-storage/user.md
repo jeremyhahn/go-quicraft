@@ -10,7 +10,7 @@ damaged.
 
 ## Before you start
 
-- Go 1.27.2 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.3 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A directory on a filesystem whose `fdatasync` you trust. Everything below
   assumes it.
 - A decision about block size if you will not use the default, because it

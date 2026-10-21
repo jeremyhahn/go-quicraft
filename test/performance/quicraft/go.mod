@@ -1,6 +1,6 @@
 module github.com/jeremyhahn/go-quicraft/test/performance/quicraft
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/jeremyhahn/go-quicraft v0.0.0

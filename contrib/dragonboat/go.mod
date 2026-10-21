@@ -3,7 +3,7 @@ module github.com/jeremyhahn/go-quicraft/contrib/dragonboat
 // Keep this in step with the parent's go directive. The replace below builds
 // against the parent tree, and Go fails the build rather than upgrading when
 // the parent requires a newer Go than this line.
-go 1.27.2
+go 1.27.3
 
 // The release recipe (make release-alpha / release-candidate / release) pins
 // this require to the version it cuts and tags contrib/dragonboat/<version>
