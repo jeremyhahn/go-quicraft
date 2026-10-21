@@ -448,6 +448,12 @@ So `Mode: "crl"` is a supported configuration under which go-quicraft runs
 fully approved-only, with no exemptions. That is a deployment choice, not a
 limit of the library.
 
+A test outside the revocation tree that drives a responder in `ocsp` mode
+reaches the same call, so it skips when `crypto/fips140.Enforced()` reports
+`fips140=only` and runs everywhere else. There is one:
+`TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP` in
+`pkg/internal/transport`.
+
 ### The approved-only recipe
 
 Four things, all checkable:
