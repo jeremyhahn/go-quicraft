@@ -55,7 +55,7 @@ const (
 // The KDF version is auto-selected via DefaultKDFVersion() (which checks
 // GOFIPS140) and stored in SealedRootKey.Metadata[0] so that Unseal can
 // always derive the correct wrapping key regardless of the current FIPS mode.
-// Backward compatibility: sealed data without metadata defaults to KDFArgon2id.
+// Sealed data without that metadata, or naming an unknown KDF, is refused.
 //
 // When deferPassphrase is true, the passphrase is not bound at construction
 // time. Instead, SealRootKey and UnsealRootKey extract the passphrase from
@@ -472,8 +472,8 @@ func (s *SoftwareStrategy) sealedFromCipher(aead cipher.AEAD, salt, rootKey []by
 
 // UnsealRootKey derives the wrapping key from the passphrase and decrypts the root key.
 // The KDF salt is extracted from the ciphertext prefix, and the KDF version is
-// read from SealedRootKey.Metadata[0]. If metadata is absent (pre-FIPS sealed
-// data), KDFArgon2id is assumed for backward compatibility.
+// read from SealedRootKey.Metadata[0]. Absent metadata or an unknown KDF version
+// is refused with ErrKDFUnsupportedVersion.
 //
 // When deferPassphrase is false (default), creds is unused; the passphrase is
 // the one bound at construction. When deferPassphrase is true, the passphrase is
@@ -521,12 +521,10 @@ func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase enclave.
 		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrCiphertextTooShort}
 	}
 
-	// Determine KDF version from metadata. Backward compatibility: absent
-	// metadata means the data was sealed before FIPS support, so default
-	// to KDFArgon2id with the strategy's current params.
-	version, params := s.unsealKDFVersionAndParams(sealed.Metadata)
-	if _, ok := kdfDispatchers[version]; !ok {
-		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrKDFUnsupportedVersion}
+	// Determine KDF version from metadata; absent or unknown is refused.
+	version, params, err := s.unsealKDFVersionAndParams(sealed.Metadata)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Extract KDF salt from the ciphertext prefix.
@@ -574,9 +572,10 @@ func (s *SoftwareStrategy) unsealRootKeyWith(ctx context.Context, passphrase enc
 }
 
 // unsealKDFVersionAndParams determines the KDF version and parameters to use
-// for unsealing based on the stored metadata. If metadata is nil or empty,
-// KDFArgon2id is assumed with the strategy's current params for backward
-// compatibility with pre-FIPS sealed data.
+// for unsealing based on the stored metadata. Every sealed root key records its
+// KDF version in Metadata[0]; metadata shorter than that, or a version byte
+// naming no known KDF, is refused with ErrKDFUnsupportedVersion wrapped in an
+// UnsealError, before any key derivation runs.
 //
 // When the metadata version matches the strategy's configured version, the
 // strategy's own params are used (preserving custom tuning like iteration
@@ -584,38 +583,29 @@ func (s *SoftwareStrategy) unsealRootKeyWith(ctx context.Context, passphrase enc
 // defaults for the metadata version are returned. This means a key sealed
 // with non-default params can only be unsealed by a strategy configured
 // with matching params.
-func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersion, KDFParams) {
+func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersion, KDFParams, error) {
 	if len(metadata) < metadataKDFVersionLen {
-		// Metadata-less (pre-FIPS) sealed data does not record which KDF or
-		// params produced it, so the only correct choice is the strategy's
-		// OWN configured KDF/params — that data was sealed by a strategy with
-		// the same configuration. (Using a hardcoded default would break
-		// round-tripping data sealed with custom Argon2id params.) A genuine
-		// KDF-config change between seal and unseal on metadata-less data is
-		// inherently ambiguous and fails closed via AES-GCM authentication.
-		return s.kdfVersion, s.kdfParams
+		return 0, KDFParams{}, &UnsealError{Strategy: passphraseStrategyName, Err: ErrKDFUnsupportedVersion}
 	}
 
 	version := KDFVersion(metadata[0])
+	switch version {
+	case KDFPbkdf2SHA256, KDFArgon2id:
+	default:
+		return 0, KDFParams{}, &UnsealError{Strategy: passphraseStrategyName, Err: ErrKDFUnsupportedVersion}
+	}
 
 	// If the sealed version matches the strategy's version, use the
 	// strategy's params (which may be custom-tuned).
 	if version == s.kdfVersion {
-		return version, s.kdfParams
+		return version, s.kdfParams, nil
 	}
 
 	// Versions differ: use defaults for the sealed version.
-	switch version {
-	case KDFPbkdf2SHA256:
-		return KDFPbkdf2SHA256, DefaultFIPSKDFParams()
-	case KDFArgon2id:
-		return KDFArgon2id, DefaultKDFParams()
-	default:
-		// Unknown version: returned as-is so unsealCipher refuses it with
-		// ErrKDFUnsupportedVersion. It is never mapped to the strategy's own
-		// KDF: this build writes no such byte, so there is nothing to open.
-		return version, KDFParams{}
+	if version == KDFPbkdf2SHA256 {
+		return KDFPbkdf2SHA256, DefaultFIPSKDFParams(), nil
 	}
+	return KDFArgon2id, DefaultKDFParams(), nil
 }
 
 // sealStrategyError and unsealStrategyError are the two error shapes this

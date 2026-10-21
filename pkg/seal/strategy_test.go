@@ -566,9 +566,8 @@ func TestSoftwareStrategy_CrossKDFUnseal_MatchingParams(t *testing.T) {
 	}
 }
 
-func TestSoftwareStrategy_BackwardCompatibility_NoMetadata(t *testing.T) {
-	passphrase := []byte("backward-compat")
-	// Create a strategy with known params.
+func TestSoftwareStrategy_UnsealRefusesMissingOrUnknownKDFMetadata(t *testing.T) {
+	passphrase := []byte("kdf-metadata-required")
 	s, err := newTestStrategy(passphrase)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -580,25 +579,46 @@ func TestSoftwareStrategy_BackwardCompatibility_NoMetadata(t *testing.T) {
 		t.Fatalf("rand.Read failed: %v", err)
 	}
 
-	// Seal normally (which writes metadata).
-	sealed, err := s.SealRootKey(context.Background(), rootKey, Credentials{})
-	if err != nil {
-		t.Fatalf("Seal failed: %v", err)
+	cases := []struct {
+		name     string
+		metadata []byte
+	}{
+		{"nil", nil},
+		{"empty", []byte{}},
+		{"unknown version 0x00", []byte{0x00}},
+		{"unknown version 0xFF", []byte{0xFF}},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Seal normally (which writes metadata), then replace it.
+			sealed, err := s.SealRootKey(context.Background(), rootKey, Credentials{})
+			if err != nil {
+				t.Fatalf("Seal failed: %v", err)
+			}
+			sealed.Metadata = tc.metadata
 
-	// Simulate pre-FIPS sealed data by clearing metadata.
-	sealed.Metadata = nil
+			decrypted, err := s.UnsealRootKey(context.Background(), sealed, Credentials{})
+			if err == nil {
+				enclave.Wipe(decrypted)
+				t.Fatal("UnsealRootKey accepted a sealed root key without a known KDF version")
+			}
+			if !errors.Is(err, ErrKDFUnsupportedVersion) {
+				t.Fatalf("UnsealRootKey: expected ErrKDFUnsupportedVersion, got %v", err)
+			}
+			var ue *UnsealError
+			if !errors.As(err, &ue) {
+				t.Fatalf("UnsealRootKey: expected *UnsealError, got %T", err)
+			}
 
-	// Unseal should still work, defaulting to KDFArgon2id with the
-	// strategy's configured params.
-	decrypted, err := s.UnsealRootKey(context.Background(), sealed, Credentials{})
-	if err != nil {
-		t.Fatalf("Unseal with nil metadata (backward compat) failed: %v", err)
-	}
-	defer enclave.Wipe(decrypted)
-
-	if !bytes.Equal(rootKey, decrypted) {
-		t.Fatal("backward compatibility unseal: decrypted key does not match original")
+			protected, err := s.UnsealRootKeyProtected(context.Background(), sealed, Credentials{})
+			if err == nil {
+				protected.Destroy()
+				t.Fatal("UnsealRootKeyProtected accepted a sealed root key without a known KDF version")
+			}
+			if !errors.Is(err, ErrKDFUnsupportedVersion) {
+				t.Fatalf("UnsealRootKeyProtected: expected ErrKDFUnsupportedVersion, got %v", err)
+			}
+		})
 	}
 }
 
@@ -719,17 +739,11 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_UnknownVersion(t *testing.T)
 	}
 	defer s.Close()
 
-	// Metadata with an unknown KDF version byte (0xFF).
-	metadata := []byte{0xFF}
-	version, params := s.unsealKDFVersionAndParams(metadata)
-
-	// An unknown version is returned as-is, never mapped to the strategy's
-	// configured KDF, so unsealCipher refuses it.
-	if version != KDFVersion(0xFF) {
-		t.Fatalf("expected the sealed version 0xFF back, got %d", version)
-	}
-	if params != (KDFParams{}) {
-		t.Fatalf("expected no params for an unknown version, got %+v", params)
+	// Metadata with an unknown KDF version byte is refused.
+	for _, b := range []byte{0x00, 0x03, 0xFF} {
+		if _, _, err := s.unsealKDFVersionAndParams([]byte{b}); !errors.Is(err, ErrKDFUnsupportedVersion) {
+			t.Fatalf("version byte 0x%02x: expected ErrKDFUnsupportedVersion, got %v", b, err)
+		}
 	}
 }
 
@@ -742,14 +756,37 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_EmptyMetadata(t *testing.T) 
 	}
 	defer s.Close()
 
-	// Empty metadata: backward compatibility path.
-	version, params := s.unsealKDFVersionAndParams([]byte{})
-
-	if version != s.kdfVersion {
-		t.Fatalf("expected strategy version=%d, got %d", s.kdfVersion, version)
+	// Nil and empty metadata record no KDF version and are refused.
+	for _, metadata := range [][]byte{nil, {}} {
+		_, _, err := s.unsealKDFVersionAndParams(metadata)
+		if !errors.Is(err, ErrKDFUnsupportedVersion) {
+			t.Fatalf("metadata %v: expected ErrKDFUnsupportedVersion, got %v", metadata, err)
+		}
+		var ue *UnsealError
+		if !errors.As(err, &ue) {
+			t.Fatalf("metadata %v: expected *UnsealError, got %T", metadata, err)
+		}
 	}
-	if params.Time != s.kdfParams.Time {
-		t.Fatalf("expected strategy params Time=%d, got %d", s.kdfParams.Time, params.Time)
+}
+
+func TestSoftwareStrategy_UnsealKDFVersionAndParams_MatchingVersionUsesOwnParams(t *testing.T) {
+	t.Parallel()
+
+	s, err := NewSoftwareStrategyFIPS(context.Background(), []byte("test"), 1000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer s.Close()
+
+	version, params, err := s.unsealKDFVersionAndParams([]byte{byte(KDFPbkdf2SHA256)})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if version != KDFPbkdf2SHA256 {
+		t.Fatalf("expected KDFPbkdf2SHA256, got %d", version)
+	}
+	if params.Iterations != s.kdfParams.Iterations {
+		t.Fatalf("expected strategy iterations=%d, got %d", s.kdfParams.Iterations, params.Iterations)
 	}
 }
 
@@ -765,7 +802,10 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_FIPSToArgon2Defaults(t *test
 
 	// Metadata says KDFArgon2id but strategy is KDFPbkdf2SHA256 (version mismatch).
 	metadata := []byte{byte(KDFArgon2id)}
-	version, params := s.unsealKDFVersionAndParams(metadata)
+	version, params, err := s.unsealKDFVersionAndParams(metadata)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if version != KDFArgon2id {
 		t.Fatalf("expected KDFArgon2id, got %d", version)

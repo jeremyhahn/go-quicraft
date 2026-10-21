@@ -616,7 +616,14 @@ it: Argon2id `time >= 2`, `memory >= 32 MiB`, `threads >= 1`; PBKDF2-SHA256
 
 The KDF version is stored in `SealedRootKey.Metadata[0]`, enabling cross-version
 unseal: when the stored version matches the strategy's, the strategy's params
-are used; when they differ, defaults for the *stored* version are.
+are used; when they differ, defaults for the *stored* version are. A sealed
+root key whose metadata is shorter than the version byte, or whose version byte
+names no known KDF, is refused with `ErrKDFUnsupportedVersion` (wrapped in
+`UnsealError`) before any key derivation runs; there is no fallback to the
+strategy's own KDF. A sealed root key whose `Strategy` field is empty is
+refused with `ErrStrategyMismatch`, exactly like one naming another strategy:
+every blob the strategy writes names it. The remedy for both is to wipe the
+data directory and reseal.
 
 ### FIPS: runtime mode vs. build tag
 

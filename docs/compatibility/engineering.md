@@ -250,6 +250,14 @@ current `HKDFV2` (`ErrUnsupportedHKDFVersion`; the value 1 is retired and 0 is
 refused), and one whose `Algorithm` disagrees with the barrier configuration
 (`*AlgorithmMismatchError`).
 
+The software strategy names itself in `SealedRootKey.Strategy` and refuses a
+blob whose field is empty or names another strategy with `ErrStrategyMismatch`.
+It records its KDF version in `SealedRootKey.Metadata[0]`.
+That byte is required: `UnsealRootKey` refuses metadata shorter than it, and a
+version byte naming no known KDF, with `ErrKDFUnsupportedVersion` before any key
+derivation runs. There is no fallback to the strategy's configured KDF, so such
+a blob is wiped and resealed.
+
 `sealedStateMACVersion` is 2: the metadata MAC covers `LoadGeneration`, because
 the barrier refuses to encrypt on the strength of that counter and an
 unauthenticated field would be a passphrase-free way to stop a node writing.

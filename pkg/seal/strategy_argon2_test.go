@@ -106,7 +106,10 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_CrossVersionDefaults(t *test
 
 	// Metadata says KDFPbkdf2SHA256 but strategy is KDFArgon2id (version mismatch).
 	metadata := []byte{byte(KDFPbkdf2SHA256)}
-	version, params := s.unsealKDFVersionAndParams(metadata)
+	version, params, err := s.unsealKDFVersionAndParams(metadata)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if version != KDFPbkdf2SHA256 {
 		t.Fatalf("expected KDFPbkdf2SHA256, got %d", version)

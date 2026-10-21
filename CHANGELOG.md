@@ -105,16 +105,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING, on disk** (#469, #473): `SoftwareStrategy.UnsealRootKey` and
+  `UnsealRootKeyProtected` refuse a sealed root key whose `Strategy` field is
+  empty with `ErrStrategyMismatch` (it was read as the passphrase strategy),
+  and a metadata-less one (metadata shorter than the KDF version byte) or one
+  whose version byte names no known KDF with `ErrKDFUnsupportedVersion`
+  wrapped in `UnsealError`, before any key derivation runs (both used to
+  unseal under the strategy's own KDF). Every blob this build writes carries
+  both fields. No KDF version value changes. Remedy: wipe and reseal.
 - post-quantum key exchange re-pinned from draft-ietf-tls-ecdhe-mlkem-05 to
   RFC 10024 (#466): same code points, share sizes and shared-secret layout, so
   no behaviour or format change; the draft copy stays, marked superseded.
-
-- **BREAKING, on disk** (#473): `SoftwareStrategy` unseal refuses a sealed
-  root key whose `Strategy` field is empty (`ErrStrategyMismatch`; it was read
-  as the passphrase strategy) and one whose metadata names a KDF version this
-  build does not implement (`ErrKDFUnsupportedVersion`; it was opened with the
-  strategy's own KDF). Every blob this build writes carries both. Wipe and
-  re-sync.
 
 - **BREAKING, on disk** (#473): WAL replay refuses a bootstrap record (`0x04`)
   that ends at the address map without the `DataDir` field, with

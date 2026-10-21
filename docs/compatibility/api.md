@@ -99,6 +99,7 @@ format error is in [user.md](user.md#upgrade-path).
 | `*SnapshotArtifactError` | `pkg` | an imported artifact's trailer is missing, truncated or mismatched |
 | `ErrSealedStateUnauthenticated` | `pkg/seal` | a sealed root key has no state MAC, or one that does not verify |
 | `*AlgorithmMismatchError` | `pkg/seal` | a sealed root key's `Algorithm` disagrees with the barrier configuration |
+| `ErrKDFUnsupportedVersion` | `pkg/seal` | a passphrase-sealed root key carries no KDF version byte, or one naming no known KDF |
 | `ErrMemberIdentityRequired` | `pkg` | a member is added without an identity |
 | `ErrDuplicateMemberIdentity` | `pkg` | one identity is bound to two replicas |
 | `*InvalidMemberError` | `pkg` | `StartShard` member identities are incomplete or inconsistent |
