@@ -109,6 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RFC 10024 (#466): same code points, share sizes and shared-secret layout, so
   no behaviour or format change; the draft copy stays, marked superseded.
 
+- **BREAKING, on disk** (#473): `SoftwareStrategy` unseal refuses a sealed
+  root key whose `Strategy` field is empty (`ErrStrategyMismatch`; it was read
+  as the passphrase strategy) and one whose metadata names a KDF version this
+  build does not implement (`ErrKDFUnsupportedVersion`; it was opened with the
+  strategy's own KDF). Every blob this build writes carries both. Wipe and
+  re-sync.
+
+- **BREAKING, on disk** (#473): WAL replay refuses a bootstrap record (`0x04`)
+  that ends at the address map without the `DataDir` field, with
+  `ErrTruncatedBootstrapRecord`; it replayed as `DataDirRecorded = false`.
+  Every record this build writes carries the field, so `waldb` now always
+  reports `DataDirRecorded = true`, and `Reencrypt` refuses to copy a record
+  that reports it unrecorded (`ErrBootstrapDataDirProvenance`). Wipe and
+  re-sync.
+
 - **BREAKING, wire and on disk** (#449): `MessageBatch`'s fixed header grows
   from 24 to 32 bytes (`MaxBinVer`), `ConfigChange` gains `WireVersion` (fixed
   portion 60 bytes) and `Membership` gains `WireVersion` (fixed region 65

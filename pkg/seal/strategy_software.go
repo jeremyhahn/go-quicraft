@@ -508,9 +508,10 @@ func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase enclave.
 	// constant strategy name), so without this check an attacker who flips
 	// the field to "none" still gets a successful decrypt here while
 	// steering Barrier.Unseal down its no-encryption branch — a downgrade
-	// that leaves the barrier "unsealed" with no cipher. Empty is accepted
-	// for sealed data written before the field was populated.
-	if sealed.Strategy != "" && sealed.Strategy != StrategyPassphrase {
+	// that leaves the barrier "unsealed" with no cipher. Every blob this
+	// strategy writes names it (sealedFromCipher), so an empty field is
+	// refused exactly like a foreign one.
+	if sealed.Strategy != StrategyPassphrase {
 		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrStrategyMismatch}
 	}
 
@@ -524,6 +525,9 @@ func (s *SoftwareStrategy) unsealCipher(ctx context.Context, passphrase enclave.
 	// metadata means the data was sealed before FIPS support, so default
 	// to KDFArgon2id with the strategy's current params.
 	version, params := s.unsealKDFVersionAndParams(sealed.Metadata)
+	if _, ok := kdfDispatchers[version]; !ok {
+		return nil, nil, &UnsealError{Strategy: passphraseStrategyName, Err: ErrKDFUnsupportedVersion}
+	}
 
 	// Extract KDF salt from the ciphertext prefix.
 	salt := sealed.Ciphertext[:kdfSaltLen]
@@ -607,9 +611,10 @@ func (s *SoftwareStrategy) unsealKDFVersionAndParams(metadata []byte) (KDFVersio
 	case KDFArgon2id:
 		return KDFArgon2id, DefaultKDFParams()
 	default:
-		// Unknown version: fall back to strategy's configured KDF.
-		// The AES-GCM authentication will catch mismatches.
-		return s.kdfVersion, s.kdfParams
+		// Unknown version: returned as-is so unsealCipher refuses it with
+		// ErrKDFUnsupportedVersion. It is never mapped to the strategy's own
+		// KDF: this build writes no such byte, so there is nothing to open.
+		return version, KDFParams{}
 	}
 }
 

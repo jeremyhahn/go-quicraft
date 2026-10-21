@@ -121,7 +121,9 @@ change is decoded wrongly. The zero value is `config.NoCompression`.
 `DataDirRecorded`. `DataDirRecorded` is a property of the stored record, set by
 the backend, and a value passed to `SaveBootstrap` is ignored. It separates
 "recorded as rooting under `NodeHostDir`" from "the record says nothing about
-`DataDir`", because `""` is itself a meaningful value.
+`DataDir`", because `""` is itself a meaningful value. The in-tree backends
+write the field in every record and always report it recorded; the flag is
+for a `LogDB` implementation that cannot.
 
 **`Update`**: `ShardID`, `ReplicaID`, `State`, `Entries`, `Snapshot`.
 
@@ -510,9 +512,10 @@ The membership section:
 [DataDirLen:4][DataDir:N]
 ```
 
-`DataDir` is a trailing field. A record that ends at the address map replays
-with `DataDirRecorded = false`; one that carries a zero-length `DataDir` replays
-as `DataDirRecorded = true` with an empty value. `DataDirLen` is bounded at 4096
+Every record carries `DataDirLen`, possibly zero (the shard roots under
+`NodeHostDir`), and replays with `DataDirRecorded = true`. A record that ends at
+the address map is refused with `ErrTruncatedBootstrapRecord`, as is one with
+bytes after `DataDir`. `DataDirLen` is bounded at 4096
 (`maxBootstrapDataDirLen`).
 
 **Compaction marker** (`0x05`):

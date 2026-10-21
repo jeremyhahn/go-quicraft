@@ -491,7 +491,6 @@ func TestWriteBootstrapRejectsBatchMode(t *testing.T) {
 		nodeKey{ShardID: 1, ReplicaID: 1},
 		1, 1,
 		logdb.Bootstrap{Addresses: map[uint64]string{1: "addr1"}},
-		true,
 	)
 	shard.batchMode = false
 	shard.mu.Unlock()
@@ -4320,11 +4319,12 @@ func TestSaveBootstrap_MarksDataDirRecordedBeforeReopen(t *testing.T) {
 // A bootstrap record written BEFORE the DataDir field existed ends at the
 // address map. Replay must accept it as "no DataDir" rather than rejecting the
 // whole WAL as corrupt, which would make an upgrade unopenable.
-func TestReplayBootstrap_LegacyRecordWithoutDataDir(t *testing.T) {
+func TestReplayBootstrap_RecordWithoutDataDirRejected(t *testing.T) {
 	s := &walShard{
 		bootstraps: make(map[nodeKey]logdb.Bootstrap),
 	}
 
+	// A record that ends at the address map, with no DataDir length prefix.
 	const addr = "addr1"
 	data := make([]byte, bootstrapRecordBaseSize+12+len(addr))
 	binary.LittleEndian.PutUint64(data[0:], 4)  // ShardID
@@ -4337,27 +4337,14 @@ func TestReplayBootstrap_LegacyRecordWithoutDataDir(t *testing.T) {
 	binary.LittleEndian.PutUint32(data[pos+8:], uint32(len(addr)))
 	copy(data[pos+12:], addr)
 
-	if err := s.replayBootstrap(data, 1); err != nil {
-		t.Fatalf("replayBootstrap of a pre-DataDir record: %v", err)
+	// This build never writes that shape. Reading its absent field as
+	// DataDir "" would let Host.ImportSnapshot resolve the shard's snapshot
+	// tree to the host's NodeHostDir on no evidence, so it is refused.
+	if err := s.replayBootstrap(data, 1); !errors.Is(err, ErrTruncatedBootstrapRecord) {
+		t.Fatalf("replayBootstrap of a record without DataDir = %v, want ErrTruncatedBootstrapRecord", err)
 	}
-	got := s.bootstraps[nodeKey{ShardID: 4, ReplicaID: 1}]
-	if got.DataDir != "" {
-		t.Fatalf("DataDir = %q for a legacy record, want empty", got.DataDir)
-	}
-	// The empty string here is the ABSENCE of the field, not the statement
-	// "this shard has no DataDir". Reporting it as recorded lets
-	// Host.ImportSnapshot resolve the shard's snapshot tree to the host's
-	// NodeHostDir on no evidence at all — and, for a shard that really does have
-	// a DataDir, write the artifact outside everything snapshot GC and the DEK
-	// purge-floor scan enumerate, so the next PurgeEpochsBefore destroys the key
-	// the restore needs. It also makes the operator's WithImportDataDir override
-	// look like a contradiction and be refused, leaving no way through.
-	if got.DataDirRecorded {
-		t.Fatal("a pre-DataDir record replayed as DataDirRecorded: the absent field is " +
-			"indistinguishable from an explicit empty one, so callers cannot fail closed")
-	}
-	if got.Type != 2 || got.Addresses[1] != addr {
-		t.Fatalf("legacy record did not replay correctly: %+v", got)
+	if _, ok := s.bootstraps[nodeKey{ShardID: 4, ReplicaID: 1}]; ok {
+		t.Fatal("a refused bootstrap record was published")
 	}
 }
 

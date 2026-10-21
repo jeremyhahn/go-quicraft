@@ -151,14 +151,14 @@ var (
 	ErrMembershipTooLarge = errors.New("waldb: membership exceeds maximum entry count")
 
 	// ErrBootstrapDataDirProvenance is returned by the migration copy path when
-	// a bootstrap record carries a DataDir while claiming the field was never
-	// recorded. No writer or replay can produce that pair — replay fills DataDir
-	// only when the record carried the field — so it is a caller fabricating
-	// provenance. The copy fails closed rather than choose between dropping the
-	// DataDir (whose loss lets the next PurgeEpochsBefore destroy the DEK a
-	// snapshot written under it needs) and stamping the field as fact.
+	// a bootstrap record reports its DataDir as never recorded. Every record
+	// this build writes carries the field and replay refuses one without it,
+	// so it is a caller fabricating provenance. The copy fails closed rather
+	// than stamp an unstated DataDir as fact (an explicit empty DataDir lets
+	// the next PurgeEpochsBefore destroy the DEK a snapshot written under the
+	// shard's real tree needs).
 	ErrBootstrapDataDirProvenance = errors.New(
-		"waldb: bootstrap record declares a DataDir but reports it as never recorded")
+		"waldb: bootstrap record reports its DataDir as never recorded")
 
 	// ErrTruncatedEntryRecord is returned when WAL replay finds an entry
 	// batch record that ends mid-entry. The batch was written as a single

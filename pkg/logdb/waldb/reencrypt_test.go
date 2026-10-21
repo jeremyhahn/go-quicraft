@@ -512,50 +512,23 @@ func TestReencrypt_StreamsLargeLogInBatches(t *testing.T) {
 	}
 }
 
-// writeLegacyBootstrap writes a bootstrap record in the PRE-DataDir on-wire
-// shape — the record ends at the address map — which is exactly what a build
-// before the DataDir field produced and what replayBootstrap reads back as
-// "absent". It is the only way to construct a legacy record, since every
-// exported write path stamps the field.
-func writeLegacyBootstrap(t *testing.T, db *DB, shardID, replicaID uint64, bs logdb.Bootstrap) {
-	t.Helper()
-	shard := db.getShard(shardID)
-	shard.mu.Lock()
-	err := shard.writeBootstrap(nodeKey{ShardID: shardID, ReplicaID: replicaID},
-		shardID, replicaID, bs, false)
-	shard.mu.Unlock()
-	if err != nil {
-		t.Fatalf("writing a legacy bootstrap record: %v", err)
-	}
-}
-
-// TestReencrypt_PreservesBootstrapDataDirProvenance is a regression test.
-//
-// Reencrypt copied the bootstrap record through SaveBootstrap, which
-// unconditionally stamps DataDirRecorded true (the field is a property of the
-// RECORD, and every record this version writes carries it). A source record
-// that PREDATES the field therefore came out of the migration as an explicit
-// DataDir="" — "this shard roots its snapshot tree under the host's
-// NodeHostDir", asserted as fact about a shard that may root it anywhere.
-//
-// For a legacy shard that really has a DataDir the consequences are the two the
-// flag exists to prevent, and a post-rekey ImportSnapshot hits one or the other:
-// it writes the artifact outside the tree the DEK purge-floor scan enumerates,
-// so the next PurgeEpochsBefore destroys the key the restored state needs, or
-// it refuses the operator's WithImportDataDir override as a contradiction of
-// what it believes was recorded. Because the flag is deliberately not
-// caller-settable, the copy path could not express absence at all.
-func TestReencrypt_PreservesBootstrapDataDirProvenance(t *testing.T) {
-	const legacyShard, modernShard, replicaID = uint64(11), uint64(12), uint64(1)
+// TestReencrypt_PreservesBootstrapDataDir verifies a migration copies each
+// bootstrap record's DataDir as the source recorded it: an explicit DataDir,
+// and an explicit EMPTY one ("this shard roots its tree under the host's
+// NodeHostDir"), both replay from the destination as recorded.
+func TestReencrypt_PreservesBootstrapDataDir(t *testing.T) {
+	const emptyShard, modernShard, replicaID = uint64(11), uint64(12), uint64(1)
 	srcDir := t.TempDir() + "/wal"
 	dstDir := t.TempDir() + "/wal.copy"
 
 	src := openWALAt(t, srcDir, nil)
-	// The legacy shard: a record that never carried the field at all.
-	writeLegacyBootstrap(t, src, legacyShard, replicaID, logdb.Bootstrap{
+	// A shard that roots its tree under the host's NodeHostDir.
+	if err := src.SaveBootstrap(emptyShard, replicaID, logdb.Bootstrap{
 		Addresses: map[uint64]string{replicaID: "127.0.0.1:1"}, Type: 7,
-	})
-	// The modern shard: a record that states a real DataDir.
+	}); err != nil {
+		t.Fatalf("SaveBootstrap: %v", err)
+	}
+	// A shard that states a real DataDir.
 	const modernDataDir = "/tenant/volume/shard-12"
 	if err := src.SaveBootstrap(modernShard, replicaID, logdb.Bootstrap{
 		Addresses: map[uint64]string{replicaID: "127.0.0.1:2"}, Type: 7,
@@ -567,27 +540,12 @@ func TestReencrypt_PreservesBootstrapDataDirProvenance(t *testing.T) {
 		t.Fatalf("close src: %v", err)
 	}
 
-	// Reopen so both records come back through REPLAY, which is what derives
-	// the provenance from the bytes.
-	src = openWALAt(t, srcDir, nil)
-	legacyBS, ok, err := src.GetBootstrap(legacyShard, replicaID)
-	if err != nil || !ok {
-		t.Fatalf("GetBootstrap(legacy) = (%+v, %v, %v)", legacyBS, ok, err)
-	}
-	if legacyBS.DataDirRecorded {
-		t.Fatal("the fixture's legacy record reports DataDirRecorded; this test cannot " +
-			"observe the provenance loss it is guarding")
-	}
-	if err := src.Close(); err != nil {
-		t.Fatalf("close src: %v", err)
-	}
-
 	if _, err := Reencrypt(srcDir, nil, dstDir, nil, nil); err != nil {
 		t.Fatalf("Reencrypt: %v", err)
 	}
 
-	// Read the destination back through replay as well: the migrated record has
-	// to say the same thing on disk, not just in memory.
+	// Read the destination back through replay: the migrated record has to
+	// say the same thing on disk, not just in memory.
 	dst := openWALAt(t, dstDir, nil)
 	if err := dst.Close(); err != nil {
 		t.Fatalf("close dst: %v", err)
@@ -595,26 +553,25 @@ func TestReencrypt_PreservesBootstrapDataDirProvenance(t *testing.T) {
 	dst = openWALAt(t, dstDir, nil)
 	defer func() { _ = dst.Close() }()
 
-	gotLegacy, ok, err := dst.GetBootstrap(legacyShard, replicaID)
-	if err != nil || !ok {
-		t.Fatalf("GetBootstrap(legacy) after migration = (%+v, %v, %v)", gotLegacy, ok, err)
-	}
-	if gotLegacy.DataDirRecorded {
-		t.Errorf("the migrated legacy record reports DataDirRecorded=true with DataDir %q: "+
-			"the migration turned a record that said NOTHING about the shard's DataDir into "+
-			"one asserting it roots under the host's NodeHostDir", gotLegacy.DataDir)
-	}
-	if gotLegacy.Type != 7 || gotLegacy.Addresses[replicaID] != "127.0.0.1:1" {
-		t.Errorf("the migrated legacy record lost content: %+v", gotLegacy)
-	}
-
-	gotModern, ok, err := dst.GetBootstrap(modernShard, replicaID)
-	if err != nil || !ok {
-		t.Fatalf("GetBootstrap(modern) after migration = (%+v, %v, %v)", gotModern, ok, err)
-	}
-	if !gotModern.DataDirRecorded || gotModern.DataDir != modernDataDir {
-		t.Errorf("the migrated modern record = %+v, want DataDir %q recorded",
-			gotModern, modernDataDir)
+	for _, tc := range []struct {
+		shard   uint64
+		dataDir string
+		addr    string
+	}{
+		{emptyShard, "", "127.0.0.1:1"},
+		{modernShard, modernDataDir, "127.0.0.1:2"},
+	} {
+		got, ok, err := dst.GetBootstrap(tc.shard, replicaID)
+		if err != nil || !ok {
+			t.Fatalf("GetBootstrap(%d) after migration = (%+v, %v, %v)", tc.shard, got, ok, err)
+		}
+		if !got.DataDirRecorded || got.DataDir != tc.dataDir {
+			t.Errorf("the migrated record for shard %d = %+v, want DataDir %q recorded",
+				tc.shard, got, tc.dataDir)
+		}
+		if got.Type != 7 || got.Addresses[replicaID] != tc.addr {
+			t.Errorf("the migrated record for shard %d lost content: %+v", tc.shard, got)
+		}
 	}
 }
 
@@ -623,17 +580,19 @@ func TestReencrypt_PreservesBootstrapDataDirProvenance(t *testing.T) {
 // never recorded is a pair no writer and no replay can produce. Dropping the
 // DataDir silently would cost the artifact's DEK at the next purge.
 func TestSaveBootstrapPreservingProvenance_RefusesFabricatedAbsence(t *testing.T) {
-	db := openTestDB(t)
-	err := db.saveBootstrapPreservingProvenance(1, 1, logdb.Bootstrap{
-		Addresses:       map[uint64]string{1: "127.0.0.1:1"},
-		DataDir:         "/tenant/volume",
-		DataDirRecorded: false,
-	})
-	if !errors.Is(err, ErrBootstrapDataDirProvenance) {
-		t.Fatalf("saveBootstrapPreservingProvenance = %v, want ErrBootstrapDataDirProvenance", err)
-	}
-	if _, ok, getErr := db.GetBootstrap(1, 1); ok || getErr != nil {
-		t.Fatalf("the refused write still stored a record (ok=%v, err=%v)", ok, getErr)
+	for _, dataDir := range []string{"/tenant/volume", ""} {
+		db := openTestDB(t)
+		err := db.saveBootstrapPreservingProvenance(1, 1, logdb.Bootstrap{
+			Addresses:       map[uint64]string{1: "127.0.0.1:1"},
+			DataDir:         dataDir,
+			DataDirRecorded: false,
+		})
+		if !errors.Is(err, ErrBootstrapDataDirProvenance) {
+			t.Fatalf("saveBootstrapPreservingProvenance(DataDir %q) = %v, want ErrBootstrapDataDirProvenance", dataDir, err)
+		}
+		if _, ok, getErr := db.GetBootstrap(1, 1); ok || getErr != nil {
+			t.Fatalf("the refused write still stored a record (ok=%v, err=%v)", ok, getErr)
+		}
 	}
 }
 

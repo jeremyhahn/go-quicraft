@@ -187,16 +187,13 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 	if bs, ok, err := src.GetBootstrap(ni.ShardID, ni.ReplicaID); err != nil {
 		return &ReencryptError{Op: "get-bootstrap", Err: err}
 	} else if ok {
-		// Copied through the provenance-preserving path, NOT SaveBootstrap:
-		// SaveBootstrap always stamps the record with the DataDir field, so a
-		// legacy record that never carried it would be rewritten as an explicit
-		// DataDir="" — "this shard roots its tree under the host's NodeHostDir",
-		// stated as fact about a shard that may root it anywhere. A post-rekey
-		// ImportSnapshot then either writes the artifact outside the tree the
-		// DEK purge-floor scan enumerates (destroying the key the restore needs)
-		// or refuses the operator's WithImportDataDir override as a
-		// contradiction. A migration must copy what the source said, including
-		// its silence.
+		// Copied through the provenance-checking path, NOT SaveBootstrap:
+		// SaveBootstrap stamps the record with the DataDir field whatever the
+		// caller says, so a record that never stated it would be rewritten as
+		// an explicit DataDir="" — "this shard roots its tree under the host's
+		// NodeHostDir", stated as fact about a shard that may root it
+		// anywhere. Replay already refuses such a record; the copy refuses it
+		// too rather than fabricate the statement.
 		if err := dst.saveBootstrapPreservingProvenance(ni.ShardID, ni.ReplicaID, bs); err != nil {
 			return &ReencryptError{Op: "save-bootstrap", Err: err}
 		}

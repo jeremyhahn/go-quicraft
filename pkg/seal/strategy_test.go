@@ -723,12 +723,13 @@ func TestSoftwareStrategy_UnsealKDFVersionAndParams_UnknownVersion(t *testing.T)
 	metadata := []byte{0xFF}
 	version, params := s.unsealKDFVersionAndParams(metadata)
 
-	// Unknown version falls back to the strategy's configured KDF.
-	if version != s.kdfVersion {
-		t.Fatalf("expected fallback version=%d, got %d", s.kdfVersion, version)
+	// An unknown version is returned as-is, never mapped to the strategy's
+	// configured KDF, so unsealCipher refuses it.
+	if version != KDFVersion(0xFF) {
+		t.Fatalf("expected the sealed version 0xFF back, got %d", version)
 	}
-	if params.KeyLen != s.kdfParams.KeyLen {
-		t.Fatalf("expected fallback params KeyLen=%d, got %d", s.kdfParams.KeyLen, params.KeyLen)
+	if params != (KDFParams{}) {
+		t.Fatalf("expected no params for an unknown version, got %+v", params)
 	}
 }
 

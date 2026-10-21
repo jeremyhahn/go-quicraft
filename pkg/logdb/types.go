@@ -217,29 +217,26 @@ type Bootstrap struct {
 	// computed by SCANNING the tree, lets the next PurgeEpochsBefore destroy
 	// the DEK the artifact needs.
 	//
-	// A record written before this field existed carries no DataDir at all.
-	// DataDirRecorded — not the emptiness of this string — is what tells the
-	// two apart.
+	// DataDirRecorded — not the emptiness of this string — is what says
+	// whether a backend stated it at all.
 	DataDir string
 
-	// DataDirRecorded reports whether the persisted record actually CARRIED
-	// the DataDir field, as opposed to predating it.
+	// DataDirRecorded reports whether the stored record actually CARRIES the
+	// DataDir field.
 	//
-	// It is the same distinction snapshot.meta draws with EpochRecorded, and
-	// for the same reason: DataDir "" is a meaningful VALUE ("this shard roots
-	// its tree under the host's NodeHostDir"), so a caller that reads a legacy
-	// record's zero value as that statement is trusting a field nobody wrote.
-	// Host.ImportSnapshot would then write the artifact under NodeHostDir for a
-	// shard whose tree is actually under its own DataDir — outside everything
-	// snapshot garbage collection and the DEK purge-floor scan enumerate — and
-	// simultaneously REFUSE the operator's WithImportDataDir override as a
-	// contradiction. Every shard bootstrapped before this field existed is
-	// broken both ways unless "absent" is distinguishable from "empty".
+	// DataDir "" is a meaningful VALUE ("this shard roots its tree under the
+	// host's NodeHostDir"), so a caller that reads an unstated field's zero
+	// value as that statement is trusting a field nobody wrote.
+	// Host.ImportSnapshot would then write the artifact under NodeHostDir for
+	// a shard whose tree is actually under its own DataDir — outside
+	// everything snapshot garbage collection and the DEK purge-floor scan
+	// enumerate — and simultaneously REFUSE the operator's WithImportDataDir
+	// override as a contradiction.
 	//
 	// It is a property of the RECORD, not of the caller's request: a backend
-	// sets it when it stores a record (every record this version writes carries
-	// the field) and derives it on replay from what was actually on the wire.
-	// A value passed to SaveBootstrap is ignored.
+	// sets it when it stores a record. The in-tree backends write the field in
+	// every record, so they always report true, and waldb refuses to replay a
+	// record without it. A value passed to SaveBootstrap is ignored.
 	DataDirRecorded bool
 }
 
