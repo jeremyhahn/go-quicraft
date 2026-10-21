@@ -74,6 +74,10 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
+		// The committed wire version is replicated state too: a snapshot
+		// that dropped it would restart a switched replica on the previous
+		// version, and a lower committed value is never accepted again.
+		WireVersion: m.WireVersion,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

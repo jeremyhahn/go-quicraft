@@ -35,6 +35,7 @@ func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 		ConfigChangeID:             7,
 		MaxWitnesses:               2,
 		RequireFullReplicaMajority: true,
+		WireVersion:                WireVersion,
 		Addresses:                  map[uint64]string{1: "10.0.0.1:5001"},
 		Observers:                  map[uint64]string{2: "10.0.0.2:5001"},
 		Witnesses:                  map[uint64]string{3: "10.0.0.3:5001"},
@@ -88,15 +89,20 @@ func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 			got.MaxSessionsPerOwner)
 	}
 
+	if got.WireVersion != WireVersion {
+		t.Fatalf("WireVersion = %d, want %d: the committed wire-version switch "+
+			"did not survive marshal/unmarshal", got.WireVersion, WireVersion)
+	}
+
 	// The fixed region must be exactly where the constants say, and the maps
 	// must start immediately after it. Recomputing the expected size from the
 	// field widths rather than reusing membershipFixedSize is deliberate: a
 	// test that asserts a constant against itself cannot fail.
-	const wantFixed = 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 // 57
+	const wantFixed = 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 // 65
 	if membershipFixedSize != wantFixed {
 		t.Fatalf("membershipFixedSize = %d, want %d (Version(1) + "+
 			"ConfigChangeID(8) + MaxWitnesses(8) + RequireFullReplicaMajority(8) "+
-			"+ the four 8-byte session-policy fields)",
+			"+ the four 8-byte session-policy fields + WireVersion(8))",
 			membershipFixedSize, wantFixed)
 	}
 	if membershipSessionPolicySize != 4*8 {

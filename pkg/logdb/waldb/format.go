@@ -91,9 +91,22 @@ const (
 	// [CRC32:4][Len:2][Type:1][DurSeq:4][GenStart:4].
 	walFormatVersion uint32 = 1
 
+	// previousWALFormatVersion is the second member of the closed read
+	// window (docs/compatibility, "The accept sets"): the format the
+	// previous MINOR release wrote. v1.0 has no previous release, so it
+	// equals walFormatVersion and the set has one member.
+	previousWALFormatVersion = walFormatVersion
+
 	// walFormatSize is the exact on-disk length of the marker.
 	walFormatSize = 8 + 4 + 4
 )
+
+// acceptsWALFormatVersion reports whether v is in the closed read set
+// {walFormatVersion, previousWALFormatVersion}. It is a set, not a range, so
+// it never widens when a constant moves.
+func acceptsWALFormatVersion(v uint32) bool {
+	return v == walFormatVersion || v == previousWALFormatVersion
+}
 
 // ErrWALFormatMalformed is returned when the WAL format marker exists but
 // cannot be parsed: wrong length, wrong magic, or an unknown version. It fails
@@ -229,7 +242,7 @@ func readWALFormat(filesystem FS, dir string) (blockSize int, present bool, err 
 	// as damage: the bytes are perfectly intelligible and name a format this
 	// build does not read. Conflating the two would send an operator looking
 	// for a corrupt file when the answer is an upgrade procedure.
-	if recordedVersion := binary.LittleEndian.Uint32(buf[8:12]); recordedVersion != walFormatVersion {
+	if recordedVersion := binary.LittleEndian.Uint32(buf[8:12]); !acceptsWALFormatVersion(recordedVersion) {
 		return 0, true, &WALFormatVersionError{
 			Dir:       dir,
 			Recorded:  recordedVersion,

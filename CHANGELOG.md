@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- rolling-upgrade wire window and committed wire-version switch (#449): every
+  wire and persisted version gate reads a closed set `{current, previous}`
+  (one member until the first release after v1.0.0; no version constant
+  changes value). Each `MessageBatch` advertises `MaxBinVer`, the highest wire
+  version the sending build reads. `Membership.WireVersion` is the shard's
+  committed wire version (zero: never switched, read as previous), moved only
+  by the new `UpdateWireVersion` config change (type 5, no target replica),
+  which is validated on proposal and on apply and never lowers it. A leader
+  whose build reads a newer version proposes the switch on its own once every
+  other member has advertised it. The transport stamps each batch and
+  snapshot stream from its shard's committed version through a per-shard
+  lookup the host installs; a batch carrying several shards takes the
+  lowest. A two-build rolling-upgrade test runs under the `quicraft_nextwire`
+  build tag (test files only).
+
 - data-dir lock and host identity (#440): `NewHost` holds a non-blocking
   exclusive lock on `NodeHostDir` (`host.lock`) and `waldb.Open` one on its
   directory (`LOCK`), flock on unix and `LockFileEx` on Windows, until
@@ -89,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runbook is `docs/quic-transport/ca-rollover.md`. No wire or format change.
 
 ### Changed
+
+- **BREAKING, wire and on disk** (#449): `MessageBatch`'s fixed header grows
+  from 24 to 32 bytes (`MaxBinVer`), `ConfigChange` gains `WireVersion` (fixed
+  portion 60 bytes) and `Membership` gains `WireVersion` (fixed region 65
+  bytes), all in place. The WAL snapshot record moves from payload type
+  `0x0c`, now retired, to `0x0e`, whose membership section ends with the
+  committed `WireVersion` (minimum section 82 bytes); a WAL holding a `0x0c`
+  record fails replay with `ErrUnknownPayloadType`. Wipe and re-sync, and
+  replace every node's binary together.
 
 - **BREAKING**: go-enclave is v0.9.0-alpha (was v0.8.0-rc.2). Its
   constructors return interfaces, so every signature here that named a

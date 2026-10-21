@@ -61,7 +61,13 @@ a format migration tool.
 
 From v1.0.0 the upgrade path is the acknowledged policy in
 [architecture.md, From v1.0.0](architecture.md#from-v100); this page does not
-restate it.
+restate it. In short: a release that moves the wire version can be rolled
+out one node at a time from the release before it. Until every member of a
+shard runs the new release the shard keeps sending the old version; once
+they all do, the shard's leader commits the switch on its own and
+`Membership.WireVersion` reports the new value. Nothing needs to be called.
+After the switch a node on the older release cannot rejoin that shard, so
+finish the rollout rather than rolling back.
 
 ## Upgrade notes by release
 

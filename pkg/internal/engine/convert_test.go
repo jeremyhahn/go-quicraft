@@ -503,6 +503,7 @@ func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
 		MaxTotalSessions:           4096,
 		MaxResponsesPerSession:     64,
 		MaxSessionsPerOwner:        16,
+		WireVersion:                9,
 		Addresses:                  map[uint64]string{1: "a1", 2: "a2"},
 		Observers:                  map[uint64]string{3: "o3"},
 		Witnesses:                  map[uint64]string{4: "w4"},
@@ -525,6 +526,7 @@ func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
 		{"MaxTotalSessions", lm.MaxTotalSessions, uint64(4096)},
 		{"MaxResponsesPerSession", lm.MaxResponsesPerSession, uint64(64)},
 		{"MaxSessionsPerOwner", lm.MaxSessionsPerOwner, uint64(16)},
+		{"WireVersion", lm.WireVersion, uint64(9)},
 		{"Addresses[1]", lm.Addresses[1], "a1"},
 		{"Addresses[2]", lm.Addresses[2], "a2"},
 		{"Observers[3]", lm.Observers[3], "o3"},
@@ -574,7 +576,7 @@ func TestProtoMembershipToLogDB_MapsAreDeepCopied(t *testing.T) {
 // places; this is what stops a fifth field from silently reaching only some
 // of them.
 func TestLogDBMembershipFieldCount(t *testing.T) {
-	const mapped = 13
+	const mapped = 14
 	if got := reflect.TypeOf(logdb.Membership{}).NumField(); got != mapped {
 		t.Fatalf("logdb.Membership has %d fields, but the converters map %d.\n"+
 			"Adding a field means updating every converter — engine/convert.go, "+

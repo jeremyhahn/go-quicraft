@@ -206,6 +206,11 @@ type hostOptions struct {
 	disableTransport  bool
 	withoutEncryption bool
 	fsys              snapshotFS
+	// wire is the host's wire window; zero means transport.DefaultWireWindow.
+	wire transport.WireWindow
+	// wireSwitchFault, when set, is consulted before each wire-version switch
+	// proposal and refuses it with the error it returns. Only tests set it.
+	wireSwitchFault func() error
 }
 
 // HostOption configures optional Host dependencies.
@@ -363,6 +368,17 @@ func WithoutEncryption() HostOption {
 func WithoutTransport() HostOption {
 	return func(o *hostOptions) {
 		o.disableTransport = true
+	}
+}
+
+// withWireWindow gives the host another build's wire window: the versions
+// its transport accepts and advertises and the window its replicas apply a
+// committed wire version against. Unexported because a release build runs
+// only its own window; the two-build upgrade test sets it to emulate the
+// next release in one process.
+func withWireWindow(w transport.WireWindow) HostOption {
+	return func(o *hostOptions) {
+		o.wire = w
 	}
 }
 
@@ -1351,7 +1367,7 @@ func emptySnapshotChunk(msg proto.Message, snap *proto.Snapshot) proto.SnapshotC
 		FileChunkCount: 1,
 		Membership:     snap.Membership,
 		OnDiskIndex:    snap.OnDiskIndex,
-		BinVer:         proto.WireVersion,
+		BinVer:         proto.PreviousWireVersion, // the transport restamps it from the shard's committed WireVersion
 		Epoch:          snap.Epoch,
 	}
 }
@@ -1501,7 +1517,7 @@ func streamSnapshotChunks(f snapshotFile, msg proto.Message, emit func(proto.Sna
 			FileChunkCount: chunkCount,
 			Membership:     snap.Membership,
 			OnDiskIndex:    snap.OnDiskIndex,
-			BinVer:         proto.WireVersion,
+			BinVer:         proto.PreviousWireVersion, // the transport restamps it from the shard's committed WireVersion
 			Epoch:          snap.Epoch,
 			Data:           chunkData,
 		}); err != nil {
@@ -1610,6 +1626,15 @@ type nodeState struct {
 	paused atomic.Bool
 	// pauseGate serializes PauseShard and ResumeShard on this shard.
 	pauseGate pauseGate
+
+	// peerWire is the MaxBinVer each member last advertised for this shard,
+	// by replica ID; the leader proposes the wire-version switch from it
+	// (see maybeProposeWireSwitch). Written only when this build's window
+	// spans two versions. wireSwitchAt is the UnixNano of the leader's last
+	// look at it, which rate-limits the look and any retried proposal.
+	peerWireMu   sync.Mutex
+	peerWire     map[uint64]uint64
+	wireSwitchAt atomic.Int64
 
 	leaderID          atomic.Uint64
 	term              atomic.Uint64
@@ -2668,6 +2693,13 @@ func (c *hostEngineCallback) OnLeaderReady(shardID, replicaID, leaderID, term ui
 	if ns.cfg.IsWitness || !ns.markLeaderReady(leaderID, term) {
 		return
 	}
+	// A shard with no other member never receives an advertisement, so a new
+	// leader retries the wire-version switch itself for the term. It proposes
+	// off the dispatcher, which must not wait on its own shard's commit.
+	if leaderID == replicaID && c.h.wireSwitchEnabled() && !c.h.closed.Load() {
+		c.h.wireSwitchWG.Add(1)
+		go c.h.retryWireSwitch(ns, term)
+	}
 	if el := c.h.cfg.EventListener; el != nil && el.OnLeaderReady != nil {
 		el.OnLeaderReady(config.LeaderInfo{
 			ShardID:   shardID,
@@ -3470,6 +3502,17 @@ type Host struct {
 	// public API.
 	fsys snapshotFS
 
+	// wire is this host's wire window (transport.DefaultWireWindow unless a
+	// test emulates another build). Its Proto half is the window each
+	// replica applies a committed UpdateWireVersion against and the
+	// version the leader switches a shard to.
+	wire transport.WireWindow
+	// wireSwitchWG counts the retryWireSwitch goroutines; Close joins them
+	// once the engine, the only thing that starts one, has stopped.
+	wireSwitchWG sync.WaitGroup
+	// wireSwitchFault is hostOptions.wireSwitchFault.
+	wireSwitchFault func() error
+
 	// joiningShards holds the shards started with join=true whose bootstrap
 	// snapshot has not arrived yet (map[uint64]struct{}). Such a shard has no
 	// membership; the operator anchor (anchorIdentity) is what authorizes the
@@ -4050,8 +4093,14 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	var tr *transport.QUICTransport
 	var msgHandler *hostMessageHandler
 
+	wire := options.wire
+	if wire == (transport.WireWindow{}) {
+		wire = transport.DefaultWireWindow()
+	}
+
 	if !transportDisabled {
 		trCfg := buildTransportConfig(cfg)
+		trCfg.Wire = wire
 		// Wire transport metrics when a MetricsCollector is provided. The
 		// transport's internal TransportMetrics interface matches the
 		// public MetricsCollector's TransportMetrics methods.
@@ -4147,6 +4196,14 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// the correct tenant barrier; otherwise the single host-wide barrier is
 	// used (unchanged behavior).
 	if tr != nil {
+		// Outbound traffic is stamped with each shard's committed wire
+		// version; a shard not loaded here sends the previous version.
+		tr.SetWireVersionLookup(func(shardID uint64) uint64 {
+			if n := eng.GetNode(shardID); n != nil {
+				return n.Peer().WireVersion()
+			}
+			return 0
+		})
 		// Receiver-side snapshot rejections reach OnSnapshotRejected through the
 		// engine's listener dispatcher, as the snapshot pool's do, so the event
 		// has one delivery class whatever produced it.
@@ -4188,6 +4245,8 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		sweepStopC:         make(chan struct{}),
 		sweepDone:          make(chan struct{}),
 		fsys:               options.fsys,
+		wire:               wire,
+		wireSwitchFault:    options.wireSwitchFault,
 		leaderExec:         newLeaderExecRouter(),
 		dirLock:            dirLock,
 	}
@@ -5015,6 +5074,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// configuration tail go to the sink the operator configured, not the
 	// process slog default.
 	peer.SetLogger(h.logger)
+	// A recovered membership already switched past this build's window is
+	// a shard this build cannot rejoin; refuse it before it runs.
+	if err := peer.SetWireWindow(h.wire.Proto); err != nil {
+		return &HostInitError{Field: "wire_version", Err: err}
+	}
 	// The read lease is measured in real time, so the peer must know how
 	// long the ticks that its election timeout is counted in really are.
 	peer.SetTickInterval(h.engine.TickInterval())
@@ -7311,6 +7375,7 @@ func protoMembershipToPublic(pm *proto.Membership) *Membership {
 		MaxTotalSessions:           pm.MaxTotalSessions,
 		MaxResponsesPerSession:     pm.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        pm.MaxSessionsPerOwner,
+		WireVersion:                pm.WireVersion,
 		Nodes:                      make(map[uint64]string, len(pm.Addresses)),
 		Observers:                  make(map[uint64]string, len(pm.Observers)),
 		Witnesses:                  make(map[uint64]string, len(pm.Witnesses)),
@@ -7914,6 +7979,18 @@ var snapshotArtifactMagic = [8]byte{'Q', 'R', 'S', 'N', 'A', 'P', '0', '1'}
 // rather than assumed uncompressed.
 const snapshotArtifactVersion uint32 = 2
 
+// previousSnapshotArtifactVersion is the second member of the closed read
+// window (docs/compatibility, "The accept sets"): the header version the
+// previous MINOR release wrote. v1.0 has no previous release, so it equals
+// snapshotArtifactVersion and the set has one member.
+const previousSnapshotArtifactVersion = snapshotArtifactVersion
+
+// acceptsSnapshotArtifactVersion reports whether v is in the closed read set.
+// It is a set, not a range, so it never widens when a constant moves.
+func acceptsSnapshotArtifactVersion(v uint32) bool {
+	return v == snapshotArtifactVersion || v == previousSnapshotArtifactVersion
+}
+
 // snapshotArtifactFixedHeaderSize is the size of the fixed portion of the
 // artifact header that precedes the variable-length membership block:
 //
@@ -7994,7 +8071,7 @@ func readSnapshotArtifactHeader(r io.Reader) (hdr snapshotArtifactHeader, raw []
 		return snapshotArtifactHeader{}, nil, &SnapshotArtifactError{Reason: "bad magic"}
 	}
 	version := binary.LittleEndian.Uint32(fixed[8:12])
-	if version != snapshotArtifactVersion {
+	if !acceptsSnapshotArtifactVersion(version) {
 		return snapshotArtifactHeader{}, nil, &SnapshotArtifactError{
 			Reason: fmt.Sprintf("unsupported version %d (want %d)", version, snapshotArtifactVersion),
 		}
@@ -8388,6 +8465,7 @@ func protoMembershipToLogDB(m proto.Membership) logdb.Membership {
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
+		WireVersion:                m.WireVersion,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))
@@ -8751,6 +8829,7 @@ func resolveImportMembership(
 		ConfigChangeID:             artifact.ConfigChangeID,
 		MaxWitnesses:               artifact.MaxWitnesses,
 		RequireFullReplicaMajority: artifact.RequireFullReplicaMajority,
+		WireVersion:                artifact.WireVersion,
 		Addresses:                  make(map[uint64]string, len(iopts.membership)),
 		Identities:                 make(map[uint64]string, len(iopts.membership)),
 	}
@@ -9853,6 +9932,9 @@ func (h *Host) Close() error {
 		if h.engine != nil {
 			h.engine.Stop()
 		}
+		// The engine's callbacks start the wire-switch retries, so none
+		// starts after this; each has seen h.closed and is returning.
+		h.wireSwitchWG.Wait()
 
 		// Drain in-flight snapshot sends that the (now-stopped) step workers
 		// launched before exiting. The transport is still up, so these sends
@@ -12207,6 +12289,7 @@ func logdbMembershipToProto(m logdb.Membership) proto.Membership {
 		MaxTotalSessions:           m.MaxTotalSessions,
 		MaxResponsesPerSession:     m.MaxResponsesPerSession,
 		MaxSessionsPerOwner:        m.MaxSessionsPerOwner,
+		WireVersion:                m.WireVersion,
 	}
 	if len(m.Addresses) > 0 {
 		result.Addresses = make(map[uint64]string, len(m.Addresses))

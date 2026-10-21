@@ -22,7 +22,7 @@ package proto
 //
 //	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
 //	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
-//	[MaxSessionsPerOwner:8]
+//	[MaxSessionsPerOwner:8][WireVersion:8]
 //	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
 //
 // The number is 1 because the project is pre-release, not because the layout
@@ -59,6 +59,19 @@ const membershipV1 uint8 = 1
 // log: a cluster-wide brick with no migration path. That is why they are two
 // constants even while they hold the same value.
 const membershipFormatVersion uint8 = membershipV1
+
+// previousMembershipFormatVersion is the second member of the persisted read
+// window (docs/compatibility, "The accept sets"): the layout the previous
+// MINOR release wrote. v1.0 has no previous release, so it equals
+// membershipFormatVersion and the set has one member.
+const previousMembershipFormatVersion uint8 = membershipFormatVersion
+
+// acceptsMembershipFormatVersion reports whether v is in the closed read set
+// {membershipFormatVersion, previousMembershipFormatVersion}. It is a set,
+// not a range, so it never widens when a constant moves.
+func acceptsMembershipFormatVersion(v uint8) bool {
+	return v == membershipFormatVersion || v == previousMembershipFormatVersion
+}
 
 // The wire-version-covers-membership assertion: at COMPILE TIME, the TRANSPORT
 // version must be at least the PERSISTED Membership version.
@@ -104,9 +117,13 @@ const (
 	// MaxResponsesPerSession(8) + MaxSessionsPerOwner(8).
 	membershipSessionPolicySize = 4 * 8 // 32 bytes
 
+	// wireVersionOffset is where the shard's committed wire version sits:
+	// immediately after the session policy.
+	wireVersionOffset = sessionPolicyOffset + membershipSessionPolicySize // 57 bytes
+
 	// membershipFixedSize is the wire size of the whole fixed region, and thus
 	// the offset the six-map region begins at.
-	membershipFixedSize = sessionPolicyOffset + membershipSessionPolicySize // 57 bytes
+	membershipFixedSize = wireVersionOffset + 8 // 65 bytes
 )
 
 // SessionPolicy is the shard's replicated session configuration: the four
@@ -219,6 +236,12 @@ type Membership struct {
 	// policy they have no config-change type yet — they are bootstrap-only, see
 	// SessionPolicy.
 	MaxSessionsPerOwner uint64
+	// WireVersion is the shard's committed transport version
+	// (docs/compatibility, "The switch is a config change"). Zero means the
+	// shard never switched and reads as PreviousWireVersion; see
+	// EffectiveWireVersion. Changed only by an UpdateWireVersion config
+	// change, which never lowers it.
+	WireVersion uint64
 	// Addresses maps replica IDs to network addresses for full voting members.
 	Addresses map[uint64]string
 	// Observers maps replica IDs to network addresses for non-voting observers.
@@ -323,7 +346,7 @@ func (m *Membership) SetSessionPolicy(p SessionPolicy) {
 // current (membershipFormatVersion) layout.
 // Format: [Version:1][ConfigChangeID:8][MaxWitnesses:8]
 // [RequireFullReplicaMajority:8][SessionExpiryEntries:8][MaxTotalSessions:8]
-// [MaxResponsesPerSession:8][MaxSessionsPerOwner:8]
+// [MaxResponsesPerSession:8][MaxSessionsPerOwner:8][WireVersion:8]
 // [Addresses map][Observers map][Witnesses map][Removed boolMap]
 // [Identities map][RemovedIdentities map]
 func (m *Membership) Size() int {
@@ -391,6 +414,7 @@ func (m *Membership) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
 	putUint64(buf[sessionPolicyOffset+16:], m.MaxResponsesPerSession)
 	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
+	putUint64(buf[wireVersionOffset:], m.WireVersion)
 	offset := membershipFixedSize
 	offset += putMap(buf[offset:], m.Addresses)
 	offset += putMap(buf[offset:], m.Observers)
@@ -439,7 +463,7 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	// ConfigChangeID low byte instead, so version 0 — the low byte of every
 	// small ConfigChangeID — is never a valid version and is rejected here.
 	version := buf[0]
-	if version != membershipFormatVersion {
+	if !acceptsMembershipFormatVersion(version) {
 		return 0, &UnsupportedMembershipVersionError{Found: version}
 	}
 	if len(buf) < membershipFixedSize+4 { // fixed region + first map count
@@ -455,6 +479,7 @@ func (m *Membership) UnmarshalFrom(buf []byte) (int, error) {
 	decoded.MaxTotalSessions = getUint64(buf[sessionPolicyOffset+8:])
 	decoded.MaxResponsesPerSession = getUint64(buf[sessionPolicyOffset+16:])
 	decoded.MaxSessionsPerOwner = getUint64(buf[sessionPolicyOffset+24:])
+	decoded.WireVersion = getUint64(buf[wireVersionOffset:])
 	offset := membershipFixedSize
 	var n int
 	var err error
@@ -501,7 +526,7 @@ func (m *Membership) isZero() bool {
 	return m.ConfigChangeID == 0 && m.MaxWitnesses == 0 &&
 		!m.RequireFullReplicaMajority && m.SessionExpiryEntries == 0 &&
 		m.MaxTotalSessions == 0 && m.MaxResponsesPerSession == 0 &&
-		m.MaxSessionsPerOwner == 0 &&
+		m.MaxSessionsPerOwner == 0 && m.WireVersion == 0 &&
 		len(m.Addresses) == 0 && len(m.Observers) == 0 && len(m.Witnesses) == 0 &&
 		len(m.Removed) == 0 && len(m.Identities) == 0 &&
 		len(m.RemovedIdentities) == 0
@@ -516,6 +541,7 @@ func (m *Membership) Reset() {
 	m.MaxTotalSessions = 0
 	m.MaxResponsesPerSession = 0
 	m.MaxSessionsPerOwner = 0
+	m.WireVersion = 0
 	m.Addresses = nil
 	m.Observers = nil
 	m.Witnesses = nil

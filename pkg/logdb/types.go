@@ -108,6 +108,9 @@ type Membership struct {
 	// MaxSessionsPerOwner is the replicated cap on concurrent sessions per
 	// declared owner; 0 disables it. See proto.SessionPolicy.MaxSessionsPerOwner.
 	MaxSessionsPerOwner uint64
+	// WireVersion is the shard's committed wire version (0 = never
+	// switched). Replicated state; see proto.Membership.WireVersion.
+	WireVersion uint64
 	// Addresses maps replica IDs to their network addresses for
 	// full voting members.
 	Addresses map[uint64]string

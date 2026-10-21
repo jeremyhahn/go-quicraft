@@ -84,6 +84,13 @@ type Membership struct {
 	// also how a shard bootstrapped before the field existed reports.
 	MaxSessionsPerOwner uint64
 
+	// WireVersion is the shard's committed wire version: the transport
+	// version every replica sends at. Zero means the shard has never
+	// switched and reads as the previous version. The leader switches it on
+	// its own once every member runs a build that reads the newer version,
+	// and it never moves back.
+	WireVersion uint64
+
 	// Identities maps replicaID to the stable node identity the shard has
 	// COMMITTED for it — the value that node reports from Host.NodeIdentity.
 	// It is the key every peer authorizes that replica's quorum-bearing

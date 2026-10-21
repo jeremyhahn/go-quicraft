@@ -41,7 +41,7 @@ anything, and many have broken the on-disk format.
 | Exported Go API (`pkg`, `pkg/config`, `pkg/sm`, `pkg/seal`, `pkg/logdb`, ...) | None between minor versions. Breaks are listed in the CHANGELOG under BREAKING. |
 | Run-time behaviour of an unchanged signature | None between minor versions. A change that compiles but alters what a caller observes (for example 0.21.0-rc.1's `ShardInfo.Replicas`) is listed under BREAKING too. |
 | On-disk formats (WAL chunk framing and records, snapshots, `snapshot.meta`, exported artifacts, sealed root key) | None between minor versions. A format break means wipe and re-sync; see [the upgrade path](user.md#upgrade-path). |
-| Wire format between nodes | Exact match only. Mixed-version clusters are not supported. |
+| Wire format between nodes | Pinned and changed in place, so binaries from different pre-release commits may not interoperate. Each gate already reads a closed `{current, previous}` set with one member; from the first release after v1.0.0 it spans one MINOR and a shard switches through its Raft log ([engineering.md](engineering.md#rolling-upgrade-what-v100-carries)). |
 | Patch releases | No intentional API or format break. Read the CHANGELOG anyway. |
 
 There is no long-term-support line, no deprecation window and no compatibility

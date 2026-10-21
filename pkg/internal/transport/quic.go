@@ -343,6 +343,11 @@ type QUICTransport struct {
 	// fields on the ReadIndex critical path.
 	hbPrefix []byte
 
+	// wireLookup returns a shard's committed WireVersion; outbound batches
+	// and snapshot streams are stamped from it. Nil until the host sets it,
+	// which means every shard sends the window's previous version.
+	wireLookup atomic.Pointer[WireVersionLookup]
+
 	// eventListener holds optional event callbacks for connection and snapshot
 	// lifecycle events. May be nil.
 	eventListener *config.EventListener
@@ -660,6 +665,7 @@ func NewQUICTransport(
 		cfg.DeploymentID,
 		handler,
 	)
+	t.snapshotRecv.wire = cfg.Wire
 	t.snapshotRecv.SetSnapshotTracker(&t.snapshotTracker)
 	t.msgRecvBudget.Store(cfg.MaxMessageReceiveMemory)
 	// Cap any single peer at a quarter of the aggregate budget, but never
@@ -1600,8 +1606,10 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 	if t.metrics != nil || debugOn {
 		sendStart = time.Now()
 	}
+	binVer, frameVer := t.batchSendVersions(msgs)
 	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
+		BinVer:        binVer,
+		MaxBinVer:     t.cfg.Wire.Proto.Current,
 		DeploymentID:  t.cfg.DeploymentID,
 		SourceEpoch:   t.bootEpoch,
 		SourceAddress: t.localAddr(),
@@ -1677,7 +1685,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		buf = buf[:totalSize]
 	}
 
-	_, err = MarshalFrame(buf, payload, flags)
+	_, err = marshalFrameAt(buf, payload, flags, frameVer)
 	if grewBuf {
 		t.putBuf(oldBufPtr)
 	}
@@ -1818,7 +1826,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 // The write deadline is set here rather than by the caller because a header
 // write to a stalled receiver would otherwise block indefinitely, holding a
 // snapshotTracker slot and with it Stop().
-func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk) error {
+func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk, ver byte) error {
 	if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
 		return err
 	}
@@ -1835,7 +1843,7 @@ func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk) error 
 	if _, err := hdr.MarshalTo(hdrBuf[:]); err != nil {
 		return err
 	}
-	return WriteFrame(stream, hdrBuf[:], FlagSnapshot)
+	return writeFrameAt(stream, hdrBuf[:], FlagSnapshot, ver)
 }
 
 // SendSnapshot sends snapshot chunks over a dedicated QUIC stream.
@@ -1904,7 +1912,10 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	}
 	defer t.closeSnapshotStream(stream, first.ShardID, first.ReplicaID)
 
-	if err := writeSnapshotHeader(stream, first); err != nil {
+	// The whole stream is stamped with the shard's committed version as it
+	// stands now, so a switch committed mid-transfer cannot split it.
+	binVer, frameVer := t.shardSendVersions(first.ShardID)
+	if err := writeSnapshotHeader(stream, first, frameVer); err != nil {
 		return err
 	}
 
@@ -1956,6 +1967,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		// on a by-value copy via its emit callback.
 		chunk := chunks[i]
 		chunk.DeploymentID = t.cfg.DeploymentID
+		chunk.BinVer = binVer
 		chunkSz := chunk.Size()
 		chunkBuf := make([]byte, chunkSz)
 		chunkN, err := chunk.MarshalTo(chunkBuf)
@@ -1965,7 +1977,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
 			return err
 		}
-		if err := WriteFrame(stream, chunkBuf[:chunkN], FlagNone); err != nil {
+		if err := writeFrameAt(stream, chunkBuf[:chunkN], FlagNone, frameVer); err != nil {
 			return &SnapshotChunkWriteTimeoutError{
 				ShardID:   first.ShardID,
 				ReplicaID: first.ReplicaID,
@@ -2116,7 +2128,9 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	if _, err := meta.MarshalTo(hdrBuf[:]); err != nil {
 		return err
 	}
-	if err := WriteFrame(stream, hdrBuf[:], FlagSnapshot); err != nil {
+	// One version for the whole stream; see SendSnapshot.
+	binVer, frameVer := t.shardSendVersions(meta.ShardID)
+	if err := writeFrameAt(stream, hdrBuf[:], FlagSnapshot, frameVer); err != nil {
 		return err
 	}
 
@@ -2157,6 +2171,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 		default:
 		}
 		chunk.DeploymentID = t.cfg.DeploymentID
+		chunk.BinVer = binVer
 		chunkSz := chunk.Size()
 		chunkBuf := make([]byte, chunkSz)
 		chunkN, marshalErr := chunk.MarshalTo(chunkBuf)
@@ -2166,7 +2181,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 		if deadlineErr := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); deadlineErr != nil {
 			return deadlineErr
 		}
-		if writeErr := WriteFrame(stream, chunkBuf[:chunkN], FlagNone); writeErr != nil {
+		if writeErr := writeFrameAt(stream, chunkBuf[:chunkN], FlagNone, frameVer); writeErr != nil {
 			return &SnapshotChunkWriteTimeoutError{
 				ShardID:   meta.ShardID,
 				ReplicaID: meta.ReplicaID,

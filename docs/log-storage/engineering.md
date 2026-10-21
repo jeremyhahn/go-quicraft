@@ -413,8 +413,9 @@ Each logical record starts with a one-byte payload type.
 | `0x09` | unallocated | retired | a snapshot record with no `Compression` field |
 | `0x0a` | unallocated | retired | a three-field session-policy tail |
 | `0x0b` | `payloadTypeEntries` | current | entry batch, 84-byte per-entry header |
-| `0x0c` | `payloadTypeSnapshot` | current | snapshot metadata, four-field session-policy tail |
+| `0x0c` | unallocated | retired | a policy tail without the committed `WireVersion` |
 | `0x0d` | `payloadTypeState` | current | hard state, 48 bytes |
+| `0x0e` | `payloadTypeSnapshot` | current | snapshot metadata, policy tail with the committed `WireVersion` |
 
 **The rule for changing a layout.** A record layout is never changed under an
 existing payload type. The new layout takes the next free byte, and the old byte
@@ -461,7 +462,7 @@ header); the two are converted at the storage boundary. See
 [ShardID:8][ReplicaID:8][Term:8][Vote:8][Commit:8][VoteWindow:8]   = 48 bytes
 ```
 
-**Snapshot metadata** (`0x0c`):
+**Snapshot metadata** (`0x0e`):
 
 ```
 [ShardID:8][ReplicaID:8][Index:8][Term:8][FileSize:8][OnDiskIndex:8][Epoch:8]
@@ -482,15 +483,18 @@ The membership section:
 [NumRemoved:4]{[ReplicaID:8]}...
 [NumIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]}...
 [SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8][MaxSessionsPerOwner:8]
+[WireVersion:8]
 [NumRemovedIdentities:4]{[ReplicaID:8][IdLen:4][Id:N]}...
 ```
 
-- `MembershipVersion` is `membershipSectionVersion` = 1, exact match; anything
-  else is `ErrUnsupportedMembershipVersion`. See
+- `MembershipVersion` is `membershipSectionVersion` = 1, read against the
+  closed set `{current, previous}` (one member until v1.1); anything else is
+  `ErrUnsupportedMembershipVersion`. See
   [Compatibility](../compatibility/architecture.md#format-versions-are-pinned-until-the-first-production-release).
-- The fixed region is 18 bytes (`membershipFixedSize`), the session-policy tail
-  32 (`membershipSessionPolicySize`), and the smallest section replay accepts is
-  74 (`minMembershipSize`): fixed region, six empty count headers, policy. That
+- The fixed region is 18 bytes (`membershipFixedSize`), the replicated-policy
+  tail 40 (`membershipSessionPolicySize`: the four session fields and the
+  shard's committed `WireVersion`), and the smallest section replay accepts is
+  82 (`minMembershipSize`): fixed region, six empty count headers, policy. That
   floor is checked before the version byte is read, so a section too short to
   hold the layout is reported as a torn record, not read past its end.
 - This is deliberately not `proto.Membership`'s layout. `PolicyFlags` packs

@@ -169,7 +169,8 @@ func TestMembershipVersionExactMatch(t *testing.T) {
 	// covered by construction rather than by an enumeration that could go stale.
 	for v := 0; v <= 0xFF; v++ {
 		version := uint8(v)
-		if version == membershipFormatVersion {
+		if acceptsMembershipFormatVersion(version) {
+			// The closed read window {current, previous}: one member in v1.0.
 			continue
 		}
 		probe := append([]byte{}, buf...)
@@ -284,6 +285,7 @@ func TestMembershipGoldenEncoding(t *testing.T) {
 	const golden = "01" + // version byte
 		membershipGoldenFixedHead +
 		membershipGoldenSessionPolicy +
+		"0000000000000000" + // WireVersion = 0 (never switched)
 		membershipGoldenMaps +
 		membershipGoldenIdentities +
 		membershipGoldenRemovedIdentities
@@ -396,6 +398,7 @@ func TestSnapshotGoldenEncodingUnchanged(t *testing.T) {
 		"01" + "0700000000000000" + "0000000000000000" + "0000000000000000" + // membership fixed head
 		"0000000000000000" + "0000000000000000" + "0000000000000000" +
 		"0000000000000000" + // membership fixed (session policy, four uint64)
+		"0000000000000000" + // membership WireVersion (never switched)
 		"01000000" + "0100000000000000" + "03000000" + "613a31" + // Addresses
 		"00000000" + "00000000" + "00000000" + // Observers, Witnesses, Removed
 		"00000000" + "00000000" + // Identities, RemovedIdentities

@@ -19,7 +19,8 @@ package proto
 // layout, and every field in it is mandatory:
 //
 //	[ConfigChangeID:8][Type:8][ReplicaID:8][Address:len+data][Initialize:8]
-//	[MaxWitnesses:8][RequireFullReplicaMajority:8][NodeIdentity:len+data]
+//	[MaxWitnesses:8][RequireFullReplicaMajority:8][WireVersion:8]
+//	[NodeIdentity:len+data]
 //
 // The type carries no version byte and needs none. Under the pre-release
 // pinning policy (see the package comment) there is one layout to decode, so
@@ -51,6 +52,9 @@ type ConfigChange struct {
 	// RequireFullReplicaMajority is the new full-replica-majority policy
 	// for UpdateWitnessPolicy changes. Ignored for other types.
 	RequireFullReplicaMajority bool
+	// WireVersion is the shard's new committed transport version for
+	// UpdateWireVersion changes. Zero for every other type.
+	WireVersion uint64
 	// NodeIdentity is the stable cryptographic node identity to commit for
 	// the replica being added — the value quicraft.NodeIdentity derives from
 	// that node's leaf certificate. Empty for RemoveNode and
@@ -78,9 +82,9 @@ type ConfigChange struct {
 
 // configChangeFixedSize is the wire size of the fixed fields:
 // ConfigChangeID(8) + Type(8) + ReplicaID(8) + Initialize(8) +
-// MaxWitnesses(8) + RequireFullReplicaMajority(8) = 48 bytes
+// MaxWitnesses(8) + RequireFullReplicaMajority(8) + WireVersion(8) = 56 bytes,
 // plus the 4-byte address string length prefix.
-const configChangeFixedSize = 6*8 + 4 // 52 bytes
+const configChangeFixedSize = 7*8 + 4 // 60 bytes
 
 // configChangeIdentitySize is the wire size the trailing NodeIdentity field
 // adds: its own 4-byte length prefix plus the bytes. The prefix is
@@ -135,6 +139,8 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[offset:], cc.MaxWitnesses)
 	offset += 8
 	putBool(buf[offset:], cc.RequireFullReplicaMajority)
+	offset += 8
+	putUint64(buf[offset:], cc.WireVersion)
 	offset += 8
 	offset += putString(buf[offset:], cc.NodeIdentity)
 	return offset, nil
@@ -197,10 +203,10 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	}
 	decoded.Address = addr
 	offset += n
-	// Initialize, MaxWitnesses and RequireFullReplicaMajority are checked as
-	// one 24-byte region: they are all mandatory, so there is no boundary
-	// between them at which a payload may legally stop.
-	if len(buf) < offset+24 {
+	// Initialize, MaxWitnesses, RequireFullReplicaMajority and WireVersion
+	// are checked as one 32-byte region: they are all mandatory, so there is
+	// no boundary between them at which a payload may legally stop.
+	if len(buf) < offset+32 {
 		return 0, ErrBufferTooSmall
 	}
 	decoded.Initialize = getBool(buf[offset:])
@@ -208,6 +214,8 @@ func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	decoded.MaxWitnesses = getUint64(buf[offset:])
 	offset += 8
 	decoded.RequireFullReplicaMajority = getBool(buf[offset:])
+	offset += 8
+	decoded.WireVersion = getUint64(buf[offset:])
 	offset += 8
 	// The trailing identity is read like any other field: getString requires
 	// its four-byte length prefix, so a payload that ends here — a truncation,
@@ -232,5 +240,6 @@ func (cc *ConfigChange) Reset() {
 	cc.Initialize = false
 	cc.MaxWitnesses = 0
 	cc.RequireFullReplicaMajority = false
+	cc.WireVersion = 0
 	cc.NodeIdentity = ""
 }

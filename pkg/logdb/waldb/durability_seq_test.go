@@ -653,7 +653,7 @@ func TestOpen_ForeignFormatVersionIsRefusedByName(t *testing.T) {
 	// foreign value a real operator will actually present to this build.
 	for _, recorded := range []uint32{0, 2, 3, 5, 255, 1 << 16, math.MaxUint32} {
 		t.Run("version_"+itoa(int(recorded)), func(t *testing.T) {
-			if recorded == walFormatVersion {
+			if acceptsWALFormatVersion(recorded) {
 				t.Fatalf("fixture: %d is the supported version, not a foreign one", recorded)
 			}
 			dir := t.TempDir()

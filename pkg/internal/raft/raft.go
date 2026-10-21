@@ -301,6 +301,11 @@ type raft struct {
 	state     roleState
 	leaderID  uint64
 
+	// wire is the wire-version window an UpdateWireVersion proposal must
+	// fall inside; zero means proto.DefaultWireWindow. Set by
+	// Peer.SetWireWindow.
+	wire proto.WireWindow
+
 	// Tick counters.
 	electionTick  int
 	heartbeatTick int
@@ -2672,6 +2677,8 @@ func (r *raft) validateConfigChangePolicy(cc proto.ConfigChange) error {
 	}
 
 	switch cc.Type {
+	case proto.UpdateWireVersion:
+		return r.validateWireVersionProposal(cc)
 	case proto.UpdateWitnessPolicy:
 		// The NEW policy must be satisfied by the current membership,
 		// mirroring validateUpdateWitnessPolicy.
@@ -2713,6 +2720,21 @@ func (r *raft) validateConfigChangePolicy(cc proto.ConfigChange) error {
 		if fullReplicas < quorumOf(fullReplicas+len(r.witnesses)) {
 			return ErrBreaksFullReplicaMajority
 		}
+	}
+	return nil
+}
+
+// validateWireVersionProposal refuses an UpdateWireVersion outside this
+// replica's window. A bare raft holds no committed wire version to compare
+// against, so only the window half of membership.validateUpdateWireVersion
+// applies here.
+func (r *raft) validateWireVersionProposal(cc proto.ConfigChange) error {
+	w := r.wire
+	if w == (proto.WireWindow{}) {
+		w = proto.DefaultWireWindow()
+	}
+	if !w.Accepts(cc.WireVersion) {
+		return proto.ErrUnsupportedVersion
 	}
 	return nil
 }

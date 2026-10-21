@@ -36,6 +36,7 @@ func goldenFullMembership() Membership {
 	m.Identities = map[uint64]string{1: "node-a", 2: "node-b"}
 	m.RemovedIdentities = map[uint64]string{5: "node-e"}
 	m.SetSessionPolicy(goldenMembershipSessionPolicy())
+	m.WireVersion = WireVersion
 	return m
 }
 
@@ -77,7 +78,7 @@ func goldenProtoCases() []struct {
 	cc := ConfigChange{
 		ConfigChangeID: 0x0a0b0c0d, Type: AddNode, ReplicaID: 4, Address: "d:4",
 		Initialize: true, MaxWitnesses: 1, RequireFullReplicaMajority: true,
-		NodeIdentity: "node-d",
+		NodeIdentity: "node-d", WireVersion: WireVersion,
 	}
 	m := goldenFullMembership()
 	s := goldenSnapshot()
@@ -93,7 +94,7 @@ func goldenProtoCases() []struct {
 		Term: 7, Snapshot: goldenSnapshot(),
 	}
 	mb := MessageBatch{
-		BinVer: WireVersion, DeploymentID: 0xfeedface, SourceEpoch: 12,
+		BinVer: WireVersion, MaxBinVer: WireVersion, DeploymentID: 0xfeedface, SourceEpoch: 12,
 		SourceAddress: "a:1", Requests: []Message{msg, install},
 	}
 	chunk := SnapshotChunk{

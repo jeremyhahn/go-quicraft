@@ -144,11 +144,20 @@ func deliverWithRetry(deliver func() bool, notify func()) bool {
 // type-based exemptions. A message for a shard that is not loaded here is
 // dropped: there is nothing to bind it to and nothing to deliver it into.
 func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transport.PeerAuth) error {
+	// What each sender advertises is recorded only by a build that has a
+	// newer version to switch to; one (shard, sender) pair per run.
+	trackWire := h.host != nil && h.host.wireSwitchEnabled()
+	var lastShard, lastFrom uint64
+	noted := false
 	for i := range batch.Requests {
 		msg := &batch.Requests[i]
 
 		if !h.authorizeInbound(msg, batch.SourceAddress, peer) {
 			continue
+		}
+		if trackWire && (!noted || msg.ShardID != lastShard || msg.From != lastFrom) {
+			noted, lastShard, lastFrom = true, msg.ShardID, msg.From
+			h.host.notePeerWireVersion(msg.ShardID, msg.From, batch.MaxBinVer)
 		}
 
 		// Leader-executed requests and their answers are host traffic, not
@@ -1806,6 +1815,7 @@ func (h *hostMessageHandler) HandleSnapshot(chunks []proto.SnapshotChunk, peer t
 				MaxTotalSessions:           first.Membership.MaxTotalSessions,
 				MaxResponsesPerSession:     first.Membership.MaxResponsesPerSession,
 				MaxSessionsPerOwner:        first.Membership.MaxSessionsPerOwner,
+				WireVersion:                first.Membership.WireVersion,
 				Addresses:                  copyMapUint64String(first.Membership.Addresses),
 				Observers:                  copyMapUint64String(first.Membership.Observers),
 				Witnesses:                  copyMapUint64String(first.Membership.Witnesses),

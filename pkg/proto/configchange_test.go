@@ -234,7 +234,7 @@ func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 		name    string
 		badType uint64
 	}{
-		{"type beyond UpdateWitnessPolicy is rejected", UpdateWitnessPolicy + 1},
+		{"type beyond UpdateWireVersion is rejected", UpdateWireVersion + 1},
 		{"large invalid type is rejected", 999},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

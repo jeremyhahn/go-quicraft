@@ -24,8 +24,8 @@ package proto
 // requests count before allocating the slice and tracks cumulative bytes
 // to enforce MaxBatchSize.
 type MessageBatch struct {
-	// BinVer is the wire format version. Receiver validates
-	// BinVer == WireVersion before unmarshaling.
+	// BinVer is the wire format version the batch is encoded at. The
+	// receiver requires it to be in its WireWindow before unmarshaling.
 	BinVer uint64
 	// DeploymentID identifies the deployment for cross-deployment
 	// message rejection.
@@ -35,6 +35,12 @@ type MessageBatch struct {
 	// peer restart (vs a benign re-dial) and evict the now-stale cached
 	// outbound connection promptly instead of waiting for MaxIdleTimeout.
 	SourceEpoch uint64
+	// MaxBinVer is the highest wire version the sending build accepts
+	// (its WireWindow.Current). A leader commits a shard's wire-version
+	// switch only once every member has advertised at least the target
+	// (docs/compatibility/engineering.md, "Rolling upgrade"). It is
+	// advertised, never negotiated: it does not choose BinVer.
+	MaxBinVer uint64
 	// SourceAddress is the sender's network address.
 	SourceAddress string
 	// Requests contains the batched Raft messages.
@@ -42,8 +48,8 @@ type MessageBatch struct {
 }
 
 // messageBatchFixedSize is the wire size of the three fixed uint64 fields
-// (BinVer, DeploymentID, SourceEpoch).
-const messageBatchFixedSize = 3 * 8 // 24 bytes
+// (BinVer, DeploymentID, SourceEpoch, MaxBinVer).
+const messageBatchFixedSize = 4 * 8 // 32 bytes
 
 // minMessageWireSize is the smallest possible encoding of a single Message:
 // the fixed fields plus the mandatory entries-count and has-snapshot
@@ -86,6 +92,7 @@ func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 	putUint64(buf[0:], mb.BinVer)
 	putUint64(buf[8:], mb.DeploymentID)
 	putUint64(buf[16:], mb.SourceEpoch)
+	putUint64(buf[24:], mb.MaxBinVer)
 	offset := messageBatchFixedSize
 	offset += putString(buf[offset:], mb.SourceAddress)
 	putUint32(buf[offset:], uint32(len(mb.Requests)))
@@ -106,24 +113,29 @@ func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 // Returns ErrUnsupportedVersion, ErrTooManyMessages,
 // ErrBatchSizeLimitExceeded, or ErrBufferTooSmall as appropriate.
 func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
+	return mb.UnmarshalFromWindow(buf, DefaultWireWindow())
+}
+
+// UnmarshalFromWindow is UnmarshalFrom against an explicit accept set. The
+// transport passes its host's window; UnmarshalFrom passes this build's.
+func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, error) {
 	if len(buf) < messageBatchFixedSize {
 		return 0, ErrBufferTooSmall
 	}
 	mb.BinVer = getUint64(buf[0:])
-	// Exact-version gate: there is no version negotiation and no legacy
-	// decode path — the v1 layout (pre-witness-policy Membership inside
-	// snapshot messages) cannot be parsed by this decoder, so batches from
-	// both older AND newer binaries are rejected with a clear signal
-	// instead of being misparsed. Correct here because MessageBatch is
-	// transport-only: a batch lives for one frame and is never persisted,
-	// so a rejection costs one connection rather than stranding data at
-	// rest (contrast the persisted Membership section, which accepts a
-	// range — see the package comment's compatibility contract).
-	if mb.BinVer != WireVersion {
+	// Closed-set gate: there is no version negotiation. The set is this
+	// build's {current, previous} rolling-upgrade window (one member until a
+	// release moves WireVersion), and a batch outside it is rejected with a
+	// clear signal instead of being misparsed. Correct here because
+	// MessageBatch is transport-only: a batch lives for one frame and is
+	// never persisted, so a rejection costs one connection rather than
+	// stranding data at rest.
+	if !w.Accepts(mb.BinVer) {
 		return 0, ErrUnsupportedVersion
 	}
 	mb.DeploymentID = getUint64(buf[8:])
 	mb.SourceEpoch = getUint64(buf[16:])
+	mb.MaxBinVer = getUint64(buf[24:])
 	offset := messageBatchFixedSize
 	addr, n, err := getString(buf[offset:], MaxAddressLength, ErrAddressTooLong)
 	if err != nil {

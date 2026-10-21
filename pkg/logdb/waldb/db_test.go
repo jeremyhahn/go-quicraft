@@ -2494,11 +2494,12 @@ func TestMembershipSizeHelper(t *testing.T) {
 		// All nil maps.
 	}
 	// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1) +
-	// 6 map count headers * 4 bytes each + the 32-byte session policy
-	// = 18 + 24 + 32 = 74. The fifth map is Identities and the sixth is
-	// RemovedIdentities; the session policy sits between them.
-	if got := membershipSize(m); got != 74 {
-		t.Fatalf("membershipSize(empty)=%d, want 74", got)
+	// 6 map count headers * 4 bytes each + the 40-byte replicated-policy
+	// tail (four session-policy fields and the WireVersion)
+	// = 18 + 24 + 40 = 82. The fifth map is Identities and the sixth is
+	// RemovedIdentities; the policy tail sits between them.
+	if got := membershipSize(m); got != 82 {
+		t.Fatalf("membershipSize(empty)=%d, want 82", got)
 	}
 	// membershipSize is what this binary WRITES; minMembershipSize is the floor
 	// for what it will READ. With one layout and every field written

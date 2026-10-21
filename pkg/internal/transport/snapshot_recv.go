@@ -203,6 +203,8 @@ type snapshotReceiver struct {
 	// from a different deployment are rejected to prevent cross-cluster
 	// data corruption.
 	deploymentID uint64
+	// wire is the accept set for snapshot frames and chunks.
+	wire WireWindow
 
 	// handler processes received snapshot chunks.
 	handler MessageHandler
@@ -258,6 +260,7 @@ func newSnapshotReceiver(
 		maxMemory:           maxMemory,
 		bytesPerSec:         bytesPerSec,
 		deploymentID:        deploymentID,
+		wire:                DefaultWireWindow(),
 		handler:             handler,
 	}
 	sr.memoryBudget.Store(maxMemory)
@@ -702,7 +705,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			break
 		}
 
-		length, _, err := ReadFrameHeader(stream)
+		length, _, err := readFrameHeaderWindow(stream, sr.wire)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				truncated = true
@@ -752,7 +755,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		}
 
 		var chunk proto.SnapshotChunk
-		if _, err := chunk.UnmarshalFrom(buf); err != nil {
+		if _, err := chunk.UnmarshalFromWindow(buf, sr.wire.Proto); err != nil {
 			// Unmarshal failed. Same as above: restore inline since
 			// this chunk is not yet tracked in charged.
 			sr.releaseChunkMemory(peerKey, chunkCharge)

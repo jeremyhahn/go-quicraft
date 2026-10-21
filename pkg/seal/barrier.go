@@ -3007,6 +3007,13 @@ const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
 // not cover.
 const sealedStateMACVersion byte = 2
 
+// previousSealedStateMACVersion is the second member of the closed read
+// window (docs/compatibility, "The accept sets"): the v1 encoding described
+// above, accepted only under its LoadGeneration == 0 gate. verifySealedStateMAC computes a tag at
+// these two versions only, so a tag at any other version is refused with
+// ErrSealedStateUnauthenticated.
+const previousSealedStateMACVersion byte = 1
+
 // sealedStateMAC computes the metadata authentication tag for a sealed root
 // key: HMAC-SHA256, keyed by HKDF-SHA256(rootKey, info=sealedStateMACInfo),
 // over a canonical encoding of the fields that decide how the barrier will use
@@ -3145,7 +3152,7 @@ func (b *Barrier) verifySealedStateMAC(rootKey []byte) error {
 		// restamped at the current version by the normal persist path, so a
 		// blob is recognised this way exactly once.
 		if b.sealed.LoadGeneration == 0 {
-			legacy, legacyErr := sealedStateMACAt(1, rootKey, b.config.DeploymentID, b.sealed)
+			legacy, legacyErr := sealedStateMACAt(previousSealedStateMACVersion, rootKey, b.config.DeploymentID, b.sealed)
 			if legacyErr == nil && hmac.Equal(legacy, b.sealed.StateMAC) {
 				slog.Warn("quicraft/seal: sealed root key authenticated under the pre-fence "+
 					"metadata encoding; it will be restamped at the current version on the "+

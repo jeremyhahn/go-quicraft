@@ -116,6 +116,22 @@ const (
 	// snapshotMetaVersion is the body version this binary WRITES.
 	snapshotMetaVersion uint16 = 1
 
+	// previousSnapshotMetaVersion is the second member of the closed read
+	// window (docs/compatibility, "The accept sets"): the body version the
+	// previous MINOR release wrote. v1.0 has no previous release, so it
+	// equals snapshotMetaVersion and the set has one member.
+	previousSnapshotMetaVersion = snapshotMetaVersion
+)
+
+// acceptsSnapshotMetaVersion reports whether v is in the closed read set
+// {snapshotMetaVersion, previousSnapshotMetaVersion}. It is a set, not a
+// range, so it never widens when a constant moves.
+func acceptsSnapshotMetaVersion(v uint16) bool {
+	return v == snapshotMetaVersion || v == previousSnapshotMetaVersion
+}
+
+const (
+
 	// Header field offsets and the total header size.
 	snapshotMetaMagicOff    = 0
 	snapshotMetaVersionOff  = 8
@@ -280,6 +296,11 @@ func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 // remaining check honest. waldb's replayBootstrap has the same shape.
 func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	version := binary.LittleEndian.Uint16(data[snapshotMetaVersionOff:])
+	if !acceptsSnapshotMetaVersion(version) {
+		// A body version outside the read window is a layout this build
+		// does not know; its fields must not be read at these offsets.
+		return SnapshotMeta{}, ErrSnapshotMetaCorrupt
+	}
 	bodyLen := binary.LittleEndian.Uint32(data[snapshotMetaBodyLenOff:])
 	if bodyLen > maxSnapshotMetaBodyLen {
 		// No record this format produces declares a body anywhere near this;

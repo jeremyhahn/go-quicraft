@@ -451,7 +451,60 @@ type Config struct {
 	// Metrics collects transport-level metrics (send latency, message
 	// counts, snapshot transfers). Nil when metrics are disabled.
 	Metrics Metrics
+
+	// Wire is the closed set of wire versions this transport accepts and
+	// the version it advertises. The zero value means this build's
+	// DefaultWireWindow; only a test emulating another build sets it.
+	Wire WireWindow
 }
+
+// WireWindow pairs the payload accept set (MessageBatch and SnapshotChunk
+// BinVer) with the frame header's. Both are closed sets of {current,
+// previous} and move together: a frame at FrameCurrent carries a payload at
+// Proto.Current, and a frame at FramePrevious one at Proto.Previous.
+type WireWindow struct {
+	Proto         proto.WireWindow
+	FrameCurrent  byte
+	FramePrevious byte
+}
+
+// DefaultWireWindow returns this build's window. In v1.0 each set has one
+// member.
+func DefaultWireWindow() WireWindow {
+	return WireWindow{
+		Proto:         proto.DefaultWireWindow(),
+		FrameCurrent:  WireVersion,
+		FramePrevious: PreviousWireVersion,
+	}
+}
+
+// isZero reports whether w is unset.
+func (w WireWindow) isZero() bool {
+	return w == (WireWindow{})
+}
+
+// AcceptsFrame reports whether a frame header version byte is in the set.
+func (w WireWindow) AcceptsFrame(v byte) bool {
+	return v == w.FrameCurrent || v == w.FramePrevious
+}
+
+// sendVersions returns the payload and frame versions to stamp on traffic
+// for a shard whose committed WireVersion is v. A shard sends the current
+// version only once it has committed the switch to it; any other value,
+// including the zero of a shard that never switched, sends the previous
+// version, which every member of the window reads.
+func (w WireWindow) sendVersions(v uint64) (uint64, byte) {
+	if v == w.Proto.Current {
+		return w.Proto.Current, w.FrameCurrent
+	}
+	return w.Proto.Previous, w.FramePrevious
+}
+
+// WireVersionLookup returns a shard's committed WireVersion (see
+// proto.Membership.WireVersion). It is called on the send path, so it must
+// be cheap and must not block; an unknown shard returns the previous
+// version or zero.
+type WireVersionLookup func(shardID uint64) uint64
 
 // connectionReceiveWindow derives the QUIC per-connection receive window from
 // the application's message-receive budget. quic-go buffers received bytes
@@ -491,6 +544,9 @@ func maxFrameCharge(maxDecompressed uint32) int64 {
 
 // SetDefaults fills zero-valued fields with production defaults.
 func (c *Config) SetDefaults() {
+	if c.Wire.isZero() {
+		c.Wire = DefaultWireWindow()
+	}
 	if c.StreamPoolSize == 0 {
 		c.StreamPoolSize = defaultStreamPoolSize
 	}

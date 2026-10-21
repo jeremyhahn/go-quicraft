@@ -489,58 +489,48 @@ func TestValidateFrameHeaderVersionErrorIsUnchanged(t *testing.T) {
 // pkg/proto, which guards a rule with the same shape for the same reason.
 func TestValidateFrameHeaderVersionGateIsNotARange(t *testing.T) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "frame.go", nil, 0)
+	f, err := parser.ParseFile(fset, "config.go", nil, 0)
 	if err != nil {
-		t.Fatalf("parse frame.go: %v", err)
+		t.Fatalf("parse config.go: %v", err)
 	}
 
 	var gate *ast.FuncDecl
 	for _, decl := range f.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "ValidateFrameHeader" && fn.Recv == nil {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "AcceptsFrame" && fn.Recv != nil {
 			gate = fn
 			break
 		}
 	}
 	if gate == nil {
-		t.Fatal("ValidateFrameHeader not found in frame.go; update this guard")
+		t.Fatal("WireWindow.AcceptsFrame not found in config.go; update this guard")
 	}
 
-	mentionsWireVersion := func(n ast.Node) bool {
-		found := false
-		ast.Inspect(n, func(v ast.Node) bool {
-			if id, ok := v.(*ast.Ident); ok && id.Name == "WireVersion" {
-				found = true
-			}
-			return true
-		})
-		return found
-	}
-
+	// The frame version is gated by set membership: exactly one equality
+	// test per member (FrameCurrent, FramePrevious) and no relational
+	// comparison, because a relational form widens into a compatibility
+	// window the moment WireVersion moves.
 	exact := 0
 	ast.Inspect(gate.Body, func(n ast.Node) bool {
 		bin, ok := n.(*ast.BinaryExpr)
 		if !ok {
 			return true
 		}
-		if !mentionsWireVersion(bin.X) && !mentionsWireVersion(bin.Y) {
-			return true
-		}
 		switch bin.Op {
-		case token.NEQ:
-			exact++
 		case token.EQL:
 			exact++
-		case token.LSS, token.LEQ, token.GTR, token.GEQ:
-			t.Errorf("ValidateFrameHeader compares the frame version to WireVersion "+
-				"with %q at %s; the gate must be exact equality, because a relational "+
-				"form widens into a compatibility window the moment WireVersion moves",
+		case token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
+			t.Errorf("AcceptsFrame compares the frame version with %q at %s; "+
+				"the gate must be set membership by equality",
 				bin.Op, fset.Position(bin.Pos()))
 		}
 		return true
 	})
-	if exact != 1 {
-		t.Fatalf("ValidateFrameHeader makes %d exact comparison(s) against WireVersion, "+
-			"want exactly 1; the version byte must be gated, and gated once", exact)
+	if exact != 2 {
+		t.Fatalf("AcceptsFrame makes %d equality test(s), want exactly 2 "+
+			"(FrameCurrent, FramePrevious)", exact)
+	}
+	if got := DefaultWireWindow(); got.FrameCurrent != WireVersion || got.FramePrevious != PreviousWireVersion {
+		t.Fatalf("DefaultWireWindow() = %+v, want {WireVersion, PreviousWireVersion}", got)
 	}
 }
 

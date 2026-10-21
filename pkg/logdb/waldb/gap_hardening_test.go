@@ -456,7 +456,7 @@ func TestOpenFailsOnUnsupportedMembershipVersion(t *testing.T) {
 	// Small values near the supported one, the two ends of the byte range and
 	// both neighbours of the supported value.
 	for _, bad := range []byte{0, 2, 3, 4, 5, 6, 0xFF} {
-		if bad == membershipSectionVersion {
+		if acceptsMembershipSectionVersion(bad) {
 			t.Fatalf("fixture %d is the supported version; the table must list "+
 				"only values the gate has to refuse", bad)
 		}

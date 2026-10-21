@@ -45,6 +45,11 @@ const (
 	// ValidateFrameHeader and docs/compatibility/architecture.md.
 	WireVersion byte = 0x01
 
+	// PreviousWireVersion is the previous MINOR's frame version, the second
+	// member of the accept set. It equals WireVersion until a release moves
+	// WireVersion (see proto.PreviousWireVersion).
+	PreviousWireVersion byte = WireVersion
+
 	// MaxFrameSize is the maximum allowed frame payload size (16MB).
 	// Frames exceeding this limit are rejected to prevent memory exhaustion.
 	MaxFrameSize uint32 = 16 * 1024 * 1024
@@ -180,13 +185,18 @@ const (
 // must not exceed MaxFrameSize. Returns ErrPayloadTooLarge if the payload
 // is oversized.
 func WriteFrame(w io.Writer, payload []byte, flags FrameFlags) error {
+	return writeFrameAt(w, payload, flags, WireVersion)
+}
+
+// writeFrameAt is WriteFrame stamping the frame version ver.
+func writeFrameAt(w io.Writer, payload []byte, flags FrameFlags, ver byte) error {
 	if uint32(len(payload)) > MaxFrameSize {
 		return ErrPayloadTooLarge
 	}
 	var header [FrameHeaderSize]byte
 	header[0] = MagicByte0
 	header[1] = MagicByte1
-	header[2] = WireVersion
+	header[2] = ver
 	header[3] = byte(flags)
 	binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
 	if _, err := w.Write(header[:]); err != nil {
@@ -204,11 +214,16 @@ func WriteFrame(w io.Writer, payload []byte, flags FrameFlags) error {
 // the payload length, flags, and any error. The caller should then read
 // exactly length bytes of payload data.
 func ReadFrameHeader(r io.Reader) (length uint32, flags FrameFlags, err error) {
+	return readFrameHeaderWindow(r, DefaultWireWindow())
+}
+
+// readFrameHeaderWindow is ReadFrameHeader against the accept set w.
+func readFrameHeaderWindow(r io.Reader, w WireWindow) (length uint32, flags FrameFlags, err error) {
 	var header [FrameHeaderSize]byte
 	if _, err = io.ReadFull(r, header[:]); err != nil {
 		return 0, FlagNone, err
 	}
-	if err = ValidateFrameHeader(header[:]); err != nil {
+	if err = ValidateFrameHeaderWindow(header[:], w); err != nil {
 		return 0, FlagNone, err
 	}
 	flags = FrameFlags(header[3])
@@ -220,22 +235,26 @@ func ReadFrameHeader(r io.Reader) (length uint32, flags FrameFlags, err error) {
 // magic bytes, wire version, and payload length. Returns the appropriate
 // typed error on failure.
 func ValidateFrameHeader(buf []byte) error {
+	return ValidateFrameHeaderWindow(buf, DefaultWireWindow())
+}
+
+// ValidateFrameHeaderWindow is ValidateFrameHeader against an explicit
+// accept set; the transport passes its own.
+func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	if len(buf) < FrameHeaderSize {
 		return ErrBufferTooSmall
 	}
 	if buf[0] != MagicByte0 || buf[1] != MagicByte1 {
 		return ErrInvalidMagic
 	}
-	// EXACT equality, not a range. Both ends of a QUIC connection are live
-	// processes and every format in this repository is pinned at version 1
-	// until the first production release, so there is no window of accepted
-	// versions to express — see docs/compatibility/architecture.md. Written as
-	// `buf[2] >= 1 && buf[2] <= WireVersion` the gate degenerates to the same
-	// test today and silently WIDENS into a compatibility window the moment
-	// the constant moves, which is the drift the pinning policy exists to
-	// prevent. A peer speaking any other dialect is refused outright rather
-	// than misparsed.
-	if buf[2] != WireVersion {
+	// A closed SET, not a range: {FrameCurrent, FramePrevious}, the
+	// rolling-upgrade window (docs/compatibility/engineering.md, "Rolling
+	// upgrade"), which has one member until a release moves WireVersion.
+	// Written as `buf[2] >= 1 && buf[2] <= WireVersion` the gate would
+	// silently WIDEN the moment the constant moves, which is the drift the
+	// pinning policy exists to prevent. A peer speaking any other dialect is
+	// refused outright rather than misparsed.
+	if !w.AcceptsFrame(buf[2]) {
 		return ErrUnsupportedVersion
 	}
 	length := binary.BigEndian.Uint32(buf[4:8])
@@ -250,6 +269,11 @@ func ValidateFrameHeader(buf []byte) error {
 // Returns ErrBufferTooSmall if buf is too short, or ErrPayloadTooLarge if
 // the payload exceeds MaxFrameSize.
 func MarshalFrame(buf []byte, payload []byte, flags FrameFlags) (int, error) {
+	return marshalFrameAt(buf, payload, flags, WireVersion)
+}
+
+// marshalFrameAt is MarshalFrame stamping the frame version ver.
+func marshalFrameAt(buf []byte, payload []byte, flags FrameFlags, ver byte) (int, error) {
 	if uint32(len(payload)) > MaxFrameSize {
 		return 0, ErrPayloadTooLarge
 	}
@@ -259,7 +283,7 @@ func MarshalFrame(buf []byte, payload []byte, flags FrameFlags) (int, error) {
 	}
 	buf[0] = MagicByte0
 	buf[1] = MagicByte1
-	buf[2] = WireVersion
+	buf[2] = ver
 	buf[3] = byte(flags)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(payload)))
 	copy(buf[FrameHeaderSize:], payload)

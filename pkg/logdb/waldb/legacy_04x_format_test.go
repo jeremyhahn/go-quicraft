@@ -17,6 +17,7 @@ package waldb
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,46 +127,54 @@ func TestRetiredEntryPayloadTypeRejected(t *testing.T) {
 // ErrTruncatedSnapshotRecord — a corruption diagnosis, sending an operator to
 // look for a damaged disk when the answer is a wiped data directory.
 func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
-	// A retired-layout snapshot record: base header, zero fpLen, membership section
-	// with its version byte, the fixed region, six empty map counts and a
-	// THREE-field session policy tail.
-	const legacySessionPolicySize = membershipSessionPolicySize - 8 // 24 bytes
-	payload := make([]byte,
-		1+snapshotRecordBaseSize+membershipFixedSize+6*4+legacySessionPolicySize)
-	// The LITERAL retired byte -- see the note in retiredEntryRecord for why a
-	// fixture built from a constant cannot fail.
-	payload[0] = 0x0a
-	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
-	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
-	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
-	binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
-	payload[1+snapshotRecordBaseSize] = membershipSectionVersion
+	// Each retired snapshot layout: base header, zero fpLen, membership
+	// section with its version byte, the fixed region, six empty map counts
+	// and the policy tail that layout wrote. 0x0a wrote a THREE-field session
+	// policy; 0x0c wrote the four-field policy without the WireVersion.
+	for _, retired := range []struct {
+		typ      byte
+		tailSize int
+	}{
+		{0x0a, membershipSessionPolicySize - 16}, // 24 bytes
+		{0x0c, membershipSessionPolicySize - 8},  // 32 bytes
+	} {
+		payload := make([]byte,
+			1+snapshotRecordBaseSize+membershipFixedSize+6*4+retired.tailSize)
+		// The LITERAL retired byte -- see the note in retiredEntryRecord for why a
+		// fixture built from a constant cannot fail.
+		payload[0] = retired.typ
+		binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
+		binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
+		binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
+		binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
+		payload[1+snapshotRecordBaseSize] = membershipSectionVersion
 
-	t.Run("replayRecord returns ErrUnknownPayloadType", func(t *testing.T) {
-		s := newReplayShard()
-		_, _, err := s.replayRecord(payload, 0)
-		if !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("replayRecord(0x0a) err = %v, want ErrUnknownPayloadType", err)
-		}
-		if errors.Is(err, ErrTruncatedSnapshotRecord) {
-			t.Fatal("a legacy snapshot record was reported as TRUNCATED; the record " +
-				"is intact and the remedy is to wipe and re-sync, not to investigate " +
-				"corruption")
-		}
-		if len(s.snapshots) != 0 {
-			t.Fatalf("a refused legacy record stored %d snapshots", len(s.snapshots))
-		}
-	})
+		t.Run(fmt.Sprintf("replayRecord(%#02x) returns ErrUnknownPayloadType", retired.typ), func(t *testing.T) {
+			s := newReplayShard()
+			_, _, err := s.replayRecord(payload, 0)
+			if !errors.Is(err, ErrUnknownPayloadType) {
+				t.Fatalf("replayRecord(%#02x) err = %v, want ErrUnknownPayloadType", retired.typ, err)
+			}
+			if errors.Is(err, ErrTruncatedSnapshotRecord) {
+				t.Fatal("a legacy snapshot record was reported as TRUNCATED; the record " +
+					"is intact and the remedy is to wipe and re-sync, not to investigate " +
+					"corruption")
+			}
+			if len(s.snapshots) != 0 {
+				t.Fatalf("a refused legacy record stored %d snapshots", len(s.snapshots))
+			}
+		})
 
-	t.Run("Open fails on a segment with a retired snapshot record", func(t *testing.T) {
-		dir := t.TempDir()
-		writeRawShardRecord(t, dir, 1, payload)
+		t.Run(fmt.Sprintf("Open fails on a segment with a retired %#02x snapshot record", retired.typ), func(t *testing.T) {
+			dir := t.TempDir()
+			writeRawShardRecord(t, dir, 1, payload)
 
-		if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
-			WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
-		}
-	})
+			if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
+				WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
+				t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+			}
+		})
+	}
 }
 
 // TestRetiredStatePayloadTypeRejected pins that a hard-state record in the
@@ -293,6 +302,7 @@ func TestPayloadTypesAreDistinct(t *testing.T) {
 		"retired 0x08":         0x08,
 		"retired 0x09":         0x09,
 		"retired 0x0a":         0x0a,
+		"retired 0x0c":         0x0c,
 	}
 	seen := make(map[byte]string, len(types))
 	for name, b := range types {
@@ -384,6 +394,7 @@ func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 			MaxTotalSessions:       200,
 			MaxResponsesPerSession: 300,
 			MaxSessionsPerOwner:    400,
+			WireVersion:            500,
 		},
 	}
 	if err := db.SaveSnapshot(1, 1, wantSnap); err != nil {
@@ -427,7 +438,8 @@ func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 		gotSnap.Membership.SessionExpiryEntries != wantSnap.Membership.SessionExpiryEntries ||
 		gotSnap.Membership.MaxTotalSessions != wantSnap.Membership.MaxTotalSessions ||
 		gotSnap.Membership.MaxResponsesPerSession != wantSnap.Membership.MaxResponsesPerSession ||
-		gotSnap.Membership.MaxSessionsPerOwner != wantSnap.Membership.MaxSessionsPerOwner {
+		gotSnap.Membership.MaxSessionsPerOwner != wantSnap.Membership.MaxSessionsPerOwner ||
+		gotSnap.Membership.WireVersion != wantSnap.Membership.WireVersion {
 		t.Fatalf("snapshot = %+v, want %+v", gotSnap, wantSnap)
 	}
 }
@@ -462,7 +474,9 @@ func TestPayloadTypesAreThePublishedBytes(t *testing.T) {
 		// 0x06 was the RemoveNode tombstone, retired above: a removal is kept
 		// in the retired-replica registry beside the WAL (retired.go).
 		{"payloadTypeEntries", payloadTypeEntries, 0x0b},
-		{"payloadTypeSnapshot", payloadTypeSnapshot, 0x0c},
+		// 0x0c was the snapshot layout without the committed WireVersion,
+		// retired above; the current layout moved to 0x0e.
+		{"payloadTypeSnapshot", payloadTypeSnapshot, 0x0e},
 	}
 	for _, p := range published {
 		if p.got != p.want {

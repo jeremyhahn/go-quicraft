@@ -774,7 +774,7 @@ func (t *QUICTransport) readFrameHeaderResilient(conn *quic.Conn, stream *quic.S
 		}
 	}
 
-	if verr := ValidateFrameHeader(header[:]); verr != nil {
+	if verr := ValidateFrameHeaderWindow(header[:], t.cfg.Wire); verr != nil {
 		return 0, FlagNone, verr
 	}
 	return binary.BigEndian.Uint32(header[4:8]), FrameFlags(header[3]), nil
@@ -997,7 +997,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 	}
 
 	batch := batchPool.Get().(*proto.MessageBatch)
-	if _, err := batch.UnmarshalFrom(payload); err != nil {
+	if _, err := batch.UnmarshalFromWindow(payload, t.cfg.Wire.Proto); err != nil {
 		batch.Reset()
 		batchPool.Put(batch)
 		if buf != nil {

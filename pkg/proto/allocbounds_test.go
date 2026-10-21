@@ -53,8 +53,8 @@ func craftedBatchHeader(reqCount uint32) []byte {
 // transport's receive-memory budget charges.
 func TestMessageBatch_UnmarshalFrom_CountExceedsBuffer(t *testing.T) {
 	buf := craftedBatchHeader(MaxMessagesPerBatch)
-	if len(buf) != 32 {
-		t.Fatalf("crafted header = %d bytes, want 32", len(buf))
+	if len(buf) != 40 {
+		t.Fatalf("crafted header = %d bytes, want 40", len(buf))
 	}
 	var mb MessageBatch
 	if _, err := mb.UnmarshalFrom(buf); !errors.Is(err, ErrBufferTooSmall) {

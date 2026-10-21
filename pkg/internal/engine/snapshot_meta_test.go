@@ -166,24 +166,29 @@ func TestSnapshotMeta_LegacyCompatibility(t *testing.T) {
 // observation — "the file is shorter than I expect" — which is why appending a
 // field silently turned every older directory into an unevaluable one.
 func TestSnapshotMeta_VersionSkew(t *testing.T) {
-	// A record written by a NEWER version that appended an 8th body field.
-	// Fields are append-only, so every field this binary knows is still at its
-	// own offset and must be read normally.
-	t.Run("newer_version_with_appended_field", func(t *testing.T) {
+	// A record whose body version is outside the closed read window
+	// {snapshotMetaVersion, previousSnapshotMetaVersion} is refused with the
+	// decode error, even when every field this binary knows is still at its
+	// own offset: the window is a set, not a range (docs/compatibility, "The
+	// accept sets").
+	t.Run("version_outside_read_window_is_refused", func(t *testing.T) {
 		body := make([]byte, snapshotMetaBodySize+8)
 		binary.LittleEndian.PutUint64(body[metaBodyIndexOff:], 900)
 		binary.LittleEndian.PutUint64(body[metaBodyEpochOff:], 11)
 		binary.LittleEndian.PutUint64(body[metaBodyCompressionOff:], uint64(config.Snappy))
-		binary.LittleEndian.PutUint64(body[snapshotMetaBodySize:], 0xFEED) // the future field
-		data := versionedMetaRecord(snapshotMetaVersion+1, body)
-
-		meta := mustParseSnapshotMeta(t, data)
-		if !meta.EpochRecorded || meta.Epoch != 11 {
-			t.Fatalf("epoch from a newer record = (%d, recorded=%v), want (11, true)",
-				meta.Epoch, meta.EpochRecorded)
+		binary.LittleEndian.PutUint64(body[snapshotMetaBodySize:], 0xFEED) // a future field
+		for _, v := range []uint16{0, snapshotMetaVersion + 1, 0xFFFF} {
+			if acceptsSnapshotMetaVersion(v) {
+				t.Fatalf("version %d is inside the read window", v)
+			}
+			if _, err := parseVersionedSnapshotMeta(versionedMetaRecord(v, body)); !errors.Is(err, ErrSnapshotMetaCorrupt) {
+				t.Errorf("version %d: err = %v, want ErrSnapshotMetaCorrupt", v, err)
+			}
 		}
-		if meta.Compression != config.Snappy {
-			t.Errorf("compression from a newer record = %d, want %d", meta.Compression, config.Snappy)
+		for _, v := range []uint16{snapshotMetaVersion, previousSnapshotMetaVersion} {
+			if _, err := parseVersionedSnapshotMeta(versionedMetaRecord(v, body)); err != nil {
+				t.Errorf("version %d inside the window refused: %v", v, err)
+			}
 		}
 	})
 

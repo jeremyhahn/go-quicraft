@@ -249,6 +249,12 @@ type Peer struct {
 	// slog default; the Host sets its own through SetLogger.
 	logger *slog.Logger
 
+	// wire is the set of wire versions this build reads, set through
+	// SetWireWindow. It is LOCAL configuration carried into every membership
+	// newMembership builds, so a committed UpdateWireVersion or an installed
+	// snapshot outside it is refused. Zero means proto.DefaultWireWindow.
+	wire proto.WireWindow
+
 	// configFoldedThrough is the highest index up to which every committed entry
 	// HAS BEEN OFFERED to applyMembershipEntry. It is the lower bound
 	// resolveStaleStartupConfig resumes its scan from.
@@ -924,6 +930,10 @@ func (p *Peer) Handle(msg proto.Message) error {
 	// snapshot inherit the newer one's restore below and roll membership
 	// backwards. The pending snapshot is cleared only by the engine's
 	// persistence ack, so it routinely outlives the message that installed it.
+	if err := p.checkSnapshotWireVersion(msg); err != nil {
+		return err
+	}
+
 	var pendingBefore *proto.Snapshot
 	var termBefore uint64
 	var committedBefore uint64
@@ -1244,7 +1254,57 @@ func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 // here so the policy survives the replacement; it is local configuration, not
 // something the replicated state carries.
 func (p *Peer) newMembership(ms proto.Membership) *membership {
-	return newMembershipWithPolicy(ms, p.cfg.RequireMemberIdentities)
+	m := newMembershipWithPolicy(ms, p.cfg.RequireMemberIdentities)
+	m.wire = p.wireWindow()
+	return m
+}
+
+// checkSnapshotWireVersion refuses an InstallSnapshot whose membership
+// commits the shard to a wire version this build cannot read: installing it
+// would leave this replica in a shard state it cannot follow, so it is
+// refused before it reaches the log, as the apply path refuses the entry.
+func (p *Peer) checkSnapshotWireVersion(msg proto.Message) error {
+	if msg.Type != proto.InstallSnapshot {
+		return nil
+	}
+	if v := msg.Snapshot.Membership.WireVersion; v != 0 && !p.wireWindow().Accepts(v) {
+		return proto.ErrUnsupportedVersion
+	}
+	return nil
+}
+
+// wireWindow returns the window set through SetWireWindow, or the build's
+// default.
+func (p *Peer) wireWindow() proto.WireWindow {
+	if p.wire == (proto.WireWindow{}) {
+		return proto.DefaultWireWindow()
+	}
+	return p.wire
+}
+
+// SetWireWindow sets the wire versions this replica reads. Like SetLogger it
+// must be called before the Peer is handed to a worker. It returns
+// proto.ErrUnsupportedVersion when the recovered membership already commits
+// the shard to a wire version outside w: this build cannot rejoin that shard.
+func (p *Peer) SetWireWindow(w proto.WireWindow) error {
+	p.wire = w
+	p.membership.wire = p.wireWindow()
+	p.r.wire = p.membership.wire
+	if v := p.membership.wireVersion; v != 0 && !p.membership.wire.Accepts(v) {
+		return proto.ErrUnsupportedVersion
+	}
+	return nil
+}
+
+// WireVersion returns the shard's committed wire version, with zero read as
+// proto.PreviousWireVersion. It reads the published membership snapshot, so
+// it is safe from any goroutine.
+func (p *Peer) WireVersion() uint64 {
+	snap := p.membershipSnap.Load()
+	if snap == nil {
+		return proto.PreviousWireVersion
+	}
+	return proto.EffectiveWireVersion(snap.wireVersion)
 }
 
 // membershipVotingBitCount returns how many ReadIndex ackBits positions the
@@ -1532,6 +1592,20 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 			return false, ErrCorruptConfigEntry
 		}
 		if err := p.membership.apply(cc, e.Index); err != nil {
+			// A committed wire version this build cannot read is FATAL, like
+			// an undecodable entry: skipping it would leave this replica
+			// sending a version its peers have switched away from, and every
+			// replica that applied it would disagree with this one about the
+			// shard's state from here on.
+			if errors.Is(err, proto.ErrUnsupportedVersion) {
+				slog.Error("committed wire version outside this build's window",
+					"shard_id", p.shardID,
+					"replica_id", p.replicaID,
+					"entry_index", e.Index,
+					"wire_version", cc.WireVersion,
+				)
+				return false, err
+			}
 			// The Host membership API pre-validates against current membership
 			// (ValidateConfigChange) before proposing, so a skip on the leader's
 			// own freshly proposed entry is unexpected and would mean the

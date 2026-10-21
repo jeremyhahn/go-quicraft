@@ -15,6 +15,8 @@
 package raft
 
 import (
+	"fmt"
+
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -31,6 +33,7 @@ var configChangeHandlers = map[uint64]configChangeHandler{
 	proto.AddNonVoting:        handleAddNonVoting,
 	proto.AddWitness:          handleAddWitness,
 	proto.UpdateWitnessPolicy: handleUpdateWitnessPolicy,
+	proto.UpdateWireVersion:   handleUpdateWireVersion,
 }
 
 // configChangeValidator is the function signature for read-only config change
@@ -60,6 +63,7 @@ var configChangeValidators = map[uint64]configChangeValidator{
 	proto.AddNonVoting:        validateAddNonVoting,
 	proto.AddWitness:          validateAddWitness,
 	proto.UpdateWitnessPolicy: validateUpdateWitnessPolicy,
+	proto.UpdateWireVersion:   validateUpdateWireVersion,
 }
 
 // membershipSnapshot is an immutable, concurrency-safe snapshot of the
@@ -77,6 +81,9 @@ type membershipSnapshot struct {
 	// through the snapshot so the state machine can read it off the published
 	// pointer from the apply goroutine; see proto.SessionPolicy.
 	sessionPolicy proto.SessionPolicy
+	// wireVersion is the shard's committed wire version (0 reads as
+	// proto.PreviousWireVersion); see membership.wireVersion.
+	wireVersion uint64
 	// addresses maps replica IDs to network addresses for full voting members.
 	addresses map[uint64]string
 	// observers maps replica IDs to network addresses for non-voting observers.
@@ -245,6 +252,7 @@ func (s *membershipSnapshot) toProto() proto.Membership {
 		Removed:                    copyBoolMap(s.removed),
 		Identities:                 copyStringMap(s.identities),
 		RemovedIdentities:          copyStringMap(s.removedIdentities),
+		WireVersion:                s.wireVersion,
 	}
 	// The policy moves as ONE value rather than field by field. This site
 	// silently dropped a policy field once already: it listed the three that
@@ -320,6 +328,18 @@ type membership struct {
 	// trails commit, so a value that changed mid-log would be observed at a
 	// replica-local point in the log. See rsm.StateMachine.sessionPolicyFn.
 	sessionPolicy proto.SessionPolicy
+	// wireVersion is the shard's committed wire version: the version every
+	// replica sends at once the switch commits. Zero reads as
+	// proto.PreviousWireVersion. Changed only by a committed
+	// UpdateWireVersion config change, which moves it forward and never back,
+	// so it is applied at one log index, replayed identically after a crash
+	// and carried in snapshots like the witness policy.
+	wireVersion uint64
+	// wire is LOCAL: the wire versions this build reads. A committed
+	// wireVersion outside it is refused with proto.ErrUnsupportedVersion,
+	// because this replica could not speak to its peers at it. Like
+	// requireIdentities it is not replicated and not carried in snapshots.
+	wire proto.WireWindow
 	// requireIdentities is LOCAL admission policy, not replicated state: when
 	// set, validate refuses to admit a member that carries no node identity
 	// (config.Config.RequireMemberIdentities). It is never consulted on the
@@ -342,6 +362,8 @@ func newMembership(m proto.Membership) *membership {
 		maxWitnesses:               m.MaxWitnesses,
 		requireFullReplicaMajority: m.RequireFullReplicaMajority,
 		sessionPolicy:              m.SessionPolicy(),
+		wireVersion:                m.WireVersion,
+		wire:                       proto.DefaultWireWindow(),
 	}
 }
 
@@ -371,6 +393,7 @@ func (m *membership) snapshot() *membershipSnapshot {
 		maxWitnesses:               m.maxWitnesses,
 		requireFullReplicaMajority: m.requireFullReplicaMajority,
 		sessionPolicy:              m.sessionPolicy,
+		wireVersion:                m.wireVersion,
 		sharedAddresses:            m.sharedAddresses(),
 	}
 }
@@ -674,9 +697,9 @@ func (m *membership) isRemoved(replicaID uint64) bool {
 // witness policy. This is a read-only operation that does not copy or mutate
 // the membership.
 func (m *membership) validate(cc proto.ConfigChange) error {
-	// UpdateWitnessPolicy targets the shard, not a replica; every other
-	// change type must name a non-zero target replica.
-	if cc.ReplicaID == 0 && cc.Type != proto.UpdateWitnessPolicy {
+	// UpdateWitnessPolicy and UpdateWireVersion target the shard, not a
+	// replica; every other change type must name a non-zero target replica.
+	if cc.ReplicaID == 0 && !targetsShard(cc.Type) {
 		return ErrZeroReplicaID
 	}
 	validator, ok := configChangeValidators[cc.Type]
@@ -707,7 +730,7 @@ func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
 	if logIndex <= m.configChangeID {
 		return nil
 	}
-	if cc.ReplicaID == 0 && cc.Type != proto.UpdateWitnessPolicy {
+	if cc.ReplicaID == 0 && !targetsShard(cc.Type) {
 		return ErrZeroReplicaID
 	}
 	handler, ok := configChangeHandlers[cc.Type]
@@ -1056,6 +1079,43 @@ func validateUpdateWitnessPolicy(m *membership, cc proto.ConfigChange) error {
 		if fullReplicas < quorumOf(fullReplicas+len(m.witnesses)) {
 			return ErrBreaksFullReplicaMajority
 		}
+	}
+	return nil
+}
+
+// targetsShard reports whether a config change type changes shard-wide
+// state rather than naming a target replica, so a zero ReplicaID is valid.
+func targetsShard(t uint64) bool {
+	return t == proto.UpdateWitnessPolicy || t == proto.UpdateWireVersion
+}
+
+// handleUpdateWireVersion moves the shard's committed wire version forward.
+// A value below the current one or outside this build's read window is
+// refused with proto.ErrUnsupportedVersion: the replica cannot follow the
+// shard, and the caller stops it rather than skip the entry.
+func handleUpdateWireVersion(m *membership, cc proto.ConfigChange) error {
+	if err := m.wire.CheckCommit(m.wireVersion, cc.WireVersion); err != nil {
+		return err
+	}
+	m.wireVersion = cc.WireVersion
+	return nil
+}
+
+// validateUpdateWireVersion checks a proposed switch against the same rule
+// the apply path enforces, so a leader never commits one it cannot apply.
+// That every member advertises the version is the proposer's check: it
+// rests on the MaxBinVer the host has seen, which is not replicated state.
+// The proposer therefore names the membership it checked by its
+// ConfigChangeID, and a switch judged against any other membership is
+// refused as pending: a member added since then was never asked what it
+// reads. Nothing entered the log, so the proposer re-checks and retries.
+func validateUpdateWireVersion(m *membership, cc proto.ConfigChange) error {
+	if err := m.wire.CheckCommit(m.wireVersion, cc.WireVersion); err != nil {
+		return err
+	}
+	if cc.ConfigChangeID != m.configChangeID {
+		return fmt.Errorf("%w: wire-version switch checked membership %d, current is %d",
+			ErrPendingConfigChange, cc.ConfigChangeID, m.configChangeID)
 	}
 	return nil
 }

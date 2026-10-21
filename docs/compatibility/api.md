@@ -86,14 +86,14 @@ format error is in [user.md](user.md#upgrade-path).
 
 | Error | Package | Returned when |
 |---|---|---|
-| `ErrUnsupportedVersion` | `pkg/proto` | a `MessageBatch` or `SnapshotChunk` carries another `BinVer` |
+| `ErrUnsupportedVersion` | `pkg/proto` | a `MessageBatch` or `SnapshotChunk` carries a `BinVer` outside the receiver's window, or an `UpdateWireVersion` change or restored `Membership.WireVersion` is outside it; on the apply path the replica stops the shard |
 | `*UnsupportedMembershipVersionError` | `pkg/proto` | a persisted `Membership` section's version byte is not 1; matches `ErrUnsupportedVersion` |
 | `ErrBufferTooSmall` | `pkg/proto` | a `ConfigChange` payload is cut short |
 | `ErrWALFormatUnsupportedVersion` (`*WALFormatVersionError`) | `pkg/logdb/waldb` | the `WALFORMAT` marker records another version |
 | `ErrWALFormatMalformed` | `pkg/logdb/waldb` | the marker cannot be parsed |
 | `ErrWALFormatMissing` | `pkg/logdb/waldb` | segments exist with no marker |
 | `ErrUnknownPayloadType` | `pkg/logdb/waldb` | a record's payload-type byte is retired or unknown, or the WAL is encrypted and was opened with no barrier |
-| `ErrTruncatedSnapshotRecord` | `pkg/logdb/waldb` | a snapshot record's membership section is shorter than 74 bytes |
+| `ErrTruncatedSnapshotRecord` | `pkg/logdb/waldb` | a snapshot record's membership section is shorter than 82 bytes |
 | `ErrBarrierContextBindingUnreportable` | `pkg/logdb/waldb` | the barrier lacks `ContextBindingResolved()` |
 | `ErrSnapshotCorrupt` | `pkg` | a `snapshot.meta` lacks `DataLen`/`DataHash`, an at-rest snapshot is truncated to nothing, or an artifact hash mismatches |
 | `*SnapshotArtifactError` | `pkg` | an imported artifact's trailer is missing, truncated or mismatched |
@@ -116,3 +116,7 @@ format error is in [user.md](user.md#upgrade-path).
   ([architecture.md](architecture.md#format-versions-are-pinned-until-the-first-production-release)).
   None of them is exported for an embedder to compare against except
   `proto.WireVersion`.
+- `Membership.WireVersion` reports the shard's committed wire version (zero:
+  never switched, read as the previous version). The host moves it on its
+  own; there is no API to propose `UpdateWireVersion`, and nothing for an
+  embedder to call during a rolling upgrade.

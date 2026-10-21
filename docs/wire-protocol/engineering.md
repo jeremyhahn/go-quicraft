@@ -480,11 +480,11 @@ MessageBatch is the transport-level framing for a batch of Raft messages
 sent in a single network write. One batch per QUIC stream write.
 
 ```
- 0                   8                  16                  24  28
- +-------------------+-------------------+-------------------+----+
- |   BinVer (8)      | DeploymentID (8)  | SourceEpoch (8)   |ALen|
- +-------------------+-------------------+-------------------+----+
-28                                       28+ALen    32+ALen
+ 0                   8                  16                  24                  32  36
+ +-------------------+-------------------+-------------------+-------------------+----+
+ |   BinVer (8)      | DeploymentID (8)  | SourceEpoch (8)   |   MaxBinVer (8)   |ALen|
+ +-------------------+-------------------+-------------------+-------------------+----+
+36                                       36+ALen    40+ALen
  +---------------------------------------+----------+
  |   SourceAddress (ALen bytes)          | ReqCnt(4)|
  +---------------------------------------+----------+
@@ -496,16 +496,23 @@ sent in a single network write. One batch per QUIC stream write.
 
 | Offset   | Size | Field         | Type   | Description                      |
 |----------|------|---------------|--------|----------------------------------|
-| 0        | 8    | BinVer        | uint64 | Wire format version              |
+| 0        | 8    | BinVer        | uint64 | Wire version the batch is encoded at |
 | 8        | 8    | DeploymentID  | uint64 | Deployment identity token        |
 | 16       | 8    | SourceEpoch   | uint64 | Sender's per-process boot epoch  |
-| 24       | 4    | AddrLen       | uint32 | Length of SourceAddress          |
-| 28       | N    | SourceAddress | string | Sender network address           |
-| 28+N     | 4    | ReqCount      | uint32 | Number of Message records        |
-| 32+N     | var  | Requests      | []Message | Count-prefixed messages       |
+| 24       | 8    | MaxBinVer     | uint64 | Highest wire version the sender accepts |
+| 32       | 4    | AddrLen       | uint32 | Length of SourceAddress          |
+| 36       | N    | SourceAddress | string | Sender network address           |
+| 36+N     | 4    | ReqCount      | uint32 | Number of Message records        |
+| 40+N     | var  | Requests      | []Message | Count-prefixed messages       |
 
-Fixed portion: `messageBatchFixedSize = 3 * 8 = 24 bytes`
-(BinVer + DeploymentID + SourceEpoch).
+Fixed portion: `messageBatchFixedSize = 4 * 8 = 32 bytes`
+(BinVer + DeploymentID + SourceEpoch + MaxBinVer).
+
+`MaxBinVer` is advertised, never negotiated: it is the sending build's
+`WireWindow.Current` and never chooses `BinVer`. A receiver whose own window
+spans two versions records it per member, and a shard's leader commits the
+wire-version switch only once every member has advertised at least the
+target. See [Upgrade strategy](#upgrade-strategy).
 SourceAddress uses the standard `[Len:4][Data:N]` string encoding.
 
 ### SourceEpoch
@@ -520,10 +527,11 @@ connection promptly instead of waiting for `MaxIdleTimeout`. See
 
 The receiver validates fields in order during `UnmarshalFrom`:
 
-1. **Wire version**: `BinVer != WireVersion` returns `ErrUnsupportedVersion`.
-   The gate is EXACT equality, not `<=`: there is no version negotiation and
-   no legacy decode path, so batches from both older AND newer binaries are
-   rejected rather than misparsed. BinVer is the FIRST field so the receiver
+1. **Wire version**: a `BinVer` outside the receiver's window
+   `{Current, Previous}` returns `ErrUnsupportedVersion`. The gate is set
+   membership, not a range: there is no version negotiation, and a batch
+   from a binary outside the window, older or newer, is rejected rather
+   than misparsed. BinVer is the FIRST field so the receiver
    rejects incompatible versions before parsing any further data.
 
 2. **Source address length**: `AddrLen > MaxAddressLength` (256) returns
@@ -699,11 +707,11 @@ The layout, at version **1**:
  +-------------------------+-------------------+-------------------+
  | SessionExpiryEntries(8) | MaxTotalSessions  | MaxSessionsPerCli |
  +-------------------------+-------------------+-------------------+
-49                       57
- +-------------------------+
- |  MaxSessionsPerOwner(8) |
- +-------------------------+
-57
+49                       57                  65
+ +-------------------------+-------------------+
+ |  MaxSessionsPerOwner(8) |  WireVersion(8)   |
+ +-------------------------+-------------------+
+65
  +-----------------------+
  |  Addresses map        |  -- map[uint64]string, sorted by key
  +-----------------------+
@@ -731,11 +739,14 @@ The layout, at version **1**:
 | 33     | 8    | MaxTotalSessions             | uint64 | Replicated cap on registered sessions |
 | 41     | 8    | MaxResponsesPerSession         | uint64 | Replicated cap on cached responses per session |
 | 49     | 8    | MaxSessionsPerOwner          | uint64 | Replicated cap on sessions per declared owner |
+| 57     | 8    | WireVersion                  | uint64 | Committed wire version (0 = never switched) |
 
-Fixed region: `membershipFixedSize = sessionPolicyOffset (25) +
-membershipSessionPolicySize (32) = 57 bytes`
-(`pkg/proto/membership.go:96-110`). An empty membership, all six maps
-present but zero-length, is **81 bytes** (57 + 6 x 4). Every map is written
+Fixed region: `membershipFixedSize = wireVersionOffset (57) + 8 = 65 bytes`,
+where `wireVersionOffset = sessionPolicyOffset (25) +
+membershipSessionPolicySize (32)` (`pkg/proto/membership.go`). An empty
+membership, all six maps present but zero-length, is **89 bytes** (65 + 6 x 4).
+`WireVersion` is moved only by an `UpdateWireVersion` config change; see
+[Upgrade strategy](#upgrade-strategy). Every map is written
 unconditionally, so an empty map is four zero bytes rather than an absent
 field, and an unset session policy is 32 zero bytes rather than an absent
 one.
@@ -917,7 +928,7 @@ entry. It describes a membership change operation.
  +-------+-----------------------+-------------------+
  |AdrLen |  Address (N bytes)    |  Initialize (8)   |
  +-------+-----------------------+-------------------+
- +--- MaxWitnesses (8) ---+--- RequireFullReplicaMajority (8) ---+
+ +--- MaxWitnesses (8) ---+--- RequireFullReplicaMajority (8) ---+--- WireVersion (8) ---+
  +--- IdLen (4) ---+--- NodeIdentity (M bytes) ---+
 ```
 
@@ -925,19 +936,20 @@ entry. It describes a membership change operation.
 |--------|------|----------------------------|--------|---------------------------------|
 | 0      | 8    | ConfigChangeID             | uint64 | Log index of this change        |
 | 8      | 8    | Type                       | uint64 | See the type table below        |
-| 16     | 8    | ReplicaID                  | uint64 | Target replica (0 for `UpdateWitnessPolicy`) |
+| 16     | 8    | ReplicaID                  | uint64 | Target replica (0 for `UpdateWitnessPolicy` and `UpdateWireVersion`) |
 | 24     | 4+N  | Address                    | string | Network address (empty for remove) |
 | 28+N   | 8    | Initialize                 | bool   | Needs initial state flag        |
 | 36+N   | 8    | MaxWitnesses               | uint64 | New witness cap for `UpdateWitnessPolicy` |
 | 44+N   | 8    | RequireFullReplicaMajority | bool   | New policy for `UpdateWitnessPolicy` |
-| 52+N   | 4+M  | NodeIdentity               | string | Committed node identity (always present; `M` may be 0) |
+| 52+N   | 8    | WireVersion                | uint64 | New committed wire version for `UpdateWireVersion`; 0 otherwise |
+| 60+N   | 4+M  | NodeIdentity               | string | Committed node identity (always present; `M` may be 0) |
 
-Fixed portion: `configChangeFixedSize = 6*8 + 4 = 52 bytes`
-(`pkg/proto/configchange.go`): the six uint64-width fields plus the
+Fixed portion: `configChangeFixedSize = 7*8 + 4 = 60 bytes`
+(`pkg/proto/configchange.go`): the seven uint64-width fields plus the
 4-byte address length prefix. The trailing `NodeIdentity` adds its own 4-byte
 length prefix plus its bytes. The prefix is **unconditional**: an empty
 identity is four zero bytes, never a shorter buffer. The smallest complete
-encoding is therefore **56 bytes**, an empty address and an empty identity.
+encoding is therefore **64 bytes**, an empty address and an empty identity.
 
 `UnmarshalFrom` decodes into a local and assigns the receiver only on
 success. Writing fields as they are parsed would leave a failure part-way
@@ -949,7 +961,7 @@ identity beside a new target.
 replica being added. It travels through consensus alongside `Address` so the
 receive-side gate reads a value no inbound message can write. It is supplied
 by the operator through the Host API, never captured from a connection.
-It is empty for `RemoveNode` and `UpdateWitnessPolicy`. An add without one is
+It is empty for `RemoveNode`, `UpdateWitnessPolicy` and `UpdateWireVersion`. An add without one is
 refused on a host with a transport (`ErrMemberIdentityRequired`), both by the
 Host API and by the leader's propose-time validator, unless the configuration
 already binds an identity to that replica: a role change such as an observer
@@ -967,7 +979,8 @@ ending after `RequireFullReplicaMajority` decoded as an identity-less change, a
 truncated `ConfigChange` would be byte-indistinguishable from a legitimate one
 and truncation could strip an identity from an add.
 
-An identity-less config change (`RemoveNode`, `UpdateWitnessPolicy`) is written
+An identity-less config change (`RemoveNode`, `UpdateWitnessPolicy`,
+`UpdateWireVersion`) is written
 with an explicit zero length prefix, so what the decoder sees is a value the
 writer chose rather than a length the reader inferred.
 
@@ -980,11 +993,13 @@ Config change type constants:
 | 2     | `AddNonVoting`        | Add non-voting observer                        |
 | 3     | `AddWitness`          | Add witness replica                            |
 | 4     | `UpdateWitnessPolicy` | Replace the shard's replicated witness policy  |
+| 5     | `UpdateWireVersion`   | Switch the shard's committed wire version      |
 
 `UpdateWitnessPolicy` carries no target replica; the `MaxWitnesses` and
-`RequireFullReplicaMajority` fields hold the new values. A `Type` above
-`UpdateWitnessPolicy` is rejected with `ErrInvalidConfigChangeType` on both
-write and read.
+`RequireFullReplicaMajority` fields hold the new values. `UpdateWireVersion`
+carries no target replica either; its `WireVersion` field holds the new
+committed version. A `Type` above `UpdateWireVersion` is rejected with
+`ErrInvalidConfigChangeType` on both write and read.
 
 `MarshalTo` mirrors the read side's per-field bounds --
 `ErrInvalidConfigChangeType`, `ErrAddressTooLong` (`MaxAddressLength`, 256)
@@ -1146,8 +1161,7 @@ decrypt barrier-encrypted snapshot data. Omitting it from a decoder reads
 the length prefix of `Data` out of the epoch field, so the chunk payload is
 mis-sized rather than merely mis-labeled.
 
-`BinVer` is gated on **exact** equality with `WireVersion`, mirroring
-`MessageBatch`. This is a deliberate choice and not the persisted-format
+`BinVer` is gated on the same closed set as `MessageBatch`. This is a deliberate choice and not the persisted-format
 oversight the Membership version byte closes: `SnapshotChunk` is
 transport-only. The receiver keeps only `chunk.Data` (written to
 `snapshot.dat`) and re-derives the metadata into a `logdb.Snapshot` record in
@@ -1189,7 +1203,7 @@ persists is `logdb.Bootstrap` (`pkg/logdb/types.go`), written through
 
 | Constant                  | Value      | Enforced In              | Description                      |
 |---------------------------|------------|--------------------------|----------------------------------|
-| `WireVersion`             | 1          | `MessageBatch.UnmarshalFrom`, `SnapshotChunk.UnmarshalFrom` | Current transport wire format version (exact match) |
+| `WireVersion`             | 1          | `MessageBatch.UnmarshalFrom`, `SnapshotChunk.UnmarshalFrom` | Current transport wire format version (closed set with `PreviousWireVersion`) |
 | `MaxEntrySize`            | 8 MB       | `Entry` (both codecs)    | Max `Entry.Cmd` payload          |
 | `MaxBatchSize`            | 64 MB      | `MessageBatch.UnmarshalFrom` | Max cumulative batch size    |
 | `MaxAddressLength`        | 256 bytes  | `getString`, `getMap`, `checkWritableMap` | Max node address string |
@@ -1505,7 +1519,9 @@ Source: `pkg/proto/messagebatch.go`, `pkg/proto/constants.go`
 ## Wire format versioning
 
 **Every version in this package is pinned at 1 for the whole pre-release
-period, and every gate on it is an exact match.** A layout change is made IN
+period, and every gate on it tests membership of a closed set
+`{current, previous}` whose two members are equal until the first release
+after v1.0.0, so each set has exactly one member.** A layout change is made IN
 PLACE at version 1, the consuming repos are rebuilt to match, and dev
 clusters are wiped and re-synced rather than migrated. The numbers increment
 for the first time at the first production release. The consequence is
@@ -1520,14 +1536,16 @@ never change how the other is read.
 **Transport-scoped: `proto.WireVersion` = 1.** Stamped into
 `MessageBatch.BinVer` and `SnapshotChunk.BinVer`. Both ends of a QUIC
 connection are live processes, so a mismatch costs one rejected connection
-and nothing durable. Gated on **exact equality**: a peer speaking another
-dialect is refused outright rather than misparsed.
+and nothing durable. Gated on the closed set `{WireVersion,
+PreviousWireVersion}` (`proto.WireWindow.Accepts`): a peer speaking a
+dialect outside it is refused outright rather than misparsed.
 
 A third constant, `transport.WireVersion = 0x01`
 (`pkg/internal/transport/frame.go`), is the version byte of the 8-byte
 frame header that wraps a marshaled `MessageBatch`
 (`[Magic:2][Version:1][Flags:1][Length:4]`). It is a separate constant that
-happens to hold the same value, gated on exact equality by
+happens to hold the same value, gated on the closed set
+`{transport.WireVersion, transport.PreviousWireVersion}` by
 `ValidateFrameHeader`, and is documented in
 [Transport](../quic-transport/engineering.md).
 
@@ -1535,7 +1553,8 @@ happens to hold the same value, gated on exact equality by
 `EntryInitialMembership` entry at log index 1 and into the exported snapshot
 artifact header. Those bytes outlive the process, and the binary, that
 wrote them, which is why the format carries an explicit discriminator at all.
-Also gated on exact equality. The WAL's own membership section uses a
+Also gated on a closed set, `{membershipFormatVersion,
+previousMembershipFormatVersion}`. The WAL's own membership section uses a
 separate layout and a separate version byte
 (`waldb.membershipSectionVersion`).
 
@@ -1549,8 +1568,8 @@ no dual-read path and no migration, a permanently unstartable cluster.
 
 Independent does not mean unrelated. `Membership` is embedded in `Snapshot`,
 which is embedded in `Message`, which is embedded in `MessageBatch`, and it
-is embedded directly in `SnapshotChunk`. Both of those gate on exact
-equality, so a `Membership` layout change alters the transport bytes without
+is embedded directly in `SnapshotChunk`. Both of those gate on the wire
+version alone, so a `Membership` layout change alters the transport bytes without
 altering the discriminator that is supposed to describe them.
 
 **The rule: bump `WireVersion` whenever any type reachable from
@@ -1568,16 +1587,39 @@ alone. That asymmetry is why the assertion is `>=` and not `==`.
 
 ### Upgrade strategy
 
-Because the transport gate is exact equality, there is **no rolling upgrade
-across a `WireVersion` bump** and no mixed-version steady state. A cluster
-spanning two wire versions does not degrade; it stops exchanging Raft
-messages entirely. The upgrade procedure is a rolling *replacement*, not a
-rolling *restart*.
+From the first release after v1.0.0 a `WireVersion` bump is crossed by a
+**rolling restart**, one MINOR at a time, by a fixed window and never by
+negotiation. A build reads its own wire version and the previous one, and
+a shard moves from one to the other through its Raft log:
 
-Pre-release the same is true across a LAYOUT change even though the number
-does not move, and it does not announce itself as a version mismatch, so
-the procedure wipes each node's data directory rather than relying on the
-gate to catch the skew.
+1. **Send at the committed version.** `Membership.WireVersion` is the
+   shard's committed wire version; zero means the shard never switched and
+   reads as the previous version. The host gives the transport a per-shard
+   lookup (`SetWireVersionLookup`) returning that value. A shard switched to
+   the build's current version sends the current `BinVer` and frame byte;
+   every other shard sends the previous pair. A batch carrying several
+   shards takes the lowest, and a snapshot stream fixes its version when
+   the stream starts. Nothing new travels per message.
+2. **Advertise what the build reads.** Every batch carries `MaxBinVer`, the
+   sending build's current version. A host whose window spans two versions
+   records the latest value per member of each shard; a member rolled back
+   to the older build lowers it again, and a member never heard from counts
+   as previous.
+3. **Switch through consensus.** When a shard's leader runs the newer build
+   and every other voter, non-voting member and witness has advertised at
+   least its current version, it proposes `UpdateWireVersion`, re-checking
+   at most once a second. The change is validated against each replica's
+   window when proposed and when applied, never lowers the committed
+   version, and travels inside every snapshot's `Membership`. A replica that
+   cannot read the committed version stops the shard rather than apply it,
+   so a switched data directory is never run by an older build.
+
+A build whose window holds one version, every build up to and including
+v1.0.0, records no advertisements and never proposes.
+
+Pre-release, a LAYOUT change is made in place without moving the number, so
+it does not announce itself as a version mismatch: the procedure wipes each
+node's data directory rather than relying on the gate to catch the skew.
 
 See [Compatibility](../compatibility/user.md#upgrade-notes-by-release) for the authoritative
 per-release procedure and the version history.

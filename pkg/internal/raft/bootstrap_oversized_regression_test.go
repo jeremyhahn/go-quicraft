@@ -147,7 +147,7 @@ func TestBuildInitialMembershipEntry_LegalMembershipStillRoundTrips(t *testing.T
 // of the ErrAddressTooLong this test is about.
 func encodeMembershipUnchecked(ms proto.Membership) []byte {
 	const membershipVersionByte = 1
-	const fixedSize = 1 + 8 + 8 + 8 + 8 + 8 + 8 // 49
+	const fixedSize = 1 + 3*8 + 4*8 + 8 // 65: header, session policy, WireVersion
 
 	keys := make([]uint64, 0, len(ms.Addresses))
 	for k := range ms.Addresses {

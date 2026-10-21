@@ -3552,7 +3552,7 @@ func overLimitMessageCountPayload(t *testing.T, sourceAddress string) []byte {
 		t.Fatalf("MarshalTo(empty batch): %v", err)
 	}
 	payload = payload[:n]
-	countOffset := 24 + 4 + len(sourceAddress)
+	countOffset := 32 + 4 + len(sourceAddress)
 	binary.LittleEndian.PutUint32(payload[countOffset:], proto.MaxMessagesPerBatch+1)
 	return payload
 }

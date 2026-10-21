@@ -12,11 +12,11 @@ the interfaces an embedder's own types must satisfy are in [api.md](api.md).
 
 | # | Discriminator | Value | Scope | Check |
 |---|---|---|---|---|
-| 1 | `proto.WireVersion` | 1 | transport: `MessageBatch.BinVer`, `SnapshotChunk.BinVer` | exact match |
-| 2 | `transport.WireVersion` (frame header byte 3) | `0x01` | transport frame header | exact match |
-| 3 | `Membership` section version byte (`membershipFormatVersion`) | 1 | persisted `proto.Membership` | exact match |
-| 3a | `waldb` `membershipSectionVersion` | 1 | the membership section inside WAL snapshot records | exact match |
-| 4 | `WALFORMAT` marker (`walFormatVersion`) | 1 | WAL chunk framing and block size | exact match, checked before any segment is read |
+| 1 | `proto.WireVersion` | 1 | transport: `MessageBatch.BinVer`, `SnapshotChunk.BinVer` | closed set `{current, previous}`; sent at the shard's committed version |
+| 2 | `transport.WireVersion` (frame header byte 3) | `0x01` | transport frame header | closed set `{current, previous}`; sent paired with `BinVer` |
+| 3 | `Membership` section version byte (`membershipFormatVersion`) | 1 | persisted `proto.Membership` | closed set `{current, previous}` |
+| 3a | `waldb` `membershipSectionVersion` | 1 | the membership section inside WAL snapshot records | closed set `{current, previous}` |
+| 4 | `WALFORMAT` marker (`walFormatVersion`) | 1 | WAL chunk framing and block size | closed set `{current, previous}`, checked before any segment is read |
 | 5 | WAL payload-type byte | per record | each WAL record's layout | unknown or retired byte is fatal on replay |
 | 6 | `snapshot.meta` (`QRSNAPMD`, `snapshotMetaVersion`) | 1 | the record beside each snapshot | self-describing, append-only |
 | 7 | at-rest snapshot frame context (`QRSNAP1`, `SnapshotFrameAADLen`) | 40 bytes | encrypted snapshot frames | authenticated |
@@ -85,7 +85,7 @@ mandatory, so a payload that does not span the whole layout is a truncation and
 fails with `ErrBufferTooSmall` at every cut point. An identity-less change is an
 explicit zero-length prefix, never an inferred short payload.
 
-`waldb` pins its own `membershipSectionVersion` (1, exact match on replay) for
+`waldb` pins its own `membershipSectionVersion` (1, closed set on replay) for
 the membership inside WAL snapshot records. Its layout differs from
 `proto.Membership`: policy flags are one byte, and the session policy is a tail
 after `Identities`, because this decoder parses straight-line from a fixed
@@ -167,11 +167,12 @@ chunk; the chunk framing is the `WALFORMAT` marker's job.
 | `0x09` | retired | fatal: `FilePathLen` where the current layout reads `Compression` |
 | `0x0a` | retired | fatal: three-field session policy tail |
 | `0x0b` | `payloadTypeEntries` | current: 84-byte record header with five session fields (`Key`, `ClientID`, `SeriesID`, `RespondedTo`, `OwnerID`) |
-| `0x0c` | `payloadTypeSnapshot` | current: artifact `Compression` in the fixed region, four-field session policy tail |
+| `0x0c` | retired | fatal: policy tail without the committed `WireVersion` |
 | `0x0d` | `payloadTypeState` | current: `Term`, `Vote`, `Commit`, `VoteWindow` (48-byte record) |
+| `0x0e` | `payloadTypeSnapshot` | current: artifact `Compression` in the fixed region, four-field session policy tail followed by the committed `WireVersion` |
 
 Retired bytes are left unallocated, not named, so `replayRecord`'s default case
-refuses them. The next layout change takes `0x0e`.
+refuses them. The next layout change takes `0x0f`.
 
 Every fatal error names the remedy: restore from a snapshot, or re-sync from
 peers. With every version number pinned, the ladder is the only thing that
@@ -261,6 +262,124 @@ after the ciphertext: `(*Barrier).StampSealedStateMAC(ctx, sealed)` with the
 barrier unsealed, or `StampSealedStateMACWithRootKey(rootKey, deploymentID,
 sealed)` when only the root key is in hand.
 
+## Rolling upgrade: what v1.0.0 carries
+
+[Architecture question 3](architecture.md#open-questions-for-the-owner) binds
+a rolling upgrade across one MINOR by a fixed window and a switch committed
+through the Raft log. A v1.0 node is the *old* side of the first such upgrade,
+so v1.0 must already carry everything the old side does; a v1.1 cannot add it
+retroactively. In v1.0 every window below has one member and nothing switches.
+
+### The accept sets
+
+Each gate tests membership of a closed set, `{current, previous}`, and refuses
+everything else with the error it returns today. In v1.0 `previous` equals
+`current`, so each set has exactly one member; a v1.1 sets `previous` to the
+v1.0 value. A range test (`v >= previous && v <= current`) is not used: it
+widens silently when a constant moves.
+
+| Gate | Set | Refusal |
+|---|---|---|
+| frame header byte 3 (`ValidateFrameHeader`, `frame.go`) | `transport.WireVersion`, `transport.PreviousWireVersion` | `ErrUnsupportedVersion` |
+| `MessageBatch.BinVer` (`messagebatch.go`) | `proto.WireVersion`, `proto.PreviousWireVersion` (`proto.AcceptsWireVersion`) | `proto.ErrUnsupportedVersion` |
+| `SnapshotChunk.BinVer` (`chunk.go`) | the same | `proto.ErrUnsupportedVersion` |
+| `Membership` version byte (`membership.go`) | `membershipFormatVersion`, `previousMembershipFormatVersion` | `*UnsupportedMembershipVersionError` |
+| `waldb` membership section (`db.go`) | `membershipSectionVersion` and its previous | the current corruption error |
+| `WALFORMAT` (`format.go`) | `walFormatVersion` and its previous | the current marker error |
+| `snapshot.meta` (`snapshot_meta.go`) | `snapshotMetaVersion` and its previous | the current decode error |
+| exported artifact (`host.go`) | `snapshotArtifactVersion` and its previous | `*SnapshotArtifactError` |
+| sealed state MAC (`seal/barrier.go`) | `sealedStateMACVersion` and its previous | the current MAC error |
+
+The persisted sets are question 2's read window; the two wire sets are
+question 3's upgrade window.
+
+### Member-version knowledge
+
+A v1.1 leader must know that every member of a shard runs v1.1 before it
+commits the switch, and it learns that from v1.0 peers, so v1.0 sends it.
+Every `MessageBatch` carries `MaxBinVer`, the highest `proto.WireVersion` the
+sending build accepts (v1.0 stamps 1). The receiving host records the latest
+`MaxBinVer` per `(shardID, replicaID)` of each request's `From`; the latest
+report, not the highest, so a node downgraded before the switch lowers it
+again. A member never heard from counts as previous. Recording is done only
+by a host whose window spans two versions (`Host.wireSwitchEnabled`), so a
+v1.0 receive path pays nothing for it.
+
+### The switch is a config change
+
+`Membership.WireVersion` holds the shard's committed wire version; zero means
+never switched and reads as `PreviousWireVersion`. A config change of type
+`UpdateWireVersion`, shaped like `UpdateWitnessPolicy` (no target replica),
+carries the new value. Because it is a config change it is:
+
+- applied at one log index by every replica, through the same membership
+  apply path, and serialised against other membership changes by the
+  one-pending-config-change rule, so the member set cannot change between the
+  leader's check and the commit;
+- persisted inside `Membership` in every snapshot, so a replica that restores
+  past the entry sees the same value it would have applied, and a crash replays
+  it identically;
+- never reverted: apply refuses a value lower than the current one, and any
+  value outside the accept set, with `proto.ErrUnsupportedVersion`.
+
+The leader's host proposes it on its own (no API call) when the shard's
+effective version is below `proto.WireVersion` and every voter, non-voting
+member and witness last reported `MaxBinVer >= proto.WireVersion`
+(`pkg/wireswitch.go`). It re-examines a shard on each received batch, at most
+once a second per shard, which also covers a lost proposal and a leadership
+change without a sweep loop. A shard with no other member receives no batch,
+so its leader, once read-ready, retries on the same once-a-second pace until
+the shard switches, gains a member, or the leader loses the term or stops. The
+proposal goes through the same validation as any config change, against the
+replica's own window rather than the build default, and it names the
+membership the leader checked by its `ConfigChangeID`: the leader's step
+worker refuses it before append, as a pending config change, if any config
+change has applied since, so a member added between the check and the
+proposal is never switched before it advertises the version. In v1.0 the effective version already equals
+`proto.WireVersion`, so it never proposes.
+
+Until the switch a node stamps each outbound `MessageBatch` and
+`SnapshotChunk` with its shard's effective version, and the frame with the
+matching transport version. The transport reads the committed version
+through a per-shard lookup the host installs at construction
+(`QUICTransport.SetWireVersionLookup`, `func(shardID uint64) uint64`); an
+unknown shard returns zero, which reads as previous. Only a shard committed
+at the build's current version sends the current pair. A batch mixing shards
+takes the lowest effective version among them, and a snapshot stream fixes
+its version when it starts, so a switch mid-transfer cannot split it. A message type new in the release is sent only on a
+switched shard.
+
+### A v1.0 node meeting the next version
+
+It fails closed and touches nothing durable. A frame, batch or chunk at the
+next version is refused with `ErrUnsupportedVersion`, which costs one
+connection and is retried; this is what happens to a v1.0 node left in, or
+added to, a switched cluster, and its remedy is to upgrade. An
+`UpdateWireVersion` entry, or a snapshot whose `Membership.WireVersion` is
+outside its set, is refused on apply with `proto.ErrUnsupportedVersion`, and
+the replica stops that shard rather than apply it. A switched data directory
+is therefore never run by a v1.0 build: no downgrade after the switch
+(question 5).
+
+### Testing the next build
+
+A process holds one value of each constant, so the mixed cluster runs in one
+process with each host carrying its build's window: the wire versions it
+accepts and the one it advertises, taken from the constants by default. The
+`quicraft_nextwire` build tag, used only by `_test.go` files, provides the
+next build's window (`WireVersion+1` with the v1.0 value as previous, and the
+matching transport pair). A release build never compiles it.
+
+`pkg/wireswitch_nextwire_test.go` runs three hosts on QUIC from this build's
+window and restarts them one at a time onto the next build's, on their own
+directories, address and leaf. It asserts the shard stays on the previous
+version while any replica runs the old build, commits the switch once all
+three run the new one, and keeps committing afterwards:
+
+```
+go test -race -tags quicraft_nextwire -run TestNextWire ./pkg/
+```
+
 ## Pinned layouts and their golden fixtures
 
 Every layout another build must read, with the function that writes it, the
@@ -284,7 +403,7 @@ the owning package's `testdata/golden/`.
 | WAL chunk framing | `encodeRecord` | `decodeRecord` | `pkg/logdb/waldb/testdata/golden/chunk.bin` |
 | WAL entries record (`0x0b`) | `(*walShard).writeEntries` | `(*walShard).replayEntries` | `pkg/logdb/waldb/testdata/golden/record-entries.bin` |
 | WAL state record (`0x0d`) | `(*walShard).writeState` | `(*walShard).replayState` | `pkg/logdb/waldb/testdata/golden/record-state.bin` |
-| WAL snapshot record (`0x0c`), with the `waldb` membership section | `(*walShard).writeSnapshot` | `(*walShard).replaySnapshot` | `pkg/logdb/waldb/testdata/golden/record-snapshot.bin` |
+| WAL snapshot record (`0x0e`), with the `waldb` membership section | `(*walShard).writeSnapshot` | `(*walShard).replaySnapshot` | `pkg/logdb/waldb/testdata/golden/record-snapshot.bin` |
 | WAL bootstrap record (`0x04`) | `(*walShard).writeBootstrap` | `(*walShard).replayBootstrap` | `pkg/logdb/waldb/testdata/golden/record-bootstrap.bin` |
 | WAL compaction record (`0x05`) | `(*DB).RemoveEntriesTo` | `(*walShard).replayCompaction` | `pkg/logdb/waldb/testdata/golden/record-compact.bin` |
 | `RETIRED` registry | `marshalRetiredRegistry` | `parseRetiredRegistry` | `pkg/logdb/waldb/testdata/golden/retired.bin` |

@@ -133,6 +133,62 @@ import (
 // this constant must never be substituted for or derived into.
 const WireVersion uint64 = 1
 
+// PreviousWireVersion is the WireVersion of the previous MINOR release, the
+// second member of the rolling-upgrade accept set (docs/compatibility,
+// architecture question 3). In v1.0 there is no previous release, so it
+// equals WireVersion and the set has exactly one member. A release that moves
+// WireVersion sets this to the value it replaced.
+const PreviousWireVersion uint64 = WireVersion
+
+// WireWindow is the closed set of transport versions a build accepts:
+// Current, which it advertises, and Previous, which it still reads and keeps
+// sending until its shard commits the switch. It is a set, not a range, so it
+// never widens when a constant moves.
+type WireWindow struct {
+	Current  uint64
+	Previous uint64
+}
+
+// DefaultWireWindow returns this build's window.
+func DefaultWireWindow() WireWindow {
+	return WireWindow{Current: WireVersion, Previous: PreviousWireVersion}
+}
+
+// Accepts reports whether v is a member of the window.
+func (w WireWindow) Accepts(v uint64) bool {
+	return v == w.Current || v == w.Previous
+}
+
+// CheckCommit validates v as the committed wire version of a shard whose
+// current committed value is cur (zero meaning never switched): v must be in
+// the window and must not be lower than cur's effective value. A switch is
+// never reverted. Both failures are ErrUnsupportedVersion, so a build that
+// meets a switch it cannot read stops the shard instead of applying it.
+func (w WireWindow) CheckCommit(cur, v uint64) error {
+	if !w.Accepts(v) {
+		return ErrUnsupportedVersion
+	}
+	if v < EffectiveWireVersion(cur) {
+		return ErrUnsupportedVersion
+	}
+	return nil
+}
+
+// EffectiveWireVersion is the version a shard whose committed
+// Membership.WireVersion is v sends at: PreviousWireVersion until it has
+// switched.
+func EffectiveWireVersion(v uint64) uint64 {
+	if v == 0 {
+		return PreviousWireVersion
+	}
+	return v
+}
+
+// AcceptsWireVersion reports whether v is in this build's accept set.
+func AcceptsWireVersion(v uint64) bool {
+	return DefaultWireWindow().Accepts(v)
+}
+
 // MaxEntrySize is the maximum byte length of an Entry.Cmd payload.
 // Enforced during UnmarshalFrom to prevent memory exhaustion from
 // crafted transport payloads.
@@ -346,11 +402,17 @@ const (
 	// (MaxWitnesses, RequireFullReplicaMajority). Carries no target
 	// replica; the policy fields on ConfigChange hold the new values.
 	UpdateWitnessPolicy uint64 = 4
+	// UpdateWireVersion commits the shard's switch to a newer transport
+	// version (docs/compatibility, "The switch is a config change"). Carries
+	// no target replica; ConfigChange.WireVersion holds the new value, which
+	// apply refuses if it is lower than the current one or outside the
+	// accept set.
+	UpdateWireVersion uint64 = 5
 )
 
 // maxConfigChangeType is the upper bound for valid ConfigChange.Type values.
 // Used in UnmarshalFrom validation instead of referencing AddWitness directly.
-const maxConfigChangeType = UpdateWitnessPolicy
+const maxConfigChangeType = UpdateWireVersion
 
 // messageTypeNames maps message type constants to human-readable names.
 var messageTypeNames = map[uint64]string{
@@ -402,6 +464,7 @@ var configChangeTypeNames = map[uint64]string{
 	AddNonVoting:        "AddNonVoting",
 	AddWitness:          "AddWitness",
 	UpdateWitnessPolicy: "UpdateWitnessPolicy",
+	UpdateWireVersion:   "UpdateWireVersion",
 }
 
 // ConfigChangeTypeName returns the human-readable name for a config change type constant.

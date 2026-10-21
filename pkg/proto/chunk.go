@@ -174,6 +174,12 @@ func (sc *SnapshotChunk) MarshalTo(buf []byte) (int, error) {
 
 // UnmarshalFrom reads the snapshot chunk from buf and returns bytes consumed.
 func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
+	return sc.UnmarshalFromWindow(buf, DefaultWireWindow())
+}
+
+// UnmarshalFromWindow is UnmarshalFrom against an explicit accept set. The
+// transport passes its host's window; UnmarshalFrom passes this build's.
+func (sc *SnapshotChunk) UnmarshalFromWindow(buf []byte, w WireWindow) (int, error) {
 	if len(buf) < 72 { // minimum: 9 uint64 fields
 		return 0, ErrBufferTooSmall
 	}
@@ -224,7 +230,10 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	sc.DeploymentID = getUint64(buf[offset:])
 	offset += 8
 	sc.BinVer = getUint64(buf[offset:])
-	// Exact-equality gate, mirroring MessageBatch.UnmarshalFrom. This is a
+	// Closed-set gate against w, the rolling-upgrade window {current,
+	// previous} (one member until a release moves WireVersion), mirroring
+	// MessageBatch.UnmarshalFromWindow; the rest of this note explains why
+	// the set stays this small. The original exact-equality reasoning: This is a
 	// DELIBERATE choice, not the persisted-format oversight fixed in
 	// Membership: SnapshotChunk is transport-only. Its encoding exists
 	// solely between MarshalTo on the sending QUIC stream and UnmarshalFrom
@@ -240,7 +249,7 @@ func (sc *SnapshotChunk) UnmarshalFrom(buf []byte) (int, error) {
 	//
 	// BinVer is a required field: senders stamp WireVersion, and an
 	// unstamped chunk (BinVer 0) is indistinguishable from a v1 sender's.
-	if sc.BinVer != WireVersion {
+	if !w.Accepts(sc.BinVer) {
 		return 0, ErrUnsupportedVersion
 	}
 	offset += 8

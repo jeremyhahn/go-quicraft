@@ -129,6 +129,55 @@ func TestMessageBatchUnsupportedVersion(t *testing.T) {
 	}
 }
 
+func TestWireWindowIsAClosedSet(t *testing.T) {
+	w := DefaultWireWindow()
+	if w.Current != WireVersion || w.Previous != PreviousWireVersion {
+		t.Fatalf("DefaultWireWindow() = %+v", w)
+	}
+	if !AcceptsWireVersion(WireVersion) {
+		t.Fatal("this build must accept its own WireVersion")
+	}
+	for _, v := range []uint64{0, WireVersion + 1, WireVersion + 2, ^uint64(0)} {
+		if AcceptsWireVersion(v) {
+			t.Fatalf("AcceptsWireVersion(%d) = true outside the set", v)
+		}
+	}
+	// A two-member window accepts exactly its members.
+	next := WireWindow{Current: 3, Previous: 2}
+	for v, want := range map[uint64]bool{1: false, 2: true, 3: true, 4: false} {
+		if got := next.Accepts(v); got != want {
+			t.Fatalf("WireWindow{3,2}.Accepts(%d) = %v, want %v", v, got, want)
+		}
+	}
+}
+
+func TestMessageBatchUnmarshalFromWindow(t *testing.T) {
+	w := WireWindow{Current: WireVersion + 1, Previous: WireVersion}
+	for _, v := range []uint64{WireVersion, WireVersion + 1, WireVersion + 2} {
+		mb := MessageBatch{BinVer: v, DeploymentID: 7, MaxBinVer: WireVersion + 1, SourceAddress: "a"}
+		buf := make([]byte, mb.Size())
+		if _, err := mb.MarshalTo(buf); err != nil {
+			t.Fatalf("MarshalTo: %v", err)
+		}
+		var got MessageBatch
+		_, err := got.UnmarshalFromWindow(buf, w)
+		if w.Accepts(v) {
+			if err != nil {
+				t.Fatalf("BinVer %d in window: %v", v, err)
+			}
+			if got.MaxBinVer != WireVersion+1 || got.BinVer != v {
+				t.Fatalf("round trip lost versions: %+v", got)
+			}
+		} else if !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("BinVer %d outside window: err = %v, want ErrUnsupportedVersion", v, err)
+		}
+		// This build's own window refuses the next version.
+		if _, err := got.UnmarshalFrom(buf); (err == nil) != AcceptsWireVersion(v) {
+			t.Fatalf("UnmarshalFrom(BinVer %d) err = %v", v, err)
+		}
+	}
+}
+
 func TestMessageBatchTooManyMessages(t *testing.T) {
 	mb := MessageBatch{
 		BinVer:        WireVersion,

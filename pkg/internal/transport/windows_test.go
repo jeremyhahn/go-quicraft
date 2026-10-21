@@ -317,7 +317,7 @@ func TestSnapshotStreamRefusal_ReleasesItsSlotOnce(t *testing.T) {
 					t.Fatalf("OpenStreamSync: %v", err)
 				}
 				chunk := proto.SnapshotChunk{ShardID: 1, ReplicaID: 2, From: 1, Index: 10, Term: 1, ChunkCount: 2}
-				if err := writeSnapshotHeader(s, &chunk); err != nil {
+				if err := writeSnapshotHeader(s, &chunk, WireVersion); err != nil {
 					var serr *quic.StreamError
 					if !refusable || !errors.As(err, &serr) || !serr.Remote ||
 						serr.ErrorCode != QUICStreamErrReceiverGone {

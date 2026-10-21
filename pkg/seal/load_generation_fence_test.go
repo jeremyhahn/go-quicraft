@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -669,4 +670,38 @@ func legacyStateMAC(t *testing.T, deploymentID uint64, s *SealedRootKey) []byte 
 		t.Fatalf("sealedStateMACAt(1): %v", err)
 	}
 	return mac
+}
+
+// TestSealedStateMACReadWindowIsClosed pins the sealed-state MAC read window
+// (docs/compatibility, "The accept sets"): a tag computed by the right root key
+// at any encoding version other than sealedStateMACVersion and
+// previousSealedStateMACVersion is refused with the error an unauthenticated
+// blob gets today, even on a blob whose LoadGeneration admits the previous one.
+func TestSealedStateMACReadWindowIsClosed(t *testing.T) {
+	const deploymentID = 931
+	for _, v := range []byte{0, sealedStateMACVersion + 1, 0xFF} {
+		if v == sealedStateMACVersion || v == previousSealedStateMACVersion {
+			t.Fatalf("fixture %d is inside the read window", v)
+		}
+		t.Run(strconv.Itoa(int(v)), func(t *testing.T) {
+			store := bootstrapFenced(t, deploymentID)
+			blob := store.read(t)
+			blob.LoadGeneration = 0
+			rootKey, err := testStrategy(t).UnsealRootKey(context.Background(), blob, Credentials{})
+			if err != nil {
+				t.Fatalf("UnsealRootKey: %v", err)
+			}
+			blob.StateMAC, err = sealedStateMACAt(v, rootKey, deploymentID, blob)
+			if err != nil {
+				t.Fatalf("sealedStateMACAt(%d): %v", v, err)
+			}
+			store.save(t, blob)
+
+			b := fenceBarrier(t, deploymentID, store)
+			err = b.Unseal(context.Background(), testStrategy(t), Credentials{})
+			if !errors.Is(err, ErrSealedStateUnauthenticated) {
+				t.Fatalf("Unseal with a version-%d tag = %v, want ErrSealedStateUnauthenticated", v, err)
+			}
+		})
+	}
 }

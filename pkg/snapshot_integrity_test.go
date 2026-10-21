@@ -17,7 +17,9 @@ package quicraft
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -334,13 +336,23 @@ func TestSnapshotArtifactHeader_RejectsLegacyVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshalSnapshotArtifactHeader: %v", err)
 	}
-	legacy := append([]byte(nil), hdr...)
-	legacy[8] = byte(snapshotArtifactVersion - 1)
-
-	_, _, err = readSnapshotArtifactHeader(bytes.NewReader(legacy))
-	var artErr *SnapshotArtifactError
-	if !errors.As(err, &artErr) {
-		t.Fatalf("error = %T (%v), want *SnapshotArtifactError", err, err)
+	// Every version outside the closed read window {snapshotArtifactVersion,
+	// previousSnapshotArtifactVersion} is refused (docs/compatibility, "The
+	// accept sets"); the members are read.
+	for _, v := range []uint32{0, snapshotArtifactVersion - 1, snapshotArtifactVersion + 1, math.MaxUint32} {
+		probe := append([]byte(nil), hdr...)
+		binary.LittleEndian.PutUint32(probe[8:12], v)
+		_, _, err = readSnapshotArtifactHeader(bytes.NewReader(probe))
+		if acceptsSnapshotArtifactVersion(v) {
+			if err != nil {
+				t.Fatalf("version %d inside the window refused: %v", v, err)
+			}
+			continue
+		}
+		var artErr *SnapshotArtifactError
+		if !errors.As(err, &artErr) {
+			t.Fatalf("version %d: error = %T (%v), want *SnapshotArtifactError", v, err, err)
+		}
 	}
 }
 

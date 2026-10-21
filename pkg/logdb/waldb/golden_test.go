@@ -55,6 +55,7 @@ func goldenWALSnapshot() logdb.Snapshot {
 			Removed:           map[uint64]bool{4: true},
 			Identities:        map[uint64]string{1: "node-a"},
 			RemovedIdentities: map[uint64]string{4: "node-d"},
+			WireVersion:       1,
 		},
 	}
 }
@@ -211,7 +212,7 @@ func TestGoldenRecordState(t *testing.T) {
 	checkReencoded(t, "record-state.bin", goldenWALRecord(t, payloadTypeState, saveGoldenState(got)))
 }
 
-// TestGoldenRecordSnapshot pins the snapshot record (payload type 0x0c) and
+// TestGoldenRecordSnapshot pins the snapshot record (payload type 0x0e) and
 // its membership section.
 func TestGoldenRecordSnapshot(t *testing.T) {
 	in := goldenWALSnapshot()

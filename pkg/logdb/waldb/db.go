@@ -1807,7 +1807,11 @@ func (e *SegmentCorruptionError) Unwrap() error {
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
-	// RETIRED, NEVER REALLOCATED: 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a.
+	// RETIRED, NEVER REALLOCATED: 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a,
+	// 0x0c.
+	//
+	// 0x0c was the snapshot layout whose membership section closed its
+	// replicated-policy tail without the committed WireVersion.
 	//
 	// 0x06 was the RemoveNode tombstone. A removal is now kept in the
 	// retired-replica registry beside the WAL (retired.go), not as a record.
@@ -1838,8 +1842,9 @@ const (
 	// Key, ClientID, SeriesID, RespondedTo and OwnerID).
 	payloadTypeEntries byte = 0x0b
 	// payloadTypeSnapshot is the current snapshot format, whose membership
-	// section closes with a four-field session policy tail.
-	payloadTypeSnapshot byte = 0x0c
+	// section carries a four-field session policy tail followed by the
+	// committed WireVersion.
+	payloadTypeSnapshot byte = 0x0e
 )
 
 // ErrUnsupportedSnapshotCompression is returned when a snapshot record
@@ -2099,7 +2104,7 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumRemoved:4]{ [ReplicaID:8] }...
 // [NumIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 // [SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
-// [MaxSessionsPerOwner:8]
+// [MaxSessionsPerOwner:8][WireVersion:8]
 // [NumRemovedIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
@@ -2127,6 +2132,18 @@ const membershipSectionV1 byte = 1
 // clean recovery failure instead of fields read at the wrong offsets.
 const membershipSectionVersion byte = membershipSectionV1
 
+// previousMembershipSectionVersion is the second member of the closed read
+// window (docs/compatibility, "The accept sets"): the section layout the
+// previous MINOR release wrote. v1.0 has no previous release, so it equals
+// membershipSectionVersion and the set has one member.
+const previousMembershipSectionVersion byte = membershipSectionVersion
+
+// acceptsMembershipSectionVersion reports whether v is in the closed read
+// set. It is a set, not a range, so it never widens when a constant moves.
+func acceptsMembershipSectionVersion(v byte) bool {
+	return v == membershipSectionVersion || v == previousMembershipSectionVersion
+}
+
 // membershipFixedSize is the size of the membership section's fixed region:
 // Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1).
 //
@@ -2147,7 +2164,7 @@ const membershipFixedSize = 1 + 8 + 8 + 1 // 18 bytes
 // It equals membershipSize of an empty membership, and must: there is one
 // layout, every field is written unconditionally, and the read floor and the
 // written size are therefore the same number by construction.
-const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 74 bytes
+const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 82 bytes
 
 // membershipAddrMapSize returns the total serialized size for an address map:
 // [NumEntries:4] + for each entry: [ReplicaID:8][AddrLen:4][Addr:N].
@@ -2165,10 +2182,10 @@ func membershipRemovedMapSize(m map[uint64]bool) int {
 	return 4 + len(m)*8
 }
 
-// membershipSessionPolicySize is the size of the session-policy tail:
+// membershipSessionPolicySize is the size of the replicated-policy tail:
 // SessionExpiryEntries(8) + MaxTotalSessions(8) + MaxResponsesPerSession(8) +
-// MaxSessionsPerOwner(8).
-const membershipSessionPolicySize = 4 * 8 // 32 bytes
+// MaxSessionsPerOwner(8) + WireVersion(8).
+const membershipSessionPolicySize = 5 * 8 // 40 bytes
 
 // membershipSize returns the total serialized size of a logdb.Membership. Every
 // field is unconditional: the size and the marshal site must agree exactly, or
@@ -2377,7 +2394,7 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	// corrupt or was produced by a binary built from a different pre-release
 	// commit, and its fields must not be interpreted at this layout's offsets.
 	sectionVersion := data[pos]
-	if sectionVersion != membershipSectionVersion {
+	if !acceptsMembershipSectionVersion(sectionVersion) {
 		slog.Error("waldb: snapshot record membership section has unsupported version",
 			"segment_id", segID, "version", sectionVersion,
 			"supported", membershipSectionVersion)
@@ -2440,6 +2457,7 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	membership.MaxTotalSessions = binary.LittleEndian.Uint64(data[pos+8:])
 	membership.MaxResponsesPerSession = binary.LittleEndian.Uint64(data[pos+16:])
 	membership.MaxSessionsPerOwner = binary.LittleEndian.Uint64(data[pos+24:])
+	membership.WireVersion = binary.LittleEndian.Uint64(data[pos+32:])
 	pos += membershipSessionPolicySize
 
 	// RemovedIdentities closes the section. It is the deny-list the receive
@@ -4114,6 +4132,7 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
 	binary.LittleEndian.PutUint64(buf[pos+16:], ss.Membership.MaxResponsesPerSession)
 	binary.LittleEndian.PutUint64(buf[pos+24:], ss.Membership.MaxSessionsPerOwner)
+	binary.LittleEndian.PutUint64(buf[pos+32:], ss.Membership.WireVersion)
 	pos += membershipSessionPolicySize
 	pos = marshalAddrMap(buf, pos, ss.Membership.RemovedIdentities)
 

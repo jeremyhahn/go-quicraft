@@ -28,7 +28,7 @@ import (
 // number of messages varies.
 //
 // The full prefix size is computed at runtime from the local address length.
-const heartbeatBatchFixedPrefix = 8 + 8 + 8 + 4 // 28 bytes: BinVer+DeploymentID+SourceEpoch+AddrLen
+const heartbeatBatchFixedPrefix = 8 + 8 + 8 + 8 + 4 // 36 bytes: BinVer+DeploymentID+SourceEpoch+MaxBinVer+AddrLen
 
 // heartbeatWriteDeadline is the write deadline for heartbeat stream writes.
 // Shorter than the 5s general deadline since heartbeats are tiny.
@@ -46,11 +46,56 @@ func (t *QUICTransport) initHeartbeatPrefix() {
 	prefixLen := heartbeatBatchFixedPrefix + len(addr)
 	t.hbPrefix = make([]byte, prefixLen)
 
-	binary.LittleEndian.PutUint64(t.hbPrefix[0:], proto.WireVersion)
+	// Each batch overwrites BinVer with its shards' lowest committed version.
+	binVer, _ := t.cfg.Wire.sendVersions(0)
+	binary.LittleEndian.PutUint64(t.hbPrefix[0:], binVer)
 	binary.LittleEndian.PutUint64(t.hbPrefix[8:], t.cfg.DeploymentID)
 	binary.LittleEndian.PutUint64(t.hbPrefix[16:], t.bootEpoch)
-	binary.LittleEndian.PutUint32(t.hbPrefix[24:], uint32(len(addr)))
-	copy(t.hbPrefix[28:], addr)
+	binary.LittleEndian.PutUint64(t.hbPrefix[24:], t.cfg.Wire.Proto.Current)
+	binary.LittleEndian.PutUint32(t.hbPrefix[32:], uint32(len(addr)))
+	copy(t.hbPrefix[36:], addr)
+}
+
+// SetWireVersionLookup installs the per-shard committed-version lookup the
+// send path stamps outbound traffic from. Until it is set every shard sends
+// the window's previous version.
+func (t *QUICTransport) SetWireVersionLookup(fn WireVersionLookup) {
+	if fn == nil {
+		t.wireLookup.Store(nil)
+		return
+	}
+	t.wireLookup.Store(&fn)
+}
+
+// shardSendVersions returns the payload and frame versions for traffic of
+// one shard: its committed WireVersion, mapped onto this build's window.
+func (t *QUICTransport) shardSendVersions(shardID uint64) (uint64, byte) {
+	var v uint64
+	if fn := t.wireLookup.Load(); fn != nil {
+		v = (*fn)(shardID)
+	}
+	return t.cfg.Wire.sendVersions(v)
+}
+
+// batchSendVersions returns the payload and frame versions for a batch. A
+// batch may carry several shards; it is stamped with the lowest version among
+// them, so a receiver that has not switched one of those shards still reads
+// it. Consecutive messages of one shard are looked up once.
+func (t *QUICTransport) batchSendVersions(msgs []proto.Message) (uint64, byte) {
+	fn := t.wireLookup.Load()
+	if fn == nil || len(msgs) == 0 {
+		return t.cfg.Wire.sendVersions(0)
+	}
+	last := msgs[0].ShardID
+	lowest := (*fn)(last)
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].ShardID == last {
+			continue
+		}
+		last = msgs[i].ShardID
+		lowest = min(lowest, (*fn)(last))
+	}
+	return t.cfg.Wire.sendVersions(lowest)
 }
 
 // sendHeartbeatBatch is the fast path for heartbeat-only message batches.
@@ -77,13 +122,15 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 	// Write frame header inline.
 	buf[0] = MagicByte0
 	buf[1] = MagicByte1
-	buf[2] = WireVersion
+	binVer, frameVer := t.batchSendVersions(msgs)
+	buf[2] = frameVer
 	buf[3] = byte(FlagNone)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(payloadSize))
 
 	// Copy the pre-serialized batch header prefix.
 	offset := FrameHeaderSize
 	copy(buf[offset:], t.hbPrefix)
+	binary.LittleEndian.PutUint64(buf[offset:], binVer)
 	offset += len(t.hbPrefix)
 
 	// Write requests count.

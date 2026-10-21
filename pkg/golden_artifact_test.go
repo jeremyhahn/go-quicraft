@@ -37,6 +37,7 @@ func goldenArtifactHeader() snapshotArtifactHeader {
 			Removed:           map[uint64]bool{4: true},
 			Identities:        map[uint64]string{1: "node-a", 2: "node-b"},
 			RemovedIdentities: map[uint64]string{4: "node-d"},
+			WireVersion:       proto.WireVersion,
 		},
 	}
 }
