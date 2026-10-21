@@ -333,6 +333,9 @@ environment. See [Contributing](../../CONTRIBUTING.md#running-the-suites-in-the-
 
 - [Testing infrastructure](infrastructure.md): suites, injectors, fuzzing, linearizability, gates
 - [Benchmark regression testing](benchmarking.md): the `bench-compare` method
+- [Pre-RC evidence](rc-evidence.md): the pre-RC pass on `main`, including draft
+  pins, fuzz corpora, hot-path benchmarks against the last release, leadership tests
+  and the batch run
 - [Contributing](../../CONTRIBUTING.md): what a change is expected to bring with it
 - Per-feature test strategy lives in each feature's `engineering.md`, for
   example [log-storage](../log-storage/engineering.md) and
