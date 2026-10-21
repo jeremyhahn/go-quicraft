@@ -446,10 +446,9 @@ older than the state the barrier already holds. Either you restored a backup, or
 someone rolled the file back. Do not lower `MinEpoch` to make it load.
 
 **`ErrSealedStateUnauthenticated`**: the blob has no `StateMAC`, or its MAC does
-not verify. If this is a genuine pre-MAC blob, start once with
-`AllowUnauthenticatedSealedState = true`, re-persist `SealedRootKeyData()`, then
-clear the flag. The flag does not apply to a MAC that is present but wrong; that
-is tampering or corruption.
+not verify. A MAC that is present but wrong is tampering or corruption. A blob
+written before the state MAC, or tagged at version 1, is not read by this build:
+wipe and reseal.
 
 **`ErrResetNotFirstBoot`**: you called `Reset` on a barrier that loaded a blob or
 rotated past epoch 1. `Reset` is only a first-boot rollback; there is no way to

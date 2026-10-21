@@ -6816,14 +6816,15 @@ func writeEncryptedSnapshotMeta(t *testing.T, nodeHostDir string, shardID, repli
 		t.Fatalf("mkdir snapshot dir: %v", err)
 	}
 	metaPath := filepath.Join(snapDir, "snapshot.meta")
-	var buf [48]byte
-	binary.LittleEndian.PutUint64(buf[0:], index)
-	binary.LittleEndian.PutUint64(buf[8:], 1) // term
-	binary.LittleEndian.PutUint64(buf[16:], shardID)
-	binary.LittleEndian.PutUint64(buf[24:], replicaID)
-	binary.LittleEndian.PutUint64(buf[32:], uint64(time.Now().Unix()))
-	binary.LittleEndian.PutUint64(buf[40:], epoch)
-	if err := os.WriteFile(metaPath, buf[:], 0o600); err != nil {
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index:     index,
+		Term:      1,
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		CreatedAt: uint64(time.Now().Unix()),
+		Epoch:     epoch,
+	})
+	if err := os.WriteFile(metaPath, meta, 0o600); err != nil {
 		t.Fatalf("write snapshot meta: %v", err)
 	}
 }

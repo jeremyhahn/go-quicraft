@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,9 +40,9 @@ func mustParseSnapshotMeta(t *testing.T, data []byte) SnapshotMeta {
 	return meta
 }
 
-// legacyMetaRecord builds a pre-magic snapshot.meta image of the given size,
-// exactly as the builds that predate the self-describing format wrote it.
-func legacyMetaRecord(size int, index, term, shardID, replicaID, createdAt, epoch uint64,
+// headerlessMetaRecord builds a snapshot.meta image with no magic or header:
+// positional little-endian fields only, the layout no build reads any more.
+func headerlessMetaRecord(size int, index, term, shardID, replicaID, createdAt, epoch uint64,
 	compression config.CompressionType) []byte {
 	buf := make([]byte, size)
 	put := func(off int, v uint64) {
@@ -101,60 +102,21 @@ func TestSnapshotMeta_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestSnapshotMeta_LegacyCompatibility is the migration contract: every record
-// an earlier build could have written must still be readable, and a record that
-// predates the Epoch field must report the epoch as ABSENT rather than as 0.
-//
-// Absent and 0 are opposite in consequence. 0 means "this artifact is
-// plaintext, it pins no DEK"; absent means "this artifact may be ciphertext at
-// an epoch nothing on disk names". Reading the second as the first is what
-// would let PurgeEpochsBefore destroy a live DEK.
-func TestSnapshotMeta_LegacyCompatibility(t *testing.T) {
-	tests := []struct {
-		name            string
-		size            int
-		epoch           uint64
-		compression     config.CompressionType
-		wantEpoch       uint64
-		wantEpochField  bool
-		wantCompression bool
-	}{
-		{
-			// Written by the snapshot RECEIVE and IMPORT paths before the epoch
-			// was recorded on disk. Those builds re-encrypted the artifact under
-			// the receiver's own barrier, so the directory is frequently
-			// ciphertext at an unnamed epoch.
-			name: "40_byte_receive_path_record", size: legacyMetaSizeNoEpoch,
-		},
-		{
-			name: "48_byte_save_path_record", size: legacyMetaSizeEpoch,
-			epoch: 4, wantEpoch: 4, wantEpochField: true,
-		},
-		{
-			name: "56_byte_save_path_record", size: legacyMetaSizeCompression,
-			epoch: 6, compression: config.Snappy, wantEpoch: 6,
-			wantEpochField: true, wantCompression: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			data := legacyMetaRecord(tt.size, 900, 7, 12, 3, 1700000000, tt.epoch, tt.compression)
-			meta := mustParseSnapshotMeta(t, data)
-
-			if meta.Version != 0 {
-				t.Errorf("legacy record parsed as version %d, want 0", meta.Version)
+// TestSnapshotMeta_HeaderlessRefused verifies that a record without the magic
+// is refused with ErrSnapshotMetaCorrupt whatever its size, including the
+// 40/48/56-byte positional layouts. Nothing reads its fields: the remedy is to
+// wipe and re-sync from peers.
+func TestSnapshotMeta_HeaderlessRefused(t *testing.T) {
+	for _, size := range []int{40, 48, 56} {
+		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
+			data := headerlessMetaRecord(size, 900, 7, 12, 3, 1700000000, 6, config.Snappy)
+			meta, err := ParseSnapshotMeta(data)
+			if !errors.Is(err, ErrSnapshotMetaCorrupt) {
+				t.Fatalf("ParseSnapshotMeta(%d-byte headerless record) error = %v, want %v",
+					size, err, ErrSnapshotMetaCorrupt)
 			}
-			if meta.Index != 900 || meta.Term != 7 || meta.ShardID != 12 || meta.ReplicaID != 3 {
-				t.Errorf("legacy identity fields = %+v, want index=900 term=7 shard=12 replica=3", meta)
-			}
-			if meta.EpochRecorded != tt.wantEpochField {
-				t.Fatalf("EpochRecorded = %v, want %v", meta.EpochRecorded, tt.wantEpochField)
-			}
-			if meta.Epoch != tt.wantEpoch {
-				t.Errorf("Epoch = %d, want %d", meta.Epoch, tt.wantEpoch)
-			}
-			if meta.CompressionRecorded != tt.wantCompression {
-				t.Errorf("CompressionRecorded = %v, want %v", meta.CompressionRecorded, tt.wantCompression)
+			if meta != (SnapshotMeta{}) {
+				t.Fatalf("refused record returned fields: %+v", meta)
 			}
 		})
 	}
@@ -220,8 +182,8 @@ func versionedMetaRecord(version uint16, body []byte) []byte {
 	return buf
 }
 
-// TestSnapshotMeta_CorruptRejected verifies that bytes which are neither a
-// versioned record nor one of the recognised pre-magic layouts are REJECTED.
+// TestSnapshotMeta_CorruptRejected verifies that bytes which are not a
+// versioned record are REJECTED.
 // Parsing them positionally would hand a fabricated epoch to the purge floor,
 // which is worse than refusing to purge.
 func TestSnapshotMeta_CorruptRejected(t *testing.T) {
@@ -230,8 +192,8 @@ func TestSnapshotMeta_CorruptRejected(t *testing.T) {
 		data []byte
 	}{
 		{name: "empty", data: nil},
-		{name: "torn_legacy_write", data: make([]byte, 44)},
-		{name: "legacy_size_plus_one", data: make([]byte, legacyMetaSizeCompression+1)},
+		{name: "headerless_44_bytes", data: make([]byte, 44)},
+		{name: "headerless_57_bytes", data: make([]byte, 7*8+1)},
 		{name: "truncated_versioned_header", data: []byte(snapshotMetaMagic)[:4]},
 		{
 			name: "versioned_body_shorter_than_declared",
@@ -287,18 +249,20 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			wantEpoch: 0, wantStatus: snapshotEpochKnown,
 		},
 		{
-			name: "legacy_record_carrying_epoch",
+			// A headerless record that carries an epoch at the offset the
+			// removed positional decode read it from: refused, never read.
+			name: "headerless_record_carrying_epoch",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
-				writeMetaFile(t, dir, legacyMetaRecord(legacyMetaSizeEpoch, 1, 1, 1, 1, 1, 4, 0))
+				writeMetaFile(t, dir, headerlessMetaRecord(48, 1, 1, 1, 1, 1, 4, 0))
 			},
-			wantEpoch: 4, wantStatus: snapshotEpochKnown,
+			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
 		},
 		{
-			name: "legacy_record_without_epoch",
+			name: "versioned_record_without_epoch",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
-				writeMetaFile(t, dir, legacyMetaRecord(legacyMetaSizeNoEpoch, 1, 1, 1, 1, 1, 0, 0))
+				writeMetaFile(t, dir, epochlessMetaRecord(1, 1, 1))
 			},
 			wantEpoch: 0, wantStatus: snapshotEpochLegacy,
 		},
@@ -408,15 +372,27 @@ func writeMetaFile(t *testing.T, dir string, data []byte) {
 	}
 }
 
-// writeLegacyShardSnapshot creates a snapshot directory whose metadata is a
-// pre-magic record of the given size.
-func writeLegacyShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, index uint64, size int) {
+// writeEpochlessShardSnapshot creates a snapshot directory whose metadata is a
+// versioned record whose body ends before the Epoch field.
+func writeEpochlessShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, index uint64) {
 	t.Helper()
 	dir := snapshotSaveDir(baseDir, shardID, replicaID, index)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	writeMetaFile(t, dir, legacyMetaRecord(size, index, 1, shardID, replicaID, 1, 0, 0))
+	writeMetaFile(t, dir, epochlessMetaRecord(index, shardID, replicaID))
+}
+
+// epochlessMetaRecord builds a versioned snapshot.meta record that carries the
+// identity fields only, so the purge-floor scan reads it as snapshotEpochLegacy.
+func epochlessMetaRecord(index, shardID, replicaID uint64) []byte {
+	body := make([]byte, metaBodyCreatedAtOff+8)
+	binary.LittleEndian.PutUint64(body[metaBodyIndexOff:], index)
+	binary.LittleEndian.PutUint64(body[metaBodyTermOff:], 1)
+	binary.LittleEndian.PutUint64(body[metaBodyShardIDOff:], shardID)
+	binary.LittleEndian.PutUint64(body[metaBodyReplicaIDOff:], replicaID)
+	binary.LittleEndian.PutUint64(body[metaBodyCreatedAtOff:], 1)
+	return versionedMetaRecord(snapshotMetaVersion, body)
 }
 
 // TestSnapshotFloorScan_ReportsEveryBlockingDirectory pins the scan's
@@ -432,8 +408,8 @@ func TestSnapshotFloorScan_ReportsEveryBlockingDirectory(t *testing.T) {
 	// first one within a shard is caught) and one good one; shard 2 is fully
 	// evaluable (so a scan that stops at the first BLOCKED shard is caught
 	// too, by the minimum). Both good directories must still be folded in.
-	writeLegacyShardSnapshot(t, baseDir, 1, 1, 100, legacyMetaSizeNoEpoch)
-	writeLegacyShardSnapshot(t, baseDir, 1, 1, 150, legacyMetaSizeNoEpoch)
+	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 100)
+	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 150)
 	writeShardSnapshot(t, baseDir, 1, 1, 200, 6)
 	writeShardSnapshot(t, baseDir, 2, 1, 200, 4)
 
@@ -479,7 +455,7 @@ func TestGlobalSafePurgeFloor_LegacyDirectoryFailsSafe(t *testing.T) {
 	// An evaluable encrypted snapshot at epoch 8 alongside a legacy directory
 	// whose epoch nothing on disk names.
 	writeShardSnapshot(t, baseDir, 1, 1, 200, 8)
-	writeLegacyShardSnapshot(t, baseDir, 1, 1, 100, legacyMetaSizeNoEpoch)
+	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 100)
 
 	if floor, ok := p.globalSafePurgeFloor(); ok {
 		t.Fatalf("globalSafePurgeFloor = (%d, true) with an indeterminate directory present; "+
@@ -521,7 +497,7 @@ func TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier(t *testing.T) {
 
 	// Shard 1 (barrier A) holds a legacy directory; shard 2 (barrier B) is
 	// fully evaluable.
-	writeLegacyShardSnapshot(t, baseDir, 1, 1, 100, legacyMetaSizeNoEpoch)
+	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 100)
 	writeShardSnapshot(t, baseDir, 2, 1, 100, 7)
 
 	if floor, ok := p.perBarrierSafePurgeFloor(bA); ok {

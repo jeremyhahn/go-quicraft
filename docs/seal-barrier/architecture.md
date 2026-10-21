@@ -307,14 +307,12 @@ from a file an attacker can write would hand them a lockout primitive.
 
 The covered-field encoding is versioned by a leading byte, currently 2, which
 covers `LoadGeneration` because the barrier refuses to encrypt on the strength of
-that number. A tag over the version-1 field set (which lacks `LoadGeneration`) is
-recognized only when `LoadGeneration == 0`, accepted once at WARN, and restamped
-at version 2. That is not a downgrade: forging either version needs the same
-HKDF-derived MAC key, which comes from the root key the strategy just recovered.
+that number. Version 2 is the only one read: a tag over the version-1 field set
+(which lacks `LoadGeneration`) is refused.
 
 A blob with no MAC is refused with `ErrSealedStateUnauthenticated`; accepting an
-absent tag would make the mechanism optional at the attacker's discretion. `AllowUnauthenticatedSealedState` is the explicit one-start
-migration hatch, and does not apply to a tag that is present but wrong.
+absent tag would make the mechanism optional at the attacker's discretion. There
+is no switch to accept one; the remedy is to wipe and reseal.
 
 ### `MinEpoch`: refusing replay
 

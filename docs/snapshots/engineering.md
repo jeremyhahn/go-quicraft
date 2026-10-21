@@ -136,8 +136,8 @@ limitation.
   the directory is published: nothing is recorded in LogDB, nothing is
   compacted, and the next save retries.
 - Recovery verifies both. A recorded snapshot whose `snapshot.meta` is missing,
-  unreadable, malformed, or without the fields (`DataHashRecorded == false`,
-  which includes every pre-magic record) fails closed with `ErrSnapshotCorrupt`
+  unreadable, malformed (including a record without the magic), or without
+  the fields (`DataHashRecorded == false`) fails closed with `ErrSnapshotCorrupt`
   (internally `*SnapshotMetaInvalidError`). There is no unverified path. A
   recorded directory whose `snapshot.dat` is missing is reported as a missing
   artifact first.

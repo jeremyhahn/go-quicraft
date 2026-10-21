@@ -141,8 +141,7 @@ read the linked material before reporting:
 - Anything requiring an attacker who already has code execution in the host
   process, or write access to the configuration the host reads at startup.
 - Missing hardening in a *deliberately* unauthenticated mode the operator
-  selected explicitly (`AllowZeroDeploymentID`,
-  `AllowUnauthenticatedSealedState`, `WithoutTransport`).
+  selected explicitly (`AllowZeroDeploymentID`, `WithoutTransport`).
 - Vulnerabilities in dependencies, unless QuicRaft's use of them is what makes
   the defect reachable. Report those upstream; tell us if we need to bump.
 
@@ -197,6 +196,3 @@ breached, so they are listed here:
 - Leave `NonceTracking` unset (a nil `*bool` defaults to enabled) unless you
   have a specific reason. Tracking covers a bounded prefix of each epoch, not
   the whole of it.
-- Leave `AllowUnauthenticatedSealedState` false. It exists only to load, once,
-  a sealed blob written before the barrier stamped `StateMAC`; Unseal restamps
-  it, after which the flag should be cleared.

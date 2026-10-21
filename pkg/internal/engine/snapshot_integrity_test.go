@@ -139,8 +139,7 @@ func TestVerifySnapshotArtifact_RefusesUnverifiableMetadata(t *testing.T) {
 			}
 		}},
 		{"corrupt", func(t *testing.T, metaPath string) {
-			// Foreign bytes: neither the magic nor any recognised pre-magic
-			// record length.
+			// Foreign bytes: not a versioned record.
 			if err := os.WriteFile(metaPath, []byte("not a snapshot metadata record"), 0o600); err != nil {
 				t.Fatalf("corrupt meta: %v", err)
 			}
@@ -163,11 +162,10 @@ func TestVerifySnapshotArtifact_RefusesUnverifiableMetadata(t *testing.T) {
 				t.Fatalf("write meta: %v", err)
 			}
 		}},
-		{"pre_magic_v0_record", func(t *testing.T, metaPath string) {
-			// No current writer produces a v0 record, and none carries the
-			// integrity fields.
+		{"headerless_record", func(t *testing.T, metaPath string) {
+			// A positional record with no magic is refused outright.
 			if err := os.WriteFile(metaPath,
-				legacyMetaRecord(legacyMetaSizeCompression, 10, 2, 1, 1, 1, 0, 0), 0o600); err != nil {
+				headerlessMetaRecord(56, 10, 2, 1, 1, 1, 0, 0), 0o600); err != nil {
 				t.Fatalf("write meta: %v", err)
 			}
 		}},

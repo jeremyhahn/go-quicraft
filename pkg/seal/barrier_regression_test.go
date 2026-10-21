@@ -600,18 +600,6 @@ func TestDeriveDEK_V2SeparatesAlgorithmAndKeySize(t *testing.T) {
 		rootKey[i] = byte(i)
 	}
 
-	v1Short, err := deriveDEK(rootKey, salt, 7, 3, AlgAES128GCM, HKDFV1)
-	if err != nil {
-		t.Fatalf("deriveDEK v1/128: %v", err)
-	}
-	v1Long, err := deriveDEK(rootKey, salt, 7, 3, AlgAES256GCM, HKDFV1)
-	if err != nil {
-		t.Fatalf("deriveDEK v1/256: %v", err)
-	}
-	if !bytes.Equal(v1Short, v1Long[:len(v1Short)]) {
-		t.Fatal("v1 layout was expected to produce prefix-related keys; test premise is stale")
-	}
-
 	v2Short, err := deriveDEK(rootKey, salt, 7, 3, AlgAES128GCM, HKDFV2)
 	if err != nil {
 		t.Fatalf("deriveDEK v2/128: %v", err)
@@ -623,76 +611,40 @@ func TestDeriveDEK_V2SeparatesAlgorithmAndKeySize(t *testing.T) {
 	if bytes.Equal(v2Short, v2Long[:len(v2Short)]) {
 		t.Fatal("v2 layout still derives the short key as a prefix of the long key")
 	}
-	if bytes.Equal(v2Long, v1Long) {
-		t.Fatal("v2 layout derived the same key as v1")
-	}
 
 	// Two algorithms that share a key size must not share a key. Which pair
 	// that is — and whether one exists at all — depends on the build; see
 	// assertV2SeparatesSameKeySizeAlgorithms.
 	assertV2SeparatesSameKeySizeAlgorithms(t, rootKey, salt, v2Long)
 
-	if _, err := deriveDEK(rootKey, salt, 7, 3, AlgAES256GCM, HKDFVersion(9)); !errors.Is(err, ErrUnsupportedHKDFVersion) {
-		t.Fatalf("deriveDEK(unknown version) = %v, want ErrUnsupportedHKDFVersion", err)
+	// 0 (no version recorded) and 1 (the retired v1 layout) are refused like
+	// any version this build does not implement.
+	for _, v := range []HKDFVersion{0, 1, 9} {
+		if _, err := deriveDEK(rootKey, salt, 7, 3, AlgAES256GCM, v); !errors.Is(err, ErrUnsupportedHKDFVersion) {
+			t.Fatalf("deriveDEK(version %d) = %v, want ErrUnsupportedHKDFVersion", v, err)
+		}
 	}
 }
 
-// TestSetSealedRootKey_LegacyBlobDerivesV1 verifies the version gate: a blob
-// with no HKDFVersion (persisted before the field existed) must keep deriving
-// DEKs with the v1 info layout, and an unknown version is rejected up front.
-func TestSetSealedRootKey_LegacyBlobDerivesV1(t *testing.T) {
+// TestSetSealedRootKey_RefusesRetiredHKDFVersions verifies the version gate: a
+// blob with no HKDFVersion (persisted before the field existed), one naming
+// the retired v1 layout, and one naming a version this build does not know are
+// all refused up front with the standard ErrUnsupportedHKDFVersion.
+func TestSetSealedRootKey_RefusesRetiredHKDFVersions(t *testing.T) {
 	b, s, _ := testPersistingBarrier(t)
 	defer s.Close()
 	sealed := b.SealedRootKeyData()
 	if sealed.HKDFVersion != currentHKDFVersion {
 		t.Fatalf("Initialize stamped HKDFVersion %d, want %d", sealed.HKDFVersion, currentHKDFVersion)
 	}
-	rootKey, err := b.RootKey(context.Background())
-	if err != nil {
-		t.Fatalf("RootKey: %v", err)
-	}
 
-	legacy := b.SealedRootKeyData()
-	legacy.HKDFVersion = 0 // pre-versioning blob
-	// A blob old enough to predate HKDFVersion also predates the metadata MAC,
-	// so it carries none — and loading one requires the explicit opt-in, which
-	// is the documented migration path. Keeping the MAC here while rewriting a
-	// field it covers would (correctly) be rejected as tampering.
-	legacy.StateMAC = nil
-
-	legacyCfg := DefaultBarrierConfig(1)
-	legacyCfg.AllowUnauthenticatedSealedState = true
-	b2 := MustNewBarrier(legacyCfg)
-	if err := b2.SetSealedRootKey(legacy); err != nil {
-		t.Fatalf("SetSealedRootKey(legacy): %v", err)
-	}
-	s2 := testStrategy(t)
-	defer s2.Close()
-	if err := b2.Unseal(context.Background(), s2, Credentials{}); err != nil {
-		t.Fatalf("Unseal(legacy): %v", err)
-	}
-
-	wantV1, err := deriveDEK(rootKey, legacy.Salt, 1, legacy.Epoch, DefaultBarrierConfig(1).Algorithm, HKDFV1)
-	if err != nil {
-		t.Fatalf("deriveDEK v1: %v", err)
-	}
-	b2.mu.RLock()
-	dek := b2.deks[legacy.Epoch]
-	b2.mu.RUnlock()
-	buf, err := dek.Open(context.Background())
-	if err != nil {
-		t.Fatalf("open DEK: %v", err)
-	}
-	defer buf.Destroy()
-	if !bytes.Equal(encCopy(buf), wantV1) {
-		t.Fatal("legacy blob did not derive its DEK with the v1 info layout")
-	}
-
-	unknown := b.SealedRootKeyData()
-	unknown.HKDFVersion = currentHKDFVersion + 1
-	b3 := MustNewBarrier(DefaultBarrierConfig(1))
-	if err := b3.SetSealedRootKey(unknown); !errors.Is(err, ErrUnsupportedHKDFVersion) {
-		t.Fatalf("SetSealedRootKey(unknown version) = %v, want ErrUnsupportedHKDFVersion", err)
+	for _, v := range []HKDFVersion{0, 1, currentHKDFVersion + 1} {
+		blob := b.SealedRootKeyData()
+		blob.HKDFVersion = v
+		b2 := MustNewBarrier(DefaultBarrierConfig(1))
+		if err := b2.SetSealedRootKey(blob); !errors.Is(err, ErrUnsupportedHKDFVersion) {
+			t.Fatalf("SetSealedRootKey(HKDFVersion %d) = %v, want ErrUnsupportedHKDFVersion", v, err)
+		}
 	}
 }
 

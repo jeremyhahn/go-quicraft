@@ -1302,6 +1302,7 @@ func TestBarrier_SetSealedRootKeyValid(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       1,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{1},
 	})
@@ -1892,6 +1893,7 @@ func TestBarrier_UnsealInvalidRootKeySize(t *testing.T) {
 			Strategy:    "test",
 			Epoch:       1,
 			Salt:        make([]byte, 32),
+			HKDFVersion: HKDFV2,
 			Ciphertext:  make([]byte, 64),
 			KnownEpochs: []uint64{1},
 		},
@@ -3277,6 +3279,7 @@ func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       0,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{0},
 	})
@@ -3333,6 +3336,7 @@ func TestBarrier_SetSealedRootKey_RejectsMissingCurrentEpoch(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{1, 2}, // Missing 3.
 	})
@@ -3348,6 +3352,7 @@ func TestBarrier_SetSealedRootKey_AcceptsValidMultiEpoch(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{1, 2, 3},
 	})

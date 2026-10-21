@@ -199,10 +199,11 @@ bytes.
 Body fields are append-only: appending one bumps the version and leaves every
 offset alone. Changing a field's meaning requires a new magic.
 
-Three pre-magic layouts are still read positionally: 40 bytes (no `Epoch`), 48
-(with `Epoch`) and 56 (with `Epoch` and `Compression`). None carries `DataLen`
-or `DataHash`, so recovery refuses them (`ErrSnapshotCorrupt`) exactly as it
-refuses a missing record; only the DEK purge-floor scan still reads them.
+A record without the magic is refused with `ErrSnapshotMetaCorrupt` whatever
+its size; no positional layout is read. Recovery refuses it
+(`ErrSnapshotCorrupt`) exactly as it refuses a missing record, and the DEK
+purge-floor scan treats its epoch as unknown and does not purge. The remedy is
+to wipe and re-sync from peers.
 
 An older binary reads a current record as corrupt. That fails safe (it
 suppresses DEK purging), but it means a downgrade is a wipe and restore.
@@ -243,24 +244,22 @@ trailer is refused; export it again with a current build.
 `seal.SealedRootKey` carries `Version`, `KDFVersion`, `HKDFVersion` and
 `Algorithm`, so a blob unseals correctly after a FIPS-mode change or on a host
 whose CPU would auto-select a different AEAD. A zero value means the field was
-not written, and the blob loads under the barrier's configured setting.
-`SetSealedRootKey` rejects a blob whose `HKDFVersion` is newer than the running
-build, and one whose `Algorithm` disagrees with the barrier configuration
+not written, and the blob loads under the barrier's configured setting, except
+`HKDFVersion`: `SetSealedRootKey` rejects a blob whose `HKDFVersion` is not the
+current `HKDFV2` (`ErrUnsupportedHKDFVersion`; the value 1 is retired and 0 is
+refused), and one whose `Algorithm` disagrees with the barrier configuration
 (`*AlgorithmMismatchError`).
 
 `sealedStateMACVersion` is 2: the metadata MAC covers `LoadGeneration`, because
 the barrier refuses to encrypt on the strength of that counter and an
 unauthenticated field would be a passphrase-free way to stop a node writing.
-`verifySealedStateMAC` still accepts a valid version-1 tag on a blob whose
-`LoadGeneration` is zero, logs it at WARN, and the next persist restamps it at
-version 2. Accepting it is not a downgrade: forging either tag needs the same
-HKDF-derived MAC key. If you persist `SealedRootKeyData()` yourself, persist it
-again after the first successful unseal.
+The gate is `{sealedStateMACVersion}`: `previousSealedStateMACVersion` equals
+it, so a tag over any other field set, including version 1, is refused with
+`ErrSealedStateUnauthenticated`.
 
-A blob with no MAC at all is refused with `ErrSealedStateUnauthenticated`,
-unless `BarrierConfig.AllowUnauthenticatedSealedState` is set for a one-time
-migration. Accepting an absent MAC by default would be a downgrade an attacker
-triggers by deleting the field. Embedders that re-wrap the root key themselves
+A blob with no MAC at all is refused with the same error, and there is no
+switch to accept it: accepting an absent MAC would be a downgrade an attacker
+triggers by deleting the field. The remedy for either is to wipe and reseal. Embedders that re-wrap the root key themselves
 (password change, rekey, key import, Shamir re-split) must stamp the MAC last,
 after the ciphertext: `(*Barrier).StampSealedStateMAC(ctx, sealed)` with the
 barrier unsealed, or `StampSealedStateMACWithRootKey(rootKey, deploymentID,
@@ -292,7 +291,7 @@ widens silently when a constant moves.
 | `WALFORMAT` (`format.go`) | `walFormatVersion` and its previous | the current marker error |
 | `snapshot.meta` (`snapshot_meta.go`) | `snapshotMetaVersion` and its previous | the current decode error |
 | exported artifact (`host.go`) | `snapshotArtifactVersion` and its previous | `*SnapshotArtifactError` |
-| sealed state MAC (`seal/barrier.go`) | `sealedStateMACVersion` and its previous | the current MAC error |
+| sealed state MAC (`seal/barrier.go`) | `sealedStateMACVersion` (`previousSealedStateMACVersion` equals it) | `ErrSealedStateUnauthenticated` |
 
 The persisted sets are question 2's read window; the two wire sets are
 question 3's upgrade window.

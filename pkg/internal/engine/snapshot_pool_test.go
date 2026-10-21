@@ -2000,11 +2000,10 @@ func TestSnapshotPool_EpochInMetadata(t *testing.T) {
 func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// Write a 40-byte pre-magic record: the layout earlier builds' snapshot
-	// RECEIVE path wrote, which carries no epoch field at all. The epoch is
-	// therefore UNKNOWN, and under the fail-safe contract the purge-floor
-	// callers must refuse to purge rather than drop this snapshot from the
-	// floor. It is reported as legacy (a recognised record), not as corrupt.
+	// Write a 40-byte headerless record. No build reads that layout, so the
+	// record is refused and the epoch is UNKNOWN: under the fail-safe contract
+	// the purge-floor callers must refuse to purge rather than drop this
+	// snapshot from the floor.
 	metaPath := filepath.Join(tmpDir, snapshotMetadataFile)
 	var buf [40]byte
 	binary.LittleEndian.PutUint64(buf[0:], 100) // Index
@@ -2015,11 +2014,11 @@ func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
 
 	epoch, status := readSnapshotEpoch(tmpDir)
 	if status == snapshotEpochKnown {
-		t.Fatalf("readSnapshotEpoch for legacy epoch-less file = (%d, known), "+
+		t.Fatalf("readSnapshotEpoch for headerless file = (%d, known), "+
 			"want a fail-safe status", epoch)
 	}
-	if status != snapshotEpochLegacy {
-		t.Fatalf("readSnapshotEpoch status = %v, want legacy", status)
+	if status != snapshotEpochUnknown {
+		t.Fatalf("readSnapshotEpoch status = %v, want unknown", status)
 	}
 }
 

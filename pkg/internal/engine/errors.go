@@ -71,8 +71,7 @@ var (
 	ErrSnapshotFrameWriterClosed = errors.New("engine: snapshot frame writer is closed")
 
 	// ErrSnapshotMetaCorrupt is returned by ParseSnapshotMeta when a
-	// snapshot.meta image is neither a versioned record nor one of the
-	// recognised pre-magic layouts. It means "these bytes say nothing about
+	// snapshot.meta image is not a versioned record this build reads. It means "these bytes say nothing about
 	// the artifact beside them", NOT "the artifact is unencrypted": the DEK
 	// purge floor must treat the directory as unevaluable.
 	ErrSnapshotMetaCorrupt = errors.New("engine: snapshot metadata record is corrupt or foreign")

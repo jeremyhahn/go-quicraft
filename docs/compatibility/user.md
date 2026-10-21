@@ -121,7 +121,7 @@ Changes from 0.4.0 that compile but fail at run time on a jump from 0.3.x:
 
 | Symptom | Meaning | Remedy |
 |---|---|---|
-| `ErrSealedStateUnauthenticated` on first unseal | the sealed root key predates the state MAC | set `BarrierConfig.AllowUnauthenticatedSealedState = true`, start once, re-persist `SealedRootKeyData()`, clear the flag |
+| `ErrSealedStateUnauthenticated` on first unseal | the sealed root key predates the state MAC, or carries a version-1 tag | wipe and reseal: initialize a fresh barrier and re-sync the node's data from peers |
 | `ErrSessionsUnsupportedOnDisk` | client sessions on an `sm.DiskStateMachine` shard; the session table lives only in the snapshot stream, which an on-disk state machine never recovers from on restart | use no-op sessions (`Host.NoOPSession`) and idempotent operations |
 | `ErrKDFNotFIPSApproved` on unseal | an Argon2id-wrapped blob under FIPS mode | unseal once with FIPS off, re-seal with `NewSoftwareStrategyFIPS` (PBKDF2-SHA256) |
 

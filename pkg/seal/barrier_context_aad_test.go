@@ -155,6 +155,7 @@ func TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{1, 2, 3},
 	}); err != nil {
@@ -170,6 +171,7 @@ func TestBarrier_SetSealedRootKey_ReloadResetsKnownEpochs(t *testing.T) {
 		Strategy:    StrategyPassphrase,
 		Epoch:       3,
 		Salt:        make([]byte, 32),
+		HKDFVersion: HKDFV2,
 		Ciphertext:  []byte("dummy"),
 		KnownEpochs: []uint64{1, 3},
 	}); err != nil {

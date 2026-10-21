@@ -182,6 +182,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`NodeHost.GetLeaderID`, `SyncRequestDeleteNode` and the rest); only its
     calls into `Host` changed.
 
+### Removed
+
+- **BREAKING, on disk** (#463): the legacy decoders. A sealed root key whose
+  `HKDFVersion` is 0 or the retired 1 is refused with
+  `ErrUnsupportedHKDFVersion`, and the exported `HKDFV1` constant is gone
+  (`HKDFV2` keeps the value 2). The sealed-state MAC gate is
+  `{sealedStateMACVersion}`: a version-1 tag, or no tag, is refused with
+  `ErrSealedStateUnauthenticated`, and `BarrierConfig.AllowUnauthenticatedSealedState`
+  is removed. A `snapshot.meta` record without the `QRSNAPMD` magic (the 40-,
+  48- and 56-byte positional layouts) is refused with `ErrSnapshotMetaCorrupt`.
+  No format version constant changes value. Remedy for all of them: wipe and
+  reseal the barrier, and re-sync the node's data from peers.
+
 ### Fixed
 
 - `TestSnapshotOver0RTTRejected` runs under `-race` again (#438). The quic-go

@@ -253,25 +253,6 @@ type BarrierConfig struct {
 	// neither substitutes for the other: the fence detects a competing claim,
 	// this floor refuses an older state.
 	MinEpoch uint64
-
-	// AllowUnauthenticatedSealedState permits loading a SealedRootKey that
-	// carries no StateMAC — a blob written before the barrier authenticated its
-	// own metadata.
-	//
-	// The metadata (Epoch, KnownEpochs, Salt, HKDFVersion, Algorithm, Strategy)
-	// is plaintext next to the root-key ciphertext and is NOT covered by that
-	// ciphertext's AAD, so without the MAC every one of those fields is
-	// attacker-controlled under the write-access threat model this package
-	// already defends elsewhere. Accepting an ABSENT MAC is therefore a
-	// downgrade an attacker can trigger by simply deleting the field, which is
-	// why it fails closed by default and this escape hatch is explicit,
-	// per-deployment, and named for what it gives up.
-	//
-	// ON-DISK CONSEQUENCE: leaving this false requires every persisted blob to
-	// have been written by a build that stamps StateMAC. Migrate a pre-MAC
-	// deployment by starting once with this set to true and re-persisting
-	// SealedRootKeyData() (Unseal restamps the MAC), then clearing it.
-	AllowUnauthenticatedSealedState bool
 }
 
 // BoolPtr returns a pointer to the given bool value, for setting *bool config

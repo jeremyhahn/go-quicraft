@@ -131,7 +131,7 @@ func TestSealedStateMAC_CoversEveryField(t *testing.T) {
 		"epoch":        func(s *SealedRootKey) { s.Epoch = 4 },
 		"known_epochs": func(s *SealedRootKey) { s.KnownEpochs = []uint64{5} },
 		"salt":         func(s *SealedRootKey) { s.Salt[0] ^= 0xff },
-		"hkdf_version": func(s *SealedRootKey) { s.HKDFVersion = HKDFV1 },
+		"hkdf_version": func(s *SealedRootKey) { s.HKDFVersion = 1 },
 		"strategy":     func(s *SealedRootKey) { s.Strategy = StrategyNone },
 		"version":      func(s *SealedRootKey) { s.Version++ },
 		"ciphertext":   func(s *SealedRootKey) { s.Ciphertext[0] ^= 0xff },
@@ -176,8 +176,9 @@ func TestSealedStateMAC_CoversEveryField(t *testing.T) {
 }
 
 // TestSealedStateMAC_AbsentTagFailsClosed pins the downgrade direction: a MAC
-// an attacker can simply DELETE is not a MAC. An absent tag is refused unless
-// the deployment opts in, and the opt-in is what makes a pre-MAC blob loadable.
+// an attacker can simply DELETE is not a MAC. An absent tag is always refused,
+// whether the metadata was edited or not: a blob written before the MAC
+// existed has no migration path and is wiped and resealed.
 func TestSealedStateMAC_AbsentTagFailsClosed(t *testing.T) {
 	b, s, _ := epochFiveBarrier(t)
 	stripped := b.SealedRootKeyData()
@@ -193,14 +194,16 @@ func TestSealedStateMAC_AbsentTagFailsClosed(t *testing.T) {
 		t.Fatalf("Unseal(stripped MAC) = %v, want ErrSealedStateUnauthenticated", err)
 	}
 
-	legacyCfg := DefaultBarrierConfig(1)
-	legacyCfg.AllowUnauthenticatedSealedState = true
-	b3 := MustNewBarrier(legacyCfg)
-	if err := b3.SetSealedRootKey(cloneSealedRootKey(stripped)); err != nil {
-		t.Fatalf("SetSealedRootKey(legacy opt-in): %v", err)
+	// The same blob with only its tag removed, metadata untouched, is what an
+	// older build left behind. It is refused the same way.
+	untagged := b.SealedRootKeyData()
+	untagged.StateMAC = nil
+	b3 := MustNewBarrier(DefaultBarrierConfig(1))
+	if err := b3.SetSealedRootKey(untagged); err != nil {
+		t.Fatalf("SetSealedRootKey(untagged): %v", err)
 	}
-	if err := b3.Unseal(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Unseal with AllowUnauthenticatedSealedState: %v", err)
+	if err := b3.Unseal(context.Background(), s, Credentials{}); !errors.Is(err, ErrSealedStateUnauthenticated) {
+		t.Fatalf("Unseal(untagged) = %v, want ErrSealedStateUnauthenticated", err)
 	}
 }
 

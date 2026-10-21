@@ -125,8 +125,7 @@ func readSnapshotMetaFile(dir string) (SnapshotMeta, error) {
 // and verifies nothing.
 //
 // It fails CLOSED when there is nothing to check against: a snapshot.meta that
-// is missing, unreadable, malformed, or lacks the integrity fields — a pre-magic
-// (v0) record among them, since no current writer produces one — is refused
+// is missing, unreadable, malformed, or lacks the integrity fields is refused
 // with *SnapshotMetaInvalidError, which matches ErrSnapshotCorrupt. Every
 // writer (save, receive, import) stamps the fields through MarshalSnapshotMeta
 // before the directory is published, and pre-v1 layouts are wiped rather than

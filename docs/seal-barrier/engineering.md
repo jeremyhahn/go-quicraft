@@ -184,7 +184,6 @@ func DeriveKey(passphrase, salt []byte, version KDFVersion, params KDFParams) ([
 func AllowWeakKDFParams() func()   // TEST HELPER; returns the restore func
 
 type HKDFVersion uint8
-const HKDFV1 HKDFVersion = 1
 const HKDFV2 HKDFVersion = 2
 
 const DefaultInvocationLimit int64 = 1 << 32
@@ -359,7 +358,7 @@ to recover. The barrier logs at ERROR once the set passes half the bound.
 Non-nil blob → `Epoch > 0` → rollback floor (`max(MinEpoch, b.epoch)`) →
 32-byte `Salt` → `len(KnownEpochs) <= MaxKnownEpochs` → no epoch `0` and none
 above `Epoch` in `KnownEpochs` → `Epoch` present in `KnownEpochs` →
-`HKDFVersion` not newer than this build → `Algorithm` agreement → the
+`HKDFVersion` equal to `HKDFV2` → `Algorithm` agreement → the
 load-generation fence.
 
 Epoch `0` is rejected because accepting it is not inert: `Unseal` would derive
@@ -424,23 +423,23 @@ trap for any data directory that outlives the host that wrote it.
 
 | Version | Length | Layout |
 |---|---|---|
-| `HKDFV1` = 1 | 36 | `prefix:20 ‖ deploymentID:8 ‖ epoch:8` |
 | `HKDFV2` = 2 | 38 | `prefix:20 ‖ deploymentID:8 ‖ epoch:8 ‖ algID:1 ‖ keyLen:1` |
 
 `prefix` is the 20 ASCII bytes `quicraft/barrier/v1/`, a fixed string unrelated
 to `HKDFVersion`. `deploymentID` and `epoch` are big-endian.
 
-**Why v2.** HKDF is a stream: under v1 the 16-byte AES-128 DEK for a
+**Why v2.** HKDF is a stream: under the retired v1 layout (36 bytes, no suffix) the 16-byte AES-128 DEK for a
 (deployment, epoch) pair is the first 16 bytes of that pair's 32-byte AES-256
 DEK, and ChaCha20-Poly1305 and AES-256-GCM share a key outright, so the
 unauthenticated `algID` header byte could select a key that is a prefix of
 another. The `[algID][keyLen]` suffix makes an algorithm change yield unrelated
 keys.
 
-`Initialize` always stamps v2. `SetSealedRootKey` treats `HKDFVersion == 0` as
-v1 and rejects anything above the current version with
-`ErrUnsupportedHKDFVersion`. The version applies to every epoch of a barrier;
-there is no per-epoch mixing and no in-place upgrade of a v1 blob.
+`Initialize` always stamps v2. `SetSealedRootKey` rejects every other value
+with `ErrUnsupportedHKDFVersion`: 1 is retired and never reallocated, and 0 is
+refused rather than read as v1. The version applies to every epoch of a
+barrier; there is no per-epoch mixing. A blob from before v2 is wiped and
+resealed.
 
 ### Brute-force backoff
 
@@ -579,7 +578,6 @@ All on `BarrierConfig`. `DefaultBarrierConfig(deploymentID)` fills the defaults;
 | `RequireContextAAD` | `bool` | false | fail closed at setup if positional binding is unavailable, `StrategyNone` included |
 | `RequireFIPS` | `bool` | false | fail closed at `NewBarrier` without the FIPS module |
 | `MinEpoch` | `uint64` | 0 (disabled) | replay floor; set to the engine's minimum live epoch |
-| `AllowUnauthenticatedSealedState` | `bool` | false | one-start migration hatch for a pre-MAC blob. Clear it afterwards. Does not apply to a wrong MAC. |
 
 **Nonce-tracking memory.** The in-memory tracker admits at most
 `DefaultMaxTrackedNonces` (4Mi, ~160 MB) per epoch and then saturates: memory
@@ -704,7 +702,7 @@ type SealedRootKey struct {
     Metadata    []byte              // strategy-specific; [0] is the KDF version
     KnownEpochs []uint64            // ascending, for DEK re-derivation
     KDFVersion  int
-    HKDFVersion HKDFVersion         // 0 = pre-versioning, derives as v1
+    HKDFVersion HKDFVersion         // HKDFV2; any other value is refused
     Algorithm   SymmetricAlgorithm
 
     LoadGeneration uint64
@@ -806,8 +804,8 @@ Targets: `make test-seal` (`./pkg/seal/...`), `make bench-seal`, `make fuzz-seal
 | `barrier_reset_test.go` | `Reset`: first-boot only, superseded and in-flight refusals, an unrelated key afterwards |
 | `barrier_context_aad_test.go` | positional binding: right context opens, wrong context fails |
 | `barrier_hardware_aad_test.go`, `aad_binding_test.go` | the `verifyAADBinding` probe, including an encryptor that drops the AAD |
-| `load_generation_fence_test.go` | claim, supersession, permanence, the backwards-generation case |
-| `barrier_stamp_state_mac_test.go` | MAC coverage and the version-1 acceptance path |
+| `load_generation_fence_test.go` | claim, supersession, permanence, the backwards-generation case, refusal of a version-1 tag |
+| `barrier_stamp_state_mac_test.go` | MAC coverage |
 | `barrier_bounds_regression_test.go`, `nonce_bound_regression_test.go` | the tracker ceiling and saturation |
 | `legacy_format_test.go` | checked-in ciphertext bytes from a caller-supplied-nonce writer decode under the current reader, proving `cipher.NewGCMWithRandomNonce` produces the same frame format |
 | `strategy_params_api_fips_test.go` | an external package, so the FIPS run fails to build if an exported symbol disappears under the tag |
@@ -858,7 +856,6 @@ Worth alerting on rather than merely collecting:
 | WARN | barrier sealing is delegated to an external encryptor | once per setup, naming what is bypassed |
 | WARN | barrier performs NO encryption | `StrategyNone` |
 | WARN | no `StatePersister`, so the load-generation fence is inert | |
-| WARN | sealed root key carries no metadata MAC | `AllowUnauthenticatedSealedState` still set |
 
 **No key material, no nonce and no plaintext appears in any log line.**
 

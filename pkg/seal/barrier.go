@@ -56,13 +56,10 @@ const (
 	// hkdfInfoPrefix is the fixed prefix for HKDF info strings.
 	hkdfInfoPrefix = "quicraft/barrier/v1/"
 
-	// hkdfInfoLenV1 is the length of the v1 HKDF info:
-	// 20 bytes prefix + 8 bytes deploymentID + 8 bytes epoch.
-	hkdfInfoLenV1 = 36
-
-	// hkdfInfoLenV2 is the length of the v2 HKDF info: v1 plus the
-	// algorithm identifier and the DEK length.
-	hkdfInfoLenV2 = 38
+	// hkdfInfoLen is the length of the HKDF info: 20 bytes prefix + 8 bytes
+	// deploymentID + 8 bytes epoch + the algorithm identifier and the DEK
+	// length.
+	hkdfInfoLen = 38
 
 	// bruteForceThreshold is the number of consecutive failed Unseal
 	// attempts before exponential backoff activates.
@@ -100,23 +97,20 @@ const (
 )
 
 // HKDFVersion identifies the layout of the HKDF info string used to derive
-// epoch DEKs. It is persisted in SealedRootKey so that data derived under an
-// older layout keeps deriving under that layout after an upgrade.
+// epoch DEKs. It is persisted in SealedRootKey and checked on load: a blob
+// that names any layout other than currentHKDFVersion is refused with
+// ErrUnsupportedHKDFVersion.
+//
+// The value 1 (the original layout, which had no algorithm/key-size domain
+// separation) is retired and never reallocated, and 0 is what a blob written
+// before the field existed decodes to; both are refused.
 type HKDFVersion uint8
 
 const (
-	// HKDFV1 is the original info layout: [prefix:20][deploymentID:8][epoch:8].
-	// It has no algorithm/key-size domain separation: because HKDF is a
-	// stream, the 16-byte AES-128 DEK for a given (deployment, epoch) is the
-	// first half of that pair's 32-byte AES-256 DEK. HKDFV1 is the fallback
-	// for sealed blobs persisted before the version field existed and must
-	// stay derivable; new deployments use HKDFV2.
-	HKDFV1 HKDFVersion = 1
-
-	// HKDFV2 appends [algID:1][keyLen:1] to the v1 info, so a change of
-	// BarrierConfig.Algorithm yields unrelated keys instead of related ones
-	// and the unauthenticated algID header byte cannot select a key that is
-	// a prefix of another.
+	// HKDFV2 is [prefix:20][deploymentID:8][epoch:8][algID:1][keyLen:1], so a
+	// change of BarrierConfig.Algorithm yields unrelated keys instead of
+	// related ones and the unauthenticated algID header byte cannot select a
+	// key that is a prefix of another.
 	HKDFV2 HKDFVersion = 2
 
 	// currentHKDFVersion is stamped into every newly initialized barrier.
@@ -781,7 +775,7 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 // at all, or nil when it may. The caller must hold b.mu.
 //
 // Extracted from Unseal to keep it under the cyclomatic limit, which the
-// load-generation claim and its pre-fence migration path pushed it over.
+// load-generation claim pushed it over.
 //
 // The superseded case is the interesting one: a barrier that has lost the claim
 // must not re-claim by sealing and unsealing again. Allowing it would launder
@@ -2992,27 +2986,17 @@ const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
 // covered field set later produces unrelated tags rather than an ambiguous
 // re-parse of the same bytes.
 //
-// v2 adds LoadGeneration to the covered set, and only v2 is ever written. A
-// blob stamped under v1 is still recognised, once, by verifySealedStateMAC:
-// only when its LoadGeneration is 0 (the field did not exist under v1, so a
-// blob that carries a claim can only have been written at v2), and only if the
-// v1 tag verifies under the root key just recovered. The next persist restamps
-// it at v2 with a claim, after which the v1 path no longer applies to it.
-// AllowUnauthenticatedSealedState plays no part in this: it admits a blob with
-// NO tag, never one whose tag is present and wrong.
-//
-// This is not a downgrade. Both encodings are keyed by the same HKDF-derived
-// MAC key, so an attacker with write access to the blob and no root key can
-// forge neither, and the LoadGeneration == 0 gate pins the one field v1 does
-// not cover.
+// v2 added LoadGeneration to the covered set. The value 1 is retired and never
+// reallocated: a blob tagged under the v1 encoding no longer authenticates and
+// is refused with ErrSealedStateUnauthenticated, like any other wrong tag.
 const sealedStateMACVersion byte = 2
 
-// previousSealedStateMACVersion is the second member of the closed read
-// window (docs/compatibility, "The accept sets"): the v1 encoding described
-// above, accepted only under its LoadGeneration == 0 gate. verifySealedStateMAC computes a tag at
-// these two versions only, so a tag at any other version is refused with
-// ErrSealedStateUnauthenticated.
-const previousSealedStateMACVersion byte = 1
+// previousSealedStateMACVersion is the second member of the closed read window
+// (docs/compatibility, "The accept sets"). In v1.0 it equals
+// sealedStateMACVersion, so the window has exactly one member;
+// verifySealedStateMAC computes a tag at these versions only, so a tag at any
+// other version is refused with ErrSealedStateUnauthenticated.
+const previousSealedStateMACVersion = sealedStateMACVersion
 
 // sealedStateMAC computes the metadata authentication tag for a sealed root
 // key: HMAC-SHA256, keyed by HKDF-SHA256(rootKey, info=sealedStateMACInfo),
@@ -3043,20 +3027,10 @@ func sealedStateMAC(rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]by
 	return sealedStateMACAt(sealedStateMACVersion, rootKey, deploymentID, s)
 }
 
-// sealedStateMACAt computes the tag under a SPECIFIC covered-field version.
-//
-// Only the current version is ever WRITTEN. Older versions are computed solely
-// to recognise a blob this build has not yet migrated: see
-// verifySealedStateMAC, which accepts a valid v1 tag once and immediately
-// restamps at the current version.
-//
-// Verifying an old version is not a downgrade. Forging a v1 tag requires the
-// same HKDF-derived MAC key as forging a v2 one, and that key comes from the
-// root key the sealing strategy just recovered — an attacker with write access
-// to the blob but no root key cannot produce either. What v1 gives up is
-// coverage of LoadGeneration, which a pre-fence blob does not carry at all, and
-// verifySealedStateMAC tries v1 only when LoadGeneration is 0, so there is
-// nothing for the older encoding to leave unprotected.
+// sealedStateMACAt computes the tag with the given version byte as its first
+// input. Only sealedStateMACVersion is ever WRITTEN; verifySealedStateMAC also
+// computes previousSealedStateMACVersion, the other member of the read window.
+// Every version covers the same field set.
 func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *SealedRootKey) ([]byte, error) {
 	macKey := make([]byte, sha256.Size)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, rootKey, nil, []byte(sealedStateMACInfo)), macKey); err != nil {
@@ -3080,11 +3054,7 @@ func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *Seal
 	putUint(uint64(s.Version))
 	putUint(deploymentID)
 	putUint(s.Epoch)
-	// v1 did not cover LoadGeneration; the field did not exist. Reproducing the
-	// v1 encoding exactly is what makes a pre-fence blob recognisable.
-	if version >= 2 {
-		putUint(s.LoadGeneration)
-	}
+	putUint(s.LoadGeneration)
 	putBytes(s.Salt)
 	putUint(uint64(len(s.KnownEpochs)))
 	for _, ep := range s.KnownEpochs {
@@ -3107,29 +3077,18 @@ func sealedStateMACAt(version byte, rootKey []byte, deploymentID uint64, s *Seal
 // never reaches here).
 //
 // A blob with NO tag is a blob written before the barrier authenticated its own
-// metadata. Accepting it unconditionally would make the whole mechanism
+// metadata. Accepting it would make the whole mechanism
 // optional at the attacker's discretion — strip the field, keep the forgery —
-// so it is refused unless the deployment opts in through
-// BarrierConfig.AllowUnauthenticatedSealedState.
+// so it is refused, and the remedy is to wipe and reseal.
 func (b *Barrier) verifySealedStateMAC(rootKey []byte) error {
 	if b.sealed == nil {
 		return ErrNilSealedData
 	}
 	if len(b.sealed.StateMAC) == 0 {
-		if b.config.AllowUnauthenticatedSealedState {
-			slog.Warn("quicraft/seal: sealed root key carries no metadata MAC; its epoch and known-epoch "+
-				"set are unauthenticated and an attacker with write access to the blob can rewrite them",
-				"epoch", b.sealed.Epoch,
-				"deployment_id", b.config.DeploymentID,
-				"remedy", "re-persist SealedRootKeyData() from this process to stamp a MAC, then clear "+
-					"BarrierConfig.AllowUnauthenticatedSealedState",
-			)
-			return nil
-		}
 		slog.Error("quicraft/seal: unseal refused; sealed root key carries no metadata MAC",
 			"epoch", b.sealed.Epoch,
 			"deployment_id", b.config.DeploymentID,
-			"remedy", "set BarrierConfig.AllowUnauthenticatedSealedState once to migrate a pre-MAC blob",
+			"remedy", "wipe and reseal",
 		)
 		return ErrSealedStateUnauthenticated
 	}
@@ -3137,39 +3096,22 @@ func (b *Barrier) verifySealedStateMAC(rootKey []byte) error {
 	if err != nil {
 		return err
 	}
-	if !hmac.Equal(want, b.sealed.StateMAC) {
-		// Before refusing, check whether this is simply a blob written by a
-		// build that predates the load-generation fence. Such a blob carries a
-		// PRESENT tag computed over the v1 field set, so it fails the
-		// comparison above while being entirely authentic — and the
-		// AllowUnauthenticatedSealedState hatch does not apply to it, because
-		// that hatch is for a blob with NO tag at all. Without this path a
-		// pre-fence deployment could never load its own sealed state again.
-		//
-		// Accepting it is not a downgrade: forging a v1 tag needs the same
-		// HKDF-derived MAC key as forging a v2 one, so an attacker with blob
-		// write access and no root key cannot produce either. The tag is
-		// restamped at the current version by the normal persist path, so a
-		// blob is recognised this way exactly once.
-		if b.sealed.LoadGeneration == 0 {
-			legacy, legacyErr := sealedStateMACAt(previousSealedStateMACVersion, rootKey, b.config.DeploymentID, b.sealed)
-			if legacyErr == nil && hmac.Equal(legacy, b.sealed.StateMAC) {
-				slog.Warn("quicraft/seal: sealed root key authenticated under the pre-fence "+
-					"metadata encoding; it will be restamped at the current version on the "+
-					"next persist",
-					"epoch", b.sealed.Epoch,
-					"deployment_id", b.config.DeploymentID,
-				)
-				return nil
-			}
-		}
-		slog.Error("quicraft/seal: unseal refused; sealed root key metadata failed authentication",
-			"epoch", b.sealed.Epoch,
-			"deployment_id", b.config.DeploymentID,
-		)
-		return ErrSealedStateUnauthenticated
+	if hmac.Equal(want, b.sealed.StateMAC) {
+		return nil
 	}
-	return nil
+	// The read window is {sealedStateMACVersion, previousSealedStateMACVersion};
+	// the second tag is computed only once the two differ.
+	if previousSealedStateMACVersion != sealedStateMACVersion {
+		prev, prevErr := sealedStateMACAt(previousSealedStateMACVersion, rootKey, b.config.DeploymentID, b.sealed)
+		if prevErr == nil && hmac.Equal(prev, b.sealed.StateMAC) {
+			return nil
+		}
+	}
+	slog.Error("quicraft/seal: unseal refused; sealed root key metadata failed authentication",
+		"epoch", b.sealed.Epoch,
+		"deployment_id", b.config.DeploymentID,
+	)
+	return ErrSealedStateUnauthenticated
 }
 
 // restampStateMACLocked recomputes s.StateMAC from a plaintext root key. It is
@@ -3409,7 +3351,9 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 
 	// Reject a DEK-derivation layout this build does not implement rather
 	// than failing later with an opaque decryption error.
-	if sealed.HKDFVersion > currentHKDFVersion {
+	// A blob naming the retired v1 layout, or none at all (0), is refused the
+	// same way: this build derives under currentHKDFVersion only.
+	if sealed.HKDFVersion != currentHKDFVersion {
 		return ErrUnsupportedHKDFVersion
 	}
 
@@ -3489,13 +3433,7 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	// KnownEpochs below.
 	b.loadGeneration = sealed.LoadGeneration
 
-	// A blob persisted before the version field existed carries 0 and must
-	// keep deriving with the v1 info layout.
-	if sealed.HKDFVersion == 0 {
-		b.hkdfVersion = HKDFV1
-	} else {
-		b.hkdfVersion = sealed.HKDFVersion
-	}
+	b.hkdfVersion = sealed.HKDFVersion
 
 	// Restore known epochs from persisted data so Unseal can re-derive DEKs for
 	// all historical epochs. Allocate a FRESH set rather than merging into the
@@ -3601,24 +3539,19 @@ func deriveDEK(rootKey, salt []byte, deploymentID, epoch uint64, alg SymmetricAl
 		return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedAlgorithm}
 	}
 
-	var info [hkdfInfoLenV2]byte
+	if version != HKDFV2 {
+		return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedHKDFVersion}
+	}
+
+	var info [hkdfInfoLen]byte
 	copy(info[:20], hkdfInfoPrefix)
 	binary.BigEndian.PutUint64(info[20:], deploymentID)
 	binary.BigEndian.PutUint64(info[28:], epoch)
 
-	infoLen := hkdfInfoLenV1
-	switch version {
-	case 0, HKDFV1:
-		// Legacy layout; nothing to append.
-	case HKDFV2:
-		info[36] = byte(alg)
-		info[37] = byte(keySize)
-		infoLen = hkdfInfoLenV2
-	default:
-		return nil, &KeyDerivationError{Epoch: epoch, Err: ErrUnsupportedHKDFVersion}
-	}
+	info[36] = byte(alg)
+	info[37] = byte(keySize)
 
-	hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:infoLen])
+	hkdfReader := hkdf.New(sha256.New, rootKey, salt, info[:])
 	dek := make([]byte, keySize)
 	if _, err := io.ReadFull(hkdfReader, dek); err != nil {
 		return nil, &KeyDerivationError{Epoch: epoch, Err: err}

@@ -76,6 +76,7 @@ func (s *NoneStrategy) SealRootKey(_ context.Context, _ []byte, _ Credentials) (
 		Epoch:       1, // matches Barrier.Initialize's initialEpoch
 		Salt:        make([]byte, hkdfSaltSize),
 		KnownEpochs: []uint64{1},
+		HKDFVersion: currentHKDFVersion,
 	}, nil
 }
 

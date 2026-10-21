@@ -285,9 +285,7 @@ type SealedRootKey struct {
 	// disagrees with the barrier's configuration (AlgorithmMismatchError).
 	//
 	// It is recorded because the algorithm is NOT recoverable from the data:
-	// under HKDFV2 it is an HKDF domain separator, under HKDFV1 it is not
-	// bound at all (so the identical DEK would be used as an AES-256-GCM key
-	// on one host and a ChaCha20-Poly1305 key on another), and Decrypt selects
+	// it is an HKDF domain separator, and Decrypt selects
 	// the AEAD by EPOCH rather than from the ciphertext header's algID. Without
 	// this field, a data directory restored onto a host whose CPU makes
 	// SelectOptimalAlgorithm choose differently reads back as ErrDecryptionFailed

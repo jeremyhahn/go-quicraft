@@ -416,12 +416,11 @@ func BoolPtr(v bool) *bool
   produce the same frame layout, which `legacy_format_test.go` checks against
   checked-in bytes.
 - **`SealedRootKey.Version`**: the sealed-blob format version.
-- **`HKDFVersion`**: current is `HKDFV2`. `0` means pre-versioning and derives
-  as v1; anything above the current version is refused with
-  `ErrUnsupportedHKDFVersion`.
-- **`StateMAC` covered-field encoding**: version byte `2`. A tag over the
-  version-1 field set is accepted once, at WARN, only when
-  `LoadGeneration == 0`, and is restamped at version 2.
+- **`HKDFVersion`**: `HKDFV2` is the only value read. `0`, the retired `1` and
+  anything newer are refused with `ErrUnsupportedHKDFVersion`.
+- **`StateMAC` covered-field encoding**: version byte `2`, the only one read. A
+  tag over the version-1 field set, or no tag, is refused with
+  `ErrSealedStateUnauthenticated`.
 - **`KDFVersion`**: `KDFArgon2id` (1) and `KDFPbkdf2SHA256` (2). Both identifiers
   stay defined in every build because they appear in data already on disk.
 - **Removed in 0.17.0**: `ProtectedCredentials` and `NewProtectedCredentials`,

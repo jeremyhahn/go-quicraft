@@ -168,7 +168,7 @@ var (
 	// ErrSealedStateUnauthenticated is returned by Unseal when the persisted
 	// SealedRootKey's metadata does not authenticate under the root key: either
 	// the StateMAC does not match the metadata, or the blob carries no StateMAC
-	// at all and BarrierConfig.AllowUnauthenticatedSealedState is not set.
+	// at all. The remedy for a blob with no StateMAC is to wipe and reseal.
 	//
 	// Only the root-key CIPHERTEXT is covered by the wrapping AEAD; Epoch,
 	// KnownEpochs, Salt, HKDFVersion, Algorithm and Strategy sit beside it in

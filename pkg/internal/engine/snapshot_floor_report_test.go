@@ -50,8 +50,8 @@ func TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport(t *testing.T
 	// two shards so a scan that stops at the first blocked SHARD is caught too.
 	const blockingPerShard = 40
 	for i := 0; i < blockingPerShard; i++ {
-		writeLegacyShardSnapshot(t, baseDir, 1, 1, uint64(100+i), legacyMetaSizeNoEpoch)
-		writeLegacyShardSnapshot(t, baseDir, 2, 1, uint64(100+i), legacyMetaSizeNoEpoch)
+		writeEpochlessShardSnapshot(t, baseDir, 1, 1, uint64(100+i))
+		writeEpochlessShardSnapshot(t, baseDir, 2, 1, uint64(100+i))
 	}
 	// One evaluable encrypted directory per shard, to prove the scan still
 	// folds in what it CAN evaluate while blocked.

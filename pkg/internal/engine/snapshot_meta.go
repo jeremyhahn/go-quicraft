@@ -85,32 +85,12 @@ const maxSnapshotMetaFileLen = snapshotMetaHeaderSize + maxSnapshotMetaBodyLen
 //
 // # Compatibility
 //
-// Two pre-magic ("v0") layouts were written by earlier builds and are still
-// accepted verbatim, positionally, at their original offsets:
-//
-//	40 bytes  Index|Term|ShardID|ReplicaID|CreatedAt
-//	          (written by the snapshot RECEIVE and IMPORT paths; carries NO
-//	          Epoch, even though the artifact beside it may be encrypted)
-//	48 bytes  ... |Epoch
-//	56 bytes  ... |Epoch|Compression
-//	          (both written by the snapshot SAVE path)
-//
-// The 40-byte layout is why "shorter record" cannot be read as "no epoch, so no
-// purge floor": the receive path re-encrypted the artifact under the receiver's
-// own barrier and recorded the epoch ONLY in LogDB, so such a directory can
-// hold ciphertext at an epoch nothing on disk names. It is therefore reported
-// as UNEVALUABLE (see snapshotEpochLegacy), never as epoch 0.
-//
-// Nothing rewrites an existing record: a v0 record stays v0 until its snapshot
-// directory rolls off, and every new record is written at the current version.
-// No current writer produces a v0 record. They are still PARSED so the DEK
-// purge-floor scan can read an epoch from one, but none carries the integrity
-// fields, so recovery refuses the artifact beside one (VerifySnapshotArtifact).
+// A record that does not begin with the magic is refused with
+// ErrSnapshotMetaCorrupt, whatever its size: there is no positional decode of
+// headerless layouts. The remedy for such a directory is to wipe it and
+// re-sync from peers.
 const (
-	// snapshotMetaMagic identifies a self-describing snapshot.meta record. It
-	// is 8 bytes so that a v0 record can never be mistaken for one: a v0
-	// record's first 8 bytes are its Index, and matching would require an
-	// index of ~4.9e18.
+	// snapshotMetaMagic identifies a self-describing snapshot.meta record.
 	snapshotMetaMagic = "QRSNAPMD"
 
 	// snapshotMetaVersion is the body version this binary WRITES.
@@ -156,11 +136,6 @@ const (
 	// snapshotMetaSize is the total size of a record this binary writes.
 	snapshotMetaSize = snapshotMetaHeaderSize + snapshotMetaBodySize
 
-	// Accepted pre-magic (v0) record sizes. See the compatibility note above.
-	legacyMetaSizeNoEpoch     = 5 * 8
-	legacyMetaSizeEpoch       = 6 * 8
-	legacyMetaSizeCompression = 7 * 8
-
 	// maxSnapshotMetaBodyLen bounds the body length a record may DECLARE.
 	//
 	// The declared length is a uint32 read from a file and is used to slice the
@@ -195,8 +170,7 @@ type SnapshotMeta struct {
 	Epoch       uint64
 	Compression config.CompressionType
 
-	// Version is the body version of the record as read. 0 identifies a
-	// pre-magic (v0) record.
+	// Version is the body version of the record as read.
 	Version uint16
 
 	// EpochRecorded reports whether the record carried the Epoch field.
@@ -224,8 +198,8 @@ type SnapshotMeta struct {
 	DataHash uint64
 
 	// DataHashRecorded reports whether the record carried DataLen/DataHash.
-	// Every current writer stamps them, so a record that leaves it false —
-	// a pre-magic one included — cannot vouch for its artifact, and recovery
+	// Every current writer stamps them, so a record that leaves it false
+	// cannot vouch for its artifact, and recovery
 	// refuses it (see VerifySnapshotArtifact). The purge-floor scan, which
 	// reads only Epoch, still accepts such a record.
 	DataHashRecorded bool
@@ -266,8 +240,8 @@ func MarshalSnapshotMeta(m SnapshotMeta) []byte {
 // ParseSnapshotMeta decodes a snapshot.meta image.
 //
 // It accepts a record carrying the magic whose declared body holds at least the
-// identity fields (see the evolution rule: fields are read by body length),
-// and the pre-magic v0 layouts. Anything else is rejected with
+// identity fields (see the evolution rule: fields are read by body length).
+// Anything else, a record without the magic included, is rejected with
 // ErrSnapshotMetaCorrupt rather than parsed positionally: reading foreign bytes
 // as an epoch would feed a fabricated value to the DEK purge floor.
 //
@@ -278,7 +252,7 @@ func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 		string(data[snapshotMetaMagicOff:snapshotMetaMagicOff+len(snapshotMetaMagic)]) == snapshotMetaMagic {
 		return parseVersionedSnapshotMeta(data)
 	}
-	return parseLegacySnapshotMeta(data)
+	return SnapshotMeta{}, ErrSnapshotMetaCorrupt
 }
 
 // parseVersionedSnapshotMeta decodes a record carrying the magic. The declared
@@ -347,35 +321,6 @@ func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	return m, nil
 }
 
-// parseLegacySnapshotMeta decodes a pre-magic (v0) record. Only the EXACT
-// sizes earlier builds wrote are accepted: a v0 record has no length prefix, so
-// its size is the only evidence of which fields it carries, and accepting an
-// arbitrary size would read a torn write as valid.
-func parseLegacySnapshotMeta(data []byte) (SnapshotMeta, error) {
-	switch len(data) {
-	case legacyMetaSizeNoEpoch, legacyMetaSizeEpoch, legacyMetaSizeCompression:
-	default:
-		return SnapshotMeta{}, ErrSnapshotMetaCorrupt
-	}
-	m := SnapshotMeta{
-		Version:   0,
-		Index:     binary.LittleEndian.Uint64(data[metaBodyIndexOff:]),
-		Term:      binary.LittleEndian.Uint64(data[metaBodyTermOff:]),
-		ShardID:   binary.LittleEndian.Uint64(data[metaBodyShardIDOff:]),
-		ReplicaID: binary.LittleEndian.Uint64(data[metaBodyReplicaIDOff:]),
-		CreatedAt: binary.LittleEndian.Uint64(data[metaBodyCreatedAtOff:]),
-	}
-	if len(data) >= legacyMetaSizeEpoch {
-		m.Epoch = binary.LittleEndian.Uint64(data[metaBodyEpochOff:])
-		m.EpochRecorded = true
-	}
-	if len(data) >= legacyMetaSizeCompression {
-		m.Compression = config.CompressionType(binary.LittleEndian.Uint64(data[metaBodyCompressionOff:]))
-		m.CompressionRecorded = true
-	}
-	return m, nil
-}
-
 // snapshotEpochStatus classifies what a snapshot directory can tell the DEK
 // purge floor about the epoch its artifact needs.
 type snapshotEpochStatus uint8
@@ -386,11 +331,11 @@ const (
 	// directory is gone), so the directory imposes no floor.
 	snapshotEpochKnown snapshotEpochStatus = iota
 
-	// snapshotEpochLegacy means the record was RECOGNISED but predates the
-	// Epoch field, so the artifact's epoch is unknown. Unknown is not "no
+	// snapshotEpochLegacy means the record was RECOGNISED but its declared
+	// body ends before the Epoch field, so the artifact's epoch is unknown. Unknown is not "no
 	// floor": the artifact may be ciphertext at any epoch, so the caller must
 	// not purge. It is reported separately from snapshotEpochUnknown because
-	// it is an expected, self-clearing upgrade condition rather than damage.
+	// the record itself is well formed rather than damaged.
 	snapshotEpochLegacy
 
 	// snapshotEpochUnknown means the record could not be read at all: an I/O
@@ -420,7 +365,7 @@ func (s snapshotEpochStatus) String() string {
 //     epoch == 0 means the artifact is unencrypted and imposes no floor;
 //     epoch > 0 pins the floor at that epoch. A missing metadata file reports
 //     (0, known) ONLY when the ARTIFACT is missing too (see below).
-//   - (0, snapshotEpochLegacy)     — a recognised pre-Epoch-field record. The
+//   - (0, snapshotEpochLegacy)     — a recognised record without Epoch. The
 //     epoch is unknown; the caller must fail safe.
 //   - (0, snapshotEpochUnknown)    — unreadable, corrupt, or absent beside an
 //     artifact that is still there. The epoch is unknown; the caller must fail

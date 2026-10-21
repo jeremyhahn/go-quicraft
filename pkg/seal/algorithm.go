@@ -280,9 +280,7 @@ func HasAESNI() bool {
 // CPU (AES-NI present or masked by the hypervisor), and the algorithm is both an
 // HKDFV2 domain separator and the cipher Decrypt selects by epoch: restore the
 // same sealed root key or data directory onto a host that chooses differently
-// and every read fails with the generic ErrDecryptionFailed. Under HKDFV1 it is
-// worse — the info string omits the algorithm, so the IDENTICAL DEK would be
-// used as an AES-256-GCM key on one host and a ChaCha20-Poly1305 key on another.
+// and every read fails with the generic ErrDecryptionFailed.
 // Pin BarrierConfig.Algorithm explicitly for anything persistent, and for a
 // mixed-generation cluster pin the SAME value on every node.
 // SealedRootKey.Algorithm records the choice so a later mismatch is refused at
