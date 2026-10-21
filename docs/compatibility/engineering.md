@@ -1,7 +1,7 @@
 # Compatibility and upgrades: engineering
 
 > **Status: NORMATIVE** · Scope: go-quicraft, all persisted and wire formats ·
-> Last verified: 2026-10-20
+> Last verified: 2026-10-21
 > Conflicts with this document are defects. Fix them here first.
 
 Every version discriminator, what it guards, how it is checked and what it
@@ -27,8 +27,10 @@ the interfaces an embedder's own types must satisfy are in [api.md](api.md).
 
 `proto.WireVersion` is stamped into every `MessageBatch` and `SnapshotChunk`.
 Both ends of a connection are live processes, so a mismatch costs one rejected
-connection and nothing durable. A peer with another value is refused, not
-misparsed; there is no negotiation.
+connection and nothing durable. A peer with a value outside the accept set is
+refused, not misparsed. There is no per-connection negotiation: a shard sends
+the version its membership committed, which moves only by the switch in
+[Rolling upgrade](#rolling-upgrade-what-v100-carries).
 
 Under the pinning policy a `BinVer` match does not mean two binaries agree on
 the bytes. A rolling upgrade across a pre-release layout change does not work
@@ -63,9 +65,10 @@ before reading a field.
 | 33 | 8 | `MaxTotalSessions` |
 | 41 | 8 | `MaxResponsesPerSession` |
 | 49 | 8 | `MaxSessionsPerOwner` |
-| 57 | var | `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities`, `RemovedIdentities` maps |
+| 57 | 8 | `WireVersion` (the shard's committed wire version; zero reads as `PreviousWireVersion`) |
+| 65 | var | `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities`, `RemovedIdentities` maps |
 
-The fixed region is 57 bytes (`membershipFixedSize`) and an empty section is 81:
+The fixed region is 65 bytes (`membershipFixedSize`) and an empty section is 89:
 the fixed region plus six 4-byte map counts. Every map is written
 unconditionally.
 
@@ -99,10 +102,11 @@ offset and growing the fixed region would move every map.
 | 17 | 1 | policy flags (`RequireFullReplicaMajority`) |
 | 18 | var | `Addresses`, `Observers`, `Witnesses`, `Removed`, `Identities` maps |
 | — | 32 | session policy: `SessionExpiryEntries`, `MaxTotalSessions`, `MaxResponsesPerSession`, `MaxSessionsPerOwner` |
+| — | 8 | committed `WireVersion` |
 | — | var | `RemovedIdentities` map |
 
 Its fixed region is 18 bytes (`membershipFixedSize` in `waldb`) and an empty
-section 74 (`minMembershipSize`), which is also the read floor replay enforces
+section 82 (`minMembershipSize`), which is also the read floor replay enforces
 before reading the version byte. A shorter section fails with
 `ErrTruncatedSnapshotRecord`.
 

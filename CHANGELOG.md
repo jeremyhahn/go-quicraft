@@ -199,6 +199,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ErrCompactionFloorsMalformed`. A new metadata file, no format version
   change; wipe dev data directories rather than migrate.
 
+### Documentation
+
+- docs/compatibility (#471): the Unreleased upgrade note says wipe and
+  re-sync, names the `Membership`, `ConfigChange`, WAL snapshot record and
+  `MessageBatch` layouts that changed in place and the new data-directory
+  files, and lists the BREAKING API and run-time changes; the troubleshooting
+  table covers the new start-time errors, and engineering.md's `Membership`
+  layouts carry the committed `WireVersion`.
+
 ## [0.23.0-alpha] - 2026-10-16
 
 A MINOR bump: the go-enclave adoption below changes exported types (pre-1.0, a
