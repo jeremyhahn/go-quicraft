@@ -246,6 +246,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a transport comment no longer claims Go's hostname check falls back to
   the certificate's CommonName.
 
+### Tests
+
+- test/integration/e2e (#281): `TestE2E_QuorumLossRunbook` walks the
+  quorum-loss runbook end to end: export from the most advanced survivor,
+  import the rewritten membership on the others (the exporter's own import is
+  refused with `*ImportSnapshotOutOfDateError`), restart, add a replacement,
+  and prove linearizable reads and writes before and after recovery.
+
 ## [0.23.0-alpha] - 2026-10-16
 
 A MINOR bump: the go-enclave adoption below changes exported types (pre-1.0, a

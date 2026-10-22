@@ -294,7 +294,9 @@ Procedure:
    advanced replica is lost.
 2. **Export a snapshot from it while its shard is still loaded.**
    `ExportSnapshot` refuses a stopped shard with `ErrShardNotFound`. It exports
-   the latest snapshot recorded in LogDB, not the log after it.
+   the latest snapshot recorded in LogDB, not the log after it, so request a
+   snapshot on it first (`RequestSnapshot`; a snapshot is local and needs no
+   quorum) for the artifact to hold everything it has applied.
 
    ```go
    f, err := os.Create("/var/backups/shard-7.artifact")
@@ -340,6 +342,9 @@ Procedure:
    among them and resumes.
 6. **Add replacements normally** with `RequestAddNodeWithIdentity` once the
    shard has a leader.
+
+`TestE2E_QuorumLossRunbook` (`test/integration/e2e`) walks these steps on a
+seven-replica shard that loses four.
 
 To verify, `ShardInfo.Replicas` on the leader reports each remote member's `Role`
 (`voter`, `observer`, `witness`), `Match`, `Next`, `State` (`probe`, `replicate`, `snapshot`), `Paused`, `Active` and
