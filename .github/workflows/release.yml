@@ -297,7 +297,7 @@ jobs:
 
   integration:
     name: Gate - integration suite
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # Runs after the cheap gates rather than beside them. This suite starts
     # multi-node QUIC clusters under -race, and sharing the runner with the
     # fuzz, errfs and module gates expires its 30s replication waits. Nothing
@@ -489,7 +489,7 @@ jobs:
 
   contrib-dragonboat:
     name: Gate - contrib/dragonboat compatibility [unit + integration]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # Runs after the other heavy suites: it starts multi-node QUIC clusters
     # under -race, and sharing the runner flakes the 30s waits.
     needs: [validate, integration, netfault]
