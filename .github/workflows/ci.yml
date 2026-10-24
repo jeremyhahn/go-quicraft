@@ -344,15 +344,14 @@ on:
 # run cancels the older. No expression reaches cancel-in-progress: Gitea
 # 1.27.1 never released go-qrdb main run 57063, the first run after v1.22.1
 # set it to an expression (Company Agent m695).
-# Customized (2026-10-24): a push to main no longer cancels the main run in
-# progress, so every main commit keeps its run and every merge is validated.
-# cancel-in-progress is false on main and true on every other ref, so a PR's
-# newer run still cancels the older. The group is unchanged. This puts an
-# expression on cancel-in-progress again, which the note above records as
-# once leaving a main run unreleased; watch the first main runs after it.
+# ci-template v1.26.2 (Company Agent m1167, ruling 145): on main the group is
+# the workflow, the event and the commit, so every main commit has a group of
+# its own and a merge never cancels a main run; every merge is validated.
+# cancel-in-progress is the literal true again, so no expression reaches it.
+# Every other ref is one group, so a PR's newer run still cancels the older.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && format('main-{0}', github.event_name) || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && format('main-{0}-{1}', github.event_name, github.sha) || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
