@@ -8864,11 +8864,10 @@ func resolveImportMembership(
 // the next PurgeEpochsBefore destroy the DEK it needs.
 //
 // The option remains meaningful for a shard whose layout cannot be discovered:
-// one with NO bootstrap record (started with join=true, which records none),
-// and one whose record PREDATES the DataDir field. Both fail closed with
-// ErrImportLayoutUnknown unless the caller states the layout here, and in both
-// cases the stated value is trusted because there is nothing to cross-check it
-// against.
+// one with NO bootstrap record (started with join=true, which records none).
+// It fails closed with ErrImportLayoutUnknown unless the caller states the
+// layout here, and the stated value is trusted because there is nothing to
+// cross-check it against.
 func WithImportDataDir(dir string) ImportOption {
 	return func(o *importOptions) {
 		o.dataDir = dir
@@ -8893,15 +8892,12 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 	if err != nil {
 		return "", err
 	}
-	// A record that PREDATES the DataDir field proves nothing about the layout:
-	// it decodes the field as "" and that is indistinguishable from a shard
-	// that genuinely has none, so it is treated exactly like no record at all.
-	// Reading it as proof was wrong in both directions — it silently resolved a
-	// DataDir shard's import to the NodeHostDir tree (the DEK destruction this
-	// whole mechanism exists to prevent), AND it refused the documented
-	// WithImportDataDir escape hatch as a contradiction, leaving the operator no
-	// way through.
-	if !ok || !bs.DataDirRecorded {
+	// With a record, its DataDir is authoritative: every bootstrap record
+	// states it ("" means the tree is rooted under NodeHostDir), and a
+	// WithImportDataDir that disagrees is a contradiction, refused below.
+	// Without one (a shard started with join=true records none), the layout
+	// is unknown.
+	if !ok {
 		// No recorded layout. Only the caller can supply it, and a wrong
 		// guess costs the artifact's DEK, so refuse rather than assume.
 		if !iopts.dataDirSet {
@@ -8954,8 +8950,7 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 // The shard's snapshot-tree root is DISCOVERED from the Config.DataDir
 // StartShard recorded in the LogDB bootstrap record. When there is no such
 // record (a shard started with join=true, or one this host has never started —
-// the disaster-recovery case), or when the record predates the DataDir field
-// and therefore carries none, the layout cannot be discovered and the import
+// the disaster-recovery case), the layout cannot be discovered and the import
 // fails closed with ErrImportLayoutUnknown; pass WithImportDataDir to state it,
 // using WithImportDataDir("") to assert the shard has no DataDir. A supplied
 // value that contradicts the recorded one is refused with

@@ -117,13 +117,9 @@ recovery path builds its reader from this field, never from
 change is decoded wrongly. The zero value is `config.NoCompression`.
 
 **`Bootstrap`**: `Addresses`, `Join`, `Type`, `DataDir` (the shard's
-`Config.DataDir`; empty when the shard roots under `NodeHostDir`),
-`DataDirRecorded`. `DataDirRecorded` is a property of the stored record, set by
-the backend, and a value passed to `SaveBootstrap` is ignored. It separates
-"recorded as rooting under `NodeHostDir`" from "the record says nothing about
-`DataDir`", because `""` is itself a meaningful value. The in-tree backends
-write the field in every record and always report it recorded; the flag is
-for a `LogDB` implementation that cannot.
+`Config.DataDir`; empty when the shard roots under `NodeHostDir`). `""` is a
+meaningful value, so a `LogDB` backend persists `DataDir` in every bootstrap
+record; a record that cannot state it is not a valid record.
 
 **`Update`**: `ShardID`, `ReplicaID`, `State`, `Entries`, `Snapshot`.
 
@@ -513,7 +509,7 @@ The membership section:
 ```
 
 Every record carries `DataDirLen`, possibly zero (the shard roots under
-`NodeHostDir`), and replays with `DataDirRecorded = true`. A record that ends at
+`NodeHostDir`). A record that ends at
 the address map is refused with `ErrTruncatedBootstrapRecord`, as is one with
 bytes after `DataDir`. `DataDirLen` is bounded at 4096
 (`maxBootstrapDataDirLen`).

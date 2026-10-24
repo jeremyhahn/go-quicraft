@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
@@ -339,127 +338,25 @@ func TestImportSnapshot_RejectsDataDirContradictingTheRecord(t *testing.T) {
 		t.Fatal("a refused import still recorded a snapshot in LogDB")
 	}
 
-	// A recorded DataDir only WINS when the record actually carries one. The
-	// same host, the same shard, the same declaration — but a record written
-	// before the DataDir field existed — must not be read as "this shard has no
-	// DataDir": see TestImportSnapshot_LegacyBootstrapRecordWithoutDataDir.
+	// A record that states DataDir "" is just as authoritative: the shard's
+	// tree is rooted under NodeHostDir, and declaring a DataDir contradicts it.
 	db.mu.Lock()
-	legacy := db.bootstraps[mockNodeKey{shardID, replicaID}]
-	legacy.DataDir = ""
-	legacy.DataDirRecorded = false
-	db.bootstraps[mockNodeKey{shardID, replicaID}] = legacy
+	rooted := db.bootstraps[mockNodeKey{shardID, replicaID}]
+	rooted.DataDir = ""
+	db.bootstraps[mockNodeKey{shardID, replicaID}] = rooted
 	db.mu.Unlock()
 
 	if impErr := h.ImportSnapshot(context.Background(), shardID,
-		bytes.NewReader(artifact), WithImportDataDir(dataDir)); impErr != nil {
-		t.Fatalf("declaring the shard's real DataDir against a record that carries "+
-			"none: err = %v, want success — the record proves nothing, so the "+
-			"operator's assertion is the only evidence there is", impErr)
+		bytes.NewReader(artifact), WithImportDataDir(dataDir)); !errorsIsImportMismatch(impErr) {
+		t.Fatalf("declaring a DataDir against a record that states none: err = %v, "+
+			"want ErrImportDataDirMismatch", impErr)
 	}
 }
 
-// A bootstrap record written BEFORE logdb.Bootstrap.DataDir existed decodes
-// the field as "", which is indistinguishable from a shard that genuinely roots
-// its snapshot tree under the host's NodeHostDir. Reading that as PROOF was
-// wrong in both directions, and every shard bootstrapped before the field
-// existed was broken both ways:
-//
-//   - with no WithImportDataDir the import silently resolved to NodeHostDir. For
-//     a shard that actually has a DataDir the artifact then lands outside the
-//     tree snapshot GC and the DEK purge-floor scan enumerate, so the next
-//     PurgeEpochsBefore destroys the key it needs — exactly the destruction the
-//     recorded-DataDir mechanism was added to prevent.
-//   - WITH the documented escape hatch the import was REFUSED as a
-//     contradiction, so the operator had no way through at all.
-//
-// "Absent" is now distinguishable from "empty" on the wire (Bootstrap
-// .DataDirRecorded), the same way snapshot.meta distinguishes an absent Epoch.
-func TestImportSnapshot_LegacyBootstrapRecordWithoutDataDir(t *testing.T) {
-	const shardID, replicaID uint64 = 44, 1
-	dataDir := t.TempDir()
-
-	newHostWithLegacyRecord := func(t *testing.T) (*Host, *mockLogDB, config.HostConfig) {
-		t.Helper()
-		cfg := testHostConfig(t)
-		db := newMockLogDB()
-		db.mu.Lock()
-		db.nodeInfos = []logdb.NodeInfo{{ShardID: shardID, ReplicaID: replicaID}}
-		// A record as an older build wrote it: addresses and type, no DataDir
-		// field at all.
-		db.bootstraps[mockNodeKey{shardID, replicaID}] = logdb.Bootstrap{
-			Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
-		}
-		db.mu.Unlock()
-		h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
-		if err != nil {
-			t.Fatalf("NewHost failed: %v", err)
-		}
-		t.Cleanup(func() { h.Close() })
-		return h, db, cfg
-	}
-
-	artifact := func() []byte {
-		return buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
-			snapshotEnvelope([]byte("disaster-recovery restore")))
-	}
-
-	t.Run("absent and undeclared fails closed", func(t *testing.T) {
-		h, db, _ := newHostWithLegacyRecord(t)
-		impErr := h.ImportSnapshot(context.Background(), shardID,
-			bytes.NewReader(artifact()))
-		if !errorsIsImportUnknown(impErr) {
-			t.Fatalf("import against a record that predates DataDir: err = %v, want "+
-				"ErrImportLayoutUnknown; resolving to NodeHostDir here writes a "+
-				"DataDir shard's artifact outside its tree and the next "+
-				"PurgeEpochsBefore destroys its DEK", impErr)
-		}
-		if _, getErr := db.GetSnapshot(shardID, replicaID); getErr == nil {
-			t.Fatal("a refused import still recorded a snapshot in LogDB")
-		}
-	})
-
-	t.Run("absent but declared trusts the operator", func(t *testing.T) {
-		h, db, cfg := newHostWithLegacyRecord(t)
-		if impErr := h.ImportSnapshot(context.Background(), shardID,
-			bytes.NewReader(artifact()), WithImportDataDir(dataDir)); impErr != nil {
-			t.Fatalf("WithImportDataDir against a record that predates the field: "+
-				"err = %v, want success — refusing the documented escape hatch "+
-				"leaves the operator no way to import at all", impErr)
-		}
-		imported, getErr := db.GetSnapshot(shardID, replicaID)
-		if getErr != nil {
-			t.Fatalf("GetSnapshot failed: %v", getErr)
-		}
-		want := engine.SnapshotSaveDir(
-			shardSnapshotBaseDir(cfg.NodeHostDir, dataDir, shardID), shardID, replicaID, 900)
-		if imported.Filepath != want {
-			t.Fatalf("imported snapshot Filepath = %q, want %q (the DECLARED tree)",
-				imported.Filepath, want)
-		}
-	})
-
-	t.Run("absent and declared empty roots under NodeHostDir", func(t *testing.T) {
-		h, db, cfg := newHostWithLegacyRecord(t)
-		if impErr := h.ImportSnapshot(context.Background(), shardID,
-			bytes.NewReader(artifact()), WithImportDataDir("")); impErr != nil {
-			t.Fatalf("WithImportDataDir(\"\") against a legacy record: %v", impErr)
-		}
-		imported, getErr := db.GetSnapshot(shardID, replicaID)
-		if getErr != nil {
-			t.Fatalf("GetSnapshot failed: %v", getErr)
-		}
-		want := engine.SnapshotSaveDir(
-			shardSnapshotBaseDir(cfg.NodeHostDir, "", shardID), shardID, replicaID, 900)
-		if imported.Filepath != want {
-			t.Fatalf("imported snapshot Filepath = %q, want %q", imported.Filepath, want)
-		}
-	})
-}
-
-// StartShard's bootstrap record must always say that it carries a DataDir, so
-// an import of a shard this host started never falls into the legacy branch
-// above. Asserted against the LogDBs a Host actually runs on.
-func TestStartShard_BootstrapRecordMarksDataDirRecorded(t *testing.T) {
+// StartShard's bootstrap record states the shard's DataDir, empty or not, so
+// an import of a shard this host started resolves its layout from the record.
+// Asserted against the LogDBs a Host actually runs on.
+func TestStartShard_BootstrapRecordStatesDataDir(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		dataDir bool
@@ -490,10 +387,6 @@ func TestStartShard_BootstrapRecordMarksDataDirRecorded(t *testing.T) {
 			bs, ok, bsErr := db.GetBootstrap(shardID, replicaID)
 			if bsErr != nil || !ok {
 				t.Fatalf("GetBootstrap: ok=%v err=%v", ok, bsErr)
-			}
-			if !bs.DataDirRecorded {
-				t.Fatal("StartShard's bootstrap record does not mark DataDir as recorded, " +
-					"so an import of this shard would be refused as an undiscoverable layout")
 			}
 			if bs.DataDir != shardCfg.DataDir {
 				t.Fatalf("recorded DataDir = %q, want %q", bs.DataDir, shardCfg.DataDir)

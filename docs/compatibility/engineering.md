@@ -258,6 +258,11 @@ version byte naming no known KDF, with `ErrKDFUnsupportedVersion` before any key
 derivation runs. There is no fallback to the strategy's configured KDF, so such
 a blob is wiped and resealed.
 
+A `LogDB` backend persists `DataDir` in every bootstrap record, so
+`Host.ImportSnapshot` takes a record's `DataDir`, `""` included, as the
+shard's layout and refuses a contradicting `WithImportDataDir`; there is no
+per-record flag for a record that does not state it (#482).
+
 `sealedStateMACVersion` is 2: the metadata MAC covers `LoadGeneration`, because
 the barrier refuses to encrypt on the strength of that counter and an
 unauthenticated field would be a passphrase-free way to stop a node writing.

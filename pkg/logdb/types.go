@@ -217,27 +217,11 @@ type Bootstrap struct {
 	// computed by SCANNING the tree, lets the next PurgeEpochsBefore destroy
 	// the DEK the artifact needs.
 	//
-	// DataDirRecorded — not the emptiness of this string — is what says
-	// whether a backend stated it at all.
+	// DataDir "" is a meaningful VALUE: the shard's tree is rooted under the
+	// host's NodeHostDir. A backend therefore persists DataDir in every
+	// bootstrap record, so a record always states it; a record that cannot
+	// state it is not a valid record and is refused, never read as "".
 	DataDir string
-
-	// DataDirRecorded reports whether the stored record actually CARRIES the
-	// DataDir field.
-	//
-	// DataDir "" is a meaningful VALUE ("this shard roots its tree under the
-	// host's NodeHostDir"), so a caller that reads an unstated field's zero
-	// value as that statement is trusting a field nobody wrote.
-	// Host.ImportSnapshot would then write the artifact under NodeHostDir for
-	// a shard whose tree is actually under its own DataDir — outside
-	// everything snapshot garbage collection and the DEK purge-floor scan
-	// enumerate — and simultaneously REFUSE the operator's WithImportDataDir
-	// override as a contradiction.
-	//
-	// It is a property of the RECORD, not of the caller's request: a backend
-	// sets it when it stores a record. The in-tree backends write the field in
-	// every record, so they always report true, and waldb refuses to replay a
-	// record without it. A value passed to SaveBootstrap is ignored.
-	DataDirRecorded bool
 }
 
 // Update represents a batch of state changes for a single shard

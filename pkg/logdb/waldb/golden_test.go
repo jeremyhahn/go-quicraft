@@ -64,7 +64,7 @@ func goldenWALBootstrap() logdb.Bootstrap {
 	return logdb.Bootstrap{
 		Addresses: map[uint64]string{1: "a:1"},
 		Join:      true, Type: 2,
-		DataDir: "/var/lib/quicraft/1", DataDirRecorded: true,
+		DataDir: "/var/lib/quicraft/1",
 	}
 }
 

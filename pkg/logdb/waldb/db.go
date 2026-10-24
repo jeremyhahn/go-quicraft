@@ -2584,11 +2584,10 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 	s.bootstraps[key] = logdb.Bootstrap{
-		Addresses:       addrs,
-		Join:            join,
-		Type:            smType,
-		DataDir:         dataDir,
-		DataDirRecorded: true,
+		Addresses: addrs,
+		Join:      join,
+		Type:      smType,
+		DataDir:   dataDir,
 	}
 	// Pin the segment so post-recovery compaction does not delete the sole
 	// durable copy of this bootstrap record.
@@ -4222,8 +4221,7 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	s.dataMu.Lock()
 	// The in-memory copy must describe the BYTES just written: a GetBootstrap
 	// served before the next restart has to agree with a replay of the very same
-	// record. Every record carries the DataDir field, so it is recorded.
-	bs.DataDirRecorded = true
+	// record.
 	// Deep-copied for the same reason writeSnapshot is: bs is the caller's
 	// value, its Addresses map is retained here and served from GetBootstrap,
 	// and memdb copies. Storing the reference let the owning layer mutate a
@@ -4855,31 +4853,9 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	return result, nil
 }
 
-// SaveBootstrap persists bootstrap information for a node.
-//
-// The record always carries the DataDir field, so the stored bootstrap reports
-// DataDirRecorded true regardless of what the caller passed: a caller states a
-// DataDir, it does not get to state that nobody ever stated one.
+// SaveBootstrap persists bootstrap information for a node. The record always
+// carries the DataDir field.
 func (db *DB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
-	return db.saveBootstrap(shardID, replicaID, bootstrap)
-}
-
-// saveBootstrapPreservingProvenance persists a bootstrap record COPIED from
-// another DB, refusing one that does not state its DataDir.
-//
-// "Absent" and "empty" are different statements: empty means the shard roots
-// its snapshot tree under the host's NodeHostDir, absent means nothing is
-// known. Copying an absent record through SaveBootstrap would turn it into an
-// explicit DataDir="" — which Host.ImportSnapshot then acts on, writing the
-// artifact under NodeHostDir for a shard whose tree is actually under its own
-// DataDir (outside everything snapshot GC and the DEK purge-floor scan
-// enumerate). Replay refuses a record without the field, so a waldb source
-// never yields one; the check keeps a migration from fabricating the
-// statement should any other source.
-func (db *DB) saveBootstrapPreservingProvenance(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
-	if !bootstrap.DataDirRecorded {
-		return ErrBootstrapDataDirProvenance
-	}
 	return db.saveBootstrap(shardID, replicaID, bootstrap)
 }
 

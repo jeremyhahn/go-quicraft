@@ -124,11 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING, on disk** (#473): WAL replay refuses a bootstrap record (`0x04`)
   that ends at the address map without the `DataDir` field, with
-  `ErrTruncatedBootstrapRecord`; it replayed as `DataDirRecorded = false`.
-  Every record this build writes carries the field, so `waldb` now always
-  reports `DataDirRecorded = true`, and `Reencrypt` refuses to copy a record
-  that reports it unrecorded (`ErrBootstrapDataDirProvenance`). Wipe and
-  re-sync.
+  `ErrTruncatedBootstrapRecord`. Every record this build writes carries the
+  field. Wipe and re-sync.
+- **BREAKING, API** (#482): `logdb.Bootstrap.DataDirRecorded` and
+  `waldb.ErrBootstrapDataDirProvenance` are removed; a third-party LogDB
+  backend must persist `DataDir` in every bootstrap record.
+  `Host.ImportSnapshot` takes a record's `DataDir`, `""` included, as
+  authoritative; only a shard with no record needs `WithImportDataDir`.
 
 - **BREAKING, wire and on disk** (#449): `MessageBatch`'s fixed header grows
   from 24 to 32 bytes (`MaxBinVer`), `ConfigChange` gains `WireVersion` (fixed

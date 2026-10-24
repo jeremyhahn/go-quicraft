@@ -738,11 +738,6 @@ func (m *MemDB) SaveBootstrap(shardID uint64, replicaID uint64, bootstrap logdb.
 	}
 	defer m.removalMu.RUnlock()
 
-	// A record stored by this version always carries an explicit DataDir, so
-	// mark it recorded regardless of what the caller passed: DataDirRecorded
-	// describes the RECORD, not the request, and a reader must be able to tell
-	// "the shard has no DataDir" from "nothing was ever written here".
-	bootstrap.DataDirRecorded = true
 	// Deep-copy the address map for exactly the reason Entry.Cmd and every
 	// Membership map are copied: the caller owns it and may reuse or mutate it
 	// after the call. This was the ONE write path that did not, so a caller

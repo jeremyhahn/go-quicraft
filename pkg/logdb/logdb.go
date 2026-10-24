@@ -142,7 +142,10 @@ type LogDB interface {
 	// ListNodeInfo returns all NodeInfo entries in the LogDB.
 	ListNodeInfo() ([]NodeInfo, error)
 
-	// SaveBootstrap persists bootstrap information for a node.
+	// SaveBootstrap persists bootstrap information for a node. A backend
+	// persists every field, DataDir included, in every bootstrap record:
+	// DataDir "" is a stated value (the tree is rooted under NodeHostDir),
+	// so GetBootstrap must never return a record that did not state it.
 	SaveBootstrap(shardID uint64, replicaID uint64, bootstrap Bootstrap) error
 
 	// GetBootstrap returns the bootstrap information for a node.

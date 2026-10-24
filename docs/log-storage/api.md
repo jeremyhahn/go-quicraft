@@ -303,7 +303,7 @@ Sentinels: `ErrCorruptedRecord`, `ErrMidSegmentCorruption`,
 `ErrBarrierContextBindingUnreportable`, `ErrBarrierContextUnresolved`,
 `ErrBarrierContextBindingChanged`, `ErrLandingSegmentOverflow`,
 `ErrDBPoisoned`, `ErrDiskFull`, `ErrRecordTooLarge`, `ErrCmdTooLarge`,
-`ErrMembershipTooLarge`, `ErrBootstrapDataDirProvenance`, `ErrSegmentFull`,
+`ErrMembershipTooLarge`, `ErrSegmentFull`,
 `ErrClosed`, `ErrBufferTooSmall`, `ErrInvalidRecordType`,
 `ErrSnapshotReencryptRequired`, the replay decode errors
 (`ErrTruncatedEntryRecord`, `ErrTruncatedStateRecord`,

@@ -261,17 +261,12 @@ func (m *mockLogDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	return m.nodeInfos, nil
 }
 
-// SaveBootstrap stamps DataDirRecorded, exactly as memdb and waldb do: a record
-// written by this version always carries an explicit DataDir. A test that wants
-// a LEGACY record (one written before the field existed) seeds m.bootstraps
-// directly and leaves the flag clear.
 func (m *mockLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.saveBootstrapErr != nil {
 		return m.saveBootstrapErr
 	}
-	bootstrap.DataDirRecorded = true
 	m.bootstraps[mockNodeKey{shardID, replicaID}] = bootstrap
 	return nil
 }

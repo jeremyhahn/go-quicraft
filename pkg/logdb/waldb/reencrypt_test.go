@@ -565,53 +565,12 @@ func TestReencrypt_PreservesBootstrapDataDir(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("GetBootstrap(%d) after migration = (%+v, %v, %v)", tc.shard, got, ok, err)
 		}
-		if !got.DataDirRecorded || got.DataDir != tc.dataDir {
-			t.Errorf("the migrated record for shard %d = %+v, want DataDir %q recorded",
+		if got.DataDir != tc.dataDir {
+			t.Errorf("the migrated record for shard %d = %+v, want DataDir %q",
 				tc.shard, got, tc.dataDir)
 		}
 		if got.Type != 7 || got.Addresses[replicaID] != tc.addr {
 			t.Errorf("the migrated record for shard %d lost content: %+v", tc.shard, got)
 		}
-	}
-}
-
-// TestSaveBootstrapPreservingProvenance_RefusesFabricatedAbsence pins the fail-
-// closed half: a record that carries a DataDir while claiming the field was
-// never recorded is a pair no writer and no replay can produce. Dropping the
-// DataDir silently would cost the artifact's DEK at the next purge.
-func TestSaveBootstrapPreservingProvenance_RefusesFabricatedAbsence(t *testing.T) {
-	for _, dataDir := range []string{"/tenant/volume", ""} {
-		db := openTestDB(t)
-		err := db.saveBootstrapPreservingProvenance(1, 1, logdb.Bootstrap{
-			Addresses:       map[uint64]string{1: "127.0.0.1:1"},
-			DataDir:         dataDir,
-			DataDirRecorded: false,
-		})
-		if !errors.Is(err, ErrBootstrapDataDirProvenance) {
-			t.Fatalf("saveBootstrapPreservingProvenance(DataDir %q) = %v, want ErrBootstrapDataDirProvenance", dataDir, err)
-		}
-		if _, ok, getErr := db.GetBootstrap(1, 1); ok || getErr != nil {
-			t.Fatalf("the refused write still stored a record (ok=%v, err=%v)", ok, getErr)
-		}
-	}
-}
-
-// TestSaveBootstrap_AlwaysRecordsDataDir pins the exported contract the
-// migration path deliberately bypasses: a caller cannot claim absence.
-func TestSaveBootstrap_AlwaysRecordsDataDir(t *testing.T) {
-	db := openTestDB(t)
-	if err := db.SaveBootstrap(1, 1, logdb.Bootstrap{
-		Addresses:       map[uint64]string{1: "127.0.0.1:1"},
-		DataDirRecorded: false,
-	}); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-	bs, ok, err := db.GetBootstrap(1, 1)
-	if err != nil || !ok {
-		t.Fatalf("GetBootstrap = (%+v, %v, %v)", bs, ok, err)
-	}
-	if !bs.DataDirRecorded {
-		t.Error("SaveBootstrap honoured the caller's DataDirRecorded=false; the record it " +
-			"wrote carries the field, so a replay would disagree with this read")
 	}
 }

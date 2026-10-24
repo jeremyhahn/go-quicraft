@@ -4253,9 +4253,6 @@ func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
 	if got.DataDir != dataDir {
 		t.Fatalf("DataDir = %q after reopen, want %q", got.DataDir, dataDir)
 	}
-	if !got.DataDirRecorded {
-		t.Fatal("DataDirRecorded is false after reopen although the record carries a DataDir")
-	}
 	if len(got.Addresses) != 2 || got.Addresses[2] != "addr2" || got.Type != 3 {
 		t.Fatalf("the trailing DataDir field disturbed the rest of the record: %+v", got)
 	}
@@ -4267,20 +4264,12 @@ func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
 	if plain.DataDir != "" {
 		t.Fatalf("DataDir = %q for a shard with none, want empty", plain.DataDir)
 	}
-	// An EMPTY DataDir is still an explicit statement ("this shard roots its
-	// tree under the host's NodeHostDir"), and must be distinguishable from the
-	// legacy record below, which states nothing.
-	if !plain.DataDirRecorded {
-		t.Fatal("DataDirRecorded is false for a record written by this version with an " +
-			"empty DataDir; the import path cannot then tell it from a pre-DataDir " +
-			"record and refuses a shard it could have resolved")
-	}
 }
 
 // The in-memory record SaveBootstrap publishes must agree with what a replay of
-// the same bytes produces: a GetBootstrap served before the next restart cannot
-// report the DataDir field as absent when the record on disk carries it.
-func TestSaveBootstrap_MarksDataDirRecordedBeforeReopen(t *testing.T) {
+// the same bytes produces: a GetBootstrap served before the next restart
+// reports the DataDir the record on disk carries.
+func TestSaveBootstrap_DataDirBeforeReopen(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if err != nil {
@@ -4305,9 +4294,6 @@ func TestSaveBootstrap_MarksDataDirRecordedBeforeReopen(t *testing.T) {
 			got, found, err := db.GetBootstrap(11, 1)
 			if err != nil || !found {
 				t.Fatalf("GetBootstrap: found=%v err=%v", found, err)
-			}
-			if !got.DataDirRecorded {
-				t.Fatal("DataDirRecorded is false immediately after SaveBootstrap")
 			}
 			if got.DataDir != tc.dataDir {
 				t.Fatalf("DataDir = %q, want %q", got.DataDir, tc.dataDir)
