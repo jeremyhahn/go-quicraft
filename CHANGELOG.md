@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Restart routing follows the recovered membership only (#481): when
+  `StartShard` recovers state, the host routes exactly the recovered members
+  (voters, observers and witnesses), and the caller's `members` map is not
+  consulted. A replica listed only by the caller, including one the cluster
+  removed, is no longer routed. No wire or format change.
 - **BREAKING, on disk** (#469, #473): `SoftwareStrategy.UnsealRootKey` and
   `UnsealRootKeyProtected` refuse a sealed root key whose `Strategy` field is
   empty with `ErrStrategyMismatch` (it was read as the passphrase strategy),

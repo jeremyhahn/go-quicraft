@@ -5038,7 +5038,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// Address routing must follow the EFFECTIVE membership, not the
 	// bootstrap map: after a restart the recovered membership may contain
 	// observers and witnesses the caller never listed, and the transport
-	// cannot resolve a replica it has no address for.
+	// cannot resolve a replica it has no address for. On restart routing is
+	// exactly the recovered membership (Addresses, Observers, Witnesses); the
+	// caller's map is not consulted, so a replica it lists that the cluster
+	// removed or never added is not routed.
 	effectiveNodes := nodesCopy
 	if !nothingRecovered {
 		_, m := lr.NodeState()
@@ -5046,13 +5049,6 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			len(m.Addresses)+len(m.Observers)+len(m.Witnesses))
 		for _, group := range []map[uint64]string{m.Addresses, m.Observers, m.Witnesses} {
 			for id, addr := range group {
-				effectiveNodes[id] = addr
-			}
-		}
-		// A member recorded without an address (possible for entries that
-		// predate address tracking) falls back to the caller's map.
-		for id, addr := range nodesCopy {
-			if _, ok := effectiveNodes[id]; !ok {
 				effectiveNodes[id] = addr
 			}
 		}
