@@ -105,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- go-enclave v0.10.0-alpha (#487), its newest release, in the root module,
+  `contrib/dragonboat` and `test/performance/quicraft`. No Go API change.
+
 - Restart routing follows the recovered membership only (#481): when
   `StartShard` recovers state, the host routes exactly the recovered members
   (voters, observers and witnesses), and the caller's `members` map is not
@@ -219,6 +222,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reseal the barrier, and re-sync the node's data from peers.
 
 ### Fixed
+
+- `make deps-check` reports a failed update lookup as an error instead of
+  "current" (#487). `go list -m -u` exits 0 when it cannot look a module up
+  and leaves no update, which the gate read as current; such a direct
+  dependency is now an `ERROR` line and the run exits 2. A module replaced by
+  a directory is still current (#188).
 
 - `TestSnapshotOver0RTTRejected` runs under `-race` again (#438). The quic-go
   `Conn.peerParams` race it skipped for no longer reproduces on quic-go

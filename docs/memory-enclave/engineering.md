@@ -140,7 +140,7 @@ passes is valid for the callback alone.
   error matches `ErrLockedMemoryUnavailable` too. The cleanup helpers above log
   or drop it like any other release report.
 - **A nil `ByteAccess` or `Sealed` is a nil interface, not a valid
-  receiver.** go-enclave v0.9.0-alpha returns interfaces and a failed
+  receiver.** go-enclave v0.10.0-alpha returns interfaces and a failed
   constructor returns a nil one, so calling through it panics. The release
   helpers (`releaseEnclave`, `releaseSealed`, shamir's `release`) skip a nil
   value, which is why `Barrier.seal()` can release `b.rootKey` and
@@ -270,7 +270,7 @@ with an `enclave` field naming the role (`root key`, `epoch DEK`, ...) and the
 | Message | Helper | When |
 |---|---|---|
 | `quicraft/seal: locked memory release was refused or ran without a wipe` | `releaseEnclave` | `ByteAccess.Destroy` returned non-nil |
-| `quicraft/seal: sealed key release failed` | `releaseSealed` | `Sealed.Destroy` returned non-nil (never, in go-enclave v0.9.0-alpha) |
+| `quicraft/seal: sealed key release failed` | `releaseSealed` | `Sealed.Destroy` returned non-nil (never, in go-enclave v0.10.0-alpha) |
 
 `pkg/crypto/shamir` has no logger and logs nothing. `pkg/seal` logs barrier lifecycle
 events without naming key material; see

@@ -17,9 +17,12 @@
 #
 # Exit 0 = every module current, documented, or behind only a release under
 # GRACE_DAYS old. Exit 1 = at least one undocumented lag behind an older
-# release. Exit 2 = the check could not run, which is not a pass.
+# release. Exit 2 = the check could not run, or the update lookup failed for a
+# direct dependency (reported as an ERROR line): a module that could not be
+# checked is not current, so neither is a pass.
 
-set -eu
+# -f: lines are word-split into fields below, and an error message must not glob.
+set -euf
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
@@ -50,28 +53,37 @@ grace_end=$((now - GRACE_DAYS * 86400))
 
 status=0
 young=0
+lookups_failed=0
 
 for dir in $mods; do
-	# The exit status is checked: `go list -m -u` prints nothing when it
-	# cannot resolve the module graph (go.sum mismatch, unreachable proxy),
-	# and that must be exit 2, not a pass.
+	# A run that cannot be trusted is exit 2, never a pass. That covers both
+	# ways the lookup can fail: `go list` exiting non-zero because it cannot
+	# resolve the module graph (go.sum mismatch), and a per-module update
+	# lookup that errored (unreachable proxy or VCS, GOPROXY=off, a cache it
+	# cannot write). The second still exits 0 and leaves .Update empty, so
+	# -e is passed and .Error is read: a module with an error is an ERROR
+	# line, not "current".
 	#
-	# Each line is: path version -> update release-time [replacement].
-	# release-time is the newest release's publication time in Unix
-	# seconds, or - when the proxy does not report one.
+	# Each record starts with a marker. "ERR path version replacement|-
+	# message" is a failed lookup; the message is the error text, whose later lines (if
+	# any) carry no marker and are skipped, so only its first line is
+	# reported. "UPD path version -> update release-time [replacement]" is
+	# a module behind its newest release; release-time is that release's
+	# publication time in Unix seconds, or - when the proxy does not report
+	# one.
 	#
 	# A module replaced by a directory (the nested modules' `=> ../..`) has
 	# no update, whatever tag the registry reports. The replacement path is
 	# appended as a last field and judged below; a replacement by another
 	# module version is still checked.
-	if ! raw=$(cd "$dir" && go list -m -u \
-		-f '{{if and (not .Indirect) .Update}}{{.Path}} {{.Version}} -> {{.Update.Version}} {{if .Update.Time}}{{.Update.Time.Unix}}{{else}}-{{end}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}' \
+	if ! raw=$(cd "$dir" && go list -m -u -e \
+		-f '{{if and (not .Main) (not .Indirect)}}{{if .Error}}ERR {{.Path}} {{.Version}} {{if .Replace}}{{.Replace.Path}}{{else}}-{{end}} {{.Error.Err}}{{else if .Update}}UPD {{.Path}} {{.Version}} -> {{.Update.Version}} {{if .Update.Time}}{{.Update.Time.Unix}}{{else}}-{{end}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}{{end}}' \
 		all 2>&1); then
 		echo "deps-check: 'go list -m -u' failed in $dir; refusing to report a pass" >&2
 		printf '%s\n' "$raw" | sed 's/^/    /' >&2
 		exit 2
 	fi
-	behind=$(printf '%s\n' "$raw" | grep -v '^$' || true)
+	behind=$(printf '%s\n' "$raw" | grep -E '^(ERR|UPD) ' || true)
 
 	test -n "$behind" || continue
 
@@ -79,6 +91,18 @@ for dir in $mods; do
 		test -n "$line" || continue
 		# shellcheck disable=SC2086 # the fields are split on purpose
 		set -- $line
+		if [ "$1" = ERR ]; then
+			case "$4" in
+			.*|/*)
+				# Replaced by a directory: there is no release to look
+				# up, so a failed lookup does not matter (#188).
+				continue ;;
+			esac
+			echo "ERROR $dir: $2 $3: update lookup failed: ${line#ERR "$2" "$3" "$4" }"
+			lookups_failed=1
+			continue
+		fi
+		shift
 		path=$1
 		released=$5
 		repl=${6:-}
@@ -137,6 +161,14 @@ To clear this:
      DOCUMENTED PIN above the require line saying what breaks and what would
      unpin it. Do not add an exclusion to this script.
 EOF
+fi
+
+if [ "$lookups_failed" -ne 0 ]; then
+	echo "deps-check: an update lookup failed (ERROR lines above); a module that could not be checked is not current, refusing to report a pass" >&2
+	exit 2
+fi
+
+if [ "$status" -ne 0 ]; then
 	exit 1
 fi
 
