@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0-alpha] - 2026-10-25
+
+A MINOR bump: the v1.0.0 API freeze removes deprecated exported surfaces, and
+the wire and on-disk layouts change in place (pre-1.0, a breaking change takes
+the MINOR position; no format version constant changes).
+
 ### Added
 
 - rolling-upgrade wire window and committed wire-version switch (#449): every
