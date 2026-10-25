@@ -99,4 +99,20 @@ The v1.0.0 bar, on top of the above:
 - A publication mechanism for agent files exists (release). Met (#436): the agent files are published and scanned like any other file; `.gitattributes` export-ignores only the private forge workflows and the release trust anchor, and `test/releasability` enforces the list ([release/public-releasability.md](release/public-releasability.md)).
 - The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release). Met (#436): every published workflow passes the `test/releasability` scan; the private forge's own workflows are export-ignored ([release/public-releasability.md](release/public-releasability.md)).
 - Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage). Holding: every discriminator is at its pinned value ([compatibility/engineering.md](compatibility/engineering.md#version-discriminators)); it is met when v1.0.0 ships with none moved.
-- The rest of the bar is rows V1-A to V1-M of the `v1.0.0 bar` milestone, one issue each. V1-A (#437: doc drift, the upgrade and root-key-compromise runbooks, the non-goal decisions below) is Met; V1-B to V1-M are Open until their issues close.
+- The rest of the bar is the rows of the `v1.0.0 bar` milestone, one issue each (the letter L was not used). Every row is closed:
+  - V1-A, doc drift, the upgrade and root-key-compromise runbooks, the non-goal decisions above. Met (#437, #441).
+  - V1-B, deprecated API removed, typed Diag results, naming. Met (#439, #445).
+  - V1-C, legacy decoders removed. Met (#463, #467).
+  - V1-C2, metadata-less and unknown-KDF sealed root keys refused. Met (#469, #470).
+  - V1-C3, `Bootstrap.DataDirRecorded` removed. Met (#482, #484).
+  - V1-D, exclusive data-dir lock and host identity check. Met (#440, #446).
+  - V1-E, durable compaction floor; missing-prefix recovery fails closed. Met (#447, #452).
+  - V1-F, session settings agree across replicas. Met (#444, #451).
+  - V1-G, rolling-upgrade readiness: two-value window, committed switch. Met (#449, #456).
+  - V1-H, golden format fixtures and an exported-API gate. Met (#455, #457).
+  - V1-I, importable contrib module, `NAReadLocalNode`, `WriteHealthMetrics`. Met (#443, #450).
+  - V1-J, quic-go race re-check, warmup, coverage tolerance. Met (#438, #442).
+  - V1-K, live mTLS reload and CA rollover. Met (#448, #453).
+  - V1-M, pre-RC evidence: draft pins, fuzz corpora, benchmarks, leadership tests. Met (#464, #465).
+  - A1, restart routing follows the recovered membership only. Met (#481, #483).
+  - Also closed under the milestone: ECDHE-MLKEM re-pinned to RFC 10024 (#466, #468); the compatibility upgrade table (#471, #472); the remaining legacy decode fallbacks refused (#473, #476); the docs identifier and example sweep (#474, #475).

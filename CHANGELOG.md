@@ -105,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Docs: SPEC Release criteria records each closed v1.0.0 bar row as Met.
 - go-enclave v0.10.0-alpha (#487), its newest release, in the root module,
   `contrib/dragonboat` and `test/performance/quicraft`. No Go API change.
 
