@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.24.1-alpha] - 2026-10-25
+## [0.24.2-alpha] - 2026-10-25
 
-A PATCH: the release workflow's FIPS gate builds again.
+A PATCH: the release workflow's FIPS gate builds again. It carries the change
+v0.24.1-alpha was meant to publish.
 
 ### Fixed
 
 - `make build-fips` no longer takes a missing module cache for a read-only
   one. The release FIPS gate runs without the toolchain image and had been
   pointed at an empty offline proxy (#492).
+
+## [0.24.1-alpha] - 2026-10-25
+
+Tagged, not released. The tagged commit's VERSION file still read
+0.24.0-alpha, so the release workflow stopped at its tag check and published
+nothing. Its change ships in 0.24.2-alpha.
 
 ## [0.24.0-alpha] - 2026-10-25
 
