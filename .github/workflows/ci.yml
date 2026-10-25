@@ -1,4 +1,39 @@
-# ci-template: v1.25 (customized)
+# ci-template: v1.27.0 (customized)
+# v1.27.0 (Company Agent m1192 (6), item 27, 2026-10-25): a new `lint-gates`
+# job runs a repository's `make -k lint-gates` in the toolchain image in
+# parallel with the image job's `make lint`, not in series after it, so Lint's
+# wall time is the longer of the two, not their sum. The job runs the target
+# only when the Makefile or a tracked *.mk defines it; without one it prints
+# OK, builds no image and passes. It gets the toolchain image as the image job
+# does (`make docker-build`, then `make -s toolchain-image`) with the same
+# cache classes, skips on a draft, is on the PR tier (a docs-only PR runs it)
+# and is in CI Gate's needs and results check as `pr`. `make lint` and
+# `go vet` do not change. Adopting v1.27 in a repository whose `make lint`
+# lists lint-gates (or runs it from its recipe) removes lint-gates from the
+# lint target in the same PR, and a repository that ran `make lint-gates` as
+# a step of its lint or image job drops that step, or the gates run twice.
+# A gate that needs a network sets the job's IN_IMAGE_NETWORK (CUSTOMIZE).
+# v1.26.2 (Company Agent m1167 (5), ruling 145, 2026-10-24): main CI runs are
+# keyed per sha, so a merge never cancels the main run in progress. The main
+# group is `main-{event}-{sha}`: each commit's run on main is its own group
+# and runs to the end, and a schedule or workflow_dispatch run still never
+# shares a group with a push run. This supersedes v1.25's `main-{event}`
+# group (m857, m774 option (i)). cancel-in-progress stays a literal `true`, so
+# a PR's newer push still cancels its older run. Only the group changes.
+# v1.26.1 (Company Agent m1128 (9), 2026-10-24): a docs-only PR runs the repository's
+# releasability test (RELEASABILITY_TEST, CUSTOMIZE), which make coverage
+# runs on every other PR, so a private value in README.md or docs/ fails the
+# PR rather than the main push after it merges.
+# v1.26 (Company Agent m804 item 3, m809 item 3; ruling 137, 2026-10-24): a
+# draft pull request runs no CI. Every job but CI Gate skips when
+# github.event.pull_request.draft is true (Gitea sets it on a WIP: title),
+# and CI Gate fails on a draft without running anything, so no draft head
+# carries a green or skipped gate into its merge. Marking the PR ready
+# starts no run, and there is no edited or ready_for_review trigger (an
+# edited run would join the PR's group and cancel a run in flight): the
+# PR's own lane pushes an empty commit when the PR leaves draft.
+# go-quicraft: errfs, zero-rtt, cross-arch and modules need no skipped job, so
+# each carries the draft guard itself, as integration does.
 # v1.25 (Company Agent m857, 2026-10-20): main has one concurrency group per
 # event, so a newer push to main cancels the older in-progress main push run.
 # At 20:00Z go-qrdb had three main-push runs in progress on three commits and
@@ -373,6 +408,12 @@ env:
   # v1.24 (CA m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
   # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
   DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
+  # v1.26.1 (Company Agent m1128 (9)): the repository's releasability test, which
+  # a docs-only PR still runs because make coverage skips on it. CUSTOMIZE: the
+  # `go test` arguments, package and -run pattern (for example
+  # `./pkg/labstrings -run '^TestTheTrackedTreeIsPubliclyReleasable$'`).
+  # Empty means the repository has none.
+  RELEASABILITY_TEST: "./test/releasability/..."   # CUSTOMIZE (go-quicraft): the package make coverage runs it in
 
 jobs:
   # v1.24 (CA m749, m751 (a)): a PR whose every changed file matches DOCS_ONLY_PATTERN
@@ -382,6 +423,8 @@ jobs:
   changes:
     name: Changed files
     runs-on: ubuntu-latest
+    # v1.26: a draft PR runs no CI; the image job needs this one and skips with it.
+    if: ${{ !github.event.pull_request.draft }}
     outputs:
       docs_only: ${{ steps.diff.outputs.docs_only }}
     steps:
@@ -536,7 +579,9 @@ jobs:
 
       # make lint: gofmt, vet, golangci-lint, actionlint with shellcheck
       # (devops.md §4). .golangci.yml enables staticcheck, errcheck, unused,
-      # ineffassign, misspell and gocritic (devops.md §8).
+      # ineffassign, misspell and gocritic (devops.md §8). v1.27: a repo's
+      # `make lint-gates` runs in the lint-gates job beside this one, never
+      # here and never as a prerequisite of lint.
       - name: make lint
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
         # >>> CUSTOMIZE (go-quicraft)
@@ -546,6 +591,13 @@ jobs:
           IN_IMAGE_NETWORK: bridge
         # <<< CUSTOMIZE
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+
+      # v1.26.1 (Company Agent m1128 (9)): a docs-only PR skips make coverage, so
+      # it runs the releasability test alone; any other run gets it from make
+      # coverage.
+      - name: Releasability test (docs-only PR)
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 -tags '$GO_BUILD_TAGS' $RELEASABILITY_TEST"
 
       # v1.9.2, now in the image: the declared tag set must select code. Each
       # tag is checked by removal: if dropping it changes no selected file
@@ -570,16 +622,6 @@ jobs:
       - name: make coverage (unit tests and the threshold)
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make coverage GO_BUILD_TAGS='$GO_BUILD_TAGS' COVERAGE_THRESHOLD=$COVERAGE_THRESHOLD"
-
-      # >>> CUSTOMIZE (go-quicraft)
-      # A docs-only PR skips make coverage, which carries test/releasability:
-      # the scan of every tracked file, markdown included, for values that
-      # cannot be published. Docs are what that scan mostly reads, so a
-      # docs-only PR runs that package alone.
-      - name: Releasability scan (docs-only PR)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only == 'true' }}
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 ./test/releasability/"
-      # <<< CUSTOMIZE
 
       # make security: gosec, govulncheck, go mod verify (devops.md §8), with
       # trivy fs per the phase (§8a). The target owns gosec's flags and its
@@ -619,6 +661,91 @@ jobs:
           rm -f "$RUNNER_TEMP/gomodauth.env" it-image.tar
           [ -z "${IT_LEASE:-}" ] || docker rm "$IT_LEASE" >/dev/null || true
 
+  # v1.27 (Company Agent m1192 (6), item 27): a repository's `make lint-gates`
+  # (its own gates beside `make lint`: script, workflow, generated-code and
+  # module checks) runs in this job, in parallel with the image job's
+  # `make lint`, not in series after it, so Lint's wall time is the longer of
+  # the two and not their sum. It runs only when the Makefile (or a tracked
+  # *.mk) defines a lint-gates target; a repository without one gets an OK and
+  # a green job, with no image built. `make lint` and `go vet` stay where they
+  # are. A repository whose `make lint` lists lint-gates as a prerequisite
+  # removes it from lint in the PR that adopts v1.27, or the gates run twice.
+  # The toolchain image comes from `make docker-build`, as in the image job,
+  # which builds only a tag the daemon does not already hold (devcontainer.md
+  # §6). A lint-class check, so it is on the PR tier and runs on a docs-only PR.
+  lint-gates:
+    name: Lint Gates [toolchain image]
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    if: ${{ !github.event.pull_request.draft }}   # v1.26
+    timeout-minutes: 45       # CUSTOMIZE: the repo's lint-gates time, with honest headroom
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      # v1.22: the cache volumes' trust class (as in the image job).
+      CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # v1.21.1: mask the forge credentials before any other step (as above).
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      # A source check on the runner's shell: no make recipe runs here.
+      - name: Does the Makefile define lint-gates?
+        id: probe
+        run: |
+          mapfile -t mk < <(git ls-files -- Makefile '*.mk')
+          if [ "${#mk[@]}" -gt 0 ] && grep -qE '^lint-gates[[:space:]]*:([^=]|$)' "${mk[@]}"; then
+            echo "lint-gates target found"
+            echo "has_target=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "OK: no lint-gates target in the Makefile; nothing to run"
+            echo "has_target=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reap stale CI stacks
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
+
+      # make docker-build needs the integration image's name (as in the image
+      # job); this job never runs or leases that image.
+      - name: Name the integration image
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
+
+      - name: Build the devcontainer images
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # v1.22: bound this repo's cache volumes (as in the image job). It never
+      # fails the job and keeps every volume a container mounts.
+      - name: Trim the CI caches
+        if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
+        run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
+
+      # -k reports every failing gate in one pass.
+      - name: make lint-gates
+        if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
+        env:
+          IN_IMAGE_NETWORK: none   # CUSTOMIZE: bridge when a gate needs the module proxy or a network
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make -k lint-gates GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
   # Integration tests run in the integration image (ci-standard.md §2), as a
   # compose stack on the runner host started by `make integration-test`. The
   # stack is named per run under the repo's prefix, the job reaps stale stacks
@@ -626,7 +753,8 @@ jobs:
   # v1.23: full tier only (CI_FULL_TIER's expression); never on a plain PR.
   integration:
     name: Integration [integration image]
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    # v1.26: never on a draft PR, ci:full or not.
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: its coverage run is the other multi-node QUIC load.
@@ -869,7 +997,8 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    # v1.26: never on a draft PR, ci:full or not.
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -914,7 +1043,8 @@ jobs:
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    # v1.26: never on a draft PR, ci:full or not.
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
     timeout-minutes: 10
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1010,7 +1140,8 @@ jobs:
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    # v1.26: never on a draft PR, ci:full or not.
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -1071,7 +1202,8 @@ jobs:
   modules:
     name: Nested module build, vet and test [toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+    # v1.26: never on a draft PR, ci:full or not.
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
     timeout-minutes: 20
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1249,6 +1381,7 @@ jobs:
   arch-gates:
     name: Architecture Gates
     runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft }}   # v1.26
     env:
       OBJSTORE_SEAMS: ''      # CUSTOMIZE
     steps:
@@ -1281,7 +1414,7 @@ jobs:
     if: always()
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs.
-    needs: [changes, image, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
+    needs: [changes, image, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -1291,7 +1424,13 @@ jobs:
           FULL_TIER: ${{ env.CI_FULL_TIER }}
           # v1.24: a `nightly` job runs on schedule and workflow_dispatch only.
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          # v1.26: a draft PR runs no CI, so its gate fails rather than pass on skips.
+          DRAFT: ${{ github.event.pull_request.draft == true }}
         run: |
+          if [ "${DRAFT}" = true ]; then
+            echo "FAIL draft pull request: no CI runs on a draft. Mark it ready, then push an empty commit to start its run."
+            exit 1
+          fi
           BAD=0
           echo "full tier selected: ${FULL_TIER}; nightly selected: ${NIGHTLY}"
           check() { # <job> <result> <pr|full|nightly>
@@ -1313,6 +1452,7 @@ jobs:
           # workflow_dispatch is nightly; every other job is pr.
           check changes     "${{ needs.changes.result }}" pr
           check image       "${{ needs.image.result }}" pr
+          check lint-gates  "${{ needs.lint-gates.result }}" pr
           check integration "${{ needs.integration.result }}" full
           check soak        "${{ needs.soak.result }}" nightly
           check arch-gates  "${{ needs.arch-gates.result }}" pr

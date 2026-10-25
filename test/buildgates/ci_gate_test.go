@@ -176,6 +176,19 @@ const fullTierIf = `github.event_name != 'pull_request' || contains(github.event
 // schedule and workflow_dispatch only).
 const nightlyIf = `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`
 
+// notDraft is the ci-template v1.26 guard (ruling 137): a draft pull request
+// runs no CI. A PR-tier job with no skipped dependency carries it as its only
+// `if:`, and a full-tier job with none ANDs it onto fullTierIf; a job that
+// needs a guarded job skips with it and keeps its plain condition.
+const notDraft = `!github.event.pull_request.draft`
+
+// draftFullTierIf is fullTierIf with the v1.26 draft guard.
+const draftFullTierIf = `(` + fullTierIf + `) && ` + notDraft
+
+// draftGateFail is the line that makes ci-gate fail on a draft, so no skipped
+// draft run reads as passed.
+const draftGateFail = `if [ "${DRAFT}" = true ]; then`
+
 // TestCIGateTiersMatchTheJobs pins the three tiers to the gate.
 //
 // ci-gate passes a skipped job only when its check line tags it `full` and
@@ -200,10 +213,27 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	if !strings.Contains(body, "NIGHTLY: ${{ "+nightlyIf+" }}") {
 		t.Errorf("%s's NIGHTLY is not the nightly condition %q", gateJobName, nightlyIf)
 	}
+	if !strings.Contains(body, "DRAFT: ${{ github.event.pull_request.draft == true }}") ||
+		!strings.Contains(body, draftGateFail) {
+		t.Errorf("%s does not fail a draft pull request (ci-template v1.26)", gateJobName)
+	}
+	// ci-template v1.26.1: a docs-only PR skips make coverage, so it runs the
+	// releasability test alone, and only when the workflow names one.
+	if !regexp.MustCompile(`(?m)^  RELEASABILITY_TEST: "\./test/releasability/\.\.\."`).MatchString(body) {
+		t.Errorf("the workflow's RELEASABILITY_TEST is not ./test/releasability/... (ci-template v1.26.1)")
+	}
+	if !strings.Contains(body, "env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true'") {
+		t.Errorf("no step runs RELEASABILITY_TEST on a docs-only PR (ci-template v1.26.1)")
+	}
 
 	tiers := map[string]string{}
 	for _, c := range regexp.MustCompile(`(?m)^\s+check\s+(\S+)\s+"[^"]*"\s*(\S*)\s*$`).FindAllStringSubmatch(body, -1) {
 		tiers[c[1]] = c[2]
+	}
+	// ci-template v1.27.0: lint-gates runs beside the image job's make lint,
+	// on the PR tier, so a docs-only PR runs it too.
+	if tiers["lint-gates"] != "pr" {
+		t.Errorf("%s checks lint-gates as %q; want pr (ci-template v1.27.0)", gateJobName, tiers["lint-gates"])
 	}
 
 	for _, j := range ciJobs(t, body) {
@@ -211,18 +241,21 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			continue
 		}
 		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
-		hasFullIf := strings.Contains(job, "\n    if: ${{ "+fullTierIf+" }}\n")
+		hasFullIf := strings.Contains(job, "\n    if: ${{ "+fullTierIf+" }}\n") ||
+			strings.Contains(job, "\n    if: ${{ "+draftFullTierIf+" }}\n")
 		switch tiers[j] {
 		case "full":
 			if !hasFullIf {
-				t.Errorf("job %q is tagged full in %s but lacks `if: ${{ %s }}`", j, gateJobName, fullTierIf)
+				t.Errorf("job %q is tagged full in %s but lacks `if: ${{ %s }}` (or its v1.26 draft-guarded form)", j, gateJobName, fullTierIf)
 			}
 		case "nightly":
 			if !strings.Contains(job, "\n    if: ${{ "+nightlyIf+" }}\n") {
 				t.Errorf("job %q is tagged nightly in %s but lacks `if: ${{ %s }}`", j, gateJobName, nightlyIf)
 			}
 		case "pr":
-			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) {
+			// The v1.26 draft guard is the one `if:` a PR-tier job may carry.
+			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) &&
+				!regexp.MustCompile(`(?m)^    if: \$\{\{ `+regexp.QuoteMeta(notDraft)+` \}\}(\s+#.*)?$`).MatchString(job) {
 				t.Errorf("job %q is PR tier but carries a job-level `if:`; a PR-tier job "+
 					"must run on every event, and %s fails it when skipped", j, gateJobName)
 			}
