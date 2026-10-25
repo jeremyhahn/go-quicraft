@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1-alpha] - 2026-10-25
+
+A PATCH: the release workflow's FIPS gate builds again.
+
 ### Fixed
 
 - `make build-fips` no longer takes a missing module cache for a read-only
