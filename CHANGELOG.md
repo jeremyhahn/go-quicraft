@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `make build-fips` no longer takes a missing module cache for a read-only
+  one. The release FIPS gate runs without the toolchain image and had been
+  pointed at an empty offline proxy (#492).
+
 ## [0.24.0-alpha] - 2026-10-25
 
 A MINOR bump: the v1.0.0 API freeze removes deprecated exported surfaces, and

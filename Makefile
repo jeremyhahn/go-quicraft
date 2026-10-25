@@ -55,12 +55,13 @@ GO_TAGS_FLAG   = $(if $(strip $(GO_BUILD_TAGS)),-tags=$(GO_TAGS_CSV))
 
 # GOFIPS140=v1.0.0 unpacks the frozen FIPS module into the module cache, which
 # the toolchain image bakes read-only with GOPROXY=off (devcontainer.md §4).
-# Where the cache is not writable, FIPS_GOENV serves it as a file proxy into a
-# writable one outside the module (./... would walk it), so the snapshot builds
-# offline; elsewhere it is empty and the go tool uses the cache as is.
+# Where the cache exists and is not writable, FIPS_GOENV serves it as a file
+# proxy into a writable one outside the module (./... would walk it), so the
+# snapshot builds offline; elsewhere it is empty and the go tool uses the cache
+# as is. A missing cache is not a read-only one: it downloads as usual (#492).
 GOMODCACHE_DIR := $(shell $(GO) env GOMODCACHE 2>/dev/null)
 FIPS_MODCACHE  ?= $(or $(TMPDIR),/tmp)/go-quicraft-fips-modcache
-FIPS_GOENV     := $(if $(shell test -w '$(GOMODCACHE_DIR)' || echo ro),GOMODCACHE='$(FIPS_MODCACHE)' GOPROXY='file://$(GOMODCACHE_DIR)/cache/download' GOPRIVATE= GONOPROXY= GOFLAGS='-mod=readonly -modcacherw')
+FIPS_GOENV     := $(if $(shell test -d '$(GOMODCACHE_DIR)' && ! test -w '$(GOMODCACHE_DIR)' && echo ro),GOMODCACHE='$(FIPS_MODCACHE)' GOPROXY='file://$(GOMODCACHE_DIR)/cache/download' GOPRIVATE= GONOPROXY= GOFLAGS='-mod=readonly -modcacherw')
 GOBENCH       := $(GO) test -run=^$$ -bench=. -benchmem
 GOVET         := $(GO) vet
 GOFMT         := gofmt
