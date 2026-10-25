@@ -8,7 +8,7 @@ go 1.27.3
 // The release recipe (make release-alpha / release-candidate / release) pins
 // this require to the version it cuts and tags contrib/dragonboat/<version>
 // beside the root tag, so importers resolve the parent at that version.
-require github.com/jeremyhahn/go-quicraft v0.0.0
+require github.com/jeremyhahn/go-quicraft v0.24.0-alpha
 
 // In-tree builds use the parent tree this module ships with. A consumer's
 // build ignores this replace and follows the require above.
