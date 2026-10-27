@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI: ci-template v1.28.0 (`make deps-check` runs on every pull request, a docs-only PR included, as `make lint` does).
+
 ## [0.24.2-alpha] - 2026-10-25
 
 A PATCH: the release workflow's FIPS gate builds again. It carries the change

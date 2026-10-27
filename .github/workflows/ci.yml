@@ -1,4 +1,13 @@
-# ci-template: v1.27.0 (customized)
+# ci-template: v1.28.0 (customized)
+# v1.28.0 (Company Agent ruling 219(3), 2026-10-26): `make deps-check` joins
+# the PR tier as a lint-class gate. Its step in the image job drops the
+# CI_FULL_TIER condition and runs on every event, as `make lint` does, so a
+# module behind its dependency floor fails the PR, not main after the merge
+# (go-objstore main 8946d5f53 went red on its push run for exactly this; fixed
+# by go-objstore #127). The step keeps IN_IMAGE_NETWORK=bridge for the module
+# proxy and runs in seconds; it stays on the full tier too. The image job is
+# already `pr` in CI Gate, so no needs or results line changes. A repository
+# adopts v1.28 as a CI-file PR; none hand-patches its ci.yml ahead of it.
 # v1.27.0 (Company Agent m1192 (6), item 27, 2026-10-25): a new `lint-gates`
 # job runs a repository's `make -k lint-gates` in the toolchain image in
 # parallel with the image job's `make lint`, not in series after it, so Lint's
@@ -62,7 +71,8 @@
 # two tiers. A pull request runs the PR tier only: lint (with
 # assert-build-tags and arch-gates), build, and the unit suite under -race
 # (`make coverage`, so unit test and race are one step). Integration, Soak,
-# security, deps-check and trivy image do not run on a PR. The full tier runs
+# security, deps-check and trivy image do not run on a PR (v1.28 puts
+# deps-check on the PR tier). The full tier runs
 # on main after every merge (push), nightly (a new `schedule:` trigger), on
 # workflow_dispatch, and on a PR labelled ci:full (kept as the opt-in). A new
 # `soak` job loops the integration suite in the integration image for
@@ -470,8 +480,10 @@ jobs:
   # bridge) for the vulnerability databases and the module proxy.
   #
   # v1.23: lint, assert-build-tags, build and coverage are the PR tier and run
-  # on every event. security, deps-check and trivy image are full tier only
+  # on every event. security and trivy image are full tier only
   # (env.CI_FULL_TIER): main after every merge, nightly, dispatch, ci:full.
+  # v1.28: deps-check is a lint-class gate on the PR tier and runs on every
+  # event (ruling 219(3)).
   #
   # v1.22: every stage mounts the build and golangci-lint cache volumes, and a
   # bridge stage the module cache volume, from the runner's Docker host
@@ -636,8 +648,10 @@ jobs:
 
       # Fails when a library, first-party or third-party, is behind its latest
       # release without devops.md §9's documented reason (ci-standard.md §1).
+      # v1.28: a lint-class gate of seconds on the PR tier, every event, a
+      # docs-only PR included (ruling 219(3)); it was full tier only from v1.23.
       - name: make deps-check
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.CI_FULL_TIER == 'true' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
         env:
           IN_IMAGE_NETWORK: bridge
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make deps-check
