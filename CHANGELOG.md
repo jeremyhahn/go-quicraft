@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - CI: ci-template v1.28.0 (`make deps-check` runs on every pull request, a docs-only PR included, as `make lint` does).
+- Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 
 ## [0.24.2-alpha] - 2026-10-25
 
