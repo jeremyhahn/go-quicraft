@@ -124,6 +124,12 @@ USER dev:dev
 
 # ---------------------------------------------------------------------------
 FROM base AS integration
+# ci-template v1.29 (devcontainer.md §6): the Alpine package index checksum CI
+# reads (scripts/apk-index-sum.sh). A new sum misses the cache from here on, so
+# the upgrade below re-runs and takes the fixed package. Declared in this stage
+# only; base and toolchain do not take it.
+ARG APK_INDEX_SUM
+RUN apk upgrade --no-cache
 WORKDIR /src
 # The source only, by name, owned by root so the suite cannot rewrite it.
 COPY --chown=root:root go.mod go.sum ./

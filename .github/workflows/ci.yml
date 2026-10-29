@@ -1,4 +1,43 @@
-# ci-template: v1.28.0 (customized)
+# ci-template: v1.29.2 (customized)
+# v1.29.2 (Company Agent ruling 239(8), 2026-10-28): comments only; no job,
+# gate or tier changes. A CUSTOMIZE job gated on a changes output (a path-gated
+# suite) needs the image job too and tests an output of the image job in its
+# `if:`. On a pull_request, an `if:` that reads only `needs.changes.result` or
+# only `needs.changes.outputs.*` left such a job skipped unstarted (two runs
+# in a row); one that also tests the image job's output started it. A
+# repository needs no adoption PR.
+# v1.29.1 (Company Agent ruling 226(15), 108 repair, 2026-10-27): lint fails
+# fast. The lint-gates job runs `make lint-gates` without `-k`, so the first
+# failing gate ends the step. Under `-k` make went on running the other gates
+# after one had failed: in go-quicbaas run 68949 Lint took 51.5 min, 37 of
+# them after the `go vet` failure. A red gate now reports as soon as it fails,
+# and the gates after it run on the next push. No other job, gate or tier
+# changes. A repository adopts v1.29.1 as a CI-file PR.
+# v1.29.0 (Company Agent ruling 220(5) and 221(4), 2026-10-27):
+# the Alpine package index checksum joins the integration image's tag hash.
+# Before v1.29 the tag hashed only the tree, so a tree whose files had not
+# changed kept its cached image after Alpine shipped a fix, and `trivy image`
+# stayed red on a fixed CVE until an unrelated file moved (go-enclave main
+# fd83b79ce, CVE-2026-92392, libcurl 8.23.0-r0). A new step, "Read the Alpine
+# package index", runs scripts/apk-index-sum.sh (v1, ships beside this file)
+# and puts its value in APK_INDEX_SUM. Every job that names the integration
+# image (image, lint-gates, integration, soak) runs it before "Name the
+# integration image", so none waits for the image job's serial stages. The
+# repository's `make -s it-image` hashes APK_INDEX_SUM, and `make
+# docker-build` passes it to the integration image's build as `--build-arg
+# APK_INDEX_SUM`. The Dockerfile's `integration` stage declares the ARG and
+# then, as root, runs `apk upgrade --no-cache`, so a new sum misses the cache
+# from that step on (ci-standard.md §9, devcontainer.md §6); `base` and
+# `toolchain` do not declare it. So a new Alpine package release changes the
+# tag and forces a rebuild, with the fixed package. A base image the script
+# cannot read fails the job: a missing index is never a pass. A repository
+# adopts v1.29 as one PR: this file, scripts/apk-index-sum.sh (in its
+# shellcheck list), the Makefile's APK_INDEX_SUM in it-image and docker-build,
+# and the Dockerfile's ARG and apk upgrade. A repository whose integration
+# image has no apk base gets `none`, a constant, so its tag changes only with
+# its tree. The parallel stage jobs move to v1.30: `runs-on` cannot take a
+# needs output on Gitea 1.27.1 (run 68501), and the registry-push question is
+# with the owner (169).
 # v1.28.0 (Company Agent ruling 219(3), 2026-10-26): `make deps-check` joins
 # the PR tier as a lint-class gate. Its step in the image job drops the
 # CI_FULL_TIER condition and runs on every event, as `make lint` does, so a
@@ -359,6 +398,11 @@
 # serialised (integration after image; soak, netfault, contrib-dragonboat and
 # fips after integration): overlapping multi-node clusters under -race starve each
 # other and expire the 30s snapshot and rolling-restart waits.
+# v1.29: the Dockerfile's GO_IMAGE ARG has no default (the pin lives in
+# scripts/tool-pins.sh), so apk-index-sum.sh cannot read its FROM lines; every
+# "Read the Alpine package index" step sources the pin file and passes the base
+# image as APK_BASE_IMAGES. No CUSTOMIZE job is path-gated, so the v1.29.2
+# `if:` note has nothing to change here.
 # <<< CUSTOMIZE
 name: CI
 
@@ -490,6 +534,14 @@ jobs:
   # (in-toolchain-image.sh v2, ci-standard.md §6), so a stage writes its
   # caches there and not into its container's layer.
   #
+  # v1.29 (Company Agent ruling 220(5)): the job reads the Alpine package
+  # indexes the build resolves against (scripts/apk-index-sum.sh, ships beside
+  # this file) into APK_INDEX_SUM, which the integration image's tag hashes and
+  # its build takes as a build argument (ci-standard.md §9, devcontainer.md
+  # §6). A new Alpine package release, a CVE fix among them, changes the tag,
+  # so the next run rebuilds the image rather than reuse a cached one with the
+  # old package (go-enclave main fd83b79ce, CVE-2026-92392).
+  #
   # The forge credentials reach the image build only as the gomodauth BuildKit
   # secret, from a file outside the context that the job removes.
   # No step and no make target prints that file, the job environment (`env`,
@@ -537,6 +589,16 @@ jobs:
       # <repo>-ci-it:<hash> (`make -s it-image`, ci-standard.md §9), so every
       # job of every run on this runner names the same image for the same
       # tree, builds it once and reuses it. No job removes it; the reap step does.
+      # v1.29 (ruling 220(5)): the Alpine package index checksum joins the
+      # integration image's tag hash (scripts/apk-index-sum.sh). A base image
+      # the script cannot read fails the step. CUSTOMIZE (go-quicraft): the
+      # base image comes from scripts/tool-pins.sh as APK_BASE_IMAGES, since the
+      # Dockerfile's GO_IMAGE ARG has no default.
+      - name: Read the Alpine package index
+        run: |
+          sum=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
+          echo "APK_INDEX_SUM=$sum" >> "$GITHUB_ENV"
+
       - name: Name the integration image
         run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
 
@@ -687,6 +749,9 @@ jobs:
   # The toolchain image comes from `make docker-build`, as in the image job,
   # which builds only a tag the daemon does not already hold (devcontainer.md
   # §6). A lint-class check, so it is on the PR tier and runs on a docs-only PR.
+  # v1.29.1 (ruling 226(15), 108 repair): the step fails fast. `make
+  # lint-gates` runs without `-k`, so the first failing gate ends the step
+  # and the job; the gates after it run on the next push.
   lint-gates:
     name: Lint Gates [toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
@@ -728,6 +793,14 @@ jobs:
 
       # make docker-build needs the integration image's name (as in the image
       # job); this job never runs or leases that image.
+      # v1.29: the Alpine package index checksum, which that name hashes (as in
+      # the image job).
+      - name: Read the Alpine package index
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: |
+          sum=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
+          echo "APK_INDEX_SUM=$sum" >> "$GITHUB_ENV"
+
       - name: Name the integration image
         if: ${{ steps.probe.outputs.has_target == 'true' }}
         run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
@@ -749,12 +822,12 @@ jobs:
         if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
         run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
 
-      # -k reports every failing gate in one pass.
+      # v1.29.1: no -k; the first failing gate ends the step (ruling 226(15)).
       - name: make lint-gates
         if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
         env:
           IN_IMAGE_NETWORK: none   # CUSTOMIZE: bridge when a gate needs the module proxy or a network
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make -k lint-gates GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint-gates GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
       - name: Tear down
         if: always()
@@ -797,6 +870,12 @@ jobs:
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
+
+      # v1.29: the Alpine package index checksum (as in the image job).
+      - name: Read the Alpine package index
+        run: |
+          sum=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
+          echo "APK_INDEX_SUM=$sum" >> "$GITHUB_ENV"
 
       # v1.23: the content-addressed integration image (as in the image job).
       - name: Name the integration image
@@ -879,6 +958,12 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.29: the Alpine package index checksum (as in the image job).
+      - name: Read the Alpine package index
+        run: |
+          sum=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
+          echo "APK_INDEX_SUM=$sum" >> "$GITHUB_ENV"
+
       # v1.23: the content-addressed integration image (as in the image job).
       - name: Name the integration image
         run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
@@ -949,6 +1034,15 @@ jobs:
   # Gate's needs list and check lines. v1.23: such a suite is full tier (the
   # integration job's `if:`, `full` in CI Gate) unless it is lint, build,
   # unit or race, which stay on the PR tier.
+  # v1.29.2 (ruling 239(8)): a CUSTOMIZE job that runs only when certain
+  # paths change (the changes job gains an output for them, `optee` here)
+  # needs the image job as well, and its `if:` tests an image job output
+  # that its build step sets (here `built`, which the image job declares in
+  # `outputs:` when a repository adds such a job), never `needs.<job>.result`
+  # and never the changes job's outputs alone. Reading `needs.changes.outputs.*`
+  # in the same `if:` is fine:
+  #   needs: [changes, image]
+  #   if: ${{ !cancelled() && needs.image.outputs.built == 'true' && !github.event.pull_request.draft && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.optee == 'true')) }}
 
   # >>> CUSTOMIZE (go-quicraft)
   # Full-tier suites the unit run does not reach. Each command is the

@@ -1538,8 +1538,12 @@ TOOLCHAIN_IMAGE = go-quicraft-toolchain:$(TOOLCHAIN_TAG)
 # untracked but not ignored, so a changed file is a new tag and runs of one
 # tree on one daemon share one image (`make it-image`). A deleted tracked file
 # drops out of the hash. Recursive: only the targets that use it pay for it.
+# ci-template v1.29 (ruling 220(5), devcontainer.md §6): APK_INDEX_SUM, the
+# Alpine package index checksum CI reads with scripts/apk-index-sum.sh, joins
+# the hash, so a new Alpine package release is a new tag and a rebuild. Unset,
+# as on a workstation that has not read it, it hashes as empty.
 IT_INPUTS = $(DEVCONTAINER_DIR)/Dockerfile $(TOOL_PINS) go.mod go.sum pkg test
-IT_TAG    = $(shell { echo 'GO_IMAGE=$(GO_IMAGE)'; git ls-files -co --exclude-standard -- $(IT_INPUTS) | LC_ALL=C sort -u | xargs -r -d '\n' sha256sum 2>/dev/null; } | sha256sum | cut -c1-16)
+IT_TAG    = $(shell { echo 'GO_IMAGE=$(GO_IMAGE)'; echo 'APK_INDEX_SUM=$(APK_INDEX_SUM)'; git ls-files -co --exclude-standard -- $(IT_INPUTS) | LC_ALL=C sort -u | xargs -r -d '\n' sha256sum 2>/dev/null; } | sha256sum | cut -c1-16)
 # The integration image and the compose project it runs under. CI names the
 # project per run so that concurrent runs on one daemon never meet, and
 # scripts/reap-stale-ci-stacks.sh removes what a killed run left, the image
@@ -1571,13 +1575,16 @@ docker-build-toolchain:
 
 # Built only when the daemon lacks the tag: the tag is the content, so a held
 # image is this tree's (handbook devcontainer.md §6).
+# APK_INDEX_SUM reaches the integration stage only, whose `apk upgrade` it
+# re-runs when the index moves (ci-template v1.29).
 .PHONY: docker-build-it
 docker-build-it:
 	$(REQUIRE_BUILDX)
 	@if docker image inspect '$(IT_IMAGE)' >/dev/null 2>&1; then \
 		echo "==> $(IT_IMAGE) is already on the daemon"; \
 	else \
-		$(DEVCONTAINER_BUILD) --target integration -t '$(IT_IMAGE)' .; \
+		$(DEVCONTAINER_BUILD) --build-arg APK_INDEX_SUM=$(APK_INDEX_SUM) \
+			--target integration -t '$(IT_IMAGE)' .; \
 	fi
 
 # Prints the toolchain image tag; `make docker-build` builds it.
