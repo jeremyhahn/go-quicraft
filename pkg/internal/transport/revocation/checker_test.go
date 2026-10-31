@@ -147,17 +147,17 @@ func TestSetDefaultsAppliesAllDefaults(t *testing.T) {
 	cfg := Config{}
 	cfg.SetDefaults()
 
-	if cfg.OCSPCacheSeconds != 300 {
-		t.Fatalf("OCSPCacheSeconds: want 300, got %d", cfg.OCSPCacheSeconds)
+	if cfg.OCSPCacheSeconds != defaultOCSPCacheSeconds {
+		t.Fatalf("OCSPCacheSeconds: want %d, got %d", defaultOCSPCacheSeconds, cfg.OCSPCacheSeconds)
 	}
-	if cfg.OCSPTimeoutSeconds != 5 {
-		t.Fatalf("OCSPTimeoutSeconds: want 5, got %d", cfg.OCSPTimeoutSeconds)
+	if cfg.OCSPTimeoutSeconds != defaultOCSPTimeoutSeconds {
+		t.Fatalf("OCSPTimeoutSeconds: want %d, got %d", defaultOCSPTimeoutSeconds, cfg.OCSPTimeoutSeconds)
 	}
-	if cfg.CheckInterval != 60*time.Second {
-		t.Fatalf("CheckInterval: want 60s, got %v", cfg.CheckInterval)
+	if cfg.CheckInterval != defaultCheckInterval {
+		t.Fatalf("CheckInterval: want %v, got %v", defaultCheckInterval, cfg.CheckInterval)
 	}
-	if cfg.Mode != ModeAny {
-		t.Fatalf("Mode: want %q, got %q", ModeAny, cfg.Mode)
+	if cfg.Mode != defaultMode {
+		t.Fatalf("Mode: want %q, got %q", defaultMode, cfg.Mode)
 	}
 }
 
@@ -1352,11 +1352,16 @@ func TestCertificateRevokedErrorIs(t *testing.T) {
 	if !errors.Is(err, ErrCertificateRevoked) {
 		t.Fatal("CertificateRevokedError should match ErrCertificateRevoked")
 	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CertificateRevokedError should not match ErrOCSPUnavailable")
-	}
 	if err.Error() != "revocation: certificate serial abc is revoked" {
 		t.Fatalf("unexpected error message: %s", err.Error())
+	}
+}
+
+// TestCertificateRevokedErrorNotIs verifies non-matching.
+func TestCertificateRevokedErrorNotIs(t *testing.T) {
+	err := &CertificateRevokedError{Serial: "abc"}
+	if errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatal("CertificateRevokedError should not match ErrOCSPUnavailable")
 	}
 }
 
@@ -1370,12 +1375,17 @@ func TestOCSPUnavailableErrorIs(t *testing.T) {
 	if !errors.Is(err, inner) {
 		t.Fatal("OCSPUnavailableError should unwrap to inner error")
 	}
-	if errors.Is(err, ErrCertificateRevoked) {
-		t.Fatal("OCSPUnavailableError should not match ErrCertificateRevoked")
-	}
 	expected := "revocation: OCSP responder http://example.com unavailable: connection refused"
 	if err.Error() != expected {
 		t.Fatalf("unexpected error message: %s", err.Error())
+	}
+}
+
+// TestOCSPUnavailableErrorNotIs verifies non-matching.
+func TestOCSPUnavailableErrorNotIs(t *testing.T) {
+	err := &OCSPUnavailableError{URL: "http://x", Err: errors.New("fail")}
+	if errors.Is(err, ErrCertificateRevoked) {
+		t.Fatal("OCSPUnavailableError should not match ErrCertificateRevoked")
 	}
 }
 
@@ -1389,12 +1399,17 @@ func TestCRLParseErrorIs(t *testing.T) {
 	if !errors.Is(err, inner) {
 		t.Fatal("CRLParseError should unwrap to inner error")
 	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CRLParseError should not match ErrOCSPUnavailable")
-	}
 	expected := "revocation: failed to parse CRL /tmp/crl.pem: asn1 decode"
 	if err.Error() != expected {
 		t.Fatalf("unexpected error message: %s", err.Error())
+	}
+}
+
+// TestCRLParseErrorNotIs verifies non-matching.
+func TestCRLParseErrorNotIs(t *testing.T) {
+	err := &CRLParseError{Path: "/tmp/x", Err: errors.New("fail")}
+	if errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatal("CRLParseError should not match ErrOCSPUnavailable")
 	}
 }
 
@@ -1415,6 +1430,22 @@ func TestModeConstants(t *testing.T) {
 	}
 	if ModeAny != "any" {
 		t.Fatalf("ModeAny: want %q, got %q", "any", ModeAny)
+	}
+}
+
+// TestDefaultConstants verifies the default constant values.
+func TestDefaultConstants(t *testing.T) {
+	if defaultOCSPCacheSeconds != 300 {
+		t.Fatalf("defaultOCSPCacheSeconds: want 300, got %d", defaultOCSPCacheSeconds)
+	}
+	if defaultOCSPTimeoutSeconds != 5 {
+		t.Fatalf("defaultOCSPTimeoutSeconds: want 5, got %d", defaultOCSPTimeoutSeconds)
+	}
+	if defaultCheckInterval != 60*time.Second {
+		t.Fatalf("defaultCheckInterval: want 60s, got %v", defaultCheckInterval)
+	}
+	if defaultMode != ModeAny {
+		t.Fatalf("defaultMode: want %q, got %q", ModeAny, defaultMode)
 	}
 }
 

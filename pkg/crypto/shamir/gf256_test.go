@@ -183,6 +183,18 @@ func TestCombineRejectsLegacyFormat(t *testing.T) {
 	}
 }
 
+// TestCombineRejectsDuplicateXCoordinate verifies that two shares with
+// the same field coordinate are rejected (zero Lagrange denominator).
+func TestCombineRejectsDuplicateXCoordinate(t *testing.T) {
+	values := splitValues(t, []byte("dup x"), 2, 3)
+	// The same value twice: the embedded x is what counts.
+	_, err := CombineBytes(pick(values, 0, 0), 2)
+	var combineErr *CombineError
+	if !errors.As(err, &combineErr) {
+		t.Fatalf("err = %v, want CombineError for duplicate x", err)
+	}
+}
+
 // TestFewerThanThresholdSharesRevealNothing verifies that threshold-1 shares
 // are refused rather than reconstructed.
 func TestFewerThanThresholdSharesRevealNothing(t *testing.T) {
