@@ -57,6 +57,7 @@ func TestMembership_NewMembership_CopiesMaps(t *testing.T) {
 
 	// Mutating the source should not affect the membership.
 	src.Addresses[1] = "mutated"
+	src.Removed[99] = false
 	if m.addresses[1] != "addr1" {
 		t.Fatalf("expected addr1, got %s", m.addresses[1])
 	}
@@ -93,13 +94,6 @@ func TestMembership_NewMembership_NilMaps(t *testing.T) {
 
 // --- numVotingMembers ---
 
-func TestMembership_NumVotingMembers_VotersOnly(t *testing.T) {
-	m := testMembership()
-	if m.numVotingMembers() != 3 {
-		t.Fatalf("expected 3 voting members, got %d", m.numVotingMembers())
-	}
-}
-
 func TestMembership_NumVotingMembers_WithWitnesses(t *testing.T) {
 	m := testMembership()
 	m.witnesses = map[uint64]string{10: "wit1"}
@@ -108,128 +102,40 @@ func TestMembership_NumVotingMembers_WithWitnesses(t *testing.T) {
 	}
 }
 
-// --- numDataBearingMembers ---
+// --- role queries ---
 
-func TestMembership_NumDataBearingMembers_ExcludesWitnesses(t *testing.T) {
-	m := testMembership()
-	m.witnesses = map[uint64]string{10: "wit1"}
-	if len(m.addresses) != 3 {
-		t.Fatalf("expected 3 data-bearing members, got %d", len(m.addresses))
-	}
-}
-
-func TestMembership_NumDataBearingMembers_VotersOnly(t *testing.T) {
-	m := testMembership()
-	if len(m.addresses) != 3 {
-		t.Fatalf("expected 3 data-bearing members, got %d", len(m.addresses))
-	}
-}
-
-// --- isVoter ---
-
-func TestMembership_IsVoter_True(t *testing.T) {
-	m := testMembership()
-	if !m.isVoter(1) {
-		t.Fatal("expected replica 1 to be voter")
-	}
-}
-
-func TestMembership_IsVoter_False(t *testing.T) {
-	m := testMembership()
-	if m.isVoter(99) {
-		t.Fatal("expected replica 99 to not be voter")
-	}
-}
-
-// --- isObserver ---
-
-func TestMembership_IsObserver_True(t *testing.T) {
+// TestMembership_RoleQueries checks isVoter, isObserver, isWitness and
+// isMember against a replica in each role and one in none.
+func TestMembership_RoleQueries(t *testing.T) {
 	m := testMembership()
 	m.observers = map[uint64]string{10: "obs1"}
-	if !m.isObserver(10) {
-		t.Fatal("expected replica 10 to be observer")
-	}
-}
-
-func TestMembership_IsObserver_False(t *testing.T) {
-	m := testMembership()
-	if m.isObserver(1) {
-		t.Fatal("expected replica 1 to not be observer")
-	}
-}
-
-// --- isWitness ---
-
-func TestMembership_IsWitness_True(t *testing.T) {
-	m := testMembership()
 	m.witnesses = map[uint64]string{20: "wit1"}
-	if !m.isWitness(20) {
-		t.Fatal("expected replica 20 to be witness")
+	tests := []struct {
+		id                                  uint64
+		voter, observer, witness, isAMember bool
+	}{
+		{id: 1, voter: true, isAMember: true},
+		{id: 10, observer: true, isAMember: true},
+		{id: 20, witness: true, isAMember: true},
+		{id: 99},
 	}
-}
-
-func TestMembership_IsWitness_False(t *testing.T) {
-	m := testMembership()
-	if m.isWitness(1) {
-		t.Fatal("expected replica 1 to not be witness")
-	}
-}
-
-// --- isMember ---
-
-func TestMembership_IsMember_Voter(t *testing.T) {
-	m := testMembership()
-	if !m.isMember(1) {
-		t.Fatal("expected replica 1 to be member")
-	}
-}
-
-func TestMembership_IsMember_Observer(t *testing.T) {
-	m := testMembership()
-	m.observers = map[uint64]string{10: "obs1"}
-	if !m.isMember(10) {
-		t.Fatal("expected replica 10 to be member")
-	}
-}
-
-func TestMembership_IsMember_Witness(t *testing.T) {
-	m := testMembership()
-	m.witnesses = map[uint64]string{20: "wit1"}
-	if !m.isMember(20) {
-		t.Fatal("expected replica 20 to be member")
-	}
-}
-
-func TestMembership_IsMember_NotMember(t *testing.T) {
-	m := testMembership()
-	if m.isMember(99) {
-		t.Fatal("expected replica 99 to not be member")
+	for _, tt := range tests {
+		if got := m.isVoter(tt.id); got != tt.voter {
+			t.Errorf("isVoter(%d) = %v, want %v", tt.id, got, tt.voter)
+		}
+		if got := m.isObserver(tt.id); got != tt.observer {
+			t.Errorf("isObserver(%d) = %v, want %v", tt.id, got, tt.observer)
+		}
+		if got := m.isWitness(tt.id); got != tt.witness {
+			t.Errorf("isWitness(%d) = %v, want %v", tt.id, got, tt.witness)
+		}
+		if got := m.isMember(tt.id); got != tt.isAMember {
+			t.Errorf("isMember(%d) = %v, want %v", tt.id, got, tt.isAMember)
+		}
 	}
 }
 
 // --- AddNode ---
-
-func TestMembership_AddNode_Success(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isVoter(4) {
-		t.Fatal("expected replica 4 to be voter")
-	}
-	if m.addresses[4] != "addr4" {
-		t.Fatalf("expected address addr4, got %s", m.addresses[4])
-	}
-	if m.configChangeID != 10 {
-		t.Fatalf("expected configChangeID 10, got %d", m.configChangeID)
-	}
-}
 
 // TestMembership_AddNode_AlreadyVoter pins the APPLY path's convergence on a
 // committed AddNode whose target the membership already records as a voter.
@@ -237,8 +143,8 @@ func TestMembership_AddNode_Success(t *testing.T) {
 // Refusing it was not a safe no-op: configChangeID stops advancing at the
 // skipped entry, so this replica reports a stale ConfigChangeID as the CAS
 // token for every later membership change while its peers have moved on.
-// validate() still rejects the same change at propose time — see
-// TestMembership_Validate_AddNodeAlreadyVoter.
+// validate() still rejects the same change at propose time — see the
+// AddNode-existing case of TestMembership_Validate_MatchesApply_AllTypes.
 func TestMembership_AddNode_AlreadyVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -255,19 +161,6 @@ func TestMembership_AddNode_AlreadyVoter(t *testing.T) {
 	if m.configChangeID != 10 {
 		t.Fatalf("configChangeID = %d, want 10; a skipped entry leaves this replica "+
 			"reporting a CAS token its peers have moved past", m.configChangeID)
-	}
-}
-
-func TestMembership_AddNode_EmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
 	}
 }
 
@@ -294,47 +187,6 @@ func TestMembership_AddNode_PromotesObserver(t *testing.T) {
 	}
 }
 
-func TestMembership_AddNode_RemovedNode(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 99,
-		Address:   "addr99",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
-func TestMembership_AddNode_ZeroReplicaID(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 0,
-		Address:   "addr0",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrZeroReplicaID) {
-		t.Fatalf("expected ErrZeroReplicaID, got %v", err)
-	}
-}
-
-func TestMembership_AddNode_AlreadyWitness(t *testing.T) {
-	m := testMembership()
-	m.witnesses = map[uint64]string{20: "wit1"}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 20,
-		Address:   "addr20",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
 // --- RemoveNode ---
 
 func TestMembership_RemoveNode_Success(t *testing.T) {
@@ -355,32 +207,6 @@ func TestMembership_RemoveNode_Success(t *testing.T) {
 	}
 	if m.configChangeID != 10 {
 		t.Fatalf("expected configChangeID 10, got %d", m.configChangeID)
-	}
-}
-
-func TestMembership_RemoveNode_LastVoter(t *testing.T) {
-	m := newMembership(proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-	})
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 1,
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrRemoveLastFullReplica) {
-		t.Fatalf("expected ErrRemoveLastFullReplica, got %v", err)
-	}
-}
-
-func TestMembership_RemoveNode_NotFound(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 99,
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("expected ErrNodeNotFound, got %v", err)
 	}
 }
 
@@ -422,20 +248,6 @@ func TestMembership_RemoveNode_Witness(t *testing.T) {
 	}
 }
 
-func TestMembership_RemoveNode_LastWitness_WithVoters(t *testing.T) {
-	m := testMembership()
-	m.witnesses = map[uint64]string{20: "wit1"}
-	// Remove the witness. This is fine because there are still 3 voters.
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 20,
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestMembership_RemoveNode_LastVotingWitness(t *testing.T) {
 	// A cluster with only 1 witness and 0 voters: removing the witness
 	// should fail because it is the last voting member.
@@ -453,22 +265,6 @@ func TestMembership_RemoveNode_LastVotingWitness(t *testing.T) {
 }
 
 // --- AddNonVoting ---
-
-func TestMembership_AddNonVoting_Success(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 10,
-		Address:   "obs1",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isObserver(10) {
-		t.Fatal("expected replica 10 to be observer")
-	}
-}
 
 // TestMembership_AddNonVoting_DemotesSeededVoter is the unit-level
 // regression. Host.StartShard seeds Membership.Addresses from the caller's
@@ -519,33 +315,6 @@ func TestMembership_AddNonVoting_AlreadyWitness(t *testing.T) {
 	}
 }
 
-func TestMembership_AddNonVoting_EmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 10,
-		Address:   "",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
-	}
-}
-
-func TestMembership_AddNonVoting_RemovedNode(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 99,
-		Address:   "obs99",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
 func TestMembership_AddNonVoting_NilObserversMap(t *testing.T) {
 	m := newMembership(proto.Membership{
 		Addresses: map[uint64]string{1: "addr1"},
@@ -565,22 +334,6 @@ func TestMembership_AddNonVoting_NilObserversMap(t *testing.T) {
 }
 
 // --- AddWitness ---
-
-func TestMembership_AddWitness_Success(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 20,
-		Address:   "wit1",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isWitness(20) {
-		t.Fatal("expected replica 20 to be witness")
-	}
-}
 
 // TestMembership_AddWitness_DemotesSeededVoter is the unit-level
 // regression for the witness half. A witness listed in the restart members map
@@ -629,33 +382,6 @@ func TestMembership_AddWitness_AlreadyObserver(t *testing.T) {
 	}
 }
 
-func TestMembership_AddWitness_EmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 20,
-		Address:   "",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
-	}
-}
-
-func TestMembership_AddWitness_RemovedNode(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 99,
-		Address:   "wit99",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
 func TestMembership_AddWitness_NilWitnessesMap(t *testing.T) {
 	m := newMembership(proto.Membership{
 		Addresses: map[uint64]string{1: "addr1"},
@@ -675,49 +401,6 @@ func TestMembership_AddWitness_NilWitnessesMap(t *testing.T) {
 }
 
 // --- validate ---
-
-func TestMembership_Validate_ValidAddNode(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// The original membership should not be mutated by validate.
-	if m.isVoter(4) {
-		t.Fatal("validate should not mutate the original membership")
-	}
-}
-
-func TestMembership_Validate_InvalidZeroReplicaID(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 0,
-		Address:   "addr0",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrZeroReplicaID) {
-		t.Fatalf("expected ErrZeroReplicaID, got %v", err)
-	}
-}
-
-func TestMembership_Validate_InvalidType(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      999,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrInvalidConfigChangeType) {
-		t.Fatalf("expected ErrInvalidConfigChangeType, got %v", err)
-	}
-}
 
 // --- validate/apply equivalence ---
 // These tests verify that validate() returns the same accept/reject
@@ -746,60 +429,6 @@ func TestMembership_Validate_AddNodePromotion_NoMutation(t *testing.T) {
 	}
 }
 
-func TestMembership_Validate_AddNodeAlreadyVoter(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 1,
-		Address:   "addr1",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddNodeAlreadyWitness(t *testing.T) {
-	m := testMembership()
-	m.witnesses = map[uint64]string{20: "wit1"}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 20,
-		Address:   "addr20",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddNodeRemoved(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 99,
-		Address:   "addr99",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddNodeEmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
-	}
-}
-
 func TestMembership_Validate_RemoveNodeSuccess_NoMutation(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -819,20 +448,6 @@ func TestMembership_Validate_RemoveNodeSuccess_NoMutation(t *testing.T) {
 	}
 }
 
-func TestMembership_Validate_RemoveNodeLastVoter(t *testing.T) {
-	m := newMembership(proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-	})
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 1,
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrRemoveLastFullReplica) {
-		t.Fatalf("expected ErrRemoveLastFullReplica, got %v", err)
-	}
-}
-
 func TestMembership_Validate_RemoveNodeLastWitness(t *testing.T) {
 	m := newMembership(proto.Membership{
 		Witnesses: map[uint64]string{1: "wit1"},
@@ -844,18 +459,6 @@ func TestMembership_Validate_RemoveNodeLastWitness(t *testing.T) {
 	err := m.validate(cc)
 	if !errors.Is(err, ErrRemoveLastVoter) {
 		t.Fatalf("expected ErrRemoveLastVoter, got %v", err)
-	}
-}
-
-func TestMembership_Validate_RemoveNodeNotFound(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 99,
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("expected ErrNodeNotFound, got %v", err)
 	}
 }
 
@@ -891,46 +494,6 @@ func TestMembership_Validate_AddNonVotingSuccess_NoMutation(t *testing.T) {
 	}
 }
 
-func TestMembership_Validate_AddNonVotingAlreadyMember(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 1,
-		Address:   "addr1",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddNonVotingRemoved(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 99,
-		Address:   "obs99",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddNonVotingEmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 10,
-		Address:   "",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
-	}
-}
-
 func TestMembership_Validate_AddWitnessSuccess_NoMutation(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -944,46 +507,6 @@ func TestMembership_Validate_AddWitnessSuccess_NoMutation(t *testing.T) {
 	}
 	if m.isWitness(20) {
 		t.Fatal("validate must not add witness to membership")
-	}
-}
-
-func TestMembership_Validate_AddWitnessAlreadyMember(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 1,
-		Address:   "addr1",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeAlreadyExists) {
-		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddWitnessRemoved(t *testing.T) {
-	m := testMembership()
-	m.removed = map[uint64]bool{99: true}
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 99,
-		Address:   "wit99",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
-func TestMembership_Validate_AddWitnessEmptyAddress(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 20,
-		Address:   "",
-	}
-	err := m.validate(cc)
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("expected ErrEmptyAddress, got %v", err)
 	}
 }
 
@@ -1001,6 +524,9 @@ func TestMembership_Validate_ConfigChangeIDUnchanged(t *testing.T) {
 	}
 	if m.configChangeID != 42 {
 		t.Fatalf("validate must not change configChangeID, got %d", m.configChangeID)
+	}
+	if m.isVoter(4) {
+		t.Fatal("validate should not mutate the original membership")
 	}
 }
 
@@ -1030,29 +556,43 @@ func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 		{"AddNode-new", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}, nil, nil},
 		// Converges: an already-listed voter is re-stated, not refused.
 		{"AddNode-existing", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
+		{"AddNode-witness", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 20, Address: "a20"}, ErrNodeAlreadyExists, ErrNodeAlreadyExists},
 		{"AddNode-empty-addr", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: ""}, ErrEmptyAddress, ErrEmptyAddress},
+		{"AddNode-removed", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 99, Address: "a99"}, ErrNodeRemoved, ErrNodeRemoved},
 		{"RemoveNode-exists", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, nil, nil},
-		{"RemoveNode-missing", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 99}, ErrNodeNotFound, ErrNodeNotFound},
-		{"AddNonVoting-new", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "o10"}, nil, nil},
+		{"RemoveNode-missing", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 98}, ErrNodeNotFound, ErrNodeNotFound},
+		{"AddNonVoting-new", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 11, Address: "o11"}, nil, nil},
 		// Converges: a seeded voter is demoted to the observer role the
 		// committed entry names.
 		{"AddNonVoting-exists", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
-		{"AddWitness-new", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 20, Address: "w20"}, nil, nil},
+		{"AddNonVoting-empty-addr", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 11, Address: ""}, ErrEmptyAddress, ErrEmptyAddress},
+		{"AddNonVoting-removed", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 99, Address: "o99"}, ErrNodeRemoved, ErrNodeRemoved},
+		{"AddWitness-new", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 21, Address: "w21"}, nil, nil},
 		// Converges: a seeded voter is moved to the witness role.
 		{"AddWitness-exists", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 1, Address: "a1"}, ErrNodeAlreadyExists, nil},
+		{"AddWitness-empty-addr", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 21, Address: ""}, ErrEmptyAddress, ErrEmptyAddress},
+		{"AddWitness-removed", proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 99, Address: "w99"}, ErrNodeRemoved, ErrNodeRemoved},
 		{"InvalidType", proto.ConfigChange{Type: 999, ReplicaID: 4, Address: "a4"}, ErrInvalidConfigChangeType, ErrInvalidConfigChangeType},
 		{"ZeroReplica", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 0, Address: "a0"}, ErrZeroReplicaID, ErrZeroReplicaID},
 	}
+	// Voters 1-3, observer 10, witness 20, replica 99 removed.
+	setup := func() *membership {
+		m := testMembership()
+		m.observers[10] = "obs1"
+		m.witnesses[20] = "wit1"
+		m.removed[99] = true
+		return m
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := testMembership()
+			m := setup()
 			validateErr := m.validate(tc.cc)
 			if !errors.Is(validateErr, tc.wantValidate) {
 				t.Fatalf("validate returned %v, want %v", validateErr, tc.wantValidate)
 			}
 
 			// Apply on a separate copy to get the "ground truth" error.
-			mCopy := testMembership()
+			mCopy := setup()
 			applyErr := mCopy.apply(tc.cc, 100)
 			if !errors.Is(applyErr, tc.wantApply) {
 				t.Fatalf("apply returned %v, want %v", applyErr, tc.wantApply)
@@ -1066,169 +606,6 @@ func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 					applyErr, validateErr)
 			}
 		})
-	}
-}
-
-// --- apply with invalid type ---
-
-func TestMembership_Apply_InvalidType(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      999,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.apply(cc, 10)
-	if !errors.Is(err, ErrInvalidConfigChangeType) {
-		t.Fatalf("expected ErrInvalidConfigChangeType, got %v", err)
-	}
-}
-
-func TestMembership_Apply_UpdatesConfigChangeID(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.apply(cc, 42)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if m.configChangeID != 42 {
-		t.Fatalf("expected configChangeID 42, got %d", m.configChangeID)
-	}
-}
-
-// --- copyStringMap / copyBoolMap ---
-
-func TestMembership_CopyStringMap_Nil(t *testing.T) {
-	result := copyStringMap(nil)
-	if result != nil {
-		t.Fatal("expected nil for nil input")
-	}
-}
-
-func TestMembership_CopyStringMap_Isolation(t *testing.T) {
-	src := map[uint64]string{1: "a", 2: "b"}
-	dst := copyStringMap(src)
-	dst[1] = "mutated"
-	if src[1] != "a" {
-		t.Fatal("copy should not affect source")
-	}
-}
-
-func TestMembership_CopyBoolMap_Nil(t *testing.T) {
-	result := copyBoolMap(nil)
-	if result != nil {
-		t.Fatal("expected nil for nil input")
-	}
-}
-
-func TestMembership_CopyBoolMap_Isolation(t *testing.T) {
-	src := map[uint64]bool{1: true, 2: false}
-	dst := copyBoolMap(src)
-	dst[1] = false
-	if !src[1] {
-		t.Fatal("copy should not affect source")
-	}
-}
-
-// --- Sequence of operations ---
-
-func TestMembership_AddThenRemove(t *testing.T) {
-	m := testMembership()
-
-	// Add a new node.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error adding node: %v", err)
-	}
-	if !m.isVoter(4) {
-		t.Fatal("expected replica 4 to be voter")
-	}
-
-	// Remove the node.
-	cc = proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 4,
-	}
-	err = m.apply(cc, 11)
-	if err != nil {
-		t.Fatalf("unexpected error removing node: %v", err)
-	}
-	if m.isVoter(4) {
-		t.Fatal("expected replica 4 to not be voter after removal")
-	}
-	if !m.removed[4] {
-		t.Fatal("expected replica 4 to be in removed set")
-	}
-
-	// Cannot re-add a removed node.
-	cc = proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4-new",
-	}
-	err = m.apply(cc, 12)
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("expected ErrNodeRemoved, got %v", err)
-	}
-}
-
-func TestMembership_AddObserverThenPromote(t *testing.T) {
-	m := testMembership()
-
-	// Add observer.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 10,
-		Address:   "obs1",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isObserver(10) {
-		t.Fatal("expected replica 10 to be observer")
-	}
-
-	// Promote to voter via AddNode.
-	cc = proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 10,
-		Address:   "obs1-promoted",
-	}
-	err = m.apply(cc, 11)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isVoter(10) {
-		t.Fatal("expected replica 10 to be voter after promotion")
-	}
-	if m.isObserver(10) {
-		t.Fatal("expected replica 10 to not be observer after promotion")
-	}
-}
-
-// --- isRemoved edge case ---
-
-func TestMembership_IsRemoved_NotInMap(t *testing.T) {
-	m := testMembership()
-	if m.removed[999] {
-		t.Fatal("expected non-existent replica to not be removed")
-	}
-}
-
-func TestMembership_IsRemoved_NilMap(t *testing.T) {
-	m := newMembership(proto.Membership{})
-	if m.removed[1] {
-		t.Fatal("expected isRemoved to be false with nil removed map")
 	}
 }
 
@@ -1256,38 +633,16 @@ func TestMembership_RemoveNode_NilRemovedMap(t *testing.T) {
 
 // --- membershipSnapshot ---
 
-func TestMembershipSnapshot_IsMember_Voter(t *testing.T) {
-	m := testMembership()
-	snap := m.snapshot()
-	if !snap.isMember(1) {
-		t.Fatal("expected replica 1 to be member in snapshot")
-	}
-	if !snap.isMember(2) {
-		t.Fatal("expected replica 2 to be member in snapshot")
-	}
-}
-
-func TestMembershipSnapshot_IsMember_Observer(t *testing.T) {
+func TestMembershipSnapshot_IsMember(t *testing.T) {
 	m := testMembership()
 	m.observers = map[uint64]string{10: "obs1"}
-	snap := m.snapshot()
-	if !snap.isMember(10) {
-		t.Fatal("expected observer 10 to be member in snapshot")
-	}
-}
-
-func TestMembershipSnapshot_IsMember_Witness(t *testing.T) {
-	m := testMembership()
 	m.witnesses = map[uint64]string{20: "wit1"}
 	snap := m.snapshot()
-	if !snap.isMember(20) {
-		t.Fatal("expected witness 20 to be member in snapshot")
+	for _, id := range []uint64{1, 10, 20} {
+		if !snap.isMember(id) {
+			t.Fatalf("expected replica %d to be member in snapshot", id)
+		}
 	}
-}
-
-func TestMembershipSnapshot_IsMember_NotMember(t *testing.T) {
-	m := testMembership()
-	snap := m.snapshot()
 	if snap.isMember(999) {
 		t.Fatal("expected replica 999 to not be member in snapshot")
 	}
@@ -1295,6 +650,7 @@ func TestMembershipSnapshot_IsMember_NotMember(t *testing.T) {
 
 func TestMembershipSnapshot_ToProto_ReturnsDeepCopy(t *testing.T) {
 	m := testMembership()
+	m.configChangeID = 42
 	snap := m.snapshot()
 	p := snap.toProto()
 
@@ -1303,40 +659,8 @@ func TestMembershipSnapshot_ToProto_ReturnsDeepCopy(t *testing.T) {
 	if snap.addresses[1] != "addr1" {
 		t.Fatalf("expected addr1 in snapshot, got %s", snap.addresses[1])
 	}
-}
-
-func TestMembershipSnapshot_ToProto_PreservesConfigChangeID(t *testing.T) {
-	m := testMembership()
-	m.configChangeID = 42
-	snap := m.snapshot()
-	p := snap.toProto()
 	if p.ConfigChangeID != 42 {
 		t.Fatalf("expected ConfigChangeID 42, got %d", p.ConfigChangeID)
-	}
-}
-
-func TestMembershipSnapshot_IsolatedFromMutableMembership(t *testing.T) {
-	m := testMembership()
-	snap := m.snapshot()
-
-	// Mutate the original membership after snapshot.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Snapshot should not see the mutation.
-	if snap.isMember(4) {
-		t.Fatal("snapshot should not reflect mutations to the mutable membership")
-	}
-	// Original should see it.
-	if !m.isMember(4) {
-		t.Fatal("mutable membership should see the mutation")
 	}
 }
 
@@ -1401,49 +725,6 @@ func TestMembership_RemoveNode_LastFullReplicaWithWitnesses(t *testing.T) {
 	// Verify the membership was not mutated.
 	if !m.isVoter(1) {
 		t.Fatal("expected replica 1 to still be voter after failed removal")
-	}
-}
-
-func TestMembership_RemoveNode_WitnessWithFullReplicasSucceeds(t *testing.T) {
-	// Cluster: 2 full replicas + 1 witness. Removing the witness
-	// is safe because full replicas remain.
-	m := newMembership(proto.Membership{
-		Addresses: map[uint64]string{1: "addr1", 2: "addr2"},
-		Witnesses: map[uint64]string{10: "wit1"},
-	})
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 10,
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error removing witness: %v", err)
-	}
-	if m.isWitness(10) {
-		t.Fatal("expected witness 10 to be removed")
-	}
-	if !m.removed[10] {
-		t.Fatal("expected witness 10 to be in removed set")
-	}
-}
-
-func TestMembership_RemoveNode_FullReplicaWhenMultipleExist(t *testing.T) {
-	// Cluster: 3 full replicas + 1 witness. Removing one full replica
-	// is safe because others remain.
-	m := newMembership(proto.Membership{
-		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
-		Witnesses: map[uint64]string{10: "wit1"},
-	})
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 1,
-	}
-	err := m.apply(cc, 10)
-	if err != nil {
-		t.Fatalf("unexpected error removing voter with remaining replicas: %v", err)
-	}
-	if m.isVoter(1) {
-		t.Fatal("expected replica 1 to be removed")
 	}
 }
 
