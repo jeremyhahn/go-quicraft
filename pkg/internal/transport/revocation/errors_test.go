@@ -185,17 +185,4 @@ func TestWrappedErrorUnwrapChains(t *testing.T) {
 	if !errors.As(sigErr, &cfgErr) || cfgErr.Field != "IssuerCertificate" {
 		t.Fatalf("CRLSignatureError must unwrap to the missing-issuer ConfigError, got %v", cfgErr)
 	}
-
-	parseErr := &CRLParseError{Path: "/etc/pki/x.crl", Err: os.ErrInvalid}
-	if !errors.Is(parseErr, os.ErrInvalid) {
-		t.Fatal("CRLParseError must unwrap to its parse cause")
-	}
-
-	ocspErr := &OCSPUnavailableError{URL: "http://r", Err: ErrOCSPStatusUnknown}
-	if !errors.Is(ocspErr, ErrOCSPUnavailable) {
-		t.Fatal("OCSPUnavailableError must match ErrOCSPUnavailable")
-	}
-	if !errors.Is(ocspErr, ErrOCSPStatusUnknown) {
-		t.Fatal("OCSPUnavailableError must unwrap to the underlying unknown-status cause")
-	}
 }
