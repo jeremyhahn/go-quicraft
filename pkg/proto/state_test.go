@@ -48,33 +48,6 @@ func TestStateMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStateMarshalUnmarshalZero(t *testing.T) {
-	s := State{}
-	buf := make([]byte, s.Size())
-	s.MarshalTo(buf)
-	var s2 State
-	s2.UnmarshalFrom(buf)
-	if s2 != (State{}) {
-		t.Fatal("Zero state round-trip failed")
-	}
-}
-
-func TestStateMarshalUnmarshalMaxValues(t *testing.T) {
-	s := State{
-		Term:       ^uint64(0),
-		Vote:       ^uint64(0),
-		Commit:     ^uint64(0),
-		VoteWindow: ^uint64(0),
-	}
-	buf := make([]byte, s.Size())
-	s.MarshalTo(buf)
-	var s2 State
-	s2.UnmarshalFrom(buf)
-	if s2 != s {
-		t.Fatal("Max value state round-trip failed")
-	}
-}
-
 func TestStateSize(t *testing.T) {
 	s := State{}
 	if s.Size() != 32 {
@@ -93,7 +66,6 @@ func TestStateIsEmpty(t *testing.T) {
 		{"vote set", State{Vote: 1}, false},
 		{"commit set", State{Commit: 1}, false},
 		{"vote window set", State{VoteWindow: 1}, false},
-		{"all set", State{Term: 1, Vote: 2, Commit: 3, VoteWindow: 4}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

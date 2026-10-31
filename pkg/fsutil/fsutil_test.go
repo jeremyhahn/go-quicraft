@@ -330,17 +330,6 @@ func TestMkdirAllSyncedWith(t *testing.T) {
 		}
 	})
 
-	t.Run("entirely new absolute tree is synced to the root", func(t *testing.T) {
-		s := newSeamFS("/")
-		if err := MkdirAllSyncedWith(s, s.syncDir, filepath.FromSlash("/a/b"), 0o700); err != nil {
-			t.Fatalf("MkdirAllSyncedWith: %v", err)
-		}
-		want := []string{"mkdir /a/b", "sync /a/b", "sync /a", "sync /"}
-		if !reflect.DeepEqual(s.log, want) {
-			t.Fatalf("calls %v, want %v", s.log, want)
-		}
-	})
-
 	t.Run("mkdir error propagates and nothing is synced", func(t *testing.T) {
 		boom := errors.New("mkdir failed")
 		s := newSeamFS("/")

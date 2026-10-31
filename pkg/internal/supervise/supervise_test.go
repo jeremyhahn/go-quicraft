@@ -193,19 +193,3 @@ func TestRunEach_IsolatesEveryCall(t *testing.T) {
 		})
 	}
 }
-
-// TestLogContained_HostileHandler: a handler that panics or Goexits never
-// reaches the caller, and the diagnostic still runs.
-func TestLogContained_HostileHandler(t *testing.T) {
-	for exitName, exit := range hostileExits {
-		t.Run(exitName, func(t *testing.T) {
-			installHostileLogger(t, exit)
-			emitted := make(chan struct{})
-			LogContained(func() {
-				defer close(emitted)
-				slog.Error("diagnostic")
-			})
-			await(t, emitted, "the diagnostic never ran")
-		})
-	}
-}

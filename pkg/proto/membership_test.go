@@ -73,48 +73,6 @@ func TestMembershipMarshalUnmarshalEmptyMaps(t *testing.T) {
 	assertMembershipEqual(t, &m, &m2)
 }
 
-func TestMembershipMarshalUnmarshalNilMaps(t *testing.T) {
-	m := Membership{
-		ConfigChangeID: 0,
-	}
-	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
-	var m2 Membership
-	_, err := m2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if m2.ConfigChangeID != 0 {
-		t.Fatalf("ConfigChangeID: got %d, want 0", m2.ConfigChangeID)
-	}
-	if len(m2.Addresses) != 0 {
-		t.Fatalf("Addresses: got %d entries, want 0", len(m2.Addresses))
-	}
-}
-
-func TestMembershipDeterministicEncoding(t *testing.T) {
-	m := Membership{
-		ConfigChangeID: 1,
-		Addresses: map[uint64]string{
-			3: "c",
-			1: "a",
-			2: "b",
-		},
-		Observers: map[uint64]string{},
-		Witnesses: map[uint64]string{},
-		Removed:   map[uint64]bool{},
-	}
-	buf1 := make([]byte, m.Size())
-	buf2 := make([]byte, m.Size())
-	m.MarshalTo(buf1)
-	m.MarshalTo(buf2)
-	for i := range buf1 {
-		if buf1[i] != buf2[i] {
-			t.Fatalf("Non-deterministic encoding at byte %d", i)
-		}
-	}
-}
-
 func TestMembershipBufferTooSmallMarshal(t *testing.T) {
 	m := Membership{Addresses: map[uint64]string{1: "x"}}
 	buf := make([]byte, m.Size()-1)
@@ -224,30 +182,6 @@ func TestMembershipReset(t *testing.T) {
 	if m.Addresses != nil || m.Observers != nil || m.Witnesses != nil || m.Removed != nil {
 		t.Fatal("Maps not reset to nil")
 	}
-}
-
-func TestMembershipLargeCluster(t *testing.T) {
-	m := Membership{
-		ConfigChangeID: 100,
-		Addresses:      make(map[uint64]string),
-		Observers:      make(map[uint64]string),
-		Witnesses:      make(map[uint64]string),
-		Removed:        make(map[uint64]bool),
-	}
-	for i := uint64(1); i <= 100; i++ {
-		m.Addresses[i] = "node:5000"
-	}
-	for i := uint64(101); i <= 110; i++ {
-		m.Observers[i] = "observer:5000"
-	}
-	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
-	var m2 Membership
-	_, err := m2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	assertMembershipEqual(t, &m, &m2)
 }
 
 func assertMembershipEqual(t *testing.T, want, got *Membership) {

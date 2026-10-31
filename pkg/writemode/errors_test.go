@@ -14,10 +14,7 @@
 
 package writemode
 
-import (
-	"errors"
-	"testing"
-)
+import "testing"
 
 func TestInvalidModeError_Error(t *testing.T) {
 	tests := []struct {
@@ -29,16 +26,6 @@ func TestInvalidModeError_Error(t *testing.T) {
 			name:  "unknown string value",
 			value: "turbo",
 			want:  `quicraft/writemode: invalid write mode: "turbo"`,
-		},
-		{
-			name:  "numeric overflow value",
-			value: "99",
-			want:  `quicraft/writemode: invalid write mode: "99"`,
-		},
-		{
-			name:  "empty value",
-			value: "",
-			want:  `quicraft/writemode: invalid write mode: ""`,
 		},
 	}
 	for _, tt := range tests {
@@ -57,18 +44,7 @@ func TestInvalidModeError_Error(t *testing.T) {
 // an interface is never nil, so the runtime half could not fail and the
 // assignment was the only real check. That check belongs here, and everything
 // else the test could have proved is already covered — the error message by
-// TestInvalidModeError_Error, recovery through the error interface by
-// TestInvalidModeError_ErrorsAs, and the production call sites that return it
-// by TestFromString_InvalidMode and TestMode_Validate_Invalid in mode_test.go.
+// TestInvalidModeError_Error, and recovery through the error interface at the
+// production call sites that return it by TestFromString_InvalidMode and
+// TestMode_UnknownValueGuaranteesNothing in mode_test.go.
 var _ error = (*InvalidModeError)(nil)
-
-func TestInvalidModeError_ErrorsAs(t *testing.T) {
-	err := &InvalidModeError{Value: "unknown"}
-	var target *InvalidModeError
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match *InvalidModeError")
-	}
-	if target.Value != "unknown" {
-		t.Errorf("errors.As target.Value = %q, want %q", target.Value, "unknown")
-	}
-}

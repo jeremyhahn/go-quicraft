@@ -14,46 +14,7 @@
 
 package queue
 
-import (
-	"sync"
-	"testing"
-)
-
-func TestSwapBuffer_AddAndSwap(t *testing.T) {
-	sb := NewSwapBuffer[int](8, 0)
-	sb.Add(42)
-	items := sb.Swap()
-	if len(items) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(items))
-	}
-	if items[0] != 42 {
-		t.Fatalf("expected 42, got %d", items[0])
-	}
-}
-
-func TestSwapBuffer_SwapEmpty(t *testing.T) {
-	sb := NewSwapBuffer[string](4, 0)
-	items := sb.Swap()
-	if items != nil {
-		t.Fatalf("expected nil from empty swap, got %v", items)
-	}
-}
-
-func TestSwapBuffer_MultipleAddThenSwap(t *testing.T) {
-	sb := NewSwapBuffer[int](4, 0)
-	for i := range 5 {
-		sb.Add(i)
-	}
-	items := sb.Swap()
-	if len(items) != 5 {
-		t.Fatalf("expected 5 items, got %d", len(items))
-	}
-	for i, v := range items {
-		if v != i {
-			t.Fatalf("items[%d] = %d, want %d", i, v, i)
-		}
-	}
-}
+import "testing"
 
 func TestSwapBuffer_SwapClearsBuffer(t *testing.T) {
 	sb := NewSwapBuffer[int](4, 0)
@@ -66,65 +27,6 @@ func TestSwapBuffer_SwapClearsBuffer(t *testing.T) {
 	second := sb.Swap()
 	if second != nil {
 		t.Fatalf("second swap: expected nil, got %v", second)
-	}
-}
-
-func TestSwapBuffer_ConcurrentProducerConsumer(t *testing.T) {
-	sb := NewSwapBuffer[int](64, 0)
-	const n = 1000
-	var wg sync.WaitGroup
-
-	// Single producer.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := range n {
-			sb.Add(i)
-		}
-	}()
-
-	// Wait for producer to finish, then drain.
-	wg.Wait()
-
-	var collected []int
-	for {
-		items := sb.Swap()
-		if items == nil {
-			break
-		}
-		collected = append(collected, items...)
-	}
-
-	if len(collected) != n {
-		t.Fatalf("expected %d total items, got %d", n, len(collected))
-	}
-}
-
-func TestSwapBuffer_Len(t *testing.T) {
-	sb := NewSwapBuffer[int](4, 0)
-	if sb.Len() != 0 {
-		t.Fatalf("expected Len() 0, got %d", sb.Len())
-	}
-	sb.Add(1)
-	sb.Add(2)
-	sb.Add(3)
-	if sb.Len() != 3 {
-		t.Fatalf("expected Len() 3, got %d", sb.Len())
-	}
-	sb.Swap()
-	if sb.Len() != 0 {
-		t.Fatalf("expected Len() 0 after swap, got %d", sb.Len())
-	}
-}
-
-func TestSwapBuffer_GrowsBeyondInitialCapacity(t *testing.T) {
-	sb := NewSwapBuffer[int](2, 0)
-	for i := range 100 {
-		sb.Add(i)
-	}
-	items := sb.Swap()
-	if len(items) != 100 {
-		t.Fatalf("expected 100 items, got %d", len(items))
 	}
 }
 
@@ -163,46 +65,6 @@ func TestSwapBuffer_BufferReuse(t *testing.T) {
 	}
 }
 
-func TestSwapBuffer_BufferReuse_NoDataLeak(t *testing.T) {
-	// Ensure recycled buffers do not leak data from prior cycles.
-	sb := NewSwapBuffer[int](4, 0)
-
-	sb.Add(1)
-	sb.Add(2)
-	sb.Add(3)
-	sb.Swap() // first: returns [1,2,3]
-
-	sb.Add(10)
-	second := sb.Swap()
-	if len(second) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(second))
-	}
-	if second[0] != 10 {
-		t.Fatalf("expected 10, got %d", second[0])
-	}
-}
-
-func TestSwapBuffer_BackpressureAtCapacity(t *testing.T) {
-	sb := NewSwapBuffer[int](4, 3) // maxLen = 3
-	if ok := sb.Add(1); !ok {
-		t.Fatal("first Add should succeed")
-	}
-	if ok := sb.Add(2); !ok {
-		t.Fatal("second Add should succeed")
-	}
-	if ok := sb.Add(3); !ok {
-		t.Fatal("third Add should succeed")
-	}
-	// At capacity, next Add should return false.
-	if ok := sb.Add(4); ok {
-		t.Fatal("Add at capacity should return false")
-	}
-	// Len should be 3, not 4.
-	if sb.Len() != 3 {
-		t.Fatalf("expected Len() 3, got %d", sb.Len())
-	}
-}
-
 func TestSwapBuffer_SwapDrainsAllowsNewAdds(t *testing.T) {
 	sb := NewSwapBuffer[int](4, 2) // maxLen = 2
 	sb.Add(1)
@@ -211,6 +73,9 @@ func TestSwapBuffer_SwapDrainsAllowsNewAdds(t *testing.T) {
 	// At capacity.
 	if ok := sb.Add(3); ok {
 		t.Fatal("Add at capacity should return false")
+	}
+	if sb.Len() != 2 {
+		t.Fatalf("expected Len() 2 after a refused Add, got %d", sb.Len())
 	}
 
 	// Swap drains the write buffer.

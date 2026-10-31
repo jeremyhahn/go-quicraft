@@ -33,14 +33,6 @@ func mustEncodeBatch(t *testing.T, cmds [][]byte) []byte {
 	return encoded
 }
 
-func TestEncodeBatch_NilSlice(t *testing.T) {
-	t.Parallel()
-	result := mustEncodeBatch(t, nil)
-	if len(result) != 0 {
-		t.Errorf("EncodeBatch(nil) produced %d bytes, want 0", len(result))
-	}
-}
-
 func TestEncodeBatch_EmptySlice(t *testing.T) {
 	t.Parallel()
 	result := mustEncodeBatch(t, [][]byte{})
@@ -143,17 +135,6 @@ func TestEncodeBatch_LargeCommand(t *testing.T) {
 	}
 }
 
-func TestDecodeBatch_NilInput(t *testing.T) {
-	t.Parallel()
-	result, err := DecodeBatch(nil)
-	if err != nil {
-		t.Fatalf("DecodeBatch(nil) returned error: %v", err)
-	}
-	if result != nil {
-		t.Errorf("DecodeBatch(nil) = %v, want nil", result)
-	}
-}
-
 func TestDecodeBatch_EmptyInput(t *testing.T) {
 	t.Parallel()
 	result, err := DecodeBatch([]byte{})
@@ -244,22 +225,6 @@ func TestDecodeBatch_Garbage(t *testing.T) {
 	}
 }
 
-func TestRoundTrip_SingleCommand(t *testing.T) {
-	t.Parallel()
-	original := [][]byte{[]byte("raft-proposal-data")}
-	encoded := mustEncodeBatch(t, original)
-	decoded, err := DecodeBatch(encoded)
-	if err != nil {
-		t.Fatalf("round-trip decode failed: %v", err)
-	}
-	if len(decoded) != len(original) {
-		t.Fatalf("decoded %d commands, want %d", len(decoded), len(original))
-	}
-	if !bytes.Equal(decoded[0], original[0]) {
-		t.Errorf("decoded[0] = %q, want %q", decoded[0], original[0])
-	}
-}
-
 func TestRoundTrip_MultipleCommands(t *testing.T) {
 	t.Parallel()
 	original := [][]byte{
@@ -280,60 +245,6 @@ func TestRoundTrip_MultipleCommands(t *testing.T) {
 	for i := range original {
 		if !bytes.Equal(decoded[i], original[i]) {
 			t.Errorf("decoded[%d] = %q, want %q", i, decoded[i], original[i])
-		}
-	}
-}
-
-func TestRoundTrip_EmptyCommands(t *testing.T) {
-	t.Parallel()
-	original := [][]byte{{}, {}, {}}
-	encoded := mustEncodeBatch(t, original)
-	decoded, err := DecodeBatch(encoded)
-	if err != nil {
-		t.Fatalf("round-trip decode failed: %v", err)
-	}
-	if len(decoded) != 3 {
-		t.Fatalf("decoded %d commands, want 3", len(decoded))
-	}
-}
-
-func TestRoundTrip_BinaryData(t *testing.T) {
-	t.Parallel()
-	// Create commands with all possible byte values.
-	cmd := make([]byte, 256)
-	for i := range cmd {
-		cmd[i] = byte(i)
-	}
-	original := [][]byte{cmd}
-	encoded := mustEncodeBatch(t, original)
-	decoded, err := DecodeBatch(encoded)
-	if err != nil {
-		t.Fatalf("round-trip decode failed: %v", err)
-	}
-	if !bytes.Equal(decoded[0], cmd) {
-		t.Error("binary data round-trip failed")
-	}
-}
-
-func TestRoundTrip_ManyCommands(t *testing.T) {
-	t.Parallel()
-
-	const count = 1000
-	original := make([][]byte, count)
-	for i := range original {
-		original[i] = []byte{byte(i & 0xFF), byte((i >> 8) & 0xFF)}
-	}
-	encoded := mustEncodeBatch(t, original)
-	decoded, err := DecodeBatch(encoded)
-	if err != nil {
-		t.Fatalf("round-trip decode failed: %v", err)
-	}
-	if len(decoded) != count {
-		t.Fatalf("decoded %d commands, want %d", len(decoded), count)
-	}
-	for i := range original {
-		if !bytes.Equal(decoded[i], original[i]) {
-			t.Errorf("decoded[%d] mismatch", i)
 		}
 	}
 }

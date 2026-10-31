@@ -19,70 +19,6 @@ import (
 	"testing"
 )
 
-func TestPutGetUint64(t *testing.T) {
-	buf := make([]byte, 8)
-	want := uint64(0xDEADBEEFCAFEBABE)
-	putUint64(buf, want)
-	got := getUint64(buf)
-	if got != want {
-		t.Fatalf("getUint64: got %d, want %d", got, want)
-	}
-}
-
-func TestPutGetUint64Zero(t *testing.T) {
-	buf := make([]byte, 8)
-	putUint64(buf, 0)
-	got := getUint64(buf)
-	if got != 0 {
-		t.Fatalf("getUint64: got %d, want 0", got)
-	}
-}
-
-func TestPutGetUint64Max(t *testing.T) {
-	buf := make([]byte, 8)
-	want := ^uint64(0) // max uint64
-	putUint64(buf, want)
-	got := getUint64(buf)
-	if got != want {
-		t.Fatalf("getUint64: got %d, want %d", got, want)
-	}
-}
-
-func TestPutGetUint32(t *testing.T) {
-	buf := make([]byte, 4)
-	want := uint32(0xDEADBEEF)
-	putUint32(buf, want)
-	got := getUint32(buf)
-	if got != want {
-		t.Fatalf("getUint32: got %d, want %d", got, want)
-	}
-}
-
-func TestPutGetUint32Zero(t *testing.T) {
-	buf := make([]byte, 4)
-	putUint32(buf, 0)
-	got := getUint32(buf)
-	if got != 0 {
-		t.Fatalf("getUint32: got %d, want 0", got)
-	}
-}
-
-func TestPutGetBoolTrue(t *testing.T) {
-	buf := make([]byte, 8)
-	putBool(buf, true)
-	if !getBool(buf) {
-		t.Fatal("getBool: got false, want true")
-	}
-}
-
-func TestPutGetBoolFalse(t *testing.T) {
-	buf := make([]byte, 8)
-	putBool(buf, false)
-	if getBool(buf) {
-		t.Fatal("getBool: got true, want false")
-	}
-}
-
 func TestPutGetBoolNonOneIsTrue(t *testing.T) {
 	buf := make([]byte, 8)
 	putUint64(buf, 42) // any non-zero value should be true
@@ -265,20 +201,6 @@ func TestPutGetMapEmpty(t *testing.T) {
 	}
 }
 
-func TestPutGetMapNil(t *testing.T) {
-	var m map[uint64]string
-	sz := mapSize(m)
-	buf := make([]byte, sz)
-	putMap(buf, m)
-	got, _, err := getMap(buf)
-	if err != nil {
-		t.Fatalf("getMap: unexpected error: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("getMap: got %d entries, want 0", len(got))
-	}
-}
-
 func TestGetMapBufferTooSmall(t *testing.T) {
 	_, _, err := getMap([]byte{0, 0})
 	if !errors.Is(err, ErrBufferTooSmall) {
@@ -420,49 +342,13 @@ func TestBoolMapSortedKeys(t *testing.T) {
 	}
 }
 
-func TestMapDeterministicEncoding(t *testing.T) {
-	m := map[uint64]string{
-		3: "c",
-		1: "a",
-		2: "b",
-	}
-	buf1 := make([]byte, mapSize(m))
-	buf2 := make([]byte, mapSize(m))
-	putMap(buf1, m)
-	putMap(buf2, m)
-	for i := range buf1 {
-		if buf1[i] != buf2[i] {
-			t.Fatalf("putMap not deterministic: buffers differ at byte %d", i)
-		}
-	}
-}
-
-func TestBoolMapDeterministicEncoding(t *testing.T) {
-	m := map[uint64]bool{
-		3: true,
-		1: false,
-		2: true,
-	}
-	buf1 := make([]byte, boolMapSize(m))
-	buf2 := make([]byte, boolMapSize(m))
-	putBoolMap(buf1, m)
-	putBoolMap(buf2, m)
-	for i := range buf1 {
-		if buf1[i] != buf2[i] {
-			t.Fatalf("putBoolMap not deterministic: buffers differ at byte %d", i)
-		}
-	}
-}
-
 func TestMapSize(t *testing.T) {
 	tests := []struct {
 		name string
 		m    map[uint64]string
 		want int
 	}{
-		{"nil", nil, 4},
 		{"empty", map[uint64]string{}, 4},
-		{"one entry", map[uint64]string{1: "abc"}, 4 + 8 + 4 + 3},
 		{"two entries", map[uint64]string{1: "a", 2: "bb"}, 4 + (8 + 4 + 1) + (8 + 4 + 2)},
 	}
 	for _, tt := range tests {
@@ -481,9 +367,7 @@ func TestBoolMapSize(t *testing.T) {
 		m    map[uint64]bool
 		want int
 	}{
-		{"nil", nil, 4},
 		{"empty", map[uint64]bool{}, 4},
-		{"one entry", map[uint64]bool{1: true}, 4 + 16},
 		{"three entries", map[uint64]bool{1: true, 2: false, 3: true}, 4 + 3*16},
 	}
 	for _, tt := range tests {

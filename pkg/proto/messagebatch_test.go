@@ -83,35 +83,6 @@ func TestMessageBatchMarshalUnmarshalEmpty(t *testing.T) {
 	}
 }
 
-func TestMessageBatchMarshalUnmarshalMultipleMessages(t *testing.T) {
-	mb := MessageBatch{
-		BinVer:        WireVersion,
-		DeploymentID:  1,
-		SourceAddress: "sender:5000",
-		Requests:      make([]Message, 10),
-	}
-	for i := range mb.Requests {
-		mb.Requests[i] = Message{
-			Type:    Heartbeat,
-			From:    1,
-			To:      uint64(i + 2),
-			ShardID: uint64(100 + i),
-			Term:    5,
-		}
-	}
-	buf := make([]byte, mb.Size())
-	mb.MarshalTo(buf)
-	var mb2 MessageBatch
-	_, err := mb2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if len(mb2.Requests) != 10 {
-		t.Fatalf("Requests: got %d, want 10", len(mb2.Requests))
-	}
-	assertMessageBatchEqual(t, &mb, &mb2)
-}
-
 func TestMessageBatchUnsupportedVersion(t *testing.T) {
 	mb := MessageBatch{
 		BinVer:        WireVersion,

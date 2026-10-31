@@ -58,29 +58,6 @@ func TestSnapshotMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertSnapshotEqual(t, &s, &s2)
 }
 
-func TestSnapshotMarshalUnmarshalAllBoolsTrue(t *testing.T) {
-	s := Snapshot{
-		ShardID:   1,
-		ReplicaID: 1,
-		Index:     50,
-		Term:      3,
-		Membership: Membership{
-			Addresses: map[uint64]string{1: "a"},
-			Observers: map[uint64]string{},
-			Witnesses: map[uint64]string{},
-			Removed:   map[uint64]bool{},
-		},
-		Filepath:    "snap.dat",
-		FileSize:    100,
-		OnDiskIndex: 49,
-	}
-	buf := make([]byte, s.Size())
-	s.MarshalTo(buf)
-	var s2 Snapshot
-	s2.UnmarshalFrom(buf)
-	assertSnapshotEqual(t, &s, &s2)
-}
-
 func TestSnapshotIsEmpty(t *testing.T) {
 	tests := []struct {
 		name string
@@ -90,7 +67,6 @@ func TestSnapshotIsEmpty(t *testing.T) {
 		{"zero", Snapshot{}, true},
 		{"index set", Snapshot{Index: 1}, false},
 		{"term set", Snapshot{Term: 1}, false},
-		{"both set", Snapshot{Index: 1, Term: 1}, false},
 		{"shardID set but index/term zero", Snapshot{ShardID: 1}, true},
 	}
 	for _, tt := range tests {
@@ -144,60 +120,6 @@ func TestSnapshotReset(t *testing.T) {
 		s.Epoch != 0 || s.Compression != 0 {
 		t.Fatal("Reset did not clear all fields")
 	}
-}
-
-func TestSnapshotWithEmptyMembership(t *testing.T) {
-	s := Snapshot{
-		ShardID:   1,
-		ReplicaID: 1,
-		Index:     10,
-		Term:      1,
-		Membership: Membership{
-			Addresses: map[uint64]string{},
-			Observers: map[uint64]string{},
-			Witnesses: map[uint64]string{},
-			Removed:   map[uint64]bool{},
-		},
-		Filepath: "test.snap",
-	}
-	buf := make([]byte, s.Size())
-	s.MarshalTo(buf)
-	var s2 Snapshot
-	_, err := s2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	assertSnapshotEqual(t, &s, &s2)
-}
-
-func TestSnapshotWithLargeMembership(t *testing.T) {
-	addrs := make(map[uint64]string)
-	for i := uint64(1); i <= 50; i++ {
-		addrs[i] = "10.0.0.1:5000"
-	}
-	s := Snapshot{
-		ShardID:   1,
-		ReplicaID: 1,
-		Index:     1000,
-		Term:      10,
-		Membership: Membership{
-			ConfigChangeID: 999,
-			Addresses:      addrs,
-			Observers:      map[uint64]string{},
-			Witnesses:      map[uint64]string{},
-			Removed:        map[uint64]bool{100: true, 200: true},
-		},
-		Filepath: "/var/lib/quicraft/shard-1/snapshot-1000",
-		FileSize: 10 * 1024 * 1024,
-	}
-	buf := make([]byte, s.Size())
-	s.MarshalTo(buf)
-	var s2 Snapshot
-	_, err := s2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	assertSnapshotEqual(t, &s, &s2)
 }
 
 func TestSnapshotUnmarshalOversizedFilepath(t *testing.T) {

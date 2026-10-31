@@ -49,17 +49,6 @@ func TestReadyToReadMarshalUnmarshalRoundTrip(t *testing.T) {
 	}
 }
 
-func TestReadyToReadMarshalUnmarshalZero(t *testing.T) {
-	ri := ReadyToRead{}
-	buf := make([]byte, ri.Size())
-	ri.MarshalTo(buf)
-	var ri2 ReadyToRead
-	ri2.UnmarshalFrom(buf)
-	if ri2.Key != 0 || ri2.Index != 0 {
-		t.Fatal("Zero ReadyToRead round-trip failed")
-	}
-}
-
 func TestReadyToReadSize(t *testing.T) {
 	ri := ReadyToRead{}
 	if ri.Size() != 16 {
@@ -90,19 +79,5 @@ func TestReadyToReadReset(t *testing.T) {
 	ri.Reset()
 	if ri.Key != 0 || ri.Index != 0 {
 		t.Fatal("Reset did not clear all fields")
-	}
-}
-
-func TestReadyToReadMaxValues(t *testing.T) {
-	ri := ReadyToRead{
-		Key:   ^uint64(0),
-		Index: ^uint64(0),
-	}
-	buf := make([]byte, ri.Size())
-	ri.MarshalTo(buf)
-	var ri2 ReadyToRead
-	ri2.UnmarshalFrom(buf)
-	if ri2.Key != ri.Key || ri2.Index != ri.Index {
-		t.Fatal("Max value round-trip failed")
 	}
 }

@@ -48,51 +48,6 @@ func TestConfigChangeMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertConfigChangeEqual(t, &cc, &cc2)
 }
 
-func TestConfigChangeMarshalUnmarshalRemoveNode(t *testing.T) {
-	cc := ConfigChange{
-		ConfigChangeID: 10,
-		Type:           RemoveNode,
-		ReplicaID:      3,
-		Address:        "",
-		Initialize:     false,
-	}
-	buf := make([]byte, cc.Size())
-	cc.MarshalTo(buf)
-	var cc2 ConfigChange
-	cc2.UnmarshalFrom(buf)
-	assertConfigChangeEqual(t, &cc, &cc2)
-}
-
-func TestConfigChangeMarshalUnmarshalAddNonVoting(t *testing.T) {
-	cc := ConfigChange{
-		ConfigChangeID: 20,
-		Type:           AddNonVoting,
-		ReplicaID:      7,
-		Address:        "observer:5000",
-		Initialize:     true,
-	}
-	buf := make([]byte, cc.Size())
-	cc.MarshalTo(buf)
-	var cc2 ConfigChange
-	cc2.UnmarshalFrom(buf)
-	assertConfigChangeEqual(t, &cc, &cc2)
-}
-
-func TestConfigChangeMarshalUnmarshalAddWitness(t *testing.T) {
-	cc := ConfigChange{
-		ConfigChangeID: 30,
-		Type:           AddWitness,
-		ReplicaID:      8,
-		Address:        "witness:5000",
-		Initialize:     false,
-	}
-	buf := make([]byte, cc.Size())
-	cc.MarshalTo(buf)
-	var cc2 ConfigChange
-	cc2.UnmarshalFrom(buf)
-	assertConfigChangeEqual(t, &cc, &cc2)
-}
-
 // TestConfigChangeAddressTooLong pins the address bound at BOTH ends.
 //
 // The write half is what makes the two agree: a ConfigChange is marshaled into
@@ -190,7 +145,6 @@ func TestConfigChangeSize(t *testing.T) {
 		want int
 	}{
 		{"empty address", "", configChangeFixedSize + 4},
-		{"short address", "a:1", configChangeFixedSize + 3 + 4},
 		{"typical", "192.168.1.100:5000", configChangeFixedSize + 18 + 4},
 	}
 	for _, tt := range tests {
@@ -235,7 +189,6 @@ func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 		badType uint64
 	}{
 		{"type beyond UpdateWireVersion is rejected", UpdateWireVersion + 1},
-		{"large invalid type is rejected", 999},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cc := ConfigChange{

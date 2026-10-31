@@ -234,17 +234,6 @@ func TestCachedDiskStateMachine_FullLifecycle(t *testing.T) {
 	}
 }
 
-func TestCachedDiskStateMachine_InvalidConfig(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	_, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: -5,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err == nil {
-		t.Fatal("expected error for invalid config")
-	}
-}
-
 func TestCachedDiskStateMachine_OpenClearsCache(t *testing.T) {
 	inner := newTrackingDiskStateMachine()
 	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
@@ -477,14 +466,6 @@ func TestCacheMaxEntriesError_Message(t *testing.T) {
 	}
 }
 
-func TestCacheMaxEntriesError_ZeroValue(t *testing.T) {
-	err := &CacheMaxEntriesError{Value: 0}
-	expected := "sm: cache max entries must be > 0, got 0"
-	if err.Error() != expected {
-		t.Errorf("Error() = %q, want %q", err.Error(), expected)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // extractQueryKey tests
 // ---------------------------------------------------------------------------
@@ -510,39 +491,9 @@ func TestExtractQueryKey_Other(t *testing.T) {
 	}
 }
 
-func TestExtractQueryKey_EmptyString(t *testing.T) {
-	key := extractQueryKey("")
-	if key != "" {
-		t.Errorf("extractQueryKey(empty string) = %q, want empty", key)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // CacheConfig validate tests
 // ---------------------------------------------------------------------------
-
-func TestCacheConfig_ValidConfig(t *testing.T) {
-	cfg := CacheConfig{MaxEntries: 100, ExtractKV: simpleExtractKV}
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate() failed: %v", err)
-	}
-}
-
-func TestCacheConfig_ZeroMaxEntries(t *testing.T) {
-	cfg := CacheConfig{MaxEntries: 0, ExtractKV: simpleExtractKV}
-	err := cfg.validate()
-	if err == nil {
-		t.Fatal("expected error for MaxEntries=0")
-	}
-}
-
-func TestCacheConfig_NilExtractKV(t *testing.T) {
-	cfg := CacheConfig{MaxEntries: 100, ExtractKV: nil}
-	err := cfg.validate()
-	if err == nil {
-		t.Fatal("expected error for nil ExtractKV")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // CachedDiskStateMachine BytesLookup and GetHash

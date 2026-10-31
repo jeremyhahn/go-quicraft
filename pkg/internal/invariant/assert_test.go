@@ -44,20 +44,3 @@ func TestAssert_FalseCondition_Panics(t *testing.T) {
 	}()
 	Assert(false, msg)
 }
-
-func TestAssert_EmptyMessage_StillPanics(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic but did not get one")
-		}
-		s, ok := r.(string)
-		if !ok {
-			t.Fatalf("expected string panic, got %T: %v", r, r)
-		}
-		if s != "invariant violated: " {
-			t.Fatalf("unexpected panic message: %q", s)
-		}
-	}()
-	Assert(false, "")
-}

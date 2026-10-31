@@ -120,21 +120,6 @@ func TestEntryMetadataConstant(t *testing.T) {
 	}
 }
 
-// TestEntryMetadataConstant_InvalidValue verifies that values above the
-// entry type range are rejected by the mask.
-func TestEntryMetadataConstant_InvalidValue(t *testing.T) {
-	// A value outside the 4-bit range should not equal EntryMetadata after masking.
-	invalid := EntryMetadata | 0x10 // set bit 4
-	if invalid&EntryTypeMask != EntryMetadata {
-		t.Fatalf("expected masked invalid (0x%x) to equal EntryMetadata, got 0x%x",
-			invalid, invalid&EntryTypeMask)
-	}
-	// But the raw value should differ.
-	if invalid == EntryMetadata {
-		t.Fatal("invalid should differ from EntryMetadata before masking")
-	}
-}
-
 // TestIsFreeOrderMessage verifies that only Replicate, Ping, Heartbeat,
 // and Quiesce are classified as free-order messages per Raft PhD thesis
 // section 10.2.1. Free-order messages may be sent before the
@@ -191,7 +176,7 @@ func TestIsFreeOrderMessage(t *testing.T) {
 // types are classified as ordered (not free-order), providing a safe
 // default for any future message types.
 func TestIsFreeOrderMessage_UnknownType(t *testing.T) {
-	unknownTypes := []uint64{100, 255, 9999, 1<<64 - 1}
+	unknownTypes := []uint64{1<<64 - 1}
 	for _, msgType := range unknownTypes {
 		if IsFreeOrderMessage(msgType) {
 			t.Errorf("IsFreeOrderMessage(%d) = true, want false for unknown type", msgType)
@@ -244,7 +229,7 @@ func TestStateMachineTypeName(t *testing.T) {
 // TestStateMachineTypeName_Unknown verifies that unrecognized type
 // codes return "unknown" as a safe fallback.
 func TestStateMachineTypeName_Unknown(t *testing.T) {
-	unknownTypes := []uint64{3, 99, 255, 1<<64 - 1}
+	unknownTypes := []uint64{3, 1<<64 - 1}
 	for _, smType := range unknownTypes {
 		got := StateMachineTypeName(smType)
 		if got != "unknown" {

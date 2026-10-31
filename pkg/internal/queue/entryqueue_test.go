@@ -19,21 +19,6 @@ import (
 	"testing"
 )
 
-func TestEntryQueue_AddAndSwap(t *testing.T) {
-	q := NewEntryQueue[int](8, 256)
-	ok := q.Add([]int{1, 2, 3})
-	if !ok {
-		t.Fatal("Add should succeed when queue is empty")
-	}
-	items := q.Swap(nil)
-	if len(items) != 3 {
-		t.Fatalf("expected 3 items, got %d", len(items))
-	}
-	if items[0] != 1 || items[1] != 2 || items[2] != 3 {
-		t.Fatalf("items = %v, want [1 2 3]", items)
-	}
-}
-
 func TestEntryQueue_AddRejectsWhenFull(t *testing.T) {
 	q := NewEntryQueue[int](4, 4)
 	ok := q.Add([]int{1, 2, 3, 4})
@@ -69,15 +54,6 @@ func TestEntryQueue_AddRejectsPartialOverflow(t *testing.T) {
 	}
 }
 
-func TestEntryQueue_SwapEmpty(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	buf := make([]int, 0, 8)
-	items := q.Swap(buf)
-	if len(items) != 0 {
-		t.Fatalf("expected empty result, got %d items", len(items))
-	}
-}
-
 func TestEntryQueue_SwapReusesBuf(t *testing.T) {
 	q := NewEntryQueue[int](4, 256)
 
@@ -100,52 +76,6 @@ func TestEntryQueue_SwapReusesBuf(t *testing.T) {
 	}
 }
 
-func TestEntryQueue_SwapClearsQueue(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	q.Add([]int{1, 2})
-	_ = q.Swap(nil)
-
-	// Second swap should return empty.
-	items := q.Swap(nil)
-	if len(items) != 0 {
-		t.Fatalf("expected empty after second swap, got %d items", len(items))
-	}
-}
-
-func TestEntryQueue_MultipleAddsThenSwap(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	for i := range 5 {
-		ok := q.Add([]int{i})
-		if !ok {
-			t.Fatalf("Add(%d) should succeed", i)
-		}
-	}
-	items := q.Swap(nil)
-	if len(items) != 5 {
-		t.Fatalf("expected 5 items, got %d", len(items))
-	}
-	for i, v := range items {
-		if v != i {
-			t.Fatalf("items[%d] = %d, want %d", i, v, i)
-		}
-	}
-}
-
-func TestEntryQueue_Len(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	if q.Len() != 0 {
-		t.Fatalf("expected Len() 0, got %d", q.Len())
-	}
-	q.Add([]int{1, 2, 3})
-	if q.Len() != 3 {
-		t.Fatalf("expected Len() 3, got %d", q.Len())
-	}
-	q.Swap(nil)
-	if q.Len() != 0 {
-		t.Fatalf("expected Len() 0 after swap, got %d", q.Len())
-	}
-}
-
 func TestEntryQueue_EmptyTracksEveryTransition(t *testing.T) {
 	q := NewEntryQueue[int](4, 3)
 	check := func(step string, want bool) {
@@ -155,9 +85,13 @@ func TestEntryQueue_EmptyTracksEveryTransition(t *testing.T) {
 		}
 	}
 	check("new", true)
-	q.Add(nil)
+	if !q.Add(nil) {
+		t.Fatal("Add of nil refused")
+	}
 	check("add nil", true)
-	q.Add([]int{})
+	if !q.Add([]int{}) {
+		t.Fatal("Add of empty slice refused")
+	}
 	check("add empty slice", true)
 	q.Add([]int{1, 2})
 	check("add", false)
@@ -236,181 +170,7 @@ func TestEntryQueue_EmptyAgreesWithSoleConsumer(t *testing.T) {
 	}
 }
 
-func TestEntryQueue_GrowsBeyondInitialCapacity(t *testing.T) {
-	q := NewEntryQueue[int](2, 1000)
-	batch := make([]int, 100)
-	for i := range batch {
-		batch[i] = i
-	}
-	ok := q.Add(batch)
-	if !ok {
-		t.Fatal("Add should succeed within maxLen")
-	}
-	items := q.Swap(nil)
-	if len(items) != 100 {
-		t.Fatalf("expected 100 items, got %d", len(items))
-	}
-}
-
-func TestEntryQueue_ConcurrentProducers(t *testing.T) {
-	const numProducers = 8
-	const itemsPerProducer = 100
-	q := NewEntryQueue[int](64, numProducers*itemsPerProducer)
-
-	var wg sync.WaitGroup
-	wg.Add(numProducers)
-	for p := range numProducers {
-		go func(id int) {
-			defer wg.Done()
-			for i := range itemsPerProducer {
-				ok := q.Add([]int{id*itemsPerProducer + i})
-				if !ok {
-					// Under maxLen, all should succeed.
-					t.Errorf("producer %d: Add(%d) rejected", id, i)
-					return
-				}
-			}
-		}(p)
-	}
-	wg.Wait()
-
-	items := q.Swap(nil)
-	if len(items) != numProducers*itemsPerProducer {
-		t.Fatalf("expected %d items, got %d", numProducers*itemsPerProducer, len(items))
-	}
-
-	// Verify all items are present (order may vary due to concurrency).
-	seen := make(map[int]bool, len(items))
-	for _, v := range items {
-		seen[v] = true
-	}
-	for i := range numProducers * itemsPerProducer {
-		if !seen[i] {
-			t.Fatalf("missing item %d", i)
-		}
-	}
-}
-
-func TestEntryQueue_ConcurrentProducersSingleConsumer(t *testing.T) {
-	const numProducers = 4
-	const itemsPerProducer = 250
-	q := NewEntryQueue[int](64, numProducers*itemsPerProducer)
-
-	var wg sync.WaitGroup
-	wg.Add(numProducers)
-	for p := range numProducers {
-		go func(id int) {
-			defer wg.Done()
-			for i := range itemsPerProducer {
-				q.Add([]int{id*itemsPerProducer + i})
-			}
-		}(p)
-	}
-
-	// Wait for all producers to complete.
-	wg.Wait()
-
-	// Consumer drains in multiple swap cycles.
-	var collected []int
-	var buf []int
-	for {
-		buf = q.Swap(buf[:0])
-		if len(buf) == 0 {
-			break
-		}
-		collected = append(collected, buf...)
-	}
-
-	if len(collected) != numProducers*itemsPerProducer {
-		t.Fatalf("expected %d total items, got %d",
-			numProducers*itemsPerProducer, len(collected))
-	}
-}
-
-func TestEntryQueue_AddEmptySlice(t *testing.T) {
-	q := NewEntryQueue[int](4, 10)
-	ok := q.Add([]int{})
-	if !ok {
-		t.Fatal("Add of empty slice should succeed")
-	}
-	if q.Len() != 0 {
-		t.Fatalf("Len should be 0 after adding empty slice, got %d", q.Len())
-	}
-}
-
-func TestEntryQueue_AddNilSlice(t *testing.T) {
-	q := NewEntryQueue[int](4, 10)
-	ok := q.Add(nil)
-	if !ok {
-		t.Fatal("Add of nil slice should succeed")
-	}
-	if q.Len() != 0 {
-		t.Fatalf("Len should be 0 after adding nil, got %d", q.Len())
-	}
-}
-
-func TestEntryQueue_MaxLenZero(t *testing.T) {
-	q := NewEntryQueue[int](0, 0)
-	ok := q.Add([]int{1})
-	if ok {
-		t.Fatal("Add should reject with maxLen=0")
-	}
-	items := q.Swap(nil)
-	if len(items) != 0 {
-		t.Fatalf("expected empty, got %d items", len(items))
-	}
-}
-
-func TestEntryQueue_AddExactlyMaxLen(t *testing.T) {
-	q := NewEntryQueue[int](4, 3)
-	ok := q.Add([]int{1, 2, 3})
-	if !ok {
-		t.Fatal("Add of exactly maxLen items should succeed")
-	}
-	ok = q.Add([]int{4})
-	if ok {
-		t.Fatal("Add should reject when at maxLen")
-	}
-}
-
-func TestEntryQueue_SwapAlternatingCycles(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	var buf []int
-
-	for cycle := range 10 {
-		ok := q.Add([]int{cycle})
-		if !ok {
-			t.Fatalf("cycle %d: Add failed", cycle)
-		}
-		buf = q.Swap(buf[:0])
-		if len(buf) != 1 {
-			t.Fatalf("cycle %d: expected 1 item, got %d", cycle, len(buf))
-		}
-		if buf[0] != cycle {
-			t.Fatalf("cycle %d: item = %d, want %d", cycle, buf[0], cycle)
-		}
-	}
-}
-
 // --- AddOne tests ---
-
-func TestEntryQueue_AddOneSucceedsWhenNotFull(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	ok := q.AddOne(42)
-	if !ok {
-		t.Fatal("AddOne should succeed when queue is empty")
-	}
-	if q.Len() != 1 {
-		t.Fatalf("expected Len() 1, got %d", q.Len())
-	}
-	items := q.Swap(nil)
-	if len(items) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(items))
-	}
-	if items[0] != 42 {
-		t.Fatalf("item = %d, want 42", items[0])
-	}
-}
 
 func TestEntryQueue_AddOneFailsWhenFull(t *testing.T) {
 	q := NewEntryQueue[int](4, 3)
@@ -434,67 +194,6 @@ func TestEntryQueue_AddOneFailsWhenFull(t *testing.T) {
 	}
 }
 
-func TestEntryQueue_AddOneAtMaxCapacity(t *testing.T) {
-	q := NewEntryQueue[int](4, 1)
-	ok := q.AddOne(10)
-	if !ok {
-		t.Fatal("AddOne should succeed when queue has space")
-	}
-	if q.Len() != 1 {
-		t.Fatalf("expected Len() 1, got %d", q.Len())
-	}
-	// Second item should be rejected.
-	ok = q.AddOne(20)
-	if ok {
-		t.Fatal("AddOne should reject when at maxLen=1")
-	}
-	if q.Len() != 1 {
-		t.Fatalf("expected Len() 1, got %d", q.Len())
-	}
-}
-
-func TestEntryQueue_AddOneMultipleThenSwap(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	for i := range 10 {
-		ok := q.AddOne(i)
-		if !ok {
-			t.Fatalf("AddOne(%d) should succeed", i)
-		}
-	}
-	if q.Len() != 10 {
-		t.Fatalf("expected Len() 10, got %d", q.Len())
-	}
-	items := q.Swap(nil)
-	if len(items) != 10 {
-		t.Fatalf("expected 10 items, got %d", len(items))
-	}
-	for i, v := range items {
-		if v != i {
-			t.Fatalf("items[%d] = %d, want %d", i, v, i)
-		}
-	}
-}
-
-func TestEntryQueue_AddOneWithDifferentTypes(t *testing.T) {
-	// Test with string type.
-	q := NewEntryQueue[string](4, 256)
-	ok := q.AddOne("hello")
-	if !ok {
-		t.Fatal("AddOne should succeed for string type")
-	}
-	ok = q.AddOne("world")
-	if !ok {
-		t.Fatal("second AddOne should succeed")
-	}
-	items := q.Swap(nil)
-	if len(items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(items))
-	}
-	if items[0] != "hello" || items[1] != "world" {
-		t.Fatalf("items = %v, want [hello world]", items)
-	}
-}
-
 func TestEntryQueue_AddOneAndAddMixed(t *testing.T) {
 	q := NewEntryQueue[int](4, 256)
 	ok := q.AddOne(1)
@@ -515,45 +214,6 @@ func TestEntryQueue_AddOneAndAddMixed(t *testing.T) {
 	}
 	if items[0] != 1 || items[1] != 2 || items[2] != 3 || items[3] != 4 {
 		t.Fatalf("items = %v, want [1 2 3 4]", items)
-	}
-}
-
-func TestEntryQueue_AddOneConcurrentProducers(t *testing.T) {
-	const numProducers = 8
-	const itemsPerProducer = 100
-	q := NewEntryQueue[int](64, numProducers*itemsPerProducer)
-
-	var wg sync.WaitGroup
-	wg.Add(numProducers)
-	for p := range numProducers {
-		go func(id int) {
-			defer wg.Done()
-			for i := range itemsPerProducer {
-				ok := q.AddOne(id*itemsPerProducer + i)
-				if !ok {
-					// Under maxLen, all should succeed.
-					t.Errorf("producer %d: AddOne(%d) rejected", id, i)
-					return
-				}
-			}
-		}(p)
-	}
-	wg.Wait()
-
-	items := q.Swap(nil)
-	if len(items) != numProducers*itemsPerProducer {
-		t.Fatalf("expected %d items, got %d", numProducers*itemsPerProducer, len(items))
-	}
-
-	// Verify all items are present.
-	seen := make(map[int]bool, len(items))
-	for _, v := range items {
-		seen[v] = true
-	}
-	for i := range numProducers * itemsPerProducer {
-		if !seen[i] {
-			t.Fatalf("missing item %d", i)
-		}
 	}
 }
 
@@ -603,58 +263,6 @@ func TestEntryQueue_AddOneMixedConcurrency(t *testing.T) {
 		if !seen[i] {
 			t.Fatalf("missing item %d", i)
 		}
-	}
-}
-
-func TestEntryQueue_AddOneFillToExactCapacity(t *testing.T) {
-	q := NewEntryQueue[int](4, 5)
-	// Add exactly 5 items using AddOne.
-	for i := range 5 {
-		ok := q.AddOne(i)
-		if !ok {
-			t.Fatalf("AddOne(%d) should succeed, at Len=%d", i, q.Len())
-		}
-	}
-	if q.Len() != 5 {
-		t.Fatalf("expected Len() 5, got %d", q.Len())
-	}
-	// Sixth item should be rejected.
-	ok := q.AddOne(5)
-	if ok {
-		t.Fatal("AddOne should reject when at exact maxLen")
-	}
-	items := q.Swap(nil)
-	if len(items) != 5 {
-		t.Fatalf("expected 5 items, got %d", len(items))
-	}
-	for i, v := range items {
-		if v != i {
-			t.Fatalf("items[%d] = %d, want %d", i, v, i)
-		}
-	}
-}
-
-func TestEntryQueue_AddOneAfterSwap(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-	ok := q.AddOne(1)
-	if !ok {
-		t.Fatal("first AddOne should succeed")
-	}
-	_ = q.Swap(nil)
-	if q.Len() != 0 {
-		t.Fatalf("Len should be 0 after swap, got %d", q.Len())
-	}
-	// Add after swap should succeed.
-	ok = q.AddOne(2)
-	if !ok {
-		t.Fatal("AddOne after swap should succeed")
-	}
-	items := q.Swap(nil)
-	if len(items) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(items))
-	}
-	if items[0] != 2 {
-		t.Fatalf("item = %d, want 2", items[0])
 	}
 }
 

@@ -24,29 +24,6 @@ import (
 	"testing"
 )
 
-func TestNewRegistry(t *testing.T) {
-	r := NewRegistry()
-	if r == nil {
-		t.Fatal("NewRegistry returned nil")
-	}
-	if r.Count() != 0 {
-		t.Fatalf("expected 0 entries, got %d", r.Count())
-	}
-}
-
-func TestRegisterAndResolve(t *testing.T) {
-	r := NewRegistry()
-	r.Register(1, 1, "10.0.0.1:5000")
-
-	addr, err := r.Resolve(1, 1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if addr != "10.0.0.1:5000" {
-		t.Fatalf("expected 10.0.0.1:5000, got %s", addr)
-	}
-}
-
 func TestResolveNonExistentNode(t *testing.T) {
 	r := NewRegistry()
 
@@ -81,19 +58,8 @@ func TestRegisterOverwritesExistingAddress(t *testing.T) {
 	if addr != "10.0.0.2:6000" {
 		t.Fatalf("expected 10.0.0.2:6000, got %s", addr)
 	}
-}
-
-func TestRemoveAndResolve(t *testing.T) {
-	r := NewRegistry()
-	r.Register(1, 1, "10.0.0.1:5000")
-	r.Remove(1, 1)
-
-	_, err := r.Resolve(1, 1)
-	if err == nil {
-		t.Fatal("expected error after removal")
-	}
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("expected NodeNotFoundError, got %T", err)
+	if r.Count() != 1 {
+		t.Fatalf("expected 1 entry after overwrite, got %d", r.Count())
 	}
 }
 
@@ -122,15 +88,6 @@ func TestCount(t *testing.T) {
 	r.Remove(2, 1)
 	if r.Count() != 2 {
 		t.Fatalf("expected 2 entries, got %d", r.Count())
-	}
-}
-
-func TestCountAfterOverwrite(t *testing.T) {
-	r := NewRegistry()
-	r.Register(1, 1, "10.0.0.1:5000")
-	r.Register(1, 1, "10.0.0.1:6000")
-	if r.Count() != 1 {
-		t.Fatalf("expected 1 entry after overwrite, got %d", r.Count())
 	}
 }
 
@@ -210,29 +167,6 @@ func TestConcurrentRegisterResolveRemove(t *testing.T) {
 	wg.Wait()
 }
 
-func TestNodeInfoAsMapKey(t *testing.T) {
-	// Verify that different (shardID, replicaID) pairs produce distinct keys.
-	r := NewRegistry()
-	r.Register(1, 2, "addr-1-2")
-	r.Register(2, 1, "addr-2-1")
-
-	addr12, err := r.Resolve(1, 2)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if addr12 != "addr-1-2" {
-		t.Fatalf("expected addr-1-2, got %s", addr12)
-	}
-
-	addr21, err := r.Resolve(2, 1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if addr21 != "addr-2-1" {
-		t.Fatalf("expected addr-2-1, got %s", addr21)
-	}
-}
-
 func TestNodeNotFoundErrorMessage(t *testing.T) {
 	err := &NodeNotFoundError{ShardID: 5, ReplicaID: 10}
 	expected := "registry: node not found (shard=5, replica=10)"
@@ -241,28 +175,9 @@ func TestNodeNotFoundErrorMessage(t *testing.T) {
 	}
 }
 
-func TestNodeNotFoundErrorIs(t *testing.T) {
-	err := &NodeNotFoundError{ShardID: 1, ReplicaID: 2}
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatal("expected errors.Is match with ErrNodeNotFound")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // AddressInUse
 // ---------------------------------------------------------------------------
-
-// TestAddressInUseEmptyRegistry verifies an empty registry reports no address
-// in use, including the empty string.
-func TestAddressInUseEmptyRegistry(t *testing.T) {
-	r := NewRegistry()
-	if r.AddressInUse("10.0.0.1:5000") {
-		t.Fatal("empty registry reported an address in use")
-	}
-	if r.AddressInUse("") {
-		t.Fatal("empty registry reported the empty address in use")
-	}
-}
 
 // TestAddressInUsePresentAndAbsent verifies the predicate matches on the
 // address value regardless of which (shard, replica) holds it, and that an

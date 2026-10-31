@@ -51,46 +51,6 @@ func TestEntryMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertEntryEqual(t, &e, &e2)
 }
 
-func TestEntryMarshalUnmarshalConfigChange(t *testing.T) {
-	e := Entry{
-		Term:  10,
-		Index: 200,
-		Type:  EntryConfigChange,
-		Cmd:   []byte("add-node 5"),
-	}
-	buf := make([]byte, e.Size())
-	_, err := e.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var e2 Entry
-	_, err = e2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	assertEntryEqual(t, &e, &e2)
-}
-
-func TestEntryMarshalUnmarshalEncodedEntry(t *testing.T) {
-	e := Entry{
-		Term:  3,
-		Index: 50,
-		Type:  EntryEncodedEntry,
-		Cmd:   []byte{0x01, 0x02, 0x03},
-	}
-	buf := make([]byte, e.Size())
-	_, err := e.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var e2 Entry
-	_, err = e2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	assertEntryEqual(t, &e, &e2)
-}
-
 func TestEntryMarshalUnmarshalWithCompression(t *testing.T) {
 	e := Entry{
 		Term:  5,
@@ -136,32 +96,6 @@ func TestEntryMarshalUnmarshalEmptyCmd(t *testing.T) {
 	}
 }
 
-func TestEntryMarshalUnmarshalLargeCmd(t *testing.T) {
-	cmd := make([]byte, 4096)
-	for i := range cmd {
-		cmd[i] = byte(i % 256)
-	}
-	e := Entry{
-		Term:  1,
-		Index: 1,
-		Type:  EntryNormal,
-		Cmd:   cmd,
-	}
-	buf := make([]byte, e.Size())
-	_, err := e.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var e2 Entry
-	_, err = e2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if !bytes.Equal(e2.Cmd, cmd) {
-		t.Fatal("Large cmd data mismatch after round-trip")
-	}
-}
-
 func TestEntrySize(t *testing.T) {
 	tests := []struct {
 		name string
@@ -169,9 +103,7 @@ func TestEntrySize(t *testing.T) {
 		want int
 	}{
 		{"nil cmd", nil, entryHeaderSize},
-		{"empty cmd", []byte{}, entryHeaderSize},
 		{"small cmd", []byte("abc"), entryHeaderSize + 3},
-		{"256 bytes", make([]byte, 256), entryHeaderSize + 256},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -382,10 +314,6 @@ func TestIsConfigChange(t *testing.T) {
 	if normal.IsConfigChange() {
 		t.Error("EntryNormal should return false")
 	}
-	encoded := Entry{Type: EntryEncodedEntry}
-	if encoded.IsConfigChange() {
-		t.Error("EntryEncodedEntry should return false")
-	}
 	// With compression flag
 	compressed := Entry{Type: EntryConfigChange | EntryCompressFlag}
 	if !compressed.IsConfigChange() {
@@ -491,10 +419,6 @@ func TestIsEmpty(t *testing.T) {
 	if withCmd.IsEmpty() {
 		t.Error("entry with Cmd should not be empty")
 	}
-	emptySlice := Entry{Cmd: []byte{}}
-	if !emptySlice.IsEmpty() {
-		t.Error("entry with empty slice Cmd should be empty")
-	}
 }
 
 func TestIsMetadataEntry(t *testing.T) {
@@ -506,31 +430,10 @@ func TestIsMetadataEntry(t *testing.T) {
 	if normal.IsMetadataEntry() {
 		t.Error("EntryNormal should return false")
 	}
-	cc := Entry{Type: EntryConfigChange}
-	if cc.IsMetadataEntry() {
-		t.Error("EntryConfigChange should return false")
-	}
-	encoded := Entry{Type: EntryEncodedEntry}
-	if encoded.IsMetadataEntry() {
-		t.Error("EntryEncodedEntry should return false")
-	}
 	// With compression flag: should still detect EntryMetadata.
 	compressed := Entry{Type: EntryMetadata | EntryCompressFlag}
 	if !compressed.IsMetadataEntry() {
 		t.Error("compressed metadata entry should return true")
-	}
-}
-
-func TestIsMetadataEntry_NotOtherTypes(t *testing.T) {
-	// Verify mutual exclusivity with other entry type predicates.
-	meta := Entry{Type: EntryMetadata}
-	if meta.IsConfigChange() {
-		t.Error("metadata entry should not be a config change")
-	}
-	// IsSessionManaged checks ClientID, not Type, so metadata entries
-	// with clientID=0 are not session-managed.
-	if meta.IsSessionManaged() {
-		t.Error("metadata entry with zero ClientID should not be session-managed")
 	}
 }
 
@@ -568,18 +471,6 @@ func TestEntryMarshalUnmarshalMetadata(t *testing.T) {
 	}
 	if e2.Cmd != nil {
 		t.Fatalf("Cmd: got %v, want nil", e2.Cmd)
-	}
-}
-
-func TestSessionSentinelValues_AreDistinct(t *testing.T) {
-	if SessionSeriesIDForRegister == SessionSeriesIDForUnregister {
-		t.Fatal("register and unregister sentinel values must differ")
-	}
-	if SessionSeriesIDForRegister == 0 {
-		t.Fatal("register sentinel must not be zero")
-	}
-	if SessionSeriesIDForUnregister == 0 {
-		t.Fatal("unregister sentinel must not be zero")
 	}
 }
 

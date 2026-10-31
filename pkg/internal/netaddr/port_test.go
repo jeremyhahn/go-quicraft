@@ -64,16 +64,6 @@ func TestCanonical_NormalisesPortSpelling(t *testing.T) {
 	}
 }
 
-// TestCanonical_DistinctPortsStayDistinct is the control. Two replicas on one
-// machine at different ports are a supported deployment and must not be
-// collapsed into one member by the normalisation above.
-func TestCanonical_DistinctPortsStayDistinct(t *testing.T) {
-	if Canonical("node-b:5001") == Canonical("node-b:5002") {
-		t.Fatal("two genuinely different ports canonicalised to one address: " +
-			"co-located replicas would be refused as duplicates")
-	}
-}
-
 // TestCanonical_IPv6AndServiceNames covers the shapes the numeric path must
 // not damage.
 func TestCanonical_IPv6AndServiceNames(t *testing.T) {

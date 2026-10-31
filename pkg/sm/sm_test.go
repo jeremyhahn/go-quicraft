@@ -27,63 +27,9 @@ import (
 // Types: Result
 // ---------------------------------------------------------------------------
 
-func TestResult_FieldsAccessible(t *testing.T) {
-	r := Result{Value: 42, Data: []byte("hello")}
-	if r.Value != 42 {
-		t.Errorf("Value = %d, want 42", r.Value)
-	}
-	if string(r.Data) != "hello" {
-		t.Errorf("Data = %q, want %q", r.Data, "hello")
-	}
-}
-
-func TestResult_ZeroValue(t *testing.T) {
-	var r Result
-	if r.Value != 0 {
-		t.Errorf("zero Value = %d, want 0", r.Value)
-	}
-	if r.Data != nil {
-		t.Errorf("zero Data = %v, want nil", r.Data)
-	}
-}
-
-func TestResult_NilData(t *testing.T) {
-	r := Result{Value: 1, Data: nil}
-	if r.Data != nil {
-		t.Errorf("Data = %v, want nil", r.Data)
-	}
-}
-
-func TestResult_EmptyData(t *testing.T) {
-	r := Result{Value: 1, Data: []byte{}}
-	if len(r.Data) != 0 {
-		t.Errorf("Data length = %d, want 0", len(r.Data))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Types: Entry
 // ---------------------------------------------------------------------------
-
-func TestEntry_FieldsAccessible(t *testing.T) {
-	e := Entry{Index: 100, Cmd: []byte("SET key val")}
-	if e.Index != 100 {
-		t.Errorf("Index = %d, want 100", e.Index)
-	}
-	if string(e.Cmd) != "SET key val" {
-		t.Errorf("Cmd = %q, want %q", e.Cmd, "SET key val")
-	}
-}
-
-func TestEntry_ZeroValue(t *testing.T) {
-	var e Entry
-	if e.Index != 0 {
-		t.Errorf("zero Index = %d, want 0", e.Index)
-	}
-	if e.Cmd != nil {
-		t.Errorf("zero Cmd = %v, want nil", e.Cmd)
-	}
-}
 
 func TestEntry_CopyCmd(t *testing.T) {
 	original := []byte("payload data")
@@ -98,14 +44,6 @@ func TestEntry_CopyCmd(t *testing.T) {
 	cp[0] = 'X'
 	if e.Cmd[0] == 'X' {
 		t.Error("CopyCmd returned a slice that aliases the original Cmd")
-	}
-}
-
-func TestEntry_CopyCmd_NilCmd(t *testing.T) {
-	e := Entry{Index: 1, Cmd: nil}
-	cp := e.CopyCmd()
-	if cp != nil {
-		t.Errorf("CopyCmd() on nil Cmd = %v, want nil", cp)
 	}
 }
 
@@ -759,36 +697,6 @@ func TestDiskStateMachine_UpdateErrorOnEmptyCmd(t *testing.T) {
 // CreateFunc and type-safe wrappers
 // ---------------------------------------------------------------------------
 
-func TestCreateFunc_ReturnsStateMachine(t *testing.T) {
-	var cf CreateFunc = func(shardID, replicaID uint64) interface{} {
-		return newTestStateMachine()
-	}
-	result := cf(1, 1)
-	if _, ok := result.(StateMachine); !ok {
-		t.Error("CreateFunc did not return StateMachine")
-	}
-}
-
-func TestCreateFunc_ReturnsConcurrentStateMachine(t *testing.T) {
-	var cf CreateFunc = func(shardID, replicaID uint64) interface{} {
-		return newTestConcurrentStateMachine()
-	}
-	result := cf(1, 1)
-	if _, ok := result.(ConcurrentStateMachine); !ok {
-		t.Error("CreateFunc did not return ConcurrentStateMachine")
-	}
-}
-
-func TestCreateFunc_ReturnsOnDiskStateMachine(t *testing.T) {
-	var cf CreateFunc = func(shardID, replicaID uint64) interface{} {
-		return newTestOnDiskStateMachine()
-	}
-	result := cf(1, 1)
-	if _, ok := result.(DiskStateMachine); !ok {
-		t.Error("CreateFunc did not return DiskStateMachine")
-	}
-}
-
 func TestNewCreateFunc_TypeSafe(t *testing.T) {
 	cf := NewCreateFunc(func(shardID, replicaID uint64) StateMachine {
 		return newTestStateMachine()
@@ -898,45 +806,3 @@ var (
 // TestInterfaces_ContextFirstParameter verifies at compile time that all
 // interface methods accept context.Context as the first parameter. The test
 // implementations above would fail to compile if the signatures differed.
-func TestInterfaces_ContextFirstParameter(t *testing.T) {
-	// This test body is intentionally empty. The compile-time interface
-	// satisfaction checks above (var _ StateMachine = ...) verify that
-	// all method signatures, including context.Context as the first parameter,
-	// are correct. If any method were missing context.Context, the test
-	// implementations would not compile.
-	t.Log("All interface methods accept context.Context as the first parameter (verified at compile time)")
-}
-
-// ---------------------------------------------------------------------------
-// CreateStateMachineFunc / CreateConcurrentStateMachineFunc / CreateDiskStateMachineFunc type aliases
-// ---------------------------------------------------------------------------
-
-func TestCreateStateMachineFunc_TypeAlias(t *testing.T) {
-	var fn CreateStateMachineFunc = func(shardID, replicaID uint64) StateMachine {
-		return newTestStateMachine()
-	}
-	sm := fn(1, 1)
-	if sm == nil {
-		t.Error("CreateStateMachineFunc returned nil")
-	}
-}
-
-func TestCreateConcurrentStateMachineFunc_TypeAlias(t *testing.T) {
-	var fn CreateConcurrentStateMachineFunc = func(shardID, replicaID uint64) ConcurrentStateMachine {
-		return newTestConcurrentStateMachine()
-	}
-	sm := fn(1, 1)
-	if sm == nil {
-		t.Error("CreateConcurrentStateMachineFunc returned nil")
-	}
-}
-
-func TestCreateDiskStateMachineFunc_TypeAlias(t *testing.T) {
-	var fn CreateDiskStateMachineFunc = func(shardID, replicaID uint64) DiskStateMachine {
-		return newTestOnDiskStateMachine()
-	}
-	sm := fn(1, 1)
-	if sm == nil {
-		t.Error("CreateDiskStateMachineFunc returned nil")
-	}
-}

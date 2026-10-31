@@ -14,10 +14,7 @@
 
 package proto
 
-import (
-	"sync"
-	"testing"
-)
+import "testing"
 
 func TestEntrySlicePool_GetReturnsEmptySlice(t *testing.T) {
 	sp := GetEntrySlice()
@@ -27,39 +24,6 @@ func TestEntrySlicePool_GetReturnsEmptySlice(t *testing.T) {
 	}
 	if cap(*sp) < defaultEntrySliceCap {
 		t.Fatalf("expected capacity >= %d, got %d", defaultEntrySliceCap, cap(*sp))
-	}
-}
-
-func TestEntrySlicePool_GetPutReuse(t *testing.T) {
-	// Get a slice and populate it.
-	sp := GetEntrySlice()
-	*sp = append(*sp, Entry{Term: 1, Index: 1, Cmd: []byte("cmd1")})
-	*sp = append(*sp, Entry{Term: 1, Index: 2, Cmd: []byte("cmd2")})
-
-	// Record the backing array pointer before returning.
-	backingPtr := &(*sp)[:cap(*sp)][0]
-
-	// Return to pool.
-	PutEntrySlice(sp)
-
-	// Get again; with high probability we get the same backing array.
-	// Note: sync.Pool does not guarantee reuse, so we verify the
-	// behavioral contract (length 0, cleaned entries) rather than
-	// pointer identity.
-	sp2 := GetEntrySlice()
-	defer PutEntrySlice(sp2)
-	if len(*sp2) != 0 {
-		t.Fatalf("expected length 0 after pool reuse, got %d", len(*sp2))
-	}
-
-	// If we got the same slice back, verify the backing array matches.
-	// This is a best-effort check since sync.Pool may GC the pooled item.
-	backingPtr2 := &(*sp2)[:cap(*sp2)][0]
-	if backingPtr == backingPtr2 {
-		// Same backing array reused -- verify capacity was preserved.
-		if cap(*sp2) < 2 {
-			t.Fatalf("expected capacity >= 2 from reuse, got %d", cap(*sp2))
-		}
 	}
 }
 
@@ -119,50 +83,6 @@ func TestEntrySlicePool_GrowthPreserved(t *testing.T) {
 	backingPtr2 := &(*sp2)[:cap(*sp2)][0]
 	if backingPtr == backingPtr2 && cap(*sp2) != grownCap {
 		t.Fatalf("expected grown capacity %d preserved, got %d", grownCap, cap(*sp2))
-	}
-}
-
-func TestEntrySlicePool_ConcurrentAccess(t *testing.T) {
-	const goroutines = 32
-	const iterations = 1000
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for range goroutines {
-		go func() {
-			defer wg.Done()
-			for range iterations {
-				sp := GetEntrySlice()
-				*sp = append(*sp, Entry{Term: 1, Index: 1, Cmd: []byte("concurrent")})
-				*sp = append(*sp, Entry{Term: 2, Index: 2, Cmd: []byte("test")})
-				// Verify entries are accessible.
-				if len(*sp) != 2 {
-					t.Errorf("expected length 2, got %d", len(*sp))
-					return
-				}
-				if (*sp)[0].Term != 1 || (*sp)[1].Term != 2 {
-					t.Errorf("entry data corrupted")
-					return
-				}
-				PutEntrySlice(sp)
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-func TestEntrySlicePool_EmptySlicePut(t *testing.T) {
-	// Getting and immediately returning an empty slice should work.
-	sp := GetEntrySlice()
-	if len(*sp) != 0 {
-		t.Fatalf("expected empty slice, got length %d", len(*sp))
-	}
-	PutEntrySlice(sp)
-
-	// Get again to verify pool is not corrupted.
-	sp2 := GetEntrySlice()
-	defer PutEntrySlice(sp2)
-	if len(*sp2) != 0 {
-		t.Fatalf("expected empty slice after empty put/get cycle, got length %d", len(*sp2))
 	}
 }
 

@@ -90,9 +90,12 @@ func newTestAggregator(t *testing.T, opts ...Option) (*Aggregator, *mockProposer
 
 func TestNewAggregator_NilProposer(t *testing.T) {
 	t.Parallel()
-	_, err := NewAggregator(nil)
+	agg, err := NewAggregator(nil)
 	if err == nil {
 		t.Fatal("NewAggregator(nil) should return error")
+	}
+	if agg != nil {
+		t.Error("aggregator should be nil when proposer is nil")
 	}
 
 	var npe *NilProposerError
@@ -101,17 +104,6 @@ func TestNewAggregator_NilProposer(t *testing.T) {
 	}
 	if !errors.Is(err, ErrNilProposer) {
 		t.Error("error should match ErrNilProposer sentinel")
-	}
-}
-
-func TestNewAggregator_NilProposerReturnsNilAggregator(t *testing.T) {
-	t.Parallel()
-	agg, err := NewAggregator(nil)
-	if err == nil {
-		t.Fatal("expected error for nil proposer")
-	}
-	if agg != nil {
-		t.Error("aggregator should be nil when proposer is nil")
 	}
 }
 
@@ -283,21 +275,6 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultConfig_NonZero(t *testing.T) {
-	t.Parallel()
-	cfg := DefaultConfig()
-
-	if cfg.MaxBatchSize <= 0 {
-		t.Errorf("MaxBatchSize = %d, should be positive", cfg.MaxBatchSize)
-	}
-	if cfg.FlushInterval <= 0 {
-		t.Errorf("FlushInterval = %v, should be positive", cfg.FlushInterval)
-	}
-	if cfg.QueueSize <= 0 {
-		t.Errorf("QueueSize = %d, should be positive", cfg.QueueSize)
-	}
-}
-
 func TestSubmit_Success(t *testing.T) {
 	t.Parallel()
 	agg, mp := newTestAggregator(t)
@@ -388,17 +365,6 @@ func TestSubmit_AfterClose(t *testing.T) {
 	}
 	if !errors.Is(err, ErrClosed) {
 		t.Error("error should match ErrClosed sentinel")
-	}
-}
-
-func TestSubmit_AfterCloseReturnsSentinel(t *testing.T) {
-	t.Parallel()
-	agg, _ := newTestAggregator(t)
-	agg.Close()
-
-	err := agg.Submit(context.Background(), 1, []byte("data"))
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("Submit after Close should return ErrClosed, got %v", err)
 	}
 }
 
@@ -709,38 +675,6 @@ func TestSubmit_ProposerError(t *testing.T) {
 	}
 }
 
-func TestSubmit_ProposerErrorMessage(t *testing.T) {
-	t.Parallel()
-
-	mp := &mockProposer{err: errors.New("connection reset")}
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(mp,
-		WithConfig(Config{
-			MaxBatchSize:  1,
-			FlushInterval: 5 * time.Millisecond,
-			QueueSize:     100,
-		}),
-		WithRegistry(reg),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
-
-	submitErr := agg.Submit(context.Background(), 42, []byte("data"))
-	if submitErr == nil {
-		t.Fatal("Submit should return error when proposer fails")
-	}
-
-	var fe *FlushError
-	if !errors.As(submitErr, &fe) {
-		t.Fatalf("error should be *FlushError, got %T: %v", submitErr, submitErr)
-	}
-	if fe.ShardID != 42 {
-		t.Errorf("ShardID = %d, want 42", fe.ShardID)
-	}
-}
-
 func TestSubmit_MultipleShards(t *testing.T) {
 	t.Parallel()
 
@@ -962,21 +896,6 @@ func TestClose_Idempotent(t *testing.T) {
 		if err := agg.Close(); err != nil {
 			t.Errorf("Close() call %d returned error: %v", i, err)
 		}
-	}
-}
-
-func TestClose_IdempotentNoError(t *testing.T) {
-	t.Parallel()
-	agg, _ := newTestAggregator(t)
-
-	err1 := agg.Close()
-	err2 := agg.Close()
-
-	if err1 != nil {
-		t.Errorf("first Close returned error: %v", err1)
-	}
-	if err2 != nil {
-		t.Errorf("second Close returned error: %v", err2)
 	}
 }
 
@@ -1239,34 +1158,6 @@ func TestProposeContext_FirstNonCanceled(t *testing.T) {
 	// other shard and hangs Close.
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		t.Error("proposeContext must bound a deadline-less caller context")
-	}
-}
-
-func TestConstants(t *testing.T) {
-	t.Parallel()
-
-	if DefaultMaxBatchSize != 1000 {
-		t.Errorf("DefaultMaxBatchSize = %d, want 1000", DefaultMaxBatchSize)
-	}
-	if DefaultFlushInterval != 50*time.Millisecond {
-		t.Errorf("DefaultFlushInterval = %v, want 50ms", DefaultFlushInterval)
-	}
-	if DefaultQueueSize != 10000 {
-		t.Errorf("DefaultQueueSize = %d, want 10000", DefaultQueueSize)
-	}
-}
-
-func TestFlushReasonConstants(t *testing.T) {
-	t.Parallel()
-
-	if flushReasonSize != "size" {
-		t.Errorf("flushReasonSize = %q, want %q", flushReasonSize, "size")
-	}
-	if flushReasonTime != "time" {
-		t.Errorf("flushReasonTime = %q, want %q", flushReasonTime, "time")
-	}
-	if flushReasonClose != "close" {
-		t.Errorf("flushReasonClose = %q, want %q", flushReasonClose, "close")
 	}
 }
 

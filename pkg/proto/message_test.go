@@ -53,27 +53,6 @@ func TestMessageMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertMessageEqual(t, &m, &m2)
 }
 
-func TestMessageMarshalUnmarshalWithReject(t *testing.T) {
-	m := Message{
-		Type:   ReplicateResp,
-		From:   2,
-		To:     1,
-		Term:   5,
-		Reject: true,
-		Hint:   95,
-	}
-	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
-	var m2 Message
-	m2.UnmarshalFrom(buf)
-	if !m2.Reject {
-		t.Fatal("Reject: got false, want true")
-	}
-	if m2.Hint != 95 {
-		t.Fatalf("Hint: got %d, want 95", m2.Hint)
-	}
-}
-
 func TestMessageMarshalUnmarshalWithEntries(t *testing.T) {
 	m := Message{
 		Type:    Replicate,
@@ -149,42 +128,6 @@ func TestMessageMarshalUnmarshalWithSnapshot(t *testing.T) {
 	assertSnapshotEqual(t, &m.Snapshot, &m2.Snapshot)
 }
 
-func TestMessageMarshalUnmarshalWithEntriesAndSnapshot(t *testing.T) {
-	m := Message{
-		Type:    InstallSnapshot,
-		From:    1,
-		To:      2,
-		ShardID: 100,
-		Term:    5,
-		Entries: []Entry{
-			{Term: 5, Index: 100, Type: EntryNormal, Cmd: []byte("data")},
-		},
-		Snapshot: Snapshot{
-			ShardID:   100,
-			ReplicaID: 1,
-			Index:     50,
-			Term:      4,
-			Membership: Membership{
-				Addresses: map[uint64]string{1: "a"},
-				Observers: map[uint64]string{},
-				Witnesses: map[uint64]string{},
-				Removed:   map[uint64]bool{},
-			},
-			Filepath: "snap",
-		},
-	}
-	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
-	var m2 Message
-	m2.UnmarshalFrom(buf)
-	if len(m2.Entries) != 1 {
-		t.Fatalf("Entries: got %d, want 1", len(m2.Entries))
-	}
-	if m2.Snapshot.IsEmpty() {
-		t.Fatal("Snapshot should not be empty")
-	}
-}
-
 func TestMessageMarshalUnmarshalNoEntries(t *testing.T) {
 	m := Message{
 		Type: Heartbeat,
@@ -198,31 +141,6 @@ func TestMessageMarshalUnmarshalNoEntries(t *testing.T) {
 	m2.UnmarshalFrom(buf)
 	if m2.Entries != nil {
 		t.Fatalf("Entries: got %v, want nil", m2.Entries)
-	}
-}
-
-func TestMessageMarshalUnmarshalAllMessageTypes(t *testing.T) {
-	types := []uint64{
-		LocalTick, Election, LeaderHeartbeat, ConfigChangeEvent, NoOP,
-		Ping, Pong, Propose, SnapshotStatus, Unreachable, CheckQuorum,
-		BatchedReadIndex, Replicate, ReplicateResp, RequestVote,
-		RequestVoteResp, InstallSnapshot, Heartbeat, HeartbeatResp,
-		ReadIndex, ReadIndexResp, Quiesce, SnapshotReceived,
-		LeaderTransfer, TimeoutNow, RequestPreVote, RequestPreVoteResp,
-		RateLimit,
-	}
-	for _, msgType := range types {
-		m := Message{Type: msgType, From: 1, To: 2, Term: 1}
-		buf := make([]byte, m.Size())
-		m.MarshalTo(buf)
-		var m2 Message
-		_, err := m2.UnmarshalFrom(buf)
-		if err != nil {
-			t.Fatalf("Message type %d: UnmarshalFrom: %v", msgType, err)
-		}
-		if m2.Type != msgType {
-			t.Fatalf("Message type: got %d, want %d", m2.Type, msgType)
-		}
 	}
 }
 

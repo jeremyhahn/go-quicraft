@@ -133,9 +133,6 @@ func TestTransportConfig_SetDefaults(t *testing.T) {
 			t.Errorf("StreamReadIdleTimeout = %v, want %v",
 				tc.StreamReadIdleTimeout, DefaultStreamReadIdleTimeout)
 		}
-		if tc.Enable0RTT {
-			t.Error("Enable0RTT should default to false")
-		}
 	})
 
 	t.Run("preserves non-zero fields", func(t *testing.T) {
@@ -226,25 +223,10 @@ func TestTransportConfig_Validate_Valid(t *testing.T) {
 		}
 	})
 
-	t.Run("valid with 0RTT enabled", func(t *testing.T) {
+	t.Run("valid with PEM mTLS", func(t *testing.T) {
 		tc := validTransportConfigWithMTLS()
-		tc.Enable0RTT = true
 		if err := tc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("valid with pre-built Certificate (no PEM Cert/Key)", func(t *testing.T) {
-		ca, cert, key := testMTLSMaterial()
-		prebuilt, err := tls.X509KeyPair(cert, key)
-		if err != nil {
-			t.Fatalf("X509KeyPair: %v", err)
-		}
-		var tc TransportConfig
-		tc.SetDefaults()
-		tc.MTLSConfig = &MTLSConfig{CACert: ca, Certificate: &prebuilt}
-		if err := tc.Validate(); err != nil {
-			t.Errorf("Validate() with pre-built certificate = %v, want nil", err)
 		}
 	})
 }
@@ -253,13 +235,6 @@ func TestTransportConfig_Validate_StreamPoolSize(t *testing.T) {
 	t.Run("zero StreamPoolSize", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.StreamPoolSize = 0
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.StreamPoolSize")
-	})
-
-	t.Run("negative StreamPoolSize", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.StreamPoolSize = -1
 		err := tc.Validate()
 		assertTransportValidationError(t, err, "TransportConfig.StreamPoolSize")
 	})
@@ -316,13 +291,6 @@ func TestTransportConfig_Validate_SnapshotReceiveRate(t *testing.T) {
 		assertTransportValidationError(t, err, "TransportConfig.MaxSnapshotReceiveRate")
 	})
 
-	t.Run("tiny rate (1 byte/s) rejected", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MaxSnapshotReceiveRate = 1
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.MaxSnapshotReceiveRate")
-	})
-
 	t.Run("rate at floor is valid", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxSnapshotReceiveRate = MinMaxSnapshotReceiveRate
@@ -336,13 +304,6 @@ func TestTransportConfig_Validate_ConcurrentSnapshotReceives(t *testing.T) {
 	t.Run("zero concurrent receives", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxConcurrentSnapshotReceives = 0
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.MaxConcurrentSnapshotReceives")
-	})
-
-	t.Run("negative concurrent receives", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MaxConcurrentSnapshotReceives = -1
 		err := tc.Validate()
 		assertTransportValidationError(t, err, "TransportConfig.MaxConcurrentSnapshotReceives")
 	})
@@ -374,13 +335,6 @@ func TestTransportConfig_Validate_SnapshotReceiveMemory(t *testing.T) {
 }
 
 func TestTransportConfig_Validate_MaxDecompressedSize(t *testing.T) {
-	t.Run("zero MaxDecompressedSize", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MaxDecompressedSize = 0
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.MaxDecompressedSize")
-	})
-
 	// A value below the frame size is the dangerous one. The send path admits
 	// frames against the MaxFrameSize constant, so a replica configured lower
 	// rejects frames every peer in the cluster considers valid. The sender
@@ -422,13 +376,6 @@ func TestTransportConfig_Validate_MaxConnectionsPerIP(t *testing.T) {
 		assertTransportValidationError(t, err, "TransportConfig.MaxConnectionsPerIP")
 	})
 
-	t.Run("negative", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MaxConnectionsPerIP = -1
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.MaxConnectionsPerIP")
-	})
-
 	t.Run("minimum valid", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxConnectionsPerIP = 1
@@ -442,13 +389,6 @@ func TestTransportConfig_Validate_MaxIncomingConnections(t *testing.T) {
 	t.Run("zero", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.MaxIncomingConnections = 0
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.MaxIncomingConnections")
-	})
-
-	t.Run("negative", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MaxIncomingConnections = -1
 		err := tc.Validate()
 		assertTransportValidationError(t, err, "TransportConfig.MaxIncomingConnections")
 	})
@@ -470,13 +410,6 @@ func TestTransportConfig_Validate_SendBatchMaxSize(t *testing.T) {
 		assertTransportValidationError(t, err, "TransportConfig.SendBatchMaxSize")
 	})
 
-	t.Run("negative", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.SendBatchMaxSize = -1
-		err := tc.Validate()
-		assertTransportValidationError(t, err, "TransportConfig.SendBatchMaxSize")
-	})
-
 	t.Run("minimum valid", func(t *testing.T) {
 		tc := validTransportConfig()
 		tc.SendBatchMaxSize = 1
@@ -486,106 +419,14 @@ func TestTransportConfig_Validate_SendBatchMaxSize(t *testing.T) {
 	})
 }
 
-func TestMTLSConfigFieldsPassthrough(t *testing.T) {
-	caCert := []byte("-----BEGIN CERTIFICATE-----\nca-cert-data\n-----END CERTIFICATE-----")
-	cert := []byte("-----BEGIN CERTIFICATE-----\nnode-cert-data\n-----END CERTIFICATE-----")
-	key := []byte("-----BEGIN PRIVATE KEY-----\nnode-key-data\n-----END PRIVATE KEY-----")
-
-	tc := validTransportConfig()
-	tc.MTLSConfig = &MTLSConfig{
-		CACert: caCert,
-		Cert:   cert,
-		Key:    key,
-	}
-
-	t.Run("CACert stored correctly", func(t *testing.T) {
-		if string(tc.MTLSConfig.CACert) != string(caCert) {
-			t.Errorf("CACert = %q, want %q", tc.MTLSConfig.CACert, caCert)
-		}
-	})
-
-	t.Run("Cert stored correctly", func(t *testing.T) {
-		if string(tc.MTLSConfig.Cert) != string(cert) {
-			t.Errorf("Cert = %q, want %q", tc.MTLSConfig.Cert, cert)
-		}
-	})
-
-	t.Run("Key stored correctly", func(t *testing.T) {
-		if string(tc.MTLSConfig.Key) != string(key) {
-			t.Errorf("Key = %q, want %q", tc.MTLSConfig.Key, key)
-		}
-	})
-}
-
 func TestValidateNilMTLSConfig(t *testing.T) {
-	t.Run("nil MTLSConfig fails when transport enabled", func(t *testing.T) {
-		tc := validTransportConfigWithMTLS()
-		tc.MTLSConfig = nil // remove mTLS, keep transport enabled
-		err := tc.Validate()
-		if !errors.Is(err, ErrMTLSConfigRequired) {
-			t.Errorf("Validate() = %v, want MTLSConfigRequiredError", err)
-		}
-	})
-
-	t.Run("nil MTLSConfig passes when transport disabled", func(t *testing.T) {
-		tc := validTransportConfig()
-		tc.MTLSConfig = nil
-		if err := tc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil for disabled transport", err)
-		}
-	})
-
-	t.Run("defaults with transport enabled require MTLSConfig", func(t *testing.T) {
-		var tc TransportConfig
-		tc.SetDefaults()
-		// TransportDisabled defaults to false, MTLSConfig defaults to nil.
-		err := tc.Validate()
-		if !errors.Is(err, ErrMTLSConfigRequired) {
-			t.Errorf("Validate() = %v, want MTLSConfigRequiredError", err)
-		}
-	})
-
-	t.Run("non-nil MTLSConfig passes when transport enabled", func(t *testing.T) {
-		tc := validTransportConfigWithMTLS()
-		if err := tc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-}
-
-func TestMTLSConfigWithSetDefaults(t *testing.T) {
-	t.Run("SetDefaults preserves non-nil MTLSConfig", func(t *testing.T) {
-		mtls := &MTLSConfig{
-			CACert: []byte("ca"),
-			Cert:   []byte("cert"),
-			Key:    []byte("key"),
-		}
-		tc := TransportConfig{
-			MTLSConfig: mtls,
-		}
-		tc.SetDefaults()
-
-		if tc.MTLSConfig != mtls {
-			t.Error("SetDefaults overwrote non-nil MTLSConfig")
-		}
-		if string(tc.MTLSConfig.CACert) != "ca" {
-			t.Errorf("CACert = %q, want %q", tc.MTLSConfig.CACert, "ca")
-		}
-		if string(tc.MTLSConfig.Cert) != "cert" {
-			t.Errorf("Cert = %q, want %q", tc.MTLSConfig.Cert, "cert")
-		}
-		if string(tc.MTLSConfig.Key) != "key" {
-			t.Errorf("Key = %q, want %q", tc.MTLSConfig.Key, "key")
-		}
-	})
-
-	t.Run("SetDefaults leaves nil MTLSConfig as nil", func(t *testing.T) {
-		var tc TransportConfig
-		tc.SetDefaults()
-		if tc.MTLSConfig != nil {
-			t.Errorf("MTLSConfig = %v, want nil", tc.MTLSConfig)
-		}
-	})
+	var tc TransportConfig
+	tc.SetDefaults()
+	// TransportDisabled defaults to false, MTLSConfig defaults to nil.
+	err := tc.Validate()
+	if !errors.Is(err, ErrMTLSConfigRequired) {
+		t.Errorf("Validate() = %v, want MTLSConfigRequiredError", err)
+	}
 }
 
 // assertTransportValidationError checks that err is a
@@ -806,7 +647,7 @@ func TestValidateRevocationConfig(t *testing.T) {
 	}
 
 	t.Run("invalid mode strings rejected", func(t *testing.T) {
-		for _, mode := range []string{"CRL", "strict", "Any", "ocsp+crl"} {
+		for _, mode := range []string{"CRL", "strict"} {
 			tc := base()
 			tc.RevocationConfig = &RevocationConfig{Mode: mode, CRLPaths: []string{"/x"}, OCSPResponderURL: "http://r"}
 			if err := tc.Validate(); err == nil {

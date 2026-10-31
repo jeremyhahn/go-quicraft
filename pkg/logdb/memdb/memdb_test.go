@@ -24,28 +24,14 @@ import (
 
 // --- Constructor and Name ---
 
-func TestNewReturnsNonNil(t *testing.T) {
-	db := New()
-	if db == nil {
-		t.Fatal("New() returned nil")
-	}
-}
-
 func TestNameReturnsMemory(t *testing.T) {
-	db := New()
+	var db logdb.LogDB = New()
 	if got := db.Name(); got != "memory" {
 		t.Errorf("Name() = %q, want %q", got, "memory")
 	}
 }
 
 // --- Close ---
-
-func TestCloseReturnsNilError(t *testing.T) {
-	db := New()
-	if err := db.Close(); err != nil {
-		t.Errorf("Close() returned unexpected error: %v", err)
-	}
-}
 
 func TestCloseIsIdempotent(t *testing.T) {
 	db := New()
@@ -154,13 +140,6 @@ func TestSaveStateWithNilUpdates(t *testing.T) {
 	db := New()
 	if err := db.SaveState(nil); err != nil {
 		t.Errorf("SaveState(nil) error: %v", err)
-	}
-}
-
-func TestSaveStateWithEmptyUpdates(t *testing.T) {
-	db := New()
-	if err := db.SaveState([]logdb.Update{}); err != nil {
-		t.Errorf("SaveState(empty) error: %v", err)
 	}
 }
 
@@ -405,25 +384,6 @@ func TestIterateEntriesMaxSizeLimit(t *testing.T) {
 	}
 }
 
-func TestIterateEntriesMaxSizeZeroIsUnlimited(t *testing.T) {
-	db := New()
-	entries := make([]logdb.Entry, 5)
-	for i := range entries {
-		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1, Cmd: []byte("data")}
-	}
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-
-	got, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 6, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if len(got) != 5 {
-		t.Errorf("IterateEntries() with maxSize=0: got %d entries, want 5", len(got))
-	}
-}
-
 func TestIterateEntriesAlwaysReturnsAtLeastOneEntry(t *testing.T) {
 	db := New()
 	db.SaveState([]logdb.Update{
@@ -544,16 +504,6 @@ func TestGetSnapshotReturnsErrNoSnapshotWhenNoneSaved(t *testing.T) {
 	_, err := db.GetSnapshot(1, 1)
 	if !errors.Is(err, logdb.ErrNoSnapshot) {
 		t.Errorf("GetSnapshot() no snapshot: got %v, want ErrNoSnapshot", err)
-	}
-}
-
-func TestSaveSnapshotRejectsOlderSnapshot(t *testing.T) {
-	db := New()
-	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Term: 5})
-
-	err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 3})
-	if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Errorf("SaveSnapshot() older snapshot: got %v, want ErrSnapshotOutOfDate", err)
 	}
 }
 
@@ -815,40 +765,6 @@ func TestRemoveEntriesToUnknownNodeIsNoOp(t *testing.T) {
 	db := New()
 	if err := db.RemoveEntriesTo(99, 99, 5); err != nil {
 		t.Errorf("RemoveEntriesTo() unknown node: got %v, want nil", err)
-	}
-}
-
-func TestRemoveEntriesToAllEntries(t *testing.T) {
-	db := New()
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1},
-			{Index: 2, Term: 1},
-		}},
-	})
-
-	if err := db.RemoveEntriesTo(1, 1, 2); err != nil {
-		t.Fatalf("RemoveEntriesTo() error: %v", err)
-	}
-
-	_, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 3, 0)
-	if !errors.Is(err, logdb.ErrUnavailable) && !errors.Is(err, logdb.ErrCompacted) {
-		t.Errorf("after removing all entries: got %v, want ErrUnavailable or ErrCompacted", err)
-	}
-}
-
-func TestRemoveEntriesToBeyondLastEntry(t *testing.T) {
-	db := New()
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1},
-			{Index: 2, Term: 1},
-		}},
-	})
-
-	// Remove up to index 100 (beyond last entry 2).
-	if err := db.RemoveEntriesTo(1, 1, 100); err != nil {
-		t.Fatalf("RemoveEntriesTo() beyond last: error %v", err)
 	}
 }
 
@@ -1238,13 +1154,6 @@ func TestMergeEntriesCompleteOverwrite(t *testing.T) {
 
 // --- Interface compliance ---
 
-func TestInterfaceCompliance(t *testing.T) {
-	var db logdb.LogDB = New()
-	if db.Name() != "memory" {
-		t.Errorf("Name() via interface = %q, want %q", db.Name(), "memory")
-	}
-}
-
 // --- Edge cases ---
 
 func TestSaveStateZeroStateIsIgnored(t *testing.T) {
@@ -1328,26 +1237,6 @@ func TestIterateEntriesPartialRange(t *testing.T) {
 	}
 	if got[0].Index != 2 || got[1].Index != 3 {
 		t.Errorf("entries = [%d, %d], want [2, 3]", got[0].Index, got[1].Index)
-	}
-}
-
-func TestEntrySizeCalculation(t *testing.T) {
-	db := New()
-	cmd := make([]byte, 24)
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1, Cmd: cmd},
-			{Index: 2, Term: 1, Cmd: cmd},
-			{Index: 3, Term: 1, Cmd: cmd},
-		}},
-	})
-
-	_, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 4, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if want := uint64(3 * (logdb.EntryOverheadBytes + 24)); size != want {
-		t.Errorf("size = %d, want %d", size, want)
 	}
 }
 

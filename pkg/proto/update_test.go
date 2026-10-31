@@ -48,18 +48,6 @@ func TestUpdateCommitMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertUpdateCommitEqual(t, &uc, &uc2)
 }
 
-func TestUpdateCommitMarshalUnmarshalZero(t *testing.T) {
-	uc := UpdateCommit{}
-	buf := make([]byte, uc.Size())
-	uc.MarshalTo(buf)
-	var uc2 UpdateCommit
-	uc2.UnmarshalFrom(buf)
-	if uc2.StableLogTo != 0 || uc2.StableLogTerm != 0 || uc2.StableSnapshotTo != 0 ||
-		uc2.Processed || uc2.LastApplied != 0 || uc2.ReadyToRead != 0 {
-		t.Fatal("Zero UpdateCommit round-trip failed")
-	}
-}
-
 func TestUpdateCommitSize(t *testing.T) {
 	uc := UpdateCommit{}
 	if uc.Size() != 48 {

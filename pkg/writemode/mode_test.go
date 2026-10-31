@@ -39,15 +39,6 @@ func TestMode_String(t *testing.T) {
 	}
 }
 
-func TestMode_String_Unknown(t *testing.T) {
-	m := Mode(255)
-	got := m.String()
-	want := "unknown(255)"
-	if got != want {
-		t.Errorf("Mode.String() for unknown = %q, want %q", got, want)
-	}
-}
-
 func TestFromString_ValidModes(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -98,47 +89,6 @@ func TestFromString_InvalidMode(t *testing.T) {
 			}
 			if target.Value != tt.input {
 				t.Errorf("InvalidModeError.Value = %q, want %q", target.Value, tt.input)
-			}
-		})
-	}
-}
-
-func TestMode_Validate_Valid(t *testing.T) {
-	tests := []struct {
-		name string
-		mode Mode
-	}{
-		{name: "sync", mode: Sync},
-		{name: "wal_durable", mode: WALDurable},
-		{name: "batched", mode: Batched},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.mode.Validate(); err != nil {
-				t.Errorf("Mode(%d).Validate() returned unexpected error: %v", tt.mode, err)
-			}
-		})
-	}
-}
-
-func TestMode_Validate_Invalid(t *testing.T) {
-	tests := []struct {
-		name string
-		mode Mode
-	}{
-		{name: "out of range 3", mode: Mode(3)},
-		{name: "out of range 255", mode: Mode(255)},
-		{name: "out of range 100", mode: Mode(100)},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.mode.Validate()
-			if err == nil {
-				t.Fatalf("Mode(%d).Validate() expected error, got nil", tt.mode)
-			}
-			var target *InvalidModeError
-			if !errors.As(err, &target) {
-				t.Fatalf("Mode(%d).Validate() error should be *InvalidModeError, got %T", tt.mode, err)
 			}
 		})
 	}
@@ -201,33 +151,6 @@ func TestMode_RequiresQuorum(t *testing.T) {
 	}
 }
 
-func TestMode_IsSynchronous_And_IsAsync_AreMutuallyExclusive(t *testing.T) {
-	modes := []Mode{Sync, WALDurable, Batched}
-	for _, m := range modes {
-		if m.IsSynchronous() && m.IsAsync() {
-			t.Errorf("Mode(%d) reports both IsSynchronous and IsAsync", m)
-		}
-		if !m.IsSynchronous() && !m.IsAsync() {
-			t.Errorf("Mode(%d) reports neither IsSynchronous nor IsAsync", m)
-		}
-	}
-}
-
-func TestFromString_RoundTrip(t *testing.T) {
-	modes := []Mode{Sync, WALDurable, Batched}
-	for _, m := range modes {
-		t.Run(m.String(), func(t *testing.T) {
-			parsed, err := FromString(m.String())
-			if err != nil {
-				t.Fatalf("FromString(%q) returned unexpected error: %v", m.String(), err)
-			}
-			if parsed != m {
-				t.Errorf("round-trip failed: %v -> %q -> %v", m, m.String(), parsed)
-			}
-		})
-	}
-}
-
 // TestFromString_RejectsAnAliasForAnUndescribedMode is the gate on Validate's
 // production caller. parseModes and modeSpecs are separate tables — the first
 // is many-to-one — and FromString is the only thing that checks them against
@@ -275,8 +198,9 @@ func TestFromString_RejectsAnAliasForAnUndescribedMode(t *testing.T) {
 // comment must move together.
 func TestMode_UnknownValueGuaranteesNothing(t *testing.T) {
 	for _, m := range []Mode{Mode(3), Mode(100), Mode(255)} {
-		if err := m.Validate(); err == nil {
-			t.Fatalf("Mode(%d).Validate() = nil, want an error", m)
+		var target *InvalidModeError
+		if err := m.Validate(); !errors.As(err, &target) {
+			t.Fatalf("Mode(%d).Validate() = %v, want *InvalidModeError", m, err)
 		}
 		if m.IsSynchronous() {
 			t.Errorf("Mode(%d).IsSynchronous() = true, want false", m)

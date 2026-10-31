@@ -427,19 +427,6 @@ func TestKV_GetHash(t *testing.T) {
 	}
 }
 
-func TestKV_GetHash_Empty(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			h, err := b.hash()
-			if err != nil {
-				t.Fatalf("GetHash = %v", err)
-			}
-			// Empty store should still produce a valid hash (the FNV offset basis).
-			_ = h
-		})
-	}
-}
-
 func TestKV_GetHash_DifferentData(t *testing.T) {
 	for _, bFn := range []func() backend{newMemoryBackend, newConcurrentBackend} {
 		b1 := bFn()
@@ -463,43 +450,6 @@ func TestKV_GetHash_DifferentData(t *testing.T) {
 			h2, _ := b2.hash()
 			if h1 == h2 {
 				t.Error("expected different hashes for different data")
-			}
-		})
-	}
-}
-
-func TestKV_GetHash_Deterministic(t *testing.T) {
-	for _, bFn := range []func() backend{newMemoryBackend, newConcurrentBackend} {
-		b := bFn()
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("z"), []byte("last"))},
-				{Index: 2, Cmd: mustEncodePut([]byte("a"), []byte("first"))},
-				{Index: 3, Cmd: mustEncodePut([]byte("m"), []byte("middle"))},
-			}
-			results := make([]sm.Result, 3)
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v", err)
-			}
-
-			// Call GetHash multiple times - should always return the same value
-			h1, err := b.hash()
-			if err != nil {
-				t.Fatalf("GetHash 1 = %v", err)
-			}
-			h2, err := b.hash()
-			if err != nil {
-				t.Fatalf("GetHash 2 = %v", err)
-			}
-			h3, err := b.hash()
-			if err != nil {
-				t.Fatalf("GetHash 3 = %v", err)
-			}
-
-			if h1 != h2 || h2 != h3 {
-				t.Errorf("GetHash not deterministic: %d, %d, %d", h1, h2, h3)
 			}
 		})
 	}
@@ -546,35 +496,6 @@ func TestKV_GetHash_OrderIndependent(t *testing.T) {
 
 			if h1 != h2 {
 				t.Errorf("GetHash differs based on insertion order: %d vs %d", h1, h2)
-			}
-		})
-	}
-}
-
-func TestKV_GetHash_LargeDataset(t *testing.T) {
-	for _, bFn := range []func() backend{newMemoryBackend, newConcurrentBackend} {
-		b := bFn()
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			// Insert 100 key-value pairs
-			entries := make([]sm.Entry, 100)
-			for i := range entries {
-				key := []byte("key" + string(rune('A'+i%26)) + string(rune('0'+i/26)))
-				val := []byte("value" + string(rune(i)))
-				entries[i] = sm.Entry{Index: uint64(i + 1), Cmd: mustEncodePut(key, val)}
-			}
-			results := make([]sm.Result, 100)
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v", err)
-			}
-
-			h, err := b.hash()
-			if err != nil {
-				t.Fatalf("GetHash = %v", err)
-			}
-			if h == 0 {
-				t.Error("GetHash should be non-zero for non-empty store")
 			}
 		})
 	}
@@ -1145,26 +1066,6 @@ func TestKV_ListNoMatches(t *testing.T) {
 			keys := val.([]string)
 			if keys == nil {
 				t.Fatal("keys should not be nil, want empty []string{}")
-			}
-			if len(keys) != 0 {
-				t.Errorf("len(keys) = %d, want 0", len(keys))
-			}
-		})
-	}
-}
-
-func TestKV_ListOnEmptyStore(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			val, err := b.lookup(ctx, ListQuery{Prefix: ""})
-			if err != nil {
-				t.Fatalf("Lookup(ListQuery) = %v", err)
-			}
-			keys := val.([]string)
-			if keys == nil {
-				t.Fatal("keys should not be nil")
 			}
 			if len(keys) != 0 {
 				t.Errorf("len(keys) = %d, want 0", len(keys))

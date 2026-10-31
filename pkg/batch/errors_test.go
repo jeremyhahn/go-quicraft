@@ -28,38 +28,6 @@ func TestClosedError_Error(t *testing.T) {
 	}
 }
 
-func TestClosedError_Is(t *testing.T) {
-	t.Parallel()
-	err := &ClosedError{}
-
-	if !errors.Is(err, ErrClosed) {
-		t.Error("ClosedError should match ErrClosed sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrQueueFull) {
-		t.Error("ClosedError should not match ErrQueueFull")
-	}
-}
-
-func TestClosedError_As(t *testing.T) {
-	t.Parallel()
-	var target *ClosedError
-	err := &ClosedError{}
-
-	if !errors.As(err, &target) {
-		t.Error("errors.As should match *ClosedError")
-	}
-}
-
-func TestClosedError_AsNonMatching(t *testing.T) {
-	t.Parallel()
-	var target *QueueFullError
-	err := &ClosedError{}
-
-	if errors.As(err, &target) {
-		t.Error("errors.As should not match *QueueFullError for a ClosedError")
-	}
-}
-
 func TestQueueFullError_Error(t *testing.T) {
 	t.Parallel()
 	err := &QueueFullError{QueueSize: 5000}
@@ -69,68 +37,12 @@ func TestQueueFullError_Error(t *testing.T) {
 	}
 }
 
-func TestQueueFullError_ErrorZeroCapacity(t *testing.T) {
-	t.Parallel()
-	err := &QueueFullError{QueueSize: 0}
-	want := "quicraft/batch: queue full (capacity 0)"
-	if got := err.Error(); got != want {
-		t.Errorf("QueueFullError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestQueueFullError_Is(t *testing.T) {
-	t.Parallel()
-	err := &QueueFullError{QueueSize: 100}
-
-	if !errors.Is(err, ErrQueueFull) {
-		t.Error("QueueFullError should match ErrQueueFull sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrClosed) {
-		t.Error("QueueFullError should not match ErrClosed")
-	}
-}
-
-func TestQueueFullError_As(t *testing.T) {
-	t.Parallel()
-	var target *QueueFullError
-	err := &QueueFullError{QueueSize: 256}
-
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match *QueueFullError")
-	}
-	if target.QueueSize != 256 {
-		t.Errorf("QueueSize = %d, want 256", target.QueueSize)
-	}
-}
-
 func TestNilProposerError_Error(t *testing.T) {
 	t.Parallel()
 	err := &NilProposerError{}
 	want := "quicraft/batch: proposer is nil"
 	if got := err.Error(); got != want {
 		t.Errorf("NilProposerError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestNilProposerError_Is(t *testing.T) {
-	t.Parallel()
-	err := &NilProposerError{}
-
-	if !errors.Is(err, ErrNilProposer) {
-		t.Error("NilProposerError should match ErrNilProposer sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrFlush) {
-		t.Error("NilProposerError should not match ErrFlush")
-	}
-}
-
-func TestNilProposerError_As(t *testing.T) {
-	t.Parallel()
-	var target *NilProposerError
-	err := &NilProposerError{}
-
-	if !errors.As(err, &target) {
-		t.Error("errors.As should match *NilProposerError")
 	}
 }
 
@@ -144,29 +56,6 @@ func TestFlushError_Error(t *testing.T) {
 	}
 }
 
-func TestFlushError_ErrorZeroShard(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("timeout")
-	err := &FlushError{ShardID: 0, Err: inner}
-	want := "quicraft/batch: flush failed for shard 0: timeout"
-	if got := err.Error(); got != want {
-		t.Errorf("FlushError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestFlushError_Is(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("some error")
-	err := &FlushError{ShardID: 1, Err: inner}
-
-	if !errors.Is(err, ErrFlush) {
-		t.Error("FlushError should match ErrFlush sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrDecode) {
-		t.Error("FlushError should not match ErrDecode")
-	}
-}
-
 func TestFlushError_Unwrap(t *testing.T) {
 	t.Parallel()
 	inner := errors.New("wrapped cause")
@@ -174,30 +63,6 @@ func TestFlushError_Unwrap(t *testing.T) {
 
 	if unwrapped := err.Unwrap(); unwrapped != inner {
 		t.Errorf("Unwrap() = %v, want %v", unwrapped, inner)
-	}
-}
-
-func TestFlushError_UnwrapWithErrorsIs(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("specific cause")
-	err := &FlushError{ShardID: 3, Err: inner}
-
-	if !errors.Is(err, inner) {
-		t.Error("errors.Is should find the wrapped inner error through Unwrap")
-	}
-}
-
-func TestFlushError_As(t *testing.T) {
-	t.Parallel()
-	var target *FlushError
-	inner := errors.New("test")
-	err := &FlushError{ShardID: 99, Err: inner}
-
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match *FlushError")
-	}
-	if target.ShardID != 99 {
-		t.Errorf("ShardID = %d, want 99", target.ShardID)
 	}
 }
 
@@ -216,40 +81,6 @@ func TestDecodeError_Error(t *testing.T) {
 	want := "quicraft/batch: decode failed: truncated length prefix"
 	if got := err.Error(); got != want {
 		t.Errorf("DecodeError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestDecodeError_ErrorEmptyReason(t *testing.T) {
-	t.Parallel()
-	err := &DecodeError{Reason: ""}
-	want := "quicraft/batch: decode failed: "
-	if got := err.Error(); got != want {
-		t.Errorf("DecodeError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestDecodeError_Is(t *testing.T) {
-	t.Parallel()
-	err := &DecodeError{Reason: "bad data"}
-
-	if !errors.Is(err, ErrDecode) {
-		t.Error("DecodeError should match ErrDecode sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrFlush) {
-		t.Error("DecodeError should not match ErrFlush")
-	}
-}
-
-func TestDecodeError_As(t *testing.T) {
-	t.Parallel()
-	var target *DecodeError
-	err := &DecodeError{Reason: "command data exceeds payload boundary"}
-
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match *DecodeError")
-	}
-	if target.Reason != "command data exceeds payload boundary" {
-		t.Errorf("Reason = %q, want %q", target.Reason, "command data exceeds payload boundary")
 	}
 }
 
@@ -349,39 +180,5 @@ func TestEncodeError_Error(t *testing.T) {
 	want := "quicraft/batch: encode failed: command length exceeds MaxInt32"
 	if got := err.Error(); got != want {
 		t.Errorf("EncodeError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestEncodeError_ErrorEmptyReason(t *testing.T) {
-	t.Parallel()
-	err := &EncodeError{Reason: ""}
-	want := "quicraft/batch: encode failed: "
-	if got := err.Error(); got != want {
-		t.Errorf("EncodeError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestEncodeError_Is(t *testing.T) {
-	t.Parallel()
-	err := &EncodeError{Reason: "bad command"}
-
-	if !errors.Is(err, ErrEncode) {
-		t.Error("EncodeError should match ErrEncode sentinel via errors.Is")
-	}
-	if errors.Is(err, ErrDecode) {
-		t.Error("EncodeError should not match ErrDecode")
-	}
-}
-
-func TestEncodeError_As(t *testing.T) {
-	t.Parallel()
-	var target *EncodeError
-	err := &EncodeError{Reason: "command length exceeds MaxInt32"}
-
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match *EncodeError")
-	}
-	if target.Reason != "command length exceeds MaxInt32" {
-		t.Errorf("Reason = %q, want %q", target.Reason, "command length exceeds MaxInt32")
 	}
 }

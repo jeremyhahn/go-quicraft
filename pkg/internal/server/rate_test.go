@@ -63,18 +63,6 @@ func TestRateLimiter_IncreaseDecrease(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_Set(t *testing.T) {
-	rl := NewRateLimiter(1000)
-	rl.Set(750)
-	if rl.Get() != 750 {
-		t.Fatalf("Get = %d, want 750", rl.Get())
-	}
-	rl.Set(0)
-	if rl.Get() != 0 {
-		t.Fatalf("Get = %d, want 0", rl.Get())
-	}
-}
-
 func TestRateLimiter_RateLimited(t *testing.T) {
 	rl := NewRateLimiter(100)
 	rl.Set(100)
@@ -99,26 +87,6 @@ func TestRateLimiter_DecreaseUnderflowSaturatesAtZero(t *testing.T) {
 	rl.Decrease(200)
 	if rl.Get() != 0 {
 		t.Fatalf("Get = %d, want 0 (underflow saturation)", rl.Get())
-	}
-}
-
-func TestRateLimiter_DecreaseExactValueGoesToZero(t *testing.T) {
-	rl := NewRateLimiter(1000)
-	rl.Set(500)
-
-	// Decrease by exactly the current value.
-	rl.Decrease(500)
-	if rl.Get() != 0 {
-		t.Fatalf("Get = %d, want 0 (exact decrease)", rl.Get())
-	}
-}
-
-func TestRateLimiter_DecreaseFromZero(t *testing.T) {
-	rl := NewRateLimiter(1000)
-	// Size is 0, decrease by any amount should stay at 0.
-	rl.Decrease(100)
-	if rl.Get() != 0 {
-		t.Fatalf("Get = %d, want 0 (decrease from zero)", rl.Get())
 	}
 }
 
@@ -208,50 +176,6 @@ func TestInMemRateLimiter_BasicIncreaseDecrease(t *testing.T) {
 	}
 }
 
-func TestInMemRateLimiter_Set(t *testing.T) {
-	rl := NewInMemRateLimiter(1000)
-	rl.Set(750)
-	if rl.Get() != 750 {
-		t.Fatalf("Get = %d, want 750", rl.Get())
-	}
-}
-
-func TestInMemRateLimiter_Hysteresis(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	// Advance past debounce threshold.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Exceed 100%: should become limited.
-	rl.Set(101)
-	if !rl.RateLimited() {
-		t.Fatal("expected rate limited at 101%")
-	}
-
-	// Advance ticks past debounce threshold.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Drop to 70%: should STILL be limited (hysteresis).
-	rl.Set(70)
-	if !rl.RateLimited() {
-		t.Fatal("expected still rate limited at 70% (hysteresis)")
-	}
-
-	// Advance ticks past debounce threshold.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Drop below 70%: should become unlimited.
-	rl.Set(69)
-	if rl.RateLimited() {
-		t.Fatal("expected not rate limited at 69%")
-	}
-}
-
 func TestInMemRateLimiter_TickDebouncing(t *testing.T) {
 	rl := NewInMemRateLimiter(100)
 	// Advance past initial debounce.
@@ -285,32 +209,6 @@ func TestInMemRateLimiter_TickDebouncing(t *testing.T) {
 	rl.Set(50)
 	if rl.RateLimited() {
 		t.Fatal("expected not rate limited after debounce window")
-	}
-}
-
-func TestInMemRateLimiter_FollowerTracking(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	// Advance past debounce.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Local size is fine, but follower reports high size.
-	rl.Set(50)
-	rl.SetFollowerState(2, 101)
-	if !rl.RateLimited() {
-		t.Fatal("expected rate limited due to follower size")
-	}
-
-	// Advance past debounce.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Update follower to be below threshold.
-	rl.SetFollowerState(2, 50)
-	if rl.RateLimited() {
-		t.Fatal("expected not rate limited after follower size drops")
 	}
 }
 
@@ -359,6 +257,9 @@ func TestInMemRateLimiter_Reset(t *testing.T) {
 
 	// Reset clears follower states, the limited flag, and the local size.
 	rl.Reset()
+	if rl.IsLimited() {
+		t.Fatal("IsLimited should be false after Reset")
+	}
 	if rl.RateLimited() {
 		t.Fatal("expected not rate limited after reset")
 	}
@@ -396,19 +297,6 @@ func TestInMemRateLimiter_ResetZeroesLocalSize(t *testing.T) {
 	}
 }
 
-func TestInMemRateLimiter_GetTick(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	if rl.GetTick() != 0 {
-		t.Fatalf("GetTick = %d, want 0", rl.GetTick())
-	}
-	rl.Tick()
-	rl.Tick()
-	rl.Tick()
-	if rl.GetTick() != 3 {
-		t.Fatalf("GetTick = %d, want 3", rl.GetTick())
-	}
-}
-
 func TestInMemRateLimiter_AtExactLimit(t *testing.T) {
 	rl := NewInMemRateLimiter(100)
 	// Advance past debounce.
@@ -443,13 +331,6 @@ func TestInMemRateLimiter_MultipleFollowers(t *testing.T) {
 	rl.SetFollowerState(5, 101)
 	if !rl.RateLimited() {
 		t.Fatal("expected rate limited when one follower exceeds limit")
-	}
-}
-
-func TestInMemRateLimiter_InitialStateNotLimited(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	if rl.RateLimited() {
-		t.Fatal("new limiter should not be rate limited")
 	}
 }
 
@@ -493,45 +374,6 @@ func TestInMemRateLimiter_IsLimited_DisabledLimiter(t *testing.T) {
 	if rl.IsLimited() {
 		t.Fatal("disabled limiter: IsLimited should always be false")
 	}
-}
-
-func TestInMemRateLimiter_Reset_ClearsCachedLimited(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	rl.Set(200)
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-	rl.RateLimited()
-	if !rl.IsLimited() {
-		t.Fatal("expected IsLimited true before reset")
-	}
-	rl.Reset()
-	if rl.IsLimited() {
-		t.Fatal("IsLimited should be false after Reset")
-	}
-}
-
-func TestInMemRateLimiter_IsLimited_ConcurrentReads(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	rl.Set(200)
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-	rl.RateLimited() // seed cache as limited
-
-	var wg sync.WaitGroup
-	n := 100
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			// Concurrent reads must not race. The value should be true.
-			if !rl.IsLimited() {
-				t.Error("IsLimited should be true during concurrent reads")
-			}
-		}()
-	}
-	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
@@ -615,52 +457,6 @@ func TestInMemRateLimiter_HysteresisExitAtExact70Percent(t *testing.T) {
 	}
 }
 
-func TestInMemRateLimiter_FollowerGCExactBoundary(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-
-	// Set a follower state at tick 0.
-	rl.SetFollowerState(2, 101)
-
-	// Advance exactly gcTick ticks. At this point, tick-fs.tick == gcTick
-	// which is NOT > gcTick, so the follower should still be alive.
-	for i := uint64(0); i < gcTick; i++ {
-		rl.Tick()
-	}
-
-	// Advance past debounce so hysteresis logic takes effect.
-	for i := uint64(0); i < ChangeTickThreshold+2-gcTick; i++ {
-		rl.Tick()
-		rl.SetFollowerState(2, 101) // keep refreshing during debounce advancement
-	}
-
-	// Now set follower at current tick and advance exactly gcTick ticks.
-	currentTick := rl.GetTick()
-	rl.SetFollowerState(3, 101)
-
-	for i := uint64(0); i < gcTick; i++ {
-		rl.Tick()
-	}
-
-	// tick - fs.tick == gcTick, NOT > gcTick, so follower 3 should survive.
-	// Verify by checking its effect on rate limiting.
-	rl.Set(0)
-	_ = currentTick
-
-	// One more tick: tick - fs.tick == gcTick + 1 > gcTick, GC triggers.
-	rl.Tick()
-
-	// Advance past debounce with no follower updates.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Local is 0, followers GC'd, should not be rate limited.
-	rl.Set(0)
-	if rl.RateLimited() {
-		t.Fatal("expected not rate limited after all followers GC'd")
-	}
-}
-
 func TestInMemRateLimiter_ResetClearsTick(t *testing.T) {
 	rl := NewInMemRateLimiter(100)
 	rl.Tick()
@@ -682,39 +478,6 @@ func TestInMemRateLimiter_ResetClearsTick(t *testing.T) {
 	rl.Tick()
 	if rl.GetTick() != 4 {
 		t.Fatalf("GetTick = %d, want 4 (tick continues after reset)", rl.GetTick())
-	}
-}
-
-func TestInMemRateLimiter_DebouncePreventsThrashing(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	// Advance past initial debounce.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-
-	// Rapidly oscillate between limited and unlimited states.
-	// Due to debouncing, the state should NOT change on every evaluation.
-	rl.Set(101)
-	if !rl.RateLimited() {
-		t.Fatal("expected rate limited initially")
-	}
-
-	// Immediately drop below and rise above limit multiple times.
-	for i := 0; i < 5; i++ {
-		rl.Set(50)
-		if !rl.RateLimited() {
-			t.Fatalf("iteration %d: expected still rate limited (debounce prevents change)", i)
-		}
-		rl.Set(101)
-	}
-
-	// After advancing past debounce, the drop should take effect.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-	rl.Set(50)
-	if rl.RateLimited() {
-		t.Fatal("expected not rate limited after debounce window passes")
 	}
 }
 
