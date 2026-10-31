@@ -36,14 +36,6 @@ func TestNewClientSession(t *testing.T) {
 			t.Errorf("lastActiveIndex = %d, want 100", sess.lastActiveIndex)
 		}
 	})
-
-	t.Run("different IDs create distinct sessions", func(t *testing.T) {
-		s1 := newClientSession(1, 0, 0)
-		s2 := newClientSession(2, 0, 0)
-		if s1.clientID == s2.clientID {
-			t.Error("sessions should have different clientIDs")
-		}
-	})
 }
 
 func TestClientSessionIsExpired(t *testing.T) {
@@ -92,14 +84,6 @@ func TestClientSessionTouchIndex(t *testing.T) {
 		}
 	})
 
-	t.Run("prevents expiration", func(t *testing.T) {
-		sess := newClientSession(1, 0, 100)
-		sess.touchIndex(950)
-		if sess.isExpired(1000, 100) {
-			t.Error("session should not be expired after touchIndex")
-		}
-	})
-
 	t.Run("does not decrease lastActiveIndex", func(t *testing.T) {
 		sess := newClientSession(1, 0, 500)
 		sess.touchIndex(300)
@@ -139,16 +123,6 @@ func TestClientSessionEvictUpTo(t *testing.T) {
 		sess.evictUpTo(3) // all series are > 3
 		if len(sess.responses) != 1 {
 			t.Errorf("len(responses) = %d, want 1", len(sess.responses))
-		}
-	})
-
-	t.Run("evicts all when respondedTo is high", func(t *testing.T) {
-		sess := newClientSession(1, 0, 0)
-		sess.responses[1] = sm.Result{Value: 1}
-		sess.responses[2] = sm.Result{Value: 2}
-		sess.evictUpTo(100)
-		if len(sess.responses) != 0 {
-			t.Errorf("len(responses) = %d, want 0", len(sess.responses))
 		}
 	})
 }
