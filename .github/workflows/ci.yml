@@ -1,4 +1,110 @@
-# ci-template: v1.29.2 (customized)
+# ci-template: v1.30 (customized)
+# v1.30 (Company Agent m1804, 2026-10-31): the five fixes of the 72-hour CI
+# evaluation (ci-standard.md §12). go-qrdb #1328, three comment lines, cost
+# about 1100 runner-minutes over three runs, and every push to main reran the
+# full tier on a tree a run had already proved.
+#   1. The toolchain image is built once per content hash (Dockerfile, pin
+#      file, go.mod and go.sum, ci-standard.md §9) by the new publish-images
+#      job on the release runner, and pulled from the registry cache by every
+#      other job (scripts/ci-image-cache.sh v1, ships beside this file). The
+#      lint-class stages leave the image job for the new `lint` job, which
+#      needs the toolchain image alone (`make docker-build-toolchain`), so
+#      they run beside build and make coverage. lint-gates builds the
+#      toolchain image alone as well.
+#   2. A push to main whose tree already has a green full-tier run (a run of
+#      this workflow whose Integration job succeeded) gets the schedule
+#      guard's `proven` verdict: its bigdisk jobs skip, the guard records the
+#      proving run id, and CI Gate reads the skips as passed. No hourly or
+#      lane ci:full reruns; lint-sweeps run in nightly.yml only.
+#   3. lint-gates is path-scoped on a pull request (LINT_GATES_PATTERN, the
+#      changes job's `lint_gates` output). A pull request from a checkpoint
+#      branch (lane-ckpt/*) is refused. cancel-in-progress stays true
+#      (v1.26.2). A PR stays draft until lane-verify passes (ci-standard.md
+#      §10 (f)).
+#   4. Every job carries timeout-minutes; a CUSTOMIZE value is ceil(1.5 x the
+#      job's 72-hour p95), with a root-cause row in ci-standard.md §12 for any
+#      job at its cap. block_on_outdated_branch is off on the P1 repositories
+#      (an Infrastructure setting, setup-pr-sdlc.sh; no workflow change).
+#   5. gosec runs in the PR tier (`make gosec`, the lint job; make security
+#      keeps it on the full tier), and a workflow_dispatch off main is
+#      refused: no full tier on a PR branch, ever. CI_FULL_TIER no longer
+#      selects one.
+# New CUSTOMIZE values: LINT_GATES_PATTERN, the timeouts, CI_IMAGE_NAMESPACE.
+# New Makefile targets: `make gosec` (devops.md §4) and
+# `make docker-build-toolchain` (devcontainer.md §6). A repository adopts
+# v1.30 in one CI-file PR, bottom-up in stack order.
+# v1.29.5 (Company Agent ruling 262(a), 2026-10-30): one change, the
+# GO_BUILD_PROXY separator. Each `make docker-build` passes
+# GO_BUILD_PROXY=<DEVCACHE_GOPROXY>|https://proxy.golang.org|direct, with
+# `|` as everywhere else (devops.md §2a): Go falls through a `,` only on a
+# 404 or 410, and through a `|` on any error, so a cache that answers the
+# probe and then fails a fetch no longer fails the build. "$bp" stays one
+# quoted make argument; the repository's Makefile quotes the value on its
+# docker build line (`--build-arg "GO_BUILD_PROXY=$(GO_BUILD_PROXY)"`), where
+# an unquoted `|` is a shell pipe. v1.29.4's `,` and its Makefile exception
+# go. Every job, gate, tier and in-toolchain-image.sh v4 is v1.29.4's. A
+# repository adopts v1.29.5 in the one CI-file PR that adopts v1.29.4, with
+# its Makefile's quoting line.
+# v1.29.4 (Company Agent ruling 261(c), 2026-10-30; Infrastructure #379
+# comment 157032): three changes, and no job, gate or tier change.
+#   - the module fetches of the image build go through Athens first, with the
+#     proxy.golang.org fallback. The toolchain image build and the Lint Gates
+#     build fetched from proxy.golang.org alone and failed on its HTTP/2
+#     stream errors (#379 comment 169857). Each `make docker-build` passes
+#     GO_BUILD_PROXY=<DEVCACHE_GOPROXY>,https://proxy.golang.org,direct when
+#     the runner sets DEVCACHE_GOPROXY (devops.md §2a) and the cache answers a
+#     5-second probe; otherwise it passes none, as before, so the github.com
+#     mirror is unchanged (v1.29.5 makes the separator `|`). A bridge stage
+#     (scripts/in-toolchain-image.sh v4) sets GOPROXY with `|`, Athens first;
+#     GOPRIVATE travels with both, so a private path never reaches a proxy;
+#   - the schedule guard reads `waiting` before `in_progress`. A run moves
+#     only waiting, then in_progress, then done, so the other order let a run
+#     start between the two queries and be counted by neither, and a nightly
+#     start beside it (trusted-firmware's fix, from its v1.29.3 adoption);
+#   - scripts/in-toolchain-image.sh v4: the stage's sibling container takes
+#     the job slot's memory bound (--memory from the job container's cgroup
+#     memory.max, 8g with no limit, IN_IMAGE_MEMORY overrides; --memory-swap
+#     the same, so no swap), and Go's build and link scratch (TMPDIR,
+#     GOTMPDIR) is an anonymous volume on /var/tmp on the daemon's data disk,
+#     not the 3 GB /tmp tmpfs (go-xkms #1733, from the 2026-10-26 ENOSPC).
+# A repository adopts v1.29.4 in one CI-file PR that takes ci.yml and
+# scripts/in-toolchain-image.sh together, keeping its CUSTOMIZE blocks; a
+# repository whose copy already holds a change (go-qrdb and
+# go-trusted-platform the memory bound, go-xkms the scratch volume,
+# trusted-firmware the guard order) keeps it and takes the rest.
+# v1.29.3 (Company Agent ruling 255(10)/(11)(c), 2026-10-29): one schedule
+# run per repository, skipped when a main run is in flight. The 04:00Z
+# nightly cron on every repository started six main runs over the throttle
+# and drove a bigdisk runner's data disk to 93 %. Two changes:
+#   - a schedule run's concurrency group is `schedule-{repository}`, with no
+#     sha, so a repository has one schedule run at a time. cancel-in-progress
+#     stays a literal `true`, so a newer schedule run cancels an older one
+#     still in flight. The push, pull_request and workflow_dispatch groups do
+#     not change;
+#   - a new `schedule-guard` job on ubuntu-latest, beside `changes`, asks the
+#     Gitea API on a schedule run only whether this workflow has a push run on
+#     main in progress or waiting, and sets `verdict`: `run`, `busy` or
+#     `unreadable`. On any other event, and on the github.com mirror, it sets
+#     `run` without a call. On a schedule run every bigdisk job (image,
+#     lint-gates, integration, soak, and any CUSTOMIZE job on bigdisk) runs
+#     only on `run`. On `busy` CI Gate skips as well, so `CI / CI Gate
+#     (schedule)` posts `skipped`, never a green nightly. On `unreadable` the
+#     bigdisk jobs skip and CI Gate fails, naming the guard: the guard fails
+#     closed and never passes silently.
+# Gitea 1.27.1, read 2026-10-29: the guard calls
+# GET /repos/{owner}/{repo}/actions/workflows/ci.yml/runs?event=push&branch=main&status=<s>
+# once with waiting and then once with in_progress (v1.29.4) (`pending` and `requested`
+# read as waiting; `running` is refused as an invalid status). The route
+# counts this workflow only: on the repository-wide route, go-qrdb's stuck
+# release-lockstep run 70835 reads in_progress and would hold every nightly
+# off. The guard trusts the server's status filter, never a listed run's
+# `status`: go-qrdb run 65111 lists as in_progress with every job completed,
+# and no status filter returns it. It reads with the job token first, under
+# `actions: read`. No workflow had read the Actions API with the job token,
+# so a non-200 answer falls back to AGENT_TOKEN, which revert-red-main.yml
+# already reads runs with. The guard checks nothing out, and it receives
+# AGENT_TOKEN only on a schedule run. A repository adopts v1.29.3 in one
+# CI-file PR, which can ride its v1.29.2 adoption bump PR while that is open.
 # v1.29.2 (Company Agent ruling 239(8), 2026-10-28): comments only; no job,
 # gate or tier changes. A CUSTOMIZE job gated on a changes output (a path-gated
 # suite) needs the image job too and tests an output of the image job in its
@@ -423,23 +529,27 @@ on:
                                         # created (see v1.3 correction above)
   # v1.23: main's full tier nightly as well as after every merge. Scheduled
   # runs are on the default branch. CUSTOMIZE: the hour, off nightly.yml's.
+  # v1.29.3: one schedule run per repository (the concurrency group below),
+  # and its bigdisk jobs skip while a main push run is in flight (the
+  # schedule-guard job).
   schedule:
     - cron: '0 5 * * *'
 
-# v1.25: on main the group is the workflow and the event, so a push to main
-# cancels the in-progress main push run of an older commit, and a schedule or
-# workflow_dispatch run cancels only an older run of its own event (Company
-# Agent m857, m774 option (i)). Every other ref is one group, so a PR's newer
-# run cancels the older. No expression reaches cancel-in-progress: Gitea
-# 1.27.1 never released go-qrdb main run 57063, the first run after v1.22.1
-# set it to an expression (Company Agent m695).
-# ci-template v1.26.2 (Company Agent m1167, ruling 145): on main the group is
-# the workflow, the event and the commit, so every main commit has a group of
-# its own and a merge never cancels a main run; every merge is validated.
-# cancel-in-progress is the literal true again, so no expression reaches it.
-# Every other ref is one group, so a PR's newer run still cancels the older.
+# v1.26.2: on main the group is the workflow, the event and the commit sha,
+# so each main run is its own group and a merge never cancels the main run in
+# progress; a schedule or workflow_dispatch run is in its own event's group
+# and never shares one with a push run (Company Agent m1167 (5), ruling 145,
+# superseding v1.25's `main-{event}` group, m857 and m774 option (i)). Every
+# other ref is one group, so a PR's newer run cancels the older. No
+# expression reaches cancel-in-progress: Gitea 1.27.1 never released go-qrdb
+# main run 57063, the first run after v1.22.1 set it to an expression
+# (Company Agent m695).
+# v1.29.3 (ruling 255(10)/(11)(c)): a schedule run's group is
+# `schedule-{repository}`, with no sha, so a repository has one schedule run
+# at a time. It is tested first, so a schedule run never takes a main group.
+# The push, pull_request and workflow_dispatch groups do not change.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && format('main-{0}-{1}', github.event_name, github.sha) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && format('main-{0}-{1}', github.event_name, github.sha) || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -458,10 +568,17 @@ env:
   # (push to main, schedule, workflow_dispatch), and a PR labelled ci:full.
   # Steps read it as env.CI_FULL_TIER; a job-level `if:` cannot read env, so
   # the integration job repeats this expression. Keep them equal.
-  CI_FULL_TIER: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+  # v1.30 (fix 5): a workflow_dispatch off main is not the full tier (the
+  # schedule guard refuses it and CI Gate fails).
+  CI_FULL_TIER: ${{ (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')) || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
   # v1.24 (CA m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
   # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
   DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
+  # v1.30 (fix 3): a PR runs the lint-gates job only when a changed file
+  # matches this extended regex. CUSTOMIZE: narrow it to what the repository's
+  # lint-gates read (scripts, workflows, generated code, go.mod). The default
+  # matches every file, so lint-gates runs on every PR.
+  LINT_GATES_PATTERN: '.'
   # v1.26.1 (Company Agent m1128 (9)): the repository's releasability test, which
   # a docs-only PR still runs because make coverage skips on it. CUSTOMIZE: the
   # `go test` arguments, package and -run pattern (for example
@@ -481,6 +598,8 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
     outputs:
       docs_only: ${{ steps.diff.outputs.docs_only }}
+      lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
+    timeout-minutes: 5        # v1.30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: ${{ github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true' }}
@@ -493,17 +612,333 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
           EVENT: ${{ github.event_name }}
         run: |
-          docs_only=false
+          # v1.30: lint_gates is false only on a PR whose changed files all
+          # miss LINT_GATES_PATTERN; any doubt runs the job.
+          docs_only=false lint_gates=true
           if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
             if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
               if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
                 docs_only=true
               fi
+              printf '%s\n' "$files" | grep -qE "$LINT_GATES_PATTERN" || lint_gates=false
               printf '%s\n' "$files"
             fi
           fi
-          echo "docs only: $docs_only"
+          echo "docs only: $docs_only; lint-gates: $lint_gates"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "lint_gates=$lint_gates" >> "$GITHUB_OUTPUT"
+
+  # v1.29.3 (Company Agent ruling 255(10)/(11)(c)): one nightly per
+  # repository, and none while main is busy. On a schedule run only, this job
+  # asks the API whether this workflow has a push run on main in progress or
+  # waiting, and sets `verdict`: `run` (none, or not a schedule run), `busy`
+  # (one is) or `unreadable` (no count came back). On a schedule run every
+  # bigdisk job runs only on `run`; CI Gate skips on `busy` and fails on
+  # `unreadable`. The job runs on every event, not on schedule alone, so no
+  # bigdisk job's `needs` meets a skipped job off schedule; off schedule it
+  # makes no call. It checks nothing out, so no repository code runs beside
+  # the tokens.
+  # v1.30 (fixes 2, 3 and 5): two more verdicts. `refused`: a
+  # workflow_dispatch off main (no full tier on a PR branch, ever) or a pull
+  # request from a checkpoint branch (lane-ckpt/*); every job but the gate
+  # skips and CI Gate fails. `proven`: on a push to main, the newest of this
+  # workflow's last 20 successful runs whose head commit has this commit's tree
+  # and whose Integration job succeeded (a ci:full PR run, a dispatch on main,
+  # an earlier main run); the guard records its id as `proof`, every bigdisk
+  # job skips and CI Gate reads the skips as passed. A proof it cannot read
+  # leaves `run`: the full tier runs. A schedule run never gets `proven`,
+  # because its security stages read fresh vulnerability databases.
+  schedule-guard:
+    name: Schedule guard
+    runs-on: ubuntu-latest
+    # v1.26: a draft PR runs no CI (as the changes job).
+    if: ${{ !github.event.pull_request.draft }}
+    timeout-minutes: 5        # v1.30
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verdict: ${{ steps.guard.outputs.verdict }}
+      proof: ${{ steps.guard.outputs.proof }}   # v1.30
+    steps:
+      - name: Is a main push run of this workflow in flight?
+        id: guard
+        env:
+          EVENT: ${{ github.event_name }}
+          SERVER: ${{ github.server_url }}
+          REF: ${{ github.ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          SHA: ${{ github.sha }}
+          # This workflow's own file: the route counts its runs only.
+          RUNS_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/ci.yml/runs
+          REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          JOB_TOKEN: ${{ github.token }}
+          # v1.30: a push to main reads the tree proof with it as well.
+          BOT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          # runs <token>: sets N to the number of this workflow's push runs
+          # on main in progress or waiting. It returns 1, with the answer in
+          # CODE, when a reply is not 200 with a count. The token reaches
+          # curl as a header from a file descriptor, never on its command line.
+          runs() {
+            local st n
+            N=0
+            # v1.29.4: waiting is read before in_progress. A run only moves
+            # waiting, then in_progress, then done, so one waiting at the
+            # first query is still waiting, in progress or done at the
+            # second, and counted or finished. The other order lets a run
+            # start between the two queries and be counted by neither.
+            for st in waiting in_progress; do
+              CODE=$(curl -sS --max-time 30 -o "$RUNNER_TEMP/runs.json" -w '%{http_code}' \
+                -H @<(printf 'Authorization: token %s\n' "$1") \
+                "$RUNS_API?event=push&branch=main&status=$st&limit=1") || CODE="curl exit $?"
+              [ "$CODE" = 200 ] || return 1
+              n=$(jq -er '.total_count | numbers' "$RUNNER_TEMP/runs.json") || { CODE="200 with no count"; return 1; }
+              echo "$st: $n"
+              N=$((N + n))
+            done
+          }
+          # get <token> <url> <file>: 0 on a 200 reply, saved in <file>.
+          get() {
+            [ "$(curl -sS --max-time 30 -o "$3" -w '%{http_code}' \
+              -H @<(printf 'Authorization: token %s\n' "$1") "$2")" = 200 ]
+          }
+          # v1.30: proof <token>: sets PROOF to the id of the newest of this
+          # workflow's last 20 successful runs whose head commit has this
+          # commit's tree and whose Integration jobs all succeeded (at least
+          # one). It returns 1 when a reply is not 200, and 0 with PROOF
+          # empty when no run proves the tree.
+          proof() {
+            local tree id sha t
+            PROOF=
+            get "$1" "$REPO_API/git/commits/$SHA" "$RUNNER_TEMP/c.json" || return 1
+            tree=$(jq -er '.commit.tree.sha' "$RUNNER_TEMP/c.json") || return 1
+            get "$1" "$RUNS_API?status=success&limit=20" "$RUNNER_TEMP/ok.json" || return 1
+            while read -r id sha; do
+              get "$1" "$REPO_API/git/commits/$sha" "$RUNNER_TEMP/c.json" || continue
+              t=$(jq -r '.commit.tree.sha' "$RUNNER_TEMP/c.json")
+              [ "$t" = "$tree" ] || continue
+              get "$1" "$REPO_API/actions/runs/$id/jobs?limit=100" "$RUNNER_TEMP/j.json" || continue
+              if jq -e '[.jobs[] | select(.name | startswith("Integration"))] | length > 0 and all(.conclusion == "success")' \
+                   "$RUNNER_TEMP/j.json" >/dev/null; then
+                PROOF=$id
+                echo "tree $tree: run $id (head $sha) has a green full tier"
+                return 0
+              fi
+            done < <(jq -r '.workflow_runs[]? | "\(.id) \(.head_sha)"' "$RUNNER_TEMP/ok.json")
+            echo "tree $tree: no green full-tier run among the last 20 successful runs"
+          }
+          verdict=run N=0 PROOF=
+          # v1.30 (fixes 3 and 5): the refusals come first.
+          if [ "$EVENT" = workflow_dispatch ] && [ "$REF" != refs/heads/main ]; then
+            verdict=refused
+            echo "::error::workflow_dispatch on $REF: the full tier runs on main only, never on a PR branch (ci-template v1.30); every job skips and CI Gate fails"
+          elif [ "$EVENT" = pull_request ] && [ "${HEAD_REF#lane-ckpt/}" != "$HEAD_REF" ]; then
+            verdict=refused
+            echo "::error::a pull request from checkpoint branch $HEAD_REF: a checkpoint branch never opens a PR (ci-template v1.30); every job skips and CI Gate fails"
+          fi
+          if [ "$verdict" != run ]; then
+            :
+          elif [ "$EVENT" != schedule ]; then
+            echo "not a schedule run: no check"
+          elif [ "$SERVER" = https://github.com ]; then
+            echo "the github.com mirror has no bigdisk runner: no check"
+          elif [ -n "$JOB_TOKEN" ] && runs "$JOB_TOKEN"; then
+            echo "read with the job token"
+          elif job="${CODE:-no job token}"; [ -n "$BOT" ] && runs "$BOT"; then
+            echo "read with AGENT_TOKEN; the job token got: $job"
+          else
+            bot="not set"; [ -z "$BOT" ] || bot="$CODE"
+            verdict=unreadable
+            echo "::error::the Actions API gave no count (job token: $job; AGENT_TOKEN: $bot), so every bigdisk job skips and CI Gate fails"
+          fi
+          if [ "$verdict" = run ] && [ "$N" -gt 0 ]; then
+            verdict=busy
+            echo "::notice::$N push run(s) of this workflow on main in flight: this schedule run skips its bigdisk jobs, and CI Gate posts skipped"
+          fi
+          # v1.30 (fix 2): the tree proof, on a push to main on the forge only.
+          if [ "$verdict" = run ] && [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ] && [ "$SERVER" != https://github.com ]; then
+            if { [ -n "$JOB_TOKEN" ] && proof "$JOB_TOKEN"; } || { [ -n "$BOT" ] && proof "$BOT"; }; then
+              if [ -n "$PROOF" ]; then
+                verdict=proven
+                echo "::notice::this tree already has a green full tier in run $PROOF: the bigdisk jobs skip, and CI Gate passes on it"
+              fi
+            else
+              echo "::warning::the tree proof could not be read: the full tier runs"
+            fi
+          fi
+          echo "verdict: $verdict${PROOF:+ (proof: run $PROOF)}"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "proof=$PROOF" >> "$GITHUB_OUTPUT"
+
+  # v1.30 (fix 1): the toolchain image is built once per content hash, here,
+  # and every other job pulls it (scripts/ci-image-cache.sh v1, ships beside
+  # this file). On a push to main only, on the release runner, which alone
+  # holds the registry credential (rulings 169 and 173): when the registry
+  # lacks `<repo>-toolchain:<hash>-main` under CI_IMAGE_NAMESPACE, it builds
+  # the image and pushes it; otherwise it does nothing. The integration image
+  # stays keyed by the tree (ruling 220(5)) and is built where it runs.
+  # This job is not in CI Gate's needs: a registry fault must not turn main
+  # red, and every consumer falls back to a local build. CUSTOMIZE: a
+  # repository whose forge has no `release` runner sets `if: false` and says
+  # so in its adoption PR, because a job no runner takes keeps the run in
+  # progress and the schedule guard reads main as busy.
+  publish-images:
+    name: Publish CI images
+    # >>> CUSTOMIZE (go-quicraft)
+    # #503: no release runner serves this repository, so the job is off. A
+    # literal `if: false` fails actionlint (constant condition), so it is
+    # gated on the CI_PUBLISH_IMAGES repository variable, unset here, ANDed
+    # with the template's condition. The server-conditional runs-on is the
+    # form the actionlint template (v7) requires for the release label.
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'release' }}
+    if: ${{ vars.CI_PUBLISH_IMAGES == 'true' && github.server_url != 'https://github.com' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # A job with no `needs` goes straight to a runner, which is what
+    # evaluates its `if`; with no release runner it would stay queued and
+    # hold every run pending. Needing schedule-guard makes the server
+    # evaluate the `if` when that job ends and mark this one skipped.
+    needs: [schedule-guard]
+    # <<< CUSTOMIZE
+    timeout-minutes: 60       # CUSTOMIZE: ceil(1.5 x a cold toolchain build's p95)
+    env:
+      CI_IMAGE_NAMESPACE: agent-ci-images   # ci-standard.md §9 (ruling 217(4))
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # v1.21.1: mask the forge credentials before any other step (as above).
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      - name: Publish the toolchain image when the registry lacks its hash
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          scripts/ci-image-cache.sh publish ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
+  # v1.30 (fix 1, parallel jobs; fix 5, gosec on the PR tier): the
+  # lint-class stages, moved from the image job, in a job of their own that
+  # needs the toolchain image alone, so they run beside build and make
+  # coverage and not in series before them. The PR tier runs `make gosec`
+  # here; the full tier runs gosec in the image job's `make security`, so it
+  # runs once per event. It runs on a docs-only PR, as lint did.
+  lint:
+    name: Lint [lint, gosec, deps-check, build tags]
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    needs: [changes, schedule-guard]
+    if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 30       # CUSTOMIZE: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+      CI_IMAGE_NAMESPACE: agent-ci-images
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # v1.21.1: mask the forge credentials before any other step (as above).
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      # v1.30 (fix 1): the registry cache first. A miss, or an unreachable
+      # registry, falls through to the local build below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
+      # v1.30: the toolchain image alone (`make docker-build-toolchain`,
+      # devcontainer.md §6), which skips when the daemon holds its tag.
+      - name: Build the toolchain image
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # v1.22: bound this repo's cache volumes (as in the image job). It never
+      # fails the job and keeps every volume a container mounts.
+      - name: Trim the CI caches
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
+
+      # make lint: gofmt, vet, golangci-lint, actionlint with shellcheck
+      # (devops.md §4). .golangci.yml enables staticcheck, errcheck, unused,
+      # ineffassign, misspell and gocritic (devops.md §8). v1.27: a repo's
+      # `make lint-gates` runs in the lint-gates job beside this one, never
+      # here and never as a prerequisite of lint. v1.30: in this job, moved
+      # from the image job.
+      - name: make lint
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        # >>> CUSTOMIZE (go-quicraft)
+        # make lint runs golangci-lint in every module; the nested modules'
+        # dependencies are not in the image's module cache.
+        env:
+          IN_IMAGE_NETWORK: bridge
+        # <<< CUSTOMIZE
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+
+      # v1.26.1 (Company Agent m1128 (9)): a docs-only PR skips make coverage, so
+      # it runs the releasability test alone; any other run gets it from make
+      # coverage.
+      - name: Releasability test (docs-only PR)
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 -tags '$GO_BUILD_TAGS' $RELEASABILITY_TEST"
+
+      # v1.9.2, now in the image: the declared tag set must select code. Each
+      # tag is checked by removal: if dropping it changes no selected file
+      # (tests included), it is misspelled or dead. Compares files, not
+      # packages, and a tag may swap files (a `!foo` stub for a `foo` body).
+      - name: Assert every build tag selects code
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' && needs.changes.outputs.docs_only != 'true' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "GO_BUILD_TAGS='$GO_BUILD_TAGS' sh scripts/assert-build-tags.sh"
+
+      # v1.30 (fix 5): gosec on the PR tier, through the developers' target,
+      # with no network. On the full tier make security runs it in the image job.
+      - name: make gosec (PR tier)
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.CI_FULL_TIER != 'true' && needs.changes.outputs.docs_only != 'true' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make gosec GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+
+      # Fails when a library, first-party or third-party, is behind its latest
+      # release without devops.md §9's documented reason (ci-standard.md §1).
+      # v1.28: a lint-class gate of seconds on the PR tier, every event, a
+      # docs-only PR included (ruling 219(3)); it was full tier only from v1.23.
+      - name: make deps-check
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        env:
+          IN_IMAGE_NETWORK: bridge
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make deps-check
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
 
   # v1.21: every stage runs in the project's own devcontainer image and no
   # other (ci-standard.md §2, devcontainer.md §7). One image job (Company Agent
@@ -553,12 +988,22 @@ jobs:
   # for the image builds) and CI Gate on ci-gate; on the github.com mirror all
   # are ubuntu-latest, which has Docker (devops.md §1: host-specific choices
   # are guarded on github.server_url).
+  #
+  # v1.30: lint, the build-tag assertion, the releasability test and
+  # deps-check moved to the lint job. This job runs build, make coverage and,
+  # on the full tier, make security and trivy image; it skips on a docs-only
+  # PR, which runs none of them, and CI Gate reads that skip as passed.
   image:
-    name: Devcontainer image [lint, build, test, security, deps-check, trivy image]
+    name: Devcontainer image [build, test, security, trivy image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    needs: changes             # v1.24 (CA m749, m751 (a))
-    timeout-minutes: 90       # CUSTOMIZE: give the stages honest headroom
+    needs: [changes, schedule-guard]   # v1.24 (CA m749, m751 (a)); v1.29.3
+    # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
+    # on every event only on `run` (not `refused`, not `proven`), and never
+    # on a docs-only PR.
+    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    timeout-minutes: 23       # CUSTOMIZE (go-quicraft, #503): ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
+      CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       # v1.22: the cache volumes' trust class. Only a push to main writes the
       # caches main's build reads; every other event, pull requests included,
@@ -612,12 +1057,26 @@ jobs:
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
       # <<< CUSTOMIZE
 
+      # v1.30 (fix 1): the toolchain image from the registry cache first, so
+      # make docker-build builds the integration image alone.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the devcontainer images
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
+          # v1.29.4: the build's module fetches go through Athens first when
+          # the runner sets DEVCACHE_GOPROXY and the cache answers, with the
+          # proxy.golang.org fallback. v1.29.5: the separator is `|`, so any
+          # error falls through, and "$bp" is one quoted make argument; the
+          # Makefile quotes it on the docker build line.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
           # >>> CUSTOMIZE (go-quicraft)
           # Only the full tier uses the integration image (the trivy image
           # step here, the integration and soak jobs), so a PR-tier run, a
@@ -626,7 +1085,7 @@ jobs:
           # a PR rebuilt an image nothing in the run read.
           target=docker-build-toolchain
           [ "$CI_FULL_TIER" != true ] || target=docker-build
-          make "$target" MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          make "$target" ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
           # <<< CUSTOMIZE
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
@@ -650,36 +1109,6 @@ jobs:
       - name: Trim the CI caches
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
         run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
-
-      # make lint: gofmt, vet, golangci-lint, actionlint with shellcheck
-      # (devops.md §4). .golangci.yml enables staticcheck, errcheck, unused,
-      # ineffassign, misspell and gocritic (devops.md §8). v1.27: a repo's
-      # `make lint-gates` runs in the lint-gates job beside this one, never
-      # here and never as a prerequisite of lint.
-      - name: make lint
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
-        # >>> CUSTOMIZE (go-quicraft)
-        # make lint runs golangci-lint in every module; the nested modules'
-        # dependencies are not in the image's module cache.
-        env:
-          IN_IMAGE_NETWORK: bridge
-        # <<< CUSTOMIZE
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint GO_BUILD_TAGS='$GO_BUILD_TAGS'"
-
-      # v1.26.1 (Company Agent m1128 (9)): a docs-only PR skips make coverage, so
-      # it runs the releasability test alone; any other run gets it from make
-      # coverage.
-      - name: Releasability test (docs-only PR)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true' }}
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 -tags '$GO_BUILD_TAGS' $RELEASABILITY_TEST"
-
-      # v1.9.2, now in the image: the declared tag set must select code. Each
-      # tag is checked by removal: if dropping it changes no selected file
-      # (tests included), it is misspelled or dead. Compares files, not
-      # packages, and a tag may swap files (a `!foo` stub for a `foo` body).
-      - name: Assert every build tag selects code
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' && needs.changes.outputs.docs_only != 'true' }}
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "GO_BUILD_TAGS='$GO_BUILD_TAGS' sh scripts/assert-build-tags.sh"
 
       # CUSTOMIZE: nested modules (sdk/go, xkey) and variants (FIPS) are built
       # by `make build` itself, never by an extra step here.
@@ -707,16 +1136,6 @@ jobs:
         env:
           IN_IMAGE_NETWORK: bridge
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make security GO_BUILD_TAGS='$GO_BUILD_TAGS'"
-
-      # Fails when a library, first-party or third-party, is behind its latest
-      # release without devops.md §9's documented reason (ci-standard.md §1).
-      # v1.28: a lint-class gate of seconds on the PR tier, every event, a
-      # docs-only PR included (ruling 219(3)); it was full tier only from v1.23.
-      - name: make deps-check
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
-        env:
-          IN_IMAGE_NETWORK: bridge
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make deps-check
 
       # The integration image is gated before any push to either registry
       # (devops.md §8): --ignore-unfixed (v1.19) and --skip-dirs /opt/go/mod
@@ -755,12 +1174,17 @@ jobs:
   lint-gates:
     name: Lint Gates [toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ !github.event.pull_request.draft }}   # v1.26
-    timeout-minutes: 45       # CUSTOMIZE: the repo's lint-gates time, with honest headroom
+    needs: [changes, schedule-guard]     # v1.29.3; v1.30
+    # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
+    # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
+    # only when a changed file matches LINT_GATES_PATTERN (fix 3).
+    if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.lint_gates != 'false' }}
+    timeout-minutes: 45       # CUSTOMIZE: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       # v1.22: the cache volumes' trust class (as in the image job).
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+      CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -791,28 +1215,26 @@ jobs:
         if: ${{ steps.probe.outputs.has_target == 'true' }}
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
-      # make docker-build needs the integration image's name (as in the image
-      # job); this job never runs or leases that image.
-      # v1.29: the Alpine package index checksum, which that name hashes (as in
-      # the image job).
-      - name: Read the Alpine package index
+      # v1.30 (fix 1): the registry cache first, then the toolchain image
+      # alone (`make docker-build-toolchain`); this job never builds the
+      # integration image.
+      - name: Pull the toolchain image from the registry cache
         if: ${{ steps.probe.outputs.has_target == 'true' }}
-        run: |
-          sum=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
-          echo "APK_INDEX_SUM=$sum" >> "$GITHUB_ENV"
+        run: scripts/ci-image-cache.sh pull || true
 
-      - name: Name the integration image
-        if: ${{ steps.probe.outputs.has_target == 'true' }}
-        run: echo "IT_IMAGE=$(make -s it-image)" >> "$GITHUB_ENV"
-
-      - name: Build the devcontainer images
+      - name: Build the toolchain image
         if: ${{ steps.probe.outputs.has_target == 'true' }}
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -840,14 +1262,16 @@ jobs:
   # v1.23: full tier only (CI_FULL_TIER's expression); never on a plain PR.
   integration:
     name: Integration [integration image]
-    # v1.26: never on a draft PR, ci:full or not.
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
+    # v1.26: never on a draft PR, ci:full or not. v1.29.3: on a schedule run,
+    # only on the schedule guard's `run`. v1.30: only on `run` on every event
+    # (a proven main push and a refused run skip it).
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: its coverage run is the other multi-node QUIC load.
-    needs: [image]
+    needs: [image, schedule-guard]
     # <<< CUSTOMIZE
-    timeout-minutes: 60       # CUSTOMIZE
+    timeout-minutes: 34       # CUSTOMIZE (go-quicraft, #503): ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       IT_PROJECT: ${{ github.event.repository.name }}-ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -929,14 +1353,16 @@ jobs:
   # it `nightly`. It replaces nothing in batch.yml, whose soak stays a dispatch.
   soak:
     name: Soak [integration image]
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    # v1.30: a dispatch off main is refused, so soak runs only on `run`.
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
-    needs: [integration]
+    # v1.29.3: and on a schedule run, only on the schedule guard's `run`.
+    needs: [integration, schedule-guard]
     # <<< CUSTOMIZE
-    timeout-minutes: 90       # CUSTOMIZE: SOAK_MINUTES plus one iteration
+    timeout-minutes: 66       # CUSTOMIZE (go-quicraft, #503): SOAK_MINUTES plus one iteration, at least ceil(1.5 x the 72-hour p95)
     env:
       SOAK_MINUTES: 30        # CUSTOMIZE
       SOAK_TARGET: integration-test   # CUSTOMIZE: a make target of the integration image
@@ -1054,9 +1480,9 @@ jobs:
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-    needs: [image, integration]
-    timeout-minutes: 30
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [image, integration, schedule-guard]
+    timeout-minutes: 13       # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1080,13 +1506,22 @@ jobs:
           sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 \
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1105,9 +1540,11 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    # v1.26: never on a draft PR, ci:full or not.
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
-    timeout-minutes: 20
+    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
+    # schedule guard's `run`.
+    needs: schedule-guard
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1126,13 +1563,22 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1151,9 +1597,11 @@ jobs:
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    # v1.26: never on a draft PR, ci:full or not.
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
-    timeout-minutes: 10
+    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
+    # schedule guard's `run`.
+    needs: schedule-guard
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 5        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1172,13 +1620,22 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1201,8 +1658,10 @@ jobs:
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    timeout-minutes: 20
+    # v1.29.3, v1.30: only on the schedule guard's `run`.
+    needs: schedule-guard
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1221,13 +1680,22 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1248,9 +1716,11 @@ jobs:
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    # v1.26: never on a draft PR, ci:full or not.
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
-    timeout-minutes: 20
+    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
+    # schedule guard's `run`.
+    needs: schedule-guard
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     strategy:
       fail-fast: false
       matrix:
@@ -1284,13 +1754,22 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1310,9 +1789,11 @@ jobs:
   modules:
     name: Nested module build, vet and test [toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    # v1.26: never on a draft PR, ci:full or not.
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft }}
-    timeout-minutes: 20
+    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
+    # schedule guard's `run`.
+    needs: schedule-guard
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    timeout-minutes: 7        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1331,13 +1812,22 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1359,9 +1849,9 @@ jobs:
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-    needs: [integration]
-    timeout-minutes: 45
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [integration, schedule-guard]
+    timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1385,13 +1875,22 @@ jobs:
           sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 \
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1417,9 +1916,9 @@ jobs:
   fips:
     name: FIPS [toolchain image]
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-    needs: [integration]
-    timeout-minutes: 45
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [integration, schedule-guard]
+    timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1443,13 +1942,22 @@ jobs:
           sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 \
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
 
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
       - name: Build the toolchain image
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
               if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
             done )
-          make docker-build-toolchain MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
@@ -1490,6 +1998,7 @@ jobs:
     name: Architecture Gates
     runs-on: ubuntu-latest
     if: ${{ !github.event.pull_request.draft }}   # v1.26
+    timeout-minutes: 5        # v1.30
     env:
       OBJSTORE_SEAMS: ''      # CUSTOMIZE
     steps:
@@ -1519,10 +2028,16 @@ jobs:
   ci-gate:
     name: CI Gate
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'ci-gate' }}
-    if: always()
+    # v1.29.3: on a schedule run the schedule guard decides. `busy` skips the
+    # gate, so `CI / CI Gate (schedule)` posts `skipped` (Gitea 1.27.1 posts a
+    # skipped job as `skipped`, not `success`), never a green nightly. Every
+    # other verdict, an empty one included, runs it.
+    if: ${{ always() && (github.event_name != 'schedule' || needs.schedule-guard.outputs.verdict != 'busy') }}
+    timeout-minutes: 5        # v1.30
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
-    # check line below; remove none of the template's jobs.
-    needs: [changes, image, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
+    # check line below; remove none of the template's jobs. v1.30: lint
+    # joins; publish-images is the one job outside the gate (see its comment).
+    needs: [changes, schedule-guard, lint, image, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -1534,6 +2049,15 @@ jobs:
           NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           # v1.26: a draft PR runs no CI, so its gate fails rather than pass on skips.
           DRAFT: ${{ github.event.pull_request.draft == true }}
+          # v1.29.3: the schedule guard's verdict on a schedule run.
+          SCHEDULE: ${{ github.event_name == 'schedule' }}
+          SCHEDULE_GUARD: ${{ needs.schedule-guard.outputs.verdict }}
+          # v1.30: the proving run of a proven main push, the docs-only PR
+          # flag (a `code` job skips on it) and the lint-gates path scope (a
+          # `scoped` job skips when no file matched).
+          PROOF: ${{ needs.schedule-guard.outputs.proof }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only == 'true' }}
+          LINT_GATES_SEL: ${{ needs.changes.outputs.lint_gates != 'false' }}
         run: |
           if [ "${DRAFT}" = true ]; then
             echo "FAIL draft pull request: no CI runs on a draft. Mark it ready, then push an empty commit to start its run."
@@ -1541,11 +2065,17 @@ jobs:
           fi
           BAD=0
           echo "full tier selected: ${FULL_TIER}; nightly selected: ${NIGHTLY}"
-          check() { # <job> <result> <pr|full|nightly>
+          check() { # <job> <result> <pr|code|scoped|full|nightly>
             case "$2" in
               success) echo "OK   $1";;
               skipped)
-                if [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
+                if [ "${SCHEDULE_GUARD}" = proven ] && [ -n "${PROOF}" ] && [ "$3" != nightly ]; then
+                  echo "SKIP $1 (tree proven by run ${PROOF})"
+                elif [ "$3" = code ] && [ "${DOCS_ONLY}" = true ]; then
+                  echo "SKIP $1 (docs-only pull request)"
+                elif [ "$3" = scoped ] && [ "${LINT_GATES_SEL}" != true ]; then
+                  echo "SKIP $1 (no changed file matches LINT_GATES_PATTERN)"
+                elif [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
                   echo "SKIP $1 (full tier not selected)"
                 elif [ "$3" = nightly ] && [ "${NIGHTLY}" != true ]; then
                   echo "SKIP $1 (nightly and dispatch only)"
@@ -1555,12 +2085,25 @@ jobs:
               *) echo "FAIL $1 ($2)"; BAD=1;;
             esac
           }
+          # v1.29.3: a schedule run reaches this step on any verdict but
+          # `busy`. Any verdict but `run` means its bigdisk jobs skipped
+          # because the guard had no count: fail closed.
+          # v1.30: a refused run (a dispatch off main, a checkpoint-branch PR) fails.
+          if [ "${SCHEDULE_GUARD}" = refused ]; then
+            echo "FAIL schedule-guard (refused: a workflow_dispatch off main or a PR from lane-ckpt/*; see its log)"; BAD=1
+          fi
+          if [ "${SCHEDULE}" = true ] && [ "${SCHEDULE_GUARD}" != run ]; then
+            echo "FAIL schedule-guard (verdict '${SCHEDULE_GUARD:-none}': the bigdisk jobs skipped because the guard could not read the API; see its log)"; BAD=1
+          fi
           # CUSTOMIZE: one line per job in needs above. A job gated to the
           # full tier by its `if:` is marked full, one gated to schedule and
-          # workflow_dispatch is nightly; every other job is pr.
+          # workflow_dispatch is nightly; every other job is pr. v1.30: a job
+          # that skips on a docs-only PR is code, and lint-gates is scoped.
           check changes     "${{ needs.changes.result }}" pr
-          check image       "${{ needs.image.result }}" pr
-          check lint-gates  "${{ needs.lint-gates.result }}" pr
+          check schedule-guard "${{ needs.schedule-guard.result }}" pr
+          check lint        "${{ needs.lint.result }}" pr
+          check image       "${{ needs.image.result }}" code
+          check lint-gates  "${{ needs.lint-gates.result }}" scoped
           check integration "${{ needs.integration.result }}" full
           check soak        "${{ needs.soak.result }}" nightly
           check arch-gates  "${{ needs.arch-gates.result }}" pr

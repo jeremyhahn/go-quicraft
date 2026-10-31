@@ -1,5 +1,20 @@
-# Nightly jobs that verify slow-moving properties: Trivy and dependency
-# freshness. They gate no merge and run only when dispatched: the coordinator
+# nightly-template: v1.9 (customized)
+# v1.9 (2026-10-31, Company Agent m1804, ci-template v1.30 fix 2): a
+# `lint-sweeps` job runs the repository's `make -k lint-sweeps` in its
+# toolchain image, nightly and on dispatch only, when the Makefile (or a
+# tracked *.mk) defines the target; without one it prints OK and passes. A
+# repository's lint sweeps never run in ci.yml: go-qrdb's ran in its PR lint
+# job at a 72-hour p95 of 87 minutes. It runs on bigdisk and needs the
+# scripts ci.yml ships (in-toolchain-image.sh, ci-image-cache.sh,
+# trim-ci-caches.sh). timeout-minutes is CUSTOMIZE, ceil(1.5 x the 72-hour p95).
+# >>> CUSTOMIZE (go-quicraft): this file adopts the v1.9 lint-sweeps job only.
+# Its schedule, its fips job and the template's trivy job are not taken: the
+# nightly is dispatch-only and FIPS runs in ci.yml's full tier, where CI Gate
+# checks it (#293).
+# <<< CUSTOMIZE
+#
+# Nightly jobs that verify slow-moving properties: lint sweeps, Trivy and
+# dependency freshness. They gate no merge and run only when dispatched: the coordinator
 # dispatches the nightly by hand, and there is no schedule (#293).
 #
 # The FIPS job moved to ci.yml's full tier (#293), where CI Gate checks it.
@@ -15,6 +30,73 @@ env:
   GOWORK: "off"
 
 jobs:
+  # v1.9: the repository's lint sweeps (whole-tree, slow lint passes beside
+  # `make lint`), off every push and PR path (ci-standard.md §12).
+  lint-sweeps:
+    name: Lint sweeps [toolchain image]
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    timeout-minutes: 5        # CUSTOMIZE (go-quicraft, #503): no lint-sweeps target yet, so the job is its probe; ceil(1.5 x p95) once one lands
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: main
+      CI_IMAGE_NAMESPACE: agent-ci-images
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      - name: Does the Makefile define lint-sweeps?
+        id: probe
+        run: |
+          mapfile -t mk < <(git ls-files -- Makefile '*.mk')
+          if [ "${#mk[@]}" -gt 0 ] && grep -qE '^lint-sweeps[[:space:]]*:([^=]|$)' "${mk[@]}"; then
+            echo "has_target=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "OK: no lint-sweeps target in the Makefile; nothing to run"
+            echo "has_target=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull the toolchain image from the registry cache
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: scripts/ci-image-cache.sh pull || true
+
+      - name: Build the toolchain image
+        if: ${{ steps.probe.outputs.has_target == 'true' }}
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      - name: Trim the CI caches
+        if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
+        run: scripts/trim-ci-caches.sh "$CI_STACK_PREFIX" "$TOOLCHAIN_IMAGE"
+
+      # -k: a sweep reports every finding in one run; it gates no merge.
+      - name: make lint-sweeps
+        if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
+        env:
+          IN_IMAGE_NETWORK: none   # CUSTOMIZE: bridge when a sweep needs the module proxy
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make -k lint-sweeps"
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
   trivy:
     name: Trivy
     runs-on: ubuntu-latest

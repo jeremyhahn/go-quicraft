@@ -1369,8 +1369,9 @@ deps-check:
 	@./scripts/deps-check.sh
 
 .PHONY: gosec
-# CI's security stage runs this target (ci-template v1.21): only
-# test/performance (separate modules that never ship) is excluded.
+# gosec alone, no network (handbook devops.md §4, §8). CI's lint job runs it
+# on the PR tier and `make security` on the full tier (ci-template v1.30):
+# only test/performance (separate modules that never ship) is excluded.
 gosec:
 	$(GOSEC) $(GO_TAGS_FLAG) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium ./...
 
@@ -1555,10 +1556,11 @@ IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 # Internal: a devcontainer build of one stage. GO_IMAGE comes from the pin file;
 # GO_BUILD_PROXY, when set in the caller's environment, replaces the public
-# module proxy for the build-time fetches.
+# module proxy for the build-time fetches. Quoted: CI passes a `|`-separated
+# list (ci-template v1.29.5), which unquoted is a shell pipe.
 DEVCONTAINER_BUILD = docker buildx build --load $(DOCKER_SECRET_ARGS) \
 	--build-arg GO_IMAGE=$(GO_IMAGE) \
-	$(if $(GO_BUILD_PROXY),--build-arg GO_BUILD_PROXY=$(GO_BUILD_PROXY)) \
+	$(if $(GO_BUILD_PROXY),--build-arg "GO_BUILD_PROXY=$(GO_BUILD_PROXY)") \
 	-f $(DEVCONTAINER_DIR)/Dockerfile
 
 # The make target docker-make runs inside the dev image.
@@ -1568,10 +1570,22 @@ DOCKER_MAKE_TARGET ?= ci
 .PHONY: docker-build
 docker-build: docker-build-toolchain docker-build-it
 
+# Built only when the daemon lacks the tag, as docker-build-it (handbook
+# devcontainer.md §6). Two jobs on one daemon can both miss the tag and race
+# to build it; the loser's build fails with the tag already held, so a failed
+# build re-inspects and succeeds when the tag is now there.
 .PHONY: docker-build-toolchain
 docker-build-toolchain:
 	$(REQUIRE_BUILDX)
-	$(DEVCONTAINER_BUILD) --target toolchain -t $(TOOLCHAIN_IMAGE) .
+	@if docker image inspect '$(TOOLCHAIN_IMAGE)' >/dev/null 2>&1; then \
+		echo "==> $(TOOLCHAIN_IMAGE) is already on the daemon"; \
+	elif ! $(DEVCONTAINER_BUILD) --target toolchain -t '$(TOOLCHAIN_IMAGE)' .; then \
+		if docker image inspect '$(TOOLCHAIN_IMAGE)' >/dev/null 2>&1; then \
+			echo "==> $(TOOLCHAIN_IMAGE) was built by a parallel job; using it"; \
+		else \
+			exit 1; \
+		fi; \
+	fi
 
 # Built only when the daemon lacks the tag: the tag is the content, so a held
 # image is this tree's (handbook devcontainer.md §6).

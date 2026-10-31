@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - CI: ci-template v1.28.0 (`make deps-check` runs on every pull request, a docs-only PR included, as `make lint` does).
 - CI: ci-template v1.29.2. The integration image's tag hashes the Alpine package index checksum (`scripts/apk-index-sum.sh`, `APK_INDEX_SUM`), and its build re-runs `apk upgrade` when that checksum moves, so a new Alpine package release, a CVE fix among them, rebuilds the image. `make lint-gates` runs without `-k`: the first failing gate ends the step.
+- CI: ci-template v1.30 (ci.yml v1.30, nightly.yml v1.9, image cache script; toolchain image build skips a tag the daemon holds)
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 
 ## [0.24.2-alpha] - 2026-10-25

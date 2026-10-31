@@ -82,6 +82,9 @@ func TestCIGateDependsOnEveryJobAndChecksEveryDependency(t *testing.T) {
 			gateFound = true
 			continue
 		}
+		if outsideGate[j] {
+			continue
+		}
 		substantive = append(substantive, j)
 	}
 	if !gateFound {
@@ -151,10 +154,10 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 	if gate == "" {
 		t.Fatalf("could not isolate the %s job body", gateJobName)
 	}
-	if !regexp.MustCompile(`(?m)^    if: always\(\)\s*$`).MatchString(gate) {
-		t.Errorf("%s is missing `if: always()`:\n%s\n\n"+
+	if !regexp.MustCompile(`(?m)^    if: ` + regexp.QuoteMeta(gateIf) + `\s*$`).MatchString(gate) {
+		t.Errorf("%s is missing `if: %s`:\n%s\n\n"+
 			"Without it the gate is skipped when a dependency fails, publishes no "+
-			"status, and a required context never arrives.", gateJobName, gate)
+			"status, and a required context never arrives.", gateJobName, gateIf, gate)
 	}
 	// Fail-closed: anything that is not success must be treated as failure.
 	// ci-template v1.21 breaks the line after `in`.
@@ -189,6 +192,41 @@ const draftFullTierIf = `(` + fullTierIf + `) && ` + notDraft
 // draft run reads as passed.
 const draftGateFail = `if [ "${DRAFT}" = true ]; then`
 
+// fullTierEnv is the workflow's CI_FULL_TIER (ci-template v1.30 fix 5): the
+// full tier is every event but a PR and a workflow_dispatch off main, and a
+// PR labelled ci:full. Jobs keep fullTierIf; a dispatch off main is refused
+// by the schedule guard, so its full-tier jobs skip on the verdict.
+const fullTierEnv = `(github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')) || contains(github.event.pull_request.labels.*.name, 'ci:full')`
+
+// guardRun is the schedule guard's verdict (ci-template v1.29.3, v1.30): every
+// bigdisk job ANDs it onto its condition, and ci-gate reads its skip as passed
+// only on a proven tree.
+const guardRun = `needs.schedule-guard.outputs.verdict == 'run'`
+
+// gateIf is ci-gate's condition (ci-template v1.29.3): always(), except that a
+// busy schedule run skips the gate so it never posts a green nightly.
+const gateIf = `${{ always() && (github.event_name != 'schedule' || needs.schedule-guard.outputs.verdict != 'busy') }}`
+
+// outsideGate is the job ci-gate does not need (ci-template v1.30):
+// publish-images runs on a push to main alone, after the gate's verdict
+// matters, and gates nothing.
+var outsideGate = map[string]bool{"publish-images": true}
+
+// jobCondition is a job's `if:` expression with the schedule guard's verdict
+// removed, so the tier checks compare the condition the job had before it.
+func jobCondition(job string) (string, bool) {
+	m := regexp.MustCompile(`(?m)^    if: \$\{\{ (.*) \}\}(?:\s+#.*)?$`).FindStringSubmatch(job)
+	if m == nil {
+		return "", false
+	}
+	c := strings.TrimSuffix(m[1], " && "+guardRun)
+	c = strings.TrimPrefix(c, guardRun+" && ")
+	if c == guardRun {
+		c = ""
+	}
+	return c, true
+}
+
 // TestCIGateTiersMatchTheJobs pins the three tiers to the gate.
 //
 // ci-gate passes a skipped job only when its check line tags it `full` and
@@ -204,8 +242,8 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	}
 	body := string(raw)
 
-	if !strings.Contains(body, "\n  CI_FULL_TIER: ${{ "+fullTierIf+" }}\n") {
-		t.Errorf("the workflow's CI_FULL_TIER is not the full-tier condition %q", fullTierIf)
+	if !strings.Contains(body, "\n  CI_FULL_TIER: ${{ "+fullTierEnv+" }}\n") {
+		t.Errorf("the workflow's CI_FULL_TIER is not the full-tier condition %q (ci-template v1.30)", fullTierEnv)
 	}
 	if !strings.Contains(body, "FULL_TIER: ${{ env.CI_FULL_TIER }}") {
 		t.Errorf("%s's FULL_TIER is not ${{ env.CI_FULL_TIER }}", gateJobName)
@@ -230,37 +268,45 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	for _, c := range regexp.MustCompile(`(?m)^\s+check\s+(\S+)\s+"[^"]*"\s*(\S*)\s*$`).FindAllStringSubmatch(body, -1) {
 		tiers[c[1]] = c[2]
 	}
-	// ci-template v1.27.0: lint-gates runs beside the image job's make lint,
-	// on the PR tier, so a docs-only PR runs it too.
-	if tiers["lint-gates"] != "pr" {
-		t.Errorf("%s checks lint-gates as %q; want pr (ci-template v1.27.0)", gateJobName, tiers["lint-gates"])
+	// ci-template v1.30: lint-gates is path-scoped on a pull request.
+	if tiers["lint-gates"] != "scoped" {
+		t.Errorf("%s checks lint-gates as %q; want scoped (ci-template v1.30)", gateJobName, tiers["lint-gates"])
 	}
 
 	for _, j := range ciJobs(t, body) {
-		if j == gateJobName {
+		if j == gateJobName || outsideGate[j] {
 			continue
 		}
 		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
-		hasFullIf := strings.Contains(job, "\n    if: ${{ "+fullTierIf+" }}\n") ||
-			strings.Contains(job, "\n    if: ${{ "+draftFullTierIf+" }}\n")
+		cond, hasIf := jobCondition(job)
 		switch tiers[j] {
 		case "full":
-			if !hasFullIf {
+			if cond != "("+fullTierIf+")" && cond != fullTierIf && cond != draftFullTierIf {
 				t.Errorf("job %q is tagged full in %s but lacks `if: ${{ %s }}` (or its v1.26 draft-guarded form)", j, gateJobName, fullTierIf)
 			}
 		case "nightly":
-			if !strings.Contains(job, "\n    if: ${{ "+nightlyIf+" }}\n") {
+			if cond != "("+nightlyIf+")" && cond != nightlyIf {
 				t.Errorf("job %q is tagged nightly in %s but lacks `if: ${{ %s }}`", j, gateJobName, nightlyIf)
 			}
+		case "code":
+			// ci-template v1.30: a code job skips on a docs-only PR alone.
+			if !strings.Contains(cond, "needs.changes.outputs.docs_only != 'true'") {
+				t.Errorf("job %q is tagged code in %s but its `if:` does not skip on docs_only", j, gateJobName)
+			}
+		case "scoped":
+			// ci-template v1.30: a scoped job skips when no file matches LINT_GATES_PATTERN.
+			if !strings.Contains(cond, "needs.changes.outputs.lint_gates != 'false'") {
+				t.Errorf("job %q is tagged scoped in %s but its `if:` does not test lint_gates", j, gateJobName)
+			}
 		case "pr":
-			// The v1.26 draft guard is the one `if:` a PR-tier job may carry.
-			if regexp.MustCompile(`(?m)^    if:`).MatchString(job) &&
-				!regexp.MustCompile(`(?m)^    if: \$\{\{ `+regexp.QuoteMeta(notDraft)+` \}\}(\s+#.*)?$`).MatchString(job) {
+			// The v1.26 draft guard, with the schedule guard's verdict, is the
+			// one `if:` a PR-tier job may carry.
+			if hasIf && cond != "" && cond != notDraft {
 				t.Errorf("job %q is PR tier but carries a job-level `if:`; a PR-tier job "+
 					"must run on every event, and %s fails it when skipped", j, gateJobName)
 			}
 		default:
-			t.Errorf("job %q's check line in %s has tier %q; want `pr`, `full` or `nightly`",
+			t.Errorf("job %q's check line in %s has tier %q; want `pr`, `code`, `scoped`, `full` or `nightly`",
 				j, gateJobName, tiers[j])
 		}
 	}
