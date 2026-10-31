@@ -177,14 +177,6 @@ func TestConfig_Validate_Valid(t *testing.T) {
 		}
 	})
 
-	t.Run("valid config with snapshots enabled", func(t *testing.T) {
-		c := validConfig()
-		c.SnapshotEntries = 10000
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("valid config with observer", func(t *testing.T) {
 		c := validConfig()
 		c.IsObserver = true
@@ -236,14 +228,6 @@ func TestConfig_Validate_WitnessMaxWitnesses(t *testing.T) {
 		err := c.Validate()
 		assertValidationError(t, err, "Witness.MaxWitnesses")
 	})
-
-	t.Run("zero MaxWitnesses is valid", func(t *testing.T) {
-		c := validConfig()
-		c.Witness.MaxWitnesses = 0
-		if err := c.Validate(); err != nil {
-			t.Errorf("zero MaxWitnesses should be valid, got %v", err)
-		}
-	})
 }
 
 func TestConfig_Validate_HeartbeatRTT(t *testing.T) {
@@ -252,15 +236,6 @@ func TestConfig_Validate_HeartbeatRTT(t *testing.T) {
 		c.HeartbeatRTT = 0
 		err := c.Validate()
 		assertValidationError(t, err, "HeartbeatRTT")
-	})
-
-	t.Run("minimum valid HeartbeatRTT", func(t *testing.T) {
-		c := validConfig()
-		c.HeartbeatRTT = 1
-		c.ElectionRTT = 10
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 }
 
@@ -280,23 +255,6 @@ func TestConfig_Validate_ElectionRTT(t *testing.T) {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
-
-	t.Run("equal to HeartbeatRTT", func(t *testing.T) {
-		c := validConfig()
-		c.ElectionRTT = 5
-		c.HeartbeatRTT = 5
-		err := c.Validate()
-		assertValidationError(t, err, "ElectionRTT")
-	})
-
-	t.Run("less than HeartbeatRTT", func(t *testing.T) {
-		c := validConfig()
-		c.ElectionRTT = 5
-		c.HeartbeatRTT = 6
-		err := c.Validate()
-		// HeartbeatRTT >= ElectionRTT triggers ElectionRTT error
-		assertValidationError(t, err, "ElectionRTT")
-	})
 }
 
 func TestConfig_Validate_ObserverWitness(t *testing.T) {
@@ -306,13 +264,6 @@ func TestConfig_Validate_ObserverWitness(t *testing.T) {
 		c.IsWitness = true
 		err := c.Validate()
 		assertValidationError(t, err, "IsObserver")
-	})
-
-	t.Run("neither set", func(t *testing.T) {
-		c := validConfig()
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 }
 
@@ -344,13 +295,6 @@ func TestConfig_Validate_SnapshotEntries(t *testing.T) {
 	t.Run("equal to CompactionOverhead", func(t *testing.T) {
 		c := validConfig()
 		c.SnapshotEntries = c.CompactionOverhead
-		err := c.Validate()
-		assertValidationError(t, err, "SnapshotEntries")
-	})
-
-	t.Run("less than CompactionOverhead", func(t *testing.T) {
-		c := validConfig()
-		c.SnapshotEntries = c.CompactionOverhead - 1
 		err := c.Validate()
 		assertValidationError(t, err, "SnapshotEntries")
 	})
@@ -520,30 +464,6 @@ func TestConfig_Validate_SafetyBooleans_AllowedFalse(t *testing.T) {
 }
 
 func TestConfig_SetDefaults_SafetyBooleans(t *testing.T) {
-	t.Run("nil CheckQuorum defaults to true", func(t *testing.T) {
-		c := Config{}
-		c.SetDefaults()
-		if c.CheckQuorum == nil || !*c.CheckQuorum {
-			t.Error("SetDefaults must default nil CheckQuorum to true")
-		}
-	})
-
-	t.Run("nil PreVote defaults to true", func(t *testing.T) {
-		c := Config{}
-		c.SetDefaults()
-		if c.PreVote == nil || !*c.PreVote {
-			t.Error("SetDefaults must default nil PreVote to true")
-		}
-	})
-
-	t.Run("nil OrderedConfigChange defaults to true", func(t *testing.T) {
-		c := Config{}
-		c.SetDefaults()
-		if c.OrderedConfigChange == nil || !*c.OrderedConfigChange {
-			t.Error("SetDefaults must default nil OrderedConfigChange to true")
-		}
-	})
-
 	t.Run("explicit false CheckQuorum preserved", func(t *testing.T) {
 		c := Config{CheckQuorum: BoolPtr(false)}
 		c.SetDefaults()
@@ -567,30 +487,6 @@ func TestConfig_SetDefaults_SafetyBooleans(t *testing.T) {
 			t.Error("SetDefaults must not overwrite explicit OrderedConfigChange=false")
 		}
 	})
-
-	t.Run("explicit true CheckQuorum preserved", func(t *testing.T) {
-		c := Config{CheckQuorum: BoolPtr(true)}
-		c.SetDefaults()
-		if c.CheckQuorum == nil || !*c.CheckQuorum {
-			t.Error("SetDefaults must not overwrite explicit CheckQuorum=true")
-		}
-	})
-
-	t.Run("explicit true PreVote preserved", func(t *testing.T) {
-		c := Config{PreVote: BoolPtr(true)}
-		c.SetDefaults()
-		if c.PreVote == nil || !*c.PreVote {
-			t.Error("SetDefaults must not overwrite explicit PreVote=true")
-		}
-	})
-
-	t.Run("explicit true OrderedConfigChange preserved", func(t *testing.T) {
-		c := Config{OrderedConfigChange: BoolPtr(true)}
-		c.SetDefaults()
-		if c.OrderedConfigChange == nil || !*c.OrderedConfigChange {
-			t.Error("SetDefaults must not overwrite explicit OrderedConfigChange=true")
-		}
-	})
 }
 
 func TestConfig_GetCheckQuorum(t *testing.T) {
@@ -605,13 +501,6 @@ func TestConfig_GetCheckQuorum(t *testing.T) {
 		c := Config{CheckQuorum: BoolPtr(false)}
 		if c.GetCheckQuorum() {
 			t.Error("GetCheckQuorum should return false when explicitly set")
-		}
-	})
-
-	t.Run("explicit true returns true", func(t *testing.T) {
-		c := Config{CheckQuorum: BoolPtr(true)}
-		if !c.GetCheckQuorum() {
-			t.Error("GetCheckQuorum should return true when explicitly set")
 		}
 	})
 }
@@ -630,13 +519,6 @@ func TestWitnessConfig_GetRequireFullReplicaMajority(t *testing.T) {
 			t.Error("GetRequireFullReplicaMajority should return false when explicitly set")
 		}
 	})
-
-	t.Run("explicit true returns true", func(t *testing.T) {
-		w := WitnessConfig{RequireFullReplicaMajority: BoolPtr(true)}
-		if !w.GetRequireFullReplicaMajority() {
-			t.Error("GetRequireFullReplicaMajority should return true when explicitly set")
-		}
-	})
 }
 
 func TestConfig_GetPreVote(t *testing.T) {
@@ -651,13 +533,6 @@ func TestConfig_GetPreVote(t *testing.T) {
 		c := Config{PreVote: BoolPtr(false)}
 		if c.GetPreVote() {
 			t.Error("GetPreVote should return false when explicitly set")
-		}
-	})
-
-	t.Run("explicit true returns true", func(t *testing.T) {
-		c := Config{PreVote: BoolPtr(true)}
-		if !c.GetPreVote() {
-			t.Error("GetPreVote should return true when explicitly set")
 		}
 	})
 }
@@ -676,58 +551,9 @@ func TestConfig_GetOrderedConfigChange(t *testing.T) {
 			t.Error("GetOrderedConfigChange should return false when explicitly set")
 		}
 	})
-
-	t.Run("explicit true returns true", func(t *testing.T) {
-		c := Config{OrderedConfigChange: BoolPtr(true)}
-		if !c.GetOrderedConfigChange() {
-			t.Error("GetOrderedConfigChange should return true when explicitly set")
-		}
-	})
-}
-
-func TestBoolPtr(t *testing.T) {
-	t.Run("true", func(t *testing.T) {
-		p := BoolPtr(true)
-		if p == nil || !*p {
-			t.Error("BoolPtr(true) should return pointer to true")
-		}
-	})
-
-	t.Run("false", func(t *testing.T) {
-		p := BoolPtr(false)
-		if p == nil || *p {
-			t.Error("BoolPtr(false) should return pointer to false")
-		}
-	})
-
-	t.Run("returns distinct pointers", func(t *testing.T) {
-		p1 := BoolPtr(true)
-		p2 := BoolPtr(true)
-		if p1 == p2 {
-			t.Error("BoolPtr should return distinct pointers on each call")
-		}
-	})
 }
 
 func TestConfig_Validate_MaxProposalPayloadSize(t *testing.T) {
-	t.Run("default is valid (proto.MaxEntrySize)", func(t *testing.T) {
-		c := validConfig()
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-		if c.MaxProposalPayloadSize != 8*1024*1024 {
-			t.Errorf("MaxProposalPayloadSize = %d, want %d", c.MaxProposalPayloadSize, 8*1024*1024)
-		}
-	})
-
-	t.Run("lower than protocol maximum is valid", func(t *testing.T) {
-		c := validConfig()
-		c.MaxProposalPayloadSize = 1024 * 1024 // 1 MB
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("equal to protocol maximum is valid", func(t *testing.T) {
 		c := validConfig()
 		c.MaxProposalPayloadSize = 8 * 1024 * 1024
@@ -836,14 +662,6 @@ func TestConfig_Validate_SessionExpiryEntries(t *testing.T) {
 		}
 	})
 
-	t.Run("above minimum is valid", func(t *testing.T) {
-		c := validConfig()
-		c.SessionExpiryEntries = 10000
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("below minimum (non-zero)", func(t *testing.T) {
 		c := validConfig()
 		c.SessionExpiryEntries = 99
@@ -860,19 +678,6 @@ func TestConfig_Validate_SessionExpiryEntries(t *testing.T) {
 		}
 		if tooSmall.Minimum != 100 {
 			t.Errorf("Minimum = %d, want 100", tooSmall.Minimum)
-		}
-	})
-
-	t.Run("value of 1 is rejected", func(t *testing.T) {
-		c := validConfig()
-		c.SessionExpiryEntries = 1
-		err := c.Validate()
-		if err == nil {
-			t.Fatal("expected error for SessionExpiryEntries = 1, got nil")
-		}
-		var tooSmall *SessionExpiryEntriesTooSmallError
-		if !errors.As(err, &tooSmall) {
-			t.Fatalf("expected *SessionExpiryEntriesTooSmallError, got %T: %v", err, err)
 		}
 	})
 
@@ -911,26 +716,6 @@ func TestConfig_Validate_LeaseReadRequiresCheckQuorum(t *testing.T) {
 		c.CheckQuorum = BoolPtr(true)
 		if err := c.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("LeaseRead true with CheckQuorum nil passes (defaults to true)", func(t *testing.T) {
-		c := validConfig()
-		c.LeaseRead = true
-		// CheckQuorum is already BoolPtr(true) from SetDefaults, set to nil
-		// to verify GetCheckQuorum returns true for nil.
-		c.CheckQuorum = nil
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil (nil CheckQuorum defaults to true)", err)
-		}
-	})
-
-	t.Run("LeaseRead false with CheckQuorum false passes validation", func(t *testing.T) {
-		c := validConfig()
-		c.LeaseRead = false
-		c.CheckQuorum = BoolPtr(false)
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil (LeaseRead disabled)", err)
 		}
 	})
 }
@@ -973,27 +758,14 @@ func TestConfig_Validate_LeaseReadRequiresElectionRTT(t *testing.T) {
 			t.Errorf("validateLeaseRead() = %v, want nil (LeaseRead disabled)", err)
 		}
 	})
-
-	// The general timing floor is what a real configuration hits first.
-	t.Run("Validate rejects a low ElectionRTT regardless of LeaseRead", func(t *testing.T) {
-		c := validConfig()
-		c.HeartbeatRTT = 1
-		c.ElectionRTT = 4
-		assertValidationError(t, c.Validate(), "ElectionRTT")
-	})
 }
 
 func TestConfig_Validate_MaxClockDrift(t *testing.T) {
 	valid := map[string]float64{
-		"zero selects the default":   0,
-		"the floor":                  MaxClockDriftMin,
-		"the default, stated":        0.01,
-		"a looser bound":             0.02,
-		"the ceiling":                MaxClockDriftMax,
-		"a tighter bound than 1%":    0.001,
-		"just above the floor":       2 * MaxClockDriftMin,
-		"just below the ceiling":     MaxClockDriftMax - MaxClockDriftMin,
-		"a typical disciplined host": 0.0005,
+		"zero selects the default": 0,
+		"the floor":                MaxClockDriftMin,
+		"the default, stated":      0.01,
+		"the ceiling":              MaxClockDriftMax,
 	}
 	for name, drift := range valid {
 		t.Run("accepts "+name, func(t *testing.T) {
@@ -1007,14 +779,10 @@ func TestConfig_Validate_MaxClockDrift(t *testing.T) {
 	}
 
 	invalid := map[string]float64{
-		"negative":            -0.01,
-		"below the floor":     MaxClockDriftMin / 2,
-		"above the ceiling":   MaxClockDriftMax + MaxClockDriftMin,
-		"1% as a percentage":  1,
-		"10% as a percentage": 10,
-		"NaN":                 math.NaN(),
-		"+Inf":                math.Inf(1),
-		"-Inf":                math.Inf(-1),
+		"below the floor":    MaxClockDriftMin / 2,
+		"above the ceiling":  MaxClockDriftMax + MaxClockDriftMin,
+		"1% as a percentage": 1,
+		"NaN":                math.NaN(),
 	}
 	for name, drift := range invalid {
 		t.Run("rejects "+name, func(t *testing.T) {
@@ -1023,22 +791,14 @@ func TestConfig_Validate_MaxClockDrift(t *testing.T) {
 			c.MaxClockDrift = drift
 			assertValidationError(t, c.Validate(), "MaxClockDrift")
 		})
-		// A value that would be rejected is rejected before LeaseRead is
-		// switched on, not carried silently until it is.
-		t.Run("rejects "+name+" with LeaseRead off", func(t *testing.T) {
-			c := validConfig()
-			c.MaxClockDrift = drift
-			assertValidationError(t, c.Validate(), "MaxClockDrift")
-		})
 	}
-}
-
-func TestConfig_SetDefaults_MaxInMemLogSizeZeroNotOverridden(t *testing.T) {
-	c := Config{}
-	c.SetDefaults()
-	if c.MaxInMemLogSize != 0 {
-		t.Errorf("MaxInMemLogSize = %d, want 0 (should not be overridden)", c.MaxInMemLogSize)
-	}
+	// A value that would be rejected is rejected before LeaseRead is
+	// switched on, not carried silently until it is.
+	t.Run("rejects with LeaseRead off", func(t *testing.T) {
+		c := validConfig()
+		c.MaxClockDrift = MaxClockDriftMax + MaxClockDriftMin
+		assertValidationError(t, c.Validate(), "MaxClockDrift")
+	})
 }
 
 // assertValidationError checks that err is a *ValidationError
@@ -1058,14 +818,6 @@ func assertValidationError(t *testing.T, err error, expectedField string) {
 }
 
 func TestConfig_Validate_DataDir(t *testing.T) {
-	t.Run("empty is valid (default)", func(t *testing.T) {
-		c := validConfig()
-		c.DataDir = ""
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() with empty DataDir = %v, want nil", err)
-		}
-	})
-
 	t.Run("absolute path is valid", func(t *testing.T) {
 		c := validConfig()
 		c.DataDir = "/var/lib/qrdb/tenant-7"

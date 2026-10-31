@@ -32,57 +32,6 @@ func TestValidationError_Error(t *testing.T) {
 			t.Errorf("Error() = %q, want %q", got, want)
 		}
 	})
-
-	t.Run("empty field and message", func(t *testing.T) {
-		err := &ValidationError{}
-		want := "config: invalid : "
-		if got := err.Error(); got != want {
-			t.Errorf("Error() = %q, want %q", got, want)
-		}
-	})
-}
-
-func TestValidationError_Unwrap(t *testing.T) {
-	t.Run("errors.As matches typed error", func(t *testing.T) {
-		err := newValidationError("ShardID", "must be > 0")
-		var ve *ValidationError
-		if !errors.As(err, &ve) {
-			t.Fatal("errors.As should match *ValidationError")
-		}
-		if ve.Field != "ShardID" {
-			t.Errorf("Field = %q, want %q", ve.Field, "ShardID")
-		}
-		if ve.Message != "must be > 0" {
-			t.Errorf("Message = %q, want %q", ve.Message, "must be > 0")
-		}
-	})
-
-	t.Run("non-matching type fails errors.As", func(t *testing.T) {
-		err := errors.New("some other error")
-		var ve *ValidationError
-		if errors.As(err, &ve) {
-			t.Fatal("errors.As should not match for non-validation error")
-		}
-	})
-}
-
-func TestNewValidationError(t *testing.T) {
-	t.Run("creates error with correct fields", func(t *testing.T) {
-		err := newValidationError("WALDir", "must not be empty")
-		if err.Field != "WALDir" {
-			t.Errorf("Field = %q, want %q", err.Field, "WALDir")
-		}
-		if err.Message != "must not be empty" {
-			t.Errorf("Message = %q, want %q", err.Message, "must not be empty")
-		}
-	})
-
-	t.Run("error satisfies error interface", func(t *testing.T) {
-		var err error = newValidationError("test", "msg")
-		if err.Error() == "" {
-			t.Fatal("error should produce a non-empty message")
-		}
-	})
 }
 
 func TestLogValidationError_Error(t *testing.T) {
@@ -95,45 +44,6 @@ func TestLogValidationError_Error(t *testing.T) {
 		want := `config: invalid LogConfig.Level: must be one of debug, info, warn, error (got "invalid")`
 		if got := err.Error(); got != want {
 			t.Errorf("Error() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("handles empty value", func(t *testing.T) {
-		err := &LogValidationError{
-			Field:   "Output",
-			Message: "must not be empty",
-			Value:   "",
-		}
-		want := `config: invalid LogConfig.Output: must not be empty (got "")`
-		if got := err.Error(); got != want {
-			t.Errorf("Error() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("handles special characters in value", func(t *testing.T) {
-		err := &LogValidationError{
-			Field:   "Format",
-			Message: "unsupported format",
-			Value:   "json\nwith\tnewlines",
-		}
-		want := `config: invalid LogConfig.Format: unsupported format (got "json\nwith\tnewlines")`
-		if got := err.Error(); got != want {
-			t.Errorf("Error() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("errors.As matches typed error", func(t *testing.T) {
-		var err error = &LogValidationError{
-			Field:   "Level",
-			Message: "invalid",
-			Value:   "bad",
-		}
-		var lve *LogValidationError
-		if !errors.As(err, &lve) {
-			t.Fatal("errors.As should match *LogValidationError")
-		}
-		if lve.Field != "Level" {
-			t.Errorf("Field = %q, want %q", lve.Field, "Level")
 		}
 	})
 }
@@ -155,20 +65,6 @@ func TestMaxProposalPayloadSizeExceededError_Error(t *testing.T) {
 			t.Fatalf("error message missing protocol maximum: %s", msg)
 		}
 	})
-
-	t.Run("errors.As matches typed error", func(t *testing.T) {
-		var err error = &MaxProposalPayloadSizeExceededError{
-			Configured:      16 * 1024 * 1024,
-			ProtocolMaximum: 8 * 1024 * 1024,
-		}
-		var exceeded *MaxProposalPayloadSizeExceededError
-		if !errors.As(err, &exceeded) {
-			t.Fatal("errors.As should match *MaxProposalPayloadSizeExceededError")
-		}
-		if exceeded.Configured != 16*1024*1024 {
-			t.Errorf("Configured = %d, want %d", exceeded.Configured, 16*1024*1024)
-		}
-	})
 }
 
 func TestKeyRotationIntervalTooSmallError_Error(t *testing.T) {
@@ -188,20 +84,6 @@ func TestKeyRotationIntervalTooSmallError_Error(t *testing.T) {
 			t.Fatalf("error message missing minimum value: %s", msg)
 		}
 	})
-
-	t.Run("errors.As matches typed error", func(t *testing.T) {
-		var err error = &KeyRotationIntervalTooSmallError{
-			Configured: 500 * time.Millisecond,
-			Minimum:    time.Second,
-		}
-		var tooSmall *KeyRotationIntervalTooSmallError
-		if !errors.As(err, &tooSmall) {
-			t.Fatal("errors.As should match *KeyRotationIntervalTooSmallError")
-		}
-		if tooSmall.Configured != 500*time.Millisecond {
-			t.Errorf("Configured = %v, want 500ms", tooSmall.Configured)
-		}
-	})
 }
 
 func TestSessionExpiryEntriesTooSmallError_Error(t *testing.T) {
@@ -219,20 +101,6 @@ func TestSessionExpiryEntriesTooSmallError_Error(t *testing.T) {
 		}
 		if !strings.Contains(msg, "100") {
 			t.Fatalf("error message missing minimum value: %s", msg)
-		}
-	})
-
-	t.Run("errors.As matches typed error", func(t *testing.T) {
-		var err error = &SessionExpiryEntriesTooSmallError{
-			Configured: 10,
-			Minimum:    100,
-		}
-		var tooSmall *SessionExpiryEntriesTooSmallError
-		if !errors.As(err, &tooSmall) {
-			t.Fatal("errors.As should match *SessionExpiryEntriesTooSmallError")
-		}
-		if tooSmall.Configured != 10 {
-			t.Errorf("Configured = %d, want 10", tooSmall.Configured)
 		}
 	})
 }

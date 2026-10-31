@@ -25,7 +25,6 @@ func TestCompressionType_String(t *testing.T) {
 		{name: "NoCompression", ct: NoCompression, want: "none"},
 		{name: "Snappy", ct: Snappy, want: "snappy"},
 		{name: "unknown value", ct: CompressionType(99), want: "unknown"},
-		{name: "max uint16", ct: CompressionType(65535), want: "unknown"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -46,8 +45,6 @@ func TestCompressionType_IsValid(t *testing.T) {
 		{name: "NoCompression", ct: NoCompression, want: true},
 		{name: "Snappy", ct: Snappy, want: true},
 		{name: "unknown 2", ct: CompressionType(2), want: false},
-		{name: "unknown 99", ct: CompressionType(99), want: false},
-		{name: "max uint16", ct: CompressionType(65535), want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

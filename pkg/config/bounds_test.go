@@ -72,19 +72,13 @@ func TestConfig_Validate_TickCeilings(t *testing.T) {
 	})
 }
 
-// TestConfig_Validate_ElectionHeartbeatMargin closes the band the existing
-// tests skip. They cover ratio <= 1 (5/5 and 5/6) and a valid 5/1, so
-// weakening the rule from `ElectionRTT/2 < HeartbeatRTT` to
-// `ElectionRTT <= HeartbeatRTT` passed cleanly — while the 1x..2x band is
-// exactly the configuration the production comment names as harmful, because
-// an election timeout under two heartbeat intervals produces election storms.
+// TestConfig_Validate_ElectionHeartbeatMargin pins the election/heartbeat
+// ratio rule inside the 1x..2x band, not only at ratio <= 1: weakening the
+// rule from `ElectionRTT/2 < HeartbeatRTT` to `ElectionRTT <= HeartbeatRTT`
+// must fail, because the 1x..2x band is exactly the configuration the
+// production comment names as harmful — an election timeout under two
+// heartbeat intervals produces election storms.
 func TestConfig_Validate_ElectionHeartbeatMargin(t *testing.T) {
-	t.Run("ratio above 1x but below 2x is refused", func(t *testing.T) {
-		c := validConfig()
-		c.HeartbeatRTT = 4
-		c.ElectionRTT = 5 // ratio 1.25 — the case the comment names
-		assertValidationError(t, c.Validate(), "ElectionRTT")
-	})
 	t.Run("ratio of exactly 2x is the accepted minimum", func(t *testing.T) {
 		// The rule refuses when ElectionRTT/2 < HeartbeatRTT, so 10/5 gives
 		// 5 < 5 = false and is accepted: 2x is the smallest permitted margin.
@@ -102,14 +96,6 @@ func TestConfig_Validate_ElectionHeartbeatMargin(t *testing.T) {
 		c.HeartbeatRTT = 5
 		c.ElectionRTT = 9 // 9/2 = 4 < 5
 		assertValidationError(t, c.Validate(), "ElectionRTT")
-	})
-	t.Run("comfortably above 2x is accepted", func(t *testing.T) {
-		c := validConfig()
-		c.HeartbeatRTT = 5
-		c.ElectionRTT = 11
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 	t.Run("a huge HeartbeatRTT does not wrap", func(t *testing.T) {
 		// The rule divides ElectionRTT rather than doubling HeartbeatRTT

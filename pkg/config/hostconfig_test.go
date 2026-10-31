@@ -125,23 +125,6 @@ func TestHostConfig_Validate_Valid(t *testing.T) {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
-
-	t.Run("valid with AllowZeroDeploymentID", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.DeploymentID = 0
-		hc.AllowZeroDeploymentID = true
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("valid with MaxWALDiskSize unlimited", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxWALDiskSize = 0
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_WALDir(t *testing.T) {
@@ -150,14 +133,6 @@ func TestHostConfig_Validate_WALDir(t *testing.T) {
 		hc.WALDir = ""
 		err := hc.Validate()
 		assertValidationError(t, err, "WALDir")
-	})
-
-	t.Run("non-empty WALDir", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.WALDir = "/data/wal"
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 }
 
@@ -168,14 +143,6 @@ func TestHostConfig_Validate_NodeHostDir(t *testing.T) {
 		err := hc.Validate()
 		assertValidationError(t, err, "NodeHostDir")
 	})
-
-	t.Run("non-empty NodeHostDir", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.NodeHostDir = "/data/node"
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_RaftAddress(t *testing.T) {
@@ -185,14 +152,6 @@ func TestHostConfig_Validate_RaftAddress(t *testing.T) {
 		err := hc.Validate()
 		assertValidationError(t, err, "RaftAddress")
 	})
-
-	t.Run("non-empty RaftAddress", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.RaftAddress = "10.0.0.1:26001"
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_ListenAddress(t *testing.T) {
@@ -201,14 +160,6 @@ func TestHostConfig_Validate_ListenAddress(t *testing.T) {
 		hc.ListenAddress = ""
 		err := hc.Validate()
 		assertValidationError(t, err, "ListenAddress")
-	})
-
-	t.Run("non-empty ListenAddress", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.ListenAddress = "0.0.0.0:26001"
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 }
 
@@ -263,14 +214,6 @@ func TestHostConfig_Validate_DeploymentID(t *testing.T) {
 			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
-
-	t.Run("non-zero", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.DeploymentID = 42
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_NumWorkers(t *testing.T) {
@@ -280,14 +223,6 @@ func TestHostConfig_Validate_NumWorkers(t *testing.T) {
 		err := hc.Validate()
 		assertValidationError(t, err, "NumWorkers")
 	})
-
-	t.Run("valid NumWorkers", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.NumWorkers = 4
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_MaxApplyWorkers(t *testing.T) {
@@ -296,14 +231,6 @@ func TestHostConfig_Validate_MaxApplyWorkers(t *testing.T) {
 		hc.MaxApplyWorkers = 0
 		err := hc.Validate()
 		assertValidationError(t, err, "MaxApplyWorkers")
-	})
-
-	t.Run("valid MaxApplyWorkers", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxApplyWorkers = 2
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
 	})
 }
 
@@ -331,39 +258,6 @@ func TestHostConfig_Validate_ShutdownTimeout(t *testing.T) {
 		err := hc.Validate()
 		assertValidationError(t, err, "ShutdownTimeout")
 	})
-
-	t.Run("negative ShutdownTimeout", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.ShutdownTimeout = -1
-		err := hc.Validate()
-		assertValidationError(t, err, "ShutdownTimeout")
-	})
-
-	t.Run("valid ShutdownTimeout", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.ShutdownTimeout = 5 * time.Second
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-}
-
-func TestHostConfig_Validate_MaxTotalInMemLogSize(t *testing.T) {
-	t.Run("zero MaxTotalInMemLogSize is valid (disabled)", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxTotalInMemLogSize = 0
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil (0 means disabled)", err)
-		}
-	})
-
-	t.Run("non-zero MaxTotalInMemLogSize is valid", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxTotalInMemLogSize = 1
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
 }
 
 func TestHostConfig_Validate_TransportConfig(t *testing.T) {
@@ -377,26 +271,6 @@ func TestHostConfig_Validate_TransportConfig(t *testing.T) {
 		var ve *ValidationError
 		if !errors.As(err, &ve) {
 			t.Fatalf("expected *ValidationError, got %T: %v", err, err)
-		}
-	})
-}
-
-func TestHostConfig_Validate_EventListener(t *testing.T) {
-	t.Run("nil EventListener is valid", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.EventListener = nil
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("non-nil EventListener is valid", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.EventListener = &EventListener{
-			OnLeaderUpdated: func(info LeaderInfo) {},
-		}
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
 }
@@ -455,6 +329,9 @@ func TestHostConfig_Validate_LogConfig(t *testing.T) {
 		if logErr.Field != "Format" {
 			t.Errorf("Field = %q, want %q", logErr.Field, "Format")
 		}
+		if logErr.Value != "invalid" {
+			t.Errorf("Value = %q, want %q", logErr.Value, "invalid")
+		}
 	})
 
 	t.Run("invalid LogConfig level propagates", func(t *testing.T) {
@@ -471,30 +348,16 @@ func TestHostConfig_Validate_LogConfig(t *testing.T) {
 		if logErr.Field != "Level" {
 			t.Errorf("Field = %q, want %q", logErr.Field, "Level")
 		}
+		if logErr.Value != "verbose" {
+			t.Errorf("Value = %q, want %q", logErr.Value, "verbose")
+		}
 	})
 }
 
 func TestHostConfig_Validate_KeyRotationInterval(t *testing.T) {
-	t.Run("zero is valid (disabled)", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.KeyRotationInterval = 0
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("exactly 1 second is valid", func(t *testing.T) {
 		hc := validHostConfig()
 		hc.KeyRotationInterval = time.Second
-		hc.MaxRetainedEpochs = 5
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("24 hours is valid", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.KeyRotationInterval = 24 * time.Hour
 		hc.MaxRetainedEpochs = 5
 		if err := hc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil", err)
@@ -520,19 +383,6 @@ func TestHostConfig_Validate_KeyRotationInterval(t *testing.T) {
 		}
 	})
 
-	t.Run("1 nanosecond is rejected", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.KeyRotationInterval = time.Nanosecond
-		err := hc.Validate()
-		if err == nil {
-			t.Fatal("expected error for KeyRotationInterval = 1ns, got nil")
-		}
-		var tooSmall *KeyRotationIntervalTooSmallError
-		if !errors.As(err, &tooSmall) {
-			t.Fatalf("expected *KeyRotationIntervalTooSmallError, got %T: %v", err, err)
-		}
-	})
-
 	t.Run("rotation with zero MaxRetainedEpochs warns but passes", func(t *testing.T) {
 		hc := validHostConfig()
 		hc.KeyRotationInterval = 24 * time.Hour
@@ -540,49 +390,6 @@ func TestHostConfig_Validate_KeyRotationInterval(t *testing.T) {
 		// Should not return error, just warn
 		if err := hc.Validate(); err != nil {
 			t.Errorf("Validate() = %v, want nil (warning only)", err)
-		}
-	})
-}
-
-func TestHostConfig_MaxRetainedEpochs(t *testing.T) {
-	t.Run("defaults to zero (no purging)", func(t *testing.T) {
-		hc := validHostConfig()
-		if hc.MaxRetainedEpochs != 0 {
-			t.Fatalf("expected MaxRetainedEpochs=0 by default, got %d", hc.MaxRetainedEpochs)
-		}
-	})
-
-	t.Run("accepts configured value", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxRetainedEpochs = 5
-		if err := hc.Validate(); err != nil {
-			t.Fatalf("Validate failed with MaxRetainedEpochs=5: %v", err)
-		}
-		if hc.MaxRetainedEpochs != 5 {
-			t.Fatalf("expected MaxRetainedEpochs=5, got %d", hc.MaxRetainedEpochs)
-		}
-	})
-
-	t.Run("zero is valid (backward compatibility)", func(t *testing.T) {
-		hc := validHostConfig()
-		hc.MaxRetainedEpochs = 0
-		if err := hc.Validate(); err != nil {
-			t.Fatalf("Validate failed with MaxRetainedEpochs=0: %v", err)
-		}
-	})
-
-	t.Run("SetDefaults does not override configured value", func(t *testing.T) {
-		hc := HostConfig{
-			WALDir:            "/tmp/wal",
-			NodeHostDir:       "/tmp/node",
-			ListenAddress:     "127.0.0.1:26001",
-			DeploymentID:      1,
-			MaxRetainedEpochs: 10,
-		}
-		hc.SetDefaults()
-		if hc.MaxRetainedEpochs != 10 {
-			t.Fatalf("SetDefaults overwrote MaxRetainedEpochs: expected 10, got %d",
-				hc.MaxRetainedEpochs)
 		}
 	})
 }

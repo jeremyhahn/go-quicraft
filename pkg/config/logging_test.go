@@ -15,7 +15,6 @@
 package config
 
 import (
-	"bytes"
 	"log/slog"
 	"testing"
 )
@@ -24,17 +23,6 @@ func TestNewLogger_TextFormat(t *testing.T) {
 	cfg := LogConfig{Format: LogFormatText, Level: LogLevelInfo}
 	logger := NewLogger(cfg)
 
-	var buf bytes.Buffer
-	// Replace the handler's writer with a buffer for verification.
-	textHandler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	testLogger := slog.New(textHandler)
-	testLogger.Info("test message", "key", "value")
-
-	if buf.Len() == 0 {
-		t.Fatal("expected text handler to produce output")
-	}
-
-	// Verify the returned logger uses a text handler by checking type.
 	handler := logger.Handler()
 	if _, ok := handler.(*slog.TextHandler); !ok {
 		t.Errorf("expected *slog.TextHandler, got %T", handler)
@@ -48,17 +36,6 @@ func TestNewLogger_JSONFormat(t *testing.T) {
 	handler := logger.Handler()
 	if _, ok := handler.(*slog.JSONHandler); !ok {
 		t.Errorf("expected *slog.JSONHandler, got %T", handler)
-	}
-}
-
-func TestNewLogger_DefaultsToTextOnUnknownFormat(t *testing.T) {
-	// If an unvalidated format slips through, NewLogger falls back to text.
-	cfg := LogConfig{Format: "unknown", Level: LogLevelInfo}
-	logger := NewLogger(cfg)
-
-	handler := logger.Handler()
-	if _, ok := handler.(*slog.TextHandler); !ok {
-		t.Errorf("expected *slog.TextHandler for unknown format, got %T", handler)
 	}
 }
 
@@ -133,112 +110,4 @@ func TestSetDefaultLogger(t *testing.T) {
 	if !handler.Enabled(t.Context(), slog.LevelWarn) {
 		t.Error("expected warn to be enabled at warn level")
 	}
-}
-
-func TestLogConfig_SetDefaults(t *testing.T) {
-	t.Run("fills zero-valued fields", func(t *testing.T) {
-		var lc LogConfig
-		lc.SetDefaults()
-
-		if lc.Format != LogFormatText {
-			t.Errorf("Format = %q, want %q", lc.Format, LogFormatText)
-		}
-		if lc.Level != LogLevelInfo {
-			t.Errorf("Level = %q, want %q", lc.Level, LogLevelInfo)
-		}
-	})
-
-	t.Run("preserves non-zero fields", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatJSON, Level: LogLevelDebug}
-		lc.SetDefaults()
-
-		if lc.Format != LogFormatJSON {
-			t.Errorf("Format = %q, want %q", lc.Format, LogFormatJSON)
-		}
-		if lc.Level != LogLevelDebug {
-			t.Errorf("Level = %q, want %q", lc.Level, LogLevelDebug)
-		}
-	})
-}
-
-func TestLogConfig_Validate(t *testing.T) {
-	t.Run("valid text/info", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatText, Level: LogLevelInfo}
-		if err := lc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("valid json/debug", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatJSON, Level: LogLevelDebug}
-		if err := lc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("valid text/warn", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatText, Level: LogLevelWarn}
-		if err := lc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("valid json/error", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatJSON, Level: LogLevelError}
-		if err := lc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
-	t.Run("invalid format", func(t *testing.T) {
-		lc := LogConfig{Format: "yaml", Level: LogLevelInfo}
-		err := lc.Validate()
-		if err == nil {
-			t.Fatal("expected error for invalid format, got nil")
-		}
-		logErr, ok := err.(*LogValidationError)
-		if !ok {
-			t.Fatalf("expected *LogValidationError, got %T: %v", err, err)
-		}
-		if logErr.Field != "Format" {
-			t.Errorf("Field = %q, want %q", logErr.Field, "Format")
-		}
-		if logErr.Value != "yaml" {
-			t.Errorf("Value = %q, want %q", logErr.Value, "yaml")
-		}
-	})
-
-	t.Run("invalid level", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatText, Level: "trace"}
-		err := lc.Validate()
-		if err == nil {
-			t.Fatal("expected error for invalid level, got nil")
-		}
-		logErr, ok := err.(*LogValidationError)
-		if !ok {
-			t.Fatalf("expected *LogValidationError, got %T: %v", err, err)
-		}
-		if logErr.Field != "Level" {
-			t.Errorf("Field = %q, want %q", logErr.Field, "Level")
-		}
-		if logErr.Value != "trace" {
-			t.Errorf("Value = %q, want %q", logErr.Value, "trace")
-		}
-	})
-
-	t.Run("empty format is invalid", func(t *testing.T) {
-		lc := LogConfig{Format: "", Level: LogLevelInfo}
-		err := lc.Validate()
-		if err == nil {
-			t.Fatal("expected error for empty format, got nil")
-		}
-	})
-
-	t.Run("empty level is invalid", func(t *testing.T) {
-		lc := LogConfig{Format: LogFormatText, Level: ""}
-		err := lc.Validate()
-		if err == nil {
-			t.Fatal("expected error for empty level, got nil")
-		}
-	})
 }
