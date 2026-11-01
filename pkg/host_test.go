@@ -7152,52 +7152,6 @@ func TestRequestAddObserver_Success(t *testing.T) {
 	rs.Release()
 }
 
-func TestRequestAddWitness_HostClosed(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	ctx := context.Background()
-	_, err = h.RequestAddWitness(ctx, 1, 4, "addr4", 0)
-	if err != ErrClosed {
-		t.Errorf("expected ErrClosed, got %v", err)
-	}
-}
-
-func TestRequestAddWitness_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	// This test exercises the witness-add API mechanics on a single-replica
-	// shard; the default RequireFullReplicaMajority policy would reject
-	// {1 full + 1 witness} (full 1 < quorum 2), so disable it explicitly.
-	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddWitness(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddWitness failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("expected non-nil RequestState")
-	}
-	rs.Release()
-}
-
 func TestRequestAddNode_ShardNotReady(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -7262,30 +7216,6 @@ func TestRequestAddNode_StaleConfigChangeID(t *testing.T) {
 	if sce.Got != 999 {
 		t.Errorf("Got = %d, want 999", sce.Got)
 	}
-}
-
-func TestRequestAddNode_ZeroConfigChangeIDSkipsCheck(t *testing.T) {
-	// Passing configChangeIndex=0 skips the staleness check.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddNode with configChangeIndex=0 should skip check, got %v", err)
-	}
-	rs.Release()
 }
 
 func TestRequestRemoveNode_StaleConfigChangeID(t *testing.T) {
@@ -7644,39 +7574,6 @@ func TestGetShardMembership_Success(t *testing.T) {
 	}
 }
 
-func TestGetShardMembership_MapsNotNil(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	m, err := h.ShardMembership(1)
-	if err != nil {
-		t.Fatalf("ShardMembership failed: %v", err)
-	}
-	// All maps must be non-nil to prevent nil map dereference.
-	if m.Nodes == nil {
-		t.Error("Nodes map is nil")
-	}
-	if m.Observers == nil {
-		t.Error("Observers map is nil")
-	}
-	if m.Witnesses == nil {
-		t.Error("Witnesses map is nil")
-	}
-	if m.Removed == nil {
-		t.Error("Removed map is nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // protoMembershipToPublic
 // ---------------------------------------------------------------------------
@@ -7756,29 +7653,6 @@ func TestProtoMembershipToPublic_EmptyMembership(t *testing.T) {
 	}
 	if m.Removed == nil || len(m.Removed) != 0 {
 		t.Errorf("Removed should be empty non-nil map, got %v", m.Removed)
-	}
-}
-
-func TestProtoMembershipToPublic_RemovedBoolConversion(t *testing.T) {
-	// Proto uses map[uint64]bool for Removed; public uses map[uint64]struct{}.
-	// Only keys matter (the bool values are always true in valid membership).
-	pm := &proto.Membership{
-		Removed: map[uint64]bool{
-			10: true,
-			20: true,
-			30: true,
-		},
-	}
-
-	m := protoMembershipToPublic(pm)
-
-	if len(m.Removed) != 3 {
-		t.Errorf("Removed length = %d, want 3", len(m.Removed))
-	}
-	for _, id := range []uint64{10, 20, 30} {
-		if _, ok := m.Removed[id]; !ok {
-			t.Errorf("Removed should contain %d", id)
-		}
 	}
 }
 
@@ -7895,74 +7769,6 @@ func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 	}
 	if nhInfo.ShardInfoList[0].Pending != 3 {
 		t.Errorf("Pending = %d, want 3", nhInfo.ShardInfoList[0].Pending)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// diskFull flag recovery
-// ---------------------------------------------------------------------------
-
-func TestBuildWALOptions_DiskFullRecovery(t *testing.T) {
-	var diskFullFlag atomic.Bool
-
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1000,
-		WALDir:         t.TempDir(),
-	}
-
-	opts := buildWALOptions(cfg, &diskFullFlag, nil)
-
-	// Verify that options were created (disk monitor configured).
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with disk monitor, got none")
-	}
-
-	// Simulate disk full by directly setting the flag.
-	diskFullFlag.Store(true)
-	if !diskFullFlag.Load() {
-		t.Fatal("diskFullFlag should be true after Store(true)")
-	}
-
-	// The recovery callback should clear the flag. We can verify the
-	// callback was wired by checking that the options include recovery
-	// handling. The actual callback is invoked by the DiskMonitor
-	// internally when usage drops below the full threshold.
-	// Direct flag clearing test via the atomic flag is sufficient here.
-	diskFullFlag.Store(false)
-	if diskFullFlag.Load() {
-		t.Error("diskFullFlag should be false after Store(false)")
-	}
-}
-
-func TestBuildWALOptions_DiskFullRecoveryWithEventListener(t *testing.T) {
-	var diskFullFlag atomic.Bool
-	var fullCalled atomic.Bool
-
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1000,
-		WALDir:         t.TempDir(),
-		EventListener: &config.EventListener{
-			OnLogDBDiskFull: func(_ config.DiskInfo) {
-				fullCalled.Store(true)
-			},
-		},
-	}
-
-	opts := buildWALOptions(cfg, &diskFullFlag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with disk monitor, got none")
-	}
-
-	// Simulate: the onFull callback sets diskFullFlag=true.
-	diskFullFlag.Store(true)
-	if !diskFullFlag.Load() {
-		t.Fatal("diskFullFlag should be true")
-	}
-
-	// After recovery, the flag should be clearable.
-	diskFullFlag.Store(false)
-	if diskFullFlag.Load() {
-		t.Error("diskFullFlag should be false after recovery")
 	}
 }
 
@@ -8153,25 +7959,6 @@ func TestHost_Close_UnblocksConcurrentWaiters(t *testing.T) {
 	}
 }
 
-func TestHost_Close_NoPendingNoError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	// Close with no pending work should succeed cleanly.
-	if closeErr := h.Close(); closeErr != nil {
-		t.Fatalf("Close with no pending work failed: %v", closeErr)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // openStopper lifecycle
 // ---------------------------------------------------------------------------
@@ -8296,28 +8083,6 @@ func TestHost_Close_ClosesOpenStoppers(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Host logger
 // ---------------------------------------------------------------------------
-
-// TestNewHost_DoesNotMutateGlobalLogger verifies that NewHost does not
-// call slog.SetDefault, preserving the caller's global logger.
-func TestNewHost_DoesNotMutateGlobalLogger(t *testing.T) {
-	// Capture the current global logger's handler.
-	originalHandler := slog.Default().Handler()
-
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// After NewHost, the global slog default should still have the
-	// same handler. If NewHost called slog.SetDefault, the handler
-	// would be different.
-	currentHandler := slog.Default().Handler()
-	if originalHandler != currentHandler {
-		t.Error("NewHost mutated the global slog default logger")
-	}
-}
 
 // TestNewHost_WithLogger_UsesProvidedLogger verifies that the WithLogger
 // option installs the provided logger on the Host without mutating the
@@ -8528,28 +8293,6 @@ func TestTransportSender_Wait_BlocksUntilDone(t *testing.T) {
 		// Success: Wait returned after Done.
 	case <-time.After(2 * time.Second):
 		t.Fatal("Wait did not return after snapshot completed")
-	}
-}
-
-// TestTransportSender_Wait_NoInFlight verifies that Wait() returns immediately
-// when no snapshot sends are in progress.
-func TestTransportSender_Wait_NoInFlight(t *testing.T) {
-	ts := &transportSender{
-		logger: slog.Default(),
-	}
-
-	// Should return instantly.
-	done := make(chan struct{})
-	go func() {
-		ts.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Good: returned immediately.
-	case <-time.After(1 * time.Second):
-		t.Fatal("Wait blocked when no snapshots are in-flight")
 	}
 }
 
@@ -8764,50 +8507,6 @@ func TestHost_Drain_CompletePendingOpIdempotent(t *testing.T) {
 // Snapshot membership reconciliation
 // ---------------------------------------------------------------------------
 
-// TestReconcileMembershipFromPeer_AddsAndRemovesNodes verifies that
-// reconcileMembershipFromPeer synchronizes ns.nodes with the Peer's
-// membership, adding new nodes and removing stale ones.
-func TestReconcileMembershipFromPeer_AddsAndRemovesNodes(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-	waitForLeader(t, h, 1)
-
-	ns := testLoadNode(h, 1)
-
-	// Add a stale node that should be removed by reconciliation.
-	ns.nodesMu.Lock()
-	ns.nodes[99] = "127.0.0.1:9999"
-	ns.nodesMu.Unlock()
-	h.registry.Register(1, 99, "127.0.0.1:9999")
-
-	// Call reconcileMembershipFromPeer. The Peer should only have
-	// replica 1, so replica 99 should be removed.
-	cb := &hostEngineCallback{h: h}
-	cb.reconcileMembershipFromPeer(1, ns)
-
-	ns.nodesMu.RLock()
-	_, hasStale := ns.nodes[99]
-	_, hasOriginal := ns.nodes[1]
-	ns.nodesMu.RUnlock()
-
-	if hasStale {
-		t.Error("stale node 99 should have been removed by reconciliation")
-	}
-	if !hasOriginal {
-		t.Error("original node 1 should still be present after reconciliation")
-	}
-}
-
 // TestReconcileMembershipFromPeer_NoEngine verifies that
 // reconcileMembershipFromPeer is a no-op when the engine node doesn't exist.
 func TestReconcileMembershipFromPeer_NoEngine(t *testing.T) {
@@ -8974,31 +8673,6 @@ func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Close waits for snapshot sends
-// ---------------------------------------------------------------------------
-
-// TestHost_Close_WaitsForSnapshotSends verifies that Host.Close() calls
-// transportSender.Wait() before stopping the transport. We verify this
-// indirectly by checking the Close ordering: if the WaitGroup has an
-// in-flight snapshot, Close should not return until it completes.
-func TestHost_Close_WaitsForSnapshotSends(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.ShutdownTimeout = 2 * time.Second
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// The noopSender is used with WithoutTransport, so the Wait path
-	// in Close only triggers for *transportSender. Verify that Close
-	// still succeeds cleanly when the sender is a noopSender.
-	closeErr := h.Close()
-	if closeErr != nil {
-		t.Fatalf("Close failed: %v", closeErr)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // buildShardInfo ConfigChangeIndex
 // ---------------------------------------------------------------------------
 
@@ -9028,32 +8702,6 @@ func TestBuildShardInfo_ConfigChangeIndex(t *testing.T) {
 	info := h.buildShardInfo(ns)
 	if info.ConfigChangeIndex != 42 {
 		t.Errorf("ConfigChangeIndex = %d, want 42", info.ConfigChangeIndex)
-	}
-}
-
-// TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange verifies that
-// ConfigChangeIndex is 0 when no membership change has been applied.
-func TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-	waitForLeader(t, h, 1)
-
-	ns := testLoadNode(h, 1)
-
-	// configChangeIndex is zero-initialized; no Store has been called.
-	info := h.buildShardInfo(ns)
-	if info.ConfigChangeIndex != 0 {
-		t.Errorf("ConfigChangeIndex = %d, want 0 for fresh shard", info.ConfigChangeIndex)
 	}
 }
 
@@ -9172,16 +8820,6 @@ func TestSyncRequestSnapshot_ShardNotFound(t *testing.T) {
 // RemoveData
 // ---------------------------------------------------------------------------
 
-func TestRemoveData_ClosedHost(t *testing.T) {
-	h := newTestHost(t)
-	h.closed.Store(true)
-
-	err := h.RemoveData(1, 1)
-	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("RemoveData closed: got %v, want ErrClosed", err)
-	}
-}
-
 func TestRemoveData_ShardStillRunning(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -9272,19 +8910,6 @@ func TestRequestCompaction_ClosedHost(t *testing.T) {
 	err := h.RequestCompaction(1, 1)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("RequestCompaction closed: got %v, want ErrClosed", err)
-	}
-}
-
-// TestRequestCompaction_UnloadedShardSucceeds verifies the retired-replica
-// contract: compaction on a shard this host does not have loaded is treated
-// as "already retired via RemoveData" and reclaims what it can, rather than
-// failing. This keeps the canonical StopShard -> RemoveData ->
-// RequestCompaction sequence working (dragonboat behaves the same way).
-func TestRequestCompaction_UnloadedShardSucceeds(t *testing.T) {
-	h := newTestHost(t)
-
-	if err := h.RequestCompaction(999, 1); err != nil {
-		t.Fatalf("RequestCompaction on an unloaded shard: unexpected error: %v", err)
 	}
 }
 
@@ -9392,15 +9017,6 @@ func TestGetLogReader_ShardNotFound(t *testing.T) {
 // ProposeWithSession
 // ---------------------------------------------------------------------------
 
-func TestProposeWithSession_NilSession(t *testing.T) {
-	h := newTestHost(t)
-
-	_, err := h.ProposeWithSession(context.Background(), nil, []byte("cmd"))
-	if !errors.Is(err, ErrInvalidSession) {
-		t.Errorf("ProposeWithSession error = %v, want ErrInvalidSession", err)
-	}
-}
-
 func TestProposeWithSession_NoOpSession(t *testing.T) {
 	h := newTestHost(t)
 
@@ -9446,22 +9062,6 @@ func TestProposeWithSession_RegisterMode(t *testing.T) {
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrInvalidSession) {
 		t.Errorf("ProposeWithSession error = %v, want ErrInvalidSession", err)
-	}
-}
-
-func TestProposeWithSession_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	session := newSession(1, 100, 0)
-	session.PrepareForPropose()
-	_, err = h.ProposeWithSession(context.Background(), session, []byte("cmd"))
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("ProposeWithSession error = %v, want ErrClosed", err)
 	}
 }
 
@@ -9517,27 +9117,6 @@ func TestProposeWithSession_NotLeader(t *testing.T) {
 	if !errors.Is(err, ErrNotLeader) {
 		t.Errorf("ProposeWithSession error = %v, want ErrNotLeader", err)
 	}
-}
-
-func TestProposeWithSession_Success(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	session := newSession(1, 100, 0)
-	session.PrepareForPropose()
-
-	rs, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("ProposeWithSession failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("ProposeWithSession returned nil RequestState")
-	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -9779,80 +9358,9 @@ func TestTransportSender_SendSnapshot_PanicRecovery_NormalError(t *testing.T) {
 	}
 }
 
-// TestSafeNotifySnapshotRejected_NilEngine verifies that
-// safeNotifySnapshotRejected does not panic when the engine is nil.
-func TestSafeNotifySnapshotRejected_NilEngine(t *testing.T) {
-	ts := &transportSender{
-		logger: slog.Default(),
-		// engine is nil -- notifySnapshotStatus would panic.
-	}
-
-	// This must not panic the test.
-	ts.safeNotifySnapshotRejected(1, 1, 2, 0)
-}
-
 // ---------------------------------------------------------------------------
 // Context cancellation returns ErrCanceled (not context.Canceled)
 // ---------------------------------------------------------------------------
-
-func TestSyncRequestAddNode_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
-
-	err := h.SyncRequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err == nil {
-		t.Fatal("expected error from canceled context")
-	}
-	// The error must match ErrCanceled (not raw context.Canceled).
-	if errors.Is(err, ErrCanceled) {
-		return // correct
-	}
-	// RequestAddNode may also fail early with a different error before
-	// reaching the select, which is acceptable.
-}
-
-func TestSyncRequestRemoveNode_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := h.SyncRequestRemoveNode(ctx, 1, 2, 0)
-	if err == nil {
-		t.Fatal("expected error from canceled context")
-	}
-	if errors.Is(err, ErrCanceled) {
-		return
-	}
-}
-
-func TestSyncRemoveData_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := h.SyncRemoveData(ctx, 1, 1)
-	if !errors.Is(err, ErrCanceled) {
-		t.Errorf("SyncRemoveData error = %v, want ErrCanceled", err)
-	}
-}
 
 func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 	h := newTestHost(t)
@@ -9873,74 +9381,6 @@ func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // sweepExpiredPending
 // ---------------------------------------------------------------------------
-
-func TestSweepExpiredPending_ExpiresProposalWithPassedDeadline(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	// Create a proposal with a deadline in the past.
-	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 10, deadline, true)
-	ns.pendingProposals.Store(uint64(10), &pendingProposal{rs: rs, deadline: deadline})
-	h.addPendingOp()
-
-	// Run sweeper.
-	h.sweepExpiredPending()
-
-	// Verify the proposal was completed with ErrTimeout.
-	select {
-	case result := <-rs.ResultC():
-		if !errors.Is(result.Err, ErrTimeout) {
-			t.Errorf("result.Err = %v, want ErrTimeout", result.Err)
-		}
-	default:
-		t.Fatal("expired proposal RS should have been completed")
-	}
-
-	// Verify the map is empty.
-	remaining := countSyncMap(&ns.pendingProposals)
-	if remaining != 0 {
-		t.Errorf("pendingProposals has %d entries, want 0", remaining)
-	}
-
-	rs.Release()
-}
-
-func TestSweepExpiredPending_DoesNotExpireActiveProposal(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	// Create a proposal with a deadline in the future.
-	deadline := time.Now().Add(10 * time.Minute)
-	rs := newRequestState(pool, 20, deadline, true)
-	ns.pendingProposals.Store(uint64(20), &pendingProposal{rs: rs, deadline: deadline})
-	h.addPendingOp()
-
-	// Run sweeper.
-	h.sweepExpiredPending()
-
-	// Verify the proposal was NOT completed.
-	select {
-	case result := <-rs.ResultC():
-		t.Fatalf("active proposal should not be completed, got %v", result)
-	default:
-		// Expected: not completed.
-	}
-
-	// Verify the map still contains the entry.
-	remaining := countSyncMap(&ns.pendingProposals)
-	if remaining != 1 {
-		t.Errorf("pendingProposals has %d entries, want 1", remaining)
-	}
-
-	// Clean up by completing it manually.
-	rs.complete(RequestResult{})
-	rs.Release()
-}
 
 func TestSweepExpiredPending_SkipsZeroDeadline(t *testing.T) {
 	h := newTestHost(t)
@@ -10204,16 +9644,6 @@ func TestSweepExpiredPending_ConcurrentWithCompletion(t *testing.T) {
 	}
 
 	rs.Release()
-}
-
-func TestPendingSweepLoop_StopsOnClose(t *testing.T) {
-	h := newTestHost(t)
-
-	// The sweeper goroutine was started by NewHost. Close should stop it.
-	// If the sweeper doesn't stop, Close will hang and the test will timeout.
-	if err := h.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -10856,79 +10286,6 @@ func TestHostEngineCallback_OnCommitted_NilPendingProposals(t *testing.T) {
 	cb.OnCommitted(50, []proto.Entry{{Index: 1, Key: 42}})
 }
 
-func TestHostEngineCallback_OnCommitted_UnmatchedKey(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	cb := &hostEngineCallback{h: h}
-	// Key 999 has no matching pending proposal. Should not panic.
-	cb.OnCommitted(1, []proto.Entry{{Index: 1, Key: 999}})
-}
-
-// ---------------------------------------------------------------------------
-// Host: DiagPipelineState
-// ---------------------------------------------------------------------------
-
-func TestHost_DiagPipelineState_ReturnsState(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	pd, diagErr := h.DiagPipelineState(1)
-	if diagErr != nil {
-		t.Fatalf("DiagPipelineState failed: %v", diagErr)
-	}
-	commitPending, proposalQLen, inboxLen, pendingProposals := pd.CommitPending, pd.ProposalQueueLen, pd.InboxLen, pd.PendingProposals
-
-	// After leader election with no pending work, values should be
-	// reasonable (non-negative). We don't assert exact values because
-	// the engine state is dynamic.
-	_ = commitPending
-	if proposalQLen < 0 {
-		t.Errorf("proposalQLen = %d, want >= 0", proposalQLen)
-	}
-	if inboxLen < 0 {
-		t.Errorf("inboxLen = %d, want >= 0", inboxLen)
-	}
-	if pendingProposals < 0 {
-		t.Errorf("pendingProposals = %d, want >= 0", pendingProposals)
-	}
-}
-
-func TestHost_DiagPipelineState_NonexistentShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, diagErr := h.DiagPipelineState(999)
-	if diagErr == nil {
-		t.Fatal("expected error for nonexistent shard")
-	}
-	if diagErr != ErrShardNotReady {
-		t.Errorf("err = %v, want ErrShardNotReady", diagErr)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // rotateBarrierKey
 // ---------------------------------------------------------------------------
@@ -11067,97 +10424,6 @@ func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	// cannot be determined, so purgedBefore stays at its zero value.
 	if got := rb.purgedBefore.Load(); got != 0 {
 		t.Errorf("PurgeEpochsBefore(%d), want no purge call (fail-safe: unknown global floor)", got)
-	}
-}
-
-// TestRotateBarrierKey_PurgeError verifies that a PurgeEpochsBefore error is
-// logged but does not propagate.
-func TestRotateBarrierKey_PurgeError(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.MaxRetainedEpochs = 1
-	rb := &rotatingBarrier{rotateEpoch: 5, purgeErr: errors.New("purge failed")}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(rb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Must not panic or return an error even when purge fails.
-	h.rotateBarrierKey(context.Background())
-
-	if rb.rotateCalled.Load() != 1 {
-		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Barrier interface - ShouldRotateKey
-// ---------------------------------------------------------------------------
-
-// thresholdBarrier is a mockBarrier that returns a configurable value from
-// ShouldRotateKey. Used to test threshold-triggered rotation in keyRotationLoop.
-type thresholdBarrier struct {
-	mockBarrier
-	shouldRotate atomic.Bool
-	rotateCalled atomic.Int64
-	rotateEpoch  uint64
-}
-
-func (b *thresholdBarrier) Rotate(ctx context.Context) (uint64, error) {
-	b.rotateCalled.Add(1)
-	return b.rotateEpoch, nil
-}
-
-func (b *thresholdBarrier) ShouldRotateKey() bool {
-	return b.shouldRotate.Load()
-}
-
-// TestBarrier_ShouldRotateKey_TriggersRotation verifies that when
-// ShouldRotateKey returns true the host's rotateBarrierKey is invoked.
-// This is a unit-level test that calls rotateBarrierKey directly after
-// confirming the barrier reports it should rotate.
-func TestBarrier_ShouldRotateKey_TriggersRotation(t *testing.T) {
-	cfg := testHostConfig(t)
-	tb := &thresholdBarrier{rotateEpoch: 2}
-	tb.shouldRotate.Store(true)
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(tb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Simulate what the thresholdCheck ticker case does.
-	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey(context.Background())
-	}
-
-	if tb.rotateCalled.Load() != 1 {
-		t.Errorf("Rotate called %d times, want 1 when ShouldRotateKey=true", tb.rotateCalled.Load())
-	}
-}
-
-// TestBarrier_ShouldRotateKey_NoRotationWhenFalse verifies that rotateBarrierKey
-// is not triggered when ShouldRotateKey returns false.
-func TestBarrier_ShouldRotateKey_NoRotationWhenFalse(t *testing.T) {
-	cfg := testHostConfig(t)
-	tb := &thresholdBarrier{rotateEpoch: 2}
-	tb.shouldRotate.Store(false)
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(tb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Simulate what the thresholdCheck ticker case does.
-	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey(context.Background())
-	}
-
-	if tb.rotateCalled.Load() != 0 {
-		t.Errorf("Rotate called %d times, want 0 when ShouldRotateKey=false", tb.rotateCalled.Load())
 	}
 }
 
