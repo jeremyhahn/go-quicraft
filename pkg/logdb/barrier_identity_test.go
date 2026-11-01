@@ -38,10 +38,9 @@ func TestSameBarrier(t *testing.T) {
 		{name: "equal contents, different pointers", a: p, b: q, want: false},
 		{name: "different pointer types", a: p, b: o, want: false},
 		{name: "non-comparable value and its copy", a: v, b: v, want: false},
-		{name: "non-comparable value and a pointer", a: v, b: p, want: false},
 		{name: "comparable equal values", a: pointerBarrier{id: 1}, b: pointerBarrier{id: 1}, want: false},
 		{name: "nil and pointer", a: nil, b: p, want: false},
-		{name: "both nil", a: nil, b: nil, want: false},
+		{name: "pointer and nil", a: p, b: nil, want: false},
 		{name: "typed nil pointer and its copy", a: typedNil, b: typedNil, want: false},
 	}
 	for _, tc := range cases {

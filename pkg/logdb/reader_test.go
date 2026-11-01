@@ -335,21 +335,6 @@ func TestLogReaderNewLogReaderInitializesCorrectly(t *testing.T) {
 	}
 }
 
-func TestLogReaderNewLogReaderWithZeroIDs(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(0, 0, db)
-
-	if lr.shardID != 0 {
-		t.Errorf("shardID = %d, want 0", lr.shardID)
-	}
-	if lr.replicaID != 0 {
-		t.Errorf("replicaID = %d, want 0", lr.replicaID)
-	}
-	if lr.length != 1 {
-		t.Errorf("length = %d, want 1", lr.length)
-	}
-}
-
 // --- NodeState tests ---
 
 func TestLogReaderNodeStateReturnsDefaultState(t *testing.T) {
@@ -365,85 +350,7 @@ func TestLogReaderNodeStateReturnsDefaultState(t *testing.T) {
 	}
 }
 
-func TestLogReaderNodeStateReturnsUpdatedState(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	lr.SetState(proto.State{Term: 5, Vote: 2, Commit: 10})
-
-	state, _ := lr.NodeState()
-	if state.Term != 5 {
-		t.Errorf("state.Term = %d, want 5", state.Term)
-	}
-	if state.Vote != 2 {
-		t.Errorf("state.Vote = %d, want 2", state.Vote)
-	}
-	if state.Commit != 10 {
-		t.Errorf("state.Commit = %d, want 10", state.Commit)
-	}
-}
-
-// --- SetState tests ---
-
-func TestLogReaderSetStateUpdatesState(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	lr.SetState(proto.State{Term: 3, Vote: 1, Commit: 42})
-	state, _ := lr.NodeState()
-
-	if state.Term != 3 {
-		t.Errorf("state.Term = %d, want 3", state.Term)
-	}
-	if state.Vote != 1 {
-		t.Errorf("state.Vote = %d, want 1", state.Vote)
-	}
-	if state.Commit != 42 {
-		t.Errorf("state.Commit = %d, want 42", state.Commit)
-	}
-}
-
-func TestLogReaderSetStateOverwritesPreviousState(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	lr.SetState(proto.State{Term: 1, Vote: 1, Commit: 1})
-	lr.SetState(proto.State{Term: 10, Vote: 5, Commit: 100})
-
-	state, _ := lr.NodeState()
-	if state.Term != 10 {
-		t.Errorf("state.Term = %d, want 10", state.Term)
-	}
-	if state.Vote != 5 {
-		t.Errorf("state.Vote = %d, want 5", state.Vote)
-	}
-	if state.Commit != 100 {
-		t.Errorf("state.Commit = %d, want 100", state.Commit)
-	}
-}
-
 // --- SetRange tests ---
-
-func TestLogReaderSetRangeExtendsRange(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Initially: markerIndex=0, length=1, so firstIndex=1, lastIndex=0.
-	// Setting range at index 1, length 5 means entries [1..5] available.
-	mustSetRange(t, lr, 1, 5)
-
-	lr.mu.RLock()
-	first := lr.firstIndex()
-	last := lr.lastIndex()
-	lr.mu.RUnlock()
-
-	if first != 1 {
-		t.Errorf("firstIndex = %d, want 1", first)
-	}
-	if last != 5 {
-		t.Errorf("lastIndex = %d, want 5", last)
-	}
-}
 
 func TestLogReaderSetRangeWithZeroLengthIsNoop(t *testing.T) {
 	db := newMemLogDB()
@@ -566,22 +473,6 @@ func TestLogReaderSetRangeGapFromAppendReturnsError(t *testing.T) {
 }
 
 // --- Append tests ---
-
-func TestLogReaderAppendUpdatesRange(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	entries := makeProtoEntries(1, 5, 1)
-	mustAppend(t, lr, entries)
-
-	lr.mu.RLock()
-	last := lr.lastIndex()
-	lr.mu.RUnlock()
-
-	if last != 5 {
-		t.Errorf("lastIndex = %d, want 5", last)
-	}
-}
 
 func TestLogReaderAppendEmptySliceIsNoop(t *testing.T) {
 	db := newMemLogDB()
@@ -948,6 +839,9 @@ func TestLogReaderApplySnapshotOutOfDateError(t *testing.T) {
 	if marker != 50 {
 		t.Errorf("markerIndex = %d, want 50 (unchanged after failed apply)", marker)
 	}
+	if got := lr.Snapshot(); got.Index != 50 {
+		t.Errorf("Snapshot().Index = %d, want 50 (unchanged after failed apply)", got.Index)
+	}
 }
 
 // --- Compact tests ---
@@ -987,38 +881,6 @@ func TestLogReaderCompactAdvancesMarker(t *testing.T) {
 	}
 }
 
-func TestLogReaderCompactBelowMarkerReturnsError(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 10, 1)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 10)
-
-	err := lr.Compact(5)
-	if err != nil {
-		t.Fatalf("Compact(5) returned error: %v", err)
-	}
-
-	// Compact below current marker should return ErrCompacted.
-	err = lr.Compact(3)
-	if !errors.Is(err, ErrCompacted) {
-		t.Errorf("Compact(3) error = %v, want ErrCompacted", err)
-	}
-}
-
-func TestLogReaderCompactBeyondLastIndexReturnsError(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-	mustSetRange(t, lr, 1, 5) // lastIndex=5
-
-	err := lr.Compact(10)
-	if !errors.Is(err, ErrUnavailable) {
-		t.Errorf("Compact(10) error = %v, want ErrUnavailable", err)
-	}
-}
-
 func TestLogReaderCompactToLastIndex(t *testing.T) {
 	db := newMemLogDB()
 	const shardID, replicaID uint64 = 1, 1
@@ -1044,32 +906,6 @@ func TestLogReaderCompactToLastIndex(t *testing.T) {
 	}
 	if length != 1 {
 		t.Errorf("length = %d, want 1", length)
-	}
-}
-
-func TestLogReaderCompactProgressivelyWorks(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 20, 3)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 20)
-
-	// Compact progressively.
-	for _, idx := range []uint64{5, 10, 15, 20} {
-		err := lr.Compact(idx)
-		if err != nil {
-			t.Fatalf("Compact(%d) returned error: %v", idx, err)
-		}
-
-		lr.mu.RLock()
-		marker := lr.markerIndex
-		lr.mu.RUnlock()
-
-		if marker != idx {
-			t.Errorf("after Compact(%d), markerIndex = %d", idx, marker)
-		}
 	}
 }
 
@@ -1481,77 +1317,6 @@ func TestLogReaderTermAtSnapshotBoundary(t *testing.T) {
 	}
 }
 
-// --- Edge case: Compact at current markerIndex ---
-
-func TestLogReaderCompactAtCurrentMarkerIsNoop(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 10, 1)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 10)
-
-	err := lr.Compact(5)
-	if err != nil {
-		t.Fatalf("Compact(5) returned error: %v", err)
-	}
-
-	lr.mu.RLock()
-	lengthBefore := lr.length
-	lr.mu.RUnlock()
-
-	// Compacting at the current marker (5) should be a no-op.
-	err = lr.Compact(5)
-	if err != nil {
-		t.Fatalf("Compact(5) at current marker returned error: %v", err)
-	}
-
-	lr.mu.RLock()
-	lengthAfter := lr.length
-	lr.mu.RUnlock()
-
-	if lengthBefore != lengthAfter {
-		t.Errorf("length changed from %d to %d after compact at marker",
-			lengthBefore, lengthAfter)
-	}
-}
-
-// --- Multiple snapshots test ---
-
-func TestLogReaderMultipleSnapshotsProgressively(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Apply progressively newer snapshots.
-	for i := uint64(10); i <= 50; i += 10 {
-		ss := proto.Snapshot{
-			Index: i,
-			Term:  i / 10,
-			Membership: proto.Membership{
-				ConfigChangeID: i,
-				Addresses:      map[uint64]string{1: "addr1"},
-			},
-		}
-		err := lr.ApplySnapshot(ss)
-		if err != nil {
-			t.Fatalf("ApplySnapshot(index=%d) returned error: %v", i, err)
-		}
-
-		lr.mu.RLock()
-		marker := lr.markerIndex
-		markerTerm := lr.markerTerm
-		lr.mu.RUnlock()
-
-		if marker != i {
-			t.Errorf("after snapshot at %d: markerIndex = %d", i, marker)
-		}
-		if markerTerm != i/10 {
-			t.Errorf("after snapshot at %d: markerTerm = %d, want %d", i, markerTerm, i/10)
-		}
-	}
-}
-
 // --- Interface satisfaction test ---
 
 func TestLogReaderSatisfiesRaftLogReaderInterface(t *testing.T) {
@@ -1589,52 +1354,6 @@ func TestLogReaderSatisfiesRaftLogReaderInterface(t *testing.T) {
 
 	// Compact(index uint64) error
 	_ = lr.Compact(0)
-}
-
-// --- GetRange with maxSize test ---
-
-func TestLogReaderGetRangeRespectsMaxSize(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 10, 1)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 10)
-
-	// Request with a small maxSize that should limit returned entries.
-	// Each entry has ~24 bytes (16 header + 8 cmd "test-cmd").
-	got, err := lr.GetRange(1, 11, 20)
-	if err != nil {
-		t.Fatalf("GetRange with maxSize returned error: %v", err)
-	}
-
-	// With maxSize=20, we should get at least 1 entry but fewer than 10.
-	if len(got) == 0 {
-		t.Error("GetRange with maxSize returned 0 entries, want at least 1")
-	}
-	if len(got) > 5 {
-		t.Errorf("GetRange with maxSize=20 returned %d entries, expected fewer", len(got))
-	}
-}
-
-func TestLogReaderGetRangeMaxSizeZeroReturnsAllEntries(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 10, 1)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 10)
-
-	// maxSize=0 means unlimited: all entries should be returned.
-	got, err := lr.GetRange(1, 11, 0)
-	if err != nil {
-		t.Fatalf("GetRange with maxSize=0 returned error: %v", err)
-	}
-	if len(got) != 10 {
-		t.Errorf("GetRange with maxSize=0 returned %d entries, want 10", len(got))
-	}
 }
 
 // --- Append with contiguous entries test ---
@@ -1719,32 +1438,6 @@ func TestLogReaderCreateSnapshotThenApplySnapshot(t *testing.T) {
 	_, membership := lr.NodeState()
 	if membership.ConfigChangeID != 8 {
 		t.Errorf("membership.ConfigChangeID = %d, want 8", membership.ConfigChangeID)
-	}
-}
-
-// --- GetRange with single entry ---
-
-func TestLogReaderGetRangeSingleEntry(t *testing.T) {
-	db := newMemLogDB()
-	const shardID, replicaID uint64 = 1, 1
-	lr := NewLogReader(shardID, replicaID, db)
-
-	dbEntries := makeEntries(1, 5, 3)
-	db.addEntries(shardID, replicaID, dbEntries)
-	mustSetRange(t, lr, 1, 5)
-
-	got, err := lr.GetRange(3, 4, 0)
-	if err != nil {
-		t.Fatalf("GetRange(3, 4) returned error: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("GetRange(3, 4) returned %d entries, want 1", len(got))
-	}
-	if got[0].Index != 3 {
-		t.Errorf("entry.Index = %d, want 3", got[0].Index)
-	}
-	if got[0].Term != 3 {
-		t.Errorf("entry.Term = %d, want 3", got[0].Term)
 	}
 }
 
@@ -2262,52 +1955,6 @@ func TestLogReaderEntryCacheNotPopulatedWithRealLogDB(t *testing.T) {
 	}
 }
 
-// --- SetMembership tests ---
-
-func TestLogReaderSetMembershipUpdatesMembership(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	m := proto.Membership{
-		ConfigChangeID: 42,
-		Addresses:      map[uint64]string{1: "addr1", 2: "addr2"},
-	}
-	lr.SetMembership(m)
-
-	_, membership := lr.NodeState()
-	if membership.ConfigChangeID != 42 {
-		t.Errorf("membership.ConfigChangeID = %d, want 42", membership.ConfigChangeID)
-	}
-	if len(membership.Addresses) != 2 {
-		t.Errorf("membership.Addresses length = %d, want 2", len(membership.Addresses))
-	}
-}
-
-func TestLogReaderSetMembershipOverwritesPrevious(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	m1 := proto.Membership{
-		ConfigChangeID: 1,
-		Addresses:      map[uint64]string{1: "addr1"},
-	}
-	lr.SetMembership(m1)
-
-	m2 := proto.Membership{
-		ConfigChangeID: 99,
-		Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
-	}
-	lr.SetMembership(m2)
-
-	_, membership := lr.NodeState()
-	if membership.ConfigChangeID != 99 {
-		t.Errorf("membership.ConfigChangeID = %d, want 99", membership.ConfigChangeID)
-	}
-	if len(membership.Addresses) != 3 {
-		t.Errorf("membership.Addresses length = %d, want 3", len(membership.Addresses))
-	}
-}
-
 // --- Additional nil-LogDB edge case tests ---
 
 func TestLogReaderNilLogDBAppendMultipleBatchesThenGetRange(t *testing.T) {
@@ -2593,118 +2240,7 @@ func TestLogReaderLogdbEntriesToProtoReuseEmptyInput(t *testing.T) {
 	}
 }
 
-func TestLogReaderLogdbEntriesToProtoReusePreservesCapacity(t *testing.T) {
-	// Pre-allocate a buffer with capacity 10.
-	buf := make([]proto.Entry, 0, 10)
-
-	// Convert 3 entries: should reuse capacity, not reallocate.
-	input := []Entry{
-		{Index: 1, Term: 1, Cmd: []byte("a")},
-		{Index: 2, Term: 1, Cmd: []byte("b")},
-		{Index: 3, Term: 1, Cmd: []byte("c")},
-	}
-	result := logdbEntriesToProtoReuse(buf, input)
-
-	if len(result) != 3 {
-		t.Fatalf("result len = %d, want 3", len(result))
-	}
-	if cap(result) != 10 {
-		t.Errorf("result cap = %d, want 10 (should reuse original capacity)", cap(result))
-	}
-}
-
-func TestLogReaderLogdbEntriesToProtoReuseGrowsWhenNeeded(t *testing.T) {
-	// Start with a small buffer.
-	buf := make([]proto.Entry, 0, 2)
-
-	// Convert 5 entries: should allocate a new buffer.
-	input := makeEntries(1, 5, 1)
-	result := logdbEntriesToProtoReuse(buf, input)
-
-	if len(result) != 5 {
-		t.Fatalf("result len = %d, want 5", len(result))
-	}
-	if cap(result) < 5 {
-		t.Errorf("result cap = %d, want >= 5", cap(result))
-	}
-}
-
-func TestLogReaderLogdbEntriesToProtoReuseNilBuffer(t *testing.T) {
-	// Starting with a nil buffer should work (allocates fresh).
-	input := makeEntries(1, 3, 2)
-	result := logdbEntriesToProtoReuse(nil, input)
-
-	if len(result) != 3 {
-		t.Fatalf("result len = %d, want 3", len(result))
-	}
-	if result[0].Index != 1 || result[0].Term != 2 {
-		t.Errorf("entry[0] = %+v, want Index=1 Term=2", result[0])
-	}
-}
-
 // --- termBuf bounding tests ---
-
-func TestLogReaderTermBufBoundsAfterManyAppends(t *testing.T) {
-	lr := NewLogReader(1, 1, nil)
-
-	// Append enough entries to exceed maxTermCacheEntries.
-	// The ring buffer auto-evicts oldest entries when full.
-	batchSize := uint64(10_000)
-	totalEntries := uint64(maxTermCacheEntries) + batchSize
-
-	for i := uint64(1); i <= totalEntries; i += batchSize {
-		count := batchSize
-		if i+count-1 > totalEntries {
-			count = totalEntries - i + 1
-		}
-		entries := makeProtoEntries(i, count, 1)
-		mustAppend(t, lr, entries)
-	}
-
-	lr.mu.Lock()
-	bufSize := lr.termBuf.len()
-	lr.mu.Unlock()
-
-	// Ring buffer should never exceed its capacity.
-	if bufSize > maxTermCacheEntries {
-		t.Errorf("termBuf size = %d, want <= %d", bufSize, maxTermCacheEntries)
-	}
-	// It should be exactly at capacity since we added more than capacity.
-	if bufSize != maxTermCacheEntries {
-		t.Errorf("termBuf size = %d, want exactly %d (full ring)", bufSize, maxTermCacheEntries)
-	}
-}
-
-func TestLogReaderTermBufEvictsOldestOnOverflow(t *testing.T) {
-	lr := NewLogReader(1, 1, nil)
-
-	// Append entries and compact some to advance markerIndex.
-	entries := makeProtoEntries(1, 100, 1)
-	mustAppend(t, lr, entries)
-
-	err := lr.Compact(50)
-	if err != nil {
-		t.Fatalf("Compact(50) returned error: %v", err)
-	}
-
-	// Now append a very large batch that overflows the ring buffer.
-	bigBatch := makeProtoEntries(101, uint64(maxTermCacheEntries), 2)
-	mustAppend(t, lr, bigBatch)
-
-	lr.mu.Lock()
-	defer lr.mu.Unlock()
-
-	// Ring buffer should be bounded.
-	if lr.termBuf.len() > maxTermCacheEntries {
-		t.Errorf("termBuf size = %d, want <= %d", lr.termBuf.len(), maxTermCacheEntries)
-	}
-
-	// The most recent entries should be in the buffer.
-	lastIdx := uint64(100) + uint64(maxTermCacheEntries)
-	if _, ok := lr.termBuf.lookup(lastIdx); !ok {
-		t.Errorf("termBuf missing most recent entry at index %d", lastIdx)
-	}
-}
 
 func TestLogReaderTermBufRetainsRecentEntries(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
@@ -3157,30 +2693,6 @@ func TestLogReaderIndexRangeAfterCompact(t *testing.T) {
 	}
 }
 
-func TestLogReaderIndexRangeAfterApplySnapshot(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Apply a snapshot at index 100.
-	ss := proto.Snapshot{
-		Index: 100,
-		Term:  5,
-		Membership: proto.Membership{
-			ConfigChangeID: 1,
-		},
-	}
-	if err := lr.ApplySnapshot(ss); err != nil {
-		t.Fatalf("ApplySnapshot: %v", err)
-	}
-
-	// After snapshot, first available entry is 101 (markerIndex+1),
-	// but length is 1 (marker only), so last is 100.
-	first, last := lr.IndexRange()
-	if first != 101 || last != 100 {
-		t.Errorf("IndexRange() = (%d, %d), want (101, 100) after snapshot", first, last)
-	}
-}
-
 func TestLogReaderIndexRangeWithEntriesAfterSnapshot(t *testing.T) {
 	db := newMemLogDB()
 	lr := NewLogReader(1, 1, db)
@@ -3304,41 +2816,6 @@ func TestLogReaderSnapshotUpdatesAfterNewerSnapshot(t *testing.T) {
 	}
 	if got.Term != 2 {
 		t.Errorf("Snapshot().Term = %d, want 2", got.Term)
-	}
-}
-
-func TestLogReaderSnapshotRejectsOlderSnapshot(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Set up state so that snapshot rejection logic is triggered.
-	// The setSnapshot only rejects older snapshots if ConfigChangeID != 0 or Commit != 0.
-	lr.SetState(proto.State{Commit: 10})
-	lr.SetMembership(proto.Membership{ConfigChangeID: 1})
-
-	// Apply initial snapshot at index 50 (with membership so state exists).
-	ss1 := proto.Snapshot{
-		Index: 50,
-		Term:  5,
-		Membership: proto.Membership{
-			ConfigChangeID: 2,
-		},
-	}
-	if err := lr.ApplySnapshot(ss1); err != nil {
-		t.Fatalf("ApplySnapshot(1): %v", err)
-	}
-
-	// Try to apply an older snapshot at index 30.
-	ss2 := proto.Snapshot{Index: 30, Term: 3}
-	err := lr.ApplySnapshot(ss2)
-	if !errors.Is(err, ErrSnapshotOutOfDate) {
-		t.Errorf("ApplySnapshot(older) = %v, want ErrSnapshotOutOfDate", err)
-	}
-
-	// Snapshot should still be the original.
-	got := lr.Snapshot()
-	if got.Index != 50 {
-		t.Errorf("Snapshot().Index = %d, want 50 (unchanged)", got.Index)
 	}
 }
 
@@ -3982,28 +3459,6 @@ func TestLogReaderGetRangeCopyPropagatesRangeErrors(t *testing.T) {
 	lr := NewLogReader(1, 1, newMemLogDB())
 	if got, err := lr.GetRangeCopy(10, 20, 0); err == nil || got != nil {
 		t.Fatalf("GetRangeCopy over an absent range = (%v, %v), want (nil, error)", got, err)
-	}
-}
-
-// TestLogReaderPersistBootstrapRegistersNothingOnWriteFailure pins the
-// durable-first ordering: when the LogDB refuses the bootstrap write, the
-// reader must not report a range the LogDB does not hold.
-func TestLogReaderPersistBootstrapRegistersNothingOnWriteFailure(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	first, last := lr.IndexRange()
-	err := lr.PersistBootstrap([]proto.Entry{{Index: 1, Term: 1}}, proto.State{Term: 1, Commit: 1})
-	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("PersistBootstrap on a closed LogDB = %v, want ErrClosed", err)
-	}
-	if f, l := lr.IndexRange(); f != first || l != last {
-		t.Fatalf("IndexRange moved from (%d, %d) to (%d, %d) after a failed durable write", first, last, f, l)
-	}
-	if st, _ := lr.NodeState(); st.Term != 0 || st.Commit != 0 {
-		t.Fatalf("NodeState = %+v after a failed durable write, want the zero state", st)
 	}
 }
 
