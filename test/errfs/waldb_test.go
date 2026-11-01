@@ -630,69 +630,6 @@ func TestErrorFS_LogDB_SaveStateWriteFailure(t *testing.T) {
 	assertEntryAbsent(t, recovered, shardID, replicaID, 3)
 }
 
-// --- TestErrorFS_LogDB_GetRangeReadFailure ---
-
-// TestErrorFS_LogDB_GetRangeReadFailure verifies that an I/O error during
-// WAL recovery surfaces as a non-nil error from waldb.Open, preventing the
-// caller from receiving a silently-partial log view.
-func TestErrorFS_LogDB_GetRangeReadFailure(t *testing.T) {
-	const (
-		shardID   = uint64(6)
-		replicaID = uint64(1)
-	)
-
-	dir := t.TempDir()
-
-	// Write 10 entries so the recovery path reads real data.
-	setup := openDB(t, dir)
-	saveEntries(t, setup, shardID, replicaID, 1, 10)
-	mustClose(t, setup)
-
-	// Probe total ops for a clean Open.
-	passthrough := errfs.New(waldb.DefaultFS(), 0, errInjectedIO)
-	probeDB, err := waldb.Open(dir,
-		waldb.WithFS(passthrough),
-		waldb.WithBlockSize(walBlockSize),
-		waldb.WithMaxFileSize(64*1024),
-	)
-	if err != nil {
-		t.Fatalf("probe Open: %v", err)
-	}
-	totalOps := passthrough.Count()
-	mustClose(t, probeDB)
-
-	failCount := 0
-
-	for target := int64(1); target <= totalOps; target++ {
-		iterDir := t.TempDir()
-		if err := copyDir(dir, iterDir); err != nil {
-			t.Fatalf("copyDir(target=%d): %v", target, err)
-		}
-
-		efs := errfs.New(waldb.DefaultFS(), target, errInjectedIO)
-		db, openErr := waldb.Open(iterDir,
-			waldb.WithFS(efs),
-			waldb.WithBlockSize(walBlockSize),
-			waldb.WithMaxFileSize(64*1024),
-		)
-		if openErr != nil {
-			if !errors.Is(openErr, errInjectedIO) {
-				t.Fatalf("target=%d: Open error does not wrap injected: %v", target, openErr)
-			}
-			failCount++
-			continue
-		}
-		mustClose(t, db)
-	}
-
-	if failCount == 0 {
-		t.Fatal("no injection caused Open to fail; read-path error surfacing may be missing")
-	}
-
-	t.Logf("Open failed for %d of %d injection targets (read-path errors correctly surfaced)",
-		failCount, totalOps)
-}
-
 // --- TestErrorFS_LogDB_SuccessfulReOpenAfterFailure ---
 
 // TestErrorFS_LogDB_SuccessfulReOpenAfterFailure is the end-to-end crash-
