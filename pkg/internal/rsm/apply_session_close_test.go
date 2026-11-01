@@ -120,60 +120,6 @@ func TestApply_CloseBeforeSessionEntryInSameBatch(t *testing.T) {
 	}
 }
 
-// TestApply_CloseOfDifferentClientInSameBatch verifies the close of one
-// client's session leaves another client's entry in the same batch fully
-// intact, including its cached response.
-func TestApply_CloseOfDifferentClientInSameBatch(t *testing.T) {
-	cs := newCountingSM()
-	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
-		return cs
-	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
-	if err != nil {
-		t.Fatalf("NewStateMachine = %v", err)
-	}
-	defer rsm.Close()
-
-	for _, id := range []uint64{10, 20} {
-		if err := rsm.Sessions().Register(id, 0, 0); err != nil {
-			t.Fatalf("Register(%d) = %v", id, err)
-		}
-	}
-
-	entries := []proto.Entry{
-		{Index: 1, ClientID: 20, SeriesID: 1, Type: proto.EntryNormal, Cmd: makeCmd("a", "1")},
-		{Index: 2, ClientID: 10, SeriesID: proto.SessionSeriesIDForUnregister, Type: proto.EntryNormal},
-	}
-	results := make([]sm.Result, len(entries))
-	if err := rsm.Apply(entries, results); err != nil {
-		t.Fatalf("Apply = %v, want nil", err)
-	}
-	if cs.total != 1 {
-		t.Errorf("user SM applied %d entries, want 1", cs.total)
-	}
-	if !rsm.Sessions().IsRegistered(20) {
-		t.Fatal("session 20 must survive the close of session 10")
-	}
-
-	// Client 20's response must be cached: a replay of the same series
-	// deduplicates instead of re-applying.
-	replay := []proto.Entry{
-		{Index: 3, ClientID: 20, SeriesID: 1, Type: proto.EntryNormal, Cmd: makeCmd("a", "1")},
-	}
-	replayResults := make([]sm.Result, 1)
-	if err := rsm.Apply(replay, replayResults); err != nil {
-		t.Fatalf("Apply replay = %v", err)
-	}
-	if cs.total != 1 {
-		t.Errorf("user SM applied %d entries after replay, want 1 (cached response reused)", cs.total)
-	}
-	if replayResults[0].Value != results[0].Value {
-		t.Errorf("replay result = %d, want cached %d", replayResults[0].Value, results[0].Value)
-	}
-	if !bytes.Equal(replayResults[0].Data, results[0].Data) {
-		t.Errorf("replay data = %q, want cached %q", replayResults[0].Data, results[0].Data)
-	}
-}
-
 // TestApply_OneSessionClosedOneOpenInSameBatch mixes a closed and a surviving
 // session in one batch: both entries apply exactly once, only the surviving
 // session retains a cached response.

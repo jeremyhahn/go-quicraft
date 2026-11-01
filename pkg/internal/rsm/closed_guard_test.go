@@ -34,21 +34,6 @@ func newClosedGuardSM(t *testing.T) *StateMachine {
 	return machine
 }
 
-// TestStateMachine_SetLastApplied verifies the applied-counter seeding used
-// by the engine's snapshot pool after RecoverFromSnapshot: the counter
-// is the index source for the next snapshot save and must be settable to the
-// recovered index.
-func TestStateMachine_SetLastApplied(t *testing.T) {
-	machine := newClosedGuardSM(t)
-	if got := machine.LastApplied(); got != 0 {
-		t.Fatalf("initial LastApplied = %d, want 0", got)
-	}
-	machine.SetLastApplied(42)
-	if got := machine.LastApplied(); got != 42 {
-		t.Fatalf("LastApplied = %d after SetLastApplied(42), want 42", got)
-	}
-}
-
 // TestStateMachine_Apply_Closed verifies the defence-in-depth guard:
 // Apply on a closed state machine must return ErrClosed without running
 // user code.

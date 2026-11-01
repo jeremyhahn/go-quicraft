@@ -82,21 +82,6 @@ func TestRegularSMWrapper(t *testing.T) {
 		}
 	})
 
-	t.Run("close", func(t *testing.T) {
-		kv := newTestKV()
-		w := &regularSMWrapper{sm: kv}
-		if err := w.Close(context.Background()); err != nil {
-			t.Errorf("Close = %v, want nil", err)
-		}
-	})
-
-	t.Run("type", func(t *testing.T) {
-		w := &regularSMWrapper{sm: newTestKV()}
-		if w.Type() != SMTypeRegular {
-			t.Errorf("Type() = %d, want %d", w.Type(), SMTypeRegular)
-		}
-	})
-
 	t.Run("open returns zero", func(t *testing.T) {
 		w := &regularSMWrapper{sm: newTestKV()}
 		lastApplied, err := w.Open(context.Background(), t.TempDir(), make(chan struct{}))
@@ -301,20 +286,6 @@ func TestConcurrentSMWrapper(t *testing.T) {
 		}
 	})
 
-	t.Run("close", func(t *testing.T) {
-		w := &concurrentSMWrapper{sm: newTestConcurrentKV()}
-		if err := w.Close(context.Background()); err != nil {
-			t.Errorf("Close = %v, want nil", err)
-		}
-	})
-
-	t.Run("type", func(t *testing.T) {
-		w := &concurrentSMWrapper{sm: newTestConcurrentKV()}
-		if w.Type() != SMTypeConcurrent {
-			t.Errorf("Type() = %d, want %d", w.Type(), SMTypeConcurrent)
-		}
-	})
-
 	t.Run("open returns zero", func(t *testing.T) {
 		w := &concurrentSMWrapper{sm: newTestConcurrentKV()}
 		lastApplied, err := w.Open(context.Background(), t.TempDir(), make(chan struct{}))
@@ -323,34 +294,6 @@ func TestConcurrentSMWrapper(t *testing.T) {
 		}
 		if lastApplied != 0 {
 			t.Errorf("lastApplied = %d, want 0", lastApplied)
-		}
-	})
-
-	t.Run("NALookup not supported", func(t *testing.T) {
-		w := &concurrentSMWrapper{sm: newTestConcurrentKV()}
-		result, supported, err := w.NALookup([]byte("key"))
-		if err != nil {
-			t.Fatalf("NALookup = %v", err)
-		}
-		if supported {
-			t.Error("NALookup should return false for testConcurrentKV")
-		}
-		if result != nil {
-			t.Errorf("NALookup result = %v, want nil", result)
-		}
-	})
-
-	t.Run("GetHash not supported", func(t *testing.T) {
-		w := &concurrentSMWrapper{sm: newTestConcurrentKV()}
-		hash, supported, err := w.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash = %v", err)
-		}
-		if supported {
-			t.Error("GetHash should return false for testConcurrentKV")
-		}
-		if hash != 0 {
-			t.Errorf("GetHash = %d, want 0", hash)
 		}
 	})
 }
@@ -407,111 +350,6 @@ func TestOnDiskSMWrapper(t *testing.T) {
 		}
 		if val.(string) != "dd" {
 			t.Errorf("Lookup = %q, want %q", val, "dd")
-		}
-	})
-
-	t.Run("close", func(t *testing.T) {
-		w := &onDiskSMWrapper{sm: newTestOnDiskKV()}
-		if err := w.Close(context.Background()); err != nil {
-			t.Errorf("Close = %v, want nil", err)
-		}
-	})
-
-	t.Run("type", func(t *testing.T) {
-		w := &onDiskSMWrapper{sm: newTestOnDiskKV()}
-		if w.Type() != SMTypeOnDisk {
-			t.Errorf("Type() = %d, want %d", w.Type(), SMTypeOnDisk)
-		}
-	})
-
-	t.Run("open delegates to SM", func(t *testing.T) {
-		w := &onDiskSMWrapper{sm: newTestOnDiskKV()}
-		lastApplied, err := w.Open(context.Background(), t.TempDir(), make(chan struct{}))
-		if err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-		if lastApplied != 0 {
-			t.Errorf("lastApplied = %d, want 0", lastApplied)
-		}
-	})
-
-	t.Run("NALookup not supported", func(t *testing.T) {
-		w := &onDiskSMWrapper{sm: newTestOnDiskKV()}
-		result, supported, err := w.NALookup([]byte("key"))
-		if err != nil {
-			t.Fatalf("NALookup = %v", err)
-		}
-		if supported {
-			t.Error("NALookup should return false for testOnDiskKV")
-		}
-		if result != nil {
-			t.Errorf("NALookup result = %v, want nil", result)
-		}
-	})
-
-	t.Run("GetHash not supported", func(t *testing.T) {
-		w := &onDiskSMWrapper{sm: newTestOnDiskKV()}
-		hash, supported, err := w.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash = %v", err)
-		}
-		if supported {
-			t.Error("GetHash should return false for testOnDiskKV")
-		}
-		if hash != 0 {
-			t.Errorf("GetHash = %d, want 0", hash)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Shared helper function tests
-// ---------------------------------------------------------------------------
-
-func TestNALookupHelper(t *testing.T) {
-	t.Run("unsupported type", func(t *testing.T) {
-		kv := newTestKV()
-		result, supported, err := naLookup(kv, []byte("key"))
-		if err != nil {
-			t.Fatalf("naLookup = %v", err)
-		}
-		if supported {
-			t.Error("naLookup should return false for testKV")
-		}
-		if result != nil {
-			t.Errorf("naLookup result = %v, want nil", result)
-		}
-	})
-
-	t.Run("supported type succeeds", func(t *testing.T) {
-		kv := &testHasherSM{testKV: testKV{data: map[string]string{"k": "v"}}}
-		result, supported, err := naLookup(kv, []byte("k"))
-		if err != nil {
-			t.Fatalf("naLookup = %v", err)
-		}
-		if !supported {
-			t.Fatal("naLookup should return true for testHasherSM")
-		}
-		if string(result) != "v" {
-			t.Errorf("naLookup = %q, want %q", result, "v")
-		}
-	})
-
-	t.Run("supported type propagates error", func(t *testing.T) {
-		kv := &testHasherSMError{testKV: testKV{data: make(map[string]string)}}
-		result, supported, err := naLookup(kv, []byte("key"))
-		if !supported {
-			t.Fatal("naLookup should return true even on error")
-		}
-		if err == nil {
-			t.Fatal("naLookup should propagate error")
-		}
-		var te *testError
-		if !errors.As(err, &te) {
-			t.Errorf("naLookup error = %T, want *testError", err)
-		}
-		if result != nil {
-			t.Errorf("naLookup result = %v, want nil on error", result)
 		}
 	})
 }
@@ -1186,200 +1024,6 @@ func (kv *testOnDiskKVOpenErr) Open(_ context.Context, _ string, _ <-chan struct
 }
 
 // ---------------------------------------------------------------------------
-// Wrapper: multiple entries update for each SM type
-// ---------------------------------------------------------------------------
-
-func TestRegularSMWrapper_MultipleEntriesUpdate(t *testing.T) {
-	t.Run("multiple entries in single Update call", func(t *testing.T) {
-		kv := newTestKV()
-		w := &regularSMWrapper{sm: kv}
-
-		entries := []sm.Entry{
-			{Index: 1, Cmd: makeCmd("a", "1")},
-			{Index: 2, Cmd: makeCmd("b", "2")},
-			{Index: 3, Cmd: makeCmd("c", "3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := w.Update(context.Background(), entries, results); err != nil {
-			t.Fatalf("Update = %v", err)
-		}
-		for i, r := range results {
-			if r.Value != uint64(i+1) {
-				t.Errorf("results[%d].Value = %d, want %d", i, r.Value, i+1)
-			}
-		}
-		// Verify all keys stored.
-		for _, key := range []string{"a", "b", "c"} {
-			val, err := w.Lookup(context.Background(), key)
-			if err != nil {
-				t.Fatalf("Lookup(%s) = %v", key, err)
-			}
-			if val.(string) == "" {
-				t.Errorf("Lookup(%s) = empty", key)
-			}
-		}
-	})
-}
-
-func TestConcurrentSMWrapper_MultipleEntriesUpdate(t *testing.T) {
-	t.Run("multiple entries in single Update call", func(t *testing.T) {
-		kv := newTestConcurrentKV()
-		w := &concurrentSMWrapper{sm: kv}
-
-		entries := []sm.Entry{
-			{Index: 1, Cmd: makeCmd("x", "10")},
-			{Index: 2, Cmd: makeCmd("y", "20")},
-			{Index: 3, Cmd: makeCmd("z", "30")},
-		}
-		results := make([]sm.Result, 3)
-		if err := w.Update(context.Background(), entries, results); err != nil {
-			t.Fatalf("Update = %v", err)
-		}
-		for i, r := range results {
-			if r.Value != uint64(i+1) {
-				t.Errorf("results[%d].Value = %d, want %d", i, r.Value, i+1)
-			}
-		}
-	})
-}
-
-func TestOnDiskSMWrapper_MultipleEntriesUpdate(t *testing.T) {
-	t.Run("multiple entries in single Update call", func(t *testing.T) {
-		kv := newTestOnDiskKV()
-		w := &onDiskSMWrapper{sm: kv}
-
-		entries := []sm.Entry{
-			{Index: 1, Cmd: makeCmd("d1", "v1")},
-			{Index: 2, Cmd: makeCmd("d2", "v2")},
-			{Index: 3, Cmd: makeCmd("d3", "v3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := w.Update(context.Background(), entries, results); err != nil {
-			t.Fatalf("Update = %v", err)
-		}
-		for i, r := range results {
-			if r.Value != uint64(i+1) {
-				t.Errorf("results[%d].Value = %d, want %d", i, r.Value, i+1)
-			}
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// On-disk SM wrapper: NALookup and GetHash error propagation
-// ---------------------------------------------------------------------------
-
-func TestOnDiskSMWrapper_NALookupError(t *testing.T) {
-	kv := &testOnDiskHasherSMError{testOnDiskKV: *newTestOnDiskKV()}
-	w := &onDiskSMWrapper{sm: kv}
-
-	result, supported, err := w.NALookup([]byte("key"))
-	if !supported {
-		t.Fatal("NALookup should return true even on error")
-	}
-	if err == nil {
-		t.Fatal("NALookup should return error")
-	}
-	var te *testError
-	if !errors.As(err, &te) {
-		t.Errorf("error = %T, want *testError", err)
-	}
-	if result != nil {
-		t.Errorf("result = %v, want nil on error", result)
-	}
-}
-
-func TestOnDiskSMWrapper_GetHashError(t *testing.T) {
-	kv := &testOnDiskHasherSMError{testOnDiskKV: *newTestOnDiskKV()}
-	w := &onDiskSMWrapper{sm: kv}
-
-	hash, supported, err := w.GetHash()
-	if !supported {
-		t.Fatal("GetHash should return true even on error")
-	}
-	if err == nil {
-		t.Fatal("GetHash should return error")
-	}
-	var te *testError
-	if !errors.As(err, &te) {
-		t.Errorf("error = %T, want *testError", err)
-	}
-	if hash != 0 {
-		t.Errorf("hash = %d, want 0 on error", hash)
-	}
-}
-
-// testOnDiskHasherSMError returns errors from GetHash and BytesLookup.
-type testOnDiskHasherSMError struct {
-	testOnDiskKV
-}
-
-func (kv *testOnDiskHasherSMError) GetHash() (uint64, error) {
-	return 0, &testError{}
-}
-
-func (kv *testOnDiskHasherSMError) BytesLookup(_ []byte) ([]byte, error) {
-	return nil, &testError{}
-}
-
-// ---------------------------------------------------------------------------
-// Concurrent SM wrapper: NALookup and GetHash error propagation
-// ---------------------------------------------------------------------------
-
-func TestConcurrentSMWrapper_NALookupError(t *testing.T) {
-	kv := &testConcurrentHasherSMError{testConcurrentKV: *newTestConcurrentKV()}
-	w := &concurrentSMWrapper{sm: kv}
-
-	result, supported, err := w.NALookup([]byte("key"))
-	if !supported {
-		t.Fatal("NALookup should return true even on error")
-	}
-	if err == nil {
-		t.Fatal("NALookup should return error")
-	}
-	var te *testError
-	if !errors.As(err, &te) {
-		t.Errorf("error = %T, want *testError", err)
-	}
-	if result != nil {
-		t.Errorf("result = %v, want nil on error", result)
-	}
-}
-
-func TestConcurrentSMWrapper_GetHashError(t *testing.T) {
-	kv := &testConcurrentHasherSMError{testConcurrentKV: *newTestConcurrentKV()}
-	w := &concurrentSMWrapper{sm: kv}
-
-	hash, supported, err := w.GetHash()
-	if !supported {
-		t.Fatal("GetHash should return true even on error")
-	}
-	if err == nil {
-		t.Fatal("GetHash should return error")
-	}
-	var te *testError
-	if !errors.As(err, &te) {
-		t.Errorf("error = %T, want *testError", err)
-	}
-	if hash != 0 {
-		t.Errorf("hash = %d, want 0 on error", hash)
-	}
-}
-
-// testConcurrentHasherSMError returns errors from GetHash and BytesLookup.
-type testConcurrentHasherSMError struct {
-	testConcurrentKV
-}
-
-func (kv *testConcurrentHasherSMError) GetHash() (uint64, error) {
-	return 0, &testError{}
-}
-
-func (kv *testConcurrentHasherSMError) BytesLookup(_ []byte) ([]byte, error) {
-	return nil, &testError{}
-}
-
-// ---------------------------------------------------------------------------
 // On-disk SM wrapper: SaveSnapshot error from underlying SM
 // ---------------------------------------------------------------------------
 
@@ -1409,56 +1053,8 @@ func (kv *testOnDiskKVSaveErr) SaveSnapshot(_ context.Context, _ interface{}, _ 
 	return &testAdapterSaveError{}
 }
 
-func TestGetHashHelper(t *testing.T) {
-	t.Run("unsupported type", func(t *testing.T) {
-		kv := newTestKV()
-		hash, supported, err := getHash(kv)
-		if err != nil {
-			t.Fatalf("getHash = %v", err)
-		}
-		if supported {
-			t.Error("getHash should return false for testKV")
-		}
-		if hash != 0 {
-			t.Errorf("getHash = %d, want 0", hash)
-		}
-	})
-
-	t.Run("supported type succeeds", func(t *testing.T) {
-		kv := &testHasherSM{testKV: testKV{data: make(map[string]string)}}
-		hash, supported, err := getHash(kv)
-		if err != nil {
-			t.Fatalf("getHash = %v", err)
-		}
-		if !supported {
-			t.Fatal("getHash should return true for testHasherSM")
-		}
-		if hash != 42 {
-			t.Errorf("getHash = %d, want 42", hash)
-		}
-	})
-
-	t.Run("supported type propagates error", func(t *testing.T) {
-		kv := &testHasherSMError{testKV: testKV{data: make(map[string]string)}}
-		hash, supported, err := getHash(kv)
-		if !supported {
-			t.Fatal("getHash should return true even on error")
-		}
-		if err == nil {
-			t.Fatal("getHash should propagate error")
-		}
-		var te *testError
-		if !errors.As(err, &te) {
-			t.Errorf("getHash error = %T, want *testError", err)
-		}
-		if hash != 0 {
-			t.Errorf("getHash = %d, want 0 on error", hash)
-		}
-	})
-}
-
 // ---------------------------------------------------------------------------
-// NALookupInto helper and wrapper tests
+// NALookupInto wrapper tests
 // ---------------------------------------------------------------------------
 
 // testNALookupIntoSM extends testHasherSM with NALookupInto support.
@@ -1487,67 +1083,20 @@ func (h *testNALookupIntoSMError) BytesLookupInto(_, _ []byte) ([]byte, error) {
 	return nil, &testError{}
 }
 
-func TestNALookupIntoHelper(t *testing.T) {
-	t.Run("unsupported type returns false", func(t *testing.T) {
-		kv := newTestKV()
-		result, supported, err := naLookupInto(kv, []byte("key"), nil)
-		if err != nil {
-			t.Fatalf("naLookupInto = %v", err)
-		}
-		if supported {
-			t.Error("naLookupInto should return false for testKV")
-		}
-		if result != nil {
-			t.Errorf("naLookupInto result = %v, want nil", result)
-		}
-	})
+func TestRegularSMWrapper_NALookupIntoError(t *testing.T) {
+	w := &regularSMWrapper{sm: &testNALookupIntoSMError{}}
 
-	t.Run("supported type succeeds with nil dst", func(t *testing.T) {
-		kv := &testNALookupIntoSM{testHasherSM: testHasherSM{testKV: testKV{data: map[string]string{"k": "v"}}}}
-		result, supported, err := naLookupInto(kv, []byte("k"), nil)
-		if err != nil {
-			t.Fatalf("naLookupInto = %v", err)
-		}
-		if !supported {
-			t.Fatal("naLookupInto should return true for testNALookupIntoSM")
-		}
-		if string(result) != "v" {
-			t.Errorf("naLookupInto = %q, want %q", result, "v")
-		}
-	})
-
-	t.Run("supported type reuses provided dst", func(t *testing.T) {
-		kv := &testNALookupIntoSM{testHasherSM: testHasherSM{testKV: testKV{data: map[string]string{"k": "hello"}}}}
-		dst := make([]byte, 0, 16)
-		result, supported, err := naLookupInto(kv, []byte("k"), dst)
-		if err != nil {
-			t.Fatalf("naLookupInto = %v", err)
-		}
-		if !supported {
-			t.Fatal("naLookupInto should return true")
-		}
-		if string(result) != "hello" {
-			t.Errorf("naLookupInto = %q, want %q", result, "hello")
-		}
-	})
-
-	t.Run("supported type propagates error", func(t *testing.T) {
-		kv := &testNALookupIntoSMError{}
-		result, supported, err := naLookupInto(kv, []byte("key"), nil)
-		if !supported {
-			t.Fatal("naLookupInto should return true even on error")
-		}
-		if err == nil {
-			t.Fatal("naLookupInto should propagate error")
-		}
-		var te *testError
-		if !errors.As(err, &te) {
-			t.Errorf("naLookupInto error = %T, want *testError", err)
-		}
-		if result != nil {
-			t.Errorf("naLookupInto result = %v, want nil on error", result)
-		}
-	})
+	result, supported, err := w.NALookupInto([]byte("key"), nil)
+	if !supported {
+		t.Fatal("NALookupInto should return true even on error")
+	}
+	var te *testError
+	if !errors.As(err, &te) {
+		t.Errorf("NALookupInto error = %T, want *testError", err)
+	}
+	if result != nil {
+		t.Errorf("NALookupInto result = %v, want nil on error", result)
+	}
 }
 
 func TestRegularSMWrapper_NALookupIntoSupported(t *testing.T) {

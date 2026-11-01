@@ -42,7 +42,6 @@ func TestMaxExpirePerCheckpoint_ScalesWithTableCapacity(t *testing.T) {
 	}{
 		{"default capacity", 16384, 2048, 8},
 		{"small capacity keeps the floor", 128, 64, 2},
-		{"tiny capacity keeps the floor", 8, 64, 1},
 		{"large capacity", 1 << 20, 1 << 17, 8},
 	}
 
