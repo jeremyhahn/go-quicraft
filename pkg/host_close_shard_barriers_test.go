@@ -54,6 +54,65 @@ func startShardBarrierTestShards(t *testing.T, h *Host, shardIDs ...uint64) {
 	}
 }
 
+// TestClose_SealsPerShardBarriers verifies Host.Close seals every barrier the
+// WithShardBarriers resolver handed the host, not only the WithBarrier one.
+// Leaving them unsealed kept every tenant's key material live after the host
+// that used it had shut down.
+func TestClose_SealsPerShardBarriers(t *testing.T) {
+	cases := []struct {
+		name        string
+		hostBarrier bool
+	}{
+		{name: "with host-wide barrier", hostBarrier: true},
+		{name: "per-shard only", hostBarrier: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shardOne := newSealCountingBarrier()
+			shardTwo := newSealCountingBarrier()
+			opts := []HostOption{
+				WithLogDB(newMockLogDB()),
+				WithoutTransport(),
+				WithShardBarriers(func(shardID uint64) Barrier {
+					switch shardID {
+					case 1:
+						return shardOne
+					case 2:
+						return shardTwo
+					}
+					return nil
+				}),
+			}
+			var host *sealCountingBarrier
+			if tc.hostBarrier {
+				host = newSealCountingBarrier()
+				opts = append(opts, WithBarrier(host))
+			}
+			h, err := NewHost(testHostConfig(t), opts...)
+			if err != nil {
+				t.Fatalf("NewHost failed: %v", err)
+			}
+			startShardBarrierTestShards(t, h, 1, 2)
+
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			for name, b := range map[string]*sealCountingBarrier{"shard 1": shardOne, "shard 2": shardTwo} {
+				if !b.IsSealed() {
+					t.Errorf("%s barrier is not sealed after Host.Close()", name)
+				}
+				if got := b.seals.Load(); got != 1 {
+					t.Errorf("%s barrier sealed %d times, want 1", name, got)
+				}
+			}
+			if host != nil && host.seals.Load() != 1 {
+				t.Errorf("host-wide barrier sealed %d times, want 1", host.seals.Load())
+			}
+		})
+	}
+}
+
 // TestClose_SealsSharedBarrierOnce verifies barriers are deduplicated by
 // identity: one barrier shared by two shards, and a resolver that returns the
 // host-wide barrier itself for a third shard, are each sealed exactly once.
