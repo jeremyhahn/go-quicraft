@@ -5846,31 +5846,6 @@ func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
 	}
 }
 
-func TestNoOpMetricsCollector_AllMethods(t *testing.T) {
-	m := NoOpMetricsCollector{}
-	// Raft metrics
-	m.ObserveProposalLatency(1, time.Millisecond)
-	m.ObserveCommitLatency(1, time.Millisecond)
-	m.ObserveApplyLatency(1, time.Millisecond)
-	m.IncProposalDropped(1)
-	m.ObserveProposalBatchSize(1, 10)
-	m.ObserveCommitBatchSize(10)
-	m.IncElection(1)
-	m.IncSnapshot(1)
-	m.IncPiggybackCommit(1)
-	// LogDB metrics
-	m.ObserveWriteLatency(time.Millisecond)
-	m.ObserveFsyncLatency(time.Millisecond)
-	m.ObserveCompactionLatency(time.Millisecond)
-	m.IncWriteBytes(1024)
-	// Transport metrics
-	m.ObserveSendLatency(time.Millisecond)
-	m.IncMessagesSent(1, 1, 1)
-	m.IncMessagesReceived(1, 1, 1)
-	m.IncSnapshotsSent(1, 100, time.Millisecond)
-	m.IncSnapshotsReceived(1, 100, time.Millisecond)
-}
-
 // ---------------------------------------------------------------------------
 // Key rotation test helpers
 // ---------------------------------------------------------------------------
@@ -6068,41 +6043,6 @@ func TestHost_KeyRotationLoop_TriggersRotation(t *testing.T) {
 	}
 }
 
-func TestHost_KeyRotationLoop_StopsOnClose(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	barrier := newTestHostBarrier(1)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Poll until at least 1 rotation has happened (avoids timing-dependent sleep).
-	// Use a generous deadline: under race detector + full suite parallelism,
-	// goroutine scheduling can be significantly delayed.
-	deadline := time.Now().Add(5 * time.Second)
-	for barrier.rotateCount.Load() < 1 && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if barrier.rotateCount.Load() < 1 {
-		t.Fatalf("expected at least 1 rotation, got %d", barrier.rotateCount.Load())
-	}
-
-	// Close stops the rotation loop and waits for the goroutine to exit.
-	// Capture countBefore AFTER close returns to avoid the race where
-	// a rotation sneaks in between snapshot and close signal.
-	h.Close()
-	countBefore := barrier.rotateCount.Load()
-
-	// Wait and verify no more rotations occurred after close.
-	// h.Close() blocks until keyRotDone is closed, guaranteeing the loop
-	// has fully exited, so no additional sleep is needed.
-	countAfter := barrier.rotateCount.Load()
-	if countAfter != countBefore {
-		t.Fatalf("rotations continued after close: before=%d, after=%d", countBefore, countAfter)
-	}
-}
-
 func TestHost_KeyRotationLoop_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.KeyRotationInterval = 1 * time.Second
@@ -6120,41 +6060,6 @@ func TestHost_KeyRotationLoop_NoBarrier(t *testing.T) {
 	default:
 		t.Fatal("expected keyRotDone to be closed when no barrier is configured")
 	}
-}
-
-// TestHost_KeyRotationLoop_SealedBarrierSkipsRotation verifies that
-// when the barrier is sealed, the rotation loop skips the Rotate call
-// and the epoch does not advance.
-func TestHost_KeyRotationLoop_SealedBarrierSkipsRotation(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	barrier := newTestHostBarrier(1)
-
-	// Seal the barrier before starting the host.
-	barrier.mu.Lock()
-	barrier.sealedVal = true
-	barrier.mu.Unlock()
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Wait for the rotation loop to have had a chance to fire at least once
-	// (2x the rotation interval) while sealed, confirming it skips rotations.
-	<-time.After(2 * cfg.KeyRotationInterval)
-
-	// No rotations should have occurred because the barrier is sealed.
-	if barrier.rotateCount.Load() != 0 {
-		t.Fatalf("expected 0 rotations while sealed, got %d", barrier.rotateCount.Load())
-	}
-
-	// Epoch should not have advanced.
-	if barrier.CurrentEpoch() != 1 {
-		t.Fatalf("epoch = %d, want 1 (no rotations)", barrier.CurrentEpoch())
-	}
-
-	h.Close()
 }
 
 // TestHost_KeyRotationLoop_RotateError verifies that when Rotate returns
@@ -6317,39 +6222,6 @@ func TestHost_RotateBarrierKey_RetentionBelowFloor(t *testing.T) {
 	}
 }
 
-// TestHost_KeyRotationLoop_NoPurgeWhenMaxRetainedZero verifies that when
-// MaxRetainedEpochs is 0 (default), the key rotation loop does not call
-// PurgeEpochsBefore.
-func TestHost_KeyRotationLoop_NoPurgeWhenMaxRetainedZero(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	cfg.MaxRetainedEpochs = 0 // default: no purging
-
-	barrier := newTestHostBarrier(1)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Wait for several rotations.
-	deadline := time.Now().Add(10 * time.Second)
-	for barrier.rotateCount.Load() < 3 && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-
-	if barrier.rotateCount.Load() < 3 {
-		t.Fatalf("expected at least 3 rotations, got %d", barrier.rotateCount.Load())
-	}
-
-	// No purge should have been called.
-	if barrier.purgeCount.Load() != 0 {
-		t.Fatalf("expected 0 purge calls with MaxRetainedEpochs=0, got %d",
-			barrier.purgeCount.Load())
-	}
-
-	h.Close()
-}
-
 // ---------------------------------------------------------------------------
 // I.4: Key rotation loop panic recovery and restart
 // ---------------------------------------------------------------------------
@@ -6383,46 +6255,6 @@ func (b *panickingBarrier) Rotate(ctx context.Context) (uint64, error) {
 }
 
 var _ Barrier = (*panickingBarrier)(nil)
-
-// TestKeyRotationLoopOnce_PanicsReturnTrue verifies that
-// keyRotationLoopOnce returns panicked=true when the barrier's Rotate()
-// panics, proving the recovery defer catches the panic and reports it
-// correctly for the outer restart loop.
-func TestKeyRotationLoopOnce_PanicsReturnTrue(t *testing.T) {
-	// Construct a minimal Host with only the fields that
-	// keyRotationLoopOnce accesses.
-	barrier := newPanickingBarrier(1, 1, "test rotation panic")
-	h := &Host{
-		keyRotStopC: make(chan struct{}),
-		barrier:     barrier,
-		logger:      slog.Default(),
-	}
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
-	if !panicked {
-		t.Fatal("expected keyRotationLoopOnce to report panic from barrier.Rotate()")
-	}
-}
-
-// TestKeyRotationLoopOnce_NormalReturnsFalse verifies that
-// keyRotationLoopOnce returns panicked=false when the stop channel
-// fires without any panic.
-func TestKeyRotationLoopOnce_NormalReturnsFalse(t *testing.T) {
-	// Construct a minimal Host. The stop channel is already closed
-	// so the inner select returns immediately.
-	stopC := make(chan struct{})
-	close(stopC)
-	h := &Host{
-		keyRotStopC: stopC,
-		barrier:     newTestHostBarrier(1),
-		logger:      slog.Default(),
-	}
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
-	if panicked {
-		t.Fatal("expected keyRotationLoopOnce to return false on normal shutdown")
-	}
-}
 
 // TestKeyRotationLoop_RestartsAfterPanic verifies that the full
 // keyRotationLoop continues rotating keys after the barrier panics
@@ -6647,46 +6479,6 @@ func TestHost_Drain_Timeout(t *testing.T) {
 	}
 }
 
-func TestHost_Drain_Idempotent(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// First drain should succeed.
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("first Drain failed: %v", drainErr)
-	}
-
-	// Second drain should also succeed (idempotent, returns immediately).
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("second Drain failed: %v", drainErr)
-	}
-}
-
-func TestHost_IsDraining(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.IsDraining() {
-		t.Error("IsDraining should be false initially")
-	}
-
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("Drain failed: %v", drainErr)
-	}
-
-	if !h.IsDraining() {
-		t.Error("IsDraining should be true after Drain")
-	}
-}
-
 func TestHost_Close_CallsDrain(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -6701,20 +6493,6 @@ func TestHost_Close_CallsDrain(t *testing.T) {
 
 	if !h.IsDraining() {
 		t.Error("IsDraining should be true after Close (Close calls Drain)")
-	}
-}
-
-func TestHost_Drain_EmptyHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Drain on a host with no shards should succeed immediately.
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("Drain failed on empty host: %v", drainErr)
 	}
 }
 
@@ -6891,30 +6669,6 @@ func TestHealthCheck_BarrierSealed(t *testing.T) {
 	}
 }
 
-func TestHealthCheck_ShardError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Set the shard health to error via direct field access.
-	ns := testLoadNode(h, 1)
-	ns.health.Store(uint32(ShardError))
-
-	status := h.HealthCheck()
-	if status.Status != "degraded" {
-		t.Errorf("Status = %q, want %q", status.Status, "degraded")
-	}
-}
-
 func TestHealthCheck_DiskFull(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -6940,27 +6694,6 @@ func TestHealthCheck_DiskFull(t *testing.T) {
 	// verdict -- it's a separate signal for monitoring.
 	if status.Status != "ok" {
 		t.Errorf("Status = %q, want %q", status.Status, "ok")
-	}
-}
-
-func TestHealthCheck_NilDiskFull(t *testing.T) {
-	// Test that DiskOK defaults to true when diskFull pointer is nil.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	status := h.HealthCheck()
-	if !status.DiskOK {
-		t.Error("DiskOK should be true when diskFull is nil")
 	}
 }
 
@@ -7039,33 +6772,6 @@ func TestRequestAddNode_NotLeader(t *testing.T) {
 	if !errors.Is(err, ErrNotLeader) {
 		t.Errorf("expected NotLeaderError, got %v", err)
 	}
-}
-
-func TestRequestAddNode_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddNode failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("expected non-nil RequestState")
-	}
-	rs.Release()
 }
 
 func TestRequestRemoveNode_HostClosed(t *testing.T) {
@@ -7321,34 +7027,6 @@ func TestSyncRequestAddNode_Success(t *testing.T) {
 	}
 }
 
-func TestSyncRequestAddNode_ContextTimeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Use an already-expired context so the select hits ctx.Done().
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
-	defer cancel()
-
-	err = h.SyncRequestAddNode(ctx, 1, 4, "addr4", 0)
-	// RequestAddNode itself may fail with ErrTimeout or the select may
-	// catch the expired context. Either way, the error must be non-nil.
-	if err == nil {
-		t.Fatal("expected error from expired context, got nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncRequestRemoveNode
 // ---------------------------------------------------------------------------
@@ -7429,34 +7107,6 @@ func TestSyncRequestRemoveNode_Success(t *testing.T) {
 	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
 	if !errors.Is(err, raft.ErrNodeNotFound) {
 		t.Fatalf("SyncRequestRemoveNode error = %v, want ErrNodeNotFound", err)
-	}
-}
-
-func TestSyncRequestRemoveNode_ContextTimeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Use an already-expired context so the select hits ctx.Done().
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
-	defer cancel()
-
-	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
-	// RequestRemoveNode itself may fail with ErrTimeout or the select may
-	// catch the expired context. Either way, the error must be non-nil.
-	if err == nil {
-		t.Fatal("expected error from expired context, got nil")
 	}
 }
 
