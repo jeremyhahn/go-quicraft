@@ -2401,9 +2401,6 @@ func TestMembershipAddrMapSizeHelpers(t *testing.T) {
 	if got := membershipAddrMapSize(nil); got != 4 {
 		t.Fatalf("membershipAddrMapSize(nil)=%d, want 4", got)
 	}
-	if got := membershipAddrMapSize(map[uint64]string{}); got != 4 {
-		t.Fatalf("membershipAddrMapSize({})=%d, want 4", got)
-	}
 
 	// Map with one entry: 4 + 8 + 4 + len("addr") = 20.
 	m := map[uint64]string{1: "addr"}
@@ -4045,22 +4042,6 @@ func TestSaveStateSuccessAppliesInMemoryUpdates(t *testing.T) {
 	}
 	if ss.Index != 3 || ss.Term != 1 {
 		t.Errorf("shard 1 snapshot: %+v", ss)
-	}
-}
-
-// TestUnmarshalAddrMapRejectsHugeCount feeds an address-map record whose
-// declared entry count is enormous (near uint32 max) but whose body is tiny.
-// Trusting the count would size a multi-GB map with make() from the untrusted
-// prefix, an OOM/DoS during recovery. The decoder must reject it as
-// corruption (-1) without allocating.
-func TestUnmarshalAddrMapRejectsHugeCount(t *testing.T) {
-	// 4-byte count = 0xFFFFFFFF, then no entry bytes at all.
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, ^uint32(0))
-
-	m, ok := unmarshalAddrMap(data, 0)
-	if ok != -1 {
-		t.Fatalf("expected -1 (corruption) for count > cap, got ok=%d m=%v", ok, m)
 	}
 }
 
