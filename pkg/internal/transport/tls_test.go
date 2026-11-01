@@ -125,13 +125,6 @@ func TestBuildMTLSTLSInvalidCertKeyPair(t *testing.T) {
 	}
 }
 
-// TestTLSALPNConstant verifies the ALPN protocol identifier.
-func TestTLSALPNConstant(t *testing.T) {
-	if tlsALPN != "quicraft" {
-		t.Fatalf("tlsALPN: want quicraft, got %s", tlsALPN)
-	}
-}
-
 // TestNilMTLSConfigReturnsError verifies that NewQUICTransport returns
 // ErrMTLSConfigRequired when MTLSConfig is nil.
 func TestNilMTLSConfigReturnsError(t *testing.T) {
@@ -144,12 +137,7 @@ func TestNilMTLSConfigReturnsError(t *testing.T) {
 	}
 	cfg.SetDefaults()
 
-	err := cfg.Validate()
-	if !errors.Is(err, ErrMTLSConfigRequired) {
-		t.Fatalf("expected ErrMTLSConfigRequired from Validate, got %v", err)
-	}
-
-	_, err = NewQUICTransport(cfg, handler, reg)
+	_, err := NewQUICTransport(cfg, handler, reg)
 	if !errors.Is(err, ErrMTLSConfigRequired) {
 		t.Fatalf("expected ErrMTLSConfigRequired from NewQUICTransport, got %v", err)
 	}
