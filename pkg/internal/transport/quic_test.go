@@ -2557,6 +2557,7 @@ func TestSendSnapshot_WithEventListeners(t *testing.T) {
 		ListenAddress: ":0",
 		DeploymentID:  42,
 		MTLSConfig:    mtls,
+		Metrics:       noopTransportMetrics{},
 		EventListener: &config.EventListener{
 			OnSnapshotSendStarted: func(info config.SnapshotInfo) {
 				select {
@@ -2639,8 +2640,8 @@ func TestSendSnapshot_WithEventListeners(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestSendSnapshotStreaming_SuccessWithEventListeners verifies that the
-// success path fires OnSnapshotSendStarted and the deferred
-// OnSnapshotSendAborted is NOT fired on success.
+// success path, with metrics recording enabled, fires OnSnapshotSendStarted
+// and OnSnapshotSent, and the deferred OnSnapshotSendAborted is NOT fired.
 
 func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 	handler1 := newTestHandler()
@@ -2651,6 +2652,7 @@ func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 
 	started := make(chan config.SnapshotInfo, 1)
 	aborted := make(chan struct{}, 1)
+	sent := make(chan config.SnapshotInfo, 1)
 
 	t1, err := NewQUICTransport(Config{
 		ListenAddress: ":0",
@@ -2670,7 +2672,12 @@ func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 				default:
 				}
 			},
-			OnSnapshotSent: func(info config.SnapshotInfo) {},
+			OnSnapshotSent: func(info config.SnapshotInfo) {
+				select {
+				case sent <- info:
+				default:
+				}
+			},
 		},
 	}, handler1, reg1)
 	if err != nil {
@@ -2729,125 +2736,21 @@ func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 		t.Fatal("OnSnapshotSendStarted was not fired")
 	}
 
-	// OnSnapshotSendAborted should NOT have been fired.
+	select {
+	case info := <-sent:
+		if info.ShardID != 1 {
+			t.Fatalf("expected ShardID 1, got %d", info.ShardID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnSnapshotSent was not fired")
+	}
+
+	// The deferred OnSnapshotSendAborted runs before SendSnapshotStreaming
+	// returns, so it would already be queued here.
 	select {
 	case <-aborted:
 		t.Fatal("OnSnapshotSendAborted should not have been fired on success")
-	case <-time.After(200 * time.Millisecond):
-		// expected
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshot with OnSnapshotSendAborted (quic.go:974-976)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshot_AbortedEventOnConnectionError verifies that
-// OnSnapshotSendAborted is fired when the connection fails during send.
-
-func TestSendSnapshot_AbortedEventOnConnectionError(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	aborted := make(chan config.SnapshotInfo, 1)
-	startedCh := make(chan config.SnapshotInfo, 1)
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {
-				select {
-				case startedCh <- info:
-				default:
-				}
-			},
-			OnSnapshotSendAborted: func(info config.SnapshotInfo) {
-				select {
-				case aborted <- info:
-				default:
-				}
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection first.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to make snapshot send fail after header.
-	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	chunks := []proto.SnapshotChunk{
-		{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			From:       1,
-			Index:      50,
-			Term:       3,
-			ChunkID:    0,
-			ChunkCount: 2,
-			ChunkSize:  5,
-			Data:       []byte("hello"),
-		},
-		{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			From:       1,
-			Index:      50,
-			Term:       3,
-			ChunkID:    1,
-			ChunkCount: 2,
-			ChunkSize:  5,
-			Data:       []byte("world"),
-		},
-	}
-
-	sendErr := t1.SendSnapshot(chunks)
-	// Should fail because t2 is stopped.
-	if sendErr == nil {
-		// If it somehow succeeded (race), that's OK.
-		return
-	}
-
-	// The abort event should have been fired if the header was written
-	// but a chunk write failed. Due to timing, the error may occur at
-	// different points (getConnection, OpenStreamSync, WriteFrame).
-	select {
-	case <-aborted:
-		// OnSnapshotSendAborted was fired.
-	case <-time.After(2 * time.Second):
-		// May not be fired if error occurred before header write.
+	default:
 	}
 }
 
@@ -3029,43 +2932,6 @@ func requireQueueFullDrop(t *testing.T, tr *QUICTransport, rec *dropRecorder, sh
 	t.Fatalf("Send never took the queue-full backpressure path in %d sends", sends)
 }
 
-// TestSend_QueueBackpressure verifies that when the send queue is full,
-// messages are dropped without blocking and counted under the queue-full
-// reason rather than vanishing.
-
-func TestSend_QueueBackpressure(t *testing.T) {
-	handler1 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-	rec := &dropRecorder{}
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		Metrics:       rec,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	// Register a target that doesn't exist so messages queue up.
-	reg1.Register(1, 2, "127.0.0.1:19999")
-
-	// Create the send queue first so the goroutine starts.
-	sq := t1.getOrCreateSendQueue("127.0.0.1:19999")
-	if sq == nil {
-		t.Fatal("expected non-nil send queue")
-	}
-
-	fillSendQueue(t, sq, 1, 2)
-	requireQueueFullDrop(t, t1, rec, 1, 2)
-}
-
 // ---------------------------------------------------------------------------
 // handleMessageFrame with debug timing (recv.go:346-348)
 // ---------------------------------------------------------------------------
@@ -3210,258 +3076,6 @@ func TestSendSnapshotStreaming_OpenStreamSyncError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from SendSnapshotStreaming after connection closed")
 	}
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshot with write deadline error (quic.go:936-938)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshot_WriteDeadlineError tests the path where
-// SetWriteDeadline fails during snapshot send by closing the stream
-// between getConnection and the write.
-
-func TestSendSnapshot_WriteDeadlineError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 while the snapshot is in flight. The connection will be
-	// dead when the write attempt occurs. This may hit either the
-	// OpenStreamSync error, write deadline error, or WriteFrame error
-	// depending on timing.
-	go func() {
-		delayTimer := time.NewTimer(50 * time.Millisecond)
-		<-delayTimer.C
-		delayTimer.Stop()
-		t2.Stop()
-	}()
-
-	err = t1.SendSnapshot([]proto.SnapshotChunk{
-		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 1, Term: 1,
-			ChunkID: 0, ChunkCount: 1, ChunkSize: 5,
-			Data: []byte("hello")},
-	})
-	// May succeed if timing allows, or fail with various errors.
-	_ = err
-}
-
-// ---------------------------------------------------------------------------
-// handleConnection StreamError (recv.go:252-256)
-// ---------------------------------------------------------------------------
-
-// TestHandleConnection_StreamErrorContinues verifies that a StreamError
-// during AcceptStream causes handleConnection to continue rather than
-// return. This is hard to test directly since it requires QUIC stream
-// errors, but we can verify the panic recovery path at recv.go:225-231.
-
-func TestSendSnapshot_AbortedWithEventListenerOnWriteError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	var abortedCalled bool
-	var startedCalled bool
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {
-				startedCalled = true
-			},
-			OnSnapshotSendAborted: func(info config.SnapshotInfo) {
-				abortedCalled = true
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 while sending snapshot with multiple chunks.
-	// The first chunk may succeed but subsequent chunks should fail.
-	go func() {
-		stopDelayTimer := time.NewTimer(10 * time.Millisecond)
-		<-stopDelayTimer.C
-		stopDelayTimer.Stop()
-		t2.Stop()
-	}()
-
-	chunks := make([]proto.SnapshotChunk, 5)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			From:       1,
-			Index:      100,
-			Term:       5,
-			ChunkID:    uint64(i),
-			ChunkCount: 5,
-			ChunkSize:  100,
-			Data:       bytes.Repeat([]byte("S"), 100),
-		}
-	}
-
-	err = t1.SendSnapshot(chunks)
-	// May succeed or fail depending on timing.
-	_ = err
-	_ = startedCalled
-	_ = abortedCalled
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshotStreaming with event listener paths (quic.go:1112-1122)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshotStreaming_AbortedEventOnWriteError exercises the
-// OnSnapshotSendAborted event path for streaming snapshots.
-
-func TestSendSnapshotStreaming_AbortedEventOnWriteError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	var abortedCalled bool
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {},
-			OnSnapshotSendAborted: func(info config.SnapshotInfo) {
-				abortedCalled = true
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 during streaming send.
-	go func() {
-		stopTimer2 := time.NewTimer(10 * time.Millisecond)
-		<-stopTimer2.C
-		stopTimer2.Stop()
-		t2.Stop()
-	}()
-
-	err = t1.SendSnapshotStreaming(
-		SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 100, Term: 5, ChunkCount: 5},
-		func(emit func(proto.SnapshotChunk) error) error {
-			for i := 0; i < 5; i++ {
-				if emitErr := emit(proto.SnapshotChunk{
-					BinVer:     proto.WireVersion,
-					ShardID:    1,
-					ReplicaID:  2,
-					From:       1,
-					Index:      100,
-					Term:       5,
-					ChunkID:    uint64(i),
-					ChunkCount: 5,
-					ChunkSize:  100,
-					Data:       bytes.Repeat([]byte("S"), 100),
-				}); emitErr != nil {
-					return emitErr
-				}
-			}
-			return nil
-		},
-	)
-	_ = err
-	_ = abortedCalled
 }
 
 // ---------------------------------------------------------------------------
@@ -3786,177 +3400,6 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 	})
 	if sendErr == nil {
 		t.Log("SendSnapshotStreaming succeeded (receiver didn't close in time)")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshot successful with metrics (quic.go:1026-1028)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshot_SuccessWithMetrics exercises the SendSnapshot success
-// path with metrics recording enabled.
-
-func TestSendSnapshot_SuccessWithMetrics(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	sentCh := make(chan config.SnapshotInfo, 1)
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		Metrics:       noopTransportMetrics{},
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {},
-			OnSnapshotSent: func(info config.SnapshotInfo) {
-				select {
-				case sentCh <- info:
-				default:
-				}
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	chunks := []proto.SnapshotChunk{
-		{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			Index:      10,
-			Term:       5,
-			ChunkID:    0,
-			ChunkCount: 1,
-			Data:       []byte("snapshot-data"),
-		},
-	}
-
-	sendErr := t1.SendSnapshot(chunks)
-	if sendErr != nil {
-		t.Fatalf("SendSnapshot failed: %v", sendErr)
-	}
-
-	// Verify the OnSnapshotSent event was fired.
-	select {
-	case info := <-sentCh:
-		if info.ShardID != 1 {
-			t.Fatalf("expected ShardID 1, got %d", info.ShardID)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("OnSnapshotSent not received within timeout")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshotStreaming successful with metrics (quic.go:1168-1170)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshotStreaming_SuccessWithMetrics exercises the streaming
-// snapshot send success path with metrics recording enabled.
-
-func TestSendSnapshotStreaming_SuccessWithMetrics(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	sentCh := make(chan config.SnapshotInfo, 1)
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		Metrics:       noopTransportMetrics{},
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {},
-			OnSnapshotSent: func(info config.SnapshotInfo) {
-				select {
-				case sentCh <- info:
-				default:
-				}
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	meta := SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      10,
-		Term:       5,
-		ChunkCount: 1,
-	}
-
-	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
-		return emit(proto.SnapshotChunk{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			Index:      10,
-			Term:       5,
-			ChunkID:    0,
-			ChunkCount: 1,
-			Data:       []byte("streaming-snapshot-data"),
-		})
-	})
-	if sendErr != nil {
-		t.Fatalf("SendSnapshotStreaming failed: %v", sendErr)
-	}
-
-	select {
-	case info := <-sentCh:
-		if info.ShardID != 1 {
-			t.Fatalf("expected ShardID 1, got %d", info.ShardID)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("OnSnapshotSent not received within timeout")
 	}
 }
 
@@ -4288,109 +3731,6 @@ func TestSend_BackpressureLoggingOverflow(t *testing.T) {
 	}
 	requireQueueFullDrop(t, tr, rec, 1, 2)
 }
-
-// ---------------------------------------------------------------------------
-// heartbeat write error path (heartbeat.go:123-126)
-// ---------------------------------------------------------------------------
-
-// TestSendHeartbeatBatch_GetStreamError exercises the heartbeat path
-// where getStream fails because the transport is shutting down.
-
-func TestSendSnapshot_ChunkLoopWriteFailure(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	abortedCh := make(chan struct{}, 1)
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {},
-			OnSnapshotSendAborted: func(info config.SnapshotInfo) {
-				select {
-				case abortedCh <- struct{}{}:
-				default:
-				}
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer func() { _ = t2.Stop() }()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Build many chunks with large data to ensure the write loop takes
-	// enough time for the connection close to interrupt.
-	largeData := bytes.Repeat([]byte("snapshot-data-payload-"), 5000)
-	chunks := make([]proto.SnapshotChunk, 500)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  2,
-			Index:      10,
-			Term:       5,
-			ChunkID:    uint64(i),
-			ChunkCount: 500,
-			Data:       largeData,
-		}
-	}
-
-	// Close the sender's connection after a delay that allows
-	// OpenStreamSync and header write to complete but interrupts
-	// the chunk write loop.
-	go func() {
-		snapInterruptTimer := time.NewTimer(100 * time.Millisecond)
-		<-snapInterruptTimer.C
-		snapInterruptTimer.Stop()
-		t1.connMu.RLock()
-		conn, ok := t1.conns[t2Addr]
-		t1.connMu.RUnlock()
-		if ok {
-			conn.CloseWithError(0, "test: interrupt snapshot send")
-		}
-	}()
-
-	sendErr := t1.SendSnapshot(chunks)
-	if sendErr == nil {
-		t.Log("SendSnapshot succeeded (connection survived)")
-	}
-
-	// Check for abort event if the send failed after the header.
-	select {
-	case <-abortedCh:
-		// Abort event received.
-	case <-time.After(1 * time.Second):
-		t.Log("no abort event (timing-dependent)")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SendSnapshotStreaming header write error (quic.go:1102-1104)
-// ---------------------------------------------------------------------------
 
 // TestSendSnapshotStreaming_ChunkWriteFailure exercises the streaming
 // snapshot chunk write error path by closing the connection during
