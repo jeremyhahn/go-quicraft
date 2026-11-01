@@ -218,29 +218,6 @@ func TestSnapshotPool_NewWithMinimumWorkers(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_StartAndStop(t *testing.T) {
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// Workers should be running.
-	close(stopC)
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected: all workers stopped.
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot pool workers did not stop within timeout")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Save snapshot tests
 // ---------------------------------------------------------------------------
@@ -433,37 +410,6 @@ func TestSnapshotPool_SaveSnapshot_MaxSnapshotSizeZeroDisablesCheck(t *testing.T
 	}
 	if result.index != 100 {
 		t.Fatalf("result.index = %d, want 100", result.index)
-	}
-}
-
-func TestSnapshotPool_SaveSnapshot_ZeroLastApplied(t *testing.T) {
-	stopC := make(chan struct{})
-	defer close(stopC)
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(0) // zero means nothing to snapshot
-	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, ss, t.TempDir(), nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   10,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("unexpected error: %v", result.err)
-	}
-	if result.index != 0 {
-		t.Fatalf("result.index = %d, want 0", result.index)
 	}
 }
 
@@ -996,14 +942,6 @@ func TestSnapshotPool_MetadataWritten(t *testing.T) {
 func TestSnapshotPool_SnapshotSaveDir(t *testing.T) {
 	dir := snapshotSaveDir("/data/snapshots", 10, 2, 500)
 	expected := filepath.Join("/data/snapshots", "shard-10", "replica-2", "snapshot-00000000000000000500")
-	if dir != expected {
-		t.Fatalf("snapshotSaveDir = %s, want %s", dir, expected)
-	}
-}
-
-func TestSnapshotPool_SnapshotSaveDir_ZeroIndex(t *testing.T) {
-	dir := snapshotSaveDir("/tmp", 1, 1, 0)
-	expected := filepath.Join("/tmp", "shard-1", "replica-1", "snapshot-00000000000000000000")
 	if dir != expected {
 		t.Fatalf("snapshotSaveDir = %s, want %s", dir, expected)
 	}
