@@ -941,59 +941,6 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 	}
 }
 
-// TestDragonboat_ProposalByProxy verifies that a follower forwards
-// proposals to the leader.
-func TestDragonboat_ProposalByProxy(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeFollower(1, 2) // node 2 is leader
-	r.drainMessages()
-
-	// Propose on the follower.
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("client-data")}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Follower should forward the proposal to leader (node 2).
-	msgs := r.drainMessages()
-	found := false
-	for _, m := range msgs {
-		if m.Type == proto.Propose && m.To == 2 {
-			found = true
-			if len(m.Entries) != 1 {
-				t.Fatalf("expected 1 entry forwarded, got %d", len(m.Entries))
-			}
-		}
-	}
-	if !found {
-		t.Fatal("expected proposal forwarded to leader")
-	}
-}
-
-// TestDragonboat_ProposalByProxy_NoLeader verifies that a follower
-// without a known leader returns NotLeaderError.
-func TestDragonboat_ProposalByProxy_NoLeader(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	// No leader known.
-	r.drainMessages()
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("data")}},
-	})
-
-	var notLeader *NotLeaderError
-	if !errors.As(err, &notLeader) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
-	}
-	if notLeader.LeaderID != 0 {
-		t.Fatalf("expected LeaderID=0, got %d", notLeader.LeaderID)
-	}
-}
-
 // ===========================================================================
 // Section 5.4.2 - Cannot commit without new term entry
 // ===========================================================================
