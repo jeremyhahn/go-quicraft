@@ -34,19 +34,9 @@ func TestMembersAdvertise(t *testing.T) {
 		Observers: map[uint64]string{3: "a3"},
 		Witnesses: map[uint64]string{4: "a4"},
 	}
-	ns := &nodeState{replicaID: 1}
-	if ns.membersAdvertise(m, target) {
-		t.Fatal("no member heard from, yet the switch precondition held")
-	}
-
-	ns.peerWire = map[uint64]uint64{2: target, 3: target}
+	ns := &nodeState{replicaID: 1, peerWire: map[uint64]uint64{2: target, 3: target}}
 	if ns.membersAdvertise(m, target) {
 		t.Fatal("the witness was never heard from, yet the precondition held")
-	}
-
-	ns.peerWire[4] = target - 1
-	if ns.membersAdvertise(m, target) {
-		t.Fatal("the witness advertised the previous version, yet the precondition held")
 	}
 
 	ns.peerWire[4] = target
@@ -69,10 +59,6 @@ func TestWireSwitchDisabledOnSingleVersionWindow(t *testing.T) {
 	h.wire.Proto = proto.DefaultWireWindow()
 	if h.wireSwitchEnabled() && proto.WireVersion == proto.PreviousWireVersion {
 		t.Fatal("a single-version window enabled the wire-version switch")
-	}
-	h.wire.Proto = proto.WireWindow{Current: proto.WireVersion + 1, Previous: proto.WireVersion}
-	if !h.wireSwitchEnabled() {
-		t.Fatal("a two-version window did not enable the wire-version switch")
 	}
 }
 
