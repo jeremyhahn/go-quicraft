@@ -16,7 +16,6 @@ package engine
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 )
 
@@ -165,12 +164,6 @@ func TestSnapshotTooLargeError_Is(t *testing.T) {
 	}
 }
 
-func TestSentinelErrors_AreDistinct(t *testing.T) {
-	if errors.Is(ErrShardFailed, ErrStopped) {
-		t.Fatal("ErrShardFailed and ErrStopped should be distinct")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // CommitError
 // ---------------------------------------------------------------------------
@@ -190,30 +183,11 @@ func TestCommitError_Error(t *testing.T) {
 	}
 }
 
-func TestCommitError_Error_PreservesInnerMessage(t *testing.T) {
-	// Verify the full inner error message is preserved, not truncated.
-	inner := errors.New("entry range [100, 200) missing from LogReader")
-	e := &CommitError{ShardID: 42, ReplicaID: 7, Err: inner}
-	msg := e.Error()
-	if !contains(msg, "entry range [100, 200) missing from LogReader") {
-		t.Fatalf("inner error message not fully preserved: %s", msg)
-	}
-}
-
 func TestCommitError_Unwrap(t *testing.T) {
 	inner := errors.New("log gap detected")
 	e := &CommitError{ShardID: 11, ReplicaID: 3, Err: inner}
 	if !errors.Is(e, inner) {
 		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestCommitError_Unwrap_ChainedErrors(t *testing.T) {
-	root := errors.New("disk I/O error")
-	wrapped := fmt.Errorf("log compaction failed: %w", root)
-	e := &CommitError{ShardID: 1, ReplicaID: 1, Err: wrapped}
-	if !errors.Is(e, root) {
-		t.Fatal("expected errors.Is to reach root cause through Unwrap chain")
 	}
 }
 
@@ -262,21 +236,6 @@ func TestTypeAssertionError_Error(t *testing.T) {
 	}
 	if !contains(msg, "string") {
 		t.Fatalf("error message missing actual type: %s", msg)
-	}
-}
-
-func TestTypeAssertionError_Error_NilValue(t *testing.T) {
-	e := &TypeAssertionError{
-		Context:      "GetNode",
-		ExpectedType: "*Node",
-		ActualValue:  nil,
-	}
-	msg := e.Error()
-	if !contains(msg, "type assertion failed") {
-		t.Fatalf("error message missing 'type assertion failed': %s", msg)
-	}
-	if !contains(msg, "<nil>") {
-		t.Fatalf("error message missing nil indicator: %s", msg)
 	}
 }
 

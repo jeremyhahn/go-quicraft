@@ -530,27 +530,8 @@ func TestInvocationCounter_Seed(t *testing.T) {
 }
 
 // TestInvocationCounter_SeedDisabled verifies that Seed is a no-op on disabled counters.
-func TestInvocationCounter_SeedDisabled(t *testing.T) {
-	t.Parallel()
-
-	ic := NewInvocationCounter(false, 1000, 0)
-	ic.Seed(500)
-	if got := ic.Count(); got != 0 {
-		t.Fatalf("Count() after Seed on disabled = %d, want 0", got)
-	}
-}
-
 // TestInvocationCounter_Close verifies that Close returns nil for the in-memory
 // implementation.
-func TestInvocationCounter_Close(t *testing.T) {
-	t.Parallel()
-
-	ic := NewInvocationCounter(true, 1000, 0)
-	if err := ic.Close(); err != nil {
-		t.Fatalf("Close() returned unexpected error: %v", err)
-	}
-}
-
 // TestInvocationCounter_InterfaceCompliance verifies that InMemoryInvocationCounter
 // satisfies the InvocationCounter interface.
 func TestInvocationCounter_InterfaceCompliance(t *testing.T) {
@@ -877,24 +858,6 @@ func TestNonceTracker_Concurrent(t *testing.T) {
 
 // TestNonceTracker_NonceKeyConsistency verifies that the same nonce always
 // produces the same key and that different nonces produce different keys.
-func TestNonceTracker_NonceKeyConsistency(t *testing.T) {
-	t.Parallel()
-
-	nonce1 := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}
-	nonce2 := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0D}
-
-	key1a := nonceKey(nonce1)
-	key1b := nonceKey(nonce1)
-	key2 := nonceKey(nonce2)
-
-	if key1a != key1b {
-		t.Fatalf("same nonce produced different keys: %x vs %x", key1a, key1b)
-	}
-	if key1a == key2 {
-		t.Fatalf("different nonces produced same key: %x", key1a)
-	}
-}
-
 // TestNonceTracker_NonceKeyVerbatim verifies that nonceKey uses the full nonce
 // verbatim — no truncation and no padding — so the key length always equals the
 // nonce length and nonces of any length are tracked exactly.

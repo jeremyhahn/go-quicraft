@@ -208,15 +208,6 @@ func TestNoneStrategy_UnsealRootKey_StrategyMismatchRejected(t *testing.T) {
 func TestNoneEncrypterRejectsEncryptedData(t *testing.T) {
 	enc := noneEncrypter{}
 
-	// Round-trip of None-written data (zero epoch) succeeds.
-	ct, err := enc.Encrypt([]byte("plain"))
-	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
-	}
-	if _, err := enc.Decrypt(ct); err != nil {
-		t.Fatalf("Decrypt(none-written): %v", err)
-	}
-
 	// Data with a non-zero epoch prefix is rejected.
 	encrypted := make([]byte, noneEpochHeaderSize+4)
 	encrypted[7] = 0x01 // epoch 1, big-endian

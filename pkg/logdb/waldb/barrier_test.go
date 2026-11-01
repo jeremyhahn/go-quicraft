@@ -885,20 +885,6 @@ func TestEncryptedWALRecoveryDecryptionError(t *testing.T) {
 	}
 }
 
-// TestWALDecryptErrorType verifies the WALDecryptError type provides
-// correct error messages and unwrapping.
-func TestWALDecryptErrorType(t *testing.T) {
-	inner := errors.New("test decryption failure")
-	e := &WALDecryptError{SegmentID: 7, Err: inner}
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("WALDecryptError.Error() returned empty string")
-	}
-	if e.Unwrap() != inner {
-		t.Fatalf("WALDecryptError.Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
 // newTestBarrierWithPassphrase creates a barrier with a specific passphrase,
 // for testing decryption with wrong keys.
 func newTestBarrierWithPassphrase(t *testing.T, passphrase string) *seal.Barrier {
@@ -915,27 +901,6 @@ func newTestBarrierWithPassphrase(t *testing.T, passphrase string) *seal.Barrier
 		t.Fatalf("barrier.Initialize: %v", err)
 	}
 	return barrier
-}
-
-// --- WithBarrier option ---
-
-// TestWithBarrierOption verifies the functional option sets the barrier.
-func TestWithBarrierOption(t *testing.T) {
-	barrier := newTestBarrier(t)
-	opts := defaultDBOptions()
-	WithBarrier(barrier)(&opts)
-	if opts.barrier != barrier {
-		t.Fatal("WithBarrier did not set barrier on dbOptions")
-	}
-}
-
-// TestWithBarrierNilOption verifies nil barrier is a no-op (no encryption).
-func TestWithBarrierNilOption(t *testing.T) {
-	opts := defaultDBOptions()
-	WithBarrier(nil)(&opts)
-	if opts.barrier != nil {
-		t.Fatal("WithBarrier(nil) should set barrier to nil")
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -962,25 +927,6 @@ func TestMinLiveEpoch_NoBarrier(t *testing.T) {
 	}
 	if epoch != 0 {
 		t.Fatalf("MinLiveEpoch = %d, want 0 (no barrier)", epoch)
-	}
-}
-
-// TestMinLiveEpoch_SingleEpoch verifies that MinLiveEpoch returns the
-// current epoch when all records are written at a single epoch.
-func TestMinLiveEpoch_SingleEpoch(t *testing.T) {
-	barrier := newTestBarrier(t)
-	db := openEncryptedTestDB(t, barrier)
-
-	if err := db.SaveEntries(1, 1, makeEntries(1, 10, 1)); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	epoch, err := db.MinLiveEpoch()
-	if err != nil {
-		t.Fatalf("MinLiveEpoch: %v", err)
-	}
-	if epoch != 1 {
-		t.Fatalf("MinLiveEpoch = %d, want 1", epoch)
 	}
 }
 

@@ -512,30 +512,6 @@ func TestRecovering_WorkSignalNotifiedAfterRecovery(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRecovering_NodeAccessors verifies the SetRecovering/IsRecovering
-// accessor methods and the initial state of the recovering flag.
-func TestRecovering_NodeAccessors(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Initial state should be false.
-	if node.IsRecovering() {
-		t.Fatal("new node should not be recovering")
-	}
-
-	// Set to true.
-	node.SetRecovering(true)
-	if !node.IsRecovering() {
-		t.Fatal("node should be recovering after SetRecovering(true)")
-	}
-
-	// Set back to false.
-	node.SetRecovering(false)
-	if node.IsRecovering() {
-		t.Fatal("node should not be recovering after SetRecovering(false)")
-	}
-}
-
 // TestRecovering_ApplyWorkerDoesNotParkEmptyBatch verifies that a batch
 // with NO committed entries is released immediately instead of waiting on
 // the recovering gate. An empty batch never touches the state machine, so

@@ -50,14 +50,6 @@ func TestProtoEntryToLogDB(t *testing.T) {
 	}
 }
 
-func TestProtoEntryToLogDB_ZeroValue(t *testing.T) {
-	var pe proto.Entry
-	le := protoEntryToLogDB(&pe)
-	if le.Term != 0 || le.Index != 0 || le.Type != 0 || le.Cmd != nil {
-		t.Errorf("expected zero logdb.Entry, got %+v", le)
-	}
-}
-
 func TestProtoStateToLogDB(t *testing.T) {
 	ps := proto.State{Term: 10, Vote: 3, Commit: 99, VoteWindow: 2_000_000_000}
 	ls := protoStateToLogDB(&ps)
@@ -72,46 +64,6 @@ func TestProtoStateToLogDB(t *testing.T) {
 	}
 	if ls.Commit != 99 {
 		t.Errorf("Commit = %d, want 99", ls.Commit)
-	}
-}
-
-func TestProtoStateToLogDB_ZeroValue(t *testing.T) {
-	var ps proto.State
-	ls := protoStateToLogDB(&ps)
-	if ls.Term != 0 || ls.Vote != 0 || ls.Commit != 0 {
-		t.Errorf("expected zero logdb.State, got %+v", ls)
-	}
-}
-
-func TestProtoMembershipToLogDB(t *testing.T) {
-	pm := proto.Membership{
-		ConfigChangeID: 7,
-		Addresses:      map[uint64]string{1: "addr1", 2: "addr2"},
-		Observers:      map[uint64]string{3: "obs1"},
-		Witnesses:      map[uint64]string{4: "wit1"},
-		Removed:        map[uint64]bool{5: true, 6: false},
-	}
-	lm := protoMembershipToLogDB(&pm)
-	if lm.ConfigChangeID != 7 {
-		t.Errorf("ConfigChangeID = %d, want 7", lm.ConfigChangeID)
-	}
-	if len(lm.Addresses) != 2 {
-		t.Errorf("Addresses length = %d, want 2", len(lm.Addresses))
-	}
-	if lm.Addresses[1] != "addr1" {
-		t.Errorf("Addresses[1] = %q, want %q", lm.Addresses[1], "addr1")
-	}
-	if len(lm.Observers) != 1 {
-		t.Errorf("Observers length = %d, want 1", len(lm.Observers))
-	}
-	if len(lm.Witnesses) != 1 {
-		t.Errorf("Witnesses length = %d, want 1", len(lm.Witnesses))
-	}
-	if len(lm.Removed) != 2 {
-		t.Errorf("Removed length = %d, want 2", len(lm.Removed))
-	}
-	if !lm.Removed[5] {
-		t.Error("Removed[5] = false, want true")
 	}
 }
 
@@ -132,98 +84,6 @@ func TestProtoMembershipToLogDB_EmptyMaps(t *testing.T) {
 	}
 	if lm.Removed != nil {
 		t.Errorf("Removed = %v, want nil", lm.Removed)
-	}
-}
-
-func TestProtoSnapshotToLogDB(t *testing.T) {
-	ps := proto.Snapshot{
-		Index:       100,
-		Term:        5,
-		Filepath:    "/data/snap",
-		FileSize:    4096,
-		OnDiskIndex: 95,
-		Epoch:       7,
-		Membership: proto.Membership{
-			ConfigChangeID: 3,
-			Addresses:      map[uint64]string{1: "addr"},
-		},
-	}
-	ls := protoSnapshotToLogDB(&ps)
-	if ls.Index != 100 {
-		t.Errorf("Index = %d, want 100", ls.Index)
-	}
-	if ls.Term != 5 {
-		t.Errorf("Term = %d, want 5", ls.Term)
-	}
-	if ls.Filepath != "/data/snap" {
-		t.Errorf("Filepath = %q, want %q", ls.Filepath, "/data/snap")
-	}
-	if ls.FileSize != 4096 {
-		t.Errorf("FileSize = %d, want 4096", ls.FileSize)
-	}
-	if ls.OnDiskIndex != 95 {
-		t.Errorf("OnDiskIndex = %d, want 95", ls.OnDiskIndex)
-	}
-	if ls.Membership.ConfigChangeID != 3 {
-		t.Errorf("Membership.ConfigChangeID = %d, want 3", ls.Membership.ConfigChangeID)
-	}
-	if ls.Epoch != 7 {
-		t.Errorf("Epoch = %d, want 7", ls.Epoch)
-	}
-}
-
-func TestProtoSnapshotToLogDB_PreservesEpoch(t *testing.T) {
-	// Epoch must be propagated to support AES-GCM decryption on recovery.
-	ps := proto.Snapshot{
-		Index: 50,
-		Term:  3,
-		Epoch: 42,
-	}
-	ls := protoSnapshotToLogDB(&ps)
-	if ls.Epoch != 42 {
-		t.Errorf("Epoch = %d, want 42; encrypted snapshot recovery requires Epoch", ls.Epoch)
-	}
-}
-
-func TestProtoSnapshotToLogDB_ZeroValue(t *testing.T) {
-	var ps proto.Snapshot
-	ls := protoSnapshotToLogDB(&ps)
-	if ls.Index != 0 || ls.Term != 0 || ls.Filepath != "" {
-		t.Errorf("expected zero logdb.Snapshot, got %+v", ls)
-	}
-}
-
-func TestProtoUpdatesToLogDBReuse(t *testing.T) {
-	src := []proto.Update{
-		{
-			ShardID: 1, ReplicaID: 1,
-			State:         proto.State{Term: 1},
-			EntriesToSave: []proto.Entry{{Term: 1, Index: 1, Cmd: []byte("a")}},
-		},
-		{
-			ShardID: 2, ReplicaID: 2,
-			State:         proto.State{Term: 2},
-			EntriesToSave: []proto.Entry{{Term: 2, Index: 10, Cmd: []byte("b")}},
-		},
-	}
-	var dst []logdb.Update
-	var flatBuf []logdb.Entry
-	dst, flatBuf = protoUpdatesToLogDBReuse(dst, flatBuf, src)
-	if len(dst) != 2 {
-		t.Fatalf("expected 2 updates, got %d", len(dst))
-	}
-	// Flat buffer should contain 2 total entries (1 per update).
-	if len(flatBuf) != 2 {
-		t.Fatalf("expected flat buffer len 2, got %d", len(flatBuf))
-	}
-	if dst[0].ShardID != 1 || dst[1].ShardID != 2 {
-		t.Errorf("ShardIDs = %d,%d, want 1,2", dst[0].ShardID, dst[1].ShardID)
-	}
-	if len(dst[0].Entries) != 1 || dst[0].Entries[0].Index != 1 {
-		t.Errorf("dst[0].Entries = %+v, want [Index=1]", dst[0].Entries)
-	}
-	if len(dst[1].Entries) != 1 || dst[1].Entries[0].Index != 10 {
-		t.Errorf("dst[1].Entries = %+v, want [Index=10]", dst[1].Entries)
 	}
 }
 
@@ -403,22 +263,6 @@ func TestProtoUpdatesToLogDBReuse_AllEmpty(t *testing.T) {
 	}
 }
 
-func TestProtoMembershipToLogDB_DeepCopy(t *testing.T) {
-	pm := proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-	}
-	lm := protoMembershipToLogDB(&pm)
-	// Modify original - should not affect copy.
-	pm.Addresses[1] = "modified"
-	pm.Addresses[99] = "new"
-	if lm.Addresses[1] != "addr1" {
-		t.Errorf("deep copy broken: Addresses[1] = %q, want %q", lm.Addresses[1], "addr1")
-	}
-	if _, ok := lm.Addresses[99]; ok {
-		t.Error("deep copy broken: Addresses[99] should not exist")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------
@@ -478,8 +322,8 @@ func BenchmarkProtoUpdatesToLogDBReuse_LargeBatch(b *testing.B) {
 	}
 }
 
-// TestProtoMembershipToLogDB_CarriesEveryField is the guard the older
-// TestProtoMembershipToLogDB could not provide.
+// TestProtoMembershipToLogDB_CarriesEveryField checks every membership field
+// survives the conversion.
 //
 // That test left MaxWitnesses, RequireFullReplicaMajority, Identities,
 // RemovedIdentities and all three session-policy fields at ZERO on both

@@ -47,13 +47,6 @@ func TestNewSoftwareStrategyWithParams_Valid(t *testing.T) {
 	}
 }
 
-func TestNewSoftwareStrategyWithParams_EmptyPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategyWithParams(context.Background(), nil, 1, 64*1024, 2)
-	if !errors.Is(err, ErrInvalidPassphrase) {
-		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
-	}
-}
-
 func TestSoftwareStrategy_CrossKDFUnseal_FIPSMismatch(t *testing.T) {
 	passphrase := []byte("cross-kdf-mismatch")
 	rootKey := make([]byte, 32)

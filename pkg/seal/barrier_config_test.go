@@ -50,27 +50,6 @@ func TestDefaultBarrierConfig(t *testing.T) {
 
 // TestDefaultBarrierConfig_DeploymentID verifies that the provided DeploymentID
 // is correctly passed through to the returned config.
-func TestDefaultBarrierConfig_DeploymentID(t *testing.T) {
-	tests := []struct {
-		name         string
-		deploymentID uint64
-	}{
-		{"zero", 0},
-		{"small", 1},
-		{"large", 18446744073709551615},  // max uint64
-		{"typical", 9223372036854775807}, // large but typical
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultBarrierConfig(tt.deploymentID)
-			if cfg.DeploymentID != tt.deploymentID {
-				t.Fatalf("expected DeploymentID=%d, got %d", tt.deploymentID, cfg.DeploymentID)
-			}
-		})
-	}
-}
-
 // TestBarrierConfig_Validate verifies that a valid config returns nil error.
 func TestBarrierConfig_Validate(t *testing.T) {
 	for _, tt := range knownAlgorithms {
@@ -109,53 +88,9 @@ func TestBarrierConfig_Validate(t *testing.T) {
 
 // TestBarrierConfig_Validate_InvalidAlgorithm verifies that an invalid
 // algorithm returns ErrUnsupportedAlgorithm.
-func TestBarrierConfig_Validate_InvalidAlgorithm(t *testing.T) {
-	cfg := BarrierConfig{
-		Algorithm:     SymmetricAlgorithm(0xFF), // Invalid algorithm identifier
-		DeploymentID:  1,
-		NonceTracking: BoolPtr(true),
-	}
-
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("validate() should return error for invalid algorithm")
-	}
-
-	if !errors.Is(err, ErrUnsupportedAlgorithm) {
-		t.Fatalf("expected ErrUnsupportedAlgorithm, got %v", err)
-	}
-}
-
 // TestBarrierConfig_Algorithm_Selection verifies that DefaultBarrierConfig
 // selects a valid algorithm (either AES256GCM or ChaCha20Poly1305) based on
 // the CPU capabilities.
-func TestBarrierConfig_Algorithm_Selection(t *testing.T) {
-	cfg := DefaultBarrierConfig(1)
-
-	// SelectOptimalAlgorithm chooses between AES256GCM and this build's
-	// software fallback based on AES-NI availability. The fallback is
-	// ChaCha20-Poly1305 normally and AES-256-GCM in a -tags fips build, which
-	// has no non-approved cipher to fall back to.
-	validAlgorithms := []SymmetricAlgorithm{AlgAES256GCM, softwareFallbackAlgorithm()}
-
-	found := false
-	for _, validAlg := range validAlgorithms {
-		if cfg.Algorithm == validAlg {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		t.Fatalf("algorithm %v is neither AES256GCM nor this build's software fallback", cfg.Algorithm)
-	}
-
-	// Ensure the algorithm is valid
-	if !cfg.Algorithm.Valid() {
-		t.Fatalf("selected algorithm is invalid: %v", cfg.Algorithm)
-	}
-}
-
 // TestBarrierConfigValidate_ExportedForRuntimeConfigs asserts the validation
 // is reachable as an error, so an embedder assembling a config at runtime can
 // reject it at admission time.

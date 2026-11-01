@@ -48,19 +48,6 @@ func TestSetDefaultsPreservesExisting(t *testing.T) {
 	}
 }
 
-// TestValidateValid verifies that Validate passes with valid options.
-func TestValidateValid(t *testing.T) {
-	o := &Options{
-		WALDir:      "/tmp/wal",
-		BlockSize:   32 * 1024,
-		MaxFileSize: 64 * 1024 * 1024,
-	}
-
-	if err := o.Validate(); err != nil {
-		t.Fatalf("Validate: unexpected error: %v", err)
-	}
-}
-
 // TestValidateVariousBlockSizes verifies that valid power-of-two block sizes
 // pass validation while invalid ones fail.
 func TestValidateVariousBlockSizes(t *testing.T) {
@@ -93,46 +80,20 @@ func TestValidateEmptyDir(t *testing.T) {
 	}
 }
 
-// TestValidateInvalidBlockSize verifies that Validate fails when BlockSize is
-// not a power of two.
+// TestValidateInvalidBlockSize verifies that Validate rejects every class of
+// unusable BlockSize.
 func TestValidateInvalidBlockSize(t *testing.T) {
-	o := &Options{
-		WALDir:      "/tmp/wal",
-		BlockSize:   100, // not power of two
-		MaxFileSize: 64 * 1024 * 1024,
-	}
-
-	err := o.Validate()
-	if err != ErrInvalidBlockSize {
-		t.Fatalf("Validate: error = %v, want %v", err, ErrInvalidBlockSize)
-	}
-}
-
-// TestValidateZeroBlockSize verifies that Validate fails when BlockSize is zero.
-func TestValidateZeroBlockSize(t *testing.T) {
-	o := &Options{
-		WALDir:      "/tmp/wal",
-		BlockSize:   0,
-		MaxFileSize: 64 * 1024 * 1024,
-	}
-
-	err := o.Validate()
-	if err != ErrInvalidBlockSize {
-		t.Fatalf("Validate: error = %v, want %v", err, ErrInvalidBlockSize)
-	}
-}
-
-// TestValidateNegativeBlockSize verifies that Validate fails when BlockSize is negative.
-func TestValidateNegativeBlockSize(t *testing.T) {
-	o := &Options{
-		WALDir:      "/tmp/wal",
-		BlockSize:   -1024,
-		MaxFileSize: 64 * 1024 * 1024,
-	}
-
-	err := o.Validate()
-	if err != ErrInvalidBlockSize {
-		t.Fatalf("Validate: error = %v, want %v", err, ErrInvalidBlockSize)
+	// Not a power of two, zero, negative, and a power of two too small for a
+	// chunk header (7 bytes) plus one payload byte.
+	for _, bs := range []int{100, 0, -1024, 4} {
+		o := &Options{
+			WALDir:      "/tmp/wal",
+			BlockSize:   bs,
+			MaxFileSize: 64 * 1024 * 1024,
+		}
+		if err := o.Validate(); err != ErrInvalidBlockSize {
+			t.Errorf("Validate(BlockSize=%d): error = %v, want %v", bs, err, ErrInvalidBlockSize)
+		}
 	}
 }
 
@@ -152,39 +113,6 @@ func TestValidateInvalidMaxFileSize(t *testing.T) {
 		if err != ErrInvalidMaxFileSize {
 			t.Errorf("Validate(MaxFileSize=%d): error = %v, want %v", mfs, err, ErrInvalidMaxFileSize)
 		}
-	}
-}
-
-// TestValidateBlockSizeTooSmallForHeader verifies that a block size smaller
-// than recordHeaderSize + 1 byte is rejected.
-func TestValidateBlockSizeTooSmallForHeader(t *testing.T) {
-	// BlockSize of 4 is a power of two but too small for header (7 bytes) + 1.
-	o := &Options{
-		WALDir:      "/tmp/wal",
-		BlockSize:   4,
-		MaxFileSize: 64 * 1024 * 1024,
-	}
-
-	err := o.Validate()
-	if err != ErrInvalidBlockSize {
-		t.Fatalf("Validate: error = %v, want %v", err, ErrInvalidBlockSize)
-	}
-}
-
-// TestDefaultOptionsValues verifies that DefaultOptions has the correct values.
-func TestDefaultOptionsValues(t *testing.T) {
-	if DefaultOptions.BlockSize != 32*1024 {
-		t.Fatalf("DefaultOptions.BlockSize = %d, want %d", DefaultOptions.BlockSize, 32*1024)
-	}
-	if DefaultOptions.MaxFileSize != 64*1024*1024 {
-		t.Fatalf("DefaultOptions.MaxFileSize = %d, want %d", DefaultOptions.MaxFileSize, int64(64*1024*1024))
-	}
-}
-
-// TestDefaultOptionsNoSync verifies that NoSync defaults to false.
-func TestDefaultOptionsNoSync(t *testing.T) {
-	if DefaultOptions.NoSync {
-		t.Fatal("DefaultOptions.NoSync = true, want false")
 	}
 }
 

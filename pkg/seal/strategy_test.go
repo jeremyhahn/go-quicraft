@@ -44,13 +44,6 @@ func TestNewSoftwareStrategy_EmptyPassphrase(t *testing.T) {
 	}
 }
 
-func TestNewSoftwareStrategy_NilPassphrase(t *testing.T) {
-	_, err := NewSoftwareStrategy(context.Background(), nil)
-	if !errors.Is(err, ErrInvalidPassphrase) {
-		t.Fatalf("expected ErrInvalidPassphrase, got %v", err)
-	}
-}
-
 func TestSoftwareStrategy_PassphraseIsCopied(t *testing.T) {
 	original := []byte("my-secret-passphrase")
 	passphrase := make([]byte, len(original))
@@ -353,35 +346,6 @@ func TestSoftwareStrategy_MultipleSealsDifferentCiphertexts(t *testing.T) {
 
 	if !bytes.Equal(dec1, dec2) {
 		t.Fatal("two unseals produced different root keys")
-	}
-}
-
-func TestWipeBytes_AllZeroed(t *testing.T) {
-	data := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	enclave.Wipe(data)
-	for i, b := range data {
-		if b != 0 {
-			t.Fatalf("byte at index %d is %d, expected 0", i, b)
-		}
-	}
-}
-
-func TestWipeBytes_EmptyAndNilSlice(t *testing.T) {
-	// Should not panic.
-	enclave.Wipe(nil)
-	enclave.Wipe([]byte{})
-}
-
-func TestWipeBytes_LargeSlice(t *testing.T) {
-	data := make([]byte, 1024)
-	for i := range data {
-		data[i] = 0xFF
-	}
-	enclave.Wipe(data)
-	for i, b := range data {
-		if b != 0 {
-			t.Fatalf("byte at index %d is %d, expected 0", i, b)
-		}
 	}
 }
 

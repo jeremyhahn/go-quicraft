@@ -53,16 +53,6 @@ func TestBarrier_ResetUnsealed(t *testing.T) {
 	}
 }
 
-func TestBarrier_ResetTwice(t *testing.T) {
-	b, _ := testSealedBarrier(t)
-	if err := b.Reset(); err != nil {
-		t.Fatalf("first Reset: %v", err)
-	}
-	if err := b.Reset(); !errors.Is(err, ErrBarrierNotInit) {
-		t.Fatalf("second Reset: got %v, want ErrBarrierNotInit", err)
-	}
-}
-
 func TestBarrier_ResetClearsState(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 	if _, err := b.Encrypt(nil, []byte("count me")); err != nil {

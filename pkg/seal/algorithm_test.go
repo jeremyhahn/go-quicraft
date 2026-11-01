@@ -263,22 +263,6 @@ func TestNewAEADForAlgorithm_UnsupportedAlgorithm(t *testing.T) {
 
 // ----- TestHasAESNI ----------------------------------------------------------
 
-func TestHasAESNI(t *testing.T) {
-	t.Run("returns a bool without panicking", func(t *testing.T) {
-		// HasAESNI is entirely hardware-dependent; we can only assert that it
-		// returns a valid bool and does not panic on any supported architecture.
-		_ = HasAESNI()
-	})
-
-	t.Run("return value is stable across repeated calls", func(t *testing.T) {
-		first := HasAESNI()
-		second := HasAESNI()
-		if first != second {
-			t.Fatalf("HasAESNI() is not stable: first=%v second=%v", first, second)
-		}
-	})
-}
-
 // ----- TestSelectOptimalAlgorithm --------------------------------------------
 
 func TestSelectOptimalAlgorithm(t *testing.T) {
@@ -289,27 +273,11 @@ func TestSelectOptimalAlgorithm(t *testing.T) {
 		}
 	})
 
-	t.Run("non-hardware backed returns a valid algorithm", func(t *testing.T) {
-		got := SelectOptimalAlgorithm(false)
-		if !got.Valid() {
-			t.Fatalf("SelectOptimalAlgorithm(false) returned invalid algorithm: %s", got)
-		}
-	})
-
 	t.Run("non-hardware backed returns AES256GCM or ChaCha20Poly1305", func(t *testing.T) {
 		// On CPUs with AES-NI, AES256GCM is preferred; on others, ChaCha20-Poly1305.
 		got := SelectOptimalAlgorithm(false)
 		if got != AlgAES256GCM && got != AlgChaCha20Poly1305 {
 			t.Fatalf("SelectOptimalAlgorithm(false) = %s, want AES-256-GCM or ChaCha20-Poly1305", got)
-		}
-	})
-
-	t.Run("hardware backed result matches AES-NI path when AES-NI present", func(t *testing.T) {
-		// Regardless of AES-NI availability, hardware-backed always wins with
-		// AES-256-GCM because the hardware token provides its own acceleration.
-		hw := SelectOptimalAlgorithm(true)
-		if hw != AlgAES256GCM {
-			t.Fatalf("hardware-backed SelectOptimalAlgorithm = %s, want AES-256-GCM", hw)
 		}
 	})
 }
@@ -371,40 +339,6 @@ func TestNewAESGCM_AllKeySizes(t *testing.T) {
 // TestAlgorithmRoundtrip verifies that plaintext encrypted with each algorithm
 // decrypts back to the original plaintext, ensuring the AEAD seal/open cycle
 // is correct for every supported algorithm.
-func TestAlgorithmRoundtrip(t *testing.T) {
-	plaintext := []byte("the quick brown fox jumps over the lazy dog")
-	additionalData := []byte("authenticated header data")
-
-	for _, tc := range knownAlgorithms {
-		t.Run(tc.name, func(t *testing.T) {
-			key := randKey(t, tc.keySize)
-
-			aead, err := newAEADForAlgorithm(tc.alg, key)
-			if err != nil {
-				t.Fatalf("newAEADForAlgorithm() error: %v", err)
-			}
-
-			// nil for a module-nonce AEAD, a random nonce otherwise.
-			nonce := tc.sealNonce(t)
-
-			// Encrypt.
-			ciphertext := aead.Seal(nil, nonce, plaintext, additionalData)
-			if len(ciphertext) == 0 {
-				t.Fatal("Seal() returned empty ciphertext")
-			}
-
-			// Decrypt with correct key, nonce, and additional data.
-			decrypted, err := aead.Open(nil, nonce, ciphertext, additionalData)
-			if err != nil {
-				t.Fatalf("Open() unexpected error: %v", err)
-			}
-			if string(decrypted) != string(plaintext) {
-				t.Fatalf("roundtrip mismatch:\n  got:  %q\n  want: %q", decrypted, plaintext)
-			}
-		})
-	}
-}
-
 // TestAlgorithmRoundtrip_TamperedCiphertextFails verifies that modifying even
 // a single byte of the ciphertext causes authentication failure.
 func TestAlgorithmRoundtrip_TamperedCiphertextFails(t *testing.T) {

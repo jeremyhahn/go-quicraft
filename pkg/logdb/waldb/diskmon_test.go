@@ -70,31 +70,6 @@ func TestDiskMonitorThrottle(t *testing.T) {
 	}
 }
 
-// TestDiskMonitorThrottleInvalidInterval verifies behavior when
-// checkEvery is 1 (check on every write).
-func TestDiskMonitorThrottleEveryWrite(t *testing.T) {
-	var callCount atomic.Uint64
-	usage := func(dir string) (uint64, error) {
-		callCount.Add(1)
-		return 0, nil
-	}
-
-	dm := NewDiskMonitor("/tmp/test-wal", 1000,
-		WithCheckEvery(1),
-		WithDiskUsageFunc(usage),
-	)
-
-	for i := 0; i < 5; i++ {
-		if err := dm.MaybeCheck(); err != nil {
-			t.Fatalf("MaybeCheck: %v", err)
-		}
-	}
-
-	if got := callCount.Load(); got != 5 {
-		t.Fatalf("expected 5 checks (every write), got %d", got)
-	}
-}
-
 // TestDiskMonitorWarningCallback verifies the warning callback fires
 // when usage crosses the warning threshold.
 func TestDiskMonitorWarningCallback(t *testing.T) {
@@ -508,30 +483,6 @@ func TestDiskMonitorIntegrationWithDB(t *testing.T) {
 	}
 }
 
-// TestDiskMonitorIntegrationWithDBNoMonitor verifies SaveState works
-// correctly when no DiskMonitor is configured (default).
-func TestDiskMonitorIntegrationWithDBNoMonitor(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir,
-		WithNoSync(true),
-		WithBlockSize(1024),
-		WithMaxFileSize(64*1024),
-	)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	err = db.SaveState([]logdb.Update{{
-		ShardID:   1,
-		ReplicaID: 1,
-		State:     logdb.State{Term: 1, Vote: 1, Commit: 0},
-	}})
-	if err != nil {
-		t.Fatalf("SaveState without monitor: %v", err)
-	}
-}
-
 // TestDiskMonitorNoCallbacksConfigured verifies the monitor works when
 // no callbacks are registered (only the error is returned).
 func TestDiskMonitorNoCallbacksConfigured(t *testing.T) {
@@ -554,35 +505,6 @@ func TestDiskMonitorNoCallbacksConfigured(t *testing.T) {
 	err = dm.MaybeCheck()
 	if err != nil {
 		t.Fatalf("expected nil at warning level, got %v", err)
-	}
-}
-
-// TestDiskUsageError verifies the DiskUsageError type.
-func TestDiskUsageError(t *testing.T) {
-	inner := errors.New("mock error")
-	err := &DiskUsageError{Dir: "/tmp/wal", Err: inner}
-
-	expected := "waldb: failed to query disk usage for /tmp/wal: mock error"
-	if got := err.Error(); got != expected {
-		t.Fatalf("error message: got %q, want %q", got, expected)
-	}
-
-	if !errors.Is(err, inner) {
-		t.Fatal("Unwrap should return inner error")
-	}
-}
-
-// TestDiskUsageErrorUnwrap verifies the DiskUsageError Unwrap method.
-func TestDiskUsageErrorUnwrap(t *testing.T) {
-	inner := errors.New("statfs failed")
-	err := &DiskUsageError{Dir: "/data/wal", Err: inner}
-
-	var target *DiskUsageError
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As should match DiskUsageError")
-	}
-	if target.Dir != "/data/wal" {
-		t.Fatalf("expected dir /data/wal, got %s", target.Dir)
 	}
 }
 

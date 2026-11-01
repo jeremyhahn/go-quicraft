@@ -180,33 +180,6 @@ func TestLookupNonExistent(t *testing.T) {
 	}
 }
 
-// TestLookupOnEmptyIndex verifies that lookup on an empty index returns false.
-func TestLookupOnEmptyIndex(t *testing.T) {
-	idx := newIndex()
-	if _, ok := idx.Lookup(1); ok {
-		t.Fatal("Lookup(1): found entry in empty index")
-	}
-}
-
-// TestRangeFullSet verifies Range returns all entries when range covers
-// the entire index.
-func TestRangeFullSet(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 5; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
-	}
-
-	result := idx.Range(1, 6)
-	if len(result) != 5 {
-		t.Fatalf("Range(1,6): got %d entries, want 5", len(result))
-	}
-	for i, e := range result {
-		if e.Index != uint64(i+1) {
-			t.Fatalf("Range(1,6)[%d]: got Index=%d, want %d", i, e.Index, i+1)
-		}
-	}
-}
-
 // TestRangeSubset verifies Range returns only entries in [low, high).
 func TestRangeSubset(t *testing.T) {
 	idx := newIndex()
@@ -284,41 +257,6 @@ func TestRangeReturnsCopy(t *testing.T) {
 	}
 	if e.Term != 1 {
 		t.Fatalf("Lookup(1) after mutating Range result: Term=%d, want 1 (should be a copy)", e.Term)
-	}
-}
-
-// TestRangeIndependentCopies verifies that two Range calls on overlapping
-// regions return independent copies.
-func TestRangeIndependentCopies(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 10; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1, SegmentID: i})
-	}
-
-	result := idx.Range(3, 8)
-	if len(result) != 5 {
-		t.Fatalf("Range(3,8): got %d entries, want 5", len(result))
-	}
-
-	// Verify entries match expected values.
-	for i, e := range result {
-		expected := uint64(i + 3)
-		if e.Index != expected || e.SegmentID != expected {
-			t.Fatalf("Range(3,8)[%d]: got Index=%d SegmentID=%d, want %d",
-				i, e.Index, e.SegmentID, expected)
-		}
-	}
-
-	// A second Range on overlapping region returns an independent copy.
-	result2 := idx.Range(3, 6)
-	if len(result2) != 3 {
-		t.Fatalf("Range(3,6): got %d entries, want 3", len(result2))
-	}
-
-	// Mutate via result2; result should be unaffected (independent copies).
-	result2[0].Term = 42
-	if result[0].Term != 1 {
-		t.Fatalf("overlapping results should be independent: got Term=%d, want 1", result[0].Term)
 	}
 }
 

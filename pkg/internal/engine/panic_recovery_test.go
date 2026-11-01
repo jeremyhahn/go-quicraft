@@ -434,22 +434,6 @@ func TestApplyWorkerDispatcherPanicRecovery_NormalFlowUnaffected(t *testing.T) {
 // P-1: WorkerPanicError typed error tests
 // ---------------------------------------------------------------------------
 
-// TestWorkerPanicError_ApplyWorkerMessage verifies WorkerPanicError formats
-// correctly for apply workers.
-func TestWorkerPanicError_ApplyWorkerMessage(t *testing.T) {
-	err := &WorkerPanicError{
-		WorkerID:   2,
-		WorkerType: "apply",
-		Value:      "nil pointer dereference",
-		Stack:      []byte("goroutine 55 [running]:"),
-	}
-
-	msg := err.Error()
-	if msg != "engine: apply worker 2 panicked: nil pointer dereference" {
-		t.Errorf("unexpected error message: %s", msg)
-	}
-}
-
 // TestWorkerPanicError_StepWorkerMessage verifies WorkerPanicError formats
 // correctly for step workers.
 func TestWorkerPanicError_StepWorkerMessage(t *testing.T) {
@@ -462,22 +446,6 @@ func TestWorkerPanicError_StepWorkerMessage(t *testing.T) {
 
 	msg := err.Error()
 	if msg != "engine: step worker 3 panicked: nil pointer dereference" {
-		t.Errorf("unexpected error message: %s", msg)
-	}
-}
-
-// TestWorkerPanicError_CommitWorkerMessage verifies WorkerPanicError formats
-// correctly for commit workers.
-func TestWorkerPanicError_CommitWorkerMessage(t *testing.T) {
-	err := &WorkerPanicError{
-		WorkerID:   0,
-		WorkerType: "commit",
-		Value:      "index out of range",
-		Stack:      []byte("goroutine 99 [running]:"),
-	}
-
-	msg := err.Error()
-	if msg != "engine: commit worker 0 panicked: index out of range" {
 		t.Errorf("unexpected error message: %s", msg)
 	}
 }

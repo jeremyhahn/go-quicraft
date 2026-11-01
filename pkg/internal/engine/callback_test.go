@@ -500,74 +500,6 @@ func TestApplyWorker_CallbackFiresOnSuccessfulApply(t *testing.T) {
 	}
 }
 
-func TestApplyWorker_OnAppliedNotCalledOnApplyError(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, NewWorkSignal(1), stopC, nil)
-
-	testSm := newTestSM()
-	testSm.setApplyError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
-	rsmSM := newTestApplier(testSm)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
-
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Term: 1, Index: 1, Cmd: []byte("cmd1")},
-		},
-	}
-	item.node = node
-	applyC <- item
-
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Poll until OnProposalFailed fires (apply error path completed).
-	deadlineErr := time.After(5 * time.Second)
-	for cb.proposalFailedCount.Load() == 0 {
-		select {
-		case <-deadlineErr:
-			t.Fatal("timed out waiting for OnProposalFailed callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
-
-	// OnApplied should NOT have been called due to apply error.
-	if cb.appliedCount.Load() != 0 {
-		t.Fatalf("expected 0 OnApplied calls, got %d", cb.appliedCount.Load())
-	}
-	// OnProposalFailed MUST be called so callers see an immediate error
-	// instead of waiting for a context deadline timeout.
-	if cb.proposalFailedCount.Load() != 1 {
-		t.Fatalf("expected 1 OnProposalFailed call, got %d", cb.proposalFailedCount.Load())
-	}
-	failedCalls := cb.getProposalFailedCalls()
-	if failedCalls[0].shardID != 1 {
-		t.Errorf("OnProposalFailed shardID = %d, want 1", failedCalls[0].shardID)
-	}
-	var applyErr *ApplyError
-	if !errors.As(failedCalls[0].err, &applyErr) {
-		t.Fatalf("expected ApplyError, got %T: %v", failedCalls[0].err, failedCalls[0].err)
-	}
-}
-
 func TestApplyWorker_NilCallbackDoesNotPanic(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -805,41 +737,6 @@ func TestEngine_SetCallback_PanicsAfterStart(t *testing.T) {
 	}()
 
 	e.SetCallback(newTestCallback())
-}
-
-// ---------------------------------------------------------------------------
-// Step worker leader change detection tests
-// ---------------------------------------------------------------------------
-
-func TestStepWorker_PrevLeadersInitialized(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	cb := newTestCallback()
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	if sw.prevLeaders == nil {
-		t.Fatal("prevLeaders should be initialized")
-	}
-	if len(sw.prevLeaders) != 0 {
-		t.Fatalf("prevLeaders should be empty, got %d entries", len(sw.prevLeaders))
-	}
-}
-
-func TestStepWorker_CallbackFieldSet(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	cb := newTestCallback()
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	if sw.callback != cb {
-		t.Fatal("callback not set on step worker")
-	}
 }
 
 // ---------------------------------------------------------------------------

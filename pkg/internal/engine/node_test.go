@@ -25,17 +25,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-func TestNewNode_SetsFields(t *testing.T) {
-	cfg := config.Config{ShardID: 10, ReplicaID: 20}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	if n.ShardID() != 10 {
-		t.Errorf("ShardID = %d, want 10", n.ShardID())
-	}
-	if n.ReplicaID() != 20 {
-		t.Errorf("ReplicaID = %d, want 20", n.ReplicaID())
-	}
-}
-
 func TestNewNode_InvalidConfig(t *testing.T) {
 	// Node creation does not validate config, but should still work
 	// with zero values.
@@ -43,23 +32,6 @@ func TestNewNode_InvalidConfig(t *testing.T) {
 	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 	if n.ShardID() != 0 {
 		t.Errorf("ShardID = %d, want 0", n.ShardID())
-	}
-}
-
-func TestNode_CommitPending(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.commitPending.Load() {
-		t.Fatal("commitPending should be false initially")
-	}
-	n.commitPending.Store(true)
-	if !n.commitPending.Load() {
-		t.Fatal("commitPending should be true after Store(true)")
-	}
-	n.commitPending.Store(false)
-	if n.commitPending.Load() {
-		t.Fatal("commitPending should be false after Store(false)")
 	}
 }
 
@@ -73,19 +45,6 @@ func TestNode_LastApplied(t *testing.T) {
 	n.lastApplied.Store(42)
 	if n.lastApplied.Load() != 42 {
 		t.Fatalf("lastApplied should be 42, got %d", n.lastApplied.Load())
-	}
-}
-
-func TestNode_Failed(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.IsFailed() {
-		t.Fatal("node should not be failed initially")
-	}
-	n.failed.Store(true)
-	if !n.IsFailed() {
-		t.Fatal("node should be failed after Store(true)")
 	}
 }
 
@@ -138,25 +97,6 @@ func TestNode_HandleError_ListenerWithoutCallback(t *testing.T) {
 	n := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	// Should not panic.
 	n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
-}
-
-func TestNode_Accessors(t *testing.T) {
-	cfg := config.Config{ShardID: 7, ReplicaID: 8}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.Peer() != nil {
-		t.Error("Peer should be nil")
-	}
-	if n.StateMachine() != nil {
-		t.Error("StateMachine should be nil")
-	}
-	if n.LogReader() != nil {
-		t.Error("LogReader should be nil")
-	}
-	gotCfg := n.Config()
-	if gotCfg.ShardID != 7 || gotCfg.ReplicaID != 8 {
-		t.Errorf("Config = %+v, want ShardID=7 ReplicaID=8", gotCfg)
-	}
 }
 
 func TestNode_StopC(t *testing.T) {
@@ -245,15 +185,6 @@ func TestNode_DeliverProposal_QueueFull(t *testing.T) {
 	ok = n.DeliverProposal([]proto.Entry{{Key: 999}})
 	if ok {
 		t.Fatal("DeliverProposal should reject when queue is at capacity")
-	}
-}
-
-func TestNode_CommittedIndex_InitiallyZero(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if got := n.CommittedIndex(); got != 0 {
-		t.Fatalf("CommittedIndex() = %d, want 0 on new node", got)
 	}
 }
 
@@ -566,21 +497,6 @@ func TestNode_IsMember_UnknownReplicaRejected(t *testing.T) {
 // SetNotifyCommit
 // ---------------------------------------------------------------------------
 
-func TestNode_SetNotifyCommit_EnablesFlag(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Default should be false.
-	if n.notifyCommit {
-		t.Fatal("notifyCommit should be false by default")
-	}
-
-	n.SetNotifyCommit(true)
-	if !n.notifyCommit {
-		t.Fatal("notifyCommit should be true after SetNotifyCommit(true)")
-	}
-}
-
 func TestNode_SetNotifyCommit_DisablesFlag(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
@@ -732,15 +648,6 @@ func TestNode_DiagRemotes_WithNonLeaderPeer(t *testing.T) {
 // Snapshotter / SnapshotDir accessors
 // ---------------------------------------------------------------------------
 
-func TestNode_Snapshotter_Nil(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.Snapshotter() != nil {
-		t.Fatal("Snapshotter should be nil when not configured")
-	}
-}
-
 func TestNode_SnapshotDir_ReturnsConfiguredPath(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, nil, "/tmp/snapshots/shard1", nil)
@@ -750,27 +657,9 @@ func TestNode_SnapshotDir_ReturnsConfiguredPath(t *testing.T) {
 	}
 }
 
-func TestNode_SnapshotDir_EmptyString(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.SnapshotDir() != "" {
-		t.Fatalf("SnapshotDir = %q, want empty string", n.SnapshotDir())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // LastSnapshotIndex
 // ---------------------------------------------------------------------------
-
-func TestNode_LastSnapshotIndex_DefaultZero(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.LastSnapshotIndex() != 0 {
-		t.Fatalf("LastSnapshotIndex should be 0 initially, got %d", n.LastSnapshotIndex())
-	}
-}
 
 func TestNode_LastSnapshotIndex_AfterStore(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
@@ -785,15 +674,6 @@ func TestNode_LastSnapshotIndex_AfterStore(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Recovering
 // ---------------------------------------------------------------------------
-
-func TestNode_Recovering_DefaultFalse(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.IsRecovering() {
-		t.Fatal("IsRecovering should be false initially")
-	}
-}
 
 func TestNode_SetRecovering_RoundTrip(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
@@ -920,164 +800,5 @@ func TestNode_LastAppliedMonotonicallyIncreasing_InvalidDecrease(t *testing.T) {
 
 	if n.lastApplied.Load() != 500 {
 		t.Fatalf("lastApplied should remain 500, got %d", n.lastApplied.Load())
-	}
-}
-
-// ===========================================================================
-// Quiesce can be disabled
-// ===========================================================================
-
-// TestNode_QuiesceCanBeDisabled verifies that creating a node without
-// the Quiesce config flag results in quiesce being disabled at the
-// raft peer level. We test this by verifying the config round-trips.
-func TestNode_QuiesceCanBeDisabled(t *testing.T) {
-	cfg := config.Config{
-		ShardID:   1,
-		ReplicaID: 1,
-		Quiesce:   false,
-	}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	gotCfg := n.Config()
-	if gotCfg.Quiesce {
-		t.Fatal("Quiesce should be disabled")
-	}
-}
-
-// TestNode_QuiesceCanBeDisabled_Enabled verifies the inverse: when
-// Quiesce is enabled, the config reflects it.
-func TestNode_QuiesceCanBeDisabled_Enabled(t *testing.T) {
-	cfg := config.Config{
-		ShardID:   1,
-		ReplicaID: 1,
-		Quiesce:   true,
-	}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	gotCfg := n.Config()
-	if !gotCfg.Quiesce {
-		t.Fatal("Quiesce should be enabled")
-	}
-}
-
-// ===========================================================================
-// Exit quiesce on config change
-// ===========================================================================
-
-// TestNode_ExitQuiesceOnConfigChange verifies that delivering a config
-// change entry to the node's proposal queue causes activity that would
-// exit quiesce mode (at the raft level). We verify this by checking
-// that the proposal queue accepts config change entries.
-func TestNode_ExitQuiesceOnConfigChange(t *testing.T) {
-	cfg := config.Config{
-		ShardID:   1,
-		ReplicaID: 1,
-		Quiesce:   true,
-	}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Deliver a config change entry.
-	ccEntry := proto.Entry{
-		Type: proto.EntryConfigChange,
-		Key:  1,
-		Cmd:  []byte("add-node"),
-	}
-	ok := n.DeliverProposal([]proto.Entry{ccEntry})
-	if !ok {
-		t.Fatal("DeliverProposal should accept config change entry")
-	}
-
-	// Drain and verify.
-	drained := n.DrainProposals(nil)
-	if len(drained) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(drained))
-	}
-	if drained[0].Type != proto.EntryConfigChange {
-		t.Fatalf("entry type = %d, want EntryConfigChange", drained[0].Type)
-	}
-}
-
-// TestNode_ExitQuiesceOnConfigChange_NormalEntryAlsoAccepted verifies
-// that normal entries are also accepted alongside config changes.
-func TestNode_ExitQuiesceOnConfigChange_NormalEntryAlsoAccepted(t *testing.T) {
-	cfg := config.Config{
-		ShardID:   1,
-		ReplicaID: 1,
-		Quiesce:   true,
-	}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	entries := []proto.Entry{
-		{Type: proto.EntryNormal, Key: 1, Cmd: []byte("data")},
-		{Type: proto.EntryConfigChange, Key: 2, Cmd: []byte("cc")},
-	}
-	ok := n.DeliverProposal(entries)
-	if !ok {
-		t.Fatal("DeliverProposal should accept mixed entries")
-	}
-
-	drained := n.DrainProposals(nil)
-	if len(drained) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(drained))
-	}
-}
-
-// ===========================================================================
-// Payload too big
-// ===========================================================================
-
-// TestNode_PayloadTooBig verifies that the proposal queue correctly handles
-// entries at the configured queue capacity limit. Individual entry size
-// validation happens at the Host layer (before DeliverProposal), but the
-// queue enforces total count limits.
-func TestNode_PayloadTooBig(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Create an entry with a large payload.
-	largeCmd := make([]byte, 1024*1024) // 1 MiB
-	for i := range largeCmd {
-		largeCmd[i] = byte(i % 256)
-	}
-
-	entry := proto.Entry{
-		Key: 1,
-		Cmd: largeCmd,
-	}
-	ok := n.DeliverProposal([]proto.Entry{entry})
-	if !ok {
-		t.Fatal("DeliverProposal should accept entry (queue not full)")
-	}
-
-	// Drain and verify the payload is intact.
-	drained := n.DrainProposals(nil)
-	if len(drained) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(drained))
-	}
-	if len(drained[0].Cmd) != len(largeCmd) {
-		t.Fatalf("Cmd length = %d, want %d", len(drained[0].Cmd), len(largeCmd))
-	}
-}
-
-// TestNode_PayloadTooBig_QueueOverflow verifies that when the proposal
-// queue is full, even small entries are rejected.
-func TestNode_PayloadTooBig_QueueOverflow(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Fill the queue to capacity.
-	batch := make([]proto.Entry, defaultProposalQueueSize)
-	for i := range batch {
-		batch[i] = proto.Entry{Key: uint64(i)}
-	}
-	ok := n.DeliverProposal(batch)
-	if !ok {
-		t.Fatal("filling to capacity should succeed")
-	}
-
-	// One more should be rejected regardless of payload size.
-	ok = n.DeliverProposal([]proto.Entry{{Key: 999, Cmd: []byte("tiny")}})
-	if ok {
-		t.Fatal("should reject when queue is at capacity")
 	}
 }

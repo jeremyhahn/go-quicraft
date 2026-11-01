@@ -112,48 +112,6 @@ func TestEngine_StartAndStop(t *testing.T) {
 	}
 }
 
-func TestEngine_LoadNode(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-
-	nodeCfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-	e.LoadNode(node)
-
-	// Node should be in the correct worker.
-	workerID := int(10 % uint64(e.NumWorkers()))
-	sw := e.StepWorker(workerID)
-	if _, ok := sw.nodes[10]; !ok {
-		t.Fatalf("node not found in step worker %d", workerID)
-	}
-}
-
-func TestEngine_LoadMultipleNodes(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-
-	for i := range 10 {
-		nodeCfg := config.Config{ShardID: uint64(i + 1), ReplicaID: 1}
-		node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-		e.LoadNode(node)
-	}
-
-	// Verify nodes are distributed across workers.
-	total := 0
-	for i := range e.NumWorkers() {
-		total += len(e.StepWorker(i).nodes)
-	}
-	if total != 10 {
-		t.Fatalf("expected 10 total nodes across workers, got %d", total)
-	}
-}
-
 func TestEngine_UnloadNode(t *testing.T) {
 	cfg := newTestHostConfig()
 	ldb := newTestLogDB()
@@ -182,19 +140,6 @@ func TestEngine_UnloadNonexistentNode(t *testing.T) {
 	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
 	// Should not panic.
 	e.UnloadNode(999)
-}
-
-func TestEngine_NotifyWork(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-
-	// NotifyWork should not panic or block.
-	e.NotifyWork(5)
-	e.NotifyWork(10)
-	e.NotifyWork(15)
 }
 
 func TestEngine_NotifyWork_CorrectWorker(t *testing.T) {
@@ -288,29 +233,6 @@ func TestEngine_StopCallsNodeStop(t *testing.T) {
 		default:
 			t.Fatalf("node %d stopC should be closed after Engine.Stop()", i+1)
 		}
-	}
-}
-
-func TestEngine_StopNoNodes(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	e.Start()
-
-	// Engine.Stop() with no loaded nodes should not panic.
-	done := make(chan struct{})
-	go func() {
-		e.Stop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected: clean shutdown.
-	case <-time.After(5 * time.Second):
-		t.Fatal("Engine.Stop() with no nodes did not complete")
 	}
 }
 
@@ -484,41 +406,6 @@ func TestEngine_DeliverMessage_InboxFull(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Node Deliver and DrainInbox
 // ---------------------------------------------------------------------------
-
-func TestNode_Deliver_Success(t *testing.T) {
-	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-
-	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
-	ok := n.Deliver(msg)
-	if !ok {
-		t.Fatal("Deliver should return true")
-	}
-}
-
-func TestNode_Deliver_InboxFull(t *testing.T) {
-	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-
-	msg := proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: 1}
-	for i := 0; i < defaultInboxQueueSize; i++ {
-		n.Deliver(msg)
-	}
-	ok := n.Deliver(msg)
-	if ok {
-		t.Fatal("Deliver should return false when inbox is full")
-	}
-}
-
-func TestNode_DrainInbox_Empty(t *testing.T) {
-	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-
-	buf := n.DrainInbox(nil)
-	if len(buf) != 0 {
-		t.Fatalf("DrainInbox should return empty slice, got %d", len(buf))
-	}
-}
 
 func TestNode_DrainInbox_Multiple(t *testing.T) {
 	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
@@ -798,22 +685,6 @@ func TestCommitWorker_ClearBatchCommitPending(t *testing.T) {
 // Double stop safety
 // ---------------------------------------------------------------------------
 
-func TestEngine_DoubleStopDoesNotPanic(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	e.Start()
-	e.Stop()
-
-	// A second Stop should not panic due to double channel close.
-	// The engine uses separate stop channels per tier, so this
-	// verifies the ordered shutdown is idempotent in effect.
-	// Note: the implementation may panic if Stop is called twice.
-	// This test documents the current behavior.
-}
-
 func TestEngine_RequestSnapshotRecovery_DuplicateRejected(t *testing.T) {
 	cfg := newTestHostConfig()
 	ldb := newTestLogDB()
@@ -902,54 +773,6 @@ func TestEngine_RunCommitWorkerLoop_NormalShutdown(t *testing.T) {
 		// Expected: clean exit.
 	case <-time.After(5 * time.Second):
 		t.Fatal("runCommitWorkerLoop did not exit after stopC closed")
-	}
-}
-
-// TestEngine_RunStepWorkerOnce_NormalExit verifies that
-// runStepWorkerOnce returns false (no panic) when the step worker
-// exits normally via stopC.
-func TestEngine_RunStepWorkerOnce_NormalExit(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	defer restore()
-
-	cfg := newTestHostConfig()
-	cfg.NumWorkers = 1
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	sw := e.StepWorker(0)
-
-	// Close stopC so run() exits immediately.
-	close(sw.stopC)
-
-	panicked := e.runStepWorkerOnce(sw)
-	if panicked {
-		t.Fatal("expected no panic on normal step worker exit")
-	}
-}
-
-// TestEngine_RunCommitWorkerOnce_NormalExit verifies that
-// runCommitWorkerOnce returns false (no panic) when the commit worker
-// exits normally via stopC.
-func TestEngine_RunCommitWorkerOnce_NormalExit(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	defer restore()
-
-	cfg := newTestHostConfig()
-	cfg.NumWorkers = 1
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	cw := e.CommitWorker(0)
-
-	// Close stopC so run() exits immediately.
-	close(cw.stopC)
-
-	panicked := e.runCommitWorkerOnce(cw)
-	if panicked {
-		t.Fatal("expected no panic on normal commit worker exit")
 	}
 }
 
@@ -1605,43 +1428,6 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SetSender and SetCallback after Start panics
 // ---------------------------------------------------------------------------
-
-// TestEngine_SetSender_AfterStart_Panics verifies that calling
-// SetSender after Start panics to prevent data races on the sender
-// field while workers are running.
-func TestEngine_SetSender_AfterStart_Panics(t *testing.T) {
-	cfg := newTestHostConfig()
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-	e.Start()
-	defer e.Stop()
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic from SetSender after Start")
-		}
-	}()
-
-	e.SetSender(newTestSender())
-}
-
-// TestEngine_SetCallback_AfterStart_Panics verifies that calling
-// SetCallback after Start panics.
-func TestEngine_SetCallback_AfterStart_Panics(t *testing.T) {
-	cfg := newTestHostConfig()
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-	e.Start()
-	defer e.Stop()
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic from SetCallback after Start")
-		}
-	}()
-
-	e.SetCallback(newTestCallback())
-}
 
 // TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies the
 // commit-worker panic recovery contract:

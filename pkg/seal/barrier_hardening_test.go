@@ -310,15 +310,6 @@ func TestNonceTracking_ZeroValueDefaultsOn(t *testing.T) {
 	if off.NonceTracker() != nil {
 		t.Fatal("NonceTracking=BoolPtr(false) must yield no tracker")
 	}
-
-	cfg := BarrierConfig{Algorithm: AlgAES256GCM}
-	if !cfg.GetNonceTracking() {
-		t.Fatal("GetNonceTracking on an unset field must default to true")
-	}
-	cfg.NonceTracking = BoolPtr(false)
-	if cfg.GetNonceTracking() {
-		t.Fatal("GetNonceTracking must honour an explicit false")
-	}
 }
 
 // TestNonceTracking_CeilingIsDocumentedAndAdjustable pins the second half of

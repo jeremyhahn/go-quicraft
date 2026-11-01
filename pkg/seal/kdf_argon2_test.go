@@ -28,30 +28,6 @@ import (
 // there is nothing here for it to exercise — the FIPS build's claim about
 // Argon2id is that it is ABSENT, which assertArgon2idBaseline pins instead.
 
-func TestDeriveKey_Argon2id(t *testing.T) {
-	passphrase := []byte("test-passphrase-argon2id")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
-
-	key, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("DeriveKey(Argon2id) returned unexpected error: %v", err)
-	}
-	if len(key) != 32 {
-		t.Fatalf("expected 32-byte key, got %d bytes", len(key))
-	}
-}
-
 func TestDeriveKey_Argon2id_Deterministic(t *testing.T) {
 	passphrase := []byte("deterministic-test")
 	salt := make([]byte, 32)

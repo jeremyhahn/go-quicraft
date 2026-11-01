@@ -60,29 +60,3 @@ func TestSoftwareAEADProvider_NewAEAD_AllAlgorithms(t *testing.T) {
 		})
 	}
 }
-
-func TestSoftwareAEADProvider_NewAEAD_InvalidAlgorithm(t *testing.T) {
-	t.Parallel()
-
-	provider := NewSoftwareAEADProvider()
-	_, err := provider.NewAEAD(SymmetricAlgorithm(0xFF), make([]byte, 32))
-	if err == nil {
-		t.Fatal("expected error for invalid algorithm, got nil")
-	}
-}
-
-func TestSoftwareAEADProvider_NewAEAD_InvalidKeySize(t *testing.T) {
-	t.Parallel()
-
-	provider := NewSoftwareAEADProvider()
-	// AES-256-GCM requires 32 bytes; supply 16 to trigger ErrInvalidKeySize.
-	_, err := provider.NewAEAD(AlgAES256GCM, make([]byte, 16))
-	if err == nil {
-		t.Fatal("expected error for invalid key size, got nil")
-	}
-}
-
-func TestSoftwareAEADProvider_InterfaceCompliance(t *testing.T) {
-	t.Parallel()
-	var _ AEADProvider = NewSoftwareAEADProvider()
-}

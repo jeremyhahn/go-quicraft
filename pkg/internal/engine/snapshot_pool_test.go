@@ -218,14 +218,6 @@ func TestSnapshotPool_NewWithMinimumWorkers(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_NewWithValidWorkers(t *testing.T) {
-	stopC := make(chan struct{})
-	p := newSnapshotPool(4, nil, nil, nil, nil, stopC, nil)
-	if p.workers != 4 {
-		t.Fatalf("expected 4 workers, got %d", p.workers)
-	}
-}
-
 func TestSnapshotPool_StartAndStop(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
@@ -737,15 +729,6 @@ func TestSnapshotPool_ConcurrentRequests_DifferentShards(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_CompletedC_ReturnsChannel(t *testing.T) {
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-	ch := p.CompletedC()
-	if ch == nil {
-		t.Fatal("CompletedC should not return nil")
-	}
-}
-
 func TestSnapshotPool_RequestFull_ReturnsError(t *testing.T) {
 	stopC := make(chan struct{})
 	p := newSnapshotPool(1, nil, nil, nil, nil, stopC, nil)
@@ -780,22 +763,6 @@ func TestSnapshotPool_RequestFull_ReturnsError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SetCallback tests
 // ---------------------------------------------------------------------------
-
-func TestSnapshotPool_SetCallback(t *testing.T) {
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-
-	if p.callback != nil {
-		t.Fatal("expected nil callback initially")
-	}
-
-	cb := newTestCallback()
-	p.setCallback(cb)
-
-	if p.callback == nil {
-		t.Fatal("expected non-nil callback after setCallback")
-	}
-}
 
 // orderedCallback records the order OnSnapshotCompleted and OnLogCompacted
 // arrive in, on top of testCallback's own bookkeeping.

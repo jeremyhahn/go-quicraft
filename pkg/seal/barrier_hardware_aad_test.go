@@ -387,7 +387,8 @@ func TestContextBinding_String(t *testing.T) {
 
 // --- (c) RequireContextAAD fails closed at setup, not at first write ---
 
-// TestBarrier_RequireContextAAD_Initialize covers every mode at Initialize. The
+// TestBarrier_RequireContextAAD_Initialize covers the refusals at Initialize
+// (the satisfying modes Initialize with the flag in the _Unseal subtests). The
 // whole value of the flag is that the refusal happens HERE, before a single
 // unbound byte is written.
 func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
@@ -396,28 +397,6 @@ func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
 		cfg.RequireContextAAD = true
 		return cfg
 	}
-
-	t.Run("software satisfies", func(t *testing.T) {
-		b := MustNewBarrier(requiring())
-		s := testStrategy(t)
-		defer func() { _ = s.Close() }()
-		if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-			t.Fatalf("Initialize (software) failed: %v", err)
-		}
-		if !b.SupportsContextAAD() {
-			t.Fatal("software barrier accepted RequireContextAAD but cannot bind context")
-		}
-	})
-
-	t.Run("capable hardware satisfies", func(t *testing.T) {
-		b, err := hwBarrier(t, requiring(), newMockAADEncryptor(t))
-		if err != nil {
-			t.Fatalf("Initialize (capable hw) failed: %v", err)
-		}
-		if !b.SupportsContextAAD() {
-			t.Fatal("capable hardware barrier accepted RequireContextAAD but cannot bind context")
-		}
-	})
 
 	t.Run("incapable hardware refused", func(t *testing.T) {
 		b, err := hwBarrier(t, requiring(), &mockHWEncryptor{prefix: []byte("HW:")})
@@ -531,20 +510,4 @@ func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 			t.Fatalf("Unseal (software) failed: %v", err)
 		}
 	})
-}
-
-// TestBarrier_RequireContextAAD_DefaultOff pins backward compatibility: the
-// zero-value config keeps constructing the barriers it always did, and only the
-// per-call ErrHardwareMode marks the missing capability.
-func TestBarrier_RequireContextAAD_DefaultOff(t *testing.T) {
-	if testBarrierConfig(1).RequireContextAAD {
-		t.Fatal("RequireContextAAD defaults to true; existing deployments would break")
-	}
-	if _, err := hwBarrier(t, testBarrierConfig(1), &mockHWEncryptor{prefix: []byte("HW:")}); err != nil {
-		t.Fatalf("Initialize with RequireContextAAD unset failed: %v", err)
-	}
-	none := MustNewBarrier(testBarrierConfig(1))
-	if err := none.Initialize(context.Background(), NewNoneStrategy(), Credentials{}); err != nil {
-		t.Fatalf("Initialize (none) with RequireContextAAD unset failed: %v", err)
-	}
 }

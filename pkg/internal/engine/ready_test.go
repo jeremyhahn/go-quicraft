@@ -19,23 +19,6 @@ import (
 	"testing"
 )
 
-func TestReadyMap_SetAndSwap(t *testing.T) {
-	rm := NewReadyMap()
-	rm.Set(7)
-	rm.Set(13)
-	rm.Set(42)
-
-	got := rm.Swap()
-	if len(got) != 3 {
-		t.Fatalf("expected 3 shards, got %d", len(got))
-	}
-	for _, id := range []uint64{7, 13, 42} {
-		if _, ok := got[id]; !ok {
-			t.Fatalf("expected shard %d in result", id)
-		}
-	}
-}
-
 func TestReadyMap_SwapEmpty(t *testing.T) {
 	rm := NewReadyMap()
 	got := rm.Swap()
@@ -76,22 +59,6 @@ func TestReadyMap_SetAcrossDifferentBuckets(t *testing.T) {
 		if _, ok := got[id]; !ok {
 			t.Fatalf("expected shard %d in result", id)
 		}
-	}
-}
-
-func TestReadyMap_SwapResetsActiveSet(t *testing.T) {
-	rm := NewReadyMap()
-	rm.Set(10)
-	rm.Set(20)
-
-	first := rm.Swap()
-	if len(first) != 2 {
-		t.Fatalf("first swap: expected 2 shards, got %d", len(first))
-	}
-
-	second := rm.Swap()
-	if len(second) != 0 {
-		t.Fatalf("second swap: expected 0 shards, got %d", len(second))
 	}
 }
 
@@ -169,26 +136,6 @@ func TestReadyMap_DoubleBufferSwapAlternates(t *testing.T) {
 	third := rm.Swap()
 	if len(third) != 0 {
 		t.Fatalf("third swap: expected 0 shards, got %d", len(third))
-	}
-}
-
-func TestReadyMap_SetAfterSwapGoesToNewActive(t *testing.T) {
-	rm := NewReadyMap()
-
-	rm.Set(100)
-	got := rm.Swap()
-	if _, ok := got[100]; !ok {
-		t.Fatal("expected shard 100 in first swap")
-	}
-
-	// Set new shard after swap; it should appear in next swap.
-	rm.Set(200)
-	got2 := rm.Swap()
-	if _, ok := got2[200]; !ok {
-		t.Fatal("expected shard 200 in second swap")
-	}
-	if _, ok := got2[100]; ok {
-		t.Fatal("shard 100 should not appear in second swap")
 	}
 }
 

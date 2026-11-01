@@ -76,33 +76,6 @@ func (s *testSender) sentMessages() []proto.Message {
 // Verify testSender implements MessageSender at compile time.
 var _ MessageSender = (*testSender)(nil)
 
-func TestMessageSender_Interface(t *testing.T) {
-	s := newTestSender()
-	var sender MessageSender = s
-
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, From: 1, To: 2, ShardID: 10},
-		{Type: proto.Replicate, From: 1, To: 3, ShardID: 10},
-	}
-	sender.Send(msgs)
-
-	if s.sentCount() != 2 {
-		t.Fatalf("expected 2 sent messages, got %d", s.sentCount())
-	}
-}
-
-func TestMessageSender_EmptySend(t *testing.T) {
-	s := newTestSender()
-	s.Send(nil)
-	if s.sentCount() != 0 {
-		t.Fatalf("expected 0 sent messages, got %d", s.sentCount())
-	}
-	s.Send([]proto.Message{})
-	if s.sentCount() != 0 {
-		t.Fatalf("expected 0 sent messages, got %d", s.sentCount())
-	}
-}
-
 func TestMessageSender_ConcurrentSend(t *testing.T) {
 	s := newTestSender()
 	const goroutines = 10

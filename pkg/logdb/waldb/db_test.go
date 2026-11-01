@@ -1585,20 +1585,6 @@ func TestDBOpenError(t *testing.T) {
 	}
 }
 
-// TestDBOpenErrorIsTyped verifies errors.As works with DBOpenError.
-func TestDBOpenErrorIsTyped(t *testing.T) {
-	inner := os.ErrPermission
-	e := &DBOpenError{Dir: "/test", Err: inner}
-
-	var target *DBOpenError
-	if !errors.As(e, &target) {
-		t.Fatal("errors.As failed for DBOpenError")
-	}
-	if target.Dir != "/test" {
-		t.Fatalf("Dir: got %q, want %q", target.Dir, "/test")
-	}
-}
-
 // TestRecoveryError verifies the error type.
 func TestRecoveryError(t *testing.T) {
 	inner := os.ErrNotExist
@@ -1624,34 +1610,6 @@ func TestSegmentCreateError(t *testing.T) {
 	}
 	if e.Unwrap() != inner {
 		t.Fatalf("Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
-// TestDirSyncError verifies the DirSyncError type fields and message.
-func TestDirSyncError(t *testing.T) {
-	inner := os.ErrPermission
-	e := &DirSyncError{Dir: "/wal/shard-0", Err: inner}
-
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("Error() returned empty string")
-	}
-	if e.Unwrap() != inner {
-		t.Fatalf("Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
-// TestDirSyncErrorIsTyped verifies errors.As works with DirSyncError.
-func TestDirSyncErrorIsTyped(t *testing.T) {
-	inner := os.ErrPermission
-	e := &DirSyncError{Dir: "/wal/shard-0", Err: inner}
-
-	var target *DirSyncError
-	if !errors.As(e, &target) {
-		t.Fatal("errors.As failed for DirSyncError")
-	}
-	if target.Dir != "/wal/shard-0" {
-		t.Fatalf("Dir: got %q, want %q", target.Dir, "/wal/shard-0")
 	}
 }
 
@@ -1773,13 +1731,6 @@ func TestShardDirName(t *testing.T) {
 	}
 }
 
-// TestShardDirNameInvalid verifies shard-0 for index 0.
-func TestShardDirNameZero(t *testing.T) {
-	if got := shardDirName(0); got != "shard-0" {
-		t.Fatalf("shardDirName(0) = %q, want %q", got, "shard-0")
-	}
-}
-
 // TestItoa verifies the internal itoa helper.
 func TestItoa(t *testing.T) {
 	tests := []struct {
@@ -1798,20 +1749,6 @@ func TestItoa(t *testing.T) {
 			t.Fatalf("itoa(%d) = %q, want %q", tt.n, got, tt.want)
 		}
 	}
-}
-
-// TestItoaZero verifies itoa(0) returns "0".
-func TestItoaZero(t *testing.T) {
-	if got := itoa(0); got != "0" {
-		t.Fatalf("itoa(0) = %q, want %q", got, "0")
-	}
-}
-
-// --- Interface satisfaction test ---
-
-// TestDBImplementsLogDB verifies DB satisfies the LogDB interface.
-func TestDBImplementsLogDB(t *testing.T) {
-	var _ logdb.LogDB = (*DB)(nil)
 }
 
 // TestFullCRUDCycle verifies a complete create-read-update-delete cycle.

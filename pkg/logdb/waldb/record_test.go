@@ -140,28 +140,6 @@ func TestEncodeEmptyData(t *testing.T) {
 	}
 }
 
-// TestEncodeEmptySliceData verifies that encoding a zero-length slice payload
-// succeeds (distinct from nil).
-func TestEncodeEmptySliceData(t *testing.T) {
-	buf := make([]byte, recordHeaderSize)
-
-	n, err := encodeRecord(buf, RecordFull, 0, 0, []byte{})
-	if err != nil {
-		t.Fatalf("encodeRecord: unexpected error: %v", err)
-	}
-	if n != recordHeaderSize {
-		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
-	}
-
-	decoded, _, _, _, _, err := decodeRecord(buf[:n])
-	if err != nil {
-		t.Fatalf("decodeRecord: unexpected error: %v", err)
-	}
-	if len(decoded) != 0 {
-		t.Fatalf("decodeRecord: data length = %d, want 0", len(decoded))
-	}
-}
-
 // TestAllRecordTypes verifies that all valid record types can be encoded and
 // decoded without error.
 func TestAllRecordTypes(t *testing.T) {

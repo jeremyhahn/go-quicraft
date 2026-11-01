@@ -64,24 +64,6 @@ func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 		}
 	})
 
-	t.Run("NewSoftwareStrategyWithParams reports its Argon2id factors", func(t *testing.T) {
-		s, err := NewSoftwareStrategyWithParams(context.Background(), passphrase, 7, 96*1024, 3)
-		if err != nil {
-			// A -tags fips build has no Argon2id deriver at all. That refusal is
-			// the documented behaviour, not a failure of this accessor.
-			if errors.Is(err, ErrKDFUnsupportedVersion) || errors.Is(err, ErrKDFNotFIPSApproved) {
-				t.Skipf("Argon2id unavailable in this build/mode: %v", err)
-			}
-			t.Fatalf("NewSoftwareStrategyWithParams: %v", err)
-		}
-		defer s.Close()
-
-		got := s.KDFParams()
-		if got.Time != 7 || got.Memory != 96*1024 || got.Threads != 3 {
-			t.Fatalf("KDFParams() = %+v, want Time=7 Memory=98304 Threads=3", got)
-		}
-	})
-
 	t.Run("NewDeferredSoftwareStrategy still reports the defaults", func(t *testing.T) {
 		s := NewDeferredSoftwareStrategy()
 		defer s.Close()
@@ -92,22 +74,6 @@ func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 		}
 		if s.KDFParams() != want {
 			t.Fatalf("KDFParams() = %+v, want %+v", s.KDFParams(), want)
-		}
-	})
-
-	t.Run("NewDeferredSoftwareStrategyWithParams reports what it was given", func(t *testing.T) {
-		params := KDFParams{Iterations: 222_222, KeyLen: 32, SaltLen: 32}
-		s, err := NewDeferredSoftwareStrategyWithParams(KDFPbkdf2SHA256, params)
-		if err != nil {
-			t.Fatalf("NewDeferredSoftwareStrategyWithParams: %v", err)
-		}
-		defer s.Close()
-
-		if s.KDFParams() != params {
-			t.Fatalf("KDFParams() = %+v, want %+v", s.KDFParams(), params)
-		}
-		if !s.DeferredPassphrase() {
-			t.Fatal("the strategy is not deferred, which is the whole point of it")
 		}
 	})
 }

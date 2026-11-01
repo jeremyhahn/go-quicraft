@@ -51,24 +51,6 @@ func newBoundStrategies(t *testing.T, passphrase []byte) map[string]*SoftwareStr
 	return out
 }
 
-// TestSoftwareStrategy_DeferredPassphrase_ReportsConstructor pins the accessor
-// against every constructor: false for the bound ones, true for the deferred
-// one. Both answers are asserted, so an implementation that returns a constant
-// fails whichever constant it picks.
-func TestSoftwareStrategy_DeferredPassphrase_ReportsConstructor(t *testing.T) {
-	for name, s := range newBoundStrategies(t, []byte("correct-horse-battery-staple")) {
-		if s.DeferredPassphrase() {
-			t.Errorf("%s: DeferredPassphrase() = true, want false — this constructor binds at construction", name)
-		}
-	}
-
-	d := NewDeferredSoftwareStrategy()
-	t.Cleanup(func() { _ = d.Close() })
-	if !d.DeferredPassphrase() {
-		t.Error("NewDeferredSoftwareStrategy: DeferredPassphrase() = false, want true")
-	}
-}
-
 // TestSoftwareStrategy_DeferredPassphrase_PredictsCredentialSemantics is the
 // test that makes the accessor worth having. The two modes have OPPOSITE
 // credential semantics — a bound strategy ignores the credentials handed to

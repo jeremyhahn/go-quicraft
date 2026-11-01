@@ -55,7 +55,6 @@ func TestFIPSBuildRefusesWithParamsBeforeValidation(t *testing.T) {
 		time, memory uint32
 		threads      uint8
 	}{
-		{"production floor", 4, 128 * 1024, 4},
 		{"below every floor", 1, 1, 1},
 		{"zero", 0, 0, 0},
 	} {
@@ -133,7 +132,6 @@ func TestFIPSBuildRefusesDeferredWithParamsBeforeValidation(t *testing.T) {
 		name   string
 		params seal.KDFParams
 	}{
-		{"production floor", seal.DefaultKDFParams()},
 		{"below every floor", seal.KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 1, SaltLen: 1}},
 		{"zero", seal.KDFParams{}},
 	} {

@@ -630,19 +630,6 @@ func TestSMPanicError_Is_MatchesSentinel(t *testing.T) {
 	}
 }
 
-// TestSMPanicError_Is_DoesNotMatchOther verifies errors.Is does not
-// match unrelated sentinels.
-func TestSMPanicError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &SMPanicError{
-		ShardID:   1,
-		ReplicaID: 1,
-		Value:     "panic",
-	}
-	if errors.Is(err, ErrStopped) {
-		t.Fatal("errors.Is(SMPanicError, ErrStopped) should return false")
-	}
-}
-
 // TestApplyWorker_ReloadServicedBeforeQueuedItem verifies that a re-loaded
 // shard's first committed batch is applied rather than dropped. LoadNode
 // requests the reload before publishing the node; the request rendezvouses

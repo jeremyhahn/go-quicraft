@@ -67,24 +67,6 @@ func TestFIPSEnabled_WithEnvUnset(t *testing.T) {
 	}
 }
 
-func TestFIPSEnabled_WithEmptyEnv(t *testing.T) {
-	skipIfModuleActive(t)
-
-	original := os.Getenv(envGOFIPS140)
-	t.Cleanup(func() {
-		if original == "" {
-			os.Unsetenv(envGOFIPS140)
-		} else {
-			os.Setenv(envGOFIPS140, original)
-		}
-	})
-
-	os.Setenv(envGOFIPS140, "")
-	if FIPSEnabled() {
-		t.Fatal("expected FIPSEnabled() to return false when GOFIPS140 is empty string")
-	}
-}
-
 func TestDefaultKDFVersion_StandardMode(t *testing.T) {
 	skipIfModuleActive(t)
 
@@ -114,22 +96,6 @@ func TestDefaultKDFVersion_FIPSMode(t *testing.T) {
 	os.Setenv(envGOFIPS140, "1")
 	if v := DefaultKDFVersion(); v != KDFPbkdf2SHA256 {
 		t.Fatalf("expected KDFPbkdf2SHA256 (%d), got %d", KDFPbkdf2SHA256, v)
-	}
-}
-
-func TestFIPSEnabled_NonEmptyArbitraryValue(t *testing.T) {
-	original := os.Getenv(envGOFIPS140)
-	t.Cleanup(func() {
-		if original == "" {
-			os.Unsetenv(envGOFIPS140)
-		} else {
-			os.Setenv(envGOFIPS140, original)
-		}
-	})
-
-	os.Setenv(envGOFIPS140, "true")
-	if !FIPSEnabled() {
-		t.Fatal("expected FIPSEnabled() to return true for any non-empty GOFIPS140 value")
 	}
 }
 

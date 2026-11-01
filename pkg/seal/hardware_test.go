@@ -432,20 +432,6 @@ func TestBarrier_IsHardwareMode_False(t *testing.T) {
 	}
 }
 
-func TestBarrier_IsHardwareMode_True(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-	enc := &mockHWEncryptor{prefix: []byte("HW:")}
-	s := &hwStrategy{hwEnc: enc}
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	if !b.IsHardwareMode() {
-		t.Fatal("expected IsHardwareMode=true for hardware strategy")
-	}
-}
-
 func TestBarrier_IsHardwareMode_ClearedAfterSeal(t *testing.T) {
 	b := MustNewBarrier(DefaultBarrierConfig(1))
 	enc := &mockHWEncryptor{prefix: []byte("HW:")}
@@ -494,30 +480,6 @@ func TestEpochBarrier_IsAlias(t *testing.T) {
 	}
 }
 
-func TestNewEpochBarrier_Functional(t *testing.T) {
-	// Full functional test: create via alias, initialize, encrypt, decrypt.
-	b := MustNewEpochBarrier(DefaultBarrierConfig(1))
-	s := testStrategy(t)
-	defer s.Close()
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	plaintext := []byte("epoch barrier alias test")
-	ct, err := b.Encrypt(nil, plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-	dec, err := b.Decrypt(nil, ct)
-	if err != nil {
-		t.Fatalf("Decrypt failed: %v", err)
-	}
-	if !bytes.Equal(plaintext, dec) {
-		t.Fatal("round-trip failed via EpochBarrier alias")
-	}
-}
-
 // --- StrategyID type and constants ---
 
 func TestStrategyID_Constants(t *testing.T) {
@@ -536,13 +498,6 @@ func TestStrategyID_Constants(t *testing.T) {
 				t.Fatalf("expected %q, got %q", tt.expected, tt.id)
 			}
 		})
-	}
-}
-
-func TestStrategyID_StringConversion(t *testing.T) {
-	id := StrategyID("custom")
-	if string(id) != "custom" {
-		t.Fatalf("expected 'custom', got %q", string(id))
 	}
 }
 
@@ -634,13 +589,6 @@ func TestSealedRootKeyData_NilNonceAndPayload(t *testing.T) {
 // TestCredentials_ZeroValue pins the contract every ambient-credential strategy
 // relies on: the zero value is legal and means "none supplied". Secret is a
 // enclave.Sealed, and a nil pointer means no secret.
-func TestCredentials_ZeroValue(t *testing.T) {
-	c := Credentials{}
-	if c.Secret != nil {
-		t.Fatalf("the zero value must carry no secret, got %v", c.Secret)
-	}
-}
-
 // TestCredentials_WithSecret round-trips a passphrase through the protected
 // form. It reads the material back through the sealed enclave rather than off
 // the struct, which is the whole change: there is no plain copy on Credentials

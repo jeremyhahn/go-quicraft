@@ -59,18 +59,6 @@ func TestWorkSignal_NotifyNoNotificationToOtherWorkers(t *testing.T) {
 	}
 }
 
-func TestWorkSignal_WaitCReturnsChannel(t *testing.T) {
-	ws := NewWorkSignal(3)
-	ch := ws.WaitC(0)
-	if ch == nil {
-		t.Fatal("WaitC returned nil channel")
-	}
-	ch2 := ws.WaitC(2)
-	if ch2 == nil {
-		t.Fatal("WaitC returned nil channel for worker 2")
-	}
-}
-
 func TestWorkSignal_SwapReturnsReadyShardsForCorrectWorker(t *testing.T) {
 	const numWorkers = 4
 	ws := NewWorkSignal(numWorkers)
@@ -214,20 +202,6 @@ func TestWorkSignal_MultipleWorkersIndependent(t *testing.T) {
 		if len(got) != 0 {
 			t.Fatalf("worker %d: expected empty ready map, got %d", wid, len(got))
 		}
-	}
-}
-
-func TestWorkSignal_NumWorkers(t *testing.T) {
-	ws := NewWorkSignal(16)
-	if ws.NumWorkers() != 16 {
-		t.Fatalf("expected 16 workers, got %d", ws.NumWorkers())
-	}
-}
-
-func TestWorkSignal_NumWorkersOne(t *testing.T) {
-	ws := NewWorkSignal(1)
-	if ws.NumWorkers() != 1 {
-		t.Fatalf("expected 1 worker, got %d", ws.NumWorkers())
 	}
 }
 

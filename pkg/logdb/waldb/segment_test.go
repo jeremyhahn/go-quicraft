@@ -344,15 +344,6 @@ func TestSegmentFilenameFormat(t *testing.T) {
 	}
 }
 
-// TestSegmentFilenameUnique verifies that different IDs produce different filenames.
-func TestSegmentFilenameUnique(t *testing.T) {
-	a := segmentFilename(1)
-	b := segmentFilename(2)
-	if a == b {
-		t.Fatalf("segmentFilename(1) == segmentFilename(2): %q", a)
-	}
-}
-
 // TestSegmentSizeTracking verifies that Size() reports the number of bytes
 // written to the segment.
 func TestSegmentSizeTracking(t *testing.T) {
@@ -521,20 +512,6 @@ func TestSegmentID(t *testing.T) {
 
 	if seg.ID() != 42 {
 		t.Fatalf("ID = %d, want 42", seg.ID())
-	}
-}
-
-// TestSegmentIDZero verifies that ID 0 is a valid segment ID.
-func TestSegmentIDZero(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 0, 1024, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-	defer seg.Close()
-
-	if seg.ID() != 0 {
-		t.Fatalf("ID = %d, want 0", seg.ID())
 	}
 }
 

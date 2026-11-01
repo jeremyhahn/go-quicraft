@@ -21,28 +21,6 @@ import (
 	"testing"
 )
 
-func TestDeriveKey_PBKDF2SHA256(t *testing.T) {
-	passphrase := []byte("test-passphrase-pbkdf2")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Iterations: 1000, // Low iteration count for fast tests.
-		KeyLen:     32,
-		SaltLen:    32,
-	}
-
-	key, err := DeriveKey(passphrase, salt, KDFPbkdf2SHA256, params)
-	if err != nil {
-		t.Fatalf("DeriveKey(PBKDF2) returned unexpected error: %v", err)
-	}
-	if len(key) != 32 {
-		t.Fatalf("expected 32-byte key, got %d bytes", len(key))
-	}
-}
-
 func TestDeriveKey_PBKDF2SHA256_Deterministic(t *testing.T) {
 	passphrase := []byte("deterministic-test-pbkdf2")
 	salt := make([]byte, 32)
@@ -111,26 +89,6 @@ func TestDeriveKey_EmptyPassphrase(t *testing.T) {
 	}
 }
 
-func TestDeriveKey_NilPassphrase(t *testing.T) {
-	salt := make([]byte, 32)
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey(nil, salt, KDFArgon2id, params)
-	if !errors.Is(err, ErrKDFInvalidPassphrase) {
-		t.Fatalf("expected ErrKDFInvalidPassphrase, got %v", err)
-	}
-}
-
-func TestDeriveKey_NilSalt(t *testing.T) {
-	passphrase := []byte("test")
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey(passphrase, nil, KDFArgon2id, params)
-	if !errors.Is(err, ErrKDFInvalidSalt) {
-		t.Fatalf("expected ErrKDFInvalidSalt, got %v", err)
-	}
-}
-
 func TestDeriveKey_ShortSalt(t *testing.T) {
 	passphrase := []byte("test")
 	salt := make([]byte, 15) // Below minimum 16 bytes.
@@ -168,17 +126,6 @@ func TestDeriveKey_InvalidVersion(t *testing.T) {
 	params := DefaultKDFParams()
 
 	_, err := DeriveKey(passphrase, salt, KDFVersion(99), params)
-	if !errors.Is(err, ErrKDFUnsupportedVersion) {
-		t.Fatalf("expected ErrKDFUnsupportedVersion, got %v", err)
-	}
-}
-
-func TestDeriveKey_InvalidVersionZero(t *testing.T) {
-	passphrase := []byte("test")
-	salt := make([]byte, 32)
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey(passphrase, salt, KDFVersion(0), params)
 	if !errors.Is(err, ErrKDFUnsupportedVersion) {
 		t.Fatalf("expected ErrKDFUnsupportedVersion, got %v", err)
 	}

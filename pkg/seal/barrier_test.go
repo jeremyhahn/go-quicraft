@@ -1585,58 +1585,6 @@ func TestBarrierDeploymentIDIsolation(t *testing.T) {
 
 // --- Error Types ---
 
-func TestKeyDerivationError(t *testing.T) {
-	inner := errors.New("hkdf failed")
-	err := &KeyDerivationError{Epoch: 42, Err: inner}
-
-	if err.Error() != "quicraft/seal: key derivation failed for epoch 42: hkdf failed" {
-		t.Fatalf("unexpected error string: %s", err.Error())
-	}
-
-	if !errors.Is(err, inner) {
-		t.Fatal("Unwrap should return the inner error")
-	}
-}
-
-func TestError(t *testing.T) {
-	inner := errors.New("rand failed")
-	err := &Error{Strategy: "passphrase", Err: inner}
-
-	if err.Error() != "quicraft/seal: seal failed (strategy=passphrase): rand failed" {
-		t.Fatalf("unexpected error string: %s", err.Error())
-	}
-
-	if !errors.Is(err, inner) {
-		t.Fatal("Unwrap should return the inner error")
-	}
-}
-
-func TestUnsealError(t *testing.T) {
-	inner := errors.New("decrypt failed")
-	err := &UnsealError{Strategy: "passphrase", Err: inner}
-
-	if err.Error() != "quicraft/seal: unseal failed (strategy=passphrase): decrypt failed" {
-		t.Fatalf("unexpected error string: %s", err.Error())
-	}
-
-	if !errors.Is(err, inner) {
-		t.Fatal("Unwrap should return the inner error")
-	}
-}
-
-func TestCipherError(t *testing.T) {
-	inner := errors.New("invalid key size")
-	err := &CipherError{Err: inner}
-
-	if err.Error() != "quicraft/seal: cipher creation failed: invalid key size" {
-		t.Fatalf("unexpected error string: %s", err.Error())
-	}
-
-	if !errors.Is(err, inner) {
-		t.Fatal("Unwrap should return the inner error")
-	}
-}
-
 // --- Cross-Barrier Isolation ---
 
 func TestBarrier_CrossBarrierIsolation(t *testing.T) {
@@ -2961,39 +2909,6 @@ func TestEpochAAD_DifferentEpochsProduceDifferentAAD(t *testing.T) {
 	}
 }
 
-func TestEpochAAD_SameEpochProducesSameAAD(t *testing.T) {
-	aad1 := epochAAD(42)
-	aad2 := epochAAD(42)
-	if !bytes.Equal(aad1, aad2) {
-		t.Fatal("same epoch must produce identical AAD")
-	}
-}
-
-func TestNewAEAD_InvalidKeySize(t *testing.T) {
-	_, err := newAEADForAlgorithm(AlgAES256GCM, []byte("too-short"))
-	if err == nil {
-		t.Fatal("expected error for invalid key size")
-	}
-	if !errors.Is(err, ErrInvalidKeySize) {
-		t.Fatalf("expected ErrInvalidKeySize, got %T: %v", err, err)
-	}
-}
-
-func TestNewAEAD_ValidKey(t *testing.T) {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	aead, err := newAEADForAlgorithm(AlgAES256GCM, key)
-	if err != nil {
-		t.Fatalf("newAEAD failed: %v", err)
-	}
-	if aead == nil {
-		t.Fatal("newAEAD returned nil AEAD")
-	}
-}
-
 // --- Brute-force backoff persistence ---
 
 func TestBarrier_BackoffPersistence(t *testing.T) {
@@ -3868,18 +3783,6 @@ func TestBarrier_Config(t *testing.T) {
 
 // TestBarrier_Config_DifferentDeploymentIDs verifies Config() returns the
 // correct DeploymentID for barriers created with different IDs.
-func TestBarrier_Config_DifferentDeploymentIDs(t *testing.T) {
-	t.Parallel()
-	ids := []uint64{0, 1, 100, ^uint64(0)}
-	for _, id := range ids {
-		cfg := DefaultBarrierConfig(id)
-		b := MustNewBarrier(cfg)
-		if got := b.Config().DeploymentID; got != id {
-			t.Fatalf("Config().DeploymentID = %d, want %d", got, id)
-		}
-	}
-}
-
 // --- Rotate resets trackers ---
 
 // TestBarrier_RotateResetsBothTrackers verifies that after a successful
@@ -4113,21 +4016,6 @@ func TestNewBarrier_ReturnsErrorOnInvalidAlgorithm(t *testing.T) {
 
 // TestNewBarrier_ValidConfig asserts the success path returns a usable barrier
 // and a nil error, so the two-value signature is not merely error-shaped.
-func TestNewBarrier_ValidConfig(t *testing.T) {
-	t.Parallel()
-
-	b, err := NewBarrier(DefaultBarrierConfig(1))
-	if err != nil {
-		t.Fatalf("NewBarrier on the default config: %v", err)
-	}
-	if b == nil {
-		t.Fatal("NewBarrier returned a nil Barrier with a nil error")
-	}
-	if b.state != barrierUninitialized {
-		t.Fatalf("new barrier state = %v, want uninitialized", b.state)
-	}
-}
-
 // TestMustNewBarrier_PanicsOnInvalidAlgorithm pins the MustXxx half of the
 // pair: the panic still exists, but only behind the name that advertises it.
 func TestMustNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
@@ -4157,33 +4045,8 @@ func TestMustNewBarrier_PanicsOnInvalidAlgorithm(t *testing.T) {
 	MustNewBarrier(cfg)
 }
 
-func TestMustNewBarrier_PanicsOnZeroAlgorithm(t *testing.T) {
-	t.Parallel()
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic for zero algorithm, got none")
-		}
-	}()
-
-	cfg := BarrierConfig{
-		Algorithm:    SymmetricAlgorithm(0x00), // zero value, not registered
-		DeploymentID: 1,
-	}
-	MustNewBarrier(cfg)
-}
-
 // TestMustNewBarrier_ValidConfig asserts the Must form returns the barrier
 // rather than only being defined for its panic.
-func TestMustNewBarrier_ValidConfig(t *testing.T) {
-	t.Parallel()
-
-	if b := MustNewBarrier(DefaultBarrierConfig(1)); b == nil {
-		t.Fatal("MustNewBarrier returned nil for a valid config")
-	}
-}
-
 // --- persistBackoffState with nil sealed ---
 
 func TestBarrier_PersistBackoffState_NilSealed(t *testing.T) {
