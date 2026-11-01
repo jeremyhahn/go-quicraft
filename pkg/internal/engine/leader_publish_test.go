@@ -375,6 +375,11 @@ func TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu(t *testing.T
 		t.Fatalf("the PHASE 1 OnLeaderUpdated (leader=%d) ran while raftMu was held",
 			cb.lastLeader)
 	}
+	if cb.lastLeader == 1 {
+		t.Fatalf("step-down in PHASE 1 was never published (last published leader=%d, "+
+			"raft leaderID=%d): Host.ShardInfo().IsLeader keeps reporting this node "+
+			"as leader", cb.lastLeader, peer.LeaderID())
+	}
 }
 
 // TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering pins
