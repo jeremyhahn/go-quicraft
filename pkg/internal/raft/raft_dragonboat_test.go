@@ -699,101 +699,18 @@ func TestDragonboat_RestoreIgnoresStaleSnapshot(t *testing.T) {
 // State Transition Matrix
 // ===========================================================================
 
-// TestDragonboat_StateTransitionMatrix tests all valid and invalid state
-// transitions comprehensively.
-func TestDragonboat_StateTransitionMatrix(t *testing.T) {
-	t.Run("follower_to_candidate", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		if r.state != candidate {
-			t.Fatalf("expected candidate, got %s", r.state)
+// TestDragonboat_BecomeLeaderFromFollowerPanics verifies that a follower
+// cannot become leader without first standing as a candidate. The other
+// state transitions are covered by the TestRaft_Become* tests in
+// raft_test.go.
+func TestDragonboat_BecomeLeaderFromFollowerPanics(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic: follower cannot become leader directly")
 		}
-	})
-
-	t.Run("follower_to_precandidate", func(t *testing.T) {
-		r := newTestRaft(1) // PreVote enabled by default
-		r.becomePreCandidate()
-		if r.state != preCandidate {
-			t.Fatalf("expected preCandidate, got %s", r.state)
-		}
-	})
-
-	t.Run("candidate_to_leader", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		r.becomeLeader()
-		if r.state != leader {
-			t.Fatalf("expected leader, got %s", r.state)
-		}
-	})
-
-	t.Run("candidate_to_follower", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("precandidate_to_candidate", func(t *testing.T) {
-		r := newTestRaft(1)
-		r.becomePreCandidate()
-		r.becomeCandidate()
-		if r.state != candidate {
-			t.Fatalf("expected candidate, got %s", r.state)
-		}
-	})
-
-	t.Run("precandidate_to_follower", func(t *testing.T) {
-		r := newTestRaft(1)
-		r.becomePreCandidate()
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("leader_to_follower", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		electLeader(r)
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("follower_to_leader_panics", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: follower cannot become leader directly")
-			}
-		}()
-		r.becomeLeader()
-	})
-
-	t.Run("leader_to_candidate_panics", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		electLeader(r)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: leader cannot become candidate")
-			}
-		}()
-		r.becomeCandidate()
-	})
-
-	t.Run("leader_to_precandidate_panics", func(t *testing.T) {
-		r := newTestRaft(1)
-		electLeader(r)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: leader cannot become preCandidate")
-			}
-		}()
-		r.becomePreCandidate()
-	})
+	}()
+	r.becomeLeader()
 }
 
 // TestDragonboat_VoteFromAnyState verifies that vote request handling
