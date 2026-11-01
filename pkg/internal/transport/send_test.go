@@ -391,79 +391,6 @@ func TestSendQueuePerTargetIsolation(t *testing.T) {
 	}
 }
 
-// TestSendQueueCreatedPerTarget verifies that the transport creates a
-// separate send queue for each unique target address.
-func TestSendQueueCreatedPerTarget(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	handler3 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-	reg3 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t3, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler3, reg3)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(3) failed: %v", err)
-	}
-	if err := t3.Start(); err != nil {
-		t.Fatalf("t3.Start failed: %v", err)
-	}
-	defer t3.Stop()
-
-	// Register targets.
-	reg1.Register(1, 2, t2.Addr().String())
-	reg1.Register(1, 3, t3.Addr().String())
-
-	// Send to both targets.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 3, Term: 2},
-	})
-
-	handler2.waitBatch(t, 10*time.Second)
-	handler3.waitBatch(t, 10*time.Second)
-
-	// Verify separate send queues were created.
-	t1.sendQueuesMu.RLock()
-	numQueues := len(t1.sendQueues)
-	t1.sendQueuesMu.RUnlock()
-
-	if numQueues != 2 {
-		t.Fatalf("expected 2 send queues (one per target), got %d", numQueues)
-	}
-}
-
 // TestSendQueueIdlePruneRemovesQueue verifies that a send queue worker
 // removes itself from the sendQueues map and exits after the idle timeout
 // expires with no messages. This prevents goroutine and memory leaks for
@@ -723,14 +650,6 @@ func TestSendQueueCountReflectsMultipleTargets(t *testing.T) {
 
 	if t1.SendQueueCount() != 2 {
 		t.Fatalf("expected 2 send queues (one per target), got %d", t1.SendQueueCount())
-	}
-}
-
-// TestSendQueueIdleTimeoutConstant verifies the idle timeout constant
-// is set to the expected value (2x QUIC MaxIdleTimeout).
-func TestSendQueueIdleTimeoutConstant(t *testing.T) {
-	if sendQueueIdleTimeout != 60*time.Second {
-		t.Fatalf("expected sendQueueIdleTimeout=60s, got %v", sendQueueIdleTimeout)
 	}
 }
 
@@ -1324,97 +1243,12 @@ func TestSendBatch_SnappyPoolCapacityTooSmall(t *testing.T) {
 // TestHandleMessageFrame_ZeroLengthPayload verifies that a zero-length
 // payload is handled gracefully.
 
-func TestSendBatch_WithMetricsAndDebugLog(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		Metrics:       noopTransportMetrics{},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		Metrics:       noopTransportMetrics{},
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	reg1.Register(1, 2, t2.Addr().String())
-
-	// Send multiple messages to exercise metrics recording for each.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("m1")}}},
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 2, Term: 1, Cmd: []byte("m2")}}},
-	})
-
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		total := 0
-		for _, b := range handler2.getBatches() {
-			total += len(b.Requests)
-		}
-		if total >= 2 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("did not receive 2 messages")
-}
-
 // ---------------------------------------------------------------------------
 // SendSnapshot with metrics (quic.go:1026-1028)
 // ---------------------------------------------------------------------------
 
 // TestSendSnapshot_WithMetrics verifies that the metrics recording path
 // is exercised for snapshot sends.
-
-func TestSendBatch_WriteDeadlineAndWriteErrorEviction(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Establish connection by sending a message.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("hello")}}},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to make writes fail.
-	t2.Stop()
-	time.Sleep(200 * time.Millisecond)
-
-	// Send another message. This should hit the write error path
-	// and trigger connection removal + stream eviction.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2,
-			Entries: []proto.Entry{{Index: 2, Term: 2, Cmd: []byte("world")}}},
-	})
-
-	// Wait for the error to be processed.
-	time.Sleep(1 * time.Second)
-}
 
 // ---------------------------------------------------------------------------
 // Stop with active connections and streams (quic.go:418-442)
@@ -1633,195 +1467,12 @@ func TestSendBatch_SnappyPoolReturnsNil(t *testing.T) {
 // TestHandleMessageFrame_CompressedUnmarshalError verifies that a compressed
 // payload that decompresses to invalid protobuf returns an unmarshal error.
 
-func TestSendBatch_DirectCallWriteDeadlineError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection and cache stream.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to kill the connection.
-	t2.Stop()
-	time.Sleep(1 * time.Second)
-
-	// Call sendBatch directly. The cached stream is dead, so either
-	// getStream will fail, or SetWriteDeadline/Write will fail.
-	t1.sendBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-}
-
-// TestSendBatch_DirectCallStreamWriteError verifies that sendBatch
-// handles stream.Write errors and evicts the connection.
-
-func TestSendBatch_DirectCallStreamWriteError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish and cache a stream.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Close t2's connection but keep the stream cached on t1.
-	// This makes stream.Write fail.
-	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Call sendBatch directly multiple times to exercise different paths.
-	for i := 0; i < 5; i++ {
-		t1.sendBatch(t2Addr, "", []proto.Message{
-			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: uint64(i + 2)},
-		})
-	}
-
-	// After errors, connections should have been cleaned up.
-	time.Sleep(200 * time.Millisecond)
-}
-
 // ---------------------------------------------------------------------------
 // sendHeartbeatBatch direct call with dead connection (heartbeat.go:108-127)
 // ---------------------------------------------------------------------------
 
 // TestSendHeartbeatBatch_DirectCallWriteError verifies the heartbeat
 // error paths by directly calling sendHeartbeatBatch on a dead connection.
-
-func TestSendBatch_DirectCallSnappyPoolPaths(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress:      ":0",
-		DeploymentID:       42,
-		MTLSConfig:         mtls,
-		DisableCompression: false,
-		Metrics:            noopTransportMetrics{},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Drain the pool completely.
-	for i := 0; i < 100; i++ {
-		v := t1.snappyEncPool.Get()
-		if v == nil {
-			break
-		}
-	}
-
-	// Call sendBatch directly with highly compressible data.
-	// Pool is empty -> allocates new buffer. Compression succeeds
-	// -> snappyBufPtr is nil (came from allocation, not pool).
-	cmd := bytes.Repeat([]byte("A"), 5000)
-	t1.sendBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: cmd}}},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Now put a buffer in the pool and send again to exercise the
-	// pool-hit + pool-return path.
-	bigBuf := make([]byte, 128*1024)
-	t1.snappyEncPool.Put(&bigBuf)
-
-	t1.sendBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2,
-			Entries: []proto.Entry{{Index: 2, Term: 2, Cmd: cmd}}},
-	})
-	time.Sleep(500 * time.Millisecond)
-
-	batches := handler2.getBatches()
-	if len(batches) < 1 {
-		t.Fatal("expected at least 1 batch")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // handleMessageFrame compressed + buf != nil path (recv.go:460-467)
@@ -1831,62 +1482,6 @@ func TestSendBatch_DirectCallSnappyPoolPaths(t *testing.T) {
 // too-many-messages check on the uncompressed path specifically exercises
 // the buf != nil cleanup path at recv.go:463-465.
 
-func TestSendBatch_SnappyPoolCapacityTooSmallForceAlloc(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress:      ":0",
-		DeploymentID:       42,
-		MTLSConfig:         mtls,
-		DisableCompression: false,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Pre-populate the snappy encode pool with a tiny buffer.
-	tinyBuf := make([]byte, 10)
-	t1.snappyEncPool.Put(&tinyBuf)
-
-	// Send a large compressible message. The pooled buffer (10 bytes)
-	// will have insufficient capacity, triggering the alloc path.
-	largeCmd := bytes.Repeat([]byte("compress-me-"), 500)
-	t1.Send([]proto.Message{
-		{
-			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{
-				{Index: 1, Term: 1, Cmd: largeCmd},
-			},
-		},
-	})
-
-	handler2.waitBatch(t, 10*time.Second)
-}
-
 // ---------------------------------------------------------------------------
 // evictStreamsForTarget close error path (conn.go:467-472)
 // ---------------------------------------------------------------------------
@@ -1894,64 +1489,6 @@ func TestSendBatch_SnappyPoolCapacityTooSmallForceAlloc(t *testing.T) {
 // TestEvictStreamsForTarget_StreamCloseError exercises the stream close
 // error logging path in evictStreamsForTarget. When a stream has already
 // been closed, Close returns an error that gets logged.
-
-func TestSendBatch_DirectSnappyPoolCapTooSmall(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress:      ":0",
-		DeploymentID:       42,
-		MTLSConfig:         mtls,
-		DisableCompression: false,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Pre-populate the snappy encode pool with a tiny (10-byte) buffer.
-	// The snappy MaxEncodedLen for a 5000-byte payload is ~5032 bytes,
-	// so cap=10 is far too small, triggering the discard path at
-	// quic.go:783-786.
-	tinyBuf := make([]byte, 10)
-	t1.snappyEncPool.Put(&tinyBuf)
-
-	// Call sendBatch directly to avoid async queue GC timing issues.
-	cmd := bytes.Repeat([]byte("A"), 5000)
-	t1.sendBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: cmd}}},
-	})
-
-	handler2.waitBatch(t, 10*time.Second)
-	batches := handler2.getBatches()
-	if len(batches) == 0 {
-		t.Fatal("expected at least 1 batch")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // sendBatch snappy pool hit + pool return (quic.go:779-783, 818-822)

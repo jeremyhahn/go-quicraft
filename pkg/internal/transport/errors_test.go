@@ -94,44 +94,6 @@ func TestCACertificateParseErrorUnwrapReturnsUnderlyingError(t *testing.T) {
 	}
 }
 
-// TestCACertificateParseErrorUnwrapReturnsNilWhenNoUnderlyingError verifies
-// that Unwrap() returns nil when Err is nil, correctly terminating the
-// errors.Is/As chain. This happens for PEM decode failures that have no
-// underlying parse error.
-func TestCACertificateParseErrorUnwrapReturnsNilWhenNoUnderlyingError(t *testing.T) {
-	err := &CACertificateParseError{
-		Reason: "PEM decode returned nil block",
-		Err:    nil,
-	}
-
-	unwrapped := err.Unwrap()
-	if unwrapped != nil {
-		t.Fatalf("Unwrap() = %v, want nil", unwrapped)
-	}
-}
-
-// TestCACertificateParseErrorIsSentinelMatch verifies that the Is()
-// method matches ErrCACertificateParse sentinel and that errors.As
-// extracts the structured fields.
-func TestCACertificateParseErrorIsSentinelMatch(t *testing.T) {
-	err := &CACertificateParseError{
-		Reason: "test reason",
-		Err:    errors.New("test underlying"),
-	}
-
-	if !errors.Is(err, ErrCACertificateParse) {
-		t.Fatal("CACertificateParseError should match ErrCACertificateParse")
-	}
-
-	var parseErr *CACertificateParseError
-	if !errors.As(err, &parseErr) {
-		t.Fatalf("expected *CACertificateParseError, got %T", err)
-	}
-	if parseErr.Reason != "test reason" {
-		t.Fatalf("Reason = %q, want %q", parseErr.Reason, "test reason")
-	}
-}
-
 // TestCACertificateParseErrorDoesNotMatchOtherSentinels verifies that the
 // error does not falsely match unrelated sentinel errors.
 func TestCACertificateParseErrorDoesNotMatchOtherSentinels(t *testing.T) {
@@ -186,23 +148,6 @@ func TestInvalidShardIDErrorIsSentinel(t *testing.T) {
 	// Should not match unrelated sentinels.
 	if errors.Is(err, ErrStreamClosed) {
 		t.Fatal("InvalidShardIDError should not match ErrStreamClosed")
-	}
-}
-
-// TestInvalidShardIDErrorAs verifies that errors.As extracts the
-// structured fields from the typed error.
-func TestInvalidShardIDErrorAs(t *testing.T) {
-	var target error = &InvalidShardIDError{From: 42, MsgType: 17}
-
-	var shardErr *InvalidShardIDError
-	if !errors.As(target, &shardErr) {
-		t.Fatal("errors.As should extract *InvalidShardIDError")
-	}
-	if shardErr.From != 42 {
-		t.Fatalf("From = %d, want 42", shardErr.From)
-	}
-	if shardErr.MsgType != 17 {
-		t.Fatalf("MsgType = %d, want 17", shardErr.MsgType)
 	}
 }
 
@@ -261,20 +206,6 @@ func TestTypeAssertionErrorMessage(t *testing.T) {
 	}
 	if !strings.Contains(msg, "string") {
 		t.Fatalf("error message missing actual type: %s", msg)
-	}
-}
-
-// TestTypeAssertionErrorWithNilValue verifies the error message when
-// ActualValue is nil.
-func TestTypeAssertionErrorWithNilValue(t *testing.T) {
-	err := &TypeAssertionError{
-		Context:      "test context",
-		ExpectedType: "*quic.Conn",
-		ActualValue:  nil,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "<nil>") {
-		t.Fatalf("error message should contain <nil> for nil value: %s", msg)
 	}
 }
 

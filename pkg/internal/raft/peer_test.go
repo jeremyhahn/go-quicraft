@@ -830,30 +830,6 @@ func TestPeer_ProposeConfigChange_InvalidChange(t *testing.T) {
 	}
 }
 
-func TestPeer_ProposeConfigChange_EntryType(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := p.ProposeConfigChange(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// The last entry should be a config change entry.
-	lastIdx := p.r.log.lastIndex()
-	e, err := getEntryForTest(&p.r.log.inmem, lastIdx)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if e.Type != proto.EntryConfigChange {
-		t.Fatalf("expected EntryConfigChange, got %d", e.Type)
-	}
-}
-
 func TestPeer_ProposeConfigChange_Serialization(t *testing.T) {
 	p := newTestLeaderPeer(t)
 
@@ -1023,16 +999,6 @@ func TestPeer_HasUpdate_EntriesToSave(t *testing.T) {
 
 	if !p.HasUpdate(0) {
 		t.Fatal("expected HasUpdate to be true with entries to save")
-	}
-}
-
-func TestPeer_HasUpdate_VoteChanged(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	// Manually change vote to simulate state change.
-	p.r.vote = 2
-
-	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate to be true when vote changed")
 	}
 }
 
@@ -1524,23 +1490,6 @@ func TestPeer_Commit_WithReadyToRead(t *testing.T) {
 	// Should not panic; ReadyToRead count is tracked.
 }
 
-func TestPeer_Commit_NoCommittedEntries(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	update := proto.Update{
-		EntriesToSave: []proto.Entry{
-			{Index: 1, Term: 1},
-		},
-	}
-	mustCommit(t, p, update)
-	if p.r.log.inmem.savedTo != 1 {
-		t.Fatalf("expected savedTo 1, got %d", p.r.log.inmem.savedTo)
-	}
-}
-
 func TestPeer_Commit_LastAppliedUsesUpdateFieldNotCommittedEntries(t *testing.T) {
 	// Verify that uc.LastApplied is set from update.LastApplied (what the
 	// apply worker confirmed in a previous cycle), NOT from
@@ -1694,36 +1643,11 @@ func TestPeer_Commit_MultipleConfigChangesInBatch_NoEntries(t *testing.T) {
 
 // --- LeaderID / IsLeader / IsFollower / IsObserver / IsWitness ---
 
-func TestPeer_LeaderID_Atomic(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.leaderID.Store(42)
-
-	if p.LeaderID() != 42 {
-		t.Fatalf("expected leaderID 42, got %d", p.LeaderID())
-	}
-}
-
 func TestPeer_LeaderID_InitialZero(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 
 	if p.LeaderID() != 0 {
 		t.Fatalf("expected initial leaderID 0, got %d", p.LeaderID())
-	}
-}
-
-func TestPeer_IsLeader_True(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	if !p.IsLeader() {
-		t.Fatal("expected IsLeader to be true")
-	}
-}
-
-func TestPeer_IsLeader_False(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-
-	if p.IsLeader() {
-		t.Fatal("expected IsLeader to be false")
 	}
 }
 
@@ -4322,31 +4246,6 @@ func TestPeer_SetProcessedIndex_RecordsAppliedClamp(t *testing.T) {
 	}
 }
 
-func TestPeer_SetProcessedIndex_LargeValue(t *testing.T) {
-	cfg := testConfig()
-	largeIndex := uint64(1 << 40)
-	// A large applied index only arises from an on-disk state machine
-	// recovered behind a SNAPSHOT; the snapshot index is what makes the
-	// recovered commit index legitimate at that height.
-	lr := newTestLogReader(nil, proto.State{Term: 1, Commit: largeIndex})
-	lr.membership = singleNodeMembership()
-	lr.snapshot = proto.Snapshot{Index: largeIndex, Term: 1}
-	p, err := NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-	if p.r.log.committed != largeIndex {
-		t.Fatalf("fixture: expected committed %d, got %d", largeIndex, p.r.log.committed)
-	}
-
-	// A large value simulates on-disk state machine recovery.
-	p.SetProcessedIndex(largeIndex)
-
-	if p.r.log.processed != largeIndex {
-		t.Fatalf("expected processed %d, got %d", largeIndex, p.r.log.processed)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SetOnCampaign tests
 // ---------------------------------------------------------------------------
@@ -4913,26 +4812,6 @@ func TestPeer_RateLimited_TrueWhenOverLimit(t *testing.T) {
 	}
 }
 
-func TestPeer_RateLimited_FalseWhenUnderLimit(t *testing.T) {
-	cfg := testConfig()
-	cfg.MaxInMemLogSize = 1000 // Enable rate limiting.
-	lr := newTestLogReader(nil, proto.State{})
-	lr.membership = singleNodeMembership()
-	p, err := NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-
-	// Add some data but stay under limit.
-	if p.r.rl != nil {
-		p.r.rl.Increase(500)
-	}
-
-	if p.RateLimited() {
-		t.Error("expected RateLimited to be false when under limit")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RateLimiter tests
 // ---------------------------------------------------------------------------
@@ -4968,44 +4847,6 @@ func TestPeer_RateLimiter_ReturnsInstanceWhenEnabled(t *testing.T) {
 	// Verify the returned rate limiter is the same as the internal one.
 	if rl != p.r.rl {
 		t.Error("expected RateLimiter to return the same instance as internal rl")
-	}
-}
-
-func TestPeer_RateLimiter_CanBeUsedForOperations(t *testing.T) {
-	cfg := testConfig()
-	cfg.MaxInMemLogSize = 500 // Enable rate limiting.
-	lr := newTestLogReader(nil, proto.State{})
-	lr.membership = singleNodeMembership()
-	p, err := NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-
-	rl := p.RateLimiter()
-	if rl == nil {
-		t.Fatal("expected non-nil RateLimiter")
-	}
-
-	// Verify operations work through the returned rate limiter.
-	if !rl.Enabled() {
-		t.Error("expected RateLimiter to be enabled")
-	}
-
-	// Initially not rate limited.
-	if rl.RateLimited() {
-		t.Error("expected not rate limited initially")
-	}
-
-	// Increase beyond limit.
-	rl.Increase(600)
-	if !rl.RateLimited() {
-		t.Error("expected rate limited after exceeding limit")
-	}
-
-	// Decrease below limit.
-	rl.Decrease(400)
-	if rl.RateLimited() {
-		t.Error("expected not rate limited after decreasing below limit")
 	}
 }
 

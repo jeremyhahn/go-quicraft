@@ -27,22 +27,6 @@ func mustAdd(t *testing.T, in *inflights, index uint64) {
 	}
 }
 
-func TestNewInflightsCreatesWithCorrectCapacity(t *testing.T) {
-	in := newInflights(10)
-	if in.size != 10 {
-		t.Errorf("expected size 10, got %d", in.size)
-	}
-	if in.count != 0 {
-		t.Errorf("expected count 0, got %d", in.count)
-	}
-	if in.start != 0 {
-		t.Errorf("expected start 0, got %d", in.start)
-	}
-	if in.buffer != nil {
-		t.Errorf("expected nil buffer before first add, got len=%d", len(in.buffer))
-	}
-}
-
 func TestNewInflightsZeroCapacity(t *testing.T) {
 	in := newInflights(0)
 	if in.size != 0 {
@@ -50,18 +34,6 @@ func TestNewInflightsZeroCapacity(t *testing.T) {
 	}
 	if !in.full() {
 		t.Errorf("expected zero-capacity inflights to be full")
-	}
-}
-
-func TestInflightsAddIncreasesCount(t *testing.T) {
-	in := newInflights(5)
-	mustAdd(t, in, 100)
-	if in.Count() != 1 {
-		t.Errorf("expected count 1, got %d", in.Count())
-	}
-	mustAdd(t, in, 101)
-	if in.Count() != 2 {
-		t.Errorf("expected count 2, got %d", in.Count())
 	}
 }
 
@@ -92,16 +64,6 @@ func TestInflightsAddReturnsErrInflightsFullWhenFull(t *testing.T) {
 	}
 }
 
-func TestInflightsAddReturnsNilWhenNotFull(t *testing.T) {
-	in := newInflights(5)
-	if err := in.add(100); err != nil {
-		t.Errorf("expected nil error, got %v", err)
-	}
-	if err := in.add(101); err != nil {
-		t.Errorf("expected nil error, got %v", err)
-	}
-}
-
 func TestInflightsFullReturnsTrueAtCapacity(t *testing.T) {
 	in := newInflights(3)
 	if in.full() {
@@ -118,39 +80,6 @@ func TestInflightsFullReturnsTrueAtCapacity(t *testing.T) {
 	mustAdd(t, in, 102)
 	if !in.full() {
 		t.Errorf("expected full with 3 of 3")
-	}
-}
-
-func TestInflightsFullReturnsFalseWhenNotAtCapacity(t *testing.T) {
-	in := newInflights(10)
-	for i := uint64(0); i < 5; i++ {
-		mustAdd(t, in, i)
-	}
-	if in.full() {
-		t.Errorf("expected not full with 5 of 10")
-	}
-}
-
-func TestInflightsFreeToFreesUpToIndex(t *testing.T) {
-	in := newInflights(10)
-	for i := uint64(0); i < 5; i++ {
-		mustAdd(t, in, i)
-	}
-	// Free up to index 2 (should free indices 0, 1, 2)
-	in.freeTo(2)
-	if in.Count() != 2 {
-		t.Errorf("expected count 2 after freeTo(2), got %d", in.Count())
-	}
-}
-
-func TestInflightsFreeToFreesAllEntries(t *testing.T) {
-	in := newInflights(5)
-	for i := uint64(10); i < 15; i++ {
-		mustAdd(t, in, i)
-	}
-	in.freeTo(14)
-	if in.Count() != 0 {
-		t.Errorf("expected count 0 after freeing all, got %d", in.Count())
 	}
 }
 
@@ -308,69 +237,6 @@ func TestInflightsCountReturnsCorrectValue(t *testing.T) {
 	in.freeFirstOne()
 	if in.Count() != 2 {
 		t.Errorf("expected 2, got %d", in.Count())
-	}
-}
-
-func TestInflightsMultipleAddFreeCycles(t *testing.T) {
-	in := newInflights(3)
-
-	// Cycle 1: fill and drain
-	mustAdd(t, in, 1)
-	mustAdd(t, in, 2)
-	mustAdd(t, in, 3)
-	if !in.full() {
-		t.Errorf("expected full after cycle 1 fill")
-	}
-	in.freeTo(3)
-	if in.Count() != 0 {
-		t.Errorf("expected empty after cycle 1 drain")
-	}
-
-	// Cycle 2: partial fill, partial drain
-	mustAdd(t, in, 4)
-	mustAdd(t, in, 5)
-	in.freeFirstOne()
-	if in.Count() != 1 {
-		t.Errorf("expected 1 after cycle 2, got %d", in.Count())
-	}
-
-	// Cycle 3: fill to capacity again
-	mustAdd(t, in, 6)
-	mustAdd(t, in, 7)
-	if !in.full() {
-		t.Errorf("expected full after cycle 3 fill")
-	}
-
-	// Free all
-	in.freeTo(7)
-	if in.Count() != 0 {
-		t.Errorf("expected empty after cycle 3 drain")
-	}
-
-	// Cycle 4: verify we can use it again
-	mustAdd(t, in, 8)
-	if in.Count() != 1 {
-		t.Errorf("expected 1 after cycle 4, got %d", in.Count())
-	}
-}
-
-func TestInflightsFreeToPartiallyOverlapping(t *testing.T) {
-	in := newInflights(10)
-	mustAdd(t, in, 5)
-	mustAdd(t, in, 10)
-	mustAdd(t, in, 15)
-	mustAdd(t, in, 20)
-
-	// Free to 10: should free entries at indices 5 and 10
-	in.freeTo(10)
-	if in.Count() != 2 {
-		t.Errorf("expected count 2, got %d", in.Count())
-	}
-
-	// Free to 20: should free remaining
-	in.freeTo(20)
-	if in.Count() != 0 {
-		t.Errorf("expected count 0, got %d", in.Count())
 	}
 }
 

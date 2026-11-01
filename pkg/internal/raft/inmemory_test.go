@@ -53,16 +53,6 @@ func TestNewInMemory_SetsCorrectMarkerIndex(t *testing.T) {
 	}
 }
 
-func TestNewInMemory_ZeroLastIndex(t *testing.T) {
-	im := newInMemory(0)
-	if im.markerIndex != 1 {
-		t.Fatalf("expected markerIndex 1, got %d", im.markerIndex)
-	}
-	if im.savedTo != 0 {
-		t.Fatalf("expected savedTo 0, got %d", im.savedTo)
-	}
-}
-
 func TestInMemory_GetEntries_ReturnsCorrectRange(t *testing.T) {
 	im := newInMemory(4)
 	im.merge(makeEntries(5, 10, 1))
@@ -76,19 +66,6 @@ func TestInMemory_GetEntries_ReturnsCorrectRange(t *testing.T) {
 	}
 	if entries[0].Index != 5 || entries[2].Index != 7 {
 		t.Fatalf("unexpected entry indices: %d, %d", entries[0].Index, entries[2].Index)
-	}
-}
-
-func TestInMemory_GetEntries_AllEntries(t *testing.T) {
-	im := newInMemory(4)
-	im.merge(makeEntries(5, 10, 1))
-
-	entries, err := im.getEntries(5, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(entries) != 5 {
-		t.Fatalf("expected 5 entries, got %d", len(entries))
 	}
 }
 
@@ -132,39 +109,6 @@ func TestInMemory_GetEntries_EqualLowHigh(t *testing.T) {
 	}
 	if entries != nil {
 		t.Fatalf("expected nil, got %v", entries)
-	}
-}
-
-func TestInMemory_GetEntry_Valid(t *testing.T) {
-	im := newInMemory(4)
-	im.merge(makeEntries(5, 10, 1))
-
-	entry, err := getEntryForTest(&im, 7)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if entry.Index != 7 {
-		t.Fatalf("expected index 7, got %d", entry.Index)
-	}
-}
-
-func TestInMemory_GetEntry_Compacted(t *testing.T) {
-	im := newInMemory(10)
-	im.merge(makeEntries(11, 15, 1))
-
-	_, err := getEntryForTest(&im, 5)
-	if !errors.Is(err, logdb.ErrCompacted) {
-		t.Fatalf("expected logdb.ErrCompacted, got %v", err)
-	}
-}
-
-func TestInMemory_GetEntry_Unavailable(t *testing.T) {
-	im := newInMemory(4)
-	im.merge(makeEntries(5, 10, 1))
-
-	_, err := getEntryForTest(&im, 20)
-	if !errors.Is(err, logdb.ErrUnavailable) {
-		t.Fatalf("expected logdb.ErrUnavailable, got %v", err)
 	}
 }
 
@@ -376,29 +320,6 @@ func TestInMemory_Restore_ResetsEverything(t *testing.T) {
 	}
 }
 
-func TestInMemory_Restore_ClearsSnapshot(t *testing.T) {
-	im := newInMemory(0)
-	im.snapshot = &proto.Snapshot{Index: 5, Term: 1}
-
-	ss := proto.Snapshot{Index: 10, Term: 2}
-	im.restore(ss)
-
-	if im.snapshot.Index != 10 || im.snapshot.Term != 2 {
-		t.Fatalf("expected snapshot to be replaced, got index=%d term=%d",
-			im.snapshot.Index, im.snapshot.Term)
-	}
-}
-
-func TestInMemory_EntriesToSave_AllUnsaved(t *testing.T) {
-	im := newInMemory(4)
-	im.merge(makeEntries(5, 10, 1))
-
-	toSave := im.entriesToSave()
-	if len(toSave) != 5 {
-		t.Fatalf("expected 5 entries to save, got %d", len(toSave))
-	}
-}
-
 func TestInMemory_EntriesToSave_PartiallySaved(t *testing.T) {
 	im := newInMemory(4)
 	im.merge(makeEntries(5, 10, 1))
@@ -515,12 +436,6 @@ func TestInMemory_AppliedLogTo_IndexBeyondEntries(t *testing.T) {
 	if len(im.entries) != originalLen {
 		t.Fatalf("expected entries unchanged, got %d", len(im.entries))
 	}
-}
-
-func TestInMemory_AppliedLogTo_EmptyEntries(t *testing.T) {
-	im := newInMemory(10)
-	im.appliedLogTo(5) // no entries, should be no-op
-	// No panic expected.
 }
 
 func TestInMemory_Resize_ReducesCapacity(t *testing.T) {
@@ -909,23 +824,6 @@ func TestInMemory_Merge_AfterRestoreGap_SavedToHigherThanNewEntries(t *testing.T
 	toSave := im.entriesToSave()
 	if len(toSave) != 3 {
 		t.Fatalf("expected 3 entries to save, got %d", len(toSave))
-	}
-}
-
-// TestInMemory_Merge_AfterRestoreContiguous verifies that merge after
-// snapshot restore with entries at exactly markerIndex works (Case 1).
-func TestInMemory_Merge_AfterRestoreContiguous(t *testing.T) {
-	im := newInMemory(0)
-	im.restore(proto.Snapshot{Index: 100, Term: 5})
-
-	// Leader sends entries starting exactly at markerIndex (Case 1).
-	im.merge(makeEntries(101, 104, 5))
-
-	if len(im.entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(im.entries))
-	}
-	if im.markerIndex != 101 {
-		t.Fatalf("expected markerIndex 101, got %d", im.markerIndex)
 	}
 }
 

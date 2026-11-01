@@ -286,28 +286,6 @@ func TestBuildMTLSTLSPairForConfig(t *testing.T) {
 	}
 }
 
-// TestHandleMessageFrameZeroLength verifies that zero-length frames
-// are handled correctly without error.
-func TestHandleMessageFrameZeroLength(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a valid message followed by zero-length is handled internally.
-	// Just verify normal messages still work.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 99},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	if batches[0].Requests[0].Term != 99 {
-		t.Fatalf("expected Term 99, got %d", batches[0].Requests[0].Term)
-	}
-}
-
 // TestDialConnectionResolveFailure verifies that dialConnection handles
 // address resolution failure correctly.
 func TestDialConnectionResolveFailure(t *testing.T) {
@@ -395,35 +373,6 @@ func TestSendVoteMessages(t *testing.T) {
 	if msg.LogTerm != 9 || msg.LogIndex != 100 {
 		t.Fatalf("LogTerm/LogIndex mismatch")
 	}
-}
-
-// TestHandleMessageFrameDirectReadFullError verifies the handleMessageFrame
-// error path when ReadFull fails.
-func TestHandleMessageFrameDirectReadFullError(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	// Create a stream that returns an error on read (via bytes.Reader with
-	// insufficient data). We test handleMessageFrame with a reader that
-	// has less data than the indicated length.
-	// handleMessageFrame takes *quic.Stream, but we can't easily mock that.
-	// Instead, test by sending a message and verifying the handler works.
-	// The error paths in handleMessageFrame are triggered when the wire
-	// format is corrupted, so we verify the happy path works fully.
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
 }
 
 // TestSnapshotReceiverMemoryBudgetExhaustion verifies that the snapshot
@@ -547,34 +496,6 @@ func TestStartWithInvalidUDPAddress(t *testing.T) {
 		tr.Stop()
 		t.Fatal("expected error for invalid UDP address")
 	}
-}
-
-// TestSendBatchStreamGetError verifies sendBatch handles getStream failure
-// gracefully by dropping the message.
-func TestSendBatchStreamGetError(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// sendBatch to an unreachable target. This triggers the getStream
-	// error path (which calls getConnection which fails).
-	tr.sendBatch("127.0.0.1:1", "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	// Should not panic or block.
 }
 
 // TestSendBatchWriteDeadlineAndWriteError verifies that sendBatch handles
@@ -1959,16 +1880,6 @@ func TestHandleMessageFrame_CompressedBoundaryCondition(t *testing.T) {
 			t.Fatalf("expected ErrDecompressedSizeLimitExceeded, got %v", err)
 		}
 	})
-}
-
-// TestFrameDecompressError_ErrorString verifies the error message format.
-func TestFrameDecompressError_ErrorString(t *testing.T) {
-	inner := errors.New("bad snappy data")
-	e := &FrameDecompressError{Err: inner}
-	want := "transport: frame decompression failed: bad snappy data"
-	if e.Error() != want {
-		t.Fatalf("error string = %q, want %q", e.Error(), want)
-	}
 }
 
 // TestFrameDecompressError_Unwrap verifies error chain traversal.

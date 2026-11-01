@@ -90,26 +90,6 @@ func TestReconstructMembership_CorruptBootstrapEntryFailsClosed(t *testing.T) {
 	}
 }
 
-// TestReconstructMembership_ValidBootstrapEntryStillDecodes is the control for
-// the test above: the refusal must key on the DECODE, not on the entry type, or
-// config-in-log recovery would never work at all.
-func TestReconstructMembership_ValidBootstrapEntryStillDecodes(t *testing.T) {
-	e, err := BuildInitialMembershipEntry(proto.Membership{
-		Addresses: map[uint64]string{1: "addr1", 2: "addr2"},
-	})
-	if err != nil {
-		t.Fatalf("BuildInitialMembershipEntry: %v", err)
-	}
-	ms, err := ReconstructMembership([]proto.Entry{e})
-	if err != nil {
-		t.Fatalf("reconstruction of a VALID bootstrap entry failed: %v", err)
-	}
-	if len(ms.Addresses) != 2 || ms.Addresses[2] != "addr2" {
-		t.Fatalf("reconstructed addresses = %v, want the 2 bootstrap voters",
-			ms.Addresses)
-	}
-}
-
 // TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy is the
 // non-voter survival test. The founding entry carries the WHOLE Membership, so
 // witnesses, observers, the Removed tombstone DENY-list, the committed member

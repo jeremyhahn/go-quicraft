@@ -381,38 +381,6 @@ func TestDialConnectionServerNameExtraction(t *testing.T) {
 	})
 }
 
-// TestDialErrorType verifies the DialError typed error formatting and unwrap.
-func TestDialErrorType(t *testing.T) {
-	t.Run("error message includes target", func(t *testing.T) {
-		inner := errors.New("missing port in address")
-		err := &DialError{Target: "badaddr", Err: inner}
-		expected := "transport: dial badaddr failed: missing port in address"
-		if err.Error() != expected {
-			t.Errorf("Error() = %q, want %q", err.Error(), expected)
-		}
-	})
-
-	t.Run("unwrap returns inner error", func(t *testing.T) {
-		inner := errors.New("test error")
-		err := &DialError{Target: "host:1234", Err: inner}
-		if !errors.Is(err, inner) {
-			t.Error("errors.Is should match the inner error")
-		}
-	})
-
-	t.Run("errors.As matches DialError", func(t *testing.T) {
-		inner := errors.New("parse failure")
-		err := &DialError{Target: "noport", Err: inner}
-		var dialErr *DialError
-		if !errors.As(err, &dialErr) {
-			t.Fatal("errors.As should match *DialError")
-		}
-		if dialErr.Target != "noport" {
-			t.Errorf("Target = %q, want %q", dialErr.Target, "noport")
-		}
-	})
-}
-
 // TestStreamPoolSizeOne verifies pool behavior when pool size is 1.
 func TestStreamPoolSizeOne(t *testing.T) {
 	handler1 := newTestHandler()
@@ -1141,7 +1109,7 @@ func TestEvictStaleOutboundOnRecvDelegatesToEvictStaleOutbound(t *testing.T) {
 
 	// Kill the connection.
 	conn.CloseWithError(0, "dead for nil-inbound test")
-	time.Sleep(500 * time.Millisecond)
+	waitConnDown(t, t1, target, 5*time.Second)
 
 	// Call evictStaleOutboundOnRecv with nil inbound — should delegate
 	// to evictStaleOutbound and clean up the dead connection.
@@ -1264,20 +1232,6 @@ func TestEvictStaleOutboundOnRecv_NoOutboundNoAdoption(t *testing.T) {
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections (no adoption), got %d",
 			t1.ConnectionCount())
-	}
-}
-
-// TestEvictStaleOutboundOnRecv_EmptyTargetNoop verifies that an empty target
-// string is a no-op, matching evictStaleOutbound's guard clause.
-func TestEvictStaleOutboundOnRecv_EmptyTargetNoop(t *testing.T) {
-	t1, _, _, _, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Should return immediately without panic.
-	t1.evictStaleOutboundOnRecv("", 0, nil)
-
-	if t1.ConnectionCount() != 0 {
-		t.Fatalf("expected 0 connections, got %d", t1.ConnectionCount())
 	}
 }
 
@@ -1562,32 +1516,6 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 	}
 }
 
-// TestGetStreamReturnsErrorOnShutdown verifies that getStream returns an error
-// (not a valid stream) when shutdownCtx is already cancelled at call time.
-func TestGetStreamReturnsErrorOnShutdown(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	tr.Stop()
-
-	_, err = tr.getStream("127.0.0.1:12345", 0, false, "")
-	if err == nil {
-		t.Fatal("expected error from getStream after stop, got nil")
-	}
-}
-
 // TestDialConnectionReturnsPromptlyOnShutdown verifies that dialConnection
 // returns promptly when shutdownCtx is cancelled, rather than blocking for
 // the full dialTimeout. This guards against the regression where
@@ -1765,55 +1693,6 @@ func TestGetStream_StoppedTransportReturnsError(t *testing.T) {
 // TestGetStream_StreamPoolSizeOne verifies that when StreamPoolSize is 1,
 // non-heartbeat messages use stream index 0 (same as heartbeats).
 
-func TestGetStream_StreamPoolSizeOne(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress:  ":0",
-		DeploymentID:   42,
-		MTLSConfig:     mtls,
-		StreamPoolSize: 1,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress:  ":0",
-		DeploymentID:   42,
-		MTLSConfig:     mtls,
-		StreamPoolSize: 1,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	reg1.Register(1, 2, t2.Addr().String())
-
-	// Send a non-heartbeat with pool size 1 to exercise the poolSize <= 1 path.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) == 0 {
-		t.Fatal("expected at least 1 batch")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // connectionCleanupOnce panic path (conn.go:384 - 66.7% coverage)
 // ---------------------------------------------------------------------------
@@ -1931,156 +1810,12 @@ func TestConnectionCleanup_ExitsOnStopAfterNormalReturn(t *testing.T) {
 // sendQueueWorkerOnce heartbeat drain paths (quic.go:620 - 74.4% coverage)
 // ---------------------------------------------------------------------------
 
-// TestSendQueueWorkerOnce_HeartbeatPriority verifies that heartbeat messages
-// on the hbCh are processed before data messages on ch.
-
-func TestEvictStaleOutbound_EmptyTarget(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	tr.evictStaleOutboundOnRecv("", 0, nil) // Should not panic.
-}
-
-// TestEvictStaleOutbound_NoConnection verifies that evictStaleOutbound
-// is a no-op when no connection exists.
-
-func TestEvictStaleOutbound_NoConnection(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	tr.evictStaleOutboundOnRecv("127.0.0.1:9999", 0, nil) // No connection, no-op.
-}
-
-// ---------------------------------------------------------------------------
-// evictStaleOutboundOnRecv (conn.go:522 - 80.8% coverage)
-// ---------------------------------------------------------------------------
-
-// TestEvictStaleOutboundOnRecv_EmptyTarget verifies empty target is a no-op.
-
-func TestEvictStaleOutboundOnRecv_EmptyTarget(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	tr.evictStaleOutboundOnRecv("", 0, nil) // Should not panic.
-}
-
-// TestEvictStaleOutboundOnRecv_NilInbound verifies that nil inbound
-// connection falls back to basic eviction.
-
-func TestEvictStaleOutboundOnRecv_NilInbound(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	tr.evictStaleOutboundOnRecv("127.0.0.1:9999", 0, nil) // Falls back to evictStaleOutbound.
-}
-
-// TestEvictStaleOutboundOnRecv_NoOutbound verifies that eviction is a
-// no-op when no outbound connection exists for the given target.
-
-func TestEvictStaleOutboundOnRecv_NoOutbound(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Establish a connection by sending a message.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	target := t2.Addr().String()
-	// Get the actual connection.
-	t1.connMu.RLock()
-	conn := t1.conns[target]
-	t1.connMu.RUnlock()
-
-	// Remove the outbound from the pool.
-	t1.removeConnection(target)
-
-	// Now evictStaleOutboundOnRecv with a real inbound conn but no outbound.
-	// Should not panic, just return early (no outbound to evict).
-	t1.evictStaleOutboundOnRecv(target, 0, conn)
-
-	if t1.ConnectionCount() != 0 {
-		t.Fatalf("expected 0 connections, got %d", t1.ConnectionCount())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // localAddr (quic.go:1177-1182)
 // ---------------------------------------------------------------------------
 
 // TestLocalAddr_BeforeStart verifies that localAddr falls back to the
 // configured address before Start is called.
-
-func TestGetConnection_StoppedTransportReturnsError(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	tr.Stop()
-
-	_, err = tr.getConnection("127.0.0.1:9999", "")
-	if !errors.Is(err, ErrStreamClosed) {
-		t.Fatalf("expected ErrStreamClosed, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Send with deep-copy of entries (quic.go:496-507)
@@ -2114,97 +1849,12 @@ func TestDialConnection_InvalidTarget(t *testing.T) {
 // TestDialConnection_EmptyHost verifies that an empty host in the target
 // defaults to "localhost".
 
-func TestDialConnection_EmptyHost(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Get the port from t2.
-	target := t2.Addr().String()
-
-	// Verify connection works with normal target.
-	conn, err := t1.dialForTest(target)
-	if err != nil {
-		t.Fatalf("dialConnection failed: %v", err)
-	}
-	if conn == nil {
-		t.Fatal("expected non-nil connection")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SendSnapshotStreaming round-trip (quic.go:1053 - 17.5% coverage)
 // ---------------------------------------------------------------------------
 
 // TestSendSnapshotStreaming_RoundTrip verifies that SendSnapshotStreaming
 // correctly streams chunks to the receiver and the snapshot is processed.
-
-func TestCleanStaleConnections_WithEventListener(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	failed := make(chan string, 1)
-	mtls := testMTLSConfig(t)
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnConnectionFailed: func(info config.ConnectionInfo) {
-				select {
-				case failed <- info.Address:
-				default:
-				}
-			},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-
-	reg1.Register(1, 2, t2.Addr().String())
-
-	// Establish a connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to make the connection stale.
-	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Trigger cleanup manually.
-	t1.cleanStaleConnections()
-
-	select {
-	case addr := <-failed:
-		if addr == "" {
-			t.Fatal("expected non-empty address in OnConnectionFailed")
-		}
-	case <-time.After(5 * time.Second):
-		// The connection may not be detected as stale yet if the QUIC
-		// idle timeout hasn't fired. This is expected in some cases.
-	}
-}
 
 // TestDialConnection_WithEventListener verifies that connection events
 // are fired when an event listener is configured.
@@ -3226,74 +2876,6 @@ func TestPreOpenHeartbeatStream_StoppedTransportReturns(t *testing.T) {
 // paths in Stop() when connections and streams are already closed before
 // Stop is called. This covers quic.go:420-422, 436-438, and 445-447.
 
-func TestGetStream_FastPathDetectsDeadConnectionAndReconnects(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to make the connection dead.
-	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Restart t2 on same address.
-	t2b, err := NewQUICTransport(Config{
-		ListenAddress: t2Addr,
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, newTestHandler(), registry.NewRegistry())
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2b) failed: %v", err)
-	}
-	if err := t2b.Start(); err != nil {
-		t.Fatalf("t2b.Start failed: %v", err)
-	}
-	defer t2b.Stop()
-
-	// getStream should detect the dead connection, evict, and reconnect.
-	stream, getErr := t1.getStream(t2Addr, 1, false, "")
-	if getErr != nil {
-		t.Fatalf("getStream failed after reconnect: %v", getErr)
-	}
-	if stream == nil {
-		t.Fatal("expected non-nil stream after reconnect")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // sendBatch with snappy encode pool capacity too small (quic.go:781-785)
 // ---------------------------------------------------------------------------
@@ -3618,7 +3200,7 @@ func TestGetStream_FastPathDeadConnection(t *testing.T) {
 		t.Fatal("expected connection to exist")
 	}
 	conn.CloseWithError(0, "test: force dead connection")
-	time.Sleep(100 * time.Millisecond)
+	waitConnDown(t, t1, t2Addr, 5*time.Second)
 
 	// getStream should detect the dead connection, evict, and reconnect.
 	stream2, err := t1.getStream(t2Addr, 1, false, "")

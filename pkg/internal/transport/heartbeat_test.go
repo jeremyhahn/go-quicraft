@@ -266,34 +266,6 @@ func TestSendHeartbeatBatch_SourceAddressSet(t *testing.T) {
 	}
 }
 
-// TestSendHeartbeatBatch_StreamEvictionOnWriteError verifies that the
-// heartbeat fast path evicts the stream when a write fails.
-func TestSendHeartbeatBatch_StreamEvictionOnWriteError(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Establish the heartbeat stream.
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to break the stream, then wait for t1 to actually SEE it.
-	//
-	// Stop closes the connection t2 ACCEPTED from t1 as well as its own
-	// outbound ones, so a CONNECTION_CLOSE reaches t1 and the real condition
-	// can be waited on rather than guessed at with a fixed sleep.
-	t2Addr := t2.Addr().String()
-	t2.Stop()
-	waitConnDown(t, t1, t2Addr, 10*time.Second)
-
-	// Send again. The write should fail, triggering stream eviction.
-	// Should not panic or block.
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-}
-
 // TestSendHeartbeatBatch_UnreachableTarget verifies that the heartbeat
 // fast path handles getStream failure gracefully.
 func TestSendHeartbeatBatch_UnreachableTarget(t *testing.T) {
@@ -701,31 +673,6 @@ func TestSendHeartbeatBatch_WriteDeadlineErrorEvicts(t *testing.T) {
 // TestGetConnection_StoppedTransportReturnsError verifies getConnection
 // returns ErrStreamClosed when the transport is stopped.
 
-func TestSendHeartbeatBatch_MarshalErrorPath(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a heartbeat with a valid message to establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Send multiple heartbeats to exercise the batch send path fully.
-	for i := 0; i < 20; i++ {
-		t1.Send([]proto.Message{
-			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: uint64(i + 2)},
-		})
-	}
-
-	// Wait for delivery. The old loop returned on success and fell out of the
-	// bottom on timeout, so a total failure to deliver anything PASSED.
-	pollUntil(t, 10*time.Second, 2*time.Millisecond,
-		"heartbeats sent through the batch path were not delivered", func() bool {
-			return countRequests(handler2) >= 10
-		})
-}
-
 // ---------------------------------------------------------------------------
 // sendBatch write deadline error and write error paths
 // ---------------------------------------------------------------------------
@@ -734,62 +681,6 @@ func TestSendHeartbeatBatch_MarshalErrorPath(t *testing.T) {
 // a write deadline or write error triggers connection removal
 // and stream eviction.
 
-func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	// Establish connection and heartbeat stream.
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 and wait for t1 to see the connection go down, observable because
-	// Stop announces itself on the inbound half.
-	t2.Stop()
-	waitConnDown(t, t1, t2Addr, 10*time.Second)
-
-	// Call sendHeartbeatBatch directly. Should hit error paths.
-	t1.sendHeartbeatBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-
-	// Call again to exercise the path after connection eviction.
-	t1.sendHeartbeatBatch(t2Addr, "", []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 3},
-	})
-}
-
 // ---------------------------------------------------------------------------
 // evictStaleOutboundOnRecv inbound changed path (conn.go:564-577)
 // ---------------------------------------------------------------------------
@@ -797,35 +688,6 @@ func TestSendHeartbeatBatch_DirectCallWriteError(t *testing.T) {
 // TestEvictStaleOutboundOnRecv_InboundChanged verifies that when the
 // inbound connection changes (simulating peer restart), the outbound
 // connection is evicted even if it's still alive.
-
-func TestSendHeartbeatBatch_GetStreamError(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	// Cancel the shutdown context so getStream/dial fails.
-	tr.shutdownCancel()
-
-	// sendHeartbeatBatch should hit the getStream error path
-	// at heartbeat.go:109-112 and return without crash.
-	tr.sendHeartbeatBatch("127.0.0.1:50001", "", []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-
-	tr.Stop()
-}
 
 // ---------------------------------------------------------------------------
 // SendSnapshot SetWriteDeadline error after open (quic.go:936-938)

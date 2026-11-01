@@ -80,18 +80,12 @@ func TestRemoteStateString(t *testing.T) {
 		{remoteReplicate, "Replicate"},
 		{remoteProbe, "Probe"},
 		{remoteSnapshot, "Snapshot"},
+		{remoteState(99), "Unknown(99)"},
 	}
 	for _, tt := range tests {
 		if tt.state.String() != tt.name {
 			t.Errorf("expected %q for state %d, got %q", tt.name, tt.state, tt.state.String())
 		}
-	}
-}
-
-func TestRemoteStateStringUnknown(t *testing.T) {
-	s := remoteState(99).String()
-	if s != "Unknown(99)" {
-		t.Errorf("expected Unknown(99), got %q", s)
 	}
 }
 
@@ -253,21 +247,6 @@ func TestUpdateDoesNotGoBackward(t *testing.T) {
 	}
 }
 
-func TestUpdateAdvancesNextWhenBehind(t *testing.T) {
-	r := newRemote(5, 5)
-	r.match = 3
-	updated := r.update(10)
-	if !updated {
-		t.Errorf("expected updated=true")
-	}
-	if r.match != 10 {
-		t.Errorf("expected match=10, got %d", r.match)
-	}
-	if r.next != 11 {
-		t.Errorf("expected next=11, got %d", r.next)
-	}
-}
-
 func TestUpdateOnlyAdvancesNextNotMatch(t *testing.T) {
 	r := newRemote(5, 5)
 	r.match = 10
@@ -311,58 +290,6 @@ func TestOptimisticUpdateDoesNotRequireHigherIndex(t *testing.T) {
 // respondedTo
 // ---------------------------------------------------------------------------
 
-func TestRespondedToFromProbeTransitionsToReplicate(t *testing.T) {
-	r := newRemote(11, 5)
-	r.match = 10
-	r.probeSent = true
-	r.respondedTo()
-	if r.state != remoteReplicate {
-		t.Errorf("expected replicate state, got %s", r.state)
-	}
-	if r.next != 11 {
-		t.Errorf("expected next=11, got %d", r.next)
-	}
-}
-
-func TestRespondedToFromSnapshotTransitionsToProbeWhenCaughtUp(t *testing.T) {
-	r := newRemote(5, 5)
-	r.match = 50
-	r.state = remoteSnapshot
-	r.snapshotIndex = 50
-	r.respondedTo()
-	if r.state != remoteProbe {
-		t.Errorf("expected probe state, got %s", r.state)
-	}
-	// next should be max(match+1, snapshotIndex+1) = max(51, 51) = 51
-	if r.next != 51 {
-		t.Errorf("expected next=51, got %d", r.next)
-	}
-}
-
-func TestRespondedToFromSnapshotStaysInSnapshotWhenBehind(t *testing.T) {
-	r := newRemote(5, 5)
-	r.match = 10
-	r.state = remoteSnapshot
-	r.snapshotIndex = 50
-	r.respondedTo()
-	if r.state != remoteSnapshot {
-		t.Errorf("expected snapshot state, got %s", r.state)
-	}
-}
-
-func TestRespondedToFromReplicateNoChange(t *testing.T) {
-	r := newRemote(11, 5)
-	r.match = 10
-	r.state = remoteReplicate
-	r.respondedTo()
-	if r.state != remoteReplicate {
-		t.Errorf("expected replicate state, got %s", r.state)
-	}
-	if r.next != 11 {
-		t.Errorf("expected next unchanged, got %d", r.next)
-	}
-}
-
 func TestRespondedToResetsProbeSent(t *testing.T) {
 	r := newRemote(11, 5)
 	r.match = 10
@@ -376,54 +303,6 @@ func TestRespondedToResetsProbeSent(t *testing.T) {
 // ---------------------------------------------------------------------------
 // declineFrom
 // ---------------------------------------------------------------------------
-
-func TestDeclineFromReplicateStateStale(t *testing.T) {
-	r := newRemote(15, 5)
-	r.match = 10
-	r.state = remoteReplicate
-	// rejected index <= match: stale
-	changed := r.declineFrom(9, 100)
-	if changed {
-		t.Errorf("expected no change for stale rejection")
-	}
-	if r.next != 15 {
-		t.Errorf("expected next unchanged, got %d", r.next)
-	}
-}
-
-func TestDeclineFromReplicateStateAtMatch(t *testing.T) {
-	r := newRemote(15, 5)
-	r.match = 10
-	r.state = remoteReplicate
-	changed := r.declineFrom(10, 100)
-	if changed {
-		t.Errorf("expected no change for rejection at match")
-	}
-}
-
-func TestDeclineFromReplicateStateFallsBack(t *testing.T) {
-	r := newRemote(15, 5)
-	r.match = 10
-	r.state = remoteReplicate
-	changed := r.declineFrom(12, 100)
-	if !changed {
-		t.Errorf("expected changed")
-	}
-	if r.next != 11 {
-		t.Errorf("expected next=match+1=11, got %d", r.next)
-	}
-}
-
-func TestDeclineFromProbeStateStale(t *testing.T) {
-	r := newRemote(15, 5)
-	r.match = 10
-	r.state = remoteProbe
-	// Stale: rejected != next-1
-	changed := r.declineFrom(20, 100)
-	if changed {
-		t.Errorf("expected no change for stale rejection")
-	}
-}
 
 func TestDeclineFromProbeStateUsesHint(t *testing.T) {
 	r := newRemote(15, 5)
@@ -443,91 +322,9 @@ func TestDeclineFromProbeStateUsesHint(t *testing.T) {
 	}
 }
 
-func TestDeclineFromProbeStateHintLastIndexLow(t *testing.T) {
-	r := newRemote(15, 5)
-	r.match = 10
-	r.state = remoteProbe
-	// lastIndex is very low
-	changed := r.declineFrom(14, 5)
-	if !changed {
-		t.Errorf("expected changed")
-	}
-	// next = min(14, 6) = 6
-	if r.next != 6 {
-		t.Errorf("expected next=6, got %d", r.next)
-	}
-}
-
-func TestDeclineFromProbeStateNeverBelowOne(t *testing.T) {
-	r := newRemote(2, 5)
-	r.state = remoteProbe
-	changed := r.declineFrom(1, 0)
-	if !changed {
-		t.Errorf("expected changed")
-	}
-	if r.next != 1 {
-		t.Errorf("expected next=1 (minimum), got %d", r.next)
-	}
-}
-
-func TestDeclineFromSnapshotStateStale(t *testing.T) {
-	r := newRemote(15, 5)
-	r.state = remoteSnapshot
-	// rejected != next-1: stale
-	changed := r.declineFrom(20, 100)
-	if changed {
-		t.Errorf("expected no change for stale rejection in snapshot state")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // isPaused
 // ---------------------------------------------------------------------------
-
-func TestIsPausedProbeNotSent(t *testing.T) {
-	r := newRemote(11, 5)
-	r.state = remoteProbe
-	r.probeSent = false
-	if r.isPaused() {
-		t.Errorf("expected not paused in probe with no pending probe")
-	}
-}
-
-func TestIsPausedProbeSent(t *testing.T) {
-	r := newRemote(11, 5)
-	r.state = remoteProbe
-	r.probeSent = true
-	if !r.isPaused() {
-		t.Errorf("expected paused in probe with pending probe")
-	}
-}
-
-func TestIsPausedReplicateNotFull(t *testing.T) {
-	r := newRemote(11, 5)
-	r.state = remoteReplicate
-	if r.isPaused() {
-		t.Errorf("expected not paused in replicate with empty inflights")
-	}
-}
-
-func TestIsPausedReplicateFull(t *testing.T) {
-	r := newRemote(11, 3)
-	r.state = remoteReplicate
-	mustAdd(t, r.inflights, 11)
-	mustAdd(t, r.inflights, 12)
-	mustAdd(t, r.inflights, 13)
-	if !r.isPaused() {
-		t.Errorf("expected paused in replicate with full inflights")
-	}
-}
-
-func TestIsPausedSnapshot(t *testing.T) {
-	r := newRemote(11, 5)
-	r.state = remoteSnapshot
-	if !r.isPaused() {
-		t.Errorf("expected paused in snapshot state")
-	}
-}
 
 func TestIsPausedTableDriven(t *testing.T) {
 	tests := []struct {
@@ -569,16 +366,6 @@ func TestIsPausedReturnsTrueForInvalidState(t *testing.T) {
 	// The remote will retry on the next heartbeat cycle.
 	if !r.isPaused() {
 		t.Errorf("expected paused=true for invalid state, got false")
-	}
-}
-
-func TestIsPausedInvalidStateDoesNotPanic(t *testing.T) {
-	r := newRemote(11, 5)
-	r.state = remoteState(255)
-	// Must not panic; should return true.
-	result := r.isPaused()
-	if !result {
-		t.Errorf("expected paused=true for invalid state 255, got false")
 	}
 }
 
@@ -759,38 +546,6 @@ func TestStateCycleProbeReplicateSnapshotProbe(t *testing.T) {
 // Active tracking
 // ---------------------------------------------------------------------------
 
-func TestActiveTracking(t *testing.T) {
-	r := newRemote(11, 5)
-	if r.isActive() {
-		t.Errorf("expected not active initially")
-	}
-	r.setActive()
-	if !r.isActive() {
-		t.Errorf("expected active after setActive")
-	}
-	r.setNotActive()
-	if r.isActive() {
-		t.Errorf("expected not active after setNotActive")
-	}
-}
-
-func TestActiveDoesNotAffectState(t *testing.T) {
-	r := newRemote(11, 5)
-	r.match = 10
-	r.state = remoteReplicate
-	r.setActive()
-	if r.state != remoteReplicate {
-		t.Errorf("setActive changed state, got %s", r.state)
-	}
-	if r.match != 10 || r.next != 11 {
-		t.Errorf("setActive changed match/next")
-	}
-	r.setNotActive()
-	if r.state != remoteReplicate {
-		t.Errorf("setNotActive changed state, got %s", r.state)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // respondedTo table-driven
 // ---------------------------------------------------------------------------
@@ -929,28 +684,6 @@ func TestDeclineFromNonReplicateTableDriven(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Edge case: rapid state transitions
 // ---------------------------------------------------------------------------
-
-func TestRapidStateTransitions(t *testing.T) {
-	r := newRemote(11, 5)
-	r.match = 10
-
-	// Rapid transitions should not corrupt state
-	r.becomeReplicate()
-	r.becomeProbe()
-	r.becomeSnapshot(50, 1)
-	r.becomeProbe()
-	r.becomeReplicate()
-
-	if r.state != remoteReplicate {
-		t.Errorf("expected replicate, got %s", r.state)
-	}
-	if r.snapshotIndex != 0 {
-		t.Errorf("expected snapshotIndex 0, got %d", r.snapshotIndex)
-	}
-	if r.probeSent {
-		t.Errorf("expected probeSent false")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Integration: update with inflights

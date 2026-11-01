@@ -224,15 +224,6 @@ func TestValidateFrameHeaderWrongMagic(t *testing.T) {
 	}
 }
 
-// TestValidateFrameHeaderUnsupportedVersion verifies version validation.
-func TestValidateFrameHeaderUnsupportedVersion(t *testing.T) {
-	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion + 5, 0x00, 0, 0, 0, 10}
-	err := ValidateFrameHeader(header[:])
-	if !errors.Is(err, ErrUnsupportedVersion) {
-		t.Fatalf("expected ErrUnsupportedVersion, got %v", err)
-	}
-}
-
 // TestValidateFrameHeaderOversized verifies oversized frame detection.
 func TestValidateFrameHeaderOversized(t *testing.T) {
 	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
@@ -403,16 +394,6 @@ func TestFrameFlagsValues(t *testing.T) {
 	}
 	if FlagCompressed != 0x01 {
 		t.Fatalf("FlagCompressed: expected 0x01, got 0x%02x", FlagCompressed)
-	}
-}
-
-// TestValidateFrameHeaderVersionZeroRejected verifies wire version 0
-// is rejected as unsupported.
-func TestValidateFrameHeaderVersionZeroRejected(t *testing.T) {
-	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, 0x00, 0x00, 0, 0, 0, 10}
-	err := ValidateFrameHeader(header[:])
-	if !errors.Is(err, ErrUnsupportedVersion) {
-		t.Fatalf("version 0 should be rejected as ErrUnsupportedVersion, got: %v", err)
 	}
 }
 

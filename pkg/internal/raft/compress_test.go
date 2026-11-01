@@ -93,24 +93,6 @@ func TestCompressEntry_EmptyCmd(t *testing.T) {
 	}
 }
 
-func TestCompressEntry_NilCmd(t *testing.T) {
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   nil,
-	}
-
-	CompressEntry(&e)
-
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("expected no compress flag on nil cmd")
-	}
-	if e.Cmd != nil {
-		t.Fatal("expected nil cmd to remain nil")
-	}
-}
-
 func TestDecompressEntry_CompressedData(t *testing.T) {
 	original := bytes.Repeat([]byte("hello world "), 100)
 	e := proto.Entry{

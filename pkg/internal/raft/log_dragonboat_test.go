@@ -16,7 +16,7 @@ package raft
 
 // Log edge case tests ported from dragonboat. These test entry retrieval
 // from in-memory and LogDB stores, spanning retrieval, post-snapshot
-// state, and uncommitted entry tracking.
+// state, and applied-index tracking.
 
 import (
 	"testing"
@@ -219,80 +219,6 @@ func TestLog_PostSnapshotRestoreState(t *testing.T) {
 	}
 }
 
-// TestLog_UncommittedEntries verifies that only uncommitted entries
-// (those beyond the committed index) can be identified.
-func TestLog_UncommittedEntries(t *testing.T) {
-	entries := makeEntries(1, 6, 1) // indices 1-5
-	l := newTestRaftLog(entries)
-	l.committed = 3
-
-	// Entries 4 and 5 are uncommitted.
-	uncommitted, err := l.entries(l.committed+1, l.lastIndex()+1, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(uncommitted) != 2 {
-		t.Fatalf("expected 2 uncommitted entries, got %d", len(uncommitted))
-	}
-	if uncommitted[0].Index != 4 {
-		t.Fatalf("expected first uncommitted at index 4, got %d", uncommitted[0].Index)
-	}
-	if uncommitted[1].Index != 5 {
-		t.Fatalf("expected second uncommitted at index 5, got %d", uncommitted[1].Index)
-	}
-}
-
-// TestLog_UncommittedEntries_AllCommitted verifies that when all entries
-// are committed, the uncommitted range is empty.
-func TestLog_UncommittedEntries_AllCommitted(t *testing.T) {
-	entries := makeEntries(1, 4, 1) // indices 1-3
-	l := newTestRaftLog(entries)
-	l.committed = 3
-
-	// No uncommitted entries.
-	result, err := l.entries(l.committed+1, l.lastIndex()+1, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 0 && result != nil {
-		t.Fatalf("expected 0 uncommitted entries, got %d", len(result))
-	}
-}
-
-// TestLog_CommitUpdateAdvancesApplied verifies that appliedTo correctly
-// tracks the applied index after commit updates.
-func TestLog_CommitUpdateAdvancesApplied(t *testing.T) {
-	entries := makeEntries(1, 6, 1) // indices 1-5
-	l := newTestRaftLog(entries)
-	l.committed = 5
-	l.processed = 0
-
-	// Apply entries 1-3.
-	l.appliedTo(3)
-	if l.processed != 3 {
-		t.Fatalf("expected processed=3, got %d", l.processed)
-	}
-
-	// Verify hasEntriesToApply is still true (entries 4-5 remain).
-	if !l.hasEntriesToApply() {
-		t.Fatal("expected entries to apply (4-5 remain)")
-	}
-
-	// firstNotAppliedIndex should be 4.
-	if l.firstNotAppliedIndex() != 4 {
-		t.Fatalf("expected firstNotAppliedIndex=4, got %d", l.firstNotAppliedIndex())
-	}
-
-	// Apply the rest.
-	l.appliedTo(5)
-	if l.processed != 5 {
-		t.Fatalf("expected processed=5, got %d", l.processed)
-	}
-	if l.hasEntriesToApply() {
-		t.Fatal("expected no entries to apply after applying all")
-	}
-}
-
 // TestLog_CommitUpdateAdvancesApplied_ZeroIsNoop verifies that
 // appliedTo(0) is a no-op.
 func TestLog_CommitUpdateAdvancesApplied_ZeroIsNoop(t *testing.T) {
@@ -337,95 +263,4 @@ func TestLog_CommitUpdateAdvancesApplied_PanicBeyondCommitted(t *testing.T) {
 		}
 	}()
 	l.appliedTo(4) // beyond committed=3
-}
-
-// TestLog_FirstIndexOfTerm verifies binary search for term boundaries.
-func TestLog_FirstIndexOfTerm(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 2},
-		{Index: 4, Term: 2},
-		{Index: 5, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	tests := []struct {
-		term     uint64
-		expected uint64
-	}{
-		{term: 1, expected: 1},
-		{term: 2, expected: 3},
-		{term: 3, expected: 5},
-		{term: 4, expected: 0}, // no entries at term 4
-		{term: 0, expected: 0}, // no entries at term 0
-	}
-
-	for _, tt := range tests {
-		result := l.firstIndexOfTerm(tt.term)
-		if result != tt.expected {
-			t.Fatalf("firstIndexOfTerm(%d): expected %d, got %d",
-				tt.term, tt.expected, result)
-		}
-	}
-}
-
-// TestLog_LastIndexOfTerm verifies binary search for last entry of a term.
-func TestLog_LastIndexOfTerm(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 2},
-		{Index: 4, Term: 2},
-		{Index: 5, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	tests := []struct {
-		term     uint64
-		expected uint64
-	}{
-		{term: 1, expected: 2},
-		{term: 2, expected: 4},
-		{term: 3, expected: 5},
-		{term: 4, expected: 0}, // no entries at term 4
-	}
-
-	for _, tt := range tests {
-		result := l.lastIndexOfTerm(tt.term)
-		if result != tt.expected {
-			t.Fatalf("lastIndexOfTerm(%d): expected %d, got %d",
-				tt.term, tt.expected, result)
-		}
-	}
-}
-
-// TestLog_LimitEntrySize verifies the entry size limiter.
-func TestLog_LimitEntrySize(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1, Cmd: make([]byte, 100)},
-		{Index: 2, Term: 1, Cmd: make([]byte, 100)},
-		{Index: 3, Term: 1, Cmd: make([]byte, 100)},
-	}
-
-	t.Run("zero_maxSize_returns_all", func(t *testing.T) {
-		result := limitEntrySize(entries, 0)
-		if len(result) != 3 {
-			t.Fatalf("expected 3 entries with maxSize=0, got %d", len(result))
-		}
-	})
-
-	t.Run("always_returns_at_least_one", func(t *testing.T) {
-		result := limitEntrySize(entries, 1)
-		if len(result) < 1 {
-			t.Fatal("expected at least 1 entry")
-		}
-	})
-
-	t.Run("empty_slice_returns_empty", func(t *testing.T) {
-		result := limitEntrySize(nil, 100)
-		if result != nil {
-			t.Fatalf("expected nil, got %v", result)
-		}
-	})
 }

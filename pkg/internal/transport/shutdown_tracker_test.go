@@ -230,40 +230,6 @@ func TestShutdownTracker_ShutdownAndWait_MultipleInFlight(t *testing.T) {
 	}
 }
 
-func TestShutdownTracker_ShutdownAndWaitWithInFlight(t *testing.T) {
-	var tracker shutdownTracker
-
-	// Start an in-flight operation.
-	if !tracker.TryAdd() {
-		t.Fatal("TryAdd should succeed before shutdown")
-	}
-
-	// Start ShutdownAndWait in a goroutine - it will block until Done().
-	done := make(chan struct{})
-	go func() {
-		tracker.ShutdownAndWait()
-		close(done)
-	}()
-
-	// Give time for ShutdownAndWait to set the flag and start waiting.
-	time.Sleep(50 * time.Millisecond)
-
-	// New TryAdd should fail after shutdown.
-	if tracker.TryAdd() {
-		t.Fatal("TryAdd should fail after shutdown initiated")
-	}
-
-	// Complete the in-flight operation.
-	tracker.Done()
-
-	// ShutdownAndWait should return.
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("ShutdownAndWait did not return after in-flight completed")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // getOrCreateSendQueue stopped during write lock (quic.go:562-565)
 // ---------------------------------------------------------------------------

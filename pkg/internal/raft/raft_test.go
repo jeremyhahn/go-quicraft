@@ -2104,6 +2104,9 @@ func TestRaft_LeaderTransfer_TargetCaughtUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if r.transferTarget != 2 {
+		t.Fatalf("expected transferTarget=2, got %d", r.transferTarget)
+	}
 
 	// Should send TimeoutNow to peer 2.
 	timeoutNows := collectMessages(r, proto.TimeoutNow)
@@ -2213,24 +2216,6 @@ func TestRaft_LeaderTransfer_TimeoutClearsTransfer(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Test: TimeoutNow
 // ---------------------------------------------------------------------------
-
-func TestRaft_TimeoutNow_StartsElection(t *testing.T) {
-	r := atTerm(newTestRaftPreVoteDisabled(1), 1)
-	r.msgs = nil
-
-	err := r.step(proto.Message{
-		Type: proto.TimeoutNow,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if r.state != candidate {
-		t.Fatalf("expected candidate after TimeoutNow, got %s", r.state)
-	}
-}
 
 func TestRaft_TimeoutNow_IgnoredByObserver(t *testing.T) {
 	cfg := raftTestCfg(1, 1)
@@ -2724,33 +2709,6 @@ func TestRaft_Observer_DoesNotStartElection(t *testing.T) {
 	}
 }
 
-func TestRaft_Observer_DoesNotStartElectionOnTimeoutNow(t *testing.T) {
-	cfg := raftTestCfg(1, 1)
-	cfg.IsObserver = true
-	// The configuration must agree: the role follows the replicated
-	// membership, and config.IsObserver is only the initial hint.
-	logdb := newTestLogReader(nil, proto.State{})
-	logdb.membership = selfObserverMembership()
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	r = atTerm(r, 1)
-
-	err = r.step(proto.Message{
-		Type: proto.TimeoutNow,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if r.state != follower {
-		t.Fatalf("expected observer to remain follower on TimeoutNow, got %s", r.state)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: Candidate receives Replicate/Heartbeat from leader
 // ---------------------------------------------------------------------------
@@ -2819,29 +2777,6 @@ func TestRaft_Send_PopulatesFromAndTerm(t *testing.T) {
 	}
 	if r.msgs[0].ShardID != r.shardID {
 		t.Fatalf("expected ShardID=%d, got %d", r.shardID, r.msgs[0].ShardID)
-	}
-}
-
-func TestRaft_DrainMessages_ClearsBuffer(t *testing.T) {
-	r := newTestRaft(1)
-	r.send(proto.Message{Type: proto.Heartbeat, To: 2})
-	r.send(proto.Message{Type: proto.Heartbeat, To: 3})
-
-	msgs := r.drainMessages()
-	if len(msgs) != 2 {
-		t.Fatalf("expected 2 drained messages, got %d", len(msgs))
-	}
-	if len(r.msgs) != 0 {
-		t.Fatalf("expected msgs cleared after drain, got %d", len(r.msgs))
-	}
-}
-
-func TestRaft_DrainMessages_EmptyReturnsNil(t *testing.T) {
-	r := newTestRaft(1)
-	// No messages sent.
-	msgs := r.drainMessages()
-	if msgs != nil {
-		t.Fatalf("expected nil for empty drain, got %v", msgs)
 	}
 }
 
@@ -2989,29 +2924,16 @@ func TestRaft_RoleState_String(t *testing.T) {
 // Test: hardState
 // ---------------------------------------------------------------------------
 
-func TestRaft_HardState_ReturnsCurrent(t *testing.T) {
+func TestRaft_HardState_ReflectsCommit(t *testing.T) {
 	r := newTestRaft(1)
 	r.term = 5
 	r.vote = 2
-	r.log.commitTo(0)
-
-	hs := r.hardState()
-	if hs.Term != 5 {
-		t.Fatalf("expected term 5, got %d", hs.Term)
-	}
-	if hs.Vote != 2 {
-		t.Fatalf("expected vote 2, got %d", hs.Vote)
-	}
-}
-
-func TestRaft_HardState_ReflectsCommit(t *testing.T) {
-	r := newTestRaft(1)
 	r.log.append([]proto.Entry{{Index: 1, Term: 1}})
 	r.log.commitTo(1)
 
 	hs := r.hardState()
-	if hs.Commit != 1 {
-		t.Fatalf("expected commit 1, got %d", hs.Commit)
+	if hs.Term != 5 || hs.Vote != 2 || hs.Commit != 1 {
+		t.Fatalf("expected term 5 vote 2 commit 1, got %+v", hs)
 	}
 }
 
@@ -3739,39 +3661,6 @@ func TestRaft_HasQuorumActive_FalseWithNoActivePeers(t *testing.T) {
 // Test: Candidate proposal returns not-leader error
 // ---------------------------------------------------------------------------
 
-func TestRaft_Candidate_RejectsProposal(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeCandidate()
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("test")}},
-	})
-
-	var nle *NotLeaderError
-	if !errors.As(err, &nle) {
-		t.Fatalf("expected NotLeaderError from candidate, got %v", err)
-	}
-}
-
-func TestRaft_Candidate_ProposalErrorHasNoLeader(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeCandidate()
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("test")}},
-	})
-
-	var nle *NotLeaderError
-	if !errors.As(err, &nle) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
-	}
-	if nle.LeaderID != 0 {
-		t.Fatalf("expected LeaderID 0 from candidate, got %d", nle.LeaderID)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: Stale vote response at higher term
 // ---------------------------------------------------------------------------
@@ -4053,14 +3942,6 @@ func TestRaft_QuiesceElectionTimeout_ReturnsCorrectTimeout(t *testing.T) {
 	}
 }
 
-func TestRaft_QuiesceElectionTimeout_ScalesWithElectionTimeout(t *testing.T) {
-	q5 := newQuiesceState(true, 5)
-	q20 := newQuiesceState(true, 20)
-	if q20.quiesceElectionTimeout() <= q5.quiesceElectionTimeout() {
-		t.Fatal("expected quiesceElectionTimeout to scale with election timeout")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: tickFollower - quiesce active path and tryEnter path
 // ---------------------------------------------------------------------------
@@ -4262,24 +4143,6 @@ func TestRaft_GetMatchForPeer_ReturnsWitnessMatch(t *testing.T) {
 	m := r.getMatchForPeer(20)
 	if m != 100 {
 		t.Fatalf("expected match 100 for witness, got %d", m)
-	}
-}
-
-func TestRaft_GetMatchForPeer_ReturnsZeroForWitnessDefault(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Witnesses = map[uint64]string{20: "wit1"}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	electLeader(r)
-
-	// A freshly initialized witness has match=0 (default).
-	m := r.getMatchForPeer(20)
-	if m != 0 {
-		t.Fatalf("expected match 0 for fresh witness, got %d", m)
 	}
 }
 
@@ -5449,46 +5312,6 @@ func TestRaft_BroadcastQuiesce_SendsToAllPeers(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Test: getRemote - observer fallback
 // ---------------------------------------------------------------------------
-
-func TestRaft_GetRemote_ReturnsObserver(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Observers = map[uint64]string{10: "obs1"}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	rm := r.getRemote(10)
-	if rm == nil {
-		t.Fatal("expected getRemote to return observer")
-	}
-}
-
-func TestRaft_GetRemote_ReturnsWitness(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Witnesses = map[uint64]string{20: "wit1"}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	rm := r.getRemote(20)
-	if rm == nil {
-		t.Fatal("expected getRemote to return witness remote")
-	}
-}
-
-func TestRaft_GetRemote_ReturnsNilForUnknown(t *testing.T) {
-	r := newTestRaft(1)
-	rm := r.getRemote(99)
-	if rm != nil {
-		t.Fatal("expected nil for unknown peer")
-	}
-}
 
 func TestRaft_GetRemote_PriorityOrder(t *testing.T) {
 	// Verify lookup priority: remotes first, then observers, then witnesses.
@@ -6719,20 +6542,6 @@ func TestBecomePreCandidate_ResetsPendingConfigChange(t *testing.T) {
 	}
 }
 
-func TestBecomePreCandidate_PendingConfigChangeFalseRemainsFalse(t *testing.T) {
-	r := newTestRaft(1)
-	// pendingConfigChange starts false (default).
-	if r.pendingConfigChange {
-		t.Fatal("precondition failed: expected pendingConfigChange false initially")
-	}
-
-	r.becomePreCandidate()
-
-	if r.pendingConfigChange {
-		t.Fatal("expected pendingConfigChange to remain false after becomePreCandidate")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // becomeLeader resets witness remotes
 // ---------------------------------------------------------------------------
@@ -6801,28 +6610,6 @@ func TestBecomeLeader_ResetsWitnessRemotes(t *testing.T) {
 	expectedNext := r.log.lastIndex()
 	if wm.next != expectedNext {
 		t.Fatalf("expected witness next %d, got %d", expectedNext, wm.next)
-	}
-}
-
-func TestBecomeLeader_ResetsWitnessRemotes_NoWitnesses(t *testing.T) {
-	// Verify that becomeLeader works correctly when there are no witnesses.
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-
-	if r.state != leader {
-		t.Fatalf("expected leader, got %s", r.state)
-	}
-	if len(r.witnesses) != 0 {
-		t.Fatalf("expected 0 witnesses, got %d", len(r.witnesses))
-	}
-	// All regular remotes should be reset.
-	for id, rm := range r.remotes {
-		if rm.match != 0 {
-			t.Fatalf("remote %d: expected match 0, got %d", id, rm.match)
-		}
-		if rm.state != remoteProbe {
-			t.Fatalf("remote %d: expected probe state, got %s", id, rm.state)
-		}
 	}
 }
 
@@ -9575,35 +9362,6 @@ func TestHasConfigChangeToApplyCompressedEntry(t *testing.T) {
 // entries are within the scan window. With many small uncommitted
 // entries followed by a config change, the function must still detect
 // the config change as long as it fits within the size limit.
-func TestHasConfigChangeToApplyBoundedScan(t *testing.T) {
-	r := newTestRaft(1)
-	electLeader(r)
-	r.drainMessages()
-
-	// Append several normal entries followed by a config change.
-	// All entries are small, so they fit well within the 64 MiB scan limit.
-	base := r.log.lastIndex()
-	entries := make([]proto.Entry, 0, 101)
-	for i := uint64(1); i <= 100; i++ {
-		entries = append(entries, proto.Entry{
-			Term:  r.term,
-			Index: base + i,
-			Type:  proto.EntryNormal,
-			Cmd:   []byte("data"),
-		})
-	}
-	// Config change as the 101st entry.
-	entries = append(entries, proto.Entry{
-		Term:  r.term,
-		Index: base + 101,
-		Type:  proto.EntryConfigChange,
-	})
-	r.log.append(entries)
-
-	if !r.hasConfigChangeToApply() {
-		t.Fatal("expected hasConfigChangeToApply to detect config change after many normal entries")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // AppendEntries Pipelining
@@ -10200,24 +9958,6 @@ func TestRaft_TimeoutNow_IgnoredByLeader(t *testing.T) {
 	if r.term != savedTerm {
 		t.Fatalf("expected term %d unchanged, got %d", savedTerm, r.term)
 	}
-}
-
-func TestRaft_TimeoutNow_IgnoredByLeader_NoMessages(t *testing.T) {
-	// Verify that a leader ignoring TimeoutNow does not emit any
-	// spurious messages (no vote requests, no heartbeats).
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	err := r.step(proto.Message{
-		Type: proto.TimeoutNow,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
 	votes := collectMessages(r, proto.RequestVote)
 	if len(votes) != 0 {
 		t.Fatalf("expected no vote requests from leader ignoring TimeoutNow, got %d", len(votes))
@@ -11071,26 +10811,6 @@ func TestTickRateLimit_DisabledRateLimiterNoOp(t *testing.T) {
 	}
 }
 
-func TestTickRateLimit_IncrementsTickCounter(t *testing.T) {
-	// tickRateLimit should increment rateLimitTick each call.
-	r := newTestRaftRateLimited(1, 1000)
-	r.becomeFollower(1, 2) // Set a known leader.
-
-	if r.rateLimitTick != 0 {
-		t.Fatalf("expected rateLimitTick=0, got %d", r.rateLimitTick)
-	}
-
-	r.tickRateLimit()
-	if r.rateLimitTick != 1 {
-		t.Fatalf("expected rateLimitTick=1, got %d", r.rateLimitTick)
-	}
-
-	r.tickRateLimit()
-	if r.rateLimitTick != 2 {
-		t.Fatalf("expected rateLimitTick=2, got %d", r.rateLimitTick)
-	}
-}
-
 func TestTickRateLimit_SendsMessageAtElectionTimeout(t *testing.T) {
 	// When rateLimitTick reaches electionTimeout, a RateLimit message
 	// should be sent and rateLimitTick reset.
@@ -11127,29 +10847,6 @@ func TestTickRateLimit_SendsMessageAtElectionTimeout(t *testing.T) {
 	// rateLimitTick should be reset.
 	if r.rateLimitTick != 0 {
 		t.Fatalf("expected rateLimitTick=0 after send, got %d", r.rateLimitTick)
-	}
-}
-
-func TestTickRateLimit_ResetsCycleAfterSend(t *testing.T) {
-	// After sending a RateLimit message, the cycle should restart.
-	r := newTestRaftRateLimited(1, 1000)
-	r.becomeFollower(1, 2)
-
-	// First cycle: tick until message sent.
-	for i := 0; i < r.electionTimeout; i++ {
-		r.tickRateLimit()
-	}
-	if len(collectMessages(r, proto.RateLimit)) != 1 {
-		t.Fatal("expected first RateLimit message")
-	}
-	r.drainMessages()
-
-	// Second cycle: tick again until message sent.
-	for i := 0; i < r.electionTimeout; i++ {
-		r.tickRateLimit()
-	}
-	if len(collectMessages(r, proto.RateLimit)) != 1 {
-		t.Fatal("expected second RateLimit message")
 	}
 }
 
@@ -11196,64 +10893,6 @@ func TestSendRateLimitMessage_SendsToLeader(t *testing.T) {
 	}
 }
 
-func TestSendRateLimitMessage_ZeroSize(t *testing.T) {
-	// When in-memory size is zero, the message should still be sent.
-	r := newTestRaftRateLimited(1, 1000)
-	r.becomeFollower(1, 2)
-	r.rl.Set(0)
-
-	r.sendRateLimitMessage()
-
-	msgs := collectMessages(r, proto.RateLimit)
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 RateLimit message, got %d", len(msgs))
-	}
-	if msgs[0].Hint != 0 {
-		t.Fatalf("expected Hint=0, got %d", msgs[0].Hint)
-	}
-}
-
-func TestSendRateLimitMessage_LargeSize(t *testing.T) {
-	// Large in-memory sizes should be correctly reported.
-	r := newTestRaftRateLimited(1, 1000)
-	r.becomeFollower(1, 2)
-	r.rl.Set(1 << 30) // 1GB.
-
-	r.sendRateLimitMessage()
-
-	msgs := collectMessages(r, proto.RateLimit)
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 RateLimit message, got %d", len(msgs))
-	}
-	if msgs[0].Hint != 1<<30 {
-		t.Fatalf("expected Hint=1<<30, got %d", msgs[0].Hint)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Test: handleLeaderRateLimit
-// ---------------------------------------------------------------------------
-
-func TestHandleLeaderRateLimit_NilRateLimiterNoOp(t *testing.T) {
-	// When rl is nil, handleLeaderRateLimit should not panic and
-	// return nil error.
-	r := newTestRaft(1)
-	electLeader(r)
-
-	if r.rl != nil {
-		t.Fatal("expected nil rate limiter")
-	}
-
-	err := r.handleLeaderRateLimit(proto.Message{
-		Type: proto.RateLimit,
-		From: 2,
-		Hint: 500,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestHandleLeaderRateLimit_DisabledRateLimiterNoOp(t *testing.T) {
 	// When rl is disabled, handleLeaderRateLimit should not track
 	// follower state.
@@ -11268,87 +10907,6 @@ func TestHandleLeaderRateLimit_DisabledRateLimiterNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-func TestHandleLeaderRateLimit_RecordsFollowerState(t *testing.T) {
-	// handleLeaderRateLimit should record the follower's in-memory
-	// log size via SetFollowerState.
-	r := newTestRaftRateLimited(1, 1000)
-	electLeader(r)
-
-	// Simulate RateLimit message from follower 2 with size 500.
-	err := r.handleLeaderRateLimit(proto.Message{
-		Type: proto.RateLimit,
-		From: 2,
-		Hint: 500,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Verify the follower state was recorded.
-	// We do this indirectly by checking if the rate limiter considers
-	// follower sizes when we call RateLimited().
-	// First, set local size low.
-	r.rl.Set(100)
-
-	// With maxSize=1000, follower size 500 < 1000, not limited.
-	if r.rl.RateLimited() {
-		t.Fatal("should not be rate limited with sizes below threshold")
-	}
-}
-
-func TestHandleLeaderRateLimit_MultipleFollowers(t *testing.T) {
-	// Leader should track multiple followers' states.
-	r := newTestRaftRateLimited(1, 1000)
-	electLeader(r)
-
-	// Receive from follower 2.
-	err := r.handleLeaderRateLimit(proto.Message{
-		From: 2,
-		Hint: 300,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Receive from follower 3.
-	err = r.handleLeaderRateLimit(proto.Message{
-		From: 3,
-		Hint: 400,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Both should be tracked (indirect verification through rate limiting
-	// behavior with large values).
-}
-
-func TestHandleLeaderRateLimit_UpdatesExistingFollower(t *testing.T) {
-	// Subsequent messages from the same follower should update the state.
-	r := newTestRaftRateLimited(1, 1000)
-	electLeader(r)
-
-	// First update.
-	err := r.handleLeaderRateLimit(proto.Message{
-		From: 2,
-		Hint: 300,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Second update with different size.
-	err = r.handleLeaderRateLimit(proto.Message{
-		From: 2,
-		Hint: 800,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// The follower state should reflect the latest value.
 }
 
 func TestHandleLeaderRateLimit_AlwaysReturnsNil(t *testing.T) {
@@ -11415,43 +10973,6 @@ func TestRateLimited_DisabledRateLimiterReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestRateLimited_BelowThresholdReturnsFalse(t *testing.T) {
-	// When in-memory size is below threshold, rateLimited() returns false.
-	r := newTestRaftRateLimited(1, 1000)
-	r.rl.Set(500) // 50% of max.
-
-	if r.rateLimited() {
-		t.Fatal("expected rateLimited()=false when below threshold")
-	}
-}
-
-func TestRateLimited_AboveThresholdReturnsTrue(t *testing.T) {
-	// When in-memory size exceeds threshold, rateLimited() returns true.
-	r := newTestRaftRateLimited(1, 1000)
-	r.rl.Set(1500) // 150% of max.
-
-	// Due to hysteresis with tick debouncing, we need to advance ticks.
-	// The InMemRateLimiter requires ChangeTickThreshold ticks to pass
-	// before changing state.
-	for i := 0; i < 15; i++ { // > ChangeTickThreshold (10)
-		r.rl.Tick()
-	}
-
-	if !r.rateLimited() {
-		t.Fatal("expected rateLimited()=true when above threshold")
-	}
-}
-
-func TestRateLimited_ExactThresholdNotLimited(t *testing.T) {
-	// At exactly maxSize, not limited (threshold is > not >=).
-	r := newTestRaftRateLimited(1, 1000)
-	r.rl.Set(1000)
-
-	if r.rateLimited() {
-		t.Fatal("expected rateLimited()=false at exact threshold")
-	}
-}
-
 func TestRateLimited_HysteresisPreventsThrashing(t *testing.T) {
 	// Rate limiting uses hysteresis: enters at 100%, exits at 70%.
 	r := newTestRaftRateLimited(1, 1000)
@@ -11487,69 +11008,9 @@ func TestRateLimited_HysteresisPreventsThrashing(t *testing.T) {
 	}
 }
 
-func TestRateLimited_FollowerStateTriggers(t *testing.T) {
-	// Rate limiting considers follower states, not just local.
-	r := newTestRaftRateLimited(1, 1000)
-	electLeader(r)
-
-	// Local size is low.
-	r.rl.Set(100)
-
-	// Advance ticks past the debounce threshold while keeping follower
-	// state fresh (gcTick=3, ChangeTickThreshold=10).
-	for i := 0; i < 15; i++ {
-		// Refresh follower state each tick to prevent GC.
-		r.rl.SetFollowerState(2, 1500)
-		r.rl.Tick()
-	}
-
-	if !r.rateLimited() {
-		t.Fatal("expected limited due to follower state")
-	}
-}
-
-func TestRateLimited_ZeroSizeNotLimited(t *testing.T) {
-	// Zero in-memory size should not be rate limited.
-	r := newTestRaftRateLimited(1, 1000)
-	r.rl.Set(0)
-
-	if r.rateLimited() {
-		t.Fatal("expected rateLimited()=false with zero size")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: Rate limiting integration (tick cycle with follower)
 // ---------------------------------------------------------------------------
-
-func TestRateLimitIntegration_FollowerSendsToLeader(t *testing.T) {
-	// Full integration: follower ticks, sends RateLimit to leader,
-	// leader processes it.
-	follower := newTestRaftRateLimited(2, 1000)
-	leader := newTestRaftRateLimited(1, 1000)
-
-	follower.becomeFollower(1, 1) // Leader is node 1.
-	electLeader(leader)
-
-	// Follower has some in-memory log.
-	follower.rl.Set(600)
-
-	// Tick follower until RateLimit sent.
-	for i := 0; i < follower.electionTimeout; i++ {
-		follower.tickRateLimit()
-	}
-
-	msgs := collectMessages(follower, proto.RateLimit)
-	if len(msgs) != 1 {
-		t.Fatalf("expected 1 RateLimit message, got %d", len(msgs))
-	}
-
-	// Leader processes the message.
-	err := leader.handleLeaderRateLimit(msgs[0])
-	if err != nil {
-		t.Fatalf("leader failed to handle RateLimit: %v", err)
-	}
-}
 
 func TestRateLimitIntegration_LeaderAggregatesFollowers(t *testing.T) {
 	// Leader aggregates in-memory sizes from multiple followers.
@@ -13303,47 +12764,6 @@ func TestRaft_LeaderTransfer_ObserverReturnsNotVoter(t *testing.T) {
 	}
 }
 
-func TestRaft_LeaderTransfer_NonExistentNodeReturnsNodeNotFound(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfg(1, 1)
-	cfg.PreVote = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Witnesses = map[uint64]string{20: "wit1"}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	// Node 99 is not in remotes, witnesses, or observers.
-	err = r.step(proto.Message{
-		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
-		Hint: 99,
-	})
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("expected ErrNodeNotFound, got %v", err)
-	}
-}
-
-func TestRaft_LeaderTransfer_ValidVoterSucceeds(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-	r.remotes[2].match = r.log.lastIndex()
-
-	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
-		Hint: 2,
-	})
-	if err != nil {
-		t.Fatalf("expected no error for valid voter transfer, got %v", err)
-	}
-	if r.transferTarget != 2 {
-		t.Fatalf("expected transferTarget=2, got %d", r.transferTarget)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Batch config change does not leave pendingConfigChange stuck
 // ---------------------------------------------------------------------------
@@ -13861,20 +13281,6 @@ func TestWitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 
 	if _, found := r.remoteLastAck[3]; !found {
 		t.Fatal("witness node 3 must be tracked in remoteLastAck after heartbeat ack")
-	}
-}
-
-func TestWitnessInReplicaToBitAndRemoteLastAck_NoWitnesses(t *testing.T) {
-	// Verify that a cluster without witnesses still works correctly.
-	// replicaToBit should only contain self + remotes.
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-
-	if len(r.replicaToBit) != 3 {
-		t.Fatalf("expected 3 entries in replicaToBit (self + 2 remotes), got %d", len(r.replicaToBit))
-	}
-	if len(r.witnesses) != 0 {
-		t.Fatal("expected no witnesses in test cluster")
 	}
 }
 

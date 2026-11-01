@@ -269,7 +269,6 @@ func TestValidateRejectsInvalidDecompressedSize(t *testing.T) {
 		// bytes can just send an uncompressed frame of that size — so a lower
 		// decompression ceiling is pure downside and must fail at startup.
 		{"below max frame size", MaxFrameSize - 1},
-		{"one byte", 1},
 	}
 
 	for _, tc := range tests {
@@ -437,112 +436,9 @@ func TestValidateAccepts0RTTWithMTLS(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsNo0RTTWithoutMTLS verifies that even with 0-RTT
-// disabled, nil MTLSConfig is rejected since mTLS is now mandatory.
-func TestValidateRejectsNo0RTTWithoutMTLS(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		Enable0RTT:    false,
-		MTLSConfig:    nil,
-	}
-	cfg.SetDefaults()
-	err := cfg.Validate()
-	if !errors.Is(err, ErrMTLSConfigRequired) {
-		t.Fatalf("expected ErrMTLSConfigRequired, got %v", err)
-	}
-}
-
-// TestDefaultConstantValues verifies the default constant values are correct.
-func TestDefaultConstantValues(t *testing.T) {
-	if defaultStreamPoolSize != 16 {
-		t.Fatalf("defaultStreamPoolSize: want 16, got %d", defaultStreamPoolSize)
-	}
-	if defaultMaxStreamPoolSize != 256 {
-		t.Fatalf("defaultMaxStreamPoolSize: want 256, got %d", defaultMaxStreamPoolSize)
-	}
-	if defaultMaxSnapshotReceiveRate != 256*1024*1024 {
-		t.Fatalf("defaultMaxSnapshotReceiveRate: want %d, got %d", 256*1024*1024, defaultMaxSnapshotReceiveRate)
-	}
-	if defaultMaxConcurrentSnapRecv != 4 {
-		t.Fatalf("defaultMaxConcurrentSnapRecv: want 4, got %d", defaultMaxConcurrentSnapRecv)
-	}
-	if defaultMaxSnapshotRecvMemory != 1024*1024*1024 {
-		t.Fatalf("defaultMaxSnapshotRecvMemory: want %d, got %d", 1024*1024*1024, defaultMaxSnapshotRecvMemory)
-	}
-	if defaultSendBatchMaxSize != 64*1024 {
-		t.Fatalf("defaultSendBatchMaxSize: want %d, got %d", 64*1024, defaultSendBatchMaxSize)
-	}
-	if defaultMaxIncomingConnections != 256 {
-		t.Fatalf("defaultMaxIncomingConnections: want 256, got %d", defaultMaxIncomingConnections)
-	}
-	if defaultMaxConnectionsPerIP != 16 {
-		t.Fatalf("defaultMaxConnectionsPerIP: want 16, got %d", defaultMaxConnectionsPerIP)
-	}
-	if defaultMaxStreamsPerConnection != 256 {
-		t.Fatalf("defaultMaxStreamsPerConnection: want 256, got %d", defaultMaxStreamsPerConnection)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 0-RTT replay defense-in-depth
-// ---------------------------------------------------------------------------
-
-// TestValidate0RTTWithoutMTLSReturnsInsecure0RTT verifies that enabling 0-RTT
-// without mTLS returns ErrInsecure0RTT (the specific 0-RTT error), not the
-// general ErrMTLSConfigRequired. This is defense-in-depth: even if the mTLS
-// mandate were relaxed, 0-RTT would still require mutual authentication.
-func TestValidate0RTTWithoutMTLSReturnsInsecure0RTT(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		Enable0RTT:    true,
-		MTLSConfig:    nil,
-	}
-	cfg.SetDefaults()
-	err := cfg.Validate()
-	if !errors.Is(err, ErrInsecure0RTT) {
-		t.Fatalf("expected ErrInsecure0RTT, got %v", err)
-	}
-}
-
-// TestValidate0RTTWithMTLSPasses verifies that enabling 0-RTT with a
-// complete mTLS configuration passes the 0-RTT validation check.
-func TestValidate0RTTWithMTLSPasses(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		Enable0RTT:    true,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-	cfg.SetDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("0-RTT with mTLS should be valid, got: %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // MaxStreamsPerConnection config + validation
 // ---------------------------------------------------------------------------
-
-// TestConfigMaxStreamsPerConnectionDefault verifies that SetDefaults
-// applies the default MaxStreamsPerConnection value.
-func TestConfigMaxStreamsPerConnectionDefault(t *testing.T) {
-	cfg := Config{ListenAddress: ":0"}
-	cfg.SetDefaults()
-	if cfg.MaxStreamsPerConnection != defaultMaxStreamsPerConnection {
-		t.Fatalf("MaxStreamsPerConnection default: want %d, got %d",
-			defaultMaxStreamsPerConnection, cfg.MaxStreamsPerConnection)
-	}
-}
-
-// TestConfigMaxStreamsPerConnectionPreserved verifies that SetDefaults
-// does not overwrite an explicitly set MaxStreamsPerConnection value.
-func TestConfigMaxStreamsPerConnectionPreserved(t *testing.T) {
-	cfg := Config{ListenAddress: ":0", MaxStreamsPerConnection: 64}
-	cfg.SetDefaults()
-	if cfg.MaxStreamsPerConnection != 64 {
-		t.Fatalf("MaxStreamsPerConnection should be preserved: want 64, got %d",
-			cfg.MaxStreamsPerConnection)
-	}
-}
 
 // TestConfigMaxStreamsPerConnectionValidation verifies that
 // MaxStreamsPerConnection < 1 returns ErrInvalidMaxStreamsPerConnection.

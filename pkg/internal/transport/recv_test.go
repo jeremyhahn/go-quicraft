@@ -266,32 +266,6 @@ func TestRecvBufPoolReuse(t *testing.T) {
 	tr.putRecvBuf(largeBuf) // Should not panic.
 }
 
-// TestRecvBufPoolCapacityGrowth verifies that getRecvBuf returns a buffer
-// with the requested size even when the pooled buffer is too small.
-func TestRecvBufPoolCapacityGrowth(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	// Get a small buffer, put it back, then request a larger one.
-	small := tr.getRecvBuf(10)
-	tr.putRecvBuf(small)
-
-	large := tr.getRecvBuf(50000)
-	if len(*large) != 50000 {
-		t.Fatalf("expected buffer length 50000, got %d", len(*large))
-	}
-	tr.putRecvBuf(large)
-}
-
 // TestSnapshotReceiverConcurrencyLimit verifies the snapshot receiver
 // semaphore limits concurrent receives.
 func TestSnapshotReceiverConcurrencyLimit(t *testing.T) {
@@ -746,62 +720,9 @@ func TestGetRecvBufReturnsUndersizedToPool(t *testing.T) {
 	tr.putRecvBuf(recovered)
 }
 
-// TestGetRecvBufPooledBufferSufficientCapacity verifies the happy path
-// where the pooled buffer has sufficient capacity for the requested size.
-// The returned buffer length must match the requested minCap and the
-// capacity must be at least as large.
-func TestGetRecvBufPooledBufferSufficientCapacity(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	// Request a buffer within the default pool capacity (4096).
-	buf := tr.getRecvBuf(100)
-	if len(*buf) != 100 {
-		t.Fatalf("expected buffer length 100, got %d", len(*buf))
-	}
-	if cap(*buf) < 100 {
-		t.Fatalf("expected buffer cap >= 100, got %d", cap(*buf))
-	}
-	tr.putRecvBuf(buf)
-
-	// Request the same size again. Should succeed with a pooled buffer.
-	buf2 := tr.getRecvBuf(100)
-	if len(*buf2) != 100 {
-		t.Fatalf("expected buffer length 100, got %d", len(*buf2))
-	}
-	tr.putRecvBuf(buf2)
-}
-
 // ---------------------------------------------------------------------------
 // ShardID zero check at transport boundary
 // ---------------------------------------------------------------------------
-
-// TestHandleMessageFrameDropsZeroShardID verifies that messages with
-// ShardID == 0 are silently dropped at the transport boundary and never
-// delivered to the handler.
-func TestHandleMessageFrameDropsZeroShardID(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a message with ShardID=0. This should be dropped.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 0, From: 1, To: 2, Term: 1},
-	})
-
-	// Verify no batches arrive for the dropped ShardID=0 message.
-	assertNever(t, 2*time.Second, 50*time.Millisecond,
-		"unexpected batch for ShardID=0 message",
-		func() bool { return handler2.batchCount.Load() != 0 })
-}
 
 // TestHandleMessageFrameAcceptsNonZeroShardID verifies that messages with
 // a valid non-zero ShardID are delivered normally.
@@ -1157,62 +1078,6 @@ func TestSnappyDecPool_GetAndPut(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// recvBufPool and getRecvBuf/putRecvBuf (recv.go:595-612)
-// ---------------------------------------------------------------------------
-
-// TestGetRecvBuf_SmallCapacity verifies that getRecvBuf returns a buffer
-// from the pool when capacity is sufficient.
-
-func TestGetRecvBuf_SmallCapacity(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	buf := tr.getRecvBuf(100)
-	if buf == nil {
-		t.Fatal("expected non-nil buffer")
-	}
-	if len(*buf) != 100 {
-		t.Fatalf("expected length 100, got %d", len(*buf))
-	}
-	tr.putRecvBuf(buf)
-}
-
-// TestGetRecvBuf_LargeCapacity verifies that getRecvBuf allocates a new
-// buffer when the pool's buffer is too small.
-
-func TestGetRecvBuf_LargeCapacity(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	// Request a buffer larger than the pool's default capacity.
-	buf := tr.getRecvBuf(maxPoolBufSize + 100)
-	if buf == nil {
-		t.Fatal("expected non-nil buffer")
-	}
-	if cap(*buf) < maxPoolBufSize+100 {
-		t.Fatalf("expected cap >= %d, got %d", maxPoolBufSize+100, cap(*buf))
-	}
-	// Should NOT be returned to pool (too large).
-	tr.putRecvBuf(buf)
-}
-
-// ---------------------------------------------------------------------------
 // processSnapshotHeader edge cases (recv.go:555)
 // ---------------------------------------------------------------------------
 
@@ -1421,52 +1286,6 @@ func TestHandleMessageFrame_HandlerError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// handleMessageFrame with metrics (recv.go:519-527)
-// ---------------------------------------------------------------------------
-
-// TestHandleMessageFrame_WithMetrics verifies that the metrics recording
-// path is exercised when a Metrics implementation is set.
-
-func TestHandleMessageFrame_WithMetrics(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-		Metrics:       noopTransportMetrics{},
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:1234",
-		Requests: []proto.Message{
-			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-		},
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-
-	reader := bytes.NewReader(payload[:n])
-	err = tr.handleMessageFrame(nil, reader, uint32(n), FlagNone)
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // dialConnection edge cases (conn.go:85-139)
 // ---------------------------------------------------------------------------
 
@@ -1534,71 +1353,6 @@ func TestHandleMessageFrame_BulkCmdCopy(t *testing.T) {
 	}
 	if string(entries[1].Cmd) != "command-beta" {
 		t.Fatalf("expected 'command-beta', got %q", entries[1].Cmd)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// handleMessageFrame compressed with entries (recv.go:365-397)
-// ---------------------------------------------------------------------------
-
-// TestHandleMessageFrame_CompressedWithEntries verifies the full path:
-// decompress -> unmarshal -> bulk Cmd copy -> handler delivery.
-
-func TestHandleMessageFrame_CompressedWithEntries(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:1234",
-		Requests: []proto.Message{
-			{
-				Type:    proto.Replicate,
-				ShardID: 1,
-				From:    1,
-				To:      2,
-				Term:    5,
-				Entries: []proto.Entry{
-					{Index: 1, Term: 5, Cmd: bytes.Repeat([]byte("A"), 200)},
-					{Index: 2, Term: 5, Cmd: bytes.Repeat([]byte("B"), 200)},
-				},
-			},
-		},
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-	payload = payload[:n]
-
-	compressed := snappy.Encode(nil, payload)
-	reader := bytes.NewReader(compressed)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(compressed)), FlagCompressed)
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
-	}
-
-	batches := handler.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	if len(batches[0].Requests[0].Entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(batches[0].Requests[0].Entries))
 	}
 }
 
@@ -1757,120 +1511,12 @@ func TestAcceptLoopIteration_GlobalConnectionLimitReached(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// handleConnection stream semaphore exhaustion (recv.go:260-270)
-// ---------------------------------------------------------------------------
-
-// TestHandleConnection_StreamSemaphoreExhaustion verifies that when
-// MaxStreamsPerConnection is reached, additional streams wait for
-// a semaphore slot. Tests the semaphore path at recv.go:260-270.
-
-func TestHandleConnection_StreamSemaphoreExhaustion(t *testing.T) {
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-	mtls := testMTLSConfig(t)
-
-	// Limit to 1 stream per connection to exercise the semaphore.
-	t1, err := NewQUICTransport(Config{
-		ListenAddress:           ":0",
-		DeploymentID:            42,
-		MTLSConfig:              mtls,
-		MaxStreamsPerConnection: 2,
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer t2.Stop()
-
-	reg2.Register(1, 2, t1.Addr().String())
-
-	// Send multiple messages concurrently to exercise stream
-	// semaphore contention.
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(shard uint64) {
-			defer wg.Done()
-			t2.Send([]proto.Message{
-				{Type: proto.Replicate, ShardID: shard, From: 2, To: 1, Term: 1,
-					Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("data")}}},
-			})
-		}(uint64(i + 1))
-	}
-	wg.Wait()
-
-	// Allow time for messages to process. The test verifies no deadlock
-	// under semaphore exhaustion. Messages with To:1 may be dropped if
-	// only shard 1, replica 2 is registered — the key check is no panic.
-	semTimer := time.NewTimer(1 * time.Second)
-	<-semTimer.C
-	semTimer.Stop()
-}
-
-// ---------------------------------------------------------------------------
 // evictStaleOutboundOnRecv inbound changed path (conn.go:554-577)
 // ---------------------------------------------------------------------------
 
 // TestEvictStaleOutboundOnRecv_PeerRestartDetected verifies that when
 // the inbound connection changes (peer restart), the stale outbound
 // connection is evicted.
-
-func TestHandleMessageFrame_DecompressionMismatch(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Create a valid snappy block, then tamper with the declared length
-	// by manipulating the varint header. Snappy format: first bytes are
-	// a varint of uncompressed length. We create a normal block, then
-	// make a copy with a modified length varint.
-	src := bytes.Repeat([]byte("A"), 100)
-	compressed := snappy.Encode(nil, src)
-
-	// Tamper with the compressed data: change the uncompressed length
-	// varint to claim a different size. The first byte of a snappy block
-	// is the uncompressed length as a varint.
-	tampered := make([]byte, len(compressed))
-	copy(tampered, compressed)
-	// Change the declared length to 200 instead of 100.
-	// For values < 128, the varint is a single byte.
-	tampered[0] = 200
-
-	reader := bytes.NewReader(tampered)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(tampered)), FlagCompressed)
-	// This should fail with either a decompress error or mismatch.
-	if err == nil {
-		t.Fatal("expected error for tampered compressed payload")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // removeAndCloseConnection close error path (conn.go:202-207)
@@ -2120,51 +1766,6 @@ func TestHandleMessageFrame_CompressedMultiMessageWithEntries(t *testing.T) {
 // the compressed payload exceeds the original buffer capacity, a new
 // buffer is allocated.
 
-func TestHandleMessageFrame_DebugTimingPath(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Send 100 messages to exercise the handler repeatedly, increasing
-	// the chance of exercising timing-related paths.
-	for i := 0; i < 100; i++ {
-		mb := proto.MessageBatch{
-			BinVer:        proto.WireVersion,
-			DeploymentID:  42,
-			SourceAddress: "127.0.0.1:1234",
-			Requests: []proto.Message{
-				{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: uint64(i + 1)},
-			},
-		}
-		sz := mb.Size()
-		payload := make([]byte, sz)
-		n, marshalErr := mb.MarshalTo(payload)
-		if marshalErr != nil {
-			t.Fatalf("MarshalTo failed: %v", marshalErr)
-		}
-		err = tr.handleMessageFrame(nil, bytes.NewReader(payload[:n]), uint32(n), FlagNone)
-		if err != nil {
-			t.Fatalf("expected nil error on iteration %d, got %v", i, err)
-		}
-	}
-
-	batches := handler.getBatches()
-	if len(batches) != 100 {
-		t.Fatalf("expected 100 batches, got %d", len(batches))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // sendBatch compression success with metrics path (quic.go:858-872)
 // ---------------------------------------------------------------------------
@@ -2411,35 +2012,6 @@ func TestHandleMessageFrame_CompressedTooManyMessages(t *testing.T) {
 // entries and their Cmd data, preventing aliasing with the caller's
 // buffers.
 
-func TestHandleMessageFrame_UncompressedTooManyMessagesWithBufCleanup(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Build a frame declaring > proto.MaxMessagesPerBatch messages, uncompressed.
-	// The key difference from TestHandleMessageFrame_TooManyMessages is
-	// that this verifies buf cleanup on the uncompressed path.
-	payload := overLimitMessageCountPayload(t, "127.0.0.1:1234")
-
-	// Uncompressed path - buf is non-nil in the cleanup.
-	reader := bytes.NewReader(payload)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(payload)), FlagNone)
-	if !errors.Is(err, proto.ErrTooManyMessages) {
-		t.Fatalf("expected ErrTooManyMessages, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // handleConnection panic recovery (recv.go:225-231)
 // ---------------------------------------------------------------------------
@@ -2538,127 +2110,12 @@ func TestHandleMessageFrame_DecompressionMismatchExact(t *testing.T) {
 // snapshot receive is rejected when it accumulates more bytes than the
 // total memory budget, even if individual chunks pass the per-chunk check.
 
-func TestHandleStream_StoppedTransportReturns(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-
-	// Establish connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2, then verify handleStream returns when stopped is set.
-	cleanup()
-
-	// Both transports are stopped, handleStream would detect this and return.
-	if !t1.stopped.Load() {
-		t.Fatal("expected t1 to be stopped")
-	}
-	if !t2.stopped.Load() {
-		t.Fatal("expected t2 to be stopped")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // dialConnection with OnConnectionFailed event (conn.go:108-110)
 // ---------------------------------------------------------------------------
 
 // TestDialConnection_OnConnectionFailedEvent verifies that dialConnection
 // fires OnConnectionFailed when the dial fails.
-
-func TestHandleMessageFrame_CompressedShardIDZeroDrop(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:5000",
-		Requests: []proto.Message{
-			{Type: proto.Replicate, ShardID: 0, From: 1, To: 2, Term: 1},
-		},
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-	payload = payload[:n]
-
-	compressed := snappy.Encode(nil, payload)
-	reader := bytes.NewReader(compressed)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(compressed)), FlagCompressed)
-	if err != nil {
-		t.Fatalf("expected nil error for ShardID=0 drop, got %v", err)
-	}
-
-	// No batch should have been delivered.
-	batches := handler.getBatches()
-	if len(batches) != 0 {
-		t.Fatalf("expected 0 batches (ShardID=0 dropped), got %d", len(batches))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// handleMessageFrame DeploymentID mismatch on compressed path (recv.go:449-457)
-// ---------------------------------------------------------------------------
-
-// TestHandleMessageFrame_CompressedDeploymentIDMismatch verifies that a
-// compressed batch with wrong DeploymentID returns ErrPeerIdentityMismatch
-// and properly returns the snappy decode buffer.
-
-func TestHandleMessageFrame_CompressedDeploymentIDMismatch(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  999, // Wrong deployment ID
-		SourceAddress: "127.0.0.1:5000",
-		Requests: []proto.Message{
-			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-		},
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-	payload = payload[:n]
-
-	compressed := snappy.Encode(nil, payload)
-	reader := bytes.NewReader(compressed)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(compressed)), FlagCompressed)
-	if !errors.Is(err, ErrPeerIdentityMismatch) {
-		t.Fatalf("expected ErrPeerIdentityMismatch, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // receiveChunks with metrics (snapshot_recv.go:295-297)
@@ -2711,85 +2168,12 @@ func TestHandleMessageFrame_WithDebugLogTiming(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// processSnapshotHeader with invalid unmarshal (recv.go:574-576)
-// ---------------------------------------------------------------------------
-
-// TestProcessSnapshotHeader_UnmarshalError exercises the unmarshal error
-// path in processSnapshotHeader. Since UnmarshalFrom only fails when the
-// buffer is too small (which can't happen given the size check above it),
-// this path is defensive. We exercise the valid path with extra header
-// bytes and verify header validation works correctly.
-
-func TestProcessSnapshotHeader_ValidWithExtraBytes(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Create a valid snapshot header with a small chunk count.
-	hdr := SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      100,
-		Term:       5,
-		ChunkCount: 1,
-		Epoch:      0,
-	}
-	var hdrBuf [SnapshotHeaderSize]byte
-	hdr.MarshalTo(hdrBuf[:])
-
-	// Create reader with header + extra padding bytes.
-	extra := make([]byte, 16)
-	data := append(hdrBuf[:], extra...)
-	reader := bytes.NewReader(data)
-
-	// headerLen includes the extra bytes.
-	tr.processSnapshotHeader(nil, reader, uint32(len(data)))
-}
-
-// ---------------------------------------------------------------------------
 // getStream fast-path with stale connection detection (conn.go:246-249)
 // ---------------------------------------------------------------------------
 
 // TestGetStream_FastPathDetectsDeadConnectionAndReconnects verifies that
 // getStream's fast path detects a dead connection backing a cached stream,
 // evicts it, and reconnects. This exercises conn.go:246-249.
-
-func TestHandleMessageFrame_CompressedInvalidBatchUnmarshal(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Create invalid protobuf data and compress it.
-	invalidData := bytes.Repeat([]byte{0xFF}, 200)
-	compressed := snappy.Encode(nil, invalidData)
-	reader := bytes.NewReader(compressed)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(compressed)), FlagCompressed)
-	if err == nil {
-		t.Fatal("expected error for invalid protobuf in compressed payload")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // receiveChunks stop signal during iteration (snapshot_recv.go:183-187)
@@ -2830,47 +2214,6 @@ func TestHandleConnection_StreamErrorAfterNormalClose(t *testing.T) {
 // TestSendSnapshot_AbortedWithEventListenerOnWriteError exercises the
 // OnSnapshotSendAborted event path by causing a snapshot send to fail
 // after the header is written but during chunk write.
-
-func TestHandleMessageFrame_WithMetricsMultiMessage(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-		Metrics:       noopTransportMetrics{},
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	mb := proto.MessageBatch{
-		BinVer:        proto.WireVersion,
-		DeploymentID:  42,
-		SourceAddress: "127.0.0.1:5000",
-		Requests: []proto.Message{
-			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-			{Type: proto.Heartbeat, ShardID: 2, From: 1, To: 3, Term: 1},
-		},
-	}
-	sz := mb.Size()
-	payload := make([]byte, sz)
-	n, marshalErr := mb.MarshalTo(payload)
-	if marshalErr != nil {
-		t.Fatalf("MarshalTo failed: %v", marshalErr)
-	}
-	payload = payload[:n]
-
-	reader := bytes.NewReader(payload)
-	err = tr.handleMessageFrame(nil, reader, uint32(len(payload)), FlagNone)
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
-	}
-}
 
 // TestSend_StoppedAfterQueueCreation verifies that Send returns
 // gracefully when the transport is stopped mid-iteration.

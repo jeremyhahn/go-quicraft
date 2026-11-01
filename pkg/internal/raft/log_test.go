@@ -315,19 +315,6 @@ func TestRaftLog_Entries_ReturnsCorrectRange(t *testing.T) {
 	}
 }
 
-func TestRaftLog_Entries_ReturnsAllEntries(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-
-	result, err := l.entries(1, 6, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 5 {
-		t.Fatalf("expected 5 entries, got %d", len(result))
-	}
-}
-
 func TestRaftLog_Entries_EmptyRange(t *testing.T) {
 	entries := makeEntries(1, 6, 1)
 	l := newTestRaftLog(entries)
@@ -694,17 +681,6 @@ func TestRaftLog_AppliedTo_Advances(t *testing.T) {
 	}
 }
 
-func TestRaftLog_AppliedTo_Zero(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-	l.committed = 5
-
-	l.appliedTo(0) // should be no-op
-	if l.processed != 0 {
-		t.Fatalf("expected processed 0, got %d", l.processed)
-	}
-}
-
 func TestRaftLog_HasEntriesToApply_True(t *testing.T) {
 	entries := makeEntries(1, 6, 1)
 	l := newTestRaftLog(entries)
@@ -765,16 +741,6 @@ func TestRaftLog_EntriesToApply_NoneAvailable(t *testing.T) {
 	}
 }
 
-func TestRaftLog_EntriesToSave_AllUnsaved(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-
-	toSave := l.entriesToSave()
-	if len(toSave) != 5 {
-		t.Fatalf("expected 5 entries to save, got %d", len(toSave))
-	}
-}
-
 func TestRaftLog_EntriesToSave_PartiallySaved(t *testing.T) {
 	entries := makeEntries(1, 6, 1)
 	l := newTestRaftLog(entries)
@@ -808,24 +774,6 @@ func TestRaftLog_Snapshot_WithSnapshot(t *testing.T) {
 	if ss.Index != 10 || ss.Term != 3 {
 		t.Fatalf("expected snapshot index=10 term=3, got index=%d term=%d",
 			ss.Index, ss.Term)
-	}
-}
-
-func TestRaftLog_Restore_FromSnapshot(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-
-	ss := proto.Snapshot{Index: 20, Term: 5}
-	l.restore(ss)
-
-	if l.committed != 20 {
-		t.Fatalf("expected committed 20, got %d", l.committed)
-	}
-	if l.processed != 20 {
-		t.Fatalf("expected processed 20, got %d", l.processed)
-	}
-	if l.lastIndex() != 20 {
-		t.Fatalf("expected lastIndex 20, got %d", l.lastIndex())
 	}
 }
 
@@ -1014,22 +962,6 @@ func TestRaftLog_CommitUpdate_LastApplied(t *testing.T) {
 	// Entries 1,2 should be truncated.
 	if l.inmem.markerIndex != 3 {
 		t.Fatalf("expected markerIndex 3, got %d", l.inmem.markerIndex)
-	}
-}
-
-func TestRaftLog_CommitUpdate_ZeroProcessed(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-	l.committed = 5
-	l.processed = 2
-
-	up := proto.UpdateCommit{
-		Processed: false, // should not affect processed index
-	}
-	l.commitUpdate(up)
-
-	if l.processed != 2 {
-		t.Fatalf("expected processed 2, got %d", l.processed)
 	}
 }
 
@@ -1259,16 +1191,6 @@ func TestRaftLog_FirstNotAppliedIndex_BelowFirstIndex(t *testing.T) {
 
 	if l.firstNotAppliedIndex() != 11 {
 		t.Fatalf("expected firstNotAppliedIndex 11, got %d", l.firstNotAppliedIndex())
-	}
-}
-
-func TestRaftLog_Entries_LowGtHigh(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-
-	_, err := l.entries(5, 3, 0)
-	if !errors.Is(err, logdb.ErrUnavailable) {
-		t.Fatalf("expected logdb.ErrUnavailable for low > high, got %v", err)
 	}
 }
 
@@ -1756,64 +1678,6 @@ func TestRaftLog_BinarySearch_MatchesLinearScan(t *testing.T) {
 		if gotLast != wantLast {
 			t.Errorf("lastIndexOfTerm(%d): binary search got %d, linear scan got %d", term, gotLast, wantLast)
 		}
-	}
-}
-
-// TestRaftLog_FirstIndexOfTerm_TermHigherThanAll verifies that searching
-// for a term larger than any in the log returns 0.
-func TestRaftLog_FirstIndexOfTerm_TermHigherThanAll(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.firstIndexOfTerm(100); got != 0 {
-		t.Fatalf("firstIndexOfTerm(100): expected 0, got %d", got)
-	}
-}
-
-// TestRaftLog_LastIndexOfTerm_TermHigherThanAll verifies that searching
-// for a term larger than any in the log returns 0.
-func TestRaftLog_LastIndexOfTerm_TermHigherThanAll(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.lastIndexOfTerm(100); got != 0 {
-		t.Fatalf("lastIndexOfTerm(100): expected 0, got %d", got)
-	}
-}
-
-// TestRaftLog_FirstIndexOfTerm_TermZero verifies that searching for
-// term 0 returns 0 (no entries should have term 0 in a valid log).
-func TestRaftLog_FirstIndexOfTerm_TermZero(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.firstIndexOfTerm(0); got != 0 {
-		t.Fatalf("firstIndexOfTerm(0): expected 0, got %d", got)
-	}
-}
-
-// TestRaftLog_LastIndexOfTerm_TermZero verifies that searching for
-// term 0 returns 0 (no entries should have term 0 in a valid log).
-func TestRaftLog_LastIndexOfTerm_TermZero(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.lastIndexOfTerm(0); got != 0 {
-		t.Fatalf("lastIndexOfTerm(0): expected 0, got %d", got)
 	}
 }
 

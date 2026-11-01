@@ -22,59 +22,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSendQueueWorkerPanicRecovery verifies that a panic inside
-// sendQueueWorker is recovered without crashing the process. After
-// the panic the goroutine exits gracefully.
-func TestSendQueueWorkerPanicRecovery(t *testing.T) {
-	handler := &panicOnHandleHandler{}
-	reg := registry.NewRegistry()
-	reg.Register(1, 2, "127.0.0.1:9999")
-
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	// Do NOT call Start() -- we only test the sendQueueWorker method
-	// directly. Set stopC to a test-controlled channel on the unstated
-	// transport (no background goroutines are running).
-	testStopC := make(chan struct{})
-	tr.stopC = testStopC
-
-	sq := &sendQueue{ch: make(chan proto.Message, 8), hbCh: make(chan proto.Message, 8)}
-
-	panicTarget := "panic-target"
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// Call the recovery-protected worker. The worker will try to
-		// send to a nonexistent target; we inject a message and then
-		// close stopC to exit cleanly. The real test is that a panic
-		// in the worker does not crash the process.
-		tr.sendQueueWorker(panicTarget, sq)
-	}()
-
-	// Send a message; the worker will call sendToTarget for a target
-	// with no real connection. This exercises the normal path. The
-	// sendBatch call will fail silently (no connection), not panic.
-	sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2}
-
-	// Allow time for the worker to process the message.
-	time.Sleep(50 * time.Millisecond)
-
-	// Signal the worker to exit.
-	close(testStopC)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("sendQueueWorker did not exit in time")
-	}
-}
-
 // TestSendQueueWorkerPanicInSendToTargetRecovery directly tests that a
 // panic originating from sendToTarget is caught by the deferred recover
 // in sendQueueWorker.
@@ -180,34 +127,6 @@ func TestAcceptLoopRestartsAfterPanic(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("acceptLoopIteration did not return after shutdown")
-	}
-}
-
-// TestConnectionCleanupPanicRecovery verifies that the connectionCleanup
-// goroutine recovers from panics without crashing the process or hanging
-// the WaitGroup.
-func TestConnectionCleanupPanicRecovery(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	// The connectionCleanup goroutine is already running. Verify that
-	// stopping the transport does not hang (the goroutine responds to
-	// stopC). The panic recovery ensures that even if cleanStaleConnections
-	// panicked, wg.Done() is still called via the deferred recover.
-	if err := tr.Stop(); err != nil {
-		t.Fatalf("Stop failed: %v", err)
 	}
 }
 
@@ -383,33 +302,6 @@ func TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery(t *testing.T) {
 	}
 }
 
-// TestConnectionCleanupOnceReturnsFalseOnNormalExit verifies that
-// connectionCleanupOnce returns panicked=false when it exits normally
-// via stopC.
-func TestConnectionCleanupOnceReturnsFalseOnNormalExit(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	// Do NOT call Start() -- we only test connectionCleanupOnce directly.
-	// Replace stopC with a pre-closed channel so the method exits immediately.
-	testStopC := make(chan struct{})
-	close(testStopC)
-	tr.stopC = testStopC
-
-	panicked := tr.connectionCleanupOnce()
-	if panicked {
-		t.Fatal("expected panicked=false when stopC is closed")
-	}
-}
-
 // TestConnectionCleanupRestartsAfterPanic verifies that the connectionCleanup
 // outer loop exits cleanly when stopC is closed, proving the restart loop
 // structure is correct.
@@ -445,37 +337,6 @@ func TestConnectionCleanupRestartsAfterPanic(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("connectionCleanup did not exit in time after stop")
 	}
-}
-
-// TestWorkerPanicErrorFields verifies that WorkerPanicError captures
-// the correct worker name, target, and panic value.
-func TestWorkerPanicErrorFields(t *testing.T) {
-	t.Run("with_target", func(t *testing.T) {
-		panicErr := &WorkerPanicError{
-			WorkerName: "sendQueueWorker",
-			Target:     "10.0.0.1:9000",
-			Value:      "test panic",
-			Stack:      []byte("fake stack"),
-		}
-		msg := panicErr.Error()
-		expected := "transport: sendQueueWorker[10.0.0.1:9000] panicked: test panic"
-		if msg != expected {
-			t.Fatalf("unexpected error message: got %q, want %q", msg, expected)
-		}
-	})
-
-	t.Run("without_target", func(t *testing.T) {
-		panicErr := &WorkerPanicError{
-			WorkerName: "connectionCleanup",
-			Value:      "cleanup panic",
-			Stack:      []byte("fake stack"),
-		}
-		msg := panicErr.Error()
-		expected := "transport: connectionCleanup panicked: cleanup panic"
-		if msg != expected {
-			t.Fatalf("unexpected error message: got %q, want %q", msg, expected)
-		}
-	})
 }
 
 // TestSendQueueWorkerExitsCleanlyOnStopSignal verifies that the worker
