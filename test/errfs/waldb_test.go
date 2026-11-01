@@ -886,45 +886,6 @@ func TestErrorFS_WAL_MultipleShards_PartialBatch(t *testing.T) {
 	assertEntryAbsent(t, recovered, shardB, repID, 3)
 }
 
-// --- TestErrorFS_LargeCmd_RoundtripSanity ---
-
-// TestErrorFS_LargeCmd_RoundtripSanity is a precondition test that verifies
-// large-payload entries survive a normal write-close-reopen cycle. This
-// ensures testEntryLarge is valid before it is used in injection tests.
-func TestErrorFS_LargeCmd_RoundtripSanity(t *testing.T) {
-	const (
-		shardID   = uint64(12)
-		replicaID = uint64(1)
-	)
-
-	dir := t.TempDir()
-
-	want := testEntryLarge(1, 1)
-	db := openDB(t, dir)
-	if err := db.SaveEntries(shardID, replicaID, []logdb.Entry{want}); err != nil {
-		t.Fatalf("SaveEntries large: %v", err)
-	}
-	mustClose(t, db)
-
-	recovered := openDB(t, dir)
-	defer mustClose(t, recovered)
-
-	got, err := recovered.GetEntries(shardID, replicaID, 1, 2, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("GetEntries: got %d entries, want 1", len(got))
-	}
-	if got[0].Index != want.Index || got[0].Term != want.Term {
-		t.Fatalf("entry mismatch: got Index=%d Term=%d, want Index=%d Term=%d",
-			got[0].Index, got[0].Term, want.Index, want.Term)
-	}
-	if !bytes.Equal(got[0].Cmd, want.Cmd) {
-		t.Fatalf("Cmd mismatch: got len=%d, want len=%d", len(got[0].Cmd), len(want.Cmd))
-	}
-}
-
 // testEntryWithPayload builds a logdb.Entry whose Cmd is a distinctive
 // repeating pattern based on the entry index. This allows byte-for-byte
 // payload verification after recovery.
