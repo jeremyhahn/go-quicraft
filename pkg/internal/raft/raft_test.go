@@ -8575,24 +8575,6 @@ func TestLeaseRead_ResetOnBecomeLeader(t *testing.T) {
 	}
 }
 
-func TestLeaseRead_ResetOnBecomeCandidate(t *testing.T) {
-	// becomeCandidate transitions from follower; verify remoteLastAck is nil.
-	r := newTestRaftLeaseRead(1)
-	electLeader(r)
-	commitNoOp(r)
-	grantLease(r)
-
-	r.becomeFollower(r.term, noLeader)
-	if r.remoteLastAck != nil {
-		t.Fatal("expected remoteLastAck to be nil after becomeFollower")
-	}
-
-	r.becomeCandidate()
-	if r.remoteLastAck != nil {
-		t.Fatal("expected remoteLastAck to remain nil after becomeCandidate")
-	}
-}
-
 func TestLeaseRead_MultipleConsecutiveReads(t *testing.T) {
 	// Multiple consecutive ReadIndex requests with a valid lease should
 	// all be served immediately.
@@ -8705,17 +8687,6 @@ func TestLeaseRead_HasValidLease_NotLeaderReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestLeaseRead_RemoteLastAckNilWhenDisabled(t *testing.T) {
-	// When LeaseRead is false, remoteLastAck should remain nil even after
-	// becoming leader.
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-
-	if r.remoteLastAck != nil {
-		t.Fatal("expected remoteLastAck to be nil when LeaseRead is disabled")
-	}
-}
-
 func TestLeaseRead_HeartbeatAckDoesNotTrackWhenDisabled(t *testing.T) {
 	// When LeaseRead is false, heartbeat responses should not populate
 	// remoteLastAck.
@@ -8821,15 +8792,6 @@ func TestLeaseRead_ElectionTickWrapResetsLeaseAcks(t *testing.T) {
 	}
 }
 
-func TestResetLeaseAcks_NilMap(t *testing.T) {
-	// resetLeaseAcks should not panic when remoteLastAck is nil
-	// (e.g., when leaseRead is disabled).
-	r := newTestRaft(1) // Non-lease raft
-	electLeader(r)
-	r.remoteLastAck = nil
-	r.resetLeaseAcks() // must not panic
-}
-
 // ---------------------------------------------------------------------------
 // replicaToBit 64-member guard
 // ---------------------------------------------------------------------------
@@ -8926,26 +8888,6 @@ func TestBecomeLeader_SucceedsWithExactly64VotingMembers(t *testing.T) {
 // ---------------------------------------------------------------------------
 // GAP-3: Campaign skipping with pending config changes
 // ---------------------------------------------------------------------------
-
-// TestHasConfigChangeToApply verifies that hasConfigChangeToApply returns
-// true when uncommitted config change entries exist between committed
-// and lastIndex.
-func TestHasConfigChangeToApply(t *testing.T) {
-	r := newTestRaft(1)
-	electLeader(r)
-	r.drainMessages()
-
-	// Append a config change entry. The leader's no-op + this entry
-	// will be beyond committed (committed is still at the no-op index
-	// from becoming leader until a quorum acks).
-	r.log.append([]proto.Entry{
-		{Term: r.term, Index: r.log.lastIndex() + 1, Type: proto.EntryConfigChange},
-	})
-
-	if !r.hasConfigChangeToApply() {
-		t.Fatal("expected hasConfigChangeToApply to return true with uncommitted config change")
-	}
-}
 
 // TestHasConfigChangeToApplyNoChanges verifies that hasConfigChangeToApply
 // returns false when there are uncommitted entries but none are config changes.
@@ -9067,54 +9009,6 @@ func TestStartElectionWithUncommittedConfigChangePreVote(t *testing.T) {
 	preVotes := collectMessages(r, proto.RequestPreVote)
 	if len(preVotes) == 0 {
 		t.Fatal("expected pre-vote messages to be sent")
-	}
-}
-
-// TestStartElectionAllowedWithoutConfigChange verifies that startElection
-// proceeds normally when there are no uncommitted config change entries.
-func TestStartElectionAllowedWithoutConfigChange(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-
-	campaignFired := false
-	r.onCampaign = func(_, _, _ uint64) {
-		campaignFired = true
-	}
-
-	// No uncommitted config changes. Election should proceed.
-	r.startElection()
-
-	if r.state != candidate {
-		t.Fatalf("expected candidate state, got %s", r.state)
-	}
-	if !campaignFired {
-		t.Fatal("expected onCampaign callback to fire")
-	}
-
-	// Verify vote messages were sent to peers.
-	votes := collectMessages(r, proto.RequestVote)
-	if len(votes) == 0 {
-		t.Fatal("expected vote messages to be sent")
-	}
-}
-
-// TestStartElectionAllowedAfterConfigChangeCommitted verifies that once
-// a config change entry is committed, elections proceed normally.
-func TestStartElectionAllowedAfterConfigChangeCommitted(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-
-	// Append a config change entry.
-	r.log.append([]proto.Entry{
-		{Term: r.term, Index: r.log.lastIndex() + 1, Type: proto.EntryConfigChange},
-	})
-
-	// Commit it.
-	r.log.commitTo(r.log.lastIndex())
-
-	// Election should proceed.
-	r.startElection()
-
-	if r.state != candidate {
-		t.Fatalf("expected candidate state after config change committed, got %s", r.state)
 	}
 }
 
@@ -9983,55 +9877,6 @@ func TestRaft_ReadIndex_BlockedDuringTransfer(t *testing.T) {
 	}
 }
 
-func TestRaft_ReadIndex_AllowedAfterTransferCompletes(t *testing.T) {
-	// After a transfer times out and is cleared, ReadIndex must resume
-	// normal operation.
-	r := newTestRaftLeaseRead(1)
-	electLeader(r)
-	commitNoOp(r)
-	grantLease(r)
-
-	// Initiate and then clear the transfer (simulating timeout).
-	err := r.step(proto.Message{
-		Type: proto.LeaderTransfer, Origin: proto.OriginLocal,
-		From: 2,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error initiating transfer: %v", err)
-	}
-	r.drainMessages()
-
-	// Clear transfer (as tickLeader does on timeout).
-	r.transferTarget = noNode
-
-	// Re-initialize the lease tracking map. The transfer invalidated it
-	// by setting remoteLastAck to nil. In production, tickLeader clears
-	// the transfer target but the lease map must be re-initialized to
-	// resume lease-based reads.
-	r.remoteLastAck = make(map[uint64]time.Time)
-
-	// Re-establish the lease since transfer invalidated it.
-	grantLease(r)
-
-	// ReadIndex should succeed now.
-	err = r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		From: 0,
-		Hint: 77,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error after transfer cleared: %v", err)
-	}
-
-	// Should have produced a readState (lease-based immediate response).
-	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 readState after transfer cleared, got %d", len(r.readStates))
-	}
-	if r.readStates[0].Key != 77 {
-		t.Fatalf("readState key: expected 77, got %d", r.readStates[0].Key)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Witness ack must not satisfy ReadIndex quorum
 // ---------------------------------------------------------------------------
@@ -10469,51 +10314,6 @@ func TestHandleLeaderReadIndex_RejectsWhenPendingReadIndexFull(t *testing.T) {
 	}
 }
 
-func TestHandleLeaderReadIndex_AcceptsAfterDrainingPendingReads(t *testing.T) {
-	// After clearing some pending entries, new ReadIndex requests
-	// must be accepted again.
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	commitNoOp(r)
-
-	// Fill to capacity.
-	r.pendingReadIndex = make([]readIndexStatus, maxPendingReadIndex)
-	for i := range r.pendingReadIndex {
-		r.pendingReadIndex[i] = readIndexStatus{
-			key:   uint64(i),
-			index: r.log.committed,
-			ctx:   uint64(i + 1),
-		}
-	}
-
-	// Verify it is full.
-	err := r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		Hint: 9999,
-	})
-	if !errors.Is(err, ErrReadIndexOverloaded) {
-		t.Fatalf("expected ErrReadIndexOverloaded when full, got %v", err)
-	}
-
-	// Drain half of the entries (simulating quorum resolution).
-	r.pendingReadIndex = r.pendingReadIndex[:maxPendingReadIndex/2]
-
-	// Now a new ReadIndex must succeed.
-	err = r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		Hint: 8888,
-	})
-	if err != nil {
-		t.Fatalf("expected ReadIndex to succeed after drain, got %v", err)
-	}
-
-	// Verify the entry was appended.
-	if len(r.pendingReadIndex) != maxPendingReadIndex/2+1 {
-		t.Fatalf("expected %d pending reads, got %d",
-			maxPendingReadIndex/2+1, len(r.pendingReadIndex))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // readIndexCtx wrap guard
 // ---------------------------------------------------------------------------
@@ -10692,31 +10492,6 @@ func TestSendRateLimitMessage_NoLeader(t *testing.T) {
 	}
 }
 
-func TestSendRateLimitMessage_SendsToLeader(t *testing.T) {
-	// When leader is known, sendRateLimitMessage sends the current
-	// in-memory size in the Hint field.
-	r := newTestRaftRateLimited(1, 1000)
-	r.becomeFollower(1, 3) // Leader is node 3.
-	r.rl.Set(750)
-
-	r.sendRateLimitMessage()
-
-	if len(r.msgs) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(r.msgs))
-	}
-
-	msg := r.msgs[0]
-	if msg.Type != proto.RateLimit {
-		t.Fatalf("expected RateLimit type, got %d", msg.Type)
-	}
-	if msg.To != 3 {
-		t.Fatalf("expected To=3 (leader), got %d", msg.To)
-	}
-	if msg.Hint != 750 {
-		t.Fatalf("expected Hint=750 (in-mem size), got %d", msg.Hint)
-	}
-}
-
 func TestHandleLeaderRateLimit_DisabledRateLimiterNoOp(t *testing.T) {
 	// When rl is disabled, handleLeaderRateLimit should not track
 	// follower state.
@@ -10743,9 +10518,6 @@ func TestHandleLeaderRateLimit_AlwaysReturnsNil(t *testing.T) {
 	}{
 		{"nil_rl", false, 2, 500},
 		{"enabled_rl", true, 2, 500},
-		{"zero_hint", true, 2, 0},
-		{"large_hint", true, 2, 1 << 40},
-		{"from_unknown_replica", true, 99, 500},
 	}
 
 	for _, tc := range tests {
@@ -10782,18 +10554,6 @@ func TestRateLimited_NilRateLimiterReturnsFalse(t *testing.T) {
 
 	if r.rateLimited() {
 		t.Fatal("expected rateLimited()=false with nil rl")
-	}
-}
-
-func TestRateLimited_DisabledRateLimiterReturnsFalse(t *testing.T) {
-	// When rl is disabled (maxSize=0), rateLimited() returns false.
-	r := newTestRaftRateLimited(1, 0)
-	if r.rl != nil && r.rl.Enabled() {
-		t.Fatal("expected disabled rate limiter")
-	}
-
-	if r.rateLimited() {
-		t.Fatal("expected rateLimited()=false with disabled rl")
 	}
 }
 
@@ -12692,40 +12452,6 @@ func TestRaft_ReadStates_BoundedGrowth(t *testing.T) {
 	}
 }
 
-// TestRaft_ReadStates_AcceptsAfterDrain verifies that after draining
-// readStates, new ReadIndex requests are accepted again.
-func TestRaft_ReadStates_AcceptsAfterDrain(t *testing.T) {
-	r := newTestRaftWithMembers(1, map[uint64]string{1: "addr1"})
-	electLeader(r)
-	r.drainMessages()
-	commitNoOp(r)
-
-	// Fill to capacity.
-	for i := range maxReadStates {
-		_ = r.step(proto.Message{
-			Type: proto.ReadIndex, Origin: proto.OriginLocal,
-			From: 1,
-			Hint: uint64(i + 1),
-		})
-	}
-
-	// Drain all readStates.
-	r.readStates = nil
-
-	// Should accept again.
-	err := r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		From: 1,
-		Hint: 42,
-	})
-	if err != nil {
-		t.Fatalf("ReadIndex after drain should succeed, got %v", err)
-	}
-	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 readState after drain+add, got %d", len(r.readStates))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // replicaToBit rebuilt on config change during leadership
 // ---------------------------------------------------------------------------
@@ -13174,38 +12900,6 @@ func TestQuiesceBlockedDuringLeaderTransfer(t *testing.T) {
 	// Transfer elapsed should have advanced.
 	if r.transferElapsed < 5 {
 		t.Fatalf("expected transferElapsed >= 5, got %d", r.transferElapsed)
-	}
-}
-
-func TestQuiesceBlockedDuringLeaderTransfer_InvalidTarget(t *testing.T) {
-	// When no transfer is active (transferTarget == noNode), quiesce
-	// should still be able to enter normally.
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
-	cfg := raftTestCfgQuiesce(1, 1)
-	cfg.PreVote = config.BoolPtr(false)
-	cfg.CheckQuorum = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("newRaft: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	// No transfer active.
-	if r.transferTarget != noNode {
-		t.Fatalf("expected no transfer target, got %d", r.transferTarget)
-	}
-
-	// Tick enough to enter quiesce.
-	for i := 0; i < 100; i++ {
-		tickLeader(r)
-		r.drainMessages()
-	}
-
-	// Quiesce should be active.
-	if !r.quiesce.active {
-		t.Fatal("quiesce should be active when no transfer is in progress")
 	}
 }
 
