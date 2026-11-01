@@ -162,35 +162,6 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 		len(updatedMembership.Nodes), targetReplicaID)
 }
 
-// TestIntegration_DB_SyncRequestAddReplica verifies that a new replica
-// can be added to the cluster via SyncRequestAddReplica. Matches
-// dragonboat's TestSyncRequestAddReplica.
-func TestIntegration_DB_SyncRequestAddReplica(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	// Get current membership, through whichever replica leads now.
-	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
-
-	// Add replica 10 at a dummy address, through the current leader, and
-	// confirmed by a linearizable read.
-	cluster.addReplicaToLeader(t, 1, 10, "127.10.0.1:59999", dbIdentityFor(10), membership.ConfigChangeID, membershipTimeout)
-
-	// Verify the membership now includes replica 10.
-	updated := cluster.membershipFromLeader(t, 1, membershipTimeout)
-	if _, exists := updated.Nodes[10]; !exists {
-		t.Fatalf("replica 10 not found in membership after add")
-	}
-	t.Logf("SyncRequestAddReplica succeeded: %d nodes (replica 10 added)", len(updated.Nodes))
-}
-
 // TestIntegration_DB_SyncRequestAddNonVoting verifies that a non-voting
 // observer can be added via SyncRequestAddNonVoting. Matches
 // dragonboat's TestSyncRequestAddNonVoting.

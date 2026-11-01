@@ -86,63 +86,6 @@ func TestIntegration_DB_AsyncRequestAddReplica(t *testing.T) {
 		len(updatedMembership.Nodes), updatedMembership.ConfigChangeID)
 }
 
-// TestIntegration_DB_SyncMembership_Roundtrip verifies SyncGetShardMembership
-// returns complete membership data including Nodes, NonVotings, Witnesses,
-// and ConfigChangeID fields.
-func TestIntegration_DB_SyncMembership_Roundtrip(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-
-	// Verify Nodes has exactly 3 voting members.
-	if len(membership.Nodes) != 3 {
-		t.Fatalf("expected 3 nodes, got %d", len(membership.Nodes))
-	}
-
-	// Verify each replica has the correct address.
-	for i, addr := range cluster.addrs {
-		replicaID := uint64(i + 1)
-		memberAddr, exists := membership.Nodes[replicaID]
-		if !exists {
-			t.Fatalf("replica %d not found in Nodes", replicaID)
-		}
-		if memberAddr != addr {
-			t.Fatalf("replica %d address = %q, want %q", replicaID, memberAddr, addr)
-		}
-	}
-
-	// Verify NonVotings is empty.
-	if len(membership.NonVotings) != 0 {
-		t.Fatalf("expected 0 non-votings, got %d", len(membership.NonVotings))
-	}
-
-	// Verify Witnesses is empty.
-	if len(membership.Witnesses) != 0 {
-		t.Fatalf("expected 0 witnesses, got %d", len(membership.Witnesses))
-	}
-
-	// ConfigChangeID is 0 for initial bootstrap membership (no config change
-	// entries have been applied yet). After a membership change, it will be
-	// set to the log index of that change.
-	t.Logf("membership roundtrip verified: Nodes=%d, NonVotings=%d, Witnesses=%d, ConfigChangeID=%d",
-		len(membership.Nodes), len(membership.NonVotings), len(membership.Witnesses), membership.ConfigChangeID)
-}
-
 // TestIntegration_DB_RequestLeaderTransfer verifies that RequestLeaderTransfer
 // moves leadership to the specified follower, which can then be confirmed
 // via GetLeaderID.

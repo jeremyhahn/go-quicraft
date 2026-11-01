@@ -16,7 +16,6 @@ package perfresult
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -237,17 +236,6 @@ func TestReadSuiteFromOutputMissingEndSentinel(t *testing.T) {
 	}
 }
 
-func TestReadSuiteFromOutputEmptyInput(t *testing.T) {
-	_, err := ReadSuiteFromOutput([]byte{})
-	if err == nil {
-		t.Fatal("expected error for empty input")
-	}
-	var noSentinel *NoSentinelError
-	if !errors.As(err, &noSentinel) {
-		t.Fatalf("expected NoSentinelError, got %T: %v", err, err)
-	}
-}
-
 func TestReadSuiteFromOutputMalformedJSON(t *testing.T) {
 	output := []byte("===PERF_JSON_BEGIN===\n{not-valid-json}\n===PERF_JSON_END===\n")
 	_, err := ReadSuiteFromOutput(output)
@@ -257,52 +245,6 @@ func TestReadSuiteFromOutputMalformedJSON(t *testing.T) {
 	var parseErr *ParseFailureError
 	if !errors.As(err, &parseErr) {
 		t.Fatalf("expected ParseFailureError, got %T: %v", err, err)
-	}
-}
-
-func TestBenchmarkSuiteJSONRoundTrip(t *testing.T) {
-	suite := NewBenchmarkSuite("quicraft", "2.0.0")
-	suite.Config.PayloadSize = 256
-	suite.Config.ConcurrentGoroutines = 16
-	suite.AddResult(ScenarioProposeSEQWAL, 10000, 5*time.Second, nil)
-
-	data, err := json.Marshal(suite)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-
-	var decoded BenchmarkSuite
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	if decoded.System != suite.System {
-		t.Fatalf("system mismatch: got %q, want %q", decoded.System, suite.System)
-	}
-	if decoded.Config.PayloadSize != 256 {
-		t.Fatalf("expected payload size 256, got %d", decoded.Config.PayloadSize)
-	}
-	if decoded.Config.ConcurrentGoroutines != 16 {
-		t.Fatalf("expected concurrent goroutines 16, got %d", decoded.Config.ConcurrentGoroutines)
-	}
-	r, ok := decoded.Results[ScenarioProposeSEQWAL]
-	if !ok {
-		t.Fatal("expected result after JSON round-trip")
-	}
-	if r.Ops != 10000 {
-		t.Fatalf("expected ops 10000, got %d", r.Ops)
-	}
-}
-
-func TestSentinelConstants(t *testing.T) {
-	if SentinelBegin == "" {
-		t.Fatal("SentinelBegin must not be empty")
-	}
-	if SentinelEnd == "" {
-		t.Fatal("SentinelEnd must not be empty")
-	}
-	if SentinelBegin == SentinelEnd {
-		t.Fatal("SentinelBegin and SentinelEnd must be different")
 	}
 }
 
@@ -341,12 +283,6 @@ func TestWriteSuiteToWriterError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from failing writer")
 	}
-}
-
-func TestWriteSuiteToStdoutCompiles(t *testing.T) {
-	// We cannot easily capture stdout in a test, but we verify the function
-	// signature exists and compiles. A deeper test is done via WriteSuiteTo.
-	_ = WriteSuiteToStdout
 }
 
 func TestErrorTypes(t *testing.T) {

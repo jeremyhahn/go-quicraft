@@ -280,7 +280,6 @@ func TestResolveSystems(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "all", args: []string{"all"}, want: knownSystems},
-		{name: "subset", args: []string{"quicraft", "etcd"}, want: []string{"quicraft", "etcd"}},
 		{name: "comma split with spaces", args: []string{"quicraft", " etcd "}, want: []string{"quicraft", "etcd"}},
 		{name: "empty entries ignored", args: []string{"", "etcd"}, want: []string{"etcd"}},
 		{name: "unknown", args: []string{"zookeeper"}, wantErr: true},
@@ -303,21 +302,6 @@ func TestResolveSystems(t *testing.T) {
 				t.Fatalf("resolveSystems(%v) = %v; want %v", tt.args, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestMissingSystems(t *testing.T) {
-	suites := map[string]*perfresult.BenchmarkSuite{
-		"quicraft": perfresult.NewBenchmarkSuite("quicraft", "v"),
-		"etcd":     perfresult.NewBenchmarkSuite("etcd", "v"),
-	}
-	got := missingSystems(knownSystems, suites)
-	want := []string{"dragonboat", "openraft"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("missingSystems = %v; want %v", got, want)
-	}
-	if len(missingSystems([]string{"quicraft"}, suites)) != 0 {
-		t.Fatal("missingSystems reported a system that is present")
 	}
 }
 

@@ -25,11 +25,6 @@ import (
 	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 )
 
-// TestIntegration_DB_NAReadLocalNode verifies that NAReadLocalNode returns
-// ErrNotImplemented, as in Dragonboat v4, when the state machine does not
-// implement IExtended: the KV state machine here has no NALookup. It checks
-// that a completed ReadIndex reaches the state machine and comes back with
-// that sentinel rather than a panic or another error.
 // awaitReadIndex waits for rs to complete. NAReadLocalNode, like
 // ReadLocalNode, serves only a completed ReadIndex. The caller releases rs.
 func awaitReadIndex(t *testing.T, rs *dragonboat.RequestState, timeout time.Duration) {
@@ -42,44 +37,6 @@ func awaitReadIndex(t *testing.T, rs *dragonboat.RequestState, timeout time.Dura
 	case <-time.After(timeout):
 		t.Fatalf("ReadIndex did not resolve within %v", timeout)
 	}
-}
-
-func TestIntegration_DB_NAReadLocalNode(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose data so there is state to potentially read.
-	proposeAndWait(t, cluster, trackers, 1, "naread-key", "naread-value")
-	waitForReplication(t, cluster, trackers, 1, "naread-key", "naread-value", defaultTimeout)
-
-	// First, get a valid ReadIndex RequestState so we have a real rs to pass.
-	// The ReadIndex itself is leader-bound and would be refused after an
-	// election, which has nothing to do with what this test asserts, so it
-	// resolves the leader instead of pinning leaderIdx. NAReadLocalNode is
-	// then called on the replica that ACCEPTED the request: it is a local
-	// read against that node's own state machine, so the rs and the host it
-	// is presented to must be the same one.
-	ri := cluster.readIndexFromLeader(t, 1, defaultTimeout)
-	defer ri.RS.Release()
-	awaitReadIndex(t, ri.RS, defaultTimeout)
-
-	// The KV state machine does not implement IExtended.
-	_, naErr := ri.Host.NAReadLocalNode(ri.RS, encodeKVGet("naread-key"))
-	if naErr == nil {
-		t.Fatal("NAReadLocalNode should return an error (ErrNotImplemented)")
-	}
-	if !errors.Is(naErr, dbSM.ErrNotImplemented) {
-		t.Fatalf("NAReadLocalNode returned %v, want %v", naErr, dbSM.ErrNotImplemented)
-	}
-	t.Logf("NAReadLocalNode correctly returned ErrNotImplemented: %v", naErr)
 }
 
 // TestIntegration_DB_NAReadLocalNode_AllNodes verifies that NAReadLocalNode

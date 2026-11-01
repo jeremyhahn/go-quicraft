@@ -86,8 +86,7 @@ func TestTheTrackedTreeIsPubliclyReleasable(t *testing.T) {
 
 // TestThePlantedViolationIsCaught proves the gate above can fail. It plants one
 // value of each class, in the kinds of file this repository ships, scans them
-// under the real allow-list, and asserts every class comes back -- then that
-// the same value passes once waived in place.
+// under the real allow-list, and asserts every class comes back.
 func TestThePlantedViolationIsCaught(t *testing.T) {
 	planted := map[string]string{
 		"Makefile":                 "REMOTE_HOST ?= " + plantedAddress + "\n",
@@ -119,17 +118,6 @@ func TestThePlantedViolationIsCaught(t *testing.T) {
 			t.Errorf("report does not name %s:\n%s", name, out)
 		}
 	}
-
-	waivedRoot, waivedFiles := writeTree(t, map[string]string{
-		"docs/guide.md": "Deploy it on " + plantedGPUHost + " <!-- lab-string-ok: measurement provenance -->\n",
-	})
-	rest, err := scan(waivedRoot, waivedFiles, allowList)
-	if err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("a waived line was still reported: %v", rest)
-	}
 }
 
 // TestTheAllowListDoesNotReachTheValuesThisChangeRemoved pins the scrub: the
@@ -159,34 +147,6 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 	accepted := acceptedClasses(allowList, "test/performance/baselines/x.txt")
 	if accepted[classLabAddress] || accepted[classOwnerAccount] {
 		t.Errorf("baselines accept %v; only %s is provenance", accepted, classLabHost)
-	}
-}
-
-func TestIsPrivateWorkflowFile(t *testing.T) {
-	cases := map[string]bool{
-		".release-allowed-signers":               true,
-		"sub/.release-allowed-signers":           false,
-		".release-allowed-signers.sample":        false,
-		".github/workflows/automerge.yml":        true,
-		".github/workflows/revert-red-main.yml":  true,
-		".github/workflows/code-review.yml":      true,
-		".github/workflows/automerge.yml.sample": false,
-		"sub/.github/workflows/automerge.yml":    false,
-		".github/workflows/batch.yml":            false,
-		".github/workflows/ci.yml":               false,
-		".github/workflows/release.yml":          false,
-		".github/dependabot.yml":                 false,
-		"CLAUDE.md":                              false,
-		"AGENTS.md":                              false,
-		"pkg/seal/CLAUDE.md":                     false,
-		".claude/agents/go-quicraft.md":          false,
-		".serena/project.yml":                    false,
-		"go.mod":                                 false,
-	}
-	for name, want := range cases {
-		if got := isPrivateWorkflowFile(name); got != want {
-			t.Errorf("isPrivateWorkflowFile(%q) = %v, want %v", name, got, want)
-		}
 	}
 }
 

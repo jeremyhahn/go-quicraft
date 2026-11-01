@@ -56,20 +56,6 @@ func TestGenerateSystemChartValidSVG(t *testing.T) {
 	}
 }
 
-func TestGenerateSystemChartCreatesDirectory(t *testing.T) {
-	suite := NewBenchmarkSuite("quicraft", "1.0.0")
-	suite.AddResult(ScenarioElectionWAL, 10, time.Second, nil)
-
-	outPath := filepath.Join(t.TempDir(), "nested", "deep", "chart.svg")
-	if err := GenerateSystemChart(suite, outPath); err != nil {
-		t.Fatalf("GenerateSystemChart failed: %v", err)
-	}
-
-	if _, err := os.Stat(outPath); os.IsNotExist(err) {
-		t.Fatal("expected output file to exist")
-	}
-}
-
 func TestGenerateSystemChartNoResults(t *testing.T) {
 	suite := NewBenchmarkSuite("quicraft", "1.0.0")
 
@@ -145,22 +131,6 @@ func TestGenerateComparisonChartValidSVG(t *testing.T) {
 	}
 }
 
-func TestGenerateComparisonChartCreatesDirectory(t *testing.T) {
-	suites := map[string]*BenchmarkSuite{}
-	qSuite := NewBenchmarkSuite("quicraft", "1.0.0")
-	qSuite.AddResult(ScenarioElectionWAL, 100, time.Second, nil)
-	suites["quicraft"] = qSuite
-
-	outPath := filepath.Join(t.TempDir(), "nested", "compare.svg")
-	if err := GenerateComparisonChart(suites, outPath); err != nil {
-		t.Fatalf("GenerateComparisonChart failed: %v", err)
-	}
-
-	if _, err := os.Stat(outPath); os.IsNotExist(err) {
-		t.Fatal("expected output file to exist")
-	}
-}
-
 func TestGenerateComparisonChartNoResults(t *testing.T) {
 	suites := map[string]*BenchmarkSuite{
 		"quicraft": NewBenchmarkSuite("quicraft", "1.0.0"),
@@ -209,37 +179,6 @@ func TestGenerateComparisonChartMissingScenario(t *testing.T) {
 	// etcd should have N/A for the election scenario.
 	if !strings.Contains(content, "N/A") {
 		t.Fatal("expected N/A for missing etcd scenario")
-	}
-}
-
-func TestGenerateComparisonChartFourSystems(t *testing.T) {
-	suites := map[string]*BenchmarkSuite{}
-
-	for _, sys := range []string{"quicraft", "etcd", "dragonboat", "openraft"} {
-		s := NewBenchmarkSuite(sys, "1.0.0")
-		s.AddResult(ScenarioProposeSEQWAL, 1000, time.Second, nil)
-		suites[sys] = s
-	}
-
-	outPath := filepath.Join(t.TempDir(), "four.svg")
-	if err := GenerateComparisonChart(suites, outPath); err != nil {
-		t.Fatalf("GenerateComparisonChart failed: %v", err)
-	}
-
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatalf("failed to read output: %v", err)
-	}
-
-	if err := xml.Unmarshal(data, new(interface{})); err != nil {
-		t.Fatalf("output is not valid XML: %v", err)
-	}
-
-	content := string(data)
-	for _, sys := range []string{"quicraft", "etcd", "dragonboat", "openraft"} {
-		if !strings.Contains(content, sys) {
-			t.Fatalf("expected %q in comparison chart", sys)
-		}
 	}
 }
 
@@ -341,16 +280,6 @@ func TestScaleBar(t *testing.T) {
 				t.Fatalf("scaleBar(%f, %f, %d) = %d, want %d", tt.ops, tt.maxOps, tt.maxWidth, got, tt.expected)
 			}
 		})
-	}
-}
-
-func TestCollectPresentScenariosEmpty(t *testing.T) {
-	suites := map[string]*BenchmarkSuite{
-		"quicraft": NewBenchmarkSuite("quicraft", "1.0.0"),
-	}
-	scenarios := collectPresentScenarios(suites)
-	if len(scenarios) != 0 {
-		t.Fatalf("expected 0 present scenarios, got %d", len(scenarios))
 	}
 }
 

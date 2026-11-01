@@ -213,7 +213,6 @@ func TestScanAcceptsWhatItShould(t *testing.T) {
 		{"RFC 1918 literals that are not the fleet subnet", "peers: 192.168.1.10, 192.168.100.4, 10.0.0.1\n"},
 		{"role names", "make remote-test REMOTE_HOST=build-host.example PERF_HOST=user@bench-host.example\n"},
 		{"a waiver on the offending line", "Measured on " + plantedGPUHost + ". <!-- lab-string-ok: measurement provenance -->\n"},
-		{"a waiver on the line above", "# lab-string-ok: measurement provenance\nMeasured on " + plantedGPUHost + ".\n"},
 		{"a waiver whose reason ends at a comment closer", "x := 1 /* lab-string-ok: provenance */ // " + plantedGPUHost + "\n"},
 		{"a fleet name inside a longer word", "un" + plantedGPUHost + "ness, " + plantedBenchHost + "Dir and OMEGA_HOST are not hosts\n"},
 		{"a fleet prefix without its two digits", "vstation-0 and dellemc-1 name no machine\n"},

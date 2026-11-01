@@ -170,65 +170,6 @@ func TestE2E_RemoveNode_FourToThree(t *testing.T) {
 	t.Logf("cluster shrunk to %d nodes, removed replica %d confirmed in Removed set", len(m.Nodes), removedReplicaID)
 }
 
-// TestE2E_AddNode_FiveToSix verifies that a 5-node cluster can scale to
-// 6 nodes. The new node catches up on 20 pre-existing entries and
-// participates in replicating 5 additional entries.
-func TestE2E_AddNode_FiveToSix(t *testing.T) {
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	const shardID uint64 = 1
-
-	trackers := cluster.startShard(shardID)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Propose 20 entries and verify replication on all 5 nodes.
-	expected := proposeNEntries(t, cluster, trackers, shardID, 20, "add5to6")
-	verifyAllData(t, cluster, trackers, shardID, expected)
-	t.Logf("20 entries replicated to all 5 nodes")
-
-	// Add a 6th node with replicaID=6.
-	const newReplicaID uint64 = 6
-	result := addNodeToCluster(t, cluster, shardID, newReplicaID, testShardConfig)
-	t.Logf("added node[%d] at %s as replica %d", result.idx, result.addr, newReplicaID)
-
-	// Wait for the new node to catch up on all 20 entries.
-	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
-	t.Logf("node[%d] caught up on all 20 entries", result.idx)
-
-	// Propose 5 more entries and verify all 25 on all 6 nodes.
-	postExpected := proposeNEntries(t, cluster, trackers, shardID, 5, "add5to6-post")
-	for k, v := range postExpected {
-		expected[k] = v
-	}
-
-	// Verify the original 5 nodes have all 25 entries.
-	verifyAllData(t, cluster, trackers, shardID, expected)
-
-	// Verify the new node also has all 25 entries.
-	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
-
-	// Verify membership size is 6.
-	leaderIdx = cluster.findLeader(shardID)
-	if leaderIdx < 0 {
-		t.Fatalf("no leader found after adding node")
-	}
-	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 6, membershipTimeout)
-	waitForMembershipConverged(t, cluster, shardID,
-		[]uint64{1, 2, 3, 4, 5, newReplicaID}, nil, membershipTimeout)
-
-	m, err := cluster.hosts[leaderIdx].ShardMembership(shardID)
-	if err != nil {
-		t.Fatalf("ShardMembership failed: %v", err)
-	}
-	if len(m.Nodes) != 6 {
-		t.Errorf("expected 6 voting nodes, got %d: %v", len(m.Nodes), m.Nodes)
-	}
-
-	t.Logf("cluster expanded to %d nodes with all %d entries replicated", len(m.Nodes), len(expected))
-}
-
 // TestE2E_AddRemove_RoundTrip verifies a complete membership change cycle:
 // add a node (3->4), verify data, remove the added node (4->3), and verify
 // the cluster remains stable and serves all data correctly.

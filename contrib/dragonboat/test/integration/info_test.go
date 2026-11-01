@@ -75,7 +75,7 @@ func TestIntegration_DB_GetNodeHostInfo_Complete(t *testing.T) {
 			if si.Term == 0 {
 				t.Fatal("ShardInfo.Term should be non-zero after election")
 			}
-			if si.Nodes == nil || len(si.Nodes) == 0 {
+			if len(si.Nodes) == 0 {
 				t.Fatal("ShardInfo.Nodes should be populated")
 			}
 			t.Logf("ShardInfo: ShardID=%d, ReplicaID=%d, LeaderID=%d, Term=%d, IsLeader=%v, Nodes=%d",
@@ -146,34 +146,4 @@ func TestIntegration_DB_GetLeaderID_FourValues(t *testing.T) {
 
 	t.Logf("GetLeaderID: leaderID=%d, term=%d, valid=%v, err=%v",
 		leaderID, term, valid, err)
-}
-
-// TestIntegration_DB_NodeHost_ID_And_RaftAddress verifies that the NodeHost
-// ID() and RaftAddress() methods return correct non-empty values.
-func TestIntegration_DB_NodeHost_ID_And_RaftAddress(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	for i, nh := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-
-		// Verify ID() returns non-empty.
-		id := nh.ID()
-		if id == "" {
-			t.Fatalf("node[%d] ID() returned empty string", i)
-		}
-
-		// Verify RaftAddress() returns the configured address.
-		addr := nh.RaftAddress()
-		if addr == "" {
-			t.Fatalf("node[%d] RaftAddress() returned empty string", i)
-		}
-		if addr != cluster.addrs[i] {
-			t.Fatalf("node[%d] RaftAddress() = %q, want %q", i, addr, cluster.addrs[i])
-		}
-
-		t.Logf("node[%d]: ID=%q, RaftAddress=%q", i, id, addr)
-	}
 }

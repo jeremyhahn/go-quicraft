@@ -276,7 +276,6 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 
 	t.Logf("stopping node[%d] to lose quorum", thirdStop)
 	cluster.stopNode(thirdStop)
-	stoppedNodes = append(stoppedNodes, thirdStop)
 
 	if cluster.liveNodes() != 2 {
 		t.Fatalf("expected 2 live nodes after quorum loss, got %d", cluster.liveNodes())

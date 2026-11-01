@@ -189,7 +189,6 @@ func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	id1 := nh.ID()
@@ -201,47 +200,6 @@ func TestIntegration_DB_NodeHostID_IsStatic(t *testing.T) {
 		t.Fatalf("NodeHost ID changed: %q != %q", id1, id2)
 	}
 	t.Logf("NodeHost ID is stable: %s", id1)
-}
-
-// TestIntegration_DB_HasNodeInfo verifies HasNodeInfo returns correct
-// results for existing and non-existing shard/replica pairs. Matches
-// dragonboat's TestNodeHostHasNodeInfo.
-func TestIntegration_DB_HasNodeInfo(t *testing.T) {
-	pki := dbTestPKIFor(t)
-	addr := kernelAddr
-	nhConfig := dbTestNodeHostConfig(t, addr, pki.leaf(t))
-
-	nh, err := dragonboat.NewNodeHostWithOptions(nhConfig, quicraft.WithMemoryLogDB(), quicraft.WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
-	}
-	addr = nh.RaftAddress()
-	defer nh.Close()
-
-	// Before starting any shard.
-	if nh.HasNodeInfo(1, 1) {
-		t.Fatal("HasNodeInfo should return false before StartReplica")
-	}
-
-	// Start a shard.
-	members := map[uint64]dragonboat.Target{1: addr}
-	createFn, _ := dbKVCreateFunc()
-	cfg := dbTestShardConfig(1, 1)
-	cfg.MemberIdentities = map[uint64]string{1: nh.NodeIdentity()}
-	if startErr := nh.StartReplica(members, false, createFn, cfg); startErr != nil {
-		t.Fatalf("StartReplica failed: %v", startErr)
-	}
-
-	// After starting, HasNodeInfo should return true.
-	if !nh.HasNodeInfo(1, 1) {
-		t.Fatal("HasNodeInfo should return true after StartReplica")
-	}
-
-	// Non-existent shard/replica should return false.
-	if nh.HasNodeInfo(99, 99) {
-		t.Fatal("HasNodeInfo should return false for non-existent shard")
-	}
-	t.Logf("HasNodeInfo verified for existing and non-existing replicas")
 }
 
 // TestIntegration_DB_StopShard verifies StopShard stops a running shard
@@ -335,7 +293,6 @@ func TestIntegration_DB_UsingClosedNodeHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	nh.Close()
 
 	// All operations should fail on closed host.
@@ -391,7 +348,6 @@ func TestIntegration_DB_NodeHostID_CustomID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	got := nh.ID()

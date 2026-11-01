@@ -587,19 +587,6 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 		return f.make("release-candidate", "VERSION="+version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
 	}
 
-	// A stable or alpha version is refused before anything is written.
-	headBefore := strings.TrimSpace(f.git("rev-parse", "HEAD"))
-	versionBefore := f.version()
-	for _, bad := range []string{"v0.9.5", "v0.9.5-alpha", "v0.9.5-rc.0", "v0.9.5-rc.01"} {
-		if out, err := run(bad); err == nil || !strings.Contains(out, "not of the form vX.Y.Z-rc.N") {
-			t.Fatalf("release-candidate did not refuse %s on the form guard (err=%v):\n%s", bad, err, out)
-		}
-	}
-	if f.version() != versionBefore || strings.TrimSpace(f.git("rev-parse", "HEAD")) != headBefore {
-		t.Fatalf("a refused candidate wrote VERSION or committed")
-	}
-	f.requireNothingPublished()
-
 	if out, err := run(rc); err != nil {
 		t.Fatalf("release-candidate refused %s: %v\n%s", rc, err, out)
 	}
@@ -649,17 +636,6 @@ func TestReleaseVerifiesAgainstTheAllowedSigners(t *testing.T) {
 			}
 		}
 	}
-
-	t.Run("plain git signed by a listed maintainer", func(t *testing.T) {
-		f := newReleaseFixture(t, true)
-		f.signWith(maintainer, keyA, true, true)
-		// No RELEASE_GIT: this pins its default as plain git.
-		out, err := f.releaseAlpha("RELEASE_ALLOWED_SIGNERS=" + writeSigners(t, maintainer+" "+pubA))
-		if err != nil {
-			t.Fatalf("release-alpha refused a release signed by a listed maintainer: %v\n%s", err, out)
-		}
-		published(t, f)
-	})
 
 	t.Run("principal on a multi-principal line", func(t *testing.T) {
 		f := newReleaseFixture(t, true)

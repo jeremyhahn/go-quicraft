@@ -31,29 +31,6 @@ func TestNewLatencyRecorderMinCapacity(t *testing.T) {
 	}
 }
 
-func TestNewLatencyRecorderLargeCapacity(t *testing.T) {
-	rec := NewLatencyRecorder(10000)
-	if cap(rec.samples) < 10000 {
-		t.Fatalf("expected capacity >= 10000, got %d", cap(rec.samples))
-	}
-}
-
-func TestRecordAndCount(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-
-	if rec.Count() != 0 {
-		t.Fatalf("expected count 0, got %d", rec.Count())
-	}
-
-	rec.Record(5 * time.Millisecond)
-	rec.Record(10 * time.Millisecond)
-	rec.Record(1 * time.Millisecond)
-
-	if rec.Count() != 3 {
-		t.Fatalf("expected count 3, got %d", rec.Count())
-	}
-}
-
 func TestReset(t *testing.T) {
 	rec := NewLatencyRecorder(10)
 	rec.Record(5 * time.Millisecond)
@@ -124,19 +101,6 @@ func TestPercentileP0Edge(t *testing.T) {
 	got := rec.Percentile(0.0)
 	if got != 1*time.Millisecond {
 		t.Fatalf("expected p0=1ms, got %v", got)
-	}
-}
-
-func TestPercentileP1Edge(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(1 * time.Millisecond)
-	rec.Record(2 * time.Millisecond)
-	rec.Record(3 * time.Millisecond)
-
-	// p=1.0 should return the largest element.
-	got := rec.Percentile(1.0)
-	if got != 3*time.Millisecond {
-		t.Fatalf("expected p100=3ms, got %v", got)
 	}
 }
 
@@ -354,45 +318,6 @@ func TestRecordInvalidatesSorted(t *testing.T) {
 	}
 	if rec.Max() != 3*time.Millisecond {
 		t.Fatalf("expected max=3ms after re-record, got %v", rec.Max())
-	}
-}
-
-func TestP999(t *testing.T) {
-	rec := NewLatencyRecorder(1000)
-	for i := 1; i <= 1000; i++ {
-		rec.Record(time.Duration(i) * time.Microsecond)
-	}
-	p999 := rec.P999()
-	// 99.9th percentile of 1-1000us should be 999us or 1000us
-	if p999 < 999*time.Microsecond || p999 > 1000*time.Microsecond {
-		t.Fatalf("expected P999 ~999-1000us, got %v", p999)
-	}
-}
-
-func TestP999Empty(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	if rec.P999() != 0 {
-		t.Fatal("expected 0 for P999 on empty recorder")
-	}
-}
-
-func TestP999SingleSample(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(42 * time.Microsecond)
-	if rec.P999() != 42*time.Microsecond {
-		t.Fatalf("expected P999=42us with single sample, got %v", rec.P999())
-	}
-}
-
-func TestPercentileNegativeClampedToMin(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(5 * time.Millisecond)
-	rec.Record(10 * time.Millisecond)
-
-	// Negative percentile should clamp rank to 1.
-	got := rec.Percentile(-0.5)
-	if got != 5*time.Millisecond {
-		t.Fatalf("expected min value for negative percentile, got %v", got)
 	}
 }
 

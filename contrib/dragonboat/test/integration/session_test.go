@@ -26,54 +26,6 @@ import (
 	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 )
 
-// TestIntegration_DB_NoOPSession verifies that creating a no-op session
-// via dbClient.NewNoOPSession and using it for proposals works correctly
-// through the dragonboat adapter in a real multi-node cluster.
-func TestIntegration_DB_NoOPSession(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Create a no-op session using the dragonboat client API directly.
-	session := dbClient.NewNoOPSession(1, nil)
-
-	if !session.IsNoOPSession() {
-		t.Fatal("expected no-op session, got tracked session")
-	}
-	if session.ShardID != 1 {
-		t.Fatalf("session.ShardID = %d, want 1", session.ShardID)
-	}
-
-	// Use the session for SyncPropose through the dragonboat adapter.
-	cmd := encodeKVPut("session-key", "session-value")
-	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
-	if result.Value != uint64(len("session-value")) {
-		t.Errorf("result.Value = %d, want %d", result.Value, len("session-value"))
-	}
-
-	// Verify the entry replicated to all nodes.
-	waitForReplication(t, cluster, trackers, 1, "session-key", "session-value", defaultTimeout)
-
-	// Verify with a linearizable read. The assertion is on the value, so the
-	// read re-resolves rather than pinning the replica that took the proposal.
-	readResult := cluster.readFromLeader(t, 1, encodeKVGet("session-key"), defaultTimeout)
-	val, ok := readResult.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", readResult)
-	}
-	if val != "session-value" {
-		t.Fatalf("SyncRead = %q, want %q", val, "session-value")
-	}
-	t.Logf("NoOPSession proposal and read verified")
-}
-
 // TestIntegration_DB_GetNoOPSession verifies that the NodeHost.GetNoOPSession
 // convenience method creates a valid no-op session that works for
 // proposals in a real multi-node cluster.

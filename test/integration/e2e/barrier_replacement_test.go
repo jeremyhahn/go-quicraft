@@ -55,7 +55,7 @@ func TestE2E_Barrier_ReplaceNode(t *testing.T) {
 	// Stop the follower and remove it from the Raft membership.
 	cluster.stopNode(followerIdx)
 
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 
 	syncDeleteNode(t, cluster.testCluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replica %d from membership", removedReplicaID)
@@ -196,7 +196,7 @@ func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 
 	cluster.stopNode(followerIdx)
 
-	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 
 	syncDeleteNode(t, cluster.testCluster, shardID, removedReplicaID, membershipTimeout)
 	t.Logf("removed replica %d from membership", removedReplicaID)

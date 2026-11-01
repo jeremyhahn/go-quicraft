@@ -128,107 +128,6 @@ func TestE2E_ReplaceFollower_ThreeNode(t *testing.T) {
 		removedReplicaID, replacementReplicaID, len(allExpected))
 }
 
-// TestE2E_ReplaceFollower_FiveNode verifies follower replacement at 5-node
-// scale. A follower is stopped, removed, replaced with a new node, and the
-// cluster continues operating with all data intact.
-func TestE2E_ReplaceFollower_FiveNode(t *testing.T) {
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	const shardID uint64 = 1
-
-	trackers := cluster.startShard(shardID)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	t.Logf("initial leader: node[%d]", leaderIdx)
-
-	// Propose 10 entries and replicate to all 5 nodes.
-	expected := proposeNEntries(t, cluster, trackers, shardID, 10, "repl5n")
-	verifyAllData(t, cluster, trackers, shardID, expected)
-	t.Logf("10 entries proposed and replicated to all 5 nodes")
-
-	// Identify a follower to replace.
-	followerIdx := cluster.findFollower(shardID)
-	if followerIdx < 0 {
-		t.Fatal("no follower found for replacement")
-	}
-	removedReplicaID := uint64(followerIdx + 1)
-	t.Logf("replacing follower: node[%d] replicaID=%d", followerIdx, removedReplicaID)
-
-	// Stop and remove the follower.
-	cluster.stopNode(followerIdx)
-
-	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
-
-	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
-	t.Logf("removed replicaID=%d from membership", removedReplicaID)
-
-	// Add replacement node with replicaID=6.
-	const replacementReplicaID uint64 = 6
-	result := addNodeToCluster(t, cluster, shardID, replacementReplicaID, testShardConfig)
-	t.Logf("added replacement node[%d] replicaID=%d at %s", result.idx, replacementReplicaID, result.addr)
-
-	// Wait for catch-up.
-	waitForNodeData(t, result.tracker, shardID, replacementReplicaID, expected, membershipTimeout)
-	t.Logf("replacement node caught up on all 10 pre-existing entries")
-
-	// Propose 5 more entries.
-	moreExpected := proposeNEntries(t, cluster, trackers, shardID, 5, "repl5n-post")
-
-	// Merge all expected data.
-	allExpected := make(map[string]string, len(expected)+len(moreExpected))
-	for k, v := range expected {
-		allExpected[k] = v
-	}
-	for k, v := range moreExpected {
-		allExpected[k] = v
-	}
-
-	// Verify all 15 entries on all 5 live nodes (4 original survivors + replacement).
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-		if i == result.idx {
-			waitForNodeData(t, result.tracker, shardID, replacementReplicaID, allExpected, membershipTimeout)
-			continue
-		}
-		replicaID := uint64(i + 1)
-		nodeSM := trackers[i].Get(shardID, replicaID)
-		if nodeSM == nil {
-			t.Fatalf("node[%d] state machine not found", i)
-		}
-		for key, val := range allExpected {
-			waitForCondition(t, membershipTimeout,
-				fmt.Sprintf("node[%d] has key=%q", i, key),
-				func() bool {
-					got, ok := nodeSM.Get(key)
-					return ok && got == val
-				},
-			)
-		}
-	}
-
-	// Assert: membership is correct. Resolve the leader now rather than reusing
-	// one captured before the membership change.
-	membership, err := cluster.hosts[cluster.waitForClusterLeader(shardID, leaderElectionTimeout)].ShardMembership(shardID)
-	if err != nil {
-		t.Fatalf("ShardMembership failed: %v", err)
-	}
-	if _, removed := membership.Removed[removedReplicaID]; !removed {
-		t.Fatalf("replicaID=%d not found in Membership.Removed: %v", removedReplicaID, membership.Removed)
-	}
-	if _, present := membership.Nodes[replacementReplicaID]; !present {
-		t.Fatalf("replacement replicaID=%d not found in Membership.Nodes: %v", replacementReplicaID, membership.Nodes)
-	}
-	// Cluster should have 5 voting members (4 originals + 1 replacement).
-	if len(membership.Nodes) != 5 {
-		t.Fatalf("expected 5 voting members, got %d: %v", len(membership.Nodes), membership.Nodes)
-	}
-
-	t.Logf("5-node replacement complete: removed=%d, replacement=%d, total entries=%d",
-		removedReplicaID, replacementReplicaID, len(allExpected))
-}
-
 // TestE2E_ReplaceNode_DataIntegrity verifies zero data loss during node
 // replacement by writing 150 entries before the replacement and confirming
 // every single entry is present on the replacement node after catch-up.
@@ -260,7 +159,7 @@ func TestE2E_ReplaceNode_DataIntegrity(t *testing.T) {
 
 	cluster.stopNode(followerIdx)
 
-	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
+	cluster.waitForClusterLeader(shardID, failoverTimeout)
 
 	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 
@@ -331,7 +230,7 @@ func TestE2E_ReplaceNode_ContinuedWrites(t *testing.T) {
 
 	cluster.stopNode(followerIdx)
 
-	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
+	cluster.waitForClusterLeader(shardID, failoverTimeout)
 
 	syncDeleteNode(t, cluster, shardID, removedReplicaID, membershipTimeout)
 

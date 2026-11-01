@@ -30,45 +30,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestIntegration_DB_SnapshotWithExportPath verifies that requesting
-// a snapshot with an ExportPath set exports the snapshot to the
-// specified directory. Matches dragonboat's TestSnapshotCanBeExported.
-func TestIntegration_DB_SnapshotWithExportPath(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	snapshotCfg := func(shardID, replicaID uint64) dbConfig.Config {
-		return dbTestShardConfigWithSnapshot(shardID, replicaID, 100, 10)
-	}
-	trackers := cluster.startShardWithConfig(1, snapshotCfg)
-
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose entries before snapshot.
-	proposeNEntries(t, cluster, trackers, 1, 20, "export-snap")
-
-	// Request snapshot with ExportPath.
-	leaderHost := cluster.hosts[leaderIdx]
-	exportDir := t.TempDir()
-
-	snapCtx, snapCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer snapCancel()
-
-	opt := dragonboat.SnapshotOption{
-		ExportPath: exportDir,
-	}
-	idx, err := leaderHost.SyncRequestSnapshot(snapCtx, 1, opt)
-	if err != nil {
-		t.Fatalf("SyncRequestSnapshot with ExportPath failed: %v", err)
-	}
-	t.Logf("snapshot exported to %s at index %d", exportDir, idx)
-}
-
 // TestIntegration_DB_SnapshotWithOverrideCompaction verifies that
 // OverrideCompactionOverhead in SnapshotOption overrides the shard-level
 // compaction overhead. Matches dragonboat's TestCanOverrideSnapshotOverhead.

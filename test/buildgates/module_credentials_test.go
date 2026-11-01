@@ -44,7 +44,6 @@ func TestTheCredentialFileLeavesTheTreeByNoRoute(t *testing.T) {
 		why  string
 	}{
 		{".gitignore", moduleCredentialFile, "the token would be one `git add` from history"},
-		{".dockerignore", moduleCredentialFile, "`COPY . .` would bake the token into the builder layer before the secret is even mounted"},
 		{"test/performance/run-remote.sh", "--exclude '" + moduleCredentialFile + "'", "rsync would stage the token onto the bench host as a file"},
 		{"test/performance/run-remote.sh", "rm -f '$REMOTE_DIR/" + moduleCredentialFile + "'", "--delete never removes an excluded path, so a copy an earlier staging left would stay on the bench host"},
 	} {

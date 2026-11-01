@@ -68,71 +68,6 @@ func TestIntegration_DB_ProposeOnClosedNodeHost(t *testing.T) {
 	t.Logf("SyncPropose on closed NodeHost returned expected error: %v", proposeErr)
 }
 
-// TestIntegration_DB_ReadOnInvalidShard verifies that SyncRead on a
-// non-existent shard returns an error.
-func TestIntegration_DB_ReadOnInvalidShard(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	leaderHost := cluster.hosts[leaderIdx]
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	// SyncRead on shard 99999 which does not exist.
-	//quicraft:direct-read the NON-EXISTENT shard is the subject: there is no shard 99999 to
-	// resolve a leader for and the refusal is the assertion
-	_, readErr := leaderHost.SyncRead(ctx, 99999, encodeKVGet("key"))
-	if readErr == nil {
-		t.Fatal("SyncRead on non-existent shard should return error")
-	}
-	if !errors.Is(readErr, dragonboat.ErrShardNotFound) {
-		t.Logf("SyncRead returned error (may vary by implementation): %v", readErr)
-	}
-	t.Logf("SyncRead on invalid shard returned expected error: %v", readErr)
-}
-
-// TestIntegration_DB_InvalidContextDeadline verifies that operations with
-// a context lacking a deadline return an appropriate error. In the
-// dragonboat adapter, this maps to ErrDeadlineNotSet (which is aliased
-// to ErrTimeout in the adapter layer).
-func TestIntegration_DB_InvalidContextDeadline(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Use context.Background() which has no deadline. The implementation
-	// must reject this with a deadline/timeout-related error.
-	ctx := context.Background()
-	session := dbClient.NewNoOPSession(1, nil)
-	cmd := encodeKVPut("key", "value")
-	//quicraft:direct-propose the deadline-less CONTEXT is the subject. SyncPropose
-	// rejects it before the proposal is routed anywhere, and proposeToLeader takes
-	// a timeout rather than a context so it cannot express this input at all.
-	_, proposeErr := leaderHost.SyncPropose(ctx, session, cmd)
-	if proposeErr == nil {
-		t.Fatal("SyncPropose with no-deadline context should return an error")
-	}
-
-	// Verify the error is related to deadline/timeout.
-	if !errors.Is(proposeErr, dragonboat.ErrDeadlineNotSet) && !errors.Is(proposeErr, dragonboat.ErrTimeout) {
-		t.Fatalf("expected ErrDeadlineNotSet or ErrTimeout, got: %v", proposeErr)
-	}
-	t.Logf("SyncPropose with no deadline returned expected error: %v", proposeErr)
-}
-
 // TestIntegration_DB_GetLeaderID_InvalidShard verifies that GetLeaderID
 // on a non-existent shard returns an error.
 func TestIntegration_DB_GetLeaderID_InvalidShard(t *testing.T) {
@@ -178,7 +113,6 @@ func TestIntegration_DB_StaleRead_Uninitialized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	// StaleRead on shard 1 which has not been started.
@@ -215,9 +149,9 @@ func TestIntegration_DB_InvalidContextDeadline_AllSyncMethods(t *testing.T) {
 	t.Run("SyncPropose", func(t *testing.T) {
 		session := dbClient.NewNoOPSession(1, nil)
 		cmd := encodeKVPut("dp-key", "dp-val")
-		//quicraft:direct-propose the deadline-less CONTEXT is the subject, as in
-		// TestIntegration_DB_InvalidContextDeadline above; the rejection happens
-		// before routing and proposeToLeader cannot express a context at all.
+		//quicraft:direct-propose the deadline-less CONTEXT is the subject. SyncPropose
+		// rejects it before the proposal is routed anywhere, and proposeToLeader takes
+		// a timeout rather than a context so it cannot express this input at all.
 		_, err := leaderHost.SyncPropose(ctx, session, cmd)
 		if err == nil {
 			t.Fatal("SyncPropose should reject context without deadline")

@@ -1277,51 +1277,6 @@ func waitForSingleLeader(t *testing.T, cluster *testCluster, shardID uint64, tim
 // Wait Helpers
 // ---------------------------------------------------------------------------
 
-// waitForLeader polls until the host for the shard elects a leader.
-func waitForLeader(t *testing.T, h *quicraft.Host, shardID uint64, timeout time.Duration) {
-	t.Helper()
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		failFastOnEngineFailure(t)
-		leaderID, known, err := h.LeaderID(shardID)
-		if err == nil && known && leaderID > 0 {
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatalf("timed out after %v waiting for leader on shard %d", timeout, shardID)
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-// waitForApplied polls the host until the shard's last applied index
-// reaches or exceeds the target index.
-func waitForApplied(t *testing.T, h *quicraft.Host, shardID, targetIndex uint64, timeout time.Duration) {
-	t.Helper()
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		failFastOnEngineFailure(t)
-		info, err := h.ShardInfo(shardID)
-		if err == nil && info.LastApplied >= targetIndex {
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatalf("timed out after %v waiting for shard %d to apply index %d", timeout, shardID, targetIndex)
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
 // waitForCondition polls until the predicate returns true or the timeout
 // expires.
 func waitForConditionDiag(

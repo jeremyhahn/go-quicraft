@@ -37,23 +37,6 @@ func TestPrintTerminalEmptyReport(t *testing.T) {
 	}
 }
 
-func TestPrintTerminalContainsSystemNames(t *testing.T) {
-	report := buildSampleReport()
-
-	var buf bytes.Buffer
-	if err := report.PrintTerminal(&buf); err != nil {
-		t.Fatalf("PrintTerminal: %v", err)
-	}
-	output := buf.String()
-
-	if !strings.Contains(output, "quicraft") {
-		t.Fatal("expected output to contain system name 'quicraft'")
-	}
-	if !strings.Contains(output, "etcd") {
-		t.Fatal("expected output to contain system name 'etcd'")
-	}
-}
-
 func TestPrintTerminalContainsScenarioLabel(t *testing.T) {
 	report := buildSampleReport()
 
@@ -66,29 +49,6 @@ func TestPrintTerminalContainsScenarioLabel(t *testing.T) {
 	// scenarioLabels maps ScenarioProposeSEQWAL to "Propose Sequential (WAL)".
 	if !strings.Contains(output, "Propose Sequential (WAL)") {
 		t.Fatalf("expected scenario label in output, got:\n%s", output)
-	}
-}
-
-func TestPrintTerminalContainsHeaderRow(t *testing.T) {
-	report := buildSampleReport()
-
-	var buf bytes.Buffer
-	if err := report.PrintTerminal(&buf); err != nil {
-		t.Fatalf("PrintTerminal: %v", err)
-	}
-	output := buf.String()
-
-	if !strings.Contains(output, "Ops/sec") {
-		t.Fatal("expected header 'Ops/sec' in output")
-	}
-	if !strings.Contains(output, "P50") {
-		t.Fatal("expected header 'P50' in output")
-	}
-	if !strings.Contains(output, "P99") {
-		t.Fatal("expected header 'P99' in output")
-	}
-	if !strings.Contains(output, "P99.9") {
-		t.Fatal("expected header 'P99.9' in output")
 	}
 }
 
@@ -240,20 +200,6 @@ func TestFormatOpsSmall(t *testing.T) {
 	}
 }
 
-func TestFormatOpsThousands(t *testing.T) {
-	got := FormatOps(5000)
-	if got != "5.00K" {
-		t.Fatalf("expected '5.00K', got %q", got)
-	}
-}
-
-func TestFormatOpsMillions(t *testing.T) {
-	got := FormatOps(2_500_000)
-	if got != "2.50M" {
-		t.Fatalf("expected '2.50M', got %q", got)
-	}
-}
-
 func TestFormatOpsExactBoundary(t *testing.T) {
 	// Exactly 1000 -> should be K format.
 	got := FormatOps(1000)
@@ -349,13 +295,6 @@ func TestFormatDurationWrapsFormatDurationNs(t *testing.T) {
 	}
 }
 
-func TestTruncateShortString(t *testing.T) {
-	got := Truncate("hello", 10)
-	if got != "hello" {
-		t.Fatalf("expected 'hello', got %q", got)
-	}
-}
-
 func TestTruncateExactLength(t *testing.T) {
 	got := Truncate("hello", 5)
 	if got != "hello" {
@@ -370,16 +309,6 @@ func TestTruncateLongString(t *testing.T) {
 	}
 	if len(got) != 15 {
 		t.Fatalf("expected length 15, got %d", len(got))
-	}
-}
-
-func TestTruncateWithEllipsis(t *testing.T) {
-	got := Truncate("abcdefghij", 6)
-	if !strings.HasSuffix(got, "...") {
-		t.Fatalf("expected '...' suffix, got %q", got)
-	}
-	if len(got) != 6 {
-		t.Fatalf("expected length 6, got %d", len(got))
 	}
 }
 

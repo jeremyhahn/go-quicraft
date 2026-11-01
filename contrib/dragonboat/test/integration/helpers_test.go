@@ -1683,57 +1683,6 @@ func (c *dbTestCluster) tryReadFromLeader(
 		})
 }
 
-// dbReadIndex is a ReadIndex request accepted by the replica that led the shard
-// when it was submitted.
-type dbReadIndex struct {
-	// RS is the in-flight request. The caller owns it and must Release it.
-	RS *dragonboat.RequestState
-	// Host is the NodeHost that accepted the request.
-	Host *dragonboat.NodeHost
-	// Index is Host's position in the cluster's hosts slice.
-	Index int
-}
-
-// readIndexFromLeader obtains a ReadIndex request from whichever replica leads
-// shardID at the moment of the call, and fails the test if none accepts one.
-//
-// It returns the live RequestState rather than a resolved index because the
-// only thing in this suite that needs a ReadIndex needs the REQUEST: NALookup
-// and NAReadLocalNode take the *RequestState itself. A helper that resolved and
-// released it would leave that caller with nothing to pass.
-//
-// Only the SUBMISSION is retried, exactly as in proposeAsyncToLeader. Once
-// ReadIndex has accepted the request the outcome belongs to the returned
-// RequestState, and what the caller reads from it is the test's own assertion.
-func (c *dbTestCluster) readIndexFromLeader(
-	t *testing.T,
-	shardID uint64,
-	timeout time.Duration,
-) dbReadIndex {
-	t.Helper()
-	ri, err := c.tryReadIndexFromLeader(shardID, timeout)
-	if err != nil {
-		t.Fatalf("read index on shard %d failed within %v: %v", shardID, timeout, err)
-	}
-	return ri
-}
-
-// tryReadIndexFromLeader is readIndexFromLeader's error-returning form.
-func (c *dbTestCluster) tryReadIndexFromLeader(
-	shardID uint64,
-	timeout time.Duration,
-) (dbReadIndex, error) {
-	return driveToLeader(c, shardID, timeout,
-		func(nh *dragonboat.NodeHost, idx int, budget time.Duration) (dbReadIndex, error) {
-			//quicraft:direct-read the single attempt this loop is built from
-			rs, err := nh.ReadIndex(shardID, budget)
-			if err != nil {
-				return dbReadIndex{}, err
-			}
-			return dbReadIndex{RS: rs, Host: nh, Index: idx}, nil
-		})
-}
-
 // ---------------------------------------------------------------------------
 // Idempotent, leader-resolving config changes
 // ---------------------------------------------------------------------------

@@ -28,43 +28,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestIntegration_DB_SyncIOAPIs verifies that the sync propose/read
-// round-trip works through the adapter. Matches dragonboat's
-// TestNodeHostSyncIOAPIs.
-func TestIntegration_DB_SyncIOAPIs(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	session := dbClient.NewNoOPSession(1, nil)
-
-	// Propose. The read below is the other half of the round trip; it is
-	// linearizable, so it re-resolves rather than pinning the replica the
-	// proposal happened to use.
-	cmd := encodeKVPut("sync-key", "sync-value")
-	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
-	if result.Value != uint64(len("sync-value")) {
-		t.Errorf("result.Value = %d, want %d", result.Value, len("sync-value"))
-	}
-
-	// Read.
-	readResult := cluster.readFromLeader(t, 1, encodeKVGet("sync-key"), defaultTimeout)
-	val, ok := readResult.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", readResult)
-	}
-	if val != "sync-value" {
-		t.Fatalf("SyncRead = %q, want %q", val, "sync-value")
-	}
-	t.Logf("sync IO round-trip verified: propose + read")
-}
-
 // TestIntegration_DB_ConcurrentSMLookup verifies that a concurrent
 // state machine correctly handles concurrent reads during writes.
 // Matches dragonboat's TestConcurrentStateMachineLookup.
@@ -168,7 +131,6 @@ func TestIntegration_DB_DroppedRequestsOnInvalidShard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -324,7 +286,6 @@ func TestIntegration_DB_GetNodeHostRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeHostWithOptions failed: %v", err)
 	}
-	addr = nh.RaftAddress()
 	defer nh.Close()
 
 	registry, ok := nh.GetNodeHostRegistry()

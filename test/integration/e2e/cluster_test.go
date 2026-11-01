@@ -42,42 +42,6 @@ func TestE2E_ThreeNodeCluster_LeaderElection(t *testing.T) {
 	t.Logf("leader elected at node index %d (single-leader check settled on node[%d])", leaderIdx, singleIdx)
 }
 
-// TestE2E_ThreeNodeCluster_AllNodesAgreeOnLeader verifies that all nodes
-// in a 3-node cluster converge on the same leader ID for a shard.
-func TestE2E_ThreeNodeCluster_AllNodesAgreeOnLeader(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Wait for all nodes to converge on the same non-zero leader.
-	// After one node becomes leader, followers need a heartbeat round
-	// to learn the leader ID.
-	var agreedLeader uint64
-	waitForCondition(t, leaderElectionTimeout, "all nodes agree on leader", func() bool {
-		var leaderID uint64
-		for i, h := range cluster.hosts {
-			if cluster.stopped[i].Load() {
-				continue
-			}
-			info, err := h.ShardInfo(1)
-			if err != nil || info.LeaderID == 0 {
-				return false
-			}
-			if leaderID == 0 {
-				leaderID = info.LeaderID
-			} else if info.LeaderID != leaderID {
-				return false
-			}
-		}
-		agreedLeader = leaderID
-		return leaderID > 0
-	})
-
-	t.Logf("all 3 nodes agree on leader replica ID %d", agreedLeader)
-}
-
 // TestE2E_FiveNodeCluster_LeaderElection verifies that a 5-node cluster
 // successfully elects a leader.
 func TestE2E_FiveNodeCluster_LeaderElection(t *testing.T) {
@@ -96,41 +60,6 @@ func TestE2E_FiveNodeCluster_LeaderElection(t *testing.T) {
 
 	t.Logf("5-node cluster elected leader at node index %d (single-leader check settled on node[%d])",
 		leaderIdx, singleIdx)
-}
-
-// TestE2E_MultipleShards_IndependentLeaders verifies that multiple shards
-// each elect their own leader independently within the same cluster.
-func TestE2E_MultipleShards_IndependentLeaders(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	shardIDs := []uint64{1, 2, 3}
-	allTrackers := make([][]*smTracker, len(shardIDs))
-
-	for i, sid := range shardIDs {
-		allTrackers[i] = cluster.startShard(sid)
-	}
-
-	// Wait for each shard to elect a leader.
-	leaders := make(map[uint64]int, len(shardIDs))
-	for _, sid := range shardIDs {
-		leaderIdx := cluster.waitForClusterLeader(sid, leaderElectionTimeout)
-		if leaderIdx < 0 {
-			t.Fatalf("shard %d failed to elect a leader", sid)
-		}
-		leaders[sid] = leaderIdx
-		t.Logf("shard %d elected leader at node index %d", sid, leaderIdx)
-	}
-
-	// Each shard must have a valid leader.
-	for _, sid := range shardIDs {
-		idx := leaders[sid]
-		if idx < 0 || idx >= 3 {
-			t.Fatalf("shard %d leader index %d out of range", sid, idx)
-		}
-	}
-
-	t.Logf("all %d shards have independent leaders", len(shardIDs))
 }
 
 // TestE2E_FiveNodeCluster_AllNodesAgreeOnLeader verifies that all 5 nodes

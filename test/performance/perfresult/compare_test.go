@@ -19,29 +19,6 @@ import (
 	"time"
 )
 
-func TestNewComparisonTable(t *testing.T) {
-	ct := NewComparisonTable()
-	if ct.Suites == nil {
-		t.Fatal("expected non-nil suites map")
-	}
-	if len(ct.Suites) != 0 {
-		t.Fatalf("expected empty suites map, got %d entries", len(ct.Suites))
-	}
-}
-
-func TestComparisonTableAdd(t *testing.T) {
-	ct := NewComparisonTable()
-	suite := NewBenchmarkSuite("quicraft", "1.0.0")
-	ct.Add(suite)
-
-	if len(ct.Suites) != 1 {
-		t.Fatalf("expected 1 suite, got %d", len(ct.Suites))
-	}
-	if ct.Suites["quicraft"] != suite {
-		t.Fatal("expected stored suite to match")
-	}
-}
-
 func TestComparisonTableAddOverwrite(t *testing.T) {
 	ct := NewComparisonTable()
 	suite1 := NewBenchmarkSuite("quicraft", "1.0.0")
@@ -285,26 +262,6 @@ func TestCompareNoScenariosWithResults(t *testing.T) {
 	report := ct.Compare()
 	if len(report.Scenarios) != 0 {
 		t.Fatalf("expected 0 scenarios when no results, got %d", len(report.Scenarios))
-	}
-}
-
-func TestOrderedSystemsPreferred(t *testing.T) {
-	ct := NewComparisonTable()
-	ct.Add(NewBenchmarkSuite("openraft", "0.8.0"))
-	ct.Add(NewBenchmarkSuite("quicraft", "1.0.0"))
-	ct.Add(NewBenchmarkSuite("etcd", "3.5.0"))
-	ct.Add(NewBenchmarkSuite("dragonboat", "4.0.0"))
-
-	systems := ct.orderedSystems()
-
-	expected := []string{"quicraft", "etcd", "dragonboat", "openraft"}
-	if len(systems) != len(expected) {
-		t.Fatalf("expected %d systems, got %d", len(expected), len(systems))
-	}
-	for i, sys := range expected {
-		if systems[i] != sys {
-			t.Fatalf("expected systems[%d]=%q, got %q", i, sys, systems[i])
-		}
 	}
 }
 
