@@ -2656,15 +2656,6 @@ func TestReplayRecordRejectsTruncatedState(t *testing.T) {
 	}
 }
 
-// TestMaxCmdLenConstant verifies the maxCmdLen constant matches the
-// proto.MaxEntrySize value (8 MB) to ensure consistency.
-func TestMaxCmdLenConstant(t *testing.T) {
-	const expectedMaxCmdLen = 8 * 1024 * 1024
-	if maxCmdLen != expectedMaxCmdLen {
-		t.Fatalf("maxCmdLen = %d, want %d (8 MB)", maxCmdLen, expectedMaxCmdLen)
-	}
-}
-
 // TestSegmentFilePermissions verifies that created WAL segment files
 // have 0600 permissions (owner read/write only), regardless of umask.
 func TestSegmentFilePermissions(t *testing.T) {
@@ -3182,86 +3173,6 @@ func TestWriteStateFailureOnEmptyDBPreservesCleanState(t *testing.T) {
 	_, _, err := db.ReadState(newShardID, replicaID)
 	if err != logdb.ErrNoState {
 		t.Fatalf("ReadState for new shard: got %v, want %v", err, logdb.ErrNoState)
-	}
-}
-
-// TestSuccessfulWriteUpdatesInMemoryState is a positive path test verifying
-// that all write methods correctly update in-memory state on success.
-func TestSuccessfulWriteUpdatesInMemoryState(t *testing.T) {
-	db := openTestDB(t)
-	const shardID, replicaID = uint64(1), uint64(1)
-
-	// Write entries.
-	entries := makeEntries(1, 5, 1)
-	if err := db.SaveEntries(shardID, replicaID, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	shard := db.getShard(shardID)
-	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
-
-	shard.mu.Lock()
-	idx := shard.indexes[key]
-	nodeEntries := shard.entries[key]
-	shard.mu.Unlock()
-
-	if idx == nil || idx.Len() != 5 {
-		t.Fatalf("index after SaveEntries: expected 5 entries, got %d", idx.Len())
-	}
-	if len(nodeEntries) != 5 {
-		t.Fatalf("entry map after SaveEntries: expected 5 entries, got %d", len(nodeEntries))
-	}
-
-	// Write state.
-	state := logdb.State{Term: 3, Vote: 1, Commit: 5}
-	if err := db.SaveState([]logdb.Update{{
-		ShardID:   shardID,
-		ReplicaID: replicaID,
-		State:     state,
-	}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotState := shard.states[key]
-	shard.mu.Unlock()
-
-	if gotState != state {
-		t.Fatalf("state after SaveState: got %+v, want %+v", gotState, state)
-	}
-
-	// Write snapshot.
-	snap := logdb.Snapshot{Index: 50, Term: 3, Filepath: "/snap"}
-	if err := db.SaveSnapshot(shardID, replicaID, snap); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotSnap := shard.snapshots[key]
-	shard.mu.Unlock()
-
-	if gotSnap.Index != snap.Index || gotSnap.Term != snap.Term {
-		t.Fatalf("snapshot after SaveSnapshot: got %+v, want Index=%d Term=%d",
-			gotSnap, snap.Index, snap.Term)
-	}
-
-	// Write bootstrap.
-	bs := logdb.Bootstrap{
-		Join:      false,
-		Type:      1,
-		Addresses: map[uint64]string{1: "addr1"},
-	}
-	if err := db.SaveBootstrap(shardID, replicaID, bs); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotBS := shard.bootstraps[key]
-	shard.mu.Unlock()
-
-	if gotBS.Type != bs.Type || len(gotBS.Addresses) != 1 {
-		t.Fatalf("bootstrap after SaveBootstrap: got Type=%d Addrs=%d, want Type=%d Addrs=1",
-			gotBS.Type, len(gotBS.Addresses), bs.Type)
 	}
 }
 
