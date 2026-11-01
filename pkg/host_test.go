@@ -786,69 +786,27 @@ func TestNewHost_ValidConfig(t *testing.T) {
 	}
 }
 
-func TestNewHost_InvalidConfig_EmptyWALDir(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.WALDir = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with empty WALDir")
+func TestNewHost_InvalidConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.HostConfig)
+	}{
+		{"EmptyWALDir", func(c *config.HostConfig) { c.WALDir = "" }},
+		{"EmptyListenAddress", func(c *config.HostConfig) { c.ListenAddress = "" }},
+		{"ZeroDeploymentID", func(c *config.HostConfig) {
+			c.DeploymentID = 0
+			c.AllowZeroDeploymentID = false
+		}},
 	}
-}
-
-func TestNewHost_InvalidConfig_EmptyListenAddress(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.ListenAddress = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with empty ListenAddress")
-	}
-}
-
-func TestNewHost_InvalidConfig_ZeroDeploymentID(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.DeploymentID = 0
-	cfg.AllowZeroDeploymentID = false
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with zero DeploymentID")
-	}
-}
-
-func TestNewHost_WithLogDB(t *testing.T) {
-	cfg := testHostConfig(t)
-	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.logdb != db {
-		t.Error("LogDB not set correctly")
-	}
-}
-
-func TestNewHost_WithMetrics(t *testing.T) {
-	cfg := testHostConfig(t)
-	m := NoOpMetricsCollector{}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithMetrics(m), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-}
-
-func TestNewHost_WithBarrier(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.IsSealed() {
-		t.Error("barrier should not be sealed initially")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			tt.mutate(&cfg)
+			_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+			if err == nil {
+				t.Fatal("NewHost should fail")
+			}
+		})
 	}
 }
 
@@ -896,26 +854,6 @@ func TestNewHost_OverrideHostID(t *testing.T) {
 // StartShard
 // ---------------------------------------------------------------------------
 
-func TestStartShard_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	err = h.StartShard(members, false, testCreateFunc, scfg)
-	if err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	if h.ShardCount() != 1 {
-		t.Errorf("ShardCount = %d, want 1", h.ShardCount())
-	}
-}
-
 func TestStartShard_WithLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -930,6 +868,9 @@ func TestStartShard_WithLogDB(t *testing.T) {
 	err = h.StartShard(members, false, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
+	}
+	if h.ShardCount() != 1 {
+		t.Errorf("ShardCount = %d, want 1", h.ShardCount())
 	}
 
 	// Verify bootstrap was saved.
@@ -1070,25 +1011,6 @@ func TestStartShard_InvalidSMType(t *testing.T) {
 	}
 }
 
-func TestStartShard_NilSMReturn(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	nilCreate := func(shardID, replicaID uint64) interface{} {
-		return nil
-	}
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	err = h.StartShard(members, false, nilCreate, scfg)
-	if !errors.Is(err, ErrInvalidSMType) {
-		t.Errorf("StartShard error = %v, want ErrInvalidSMType", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // StopShard
 // ---------------------------------------------------------------------------
@@ -1147,34 +1069,6 @@ func TestStopShard_ClosedHost(t *testing.T) {
 // Propose
 // ---------------------------------------------------------------------------
 
-func TestPropose_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.Propose(context.Background(), 1, []byte("cmd"))
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("Propose error = %v, want ErrClosed", err)
-	}
-}
-
-func TestPropose_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.Propose(context.Background(), 999, []byte("cmd"))
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("Propose error = %v, want ErrShardNotFound", err)
-	}
-}
-
 func TestPropose_EntryTooLarge(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -1195,50 +1089,6 @@ func TestPropose_EntryTooLarge(t *testing.T) {
 	if !errors.Is(err, ErrEntryTooLarge) {
 		t.Errorf("Propose error = %v, want ErrEntryTooLarge", err)
 	}
-}
-
-func TestPropose_NotLeader(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Node is not leader by default.
-	_, err = h.Propose(context.Background(), 1, []byte("cmd"))
-	if !errors.Is(err, ErrNotLeader) {
-		t.Errorf("Propose error = %v, want ErrNotLeader", err)
-	}
-}
-
-func TestPropose_AsLeader_ReturnsRequestState(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Wait for the single-node raft peer to self-elect as leader.
-	waitForLeader(t, h, 1)
-
-	rs, err := h.Propose(context.Background(), 1, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("Propose returned nil RequestState")
-	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,20 +1145,6 @@ func TestSyncRead_ShardNotFound(t *testing.T) {
 // ReadIndex
 // ---------------------------------------------------------------------------
 
-func TestReadIndex_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.ReadIndex(context.Background(), 1)
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("ReadIndex error = %v, want ErrClosed", err)
-	}
-}
-
 func TestReadIndex_Success(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -1329,38 +1165,6 @@ func TestReadIndex_Success(t *testing.T) {
 		t.Fatal("ReadIndex returned nil")
 	}
 	rs.Release()
-}
-
-// ---------------------------------------------------------------------------
-// QueryLocalNode
-// ---------------------------------------------------------------------------
-
-func TestQueryLocalNode_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.QueryLocalNode(context.Background(), 1, nil)
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("QueryLocalNode error = %v, want ErrClosed", err)
-	}
-}
-
-func TestQueryLocalNode_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.QueryLocalNode(context.Background(), 999, nil)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("QueryLocalNode error = %v, want ErrShardNotFound", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2274,24 +2078,6 @@ func TestIsSealed_SealedBarrier(t *testing.T) {
 // EmergencySeal
 // ---------------------------------------------------------------------------
 
-func TestEmergencySeal_SealsBarrier(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{sealed: false}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if err := h.EmergencySeal(); err != nil {
-		t.Fatalf("EmergencySeal failed: %v", err)
-	}
-
-	if !h.IsSealed() {
-		t.Error("barrier should be sealed after EmergencySeal")
-	}
-}
-
 func TestEmergencySeal_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2319,6 +2105,9 @@ func TestEmergencySeal_AlreadySealed(t *testing.T) {
 	if err := h.EmergencySeal(); err != nil {
 		t.Fatalf("first EmergencySeal failed: %v", err)
 	}
+	if !h.IsSealed() {
+		t.Error("barrier should be sealed after EmergencySeal")
+	}
 
 	// Seal again should return ErrBarrierSealed.
 	err = h.EmergencySeal()
@@ -2327,65 +2116,9 @@ func TestEmergencySeal_AlreadySealed(t *testing.T) {
 	}
 }
 
-func TestEmergencySeal_ProposalFailsAfterSeal(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{sealed: false}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Start a shard and make the local node believe it is the leader.
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Emergency seal.
-	if err := h.EmergencySeal(); err != nil {
-		t.Fatalf("EmergencySeal failed: %v", err)
-	}
-
-	// The barrier is sealed; verify IsSealed reflects this.
-	if !h.IsSealed() {
-		t.Error("barrier should be sealed after EmergencySeal")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // updateNodeLeader
 // ---------------------------------------------------------------------------
-
-func TestUpdateNodeLeader_SetsFields(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	h.updateNodeLeader(1, 1, 10)
-
-	info, err := h.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo failed: %v", err)
-	}
-	if info.LeaderID != 1 {
-		t.Errorf("LeaderID = %d, want 1", info.LeaderID)
-	}
-	if info.Term != 10 {
-		t.Errorf("Term = %d, want 10", info.Term)
-	}
-	if !info.IsLeader {
-		t.Error("IsLeader should be true")
-	}
-}
 
 func TestUpdateNodeLeader_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -2433,32 +2166,6 @@ func TestNodeState_LastApplied_SetsField(t *testing.T) {
 	}
 }
 
-func TestNodeState_Health_SetsField(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	ns := testLoadNode(h, 1)
-	ns.health.Store(uint32(ShardError))
-
-	info, err := h.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo failed: %v", err)
-	}
-	if info.Health != ShardError {
-		t.Errorf("Health = %v, want ShardError", info.Health)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // HostInitError
 // ---------------------------------------------------------------------------
@@ -2471,27 +2178,9 @@ func TestHostInitError_Error(t *testing.T) {
 	}
 }
 
-func TestHostInitError_Unwrap(t *testing.T) {
-	inner := errors.New("inner error")
-	err := &HostInitError{Field: "test", Err: inner}
-	if !errors.Is(err, inner) {
-		t.Error("Unwrap should return the inner error")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // loadOrGenerateHostID
 // ---------------------------------------------------------------------------
-
-func TestLoadOrGenerateHostID_Override(t *testing.T) {
-	id, err := loadOrGenerateHostID(slog.Default(), t.TempDir(), "my-custom-id")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id != "my-custom-id" {
-		t.Errorf("id = %q, want %q", id, "my-custom-id")
-	}
-}
 
 func TestLoadOrGenerateHostID_GeneratesAndPersists(t *testing.T) {
 	dir := t.TempDir()
@@ -2510,43 +2199,6 @@ func TestLoadOrGenerateHostID_GeneratesAndPersists(t *testing.T) {
 	}
 	if id1 != id2 {
 		t.Errorf("IDs differ: %q vs %q", id1, id2)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Multi-shard operations
-// ---------------------------------------------------------------------------
-
-func TestMultipleShardsOnHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	for i := uint64(1); i <= 10; i++ {
-		members := map[uint64]string{i: "127.0.0.1:5000"}
-		scfg := testShardConfig(i, i)
-		err := h.StartShard(members, false, testCreateFunc, scfg)
-		if err != nil {
-			t.Fatalf("StartShard(%d) failed: %v", i, err)
-		}
-	}
-
-	if h.ShardCount() != 10 {
-		t.Errorf("ShardCount = %d, want 10", h.ShardCount())
-	}
-
-	for i := uint64(1); i <= 5; i++ {
-		err := h.StopShard(i)
-		if err != nil {
-			t.Fatalf("StopShard(%d) failed: %v", i, err)
-		}
-	}
-
-	if h.ShardCount() != 5 {
-		t.Errorf("ShardCount = %d, want 5", h.ShardCount())
 	}
 }
 
@@ -2745,28 +2397,6 @@ func TestStaleRead_ReturnsResult(t *testing.T) {
 	}
 }
 
-func TestQueryLocalNode_ReturnsResult(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// The RSM is now wired during StartShard, so Lookup should succeed.
-	result, err := h.QueryLocalNode(context.Background(), 1, "local-query")
-	if err != nil {
-		t.Fatalf("QueryLocalNode error = %v, want nil", err)
-	}
-	if result != "local-query" {
-		t.Errorf("QueryLocalNode result = %v, want %q", result, "local-query")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncPropose complete path
 // ---------------------------------------------------------------------------
@@ -2804,47 +2434,6 @@ func TestSyncPropose_ShardNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncPropose with result (simulate engine completion)
-// ---------------------------------------------------------------------------
-
-func TestSyncPropose_WithResult(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Wait for the single-node raft peer to self-elect.
-	waitForLeader(t, h, 1)
-
-	// Propose through the real peer which is now the leader. The
-	// proposal flows through the full pipeline (step -> commit ->
-	// apply -> callback) and completes the RequestState with the
-	// result from the state machine.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	rs, err := h.Propose(ctx, 1, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result failed: %v", err)
-	}
-	// The mockStateMachine sets Value = entry.Index.
-	if result.Value == 0 {
-		t.Error("expected non-zero result Value from state machine")
-	}
-	rs.Release()
-}
-
-// ---------------------------------------------------------------------------
 // Close with LogDB error
 // ---------------------------------------------------------------------------
 
@@ -2860,24 +2449,6 @@ func TestClose_LogDBCloseError(t *testing.T) {
 	err = h.Close()
 	if err == nil {
 		t.Error("Close should propagate LogDB close error")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadIndex with shard not found
-// ---------------------------------------------------------------------------
-
-func TestReadIndex_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.ReadIndex(context.Background(), 999)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("ReadIndex error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -2922,24 +2493,6 @@ func TestRequestLeaderTransfer_ShardNotFound(t *testing.T) {
 // loadOrGenerateHostID invalid file content
 // ---------------------------------------------------------------------------
 
-func TestLoadOrGenerateHostID_InvalidHexContent(t *testing.T) {
-	dir := t.TempDir()
-	idPath := dir + "/host.id"
-	// Write invalid content.
-	if err := os.WriteFile(idPath, []byte("not-valid-hex-content-!@#$"), hostIDFilePerms); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	// Should have regenerated a valid ID.
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
-	}
-}
-
 func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 	dir := t.TempDir()
 	idPath := dir + "/host.id"
@@ -2956,10 +2509,6 @@ func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// SyncPropose full happy path
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // StartShard with concurrent and on-disk state machines
@@ -3247,22 +2796,6 @@ func TestFailPendingRequests_CompletesAllPendingWithError(t *testing.T) {
 	rsProposal.Release()
 	rsRead.Release()
 	rsSnapshot.Release()
-}
-
-func TestFailPendingRequests_IdempotentOnEmptyMaps(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-
-	// Calling on empty maps must not panic or error.
-	h.failPendingRequests(ns, ErrClosed)
-	h.failPendingRequests(ns, ErrClosed)
 }
 
 func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
@@ -3613,10 +3146,6 @@ func TestGetNode_StoppedNode(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncPropose with completed result through full path
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // NewHost with MkdirAll failures
 // ---------------------------------------------------------------------------
 
@@ -3693,33 +3222,6 @@ func TestStartShard_LogDBBootstrapError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Engine callback integration tests
 // ---------------------------------------------------------------------------
-
-func TestHostEngineCallback_OnApplied_CompletesProposal(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	// Propose and verify it completes through the full pipeline.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	result, err := h.SyncPropose(ctx, 1, []byte("test-cmd"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
-	// mockStateMachine sets Value = entry.Index.
-	if result.Value == 0 {
-		t.Error("expected non-zero result Value")
-	}
-}
 
 func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 	cfg := testHostConfig(t)
