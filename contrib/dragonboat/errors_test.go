@@ -24,47 +24,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-func TestSentinelMappingsAreNonNil(t *testing.T) {
-	sentinels := map[string]error{
-		"ErrClosed":                  ErrClosed,
-		"ErrShardNotFound":           ErrShardNotFound,
-		"ErrShardAlreadyExist":       ErrShardAlreadyExist,
-		"ErrShardNotStopped":         ErrShardNotStopped,
-		"ErrSystemBusy":              ErrSystemBusy,
-		"ErrTimeout":                 ErrTimeout,
-		"ErrCanceled":                ErrCanceled,
-		"ErrRejected":                ErrRejected,
-		"ErrAborted":                 ErrAborted,
-		"ErrInvalidSession":          ErrInvalidSession,
-		"ErrPayloadTooBig":           ErrPayloadTooBig,
-		"ErrShardNotReady":           ErrShardNotReady,
-		"ErrShardClosed":             ErrShardClosed,
-		"ErrShardNotInitialized":     ErrShardNotInitialized,
-		"ErrInvalidShardSettings":    ErrInvalidShardSettings,
-		"ErrInvalidAddress":          ErrInvalidAddress,
-		"ErrInvalidOperation":        ErrInvalidOperation,
-		"ErrInvalidRange":            ErrInvalidRange,
-		"ErrReplicaRemoved":          ErrReplicaRemoved,
-		"ErrShardNotBootstrapped":    ErrShardNotBootstrapped,
-		"ErrDeadlineNotSet":          ErrDeadlineNotSet,
-		"ErrInvalidDeadline":         ErrInvalidDeadline,
-		"ErrTimeoutTooSmall":         ErrTimeoutTooSmall,
-		"ErrDirNotExist":             ErrDirNotExist,
-		"ErrInvalidOption":           ErrInvalidOption,
-		"ErrInvalidTarget":           ErrInvalidTarget,
-		"ErrLogDBNotCreatedOrClosed": ErrLogDBNotCreatedOrClosed,
-		"ErrNoSnapshot":              ErrNoSnapshot,
-	}
-
-	for name, sentinel := range sentinels {
-		t.Run(name, func(t *testing.T) {
-			if sentinel == nil {
-				t.Errorf("sentinel %s is nil", name)
-			}
-		})
-	}
-}
-
 func TestSentinelMappingsMatchQuicraft(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -218,8 +177,10 @@ func TestTranslateError_MapsQuicraftToDragonboat(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := translateError(tt.input)
-			if !errors.Is(result, tt.expected) {
-				t.Errorf("translateError(%v) = %v, want %v", tt.input, result, tt.expected)
+			// A bare mapped error comes back as the sentinel itself, so
+			// callers comparing with == keep working.
+			if result != tt.expected {
+				t.Errorf("translateError(%v) = %v, want exactly %v", tt.input, result, tt.expected)
 			}
 		})
 	}
@@ -299,34 +260,6 @@ func TestIsTempError_WrappedTemporaryError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Rate-limiting / busy error tests
-// ---------------------------------------------------------------------------
-
-func TestErrSystemBusy_IsTemp(t *testing.T) {
-	if !IsTempError(ErrSystemBusy) {
-		t.Fatal("ErrSystemBusy should be temporary")
-	}
-}
-
-func TestErrPayloadTooBig_Exists(t *testing.T) {
-	if ErrPayloadTooBig == nil {
-		t.Fatal("ErrPayloadTooBig should be non-nil")
-	}
-}
-
-func TestErrPayloadTooBig_IsNotTemp(t *testing.T) {
-	if IsTempError(ErrPayloadTooBig) {
-		t.Fatal("ErrPayloadTooBig should not be temporary")
-	}
-}
-
-func TestErrPayloadTooBig_MapsToEntryTooLarge(t *testing.T) {
-	if !errors.Is(ErrPayloadTooBig, quicraft.ErrEntryTooLarge) {
-		t.Fatal("ErrPayloadTooBig should match quicraft.ErrEntryTooLarge")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Additional sentinel coverage
 // ---------------------------------------------------------------------------
 
@@ -336,48 +269,6 @@ func TestErrShardNotBootstrapped_IsNotTemp(t *testing.T) {
 	// a transient condition.
 	if IsTempError(ErrShardNotBootstrapped) {
 		t.Fatal("ErrShardNotBootstrapped should NOT be temporary")
-	}
-}
-
-func TestErrDeadlineNotSet_Exists(t *testing.T) {
-	if ErrDeadlineNotSet == nil {
-		t.Fatal("ErrDeadlineNotSet should be non-nil")
-	}
-}
-
-func TestErrInvalidDeadline_Exists(t *testing.T) {
-	if ErrInvalidDeadline == nil {
-		t.Fatal("ErrInvalidDeadline should be non-nil")
-	}
-}
-
-func TestErrTimeoutTooSmall_Exists(t *testing.T) {
-	if ErrTimeoutTooSmall == nil {
-		t.Fatal("ErrTimeoutTooSmall should be non-nil")
-	}
-}
-
-func TestErrDirNotExist_Exists(t *testing.T) {
-	if ErrDirNotExist == nil {
-		t.Fatal("ErrDirNotExist should be non-nil")
-	}
-}
-
-func TestErrInvalidTarget_Exists(t *testing.T) {
-	if ErrInvalidTarget == nil {
-		t.Fatal("ErrInvalidTarget should be non-nil")
-	}
-}
-
-func TestErrInvalidOption_Exists(t *testing.T) {
-	if ErrInvalidOption == nil {
-		t.Fatal("ErrInvalidOption should be non-nil")
-	}
-}
-
-func TestErrInvalidAddress_Exists(t *testing.T) {
-	if ErrInvalidAddress == nil {
-		t.Fatal("ErrInvalidAddress should be non-nil")
 	}
 }
 
@@ -392,26 +283,6 @@ func TestTranslateError_DoubleWrappedError(t *testing.T) {
 	result := translateError(outer)
 	if !errors.Is(result, ErrTimeout) {
 		t.Errorf("expected ErrTimeout for double-wrapped, got %v", result)
-	}
-}
-
-func TestIsTempError_WrappedAborted(t *testing.T) {
-	wrapped := fmt.Errorf("operation failed: %w", ErrAborted)
-	if !IsTempError(wrapped) {
-		t.Error("expected IsTempError to return true for wrapped ErrAborted")
-	}
-}
-
-func TestIsTempError_WrappedSystemBusy(t *testing.T) {
-	wrapped := fmt.Errorf("rate limited: %w", ErrSystemBusy)
-	if !IsTempError(wrapped) {
-		t.Error("expected IsTempError to return true for wrapped ErrSystemBusy")
-	}
-}
-
-func TestIsTempError_CanceledIsNotTemp(t *testing.T) {
-	if IsTempError(ErrCanceled) {
-		t.Error("expected IsTempError to return false for ErrCanceled")
 	}
 }
 
@@ -455,17 +326,6 @@ func TestCompactionIndexNotSupportedError_IsErrInvalidOption(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// translateError: ErrSessionLimitExceeded mapping
-// ---------------------------------------------------------------------------
-
-func TestTranslateError_SessionLimitExceeded(t *testing.T) {
-	result := translateError(quicraft.ErrSessionLimitExceeded)
-	if !errors.Is(result, ErrSystemBusy) {
-		t.Errorf("translateError(ErrSessionLimitExceeded) = %v, want ErrSystemBusy", result)
-	}
-}
-
 func TestTranslateError_TooManySessions(t *testing.T) {
 	// ErrTooManySessions is an alias for ErrSessionLimitExceeded.
 	result := translateError(quicraft.ErrTooManySessions)
@@ -495,38 +355,6 @@ func TestTranslateError_PackageLevelMappings(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// New error mappings
-// ---------------------------------------------------------------------------
-
-func TestTranslateError_LogDBWrite(t *testing.T) {
-	result := translateError(quicraft.ErrLogDBWrite)
-	if !errors.Is(result, ErrSystemBusy) {
-		t.Errorf("translateError(ErrLogDBWrite) = %v, want ErrSystemBusy", result)
-	}
-}
-
-func TestTranslateError_LogDBWrite_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrLogDBWrite)
-	if result != ErrSystemBusy {
-		t.Errorf("expected exact ErrSystemBusy pointer, got %v", result)
-	}
-}
-
-func TestTranslateError_DiskFull(t *testing.T) {
-	result := translateError(quicraft.ErrDiskFull)
-	if !errors.Is(result, ErrSystemBusy) {
-		t.Errorf("translateError(ErrDiskFull) = %v, want ErrSystemBusy", result)
-	}
-}
-
-func TestTranslateError_DiskFull_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrDiskFull)
-	if result != ErrSystemBusy {
-		t.Errorf("expected exact ErrSystemBusy pointer, got %v", result)
-	}
-}
-
 // ErrShardPaused has no Dragonboat counterpart: it passes through as an
 // AdapterError, like ErrBarrierSealed, and stays matchable and temporary.
 func TestTranslateError_ShardPaused(t *testing.T) {
@@ -540,62 +368,6 @@ func TestTranslateError_ShardPaused(t *testing.T) {
 	}
 	if !IsTempError(result) {
 		t.Error("IsTempError(translated ErrShardPaused) = false, want true")
-	}
-}
-
-func TestTranslateError_SnapshotRecoveryFailed(t *testing.T) {
-	result := translateError(quicraft.ErrSnapshotRecoveryFailed)
-	if !errors.Is(result, ErrAborted) {
-		t.Errorf("translateError(ErrSnapshotRecoveryFailed) = %v, want ErrAborted", result)
-	}
-}
-
-func TestTranslateError_SnapshotRecoveryFailed_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrSnapshotRecoveryFailed)
-	if result != ErrAborted {
-		t.Errorf("expected exact ErrAborted pointer, got %v", result)
-	}
-}
-
-func TestTranslateError_SnapshotSizeMismatch(t *testing.T) {
-	result := translateError(quicraft.ErrSnapshotSizeMismatch)
-	if !errors.Is(result, ErrAborted) {
-		t.Errorf("translateError(ErrSnapshotSizeMismatch) = %v, want ErrAborted", result)
-	}
-}
-
-func TestTranslateError_SnapshotSizeMismatch_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrSnapshotSizeMismatch)
-	if result != ErrAborted {
-		t.Errorf("expected exact ErrAborted pointer, got %v", result)
-	}
-}
-
-func TestTranslateError_ResponseLimitExceeded(t *testing.T) {
-	result := translateError(quicraft.ErrResponseLimitExceeded)
-	if !errors.Is(result, ErrPayloadTooBig) {
-		t.Errorf("translateError(ErrResponseLimitExceeded) = %v, want ErrPayloadTooBig", result)
-	}
-}
-
-func TestTranslateError_ResponseLimitExceeded_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrResponseLimitExceeded)
-	if result != ErrPayloadTooBig {
-		t.Errorf("expected exact ErrPayloadTooBig pointer, got %v", result)
-	}
-}
-
-func TestTranslateError_InvalidSMType(t *testing.T) {
-	result := translateError(quicraft.ErrInvalidSMType)
-	if !errors.Is(result, ErrInvalidShardSettings) {
-		t.Errorf("translateError(ErrInvalidSMType) = %v, want ErrInvalidShardSettings", result)
-	}
-}
-
-func TestTranslateError_InvalidSMType_ErrorsIs(t *testing.T) {
-	result := translateError(quicraft.ErrInvalidSMType)
-	if result != ErrInvalidShardSettings {
-		t.Errorf("expected exact ErrInvalidShardSettings pointer, got %v", result)
 	}
 }
 

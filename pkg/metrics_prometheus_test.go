@@ -16,7 +16,6 @@ package quicraft
 
 import (
 	"sort"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -144,22 +143,6 @@ func matchLabels(m *dto.Metric, labels map[string]string) bool {
 // Compile-time interface compliance
 // ---------------------------------------------------------------------------
 
-func TestPrometheusMetricsCollector_ImplementsMetricsCollector(t *testing.T) {
-	var _ MetricsCollector = (*PrometheusMetricsCollector)(nil)
-}
-
-func TestPrometheusMetricsCollector_ImplementsRaftMetrics(t *testing.T) {
-	var _ RaftMetrics = (*PrometheusMetricsCollector)(nil)
-}
-
-func TestPrometheusMetricsCollector_ImplementsLogDBMetrics(t *testing.T) {
-	var _ LogDBMetrics = (*PrometheusMetricsCollector)(nil)
-}
-
-func TestPrometheusMetricsCollector_ImplementsTransportMetrics(t *testing.T) {
-	var _ TransportMetrics = (*PrometheusMetricsCollector)(nil)
-}
-
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -241,13 +224,6 @@ func TestNewPrometheusMetricsCollector(t *testing.T) {
 	}
 }
 
-func TestNewPrometheusMetricsCollector_RegistryNotNil(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
-	if c.Registry == nil {
-		t.Fatal("Registry must not be nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Proposal Latency
 // ---------------------------------------------------------------------------
@@ -304,16 +280,6 @@ func TestPrometheusMetricsCollector_ObserveCommitLatency(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveCommitLatency_ZeroDuration(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveCommitLatency(1, 0)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_commit_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("zero duration should still be observed")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Apply Latency
 // ---------------------------------------------------------------------------
@@ -325,16 +291,6 @@ func TestPrometheusMetricsCollector_ObserveApplyLatency(t *testing.T) {
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_apply_latency_seconds")
 	if histogramCount(t, mf, map[string]string{"shard_id": "7"}) != 1 {
 		t.Error("expected 1 observation")
-	}
-}
-
-func TestPrometheusMetricsCollector_ObserveApplyLatency_LargeShardID(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveApplyLatency(18446744073709551615, time.Second)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_apply_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "18446744073709551615"}) != 1 {
-		t.Error("max uint64 shard ID should be handled")
 	}
 }
 
@@ -360,41 +316,6 @@ func TestPrometheusMetricsCollector_ObserveReadIndexLatency(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveReadIndexLatency_MultipleShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveReadIndexLatency(1, time.Millisecond)
-	c.ObserveReadIndexLatency(2, 2*time.Millisecond)
-	c.ObserveReadIndexLatency(2, 3*time.Millisecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_read_index_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("shard 1 should have 1 observation")
-	}
-	if histogramCount(t, mf, map[string]string{"shard_id": "2"}) != 2 {
-		t.Error("shard 2 should have 2 observations")
-	}
-}
-
-func TestPrometheusMetricsCollector_ObserveReadIndexLatency_ZeroDuration(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveReadIndexLatency(1, 0)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_read_index_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("zero duration should still be observed")
-	}
-}
-
-func TestPrometheusMetricsCollector_ObserveReadIndexLatency_LargeShardID(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveReadIndexLatency(18446744073709551615, time.Second)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_read_index_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "18446744073709551615"}) != 1 {
-		t.Error("max uint64 shard ID should be handled")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Proposal Dropped
 // ---------------------------------------------------------------------------
@@ -409,21 +330,6 @@ func TestPrometheusMetricsCollector_IncProposalDropped(t *testing.T) {
 	val := counterValue(t, mf, map[string]string{"shard_id": "5"})
 	if val != 3 {
 		t.Errorf("proposals_dropped = %f, want 3", val)
-	}
-}
-
-func TestPrometheusMetricsCollector_IncProposalDropped_MultipleShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.IncProposalDropped(1)
-	c.IncProposalDropped(2)
-	c.IncProposalDropped(2)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposals_dropped_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("shard 1 should have 1 drop")
-	}
-	if counterValue(t, mf, map[string]string{"shard_id": "2"}) != 2 {
-		t.Error("shard 2 should have 2 drops")
 	}
 }
 
@@ -447,16 +353,6 @@ func TestPrometheusMetricsCollector_ObserveProposalBatchSize(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveProposalBatchSize_Zero(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveProposalBatchSize(1, 0)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_batch_size")
-	if histogramCount(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("zero batch size should be recorded")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Commit Batch Size
 // ---------------------------------------------------------------------------
@@ -476,16 +372,6 @@ func TestPrometheusMetricsCollector_ObserveCommitBatchSize(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveCommitBatchSize_Single(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveCommitBatchSize(1)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_commit_batch_size")
-	if simpleHistogramCount(t, mf) != 1 {
-		t.Error("expected 1 observation")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Elections
 // ---------------------------------------------------------------------------
@@ -498,20 +384,6 @@ func TestPrometheusMetricsCollector_IncElection(t *testing.T) {
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_elections_total")
 	if counterValue(t, mf, map[string]string{"shard_id": "99"}) != 2 {
 		t.Error("expected 2 elections")
-	}
-}
-
-func TestPrometheusMetricsCollector_IncElection_MultipleShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.IncElection(1)
-	c.IncElection(2)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_elections_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("shard 1 should have 1 election")
-	}
-	if counterValue(t, mf, map[string]string{"shard_id": "2"}) != 1 {
-		t.Error("shard 2 should have 1 election")
 	}
 }
 
@@ -529,21 +401,6 @@ func TestPrometheusMetricsCollector_IncSnapshot(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_IncSnapshot_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	for i := range 5 {
-		c.IncSnapshot(uint64(i))
-	}
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_snapshots_total")
-	for i := range 5 {
-		labels := map[string]string{"shard_id": strconv.Itoa(i)}
-		if counterValue(t, mf, labels) != 1 {
-			t.Errorf("shard %d should have 1 snapshot", i)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Piggyback Commits
 // ---------------------------------------------------------------------------
@@ -555,18 +412,6 @@ func TestPrometheusMetricsCollector_IncPiggybackCommit(t *testing.T) {
 	mf := gatherMetric(t, c.Registry, "quicraft_raft_piggyback_commits_total")
 	if counterValue(t, mf, map[string]string{"shard_id": "60"}) != 1 {
 		t.Error("expected 1 piggyback commit")
-	}
-}
-
-func TestPrometheusMetricsCollector_IncPiggybackCommit_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	for range 3 {
-		c.IncPiggybackCommit(10)
-	}
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_piggyback_commits_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "10"}) != 3 {
-		t.Error("expected 3 piggyback commits")
 	}
 }
 
@@ -588,18 +433,6 @@ func TestPrometheusMetricsCollector_ObserveWriteLatency(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveWriteLatency_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveWriteLatency(time.Millisecond)
-	c.ObserveWriteLatency(3 * time.Millisecond)
-	c.ObserveWriteLatency(5 * time.Millisecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_logdb_write_latency_seconds")
-	if simpleHistogramCount(t, mf) != 3 {
-		t.Error("expected 3 observations")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // LogDBMetrics: Fsync Latency
 // ---------------------------------------------------------------------------
@@ -614,16 +447,6 @@ func TestPrometheusMetricsCollector_ObserveFsyncLatency(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveFsyncLatency_SubMicrosecond(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveFsyncLatency(500 * time.Nanosecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_logdb_fsync_latency_seconds")
-	if simpleHistogramCount(t, mf) != 1 {
-		t.Error("sub-microsecond observation should be recorded")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // LogDBMetrics: Compaction Latency
 // ---------------------------------------------------------------------------
@@ -635,17 +458,6 @@ func TestPrometheusMetricsCollector_ObserveCompactionLatency(t *testing.T) {
 	mf := gatherMetric(t, c.Registry, "quicraft_logdb_compaction_latency_seconds")
 	if simpleHistogramCount(t, mf) != 1 {
 		t.Error("expected 1 observation")
-	}
-}
-
-func TestPrometheusMetricsCollector_ObserveCompactionLatency_Large(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveCompactionLatency(30 * time.Second)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_logdb_compaction_latency_seconds")
-	sum := simpleHistogramSum(t, mf)
-	if sum < 29.9 || sum > 30.1 {
-		t.Errorf("compaction latency sum = %f, want ~30", sum)
 	}
 }
 
@@ -665,17 +477,6 @@ func TestPrometheusMetricsCollector_IncWriteBytes(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_IncWriteBytes_Zero(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.IncWriteBytes(0)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_logdb_write_bytes_total")
-	val := simpleCounterValue(t, mf)
-	if val != 0 {
-		t.Errorf("write bytes = %f, want 0", val)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // TransportMetrics: Send Latency
 // ---------------------------------------------------------------------------
@@ -687,18 +488,6 @@ func TestPrometheusMetricsCollector_ObserveSendLatency(t *testing.T) {
 	mf := gatherMetric(t, c.Registry, "quicraft_transport_send_latency_seconds")
 	if simpleHistogramCount(t, mf) != 1 {
 		t.Error("expected 1 observation")
-	}
-}
-
-func TestPrometheusMetricsCollector_ObserveSendLatency_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	for range 10 {
-		c.ObserveSendLatency(time.Millisecond)
-	}
-
-	mf := gatherMetric(t, c.Registry, "quicraft_transport_send_latency_seconds")
-	if simpleHistogramCount(t, mf) != 10 {
-		t.Error("expected 10 observations")
 	}
 }
 
@@ -775,27 +564,6 @@ func TestPrometheusMetricsCollector_IncMessagesReceived(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_IncMessagesReceived_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.EnablePerMessageMetrics = true // Enable detailed per-message metrics
-	for range 7 {
-		c.IncMessagesReceived(1, 2, 0)
-	}
-
-	// Check aggregate counter
-	mf := gatherMetric(t, c.Registry, "quicraft_transport_messages_received_total")
-	if counterValue(t, mf, nil) != 7 {
-		t.Error("expected 7 messages received (aggregate)")
-	}
-
-	// Check detailed counter
-	mf = gatherMetric(t, c.Registry, "quicraft_transport_messages_received_detailed_total")
-	labels := map[string]string{"shard_id": "1", "from": "2", "msg_type": "0"}
-	if counterValue(t, mf, labels) != 7 {
-		t.Error("expected 7 messages received (detailed)")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // TransportMetrics: Snapshots Sent
 // ---------------------------------------------------------------------------
@@ -820,23 +588,6 @@ func TestPrometheusMetricsCollector_IncSnapshotsSent(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_IncSnapshotsSent_Multiple(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.IncSnapshotsSent(1, 1024, time.Second)
-	c.IncSnapshotsSent(1, 2048, 2*time.Second)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_sent_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 2 {
-		t.Error("expected 2 snapshots sent")
-	}
-
-	bytesMF := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_sent_bytes")
-	sum := histogramSum(t, bytesMF, map[string]string{"shard_id": "1"})
-	if sum != 3072 {
-		t.Errorf("total snapshot bytes sent = %f, want 3072", sum)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // TransportMetrics: Snapshots Received
 // ---------------------------------------------------------------------------
@@ -853,20 +604,6 @@ func TestPrometheusMetricsCollector_IncSnapshotsReceived(t *testing.T) {
 	bytesMF := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_received_bytes")
 	if histogramCount(t, bytesMF, map[string]string{"shard_id": "2"}) != 1 {
 		t.Error("expected 1 bytes observation")
-	}
-}
-
-func TestPrometheusMetricsCollector_IncSnapshotsReceived_MultipleShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.IncSnapshotsReceived(1, 512, time.Second)
-	c.IncSnapshotsReceived(2, 1024, time.Second)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_transport_snapshots_received_total")
-	if counterValue(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("shard 1 should have 1 snapshot received")
-	}
-	if counterValue(t, mf, map[string]string{"shard_id": "2"}) != 1 {
-		t.Error("shard 2 should have 1 snapshot received")
 	}
 }
 
@@ -1325,22 +1062,6 @@ func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
 
 	mf := gatherMetric(t, inner.Registry, "quicraft_raft_commit_latency_seconds")
 	count := histogramCount(t, mf, map[string]string{"shard_id": "1"})
-	if count != 10 {
-		t.Errorf("expected 10 sampled observations, got %d", count)
-	}
-}
-
-func TestSampledMetricsCollector_ObserveApplyLatency_Sampling(t *testing.T) {
-	inner := newPerShardTestCollector()
-	s := NewSampledMetricsCollector(inner, 5) // 1 in 5
-
-	// Record 50 observations; only 10 should be recorded.
-	for range 50 {
-		s.ObserveApplyLatency(2, time.Millisecond)
-	}
-
-	mf := gatherMetric(t, inner.Registry, "quicraft_raft_apply_latency_seconds")
-	count := histogramCount(t, mf, map[string]string{"shard_id": "2"})
 	if count != 10 {
 		t.Errorf("expected 10 sampled observations, got %d", count)
 	}

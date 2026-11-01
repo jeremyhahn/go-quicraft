@@ -256,25 +256,6 @@ func (d *diskCounterSM) Close() error {
 // regularAdapter tests
 // ---------------------------------------------------------------------------
 
-func TestRegularAdapter_Update_SingleEntry(t *testing.T) {
-	inner := &counterSM{}
-	adapter := &regularAdapter{inner: inner}
-
-	entries := []qcSM.Entry{{Index: 1, Cmd: []byte("hello")}}
-	results := make([]qcSM.Result, 1)
-
-	err := adapter.Update(context.Background(), entries, results)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if results[0].Value != 1 {
-		t.Errorf("expected result value 1, got %d", results[0].Value)
-	}
-	if !bytes.Equal(results[0].Data, []byte("hello")) {
-		t.Errorf("expected result data %q, got %q", "hello", results[0].Data)
-	}
-}
-
 func TestRegularAdapter_Update_BatchEntries(t *testing.T) {
 	inner := &counterSM{}
 	adapter := &regularAdapter{inner: inner}
@@ -1164,12 +1145,6 @@ func TestUitoa_Zero(t *testing.T) {
 	if result != "0" {
 		t.Errorf("expected %q, got %q", "0", result)
 	}
-}
-
-func TestSnapshotFileCollection_NoOp(t *testing.T) {
-	fc := &snapshotFileCollection{}
-	// Verify AddFile does not panic.
-	fc.AddFile(1, "/path", []byte("meta"))
 }
 
 // naExtension adds IExtended to the counter state machines.

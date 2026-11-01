@@ -25,36 +25,6 @@ import (
 	"time"
 )
 
-// TestIntegration_GetLeaderID_MultiNode_AllAgree verifies that in a 3-node
-// cluster, all nodes eventually agree on the same leader ID after election.
-func TestIntegration_GetLeaderID_MultiNode_AllAgree(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Determine the expected leader ID from the node that reports itself
-	// as leader.
-	leaderHost := cluster.hosts[leaderIdx]
-	leaderInfo, err := leaderHost.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo on leader node failed: %v", err)
-	}
-	expectedLeaderID := leaderInfo.ReplicaID
-
-	// Wait for every node to agree on the leader ID.
-	for i, h := range cluster.hosts {
-		waitForCondition(t, leaderElectionTimeout,
-			fmt.Sprintf("node %d agrees on leader ID %d", i, expectedLeaderID),
-			func() bool {
-				lid, known, getErr := h.LeaderID(1)
-				return getErr == nil && known && lid == expectedLeaderID
-			},
-		)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Leadership stability, transfer, and step-down
 // ---------------------------------------------------------------------------

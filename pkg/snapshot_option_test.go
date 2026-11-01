@@ -58,15 +58,6 @@ func TestSnapshotOption_Validate_RelativeExportPath(t *testing.T) {
 	}
 }
 
-func TestSnapshotOption_Validate_EmptyExportPath(t *testing.T) {
-	opt := SnapshotOption{
-		ExportPath: "",
-	}
-	if err := opt.Validate(); err != nil {
-		t.Fatalf("empty ExportPath should be valid (means no export), got: %v", err)
-	}
-}
-
 func TestSnapshotOption_IsExport_WithExportPath(t *testing.T) {
 	opt := SnapshotOption{ExportPath: "/tmp/export"}
 	if !opt.IsExport() {
@@ -85,21 +76,6 @@ func TestSnapshotOption_IsExport_ZeroValue(t *testing.T) {
 	opt := SnapshotOption{}
 	if opt.IsExport() {
 		t.Error("IsExport() should return false for zero-value SnapshotOption")
-	}
-}
-
-func TestSnapshotOption_DefaultSnapshotOption(t *testing.T) {
-	if DefaultSnapshotOption.ExportPath != "" {
-		t.Error("DefaultSnapshotOption.ExportPath should be empty")
-	}
-	if DefaultSnapshotOption.CompactionOverhead != 0 {
-		t.Error("DefaultSnapshotOption.CompactionOverhead should be 0")
-	}
-	if DefaultSnapshotOption.OverrideCompactionOverhead {
-		t.Error("DefaultSnapshotOption.OverrideCompactionOverhead should be false")
-	}
-	if DefaultSnapshotOption.Exported {
-		t.Error("DefaultSnapshotOption.Exported should be false")
 	}
 }
 

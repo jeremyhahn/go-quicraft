@@ -81,14 +81,6 @@ func TestConcurrentAdapter_SaveSnapshot_ExternalFilesFailLoudly(t *testing.T) {
 	}
 }
 
-func TestRegularAdapter_SaveSnapshot_NoFilesStillSucceeds(t *testing.T) {
-	a := &regularAdapter{inner: &counterSM{}}
-	var buf bytes.Buffer
-	if err := a.SaveSnapshot(context.Background(), &buf, nil); err != nil {
-		t.Fatalf("SaveSnapshot without external files: %v", err)
-	}
-}
-
 func TestSnapshotFileCollection_RecordsFiles(t *testing.T) {
 	fc := &snapshotFileCollection{}
 	fc.AddFile(1, "/a", []byte("m1"))

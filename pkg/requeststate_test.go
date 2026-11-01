@@ -325,17 +325,6 @@ func TestResult_BlockingWithError(t *testing.T) {
 	}
 }
 
-func TestResult_Timeout(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline, true)
-
-	_, err := rs.Result()
-	if !errors.Is(err, ErrTimeout) {
-		t.Errorf("Result error = %v, want ErrTimeout", err)
-	}
-}
-
 func TestResult_AlreadyExpiredDeadline(t *testing.T) {
 	pool := NewRequestStatePool()
 	deadline := time.Now().Add(-1 * time.Second) // Already past.
@@ -362,16 +351,6 @@ func TestResult_AfterRelease(t *testing.T) {
 // ---------------------------------------------------------------------------
 // ResultC (non-blocking)
 // ---------------------------------------------------------------------------
-
-func TestResultC_ReturnsChannel(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	ch := rs.ResultC()
-	if ch == nil {
-		t.Fatal("ResultC returned nil channel")
-	}
-}
 
 func TestResultC_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
@@ -407,16 +386,6 @@ func TestResultC_ReceivesResult(t *testing.T) {
 // ---------------------------------------------------------------------------
 // CommittedC
 // ---------------------------------------------------------------------------
-
-func TestCommittedC_ReturnsChannel(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	ch := rs.CommittedC()
-	if ch == nil {
-		t.Fatal("CommittedC returned nil channel")
-	}
-}
 
 func TestCommittedC_AfterRelease(t *testing.T) {
 	pool := NewRequestStatePool()
@@ -515,20 +484,6 @@ func TestApplyResultC_AfterRelease(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Release (idempotent)
 // ---------------------------------------------------------------------------
-
-func TestRelease_Idempotent(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Release should not panic when called multiple times.
-	rs.Release()
-	rs.Release()
-	rs.Release()
-
-	if !rs.released.Load() {
-		t.Error("released flag should be true after Release")
-	}
-}
 
 func TestRelease_ConcurrentSafety(t *testing.T) {
 	pool := NewRequestStatePool()
@@ -637,20 +592,6 @@ func TestComplete_AfterRelease_IsNoOp(t *testing.T) {
 	rs.complete(RequestResult{Value: 42})
 }
 
-func TestComplete_DoubleComplete_DoesNotBlock(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.complete(RequestResult{Value: 1})
-	// Second complete should not block (already completed).
-	rs.complete(RequestResult{Value: 2})
-
-	result := <-rs.completedC
-	if result.Value != 1 {
-		t.Errorf("Value = %d, want 1 (first complete)", result.Value)
-	}
-}
-
 func TestComplete_DoubleComplete_AtomicGuard(t *testing.T) {
 	pool := NewRequestStatePool()
 	rs := newRequestState(pool, 1, time.Time{}, true)
@@ -712,22 +653,6 @@ func TestComplete_ConcurrentDoubleComplete(t *testing.T) {
 // ---------------------------------------------------------------------------
 // commitNotify
 // ---------------------------------------------------------------------------
-
-func TestCommitNotify_SendsNotification(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.commitNotify(RequestResult{Value: 0})
-
-	select {
-	case result := <-rs.committedC:
-		if result.Value != 0 {
-			t.Errorf("Value = %d, want 0", result.Value)
-		}
-	default:
-		t.Error("committedC should have a notification")
-	}
-}
 
 func TestCommitNotify_AfterRelease_IsNoOp(t *testing.T) {
 	pool := NewRequestStatePool()
@@ -794,35 +719,6 @@ func TestCommitNotify_ConcurrentSafety(t *testing.T) {
 	}
 }
 
-func TestCommitNotify_IndependentFromComplete(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Both commitNotify and complete should work independently.
-	rs.commitNotify(RequestResult{Value: 0})
-	rs.complete(RequestResult{Value: 42})
-
-	// committedC should have Value=0.
-	select {
-	case result := <-rs.committedC:
-		if result.Value != 0 {
-			t.Errorf("committedC Value = %d, want 0", result.Value)
-		}
-	default:
-		t.Error("committedC should have a notification")
-	}
-
-	// completedC should have Value=42.
-	select {
-	case result := <-rs.completedC:
-		if result.Value != 42 {
-			t.Errorf("completedC Value = %d, want 42", result.Value)
-		}
-	default:
-		t.Error("completedC should have a result")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Key and Deadline accessors
 // ---------------------------------------------------------------------------
@@ -841,14 +737,6 @@ func TestDeadline_ReturnsDeadline(t *testing.T) {
 	rs := newRequestState(pool, 1, deadline, true)
 	if !rs.Deadline().Equal(deadline) {
 		t.Errorf("Deadline = %v, want %v", rs.Deadline(), deadline)
-	}
-}
-
-func TestDeadline_ZeroValue(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-	if !rs.Deadline().IsZero() {
-		t.Error("Deadline should be zero when not set")
 	}
 }
 

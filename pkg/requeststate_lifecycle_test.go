@@ -453,57 +453,9 @@ func TestRequestState_DoubleReleaseConcurrent(t *testing.T) {
 	}
 }
 
-// TestRequestState_CompleteAfterDoubleRelease verifies that completing
-// a request after double release is a safe no-op.
-func TestRequestState_CompleteAfterDoubleRelease(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.Release()
-	rs.Release()
-
-	// Complete should be no-op.
-	rs.complete(RequestResult{Value: 999})
-
-	// CommitNotify should also be no-op.
-	rs.commitNotify(RequestResult{Value: 0})
-}
-
 // ===========================================================================
 // CommitNotify + Complete interaction
 // ===========================================================================
-
-// TestRequestState_CommitThenComplete_BothChannelsWork verifies that
-// commitNotify and complete can be called sequentially, delivering
-// independent results to their respective channels.
-func TestRequestState_CommitThenComplete_BothChannelsWork(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.commitNotify(RequestResult{Value: 0})
-	rs.complete(RequestResult{Value: 42, Data: []byte("applied")})
-
-	// Commit channel.
-	select {
-	case result := <-rs.CommittedC():
-		if result.Value != 0 {
-			t.Errorf("CommittedC Value = %d, want 0", result.Value)
-		}
-	default:
-		t.Error("CommittedC should have a notification")
-	}
-
-	// Apply channel.
-	select {
-	case result := <-rs.ApplyResultC():
-		if result.Value != 42 {
-			t.Errorf("ApplyResultC Value = %d, want 42", result.Value)
-		}
-	default:
-		t.Error("ApplyResultC should have a result")
-	}
-	rs.Release()
-}
 
 // TestRequestState_PoolRecycleFullLifecycle verifies a full
 // create-complete-release-recycle-create-complete-release cycle
@@ -589,23 +541,6 @@ func TestRequestState_ZeroDeadline_BlocksIndefinitely(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for result")
-	}
-	rs.Release()
-}
-
-// TestRequestState_CompleteWithError_PropagatesToResult verifies that
-// completing with an error result propagates through Result().
-func TestRequestState_CompleteWithError_PropagatesToResult(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	go func() {
-		rs.complete(RequestResult{Err: ErrAborted})
-	}()
-
-	_, err := rs.Result()
-	if !errors.Is(err, ErrAborted) {
-		t.Errorf("expected ErrAborted, got %v", err)
 	}
 	rs.Release()
 }

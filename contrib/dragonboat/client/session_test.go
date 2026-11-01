@@ -30,13 +30,6 @@ func (r *testRNG) Uint64() uint64 {
 	return r.val
 }
 
-func TestSourceInterface(t *testing.T) {
-	var s Source = &testRNG{val: 42}
-	if s.Uint64() != 42 {
-		t.Errorf("Source.Uint64() = %d, want 42", s.Uint64())
-	}
-}
-
 func TestSourceInterface_NilAccepted(t *testing.T) {
 	var s Source
 	if s != nil {
@@ -121,28 +114,6 @@ func TestNewSession_ZeroRNGFallsThroughToCryptoRand(t *testing.T) {
 	}
 }
 
-func TestNewSession_DifferentShards(t *testing.T) {
-	tests := []struct {
-		name    string
-		shardID uint64
-	}{
-		{name: "shard_0", shardID: 0},
-		{name: "shard_1", shardID: 1},
-		{name: "shard_max", shardID: ^uint64(0)},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := NewSession(tc.shardID, &testRNG{val: 42})
-			if s.ShardID != tc.shardID {
-				t.Errorf("ShardID = %d, want %d", s.ShardID, tc.shardID)
-			}
-			if s.Inner().ShardID() != tc.shardID {
-				t.Errorf("Inner().ShardID() = %d, want %d", s.Inner().ShardID(), tc.shardID)
-			}
-		})
-	}
-}
-
 func TestNewSession_UniqueClientIDs(t *testing.T) {
 	s1 := NewSession(1, nil)
 	s2 := NewSession(1, nil)
@@ -171,28 +142,6 @@ func TestNewNoOPSession(t *testing.T) {
 	}
 	if s.ClientID() != 0 {
 		t.Errorf("ClientID() = %d, want 0 for no-op session", s.ClientID())
-	}
-}
-
-func TestNewNoOPSession_DifferentShards(t *testing.T) {
-	tests := []struct {
-		name    string
-		shardID uint64
-	}{
-		{name: "shard_0", shardID: 0},
-		{name: "shard_1", shardID: 1},
-		{name: "shard_max", shardID: ^uint64(0)},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := NewNoOPSession(tc.shardID, nil)
-			if s.ShardID != tc.shardID {
-				t.Errorf("ShardID = %d, want %d", s.ShardID, tc.shardID)
-			}
-			if s.Inner().ShardID() != tc.shardID {
-				t.Errorf("Inner().ShardID() = %d, want %d", s.Inner().ShardID(), tc.shardID)
-			}
-		})
 	}
 }
 
@@ -332,21 +281,6 @@ func TestWrapSession_FieldsMatch(t *testing.T) {
 	}
 }
 
-func TestWrapSession_PreservesSessionState(t *testing.T) {
-	inner := quicraft.NewNoOPSession(7)
-	wrapped := WrapSession(inner)
-
-	if !wrapped.IsNoOPSession() {
-		t.Error("wrapped no-op session must report IsNoOPSession true")
-	}
-	if wrapped.ClientID() != inner.ClientID() {
-		t.Errorf("ClientID mismatch: wrapped=%d, inner=%d", wrapped.ClientID(), inner.ClientID())
-	}
-	if wrapped.SeriesID() != inner.SeriesID() {
-		t.Errorf("SeriesID mismatch: wrapped=%d, inner=%d", wrapped.SeriesID(), inner.SeriesID())
-	}
-}
-
 func TestWrapSession_TrackedSession(t *testing.T) {
 	inner := quicraft.NewSession(5, 42)
 	wrapped := WrapSession(inner)
@@ -452,13 +386,6 @@ func TestGenerateClientID_RejectsZeroFromRNG(t *testing.T) {
 	id := generateClientID(rng)
 	if id == 0 {
 		t.Error("generateClientID must never return 0")
-	}
-}
-
-func TestGenerateClientID_NilRNGUsesCryptoRand(t *testing.T) {
-	id := generateClientID(nil)
-	if id == 0 {
-		t.Error("generateClientID(nil) must return non-zero value")
 	}
 }
 

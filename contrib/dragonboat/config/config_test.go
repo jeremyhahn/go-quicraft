@@ -666,18 +666,6 @@ func TestNodeHostConfig_Validate_ZeroRTTMillisecond(t *testing.T) {
 	}
 }
 
-func TestNodeHostConfig_Validate_PositiveRTTMillisecond(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		RTTMillisecond: 200,
-	}
-	if err := c.Validate(); err != nil {
-		t.Errorf("unexpected error for valid RTTMillisecond: %v", err)
-	}
-}
-
 func TestNodeHostConfig_Validate_EmptyWALDir(t *testing.T) {
 	c := NodeHostConfig{
 		NodeHostDir:   "/tmp/nodehost",
@@ -844,21 +832,6 @@ func TestConfig_Validate_WitnessWithSnapshotEntries(t *testing.T) {
 	}
 	if ve.Field != "SnapshotEntries" {
 		t.Errorf("Field: got %q, want %q", ve.Field, "SnapshotEntries")
-	}
-}
-
-func TestConfig_Validate_WitnessAndNonVotingConflict(t *testing.T) {
-	c := Config{
-		ShardID:      1,
-		ReplicaID:    1,
-		HeartbeatRTT: 1,
-		ElectionRTT:  10,
-		IsWitness:    true,
-		IsNonVoting:  true,
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error when IsWitness and IsNonVoting are both true")
 	}
 }
 

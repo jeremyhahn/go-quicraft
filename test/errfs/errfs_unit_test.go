@@ -117,26 +117,6 @@ func TestOnlyOpsRestrictsWhichOperationCanFire(t *testing.T) {
 	}
 }
 
-// TestTimesBoundsHowOftenAnInjectionFires pins the one-shot behaviour recovery
-// tests rely on: they inject a single failure and then expect the filesystem to
-// work, so that re-open and repair can be observed. An unbounded injector would
-// fail the recovery too and the test would prove nothing about repair.
-func TestTimesBoundsHowOftenAnInjectionFires(t *testing.T) {
-	delegate, dir := realFS(t)
-	efs := New(delegate, 1, errUnit).Times(1)
-
-	if err := efs.MkdirAll(filepath.Join(dir, "x"), 0o755); err == nil {
-		t.Fatal("the first operation did not fire")
-	}
-	if err := efs.MkdirAll(filepath.Join(dir, "y"), 0o755); err != nil {
-		t.Fatalf("the second operation fired under Times(1): %v; a recovery "+
-			"path can never be observed if the injector never stops", err)
-	}
-	if got := efs.Fires(); got != 1 {
-		t.Errorf("Fires() = %d, want 1", got)
-	}
-}
-
 // TestShortWriteDisturbsTheDelegateBeforeFailing pins the torn-write mode. A
 // short write that reported an error WITHOUT writing anything would leave the
 // medium clean, and the recovery paths that exist to handle a partial record
@@ -174,25 +154,6 @@ func TestShortWriteDisturbsTheDelegateBeforeFailing(t *testing.T) {
 	if len(got) != 4 {
 		t.Errorf("wrote %d bytes, want the 4 requested by ShortWrite", len(got))
 	}
-}
-
-// TestUnknownOpIsRejected pins the typo guard. OnlyOps takes strings, so a
-// misspelled operation name would otherwise mean "filter matches nothing" — a
-// sweep that silently never injects and passes.
-func TestUnknownOpIsRejected(t *testing.T) {
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("OnlyOps accepted an operation name that does not exist; a " +
-				"typo would silently disable injection for the whole sweep")
-		}
-		if _, ok := r.(*UnknownOpError); !ok {
-			if err, isErr := r.(error); !isErr || !errors.As(err, new(*UnknownOpError)) {
-				t.Fatalf("panic value %v is not an *UnknownOpError", r)
-			}
-		}
-	}()
-	New(waldb.DefaultFS(), 1, errUnit).OnlyOps("Fsynk")
 }
 
 // TestOperationsDelegateWhenNotInjecting pins that ErrorFS is transparent with

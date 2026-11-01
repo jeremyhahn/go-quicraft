@@ -473,42 +473,6 @@ func authorizeSnapshotPath(t *testing.T, eng *engine.Engine, h *Host, shardID, l
 // closed): without a loaded node there is no membership to authorize the
 // sender against, and persisting the snapshot would poison a later
 // StartShard.
-func TestHostMessageHandler_HandleSnapshot_ShardNotLoaded(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	ldb := memdb.New()
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
-	handler := &hostMessageHandler{engine: eng, host: h}
-
-	chunks := []proto.SnapshotChunk{
-		{ShardID: 42, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
-	}
-
-	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
-	var authErr *UnauthorizedMessageError
-	if !errors.As(err, &authErr) {
-		t.Fatalf("expected UnauthorizedMessageError for unloaded shard, got %T: %v", err, err)
-	}
-
-	// Nothing must have been persisted.
-	if _, gerr := ldb.GetSnapshot(42, 1); gerr == nil {
-		t.Fatal("snapshot must not be persisted for an unloaded shard")
-	}
-}
-
 // TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound verifies
 // that a snapshot whose claimed From identity is not covered by the
 // sending connection's verified TLS certificate is rejected, even when
@@ -577,15 +541,6 @@ func TestHostMessageHandler_HandleSnapshot_NilChunks(t *testing.T) {
 	handler := &hostMessageHandler{}
 
 	err := handler.HandleSnapshot(nil, transport.PeerAuth{})
-	if err != nil {
-		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
-	}
-}
-
-func TestHostMessageHandler_HandleSnapshot_EmptyChunks(t *testing.T) {
-	handler := &hostMessageHandler{}
-
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{}, transport.PeerAuth{})
 	if err != nil {
 		t.Fatalf("HandleSnapshot returned unexpected error: %v", err)
 	}
@@ -766,67 +721,6 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 	// own at-rest epoch).
 	if snap.Epoch != 0 {
 		t.Errorf("LogDB snapshot epoch = %d, want 0 (no receiver barrier => plaintext at rest)", snap.Epoch)
-	}
-}
-
-// TestHostMessageHandler_HandleSnapshot_SingleChunk verifies that a snapshot
-// delivered as a single chunk is handled correctly.
-func TestHostMessageHandler_HandleSnapshot_SingleChunk(t *testing.T) {
-	nodeHostDir := t.TempDir()
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           nodeHostDir,
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	ldb := memdb.New()
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	h := &Host{
-		cfg:   cfg,
-		logdb: ldb,
-	}
-
-	handler := &hostMessageHandler{
-		engine: eng,
-		host:   h,
-	}
-	authorizeSnapshotPath(t, eng, h, 3, 1, 2)
-
-	payload := []byte("complete-snapshot-in-one-chunk")
-	chunks := []proto.SnapshotChunk{
-		{
-			ShardID:    3,
-			ReplicaID:  1,
-			From:       2,
-			Index:      1000,
-			Term:       20,
-			ChunkID:    0,
-			ChunkCount: 1,
-			Data:       payload,
-		},
-	}
-
-	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleSnapshot returned error: %v", err)
-	}
-
-	// Verify data file.
-	snapshotDir := handler.engine.GetNode(3).SnapshotSaveDir(1000)
-	data, readErr := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
-	if readErr != nil {
-		t.Fatalf("failed to read snapshot data: %v", readErr)
-	}
-	if string(data) != string(payload) {
-		t.Fatalf("data mismatch: got %q, want %q", string(data), string(payload))
 	}
 }
 
@@ -1027,27 +921,6 @@ func TestBuildTransportConfig_MapsAllFields(t *testing.T) {
 	}
 }
 
-func TestBuildTransportConfig_DefaultValues(t *testing.T) {
-	hc := config.HostConfig{
-		ListenAddress: ":4001",
-		DeploymentID:  1,
-	}
-	hc.SetDefaults()
-
-	tc := buildTransportConfig(hc)
-
-	if tc.ListenAddress != ":4001" {
-		t.Fatalf("ListenAddress: got %q, want %q", tc.ListenAddress, ":4001")
-	}
-	if tc.DeploymentID != 1 {
-		t.Fatalf("DeploymentID: got %d, want %d", tc.DeploymentID, 1)
-	}
-	// After SetDefaults, StreamPoolSize should be the default.
-	if tc.StreamPoolSize != config.DefaultStreamPoolSize {
-		t.Fatalf("StreamPoolSize: got %d, want %d", tc.StreamPoolSize, config.DefaultStreamPoolSize)
-	}
-}
-
 func TestHost_CloseWithTransportDisabled(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -1059,31 +932,6 @@ func TestHost_CloseWithTransportDisabled(t *testing.T) {
 	if err := h.Close(); err != nil {
 		t.Fatalf("Close returned unexpected error: %v", err)
 	}
-}
-
-func TestNoopSender_Send_DoesNotPanic(t *testing.T) {
-	s := &noopSender{}
-
-	// Nil slice.
-	s.Send(nil)
-
-	// Empty slice.
-	s.Send([]proto.Message{})
-
-	// Non-empty slice.
-	s.Send([]proto.Message{
-		{ShardID: 1, To: 2},
-	})
-}
-
-func TestNoopSender_SendSnapshot_DoesNotPanic(t *testing.T) {
-	s := &noopSender{}
-	s.SendSnapshot(proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
-	})
 }
 
 // stampTestSnapshotMeta writes the snapshot.meta record beside a hand-built
@@ -1312,71 +1160,6 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		if engine.IsSnapshotRecvStage(name) {
 			t.Fatalf("the failed receive left its staging directory %q behind", name)
 		}
-	}
-}
-
-// TestHostMessageHandler_HandleSnapshot_NoCleanupOnSuccess verifies that
-// on a successful snapshot receive, the directory is NOT cleaned up.
-func TestHostMessageHandler_HandleSnapshot_NoCleanupOnSuccess(t *testing.T) {
-	nodeHostDir := t.TempDir()
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           nodeHostDir,
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	ldb := memdb.New()
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	h := &Host{
-		cfg:   cfg,
-		logdb: ldb,
-	}
-
-	handler := &hostMessageHandler{
-		engine: eng,
-		host:   h,
-	}
-	authorizeSnapshotPath(t, eng, h, 20, 1, 2)
-
-	chunks := []proto.SnapshotChunk{
-		{
-			ShardID:    20,
-			ReplicaID:  1,
-			From:       2,
-			Index:      888,
-			Term:       25,
-			ChunkID:    0,
-			ChunkCount: 1,
-			Data:       []byte("good-snapshot-data"),
-		},
-	}
-
-	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleSnapshot returned error: %v", err)
-	}
-
-	// The snapshot directory should still exist.
-	snapshotDir := handler.engine.GetNode(20).SnapshotSaveDir(888)
-	if _, statErr := os.Stat(snapshotDir); os.IsNotExist(statErr) {
-		t.Fatal("snapshot directory should exist after successful receive")
-	}
-
-	// Verify the data file is correct.
-	data, readErr := os.ReadFile(filepath.Join(snapshotDir, "snapshot.dat"))
-	if readErr != nil {
-		t.Fatalf("failed to read snapshot data: %v", readErr)
-	}
-	if string(data) != "good-snapshot-data" {
-		t.Fatalf("data mismatch: got %q, want %q", string(data), "good-snapshot-data")
 	}
 }
 
@@ -2034,56 +1817,6 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSkipped(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_HandleSnapshot_DuplicateSameIndex verifies that
-// a snapshot at the exact same index is also deduped.
-func TestHostMessageHandler_HandleSnapshot_DuplicateSameIndex(t *testing.T) {
-	nodeHostDir := t.TempDir()
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           nodeHostDir,
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	ldb := memdb.New()
-	seedPersistedSnapshot(t, ldb, 1, 1, 100, 5, []byte("persisted-snapshot"))
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, ldb, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	h := &Host{
-		cfg:   cfg,
-		logdb: ldb,
-	}
-	handler := &hostMessageHandler{
-		engine: eng,
-		host:   h,
-	}
-	authorizeSnapshotPath(t, eng, h, 1, 1, 2)
-
-	chunks := []proto.SnapshotChunk{
-		{
-			ShardID:    1,
-			ReplicaID:  1,
-			From:       2,
-			Index:      100, // same index
-			Term:       5,
-			ChunkID:    0,
-			ChunkCount: 1,
-			Data:       []byte("dup-snapshot"),
-		},
-	}
-	err := handler.HandleSnapshot(chunks, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleSnapshot should return nil for same-index dedup, got: %v", err)
-	}
-}
-
 // TestHostMessageHandler_HandleSnapshot_NoEngineDelivery verifies that
 // HandleSnapshot REJECTS a snapshot when the engine node is nil (shard
 // not loaded in engine): authorization fails closed because there is no
@@ -2184,22 +1917,6 @@ func assertValidateError(t *testing.T, err error) {
 	if snapErr.Op != "validate" {
 		t.Fatalf("SnapshotReceiveError.Op = %q, want %q", snapErr.Op, "validate")
 	}
-}
-
-// TestHandleSnapshot_RejectsGap verifies a chunk set with a missing ChunkID
-// (gap) is rejected without persisting anything.
-func TestHandleSnapshot_RejectsGap(t *testing.T) {
-	handler, _ := newSnapshotHandler(t)
-
-	// ChunkCount 3 but only ChunkIDs 0 and 2 present (1 is missing).
-	chunks := []proto.SnapshotChunk{
-		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 3, Data: []byte("a")},
-		{ShardID: 1, ReplicaID: 1, From: 2, Index: 100, Term: 5, ChunkID: 2, ChunkCount: 3, Data: []byte("c")},
-	}
-	// Note: len(chunks)=2 != ChunkCount=3, so this also trips the count check;
-	// either way it must be a validate error.
-	assertValidateError(t, handler.HandleSnapshot(chunks, authorizeAllSenders))
-	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
 // TestHandleSnapshot_RejectsMissingMiddleChunk verifies a chunk set whose

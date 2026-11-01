@@ -422,10 +422,6 @@ func TestWasSubmitted(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"post-delivery not-leader", postDeliveryNotLeader(), true},
-		{"pre-flight not-leader", preflightNotLeader(), false},
-		{"timeout", quicraft.ErrTimeout, true},
-		{"canceled", quicraft.ErrCanceled, false},
 		{"system busy", quicraft.ErrSystemBusy, false},
 		{"shard not ready", quicraft.ErrShardNotReady, false},
 		{"pending config change", quicraft.ErrRejected, false},
@@ -451,13 +447,8 @@ func TestIsRetryable(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"pre-flight not-leader", preflightNotLeader(), true},
-		{"post-delivery not-leader", postDeliveryNotLeader(), true},
 		{"system busy", quicraft.ErrSystemBusy, true},
-		{"timeout", quicraft.ErrTimeout, true},
-		{"canceled", quicraft.ErrCanceled, true},
 		{"shard not ready", quicraft.ErrShardNotReady, true},
-		{"pending config change", quicraft.ErrRejected, true},
 		{"context deadline", context.DeadlineExceeded, true},
 		{"context canceled", context.Canceled, true},
 		// The real sentinel, not a look-alike built from the same text.

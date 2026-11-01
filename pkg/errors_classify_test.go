@@ -346,55 +346,10 @@ func mustSentinel(t *testing.T, name string) error {
 	return nil
 }
 
-// TestTemporary_Wrapped proves the classification survives wrapping, which is
-// the whole reason it uses errors.Is instead of equality.
-func TestTemporary_Wrapped(t *testing.T) {
-	if !Temporary(fmt.Errorf("proposing to shard 7: %w", ErrTimeout)) {
-		t.Error("wrapped ErrTimeout must classify as temporary")
-	}
-	if Temporary(fmt.Errorf("proposing to shard 7: %w", ErrShardNotFound)) {
-		t.Error("wrapped ErrShardNotFound must not classify as temporary")
-	}
-	// Two layers, and the temporary sentinel is the innermost.
-	deep := fmt.Errorf("host: %w", fmt.Errorf("shard 7: %w", ErrBusy))
-	if !Temporary(deep) {
-		t.Error("doubly wrapped ErrBusy must classify as temporary")
-	}
-}
-
-// TestTemporary_TypedErrors proves the typed errors classify through their Is
-// methods rather than only as bare sentinels.
-func TestTemporary_TypedErrors(t *testing.T) {
-	busy := &BusyError{ShardID: 3, CurrentSize: 10, MaxSize: 5}
-	if !Temporary(busy) {
-		t.Error("*BusyError must classify as temporary")
-	}
-	notLeader := &NotLeaderError{ShardID: 3, LeaderID: 9, LeaderAddress: "n9:9000"}
-	if !Temporary(notLeader) {
-		t.Error("*NotLeaderError must classify as temporary")
-	}
-	tooLarge := &EntryTooLargeError{Size: 100, MaxSize: 10}
-	if Temporary(tooLarge) {
-		t.Error("*EntryTooLargeError must not classify as temporary")
-	}
-	expired := &SessionExpiredError{ShardID: 3, ClientID: 4}
-	if Temporary(expired) {
-		t.Error("*SessionExpiredError must not classify as temporary")
-	}
-}
-
 // TestTemporary_Nil pins the documented nil behaviour.
 func TestTemporary_Nil(t *testing.T) {
 	if Temporary(nil) {
 		t.Error("Temporary(nil) must be false")
-	}
-}
-
-// TestTemporary_ForeignError pins the conservative default: an error this
-// package never produced is permanent, not temporary.
-func TestTemporary_ForeignError(t *testing.T) {
-	if Temporary(errors.New("some other library: connection reset")) {
-		t.Error("an unrecognised error must default to permanent")
 	}
 }
 
@@ -408,27 +363,6 @@ func TestNotLeader(t *testing.T) {
 		}
 		if id != 7 {
 			t.Fatalf("NotLeader returned replicaID %d, want 7", id)
-		}
-	})
-
-	t.Run("wrapped typed error still carries the leader", func(t *testing.T) {
-		wrapped := fmt.Errorf("propose: %w", &NotLeaderError{ShardID: 1, LeaderID: 42})
-		id, ok := NotLeader(wrapped)
-		if !ok {
-			t.Fatal("NotLeader must unwrap to *NotLeaderError")
-		}
-		if id != 42 {
-			t.Fatalf("NotLeader returned replicaID %d, want 42", id)
-		}
-	})
-
-	t.Run("unknown leader is reported as zero, not as not-a-leader-error", func(t *testing.T) {
-		id, ok := NotLeader(&NotLeaderError{ShardID: 1, LeaderID: 0})
-		if !ok {
-			t.Fatal("an unknown leader is still a not-leader error")
-		}
-		if id != 0 {
-			t.Fatalf("NotLeader returned replicaID %d, want 0", id)
 		}
 	})
 

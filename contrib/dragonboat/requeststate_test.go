@@ -23,47 +23,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-func TestRequestResult_Completed(t *testing.T) {
-	r := RequestResult{
-		inner: quicraft.RequestResult{Value: 42, Data: []byte("ok")},
-		code:  RequestCompleted,
-	}
-	if !r.Completed() {
-		t.Error("expected Completed() to be true")
-	}
-	if r.Timeout() {
-		t.Error("expected Timeout() to be false")
-	}
-	if r.Rejected() {
-		t.Error("expected Rejected() to be false")
-	}
-	if r.Terminated() {
-		t.Error("expected Terminated() to be false")
-	}
-	if r.Dropped() {
-		t.Error("expected Dropped() to be false")
-	}
-	if r.Aborted() {
-		t.Error("expected Aborted() to be false")
-	}
-	if !r.Committed() {
-		t.Error("expected Committed() to be true (completed implies committed)")
-	}
-}
-
-func TestRequestResult_Timeout(t *testing.T) {
-	r := RequestResult{
-		inner: quicraft.RequestResult{Err: quicraft.ErrTimeout},
-		code:  RequestTimeout,
-	}
-	if !r.Timeout() {
-		t.Error("expected Timeout() to be true")
-	}
-	if r.Completed() {
-		t.Error("expected Completed() to be false")
-	}
-}
-
 func TestRequestResult_GetResult(t *testing.T) {
 	data := []byte("payload")
 	r := RequestResult{
@@ -76,20 +35,6 @@ func TestRequestResult_GetResult(t *testing.T) {
 	}
 	if string(result.Data) != "payload" {
 		t.Errorf("Data = %q, want %q", string(result.Data), "payload")
-	}
-}
-
-func TestRequestResult_GetResult_NilData(t *testing.T) {
-	r := RequestResult{
-		inner: quicraft.RequestResult{Value: 0, Data: nil},
-		code:  RequestCompleted,
-	}
-	result := r.GetResult()
-	if result.Value != 0 {
-		t.Errorf("Value = %d, want 0", result.Value)
-	}
-	if result.Data != nil {
-		t.Errorf("Data = %v, want nil", result.Data)
 	}
 }
 
@@ -128,17 +73,6 @@ func TestRequestResult_RequestOutOfRange_False(t *testing.T) {
 	}
 }
 
-func TestRequestResult_SnapshotIndex(t *testing.T) {
-	// Quicraft carries the snapshot index in the result's Value field.
-	r := RequestResult{
-		inner: quicraft.RequestResult{Value: 42},
-		code:  RequestCompleted,
-	}
-	if r.SnapshotIndex() != 42 {
-		t.Errorf("SnapshotIndex() = %d, want 42", r.SnapshotIndex())
-	}
-}
-
 func TestRequestResult_SnapshotIndex_FromTranslateResult(t *testing.T) {
 	// A completed snapshot request delivered through translateResult must
 	// surface the quicraft result Value as the snapshot index, matching
@@ -150,13 +84,6 @@ func TestRequestResult_SnapshotIndex_FromTranslateResult(t *testing.T) {
 	}
 	if r.SnapshotIndex() != 7788 {
 		t.Errorf("SnapshotIndex() = %d, want 7788", r.SnapshotIndex())
-	}
-}
-
-func TestRequestResult_SnapshotIndex_Zero(t *testing.T) {
-	r := RequestResult{code: RequestCompleted}
-	if r.SnapshotIndex() != 0 {
-		t.Errorf("SnapshotIndex() = %d, want 0", r.SnapshotIndex())
 	}
 }
 
@@ -239,6 +166,10 @@ func TestTranslateResultCode(t *testing.T) {
 		{name: "readindex_not_ready", err: quicraft.ErrReadIndexNotReady, want: RequestDropped},
 		{name: "shard_not_ready", err: quicraft.ErrShardNotReady, want: RequestDropped},
 		{name: "disk_full", err: quicraft.ErrDiskFull, want: RequestDropped},
+		{name: "busy", err: quicraft.ErrBusy, want: RequestDropped},
+		{name: "system_busy", err: quicraft.ErrSystemBusy, want: RequestDropped},
+		{name: "draining", err: quicraft.ErrDraining, want: RequestDropped},
+		{name: "shard_paused", err: quicraft.ErrShardPaused, want: RequestDropped},
 		{name: "unknown", err: errors.New("no mapping"), want: RequestAborted},
 	}
 	for _, tc := range tests {
@@ -283,77 +214,6 @@ func TestRequestState_Release_NilInner(t *testing.T) {
 	rs.Release()
 }
 
-func TestRequestState_Release_WithInner(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner, false)
-	// Should not panic.
-	rs.Release()
-}
-
-func TestRequestState_CompletedC_Field(t *testing.T) {
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 10},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	if rs.CompletedC == nil {
-		t.Fatal("expected non-nil CompletedC field")
-	}
-
-	select {
-	case r := <-rs.CompletedC:
-		if !r.Completed() {
-			t.Error("expected Completed() from CompletedC field")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from CompletedC field")
-	}
-}
-
-func TestRequestState_ResultC_Bidirectional(t *testing.T) {
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 20},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	ch := rs.ResultC()
-	if ch == nil {
-		t.Fatal("expected non-nil ResultC channel")
-	}
-	select {
-	case r := <-ch:
-		if !r.Completed() {
-			t.Error("expected Completed() from ResultC")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from ResultC")
-	}
-}
-
-func TestRequestState_AppliedC_Resolved(t *testing.T) {
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 30},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	ch := rs.AppliedC()
-	if ch == nil {
-		t.Fatal("expected non-nil AppliedC channel")
-	}
-	select {
-	case r := <-ch:
-		if r.GetResult().Value != 30 {
-			t.Errorf("Value = %d, want 30", r.GetResult().Value)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from AppliedC")
-	}
-}
-
 func TestRequestState_ShardID(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
@@ -369,23 +229,6 @@ func TestRequestState_makeAdaptedChannel_NilInner(t *testing.T) {
 	ch := rs.makeAdaptedChannel()
 	if ch != nil {
 		t.Error("makeAdaptedChannel(nil inner) should return nil")
-	}
-}
-
-func TestSysOpState_CompletedC_PreCompleted(t *testing.T) {
-	// Test with a pre-completed SysOpState (channel already closed).
-	s := &SysOpState{
-		inner:      quicraft.NewRequestStatePool().Get().(*quicraft.RequestState),
-		completedC: make(chan struct{}),
-	}
-	close(s.completedC)
-
-	ch := s.CompletedC()
-	select {
-	case <-ch:
-		// Expected: channel closed.
-	default:
-		t.Error("expected CompletedC to be closed")
 	}
 }
 
@@ -469,163 +312,6 @@ func TestRequestResult_AllCodes(t *testing.T) {
 	}
 }
 
-func TestLogRange_ZeroValue(t *testing.T) {
-	var lr LogRange
-	if lr.FirstIndex != 0 {
-		t.Errorf("FirstIndex = %d, want 0", lr.FirstIndex)
-	}
-	if lr.LastIndex != 0 {
-		t.Errorf("LastIndex = %d, want 0", lr.LastIndex)
-	}
-}
-
-func TestEntry_Fields(t *testing.T) {
-	e := Entry{Index: 10, Term: 3, Cmd: []byte("cmd")}
-	if e.Index != 10 {
-		t.Errorf("Index = %d, want 10", e.Index)
-	}
-	if e.Term != 3 {
-		t.Errorf("Term = %d, want 3", e.Term)
-	}
-	if string(e.Cmd) != "cmd" {
-		t.Errorf("Cmd = %q, want %q", string(e.Cmd), "cmd")
-	}
-}
-
-func TestEntry_TermField(t *testing.T) {
-	e := Entry{Index: 5, Term: 42, Cmd: []byte("data")}
-	if e.Term != 42 {
-		t.Errorf("Term = %d, want 42", e.Term)
-	}
-}
-
-func TestEntry_ZeroTerm(t *testing.T) {
-	e := Entry{Index: 1, Cmd: []byte("x")}
-	if e.Term != 0 {
-		t.Errorf("Term = %d, want 0 for zero value", e.Term)
-	}
-}
-
-func TestResult_TypeAlias(t *testing.T) {
-	r := Result{Value: 5, Data: []byte("data")}
-	if r.Value != 5 {
-		t.Errorf("Value = %d, want 5", r.Value)
-	}
-	if string(r.Data) != "data" {
-		t.Errorf("Data = %q, want %q", string(r.Data), "data")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SnapshotIndex behavior on non-snapshot results
-// ---------------------------------------------------------------------------
-
-func TestRequestResult_SnapshotIndex_NonSnapshotResult(t *testing.T) {
-	// In dragonboat, accessing SnapshotIndex on a regular (non-snapshot)
-	// result panics, so its value there is undefined. Our adapter returns
-	// the raw result value in all cases, which for a snapshot request is
-	// the snapshot index.
-	r := RequestResult{
-		inner: quicraft.RequestResult{Value: 42, Data: []byte("data")},
-		code:  RequestCompleted,
-	}
-	if r.SnapshotIndex() != 42 {
-		t.Errorf("SnapshotIndex() = %d, want raw result value 42", r.SnapshotIndex())
-	}
-}
-
-func TestRequestResult_SnapshotIndex_WithSnapshotResult(t *testing.T) {
-	r := RequestResult{
-		code:  RequestCompleted,
-		inner: quicraft.RequestResult{Value: 12345},
-	}
-	if r.SnapshotIndex() != 12345 {
-		t.Errorf("SnapshotIndex() = %d, want 12345", r.SnapshotIndex())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SysOpState CompletedC multiple reads
-// ---------------------------------------------------------------------------
-
-func TestSysOpState_CompletedC_MultipleReads(t *testing.T) {
-	s := &SysOpState{
-		inner:      quicraft.NewRequestStatePool().Get().(*quicraft.RequestState),
-		completedC: make(chan struct{}),
-	}
-	close(s.completedC)
-
-	ch1 := s.CompletedC()
-	ch2 := s.CompletedC()
-
-	// Both calls should return the same channel and both should be readable.
-	select {
-	case <-ch1:
-	default:
-		t.Error("first CompletedC read should succeed on closed channel")
-	}
-	select {
-	case <-ch2:
-	default:
-		t.Error("second CompletedC read should succeed on closed channel")
-	}
-
-	// Reading again from the same channel should still work (closed channels
-	// return the zero value indefinitely).
-	select {
-	case <-ch1:
-	default:
-		t.Error("third CompletedC read should succeed on closed channel")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// WrapSysOpState with real inner
-// ---------------------------------------------------------------------------
-
-func TestSysOpState_Release_NilCompletedC(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	s := &SysOpState{
-		inner:      inner,
-		completedC: make(chan struct{}),
-	}
-	close(s.completedC)
-	// Release should not panic when inner is from pool.
-	s.Release()
-}
-
-// ---------------------------------------------------------------------------
-// RequestState with resolved channel - multiple reads
-// ---------------------------------------------------------------------------
-
-func TestRequestState_ResolvedC_MultipleAppliedCCalls(t *testing.T) {
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 77},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	// Both AppliedC and ResultC should return the same resolved channel.
-	ac := rs.AppliedC()
-	rc := rs.ResultC()
-
-	// They should be the same channel.
-	if ac == nil || rc == nil {
-		t.Fatal("expected non-nil channels")
-	}
-
-	// Read from one should consume the result.
-	select {
-	case r := <-ac:
-		if r.GetResult().Value != 77 {
-			t.Errorf("Value = %d, want 77", r.GetResult().Value)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from AppliedC")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RequestState ShardID on non-shard wrapper
 // ---------------------------------------------------------------------------
@@ -641,90 +327,8 @@ func TestRequestState_ShardID_ZeroDefault(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// translateResult with various error types
-// ---------------------------------------------------------------------------
-
-func TestTranslateResult_Rejected(t *testing.T) {
-	qr := quicraft.RequestResult{Err: quicraft.ErrRejected}
-	r := translateResult(qr)
-	if !r.Rejected() {
-		t.Error("expected Rejected() for ErrRejected")
-	}
-}
-
-func TestTranslateResult_Dropped(t *testing.T) {
-	qr := quicraft.RequestResult{Err: quicraft.ErrDropped}
-	r := translateResult(qr)
-	if !r.Dropped() {
-		t.Error("expected Dropped() for ErrDropped")
-	}
-}
-
-func TestTranslateResult_Closed(t *testing.T) {
-	qr := quicraft.RequestResult{Err: quicraft.ErrClosed}
-	r := translateResult(qr)
-	if !r.Terminated() {
-		t.Error("expected Terminated() for ErrClosed")
-	}
-}
-
-func TestTranslateResult_Aborted(t *testing.T) {
-	qr := quicraft.RequestResult{Err: quicraft.ErrAborted}
-	r := translateResult(qr)
-	if !r.Aborted() {
-		t.Error("expected Aborted() for ErrAborted")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// RaftLogs with single entry
-// ---------------------------------------------------------------------------
-
-func TestRequestResult_RaftLogs_SingleEntry(t *testing.T) {
-	entries := []Entry{{Index: 10, Cmd: []byte("single")}}
-	r := RequestResult{
-		code:     RequestCompleted,
-		entries:  entries,
-		logRange: LogRange{FirstIndex: 10, LastIndex: 11},
-	}
-	gotEntries, lr := r.RaftLogs()
-	if len(gotEntries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(gotEntries))
-	}
-	if lr.FirstIndex != 10 {
-		t.Errorf("FirstIndex = %d, want 10", lr.FirstIndex)
-	}
-	if lr.LastIndex != 11 {
-		t.Errorf("LastIndex = %d, want 11", lr.LastIndex)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // WrapSysOpState
 // ---------------------------------------------------------------------------
-
-func TestWrapSysOpState_CompletesWhenInnerReleased(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-
-	// A pool RequestState cannot be resolved from outside the quicraft
-	// package (completion is unexported), so this exercises the released
-	// path: ResultC returns nil and waitForCompletion closes completedC at
-	// once. Release BEFORE wrapping, as TestWrapSysOpState_Release does:
-	// releasing after wrapping raced the wrapper's goroutine, which, when it
-	// read ResultC first, held a live channel a released, never-completed
-	// request never closes, and timed out under load.
-	inner.Release()
-	sysOp := WrapSysOpState(inner)
-
-	// Wait for completion signal.
-	select {
-	case <-sysOp.CompletedC():
-		// Expected: waitForCompletion detected nil src and closed completedC.
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for WrapSysOpState completion")
-	}
-}
 
 func TestWrapSysOpState_Release(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
@@ -799,15 +403,6 @@ func TestWrapRequestStateWithCancel_CancelOnRelease(t *testing.T) {
 	if !canceled {
 		t.Error("cancel should be called on Release")
 	}
-}
-
-func TestWrapRequestStateWithCancel_NilCancel(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-
-	// Passing nil cancel should not panic on Release.
-	rs := WrapRequestState(inner, false)
-	rs.Release()
 }
 
 func TestWrapRequestStateForShardWithCancel_ShardID(t *testing.T) {
@@ -957,29 +552,6 @@ func TestRequestState_ResultThenRelease_NormalFlow(t *testing.T) {
 	rs.Release()
 }
 
-func TestRequestState_ResultArrivesThenRelease(t *testing.T) {
-	// Use newResolvedRequestState which delivers the result immediately.
-	// This confirms the normal flow: result arrives, caller reads, then releases.
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 42},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	ch := rs.AppliedC()
-	select {
-	case r := <-ch:
-		if r.GetResult().Value != 42 {
-			t.Errorf("Value = %d, want 42", r.GetResult().Value)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for result")
-	}
-
-	// Release after consuming - should not panic.
-	rs.Release()
-}
-
 func TestRequestState_DoubleRelease_NoPanic(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
@@ -1025,29 +597,6 @@ func TestSysOpState_ReleaseBeforeCompletion_NoGoroutineLeak(t *testing.T) {
 	if leaked > 5 {
 		t.Errorf("SysOpState goroutine leak: baseline=%d, after=%d, leaked=%d", baseline, after, leaked)
 	}
-}
-
-func TestSysOpState_CompletionThenRelease_NormalFlow(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-
-	// Release the inner BEFORE wrapping so ResultC returns nil, which
-	// triggers the nil-src fast path in waitForCompletion (closes
-	// completedC). Releasing after wrapping races the wrapper's goroutine;
-	// see TestWrapSysOpState_Release.
-	inner.Release()
-	sysOp := WrapSysOpState(inner)
-
-	// Wait for completion signal.
-	select {
-	case <-sysOp.CompletedC():
-		// Expected: completion arrived normally.
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for SysOpState completion")
-	}
-
-	// Release after completion - should not panic.
-	sysOp.Release()
 }
 
 func TestSysOpState_DoubleRelease_NoPanic(t *testing.T) {
@@ -1100,59 +649,6 @@ func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) 
 }
 
 // ---------------------------------------------------------------------------
-// Result code mappings for ErrBusy, ErrSystemBusy, ErrDraining
-// ---------------------------------------------------------------------------
-
-func TestTranslateResultCode_Busy(t *testing.T) {
-	got := translateResultCode(quicraft.ErrBusy)
-	if got != RequestDropped {
-		t.Errorf("translateResultCode(ErrBusy) = %v, want RequestDropped", got)
-	}
-}
-
-func TestTranslateResultCode_BusyNotAborted(t *testing.T) {
-	got := translateResultCode(quicraft.ErrBusy)
-	if got == RequestAborted {
-		t.Error("ErrBusy should map to RequestDropped, not fall through to RequestAborted")
-	}
-}
-
-func TestTranslateResultCode_SystemBusy(t *testing.T) {
-	got := translateResultCode(quicraft.ErrSystemBusy)
-	if got != RequestDropped {
-		t.Errorf("translateResultCode(ErrSystemBusy) = %v, want RequestDropped", got)
-	}
-}
-
-func TestTranslateResultCode_SystemBusyNotAborted(t *testing.T) {
-	got := translateResultCode(quicraft.ErrSystemBusy)
-	if got == RequestAborted {
-		t.Error("ErrSystemBusy should map to RequestDropped, not fall through to RequestAborted")
-	}
-}
-
-func TestTranslateResultCode_Draining(t *testing.T) {
-	got := translateResultCode(quicraft.ErrDraining)
-	if got != RequestDropped {
-		t.Errorf("translateResultCode(ErrDraining) = %v, want RequestDropped", got)
-	}
-}
-
-func TestTranslateResultCode_ShardPaused(t *testing.T) {
-	got := translateResultCode(quicraft.ErrShardPaused)
-	if got != RequestDropped {
-		t.Errorf("translateResultCode(ErrShardPaused) = %v, want RequestDropped", got)
-	}
-}
-
-func TestTranslateResultCode_DrainingNotAborted(t *testing.T) {
-	got := translateResultCode(quicraft.ErrDraining)
-	if got == RequestAborted {
-		t.Error("ErrDraining should map to RequestDropped, not fall through to RequestAborted")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Resolved RequestState multiple independent reads
 // ---------------------------------------------------------------------------
 
@@ -1188,23 +684,6 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 	case <-rs.AppliedC():
 		t.Fatal("resolved RequestState delivered a second value")
 	default:
-	}
-}
-
-func TestResolvedRequestState_MultipleReads_DataPreserved(t *testing.T) {
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 42, Data: []byte("preserved")},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	select {
-	case r := <-rs.CompletedC:
-		if string(r.GetResult().Data) != "preserved" {
-			t.Errorf("Data = %q, want %q", string(r.GetResult().Data), "preserved")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading from CompletedC")
 	}
 }
 

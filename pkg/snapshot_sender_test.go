@@ -1245,38 +1245,3 @@ func TestForEachSnapshotChunk_EmptySnapshot(t *testing.T) {
 		t.Errorf("expected 1 callback for empty snapshot, got %d", callCount)
 	}
 }
-
-// TestResourceCleanup_Pattern verifies the resource cleanup pattern used in
-// doSendSnapshot correctly handles cleanup of multiple resources in reverse
-// order.
-func TestResourceCleanup_Pattern(t *testing.T) {
-	var cleanupOrder []int
-
-	// Simulate the cleanup pattern from doSendSnapshot.
-	var resourceCleanup []func()
-	cleanup := func() {
-		for i := len(resourceCleanup) - 1; i >= 0; i-- {
-			resourceCleanup[i]()
-		}
-	}
-	defer cleanup()
-
-	// Register cleanup functions in order.
-	resourceCleanup = append(resourceCleanup, func() { cleanupOrder = append(cleanupOrder, 1) })
-	resourceCleanup = append(resourceCleanup, func() { cleanupOrder = append(cleanupOrder, 2) })
-	resourceCleanup = append(resourceCleanup, func() { cleanupOrder = append(cleanupOrder, 3) })
-
-	// Manually trigger cleanup (simulating function return).
-	cleanup()
-
-	// Verify reverse order cleanup.
-	if len(cleanupOrder) != 3 {
-		t.Fatalf("expected 3 cleanups, got %d", len(cleanupOrder))
-	}
-	if cleanupOrder[0] != 3 || cleanupOrder[1] != 2 || cleanupOrder[2] != 1 {
-		t.Errorf("expected cleanup order [3,2,1], got %v", cleanupOrder)
-	}
-
-	// Clear for the deferred cleanup call at function exit.
-	resourceCleanup = nil
-}

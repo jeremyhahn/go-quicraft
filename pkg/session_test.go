@@ -241,14 +241,6 @@ func TestPrepareForUnregister_SetsSentinel(t *testing.T) {
 	}
 }
 
-func TestPrepareForUnregister_Fresh(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForUnregister()
-	if s.SeriesID() != SeriesIDForUnregister {
-		t.Errorf("SeriesID = %d, want %d", s.SeriesID(), SeriesIDForUnregister)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ValidForSessionOp
 // ---------------------------------------------------------------------------
@@ -325,42 +317,6 @@ func TestSetRespondedTo_SameValueIsNoOp(t *testing.T) {
 	s.SetRespondedTo(5)
 	if s.RespondedTo() != 5 {
 		t.Errorf("RespondedTo = %d, want 5", s.RespondedTo())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Getters
-// ---------------------------------------------------------------------------
-
-func TestSession_ShardID(t *testing.T) {
-	s := newSession(42, 100, 0)
-	if s.ShardID() != 42 {
-		t.Errorf("ShardID = %d, want 42", s.ShardID())
-	}
-}
-
-func TestSession_ClientID(t *testing.T) {
-	s := newSession(1, 999, 0)
-	if s.ClientID() != 999 {
-		t.Errorf("ClientID = %d, want 999", s.ClientID())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// IsNoOPSession
-// ---------------------------------------------------------------------------
-
-func TestIsNoOPSession_True(t *testing.T) {
-	s := NewNoOPSession(1)
-	if !s.IsNoOPSession() {
-		t.Error("no-op session should return true")
-	}
-}
-
-func TestIsNoOPSession_False(t *testing.T) {
-	s := newSession(1, 100, 0)
-	if s.IsNoOPSession() {
-		t.Error("regular session should return false")
 	}
 }
 

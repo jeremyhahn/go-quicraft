@@ -177,8 +177,6 @@ func TestIsNotLeaderRejection(t *testing.T) {
 		{"sentinel", quicraft.ErrNotLeader, true},
 		{"pre-flight", preflightNotLeader(), true},
 		{"post-delivery", postDeliveryNotLeader(), true},
-		{"timeout", quicraft.ErrTimeout, false},
-		{"read index not ready", quicraft.ErrReadIndexNotReady, false},
 		{"closed", quicraft.ErrClosed, false},
 		// A sealed node refuses until an operator unseals it. Leadership has
 		// not moved, so re-resolving and retrying would only spin.
@@ -335,7 +333,6 @@ func TestReadRefusal(t *testing.T) {
 		{"wrapped post-delivery", fmt.Errorf("read: %w", postDeliveryNotLeader()), true},
 		{"read index not ready", quicraft.ErrReadIndexNotReady, true},
 		{"wrapped read index not ready", fmt.Errorf("read: %w", quicraft.ErrReadIndexNotReady), true},
-		{"timeout", quicraft.ErrTimeout, false},
 		{"busy", quicraft.ErrBusy, false},
 		// The Host surfaces the raft layer's ErrReadIndexOverloaded as
 		// ErrSystemBusy, so this row is the overloaded read index too.

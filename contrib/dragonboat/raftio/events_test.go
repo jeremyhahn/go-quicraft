@@ -358,13 +358,3 @@ func TestGetNodeInfo(t *testing.T) {
 		t.Errorf("ReplicaID = %d, want 7", ni.ReplicaID)
 	}
 }
-
-func TestGetNodeInfo_ZeroValues(t *testing.T) {
-	ni := GetNodeInfo(0, 0)
-	if ni.ShardID != 0 {
-		t.Errorf("ShardID = %d, want 0", ni.ShardID)
-	}
-	if ni.ReplicaID != 0 {
-		t.Errorf("ReplicaID = %d, want 0", ni.ReplicaID)
-	}
-}

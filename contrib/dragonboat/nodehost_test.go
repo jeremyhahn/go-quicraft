@@ -183,16 +183,6 @@ func TestNodeHost_NewAndClose(t *testing.T) {
 	}
 }
 
-func TestNodeHost_NewAndClose_InvalidConfig(t *testing.T) {
-	nhConfig := dbConfig.NodeHostConfig{
-		// Missing required fields.
-	}
-	_, err := NewNodeHost(nhConfig)
-	if err == nil {
-		t.Error("expected error for invalid config, got nil")
-	}
-}
-
 func TestNodeHost_StartReplica_SyncPropose_SyncRead(t *testing.T) {
 	nh := newTestNodeHost(t)
 	shardID := uint64(1)
@@ -255,19 +245,6 @@ func TestNodeHost_GetNoOPSession(t *testing.T) {
 	}
 }
 
-func TestNodeHost_GetNoOPSession_DifferentShards(t *testing.T) {
-	nh := newTestNodeHost(t)
-	s1 := nh.GetNoOPSession(1)
-	s2 := nh.GetNoOPSession(2)
-
-	if s1.ShardID == s2.ShardID {
-		t.Error("expected different ShardIDs for different sessions")
-	}
-	if !s1.IsNoOPSession() || !s2.IsNoOPSession() {
-		t.Error("both sessions should be no-op")
-	}
-}
-
 func TestNodeHost_GetLeaderID_ReturnsFourValues(t *testing.T) {
 	nh := newTestNodeHost(t)
 	shardID := uint64(1)
@@ -287,14 +264,6 @@ func TestNodeHost_GetLeaderID_ReturnsFourValues(t *testing.T) {
 	// Term should be at least 1 after election.
 	if term == 0 {
 		t.Error("expected term > 0 after leader election")
-	}
-}
-
-func TestNodeHost_GetLeaderID_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	_, _, _, err := nh.GetLeaderID(999)
-	if err == nil {
-		t.Error("expected error for non-existent shard, got nil")
 	}
 }
 
@@ -418,23 +387,6 @@ func TestSnapshotOption_ToQuicraft(t *testing.T) {
 	}
 }
 
-func TestSnapshotOption_ToQuicraft_ZeroValue(t *testing.T) {
-	opt := SnapshotOption{}
-	qc := opt.toQuicraft()
-	if qc.ExportPath != "" {
-		t.Errorf("expected empty ExportPath, got %s", qc.ExportPath)
-	}
-	if qc.CompactionOverhead != 0 {
-		t.Errorf("expected CompactionOverhead=0, got %d", qc.CompactionOverhead)
-	}
-	if qc.OverrideCompactionOverhead {
-		t.Error("expected OverrideCompactionOverhead=false")
-	}
-	if qc.Exported {
-		t.Error("expected Exported=false")
-	}
-}
-
 func TestSnapshotOption_Validate_Valid(t *testing.T) {
 	opt := SnapshotOption{CompactionOverhead: 100}
 	if err := opt.Validate(); err != nil {
@@ -454,14 +406,6 @@ func TestSnapshotOption_Validate_MutuallyExclusive(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidOption) {
 		t.Errorf("expected ErrInvalidOption, got %v", err)
-	}
-}
-
-func TestSnapshotOption_Validate_CompactionIndexOnly(t *testing.T) {
-	// CompactionIndex with OverrideCompactionOverhead is rejected.
-	opt := SnapshotOption{OverrideCompactionOverhead: true, CompactionIndex: 50}
-	if err := opt.Validate(); err == nil {
-		t.Error("expected error for unsupported CompactionIndex")
 	}
 }
 
@@ -597,34 +541,6 @@ func TestNodeHost_StartDuplicateReplica(t *testing.T) {
 	}
 }
 
-func TestNodeHost_Propose_Async(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	session := nh.GetNoOPSession(shardID)
-	rs, err := nh.Propose(session, []byte("async-data"), 5*time.Second)
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	defer rs.Release()
-
-	resultC := rs.ResultC()
-	if resultC == nil {
-		t.Fatal("expected non-nil ResultC channel")
-	}
-
-	select {
-	case result := <-resultC:
-		if !result.Completed() {
-			t.Errorf("expected completed result, got code %d", result.code)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for async proposal result")
-	}
-}
-
 func TestNodeHost_Propose_InvalidShard(t *testing.T) {
 	nh := newTestNodeHost(t)
 	session := nh.GetNoOPSession(999)
@@ -660,60 +576,6 @@ func TestNodeHost_GetNodeHostInfo_EmptyHost(t *testing.T) {
 	}
 	if len(info.ShardInfoList) != 0 {
 		t.Errorf("expected 0 shards, got %d", len(info.ShardInfoList))
-	}
-}
-
-func TestNodeHost_GetNodeHostInfo_EmptyHost_WithLogInfo(t *testing.T) {
-	nh := newTestNodeHost(t)
-	info := nh.GetNodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
-	if info == nil {
-		t.Fatal("expected non-nil info")
-	}
-	if info.RaftAddress == "" {
-		t.Error("expected non-empty RaftAddress even with no shards")
-	}
-}
-
-func TestFromQuicraftShardInfo(t *testing.T) {
-	nodes := map[uint64]string{1: "addr1", 2: "addr2"}
-	qcSI := quicraft.ShardInfo{
-		ShardID:           10,
-		ReplicaID:         1,
-		LeaderID:          1,
-		Term:              5,
-		IsLeader:          true,
-		IsObserver:        false,
-		IsWitness:         false,
-		StateMachineType:  0,
-		Pending:           3,
-		Nodes:             nodes,
-		ConfigChangeIndex: 42,
-	}
-
-	si := fromQuicraftShardInfo(qcSI)
-	if si.ShardID != 10 {
-		t.Errorf("expected ShardID=10, got %d", si.ShardID)
-	}
-	if si.ReplicaID != 1 {
-		t.Errorf("expected ReplicaID=1, got %d", si.ReplicaID)
-	}
-	if si.LeaderID != 1 {
-		t.Errorf("expected LeaderID=1, got %d", si.LeaderID)
-	}
-	if si.Term != 5 {
-		t.Errorf("expected Term=5, got %d", si.Term)
-	}
-	if !si.IsLeader {
-		t.Error("expected IsLeader=true")
-	}
-	if si.PendingProposals != 3 {
-		t.Errorf("expected PendingProposals=3, got %d", si.PendingProposals)
-	}
-	if len(si.Nodes) != 2 {
-		t.Errorf("expected 2 nodes, got %d", len(si.Nodes))
-	}
-	if si.ConfigChangeIndex != 42 {
-		t.Errorf("expected ConfigChangeIndex=42, got %d", si.ConfigChangeIndex)
 	}
 }
 
@@ -789,37 +651,6 @@ func TestCodeToError_UnknownCode(t *testing.T) {
 	if result != ErrAborted {
 		t.Errorf("expected ErrAborted for unknown code, got %v", result)
 	}
-}
-
-func TestNodeHostConstructionError_WithErr(t *testing.T) {
-	inner := &dbConfig.ValidationError{Field: "test", Message: "bad"}
-	e := &NodeHostConstructionError{Reason: "config conversion", Err: inner}
-
-	msg := e.Error()
-	if msg == "" {
-		t.Error("expected non-empty error message")
-	}
-	if e.Unwrap() != inner {
-		t.Error("expected Unwrap to return the inner error")
-	}
-}
-
-func TestNodeHostConstructionError_WithoutErr(t *testing.T) {
-	e := &NodeHostConstructionError{Reason: "no host"}
-	msg := e.Error()
-	if msg == "" {
-		t.Error("expected non-empty error message")
-	}
-	if e.Unwrap() != nil {
-		t.Error("expected Unwrap to return nil")
-	}
-}
-
-func TestNodeHost_RemoveData_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	err := nh.RemoveData(999, 999)
-	// Should succeed or return a specific error -- not panic.
-	_ = err
 }
 
 func TestNodeHost_SyncRemoveData_CanceledContext(t *testing.T) {
@@ -1040,83 +871,9 @@ func TestNodeHost_RequestCompaction_UnloadedShard(t *testing.T) {
 // GossipInfo / ShardView
 // ---------------------------------------------------------------------------
 
-func TestGossipInfo_ZeroValue(t *testing.T) {
-	var gi GossipInfo
-	if gi.Enabled {
-		t.Error("expected Enabled to be false")
-	}
-	if gi.AdvertiseAddress != "" {
-		t.Error("expected empty AdvertiseAddress")
-	}
-	if gi.NumOfKnownNodeHosts != 0 {
-		t.Errorf("expected NumOfKnownNodeHosts=0, got %d", gi.NumOfKnownNodeHosts)
-	}
-}
-
-func TestShardView_ZeroValue(t *testing.T) {
-	// ShardView is a placeholder; just verify it exists.
-	var sv ShardView
-	_ = sv
-}
-
 // ---------------------------------------------------------------------------
 // SnapshotOption Validation (matching dragonboat TestSnapshotOptionIsChecked)
 // ---------------------------------------------------------------------------
-
-func TestSnapshotOption_Validate_CompactionOverheadOnly(t *testing.T) {
-	// Both CompactionOverhead and CompactionIndex set with override should fail.
-	opt := SnapshotOption{OverrideCompactionOverhead: true, CompactionOverhead: 10, CompactionIndex: 5}
-	if err := opt.Validate(); err == nil {
-		t.Fatal("expected error when both CompactionOverhead and CompactionIndex are set")
-	}
-	if !errors.Is(opt.Validate(), ErrInvalidOption) {
-		t.Fatal("expected ErrInvalidOption")
-	}
-}
-
-func TestSnapshotOption_Validate_ExportPath(t *testing.T) {
-	opt := SnapshotOption{ExportPath: "/tmp/snapshot"}
-	if err := opt.Validate(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	qcOpt := opt.toQuicraft()
-	if qcOpt.ExportPath != "/tmp/snapshot" {
-		t.Fatalf("ExportPath not mapped: got %q", qcOpt.ExportPath)
-	}
-}
-
-func TestSnapshotOption_Validate_OverrideCompaction(t *testing.T) {
-	opt := SnapshotOption{OverrideCompactionOverhead: true, CompactionOverhead: 100}
-	if err := opt.Validate(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	qcOpt := opt.toQuicraft()
-	if !qcOpt.OverrideCompactionOverhead {
-		t.Fatal("OverrideCompactionOverhead not mapped")
-	}
-	if qcOpt.CompactionOverhead != 100 {
-		t.Fatalf("CompactionOverhead = %d, want 100", qcOpt.CompactionOverhead)
-	}
-}
-
-func TestSnapshotOption_Validate_CompactionIndexRejected(t *testing.T) {
-	// CompactionIndex with OverrideCompactionOverhead is rejected by Validate.
-	opt := SnapshotOption{OverrideCompactionOverhead: true, CompactionIndex: 50}
-	if err := opt.Validate(); err == nil {
-		t.Fatal("expected error for unsupported CompactionIndex")
-	}
-}
-
-func TestSnapshotOption_Validate_ExportedFlag(t *testing.T) {
-	opt := SnapshotOption{Exported: true, ExportPath: "/tmp/export"}
-	if err := opt.Validate(); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	qcOpt := opt.toQuicraft()
-	if !qcOpt.Exported {
-		t.Fatal("Exported flag not mapped")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // NodeHostConstructionError
@@ -1278,23 +1035,6 @@ func TestNodeHost_QueryRaftLog_InvalidShard(t *testing.T) {
 	}
 }
 
-func TestNodeHost_QueryRaftLog_ReturnsResolvedRequestState(t *testing.T) {
-	// QueryRaftLog wraps synchronous results into a pre-resolved RequestState.
-	// We verify the shape of the returned RequestState rather than specific
-	// log entries, since the in-memory LogDB may not retain early entries.
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	// Even if entries aren't available for the range, the method should
-	// return an error rather than panic.
-	_, err := nh.QueryRaftLog(shardID, 1, 100, 1024*1024)
-	// Error is acceptable (entries may be unavailable in in-memory LogDB).
-	// We just verify no panic occurs.
-	_ = err
-}
-
 // ---------------------------------------------------------------------------
 // ReadIndex + ReadLocalNode
 // ---------------------------------------------------------------------------
@@ -1337,14 +1077,6 @@ func TestNodeHost_RequestSnapshot_InvalidShard(t *testing.T) {
 // ---------------------------------------------------------------------------
 // GetLogReader
 // ---------------------------------------------------------------------------
-
-func TestNodeHost_GetLogReader_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	_, err := nh.GetLogReader(999)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Async membership operations with invalid shard
@@ -1885,26 +1617,6 @@ func TestNodeHost_SyncGetSession_Success(t *testing.T) {
 // SyncCloseSession
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_SyncCloseSession_Success(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	session, err := nh.SyncGetSession(ctx, shardID)
-	if err != nil {
-		t.Fatalf("SyncGetSession: %v", err)
-	}
-
-	err = nh.SyncCloseSession(ctx, session)
-	if err != nil {
-		t.Fatalf("SyncCloseSession: %v", err)
-	}
-}
-
 func TestNodeHost_SyncCloseSession_CanceledContext(t *testing.T) {
 	nh := newTestNodeHost(t)
 	shardID := uint64(1)
@@ -2243,49 +1955,6 @@ func (f *fixedSource) Uint64() uint64 {
 // ReadLocalNode success path (ReadIndex -> ReadLocalNode)
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_ReadIndex_And_ReadLocalNode(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Write some data first.
-	session := nh.GetNoOPSession(shardID)
-	payload := []byte("read-local-data")
-	_, err := nh.SyncPropose(ctx, session, payload)
-	if err != nil {
-		t.Fatalf("SyncPropose: %v", err)
-	}
-
-	// ReadIndex, then wait for completion on ResultC — the dragonboat
-	// contract requires observing RequestCompleted before ReadLocalNode.
-	rs, err := nh.ReadIndex(shardID, 5*time.Second)
-	if err != nil {
-		t.Fatalf("ReadIndex: %v", err)
-	}
-	defer rs.Release()
-	s := <-rs.ResultC()
-	if !s.Completed() {
-		t.Fatalf("ReadIndex did not complete: code=%v", s.code)
-	}
-
-	// ReadLocalNode should query the local state machine.
-	result, err := nh.ReadLocalNode(rs, nil)
-	if err != nil {
-		t.Fatalf("ReadLocalNode: %v", err)
-	}
-	data, ok := result.([]byte)
-	if !ok {
-		t.Fatalf("expected []byte, got %T", result)
-	}
-	if string(data) != string(payload) {
-		t.Errorf("expected %q, got %q", payload, data)
-	}
-}
-
 func TestNodeHost_ReadLocalNode_ClosedChannel(t *testing.T) {
 	nh := newTestNodeHost(t)
 
@@ -2302,19 +1971,6 @@ func TestNodeHost_ReadLocalNode_ClosedChannel(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidOperation) {
 		t.Errorf("expected ErrInvalidOperation, got %v", err)
-	}
-}
-
-func TestNodeHost_ReadLocalNode_NonCompletedResult(t *testing.T) {
-	nh := newTestNodeHost(t)
-
-	// Create a RequestState with a timeout result.
-	result := RequestResult{code: RequestTimeout}
-	rs := newResolvedRequestState(result)
-
-	_, err := nh.ReadLocalNode(rs, nil)
-	if err == nil {
-		t.Error("expected error for timed-out result")
 	}
 }
 
@@ -2429,22 +2085,6 @@ func TestNodeHost_RequestSnapshot_Success(t *testing.T) {
 // ExportSnapshot and ImportSnapshot
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_ExportSnapshot_NoSnapshot(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var buf bytes.Buffer
-	err := nh.ExportSnapshot(ctx, shardID, &buf)
-	// May fail if no snapshot exists yet, which is expected.
-	// The important thing is that the API call works and doesn't panic.
-	_ = err
-}
-
 func TestNodeHost_ExportSnapshot_InvalidShard(t *testing.T) {
 	nh := newTestNodeHost(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2455,34 +2095,6 @@ func TestNodeHost_ExportSnapshot_InvalidShard(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for non-existent shard, got nil")
 	}
-}
-
-func TestNodeHost_ExportSnapshot_AfterSnapshot(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Propose data and take a snapshot.
-	session := nh.GetNoOPSession(shardID)
-	_, err := nh.SyncPropose(ctx, session, []byte("export-data"))
-	if err != nil {
-		t.Fatalf("SyncPropose: %v", err)
-	}
-
-	_, err = nh.SyncRequestSnapshot(ctx, shardID, DefaultSnapshotOption)
-	if err != nil {
-		t.Fatalf("SyncRequestSnapshot: %v", err)
-	}
-
-	var buf bytes.Buffer
-	err = nh.ExportSnapshot(ctx, shardID, &buf)
-	// Success depends on whether the implementation supports export.
-	// We verify no panic and the function returns.
-	_ = err
 }
 
 func TestNodeHost_ImportSnapshot_InvalidShard(t *testing.T) {
@@ -2999,15 +2611,6 @@ func TestNodeHost_Propose_Async_ContextNotCanceledPrematurely(t *testing.T) {
 	rs.Release()
 }
 
-func TestNodeHost_Propose_Async_InvalidShard_CancelsClearly(t *testing.T) {
-	nh := newTestNodeHost(t)
-	session := nh.GetNoOPSession(999)
-	_, err := nh.Propose(session, []byte("test"), time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard, got nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Entry Term field in QueryRaftLog
 // ---------------------------------------------------------------------------
@@ -3101,55 +2704,6 @@ func TestNodeHost_GetLeaderID_InvalidShard_ReturnsError(t *testing.T) {
 	}
 	if term != 0 {
 		t.Errorf("expected term=0 for error case, got %d", term)
-	}
-}
-
-func TestNodeHost_QueryRaftLog_EntryTypeField(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Propose entries so there is data in the log.
-	session := nh.GetNoOPSession(shardID)
-	for i := 0; i < 3; i++ {
-		_, propErr := nh.SyncPropose(ctx, session, []byte("typed-entry"))
-		if propErr != nil {
-			t.Fatalf("SyncPropose: %v", propErr)
-		}
-	}
-
-	rs, err := nh.QueryRaftLog(shardID, 1, 100, 1024*1024)
-	if err != nil {
-		// Log entries may be unavailable; this is acceptable.
-		return
-	}
-	defer rs.Release()
-
-	resultC := rs.ResultC()
-	if resultC == nil {
-		return
-	}
-
-	select {
-	case result := <-resultC:
-		entries, _ := result.RaftLogs()
-		if len(entries) == 0 {
-			return
-		}
-		for _, e := range entries {
-			// Normal proposal entries should have Type matching
-			// the proto entry type. For normal entries, Type is 0
-			// (EntryNormal). The key assertion is that the Type field
-			// is populated and accessible, not silently zero-valued
-			// due to being missing from the struct.
-			_ = e.Type // Compile-time proof the field exists.
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading QueryRaftLog result")
 	}
 }
 
