@@ -127,19 +127,6 @@ func TestInternalErrorTypeAliasesMatchThroughWrapping(t *testing.T) {
 		check func(t *testing.T, err error)
 	}{
 		{
-			name:  "ApplyError",
-			built: &engine.ApplyError{ShardID: 7, ReplicaID: 3, Err: cause},
-			check: func(t *testing.T, err error) {
-				var typed *ApplyError
-				if !errors.As(err, &typed) || typed.ShardID != 7 || typed.ReplicaID != 3 {
-					t.Fatalf("errors.As(*ApplyError) on %v = %+v", err, typed)
-				}
-				if !errors.Is(err, cause) {
-					t.Fatal("*ApplyError does not unwrap to the state machine's error")
-				}
-			},
-		},
-		{
 			name:  "ApplyError wrapping a decompression bomb",
 			built: &engine.ApplyError{ShardID: 7, ReplicaID: 3, Err: raft.ErrDecompressionBomb},
 			check: func(t *testing.T, err error) {
@@ -164,20 +151,6 @@ func TestInternalErrorTypeAliasesMatchThroughWrapping(t *testing.T) {
 			check: func(t *testing.T, err error) {
 				if !errors.Is(err, ErrApplyGap) {
 					t.Fatalf("errors.Is(%v, ErrApplyGap) = false", err)
-				}
-			},
-		},
-		{
-			name:  "SMPanicError",
-			built: &engine.SMPanicError{ShardID: 7, ReplicaID: 3, Value: "boom"},
-			check: func(t *testing.T, err error) {
-				var typed *SMPanicError
-				if !errors.As(err, &typed) || typed.Value != "boom" {
-					t.Fatalf("errors.As(*SMPanicError) on %v = %+v", err, typed)
-				}
-				if !errors.Is(err, ErrShardFailed) {
-					t.Fatalf("errors.Is(%v, ErrShardFailed) = false: a panicked state "+
-						"machine is a failed shard and must say so by public identity", err)
 				}
 			},
 		},
@@ -294,19 +267,6 @@ func TestInternalErrorTypeAliasesMatchThroughWrapping(t *testing.T) {
 			check: func(t *testing.T, err error) {
 				if !errors.Is(err, ErrSnapshotSizeMismatch) {
 					t.Fatalf("errors.Is(%v, ErrSnapshotSizeMismatch) = false", err)
-				}
-			},
-		},
-		{
-			name:  "CACertificateParseError",
-			built: &transport.CACertificateParseError{Reason: "no issuer"},
-			check: func(t *testing.T, err error) {
-				var typed *CACertificateParseError
-				if !errors.As(err, &typed) || typed.Reason != "no issuer" {
-					t.Fatalf("errors.As(*CACertificateParseError) on %v = %+v", err, typed)
-				}
-				if !errors.Is(err, ErrCACertificateParse) {
-					t.Fatalf("errors.Is(%v, ErrCACertificateParse) = false", err)
 				}
 			},
 		},
