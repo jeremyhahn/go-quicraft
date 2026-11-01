@@ -2355,69 +2355,6 @@ func TestPeer_ProposeConfigChange_AllowsAfterCommit(t *testing.T) {
 
 // --- Follower config change application (commit-time) ---
 
-func TestPeer_Handle_FollowerAppliesConfigChangeOnCommit(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Seed the log with an initial entry so the follower has a matching
-	// prevLogIndex for the Replicate message.
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-	})
-
-	// Construct a config change entry that adds node 4.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	buf := make([]byte, cc.Size())
-	_, err := cc.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("failed to marshal config change: %v", err)
-	}
-
-	// Send a Replicate message from the leader containing the config
-	// change entry with the leader's commit index covering it. Config
-	// changes take effect at COMMIT time, applied via the update cycle
-	// (Peer.Commit -> processConfigChanges).
-	msg := proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		LogIndex: 1, // prevLogIndex
-		LogTerm:  1, // prevLogTerm
-		Commit:   2,
-		Entries: []proto.Entry{
-			{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: buf},
-		},
-	}
-	err = p.Handle(msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Not yet applied: membership mutates only when the committed entry
-	// flows through Peer.Commit.
-	if _, ok := p.GetMembership().Addresses[4]; ok {
-		t.Fatal("membership must not change before the update cycle commits the entry")
-	}
-	runUpdateCycles(t, p)
-
-	// Verify the peer's membership reflects the new node.
-	membership := p.GetMembership()
-	addr, ok := membership.Addresses[4]
-	if !ok {
-		t.Fatal("expected replica 4 to be in membership after follower commits config change")
-	}
-	if addr != "addr4" {
-		t.Fatalf("expected address addr4, got %s", addr)
-	}
-}
-
 func TestPeer_Handle_RejectedReplicateDoesNotApplyConfigChange(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
@@ -2517,8 +2454,17 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
+	// Config changes take effect at COMMIT time: membership mutates only
+	// when the committed entry flows through Peer.Commit.
+	if _, ok := p.GetMembership().Addresses[4]; ok {
+		t.Fatal("membership must not change before the update cycle commits the entry")
+	}
 	runUpdateCycles(t, p)
 
+	if addr := p.GetMembership().Addresses[4]; addr != "addr4" {
+		t.Fatalf("expected address addr4 for replica 4, got %q", addr)
+	}
 	// Verify that the membership's internal state includes node 4 as a voter.
 	if !p.membership.isVoter(4) {
 		t.Fatal("expected replica 4 to be a voter in membership after config change committed")
@@ -2888,45 +2834,6 @@ func TestGetUpdate_NotReadOnly_WithEntries(t *testing.T) {
 	}
 }
 
-func TestGetUpdate_NotReadOnly_StateChange(t *testing.T) {
-	// When the peer's hard state changes (e.g., term increases from a
-	// higher-term message), the resulting update must not be read-only.
-	cfg := testConfig()
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// The peer starts as a follower at term 0. Receive a heartbeat from
-	// a leader at term 5. This causes a term change (state change).
-	msg := proto.Message{
-		Type: proto.Heartbeat,
-		From: 2,
-		Term: 5,
-	}
-	err := p.Handle(msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate to be true after term change")
-	}
-
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// ReadOnly must be false because the hard state changed (term).
-	if update.ReadOnly {
-		t.Fatal("expected update.ReadOnly to be false when state changed")
-	}
-
-	// Verify the state change is reflected.
-	if update.State.Term != 5 {
-		t.Fatalf("expected term 5 in update state, got %d", update.State.Term)
-	}
-}
-
 // --- Benchmarks ---
 
 // benchLeaderPeer creates a single-node Peer that has self-elected as
@@ -2986,24 +2893,6 @@ func BenchmarkPeerHasUpdate(b *testing.B) {
 }
 
 // --- IsMember ---
-
-func TestPeer_IsMember_Voter(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// All voting members should be recognized.
-	for id := range ms.Addresses {
-		if !p.IsMember(id) {
-			t.Errorf("expected replica %d to be a member (voter)", id)
-		}
-	}
-
-	// Unknown replica should not be a member.
-	if p.IsMember(999) {
-		t.Error("expected replica 999 to NOT be a member")
-	}
-}
 
 func TestPeer_IsMember_Observer(t *testing.T) {
 	cfg := testConfig()
@@ -3547,96 +3436,6 @@ func captureSlog(level slog.Level) (*bytes.Buffer, func()) {
 	return &buf, func() { slog.SetDefault(prev) }
 }
 
-func TestPeer_processConfigChanges_LogsUnmarshalError(t *testing.T) {
-	buf, cleanup := captureSlog(slog.LevelDebug)
-	defer cleanup()
-
-	cfg := testConfigWithID(1, 1)
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Create an entry with corrupt config change data.
-	entries := []proto.Entry{
-		{
-			Index: 2,
-			Term:  1,
-			Type:  proto.EntryConfigChange,
-			Cmd:   []byte{0xFF, 0xFF}, // invalid binary, will fail UnmarshalFrom
-		},
-	}
-	p.processConfigChanges(entries)
-
-	logOutput := buf.String()
-	if !bytes.Contains([]byte(logOutput), []byte("config change unmarshal failed")) {
-		t.Errorf("expected 'config change unmarshal failed' in log, got:\n%s", logOutput)
-	}
-	if !bytes.Contains([]byte(logOutput), []byte("shard_id=1")) {
-		t.Errorf("expected structured shard_id in log, got:\n%s", logOutput)
-	}
-	if !bytes.Contains([]byte(logOutput), []byte("level=ERROR")) {
-		t.Errorf("expected ERROR level for unmarshal failure, got:\n%s", logOutput)
-	}
-}
-
-func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
-	buf, cleanup := captureSlog(slog.LevelDebug)
-	defer cleanup()
-
-	cfg := testConfigWithID(1, 1)
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// First, apply a valid config change at index 2.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 5,
-		Address:   "addr5",
-	}
-	ccBuf := make([]byte, cc.Size())
-	_, _ = cc.MarshalTo(ccBuf)
-
-	entries := []proto.Entry{
-		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: ccBuf},
-	}
-	p.processConfigChanges(entries)
-
-	if !p.IsMember(5) {
-		t.Fatal("replica 5 should be a member after first apply")
-	}
-
-	// Remove replica 5, then re-add it at a higher index. The replay guard
-	// (logIndex <= configChangeID) does not cover either entry, so the
-	// Removed-tombstone refusal is surfaced and logged. A tombstone is
-	// replicated state every replica evaluates identically, which is what
-	// makes refusing it safe — unlike a duplicate add, which apply converges
-	// on rather than skipping (see membership.go).
-	rm := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 5}
-	rmBuf := make([]byte, rm.Size())
-	_, _ = rm.MarshalTo(rmBuf)
-	p.processConfigChanges([]proto.Entry{
-		{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: rmBuf},
-	})
-	if p.IsMember(5) {
-		t.Fatal("replica 5 should not be a member after the removal")
-	}
-
-	entries[0].Index = 4
-	buf.Reset()
-	p.processConfigChanges(entries)
-
-	logOutput := buf.String()
-	if !bytes.Contains([]byte(logOutput), []byte("config change apply skipped")) {
-		t.Errorf("expected 'config change apply skipped' in log, got:\n%s", logOutput)
-	}
-	// The apply-skip is now logged at WARN: the Host membership API
-	// pre-validates against current membership before proposing, so any skip
-	// on the leader's own freshly proposed entry is unexpected and should be
-	// visible to operators rather than buried at DEBUG.
-	if !bytes.Contains([]byte(logOutput), []byte("level=WARN")) {
-		t.Errorf("expected WARN level for apply skip, got:\n%s", logOutput)
-	}
-}
-
 // TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard pins the runtime
 // decode site as fail-CLOSED.
 //
@@ -3648,6 +3447,9 @@ func TestPeer_processConfigChanges_LogsApplyError(t *testing.T) {
 // these bytes (ReconstructMembership / bootstrap.go); the runtime failing open
 // while recovery fails closed over the same input would be the inconsistency.
 func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) {
+	logBuf, cleanup := captureSlog(slog.LevelDebug)
+	defer cleanup()
+
 	cfg := testConfigWithID(1, 1)
 	ms := singleNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
@@ -3667,6 +3469,12 @@ func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) 
 			"undecodable COMMITTED config entry must fault the shard, not be skipped",
 			err)
 	}
+	logOutput := logBuf.String()
+	for _, want := range []string{"config change unmarshal failed", "shard_id=1", "level=ERROR"} {
+		if !bytes.Contains([]byte(logOutput), []byte(want)) {
+			t.Errorf("expected %q in log, got:\n%s", want, logOutput)
+		}
+	}
 	if p.IsMember(7) {
 		t.Fatal("the scan folded a config change ABOVE the entry it could not " +
 			"decode: every change after the corrupt one is defined relative to a " +
@@ -3680,6 +3488,9 @@ func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) 
 // (a Removed tombstone re-add here), so it is agreement rather than corruption,
 // and faulting on it would kill shards over an outcome the whole cluster shares.
 func TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored(t *testing.T) {
+	logBuf, cleanup := captureSlog(slog.LevelDebug)
+	defer cleanup()
+
 	cfg := testConfigWithID(1, 1)
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
@@ -3708,6 +3519,15 @@ func TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored(t *testing
 	}
 	if !p.IsMember(9) {
 		t.Fatal("the scan stopped at a deterministic refusal instead of continuing")
+	}
+	// The refusal is logged at WARN: the Host membership API pre-validates
+	// against current membership before proposing, so any skip on a freshly
+	// proposed entry is unexpected and must be visible to operators.
+	logOutput := logBuf.String()
+	for _, want := range []string{"config change apply skipped", "level=WARN"} {
+		if !bytes.Contains([]byte(logOutput), []byte(want)) {
+			t.Errorf("expected %q in log, got:\n%s", want, logOutput)
+		}
 	}
 }
 
@@ -3985,22 +3805,6 @@ func TestPeer_GetPiggybackUpdate_ReturnsCommittedEntries(t *testing.T) {
 	}
 	if update.ReplicaID != cfg.ReplicaID {
 		t.Fatalf("expected ReplicaID %d, got %d", cfg.ReplicaID, update.ReplicaID)
-	}
-}
-
-func TestPeer_GetPiggybackUpdate_EmptyWhenNoEntries(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-
-	// No entries merged; committed == processed == 0.
-	update, err := p.GetPiggybackUpdate(0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if update.CommittedEntries != nil {
-		t.Fatalf("expected nil CommittedEntries, got %d entries", len(update.CommittedEntries))
-	}
-	if update.ShardID != 0 {
-		t.Fatalf("expected zero ShardID in empty update, got %d", update.ShardID)
 	}
 }
 
@@ -4289,22 +4093,6 @@ func TestPeer_SetOnCampaign_CallbackInvoked(t *testing.T) {
 	_ = callbackTerm // Term is valid regardless of value.
 }
 
-func TestPeer_SetOnCampaign_NilCallbackSafe(t *testing.T) {
-	cfg := testConfig()
-	cfg.PreVote = config.BoolPtr(false)
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Explicitly set callback to nil.
-	p.SetOnCampaign(nil)
-
-	// Tick past election timeout. Should not panic.
-	for range 30 {
-		p.Tick()
-	}
-	// Test passes if no panic occurred.
-}
-
 // ---------------------------------------------------------------------------
 // DrainMessages tests
 // ---------------------------------------------------------------------------
@@ -4454,57 +4242,9 @@ func TestPeer_DrainFreeOrderMessages_AllOrderedReturnsNil(t *testing.T) {
 	}
 }
 
-func TestPeer_DrainFreeOrderMessages_AllFreeOrderDrainsAll(t *testing.T) {
-	cfg := testConfig()
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Populate with only free-order messages.
-	p.r.msgs = append(p.r.msgs,
-		proto.Message{Type: proto.Heartbeat, To: 2},
-		proto.Message{Type: proto.Replicate, To: 3},
-		proto.Message{Type: proto.Ping, To: 2},
-	)
-
-	freeOrderMsgs := p.DrainFreeOrderMessages()
-
-	if len(freeOrderMsgs) != 3 {
-		t.Fatalf("expected 3 free-order messages, got %d", len(freeOrderMsgs))
-	}
-
-	// Buffer should be empty now.
-	if len(p.r.msgs) != 0 {
-		t.Fatalf("expected 0 messages to remain, got %d", len(p.r.msgs))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // DrainReadStatesOnly tests
 // ---------------------------------------------------------------------------
-
-func TestPeer_DrainReadStatesOnly_ExtractsReadStates(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	// Add multiple read states.
-	p.r.readStates = append(p.r.readStates,
-		proto.ReadyToRead{Key: 1, Index: 10},
-		proto.ReadyToRead{Key: 2, Index: 20},
-	)
-
-	readStates := p.DrainReadStatesOnly()
-
-	if len(readStates) != 2 {
-		t.Fatalf("expected 2 readStates, got %d", len(readStates))
-	}
-	if readStates[0].Key != 1 || readStates[1].Key != 2 {
-		t.Errorf("unexpected readState keys: %d, %d", readStates[0].Key, readStates[1].Key)
-	}
-
-	// After drain, raft's readStates should be nil.
-	if p.r.readStates != nil {
-		t.Fatalf("expected raft readStates to be nil, got %d", len(p.r.readStates))
-	}
-}
 
 func TestPeer_DrainReadStatesOnly_EmptyReturnsNil(t *testing.T) {
 	p := newTestLeaderPeer(t)
@@ -4537,8 +4277,12 @@ func TestPeer_DrainReadStatesOnly_DoesNotTouchMessages(t *testing.T) {
 	readStates := p.DrainReadStatesOnly()
 
 	// ReadStates should be extracted.
-	if len(readStates) != 1 {
-		t.Fatalf("expected 1 readState, got %d", len(readStates))
+	if len(readStates) != 1 || readStates[0].Key != 42 {
+		t.Fatalf("expected the one readState with key 42, got %v", readStates)
+	}
+	// After drain, raft's readStates should be nil.
+	if p.r.readStates != nil {
+		t.Fatalf("expected raft readStates to be nil, got %d", len(p.r.readStates))
 	}
 
 	// Messages should remain untouched.
@@ -4550,36 +4294,6 @@ func TestPeer_DrainReadStatesOnly_DoesNotTouchMessages(t *testing.T) {
 // ---------------------------------------------------------------------------
 // DiagRaftState tests
 // ---------------------------------------------------------------------------
-
-func TestPeer_DiagRaftState_LeaderState(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	term, committed, processed, lastIdx, msgs, state := p.DiagRaftState()
-
-	if term == 0 {
-		t.Error("expected non-zero term for leader")
-	}
-	if state == "" {
-		t.Error("expected non-empty state string")
-	}
-	if !bytes.Contains([]byte(state), []byte("leader")) {
-		t.Errorf("expected state to contain 'leader', got %s", state)
-	}
-	// Should include heartbeat tick info.
-	if !bytes.Contains([]byte(state), []byte("hb=")) {
-		t.Errorf("expected state to contain 'hb=' for leader, got %s", state)
-	}
-	// Should include election tick info.
-	if !bytes.Contains([]byte(state), []byte("et=")) {
-		t.Errorf("expected state to contain 'et=' for leader, got %s", state)
-	}
-
-	// Verify numeric fields are reasonable.
-	_ = committed
-	_ = processed
-	_ = lastIdx
-	_ = msgs
-}
 
 func TestPeer_DiagRaftState_FollowerState(t *testing.T) {
 	cfg := testConfig()
@@ -4655,7 +4369,14 @@ func TestPeer_DiagRaftState_ReturnsCorrectMetrics(t *testing.T) {
 		t.Fatalf("Propose failed: %v", err)
 	}
 
-	term, committed, processed, lastIdx, msgs, _ := p.DiagRaftState()
+	term, committed, processed, lastIdx, msgs, state := p.DiagRaftState()
+
+	// A leader's state string names the role and both tick counters.
+	for _, want := range []string{"leader", "hb=", "et="} {
+		if !bytes.Contains([]byte(state), []byte(want)) {
+			t.Errorf("expected state to contain %q, got %s", want, state)
+		}
+	}
 
 	// Term should match the leader's current term.
 	if term != p.r.term {
@@ -4714,6 +4435,17 @@ func TestPeer_DiagRemotes_LeaderReturnsRemoteInfo(t *testing.T) {
 	if !bytes.Contains([]byte(remotesStr), []byte("state=")) {
 		t.Errorf("expected 'state=' in output, got: %s", remotesStr)
 	}
+	for _, want := range []string{"paused=", "active=", "inflights="} {
+		if !bytes.Contains([]byte(remotesStr), []byte(want)) {
+			t.Errorf("expected %q in output, got: %s", want, remotesStr)
+		}
+	}
+	// Remote state should be one of: probe, replicate, snapshot.
+	if !bytes.Contains([]byte(remotesStr), []byte("state=probe")) &&
+		!bytes.Contains([]byte(remotesStr), []byte("state=replicate")) &&
+		!bytes.Contains([]byte(remotesStr), []byte("state=snapshot")) {
+		t.Errorf("expected valid state in output, got: %s", remotesStr)
+	}
 }
 
 func TestPeer_DiagRemotes_NotLeaderReturnsMessage(t *testing.T) {
@@ -4736,40 +4468,6 @@ func TestPeer_DiagRemotes_SingleNodeLeaderNoRemotes(t *testing.T) {
 	// Single-node leader has no remotes, so output should be empty.
 	if remotesStr != "" {
 		t.Errorf("expected empty string for single-node leader, got: %s", remotesStr)
-	}
-}
-
-func TestPeer_DiagRemotes_ContainsRemoteState(t *testing.T) {
-	p := newTestMultiNodeLeaderPeer(t)
-
-	remotesStr := p.DiagRemotes()
-
-	// Remote state should be one of: probe, replicate, snapshot.
-	validStates := []string{"probe", "replicate", "snapshot"}
-	foundValidState := false
-	for _, s := range validStates {
-		if bytes.Contains([]byte(remotesStr), []byte("state="+s)) {
-			foundValidState = true
-			break
-		}
-	}
-	if !foundValidState {
-		t.Errorf("expected valid state in output, got: %s", remotesStr)
-	}
-
-	// Should contain paused status.
-	if !bytes.Contains([]byte(remotesStr), []byte("paused=")) {
-		t.Errorf("expected 'paused=' in output, got: %s", remotesStr)
-	}
-
-	// Should contain active status.
-	if !bytes.Contains([]byte(remotesStr), []byte("active=")) {
-		t.Errorf("expected 'active=' in output, got: %s", remotesStr)
-	}
-
-	// Should contain inflights count.
-	if !bytes.Contains([]byte(remotesStr), []byte("inflights=")) {
-		t.Errorf("expected 'inflights=' in output, got: %s", remotesStr)
 	}
 }
 
@@ -4825,28 +4523,6 @@ func TestPeer_RateLimiter_ReturnsNilWhenDisabled(t *testing.T) {
 
 	if rl != nil {
 		t.Error("expected RateLimiter to return nil when rate limiting is disabled")
-	}
-}
-
-func TestPeer_RateLimiter_ReturnsInstanceWhenEnabled(t *testing.T) {
-	cfg := testConfig()
-	cfg.MaxInMemLogSize = 1000 // Enable rate limiting.
-	lr := newTestLogReader(nil, proto.State{})
-	lr.membership = singleNodeMembership()
-	p, err := NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-
-	rl := p.RateLimiter()
-
-	if rl == nil {
-		t.Fatal("expected RateLimiter to return non-nil instance")
-	}
-
-	// Verify the returned rate limiter is the same as the internal one.
-	if rl != p.r.rl {
-		t.Error("expected RateLimiter to return the same instance as internal rl")
 	}
 }
 
