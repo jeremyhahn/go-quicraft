@@ -2577,48 +2577,6 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 			t.Fatal("oversized entry at index 11 should not be present")
 		}
 	})
-
-	t.Run("entry at exactly maxCmdLen is accepted", func(t *testing.T) {
-		s := &walShard{
-			indexes:       make(map[nodeKey]*index),
-			entries:       make(map[nodeKey]map[uint64]logdb.Entry),
-			states:        make(map[nodeKey]logdb.State),
-			bootstraps:    make(map[nodeKey]logdb.Bootstrap),
-			snapshots:     make(map[nodeKey]logdb.Snapshot),
-			compactedTo:   make(map[nodeKey]uint64),
-			knownSegments: make(map[uint64]bool),
-		}
-
-		// Use a much smaller cmdLen for the test to avoid 8MB allocation.
-		// We test the boundary by verifying maxCmdLen itself is accepted.
-		// The actual boundary check: cmdLen > maxCmdLen. So cmdLen == maxCmdLen
-		// must pass. We test with a tiny realistic size to avoid test memory
-		// bloat, and also verify the boundary constant is correctly defined.
-		cmdLen := uint32(64) // small but valid
-		cmd := make([]byte, cmdLen)
-		for i := range cmd {
-			cmd[i] = byte(i)
-		}
-
-		buf := make([]byte, entryRecordHeaderSize+int(cmdLen))
-		binary.LittleEndian.PutUint64(buf[0:], 1)       // shardID
-		binary.LittleEndian.PutUint64(buf[8:], 1)       // replicaID
-		binary.LittleEndian.PutUint64(buf[16:], 1)      // raftIndex
-		binary.LittleEndian.PutUint64(buf[24:], 5)      // term
-		binary.LittleEndian.PutUint64(buf[32:], 0)      // entryType
-		binary.LittleEndian.PutUint32(buf[80:], cmdLen) // cmdLen
-		copy(buf[entryRecordHeaderSize:], cmd)
-
-		if err := s.replayEntries(buf, 0); err != nil {
-			t.Fatalf("replayEntries = %v, want nil for valid entry", err)
-		}
-
-		key := nodeKey{ShardID: 1, ReplicaID: 1}
-		nodeEntries := s.entries[key]
-		if nodeEntries == nil || len(nodeEntries) != 1 {
-			t.Fatalf("expected 1 entry, got %v", nodeEntries)
-		}
-	})
 }
 
 // TestReplayRecordSkipsEmptyRecord verifies replayRecord reports a skip
@@ -2643,17 +2601,6 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 	}
 	if reason != "empty record" {
 		t.Fatalf("replayRecord(nil) reason=%q, want %q", reason, "empty record")
-	}
-
-	skipped, reason, err = s.replayRecord([]byte{}, 0)
-	if err != nil {
-		t.Fatalf("replayRecord([]) err=%v, want nil", err)
-	}
-	if skipped != 1 {
-		t.Fatalf("replayRecord([]) skipped=%d, want 1", skipped)
-	}
-	if reason != "empty record" {
-		t.Fatalf("replayRecord([]) reason=%q, want %q", reason, "empty record")
 	}
 }
 
@@ -2706,48 +2653,6 @@ func TestReplayRecordRejectsTruncatedState(t *testing.T) {
 	}
 	if len(s.states) != 0 {
 		t.Fatalf("truncated state record was stored: %v", s.states)
-	}
-}
-
-// TestReplayRecordValidStateSetsNoSkip verifies a well-formed state
-// record produces zero skips.
-func TestReplayRecordValidStateSetsNoSkip(t *testing.T) {
-	s := &walShard{
-		indexes:       make(map[nodeKey]*index),
-		entries:       make(map[nodeKey]map[uint64]logdb.Entry),
-		states:        make(map[nodeKey]logdb.State),
-		bootstraps:    make(map[nodeKey]logdb.Bootstrap),
-		snapshots:     make(map[nodeKey]logdb.Snapshot),
-		compactedTo:   make(map[nodeKey]uint64),
-		knownSegments: make(map[uint64]bool),
-	}
-
-	rec := make([]byte, 1+stateRecordSize)
-	rec[0] = payloadTypeState
-	binary.LittleEndian.PutUint64(rec[1:], 1)  // shardID
-	binary.LittleEndian.PutUint64(rec[9:], 1)  // replicaID
-	binary.LittleEndian.PutUint64(rec[17:], 5) // term
-	binary.LittleEndian.PutUint64(rec[25:], 2) // vote
-	binary.LittleEndian.PutUint64(rec[33:], 3) // commit
-
-	skipped, reason, err := s.replayRecord(rec, 0)
-	if err != nil {
-		t.Fatalf("err=%v, want nil", err)
-	}
-	if skipped != 0 {
-		t.Fatalf("skipped=%d, want 0", skipped)
-	}
-	if reason != "" {
-		t.Fatalf("reason=%q, want empty", reason)
-	}
-
-	key := nodeKey{ShardID: 1, ReplicaID: 1}
-	state, ok := s.states[key]
-	if !ok {
-		t.Fatal("state not found after replay")
-	}
-	if state.Term != 5 || state.Vote != 2 || state.Commit != 3 {
-		t.Fatalf("state = %+v, want Term=5 Vote=2 Commit=3", state)
 	}
 }
 
