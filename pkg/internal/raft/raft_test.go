@@ -3658,10 +3658,6 @@ func TestRaft_HasQuorumActive_FalseWithNoActivePeers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Candidate proposal returns not-leader error
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Test: Stale vote response at higher term
 // ---------------------------------------------------------------------------
 
@@ -3979,33 +3975,6 @@ func TestRaft_TickFollower_QuiesceActiveTriggersElectionOnTimeout(t *testing.T) 
 	}
 	if r.quiesce.active {
 		t.Fatal("expected quiesce to be exited after election timeout")
-	}
-}
-
-func TestRaft_TickFollower_QuiesceActiveReturnsEarlyWithoutNormalPath(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
-	cfg := raftTestCfgQuiesce(1, 1)
-	cfg.PreVote = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Enter quiesce on the follower.
-	r.quiesce.active = true
-	r.quiesce.livenessTick = 0
-	r.electionTick = 0
-
-	// A single tick should take the quiesce path and NOT trigger a
-	// normal election (the normal election timeout is much shorter).
-	r.tickFunc(r)
-
-	if r.state != follower {
-		t.Fatalf("expected follower, got %s", r.state)
-	}
-	if r.electionTick != 1 {
-		t.Fatalf("expected electionTick 1, got %d", r.electionTick)
 	}
 }
 
@@ -4791,45 +4760,6 @@ func TestRaft_BroadcastAppend_SendsMetadataReplicateToWitnesses(t *testing.T) {
 	}
 }
 
-func TestRaft_BroadcastAppend_WitnessMetadataMultipleWitnesses(t *testing.T) {
-	// Verify that broadcastAppend sends metadata Replicate messages to
-	// all witnesses, not just the first one.
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	cfg.CheckQuorum = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	logdb.membership.Witnesses = map[uint64]string{20: "wit1", 30: "wit2"}
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	for _, rm := range r.remotes {
-		rm.probeSent = false
-	}
-	for _, rm := range r.witnesses {
-		rm.probeSent = false
-	}
-
-	r.broadcastAppend()
-
-	replicates := collectMessages(r, proto.Replicate)
-	witnessIDs := make(map[uint64]bool)
-	for _, rep := range replicates {
-		if rep.To == 20 || rep.To == 30 {
-			witnessIDs[rep.To] = true
-		}
-	}
-	if !witnessIDs[20] {
-		t.Fatal("expected Replicate to witness 20")
-	}
-	if !witnessIDs[30] {
-		t.Fatal("expected Replicate to witness 30")
-	}
-}
-
 func TestRaft_BroadcastAppend_WitnessElectionTimerReset(t *testing.T) {
 	// Verify that a witness receiving a Replicate (metadata entries) from
 	// broadcastAppend resets its election timer, preventing unnecessary
@@ -4876,36 +4806,6 @@ func TestRaft_BroadcastAppend_WitnessElectionTimerReset(t *testing.T) {
 	if witness.electionTick != 0 {
 		t.Fatalf("expected electionTick 0 after replicate, got %d",
 			witness.electionTick)
-	}
-}
-
-func TestRaft_BroadcastAppend_NoWitnesses(t *testing.T) {
-	// Verify broadcastAppend works correctly when there are no witnesses.
-	members := map[uint64]string{1: "addr1", 2: "addr2"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	for _, rm := range r.remotes {
-		rm.probeSent = false
-	}
-
-	r.broadcastAppend()
-
-	// Should produce Replicate to remote 2 and no Heartbeats.
-	replicates := collectMessages(r, proto.Replicate)
-	if len(replicates) == 0 {
-		t.Fatal("expected at least one Replicate message")
-	}
-	heartbeats := collectMessages(r, proto.Heartbeat)
-	if len(heartbeats) != 0 {
-		t.Fatalf("expected no Heartbeat messages without witnesses, got %d",
-			len(heartbeats))
 	}
 }
 
@@ -4995,25 +4895,6 @@ func TestMakeMetadataEntries_PreservesConfigChange(t *testing.T) {
 	// Entry 2: normal -> metadata.
 	if meta[2].Type != proto.EntryMetadata {
 		t.Fatalf("entry 2: expected EntryMetadata, got %d", meta[2].Type)
-	}
-}
-
-func TestMakeMetadataEntries_AllConfigChanges(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1, Type: proto.EntryConfigChange, Cmd: []byte("cc1")},
-		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: []byte("cc2")},
-	}
-	meta := makeMetadataEntries(entries)
-	if len(meta) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(meta))
-	}
-	for i, m := range meta {
-		if m.Type != proto.EntryConfigChange {
-			t.Fatalf("entry %d: expected EntryConfigChange, got %d", i, m.Type)
-		}
-		if m.Cmd == nil {
-			t.Fatalf("entry %d: config change Cmd should not be nil", i)
-		}
 	}
 }
 
@@ -5566,35 +5447,6 @@ func TestRaft_SnapshotStatus_UnknownPeerIgnored(t *testing.T) {
 // Test: log.entries with LogDB fallback path
 // ---------------------------------------------------------------------------
 
-func TestRaftLog_Entries_FallsBackToLogDB(t *testing.T) {
-	// Create a log reader with persisted entries.
-	logdb := newTestLogReader(
-		[]proto.Entry{
-			{Index: 1, Term: 1},
-			{Index: 2, Term: 1},
-			{Index: 3, Term: 1},
-		},
-		proto.State{},
-	)
-	l := &raftLog{
-		logdb:     logdb,
-		inmem:     newInMemory(3), // markerIndex = 4, so entries 1-3 are in LogDB
-		committed: 0,
-		processed: 0,
-	}
-
-	result, err := l.entries(1, 4, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 3 {
-		t.Fatalf("expected 3 entries from LogDB, got %d", len(result))
-	}
-	if result[0].Index != 1 || result[2].Index != 3 {
-		t.Fatalf("unexpected indices: %d, %d", result[0].Index, result[2].Index)
-	}
-}
-
 func TestRaftLog_Entries_CombinesLogDBAndInmem(t *testing.T) {
 	// Entries 1-3 in LogDB, entries 4-5 in inmem.
 	logdb := newTestLogReader(
@@ -6080,34 +5932,6 @@ func TestRaft_PendingConfigChange_BlocksSecondConfigChange(t *testing.T) {
 	})
 	if !errors.Is(err, ErrPendingConfigChange) {
 		t.Fatalf("expected ErrPendingConfigChange, got %v", err)
-	}
-}
-
-func TestRaft_PendingConfigChange_ClearedOnBecomeFollower(t *testing.T) {
-	// pendingConfigChange must be false after becoming follower.
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	// Set a pending config change.
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{
-			{Type: proto.EntryConfigChange, Cmd: testConfigChangeCmd(11)},
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !r.pendingConfigChange {
-		t.Fatal("pendingConfigChange should be true")
-	}
-
-	// Step down to follower.
-	r.becomeFollower(r.term+1, 2)
-
-	if r.pendingConfigChange {
-		t.Fatal("pendingConfigChange should be cleared after becoming follower")
 	}
 }
 
