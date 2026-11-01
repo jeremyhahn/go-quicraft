@@ -49,6 +49,9 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+    # Only a CI run on main can be a red main; without this filter every PR
+    # CI completion started a run that the job `if:` below then skipped.
+    branches: [main]
 
 permissions:
   contents: read
