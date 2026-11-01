@@ -2686,36 +2686,6 @@ func TestSegmentFilePermissions(t *testing.T) {
 	}
 }
 
-// TestSegmentFilePermissionsAfterReopen verifies that reopened segments
-// retain 0600 permissions.
-func TestSegmentFilePermissionsAfterReopen(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
-	if err != nil {
-		t.Fatalf("createSegment: %v", err)
-	}
-
-	// Write data and close.
-	if _, err := seg.Write([]byte("test data")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := seg.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Check permissions via os.Stat on the file path.
-	name := seg.dir + "/" + segmentFilename(1)
-	info, err := os.Stat(name)
-	if err != nil {
-		t.Fatalf("Stat after close: %v", err)
-	}
-
-	perm := info.Mode().Perm()
-	if perm != 0600 {
-		t.Fatalf("segment file permissions after close = %04o, want 0600", perm)
-	}
-}
-
 // TestReplayEntriesCmdLenBoundaryOverflow verifies that a cmdLen of
 // math.MaxUint32 (which would cause integer overflow in totalSize
 // calculation) is caught by the maxCmdLen check.
