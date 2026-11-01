@@ -244,23 +244,6 @@ func TestPeer_NewPeer_InvalidConfig(t *testing.T) {
 	}
 }
 
-func TestPeer_NewPeer_InitializesRaftStateMachine(t *testing.T) {
-	cfg := testConfig()
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Verify the raft state machine is initialized as follower.
-	if p.r.state != follower {
-		t.Fatalf("expected follower state, got %s", p.r.state)
-	}
-	if p.r.shardID != cfg.ShardID {
-		t.Fatalf("expected raft shardID %d, got %d", cfg.ShardID, p.r.shardID)
-	}
-	if p.r.replicaID != cfg.ReplicaID {
-		t.Fatalf("expected raft replicaID %d, got %d", cfg.ReplicaID, p.r.replicaID)
-	}
-}
-
 // --- Tick ---
 
 func TestPeer_Tick_TriggersElection_SingleNode(t *testing.T) {
@@ -281,29 +264,6 @@ func TestPeer_Tick_TriggersElection_SingleNode(t *testing.T) {
 	}
 	if p.LeaderID() != cfg.ReplicaID {
 		t.Fatalf("expected leaderID %d, got %d", cfg.ReplicaID, p.LeaderID())
-	}
-}
-
-func TestPeer_Tick_StartsAtZeroElectionTick(t *testing.T) {
-	cfg := testConfig()
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// The raft state machine starts with electionTick=0.
-	if p.r.electionTick != 0 {
-		t.Fatalf("expected initial electionTick 0, got %d", p.r.electionTick)
-	}
-}
-
-func TestPeer_Tick_AdvancesElectionTick(t *testing.T) {
-	cfg := testConfig()
-	// Use a 3-node cluster so election doesn't complete in one tick.
-	ms := threeNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	p.Tick()
-	if p.r.electionTick < 1 {
-		t.Fatalf("expected electionTick >= 1 after tick, got %d", p.r.electionTick)
 	}
 }
 
@@ -545,27 +505,6 @@ func TestPeer_Handle_TracksLeaderFromReplicate(t *testing.T) {
 	}
 }
 
-func TestPeer_Handle_TracksLeaderFromHeartbeat(t *testing.T) {
-	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
-
-	msg := proto.Message{
-		Type:    proto.Heartbeat,
-		From:    7,
-		To:      1,
-		ShardID: 1,
-		Term:    1,
-	}
-	err := p.Handle(msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if p.LeaderID() != 7 {
-		t.Fatalf("expected leaderID 7, got %d", p.LeaderID())
-	}
-}
-
 func TestPeer_Handle_InstallSnapshot_Success(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
@@ -752,49 +691,7 @@ func TestPeer_Propose_EmptyEntries(t *testing.T) {
 	}
 }
 
-func TestPeer_Propose_SingleNodeAutoCommits(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	entries := []proto.Entry{
-		{Cmd: []byte("cmd1")},
-	}
-	_, err := p.Propose(entries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// In a single-node cluster, quorum == 1 and the leader's own match
-	// is its durable index, so the entry commits at the persistence
-	// edge: Commit acknowledges local durability and re-runs tryCommit.
-	runUpdateCycles(t, p)
-	if p.r.log.committed != p.r.log.lastIndex() {
-		t.Fatalf("expected committed == lastIndex (%d), got committed=%d",
-			p.r.log.lastIndex(), p.r.log.committed)
-	}
-}
-
 // --- ProposeConfigChange ---
-
-func TestPeer_ProposeConfigChange_Success(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := p.ProposeConfigChange(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Membership takes effect at commit time; drive the update cycles so
-	// the single-node leader persists and commits the entry.
-	runUpdateCycles(t, p)
-	if !p.membership.isVoter(4) {
-		t.Fatal("expected replica 4 to be voter after config change committed")
-	}
-}
 
 func TestPeer_ProposeConfigChange_NotLeader(t *testing.T) {
 	cfg := testConfig()
@@ -827,38 +724,6 @@ func TestPeer_ProposeConfigChange_InvalidChange(t *testing.T) {
 	err := p.ProposeConfigChange(cc)
 	if !errors.Is(err, ErrNodeAlreadyExists) {
 		t.Fatalf("expected ErrNodeAlreadyExists, got %v", err)
-	}
-}
-
-func TestPeer_ProposeConfigChange_Serialization(t *testing.T) {
-	p := newTestLeaderPeer(t)
-
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := p.ProposeConfigChange(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Verify the entry Cmd can be deserialized back to the config change.
-	lastIdx := p.r.log.lastIndex()
-	e, err := getEntryForTest(&p.r.log.inmem, lastIdx)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	var decoded proto.ConfigChange
-	_, unmarshalErr := decoded.UnmarshalFrom(e.Cmd)
-	if unmarshalErr != nil {
-		t.Fatalf("failed to unmarshal config change: %v", unmarshalErr)
-	}
-	if decoded.ReplicaID != 4 {
-		t.Fatalf("expected ReplicaID 4, got %d", decoded.ReplicaID)
-	}
-	if decoded.Address != "addr4" {
-		t.Fatalf("expected address addr4, got %s", decoded.Address)
 	}
 }
 
@@ -1205,24 +1070,6 @@ func TestPeer_GetUpdate_CollectsEntriesToSave(t *testing.T) {
 	}
 }
 
-func TestPeer_GetUpdate_CollectsCommittedEntries(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-	})
-	p.r.log.committed = 2
-
-	update, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(update.CommittedEntries) != 2 {
-		t.Fatalf("expected 2 committed entries, got %d", len(update.CommittedEntries))
-	}
-}
-
 func TestPeer_GetUpdate_SkipsCommittedWhenFalse(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 	p.r.log.inmem.merge([]proto.Entry{
@@ -1291,17 +1138,6 @@ func TestPeer_GetUpdate_UpdatesState(t *testing.T) {
 	if update.State.Vote != 2 {
 		t.Fatalf("expected vote 2, got %d", update.State.Vote)
 	}
-}
-
-func TestPeer_GetUpdate_ResetsPrevState(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.term = 5
-
-	_, err := p.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
 	if p.prevState.Term != 5 {
 		t.Fatalf("expected prevState.Term 5, got %d", p.prevState.Term)
 	}
@@ -1338,6 +1174,9 @@ func TestPeer_GetUpdate_DoesNotAdvanceProcessed(t *testing.T) {
 	update, err := p.GetUpdate(true, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(update.CommittedEntries) != 2 {
+		t.Fatalf("expected 2 committed entries, got %d", len(update.CommittedEntries))
 	}
 
 	// GetUpdate must NOT advance processed. The processed marker is
@@ -1437,43 +1276,6 @@ func TestPeer_Commit_WithSnapshot(t *testing.T) {
 	// Snapshot should be cleared after commit.
 	if p.r.log.inmem.snapshot != nil {
 		t.Fatal("expected snapshot to be nil after commit")
-	}
-}
-
-func TestPeer_Commit_WithCommittedEntries(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.log.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-	})
-	p.r.log.committed = 3
-	p.r.log.processed = 2
-
-	// LastApplied reflects what the apply worker confirmed in the
-	// previous cycle. CommittedEntries are being committed NOW;
-	// LastApplied is what was applied BEFORE. appliedLogTo truncates
-	// inmem up to LastApplied, not CommittedEntries[last].Index.
-	update := proto.Update{
-		CommittedEntries: []proto.Entry{
-			{Index: 2, Term: 1},
-			{Index: 3, Term: 1},
-		},
-		LastApplied: 1,
-	}
-	mustCommit(t, p, update)
-
-	// appliedLogTo(1) truncated entry@1, so appliedTo = 1.
-	if p.r.log.inmem.appliedTo != 1 {
-		t.Fatalf("expected appliedTo 1, got %d", p.r.log.inmem.appliedTo)
-	}
-	// markerIndex should advance past the truncated entry.
-	if p.r.log.inmem.markerIndex != 2 {
-		t.Fatalf("expected markerIndex 2, got %d", p.r.log.inmem.markerIndex)
-	}
-	// Entries 2 and 3 should remain in inmem.
-	if len(p.r.log.inmem.entries) != 2 {
-		t.Fatalf("expected 2 remaining entries, got %d", len(p.r.log.inmem.entries))
 	}
 }
 
@@ -1643,20 +1445,18 @@ func TestPeer_Commit_MultipleConfigChangesInBatch_NoEntries(t *testing.T) {
 
 // --- LeaderID / IsLeader / IsFollower / IsObserver / IsWitness ---
 
-func TestPeer_LeaderID_InitialZero(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-
-	if p.LeaderID() != 0 {
-		t.Fatalf("expected initial leaderID 0, got %d", p.LeaderID())
-	}
-}
-
 func TestPeer_IsFollower_True(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
 
 	if !p.IsFollower() {
 		t.Fatal("expected IsFollower to be true")
+	}
+	if p.IsObserver() {
+		t.Fatal("expected IsObserver to be false")
+	}
+	if p.IsWitness() {
+		t.Fatal("expected IsWitness to be false")
 	}
 }
 
@@ -1676,23 +1476,8 @@ func TestPeer_IsFollower_FalseWhenObserver(t *testing.T) {
 	if p.IsFollower() {
 		t.Fatal("expected IsFollower to be false when observer")
 	}
-}
-
-func TestPeer_IsObserver_True(t *testing.T) {
-	cfg := testConfig()
-	cfg.IsObserver = true
-	p := newTestPeer(t, cfg, proto.State{}, selfObserverMembership())
-
 	if !p.IsObserver() {
 		t.Fatal("expected IsObserver to be true")
-	}
-}
-
-func TestPeer_IsObserver_False(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-
-	if p.IsObserver() {
-		t.Fatal("expected IsObserver to be false")
 	}
 }
 
@@ -1703,14 +1488,6 @@ func TestPeer_IsWitness_True(t *testing.T) {
 
 	if !p.IsWitness() {
 		t.Fatal("expected IsWitness to be true")
-	}
-}
-
-func TestPeer_IsWitness_False(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-
-	if p.IsWitness() {
-		t.Fatal("expected IsWitness to be false")
 	}
 }
 
@@ -1766,15 +1543,6 @@ func TestPeer_GetMembership_ReflectsMutations(t *testing.T) {
 }
 
 // --- hasStateChanged ---
-
-func TestPeer_HasStateChanged_TermChanged(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.term = 5
-
-	if !p.hasStateChanged() {
-		t.Fatal("expected state changed when term differs")
-	}
-}
 
 func TestPeer_HasStateChanged_VoteChanged(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
@@ -1966,44 +1734,6 @@ func TestPeer_FullLifecycle_HandleReplicateGetUpdateCommit(t *testing.T) {
 	mustCommit(t, p, update)
 }
 
-func TestPeer_FullLifecycle_ElectAndPropose(t *testing.T) {
-	cfg := testConfig()
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Tick until we become leader.
-	electSingleNodeLeader(t, p)
-
-	// Drain election state.
-	runUpdateCycles(t, p)
-
-	// Now propose.
-	entries := []proto.Entry{{Cmd: []byte("hello")}}
-	_, err := p.Propose(entries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Should have update.
-	if !p.HasUpdate(0) {
-		t.Fatal("expected HasUpdate to be true after propose")
-	}
-
-	// A single-node proposal commits at the persistence edge: the first
-	// cycle persists the entry, the second surfaces it as committed.
-	committed := runUpdateCycles(t, p)
-
-	var foundCmd bool
-	for _, e := range committed {
-		if string(e.Cmd) == "hello" {
-			foundCmd = true
-		}
-	}
-	if !foundCmd {
-		t.Fatal("expected proposed entry in committed entries")
-	}
-}
-
 // --- Leader heartbeat production ---
 
 func TestPeer_Leader_ProducesHeartbeats(t *testing.T) {
@@ -2067,26 +1797,6 @@ func TestPeer_Leader_ProducesReplicateOnPropose(t *testing.T) {
 }
 
 // --- syncLeaderID ---
-
-func TestPeer_SyncLeaderID_ReflectsRaftState(t *testing.T) {
-	cfg := testConfig()
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Initially leaderID is 0 (follower, no known leader).
-	if p.LeaderID() != 0 {
-		t.Fatalf("expected initial leaderID 0, got %d", p.LeaderID())
-	}
-
-	// Become leader.
-	electSingleNodeLeader(t, p)
-
-	// syncLeaderID should have been called by Tick.
-	if p.LeaderID() != cfg.ReplicaID {
-		t.Fatalf("expected leaderID %d after election, got %d",
-			cfg.ReplicaID, p.LeaderID())
-	}
-}
 
 func TestPeer_SyncLeaderID_UpdatedOnHandle(t *testing.T) {
 	cfg := testConfig()

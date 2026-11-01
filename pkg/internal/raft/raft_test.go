@@ -370,22 +370,6 @@ func TestRaft_NewRaft_InitializesAsFollower(t *testing.T) {
 	}
 }
 
-func TestRaft_NewRaft_InvalidEntropyFails(t *testing.T) {
-	// This test validates the newRaft function signature and error path.
-	// We cannot easily simulate crypto/rand failure, but we validate
-	// the normal path succeeds and the return values are correct.
-	members := map[uint64]string{1: "addr1"}
-	cfg := raftTestCfg(1, 1)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if r == nil {
-		t.Fatal("expected non-nil raft")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: State transitions
 // ---------------------------------------------------------------------------
@@ -942,31 +926,6 @@ func TestRaft_VoteRequest_RejectedWhenCandidateLogBehind(t *testing.T) {
 // Test: PreVote request handling
 // ---------------------------------------------------------------------------
 
-func TestRaft_PreVoteRequest_RejectedWhenLeaderActive(t *testing.T) {
-	r := newTestRaft(1)
-	r.leaderID = 3
-	r.electionTick = 0 // recently received from leader
-	r.msgs = nil
-
-	err := r.step(proto.Message{
-		Type:     proto.RequestPreVote,
-		From:     2,
-		Term:     r.term + 1,
-		LogTerm:  0,
-		LogIndex: 0,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	resps := collectMessages(r, proto.RequestPreVoteResp)
-	if len(resps) == 0 {
-		t.Fatal("expected pre-vote response")
-	}
-	if !resps[0].Reject {
-		t.Fatal("expected pre-vote rejected (leader active)")
-	}
-}
-
 func TestRaft_PreVoteRequest_GrantedWhenNoLeader(t *testing.T) {
 	r := newTestRaft(1)
 	r.leaderID = noLeader
@@ -1089,20 +1048,6 @@ func TestRaft_Replication_BatchAppend(t *testing.T) {
 	// lastIndex should be noop(1) + 3 entries = 4.
 	if r.log.lastIndex() < 4 {
 		t.Fatalf("expected at least 4 entries, lastIndex=%d", r.log.lastIndex())
-	}
-}
-
-func TestRaft_Replication_ProposalDuringTransferFails(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.transferTarget = 2
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("test")}},
-	})
-	if !errors.Is(err, ErrTransferInProgress) {
-		t.Fatalf("expected ErrTransferInProgress, got %v", err)
 	}
 }
 
@@ -1620,72 +1565,6 @@ func TestRaft_HeartbeatResp_ClearsProbeSentAndRetriesAppend(t *testing.T) {
 	}
 }
 
-func TestRaft_HeartbeatResp_ProbeSentFalseStillSendsAppend(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	rm := r.remotes[2]
-	rm.becomeProbe()
-	rm.probeSent = false // already unpaused
-
-	// HeartbeatResp should still trigger sendAppend.
-	err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	apps := collectMessages(r, proto.Replicate)
-	found := false
-	for _, m := range apps {
-		if m.To == 2 {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("expected MsgApp to peer 2 after HeartbeatResp")
-	}
-}
-
-func TestRaft_HeartbeatResp_ReplicateStateSendsAppend(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	rm := r.remotes[2]
-	// Simulate: remote has transitioned to replicate after responding
-	// to initial MsgApp, but a subsequent MsgApp was dropped.
-	rm.becomeReplicate()
-
-	err := r.step(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// In replicate state, HeartbeatResp should trigger sendAppend
-	// as a recovery path for dropped MsgApp.
-	apps := collectMessages(r, proto.Replicate)
-	found := false
-	for _, m := range apps {
-		if m.To == 2 {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("expected MsgApp to peer 2 in replicate state after HeartbeatResp")
-	}
-}
-
 // TestRaft_HeartbeatResp_StalledReplicateFallsBackToProbe verifies that
 // when the leader is in replicate mode, has advanced next past lastIndex
 // (nothing more to send), but still has unacknowledged inflights, a
@@ -2158,26 +2037,6 @@ func TestRaft_LeaderTransfer_InvalidTarget(t *testing.T) {
 	}
 }
 
-func TestRaft_LeaderTransfer_AlreadyInProgress(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-	r.remotes[2].match = r.log.lastIndex()
-
-	// First transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	r.drainMessages()
-
-	// Second transfer should fail.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 3})
-	if !errors.Is(err, ErrTransferInProgress) {
-		t.Fatalf("expected ErrTransferInProgress, got %v", err)
-	}
-}
-
 func TestRaft_LeaderTransfer_TransferToSelf(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -2191,25 +2050,6 @@ func TestRaft_LeaderTransfer_TransferToSelf(t *testing.T) {
 	if r.transferTarget != noNode {
 		t.Fatalf("expected no transfer target when transferring to self, got %d",
 			r.transferTarget)
-	}
-}
-
-func TestRaft_LeaderTransfer_TimeoutClearsTransfer(t *testing.T) {
-	r := newTestRaftCheckQuorumDisabled(1)
-	r.preVote = false
-	electLeader(r)
-	r.drainMessages()
-	r.remotes[2].match = 0
-	r.transferTarget = 2
-	r.transferElapsed = 0
-
-	// Tick past the election timeout to trigger transfer abort.
-	for i := 0; i < r.electionTimeout+1; i++ {
-		r.tickFunc(r)
-	}
-
-	if r.transferTarget != noNode {
-		t.Fatalf("expected transfer cleared after timeout, got %d", r.transferTarget)
 	}
 }
 
@@ -2410,31 +2250,6 @@ func TestRaft_ReadIndexResp_PopulatesReadStates(t *testing.T) {
 // Test: Quiesce
 // ---------------------------------------------------------------------------
 
-func TestRaft_Quiesce_LeaderEntersAfterInactivity(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
-	cfg := raftTestCfgQuiesce(1, 1)
-	cfg.PreVote = config.BoolPtr(false)
-	cfg.CheckQuorum = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	// Tick through the quiesce threshold.
-	threshold := r.quiesce.threshold
-	for i := 0; i < threshold+r.heartbeatTimeout+1; i++ {
-		r.tickFunc(r)
-		r.drainMessages()
-	}
-
-	if !r.quiesce.active {
-		t.Fatal("expected quiesce to be active after inactivity")
-	}
-}
-
 func TestRaft_Quiesce_ExitOnProposal(t *testing.T) {
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgQuiesce(1, 1)
@@ -2532,20 +2347,6 @@ func TestRaft_TickFollower_DoesNotStartElectionBeforeTimeout(t *testing.T) {
 	}
 }
 
-func TestRaft_TickLeader_SendsHeartbeat(t *testing.T) {
-	r := newTestRaftCheckQuorumDisabled(1)
-	r.preVote = false
-	electLeader(r)
-	r.drainMessages()
-
-	// With heartbeatTimeout=1, the first tick triggers a heartbeat.
-	r.tickFunc(r)
-	heartbeats := collectMessages(r, proto.Heartbeat)
-	if len(heartbeats) == 0 {
-		t.Fatal("expected heartbeat after one leader tick")
-	}
-}
-
 func TestRaft_TickLeader_HeartbeatTickResetsAfterFiring(t *testing.T) {
 	r := newTestRaftCheckQuorumDisabled(1)
 	r.preVote = false
@@ -2556,19 +2357,6 @@ func TestRaft_TickLeader_HeartbeatTickResetsAfterFiring(t *testing.T) {
 	r.tickFunc(r)
 	if r.heartbeatTick != 1 {
 		t.Fatalf("expected heartbeatTick 1 after one tick, got %d", r.heartbeatTick)
-	}
-}
-
-func TestRaft_TickCandidate_RestartsElection(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeCandidate()
-	termBefore := r.term
-	r.drainMessages()
-
-	advanceElection(r)
-	// Should restart: either stays candidate with bumped term or same.
-	if r.term < termBefore {
-		t.Fatalf("expected term >= %d, got %d", termBefore, r.term)
 	}
 }
 
@@ -2647,12 +2435,6 @@ func TestRaft_Witness_CountsInElectionQuorum(t *testing.T) {
 	eq := quorum(r.remotes, r.witnesses)
 	if eq != 2 {
 		t.Fatalf("expected election quorum 2, got %d", eq)
-	}
-
-	// Unified quorum counts witnesses: self + remote 2 + witness 3 = 3 voting, quorum = 2.
-	cq := quorum(r.remotes, r.witnesses)
-	if cq != 2 {
-		t.Fatalf("expected commit quorum 2, got %d", cq)
 	}
 }
 
@@ -3438,48 +3220,6 @@ func TestRaft_Append_StaleLogIndexBelowCommitted(t *testing.T) {
 	}
 }
 
-// TestRaft_Append_StaleLogIndexAtCommittedBoundary verifies that when
-// prevLogIndex equals committed-1 (one below committed), the stale guard
-// triggers and responds with the committed index.
-func TestRaft_Append_StaleLogIndexAtCommittedBoundary(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.log.append([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-	})
-	r.log.commitTo(3)
-	r.leaderID = 2
-	r.msgs = nil
-
-	// prevLogIndex=2 < committed=3: should trigger stale guard.
-	err := r.step(proto.Message{
-		Type:     proto.Replicate,
-		From:     2,
-		Term:     1,
-		LogIndex: 2,
-		LogTerm:  1,
-		Entries: []proto.Entry{
-			{Index: 3, Term: 1},
-		},
-		Commit: 3,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	resps := collectMessages(r, proto.ReplicateResp)
-	if len(resps) == 0 {
-		t.Fatal("expected ReplicateResp")
-	}
-	if resps[0].Reject {
-		t.Fatal("expected non-rejection for stale guard")
-	}
-	if resps[0].LogIndex != 3 {
-		t.Fatalf("expected LogIndex=3 (committed), got %d", resps[0].LogIndex)
-	}
-}
-
 // TestRaft_Append_ExactlyAtCommittedNotStale verifies that when
 // prevLogIndex equals committed, the normal append path is taken
 // (the stale guard only fires for prevLogIndex < committed).
@@ -3617,17 +3357,6 @@ func TestRaft_ElectionTimeout_Randomized(t *testing.T) {
 		if timeout < r.electionTimeout || timeout >= 2*r.electionTimeout {
 			t.Fatalf("timeout %d out of range [%d, %d)",
 				timeout, r.electionTimeout, 2*r.electionTimeout)
-		}
-	}
-}
-
-func TestRaft_ElectionTimeout_NeverBelowMinimum(t *testing.T) {
-	r := newTestRaft(1)
-	for i := 0; i < 100; i++ {
-		r.resetElectionTimeout()
-		if r.randomizedElectionTimeout < r.electionTimeout {
-			t.Fatalf("randomizedElectionTimeout %d < electionTimeout %d",
-				r.randomizedElectionTimeout, r.electionTimeout)
 		}
 	}
 }

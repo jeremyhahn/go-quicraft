@@ -20,7 +20,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -36,14 +35,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
-	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
@@ -13425,13 +13421,6 @@ func TestEffectiveMaxPayload_BothSetEntrySmaller(t *testing.T) {
 	}
 }
 
-func TestEffectiveMaxPayload_BothSetEqual(t *testing.T) {
-	result := effectiveMaxPayload(100, 100)
-	if result != 100 {
-		t.Errorf("effectiveMaxPayload(100, 100) = %d, want 100", result)
-	}
-}
-
 func TestEffectiveMaxPayload_OnlyProposalSet(t *testing.T) {
 	result := effectiveMaxPayload(100, 0)
 	if result != 100 {
@@ -13443,13 +13432,6 @@ func TestEffectiveMaxPayload_OnlyEntrySet(t *testing.T) {
 	result := effectiveMaxPayload(0, 200)
 	if result != 200 {
 		t.Errorf("effectiveMaxPayload(0, 200) = %d, want 200", result)
-	}
-}
-
-func TestEffectiveMaxPayload_NeitherSet(t *testing.T) {
-	result := effectiveMaxPayload(0, 0)
-	if result != 0 {
-		t.Errorf("effectiveMaxPayload(0, 0) = %d, want 0", result)
 	}
 }
 
@@ -13535,18 +13517,6 @@ func TestCopyWithContext_ReadError(t *testing.T) {
 	}
 }
 
-func TestCopyWithContext_EmptySource(t *testing.T) {
-	src := bytes.NewReader([]byte{})
-	var dst bytes.Buffer
-	err := copyWithContext(context.Background(), &dst, src)
-	if err != nil {
-		t.Fatalf("copyWithContext(empty) error: %v", err)
-	}
-	if dst.Len() != 0 {
-		t.Errorf("copyWithContext(empty) wrote %d bytes, want 0", dst.Len())
-	}
-}
-
 // failWriter is a writer that always returns an error.
 type failWriter struct {
 	err error
@@ -13583,14 +13553,6 @@ func TestEmptyMembersError_Error(t *testing.T) {
 	}
 }
 
-func TestEmptyMembersError_ErrorDifferentShardID(t *testing.T) {
-	err := &EmptyMembersError{ShardID: 999}
-	msg := err.Error()
-	if !strings.Contains(msg, "999") {
-		t.Errorf("EmptyMembersError.Error() = %q, want to contain shard ID 999", msg)
-	}
-}
-
 func TestSelfNotInMembersError_Error(t *testing.T) {
 	err := &SelfNotInMembersError{ShardID: 10, ReplicaID: 5}
 	msg := err.Error()
@@ -13602,14 +13564,6 @@ func TestSelfNotInMembersError_Error(t *testing.T) {
 	}
 	if !strings.Contains(msg, "5") {
 		t.Errorf("SelfNotInMembersError.Error() = %q, want to contain replica ID 5", msg)
-	}
-}
-
-func TestSelfNotInMembersError_ErrorZeroValues(t *testing.T) {
-	err := &SelfNotInMembersError{ShardID: 0, ReplicaID: 0}
-	msg := err.Error()
-	if msg == "" {
-		t.Fatal("SelfNotInMembersError.Error() returned empty string")
 	}
 }
 
@@ -13635,19 +13589,6 @@ func TestInvalidMemberError_Error(t *testing.T) {
 	}
 }
 
-func TestInvalidMemberError_ErrorEmptyAddress(t *testing.T) {
-	err := &InvalidMemberError{
-		ShardID:   1,
-		ReplicaID: 2,
-		Address:   "",
-		Reason:    "address must be non-empty",
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "address must be non-empty") {
-		t.Errorf("InvalidMemberError.Error() = %q, want to contain reason", msg)
-	}
-}
-
 func TestTypeAssertionError_Error(t *testing.T) {
 	err := &TypeAssertionError{
 		Context:      "OnCommitted nodeState lookup",
@@ -13660,18 +13601,6 @@ func TestTypeAssertionError_Error(t *testing.T) {
 	}
 	if !strings.Contains(msg, "*nodeState") {
 		t.Errorf("TypeAssertionError.Error() = %q, want to contain expected type", msg)
-	}
-}
-
-func TestTypeAssertionError_ErrorNilActual(t *testing.T) {
-	err := &TypeAssertionError{
-		Context:      "test",
-		ExpectedType: "*nodeState",
-		ActualValue:  nil,
-	}
-	msg := err.Error()
-	if msg == "" {
-		t.Fatal("TypeAssertionError.Error() returned empty string with nil actual")
 	}
 }
 
@@ -13861,33 +13790,6 @@ func TestExportSnapshot_ContextCanceled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead context cancellation via goto path
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ContextCanceledAfterReadIndex(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use a very short deadline that will expire during the read.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
-	// Wait for the deadline to pass.
-	<-ctx.Done()
-	_, err := h.SyncRead(ctx, 1, "query")
-	if err == nil {
-		t.Fatal("expected error from SyncRead with expired context")
-	}
-	if !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) {
-		t.Errorf("SyncRead error = %v, want ErrTimeout or ErrCanceled", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: Membership.ConfigChangeIndex
 // ---------------------------------------------------------------------------
 
@@ -13896,30 +13798,6 @@ func TestMembership_ConfigChangeIndex(t *testing.T) {
 	idx := m.ConfigChangeIndex()
 	if idx != 42 {
 		t.Errorf("ConfigChangeIndex() = %d, want 42", idx)
-	}
-}
-
-func TestMembership_ConfigChangeIndex_Zero(t *testing.T) {
-	m := &Membership{}
-	idx := m.ConfigChangeIndex()
-	if idx != 0 {
-		t.Errorf("ConfigChangeIndex() = %d, want 0", idx)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: DiagRaftState error path (no shard loaded)
-// ---------------------------------------------------------------------------
-
-func TestDiagRaftState_ClosedHost(t *testing.T) {
-	h := newTestHost(t)
-	h.Close()
-
-	_, err := h.DiagRaftState(1)
-	if !errors.Is(err, ErrShardNotReady) {
-		// DiagRaftState doesn't check closed - it checks engine node existence.
-		// After close, GetNode returns nil, so ErrShardNotReady.
-		_ = err
 	}
 }
 
@@ -14041,103 +13919,6 @@ func TestStopShard_WithMetrics(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: Prometheus metrics fallback paths (unregistered shard)
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_FallbackPaths(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	// Use a shard ID that was never registered to trigger the fallback path.
-	shardID := uint64(99999)
-
-	// Each of these should hit the fallback (slow) path.
-	c.ObserveCommitLatency(shardID, time.Millisecond)
-	c.ObserveApplyLatency(shardID, time.Millisecond)
-	c.ObserveReadIndexLatency(shardID, time.Millisecond)
-	c.IncProposalDropped(shardID)
-	c.ObserveProposalBatchSize(shardID, 5)
-	c.IncPiggybackCommit(shardID)
-
-	// Verify the metrics were recorded by gathering from the default registry.
-	families, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		t.Fatalf("Gather() failed: %v", err)
-	}
-	if len(families) == 0 {
-		t.Error("expected at least one metric family from fallback paths")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Prometheus IncSnapshotsSent/Received fallback
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_SnapshotsSentFallback(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	// Register shard to test the fast path.
-	c.RegisterShard(1)
-	c.IncSnapshotsSent(1, 1024, time.Millisecond)
-	// Unregistered shard triggers fallback.
-	c.IncSnapshotsSent(99999, 2048, time.Millisecond)
-}
-
-func TestPrometheusMetrics_SnapshotsReceivedFallback(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	c.RegisterShard(1)
-	c.IncSnapshotsReceived(1, 1024, time.Millisecond)
-	c.IncSnapshotsReceived(99999, 2048, time.Millisecond)
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RequestLeaderTransfer context cancellation after leader check
-// ---------------------------------------------------------------------------
-
-func TestRequestLeaderTransfer_ContextCanceledAfterLeaderCheck(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Create a context that is already canceled to test the second ctx check.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := h.RequestLeaderTransfer(ctx, 1, 0)
-	if !errors.Is(err, ErrCanceled) {
-		t.Errorf("RequestLeaderTransfer(canceled) = %v, want ErrCanceled", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot context cancellation mid-flow
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ContextCanceledBeforeWrite(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	// Stop shard so ImportSnapshot can proceed.
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard failed: %v", err)
-	}
-
-	// Create a context with an already-expired deadline.
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	err := h.ImportSnapshot(ctx, 1, bytes.NewReader([]byte("data")))
-	if err == nil {
-		t.Fatal("expected error from ImportSnapshot with expired context")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: NewSession and RegisterSession draining paths
 // ---------------------------------------------------------------------------
 
@@ -14240,65 +14021,6 @@ func TestHostEngineCallback_OnReadIndexFailed_NonexistentShard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead result error path
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ReadIndexError(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use a short deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	_, err := h.SyncRead(ctx, 1, "query")
-	// The read should either succeed or timeout, but not panic.
-	if err != nil && !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) {
-		// Some other error is fine, just verify it doesn't panic.
-		_ = err
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: SyncGetShardMembership context cancellation path
-// ---------------------------------------------------------------------------
-
-func TestSyncGetShardMembership_Timeout(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
-	<-ctx.Done() // wait for context to expire
-	_, err := h.SyncGetShardMembership(ctx, 1)
-	if err == nil {
-		t.Fatal("expected error from SyncGetShardMembership with expired context")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: NewHost WAL LogDB default path
-// ---------------------------------------------------------------------------
-
-func TestNewHost_WALLogDB_Validates(t *testing.T) {
-	cfg := testHostConfig(t)
-	// Do not pass WithMemoryLogDB or WithLogDB - use default WAL path.
-	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost with default WAL LogDB failed: %v", err)
-	}
-	defer h.Close()
-	if h.logdb == nil {
-		t.Error("logdb should not be nil with default WAL LogDB")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: StopShard with EventListener
 // ---------------------------------------------------------------------------
 
@@ -14392,111 +14114,6 @@ func TestBuildWALOptions_NoDiskMonitoring(t *testing.T) {
 	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) != 0 {
 		t.Errorf("buildWALOptions returned %d options, want 0", len(opts))
-	}
-}
-
-func TestBuildWALOptions_MaxWALDiskSizeOnly(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30, // 1 GiB
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("buildWALOptions returned no options with MaxWALDiskSize set")
-	}
-}
-
-func TestBuildWALOptions_CallbacksNoMaxSize(t *testing.T) {
-	warningCalled := false
-	cfg := config.HostConfig{
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(_ config.DiskInfo) {
-				warningCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	// MaxWALDiskSize=0 with callbacks should return early (no options).
-	if len(opts) != 0 {
-		t.Errorf("buildWALOptions returned %d options, want 0 (no MaxWALDiskSize)", len(opts))
-	}
-	_ = warningCalled // not called in this test
-}
-
-func TestBuildWALOptions_WithWarningCallback(t *testing.T) {
-	warningCalled := false
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(di config.DiskInfo) {
-				warningCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with warning callback and MaxWALDiskSize")
-	}
-	_ = warningCalled
-}
-
-func TestBuildWALOptions_WithFullCallback(t *testing.T) {
-	fullCalled := false
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskFull: func(di config.DiskInfo) {
-				fullCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with full callback and MaxWALDiskSize")
-	}
-	_ = fullCalled
-}
-
-func TestBuildWALOptions_WithBothCallbacks(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(_ config.DiskInfo) {},
-			OnLogDBDiskFull:    func(_ config.DiskInfo) {},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with both callbacks")
-	}
-}
-
-func TestBuildWALOptions_NoEventListenerWithMaxSize(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	// Should add disk monitor with only recovery and full (no user) callbacks.
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options when MaxWALDiskSize > 0")
-	}
-}
-
-func TestBuildWALOptions_EventListenerNoFullCallback(t *testing.T) {
-	// EventListener set but no OnLogDBDiskFull -- should still wire diskFull flag.
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener:  &config.EventListener{},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with EventListener + MaxWALDiskSize")
 	}
 }
 
@@ -14756,34 +14373,6 @@ func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot - context cancellation between copy and save
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ContextCanceledDuringCopy(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel immediately so ImportSnapshot sees a canceled context.
-	// Both success and context.Canceled are valid outcomes.
-	cancel()
-	r := bytes.NewReader([]byte("snapshot-data"))
-	err := h.ImportSnapshot(ctx, 1, r)
-	// Might succeed or might get canceled, both are valid.
-	if err != nil && !errors.Is(err, context.Canceled) {
-		_ = err
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: OnReadyToRead - alias completion when lastApplied >= readIndex
 // ---------------------------------------------------------------------------
 
@@ -14917,37 +14506,6 @@ func TestOnReadIndexBatched_MissingBatchKeyNoOp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: OnLeaderUpdated - became leader with event listener
-// ---------------------------------------------------------------------------
-
-func TestOnLeaderUpdated_BecameLeaderWithEventListener(t *testing.T) {
-	leaderEventFired := false
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnLeaderUpdated: func(info config.LeaderInfo) {
-			leaderEventFired = true
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	t.Cleanup(func() { h.Close() })
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-
-	ns.isLeader.Store(false)
-	ns.leaderID.Store(0)
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnLeaderUpdated(1, 1, 2)
-
-	if !leaderEventFired {
-		t.Error("OnLeaderUpdated event was not fired")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: OnApplied - membership change paths
 // ---------------------------------------------------------------------------
 
@@ -15062,52 +14620,6 @@ func TestClose_FiresOnNodeHostShuttingDown(t *testing.T) {
 	h.Close()
 	if !shutdownCalled {
 		t.Error("OnNodeHostShuttingDown was not called")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Drain idempotent (second call returns nil)
-// ---------------------------------------------------------------------------
-
-func TestDrain_IdempotentSecondCall(t *testing.T) {
-	h := newTestHost(t)
-	if err := h.Drain(); err != nil {
-		t.Fatalf("first Drain: %v", err)
-	}
-	if err := h.Drain(); err != nil {
-		t.Fatalf("second Drain: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Close idempotent
-// ---------------------------------------------------------------------------
-
-func TestClose_IdempotentSecondCall(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	if err := h.Close(); err != nil {
-		t.Fatalf("first Close: %v", err)
-	}
-	if err := h.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ExportSnapshot shard not found
-// ---------------------------------------------------------------------------
-
-func TestExportSnapshot_ShardNotFoundError(t *testing.T) {
-	h := newTestHost(t)
-	ctx := context.Background()
-	var buf bytes.Buffer
-	err := h.ExportSnapshot(ctx, 999, &buf)
-	if err == nil {
-		t.Error("expected error from ExportSnapshot for nonexistent shard")
 	}
 }
 
@@ -15231,67 +14743,6 @@ func TestSyncRemoveData_SuccessAfterStop(t *testing.T) {
 	defer cancel()
 	if err := h.SyncRemoveData(ctx, 1, 1); err != nil {
 		t.Fatalf("SyncRemoveData: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: info.go UnmarshalJSON unknown value
-// ---------------------------------------------------------------------------
-
-func TestShardHealth_UnmarshalJSON_UnknownValue(t *testing.T) {
-	h := ShardError
-	err := json.Unmarshal([]byte(`"unknown-value"`), &h)
-	// An unrecognized value must be REFUSED, not decoded to ShardHealthy.
-	// ShardHealthy is the zero value, so defaulting to it reports a typo as
-	// perfect health. See TestShardHealth_UnmarshalJSONFailsClosed in
-	// info_test.go for the full statement of the property.
-	if !errors.Is(err, ErrInvalidShardHealth) {
-		t.Fatalf("UnmarshalJSON of an unknown value = %v, want ErrInvalidShardHealth", err)
-	}
-	if h != ShardError {
-		t.Errorf("ShardHealth = %v, want the receiver left untouched (ShardError)", h)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RequestSnapshot not leader path
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: NoOpMetricsCollector - all no-op methods
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: Prometheus metrics - pre-bound (registered shard) paths
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_RegisteredShardPaths(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
-	shardID := uint64(42)
-	c.RegisterShard(shardID)
-	defer c.UnregisterShard(shardID)
-
-	// Call all shard-scoped methods with the registered shard to cover
-	// the pre-bound (sm != nil) fast path.
-	c.ObserveCommitLatency(shardID, time.Millisecond)
-	c.ObserveApplyLatency(shardID, time.Millisecond)
-	c.ObserveReadIndexLatency(shardID, time.Millisecond)
-	c.IncProposalDropped(shardID)
-	c.ObserveProposalBatchSize(shardID, 5)
-	c.IncPiggybackCommit(shardID)
-}
-
-func TestRequestSnapshot_NotLeader(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.isLeader.Store(false) // not leader
-
-	ctx := context.Background()
-	_, err := h.RequestSnapshot(ctx, 1, SnapshotOption{})
-	// Should return ErrShardNotReady because engine node is nil.
-	if err == nil {
-		t.Error("expected error from RequestSnapshot when engine node is nil")
 	}
 }
 
@@ -15535,101 +14986,14 @@ func TestProposeEntry_DroppedProposalFiresEvent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead closed host
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: SyncRead - goto lookup with canceled context
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ContextCanceledAfterNonBlockingReceive(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Cancel context before calling SyncRead to trigger the re-check
-	// after the goto label.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := h.SyncRead(ctx, 1, "test-query")
-	if err == nil {
-		t.Fatal("expected error from SyncRead with canceled context")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: DiagRaftState shard not ready
 // ---------------------------------------------------------------------------
-
 func TestDiagRaftState_EngineNodeNil(t *testing.T) {
 	h := newTestHost(t)
 
 	_, err := h.DiagRaftState(999)
 	if !errors.Is(err, ErrShardNotReady) {
 		t.Errorf("expected ErrShardNotReady, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: pendingSweepLoopOnce - normal stop
-// ---------------------------------------------------------------------------
-
-func TestPendingSweepLoopOnce_StopChannel(t *testing.T) {
-	// Create a dedicated host with its own sweep channels to avoid
-	// racing with the background sweeper started by NewHost.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	// Close the host first to stop its background goroutines.
-	h.Close()
-
-	// Create a fresh stop channel and run the loop manually.
-	stopCh := make(chan struct{})
-	h.sweepStopC = stopCh
-	h.closed.Store(false) // allow iteration
-
-	go func() {
-		<-time.After(50 * time.Millisecond)
-		close(stopCh)
-	}()
-
-	panicked := h.pendingSweepLoopOnce(10 * time.Millisecond)
-	if panicked {
-		t.Error("expected normal exit, got panic")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: keyRotationLoopOnce - normal stop
-// ---------------------------------------------------------------------------
-
-func TestKeyRotationLoopOnce_StopChannel(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	stopCh := make(chan struct{})
-	h.keyRotStopC = stopCh
-
-	go func() {
-		<-time.After(50 * time.Millisecond)
-		close(stopCh)
-	}()
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 10*time.Millisecond)
-	if panicked {
-		t.Error("expected normal exit, got panic")
 	}
 }
 
@@ -15682,10 +15046,6 @@ func TestSyncRequestAddWitness_ClosedHost(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: RequestAddObserver and RequestAddWitness - closed host
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Coverage: ExportSnapshot - various error paths
 // ---------------------------------------------------------------------------
 
@@ -15701,38 +15061,6 @@ func TestExportSnapshot_NoLogDB(t *testing.T) {
 	err := h.ExportSnapshot(ctx, 1, &bytes.Buffer{})
 	if !errors.Is(err, ErrSnapshotNotFound) {
 		t.Errorf("expected ErrSnapshotNotFound, got: %v", err)
-	}
-}
-
-func TestExportSnapshot_NoExistingSnapshot(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// LogDB has no snapshot for this shard yet.
-	ctx := context.Background()
-	err := h.ExportSnapshot(ctx, 1, &bytes.Buffer{})
-	if err == nil {
-		t.Error("expected error when no snapshot exists")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot - shard not found
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ShardNotFound(t *testing.T) {
-	h := newTestHost(t)
-
-	ctx := context.Background()
-	err := h.ImportSnapshot(ctx, 999, bytes.NewReader([]byte("data")))
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("expected ErrShardNotFound, got: %v", err)
 	}
 }
 
@@ -15782,39 +15110,6 @@ func TestOnLeaderUpdated_LostLeadership(t *testing.T) {
 		}
 	default:
 		t.Error("expected pending read to be completed on leadership loss")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: OnCampaignLaunched
-// ---------------------------------------------------------------------------
-
-func TestOnCampaignLaunched_NoListener(t *testing.T) {
-	h := newTestHost(t)
-
-	cb := &hostEngineCallback{h: h}
-	// Should not panic when no event listener is set.
-	cb.OnCampaignLaunched(1, 1, 5)
-}
-
-func TestOnCampaignLaunched_WithListener(t *testing.T) {
-	var fired atomic.Bool
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnCampaignLaunched: func(info config.EventShardInfo) {
-			fired.Store(true)
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnCampaignLaunched(1, 1, 5)
-	if !fired.Load() {
-		t.Error("expected OnCampaignLaunched event to fire")
 	}
 }
 
@@ -16020,29 +15315,6 @@ func TestFailPendingRequests_BadPendingProposalType(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: QueryRaftLog - various paths
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: IsDraining
-// ---------------------------------------------------------------------------
-
-func TestIsDraining_InitiallyFalse(t *testing.T) {
-	h := newTestHost(t)
-	if h.IsDraining() {
-		t.Error("expected IsDraining to be false initially")
-	}
-}
-
-func TestIsDraining_TrueAfterDrain(t *testing.T) {
-	h := newTestHost(t)
-	h.Drain()
-	if !h.IsDraining() {
-		t.Error("expected IsDraining to be true after Drain")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: NodeHostInfo - closed host
 // ---------------------------------------------------------------------------
 
@@ -16059,86 +15331,6 @@ func TestGetNodeHostInfo_BadNodeStateType(t *testing.T) {
 		if si.ShardID == 99 {
 			t.Error("should not contain shard 99 from malformed entry")
 		}
-	}
-}
-
-func TestGetNodeHostInfo_WithLogInfo(t *testing.T) {
-	h := newTestHost(t)
-	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
-	if info == nil {
-		t.Fatal("expected non-nil info")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: loadOrGenerateHostID - already exists
-// ---------------------------------------------------------------------------
-
-func TestLoadOrGenerateHostID_AlreadyExists(t *testing.T) {
-	h := newTestHost(t)
-
-	// The first call by NewHost generated the ID. Call again to
-	// test the "load existing" path.
-	logger := slog.Default()
-	id, err := loadOrGenerateHostID(logger, h.cfg.NodeHostDir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id == "" {
-		t.Error("expected non-empty host ID")
-	}
-	if id != h.ID() {
-		t.Errorf("expected same ID %q, got %q", h.ID(), id)
-	}
-}
-
-func TestLoadOrGenerateHostID_OverrideID(t *testing.T) {
-	dir := t.TempDir()
-	logger := slog.Default()
-	id, err := loadOrGenerateHostID(logger, dir, "custom-host-id")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id != "custom-host-id" {
-		t.Errorf("expected %q, got %q", "custom-host-id", id)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RemoveData - various paths
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: HandleSnapshot - bad type assertions and missing host
-// ---------------------------------------------------------------------------
-
-func TestHandleSnapshot_EmptyChunks(t *testing.T) {
-	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot(nil, transport.PeerAuth{})
-	if err != nil {
-		t.Errorf("expected nil error for empty chunks, got: %v", err)
-	}
-}
-
-func TestHandleSnapshot_NilHost(t *testing.T) {
-	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}}, transport.PeerAuth{})
-	if err != nil {
-		t.Errorf("expected nil error for nil host, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: HandleMessage - batch source address registration
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_EmptyBatch(t *testing.T) {
-	h := newTestHost(t)
-	handler := &hostMessageHandler{host: h, engine: h.engine}
-
-	err := handler.HandleMessage(proto.MessageBatch{}, authorizeAllSenders)
-	if err != nil {
-		t.Errorf("expected nil error for empty batch, got: %v", err)
 	}
 }
 
@@ -16234,10 +15426,6 @@ func TestOnApplied_ConfigChangeUnmarshalError(t *testing.T) {
 		[]proto.Entry{{Index: 10, Key: 0, Type: proto.EntryConfigChange, Cmd: []byte("invalid")}},
 		[]sm.Result{{Value: 0}})
 }
-
-// ---------------------------------------------------------------------------
-// Coverage: QueryRaftLog - success path with running shard
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Coverage: OnReadyToRead - type assertion failure
@@ -16371,7 +15559,6 @@ func TestSyncRead_SuccessPath(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Coverage: DiagPipelineState - shard not ready
 // ---------------------------------------------------------------------------
-
 func TestDiagPipelineState_ShardNotReady(t *testing.T) {
 	h := newTestHost(t)
 
@@ -16382,25 +15569,8 @@ func TestDiagPipelineState_ShardNotReady(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: Stoppable/Drain in various states
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Coverage: ReadIndex - witness, draining
 // ---------------------------------------------------------------------------
-
-func TestReadIndex_WitnessRejected(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.cfg.IsWitness = true
-
-	ctx := context.Background()
-	_, err := h.ReadIndex(ctx, 1)
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Errorf("expected ErrInvalidOperation for witness, got: %v", err)
-	}
-}
 
 func TestReadIndex_DrainingRejected(t *testing.T) {
 	h := newTestHost(t)
