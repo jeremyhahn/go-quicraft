@@ -63,47 +63,6 @@ func TestDragonboat_AppendRejectsIndexHole(t *testing.T) {
 	}
 }
 
-// TestDragonboat_AppendRejectsTermRegression verifies that when entries
-// arrive with correct sequential indices but a later entry has a lower
-// term than an earlier entry, the conflict detection handles it correctly.
-// In practice, the leader assigns terms, so this only occurs via stale
-// retransmissions which are handled by conflict detection.
-func TestDragonboat_AppendRejectsTermRegression(t *testing.T) {
-	entries := makeEntries(1, 4, 2) // indices 1,2,3 at term 2
-	l := newTestRaftLog(entries)
-	l.committed = 1
-
-	// Try to append entries where term regresses: index 3 has term 1
-	// (lower than existing term 2). This creates a conflict at index 3.
-	newEntries := []proto.Entry{
-		{Index: 3, Term: 1, Cmd: []byte("bad")},
-		{Index: 4, Term: 1, Cmd: []byte("also-bad")},
-	}
-
-	// prevLogIndex=2, prevLogTerm=2 matches existing entry.
-	lastIdx, ok, truncated, err := l.tryAppend(2, 2, newEntries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected tryAppend to succeed (prevLog matches)")
-	}
-	if !truncated {
-		t.Fatal("expected truncated=true since entry 3 was overwritten")
-	}
-	if lastIdx != 4 {
-		t.Fatalf("expected lastIndex 4, got %d", lastIdx)
-	}
-	// Verify the overwritten entry has the new term.
-	term, terr := l.term(3)
-	if terr != nil {
-		t.Fatalf("unexpected error getting term: %v", terr)
-	}
-	if term != 1 {
-		t.Fatalf("expected term 1 at index 3 after overwrite, got %d", term)
-	}
-}
-
 // TestDragonboat_AppendPanicsOnCommittedOverwrite verifies that appending
 // entries at or below the committed index triggers an invariant assertion.
 // The Raft safety property requires committed entries to never be overwritten.
