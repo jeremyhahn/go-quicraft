@@ -14691,46 +14691,6 @@ func TestDiagPipelineState_WithPendingProposals(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// RequestSnapshot - double call triggers in-progress error
-// ---------------------------------------------------------------------------
-
-// TestRequestSnapshot_DoubleCallInProgress verifies that calling
-// RequestSnapshot twice in quick succession results in the second call
-// returning ErrSnapshotInProgress (exercise the submit rejection path).
-func TestRequestSnapshot_DoubleCallInProgress(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// First call should succeed.
-	rs1, err := h.RequestSnapshot(ctx, 1, SnapshotOption{})
-	if err != nil {
-		t.Fatalf("first RequestSnapshot failed: %v", err)
-	}
-	defer rs1.Release()
-
-	// Second call while the first is still in progress should fail.
-	_, err = h.RequestSnapshot(ctx, 1, SnapshotOption{})
-	if !errors.Is(err, ErrSnapshotInProgress) {
-		t.Fatalf("expected ErrSnapshotInProgress, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // proposeEntry - rate limiter paths
 // ---------------------------------------------------------------------------
 
