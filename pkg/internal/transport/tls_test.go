@@ -125,6 +125,14 @@ func TestBuildMTLSTLSInvalidCertKeyPair(t *testing.T) {
 	}
 }
 
+// TestTLSALPNConstant pins the ALPN protocol identifier. It is a wire
+// value: peers that advertise a different identifier fail the handshake.
+func TestTLSALPNConstant(t *testing.T) {
+	if tlsALPN != "quicraft" {
+		t.Fatalf("tlsALPN: want quicraft, got %s", tlsALPN)
+	}
+}
+
 // TestNilMTLSConfigReturnsError verifies that NewQUICTransport returns
 // ErrMTLSConfigRequired when MTLSConfig is nil.
 func TestNilMTLSConfigReturnsError(t *testing.T) {
