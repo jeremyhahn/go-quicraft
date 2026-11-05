@@ -532,8 +532,10 @@ on:
   # v1.29.3: one schedule run per repository (the concurrency group below),
   # and its bigdisk jobs skip while a main push run is in flight (the
   # schedule-guard job).
+  # m1919 rotation (#619): one project per night until the R640s return;
+  # go-quicraft's night is Wednesday, so the run fires 05:00 UTC Thursday.
   schedule:
-    - cron: '0 5 * * *'
+    - cron: '0 5 * * 4'
 
 # v1.26.2: on main the group is the workflow, the event and the commit sha,
 # so each main run is its own group and a merge never cancels the main run in
