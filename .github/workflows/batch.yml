@@ -1,4 +1,4 @@
-# batch-template: v1.1 — token-free CPU work on the batch runners: fuzz,
+# batch-template: v1.1 — token-free CPU work on hosted runners: fuzz,
 # race-full, soak, bench. Dispatch only; never in a merge gate.
 #
 # It puts idle runner capacity to work: long CPU-bound checks that need no
@@ -19,9 +19,10 @@
 #              artifact on Gitea)
 # A finding that is already an open issue gets a comment, not a new issue.
 #
-# RUNNERS. `runs-on: batch`: Infrastructure registers "batch" runners on the
-# build hosts. Nothing else uses that label, so batch work never takes a CI
-# slot from a pull request.
+# RUNNERS. Every job runs on GitHub-hosted ubuntu-latest (4 vCPU, 16 GB RAM,
+# about 14 GB free disk, a 6 h job limit), so each is sized to finish well
+# inside that limit: fuzz and race-full are matrices of four shards, and every
+# timeout leaves headroom under the 6 h cap.
 #
 # ARTIFACTS. actions/upload-artifact v4 and later refuse any server that is
 # not github.com ("not currently supported on GHES"; Gitea presents as one),
@@ -33,10 +34,8 @@
 #                          (go-quicraft: quicraft_fuzz)
 #   RACE_PKGS              the unit-test package scope, the same as ci.yml's
 #                          Test job (dark or environment-bound suites excluded)
-#   SOAK_CMD               the repo's integration suite. go-quicraft and
-#                          go-qrdb run their cluster suites, and their soak
-#                          job's runs-on names the raft-guest runner label
-#                          where Infrastructure has registered one
+#   SOAK_CMD               the repo's integration suite. go-quicraft runs
+#                          its cluster suites on the hosted runner itself
 #   BENCH_PKGS             benchmark scope (harness modules excluded)
 # A repo with no Fuzz* targets keeps the fuzz job; it finds none and passes.
 
@@ -82,11 +81,11 @@ jobs:
   # The runner does not expand a matrix built from another job's output
   # (go-quicraft ci.yml), so the targets are split over a static matrix of
   # four shards, and each shard fuzzes two targets at a time with
-  # -parallel=4: 8 cores per shard, 20 minutes per pair of targets.
+  # -parallel=2: the runner's 4 cores, 20 minutes per pair of targets.
   fuzz:
     name: Fuzz (shard ${{ matrix.shard }}/4)
     if: inputs.jobs == 'all' || inputs.jobs == 'fuzz'
-    runs-on: batch
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -121,7 +120,7 @@ jobs:
           fuzz_one() {
             pkg=$1 target=$2 log="fuzz-logs/$(echo "$pkg" | tr / _).$target.log"
             if go test -tags="$FUZZ_TAGS" -run='^$' -fuzz="^${target}\$" \
-                 -fuzztime="$FUZZTIME" -parallel=4 "$pkg" > "$log" 2>&1; then
+                 -fuzztime="$FUZZTIME" -parallel=2 "$pkg" > "$log" 2>&1; then
               echo "ok   $pkg $target"
             elif grep -q 'context deadline exceeded' "$log" &&
                  ! grep -q 'Failing input written to' "$log"; then
@@ -170,12 +169,22 @@ jobs:
             fuzz-logs/
           retention-days: 30
 
-  # The unit suite under the race detector, three times, on main.
+  # The unit suite under the race detector, three times, on main, dealt over
+  # four shards by `make shard-packages` (the deal ci.yml's unit shards use:
+  # packages weighed by their test files, heaviest first to the lightest
+  # shard). Basis: one -race pass of a quarter of the suite is sized at about
+  # 20 minutes on a 4-core runner, so three are about an hour; a shard gets a
+  # 240-minute job and a 220-minute go test -timeout. -p 2 bounds the race
+  # detector's memory to what the runner's 16 GB holds.
   race-full:
-    name: Race (full, -count=3)
+    name: Race (full, -count=3, shard ${{ matrix.shard }}/4)
     if: inputs.jobs == 'all' || inputs.jobs == 'race-full'
-    runs-on: batch
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -194,8 +203,10 @@ jobs:
         run: |
           set -o pipefail
           rc=0
-          # shellcheck disable=SC2086 # RACE_PKGS is a package list
-          go test -race -count=3 -timeout=170m -tags="$RACE_TAGS" $RACE_PKGS 2>&1 | tee race.log || rc=$?
+          pkgs=$(make -s shard-packages SHARD=${{ matrix.shard }} SHARDS=4 SHARD_TAGS="$RACE_TAGS" SHARD_PKGS="$RACE_PKGS")
+          echo "shard ${{ matrix.shard }}: $(printf '%s\n' "$pkgs" | wc -l) packages"
+          # shellcheck disable=SC2086 # pkgs is a package list
+          go test -race -count=3 -p 2 -timeout=220m -tags="$RACE_TAGS" $pkgs 2>&1 | tee race.log || rc=$?
           grep -n 'WARNING: DATA RACE' race.log | sed 's/^/BATCH-FINDING race /' || true
           grep -E '^(--- FAIL|FAIL)' race.log | sed 's/^/BATCH-FINDING race-fail /' || true
           exit "$rc"
@@ -206,10 +217,11 @@ jobs:
   soak:
     name: Soak (${{ inputs.soak_minutes }} min)
     if: inputs.jobs == 'all' || inputs.jobs == 'soak'
-    # CUSTOMIZE: the raft-guest runner label once Infrastructure registers one;
-    # until then, batch.
-    runs-on: batch
-    timeout-minutes: 180
+    # The suite is a set of in-process clusters and the netfault suite, run on
+    # the runner itself. 300 minutes covers a soak_minutes run plus one
+    # iteration on 4 cores, under the 6 h cap.
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -296,8 +308,8 @@ jobs:
   bench:
     name: Bench
     if: inputs.jobs == 'all' || inputs.jobs == 'bench'
-    runs-on: batch
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+    timeout-minutes: 300      # 4 cores run the -count=5 benchmarks slower; under the 6 h cap
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -309,7 +321,7 @@ jobs:
         run: |
           set -o pipefail
           # shellcheck disable=SC2086 # BENCH_PKGS is a package list
-          go test -run='^$' -bench=. -benchmem -count=5 -timeout=170m $BENCH_PKGS 2>&1 | tee "bench-${GITHUB_SHA}.txt"
+          go test -run='^$' -bench=. -benchmem -count=5 -timeout=280m $BENCH_PKGS 2>&1 | tee "bench-${GITHUB_SHA}.txt"
 
       - name: Post the results to the run summary
         if: always()

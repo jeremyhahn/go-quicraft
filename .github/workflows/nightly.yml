@@ -4,7 +4,7 @@
 # toolchain image, nightly and on dispatch only, when the Makefile (or a
 # tracked *.mk) defines the target; without one it prints OK and passes. A
 # repository's lint sweeps never run in ci.yml: go-qrdb's ran in its PR lint
-# job at a 72-hour p95 of 87 minutes. It runs on bigdisk and needs the
+# job at a 72-hour p95 of 87 minutes. It runs on ubuntu-latest and needs the
 # scripts ci.yml ships (in-toolchain-image.sh, ci-image-cache.sh,
 # trim-ci-caches.sh). timeout-minutes is CUSTOMIZE, ceil(1.5 x the 72-hour p95).
 # >>> CUSTOMIZE (go-quicraft): this file adopts the v1.9 lint-sweeps job only.
@@ -34,8 +34,8 @@ jobs:
   # `make lint`), off every push and PR path (ci-standard.md §12).
   lint-sweeps:
     name: Lint sweeps [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
-    timeout-minutes: 5        # CUSTOMIZE (go-quicraft, #503): no lint-sweeps target yet, so the job is its probe; ceil(1.5 x p95) once one lands
+    runs-on: ubuntu-latest
+    timeout-minutes: 15       # CUSTOMIZE (go-quicraft, #503): no lint-sweeps target yet, so the job is its probe; hosted-runner headroom until one lands
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: main

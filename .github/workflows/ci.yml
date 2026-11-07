@@ -1,4 +1,15 @@
 # ci-template: v1.30 (customized)
+# Hosted runners (go-quicraft, after go-quicbaas #261): every job runs on
+# GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB free disk, a 6 h
+# job limit); no job names a self-hosted label (.github/actionlint.yaml keeps
+# only code-review.yml's review runners). Each job frees the runner's
+# preinstalled toolchains before it builds an image. The -race unit suite is
+# four `unit` shards (`make coverage-shard`) joined by the `coverage` job
+# (`make coverage-merge`, the threshold); integration is two shards
+# (`make it-shard-packages`, IT_PKGS) under the unchanged 8g compose cap.
+# FIPS stays one job: it is short, and test/buildgates pins its steps.
+# Timeouts are sized for a cold image build on a 4-core runner. CI Gate
+# needs every job; a matrix job is one entry, green only when every shard is.
 # v1.30 (Company Agent m1804, 2026-10-31): the five fixes of the 72-hour CI
 # evaluation (ci-standard.md §12). go-qrdb #1328, three comment lines, cost
 # about 1100 runner-minutes over three runs, and every push to main reran the
@@ -277,7 +288,7 @@
 # COVERAGE_THRESHOLD, m601 (c)), security, deps-check (new, ci-standard.md
 # §1) and trivy image on the integration image (it leaves the CUSTOMIZE note).
 # The integration stage stays its own job, `make integration-test` in the
-# integration image. Both run on bigdisk (ubuntu-latest on github.com).
+# integration image. Both run on ubuntu-latest (see the hosted-runner note).
 # setup-go, the runner tool installs and the SARIF upload (m601 (d): CI runs
 # on Gitea) are gone, and with them GO_VERSION: the image pins Go. The tag
 # assertion moves to scripts/assert-build-tags.sh (ships beside this file).
@@ -587,10 +598,21 @@ env:
   # `./pkg/labstrings -run '^TestTheTrackedTreeIsPubliclyReleasable$'`).
   # Empty means the repository has none.
   RELEASABILITY_TEST: "./test/releasability/..."   # CUSTOMIZE (go-quicraft): the package make coverage runs it in
-  # #621 (Company Agent m1923 (e)): every Gitea stage job runs on the bigdisk
-  # runner host, whose sidecars get 8g each (scripts/in-toolchain-image.sh);
-  # empty on github.com, where the script takes the job's memory.max, else 8g.
-  IN_IMAGE_MEMORY: ${{ github.server_url != 'https://github.com' && '8g' || '' }}
+  # #621 (Company Agent m1923 (e)): every stage sidecar gets 8g
+  # (scripts/in-toolchain-image.sh), on every server. A hosted runner has
+  # 16 GB, so one 8g sidecar per job fits with room for the runner; the
+  # integration stack keeps its own 8g cap (devcontainer compose.yaml
+  # mem_limit and memswap_limit).
+  IN_IMAGE_MEMORY: 8g
+  # CUSTOMIZE: the number of `unit` shards; the unit job's matrix lists
+  # 0..UNIT_SHARDS-1. `make coverage-shard` deals packages by test-file size.
+  UNIT_SHARDS: 4
+  # The per-package -timeout of the -race unit run. Go's default (10m) is
+  # sized for a large runner; a 4-core hosted runner is slower.
+  COVER_TIMEOUT: 30m
+  # CUSTOMIZE: the number of integration shards; the integration job's matrix
+  # lists 0..IT_SHARDS-1 (`make it-shard-packages`).
+  IT_SHARDS: 2
 
 jobs:
   # v1.24 (CA m749, m751 (a)): a PR whose every changed file matches DOCS_ONLY_PATTERN
@@ -846,10 +868,10 @@ jobs:
   # runs once per event. It runs on a docs-only PR, as lint did.
   lint:
     name: Lint [lint, gosec, deps-check, build tags]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     needs: [changes, schedule-guard]
     if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 30       # CUSTOMIZE: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the lint stages (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -866,6 +888,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       # v1.30 (fix 1): the registry cache first. A miss, or an unreachable
       # registry, falls through to the local build below.
@@ -990,24 +1023,26 @@ jobs:
   # file writes run silent, and lint steps and `make check-public-literals`
   # report path and line only (ci-standard.md §5, Company Agent m605 item 8).
   #
-  # Runners: the image and integration jobs run on bigdisk (Docker and the disk
-  # for the image builds) and CI Gate on ci-gate; on the github.com mirror all
-  # are ubuntu-latest, which has Docker (devops.md §1: host-specific choices
-  # are guarded on github.server_url).
+  # Runners: every job in this workflow runs on GitHub-hosted ubuntu-latest
+  # (4 vCPU, 16 GB, about 14 GB free disk, a 6 h job limit), which has
+  # Docker. Each job is a fresh VM, so it builds the images it needs and
+  # frees the runner's preinstalled toolchains first ("Free runner disk").
   #
   # v1.30: lint, the build-tag assertion, the releasability test and
-  # deps-check moved to the lint job. This job runs build, make coverage and,
-  # on the full tier, make security and trivy image; it skips on a docs-only
-  # PR, which runs none of them, and CI Gate reads that skip as passed.
+  # deps-check moved to the lint job. This job runs build and, on the full
+  # tier, make security and trivy image; it skips on a docs-only PR, which
+  # runs none of them, and CI Gate reads that skip as passed. The unit test
+  # stage (make coverage) moved to the `unit` shards and the `coverage` merge
+  # below, so no single job runs the whole -race suite on a 4-core runner.
   image:
-    name: Devcontainer image [build, test, security, trivy image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    name: Devcontainer image [build, security, trivy image]
+    runs-on: ubuntu-latest
     needs: [changes, schedule-guard]   # v1.24 (CA m749, m751 (a)); v1.29.3
     # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
     # on every event only on `run` (not `refused`, not `proven`), and never
     # on a docs-only PR.
     if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
-    timeout-minutes: 23       # CUSTOMIZE (go-quicraft, #503): ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 120     # hosted runner: both image builds cold, build, security and trivy image (6 h cap)
     env:
       CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1032,6 +1067,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1122,16 +1168,6 @@ jobs:
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make build GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
-      # The test stage (m601 (c)): make coverage runs the whole unit suite with
-      # -race (make test's flags), the PR tier's unit test and race checks in
-      # one run (v1.23), and fails when total coverage is below
-      # COVERAGE_THRESHOLD (testing-guidelines.md), so the suite runs once.
-      # Tags matter here too: without them tag-gated packages are neither
-      # tested nor counted. The integration stage is its own job below.
-      - name: make coverage (unit tests and the threshold)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
-        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make coverage GO_BUILD_TAGS='$GO_BUILD_TAGS' COVERAGE_THRESHOLD=$COVERAGE_THRESHOLD"
-
       # make security: gosec, govulncheck, go mod verify (devops.md §8), with
       # trivy fs per the phase (§8a). The target owns gosec's flags and its
       # memory bounds (GOMEMLIMIT, GOMAXPROCS, -concurrency; v1.6 to v1.8) and
@@ -1162,6 +1198,204 @@ jobs:
           rm -f "$RUNNER_TEMP/gomodauth.env" it-image.tar
           [ -z "${IT_LEASE:-}" ] || docker rm "$IT_LEASE" >/dev/null || true
 
+  # The test stage (m601 (c)), sharded for hosted runners: the whole unit
+  # suite with -race (make test's flags) was one ~40-minute run on a large
+  # runner and does not fit a 4-core one with headroom. `make coverage-shard`
+  # deals the packages over UNIT_SHARDS shards by test-file size, heaviest
+  # first, so each shard runs a disjoint quarter with -race and writes its
+  # own profile. Tags matter here too: without them tag-gated packages are
+  # neither tested nor counted. The PR tier's unit test and race checks;
+  # `code` tier, so a docs-only PR skips it. CI Gate needs the matrix as one
+  # entry, whose result is success only when every shard succeeded.
+  unit:
+    name: Unit tests [-race, coverage, shard ${{ matrix.shard }}/4]
+    runs-on: ubuntu-latest
+    needs: [changes, schedule-guard]
+    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    timeout-minutes: 120     # hosted runner: a cold toolchain image build, then a quarter of the -race suite (6 h cap)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]   # 0..UNIT_SHARDS-1
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
+
+      - name: Reap stale CI stacks
+        run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
+
+      # >>> CUSTOMIZE (go-quicraft)
+      - name: Tune QUIC UDP buffers
+        run: |
+          sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 \
+            || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
+      # <<< CUSTOMIZE
+
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
+      - name: Build the toolchain image
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # The container gets a copy of the checkout, so the profile comes back
+      # on stdout: make's own output goes to stderr, then the profile is cat.
+      - name: make coverage-shard
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        run: |
+          out="coverage-shard-$SHARD-of-$UNIT_SHARDS.out"
+          scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" \
+            "make coverage-shard SHARD=$SHARD SHARDS=$UNIT_SHARDS COVER_TIMEOUT=$COVER_TIMEOUT GO_BUILD_TAGS='$GO_BUILD_TAGS' 1>&2 && cat build/coverage/$out" > "$out"
+          test -s "$out"
+
+      # Gitea's artifact server takes only the v3 protocol (as in batch.yml).
+      - name: Upload the shard profile (Gitea)
+        if: ${{ github.server_url != 'https://github.com' }}
+        uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard-${{ matrix.shard }}-of-${{ env.UNIT_SHARDS }}.out
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload the shard profile
+        if: ${{ github.server_url == 'https://github.com' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage-shard-${{ matrix.shard }}-of-${{ env.UNIT_SHARDS }}.out
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
+  # The coverage threshold over the merged unit profiles: `make
+  # coverage-merge` requires all UNIT_SHARDS profiles, joins them and fails
+  # when total coverage, or any package under pkg/, is below
+  # COVERAGE_THRESHOLD (testing-guidelines.md). It runs only when every
+  # shard passed; a red shard leaves it skipped, and CI Gate fails on the
+  # shard. `code` tier, like the shards.
+  coverage:
+    name: Coverage [merge, threshold]
+    runs-on: ubuntu-latest
+    needs: [changes, schedule-guard, unit]
+    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the merge (6 h cap)
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
+
+      - name: Reap stale CI stacks
+        run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
+
+      # v3 puts each artifact in its own directory; the move below flattens
+      # both forms into build/coverage, where `make coverage-merge` reads them.
+      - name: Download the shard profiles (Gitea)
+        if: ${{ github.server_url != 'https://github.com' }}
+        uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a # v3.0.2
+        with:
+          path: ${{ runner.temp }}/coverage-shards
+
+      - name: Download the shard profiles
+        if: ${{ github.server_url == 'https://github.com' }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: coverage-shard-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/coverage-shards
+
+      - name: Collect the shard profiles
+        run: |
+          mkdir -p build/coverage
+          find "$RUNNER_TEMP/coverage-shards" -type f -name 'coverage-shard-*-of-*.out' -exec mv -t build/coverage {} +
+          ls -l build/coverage
+
+      # v1.30 (fix 1): the registry cache first; a miss builds it below.
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
+      - name: Build the toolchain image
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          # v1.29.4: Athens first, as in the image job.
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org|direct"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      - name: make coverage-merge (the threshold)
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make coverage-merge SHARDS=$UNIT_SHARDS COVERAGE_THRESHOLD=$COVERAGE_THRESHOLD GO_BUILD_TAGS='$GO_BUILD_TAGS'"
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
   # v1.27 (Company Agent m1192 (6), item 27): a repository's `make lint-gates`
   # (its own gates beside `make lint`: script, workflow, generated-code and
   # module checks) runs in this job, in parallel with the image job's
@@ -1179,13 +1413,13 @@ jobs:
   # and the job; the gates after it run on the next push.
   lint-gates:
     name: Lint Gates [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     needs: [changes, schedule-guard]     # v1.29.3; v1.30
     # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
     # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
     # only when a changed file matches LINT_GATES_PATTERN (fix 3).
     if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.lint_gates != 'false' }}
-    timeout-minutes: 45       # CUSTOMIZE: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the gates (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       # v1.22: the cache volumes' trust class (as in the image job).
@@ -1203,6 +1437,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       # A source check on the runner's shell: no make recipe runs here.
       - name: Does the Makefile define lint-gates?
@@ -1266,21 +1511,32 @@ jobs:
   # stack is named per run under the repo's prefix, the job reaps stale stacks
   # first (v1.18) and keeps its own teardown last under `if: always()`.
   # v1.23: full tier only (CI_FULL_TIER's expression); never on a plain PR.
+  #
+  # Hosted runners: the suite is dealt over IT_SHARDS shards by test-file
+  # size (`make it-shard-packages`), each its own compose stack (IT_PROJECT
+  # carries the shard) under the same 8g integration cap (compose.yaml).
   integration:
-    name: Integration [integration image]
+    name: Integration [integration image, shard ${{ matrix.shard }}/2]
     # v1.26: never on a draft PR, ci:full or not. v1.29.3: on a schedule run,
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # >>> CUSTOMIZE (go-quicraft)
-    # Behind the image job: its coverage run is the other multi-node QUIC load.
+    # Behind the image job: it was the other multi-node QUIC load on a shared
+    # runner host. Kept so a forge whose ubuntu-latest runners share a host
+    # still serializes them; on hosted runners it costs wall time only.
     needs: [image, schedule-guard]
     # <<< CUSTOMIZE
-    timeout-minutes: 34       # CUSTOMIZE (go-quicraft, #503): ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 150     # hosted runner: a cold integration image build, then half the suite (6 h cap)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]   # 0..IT_SHARDS-1
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
-      IT_PROJECT: ${{ github.event.repository.name }}-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      IT_PROJECT: ${{ github.event.repository.name }}-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+      SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -1297,6 +1553,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1342,7 +1609,11 @@ jobs:
           done
 
       - name: make integration-test (integration image)
-        run: make integration-test MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_PROJECT="$IT_PROJECT" IT_IMAGE="$IT_IMAGE" GO_BUILD_TAGS="$GO_BUILD_TAGS"
+        run: |
+          pkgs=$(make -s it-shard-packages SHARD="$SHARD" SHARDS="$IT_SHARDS" | tr '\n' ' ')
+          [ -n "${pkgs// /}" ] || { echo "FAIL: integration shard $SHARD of $IT_SHARDS has no packages"; exit 1; }
+          echo "integration shard $SHARD of $IT_SHARDS: $pkgs"
+          make integration-test MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_PROJECT="$IT_PROJECT" IT_IMAGE="$IT_IMAGE" GO_BUILD_TAGS="$GO_BUILD_TAGS" IT_PKGS="$pkgs"
 
       - name: Tear down
         if: always()
@@ -1361,14 +1632,14 @@ jobs:
     name: Soak [integration image]
     # v1.30: a dispatch off main is refused, so soak runs only on `run`.
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
     # v1.29.3: and on a schedule run, only on the schedule guard's `run`.
     needs: [integration, schedule-guard]
     # <<< CUSTOMIZE
-    timeout-minutes: 66       # CUSTOMIZE (go-quicraft, #503): SOAK_MINUTES plus one iteration, at least ceil(1.5 x the 72-hour p95)
+    timeout-minutes: 180     # hosted runner: a cold image build, SOAK_MINUTES, then one iteration (6 h cap)
     env:
       SOAK_MINUTES: 30        # CUSTOMIZE
       SOAK_TARGET: integration-test   # CUSTOMIZE: a make target of the integration image
@@ -1386,6 +1657,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1485,10 +1767,10 @@ jobs:
   # bounds the volumes on every host they reach.
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [image, integration, schedule-guard]
-    timeout-minutes: 13       # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1503,6 +1785,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1545,12 +1838,12 @@ jobs:
   # The WAL under injected I/O failures.
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1565,6 +1858,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1602,12 +1906,12 @@ jobs:
   # The 0-RTT replay policy, the one suite run without -race.
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 5        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1622,6 +1926,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1663,11 +1978,11 @@ jobs:
   # main pushes); the Gate marks it `nightly`.
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # v1.29.3, v1.30: only on the schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the seeds (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1682,6 +1997,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1721,12 +2047,12 @@ jobs:
   # FreeBSD runner exists and QEMU would multiply every test's wall clock.
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 6        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the builds (6 h cap)
     strategy:
       fail-fast: false
       matrix:
@@ -1756,6 +2082,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1794,12 +2131,12 @@ jobs:
   # Every module in the tree, discovered rather than declared.
   modules:
     name: Nested module build, vet and test [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    timeout-minutes: 7        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the modules (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1814,6 +2151,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1854,10 +2202,10 @@ jobs:
   # The Dragonboat-compatible API module, its own Go module.
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [integration, schedule-guard]
-    timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1872,6 +2220,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -1921,10 +2280,10 @@ jobs:
   # The Makefile's two-tier FIPS verification (moved from nightly.yml in #293).
   fips:
     name: FIPS [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [integration, schedule-guard]
-    timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
+    timeout-minutes: 120     # hosted runner: a cold toolchain image build, then the unsharded fips140=only run (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1939,6 +2298,17 @@ jobs:
             echo "::add-mask::$val"
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
+
+      # A hosted runner starts with about 14 GB free, less than the image
+      # builds and the stages' caches need. It is a fresh VM per job, so
+      # nothing removed here is shared: the .NET, Android and GHC toolchains
+      # and the preloaded images free well over 20 GB.
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
 
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
@@ -2028,12 +2398,13 @@ jobs:
   # BOTH the needs list and the results check — a gate that can pass vacuously
   # is worse than no gate. Do not use join(needs.*.result); it evaluates empty
   # on Gitea and reports success while jobs fail.
-  # v1.21: on the ci-gate runners (Company Agent m386: only CI Gate runs there;
-  # a 1-CPU gate runner cannot hold a stage). trivy and fips are in nightly.yml
-  # (v1.9, devops.md §8a: the alpha regime).
+  # Every job, CI Gate included, runs on GitHub-hosted ubuntu-latest. A matrix
+  # job (unit, integration) is one needs entry whose result is success only
+  # when every shard succeeded. trivy and fips are in nightly.yml (v1.9,
+  # devops.md §8a: the alpha regime).
   ci-gate:
     name: CI Gate
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'ci-gate' }}
+    runs-on: ubuntu-latest
     # v1.29.3: on a schedule run the schedule guard decides. `busy` skips the
     # gate, so `CI / CI Gate (schedule)` posts `skipped` (Gitea 1.27.1 posts a
     # skipped job as `skipped`, not `success`), never a green nightly. Every
@@ -2043,7 +2414,7 @@ jobs:
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs. v1.30: lint
     # joins; publish-images is the one job outside the gate (see its comment).
-    needs: [changes, schedule-guard, lint, image, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
+    needs: [changes, schedule-guard, lint, image, unit, coverage, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -2109,6 +2480,8 @@ jobs:
           check schedule-guard "${{ needs.schedule-guard.result }}" pr
           check lint        "${{ needs.lint.result }}" pr
           check image       "${{ needs.image.result }}" code
+          check unit        "${{ needs.unit.result }}" code
+          check coverage    "${{ needs.coverage.result }}" code
           check lint-gates  "${{ needs.lint-gates.result }}" scoped
           check integration "${{ needs.integration.result }}" full
           check soak        "${{ needs.soak.result }}" nightly
