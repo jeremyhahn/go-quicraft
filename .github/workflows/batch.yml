@@ -86,7 +86,7 @@ jobs:
   fuzz:
     name: Fuzz (shard ${{ matrix.shard }}/4)
     if: inputs.jobs == 'all' || inputs.jobs == 'fuzz'
-    runs-on: batch
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'batch' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -174,7 +174,7 @@ jobs:
   race-full:
     name: Race (full, -count=3)
     if: inputs.jobs == 'all' || inputs.jobs == 'race-full'
-    runs-on: batch
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'batch' }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -208,7 +208,7 @@ jobs:
     if: inputs.jobs == 'all' || inputs.jobs == 'soak'
     # CUSTOMIZE: the raft-guest runner label once Infrastructure registers one;
     # until then, batch.
-    runs-on: batch
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'batch' }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -296,7 +296,7 @@ jobs:
   bench:
     name: Bench
     if: inputs.jobs == 'all' || inputs.jobs == 'bench'
-    runs-on: batch
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'batch' }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

@@ -676,8 +676,8 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           SHA: ${{ github.sha }}
           # This workflow's own file: the route counts its runs only.
-          RUNS_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/ci.yml/runs
-          REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          RUNS_API: ${{ github.api_url }}/repos/${{ github.repository }}/actions/workflows/ci.yml/runs
+          REPO_API: ${{ github.api_url }}/repos/${{ github.repository }}
           JOB_TOKEN: ${{ github.token }}
           # v1.30: a push to main reads the tree proof with it as well.
           BOT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}

@@ -146,7 +146,7 @@ jobs:
       - name: Merge, hold, or wait
         env:
           BOT: ${{ secrets.AGENT_TOKEN }}
-          REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          REPO_API: ${{ github.api_url }}/repos/${{ github.repository }}
           GIT_URL: ${{ github.server_url }}/${{ github.repository }}.git
           EVENT: ${{ github.event_name }}
           PR_FROM_EVENT: ${{ github.event.pull_request.number }}
