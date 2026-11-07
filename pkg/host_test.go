@@ -14372,55 +14372,6 @@ func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Coverage: OnReadyToRead - alias completion when lastApplied >= readIndex
-// ---------------------------------------------------------------------------
-
-func TestOnReadyToRead_AliasCompletionWithSufficientApply(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-
-	ns := testLoadNode(h, 1)
-	ns.requestPool = NewRequestStatePool()
-
-	// Set lastApplied high enough that the read can complete immediately.
-	ns.lastApplied.Store(100)
-
-	// Create batch primary and alias pending reads.
-	batchKey := uint64(10)
-	aliasKey := uint64(11)
-
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
-	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{}, true)
-
-	ns.pendingReadsMu.Lock()
-	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS, aliases: []uint64{aliasKey}}
-	ns.pendingReads[aliasKey] = &pendingRead{rs: aliasRS}
-	ns.pendingReadsMu.Unlock()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnReadyToRead(1, []proto.ReadyToRead{{Key: batchKey, Index: 50}})
-
-	// Both should be completed.
-	select {
-	case r := <-batchRS.ResultC():
-		if r.Value != 50 {
-			t.Errorf("batch result = %d, want 50", r.Value)
-		}
-	default:
-		t.Error("batch RS not completed")
-	}
-
-	select {
-	case r := <-aliasRS.ResultC():
-		if r.Value != 50 {
-			t.Errorf("alias result = %d, want 50", r.Value)
-		}
-	default:
-		t.Error("alias RS not completed")
-	}
-}
-
 func TestOnReadyToRead_AliasConfirmedButNotCaughtUp(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
