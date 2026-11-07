@@ -846,7 +846,7 @@ jobs:
   # runs once per event. It runs on a docs-only PR, as lint did.
   lint:
     name: Lint [lint, gosec, deps-check, build tags]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     needs: [changes, schedule-guard]
     if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
     timeout-minutes: 30       # CUSTOMIZE: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
@@ -1001,7 +1001,7 @@ jobs:
   # PR, which runs none of them, and CI Gate reads that skip as passed.
   image:
     name: Devcontainer image [build, test, security, trivy image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     needs: [changes, schedule-guard]   # v1.24 (CA m749, m751 (a)); v1.29.3
     # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
     # on every event only on `run` (not `refused`, not `proven`), and never
@@ -1179,7 +1179,7 @@ jobs:
   # and the job; the gates after it run on the next push.
   lint-gates:
     name: Lint Gates [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     needs: [changes, schedule-guard]     # v1.29.3; v1.30
     # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
     # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
@@ -1272,7 +1272,7 @@ jobs:
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: its coverage run is the other multi-node QUIC load.
     needs: [image, schedule-guard]
@@ -1361,7 +1361,7 @@ jobs:
     name: Soak [integration image]
     # v1.30: a dispatch off main is refused, so soak runs only on `run`.
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
@@ -1485,7 +1485,7 @@ jobs:
   # bounds the volumes on every host they reach.
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [image, integration, schedule-guard]
     timeout-minutes: 13       # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
@@ -1545,7 +1545,7 @@ jobs:
   # The WAL under injected I/O failures.
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
@@ -1602,7 +1602,7 @@ jobs:
   # The 0-RTT replay policy, the one suite run without -race.
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
@@ -1663,7 +1663,7 @@ jobs:
   # main pushes); the Gate marks it `nightly`.
   fuzz-seeds:
     name: Fuzz seeds [build tag quicraft_fuzz, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # v1.29.3, v1.30: only on the schedule guard's `run`.
     needs: schedule-guard
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
@@ -1721,7 +1721,7 @@ jobs:
   # FreeBSD runner exists and QEMU would multiply every test's wall clock.
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
@@ -1794,7 +1794,7 @@ jobs:
   # Every module in the tree, discovered rather than declared.
   modules:
     name: Nested module build, vet and test [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
     needs: schedule-guard
@@ -1854,7 +1854,7 @@ jobs:
   # The Dragonboat-compatible API module, its own Go module.
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [integration, schedule-guard]
     timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12
@@ -1921,7 +1921,7 @@ jobs:
   # The Makefile's two-tier FIPS verification (moved from nightly.yml in #293).
   fips:
     name: FIPS [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
     needs: [integration, schedule-guard]
     timeout-minutes: 8        # #503: ceil(1.5 x this job's 72-hour p95), ci-standard.md §12

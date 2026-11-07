@@ -34,7 +34,7 @@ jobs:
   # `make lint`), off every push and PR path (ci-standard.md §12).
   lint-sweeps:
     name: Lint sweeps [toolchain image]
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON('["self-hosted","bigdisk"]') || 'bigdisk' }}
     timeout-minutes: 5        # CUSTOMIZE (go-quicraft, #503): no lint-sweeps target yet, so the job is its probe; ceil(1.5 x p95) once one lands
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
