@@ -587,6 +587,10 @@ env:
   # `./pkg/labstrings -run '^TestTheTrackedTreeIsPubliclyReleasable$'`).
   # Empty means the repository has none.
   RELEASABILITY_TEST: "./test/releasability/..."   # CUSTOMIZE (go-quicraft): the package make coverage runs it in
+  # #621 (Company Agent m1923 (e)): every Gitea stage job runs on the bigdisk
+  # runner host, whose sidecars get 8g each (scripts/in-toolchain-image.sh);
+  # empty on github.com, where the script takes the job's memory.max, else 8g.
+  IN_IMAGE_MEMORY: ${{ github.server_url != 'https://github.com' && '8g' || '' }}
 
 jobs:
   # v1.24 (CA m749, m751 (a)): a PR whose every changed file matches DOCS_ONLY_PATTERN
