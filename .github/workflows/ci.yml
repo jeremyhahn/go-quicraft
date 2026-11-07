@@ -1347,14 +1347,10 @@ jobs:
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
-      # v3 puts each artifact in its own directory; the move below flattens
-      # both forms into build/coverage, where `make coverage-merge` reads them.
-      - name: Download the shard profiles (Gitea)
-        if: ${{ github.server_url != 'https://github.com' }}
-        uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a # v3.0.2
-        with:
-          path: ${{ runner.temp }}/coverage-shards
-
+      # GitHub fails the whole job when any step names download-artifact v3,
+      # even one its condition skips, so there is no v3 download step here.
+      # The move below flattens the profiles into build/coverage, where
+      # `make coverage-merge` reads them.
       - name: Download the shard profiles
         if: ${{ github.server_url == 'https://github.com' }}
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
