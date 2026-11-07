@@ -45,6 +45,13 @@ func waitForMessageCount(t *testing.T, h *testHandler, want int, timeout time.Du
 		func() bool { return h.messageCount() >= want })
 }
 
+// waitForDrops waits until rec has recorded at least want message drops.
+func waitForDrops(t *testing.T, rec *dropRecorder, want int) {
+	t.Helper()
+	pollUntil(t, 10*time.Second, 5*time.Millisecond, "the expected message drops were not recorded",
+		func() bool { return len(rec.drops()) >= want })
+}
+
 func snappyEncode(dst, src []byte) []byte {
 	return snappy.Encode(dst, src)
 }
