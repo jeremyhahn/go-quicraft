@@ -29,6 +29,22 @@ import (
 )
 
 // snappyEncode is a test helper that wraps snappy.Encode.
+// messageCount is the number of messages h has received, over all batches.
+func (h *testHandler) messageCount() int {
+	n := 0
+	for _, b := range h.getBatches() {
+		n += len(b.Requests)
+	}
+	return n
+}
+
+// waitForMessageCount waits until h has received at least want messages.
+func waitForMessageCount(t *testing.T, h *testHandler, want int, timeout time.Duration) {
+	t.Helper()
+	pollUntil(t, timeout, 5*time.Millisecond, "the expected messages did not arrive",
+		func() bool { return h.messageCount() >= want })
+}
+
 func snappyEncode(dst, src []byte) []byte {
 	return snappy.Encode(dst, src)
 }
