@@ -1000,6 +1000,21 @@ func findAnyLiveHost(cluster *testCluster, shardID uint64) *quicraft.Host {
 // run never reaches the cap: attempt resets to 0 on every success.
 const maxAttemptsPerOp = 10
 
+// minOpInterval is the least time between the starts of two attempts by one
+// client. Without it the workload is bounded only by wall time, so a wider,
+// faster host records more operations in the same window: on a 24-CPU runner
+// a 5s single-key run recorded ~12,900 operations, and porcupine's search
+// over that one partition (whose cache grows with the square of its length)
+// drove the race-instrumented package past the 8g integration cap (#623).
+// Pacing bounds every history at duration/minOpInterval operations per client
+// whatever the host, while keeping load on the cluster for the whole window,
+// so every fault a test injects still lands under traffic. 100 attempts per
+// client-second is ~9x the slowest throughput observed
+// (baselineWritesPerClientSecond counts writes, half the attempts) and ~30x
+// the floor, so the throughput assertion still separates a slow cluster from
+// a collapsed one.
+const minOpInterval = 10 * time.Millisecond
+
 // clientWorker runs Put and Get operations against the cluster for the given
 // duration. Every operation is recorded, whether it succeeded, failed, or
 // timed out with an unknown outcome.
@@ -1018,6 +1033,7 @@ func clientWorker(
 	attempt := 0
 	completed := 0
 	var pacer retryPacer
+	var nextOp time.Time
 
 	// A client that ran its full window without completing a single operation
 	// is a wedge, not slow progress. The aggregate floor can be met by the
@@ -1034,6 +1050,14 @@ func clientWorker(
 			return
 		default:
 		}
+
+		// See minOpInterval: the history is bounded by op count, not by how
+		// fast the host is.
+		if wait := time.Until(nextOp); wait > 0 {
+			pause(wait, done)
+			continue
+		}
+		nextOp = time.Now().Add(minOpInterval)
 
 		// The key advances every OTHER operation so that the put at opIdx and
 		// the get at opIdx+1 target the SAME key. Deriving the key from opIdx
