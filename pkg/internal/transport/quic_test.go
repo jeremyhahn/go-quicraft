@@ -1601,16 +1601,15 @@ func TestSendBatch_WriteError(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", t1.ConnectionCount())
 	}
 
-	// Stop t2 to break the connection.
+	// Stop t2 to break the connection, then send until a send fails on it
+	// and evicts it.
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Send again - this should fail and evict the connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
+	pollUntil(t, 10*time.Second, 20*time.Millisecond, "a send on the broken connection did not evict it", func() bool {
+		t1.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
+		})
+		return t1.ConnectionCount() == 0
 	})
-
-	// Should not panic. The rest of cleanup.
 	cleanup()
 }
 
@@ -3218,6 +3217,7 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 	if err := t2.Start(); err != nil {
 		t.Fatalf("t2.Start failed: %v", err)
 	}
+	defer t2.Stop()
 
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)
@@ -3230,15 +3230,13 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 		ChunkCount: 100,
 	}
 
-	// Stop t2 after a short delay.
-	go func() {
-		streamStopTimer := time.NewTimer(50 * time.Millisecond)
-		<-streamStopTimer.C
-		streamStopTimer.Stop()
-		t2.Stop()
-	}()
-
+	// Close the connection once the first chunk is on the wire: the next
+	// chunk write fails on it.
 	largeData := bytes.Repeat([]byte("streaming-chunk"), 1000)
+	conn, err := t1.getConnection(t2Addr, "")
+	if err != nil {
+		t.Fatalf("getConnection: %v", err)
+	}
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 100; i++ {
 			if err := emit(proto.SnapshotChunk{
@@ -3253,11 +3251,19 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 			}); err != nil {
 				return err
 			}
+			if i == 0 {
+				conn.CloseWithError(0, "test: break the snapshot stream")
+			}
 		}
-		return nil
+		return errors.New("no chunk write failed after the connection closed")
 	})
-	if sendErr == nil {
-		t.Log("SendSnapshotStreaming succeeded (receiver didn't close in time)")
+	var writeErr *SnapshotChunkWriteTimeoutError
+	if !errors.As(sendErr, &writeErr) {
+		t.Fatalf("SendSnapshotStreaming error = %v, want *SnapshotChunkWriteTimeoutError", sendErr)
+	}
+	if writeErr.ShardID != 1 || writeErr.ReplicaID != 2 || writeErr.ChunkID == 0 {
+		t.Fatalf("chunk write error names shard %d replica %d chunk %d, want 1, 2 and a chunk after the first",
+			writeErr.ShardID, writeErr.ReplicaID, writeErr.ChunkID)
 	}
 }
 
@@ -3777,8 +3783,14 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 	sendErr := make(chan error, 1)
 	go func() { sendErr <- t1.SendSnapshot(chunks) }()
 
-	// Let the send fill the flow-control window and block.
-	time.Sleep(2 * time.Second)
+	// Wait until the send has filled the stream's initial flow-control
+	// window, so its chunk Write blocks.
+	conn, err := t1.getConnection(t2.Addr().String(), "")
+	if err != nil {
+		t.Fatalf("getConnection: %v", err)
+	}
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "the snapshot send did not fill the flow-control window",
+		func() bool { return conn.ConnectionStats().BytesSent >= initialStreamReceiveWindow })
 
 	stopStart := time.Now()
 	if err := t1.Stop(); err != nil {
@@ -3956,7 +3968,15 @@ func TestSend_AMovedRouteNeitherReceivesNorChurnsAnotherReplicasTraffic(t *testi
 	}
 	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 7, From: 1, To: 9, Term: 1}})
 	waitForBatchCount(t, handler2, 1, 5*time.Second)
-	time.Sleep(200 * time.Millisecond) // let any stray victim frame land
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "the victim's six messages were not all dropped", func() bool {
+		var victim int
+		for _, d := range rec.drops() {
+			if d.reason == dropReasonIdentityMismatch && d.shardID == 1 && d.to == 2 {
+				victim++
+			}
+		}
+		return victim >= 6
+	})
 
 	for _, b := range handler2.getBatches() {
 		for _, m := range b.Requests {
@@ -4100,8 +4120,18 @@ func TestSend_AMessageForAnUnboundReplicaIsDropped(t *testing.T) {
 		{Type: proto.Replicate, ShardID: 3, From: 1, To: 5, Term: 1},
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
+	countUnbound := func() int {
+		var unbound int
+		for _, d := range rec.drops() {
+			if d.reason == dropReasonIdentityMismatch && d.shardID == 3 && d.to == 5 {
+				unbound++
+			}
+		}
+		return unbound
+	}
 	waitForBatchCount(t, handler2, 1, 5*time.Second)
-	time.Sleep(100 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "the unbound replica's messages were not dropped",
+		func() bool { return countUnbound() >= 2 })
 
 	for _, b := range handler2.getBatches() {
 		for _, m := range b.Requests {
@@ -4110,13 +4140,7 @@ func TestSend_AMessageForAnUnboundReplicaIsDropped(t *testing.T) {
 			}
 		}
 	}
-	var unbound int
-	for _, d := range rec.drops() {
-		if d.reason == dropReasonIdentityMismatch && d.shardID == 3 && d.to == 5 {
-			unbound++
-		}
-	}
-	if unbound != 2 {
+	if unbound := countUnbound(); unbound != 2 {
 		t.Fatalf("%d identity_mismatch drops for the unbound replica, want 2 (alone and mixed)", unbound)
 	}
 }
