@@ -78,6 +78,11 @@ var allowList = []allowRule{
 		reason: "Historical release notes recording where measurements ran. Released " +
 			"entries are not rewritten; new entries name roles, not machines.",
 	},
+	{
+		path:    "docs/references/**",
+		classes: []class{classLabAddress},
+		reason:  "Verbatim IETF text: the RFCs use RFC 5737 documentation addresses, and a reference copy is never edited.",
+	},
 }
 
 // validateAllowList reports the first unusable entry. scan calls it, so a

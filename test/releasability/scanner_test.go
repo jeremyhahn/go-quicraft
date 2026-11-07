@@ -124,38 +124,42 @@ type pattern struct {
 	guidance string
 }
 
-// patterns is the rule set, and the one place in this repository the fleet's
-// own subnet, hostnames, path prefixes and internal mail domain are written
-// down.
+// patterns is the rule set. It names the placeholder vocabulary the published
+// tree uses for the development fleet's subnet, hostnames, path prefixes and
+// internal mail domain, so a placeholder copied into new prose or a new fixture
+// is caught like the value it stands for.
 //
-// Note what is NOT here: 192.168.0.0/16 at large. Tests across this tree use
-// RFC 1918 literals as opaque addresses that are never dialed; banning the whole
-// space would bury real findings under them. The fleet subnet is named precisely
-// instead.
+// The values a private scan of an unpublished tree needs live outside this
+// repository.
+//
+// Note what is NOT here: the documentation and RFC 1918 ranges at large. Tests
+// across this tree use such literals as opaque addresses that are never dialed;
+// banning whole ranges would bury real findings under them. The placeholder
+// subnet is named precisely instead.
 var patterns = []pattern{
 	{
 		class:    classLabAddress,
-		expr:     regexp.MustCompile(`\b192\.168\.101\.\d{1,3}\b`),
-		needle:   "192.168.101.",
-		guidance: "use an RFC 5737 documentation address (198.51.100.0/24) or a name under .example",
+		expr:     regexp.MustCompile(`\b198\.51\.100\.\d{1,3}\b`),
+		needle:   "198.51.100.",
+		guidance: "use an address from another RFC 5737 documentation range (192.0.2.0/24, 203.0.113.0/24) or a name under .example",
 	},
 	{
 		class:    classLabHost,
-		expr:     regexp.MustCompile(`(?i)\bvstation-\d{2}\b`),
-		needle:   "vstation-",
-		guidance: "name the role, not the machine: build-host.example, bench-01, agent-01",
+		expr:     regexp.MustCompile(`(?i)\bgpu-host\b`), // lab-string-ok: the hostname this rule exists to find
+		needle:   "gpu-host",                             // lab-string-ok: the hostname this rule exists to find
+		guidance: "name the role, not the machine: review-host.example, build-host.example",
 	},
 	{
 		class:    classLabHost,
-		expr:     regexp.MustCompile(`(?i)\bdellemc-\d{2}\b`),
-		needle:   "dellemc-",
+		expr:     regexp.MustCompile(`(?i)\bci-node-\d+\b`),
+		needle:   "ci-node-",
 		guidance: "a CI runner's or bench machine's own hostname is never load-bearing: bench-01 reads the same",
 	},
 	{
 		class:    classLabHost,
-		expr:     regexp.MustCompile(`(?i)\bgodlike(\.internal)?\b`), // lab-string-ok: the hostname this rule exists to find
-		needle:   "gpu-host",                                          // lab-string-ok: the hostname this rule exists to find
-		guidance: "name the role, not the machine: gpu-host.internal, review-host.internal",
+		expr:     regexp.MustCompile(`(?i)\bvm-host-\d+\b`),
+		needle:   "vm-host-",
+		guidance: "name the role, not the machine: build-host.example, bench-01, agent-01",
 	},
 	{
 		class:    classLabHost,
@@ -171,8 +175,8 @@ var patterns = []pattern{
 	},
 	{
 		class:    classOwnerPath,
-		expr:     regexp.MustCompile(`/mnt/vstation`), // lab-string-ok: the mount prefix this rule exists to find
-		needle:   "/mnt/vstation",                     // lab-string-ok: the mount prefix this rule exists to find
+		expr:     regexp.MustCompile(`/mnt/vm-host`), // lab-string-ok: the mount prefix this rule exists to find
+		needle:   "/mnt/vm-host",                     // lab-string-ok: the mount prefix this rule exists to find
 		guidance: "the lab's NFS mount does not exist anywhere else; use a repository-relative path",
 	},
 	{
@@ -185,17 +189,9 @@ var patterns = []pattern{
 	},
 	{
 		class:    classInternalIdentity,
-		expr:     regexp.MustCompile(`(?i)\bautomatethethings\.internal\b`), // lab-string-ok: the mail domain this rule exists to find
+		expr:     regexp.MustCompile(`(?i)\bexample\.internal\b`), // lab-string-ok: the mail domain this rule exists to find
 		needle:   "example.internal",                              // lab-string-ok: the mail domain this rule exists to find
 		guidance: "the internal mail domain resolves nowhere public: use a name under .example or .invalid",
-	},
-	{
-		// After the domain rule on purpose: the company repository's name
-		// inside the mail domain is reported once, as the domain.
-		class:    classInternalRepository,
-		expr:     regexp.MustCompile(`(?i)\bautomatethethings\b`), // lab-string-ok: the repository name this rule exists to find
-		needle:   "automatethethings",                             // lab-string-ok: the repository name this rule exists to find
-		guidance: internalRepositoryGuidance,
 	},
 	{
 		class:    classInternalRepository,
