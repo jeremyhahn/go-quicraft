@@ -607,7 +607,7 @@ jobs:
       lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
     timeout-minutes: 5        # v1.30
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true' }}
         with:
           fetch-depth: 0
@@ -810,7 +810,7 @@ jobs:
     env:
       CI_IMAGE_NAMESPACE: agent-ci-images   # ci-standard.md §9 (ruling 217(4))
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1: mask the forge credentials before any other step (as above).
       - name: Mask the forge credentials
@@ -855,7 +855,7 @@ jobs:
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
       CI_IMAGE_NAMESPACE: agent-ci-images
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1: mask the forge credentials before any other step (as above).
       - name: Mask the forge credentials
@@ -1017,7 +1017,7 @@ jobs:
       # on main, so it writes main's set too.
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1 (Company Agent m605 item 8): mask the forge credentials before
       # any other step. The runner injects them as plain environment
@@ -1192,7 +1192,7 @@ jobs:
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
       CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1: mask the forge credentials before any other step (as above).
       - name: Mask the forge credentials
@@ -1282,7 +1282,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       IT_PROJECT: ${{ github.event.repository.name }}-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1 (Company Agent m605 item 8): mask the forge credentials before
       # any other step. The runner injects them as plain environment
@@ -1375,7 +1375,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       IT_PROJECT: ${{ github.event.repository.name }}-ci-${{ github.run_id }}-${{ github.run_attempt }}-soak
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v1.21.1: mask the forge credentials before any other step (as above).
       - name: Mask the forge credentials
@@ -1493,7 +1493,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1555,7 +1555,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1612,7 +1612,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1672,7 +1672,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1746,7 +1746,7 @@ jobs:
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
       PLATFORM: ${{ matrix.goos }}/${{ matrix.goarch }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1804,7 +1804,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1862,7 +1862,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -1929,7 +1929,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Mask the forge credentials
         run: |
@@ -2008,7 +2008,7 @@ jobs:
     env:
       OBJSTORE_SEAMS: ''      # CUSTOMIZE
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: No direct go-objstore import outside the storage seam
         run: |
