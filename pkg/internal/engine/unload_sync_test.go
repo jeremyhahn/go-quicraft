@@ -25,17 +25,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// slowUnloadApplier signals when Apply starts, then holds the apply long
-// enough for UnloadNode to be called mid-Apply, and records completion.
+// slowUnloadApplier signals when Apply starts, then holds the apply until
+// release is closed, so UnloadNode is called mid-Apply, and records completion.
 type slowUnloadApplier struct {
 	started   chan struct{}
+	release   chan struct{}
 	startOnce sync.Once
 	completed atomic.Bool
 }
 
 func (s *slowUnloadApplier) Apply(entries []proto.Entry, results []sm.Result) error {
 	s.startOnce.Do(func() { close(s.started) })
-	time.Sleep(150 * time.Millisecond)
+	<-s.release
 	for i := range entries {
 		results[i] = sm.Result{}
 	}
@@ -55,7 +56,7 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
-	applier := &slowUnloadApplier{started: make(chan struct{})}
+	applier := &slowUnloadApplier{started: make(chan struct{}), release: make(chan struct{})}
 	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
 	nodeCfg.SetDefaults()
 	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
@@ -81,7 +82,23 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	}
 
 	// Apply is now in flight. UnloadNode must block until it completes.
-	e.UnloadNode(7)
+	unloadDone := make(chan struct{})
+	go func() {
+		e.UnloadNode(7)
+		close(unloadDone)
+	}()
+	waitFor(t, 5*time.Second, time.Millisecond, "UnloadNode never marked the node unloaded", node.unloaded.Load)
+	select {
+	case <-unloadDone:
+		t.Fatal("UnloadNode returned while SM.Apply was still blocked")
+	default:
+	}
+	close(applier.release)
+	select {
+	case <-unloadDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UnloadNode did not return after SM.Apply completed")
+	}
 
 	if !applier.completed.Load() {
 		t.Fatal("UnloadNode returned while SM.Apply was still in flight: " +
