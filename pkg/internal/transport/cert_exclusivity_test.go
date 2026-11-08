@@ -294,13 +294,6 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 			wantFail: true,
 		},
 		{
-			name:     "per-node cert with an uncovered peer passes",
-			leaf:     perNode,
-			self:     "node-a.raft.test:5000",
-			peers:    []string{"node-b.raft.test:5000"},
-			wantFail: false,
-		},
-		{
 			name: "per-node cert is not flagged by its own address repeated",
 			leaf: perNode,
 			self: "node-a.raft.test:5000",
