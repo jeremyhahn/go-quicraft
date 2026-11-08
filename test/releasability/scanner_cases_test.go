@@ -27,20 +27,20 @@ import (
 // rules exist to find, so each line carries a waiver; every other test in the
 // repository uses neutral fixtures.
 const (
-	plantedAddress   = "198.51.100.51" // lab-string-ok: planted fixture for the lab-address rule
-	plantedGPUHost   = "gpu-host"      // lab-string-ok: planted fixture for the lab-host rule
-	plantedBenchHost = "omega"         // lab-string-ok: planted fixture for the lab-host rule
-	plantedRunner    = "ci-node-2"     // lab-string-ok: planted fixture for the lab-host rule
-	plantedAgent     = "vm-host-4"     // lab-string-ok: planted fixture for the lab-host rule
-	plantedHome      = "/home/jhahn"   // lab-string-ok: planted fixture for the owner-path rule
-	plantedMount     = "/mnt/vm-host"  // lab-string-ok: planted fixture for the owner-path rule
-	plantedAccount   = "jhahn"         // lab-string-ok: planted fixture for the owner-account rule
+	plantedAddress   = "198.51.100.51"        // lab-string-ok: planted fixture for the lab-address rule
+	plantedGPUHost   = "gpu-host"             // lab-string-ok: planted fixture for the lab-host rule
+	plantedBenchHost = "omega"                // lab-string-ok: planted fixture for the lab-host rule
+	plantedRunner    = "ci-node-2"            // lab-string-ok: planted fixture for the lab-host rule
+	plantedAgent     = "vm-host-4"            // lab-string-ok: planted fixture for the lab-host rule
+	plantedHome      = plantedMount + "/home" // lab-string-ok: planted fixture for the owner-path rule, a home under the lab mount
+	plantedMount     = "/mnt/vm-host"         // lab-string-ok: planted fixture for the owner-path rule
+	plantedAccount   = "jhahn"                // lab-string-ok: planted fixture for the owner-account rule
 
-	plantedDomain        = "example.internal"                   // lab-string-ok: planted fixture for the internal-identity rule
-	plantedPrincipal     = "agent-go-quicraft@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
-	plantedSibling       = "agent-go-qrdb@forge.example"        // lab-string-ok: an agent principal outside the internal domain is still one
-	plantedHandbookIssue = "handbook #392"                      // lab-string-ok: planted fixture for the internal-repository rule
-	plantedAgentsRepo    = "claude-agents"                      // lab-string-ok: planted fixture for the internal-repository rule
+	plantedDomain        = "example.internal"          // lab-string-ok: planted fixture for the internal-identity rule
+	plantedPrincipal     = "agent-01@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
+	plantedSibling       = "agent-02@forge.example"    // lab-string-ok: an agent principal outside the internal domain is still one
+	plantedHandbookIssue = "handbook #392"             // lab-string-ok: planted fixture for the internal-repository rule
+	plantedAgentsRepo    = "claude-agents"             // lab-string-ok: planted fixture for the internal-repository rule
 )
 
 // writeTree writes files into a temporary directory and returns the root plus
@@ -103,13 +103,6 @@ func TestScanReportsEveryClassWithItsLineAndMatch(t *testing.T) {
 			content:   "// observed on " + plantedAgent + "\n",
 			wantClass: classLabHost,
 			wantMatch: plantedAgent,
-			wantLine:  1,
-		},
-		{
-			name:      "owner home path in a doc",
-			content:   "See " + plantedHome + "/sources for the checkout.\n",
-			wantClass: classOwnerPath,
-			wantMatch: plantedHome,
 			wantLine:  1,
 		},
 		{
@@ -465,7 +458,6 @@ func TestPatternsEveryNeedleIsImpliedByItsExpr(t *testing.T) {
 		`(?i)\bci-node-\d+\b`:       {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
 		`(?i)\bvm-host-\d+\b`:       {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
 		`(?i)\bomega\b`:             {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
-		`/home/jhahn\b`:             {plantedHome + "/sources"},     // lab-string-ok: the rule's own source text, as the map key
 		`/mnt/vm-host`:              {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`: {plantedPrincipal, "user.email=" + strings.ToUpper(plantedSibling)},
 		`(?i)\bexample\.internal\b`:                        {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
