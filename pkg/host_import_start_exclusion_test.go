@@ -135,8 +135,8 @@ func TestImportSnapshot_RechecksTheShardIsStoppedUnderTheLock(t *testing.T) {
 	go func() {
 		done <- f.host.ImportSnapshot(context.Background(), f.shardID, bytes.NewReader(artifact), WithImportDataDir(""))
 	}()
-	// Let the import pass its preflight and park on the lock.
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the import to pass its preflight and park on the lock.
+	waitForShardLockRefs(t, &f.host.importLocks, f.shardID, 2)
 	select {
 	case err := <-done:
 		release()
