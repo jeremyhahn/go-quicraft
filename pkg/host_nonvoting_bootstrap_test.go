@@ -414,22 +414,17 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 			// HardState.Commit is 2, the processed marker is 0), so poll for
 			// it rather than assuming it landed before StartShard returned.
 			var after *Membership
-			deadline := time.Now().Add(10 * time.Second)
-			for {
+			if !waitUntil(10*time.Second, func() bool {
 				var memErr error
 				after, memErr = h.ShardMembership(shardID)
 				if memErr != nil {
 					t.Fatalf("ShardMembership failed: %v", memErr)
 				}
-				if after.ConfigChangeID == 2 {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("the committed %s config change at index 2 was never applied: %+v; "+
-						"the replica was seeded into the FULL VOTER set by the members map "+
-						"and nothing repaired it", tt.name, after)
-				}
-				time.Sleep(2 * time.Millisecond)
+				return after.ConfigChangeID == 2
+			}) {
+				t.Fatalf("the committed %s config change at index 2 was never applied: %+v; "+
+					"the replica was seeded into the FULL VOTER set by the members map "+
+					"and nothing repaired it", tt.name, after)
 			}
 
 			if _, ok := after.Nodes[replicaID]; ok {
