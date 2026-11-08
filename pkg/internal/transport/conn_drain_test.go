@@ -297,10 +297,13 @@ func TestCloseTarget_DrainingOutboundClosedExactlyOnce(t *testing.T) {
 		t.Fatalf("draining outbound not closed by CloseTarget: cause %v",
 			context.Cause(outbound.Context()))
 	}
-	// Outlast the grace so the drain goroutine has run its ownership check.
-	time.Sleep(staleOutboundDrainGrace + 250*time.Millisecond)
+	// The close wakes the drain goroutine at once, and Stop joins it through
+	// t.wg, so past Stop it has run and found nothing to close.
+	if err := t1.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
 	if !removedPeerClose(outbound) {
-		t.Fatalf("close cause changed after the drain grace: %v",
+		t.Fatalf("close cause changed after the drain goroutine ran: %v",
 			context.Cause(outbound.Context()))
 	}
 	t1.connMu.RLock()

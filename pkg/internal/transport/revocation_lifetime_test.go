@@ -80,14 +80,10 @@ func TestRevocation_EvictsAnAlreadyEstablishedConnection(t *testing.T) {
 	t1.revocationChecker.AddRevokedSerial(serial)
 	t1.revokeCheckConnections()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case <-conn.Context().Done():
-			return // torn down, as required
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+	select {
+	case <-conn.Context().Done():
+		return // torn down, as required
+	case <-time.After(5 * time.Second):
 	}
 	t.Fatal("a connection whose peer certificate was revoked is still live: " +
 		"revocation only stops the peer RECONNECTING, so a compromised node " +

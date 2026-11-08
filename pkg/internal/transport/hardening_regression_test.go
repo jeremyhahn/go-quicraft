@@ -655,7 +655,8 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 
 	// First connection: completes a full handshake so the server issues a
 	// session ticket the client caches. The ticket arrives shortly AFTER the
-	// handshake, so the connection is held open briefly before closing.
+	// handshake, so the connection is held open until the client cache holds
+	// it (keyed by the SNI DialAddrEarly derives from the address).
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	warm, err := quic.DialAddrEarly(ctx, addr, pair.client, qcfg)
@@ -663,7 +664,11 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 		t.Fatalf("warm-up dial: %v", err)
 	}
 	<-warm.HandshakeComplete()
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "no session ticket cached after the warm-up handshake",
+		func() bool {
+			_, ok := pair.client.ClientSessionCache.Get("127.0.0.1")
+			return ok
+		})
 	_ = warm.CloseWithError(0, "warm-up done")
 
 	// Resumed connection: the snapshot header is written BEFORE the handshake

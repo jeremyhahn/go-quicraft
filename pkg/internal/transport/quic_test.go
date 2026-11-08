@@ -16,6 +16,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/quic-go/quic-go"
 )
 
 // testMTLSConfig returns a valid MTLSConfig for use in tests. It generates
@@ -1601,16 +1603,15 @@ func TestSendBatch_WriteError(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", t1.ConnectionCount())
 	}
 
-	// Stop t2 to break the connection.
+	// Stop t2 to break the connection, then send until a send fails on it
+	// and evicts it.
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Send again - this should fail and evict the connection.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
+	pollUntil(t, 10*time.Second, 20*time.Millisecond, "a send on the broken connection did not evict it", func() bool {
+		t1.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
+		})
+		return t1.ConnectionCount() == 0
 	})
-
-	// Should not panic. The rest of cleanup.
 	cleanup()
 }
 
@@ -3079,148 +3080,6 @@ func TestSendSnapshotStreaming_OpenStreamSyncError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Multiple concurrent send queue creations (quic.go:567-571)
-// ---------------------------------------------------------------------------
-
-// TestGetOrCreateSendQueue_ConcurrentCreation exercises the slow-path
-// double-check in getOrCreateSendQueue by having many goroutines race
-// to create a queue for the same target with higher goroutine count.
-
-func TestGetOrCreateSendQueue_ConcurrentCreationHighContention(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Race many goroutines to create a queue for the same target.
-	const numGoroutines = 100
-	var wg sync.WaitGroup
-	results := make([]*sendQueue, numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		idx := i
-		go func() {
-			defer wg.Done()
-			results[idx] = tr.getOrCreateSendQueue("127.0.0.1:29999")
-		}()
-	}
-	wg.Wait()
-
-	// All should return the same queue.
-	for i := 1; i < numGoroutines; i++ {
-		if results[i] != results[0] {
-			t.Fatalf("goroutine %d got different queue", i)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// handleMessageFrame with metrics (recv.go:519-527)
-// ---------------------------------------------------------------------------
-
-// TestHandleMessageFrame_WithMetricsMultiMessage verifies that message
-// receive metrics are recorded when metrics are configured with multiple
-// message types in a single batch.
-
-func TestSend_StoppedAfterQueueCreation(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	// Register two targets.
-	reg.Register(1, 2, "127.0.0.1:10001")
-	reg.Register(2, 3, "127.0.0.1:10002")
-
-	// Send to first target to create its queue.
-	tr.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-
-	// Stop and then try to send to second target.
-	tr.Stop()
-	tr.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 2, From: 1, To: 3, Term: 1},
-	})
-}
-
-// ---------------------------------------------------------------------------
-// sendBatch snappy pool cap-too-small via direct call (quic.go:783-786)
-// ---------------------------------------------------------------------------
-
-// TestSendBatch_DirectSnappyPoolCapTooSmall exercises the snappy encode
-// pool path where a pooled buffer has insufficient capacity for the
-// compressed output. The pooled pointer is discarded and a fresh buffer
-// is allocated. This must use a direct sendBatch call (not Send) to
-// avoid sync.Pool GC timing issues with async queue workers.
-
-func TestGetOrCreateSendQueue_SlowPathDoubleCheckHit(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	target := "127.0.0.1:30000"
-
-	// Create the queue first so it exists in the map.
-	sq1 := tr.getOrCreateSendQueue(target)
-	if sq1 == nil {
-		t.Fatal("expected non-nil queue")
-	}
-
-	// Now race 50 goroutines requesting the same target. Since the
-	// queue exists, most will hit the fast path (RLock), but some
-	// may hit the slow path and find the queue in the double-check.
-	const numGoroutines = 50
-	var wg sync.WaitGroup
-	results := make([]*sendQueue, numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		idx := i
-		go func() {
-			defer wg.Done()
-			results[idx] = tr.getOrCreateSendQueue(target)
-		}()
-	}
-	wg.Wait()
-
-	for i := range results {
-		if results[i] != sq1 {
-			t.Fatalf("goroutine %d got different queue", i)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
 // sendBatch write deadline and write error paths (quic.go:839-857)
 // ---------------------------------------------------------------------------
 
@@ -3360,6 +3219,7 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 	if err := t2.Start(); err != nil {
 		t.Fatalf("t2.Start failed: %v", err)
 	}
+	defer t2.Stop()
 
 	t2Addr := t2.Addr().String()
 	reg1.Register(1, 2, t2Addr)
@@ -3372,15 +3232,13 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 		ChunkCount: 100,
 	}
 
-	// Stop t2 after a short delay.
-	go func() {
-		streamStopTimer := time.NewTimer(50 * time.Millisecond)
-		<-streamStopTimer.C
-		streamStopTimer.Stop()
-		t2.Stop()
-	}()
-
+	// Close the connection once the first chunk is on the wire: the next
+	// chunk write fails on it.
 	largeData := bytes.Repeat([]byte("streaming-chunk"), 1000)
+	conn, err := t1.getConnection(t2Addr, "")
+	if err != nil {
+		t.Fatalf("getConnection: %v", err)
+	}
 	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
 		for i := uint64(0); i < 100; i++ {
 			if err := emit(proto.SnapshotChunk{
@@ -3395,11 +3253,19 @@ func TestSendSnapshotStreaming_ChunkWriteError(t *testing.T) {
 			}); err != nil {
 				return err
 			}
+			if i == 0 {
+				conn.CloseWithError(0, "test: break the snapshot stream")
+			}
 		}
-		return nil
+		return errors.New("no chunk write failed after the connection closed")
 	})
-	if sendErr == nil {
-		t.Log("SendSnapshotStreaming succeeded (receiver didn't close in time)")
+	var writeErr *SnapshotChunkWriteTimeoutError
+	if !errors.As(sendErr, &writeErr) {
+		t.Fatalf("SendSnapshotStreaming error = %v, want *SnapshotChunkWriteTimeoutError", sendErr)
+	}
+	if writeErr.ShardID != 1 || writeErr.ReplicaID != 2 || writeErr.ChunkID == 0 {
+		t.Fatalf("chunk write error names shard %d replica %d chunk %d, want 1, 2 and a chunk after the first",
+			writeErr.ShardID, writeErr.ReplicaID, writeErr.ChunkID)
 	}
 }
 
@@ -3732,95 +3598,6 @@ func TestSend_BackpressureLoggingOverflow(t *testing.T) {
 	requireQueueFullDrop(t, tr, rec, 1, 2)
 }
 
-// TestSendSnapshotStreaming_ChunkWriteFailure exercises the streaming
-// snapshot chunk write error path by closing the connection during
-// the chunk emission loop.
-
-func TestSendSnapshotStreaming_ChunkWriteFailure(t *testing.T) {
-	mtls := testMTLSConfig(t)
-	handler1 := newTestHandler()
-	handler2 := newTestHandler()
-	reg1 := registry.NewRegistry()
-	reg2 := registry.NewRegistry()
-
-	t1, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-		EventListener: &config.EventListener{
-			OnSnapshotSendStarted: func(info config.SnapshotInfo) {},
-			OnSnapshotSendAborted: func(info config.SnapshotInfo) {},
-		},
-	}, handler1, reg1)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(1) failed: %v", err)
-	}
-	if err := t1.Start(); err != nil {
-		t.Fatalf("t1.Start failed: %v", err)
-	}
-	defer t1.Stop()
-
-	t2, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    mtls,
-	}, handler2, reg2)
-	if err != nil {
-		t.Fatalf("NewQUICTransport(2) failed: %v", err)
-	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
-	}
-	defer func() { _ = t2.Stop() }()
-
-	t2Addr := t2.Addr().String()
-	reg1.Register(1, 2, t2Addr)
-
-	meta := SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      10,
-		Term:       5,
-		ChunkCount: 500,
-	}
-
-	largeData := bytes.Repeat([]byte("streaming-data-"), 5000)
-
-	// Close the connection during chunk emission, after header is written.
-	go func() {
-		streamInterruptTimer := time.NewTimer(100 * time.Millisecond)
-		<-streamInterruptTimer.C
-		streamInterruptTimer.Stop()
-		t1.connMu.RLock()
-		conn, ok := t1.conns[t2Addr]
-		t1.connMu.RUnlock()
-		if ok {
-			conn.CloseWithError(0, "test: interrupt streaming snapshot")
-		}
-	}()
-
-	sendErr := t1.SendSnapshotStreaming(meta, func(emit func(proto.SnapshotChunk) error) error {
-		for i := uint64(0); i < 500; i++ {
-			if emitErr := emit(proto.SnapshotChunk{
-				BinVer:     proto.WireVersion,
-				ShardID:    1,
-				ReplicaID:  2,
-				Index:      10,
-				Term:       5,
-				ChunkID:    i,
-				ChunkCount: 500,
-				Data:       largeData,
-			}); emitErr != nil {
-				return emitErr
-			}
-		}
-		return nil
-	})
-	if sendErr == nil {
-		t.Log("SendSnapshotStreaming succeeded (connection survived)")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // snappyEncPool bootstrap + cap (quic.go NewQUICTransport / sendBatch)
 // ---------------------------------------------------------------------------
@@ -3943,10 +3720,9 @@ func TestSend_UnresolvedTargetLogsDrop(t *testing.T) {
 
 // TestSendSnapshot_StopUnblocksStalledChunkWrite verifies that Stop() is not
 // held hostage by an in-flight snapshot send whose chunk writes are blocked
-// on a slow receiver. The receiver rate-limits snapshot chunks (capped 5s
-// sleep per chunk), so the sender fills its QUIC flow-control window and
-// blocks in Write; without the shutdown watcher, Stop() would wait for the
-// entire transfer (30s write deadline per chunk).
+// on a stalled receiver. The receiver never reads the stream, so the sender
+// fills its QUIC flow-control window and blocks in Write; without the
+// shutdown watcher, Stop() would wait out the 30s chunk write deadline.
 func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 	handler1 := newTestHandler()
 	handler2 := newTestHandler()
@@ -3966,26 +3742,37 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 		t.Fatalf("t1.Start failed: %v", err)
 	}
 
-	// 1 B/s receive rate: every chunk hits the capped 5s rate-limit sleep,
-	// during which the receiver does not drain the stream.
+	// The receiver is a bare QUIC listener with t2's TLS that accepts the
+	// connection and never reads a stream, so no stream credit comes back.
+	// Its 64KB stream window is far below one 1MB chunk, so the first chunk
+	// Write can end only by a cancel or its write deadline.
 	t2, err := NewQUICTransport(Config{
-		ListenAddress:          "127.0.0.1:0",
-		DeploymentID:           42,
-		MTLSConfig:             mtls,
-		MaxSnapshotReceiveRate: 1,
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
 	}, handler2, reg2)
 	if err != nil {
 		t.Fatalf("NewQUICTransport(2) failed: %v", err)
 	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", t2.listenerTLS(), &quic.Config{
+		HandshakeIdleTimeout:       3 * time.Second,
+		InitialStreamReceiveWindow: 64 << 10,
+		MaxStreamReceiveWindow:     64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	defer t2.Stop()
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			if _, aerr := ln.Accept(context.Background()); aerr != nil {
+				return
+			}
+		}
+	}()
 
-	reg1.Register(1, 2, t2.Addr().String())
+	reg1.Register(1, 2, ln.Addr().String())
 
-	// 32 x 1MB chunks: far more than the 8MB stream receive window, so the
-	// sender's Write blocks once the window fills.
 	const chunkCount = 32
 	data := bytes.Repeat([]byte("x"), 1<<20)
 	chunks := make([]proto.SnapshotChunk, chunkCount)
@@ -4005,11 +3792,17 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 		}
 	}
 
+	idC := make(chan uint64, 1)
 	sendErr := make(chan error, 1)
-	go func() { sendErr <- t1.SendSnapshot(chunks) }()
+	go func() {
+		idC <- goroutineID()
+		sendErr <- t1.SendSnapshot(chunks)
+	}()
 
-	// Let the send fill the flow-control window and block.
-	time.Sleep(2 * time.Second)
+	// Wait until the send is parked inside the first chunk's stream Write,
+	// which the receiver never lets complete, so Stop meets a write in
+	// flight rather than the between-chunks stopC check.
+	waitBlockedIn(t, idC, "quic-go.(*SendStream).Write", 10*time.Second)
 
 	stopStart := time.Now()
 	if err := t1.Stop(); err != nil {
@@ -4187,7 +3980,15 @@ func TestSend_AMovedRouteNeitherReceivesNorChurnsAnotherReplicasTraffic(t *testi
 	}
 	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 7, From: 1, To: 9, Term: 1}})
 	waitForBatchCount(t, handler2, 1, 5*time.Second)
-	time.Sleep(200 * time.Millisecond) // let any stray victim frame land
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "the victim's six messages were not all dropped", func() bool {
+		var victim int
+		for _, d := range rec.drops() {
+			if d.reason == dropReasonIdentityMismatch && d.shardID == 1 && d.to == 2 {
+				victim++
+			}
+		}
+		return victim >= 6
+	})
 
 	for _, b := range handler2.getBatches() {
 		for _, m := range b.Requests {
@@ -4331,8 +4132,18 @@ func TestSend_AMessageForAnUnboundReplicaIsDropped(t *testing.T) {
 		{Type: proto.Replicate, ShardID: 3, From: 1, To: 5, Term: 1},
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
+	countUnbound := func() int {
+		var unbound int
+		for _, d := range rec.drops() {
+			if d.reason == dropReasonIdentityMismatch && d.shardID == 3 && d.to == 5 {
+				unbound++
+			}
+		}
+		return unbound
+	}
 	waitForBatchCount(t, handler2, 1, 5*time.Second)
-	time.Sleep(100 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "the unbound replica's messages were not dropped",
+		func() bool { return countUnbound() >= 2 })
 
 	for _, b := range handler2.getBatches() {
 		for _, m := range b.Requests {
@@ -4341,13 +4152,7 @@ func TestSend_AMessageForAnUnboundReplicaIsDropped(t *testing.T) {
 			}
 		}
 	}
-	var unbound int
-	for _, d := range rec.drops() {
-		if d.reason == dropReasonIdentityMismatch && d.shardID == 3 && d.to == 5 {
-			unbound++
-		}
-	}
-	if unbound != 2 {
+	if unbound := countUnbound(); unbound != 2 {
 		t.Fatalf("%d identity_mismatch drops for the unbound replica, want 2 (alone and mixed)", unbound)
 	}
 }

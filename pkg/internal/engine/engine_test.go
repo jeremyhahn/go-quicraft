@@ -1020,18 +1020,18 @@ func TestEngine_StepWorkerSurvivesGoexitInACallback(t *testing.T) {
 	e.LoadNode(node)
 
 	key := uint64(1000)
-	deadline := time.Now().Add(15 * time.Second)
-	for cb.readyCount.Load() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("ReadIndex confirmations = %d (goexited=%v), want a second one after "+
-				"the callback Goexited: the step worker did not survive it",
-				cb.readyCount.Load(), cb.goexited.Load())
-		}
-		key++
-		node.DeliverReadIndex(key)
-		e.NotifyWork(1)
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Each poll that finds fewer than two confirmations issues another read.
+	waitFor(t, 15*time.Second, 10*time.Millisecond, "no second ReadIndex confirmation after "+
+		"the callback Goexited: the step worker did not survive it",
+		func() bool {
+			if cb.readyCount.Load() >= 2 {
+				return true
+			}
+			key++
+			node.DeliverReadIndex(key)
+			e.NotifyWork(1)
+			return false
+		})
 	if !cb.goexited.Load() {
 		t.Fatal("fixture: the callback never Goexited")
 	}
@@ -1080,13 +1080,8 @@ func TestEngine_ShardApplyGoexitFailsTheShard(t *testing.T) {
 	item.node = node
 	e.applyCs[int(node.shardID%uint64(e.NumWorkers()))] <- item
 
-	deadline := time.Now().Add(5 * time.Second)
-	for cb.shardFailedCount.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("a Goexit in SM.Apply never failed the shard")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, 5*time.Millisecond, "a Goexit in SM.Apply never failed the shard",
+		func() bool { return cb.shardFailedCount.Load() != 0 })
 	cb.mu.Lock()
 	failErr := cb.shardFailedCalls[0].err
 	cb.mu.Unlock()
@@ -1160,9 +1155,8 @@ func TestListenerDispatcher_StopSurvivesGoexitsInItsFinalDrain(t *testing.T) {
 	}()
 	// stop has closed stopC once running is false; only then release the
 	// first listener, so its Goexit lands on the stopped path.
-	for d.running.Load() {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "stop never cleared running",
+		func() bool { return !d.running.Load() })
 	close(gate)
 	select {
 	case <-stopped:

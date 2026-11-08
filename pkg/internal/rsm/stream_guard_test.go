@@ -209,6 +209,10 @@ func TestCloseWaitsForStreamingSnapshot(t *testing.T) {
 	}()
 
 	// Close must still be waiting: the snapshot has not finished streaming.
+	// This window is a deliberate wait, not a condition timeout: the test
+	// checks that Close does NOT return, and there is no event to wait on for
+	// something that must not happen. Every other wait in this file is a
+	// deadline on a condition.
 	select {
 	case <-closeReturned:
 		close(blocking.release)

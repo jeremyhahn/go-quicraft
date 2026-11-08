@@ -349,6 +349,8 @@ func TestSoak_RollingRestartUnderLoad(t *testing.T) {
 		} else {
 			stalledSince = time.Time{}
 		}
+		// The pause between restart rounds is part of the soak's schedule,
+		// not a wait for an effect: the catch-up wait above already ended.
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -553,13 +555,21 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 			clientWorker(t, cluster, shardID, clientID, numKeys, 20*time.Second, recorder, done)
 		}(i)
 	}
-
-	// Let the cluster reach steady state so the measurement is not dominated
-	// by warmup.
-	time.Sleep(steadyState)
-	if recorder.completed() == 0 {
+	// stopClients ends the workload once. It is deferred so that a wait
+	// below that fails with t.Fatal still stops the clients before the
+	// cluster closes under them.
+	stopClients := sync.OnceFunc(func() {
 		close(done)
 		wg.Wait()
+	})
+	defer stopClients()
+
+	// Let the cluster reach steady state so the measurement is not dominated
+	// by warmup. The interval is the phase itself (the floor below is sized
+	// to it), not a wait for an effect.
+	time.Sleep(steadyState)
+	if recorder.completed() == 0 {
+		stopClients()
 		t.Fatal("no operations committed before the leader was closed")
 	}
 
@@ -572,20 +582,13 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	// or two). That is a timing bound, not a fault, and the test needs a
 	// leader to close, not one at an exact instant. The wait ends before the
 	// close, so the outage measured below is unchanged.
-	leaderWaitStart := time.Now()
-	leaderDeadline := leaderWaitStart.Add(failoverTimeout)
 	leaderIdx = cluster.findLeader(shardID)
-	waitedForLeader := leaderIdx < 0
-	for leaderIdx < 0 && time.Now().Before(leaderDeadline) {
-		time.Sleep(10 * time.Millisecond)
-		leaderIdx = cluster.findLeader(shardID)
-	}
 	if leaderIdx < 0 {
-		close(done)
-		wg.Wait()
-		t.Fatalf("no leader within %v of the end of the steady-state phase", failoverTimeout)
-	}
-	if waitedForLeader {
+		leaderWaitStart := time.Now()
+		waitForCondition(t, failoverTimeout, "a leader at the end of the steady-state phase", func() bool {
+			leaderIdx = cluster.findLeader(shardID)
+			return leaderIdx >= 0
+		})
 		t.Logf("waited %v for a leader at the end of the steady-state phase",
 			time.Since(leaderWaitStart))
 	}
@@ -629,24 +632,25 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 		}
 		t.Errorf("no leader was elected within %v of closing the leader", failoverTimeout)
 	}()
+	// On a t.Fatal below, stop the clients (which closes done and so ends the
+	// watcher) and join the watcher before the test returns.
+	defer func() {
+		stopClients()
+		<-electionWatcherDone
+	}()
 
 	// Require SUSTAINED recovery, not a single completion. An operation that
 	// was already in flight when the leader closed will finish moments later
 	// and would otherwise be misread as "the cluster is healthy again",
 	// hiding an outage entirely. Demand a run of new commits instead.
 	const recoveredOps = 50
-	outage := time.Duration(0)
-	deadline := time.Now().Add(maxOutage + 10*time.Second)
-	for time.Now().Before(deadline) {
-		if recorder.completed() >= before+recoveredOps {
-			outage = time.Since(closeStart)
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForCondition(t, maxOutage+10*time.Second,
+		"a sustained run of commits after closing the leader", func() bool {
+			return recorder.completed() >= before+recoveredOps
+		})
+	outage := time.Since(closeStart)
 
-	close(done)
-	wg.Wait()
+	stopClients()
 	// Join the watcher before reading electedAt so the log line reports a
 	// settled value rather than racing the goroutine that fills it in.
 	<-electionWatcherDone
@@ -659,9 +663,6 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	t.Logf("leader close took %v; new leader after %v; %d sustained ops committed after %v (%d total)",
 		closeElapsed, elected, recoveredOps, outage, recorder.completed())
 
-	if outage == 0 {
-		t.Fatalf("writes never resumed within %v of closing the leader", maxOutage+5*time.Second)
-	}
 	if outage > maxOutage {
 		t.Errorf("writes were unavailable for %v after gracefully closing the "+
 			"leader, exceeding %v: that is a drain-length stall, meaning "+
@@ -685,12 +686,20 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 func waitForLeaderOrDump(t *testing.T, cluster *testCluster, shardID uint64,
 	timeout time.Duration, down map[int]bool) bool {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	// A bounded poll that reports instead of failing: the caller stops its
+	// workload before it fails the test, which waitForCondition cannot do.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	expired := time.After(timeout)
+	for polling := true; polling; {
 		if cluster.findLeader(shardID) >= 0 {
 			return true
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-expired:
+			polling = false
+		case <-ticker.C:
+		}
 	}
 
 	t.Logf("ELECTION FAILURE: no leader after %v; per-replica state follows", timeout)
