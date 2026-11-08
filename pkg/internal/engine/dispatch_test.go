@@ -319,15 +319,9 @@ func TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull(t *testing.T) {
 
 	// Drain the queue and retry: the change must still be published.
 	close(block)
-	deadline := time.After(10 * time.Second)
-	for len(d.q) > 0 {
-		select {
-		case <-deadline:
-			t.Fatal("listener queue never drained")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
+	waitFor(t, 10*time.Second, time.Millisecond, "listener queue never drained", func() bool {
+		return len(d.q) == 0
+	})
 	sw.publishLeaderChange(1, node)
 	d.stop()
 	wg.Wait()
