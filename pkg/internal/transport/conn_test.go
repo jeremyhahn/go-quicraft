@@ -2608,8 +2608,11 @@ func TestGetStream_StaleStreamInShardDedupRetry(t *testing.T) {
 	shard.mu.RUnlock()
 
 	// Step 4: Stop t2 (kills the connection).
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Step 5: Remove the connection from conns but leave the stale stream
 	// in the shard map. This is the key setup: getStream slow path will
@@ -2901,13 +2904,17 @@ func TestEvictStreamsForTarget_StreamCloseError(t *testing.T) {
 	t1.connMu.RLock()
 	conn := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
-	if conn != nil {
-		conn.CloseWithError(0, "pre-close for stream error test")
+	if conn == nil {
+		t.Fatal("expected outbound connection to exist")
 	}
-	time.Sleep(200 * time.Millisecond)
+	conn.CloseWithError(0, "pre-close for stream error test")
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Now evict streams - they should fail to close since connection is dead.
 	t1.evictStreamsForTarget(t2Addr)
+	if n := countStreamsForTarget(t1, t2Addr); n != 0 {
+		t.Fatalf("expected no pooled streams after eviction despite close errors, got %d", n)
+	}
 
 	t2.Stop()
 }
@@ -3067,7 +3074,6 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 			// Repeatedly remove the connection.
 			for i := 0; i < 100; i++ {
 				t1.removeConnection(t2Addr)
-				time.Sleep(time.Microsecond)
 			}
 		}()
 
@@ -3084,7 +3090,6 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 				shard.mu.Unlock()
 
 				_, _ = t1.getStream(t2Addr, shardID, false, "")
-				time.Sleep(time.Microsecond)
 			}
 		}()
 
@@ -3105,7 +3110,7 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 // OpenStreamSync completes.
 
 func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
 
 	t2Addr := t2.Addr().String()
@@ -3114,7 +3119,7 @@ func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
 	t1.Send([]proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-	time.Sleep(300 * time.Millisecond)
+	handler2.waitBatch(t, 10*time.Second)
 
 	// Get a stream to populate the cache.
 	stream1, err := t1.getStream(t2Addr, 1, false, "")
