@@ -260,15 +260,21 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 	close(shardC)
 
 	done := make(chan struct{})
+	applyG := make(chan string, 1)
 	go func() {
+		applyG <- goroutineID()
 		aw.runShardApply(shardC)
 		close(done)
 	}()
+	gid := <-applyG
 
 	// The goroutine dequeues one batch and parks it on the held gate; a
-	// drop-style gate would discard it and dequeue the next.
+	// drop-style gate would discard it and dequeue the next. Wait until it
+	// is asleep in the gate's wait loop, the only time.Sleep in
+	// runShardApply: the receive from shardC shortens it before the gate is
+	// evaluated, so its length alone does not prove the batch is held.
 	waitFor(t, 5*time.Second, time.Millisecond, "no batch reached the held saving gate",
-		func() bool { return len(shardC) < total })
+		func() bool { return goroutineSleepingIn(gid, "runShardApply") })
 	if got := len(shardC); got != total-1 {
 		t.Fatalf("%d batches dequeued while the saving gate was held, want 1 parked", total-got)
 	}
