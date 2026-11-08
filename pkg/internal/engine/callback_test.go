@@ -453,15 +453,9 @@ func TestApplyWorker_CallbackFiresOnSuccessfulApply(t *testing.T) {
 	}()
 
 	// Poll until the callback fires (apply completed).
-	deadlineCB := time.After(5 * time.Second)
-	for cb.appliedCount.Load() == 0 {
-		select {
-		case <-deadlineCB:
-			t.Fatal("timed out waiting for OnApplied callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for OnApplied callback", func() bool {
+		return cb.appliedCount.Load() != 0
+	})
 
 	close(stopC)
 	<-runDone
@@ -534,15 +528,9 @@ func TestApplyWorker_NilCallbackDoesNotPanic(t *testing.T) {
 	}()
 
 	// Poll until the SM apply completes (no panic occurred).
-	deadlineNil := time.After(5 * time.Second)
-	for testSm.applyCount.Load() == 0 {
-		select {
-		case <-deadlineNil:
-			t.Fatal("timed out waiting for SM apply with nil callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for SM apply with nil callback", func() bool {
+		return testSm.applyCount.Load() != 0
+	})
 
 	close(stopC)
 	<-runDone
@@ -590,15 +578,9 @@ func TestApplyWorker_CallbackMultipleShards(t *testing.T) {
 	}()
 
 	// Poll until all 3 shards have fired callbacks.
-	deadlineMulti := time.After(5 * time.Second)
-	for cb.appliedCount.Load() < 3 {
-		select {
-		case <-deadlineMulti:
-			t.Fatalf("timed out waiting for 3 OnApplied callbacks, got %d", cb.appliedCount.Load())
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for 3 OnApplied callbacks", func() bool {
+		return cb.appliedCount.Load() >= 3
+	})
 
 	close(stopC)
 	<-runDone
@@ -941,15 +923,9 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	}()
 
 	// Wait for the proposal failed callback.
-	deadline := time.After(5 * time.Second)
-	for cb.proposalFailedCount.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for OnProposalFailed callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for OnProposalFailed callback", func() bool {
+		return cb.proposalFailedCount.Load() != 0
+	})
 
 	close(stopC)
 	<-runDone
@@ -1062,15 +1038,7 @@ func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
 	}()
 
 	// Wait for the shard to be marked failed (confirms the error path ran).
-	deadline := time.After(5 * time.Second)
-	for !node.failed.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard to fail")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard to fail", node.failed.Load)
 
 	close(stopC)
 	<-runDone
@@ -1125,15 +1093,7 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 	}()
 
 	// Wait for the shard to be marked failed (confirms the error path ran).
-	deadline := time.After(5 * time.Second)
-	for !node.failed.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard to be marked failed with nil callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard to be marked failed with nil callback", node.failed.Load)
 
 	close(stopC)
 	<-runDone
@@ -1189,15 +1149,7 @@ func TestApplyWorker_ApplyError_FailsFast(t *testing.T) {
 	applyC <- item
 
 	// Wait for the shard to be marked failed.
-	deadline := time.After(5 * time.Second)
-	for !node.failed.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard to fail")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard to fail", node.failed.Load)
 
 	// lastApplied must not advance under fail-fast.
 	if got := node.lastApplied.Load(); got != 0 {
@@ -1206,7 +1158,7 @@ func TestApplyWorker_ApplyError_FailsFast(t *testing.T) {
 
 	// An ApplyError must be reported through the listener.
 	var foundApplyErr bool
-	deadline = time.After(2 * time.Second)
+	deadline := time.After(2 * time.Second)
 	for !foundApplyErr {
 		select {
 		case reported := <-errorsCh:

@@ -16,6 +16,7 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -43,29 +44,29 @@ func newCallbackCluster(t *testing.T, shardID uint64) (*testCluster, map[uint64]
 // it is answered as a successful read or not answered at all.
 func awaitReadFailure(t *testing.T, cb *testCallback, key uint64) error {
 	t.Helper()
-	deadline := time.Now().Add(refusalWatchdog)
-	for time.Now().Before(deadline) {
+	var failure error
+	msg := fmt.Sprintf("read %d was neither served nor failed within %v: the caller would block forever", key, refusalWatchdog)
+	waitFor(t, refusalWatchdog, 5*time.Millisecond, msg, func() bool {
 		for _, call := range cb.getReadIndexFailedCalls() {
 			for _, k := range call.keys {
 				if k == key {
-					return call.err
+					failure = call.err
+					return true
 				}
 			}
 		}
 		cb.mu.Lock()
+		defer cb.mu.Unlock()
 		for _, call := range cb.readyToReadKeys {
 			for _, rtr := range call.readyToRead {
 				if rtr.Key == key {
-					cb.mu.Unlock()
 					t.Fatalf("read %d was served at index %d by a leader that refused it", key, rtr.Index)
 				}
 			}
 		}
-		cb.mu.Unlock()
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("read %d was neither served nor failed within %v: the caller would block forever", key, refusalWatchdog)
-	return nil
+		return false
+	})
+	return failure
 }
 
 // TestForwardedRead_NewLeaderNotReady_FailsFast holds a freshly elected
@@ -85,16 +86,10 @@ func TestForwardedRead_NewLeaderNotReady_FailsFast(t *testing.T) {
 	}
 	follower := leader%3 + 1
 	fnode := c.replicas[follower].node
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if l, _ := fnode.LeaderAndTerm(); l == leader {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("follower %d never learned leader %d", follower, leader)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 10*time.Second, 5*time.Millisecond, fmt.Sprintf("follower %d never learned leader %d", follower, leader), func() bool {
+		l, _ := fnode.LeaderAndTerm()
+		return l == leader
+	})
 	if got := c.replicas[leader].node.CommittedIndex(); got != 0 {
 		t.Fatalf("fixture: the leader committed index %d with every Replicate dropped", got)
 	}
@@ -129,16 +124,10 @@ func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 	follower := leader%3 + 1
 	fnode := c.replicas[follower].node
 	lnode := c.replicas[leader].node
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if l, _ := fnode.LeaderAndTerm(); l == leader {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("follower %d never learned leader %d", follower, leader)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 10*time.Second, 5*time.Millisecond, fmt.Sprintf("follower %d never learned leader %d", follower, leader), func() bool {
+		l, _ := fnode.LeaderAndTerm()
+		return l == leader
+	})
 
 	// Hold the leader in commitPending. A hand-off in flight when the flag is
 	// raised clears it on completion, so raise it until it stays up; once it
@@ -150,6 +139,7 @@ func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 	held := false
 	for range 100 {
 		lnode.commitPending.Store(true)
+		// Kept: the window is the check; the flag must stay raised through it, which no signal reports.
 		time.Sleep(50 * time.Millisecond)
 		if lnode.commitPending.Load() {
 			held = true
@@ -209,13 +199,9 @@ func TestForwardedRead_LeaderRefusalIsAnswered(t *testing.T) {
 	follower := leader%3 + 1
 	target := follower%3 + 1
 	lnode := c.replicas[leader].node
-	deadline := time.Now().Add(10 * time.Second)
-	for lnode.CommittedIndex() == 0 || !lnode.Peer().IsLeader() {
-		if time.Now().After(deadline) {
-			t.Fatal("leader never committed its first entry")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 10*time.Second, 5*time.Millisecond, "leader never committed its first entry", func() bool {
+		return lnode.CommittedIndex() != 0 && lnode.Peer().IsLeader()
+	})
 	_, term := lnode.LeaderAndTerm()
 
 	c.router.kill(target)

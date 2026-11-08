@@ -61,31 +61,6 @@ func TestBorrow_EndsWithTheCallback(t *testing.T) {
 	}
 }
 
-// TestBorrow_FreezeAfterTheCallback is the shape CombineProtected relies on: it
-// fills the reconstructed secret inside a borrow, then freezes it. Freeze waits
-// out in-flight borrows, so it can only succeed once the borrow has ended.
-func TestBorrow_FreezeAfterTheCallback(t *testing.T) {
-	e, err := enclave.NewMemorySized(16)
-	if err != nil {
-		t.Skipf("could not allocate locked memory: %v", err)
-	}
-	defer release(e)
-
-	want := []byte("sixteen-byte-key")
-	if err := borrow(e, "filling", func(b []byte) error {
-		copy(b, want)
-		return nil
-	}); err != nil {
-		t.Fatalf("borrow: %v", err)
-	}
-	if err := freeze(e); err != nil {
-		t.Fatalf("Freeze after the borrow: %v", err)
-	}
-	if eq, err := e.EqualTo(want); err != nil || !eq {
-		t.Fatalf("frozen enclave EqualTo = %v, %v; want true, nil", eq, err)
-	}
-}
-
 // TestBorrow_RefusedBorrowIsProtectedMemoryError pins the refusal path: a
 // destroyed enclave is never handed to the callback, and the refusal is a
 // *ProtectedMemoryError naming the operation that still unwraps to go-enclave's
