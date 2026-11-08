@@ -17,6 +17,7 @@ package transport
 import (
 	"bytes"
 	"errors"
+	"net"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1656,9 +1657,16 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	// Use a non-routable address to force the dial to block for the full
-	// timeout. 192.0.2.1 is TEST-NET-1 (RFC 5737) and is non-routable.
-	target := "192.0.2.1:9999"
+	// Dial a local UDP socket that is open but never answers: the QUIC
+	// handshake then waits on it for the full timeout on any host. A
+	// TEST-NET address depends on the host's routing and can fail at once
+	// with a send error, so the dial would never block.
+	silent, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer silent.Close()
+	target := silent.LocalAddr().String()
 
 	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
