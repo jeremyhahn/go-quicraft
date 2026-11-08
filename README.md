@@ -64,7 +64,7 @@ them:
 
 ```sh
 go env -w GOPRIVATE='github.com/jeremyhahn/*'
-git config --global url."ssh://git@forge.example:2222/jeremyhahn/".insteadOf "https://github.com/jeremyhahn/"
+git config --global url."ssh://git@forge.example/jeremyhahn/".insteadOf "https://github.com/jeremyhahn/"
 ```
 
 `GOPRIVATE` makes Go fetch these modules directly and skip the public checksum

@@ -1,9 +1,8 @@
 self-hosted-runner:
   labels:
-    - batch
-    # The reserved 1-CPU runners the CI Gate runs on (workflows/ci.yml ci-gate).
-    - ci-gate
-    # The code-review workflow's runners (workflows/code-review.yml): Codex
-    # reviews on `codex`, the advisory opencode review on `qwen` (CUSTOMIZE).
+    # Only the code-review workflow's runners are self-hosted
+    # (workflows/code-review.yml): Codex reviews on `codex`, the advisory
+    # opencode review on `qwen` (CUSTOMIZE). Every other job runs on
+    # GitHub-hosted ubuntu-latest.
     - codex
     - qwen
