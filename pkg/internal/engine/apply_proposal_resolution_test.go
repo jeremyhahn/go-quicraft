@@ -120,15 +120,9 @@ func TestApplyWorker_SMPanicFailsProposals(t *testing.T) {
 	}
 	applyC <- item
 
-	deadline := time.After(5 * time.Second)
-	for errorReported.Load() == nil {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return errorReported.Load() != nil
+	})
 
 	calls := cb.getProposalFailedCalls()
 	if len(calls) != 1 {

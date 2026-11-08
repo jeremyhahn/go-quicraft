@@ -95,6 +95,7 @@ package e2e_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -186,22 +187,20 @@ func transferLeadershipTo(t *testing.T, cluster *testCluster, shardID, targetRep
 	t.Helper()
 
 	targetIdx := indexOf(targetReplica)
-	deadline := time.Now().Add(timeout)
 	var lastErr error
-	for time.Now().Before(deadline) {
-		if isLeaderAt(cluster, targetIdx, shardID) {
-			t.Logf("replica %d holds leadership of shard %d", targetReplica, shardID)
-			return
-		}
-		if h := cluster.leaderHost(shardID); h != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			lastErr = h.RequestLeaderTransfer(ctx, shardID, targetReplica)
-			cancel()
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("leadership did not move to replica %d within %v (last transfer error: %v)",
-		targetReplica, timeout, lastErr)
+	waitForConditionDiag(t, timeout,
+		fmt.Sprintf("leadership moves to replica %d", targetReplica), func() bool {
+			if isLeaderAt(cluster, targetIdx, shardID) {
+				return true
+			}
+			if h := cluster.leaderHost(shardID); h != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+				lastErr = h.RequestLeaderTransfer(ctx, shardID, targetReplica)
+				cancel()
+			}
+			return false
+		}, func() string { return fmt.Sprintf("last transfer error: %v", lastErr) })
+	t.Logf("replica %d holds leadership of shard %d", targetReplica, shardID)
 }
 
 // TestElectionSafety_SpentTermCannotBeWonTwice asserts the one-vote-per-term
@@ -310,31 +309,27 @@ func TestElectionSafety_SpentTermCannotBeWonTwice(t *testing.T) {
 	// a second time. A leader at a HIGHER term is the correct outcome and ends
 	// the test.
 	var electedTerm, electedReplica uint64
-	deadline := time.Now().Add(failoverTimeout)
-	for time.Now().Before(deadline) && electedTerm == 0 {
-		for _, obs := range cluster.observeLeaders(shardID) {
-			switch {
-			case obs.term == spentTerm:
-				t.Fatalf("node[%d] (replica %d) was elected leader in term %d, "+
-					"a term in which replicas %d, %d and %d had already granted "+
-					"their votes to replica %d. A voter granted a second vote in "+
-					"one term: the election-safety property no longer holds and "+
-					"two leaders can now write different entries at the same "+
-					"(index, term).",
-					obs.index, obs.replicaID, obs.term,
-					esVoterA, esVoterB, esOutgoingLeader, esVoteSink)
-			case obs.term > spentTerm:
-				electedTerm, electedReplica = obs.term, obs.replicaID
+	waitForCondition(t, failoverTimeout,
+		"a replica is elected in a term above the spent one (the shard should "+
+			"recover by electing in the NEXT term, and a test that never sees "+
+			"that has not exercised the refusal it asserts)", func() bool {
+			for _, obs := range cluster.observeLeaders(shardID) {
+				switch {
+				case obs.term == spentTerm:
+					t.Fatalf("node[%d] (replica %d) was elected leader in term %d, "+
+						"a term in which replicas %d, %d and %d had already granted "+
+						"their votes to replica %d. A voter granted a second vote in "+
+						"one term: the election-safety property no longer holds and "+
+						"two leaders can now write different entries at the same "+
+						"(index, term).",
+						obs.index, obs.replicaID, obs.term,
+						esVoterA, esVoterB, esOutgoingLeader, esVoteSink)
+				case obs.term > spentTerm:
+					electedTerm, electedReplica = obs.term, obs.replicaID
+				}
 			}
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if electedTerm == 0 {
-		t.Fatalf("no replica was elected in any term above %d within %v; the "+
-			"shard should recover by electing in the NEXT term, and a test that "+
-			"never sees that has not exercised the refusal it asserts",
-			spentTerm, failoverTimeout)
-	}
+			return electedTerm != 0
+		})
 	t.Logf("replica %d was elected in term %d — the term after the spent one, "+
 		"which is the only correct outcome", electedReplica, electedTerm)
 

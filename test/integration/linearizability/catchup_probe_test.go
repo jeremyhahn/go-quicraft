@@ -96,10 +96,12 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 	}()
 
 	// Let the leader reach steady-state pipelining before the first restart.
+	// The build-up is a held interval of load, not a wait for an effect.
 	time.Sleep(buildUp)
 
 	for cycle := range cycles {
 		cluster.stopNode(victim)
+		// The victim stays down for a set time: the downtime is the fault.
 		time.Sleep(downtime)
 		cluster.restartNode(victim, shardID)
 		leaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
@@ -158,6 +160,8 @@ func TestRestartedReplicaResumesReplication(t *testing.T) {
 		}
 		t.Logf("cycle %d: node[%d] caught up in %v (leader node[%d], %d ops)",
 			cycle, victim, caughtUp.Round(time.Millisecond), leaderIdx, recorder.completed())
+		// The settle period is the steady state the next cycle needs (see
+		// settle above); nothing is being waited for.
 		time.Sleep(settle)
 	}
 }

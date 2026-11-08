@@ -235,24 +235,10 @@ func TestSendLargeMessageBatch(t *testing.T) {
 
 	// Wait until all 100 messages have been received. The per-target
 	// sender goroutine may deliver them across multiple batches.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		total := 0
-		for _, b := range batches {
-			total += len(b.Requests)
-		}
-		if total == 100 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitForMessageCount(t, handler2, 100, 10*time.Second)
+	if total := handler2.messageCount(); total != 100 {
+		t.Fatalf("expected 100 messages total, got %d", total)
 	}
-	batches := handler2.getBatches()
-	total := 0
-	for _, b := range batches {
-		total += len(b.Requests)
-	}
-	t.Fatalf("expected 100 messages total, got %d", total)
 }
 
 // TestSendNoStaleMessageLeak verifies that successive Send calls do not
@@ -275,18 +261,7 @@ func TestSendNoStaleMessageLeak(t *testing.T) {
 	})
 
 	// Wait until both messages are received.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		total := 0
-		for _, b := range batches {
-			total += len(b.Requests)
-		}
-		if total >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForMessageCount(t, handler2, 2, 10*time.Second)
 
 	// Clear handler state.
 	handler2.mu.Lock()
@@ -299,18 +274,7 @@ func TestSendNoStaleMessageLeak(t *testing.T) {
 	})
 
 	// Wait for the single message to arrive.
-	deadline = time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		total := 0
-		for _, b := range batches {
-			total += len(b.Requests)
-		}
-		if total >= 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForMessageCount(t, handler2, 1, 10*time.Second)
 
 	batches := handler2.getBatches()
 	totalMsgs := 0
@@ -340,25 +304,10 @@ func TestRepeatedSendCorrectness(t *testing.T) {
 	}
 
 	// Wait until all messages are received.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		totalMsgs := 0
-		for _, b := range batches {
-			totalMsgs += len(b.Requests)
-		}
-		if totalMsgs == iterations {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	waitForMessageCount(t, handler2, iterations, 10*time.Second)
+	if totalMsgs := handler2.messageCount(); totalMsgs != iterations {
+		t.Fatalf("expected %d messages, got %d", iterations, totalMsgs)
 	}
-
-	batches := handler2.getBatches()
-	totalMsgs := 0
-	for _, b := range batches {
-		totalMsgs += len(b.Requests)
-	}
-	t.Fatalf("expected %d messages, got %d", iterations, totalMsgs)
 }
 
 // TestSendQueuePerTargetIsolation verifies that per-target send queues
@@ -554,27 +503,13 @@ func TestSendQueueIdlePruneDoesNotAffectActiveQueues(t *testing.T) {
 	t1, _, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	// Send several messages with short gaps to keep the queue active.
+	// Send several messages to keep the queue active.
 	for i := range 5 {
 		t1.Send([]proto.Message{
 			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: uint64(i + 1)},
 		})
-		time.Sleep(10 * time.Millisecond)
 	}
-
-	// Wait for messages to arrive.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		total := 0
-		for _, b := range batches {
-			total += len(b.Requests)
-		}
-		if total >= 5 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForMessageCount(t, handler2, 5, 10*time.Second)
 
 	// The send queue should still exist because it was active.
 	if t1.SendQueueCount() != 1 {
@@ -860,18 +795,7 @@ func TestSendQueueWorker_StopDrains(t *testing.T) {
 		})
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		batches := handler2.getBatches()
-		total := 0
-		for _, b := range batches {
-			total += len(b.Requests)
-		}
-		if total >= 5 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitForMessageCount(t, handler2, 5, 5*time.Second)
 
 	done := make(chan struct{})
 	go func() {
@@ -966,25 +890,7 @@ func TestSendBatch_BurstExercisesDrainLoop(t *testing.T) {
 		})
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		total := 0
-		for _, b := range handler2.getBatches() {
-			total += len(b.Requests)
-		}
-		if total >= 20 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	total := 0
-	for _, b := range handler2.getBatches() {
-		total += len(b.Requests)
-	}
-	if total < 20 {
-		t.Fatalf("expected at least 20 total messages, got %d", total)
-	}
+	waitForMessageCount(t, handler2, 20, 10*time.Second)
 }
 
 // TestSendBatch_MultipleMsgsInOneSend verifies multiple messages in a
@@ -1003,25 +909,7 @@ func TestSendBatch_MultipleMsgsInOneSend(t *testing.T) {
 	}
 	t1.Send(msgs)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		total := 0
-		for _, b := range handler2.getBatches() {
-			total += len(b.Requests)
-		}
-		if total >= 3 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	total := 0
-	for _, b := range handler2.getBatches() {
-		total += len(b.Requests)
-	}
-	if total < 3 {
-		t.Fatalf("expected at least 3 messages, got %d", total)
-	}
+	waitForMessageCount(t, handler2, 3, 10*time.Second)
 }
 
 // noopTransportMetrics implements the transport Metrics interface with no-op methods.
@@ -1743,39 +1631,34 @@ func TestSendBatch_DirectWriteErrorViaConnectionClose(t *testing.T) {
 		t.Fatal("expected non-nil stream")
 	}
 
-	// Close the remote transport to kill the connection.
+	rec := &dropRecorder{}
+	t1.metrics = rec
+
+	// Close the remote transport and wait for the connection to die.
 	t2.Stop()
-	time.Sleep(200 * time.Millisecond)
+	t1.connMu.Lock()
+	deadConn, ok := t1.conns[t2Addr]
+	t1.connMu.Unlock()
+	if ok {
+		waitForChan(t, deadConn.Context().Done(), 10*time.Second, "the connection did not close after the peer stopped")
+	}
 
 	// Remove the connection from conns but keep the cached stream.
 	// This prevents getStream's liveness check from detecting the
 	// dead connection and reconnecting.
 	t1.connMu.Lock()
-	deadConn, ok := t1.conns[t2Addr]
-	if ok {
-		delete(t1.conns, t2Addr)
-	}
+	delete(t1.conns, t2Addr)
 	t1.connMu.Unlock()
 
-	if deadConn != nil {
-		// Verify connection is actually dead.
-		select {
-		case <-deadConn.Context().Done():
-			// Expected.
-		default:
-			t.Log("connection not yet dead, test may not exercise write error")
-		}
-	}
-
-	// sendBatch will call getStream which won't find the connection in
-	// conns (removed above). It will try to reconnect (which fails since
-	// t2 is stopped), so getStream returns error.
-	// This covers the getStream error path (line 833-835) at minimum.
+	// sendBatch's getStream does not find the connection and its re-dial
+	// to the stopped peer fails, so the message is dropped.
 	t1.sendBatch(t2Addr, "", []proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
 	})
-
-	// No crash = success. The error paths are logged and dropped.
+	drops := rec.drops()
+	if len(drops) != 1 || drops[0].shardID != 1 || drops[0].to != 2 {
+		t.Fatalf("drops = %+v, want one for shard 1 replica 2", drops)
+	}
 }
 
 // ---------------------------------------------------------------------------

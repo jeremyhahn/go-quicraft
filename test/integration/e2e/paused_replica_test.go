@@ -258,6 +258,8 @@ func runPausedReplica(t *testing.T, sc pauseScenario) {
 			default:
 			}
 		}
+		// Sampling interval across the held pause: the hold is the behaviour
+		// under test, so it runs to its end rather than to a condition.
 		time.Sleep(50 * time.Millisecond)
 	}
 	if sc.leader {
@@ -383,6 +385,7 @@ func TestE2E_PausedFollower_SnapshotRecoveryAfterResume(t *testing.T) {
 		return err == nil && lr.FirstIndex > appliedAtPause+1
 	})
 	// Several heartbeat rounds in which the leader tries to send its snapshot.
+	// The pause is held for a set time: the assertion is that nothing happens.
 	time.Sleep(pauseHold)
 
 	if got := machine.LastApplied(); got != appliedAtPause {

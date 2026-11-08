@@ -194,14 +194,9 @@ func TestSnapshotPool_GoexitInARestoreFailsTheShardAndTheWorkerSurvives(t *testi
 	if err := pool.requestRecovery(1, 1, node); err != nil {
 		t.Fatalf("requestRecovery: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for cb.shardFailedCount.Load() == 0 || node.snapshotting.Load() {
-		if time.Now().After(deadline) {
-			t.Fatalf("after a Goexit in the restore: failed=%d snapshotting=%v, want the shard "+
-				"failed and the slot released", cb.shardFailedCount.Load(), node.snapshotting.Load())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, 5*time.Millisecond, "after a Goexit in the restore, want the shard "+
+		"failed and the slot released",
+		func() bool { return cb.shardFailedCount.Load() != 0 && !node.snapshotting.Load() })
 
 	// A second request, for a shard with no snapshot, is still served.
 	other, _ := newRecoveryTestNode(t, 2, 1, newSnapshotTestSnapshotter(0))

@@ -970,8 +970,9 @@ func TestSendSnapshot_ShutdownCancelsStreamOpen(t *testing.T) {
 		sendDone <- t1.SendSnapshot(chunks)
 	}()
 
-	// Give the SendSnapshot goroutine time to start the dial/open.
-	time.Sleep(100 * time.Millisecond)
+	// Wait until the send is in flight (registered with the tracker).
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "SendSnapshot did not start",
+		func() bool { return t1.snapshotTracker.InFlight() == 1 })
 
 	// Stop the transport. This cancels shutdownCtx, which should
 	// unblock the OpenStreamSync in SendSnapshot.
@@ -2510,7 +2511,6 @@ func TestReceiveChunksRejectsExceededTransferDuration(t *testing.T) {
 	reader := &testChunkReader{data: buildChunkFrames(t, chunks)}
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, ChunkCount: 1}
 
-	time.Sleep(time.Millisecond)
 	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
 
 	if rejected.Load() != 1 {

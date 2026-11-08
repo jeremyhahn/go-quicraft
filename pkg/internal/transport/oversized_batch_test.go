@@ -323,26 +323,30 @@ func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 
 	sendReg.Register(1, 2, receiver.Addr().String())
 
-	// As in TestPeerRejectedHeartbeatFrameKeepsConnection, this pacing cannot
-	// become a poll on PeerFrameRejections: the counter trails the sends by one
-	// write, so waiting for attempt i before making attempt i+1 deadlocks.
-	const attempts = 20
-	for i := 0; i < attempts; i++ {
-		sender.Send([]proto.Message{{
-			Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: entriesOfSize(t, 1, 8, uint64(i+1)),
-		}})
-		time.Sleep(50 * time.Millisecond)
-	}
+	// As in TestPeerRejectedHeartbeatFrameKeepsConnection, the counter trails
+	// the sends by one write, so one message goes out per poll tick until
+	// three rejections are counted: the writes after the first two would
+	// have re-dialed had a rejection torn the connection down.
+	const wantRejections = 3
+	attempts := 0
+	pollUntil(t, 10*time.Second, 50*time.Millisecond,
+		"expected the peer's frame rejections to be counted", func() bool {
+			if sender.PeerFrameRejections() >= wantRejections {
+				return true
+			}
+			attempts++
+			sender.Send([]proto.Message{{
+				Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
+				Entries: entriesOfSize(t, 1, 8, uint64(attempts)),
+			}})
+			return false
+		})
 
 	got := dials.Load()
 	t.Logf("dials after %d rejected sends: %d, peer rejections: %d",
 		attempts, got, sender.PeerFrameRejections())
 	if got != 1 {
 		t.Fatalf("peer frame rejection caused re-dialing: %d dials after %d sends (want 1)", got, attempts)
-	}
-	if sender.PeerFrameRejections() == 0 {
-		t.Fatal("expected the peer's frame rejections to be counted")
 	}
 }
 

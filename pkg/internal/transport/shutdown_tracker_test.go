@@ -119,7 +119,8 @@ func TestShutdownTracker_ConcurrentTryAddDuringShutdown(t *testing.T) {
 				<-start
 				if st.TryAdd() {
 					succeeded.Add(1)
-					// Simulate some work.
+					// The sleep is the behaviour under test: it holds the op
+					// in flight so ShutdownAndWait must wait on it.
 					time.Sleep(time.Microsecond)
 					st.Done()
 				}

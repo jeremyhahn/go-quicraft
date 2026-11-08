@@ -115,13 +115,9 @@ func TestConnectionCleanup_SweepsExpiredDialRefusals(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() { done <- tr.connectionCleanupOnce() }()
-	deadline := time.Now().Add(5 * time.Second)
-	for dialRefusalCount(tr) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the cleanup tick never swept the expired refusal")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	pollUntil(t, 5*time.Second, time.Millisecond,
+		"the cleanup tick never swept the expired refusal",
+		func() bool { return dialRefusalCount(tr) == 0 })
 	close(tr.stopC)
 	if panicked := <-done; panicked {
 		t.Fatal("connectionCleanupOnce panicked")

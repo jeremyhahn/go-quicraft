@@ -262,7 +262,7 @@ func (c *testCluster) waitForLeader(t *testing.T, timeout time.Duration, skip ..
 				return id
 			}
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond) // poll interval: a timeout returns 0, not fatal, so not waitFor
 	}
 	return 0
 }

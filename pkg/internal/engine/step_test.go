@@ -322,15 +322,8 @@ func TestStepWorker_MemoryMode_StopC_ClearsState(t *testing.T) {
 
 	// Wait until commitPending is set, which means processReady has
 	// reached the applyC send and is now blocking on the select.
-	deadlineBlock := time.After(5 * time.Second)
-	for !node.commitPending.Load() {
-		select {
-		case <-deadlineBlock:
-			t.Fatal("timed out waiting for processReady to block on applyC send")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for processReady to block on applyC send",
+		node.commitPending.Load)
 	close(stopC)
 
 	select {
@@ -1331,15 +1324,8 @@ func TestProcessReady_WALMode_FreeOrderSentBeforeCommitC(t *testing.T) {
 
 	// Wait for commitPending to be set, which means enqueueForCommit
 	// has sent all free-order messages and is now blocking on commitC.
-	deadlineCommit := time.After(5 * time.Second)
-	for !node.commitPending.Load() {
-		select {
-		case <-deadlineCommit:
-			t.Fatal("timed out waiting for step worker to block on commitC")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for step worker to block on commitC",
+		node.commitPending.Load)
 
 	// Check that only free-order messages were sent.
 	sentMsgs := sender.sentMessages()

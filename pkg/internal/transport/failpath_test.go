@@ -580,22 +580,16 @@ func TestIsProtocolViolation_DecoderSentinels(t *testing.T) {
 		proto.ErrDuplicateMapKey,
 		proto.ErrUnsupportedVersion,
 	}
+	// The bare sentinels and io.EOF are pinned by
+	// TestIsProtocolViolationCoversDecoderSentinels; the wrapped form must
+	// classify identically, since the receive path sees these through the
+	// decoder's error chain.
 	for _, err := range violations {
-		if !isProtocolViolation(err) {
-			t.Errorf("isProtocolViolation(%v) = false, want true", err)
-		}
-		// Wrapped form must classify identically: the receive path sees these
-		// through the decoder's error chain.
 		if !isProtocolViolation(&FrameDecompressError{Err: err}) {
 			t.Errorf("isProtocolViolation(wrapped %v) = false, want true", err)
 		}
 	}
 
-	// A transient I/O error is NOT a violation: counting it would make the
-	// violation counter useless for detecting an actually-broken peer.
-	if isProtocolViolation(io.EOF) {
-		t.Error("isProtocolViolation(io.EOF) = true, want false")
-	}
 	if isProtocolViolation(nil) {
 		t.Error("isProtocolViolation(nil) = true, want false")
 	}
