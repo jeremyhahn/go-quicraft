@@ -377,16 +377,6 @@ func (kv *testOnDiskKV) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-
 
 func (kv *testOnDiskKV) Close(_ context.Context) error { return nil }
 
-// testOnDiskKVWithApplied returns a specific lastApplied from Open.
-type testOnDiskKVWithApplied struct {
-	testOnDiskKV
-	lastApplied uint64
-}
-
-func (kv *testOnDiskKVWithApplied) Open(_ context.Context, _ string, _ <-chan struct{}) (uint64, error) {
-	return kv.lastApplied, nil
-}
-
 // testOnDiskKVOpenError returns an error from Open.
 type testOnDiskKVOpenError struct {
 	testOnDiskKV
