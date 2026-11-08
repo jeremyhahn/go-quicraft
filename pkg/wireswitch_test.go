@@ -115,13 +115,11 @@ func TestWireSwitch_SingleMemberShardSwitches(t *testing.T) {
 	}
 	// No waitForLeader: it overwrites the host's cached term with 0, which
 	// makes the leader-ready mark, and so this trigger, refuse the real pair.
-	deadline := time.Now().Add(10 * time.Second)
-	for h.engine.GetNode(1).Peer().WireVersion() != next.Proto.Current {
-		if time.Now().After(deadline) {
-			t.Fatalf("single-member shard at WireVersion %d, never switched to %d",
-				h.engine.GetNode(1).Peer().WireVersion(), next.Proto.Current)
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !waitUntil(10*time.Second, func() bool {
+		return h.engine.GetNode(1).Peer().WireVersion() == next.Proto.Current
+	}) {
+		t.Fatalf("single-member shard at WireVersion %d, never switched to %d",
+			h.engine.GetNode(1).Peer().WireVersion(), next.Proto.Current)
 	}
 }
 
@@ -165,13 +163,11 @@ func TestWireSwitch_SingleMemberRetriesAfterRefusal(t *testing.T) {
 		}
 		return nil
 	})
-	deadline := time.Now().Add(10 * time.Second)
-	for h.engine.GetNode(1).Peer().WireVersion() != next {
-		if time.Now().After(deadline) {
-			t.Fatalf("single-member shard at WireVersion %d after %d attempts, never switched to %d",
-				h.engine.GetNode(1).Peer().WireVersion(), attempts.Load(), next)
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !waitUntil(10*time.Second, func() bool {
+		return h.engine.GetNode(1).Peer().WireVersion() == next
+	}) {
+		t.Fatalf("single-member shard at WireVersion %d after %d attempts, never switched to %d",
+			h.engine.GetNode(1).Peer().WireVersion(), attempts.Load(), next)
 	}
 	if n := attempts.Load(); n < 2 {
 		t.Fatalf("switched after %d attempts, want a retry after the refusal", n)
@@ -187,12 +183,8 @@ func TestWireSwitch_RetryStopsOnLeadershipLossAndClose(t *testing.T) {
 		attempts.Add(1)
 		return ErrSystemBusy
 	})
-	deadline := time.Now().Add(10 * time.Second)
-	for attempts.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the leader never attempted the switch")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !waitUntil(10*time.Second, func() bool { return attempts.Load() > 0 }) {
+		t.Fatal("the leader never attempted the switch")
 	}
 
 	ns, err := h.getNode(1)
@@ -215,6 +207,7 @@ func TestWireSwitch_RetryStopsOnLeadershipLossAndClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	after := attempts.Load()
+	// Kept: the absence of an attempt for one retry interval is the behaviour under test.
 	time.Sleep(wireSwitchRetryInterval + 200*time.Millisecond)
 	if n := attempts.Load(); n != after {
 		t.Fatalf("%d switch attempts after Close returned", n-after)
