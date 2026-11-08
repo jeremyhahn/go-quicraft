@@ -352,6 +352,8 @@ func waitForAcks(t *testing.T, path string, n int) {
 		if err == nil && len(acks) >= n {
 			return
 		}
+		// Kept: the acks come from a child process, so the bounded poll
+		// of its ack file is the condition wait.
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("child produced fewer than %d durable acks within %v", n, crashAckTimeout)
@@ -807,6 +809,7 @@ func runCrashChildProcess(t *testing.T, walDir, ackPath, sealPath string, minAck
 	}
 
 	waitForAcks(t, ackPath, minAcks)
+	// Kept: delay is the crash window under test.
 	time.Sleep(delay)
 	_ = cmd.Process.Kill()
 	waitErr := cmd.Wait()
