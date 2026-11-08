@@ -15,7 +15,11 @@
 package transport
 
 import (
+	"bytes"
 	"errors"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -174,9 +178,7 @@ func TestCleanStaleConnections(t *testing.T) {
 
 	// Close the connection from the remote side.
 	conn.CloseWithError(0, "test close")
-
-	// Wait for context to propagate.
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Run cleanup.
 	t1.cleanStaleConnections()
@@ -318,16 +320,9 @@ func TestConcurrentSendDoesNotRace(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for some messages to arrive.
-	deadline := time.After(10 * time.Second)
-	for handler2.batchCount.Load() < 1 {
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for any batch to arrive")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "timeout waiting for any batch to arrive", func() bool {
+		return handler2.batchCount.Load() >= 1
+	})
 
 	// At least some batches should have arrived.
 	var received atomic.Int64
@@ -466,7 +461,7 @@ func TestCleanStaleConnectionsEvictsStreams(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 	conn.CloseWithError(0, "test kill connection")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Run cleanup.
 	t1.cleanStaleConnections()
@@ -546,8 +541,9 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 		t.Fatalf("getStream(t3) failed: %v", err)
 	}
 
-	// Wait for pre-opened heartbeat streams to settle.
-	time.Sleep(200 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat streams not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target2) == 2 && countStreamsForTarget(t1, target3) == 2
+	})
 
 	// Each connection has 1 data stream + 1 pre-opened heartbeat stream.
 	streamsBefore := t1.StreamCount()
@@ -564,7 +560,7 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 		t.Fatalf("getConnection(t2) failed: %v", err)
 	}
 	conn2.CloseWithError(0, "kill t2")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn2.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	t1.cleanStaleConnections()
 
@@ -593,8 +589,9 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
-	// Wait for pre-opened heartbeat stream to settle.
-	time.Sleep(200 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	streamsBefore := t1.StreamCount()
 	if streamsBefore < 1 {
@@ -607,7 +604,7 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 	conn.CloseWithError(0, "test kill for redial")
-	time.Sleep(300 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// getConnection should detect the dead connection, evict streams,
 	// and redial. The redial will also fire preOpenHeartbeatStream
@@ -675,8 +672,7 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 	// Wait for the async preOpenHeartbeatStream goroutine to complete.
 	// The goroutine opens a stream with a 5s timeout, but on loopback
 	// it completes in microseconds. Poll for the heartbeat stream.
-	deadline := time.After(5 * time.Second)
-	for {
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "timeout waiting for heartbeat stream to be pre-opened", func() bool {
 		shardIdx := uint64(0) & (streamShardCount - 1)
 		shard := &t1.streamShards[shardIdx]
 		key := streamKey{target: target, idx: 0}
@@ -684,17 +680,8 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 		shard.mu.RLock()
 		_, ok := shard.streams[key]
 		shard.mu.RUnlock()
-		if ok {
-			break
-		}
-
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for heartbeat stream to be pre-opened")
-		default:
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
+		return ok
+	})
 
 	// Verify getStream returns the pre-opened heartbeat stream without
 	// needing to open a new one (cache hit path).
@@ -734,36 +721,14 @@ func TestPreOpenHeartbeatStreamNoRaceWithGetStream(t *testing.T) {
 		t.Fatal("expected non-nil heartbeat stream")
 	}
 
-	// Wait for preOpenHeartbeatStream to finish.
-	time.Sleep(200 * time.Millisecond)
-
-	// The stream pool should have exactly one heartbeat stream for
-	// this target, not two. Verify by fetching again.
+	// Whichever of the pre-open and getStream stored first, the pool keeps
+	// one live heartbeat stream for the target and later calls get it.
 	stream2, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("second getStream(heartbeat) failed: %v", err)
 	}
-	if stream2 == nil {
-		t.Fatal("expected non-nil heartbeat stream on second call")
-	}
-
-	// Both calls should return the same stream (one of them won the race).
-	// We can't assert pointer equality because the pre-open goroutine
-	// may have won and the getStream returned the pre-opened one, or
-	// vice versa. But the stream should be functional.
-	shardIdx := uint64(0) & (streamShardCount - 1)
-	shard := &t1.streamShards[shardIdx]
-	key := streamKey{target: target, idx: 0}
-	shard.mu.RLock()
-	count := 0
-	for k := range shard.streams {
-		if k == key {
-			count++
-		}
-	}
-	shard.mu.RUnlock()
-	if count != 1 {
-		t.Fatalf("expected exactly 1 heartbeat stream entry, got %d", count)
+	if stream2 != stream {
+		t.Fatal("second getStream(heartbeat) returned a different stream: the pre-open replaced a live entry")
 	}
 }
 
@@ -785,14 +750,16 @@ func TestPreOpenHeartbeatStreamDeadConnection(t *testing.T) {
 
 	// Wait for the async preOpenHeartbeatStream from dialConnection to
 	// complete so it does not interfere with our test.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Evict any streams that were pre-opened by dialConnection.
 	t1.evictStreamsForTarget(target)
 
 	// Close the connection so OpenStreamSync will fail.
 	conn.CloseWithError(0, "test close before pre-open")
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Calling preOpenHeartbeatStream on a dead connection should not
 	// panic or block. The stream open will fail and return silently.
@@ -887,7 +854,9 @@ func TestPreOpenHeartbeatStreamExitsEarlyWhenStopped(t *testing.T) {
 	}
 
 	// Wait for the initial preOpenHeartbeatStream from dialConnection.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Evict all streams so we can observe if preOpen creates a new one.
 	t1.evictStreamsForTarget(target)
@@ -929,11 +898,13 @@ func TestPreOpenHeartbeatStreamWaitGroupDoneOnAllPaths(t *testing.T) {
 	}
 
 	// Wait for initial preOpenHeartbeatStream to complete.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Close the connection so OpenStreamSync will fail.
 	conn.CloseWithError(0, "test close for wg done verification")
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Call preOpenHeartbeatStream on the dead connection. It should fail
 	// gracefully and still call wg.Done() via defer.
@@ -1016,10 +987,9 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 	// against a fully-populated pool rather than whatever subset happened to
 	// exist at snapshot time.
 	const wantStreams = 2
-	deadline := time.Now().Add(5 * time.Second)
-	for t1.StreamCount() < wantStreams && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "stream pool did not reach the pre-opened heartbeat plus the data stream", func() bool {
+		return t1.StreamCount() >= wantStreams
+	})
 	if got := t1.StreamCount(); got != wantStreams {
 		t.Fatalf("stream pool did not settle: StreamCount = %d, want %d "+
 			"(pre-opened heartbeat stream plus the data stream)", got, wantStreams)
@@ -1071,9 +1041,15 @@ func TestEvictStaleOutboundDeadConnection(t *testing.T) {
 		t.Fatal("expected at least 1 stream")
 	}
 
+	// Let the pre-opened heartbeat land before the kill, so it cannot be
+	// stored after the eviction: heartbeat plus three data streams.
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 4
+	})
+
 	// Kill the connection to simulate a peer restart.
 	conn.CloseWithError(0, "simulate peer restart")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// evictStaleOutbound should detect the dead context and clean up.
 	t1.evictStaleOutboundOnRecv(target, 0, nil)
@@ -1183,9 +1159,15 @@ func TestEvictStaleOutboundOnRecv_DeadOutboundEvicted(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
+	// Let the pre-opened heartbeat land before the kill, so it cannot be
+	// stored after the eviction.
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
+
 	// Kill the outbound connection to simulate a peer restart.
 	outbound.CloseWithError(0, "simulate dead outbound")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, outbound.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Use a different connection as inbound (t2 dialing t1).
 	inbound, err := t2.getConnection(t1.Addr().String(), "")
@@ -1259,7 +1241,9 @@ func TestEvictStaleOutboundOnRecv_SameConnectionNoop(t *testing.T) {
 	// Wait for the async preOpenHeartbeatStream goroutine (launched by
 	// getConnection) to settle so StreamCount() is stable before we
 	// capture the "before" snapshot.
-	waitForStableStreamCount(t, t1, 50*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	connsBefore := t1.ConnectionCount()
 	streamsBefore := t1.StreamCount()
@@ -1316,7 +1300,9 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 	}
 
 	// Wait for pre-opened heartbeat stream to settle.
-	waitForStableStreamCount(t, t1, 200*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	// Kill the connection. This makes the context Done channel close.
 	conn, err := t1.getConnection(target, "")
@@ -1360,7 +1346,9 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial getStream failed: %v", err)
 	}
-	waitForStableStreamCount(t, t1, 200*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -1384,14 +1372,18 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 				t1.removeConnection(target)
 				t1.evictStreamsForTarget(target)
 			}
+			// Paces the churn on purpose: one eviction per millisecond
+			// leaves the reader's re-dials room to complete.
 			time.Sleep(time.Millisecond)
 		}
 	}()
 
 	// Reader goroutine: repeatedly call getStream.
+	readerDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(readerDone)
 		for i := 0; i < 20; i++ {
 			select {
 			case <-stop:
@@ -1410,14 +1402,131 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 		}
 	}()
 
-	// Let the goroutines run, then signal stop.
-	time.Sleep(500 * time.Millisecond)
+	// Stop the evictor once the reader has made its 20 calls.
+	waitForChan(t, readerDone, 30*time.Second, "reader goroutine did not finish")
 	close(stop)
 	wg.Wait()
 
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+// goroutineID returns the calling goroutine's ID, parsed from the
+// "goroutine N [running]:" header of its own stack.
+func goroutineID() uint64 {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+	buf = bytes.TrimPrefix(buf, []byte("goroutine "))
+	if i := bytes.IndexByte(buf, ' '); i >= 0 {
+		buf = buf[:i]
+	}
+	id, _ := strconv.ParseUint(string(buf), 10, 64)
+	return id
+}
+
+// goroutineStack returns the stack of goroutine id, or "" if it has exited.
+func goroutineStack(id uint64) string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	header := "goroutine " + strconv.FormatUint(id, 10) + " ["
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.HasPrefix(g, header) {
+			return g
+		}
+	}
+	return ""
+}
+
+// goroutineBlockedIn reports whether the stack g is parked (not running or
+// runnable) with fn on it.
+func goroutineBlockedIn(g, fn string) bool {
+	_, state, ok := strings.Cut(g, " [")
+	if !ok || strings.HasPrefix(state, "running") || strings.HasPrefix(state, "runnable") {
+		return false
+	}
+	return strings.Contains(g, fn)
+}
+
+// exhaustStreamCredit opens streams on conn until the peer's stream limit is
+// reached, so the next OpenStreamSync blocks until its context ends. The
+// streams carry no data, so the peer never sees them nor grants more.
+func exhaustStreamCredit(t *testing.T, conn *quic.Conn) {
+	t.Helper()
+	for i := 0; i < 1<<16; i++ {
+		if _, err := conn.OpenStream(); err != nil {
+			// quic-go reports the limit only by message.
+			if !strings.Contains(err.Error(), "too many open streams") {
+				t.Fatalf("OpenStream failed: %v", err)
+			}
+			return
+		}
+	}
+	t.Fatal("stream limit never reached")
+}
+
+// takeHeartbeatStream waits until the heartbeat stream that getConnection
+// pre-opens in the background is in tr's stream pool, then takes it out
+// without closing it. The pre-open is then over and holds no stream credit,
+// and Stop has no pooled stream to close. A close (as evictStreamsForTarget
+// does) would send the stream's first frame; the live peer, done with it,
+// would grant new stream credit and could release a blocked open without the
+// shutdown. Never written to, the stream stays unknown to the peer.
+func takeHeartbeatStream(t *testing.T, tr *QUICTransport, target string) {
+	t.Helper()
+	key := streamKey{target: target, idx: 0}
+	shard := &tr.streamShards[uint64(0)&(streamShardCount-1)]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		shard.mu.Lock()
+		_, ok := shard.streams[key]
+		if ok {
+			shard.drop(key)
+		}
+		shard.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("heartbeat stream was not pooled within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitBlockedIn waits until the goroutine whose ID arrives on idC is parked
+// inside fn, so the caller acts on an operation that is in flight rather
+// than one that has not begun.
+func waitBlockedIn(t *testing.T, idC <-chan uint64, fn string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var id uint64
+	select {
+	case id = <-idC:
+	case <-deadline.C:
+		t.Fatal("goroutine under test did not start")
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		g := goroutineStack(id)
+		if goroutineBlockedIn(g, fn) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("goroutine %d did not block in %s within %v; stack:\n%s", id, fn, timeout, g)
+		}
 	}
 }
 
@@ -1437,20 +1546,26 @@ func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
-	// Kill the peer so OpenStreamSync will block until context timeout.
-	t2.Stop()
+	// Take the pre-opened heartbeat stream out of the pool, so nothing but
+	// the shutdown can release the open below.
+	takeHeartbeatStream(t, t1, target)
+
+	// Use up the peer's stream credit so OpenStreamSync blocks until its
+	// context ends. (Stopping the peer instead would close the connection,
+	// and OpenStreamSync would fail at once without blocking.)
+	exhaustStreamCredit(t, conn)
 
 	// Call preOpenHeartbeatStream in a goroutine and measure how long
 	// it takes after we cancel shutdownCtx.
 	t1.wg.Add(1)
+	idC := make(chan uint64, 1)
 	done := make(chan struct{})
 	go func() {
+		idC <- goroutineID()
 		t1.preOpenHeartbeatStream(target, conn)
 		close(done)
 	}()
-
-	// Give the goroutine time to start blocking on OpenStreamSync.
-	time.Sleep(100 * time.Millisecond)
+	waitBlockedIn(t, idC, "quic-go.(*Conn).OpenStreamSync", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping t1. This should unblock the
 	// goroutine promptly.
@@ -1480,25 +1595,29 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection so getStream's slow path can reach OpenStreamSync.
-	_, err := t1.getConnection(target, "")
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
-	// Kill the peer so OpenStreamSync will block until context cancellation.
-	t2.Stop()
+	// Take the pre-opened heartbeat stream out of the pool, so getStream
+	// takes the slow path and nothing but the shutdown can release the open
+	// below.
+	takeHeartbeatStream(t, t1, target)
 
-	// Evict cached streams so getStream takes the slow path.
-	t1.evictStreamsForTarget(target)
+	// Use up the peer's stream credit so OpenStreamSync blocks until its
+	// context ends. (Stopping the peer instead would close the connection,
+	// and getStream would redial rather than open a stream.)
+	exhaustStreamCredit(t, conn)
 
+	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
 	go func() {
+		idC <- goroutineID()
 		_, err := t1.getStream(target, 1, false, "")
 		done <- err
 	}()
-
-	// Give the goroutine time to enter OpenStreamSync.
-	time.Sleep(100 * time.Millisecond)
+	waitBlockedIn(t, idC, "quic-go.(*Conn).OpenStreamSync", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping t1. This should unblock getStream promptly.
 	start := time.Now()
@@ -1541,14 +1660,14 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 	// timeout. 192.0.2.1 is TEST-NET-1 (RFC 5737) and is non-routable.
 	target := "192.0.2.1:9999"
 
+	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
 	go func() {
+		idC <- goroutineID()
 		_, err := tr.dialForTest(target)
 		done <- err
 	}()
-
-	// Give the goroutine time to enter Dial.
-	time.Sleep(100 * time.Millisecond)
+	waitBlockedIn(t, idC, "quic-go.(*Transport).Dial", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping the transport. This should unblock
 	// dialConnection promptly.
@@ -1590,24 +1709,6 @@ func TestDialConnectionReturnsErrorOnShutdown(t *testing.T) {
 	_, err = tr.dialForTest("127.0.0.1:12345")
 	if err == nil {
 		t.Fatal("expected error from dialConnection after stop, got nil")
-	}
-}
-
-// waitForStableStreamCount polls StreamCount until it stops changing for at
-// least two consecutive checks separated by interval/5, or until timeout.
-// This handles the async preOpenHeartbeatStream goroutine that may still be
-// in-flight after getConnection returns.
-func waitForStableStreamCount(t *testing.T, tr *QUICTransport, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	prev := tr.StreamCount()
-	for time.Now().Before(deadline) {
-		time.Sleep(timeout / 10)
-		curr := tr.StreamCount()
-		if curr == prev {
-			return
-		}
-		prev = curr
 	}
 }
 
@@ -1795,8 +1896,6 @@ func TestConnectionCleanup_ExitsOnStopAfterNormalReturn(t *testing.T) {
 		tr.connectionCleanup()
 	}()
 
-	// Let it start, then stop.
-	time.Sleep(20 * time.Millisecond)
 	close(testStopC)
 
 	select {
@@ -1937,6 +2036,9 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 
 	testStopC := make(chan struct{})
 	tr.stopC = testStopC
+	// Sweep every millisecond so the injected entry panics within the window
+	// below rather than after the default 30s interval.
+	tr.cleanupInterval = time.Millisecond
 
 	// Inject a nil connection that will cause a panic during cleanup.
 	tr.connMu.Lock()
@@ -1949,7 +2051,8 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 		tr.connectionCleanup()
 	}()
 
-	// Let the panic-restart happen (supervise.RestartDelay is 100ms).
+	// Kept on purpose: the window spans a panicking sweep and a restart delay
+	// (supervise.RestartDelay, 100ms), which expose no signal to wait on.
 	time.Sleep(300 * time.Millisecond)
 
 	// Close stopC to exit the loop.
@@ -2019,14 +2122,14 @@ func TestEvictStaleOutboundOnRecv_PeerRestartDetected(t *testing.T) {
 
 	// Stop t2 to simulate peer restart.
 	t2.Stop()
-	time.Sleep(200 * time.Millisecond)
 
 	// Create a new t2 on the same address to simulate restart.
+	handler2b := newTestHandler()
 	t2b, err := NewQUICTransport(Config{
 		ListenAddress: t2Addr,
 		DeploymentID:  42,
 		MTLSConfig:    mtls,
-	}, newTestHandler(), registry.NewRegistry())
+	}, handler2b, registry.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewQUICTransport(2b) failed: %v", err)
 	}
@@ -2035,11 +2138,14 @@ func TestEvictStaleOutboundOnRecv_PeerRestartDetected(t *testing.T) {
 	}
 	defer t2b.Stop()
 
-	// Send again. The stale outbound should be detected and evicted.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+	// Send again until the restarted peer receives: the stale outbound
+	// must be detected and replaced by a fresh dial.
+	pollUntil(t, 10*time.Second, 50*time.Millisecond, "restarted peer never received a message", func() bool {
+		t1.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+		})
+		return handler2b.batchCount.Load() > 0
 	})
-	time.Sleep(500 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,8 +2236,11 @@ func TestGetStream_StaleConnectionFastPathEviction(t *testing.T) {
 	handler2.waitBatch(t, 10*time.Second)
 
 	// Stop t2 to make the connection dead.
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Restart t2 on the same address.
 	t2b, err := NewQUICTransport(Config{
@@ -2151,10 +2260,7 @@ func TestGetStream_StaleConnectionFastPathEviction(t *testing.T) {
 	// evict it, and fall through to the slow path.
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		// This may fail if the connection isn't fully dead yet, which
-		// is acceptable. The important thing is that the eviction path
-		// was exercised.
-		t.Logf("getStream returned error (expected on timing): %v", err)
+		t.Fatalf("getStream after stale eviction failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream")
 	}
@@ -2183,18 +2289,13 @@ func TestEvictStreamsForTarget_WithMultipleStreams(t *testing.T) {
 		})
 	}
 
-	// Wait for messages to arrive.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "not all eight messages arrived", func() bool {
 		total := 0
 		for _, b := range handler2.getBatches() {
 			total += len(b.Requests)
 		}
-		if total >= 5 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return total >= 8
+	})
 
 	// Evict all streams for the target.
 	t1.evictStreamsForTarget(t2Addr)
@@ -2202,7 +2303,7 @@ func TestEvictStreamsForTarget_WithMultipleStreams(t *testing.T) {
 	// After eviction, getting a stream should open a new one.
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		t.Logf("getStream after eviction: %v", err)
+		t.Fatalf("getStream after eviction failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream after eviction")
 	}
@@ -2259,8 +2360,11 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// Now evict the fast-path cached stream so the next getStream
 	// enters the slow path, but leave a stale stream in the shard map
 	// by stopping t2 (killing the connection) without evicting streams.
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Remove the connection from the pool but leave streams in the shards.
 	// This simulates the race: another goroutine cached a stream on a
@@ -2288,7 +2392,7 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// 4. Detect it's stale (!connOK), discard + retry
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		t.Logf("getStream stale dedup: %v (may be timing-dependent)", err)
+		t.Fatalf("getStream stale dedup retry failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream from stale dedup retry")
 	}
@@ -2366,8 +2470,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	t1.connMu.Unlock()
 	conn2, dialErr := t1.dialForTest(t2Addr)
 	if dialErr != nil {
-		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
-		return
+		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
 	}
 	if conn2 == outbound {
 		t.Fatal("expected a distinct second connection after cache removal")
@@ -2380,7 +2483,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	// alive-but-stale outbound must be evicted promptly.
 	t1.evictStaleOutboundOnRecv(t2Addr, 2, conn2)
 
-	time.Sleep(200 * time.Millisecond)
+	// The eviction leaves the pool synchronously; there is nothing to wait on.
 	t1.connMu.RLock()
 	current, stillExists := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
@@ -2475,7 +2578,7 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	t1.evictStaleOutboundOnRecv(t2Addr, 7, conn2)
 
 	// The alive outbound must still be present (same epoch ⇒ no eviction).
-	time.Sleep(200 * time.Millisecond)
+	// evictStaleOutboundOnRecv decides synchronously, so this is final.
 	t1.connMu.RLock()
 	current, stillExists := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
@@ -2636,8 +2739,11 @@ func TestGetStream_StaleStreamInShardDedupRetry(t *testing.T) {
 	shard.mu.RUnlock()
 
 	// Step 4: Stop t2 (kills the connection).
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Step 5: Remove the connection from conns but leave the stale stream
 	// in the shard map. This is the key setup: getStream slow path will
@@ -2929,13 +3035,17 @@ func TestEvictStreamsForTarget_StreamCloseError(t *testing.T) {
 	t1.connMu.RLock()
 	conn := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
-	if conn != nil {
-		conn.CloseWithError(0, "pre-close for stream error test")
+	if conn == nil {
+		t.Fatal("expected outbound connection to exist")
 	}
-	time.Sleep(200 * time.Millisecond)
+	conn.CloseWithError(0, "pre-close for stream error test")
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Now evict streams - they should fail to close since connection is dead.
 	t1.evictStreamsForTarget(t2Addr)
+	if n := countStreamsForTarget(t1, t2Addr); n != 0 {
+		t.Fatalf("expected no pooled streams after eviction despite close errors, got %d", n)
+	}
 
 	t2.Stop()
 }
@@ -3095,7 +3205,6 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 			// Repeatedly remove the connection.
 			for i := 0; i < 100; i++ {
 				t1.removeConnection(t2Addr)
-				time.Sleep(time.Microsecond)
 			}
 		}()
 
@@ -3112,7 +3221,6 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 				shard.mu.Unlock()
 
 				_, _ = t1.getStream(t2Addr, shardID, false, "")
-				time.Sleep(time.Microsecond)
 			}
 		}()
 
@@ -3133,7 +3241,7 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 // OpenStreamSync completes.
 
 func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
 
 	t2Addr := t2.Addr().String()
@@ -3142,7 +3250,7 @@ func TestGetStream_FastPathEvictionBetweenReads(t *testing.T) {
 	t1.Send([]proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-	time.Sleep(300 * time.Millisecond)
+	handler2.waitBatch(t, 10*time.Second)
 
 	// Get a stream to populate the cache.
 	stream1, err := t1.getStream(t2Addr, 1, false, "")

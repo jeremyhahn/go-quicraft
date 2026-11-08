@@ -82,20 +82,29 @@ func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 
 	// A bare Heartbeat carries neither entries nor a snapshot, so Send routes
 	// it through the heartbeat fast path and its dedicated stream (index 0).
-	// The pacing here cannot be replaced by a poll on PeerFrameRejections:
-	// MEASURED, the sender learns of a rejection only when it NEXT writes to
-	// the stream the peer reset, so the counter trails the sends by one and
-	// waiting for attempt i to be counted before making attempt i+1 deadlocks
-	// (it ran the full 10s at i=0). The sleep also keeps the sends from being
-	// coalesced into one frame, which would leave a single write and therefore
-	// no second write to observe the rejection on.
-	const attempts = 20
-	for range attempts {
-		sender.Send([]proto.Message{{
-			Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1,
-		}})
-		time.Sleep(50 * time.Millisecond)
-	}
+	// The sender learns of a rejection only when it NEXT writes to the stream
+	// the peer reset, so the counter trails the sends by one: waiting for
+	// attempt i to be counted before making attempt i+1 deadlocks. Instead
+	// one heartbeat goes out per poll tick until three rejections are counted,
+	// which takes writes after the first two rejections, each of which
+	// would have re-dialed had a rejection torn the connection down. The
+	// tick keeps the sends from being coalesced into one frame.
+	const wantRejections = 3
+	attempts := 0
+	pollUntil(t, 10*time.Second, 50*time.Millisecond,
+		"heartbeat frames rejected by the peer were not counted: the only "+
+			"signal an operator gets for a peer that silently refuses every "+
+			"frame is this counter and its rate-limited warning",
+		func() bool {
+			if sender.PeerFrameRejections() >= wantRejections {
+				return true
+			}
+			attempts++
+			sender.Send([]proto.Message{{
+				Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1,
+			}})
+			return false
+		})
 
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("a rejected heartbeat frame caused re-dialing: %d dials after "+
@@ -104,12 +113,6 @@ func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 			"wire-version or deployment mismatch into a permanent dial storm",
 			got, attempts)
 	}
-	if sender.PeerFrameRejections() == 0 {
-		t.Fatal("heartbeat frames rejected by the peer were not counted: the " +
-			"only signal an operator gets for a peer that silently refuses " +
-			"every frame is this counter and its rate-limited warning")
-	}
-
 	var rejected int
 	for _, d := range metrics.drops() {
 		if d.reason == dropReasonPeerRejected {

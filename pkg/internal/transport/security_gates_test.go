@@ -154,10 +154,8 @@ func TestListenerRefusesUnauthenticatedClients(t *testing.T) {
 	// cases below are verdicts rather than a blanket inability to connect.
 	before := h.countIdentities()
 	sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
-	if _, ok := waitForCount(h, before+1, 5*time.Second); !ok {
-		t.Fatal("the control peer was never admitted: every negative case " +
-			"below would then pass for the wrong reason")
-	}
+	waitForCount(t, h, before+1, 5*time.Second, "the control peer was never admitted: every negative case "+
+		"below would then pass for the wrong reason")
 
 	target := recv.Addr().String()
 	for name, cfg := range map[string]*tls.Config{
@@ -170,7 +168,7 @@ func TestListenerRefusesUnauthenticatedClients(t *testing.T) {
 			start := h.countIdentities()
 			dialAndWriteBestEffort(t, cfg, target)
 			// Allow a wrongly-admitted batch time to arrive.
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond) // kept: a batch that must never arrive has no event to wait on
 			if got := h.countIdentities(); got != start {
 				t.Fatalf("a %s client delivered a batch to the handler: "+
 					"mandatory mTLS is enforced only in the struct the config "+
@@ -226,15 +224,11 @@ func (h *identityCapturingHandler) countIdentities() int {
 	return len(h.identities)
 }
 
-func waitForCount(h *identityCapturingHandler, want int, d time.Duration) (int, bool) {
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if got := h.countIdentities(); got >= want {
-			return got, true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return h.countIdentities(), false
+func waitForCount(t *testing.T, h *identityCapturingHandler, want int, d time.Duration, msg string) {
+	t.Helper()
+	pollUntil(t, d, 10*time.Millisecond, msg, func() bool {
+		return h.countIdentities() >= want
+	})
 }
 
 // peerVisibleCloseError returns the CONNECTION_CLOSE the REMOTE end sent for a

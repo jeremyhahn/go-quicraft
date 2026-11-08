@@ -119,8 +119,8 @@ func TestAcceptLoopRestartsAfterPanic(t *testing.T) {
 		)
 	}()
 
-	// Give the goroutine time to enter Accept, then stop.
-	time.Sleep(20 * time.Millisecond)
+	// Stop: Accept returns whether it was entered before or after the
+	// cancel.
 	tr.shutdownCancel()
 
 	select {
@@ -140,7 +140,7 @@ func TestHandleStreamPanicRecovery(t *testing.T) {
 	// message arrives, HandleMessage panics. The panic recovery in
 	// handleStream catches it. Then verify the accept loop is still
 	// functional by using a second sender with a working handler.
-	panicHandler := &panicOnHandleHandler{}
+	panicHandler := &panicOnHandleHandler{panicked: make(chan struct{}, 1)}
 	reg1 := registry.NewRegistry()
 
 	mtls := testMTLSConfig(t)
@@ -182,13 +182,21 @@ func TestHandleStreamPanicRecovery(t *testing.T) {
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
 
-	// Wait for the panic to be recovered. The receiver process must
-	// NOT crash. We verify this by the test not panicking. Give enough
-	// time for the message to arrive and the panic to fire.
-	time.Sleep(200 * time.Millisecond)
+	waitForChan(t, panicHandler.panicked, 10*time.Second, "the receiver's handler was not called")
 
-	// The key assertion: the receiver is still alive and its accept
-	// loop is still running. The process did not crash.
+	// The receiver recovered and still handles messages: a later send
+	// reaches its handler again.
+	pollUntil(t, 10*time.Second, 20*time.Millisecond, "the receiver stopped handling messages after the panic", func() bool {
+		sender.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
+		})
+		select {
+		case <-panicHandler.panicked:
+			return true
+		default:
+			return false
+		}
+	})
 	if receiver.stopped.Load() {
 		t.Fatal("receiver should still be running after handleStream panic")
 	}
@@ -269,6 +277,9 @@ func TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery(t *testing.T) {
 	// Set stopC to a test-controlled channel on the unstarted transport.
 	testStopC := make(chan struct{})
 	tr.stopC = testStopC
+	// Each message the worker processes fails to send and is dropped.
+	rec := &dropRecorder{}
+	tr.metrics = rec
 
 	sq := &sendQueue{
 		ch:   make(chan proto.Message, 8),
@@ -285,12 +296,12 @@ func TestSendQueueWorkerRestartsAfterPanicAndResumesDelivery(t *testing.T) {
 	// will fail silently (no real connection). This verifies the worker
 	// is alive and processing.
 	sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2}
-	time.Sleep(50 * time.Millisecond)
+	waitForDrops(t, rec, 1)
 
 	// Enqueue another message to verify the worker is still alive after
 	// the first message was processed (no panic on normal send failure).
 	sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2}
-	time.Sleep(50 * time.Millisecond)
+	waitForDrops(t, rec, 2)
 
 	// Signal shutdown.
 	close(testStopC)
@@ -328,8 +339,6 @@ func TestConnectionCleanupRestartsAfterPanic(t *testing.T) {
 		tr.connectionCleanup()
 	}()
 
-	// Let the cleanup loop run for a tick, then stop.
-	time.Sleep(50 * time.Millisecond)
 	close(testStopC)
 
 	select {
@@ -358,6 +367,9 @@ func TestSendQueueWorkerExitsCleanlyOnStopSignal(t *testing.T) {
 	// Set stopC to a test-controlled channel on the unstarted transport.
 	testStopC := make(chan struct{})
 	tr.stopC = testStopC
+	// Each message the worker processes fails to send and is dropped.
+	rec := &dropRecorder{}
+	tr.metrics = rec
 
 	sq := &sendQueue{
 		ch:   make(chan proto.Message, 8),
@@ -372,7 +384,7 @@ func TestSendQueueWorkerExitsCleanlyOnStopSignal(t *testing.T) {
 
 	// Enqueue a message, let it process, then stop.
 	sq.ch <- proto.Message{Type: proto.Replicate, ShardID: 1, From: 1, To: 2}
-	time.Sleep(30 * time.Millisecond)
+	waitForDrops(t, rec, 1)
 
 	close(testStopC)
 
@@ -385,9 +397,16 @@ func TestSendQueueWorkerExitsCleanlyOnStopSignal(t *testing.T) {
 
 // panicOnHandleHandler is a MessageHandler that panics when HandleMessage
 // is called. Used to verify panic recovery on the receive path.
-type panicOnHandleHandler struct{}
+// A non-nil panicked receives a signal, when it has room, before each panic.
+type panicOnHandleHandler struct {
+	panicked chan struct{}
+}
 
 func (h *panicOnHandleHandler) HandleMessage(_ proto.MessageBatch, _ PeerAuth) error {
+	select {
+	case h.panicked <- struct{}{}:
+	default:
+	}
 	panic("intentional panic in HandleMessage")
 }
 

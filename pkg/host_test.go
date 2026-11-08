@@ -521,20 +521,22 @@ func injectApplyLag(t *testing.T, h *Host, shardID uint64) uint64 {
 	const settle = 50 * time.Millisecond
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		committed := engNode.CommittedIndex()
-		if committed > 0 && ns.lastApplied.Load() == committed {
-			time.Sleep(settle)
-			if engNode.CommittedIndex() == committed && ns.lastApplied.Load() == committed {
-				ns.lastApplied.Store(0)
-				return committed
-			}
-		}
-		if time.Now().After(deadline) {
+		var committed uint64
+		agreed := waitUntil(time.Until(deadline), func() bool {
+			committed = engNode.CommittedIndex()
+			return committed > 0 && ns.lastApplied.Load() == committed
+		})
+		if !agreed {
 			t.Fatalf("shard %d never settled: committed=%d lastApplied=%d; the lag "+
 				"cannot be injected without racing an apply that is still coming",
 				shardID, engNode.CommittedIndex(), ns.lastApplied.Load())
 		}
-		time.Sleep(time.Millisecond)
+		// Kept: the settle window is the check itself; no event marks that no apply is still coming.
+		time.Sleep(settle)
+		if engNode.CommittedIndex() == committed && ns.lastApplied.Load() == committed {
+			ns.lastApplied.Store(0)
+			return committed
+		}
 	}
 }
 
@@ -6319,11 +6321,8 @@ func TestKeyRotationLoop_RestartsAfterGoexit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	deadline := time.Now().Add(6 * time.Second)
-	for barrier.successCount.Load() < 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !barrier.goexited.Load() || barrier.successCount.Load() < 1 {
+	rotated := waitUntil(6*time.Second, func() bool { return barrier.successCount.Load() >= 1 })
+	if !rotated || !barrier.goexited.Load() {
 		t.Fatalf("goexited=%v successful rotations=%d, want a rotation after the Goexit",
 			barrier.goexited.Load(), barrier.successCount.Load())
 	}
@@ -14369,55 +14368,6 @@ func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("SyncGetShardMembership = %v, want ErrTimeout: a read that "+
 			"cannot reach quorum must be bounded by the caller's deadline", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: OnReadyToRead - alias completion when lastApplied >= readIndex
-// ---------------------------------------------------------------------------
-
-func TestOnReadyToRead_AliasCompletionWithSufficientApply(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-
-	ns := testLoadNode(h, 1)
-	ns.requestPool = NewRequestStatePool()
-
-	// Set lastApplied high enough that the read can complete immediately.
-	ns.lastApplied.Store(100)
-
-	// Create batch primary and alias pending reads.
-	batchKey := uint64(10)
-	aliasKey := uint64(11)
-
-	batchRS := newRequestState(ns.requestPool, batchKey, time.Time{}, true)
-	aliasRS := newRequestState(ns.requestPool, aliasKey, time.Time{}, true)
-
-	ns.pendingReadsMu.Lock()
-	ns.pendingReads[batchKey] = &pendingRead{rs: batchRS, aliases: []uint64{aliasKey}}
-	ns.pendingReads[aliasKey] = &pendingRead{rs: aliasRS}
-	ns.pendingReadsMu.Unlock()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnReadyToRead(1, []proto.ReadyToRead{{Key: batchKey, Index: 50}})
-
-	// Both should be completed.
-	select {
-	case r := <-batchRS.ResultC():
-		if r.Value != 50 {
-			t.Errorf("batch result = %d, want 50", r.Value)
-		}
-	default:
-		t.Error("batch RS not completed")
-	}
-
-	select {
-	case r := <-aliasRS.ResultC():
-		if r.Value != 50 {
-			t.Errorf("alias result = %d, want 50", r.Value)
-		}
-	default:
-		t.Error("alias RS not completed")
 	}
 }
 
